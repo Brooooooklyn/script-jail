@@ -11,16 +11,23 @@
 // Bun handling: if `bun.lock` or `bun.lockb` is the ONLY lockfile present,
 // throw `BunUnsupportedError`.  npm-jar v1 only supports npm/pnpm/yarn.
 //
-// When multiple supported lockfiles are present we log a warning and pick the
-// highest priority.  This mirrors the behaviour of `corepack` and most CI
-// install actions.
+// When multiple supported lockfiles are present we log a warning (via the
+// shared `warn` helper from ./log.ts so it shows up as a GitHub Actions
+// `::warning::` annotation) and pick the highest priority.  This mirrors
+// the behaviour of `corepack` and most CI install actions.
 //
-// The `fs` field on `DetectInput` is an injection seam so tests can avoid
-// touching the real filesystem.  Production code uses node:fs.
+// The `fs` and `warn` fields on `DetectInput` are injection seams so tests
+// can avoid touching the real filesystem or stdout.  Production code uses
+// node:fs and the default warn helper.
+//
+// This function is synchronous: the lockfile read is small and one-shot, so
+// async IO buys nothing.  We return `DetectedPm` directly (not a Promise).
 
 import { createHash } from 'node:crypto';
 import { existsSync as realExistsSync, readFileSync as realReadFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+import { warn as realWarn } from './log.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -48,6 +55,11 @@ export interface DetectInput {
     existsSync(p: string): boolean;
     readFileSync(p: string): Buffer;
   } | undefined;
+  /**
+   * Optional injection seam for the warning sink.  Defaults to the shared
+   * `warn` helper which writes a `::warning::` annotation to stdout.
+   */
+  warn?: ((msg: string) => void) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,11 +102,12 @@ const BUN_LOCKFILES: ReadonlyArray<string> = ['bun.lock', 'bun.lockb'];
 // detectPm
 // ---------------------------------------------------------------------------
 
-export async function detectPm(input: DetectInput): Promise<DetectedPm> {
+export function detectPm(input: DetectInput): DetectedPm {
   const fs = input.fs ?? {
     existsSync: realExistsSync,
     readFileSync: (p: string): Buffer => realReadFileSync(p),
   };
+  const warn = input.warn ?? realWarn;
 
   // Collect every supported lockfile that exists in the repo root.
   const found = LOCKFILE_PRIORITY.filter((entry) =>
@@ -120,7 +133,7 @@ export async function detectPm(input: DetectInput): Promise<DetectedPm> {
   const others = found.slice(1);
   if (others.length > 0) {
     const otherNames = others.map((o) => o.name).join(', ');
-    console.warn(
+    warn(
       `[detect-pm] multiple lockfiles found; using ${chosen.name} ` +
       `(ignoring: ${otherNames})`,
     );

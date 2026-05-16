@@ -24,8 +24,9 @@ import { isAbsolute, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import { parseInputs } from './action/inputs.js';
-import { detectPm, BunUnsupportedError } from './action/detect-pm.js';
+import { detectPm, BunUnsupportedError, type DetectedPm } from './action/detect-pm.js';
 import { renderDiff } from './action/diff.js';
+import { warn } from './action/log.js';
 import {
   ensureBinaries,
   NodeHttpClient,
@@ -71,19 +72,29 @@ export async function main(): Promise<void> {
   // --- PM detection --------------------------------------------------------
   // BunUnsupportedError is non-fatal: emit a ::warning and exit cleanly so
   // bun-using repos can install the action without breaking their CI.
-  let pm;
+  let pm: DetectedPm;
   try {
-    pm = await detectPm({ repoDir });
+    pm = detectPm({ repoDir });
   } catch (err) {
     if (err instanceof BunUnsupportedError) {
-      process.stdout.write(`::warning::${err.message}\n`);
+      warn(err.message);
       process.exit(0);
     }
     throw err;
   }
 
   // --- Resolve image paths -------------------------------------------------
-  const imagesDir = join(repoDir, 'images');
+  // imagesDir must live OUTSIDE the user's repo (we previously joined it onto
+  // repoDir, which polluted their working tree).  RUNNER_TEMP is the GitHub
+  // Actions runner's scratch directory — writable and cleaned between jobs.
+  // os.tmpdir() is the dev/test fallback.
+  //
+  // The rootfs image (`rootfs-node<MAJOR>-<MANAGER>.ext4`) is also resolved
+  // here.  Production deployments will need to provision or fetch the rootfs
+  // into this location; if it is missing, `launchVm` will fail loudly.
+  const imagesDir = process.env['RUNNER_TEMP']
+    ? join(process.env['RUNNER_TEMP'], 'npm-jar-images')
+    : join(tmpdir(), 'npm-jar-images');
   mkdirSync(imagesDir, { recursive: true });
 
   // The rootfs image is keyed by node-major + manager (e.g. rootfs-node20-pnpm.ext4).
@@ -117,6 +128,10 @@ export async function main(): Promise<void> {
   let vsock: VsockSession | null = null;
   let finalYaml: string | null = null;
   let fatalError: Error | null = null;
+  // Non-fatal guest errors are surfaced as ::warning:: annotations as they
+  // arrive, AND retained here so we can attach them to a "no final frame"
+  // diagnostic if the session ends without a `final`.
+  const nonFatalErrors: string[] = [];
 
   try {
     // --- Boot the VM -------------------------------------------------------
@@ -140,15 +155,19 @@ export async function main(): Promise<void> {
     // --- Drive the protocol -----------------------------------------------
     for await (const frame of vsock.events) {
       if (frame.kind === 'event') {
-        // Events are emitted continuously; the host normalizer will use them
-        // in a future iteration.  For v1 we ignore the live stream because
-        // the guest emits the final lockfile YAML directly.
+        // We deliberately ignore the live event stream: the guest agent does
+        // its own normalisation inside the VM and emits the YAML in the
+        // `final` frame.  Host-side normalisation is not on the v1 roadmap.
         continue;
       }
       if (frame.kind === 'handshake') {
         if (frame.phase === 'fetch_done') {
           await vsock.sendGo();
+          continue;
         }
+        // `install_done` is an FYI marker; the agent will follow with `final`.
+        // No action needed here, but we keep the branch explicit so future
+        // handshake phases must opt in rather than fall through unnoticed.
         continue;
       }
       if (frame.kind === 'error') {
@@ -156,8 +175,11 @@ export async function main(): Promise<void> {
           fatalError = new Error(`npm-jar guest fatal: ${frame.message}`);
           break;
         }
-        // Non-fatal errors are surfaced as warnings.
-        process.stdout.write(`::warning::npm-jar guest: ${frame.message}\n`);
+        // Non-fatal errors are surfaced as warnings AND retained so that, if
+        // the stream ends without a final frame, we can attach them to the
+        // diagnostic message instead of throwing a context-free error.
+        nonFatalErrors.push(frame.message);
+        warn(`npm-jar guest: ${frame.message}`);
         continue;
       }
       if (frame.kind === 'final') {
@@ -177,8 +199,12 @@ export async function main(): Promise<void> {
 
   if (fatalError !== null) throw fatalError;
   if (finalYaml === null) {
+    const tail =
+      nonFatalErrors.length > 0
+        ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(', ')}]`
+        : '';
     throw new Error(
-      'npm-jar: guest did not emit a "final" frame before the vsock stream ended.',
+      `npm-jar: vsock session ended without a final frame.${tail}`,
     );
   }
 
@@ -194,7 +220,11 @@ export async function main(): Promise<void> {
       generated: finalYaml,
     });
 
-    process.stdout.write(diff.unified);
+    if (diff.unified !== '') {
+      process.stdout.write(diff.unified);
+      // Make sure the annotations don't smash onto the diff's last line.
+      if (!diff.unified.endsWith('\n')) process.stdout.write('\n');
+    }
     for (const ann of diff.annotations) {
       process.stdout.write(`${ann}\n`);
     }
