@@ -33,13 +33,13 @@ node /usr/local/lib/npm-jar/guest-agent.cjs &
 AGENT_PID=$!
 
 # 2. Wait for the TCP listener on 127.0.0.1:10243 to appear in /proc/net/tcp.
-#    The local-address column is "0100007F:280B" (127.0.0.1 in little-endian
-#    hex, port 10243 = 0x280B) when bound; the state column is "0A" (LISTEN).
+#    The local-address column is "0100007F:2803" (127.0.0.1 in little-endian
+#    hex, port 10243 = 0x2803) when bound; the state column is "0A" (LISTEN).
 #    Poll for up to ~2 seconds (200 iterations x 10ms) — far longer than Node's
 #    actual bind latency, but bounded so a wedged agent doesn't hang init.
 i=0
 while [ "${i}" -lt 200 ]; do
-  if grep -q ' 0100007F:280B [0-9A-F:]* 0A ' /proc/net/tcp 2>/dev/null; then
+  if grep -q ' 0100007F:2803 [0-9A-F:]* 0A ' /proc/net/tcp 2>/dev/null; then
     break
   fi
   # If the agent died before binding, abort immediately with its exit code.
@@ -75,7 +75,10 @@ if ! kill -0 "${SOCAT_PID}" 2>/dev/null; then
 fi
 
 # 4. Wait on the agent; cleanup the bridge on exit.
-wait "${AGENT_PID}"
-AGENT_STATUS=$?
+#    `set -e` would abort on a non-zero wait status, skipping cleanup and the
+#    explicit exit below; the `|| AGENT_STATUS=$?` suppresses that so we always
+#    run cleanup and propagate the agent's exit code.
+AGENT_STATUS=0
+wait "${AGENT_PID}" || AGENT_STATUS=$?
 cleanup
 exit "${AGENT_STATUS}"
