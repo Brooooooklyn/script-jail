@@ -63,6 +63,26 @@ describe('openat', () => {
     expect(evs).toEqual([{ kind: 'read', path: '/root/secret', pid: 1, ts: 0, hidden: false }]);
   });
 
+  it('EACCES on O_WRONLY → still emits write event (record probe attempt)', () => {
+    const line = 'openat(AT_FDCWD, "/etc/shadow", O_WRONLY|O_CREAT, 0644) = -1 EACCES (Permission denied)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/etc/shadow', pid: 1, ts: 0, hidden: false }]);
+  });
+
+  it('path containing literal ) is parsed correctly (quote-aware paren scan)', () => {
+    // A file named "a)b" must not confuse the outer-paren depth counter.
+    const line = 'openat(AT_FDCWD, "/work/pkg/a)b", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a)b', pid: 1, ts: 0, hidden: false }]);
+  });
+
+  it('path containing literal ( is parsed correctly (quote-aware paren scan)', () => {
+    // A file named "a(b" must not push the depth counter to 2.
+    const line = 'openat(AT_FDCWD, "/work/pkg/a(b", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a(b', pid: 1, ts: 0, hidden: false }]);
+  });
+
   it('numeric dir-fd → null (v1 limitation)', () => {
     const line = 'openat(5, "relative.txt", O_RDONLY) = 6';
     expect(parseStraceLine(line, 1, 0)).toBeNull();
@@ -128,6 +148,15 @@ describe('execve', () => {
     if (ev?.kind === 'spawn') {
       expect(ev.argv[0]).toBe('node');
     }
+  });
+
+  it('argv element containing ) is parsed correctly (quote-aware paren scan)', () => {
+    // The ) inside "require('fs').readFileSync('/etc/hostname')" must not
+    // close the outer syscall paren early.
+    const line = "execve(\"/usr/bin/node\", [\"node\", \"-e\", \"require('fs').readFileSync('/etc/hostname')\"], 0x7ffd...) = 0";
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['node', '-e', "require('fs').readFileSync('/etc/hostname')"] });
   });
 });
 
@@ -217,6 +246,15 @@ describe('renameat2', () => {
   it('failure → null (nothing emitted)', () => {
     const line = 'renameat2(AT_FDCWD, "/tmp/a", AT_FDCWD, "/tmp/b", 0) = -1 ENOENT (No such file or directory)';
     expect(parseStraceLine(line, 1, 0)).toBeNull();
+  });
+
+  it('RENAME_EXCHANGE → [write(old), write(new)] (both paths mutated by atomic swap)', () => {
+    // Real strace line for an atomic swap: both paths are written.
+    const line = 'renameat2(AT_FDCWD, "/work/victim/index.js", AT_FDCWD, "/tmp/malware", RENAME_EXCHANGE) = 0';
+    const evs = parseStraceLine(line, 7, 3);
+    expect(evs).toHaveLength(2);
+    expect(evs![0]).toEqual({ kind: 'write', path: '/work/victim/index.js', pid: 7, ts: 3, hidden: false });
+    expect(evs![1]).toEqual({ kind: 'write', path: '/tmp/malware', pid: 7, ts: 3, hidden: false });
   });
 });
 

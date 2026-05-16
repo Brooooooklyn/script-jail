@@ -130,8 +130,9 @@ interface RetVal {
  * Returns null if no return-value clause is found (unfinished etc.).
  */
 function parseRetVal(line: string): RetVal | null {
-  // Match "= -1 ERRNO (...)" or "= 0" or "= 0x..." at end of line
-  const m = line.match(/=\s+(-?\d[\w]*)\s*(?:(\w+)\s*\([^)]*\))?\s*$/);
+  // Match "= -1 ERRNO (...)" or "= 0" or "= 0x..." at end of line.
+  // Tolerates strace -T duration suffix like "<0.000042>".
+  const m = line.match(/=\s+(-?\d[\w]*)\s*(?:(\w+)\s*\([^)]*\))?\s*(?:<[^>]*>)?\s*$/);
   if (!m) return null;
   const raw = m[1] ?? '';
   const errno = m[2]; // may be undefined
@@ -169,14 +170,14 @@ function flagsImplyWrite(flags: string): boolean {
 function parseArgvToken(token: string): string[] {
   // token looks like: ["node", "-e", "require(...)"] or ["node", ...]
   const inside = token.replace(/^\[/, '').replace(/\]$/, '').trim();
-  // remove /* ... */ comments
-  const cleaned = inside.replace(/\/\*[^*]*\*\//g, '').trim();
+  // remove /* ... */ comments (lazy match handles * inside comment body)
+  const cleaned = inside.replace(/\/\*[\s\S]*?\*\//g, '').trim();
   if (cleaned.length === 0 || cleaned === '...') return [];
   const args: string[] = [];
   let i = 0;
   while (i < cleaned.length) {
     // skip whitespace and commas
-    while (i < cleaned.length && (cleaned[i] === ',' || cleaned[i] === ' ')) i++;
+    while (i < cleaned.length && (cleaned[i] === ',' || /\s/.test(cleaned[i]!))) i++;
     if (i >= cleaned.length) break;
     if (cleaned[i] === '"') {
       const r = extractQuotedString(cleaned, i);
@@ -193,7 +194,7 @@ function parseArgvToken(token: string): string[] {
     } else {
       // unquoted token (rare)
       let j = i;
-      while (j < cleaned.length && cleaned[j] !== ',' && cleaned[j] !== ' ') j++;
+      while (j < cleaned.length && cleaned[j] !== ',' && !/\s/.test(cleaned[j]!)) j++;
       args.push(cleaned.slice(i, j));
       i = j;
     }
@@ -285,12 +286,21 @@ function _parseStraceLine(line: string, pid: number, ts: number): RawEvent[] | n
   if (parenIdx === -1) return null;
   const syscallName = line.slice(0, parenIdx).trim();
 
-  // Find the matching close paren by scanning (handles nested parens)
+  // Find the matching close paren by scanning (handles nested parens).
+  // Quote-aware: skip over "..." tokens so that a literal ) or ( inside a
+  // quoted path (e.g. "/work/pkg/a)b") does not confuse the depth counter.
   let depth = 0;
   let closeIdx = -1;
-  for (let i = parenIdx; i < line.length; i++) {
-    if (line[i] === '(') depth++;
-    else if (line[i] === ')') { depth--; if (depth === 0) { closeIdx = i; break; } }
+  let i = parenIdx;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === '"') {
+      const r = extractQuotedString(line, i);
+      if (r !== null) { i = r[1]; continue; }
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') { depth--; if (depth === 0) { closeIdx = i; break; } }
+    i++;
   }
   if (closeIdx === -1) return null;
 
@@ -311,6 +321,9 @@ function _parseStraceLine(line: string, pid: number, ts: number): RawEvent[] | n
     case 'renameat2':   return parseRenameat2(args, retVal, pid, ts);
     case 'unlinkat':    return parseUnlinkat(args, retVal, pid, ts);
     case 'faccessat2':  return parseFaccessat2(args, retVal, pid, ts);
+    // TODO(v2): add mkdir, mkdirat, symlink, symlinkat, link, linkat, rmdir,
+    // truncate, truncate64, chmod, fchmodat; also resolve numeric dir-fds by
+    // tracking the open-fd table across syscalls.
     default: return null;
   }
 }
@@ -331,13 +344,13 @@ function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): R
   const flags = args[2] ?? '';
   const isWrite = flagsImplyWrite(flags);
 
-  // On failure: ENOENT → null (nothing happened). Other errors on write are also null.
-  // EACCES on a read → still emit the read event (we record the attempt).
+  // On failure: ENOENT → null (nothing happened). Other errors → drop.
+  // EACCES on read or write → still emit the event (we record the attempt;
+  // a script probing for writable paths would otherwise leave no trace).
   if (retVal.isError) {
     if (retVal.errno === 'ENOENT') return null;
     if (retVal.errno !== 'EACCES') return null; // other errors: drop
-    // EACCES on read: fall through and emit read event
-    if (isWrite) return null;
+    // EACCES on read or write: fall through and emit the appropriate event
   }
 
   if (isWrite) {
@@ -382,7 +395,12 @@ function parseConnect(args: string[], retVal: RetVal, pid: number, ts: number): 
   if (addr === null) return null;
 
   // Success: retVal 0 → ok; any failure → blocked.
-  // This includes EINPROGRESS/EAGAIN (non-blocking connect in progress).
+  // EINPROGRESS is classified as blocked here even though the connect may
+  // eventually succeed; for phase-B audit purposes we only count connections
+  // that complete synchronously, which is operationally correct even if
+  // semantically imprecise (the caller would need SO_ERROR/getsockopt to
+  // confirm completion, which we do not trace in v1).
+  // TODO(v2): track SO_ERROR getsockopt results to resolve EINPROGRESS.
   const result = retVal.isError ? 'blocked' : 'ok';
 
   return [{ kind: 'connect', host: addr.host, port: addr.port, result, pid, ts }];
@@ -422,7 +440,10 @@ function parseStatx(args: string[], retVal: RetVal, pid: number, ts: number): Ra
 
 function parseRenameat2(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
   // renameat2(AT_FDCWD, "oldpath", AT_FDCWD, "newpath", flags) = 0
-  // Emits TWO events on success: a read on oldpath + a write on newpath.
+  // Normal rename: read(oldpath) + write(newpath).
+  // RENAME_EXCHANGE (atomic swap): write(oldpath) + write(newpath) — both
+  // paths are mutated; classifying oldpath as a read would silently miss a
+  // write to it.
   // On any failure: emit nothing.
   if (retVal.isError) return null;
 
@@ -433,6 +454,7 @@ function parseRenameat2(args: string[], retVal: RetVal, pid: number, ts: number)
 
   const oldPathToken = args[1] ?? '';
   const newPathToken = args[3] ?? '';
+  const flagsToken = args[4] ?? '';
 
   const rOld = extractQuotedString(oldPathToken, 0);
   const rNew = extractQuotedString(newPathToken, 0);
@@ -441,9 +463,12 @@ function parseRenameat2(args: string[], retVal: RetVal, pid: number, ts: number)
   const [oldPath] = rOld;
   const [newPath] = rNew;
 
-  const readEv: RawEvent = { kind: 'read', path: oldPath, pid, ts, hidden: false };
-  const writeEv: RawEvent = { kind: 'write', path: newPath, pid, ts, hidden: false };
-  return [readEv, writeEv];
+  const isExchange = flagsToken.includes('RENAME_EXCHANGE');
+  const oldEv: RawEvent = isExchange
+    ? { kind: 'write', path: oldPath, pid, ts, hidden: false }
+    : { kind: 'read',  path: oldPath, pid, ts, hidden: false };
+  const newEv: RawEvent = { kind: 'write', path: newPath, pid, ts, hidden: false };
+  return [oldEv, newEv];
 }
 
 function parseUnlinkat(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
