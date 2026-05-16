@@ -447,6 +447,9 @@ describe('agent main()', () => {
   });
 
   it('aborts fatally with an error frame when DNS still resolves after go', async () => {
+    // Stronger failure signal now: dropEth0 succeeded AND DNS still resolved
+    // within the timeout, which means the in-guest interface drop did not
+    // take effect (or was bypassed entirely).
     const { conn, hostSend, getOutput } = makeConn();
     const { spawner } = mockSpawner();
     const { strace, calls: installCalls } = trackingStrace();
@@ -465,7 +468,8 @@ describe('agent main()', () => {
         connection: conn,
         spawner,
         strace,
-        dnsLookup: onlineLookup, // resolver still works → host failed to disable network
+        dropEth0: async () => { /* pretend the drop succeeded */ },
+        dnsLookup: onlineLookup, // resolver still works → interface drop ineffective
       });
     } finally {
       process.exit = origExit;
@@ -491,6 +495,113 @@ describe('agent main()', () => {
     expect(
       frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
     ).toBe(false);
+  });
+
+  it('calls dropEth0 before the DNS verifyOffline lookup', async () => {
+    const { conn, hostSend } = makeConn();
+    const { spawner } = mockSpawner();
+    const { strace } = trackingStrace();
+    const configPath = writeConfig(testDir);
+
+    const order: string[] = [];
+    const dropEth0 = async (): Promise<void> => {
+      order.push('dropEth0');
+    };
+    const lookup: DnsLookupFn = (_h, cb) => {
+      order.push('lookup');
+      setImmediate(() => {
+        const err = new Error('ENOTFOUND') as NodeJS.ErrnoException;
+        err.code = 'ENOTFOUND';
+        cb(err);
+      });
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner,
+      strace,
+      dropEth0,
+      dnsLookup: lookup,
+    });
+
+    expect(order).toEqual(['dropEth0', 'lookup']);
+  });
+
+  it('emits a non-fatal error frame and continues when dropEth0 fails', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const { strace, calls: installCalls } = trackingStrace();
+    const configPath = writeConfig(testDir);
+
+    const dropEth0 = async (): Promise<void> => {
+      throw new Error('no such device');
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner,
+      strace,
+      dropEth0,
+      dnsLookup: offlineLookup,
+    });
+
+    // Phase B still ran — the DNS probe is the final gate.
+    expect(installCalls.length).toBeGreaterThanOrEqual(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    // Exactly one non-fatal error frame from the dropEth0 failure.
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(false);
+    expect(String(errors[0]!['message'])).toMatch(/drop eth0/);
+
+    // Install_done and final were still emitted.
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(true);
+  });
+
+  it('treats a hung DNS lookup as offline once the verify timeout fires', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const { strace, calls: installCalls } = trackingStrace();
+    const configPath = writeConfig(testDir);
+
+    // A lookup that never invokes its callback — simulates the resolver
+    // hanging after we drop eth0.  The timeout must rescue us.
+    const hangingLookup: DnsLookupFn = () => { /* never calls back */ };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner,
+      strace,
+      dropEth0: async () => { /* succeed silently */ },
+      dnsLookup: hangingLookup,
+      verifyOfflineTimeoutMs: 25,
+    });
+
+    // Phase B ran (hung lookup treated as offline).
+    expect(installCalls.length).toBeGreaterThanOrEqual(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).toContain('final');
+    // No fatal error from the verify step.
+    const fatalErrors = frames.filter((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatalErrors).toHaveLength(0);
   });
 
   it('order: fetch_done then events then install_done then final', async () => {

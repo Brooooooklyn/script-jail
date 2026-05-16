@@ -35,7 +35,6 @@ import {
 } from './action/firecracker/download.js';
 import { makeOverlay } from './action/firecracker/overlay.js';
 import { launchVm, type VmHandle } from './action/firecracker/launch.js';
-import { disableNetwork } from './action/firecracker/network.js';
 import { openVsockSession, type VsockSession } from './action/firecracker/vsock.js';
 import { teardown } from './action/firecracker/teardown.js';
 import type { OverlayResult } from './action/firecracker/overlay.js';
@@ -175,10 +174,13 @@ export async function main(): Promise<void> {
   try {
     // --- Boot the VM -------------------------------------------------------
     // Phase A networking is enabled at launch (tap0 + /network-interfaces/eth0
-    // in `launch.ts`) and torn down at the `fetch_done` handshake below by
-    // zeroing the eth0 rate-limiter buckets.  Firecracker has no API for
-    // removing a network interface, so the rate-limiter trick is the cleanest
-    // way to make Phase B genuinely offline without rebooting the VM.
+    // in `launch.ts`).  Phase B's offline guarantee is enforced from inside
+    // the guest itself: after receiving `go` the agent runs `ip link set eth0
+    // down` (see `src/guest/agent.ts`) and then verifies with a DNS probe.
+    // We deliberately do NOT touch Firecracker's host-side rate-limiter API
+    // here — its `size: 0` is interpreted as "rate limiter disabled" (i.e.
+    // unlimited), not "no bandwidth", so a host-side patch would be a silent
+    // no-op.  The guest is the source of truth for interface state.
     vm = await launchVm({
       firecrackerPath,
       vmlinuxPath,
@@ -204,15 +206,11 @@ export async function main(): Promise<void> {
       }
       if (frame.kind === 'handshake') {
         if (frame.phase === 'fetch_done') {
-          // Disable network BEFORE releasing the guest with `go`, so the
-          // moment Phase B starts the in-VM connect()s are already dead.
-          // `vm` is non-null here because we're inside the try-block that
-          // only runs after a successful `launchVm`, but narrow it anyway
-          // so the compiler is happy with strict null checks.
-          if (vm === null) {
-            throw new Error('npm-jar: vm not initialised at fetch_done');
-          }
-          await disableNetwork(vm.apiClient);
+          // Release the guest with `go`.  Network teardown happens inside
+          // the guest before Phase B starts (see `src/guest/agent.ts`,
+          // `dropEth0`) — host-side rate-limiter patching is unreliable
+          // because Firecracker treats `size: 0` as "rate limiter disabled"
+          // (unlimited), not "no bandwidth".
           await vsock.sendGo();
           continue;
         }

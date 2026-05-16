@@ -370,24 +370,77 @@ export interface AgentInput {
    * succeeds → fatal" branches without touching the network.
    */
   dnsLookup?: DnsLookupFn;
+  /**
+   * Optional override for the guest-side network drop.  Production runs
+   * `ip link set eth0 down` (busybox `ip` applet on Ubuntu 22.04/24.04) via
+   * the agent's `Spawner`.  Tests inject a stub to assert call ordering and
+   * exercise the "command failed" branch without touching the VM's networking.
+   */
+  dropEth0?: () => Promise<void>;
+  /**
+   * Per-call override for the DNS-probe timeout in milliseconds.  Defaults
+   * to 2000ms.  Exposed primarily so tests can shorten it for the
+   * "lookup hangs forever → treated as offline" case.
+   */
+  verifyOfflineTimeoutMs?: number;
 }
 
 /**
  * Confirm Phase B truly has no network by asking the resolver to look up a
- * well-known registry host.  Returns:
+ * well-known registry host, with a bounded timeout.  Returns:
  *   - `true`  — lookup failed (e.g. ENOTFOUND / ECONNREFUSED) → network is
  *               disabled as expected, safe to continue.
- *   - `false` — lookup succeeded → host failed to drop network and any
- *               `connect ok` events in Phase B would be FALSE NEGATIVES.
- *               Caller MUST abort with a fatal error.
+ *   - `true`  — lookup hung past `timeoutMs` → after we dropped eth0 the
+ *               resolver will typically retry until it times out; counting
+ *               that as "offline" is correct AND prevents the agent from
+ *               stalling forever.
+ *   - `false` — lookup succeeded within the timeout → the interface drop did
+ *               not take effect and any `connect ok` events in Phase B would
+ *               be FALSE NEGATIVES.  Caller MUST abort with a fatal error.
  */
-async function verifyOffline(lookup: DnsLookupFn): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    lookup('registry.npmjs.org', (err) => {
-      // Lookup error → offline (good).  Lookup success → still online (bad).
-      resolve(err !== null);
-    });
-  });
+async function verifyOfflineWithTimeout(
+  lookup: DnsLookupFn,
+  timeoutMs = 2000,
+): Promise<boolean> {
+  return Promise.race([
+    new Promise<boolean>((resolve) => {
+      lookup('registry.npmjs.org', (err) => { resolve(err !== null); });
+    }),
+    new Promise<boolean>((resolve) => {
+      setTimeout(() => { resolve(true); }, timeoutMs);
+    }),
+  ]);
+}
+
+/**
+ * Drop the eth0 network interface from inside the guest using busybox's
+ * `ip` applet (present on the Ubuntu 22.04/24.04 rootfs).  Falls back to the
+ * traditional `ifconfig eth0 down` for rootfs variants that ship net-tools
+ * but no `ip`.
+ *
+ * Both invocations are best-effort: a missing interface (e.g. a Phase B-only
+ * test rig) is non-fatal — `verifyOfflineWithTimeout` is the final gate.
+ *
+ * Returns the spawn result of whichever command succeeded, or the last
+ * failure if neither worked.
+ */
+async function defaultDropEth0(spawner: Spawner, env: NodeJS.ProcessEnv): Promise<void> {
+  const tries: Array<{ cmd: string; args: string[] }> = [
+    { cmd: 'ip', args: ['link', 'set', 'eth0', 'down'] },
+    { cmd: 'ifconfig', args: ['eth0', 'down'] },
+  ];
+
+  let lastErr: Error | null = null;
+  for (const { cmd, args } of tries) {
+    try {
+      const res = await spawner.spawn(cmd, args, { env, cwd: '/' });
+      if (res.exitCode === 0) return;
+      lastErr = new Error(`${cmd} ${args.join(' ')} exited with code ${res.exitCode}: ${res.stderr}`);
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+  throw lastErr ?? new Error('npm-jar agent: dropEth0 failed for unknown reason');
 }
 
 export async function main(input: AgentInput): Promise<void> {
@@ -449,19 +502,47 @@ export async function main(input: AgentInput): Promise<void> {
     process.exit(1);
   }
 
-  // 9b. Sanity check: confirm the host actually disabled the network on the
-  //     `fetch_done` -> `go` boundary.  If DNS still resolves, the audit
-  //     would silently produce false-negative `connect ok` events for any
+  // 9b. Before verifying offline, drop the eth0 interface from inside the
+  //     guest.  We use guest-side control because Firecracker's host-side
+  //     rate-limiter API treats `size: 0` as "rate limiter disabled" (i.e.
+  //     unlimited), not "no bandwidth" — making host-side disabling a no-op
+  //     across versions.  `ip link set eth0 down` (busybox) authoritatively
+  //     removes the interface from the routing table.
+  //
+  //     Failure here (e.g. no eth0 interface on a Phase B-only test rig) is
+  //     surfaced as a non-fatal error frame but we continue: the DNS probe
+  //     immediately below is the real gate.
+  try {
+    if (input.dropEth0) {
+      await input.dropEth0();
+    } else {
+      await defaultDropEth0(spawner, childEnv);
+    }
+  } catch (err) {
+    emitter.emitError(
+      `npm-jar agent: failed to drop eth0 from inside the guest: ${String(err)}`,
+      false,
+    );
+  }
+
+  // 9c. Sanity check: confirm the interface drop actually killed network
+  //     access.  If DNS still resolves *within the timeout* the audit would
+  //     silently produce false-negative `connect ok` events for any
   //     postinstall script that talks to the network — abort fatally.
+  //     A hung lookup is treated as offline (the resolver retries until it
+  //     times out once the interface is down).
   //
   //     We `return` after `process.exit(1)` so tests that stub out
   //     `process.exit` don't fall through to Phase B; in production
   //     `process.exit` terminates the process and the return is unreached.
   const lookupFn: DnsLookupFn = input.dnsLookup ?? dnsLookup;
-  const offline = await verifyOffline(lookupFn);
+  const offline = await verifyOfflineWithTimeout(
+    lookupFn,
+    input.verifyOfflineTimeoutMs,
+  );
   if (!offline) {
     emitter.emitError(
-      'Phase B aborted: DNS still resolves after host go signal — ' +
+      'Phase B aborted: DNS still resolves after dropping eth0 — ' +
         'network was not disabled, audit results would be unreliable.',
       true,
     );
