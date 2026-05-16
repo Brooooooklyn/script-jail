@@ -24,6 +24,7 @@ import { LinuxProcReader } from './proc-reader.js';
 import { Emitter } from './emit.js';
 import { runFetchPhase, type Spawner } from './phase-fetch.js';
 import { runInstallPhase, type StraceRunner } from './phase-install.js';
+import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
 import type { Readable } from 'node:stream';
@@ -444,6 +445,22 @@ export async function main(input: AgentInput): Promise<void> {
     })()
   );
 
+  // Tokenize roots used by BOTH the install-phase protected-paths matcher and
+  // the post-phase normalize step. Defined once so both stages agree on what
+  // `$HOME`, `$REPO`, etc. resolve to.
+  const roots = {
+    repo: config.work_dir,
+    nodeModules: `${config.work_dir}/node_modules`,
+    home: '/root',
+    tmp: '/tmp',
+    cache: '/root/.cache/pnpm',
+  };
+
+  const protectedPaths = new ProtectedPathsMatcher({
+    patterns: config.protected.files,
+    roots,
+  });
+
   const installResult = await runInstallPhase({
     manager,
     cwd: config.work_dir,
@@ -452,6 +469,7 @@ export async function main(input: AgentInput): Promise<void> {
     attribution,
     emitter: collectingEmitter,
     straceBasePath: '/tmp/npm-jar-strace/strace.out',
+    protectedPaths,
   });
 
   // 11. If install failed, emit error and abort — do NOT emit a final lockfile
@@ -470,14 +488,6 @@ export async function main(input: AgentInput): Promise<void> {
 
   // 12. Normalize + render
   const pkgDirs = new Map(Object.entries(config.pkg_dirs));
-
-  const roots = {
-    repo: config.work_dir,
-    nodeModules: `${config.work_dir}/node_modules`,
-    home: '/root',
-    tmp: '/tmp',
-    cache: '/root/.cache/pnpm',
-  };
 
   const ctx: NormalizeContext = { roots, pkgDirs };
 

@@ -14,6 +14,20 @@
 //     tolerated (stripped) if present, but the ts field is a monotonic counter
 //     owned by parseStraceStream, not a wall-clock value.
 //   - AF_UNIX connect calls are dropped -- we only track AF_INET/AF_INET6.
+//
+// ASYMMETRY (failure handling):
+//   - openat: ENOENT and EACCES are EMITTED with an `errno` field. The
+//     downstream protected-paths policy filter decides whether to drop the
+//     event (unprotected ENOENT) or surface it as <HIDDEN> (protected path,
+//     whether ENOENT or EACCES). This preserves the audit promise that a
+//     probe for `~/.ssh/id_rsa` shows up under external_reads even when the
+//     file doesn't exist in the sandbox.
+//   - statx / faccessat2 / readlinkat: ENOENT is DROPPED at parse time. These
+//     are info-query syscalls (does the path exist? what mode? where does the
+//     symlink point?) rather than real reads; the audit only cares about
+//     actual fs accesses. A path under `~/.ssh/**` that produces a statx miss
+//     does not flow through the hidden-marking pipeline.
+//   - unlinkat / renameat2: errors emit nothing (no kernel state change).
 
 import type { RawEvent } from '../lock/schema.js';
 
@@ -344,27 +358,30 @@ function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): R
   const flags = args[2] ?? '';
   const isWrite = flagsImplyWrite(flags);
 
-  // On failure: ENOENT → null (nothing happened). Other errors → drop.
-  // EACCES on read or write → still emit the event (we record the attempt;
-  // a script probing for writable paths would otherwise leave no trace).
-  //
-  // TODO(v2): hidden-marking gap. Paths matching the user's `protected.files`
-  // config should be emitted with `hidden: true` and `<HIDDEN>` should win
-  // over the ENOENT-drop above, so a probe for `~/.ssh/id_rsa` shows up as
-  // `<HIDDEN> $HOME/.ssh/id_rsa` instead of vanishing. The policy check
-  // belongs upstream of this drop — likely in attribution.ts/emit.ts after
-  // tokenize, since the protected-paths config is matched against tokenized
-  // paths (`$HOME/...`), not raw kernel paths. See plan §"hidden marking".
+  // On failure we stamp the event with `errno` and emit it. The downstream
+  // protected-paths policy filter (src/guest/protected-paths.ts) decides
+  // whether to drop the event or surface it as <HIDDEN>:
+  //   - ENOENT, path NOT protected      → policy filter drops (noise filter)
+  //   - ENOENT, path IS protected       → policy filter emits as <HIDDEN>
+  //   - EACCES, path NOT protected      → policy filter emits (record probe)
+  //   - EACCES, path IS protected       → policy filter emits as <HIDDEN>
+  // Errors other than ENOENT/EACCES are dropped here (unusual kernel results
+  // we have no audit story for).
+  let errno: 'ENOENT' | 'EACCES' | undefined;
   if (retVal.isError) {
-    if (retVal.errno === 'ENOENT') return null;
-    if (retVal.errno !== 'EACCES') return null; // other errors: drop
-    // EACCES on read or write: fall through and emit the appropriate event
+    if (retVal.errno === 'ENOENT') errno = 'ENOENT';
+    else if (retVal.errno === 'EACCES') errno = 'EACCES';
+    else return null; // other errors: drop
   }
 
   if (isWrite) {
-    return [{ kind: 'write', path, pid, ts, hidden: false }];
+    return [errno === undefined
+      ? { kind: 'write', path, pid, ts, hidden: false }
+      : { kind: 'write', path, pid, ts, hidden: false, errno }];
   }
-  return [{ kind: 'read', path, pid, ts, hidden: false }];
+  return [errno === undefined
+    ? { kind: 'read', path, pid, ts, hidden: false }
+    : { kind: 'read', path, pid, ts, hidden: false, errno }];
 }
 
 function parseExecve(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {

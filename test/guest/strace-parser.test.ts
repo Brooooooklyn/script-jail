@@ -47,26 +47,35 @@ describe('openat', () => {
     expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false }]);
   });
 
-  it('ENOENT on O_RDONLY → null', () => {
+  it('ENOENT on O_RDONLY → read event stamped with errno (policy filter decides downstream)', () => {
     const line = 'openat(AT_FDCWD, "/nonexistent", O_RDONLY) = -1 ENOENT (No such file or directory)';
-    expect(parseStraceLine(line, 1, 0)).toBeNull();
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/nonexistent', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
   });
 
-  it('ENOENT on O_WRONLY → null', () => {
+  it('ENOENT on O_WRONLY → write event stamped with errno (policy filter decides downstream)', () => {
     const line = 'openat(AT_FDCWD, "/no/dir/file", O_WRONLY|O_CREAT, 0644) = -1 ENOENT (No such file or directory)';
-    expect(parseStraceLine(line, 1, 0)).toBeNull();
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/no/dir/file', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
   });
 
-  it('EACCES on O_RDONLY → still emits read event (we record the attempt)', () => {
+  it('EACCES on O_RDONLY → read event stamped with errno=EACCES', () => {
     const line = 'openat(AT_FDCWD, "/root/secret", O_RDONLY) = -1 EACCES (Permission denied)';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'read', path: '/root/secret', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'read', path: '/root/secret', pid: 1, ts: 0, hidden: false, errno: 'EACCES' }]);
   });
 
-  it('EACCES on O_WRONLY → still emits write event (record probe attempt)', () => {
+  it('EACCES on O_WRONLY → write event stamped with errno=EACCES', () => {
     const line = 'openat(AT_FDCWD, "/etc/shadow", O_WRONLY|O_CREAT, 0644) = -1 EACCES (Permission denied)';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'write', path: '/etc/shadow', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'write', path: '/etc/shadow', pid: 1, ts: 0, hidden: false, errno: 'EACCES' }]);
+  });
+
+  it('successful openat does NOT carry an errno field (no exactOptional `undefined`)', () => {
+    const line = 'openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).not.toHaveProperty('errno');
   });
 
   it('path containing literal ) is parsed correctly (quote-aware paren scan)', () => {

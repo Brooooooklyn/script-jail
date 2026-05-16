@@ -7,6 +7,10 @@ import { runInstallPhase, type StraceRunner } from '../../src/guest/phase-instal
 import { Emitter } from '../../src/guest/emit.js';
 import { Attribution } from '../../src/guest/attribution.js';
 import type { ProcReader } from '../../src/guest/attribution.js';
+import { ProtectedPathsMatcher } from '../../src/guest/protected-paths.js';
+import { normalize, type NormalizeContext } from '../../src/lock/normalize.js';
+import { render } from '../../src/lock/render.js';
+import type { AttributedEvent } from '../../src/lock/schema.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -428,6 +432,232 @@ describe('runInstallPhase', () => {
       const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
       expect(parsed['pkg']).toBe('awesome-lib@5.1.0');
       expect(parsed['lifecycle']).toBe('prepare');
+    });
+  });
+
+  describe('protected-paths policy filter', () => {
+    const roots = {
+      repo: '/work',
+      nodeModules: '/work/node_modules',
+      home: '/root',
+      tmp: '/tmp',
+      cache: '/root/.cache/pnpm',
+    };
+
+    function makeProtectedMatcher(patterns: string[]): ProtectedPathsMatcher {
+      return new ProtectedPathsMatcher({ patterns, roots });
+    }
+
+    const npmEnv = {
+      npm_package_name: 'my-pkg',
+      npm_package_version: '1.0.0',
+      npm_lifecycle_event: 'postinstall',
+    };
+
+    it('protected ENOENT read → emitted with hidden=true (no errno in event)', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      expect(lines).toHaveLength(1);
+      const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
+      const raw = parsed['raw'] as Record<string, unknown>;
+      expect(raw['kind']).toBe('read');
+      expect(raw['path']).toBe('/root/.ssh/id_rsa');
+      expect(raw['hidden']).toBe(true);
+      expect(raw).not.toHaveProperty('errno'); // never leak errno to emit
+    });
+
+    it('unprotected ENOENT read → dropped silently (existing noise filter)', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/usr/local/missing.so", O_RDONLY) = -1 ENOENT (No such file or directory)' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      expect(lines).toHaveLength(0);
+      expect(result.eventCount).toBe(0);
+    });
+
+    it('protected EACCES read → emitted with hidden=true', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 EACCES (Permission denied)' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['hidden']).toBe(true);
+      expect(raw).not.toHaveProperty('errno');
+    });
+
+    it('unprotected EACCES read → emitted with hidden=false (existing behaviour)', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/etc/shadow", O_RDONLY) = -1 EACCES (Permission denied)' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['hidden']).toBe(false);
+      expect(raw).not.toHaveProperty('errno');
+    });
+
+    it('without protectedPaths the default no-op matcher drops ENOENT and emits EACCES', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)' }, // dropped
+        { pid: 42, line: 'openat(AT_FDCWD, "/etc/shadow", O_RDONLY) = -1 EACCES (Permission denied)' },               // emitted plain
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/etc/shadow');
+      expect(raw['hidden']).toBe(false);
+      expect(raw).not.toHaveProperty('errno');
+    });
+
+    it('end-to-end: ENOENT on protected path → emitted event → normalize → render shows <HIDDEN> $HOME/...', async () => {
+      // Cross-check: a strace ENOENT line for ~/.ssh/id_rsa flows all the way
+      // through to the rendered YAML as `<HIDDEN> $HOME/.ssh/id_rsa` (and the
+      // errno never appears in the rendered output).
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)' },
+      ];
+
+      // Custom emitter that captures AttributedEvents (same shape agent.ts uses).
+      const collected: AttributedEvent[] = [];
+      const pt = new PassThrough();
+      pt.on('data', (chunk: Buffer) => {
+        for (const l of chunk.toString().split('\n')) {
+          if (!l.trim()) continue;
+          const parsed = JSON.parse(l) as Record<string, unknown>;
+          if (parsed['kind'] === 'event') {
+            collected.push({
+              raw: parsed['raw'] as AttributedEvent['raw'],
+              pkg: parsed['pkg'] as string,
+              lifecycle: parsed['lifecycle'] as AttributedEvent['lifecycle'],
+            });
+          }
+        }
+      });
+      const emitter = new Emitter(pt);
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      expect(collected).toHaveLength(1);
+
+      // Now normalize + render exactly the way agent.ts does.
+      const ctx: NormalizeContext = {
+        roots,
+        pkgDirs: new Map([['my-pkg@1.0.0', '/work/node_modules/my-pkg']]),
+      };
+      const packages = normalize(collected, ctx);
+
+      const yaml = render({
+        manager: 'npm',
+        manager_lockfile_sha256: 'deadbeef',
+        node_version: '20.19.0',
+        generated_at: '2026-05-17T00:00:00Z',
+        packages,
+      });
+
+      // The rendered YAML must surface the hidden probe.
+      expect(yaml).toContain('<HIDDEN> $HOME/.ssh/id_rsa');
+      // And the errno transport field must never reach the rendered output.
+      expect(yaml).not.toContain('errno');
+      expect(yaml).not.toContain('ENOENT');
+    });
+
+    it('successful read passes through unchanged (no errno -> no policy intervention)', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = 3' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      // Note: a successful read of ~/.ssh/id_rsa would naturally already have
+      // hidden=false from the strace-parser; the policy filter doesn't touch
+      // successful syscalls. This is intentional: <HIDDEN> exists to surface
+      // probes for paths absent from the sandbox, not to redact successful
+      // reads (which contain real data the script presumably needed).
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['hidden']).toBe(false);
+      expect(raw).not.toHaveProperty('errno');
     });
   });
 

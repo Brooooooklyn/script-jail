@@ -8,12 +8,24 @@ import { z } from 'zod';
 export const LifecycleStage = z.enum(['preinstall', 'install', 'postinstall', 'prepare']);
 export type LifecycleStage = z.infer<typeof LifecycleStage>;
 
+// `errno` is a transport-only field carried from strace-parser to the
+// protected-paths policy filter (src/guest/protected-paths.ts). It is set on
+// failed syscalls (ENOENT / EACCES) so the policy filter can decide whether
+// the event should be emitted as `<HIDDEN>` or dropped. The field MUST be
+// stripped before the event reaches lock/normalize.ts or lock/render.ts —
+// neither renders it, and its presence in the public event stream would
+// pollute the JSONL audit. Absence means "syscall succeeded."
+//
+// With exactOptionalPropertyTypes enabled, we OMIT the field entirely when the
+// syscall succeeds (rather than setting it to `undefined`). Downstream code
+// reads `errno === undefined` to mean "no failure to report."
 export const FsReadEvent = z.object({
   kind: z.literal('read'),
   path: z.string(),
   pid: z.number(),
   ts: z.number(),
   hidden: z.boolean(),
+  errno: z.enum(['ENOENT', 'EACCES']).optional(),
 });
 export type FsReadEvent = z.infer<typeof FsReadEvent>;
 
@@ -23,6 +35,7 @@ export const FsWriteEvent = z.object({
   pid: z.number(),
   ts: z.number(),
   hidden: z.boolean(),
+  errno: z.enum(['ENOENT', 'EACCES']).optional(),
 });
 export type FsWriteEvent = z.infer<typeof FsWriteEvent>;
 

@@ -21,7 +21,8 @@
 import type { Emitter } from './emit.js';
 import type { Attribution } from './attribution.js';
 import { parseStraceLine } from './strace-parser.js';
-import type { RawEvent } from '../lock/schema.js';
+import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
+import type { AttributedEvent, RawEvent } from '../lock/schema.js';
 
 /**
  * StraceRunner abstraction. Spawns strace and streams (pid, line) records.
@@ -67,6 +68,15 @@ export interface PhaseInstallInput {
    * e.g. `/tmp/npm-jar-strace/strace.out` → strace writes .out.<pid> files.
    */
   straceBasePath?: string;
+  /**
+   * Optional protected-paths matcher. When provided, fs events carrying an
+   * `errno` are filtered: matches are stamped `hidden: true` and emitted,
+   * unprotected ENOENTs are dropped, unprotected EACCES are emitted plainly.
+   * When omitted, a no-op matcher is used (no patterns) so callers that
+   * don't care about hidden-marking still get the existing drop-ENOENT
+   * behaviour from the policy filter.
+   */
+  protectedPaths?: ProtectedPathsMatcher;
 }
 
 export interface PhaseInstallResult {
@@ -128,7 +138,22 @@ export async function runInstallPhase(
   const { cmd, args } = INSTALL_CMD[input.manager];
   const basePath = input.straceBasePath ?? '/tmp/npm-jar-strace/strace.out';
 
+  // No-op matcher when the caller didn't supply one. Its `isProtected()`
+  // short-circuits to false, so ENOENT events get dropped exactly like the
+  // pre-Task-16 strace-parser behaviour, while EACCES events still flow.
+  const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
+    patterns: [],
+    roots: { repo: '', nodeModules: '', home: '', tmp: '', cache: '' },
+  });
+
   let eventCount = 0;
+
+  const emit = (ev: AttributedEvent): void => {
+    const filtered = applyProtectedPathsPolicy(ev, matcher);
+    if (filtered === null) return;
+    input.emitter.emitEvent(filtered);
+    eventCount++;
+  };
 
   // StraceRunner is the SOLE owner of the install process.
   // We do NOT call a separate spawner here — that would run install twice.
@@ -142,8 +167,7 @@ export async function runInstallPhase(
     if (shimEvent !== null) {
       const result = input.attribution.attribute(shimEvent.pid);
       if (result !== null) {
-        input.emitter.emitEvent({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
-        eventCount++;
+        emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
     }
@@ -157,8 +181,7 @@ export async function runInstallPhase(
     for (const rawEvent of straceEvents) {
       const result = input.attribution.attribute(rawEvent.pid);
       if (result === null) continue;
-      input.emitter.emitEvent({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
-      eventCount++;
+      emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
     }
   }
 
