@@ -141,7 +141,13 @@ export async function main(): Promise<void> {
   // third ext4 disk and mount it at /opt/host-node inside the VM.  Whichever
   // Node the user's workflow set up (typically via actions/setup-node) is the
   // Node the audit runs against.
-  const hostNodePrefix = resolveHostNodePrefix(process.execPath);
+  //
+  // We deliberately do NOT use `process.execPath` here.  This action is wired
+  // as `runs.using: node20`, so `process.execPath` is the GitHub Actions
+  // runner's bundled Node, not the user-selected Node.  `resolveHostNodePrefix`
+  // walks PATH instead (where `actions/setup-node` has prepended its toolcache
+  // bin/ directory) so it finds the right Node.
+  const hostNodePrefix = resolveHostNodePrefix();
 
   // --- Build per-run overlay ----------------------------------------------
   const overlay: OverlayResult = await makeOverlay({

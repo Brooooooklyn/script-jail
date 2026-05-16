@@ -73,10 +73,12 @@ export interface OverlayInput {
   configPath: string;
   /**
    * Absolute path to the runner's Node install prefix (the directory that
-   * contains bin/node, lib/, include/, etc.).  Typically derived from
-   * process.execPath at the action level via `resolveHostNodePrefix()`.
-   * The whole tree is packed into a tiny ext4 attached to the VM at
-   * /opt/host-node and mounted read-only by the guest.
+   * contains bin/node, lib/, include/, etc.).  Derived at the action level
+   * by `resolveHostNodePrefix()`, which walks PATH (NOT process.execPath —
+   * that would resolve to the GitHub Actions runner's bundled Node20 used
+   * to execute dist/main.js, not the user-selected Node).  The whole tree
+   * is packed into a tiny ext4 attached to the VM at /opt/host-node and
+   * mounted read-only by the guest.
    */
   hostNodePrefix: string;
   /**
@@ -245,7 +247,8 @@ function estimateDiskSizeMB(dir: string): number {
  * Build a tiny ext4 image containing the runner's Node install.
  *
  * `hostNodePrefix` is the directory that contains `bin/node` + `lib/` (etc.) —
- * see resolveHostNodePrefix() for how it is derived from process.execPath.
+ * see resolveHostNodePrefix() for how it is derived from the runner's PATH
+ * (the location `actions/setup-node` planted the user-selected Node).
  * The whole tree is packed; the guest mounts the disk at /opt/host-node and
  * prepends /opt/host-node/bin to PATH so that whichever Node the runner
  * installed is the Node the audit runs against.
