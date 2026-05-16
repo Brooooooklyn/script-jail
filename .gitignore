@@ -1,0 +1,22 @@
+node_modules/
+.pnpm-store/
+
+# Built rootfs / firecracker / kernel — produced by scripts/build.ts, fetched/cached in CI
+images/firecracker
+images/vmlinux
+images/*.ext4
+images/*.so
+
+# Local research scratch
+.firecrawl/
+
+# Test + coverage
+coverage/
+*.log
+.npm-jar.log
+.npm-jar.events.jsonl
+
+# Editor
+.vscode/
+.idea/
+.DS_Store

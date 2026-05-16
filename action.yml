@@ -1,0 +1,46 @@
+name: npm-jar
+description: Firecracker-sandboxed audit of package-manager lifecycle scripts. Runs on lockfile changes; emits a human-readable .npm-jar.lock.yml; fails the PR if the audit diverges from the committed lockfile.
+author: brooklyn
+branding:
+  icon: lock
+  color: purple
+
+inputs:
+  config:
+    description: Path to the npm-jar config file.
+    required: false
+    default: .npm-jar.yml
+  lock:
+    description: Path to the install-lock file to compare/regenerate.
+    required: false
+    default: .npm-jar.lock.yml
+  mode:
+    description: "`check` (default) fails on diff; `update` regenerates the lockfile in place."
+    required: false
+    default: check
+  spoof-platform:
+    description: "Spoofed value for process.platform inside the VM. One of: linux | darwin | win32."
+    required: false
+    default: linux
+  spoof-arch:
+    description: "Spoofed value for process.arch inside the VM. One of: x64 | arm64."
+    required: false
+    default: x64
+  node-version:
+    description: Node major version used inside the sandbox. Defaults to the project's `.nvmrc` or `engines.node` if unset.
+    required: false
+    default: ""
+  cache-firecracker:
+    description: Cache the firecracker binary + kernel + rootfs across runs.
+    required: false
+    default: "true"
+
+outputs:
+  lockfile:
+    description: Absolute path to the generated install lockfile.
+  diff:
+    description: Unified diff between the generated and committed lockfile; empty on match.
+
+runs:
+  using: node20
+  main: dist/main.js

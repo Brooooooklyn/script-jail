@@ -1,0 +1,8 @@
+# pnpm-workspace.yaml doubles as the pnpm config in v11. Keep this minimal —
+# every entry below relaxes a default security control, so each should be
+# justified.
+
+# esbuild downloads a prebuilt binary in its install script. Used at build
+# time only (host-side bundler); never shipped into the Firecracker VM.
+allowBuilds:
+  esbuild: true

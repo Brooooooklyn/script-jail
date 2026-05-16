@@ -1,0 +1,40 @@
+{
+  "name": "npm-jar",
+  "version": "0.0.0",
+  "description": "Firecracker-sandboxed install auditor for npm/pnpm/yarn lifecycle scripts.",
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "pnpm@11.1.2",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "oxnode scripts/build.ts",
+    "build:bundle": "esbuild src/main.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/main.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:guest": "vitest run --project=guest",
+    "test:integration": "vitest run --project=integration",
+    "typecheck": "tsc --noEmit",
+    "cli": "oxnode src/cli/index.ts"
+  },
+  "dependencies": {
+    "@actions/cache": "6.0.0",
+    "@actions/core": "3.0.1",
+    "@actions/exec": "3.0.0",
+    "@actions/io": "3.0.2",
+    "diff": "9.0.0",
+    "micromatch": "4.0.8",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/diff": "8.0.0",
+    "@types/micromatch": "4.0.10",
+    "@types/node": "25.8.0",
+    "esbuild": "0.28.0",
+    "oxnode": "0.0.34",
+    "typescript": "6.0.3",
+    "vitest": "4.1.6"
+  }
+}
