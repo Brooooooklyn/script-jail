@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+ARG NODE_MAJOR=20
+ARG PM=pnpm
+
+FROM node:${NODE_MAJOR}-slim
+
+ARG PM
+
+# Minimal user-space: strace + busybox for /sbin/init + the chosen PM via corepack
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      strace busybox dumb-init ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    if [ "${PM}" = "pnpm" ] || [ "${PM}" = "yarn" ]; then \
+      corepack enable; \
+    fi
+
+# Build directories the agent + init script expect
+RUN mkdir -p /work /etc/npm-jar /usr/local/lib/npm-jar /usr/local/bin
+
+# Init + agent + JS preloads (copied at build time from the host build context)
+COPY src/rootfs/init.sh /sbin/init
+COPY src/rootfs/cleanup.sh /sbin/cleanup
+COPY dist/guest-agent.cjs /usr/local/bin/agent
+COPY dist/preloads/platform-spoof.cjs /usr/local/lib/npm-jar/platform-spoof.cjs
+COPY dist/preloads/dlopen-block.cjs /usr/local/lib/npm-jar/dlopen-block.cjs
+COPY images/libnpmjar.so /lib/libnpmjar.so
+
+RUN chmod +x /sbin/init /sbin/cleanup /usr/local/bin/agent
+
+# Strip docs / locales to keep the rootfs small (~150MB target)
+RUN rm -rf /usr/share/doc /usr/share/man /usr/share/locale/* \
+           /var/cache/apt /var/lib/dpkg/info/*.md5sums || true
+
+CMD ["/sbin/init"]
