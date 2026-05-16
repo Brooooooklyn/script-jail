@@ -59,20 +59,18 @@ export interface DownloadResult {
  * KNOWN_VERSIONS maps Firecracker release versions to the SHA-256 of their
  * x86_64 release tarball (firecracker-v<ver>-x86_64.tgz).
  *
- * IMPORTANT: These are placeholder values. Before using this in production,
- * replace each hash with the actual SHA-256 of the official GitHub release
- * tarball, which you can verify with:
+ * These are pinned values fetched from the official GitHub release tarballs at:
+ *   https://github.com/firecracker-microvm/firecracker/releases/download/v<ver>/firecracker-v<ver>-x86_64.tgz
+ *
+ * To re-verify or pin a new release, run:
  *
  *   curl -sL <tarball-url> | sha256sum
  *
- * The release tarballs live at:
- *   https://github.com/firecracker-microvm/firecracker/releases/download/v<ver>/firecracker-v<ver>-x86_64.tgz
- *
- * TODO(ops): populate real hashes before shipping.
+ * and add the resulting 64-char lowercase hex digest as a new entry.
  */
 export const KNOWN_VERSIONS: Readonly<Record<string, string>> = {
-  '1.8.0': 'PLACEHOLDER_SHA256_FIRECRACKER_1_8_0_x86_64_TGZ',
-  '1.9.0': 'PLACEHOLDER_SHA256_FIRECRACKER_1_9_0_x86_64_TGZ',
+  '1.8.0': 'bc899bdaef8d0aa7b0fafbf49a2bf647e0298558f4faee44970d87a1c6d1ae2d',
+  '1.9.0': '95c13740c7ca1a6dfb40e0f51cd0a9eefee1f223cd2c3538755d03c3a9ba5237',
 };
 
 // ---------------------------------------------------------------------------

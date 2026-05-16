@@ -166,10 +166,10 @@ describe('ensureBinaries', () => {
 
   it('calls http.download for the firecracker tarball and vmlinux on first run', async () => {
     const tarPayload = fakeTarGz(FAKE_VERSION);
-    // We need the tarball SHA to match what KNOWN_VERSIONS holds.
-    // Since KNOWN_VERSIONS has placeholder hashes, override the download
-    // function to always succeed (we're only checking it's called, not
-    // the actual hash verification flow here).
+    // The mock HttpClient bypasses real hash verification — it writes the
+    // payload to destPath without checking it against the expected SHA.
+    // We're only asserting that download() is called for both URLs here;
+    // the hash-verification path is exercised by other tests in this file.
     const calls: Array<{ url: string }> = [];
     const client: HttpClient = {
       async download(url, destPath) {
@@ -209,10 +209,11 @@ describe('ensureBinaries', () => {
     writeFileSync(tarPath, tarContent);
     void tarPath; // referenced for its side-effect (file creation)
 
-    // Override KNOWN_VERSIONS via module internals is not possible directly,
-    // so we use a version where KNOWN_VERSIONS sha happens to equal our tarSha.
-    // Instead we test only the vmlinux idempotency by checking download not called
-    // for the vmlinux URL when the file exists with correct hash.
+    // The pinned tarball SHA in KNOWN_VERSIONS won't match our fake tarball,
+    // so the firecracker re-download path will fire; that's fine — we only
+    // assert the vmlinux side here.  The mock client doesn't enforce SHAs,
+    // so the firecracker download succeeds and extraction is what fails
+    // (caught by the try/catch).
 
     try {
       await ensureBinaries({

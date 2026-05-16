@@ -40,21 +40,20 @@ import { teardown } from './action/firecracker/teardown.js';
 import type { OverlayResult } from './action/firecracker/overlay.js';
 
 // ---------------------------------------------------------------------------
-// Pinned versions / placeholders
+// Pinned versions
 // ---------------------------------------------------------------------------
 
 /** Firecracker release version (must match a key in KNOWN_VERSIONS). */
 const FIRECRACKER_VERSION = '1.8.0';
 
-/**
- * TODO(ops): populate the production vmlinux URL + SHA-256.  These are
- * placeholders so the action can be compiled and unit-tested before the
- * ops team has uploaded a kernel image.
- */
-const PLACEHOLDER_VMLINUX_URL =
-  'https://example.invalid/npm-jar/vmlinux-PLACEHOLDER';
-const PLACEHOLDER_VMLINUX_SHA256 =
-  'PLACEHOLDER_SHA256_VMLINUX_NOT_YET_PUBLISHED';
+// Pinned from Firecracker CI artifacts (v1.10, kernel 5.10.223).
+// See src/rootfs/vmlinux.md for provenance and a "build your own" recipe;
+// production deployments may prefer a stricter kernel config — refer to
+// https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md
+const PINNED_VMLINUX_URL =
+  'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223';
+const PINNED_VMLINUX_SHA256 =
+  '22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65';
 
 /** vsock port the guest agent listens on. */
 const VSOCK_PORT = 10242;
@@ -131,8 +130,8 @@ export async function main(): Promise<void> {
   const { firecrackerPath, vmlinuxPath } = await ensureBinaries({
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
-    kernelUrl: PLACEHOLDER_VMLINUX_URL,
-    kernelSha256: PLACEHOLDER_VMLINUX_SHA256,
+    kernelUrl: PINNED_VMLINUX_URL,
+    kernelSha256: PINNED_VMLINUX_SHA256,
     http: new NodeHttpClient(),
   });
 
