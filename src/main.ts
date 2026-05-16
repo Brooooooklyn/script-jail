@@ -29,6 +29,8 @@ import { detectRunnerImage } from './action/runner-image.js';
 import { resolveHostNodePrefix } from './action/host-node-prefix.js';
 import { renderDiff } from './action/diff.js';
 import { warn } from './action/log.js';
+import { buildEffectiveConfig } from './action/config-override.js';
+import { maybeClearCache } from './action/cache.js';
 import {
   ensureBinaries,
   NodeHttpClient,
@@ -70,16 +72,6 @@ export async function main(): Promise<void> {
   const repoDir = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
 
   const inputs = parseInputs({ repoDir });
-  // TODO(v2): wire `inputs.spoofPlatform`, `inputs.spoofArch`, and
-  // `inputs.cacheFirecracker` through to the VM. The first two currently
-  // live in `.npm-jar.yml` (read by the guest's platform-spoof preload);
-  // the action input should override the YAML value by rewriting the
-  // config before `makeOverlay` seals it into the repo disk. The cache
-  // flag should gate a wipe-before-ensureBinaries step. Until then these
-  // inputs are advertised in action.yml but the YAML wins.
-  void inputs.spoofPlatform;
-  void inputs.spoofArch;
-  void inputs.cacheFirecracker;
 
   // --- PM detection --------------------------------------------------------
   // BunUnsupportedError is non-fatal: emit a ::warning and exit cleanly so
@@ -118,6 +110,20 @@ export async function main(): Promise<void> {
     : join(tmpdir(), 'npm-jar-images');
   mkdirSync(imagesDir, { recursive: true });
 
+  // --- Honour `cache-firecracker: false` -----------------------------------
+  // With caching disabled we remove the cacheable artifacts (Firecracker
+  // tarball + binary + vmlinux) so ensureBinaries below takes the fresh-
+  // download path.  Useful for forcing a re-pull after rotating the pinned
+  // SHAs in this file, or to validate the download path on demand.  We do
+  // NOT wipe the whole imagesDir — the rootfs ext4 lives there too and is
+  // provisioned by a separate step (see `baseRootfsPath` below); deleting
+  // it would break the very next call to `makeOverlay()`.
+  maybeClearCache({
+    imagesDir,
+    firecrackerVersion: FIRECRACKER_VERSION,
+    cacheFirecracker: inputs.cacheFirecracker,
+  });
+
   // The rootfs image is keyed by runner image (e.g. rootfs-ubuntu-24.04.ext4)
   // rather than by (node-major, package-manager): Node is bind-mounted from
   // the host (Task #12), so the rootfs only needs to match the host's
@@ -149,11 +155,29 @@ export async function main(): Promise<void> {
   // bin/ directory) so it finds the right Node.
   const hostNodePrefix = resolveHostNodePrefix();
 
+  // --- Apply spoof-platform / spoof-arch overrides -------------------------
+  // The user's config YAML ships `spoof.platform` and `spoof.arch`, which the
+  // guest agent reads and exports as NPM_JAR_SPOOF_PLATFORM / _ARCH for the
+  // platform-spoof preload (see src/guest/agent.ts and platform-spoof.cjs).
+  // The action also advertises `spoof-platform` / `spoof-arch` inputs and
+  // users supplying them expect them to take precedence over whatever is on
+  // disk.  We materialise an effective copy of the config to a per-run temp
+  // path, applying the overrides, and feed that path into makeOverlay() so
+  // the override lands in the VM's repo disk at /etc/npm-jar/config.yml.
+  // The user's source file on the host is never modified.
+  const effectiveConfigPath = buildEffectiveConfig({
+    userConfigPath: inputs.configPath,
+    overrides: {
+      spoofPlatform: inputs.spoofPlatform,
+      spoofArch: inputs.spoofArch,
+    },
+  });
+
   // --- Build per-run overlay ----------------------------------------------
   const overlay: OverlayResult = await makeOverlay({
     baseRootfsPath,
     repoSrcPath: repoDir,
-    configPath: inputs.configPath,
+    configPath: effectiveConfigPath,
     hostNodePrefix,
   });
 

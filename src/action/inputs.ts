@@ -155,13 +155,23 @@ function resolveAgainstRepo(p: string, repoDir: string): string {
 }
 
 /**
- * Default `getInput` — reads from `process.env.INPUT_<UPPER>` with hyphens
- * converted to underscores.  Matches `@actions/core`'s `getInput` convention.
+ * Default `getInput` — mirrors `@actions/core`'s `getInput` semantics:
+ * spaces become underscores, the result is uppercased, hyphens are
+ * PRESERVED, and the env var is read as `INPUT_<NAME>`.  See
+ * `@actions/core@3.0.1` `lib/core.js` `getInput()`:
+ *
+ *     process.env[`INPUT_${name.replace(/ /g, '_').toUpperCase()}`]
+ *
+ * Hyphenated inputs like `spoof-platform` resolve to `INPUT_SPOOF-PLATFORM`,
+ * which is the env name GitHub Actions actually sets.  The previous
+ * implementation incorrectly mapped hyphens to underscores, so production
+ * runs ignored every hyphenated input (`spoof-platform`, `spoof-arch`,
+ * `cache-firecracker`) and silently fell back to the defaults.
  *
  * Returns `undefined` (not '') when the env var is unset so callers can
  * distinguish "not provided" from "empty string".
  */
 function defaultGetInput(name: string): string | undefined {
-  const key = `INPUT_${name.replace(/-/g, '_').toUpperCase()}`;
+  const key = `INPUT_${name.replace(/ /g, '_').toUpperCase()}`;
   return process.env[key];
 }

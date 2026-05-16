@@ -204,24 +204,98 @@ describe('parseInputs — path resolution', () => {
 describe('parseInputs — default getInput from process.env', () => {
   const repoDir = '/fake/repo';
 
-  it('reads INPUT_<UPPER>_<SNAKE> from process.env when no getInput injected', () => {
-    const prevMode = process.env['INPUT_MODE'];
-    const prevPlatform = process.env['INPUT_SPOOF_PLATFORM'];
+  // GitHub Actions sets one env var per input as `INPUT_<NAME>`, where
+  // `<NAME>` has spaces replaced with underscores, is upper-cased, and
+  // crucially PRESERVES hyphens.  Compare `@actions/core@3.0.1` lib/core.js
+  // `getInput`:  process.env[`INPUT_${name.replace(/ /g, '_').toUpperCase()}`]
+  //
+  // We assert against the real env-var names a runner would set so that
+  // wiring `spoof-platform` / `spoof-arch` / `cache-firecracker` through
+  // parseInputs in production actually works.  An earlier version of
+  // `defaultGetInput` incorrectly mapped hyphens to underscores, silently
+  // breaking every hyphenated input in production — this suite is the gate.
+  it('reads non-hyphenated inputs via INPUT_<UPPER> (e.g. mode → INPUT_MODE)', () => {
+    const prev = process.env['INPUT_MODE'];
     try {
       process.env['INPUT_MODE'] = 'update';
+      const r = parseInputs({
+        repoDir,
+        fs: makeFs(repoDir, []),
+      });
+      expect(r.mode).toBe('update');
+    } finally {
+      if (prev === undefined) delete process.env['INPUT_MODE'];
+      else process.env['INPUT_MODE'] = prev;
+    }
+  });
+
+  it('reads hyphenated inputs via INPUT_<UPPER-WITH-HYPHENS> (spoof-platform → INPUT_SPOOF-PLATFORM)', () => {
+    const prev = process.env['INPUT_SPOOF-PLATFORM'];
+    try {
+      process.env['INPUT_SPOOF-PLATFORM'] = 'darwin';
+      const r = parseInputs({
+        repoDir,
+        fs: makeFs(repoDir, []),
+      });
+      expect(r.spoofPlatform).toBe('darwin');
+    } finally {
+      if (prev === undefined) delete process.env['INPUT_SPOOF-PLATFORM'];
+      else process.env['INPUT_SPOOF-PLATFORM'] = prev;
+    }
+  });
+
+  it('reads spoof-arch via INPUT_SPOOF-ARCH', () => {
+    const prev = process.env['INPUT_SPOOF-ARCH'];
+    try {
+      process.env['INPUT_SPOOF-ARCH'] = 'arm64';
+      const r = parseInputs({
+        repoDir,
+        fs: makeFs(repoDir, []),
+      });
+      expect(r.spoofArch).toBe('arm64');
+    } finally {
+      if (prev === undefined) delete process.env['INPUT_SPOOF-ARCH'];
+      else process.env['INPUT_SPOOF-ARCH'] = prev;
+    }
+  });
+
+  it('reads cache-firecracker via INPUT_CACHE-FIRECRACKER', () => {
+    const prev = process.env['INPUT_CACHE-FIRECRACKER'];
+    try {
+      process.env['INPUT_CACHE-FIRECRACKER'] = 'false';
+      const r = parseInputs({
+        repoDir,
+        fs: makeFs(repoDir, []),
+      });
+      expect(r.cacheFirecracker).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env['INPUT_CACHE-FIRECRACKER'];
+      else process.env['INPUT_CACHE-FIRECRACKER'] = prev;
+    }
+  });
+
+  it('does NOT read hyphenated inputs from INPUT_<UPPER>_<UNDER> (regression guard for the old hyphen→underscore bug)', () => {
+    // If a runner-set env var with the WRONG (underscore) name is the only
+    // thing present, parseInputs must fall back to the action default, not
+    // pick it up.  This guards against regressing to the pre-Task #18 fix.
+    const prevWrong = process.env['INPUT_SPOOF_PLATFORM'];
+    const prevRight = process.env['INPUT_SPOOF-PLATFORM'];
+    try {
+      // Ensure the correct env name is NOT set so the default-fallback
+      // branch is exercised cleanly.
+      delete process.env['INPUT_SPOOF-PLATFORM'];
       process.env['INPUT_SPOOF_PLATFORM'] = 'darwin';
 
       const r = parseInputs({
         repoDir,
         fs: makeFs(repoDir, []),
       });
-      expect(r.mode).toBe('update');
-      expect(r.spoofPlatform).toBe('darwin');
+      expect(r.spoofPlatform).toBe('linux'); // default, not darwin
     } finally {
-      if (prevMode === undefined) delete process.env['INPUT_MODE'];
-      else process.env['INPUT_MODE'] = prevMode;
-      if (prevPlatform === undefined) delete process.env['INPUT_SPOOF_PLATFORM'];
-      else process.env['INPUT_SPOOF_PLATFORM'] = prevPlatform;
+      if (prevWrong === undefined) delete process.env['INPUT_SPOOF_PLATFORM'];
+      else process.env['INPUT_SPOOF_PLATFORM'] = prevWrong;
+      if (prevRight === undefined) delete process.env['INPUT_SPOOF-PLATFORM'];
+      else process.env['INPUT_SPOOF-PLATFORM'] = prevRight;
     }
   });
 });
