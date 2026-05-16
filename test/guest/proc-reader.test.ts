@@ -46,9 +46,10 @@ function writeStatus(dir: string, ppid: number): void {
  * Keys and values are joined with '=' and records are separated by NUL.
  */
 function writeEnviron(dir: string, env: Record<string, string>): void {
+  // Real /proc/<pid>/environ ends with a trailing NUL byte.
   const buf = Object.entries(env)
     .map(([k, v]) => `${k}=${v}`)
-    .join('\0');
+    .join('\0') + '\0';
   // Write as a Buffer so NUL bytes are literal (not escaped).
   writeFileSync(join(dir, 'environ'), Buffer.from(buf, 'utf8'));
 }
@@ -117,13 +118,13 @@ describe('LinuxProcReader.readPpid', () => {
     expect(reader.readPpid(100)).toBe(42);
   });
 
-  it('reads from default /proc root when no root is injected', () => {
-    // We only verify it doesn't throw — on macOS /proc doesn't exist so
-    // it returns null; on Linux pid 1 always exists and returns 0.
+  // On macOS /proc does not exist, so this is a no-op returning null.
+  // On Linux pid 1 always exists and returns 0 (kernel).
+  it.skipIf(process.platform !== 'linux')('reads from default /proc root on Linux', () => {
     const reader = new LinuxProcReader();
     const result = reader.readPpid(1);
-    // Either null (no /proc) or a non-negative integer is acceptable.
-    expect(result === null || (typeof result === 'number' && result >= 0)).toBe(true);
+    // On Linux pid 1's PPid is 0 (kernel pseudo-process).
+    expect(result).toBe(0);
   });
 });
 
@@ -223,6 +224,18 @@ describe('LinuxProcReader.readEnviron', () => {
     expect(env).not.toBeNull();
     expect(env!.get('FOO')).toBe('bar');
     expect(env!.size).toBe(1);
+  });
+
+  it('readEnviron handles leading and consecutive NUL bytes gracefully', () => {
+    const root = makeFakeProc();
+    const dir = makePidDir(root, 300);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'environ'), Buffer.from('\0KEY1=val1\0\0KEY2=val2\0', 'utf8'));
+    const reader = new LinuxProcReader(root);
+    const result = reader.readEnviron(300);
+    expect(result?.size).toBe(2);
+    expect(result?.get('KEY1')).toBe('val1');
+    expect(result?.get('KEY2')).toBe('val2');
   });
 });
 

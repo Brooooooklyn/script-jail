@@ -263,12 +263,21 @@ describe('Attribution', () => {
     expect(attr.attribute(500)).toBeNull();
   });
 
+  // Empty npm_package_name is rejected — would produce malformed pkg like '@1.2.3'
+  it('empty npm_package_name is not treated as a match → null', () => {
+    const reader = syntheticReader({
+      300: { ppid: 1, env: { npm_package_name: '', npm_lifecycle_event: 'install', npm_package_version: '1.2.3' } },
+    });
+    const attr = new Attribution(reader);
+    expect(attr.attribute(300)).toBeNull();
+  });
+
   // TODO(v2): forged-env limitation — documents the current behaviour.
   // In v1 attribution trusts the environment of the observed process itself;
   // a subprocess that injects forged npm_* vars is accepted as-is.
   // A future trusted-root design would require attribution anchored to the
   // package-manager's own launch context rather than unchecked process env.
-  it('forged npm env on the starting pid is accepted (v1 limitation, see TODO)', () => {
+  it('forged npm env on the starting pid is accepted (v1 limitation, see attribution.ts:120)', () => {
     const reader = syntheticReader({
       // pid 600 is a child spawned by a malicious lifecycle script that set
       // npm_package_name to a different package ('victim-pkg').

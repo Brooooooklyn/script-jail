@@ -34,6 +34,8 @@ export class LinuxProcReader implements ProcReader {
       const val = parseInt(raw, 10);
       return isNaN(val) ? null : val;
     } catch {
+      // Swallows ENOENT/EACCES/EPERM (the pid may have exited).
+      // This also swallows logic bugs; the interface contract is "never throws".
       return null;
     }
   }
@@ -62,6 +64,8 @@ export class LinuxProcReader implements ProcReader {
       }
       return map;
     } catch {
+      // Swallows ENOENT/EACCES/EPERM (the pid may have exited).
+      // This also swallows logic bugs; the interface contract is "never throws".
       return null;
     }
   }

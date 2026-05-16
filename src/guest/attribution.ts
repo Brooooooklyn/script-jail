@@ -1,11 +1,11 @@
 // pid → lifecycle-package attribution
 //
 // The Attribution class walks the /proc/<pid>/status PPid chain to find the
-// nearest ancestor process whose environment contains:
+// process itself or its nearest ancestor whose environment contains:
 //   - npm_package_name   (and optionally npm_package_version)
 //   - npm_lifecycle_event set to one of the four canonical LifecycleStage values
 //
-// That ancestor's environment determines the pkg and lifecycle for the
+// That process's environment determines the pkg and lifecycle for the
 // AttributedEvent. The result is cached per starting pid so subsequent calls
 // for the same pid never re-read /proc.
 //
@@ -57,19 +57,18 @@ function isCanonicalStage(s: string): s is LifecycleStage {
 }
 
 /**
- * Build the pkg string from the environment map.
- * Returns `name@version` when both npm_package_name and npm_package_version
- * are present, otherwise just `name`.
+ * Build the pkg string from a non-empty name and an optional version.
+ * Returns `name@version` when version is present, otherwise just `name`.
  */
-function buildPkg(env: Map<string, string>): string {
-  const name = env.get('npm_package_name') ?? '';
-  const version = env.get('npm_package_version');
+function buildPkg(name: string, version: string | undefined): string {
   return version !== undefined ? `${name}@${version}` : name;
 }
 
 export class Attribution {
   private readonly reader: ProcReader;
-  /** Terminal-result cache: keyed by the *starting* pid of each attribute() call. */
+  // Terminal-only cache: keyed by starting pid. Intermediate pids are not
+  // cached (v1 limitation). Pid recycling is impossible in the single-install
+  // Firecracker environment where this runs.
   private readonly cache: Map<number, AttributionResult | null> = new Map();
 
   constructor(reader: ProcReader) {
@@ -77,14 +76,15 @@ export class Attribution {
   }
 
   /**
-   * Walk pid → ppid → ppid' … until we find a process whose environ has
-   * `npm_package_name` AND `npm_lifecycle_event` is one of the four canonical
-   * LifecycleStage values. Return that pkg + lifecycle pair.
+   * Walk pid → ppid → ppid' … until we find the process itself or its nearest
+   * ancestor whose environ has `npm_package_name` (non-empty) AND
+   * `npm_lifecycle_event` is one of the four canonical LifecycleStage values.
+   * Return that pkg + lifecycle pair.
    *
    * Returns null when:
    *   - The walk reaches pid 0 or 1 without finding a match.
    *   - readPpid() returns null for any pid in the chain.
-   *   - No ancestor in the chain has the required env vars.
+   *   - No process in the chain has the required env vars.
    *
    * Results are cached per starting pid. A second call with the same pid will
    * return the cached value without any additional /proc reads.
@@ -104,7 +104,8 @@ export class Attribution {
 
     // Safety bound to prevent infinite loops on malformed /proc data.
     // In practice, process trees are shallow; 1024 levels is far beyond any
-    // realistic depth.
+    // realistic depth. Linux's PID namespace nesting cap is ≤32, so 1024 is
+    // a conservative upper bound.
     const MAX_DEPTH = 1024;
 
     for (let depth = 0; depth < MAX_DEPTH; depth++) {
@@ -128,8 +129,8 @@ export class Attribution {
       if (env !== null) {
         const name = env.get('npm_package_name');
         const event = env.get('npm_lifecycle_event');
-        if (name !== undefined && event !== undefined && isCanonicalStage(event)) {
-          return { pkg: buildPkg(env), lifecycle: event };
+        if (name !== undefined && name.length > 0 && event !== undefined && isCanonicalStage(event)) {
+          return { pkg: buildPkg(name, env.get('npm_package_version')), lifecycle: event };
         }
         // npm_package_name is set but event is not canonical (or missing):
         // continue walking up.
