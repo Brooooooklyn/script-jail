@@ -165,12 +165,18 @@ export async function main(): Promise<void> {
   // path, applying the overrides, and feed that path into makeOverlay() so
   // the override lands in the VM's repo disk at /etc/npm-jar/config.yml.
   // The user's source file on the host is never modified.
+  // Pass `imagesDir` as the workDir so the rewritten config lives under the
+  // same RUNNER_TEMP-rooted tree we already use for binaries.  GitHub Actions
+  // purges RUNNER_TEMP between jobs; without this, leaving the workDir at the
+  // helper's mkdtemp default would accumulate stray dirs under os.tmpdir() on
+  // self-hosted runners.
   const effectiveConfigPath = buildEffectiveConfig({
     userConfigPath: inputs.configPath,
     overrides: {
       spoofPlatform: inputs.spoofPlatform,
       spoofArch: inputs.spoofArch,
     },
+    workDir: imagesDir,
   });
 
   // --- Build per-run overlay ----------------------------------------------
