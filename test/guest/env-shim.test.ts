@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, unlinkSync, existsSync, statSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, unlinkSync, existsSync, statSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,28 +32,40 @@ function makeTempFile(content: string, suffix = ''): string {
 }
 
 afterEach(() => {
-  for (const p of tempFiles.splice(0)) {
+  for (const p of tempFiles) {
     try {
-      if (existsSync(p)) unlinkSync(p);
+      if (existsSync(p)) {
+        const stat = statSync(p);
+        if (stat.isDirectory()) rmSync(p, { recursive: true, force: true });
+        else unlinkSync(p);
+      }
     } catch { /* ignore */ }
   }
+  tempFiles.length = 0;
 });
 
 // ── Build helper ─────────────────────────────────────────────────────────────
 
 /**
- * Returns true if the .so is up-to-date (exists and newer than the source).
+ * Returns true if the .so is up-to-date (exists and newer than the source and
+ * the build script).
  */
 function soIsUpToDate(): boolean {
-  if (!existsSync(shimSo) || !existsSync(shimSrc)) return false;
+  if (!existsSync(shimSo) || !existsSync(shimSrc) || !existsSync(buildSh)) return false;
   const soMtime  = statSync(shimSo).mtimeMs;
   const srcMtime = statSync(shimSrc).mtimeMs;
-  return soMtime >= srcMtime;
+  const shMtime  = statSync(buildSh).mtimeMs;
+  return soMtime >= srcMtime && soMtime >= shMtime;
 }
 
 // ── Suite ─────────────────────────────────────────────────────────────────────
 
 describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
+
+  // shimAvailable tracks whether the .so was successfully built/found.
+  // Tests skip dynamically (via ctx.skip()) when the shim is unavailable,
+  // producing a visible SKIP in the test report rather than a vacuous pass.
+  let shimAvailable = false;
 
   // ── beforeAll: compile .so if stale ─────────────────────────────────────
   //
@@ -62,18 +74,15 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   // compiler is treated as a skip condition.
 
   beforeAll(() => {
-    if (soIsUpToDate()) return;
-
     // Check that a C compiler is available.
     const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
     if (cc.status !== 0 || cc.error) {
-      // No C compiler — skip the entire suite by removing the .so path from
-      // all checks.  Tests guard on existsSync(shimSo) and will be no-ops,
-      // but we mark them as skipped via a thrown skip signal below.
-      // Note: vitest's `skip()` is not available in beforeAll; the tests
-      // themselves guard with `if (!existsSync(shimSo)) return` which makes
-      // them vacuously pass.  This is acceptable ONLY for the no-cc case
-      // on Linux; any other build failure is a hard error.
+      // No C compiler — leave shimAvailable = false so all tests are skipped.
+      return;
+    }
+
+    if (soIsUpToDate()) {
+      shimAvailable = true;
       return;
     }
 
@@ -85,6 +94,19 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     if (result.status !== 0) {
       throw new Error(`build.sh failed:\n${result.stderr}\n${result.stdout}`);
     }
+
+    shimAvailable = true;
+
+    // Sanity-check: the wrapper symbols must be visible in .dynsym so that
+    // ld-linux.so can intercept them via LD_PRELOAD.  readelf is optional
+    // (skip if absent rather than failing).
+    const readelf = spawnSync('readelf', ['-Ws', '--dyn-syms', shimSo], { encoding: 'utf8' });
+    if (readelf.status === 0 && !readelf.error) {
+      if (!/\bgetenv\b/.test(readelf.stdout)) {
+        throw new Error('libnpmjar.so does not export getenv as a dynamic symbol — check -fvisibility=hidden and __attribute__((visibility("default")))');
+      }
+    }
+    // readelf unavailable: skip the assertion (don't fail)
   });
 
   // ── helper: run a command with the shim preloaded ────────────────────────
@@ -151,8 +173,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
   // ── Test 1: getenv calls are logged to FD 3 ──────────────────────────────
 
-  it('getenv calls are logged as env_read JSONL lines', () => {
-    if (!existsSync(shimSo)) return; // cc was unavailable; skip gracefully
+  it('getenv calls are logged as env_read JSONL lines', (ctx) => {
+    if (!shimAvailable) ctx.skip(); // cc was unavailable; skip visibly
 
     const res = runWithShim({ cmd: 'env | head -1' });
 
@@ -173,8 +195,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     }
   });
 
-  it('a known env var (PATH) appears in log', () => {
-    if (!existsSync(shimSo)) return;
+  it('a known env var (PATH) appears in log', (ctx) => {
+    if (!shimAvailable) ctx.skip();
 
     // Use printenv PATH which must call getenv("PATH").
     const res = runWithShim({ cmd: 'printenv PATH' });
@@ -194,8 +216,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
   // ── Test 2: protected names return NULL ──────────────────────────────────
 
-  it('protected env var is hidden and logged with hidden:true', () => {
-    if (!existsSync(shimSo)) return;
+  it('protected env var is hidden and logged with hidden:true', (ctx) => {
+    if (!shimAvailable) ctx.skip();
 
     const protectFile = makeTempFile('NPM_TOKEN\n', '.txt');
 
@@ -229,8 +251,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
   // ── Test 4: comments and blank lines in protect-list are ignored ──────────
 
-  it('protect-list respects comments and blank lines', () => {
-    if (!existsSync(shimSo)) return;
+  it('protect-list respects comments and blank lines', (ctx) => {
+    if (!shimAvailable) ctx.skip();
 
     const protectContent = [
       '# comment line',
@@ -275,8 +297,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
   // ── Test 5: unprotected env var still visible ─────────────────────────────
 
-  it('non-protected env var value is passed through unchanged', () => {
-    if (!existsSync(shimSo)) return;
+  it('non-protected env var value is passed through unchanged', (ctx) => {
+    if (!shimAvailable) ctx.skip();
 
     const protectFile = makeTempFile('HIDDEN_VAR\n', '.txt');
 
@@ -295,8 +317,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
   // ── Test 6: shim is silent when NPM_JAR_LOG_FD is unset ──────────────────
 
-  it('shim does not crash when NPM_JAR_LOG_FD is unset', () => {
-    if (!existsSync(shimSo)) return;
+  it('shim does not crash when NPM_JAR_LOG_FD is unset', (ctx) => {
+    if (!shimAvailable) ctx.skip();
 
     // Run without NPM_JAR_LOG_FD; the shim should be silent (no log output)
     // and not crash the child process.

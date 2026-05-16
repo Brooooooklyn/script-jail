@@ -184,7 +184,7 @@ static void do_init(void)
                         continue;
 
                     if (protected_count < MAX_PROTECTED) {
-                        strncpy(protected_names[protected_count], buf, NAME_MAX_LEN - 1);
+                        strncpy(protected_names[protected_count], buf, NAME_MAX_LEN);
                         protected_names[protected_count][NAME_MAX_LEN - 1] = '\0';
                         protected_count++;
                     }
@@ -297,6 +297,9 @@ static void emit(const char *name, int hidden)
     pos += json_escape(buf + pos, sizeof(buf) - (size_t)pos - 80, name);
 
     /* ","pid":<pid>,"ts":<ns>,"hidden":<bool>}\n */
+    /* NOTE: snprintf is not async-signal-safe (POSIX); emit() must never be
+     * called from a signal handler.  This is safe here because emit() is only
+     * invoked from the getenv wrappers, which are not signal-handler contexts. */
     pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
                     "\",\"pid\":%d,\"ts\":%lld,\"hidden\":%s}\n",
                     pid, ns, hidden ? "true" : "false");
@@ -317,6 +320,7 @@ static void emit(const char *name, int hidden)
  * the array pointer itself.
  */
 
+__attribute__((visibility("default")))
 char *getenv(const char *name)
 {
     /*
@@ -351,6 +355,7 @@ char *getenv(const char *name)
     return val;
 }
 
+__attribute__((visibility("default")))
 char *secure_getenv(const char *name)
 {
     if (in_shim) {
@@ -364,8 +369,14 @@ char *secure_getenv(const char *name)
     int hidden = is_protected(name);
     emit(name, hidden);
     char *val = NULL;
-    if (!hidden && real_secure_getenv)
-        val = real_secure_getenv(name);
+    if (!hidden) {
+        if (real_secure_getenv)
+            val = real_secure_getenv(name);
+        else if (real_getenv)
+            val = real_getenv(name); /* musl fallback: secure_getenv absent, but
+                                      * npm-jar guests are never setuid, so
+                                      * secure_getenv == getenv semantically. */
+    }
 
     in_shim = 0;
     return val;
@@ -373,9 +384,29 @@ char *secure_getenv(const char *name)
 
 /*
  * __secure_getenv is a deprecated glibc alias for secure_getenv.
- * Wrap it for completeness; returns NULL on musl (dlsym returns NULL there).
+ * Wrap it for completeness; applies the same musl fallback as secure_getenv.
  */
+__attribute__((visibility("default")))
 char *__secure_getenv(const char *name)
 {
-    return secure_getenv(name);
+    if (in_shim) {
+        if (real_secure_getenv) return real_secure_getenv(name);
+        return NULL;
+    }
+
+    in_shim = 1;
+    pthread_once(&init_once, do_init);
+
+    int hidden = is_protected(name);
+    emit(name, hidden);
+    char *val = NULL;
+    if (!hidden) {
+        if (real_secure_getenv)
+            val = real_secure_getenv(name);
+        else if (real_getenv)
+            val = real_getenv(name); /* musl fallback: see secure_getenv above */
+    }
+
+    in_shim = 0;
+    return val;
 }
