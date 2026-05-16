@@ -14,14 +14,13 @@
 //     Update the map whenever you pin a new release; the CI gate will catch
 //     missing entries at plan time.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync, mkdirSync } from 'node:fs';
-import { rename, unlink } from 'node:fs/promises';
+import { chmod, rename, unlink } from 'node:fs/promises';
 import { get as httpsGet } from 'node:https';
 import { get as httpGet } from 'node:http';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { randomBytes } from 'node:crypto';
 import { createGunzip } from 'node:zlib';
 
 // ---------------------------------------------------------------------------
@@ -133,8 +132,7 @@ export async function ensureBinaries(input: DownloadInput): Promise<DownloadResu
   // TODO(v2): pin a separate SHA-256 for the extracted binary so a cache hit
   // on both the tarball and the binary can skip the extraction step safely.
   if (existsSync(fcBinPath)) {
-    const { unlink: unlinkSync } = await import('node:fs/promises');
-    await unlinkSync(fcBinPath);
+    await unlink(fcBinPath);
   }
   void tarFresh; // always re-extract (see comment above)
   await extractFirecrackerBinary(tarPath, fcBinPath, firecrackerVersion);
@@ -225,6 +223,7 @@ async function extractFirecrackerBinary(
     let declaredRemaining = 0;
     let capturing = false;
     let outStream: ReturnType<typeof createWriteStream> | null = null;
+    let foundEntry = false;
 
     const cleanup = (err?: Error): void => {
       outStream?.close();
@@ -240,6 +239,12 @@ async function extractFirecrackerBinary(
 
     gunzip.on('end', () => {
       if (outStream) outStream.close();
+      if (!foundEntry) {
+        reject(new Error(
+          `npm-jar: entry "${targetEntry}" not found in tarball ${tarPath}`,
+        ));
+        return;
+      }
       resolve();
     });
 
@@ -269,6 +274,7 @@ async function extractFirecrackerBinary(
 
           if (name === targetEntry && declaredSize > 0) {
             capturing = true;
+            foundEntry = true;
             outStream = createWriteStream(tmpOut);
           } else {
             capturing = false;
@@ -306,7 +312,6 @@ async function extractFirecrackerBinary(
   await rename(tmpOut, destPath);
 
   // Make executable.
-  const { chmod } = await import('node:fs/promises');
   await chmod(destPath, 0o755);
 }
 

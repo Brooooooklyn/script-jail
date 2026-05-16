@@ -7,7 +7,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { createGzip } from 'node:zlib';
 
 import {
   ensureBinaries,
@@ -41,6 +42,63 @@ function fakeTarGz(version: string): Buffer {
   // ensuring the HttpClient is (or is not) called.  We just need a non-empty
   // buffer to write so the hash check can work.
   return Buffer.from(`fake-firecracker-v${version}-tarball`);
+}
+
+/**
+ * Build a minimal real .tgz buffer containing one file entry named `entryName`
+ * with the given `content`.  This is used to test the tar parser path inside
+ * `extractFirecrackerBinary`.
+ */
+function buildTarGz(entryName: string, content: Buffer): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    // Construct a POSIX ustar tar block manually.
+    const BLOCK = 512;
+    const nameBytes = Buffer.alloc(100);
+    Buffer.from(entryName).copy(nameBytes);
+
+    const header = Buffer.alloc(BLOCK);
+    nameBytes.copy(header, 0);
+
+    // File mode: 0755
+    Buffer.from('0000755\0').copy(header, 100);
+    // UID / GID
+    Buffer.from('0000000\0').copy(header, 108);
+    Buffer.from('0000000\0').copy(header, 116);
+    // Size (octal, 11 digits + space)
+    const sizeOctal = content.length.toString(8).padStart(11, '0') + ' ';
+    Buffer.from(sizeOctal).copy(header, 124);
+    // mtime
+    Buffer.from('00000000000 ').copy(header, 136);
+    // typeflag: '0' = regular file
+    header[156] = 0x30;
+    // ustar magic
+    Buffer.from('ustar  \0').copy(header, 257);
+
+    // Compute checksum (unsigned sum of all header bytes with checksum field as spaces).
+    Buffer.from('        ').copy(header, 148); // 8 spaces for checksum field
+    let sum = 0;
+    for (let i = 0; i < BLOCK; i++) sum += header[i]!;
+    const checksumStr = sum.toString(8).padStart(6, '0') + '\0 ';
+    Buffer.from(checksumStr).copy(header, 148);
+
+    // Pad content to a multiple of 512 bytes.
+    const paddedSize = Math.ceil(content.length / BLOCK) * BLOCK;
+    const dataPadded = Buffer.alloc(paddedSize);
+    content.copy(dataPadded);
+
+    // End-of-archive: two 512-byte zero blocks.
+    const eof = Buffer.alloc(BLOCK * 2);
+
+    const tarBuf = Buffer.concat([header, dataPadded, eof]);
+
+    // Gzip compress.
+    const gz = createGzip();
+    const chunks: Buffer[] = [];
+    gz.on('data', (c: Buffer) => chunks.push(c));
+    gz.on('end', () => resolve(Buffer.concat(chunks)));
+    gz.on('error', reject);
+    gz.end(tarBuf);
+  });
 }
 
 /** Build a mock HttpClient that writes a fixed payload to destPath. */
@@ -221,6 +279,36 @@ describe('ensureBinaries', () => {
   it('KNOWN_VERSIONS includes 1.8.0 and 1.9.0', () => {
     expect(Object.keys(KNOWN_VERSIONS)).toContain('1.8.0');
     expect(Object.keys(KNOWN_VERSIONS)).toContain('1.9.0');
+  });
+
+  it('rejects with a descriptive error when the tar entry is missing from the tarball', async () => {
+    // Build a real .tgz containing an entry named "wrong-entry", not the
+    // expected "firecracker-v1.8.0-x86_64".
+    const tarGzBuffer = await buildTarGz('wrong-entry-name', randomBytes(64));
+    const tarHash = fakeHash(tarGzBuffer.toString('latin1'));
+
+    // Inject a client that writes the real tarball payload.
+    const client: HttpClient = {
+      async download(url, destPath) {
+        if (url.includes('firecracker')) {
+          writeFileSync(destPath, tarGzBuffer);
+        } else {
+          writeFileSync(destPath, FAKE_KERNEL_CONTENT);
+        }
+      },
+    };
+
+    await expect(
+      ensureBinaries({
+        imagesDir: testDir,
+        firecrackerVersion: FAKE_VERSION,
+        kernelUrl: 'https://example.com/vmlinux',
+        kernelSha256: FAKE_KERNEL_SHA,
+        http: client,
+      }),
+    ).rejects.toThrow(/entry "firecracker-v1\.8\.0-x86_64" not found in tarball/);
+
+    void tarHash; // used implicitly via tarGzBuffer content
   });
 
   it('firecracker tarball URL includes the version string', async () => {

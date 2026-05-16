@@ -227,6 +227,52 @@ describe('openVsockSession', () => {
     expect(duplex.hostWrote()).toContain('go\n');
   });
 
+  it('sendGo() under backpressure: sends exactly one "go\\n" and resolves', async () => {
+    // Build a FakeDuplex whose first write() returns false (backpressure),
+    // then emits 'drain' asynchronously.  Assert 'go\n' is written exactly once.
+    const { EventEmitter } = await import('node:events');
+    const emitter = new EventEmitter();
+    const guestToHost = new (await import('node:stream')).PassThrough();
+
+    let writeCount = 0;
+    const writes: string[] = [];
+
+    const backpressureDuplex: VsockDuplex & { once: (event: string, cb: () => void) => void } = {
+      write(data: string): boolean {
+        writes.push(data);
+        writeCount++;
+        if (data === 'go\n') {
+          // Simulate backpressure: buffer is full on the first go write.
+          // Schedule a drain event after a tick.
+          setImmediate(() => emitter.emit('drain'));
+          return false;
+        }
+        return true; // CONNECT handshake succeeds immediately
+      },
+      destroy(): void {
+        guestToHost.destroy();
+      },
+      get readable(): NodeJS.ReadableStream {
+        return guestToHost as unknown as NodeJS.ReadableStream;
+      },
+      once(event: string, cb: () => void): void {
+        emitter.once(event, cb);
+      },
+    };
+
+    guestToHost.end(); // close guest side so events iterable finishes
+
+    const session = await openVsockSession('/tmp/vsock-bp.sock', 10242, {
+      duplex: backpressureDuplex,
+    });
+
+    await session.sendGo();
+
+    // Exactly one 'go\n' must have been written (not two).
+    const goWrites = writes.filter((w) => w === 'go\n');
+    expect(goWrites).toHaveLength(1);
+  });
+
   it('close() does not throw', async () => {
     const duplex = makeFakeDuplex();
     duplex.guestClose();

@@ -114,21 +114,22 @@ export async function openVsockSession(
 
     sendGo: (): Promise<void> => {
       return new Promise<void>((resolve, reject) => {
+        void reject; // unused — we resolve unconditionally
         const ok = duplex.write('go\n');
-        if (ok) {
-          resolve();
-        } else {
-          // Write buffer full — wait for drain.
+        if (!ok) {
+          // Write buffer full — 'go\n' is already buffered; wait for drain
+          // before resolving, but do NOT re-write it (that would double-send).
           const writeable = duplex as unknown as NodeJS.WritableStream;
           if (typeof (writeable as NodeJS.WritableStream & { once?: (event: string, cb: () => void) => void }).once === 'function') {
             (writeable as NodeJS.WritableStream & { once: (event: string, cb: () => void) => void })
-              .once('drain', () => { duplex.write('go\n'); resolve(); });
+              .once('drain', () => { resolve(); });
           } else {
-            // Fallback: try again after one tick.
-            setImmediate(() => { duplex.write('go\n'); resolve(); });
+            // Fallback: resolve after one tick (data is already buffered).
+            setImmediate(() => { resolve(); });
           }
+        } else {
+          resolve();
         }
-        void reject; // unused — we resolve unconditionally
       });
     },
 

@@ -66,6 +66,12 @@ function fakeConfig(dir: string): string {
 // File-staging tests (run on both macOS and Linux)
 // ---------------------------------------------------------------------------
 
+// TODO(v2): The tests in this describe block do not call makeOverlay() and
+// therefore do not exercise the actual staging logic.  They duplicate the
+// file-system operations directly.  Rewiring them to call makeOverlay() with
+// a stubbed mkfs.ext4 requires > 50 lines of mock infrastructure.  Leave as
+// is until a dedicated ext4-mock helper is available.
+
 describe('makeOverlay — staging (no ext4 build)', () => {
   it('copies the base rootfs to rootfsCopyPath', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);

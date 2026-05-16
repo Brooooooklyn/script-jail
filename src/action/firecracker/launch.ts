@@ -23,7 +23,8 @@
 
 import { request as httpRequest } from 'node:http';
 import { existsSync } from 'node:fs';
-import { spawn as nodeSpawn } from 'node:child_process';
+import { unlink } from 'node:fs/promises';
+import { spawn as nodeSpawn, spawnSync } from 'node:child_process';
 import { platform } from 'node:process';
 
 // ---------------------------------------------------------------------------
@@ -234,7 +235,6 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     handle.kill('SIGKILL');
     // Remove the API socket if it exists (Firecracker creates it at startup).
     try {
-      const { unlink } = await import('node:fs/promises');
       await unlink(socketPath);
     } catch { /* ignore — socket may not exist */ }
     throw err;
@@ -266,8 +266,6 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
 async function setupTapDevice(api: FirecrackerApiClient): Promise<void> {
   // Attempt to create the tap device.  Failures are non-fatal — the VM
   // starts without a network interface, which is acceptable during tests.
-  const { spawnSync } = await import('node:child_process');
-
   const mkTap = spawnSync('ip', ['tuntap', 'add', 'tap0', 'mode', 'tap'], {
     stdio: 'ignore',
   });
@@ -385,10 +383,10 @@ export class UnixSocketApiClient implements FirecrackerApiClient {
           // Drain the response body.
           res.resume();
           res.on('end', () => {
-            if (res.statusCode !== undefined && res.statusCode >= 400) {
+            if (res.statusCode === undefined || res.statusCode < 200 || res.statusCode >= 300) {
               reject(
                 new Error(
-                  `Firecracker API ${method} ${path} returned HTTP ${res.statusCode}`,
+                  `Firecracker API ${method} ${path} returned HTTP ${res.statusCode ?? '?'}`,
                 ),
               );
             } else {

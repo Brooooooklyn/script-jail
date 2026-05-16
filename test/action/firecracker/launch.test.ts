@@ -6,13 +6,17 @@
 //   - FakePoller: immediately resolves (no real socket polling).
 
 import { describe, it, expect } from 'vitest';
+import { createServer } from 'node:net';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type {
   Spawner,
   SpawnHandle,
   FirecrackerApiClient,
   SocketPoller,
 } from '../../../src/action/firecracker/launch.js';
-import { launchVm } from '../../../src/action/firecracker/launch.js';
+import { launchVm, UnixSocketApiClient } from '../../../src/action/firecracker/launch.js';
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -339,5 +343,86 @@ describe('launchVm', () => {
 
     // The spawned process MUST have been killed.
     expect(killCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UnixSocketApiClient — status code guard tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Spin up a minimal HTTP/1.1 server on a Unix socket that responds with a
+ * fixed status code, then assert whether UnixSocketApiClient resolves or rejects.
+ */
+function withFakeFirecrackerServer(
+  statusCode: number | undefined,
+  body: string,
+  test: (socketPath: string) => Promise<void>,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'npm-jar-api-test-'));
+    const socketPath = join(tmpDir, 'fc.sock');
+
+    const server = createServer((sock) => {
+      // Read until we have consumed the request headers, then respond.
+      let received = '';
+      sock.on('data', (chunk: Buffer) => {
+        received += chunk.toString();
+        if (received.includes('\r\n\r\n')) {
+          // Send a minimal HTTP/1.1 response.
+          const statusLine =
+            statusCode !== undefined
+              ? `HTTP/1.1 ${statusCode} Status\r\n`
+              : 'HTTP/1.1 \r\n'; // malformed — triggers undefined in Node
+          const response =
+            `${statusLine}Content-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`;
+          sock.end(response);
+        }
+      });
+    });
+
+    server.listen(socketPath, async () => {
+      try {
+        await test(socketPath);
+        resolve();
+      } catch (err) {
+        reject(err);
+      } finally {
+        server.close();
+        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    });
+
+    server.on('error', reject);
+  });
+}
+
+describe('UnixSocketApiClient status code guard', () => {
+  it('rejects with a descriptive error when statusCode is 500', async () => {
+    await withFakeFirecrackerServer(500, '{"error":"internal"}', async (socketPath) => {
+      const client = new UnixSocketApiClient(socketPath);
+      await expect(client.put('/boot-source', {})).rejects.toThrow(/HTTP 500/);
+    });
+  });
+
+  it('rejects when statusCode is 404', async () => {
+    await withFakeFirecrackerServer(404, 'not found', async (socketPath) => {
+      const client = new UnixSocketApiClient(socketPath);
+      await expect(client.put('/nonexistent', {})).rejects.toThrow(/HTTP 404/);
+    });
+  });
+
+  it('resolves when statusCode is 204 (Firecracker success)', async () => {
+    await withFakeFirecrackerServer(204, '', async (socketPath) => {
+      const client = new UnixSocketApiClient(socketPath);
+      await expect(client.put('/boot-source', {})).resolves.toBeUndefined();
+    });
+  });
+
+  it('resolves when statusCode is 200', async () => {
+    await withFakeFirecrackerServer(200, '{}', async (socketPath) => {
+      const client = new UnixSocketApiClient(socketPath);
+      await expect(client.put('/boot-source', {})).resolves.toBeUndefined();
+    });
   });
 });
