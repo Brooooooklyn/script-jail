@@ -32,10 +32,16 @@ mount -o ro /dev/vdb /work
 # Copy the user's config from the repo disk into the rootfs's canonical
 # /etc/npm-jar/config.yml so the agent can read it regardless of /work staying
 # mounted.  overlay.ts stages the config at /work/etc/npm-jar/config.yml.
+#
+# Fail fast if the host overlay didn't stage it: the agent has no useful
+# behaviour without a config, and a clear FATAL line is far easier to debug
+# than the downstream YAML/parse errors we'd otherwise see.
 mkdir -p /etc/npm-jar
-if [ -f /work/etc/npm-jar/config.yml ]; then
-  cp /work/etc/npm-jar/config.yml /etc/npm-jar/config.yml
+if [ ! -f /work/etc/npm-jar/config.yml ]; then
+  echo "[init] FATAL: /work/etc/npm-jar/config.yml not staged by host overlay" >&2
+  exit 1
 fi
+cp /work/etc/npm-jar/config.yml /etc/npm-jar/config.yml
 
 # --- Host-Node disk (/dev/vdc, label `host-node`) -----------------------------
 # Mount the runner's packed Node install read-only at /opt/host-node, then

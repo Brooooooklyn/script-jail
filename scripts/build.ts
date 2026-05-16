@@ -79,11 +79,21 @@ function parseArgs(): ParsedArgs {
  * Tries to detect the current host via `detectRunnerImage()`; if that throws
  * (typical on macOS dev hosts where `/etc/os-release` is absent and `ImageOS`
  * is unset), falls back to `ubuntu-24.04`.
+ *
+ * Both branches log via `console.log` — the detection result is informational,
+ * not an error, even when detection fails (we have a sensible fallback).
  */
 function defaultRunnerImage(): RunnerImage {
   try {
-    return detectRunnerImage();
+    const img = detectRunnerImage();
+    console.log(
+      `[build] No --runner-image flag; detected ${img} from ImageOS/os-release.`,
+    );
+    return img;
   } catch {
+    console.log(
+      '[build] No --runner-image flag and detection failed; falling back to ubuntu-24.04.',
+    );
     return 'ubuntu-24.04';
   }
 }
