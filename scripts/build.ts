@@ -4,20 +4,34 @@
 // Steps:
 //   1. Compile the action entry: esbuild src/main.ts → dist/main.js
 //   2. Build the C shim: src/shim/build.sh → images/libnpmjar.so (skip on macOS)
-//   3. Build the rootfs(es): src/rootfs/build.ts for each (nodeMajor, pm) combo
+//   3. Build the rootfs(es): src/rootfs/build.ts for the selected runner image.
 //
 // Flags:
-//   --skip-rootfs        skip rootfs build (e.g., when you only need the action bundle)
-//   --node-major=<N>     override Node.js major version (default: 20)
-//   --pm=<pm>            override package manager (default: pnpm)
+//   --skip-rootfs                                skip rootfs build (e.g., when you
+//                                                only need the action bundle)
+//   --runner-image=ubuntu-22.04|ubuntu-24.04     which Ubuntu base to build the
+//                                                rootfs against
+//   --all                                        build BOTH runner-image rootfses
+//                                                (overrides --runner-image)
+//
+// Default: build a single rootfs for whichever runner image we detect (via
+// `detectRunnerImage()`); falls back to `ubuntu-24.04` when detection fails
+// (e.g. on macOS dev hosts).
 
 import { execSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildRootfs, formatBytes, imageOutputPath } from '../src/rootfs/build.js';
-import type { BuildInput } from '../src/rootfs/build.js';
+import {
+  buildRootfs,
+  formatBytes,
+  imageOutputPath,
+  parseRunnerImageArg,
+  type BuildInput,
+  type RunnerImage,
+} from '../src/rootfs/build.js';
+import { detectRunnerImage } from '../src/action/runner-image.js';
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -31,40 +45,47 @@ const REPO_ROOT = join(__dirname, '..');
 // Arg parsing
 // ---------------------------------------------------------------------------
 
-function parseArgs(): {
+interface ParsedArgs {
   skipRootfs: boolean;
-  nodeMajor: number;
-  pm: 'npm' | 'pnpm' | 'yarn';
-} {
+  /** When `--all`, build both runner-image rootfses. */
+  all: boolean;
+  /** Explicit `--runner-image=…` choice; ignored when `--all`. */
+  runnerImage: RunnerImage | undefined;
+}
+
+function parseArgs(): ParsedArgs {
   const args = process.argv.slice(2);
 
   const skipRootfs = args.includes('--skip-rootfs');
+  const all = args.includes('--all');
+  const runnerImage = parseRunnerImageArg(args);
 
-  let nodeMajor = 20;
-  let pm: 'npm' | 'pnpm' | 'yarn' = 'pnpm';
-
+  // Warn about unknown flags so typos don't silently no-op.
   for (const arg of args) {
-    const majorMatch = /^--node-major=(\d+)$/.exec(arg);
-    if (majorMatch) {
-      nodeMajor = parseInt(majorMatch[1] ?? '20', 10);
-      continue;
-    }
-
-    const pmMatch = /^--pm=(npm|pnpm|yarn)$/.exec(arg);
-    if (pmMatch) {
-      const parsedPm = pmMatch[1];
-      if (parsedPm === 'npm' || parsedPm === 'pnpm' || parsedPm === 'yarn') {
-        pm = parsedPm;
-      }
-      continue;
-    }
-
-    if (arg !== '--skip-rootfs') {
-      console.warn(`[build] Unknown flag: ${arg}`);
-    }
+    if (
+      arg === '--skip-rootfs' ||
+      arg === '--all' ||
+      /^--runner-image=/.test(arg)
+    ) continue;
+    console.warn(`[build] Unknown flag: ${arg}`);
   }
 
-  return { skipRootfs, nodeMajor, pm };
+  return { skipRootfs, all, runnerImage };
+}
+
+/**
+ * Pick the default runner image when none is explicitly requested.
+ *
+ * Tries to detect the current host via `detectRunnerImage()`; if that throws
+ * (typical on macOS dev hosts where `/etc/os-release` is absent and `ImageOS`
+ * is unset), falls back to `ubuntu-24.04`.
+ */
+function defaultRunnerImage(): RunnerImage {
+  try {
+    return detectRunnerImage();
+  } catch {
+    return 'ubuntu-24.04';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +159,7 @@ function collectSummary(artifacts: ArtifactSummary[]): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const { skipRootfs, nodeMajor, pm } = parseArgs();
+  const { skipRootfs, all, runnerImage } = parseArgs();
 
   const artifacts: ArtifactSummary[] = [];
 
@@ -154,14 +175,19 @@ async function main(): Promise<void> {
   if (skipRootfs) {
     console.log('[build] --skip-rootfs passed; skipping rootfs build.');
   } else {
-    const rootfsInput: BuildInput = {
-      nodeMajor,
-      pm,
-      outputDir: join(REPO_ROOT, 'images'),
-    };
+    const targets: ReadonlyArray<RunnerImage> = all
+      ? ['ubuntu-22.04', 'ubuntu-24.04']
+      : [runnerImage ?? defaultRunnerImage()];
 
-    await buildRootfs(rootfsInput);
-    artifacts.push({ path: imageOutputPath(rootfsInput) });
+    for (const target of targets) {
+      const rootfsInput: BuildInput = {
+        runnerImage: target,
+        outputDir: join(REPO_ROOT, 'images'),
+      };
+
+      await buildRootfs(rootfsInput);
+      artifacts.push({ path: imageOutputPath(rootfsInput) });
+    }
   }
 
   // Summary

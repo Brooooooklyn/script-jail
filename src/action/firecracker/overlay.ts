@@ -35,15 +35,13 @@
 // Cleanup contract: `overlay.cleanup()` removes the entire `workDir`.  The
 // caller MUST invoke it (via teardown.ts) whether the VM run succeeds or fails.
 //
-// TODO(Task #13): The three-disk layout only works once the guest's init.sh
-// is updated to mount and prepare each disk.  The current src/rootfs/init.sh
-// does not yet do this, so a real VM boot will fail.  Tracked checklist:
-//   1. Mount the second virtio disk (/dev/vdb, label `repo`) at /work.
-//   2. mkdir -p /etc/npm-jar && cp /work/etc/npm-jar/config.yml /etc/npm-jar/
-//   3. Mount the third virtio disk (/dev/vdc, label `host-node`) read-only
-//      at /opt/host-node and prepend /opt/host-node/bin to PATH.
-//   4. exec dumb-init node /usr/local/lib/npm-jar/guest-agent.cjs (node
-//      resolves to the host-mounted binary via the prepended PATH).
+// Guest mount contract (closed by Task #13, see src/rootfs/init.sh):
+//   1. /dev/vdb (label `repo`)      → mounted read-only at /work.
+//   2. /work/etc/npm-jar/config.yml → copied into /etc/npm-jar/config.yml.
+//   3. /dev/vdc (label `host-node`) → mounted read-only at /opt/host-node,
+//      /opt/host-node/bin prepended to PATH.
+//   4. The agent execs as `node /usr/local/lib/npm-jar/guest-agent.cjs` so
+//      `node` resolves to the host-mounted binary.
 
 import {
   cpSync,
@@ -65,7 +63,7 @@ import { platform } from 'node:process';
 // ---------------------------------------------------------------------------
 
 export interface OverlayInput {
-  /** Absolute path to the base rootfs ext4 (e.g. images/rootfs-node20-pnpm.ext4). */
+  /** Absolute path to the base rootfs ext4 (e.g. images/rootfs-ubuntu-24.04.ext4). */
   baseRootfsPath: string;
   /** Absolute path to the user's repository on the host. */
   repoSrcPath: string;

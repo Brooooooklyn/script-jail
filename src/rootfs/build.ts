@@ -1,13 +1,19 @@
 // npm-jar — src/rootfs/build.ts
 // Orchestrates building the Firecracker rootfs ext4 image.
 //
+// In v2 the rootfs is keyed by Ubuntu major (`ubuntu-22.04`, `ubuntu-24.04`)
+// rather than by `(node-major, package-manager)`: Node ships into the VM at
+// runtime via a third virtio drive packed by the action (see
+// `src/action/firecracker/overlay.ts`).  The rootfs therefore only needs to
+// be ABI-compatible with whatever the host runner provides.
+//
 // Steps:
 //   1. Bundle src/guest/agent.ts → dist/guest-agent.cjs via esbuild
 //   2. Copy the two .cjs preloads to dist/preloads/
 //   3. Ensure images/libnpmjar.so is present (build if not, skip on macOS)
-//   4. docker build → npm-jar-rootfs:<nodeMajor>-<pm>
+//   4. docker build → npm-jar-rootfs:<runnerImage>
 //   5. docker export → tar → directory → ext4 image
-//   6. Write images/rootfs-node<nodeMajor>-<pm>.ext4
+//   6. Write images/rootfs-<runnerImage>.ext4
 //   7. Report size; warn if > 200 MB
 
 import { execSync, spawnSync } from 'node:child_process';
@@ -21,9 +27,11 @@ import { randomBytes } from 'node:crypto';
 // Types
 // ---------------------------------------------------------------------------
 
+/** Supported runner images.  Must stay in sync with `src/action/runner-image.ts`. */
+export type RunnerImage = 'ubuntu-22.04' | 'ubuntu-24.04';
+
 export interface BuildInput {
-  nodeMajor: number;
-  pm: 'npm' | 'pnpm' | 'yarn';
+  runnerImage: RunnerImage;
   /** Directory where images/*.ext4 are written. Defaults to <repo root>/images */
   outputDir: string;
 }
@@ -42,8 +50,8 @@ const REPO_ROOT = join(__dirname, '..', '..');
 // ---------------------------------------------------------------------------
 
 /** Compute the output ext4 image filename. */
-export function imageFilename(input: Pick<BuildInput, 'nodeMajor' | 'pm'>): string {
-  return `rootfs-node${input.nodeMajor}-${input.pm}.ext4`;
+export function imageFilename(input: Pick<BuildInput, 'runnerImage'>): string {
+  return `rootfs-${input.runnerImage}.ext4`;
 }
 
 /** Compute the full output path for the ext4 image. */
@@ -51,9 +59,24 @@ export function imageOutputPath(input: BuildInput): string {
   return join(input.outputDir, imageFilename(input));
 }
 
-/** Docker image tag for this (nodeMajor, pm) combination. */
-export function dockerTag(input: Pick<BuildInput, 'nodeMajor' | 'pm'>): string {
-  return `npm-jar-rootfs:${input.nodeMajor}-${input.pm}`;
+/** Docker image tag for this runner image. */
+export function dockerTag(input: Pick<BuildInput, 'runnerImage'>): string {
+  return `npm-jar-rootfs:${input.runnerImage}`;
+}
+
+/** Map a runner image to its `ubuntu:<version>` base tag. */
+export function ubuntuBaseTag(input: Pick<BuildInput, 'runnerImage'>): string {
+  const versions: Record<RunnerImage, string> = {
+    'ubuntu-22.04': '22.04',
+    'ubuntu-24.04': '24.04',
+  };
+  return `ubuntu:${versions[input.runnerImage]}`;
+}
+
+/** Extract the bare Ubuntu major version (e.g. `22.04`) from a runner image. */
+export function ubuntuMajor(input: Pick<BuildInput, 'runnerImage'>): string {
+  // ubuntuBaseTag is `ubuntu:<version>`; strip the prefix.
+  return ubuntuBaseTag(input).slice('ubuntu:'.length);
 }
 
 /** Return true when the process is running on macOS. */
@@ -170,8 +193,7 @@ function dockerBuild(input: BuildInput): void {
   const dockerfile = join(REPO_ROOT, 'src', 'rootfs', 'Dockerfile.base');
   run(
     `docker build ` +
-    `--build-arg NODE_MAJOR=${input.nodeMajor} ` +
-    `--build-arg PM=${input.pm} ` +
+    `--build-arg UBUNTU_MAJOR=${ubuntuMajor(input)} ` +
     `-f "${dockerfile}" ` +
     `-t "${tag}" ` +
     `.`,
@@ -290,7 +312,7 @@ function reportSize(input: BuildInput): void {
 
 export async function buildRootfs(input: BuildInput): Promise<void> {
   console.log(
-    `[rootfs] Building rootfs for node${input.nodeMajor}/${input.pm} → ${imageFilename(input)}`,
+    `[rootfs] Building rootfs for ${input.runnerImage} → ${imageFilename(input)}`,
   );
 
   if (!commandExists('docker')) {
@@ -345,9 +367,10 @@ const isMain =
   resolve(process.argv[1]) === __filename;
 
 if (isMain) {
+  // CLI: `oxnode src/rootfs/build.ts [--runner-image=ubuntu-22.04|ubuntu-24.04]`
+  const runnerImage = parseRunnerImageArg(process.argv.slice(2)) ?? 'ubuntu-24.04';
   const defaultInput: BuildInput = {
-    nodeMajor: 20,
-    pm: 'pnpm',
+    runnerImage,
     outputDir: join(REPO_ROOT, 'images'),
   };
 
@@ -355,4 +378,24 @@ if (isMain) {
     console.error(String(err instanceof Error ? err.stack ?? err.message : err));
     process.exit(1);
   });
+}
+
+/**
+ * Parse `--runner-image=ubuntu-22.04|ubuntu-24.04` from argv.  Returns
+ * `undefined` when the flag is absent so callers can apply their own default.
+ * Throws on an unknown value so the user sees a clear error rather than
+ * silently getting the default.
+ */
+export function parseRunnerImageArg(args: ReadonlyArray<string>): RunnerImage | undefined {
+  for (const arg of args) {
+    const m = /^--runner-image=(.+)$/.exec(arg);
+    if (m === null) continue;
+    const value = m[1];
+    if (value === 'ubuntu-22.04' || value === 'ubuntu-24.04') return value;
+    throw new Error(
+      `[rootfs] Unknown --runner-image value: ${String(value)}. ` +
+      `Expected one of: ubuntu-22.04, ubuntu-24.04.`,
+    );
+  }
+  return undefined;
 }

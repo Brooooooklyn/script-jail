@@ -11,31 +11,38 @@ import {
   imageFilename,
   imageOutputPath,
   dockerTag,
+  ubuntuBaseTag,
+  ubuntuMajor,
+  parseRunnerImageArg,
   formatBytes,
   SIZE_WARN_THRESHOLD_BYTES,
 } from '../../src/rootfs/build.js';
-import type { BuildInput } from '../../src/rootfs/build.js';
+import type { BuildInput, RunnerImage } from '../../src/rootfs/build.js';
 
 // ---------------------------------------------------------------------------
 // imageFilename
 // ---------------------------------------------------------------------------
 
 describe('imageFilename', () => {
-  it('produces the expected filename for node20/pnpm', () => {
-    expect(imageFilename({ nodeMajor: 20, pm: 'pnpm' })).toBe('rootfs-node20-pnpm.ext4');
+  it('produces the expected filename for ubuntu-22.04', () => {
+    expect(imageFilename({ runnerImage: 'ubuntu-22.04' })).toBe(
+      'rootfs-ubuntu-22.04.ext4',
+    );
   });
 
-  it('produces the expected filename for node22/yarn', () => {
-    expect(imageFilename({ nodeMajor: 22, pm: 'yarn' })).toBe('rootfs-node22-yarn.ext4');
+  it('produces the expected filename for ubuntu-24.04', () => {
+    expect(imageFilename({ runnerImage: 'ubuntu-24.04' })).toBe(
+      'rootfs-ubuntu-24.04.ext4',
+    );
   });
 
-  it('produces the expected filename for node18/npm', () => {
-    expect(imageFilename({ nodeMajor: 18, pm: 'npm' })).toBe('rootfs-node18-npm.ext4');
-  });
-
-  it('includes the nodeMajor as a number (no decimals)', () => {
-    const name = imageFilename({ nodeMajor: 20, pm: 'npm' });
-    expect(name).toMatch(/^rootfs-node\d+-npm\.ext4$/);
+  it('matches the `rootfs-<runner-image>.ext4` shape main.ts expects', () => {
+    // main.ts builds the rootfs path as `rootfs-${runnerImage}.ext4`; this
+    // test fails loudly if the shape ever drifts between the two files.
+    const images: ReadonlyArray<RunnerImage> = ['ubuntu-22.04', 'ubuntu-24.04'];
+    for (const runnerImage of images) {
+      expect(imageFilename({ runnerImage })).toBe(`rootfs-${runnerImage}.ext4`);
+    }
   });
 });
 
@@ -45,19 +52,18 @@ describe('imageFilename', () => {
 
 describe('imageOutputPath', () => {
   it('joins outputDir with imageFilename', () => {
-    const input: BuildInput = { nodeMajor: 20, pm: 'pnpm', outputDir: '/some/dir' };
-    expect(imageOutputPath(input)).toBe('/some/dir/rootfs-node20-pnpm.ext4');
+    const input: BuildInput = { runnerImage: 'ubuntu-24.04', outputDir: '/some/dir' };
+    expect(imageOutputPath(input)).toBe('/some/dir/rootfs-ubuntu-24.04.ext4');
   });
 
   it('handles outputDir with trailing slash gracefully', () => {
     // path.join normalises trailing slashes
-    const input: BuildInput = { nodeMajor: 20, pm: 'npm', outputDir: '/out/' };
-    // path.join('/out/', 'rootfs-node20-npm.ext4') === '/out/rootfs-node20-npm.ext4'
-    expect(imageOutputPath(input)).toMatch(/rootfs-node20-npm\.ext4$/);
+    const input: BuildInput = { runnerImage: 'ubuntu-22.04', outputDir: '/out/' };
+    expect(imageOutputPath(input)).toMatch(/rootfs-ubuntu-22\.04\.ext4$/);
   });
 
   it('is an absolute path when outputDir is absolute', () => {
-    const input: BuildInput = { nodeMajor: 22, pm: 'yarn', outputDir: '/images' };
+    const input: BuildInput = { runnerImage: 'ubuntu-24.04', outputDir: '/images' };
     expect(imageOutputPath(input)).toMatch(/^\//);
   });
 });
@@ -67,22 +73,85 @@ describe('imageOutputPath', () => {
 // ---------------------------------------------------------------------------
 
 describe('dockerTag', () => {
-  it('formats the tag as npm-jar-rootfs:<nodeMajor>-<pm>', () => {
-    expect(dockerTag({ nodeMajor: 20, pm: 'pnpm' })).toBe('npm-jar-rootfs:20-pnpm');
+  it('formats the tag as npm-jar-rootfs:<runner-image>', () => {
+    expect(dockerTag({ runnerImage: 'ubuntu-22.04' })).toBe(
+      'npm-jar-rootfs:ubuntu-22.04',
+    );
   });
 
-  it('includes the full node major version', () => {
-    expect(dockerTag({ nodeMajor: 22, pm: 'yarn' })).toBe('npm-jar-rootfs:22-yarn');
+  it('produces a distinct tag for ubuntu-24.04', () => {
+    expect(dockerTag({ runnerImage: 'ubuntu-24.04' })).toBe(
+      'npm-jar-rootfs:ubuntu-24.04',
+    );
   });
 
-  it('works for npm pm', () => {
-    expect(dockerTag({ nodeMajor: 18, pm: 'npm' })).toBe('npm-jar-rootfs:18-npm');
-  });
-
-  it('does not include a colon within the tag portion', () => {
-    const tag = dockerTag({ nodeMajor: 20, pm: 'pnpm' });
-    // Should have exactly one colon (separating name from tag)
+  it('has exactly one colon separating name from tag', () => {
+    // The runner-image portion (ubuntu-22.04) contains a dot but no colon —
+    // the docker tag spec allows dots but treats colons as separators, so the
+    // colon-count must remain at 1.
+    const tag = dockerTag({ runnerImage: 'ubuntu-22.04' });
     expect(tag.split(':').length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ubuntuBaseTag / ubuntuMajor
+// ---------------------------------------------------------------------------
+
+describe('ubuntuBaseTag', () => {
+  it('maps ubuntu-22.04 to ubuntu:22.04', () => {
+    expect(ubuntuBaseTag({ runnerImage: 'ubuntu-22.04' })).toBe('ubuntu:22.04');
+  });
+
+  it('maps ubuntu-24.04 to ubuntu:24.04', () => {
+    expect(ubuntuBaseTag({ runnerImage: 'ubuntu-24.04' })).toBe('ubuntu:24.04');
+  });
+});
+
+describe('ubuntuMajor', () => {
+  it('returns 22.04 for ubuntu-22.04', () => {
+    expect(ubuntuMajor({ runnerImage: 'ubuntu-22.04' })).toBe('22.04');
+  });
+
+  it('returns 24.04 for ubuntu-24.04', () => {
+    expect(ubuntuMajor({ runnerImage: 'ubuntu-24.04' })).toBe('24.04');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseRunnerImageArg
+// ---------------------------------------------------------------------------
+
+describe('parseRunnerImageArg', () => {
+  it('returns undefined when the flag is absent', () => {
+    expect(parseRunnerImageArg([])).toBeUndefined();
+    expect(parseRunnerImageArg(['--skip-rootfs'])).toBeUndefined();
+  });
+
+  it('parses --runner-image=ubuntu-22.04', () => {
+    expect(parseRunnerImageArg(['--runner-image=ubuntu-22.04'])).toBe('ubuntu-22.04');
+  });
+
+  it('parses --runner-image=ubuntu-24.04', () => {
+    expect(parseRunnerImageArg(['--runner-image=ubuntu-24.04'])).toBe('ubuntu-24.04');
+  });
+
+  it('throws on an unknown value rather than silently defaulting', () => {
+    expect(() => parseRunnerImageArg(['--runner-image=debian-12'])).toThrow(
+      /Unknown --runner-image/,
+    );
+  });
+
+  it('returns the FIRST recognised value when the flag is repeated', () => {
+    // We don't formally specify first-wins, but exercising the loop with a
+    // repeated flag locks in the current behaviour and surfaces a regression
+    // if the parser is ever refactored (the loop returns on the first hit).
+    expect(
+      parseRunnerImageArg([
+        '--runner-image=ubuntu-22.04',
+        '--runner-image=ubuntu-24.04',
+      ]),
+    ).toBe('ubuntu-22.04');
   });
 });
 
@@ -132,24 +201,18 @@ describe('SIZE_WARN_THRESHOLD_BYTES', () => {
 });
 
 // ---------------------------------------------------------------------------
-// BuildInput shape validation (type-level; runtime sanity checks)
+// BuildInput shape (type-level; runtime sanity over the two known images)
 // ---------------------------------------------------------------------------
 
 describe('BuildInput shape', () => {
-  it('accepts all three pm values', () => {
-    const pms: Array<BuildInput['pm']> = ['npm', 'pnpm', 'yarn'];
-    for (const pm of pms) {
-      const input: BuildInput = { nodeMajor: 20, pm, outputDir: '/images' };
-      // imageFilename must produce a non-empty string for each pm
+  it('accepts each supported runner image', () => {
+    const images: ReadonlyArray<RunnerImage> = ['ubuntu-22.04', 'ubuntu-24.04'];
+    for (const runnerImage of images) {
+      const input: BuildInput = { runnerImage, outputDir: '/images' };
+      // imageFilename must produce a non-empty string for each image
       expect(imageFilename(input)).toBeTruthy();
-    }
-  });
-
-  it('accepts different node major versions', () => {
-    const versions = [18, 20, 22, 24];
-    for (const nodeMajor of versions) {
-      const input: BuildInput = { nodeMajor, pm: 'pnpm', outputDir: '/images' };
-      expect(imageFilename(input)).toContain(String(nodeMajor));
+      // and the filename includes the runner image verbatim
+      expect(imageFilename(input)).toContain(runnerImage);
     }
   });
 });
