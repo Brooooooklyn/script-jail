@@ -8,7 +8,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 
-import { main, MemoryConnection } from '../../src/guest/agent.js';
+import { createConnection } from 'node:net';
+
+import { LinuxVsockConnection, main, MemoryConnection } from '../../src/guest/agent.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
 import type { StraceRunner } from '../../src/guest/phase-install.js';
 
@@ -426,5 +428,109 @@ describe('MemoryConnection', () => {
     const w = new PassThrough();
     const conn = new MemoryConnection(r, w);
     expect(() => conn.close()).not.toThrow();
+  });
+});
+
+describe('LinuxVsockConnection', () => {
+  // Use a fixed high port that's very unlikely to clash with anything else on
+  // the dev machine.  vitest gives each describe-block its own process, but
+  // tests within the block run sequentially anyway because each one binds
+  // and tears down the same listener.
+  const TEST_PORT = 24317;
+
+  it('listen() resolves when a client connects', async () => {
+    const connPromise = LinuxVsockConnection.listen(TEST_PORT);
+
+    // Connect from a "client" (simulating the in-VM socat bridge).
+    const client = createConnection({ port: TEST_PORT, host: '127.0.0.1' });
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', () => { resolve(); });
+      client.once('error', reject);
+    });
+
+    const conn = await connPromise;
+    expect(conn).toBeDefined();
+    expect(conn.readable).toBeDefined();
+    expect(conn.writable).toBeDefined();
+
+    conn.close();
+    client.destroy();
+  });
+
+  it('forwards bytes through the accepted connection', async () => {
+    const connPromise = LinuxVsockConnection.listen(TEST_PORT);
+
+    const client = createConnection({ port: TEST_PORT, host: '127.0.0.1' });
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', () => { resolve(); });
+      client.once('error', reject);
+    });
+
+    const conn = await connPromise;
+
+    // Client (host side) -> agent (readable).
+    const received = new Promise<string>((resolve) => {
+      conn.readable.once('data', (chunk: Buffer) => { resolve(chunk.toString()); });
+    });
+    client.write('hello\n');
+    expect(await received).toBe('hello\n');
+
+    // Agent (writable) -> client (host side).
+    const echoed = new Promise<string>((resolve) => {
+      client.once('data', (chunk: Buffer) => { resolve(chunk.toString()); });
+    });
+    conn.writable.write('world\n');
+    expect(await echoed).toBe('world\n');
+
+    conn.close();
+    client.destroy();
+  });
+
+  it('close() destroys the accepted socket', async () => {
+    const connPromise = LinuxVsockConnection.listen(TEST_PORT);
+
+    const client = createConnection({ port: TEST_PORT, host: '127.0.0.1' });
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', () => { resolve(); });
+      client.once('error', reject);
+    });
+
+    const conn = await connPromise;
+
+    // Client should see the socket close after conn.close().
+    const closed = new Promise<void>((resolve) => {
+      client.once('close', () => { resolve(); });
+    });
+    conn.close();
+    await closed;
+
+    client.destroy();
+  });
+
+  it('after accepting, the listener is closed (port can be re-bound)', async () => {
+    const connPromise = LinuxVsockConnection.listen(TEST_PORT);
+
+    const client = createConnection({ port: TEST_PORT, host: '127.0.0.1' });
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', () => { resolve(); });
+      client.once('error', reject);
+    });
+
+    const conn = await connPromise;
+
+    // The listener has been closed inside listen() after accepting; rebinding
+    // on the same port must succeed.  Use a fresh listen() call as the probe.
+    const probePromise = LinuxVsockConnection.listen(TEST_PORT);
+    const probeClient = createConnection({ port: TEST_PORT, host: '127.0.0.1' });
+    await new Promise<void>((resolve, reject) => {
+      probeClient.once('connect', () => { resolve(); });
+      probeClient.once('error', reject);
+    });
+    const probeConn = await probePromise;
+
+    probeConn.close();
+    probeClient.destroy();
+    conn.close();
+    client.destroy();
   });
 });

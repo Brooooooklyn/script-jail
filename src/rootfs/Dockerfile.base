@@ -11,7 +11,7 @@ FROM ubuntu:${UBUNTU_MAJOR}
 # follow-up `RUN rm -rf …` would only mask the bytes, not shrink the image.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      strace busybox dumb-init ca-certificates && \
+      strace busybox dumb-init ca-certificates socat && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /usr/share/doc /usr/share/man /usr/share/locale \
            /var/cache/apt /var/lib/dpkg/info/*.md5sums
@@ -23,12 +23,13 @@ RUN mkdir -p /work /etc/npm-jar /usr/local/lib/npm-jar /usr/local/bin /opt/host-
 
 # Init + agent + JS preloads (copied at build time from the host build context)
 COPY src/rootfs/init.sh /sbin/init
+COPY src/rootfs/orchestrate.sh /sbin/orchestrate
 COPY src/rootfs/cleanup.sh /sbin/cleanup
 COPY dist/guest-agent.cjs /usr/local/lib/npm-jar/guest-agent.cjs
 COPY dist/preloads/platform-spoof.cjs /usr/local/lib/npm-jar/platform-spoof.cjs
 COPY dist/preloads/dlopen-block.cjs /usr/local/lib/npm-jar/dlopen-block.cjs
 COPY images/libnpmjar.so /lib/libnpmjar.so
 
-RUN chmod +x /sbin/init /sbin/cleanup
+RUN chmod +x /sbin/init /sbin/orchestrate /sbin/cleanup
 
 CMD ["/sbin/init"]

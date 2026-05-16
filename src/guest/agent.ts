@@ -14,7 +14,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { createConnection } from 'node:net';
+import { createServer, type Server, type Socket } from 'node:net';
 import { PassThrough, Writable } from 'node:stream';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
@@ -69,25 +69,59 @@ export interface Connection {
   close(): void;
 }
 
-/** Production connection via Linux vsock. */
+/**
+ * Production connection via Linux vsock.
+ *
+ * Node has no native AF_VSOCK support, so the data path in the VM is:
+ *   Firecracker -> AF_VSOCK port 10242 (socat in guest, see init.sh)
+ *                  -> TCP 127.0.0.1:10243 (this listener)
+ *
+ * The guest agent LISTENS — Firecracker, via socat, makes the inbound
+ * connection — so we open a TCP server on the loopback, await the first
+ * (and only) inbound connection, then stop accepting.  Use the static
+ * `listen()` factory; the constructor is internal.
+ */
 export class LinuxVsockConnection implements Connection {
   readonly readable: Readable;
   readonly writable: Writable;
-  private readonly sock: ReturnType<typeof createConnection>;
+  private readonly sock: Socket;
+  private readonly server: Server;
 
-  constructor(port: number) {
-    // AF_VSOCK is not directly exposed in Node's net module; we use a TCP
-    // connection to localhost as the vsock abstraction in tests. In production
-    // the host sets up a vsock-to-TCP proxy or we use a raw socket via a
-    // native addon. For v1 we connect via TCP to the vsock port exposed by
-    // the host's vsock-TCP bridge at 127.0.0.1:<port>.
-    this.sock = createConnection({ port, host: '127.0.0.1' });
-    this.readable = this.sock;
-    this.writable = this.sock;
+  private constructor(server: Server, sock: Socket) {
+    this.server = server;
+    this.sock = sock;
+    this.readable = sock;
+    this.writable = sock;
+  }
+
+  /**
+   * Bind a TCP listener on 127.0.0.1:<port>, wait for the single inbound
+   * connection from the socat AF_VSOCK->TCP bridge, then stop listening
+   * (one-shot).  Resolves once the host's connection has been accepted.
+   */
+  static async listen(port: number): Promise<LinuxVsockConnection> {
+    const server = createServer();
+    return new Promise<LinuxVsockConnection>((resolve, reject) => {
+      const onError = (err: Error): void => {
+        server.removeListener('connection', onConnection);
+        reject(err);
+      };
+      const onConnection = (sock: Socket): void => {
+        server.removeListener('error', onError);
+        // One-shot: stop accepting further connections.  Existing accepted
+        // socket stays open; `server.close()` only stops the listener.
+        server.close();
+        resolve(new LinuxVsockConnection(server, sock));
+      };
+      server.once('error', onError);
+      server.once('connection', onConnection);
+      server.listen(port, '127.0.0.1');
+    });
   }
 
   close(): void {
     this.sock.destroy();
+    this.server.close();
   }
 }
 
@@ -503,13 +537,19 @@ if (isMain) {
   // the renderer captures `process.version` of the running interpreter — which
   // is the host-mounted Node at /opt/host-node, picked up via PATH by init.sh.
   // That's the entire point of the host-Node mount (Task #12).
-  const conn = new LinuxVsockConnection(10242);
-  main({ connection: conn }).catch((err: unknown) => {
-    const pt = new PassThrough();
-    const em = new Emitter(pt);
-    em.emitError(String(err), true);
-    process.exit(1);
-  });
+  //
+  // The TCP port here (10243) is the guest-side endpoint of the socat
+  // AF_VSOCK<->TCP bridge configured in src/rootfs/init.sh.  The host still
+  // talks to Firecracker's UDS at vsock port 10242 (see src/main.ts) — socat
+  // listens on AF_VSOCK 10242 inside the VM and forwards to TCP 10243 here.
+  LinuxVsockConnection.listen(10243)
+    .then((conn) => main({ connection: conn }))
+    .catch((err: unknown) => {
+      const pt = new PassThrough();
+      const em = new Emitter(pt);
+      em.emitError(String(err), true);
+      process.exit(1);
+    });
 }
 
 // Re-export PassThrough for use in tests if needed.

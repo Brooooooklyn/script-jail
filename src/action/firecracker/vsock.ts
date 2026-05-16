@@ -16,17 +16,19 @@
 // net.Socket-like duplex (e.g. a pair of PassThrough streams) in place of
 // the real UDS connection.
 //
-// TODO(v2): Transport mismatch — the current guest `LinuxVsockConnection`
-// opens a plain TCP connection to 127.0.0.1:<port> (see src/guest/agent.ts)
-// while this host side uses the Firecracker UDS vsock-over-UDS pattern with a
-// "CONNECT <port>\n" handshake.  These two sides are NOT compatible out of the
-// box.  To wire them together in production one of the following is needed:
-//   a) Replace LinuxVsockConnection with a real AF_VSOCK socket that listens
-//      on the guest side (requires a Node native addon or a C helper process).
-//   b) Add a vsock-to-TCP bridge on the host (e.g. socat or a Node proxy) and
-//      keep the TCP guest connection.
-// Until this is resolved, end-to-end VM runs will fail at the control channel
-// setup step.  The unit tests are not affected because they inject a fake duplex.
+// Transport bridge (host <-> guest):
+//   Node has no native AF_VSOCK support, so the guest agent cannot speak
+//   AF_VSOCK directly.  The rootfs ships `socat`, and the guest's
+//   /sbin/orchestrate script (invoked by init.sh under dumb-init) runs
+//   `socat VSOCK-LISTEN:10242,fork TCP:127.0.0.1:10243` *only after* the
+//   agent has bound TCP 127.0.0.1:10243 — confirmed by polling /proc/net/tcp
+//   — so the bridge cannot accept a host CONNECT before the agent is ready.
+//   The host side (this file) connects to Firecracker's UDS at
+//   `${udsPath}_${port}` and sends `CONNECT 10242\n`; Firecracker forwards
+//   that to AF_VSOCK port 10242 in the guest, where socat accepts it and
+//   pipes the bytes through to TCP 127.0.0.1:10243, where the agent's
+//   `LinuxVsockConnection.listen` is waiting.  See src/rootfs/init.sh,
+//   src/rootfs/orchestrate.sh, and src/guest/agent.ts.
 
 import { createConnection, type Socket } from 'node:net';
 import { createInterface } from 'node:readline';

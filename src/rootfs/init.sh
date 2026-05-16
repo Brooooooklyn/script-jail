@@ -90,7 +90,9 @@ export PATH="/opt/host-node/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 # Strace output directory used by phase B.
 mkdir -p /tmp/npm-jar-strace
 
-# Exec the agent through dumb-init so signals propagate and orphans are reaped.
-# `node` here is the host-mounted binary thanks to PATH; the agent path is
-# absolute so it loads regardless of cwd.
-exec dumb-init node /usr/local/lib/npm-jar/guest-agent.cjs
+# Hand off to the orchestrator under dumb-init.  dumb-init becomes PID 1 and
+# reaps the two children (the agent and socat); orchestrate.sh is responsible
+# for the startup ordering — start agent first, wait until its TCP listener
+# is bound, THEN start socat, so the AF_VSOCK port doesn't accept a host
+# connection before the agent's TCP target exists (see Task #14).
+exec dumb-init /sbin/orchestrate
