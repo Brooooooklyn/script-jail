@@ -20,6 +20,13 @@ This is the kernel image AWS publishes for Firecracker's own CI under
 under `firecracker-ci/v1.10/x86_64/vmlinux-5.10.223.config` in the same
 bucket; the kernel is GPL-2.0, the build is reproducible from that config.
 
+### Why 5.10.223 (not "vmlinux-5.10.bin")
+
+Earlier Firecracker docs referenced an unsuffixed `vmlinux-5.10.bin` in the
+same bucket; that key returns `NoSuchKey` today. The `firecracker-ci/v1.10/`
+prefix now publishes patch-level kernels (`vmlinux-5.10.223`, etc.). We pin
+to a specific patch so the SHA stays meaningful; bump it deliberately.
+
 Re-verify with:
 
     curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223" | sha256sum
@@ -37,7 +44,8 @@ in their repo; with the Linux source tree extracted alongside it, run:
 
 then update `PINNED_VMLINUX_URL` (point at your own hosted artifact) and
 `PINNED_VMLINUX_SHA256` (the `sha256sum` of your `vmlinux`) in `src/main.ts`,
-and mirror the new digest in this file. See Firecracker's kernel policy
-(`https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md`)
+and mirror the new digest in this file. See Firecracker's kernel policy at
+[firecracker-microvm/firecracker v1.8.0 docs/kernel-policy.md](https://github.com/firecracker-microvm/firecracker/blob/v1.8.0/docs/kernel-policy.md)
 for guidance on supported kernel versions and required features (vsock,
-virtio, MMIO, KVM guest support).
+virtio, MMIO, KVM guest support). Tag-pinned so the link doesn't shift
+meaning when Firecracker reorganizes their docs tree.

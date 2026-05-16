@@ -48,8 +48,9 @@ const FIRECRACKER_VERSION = '1.8.0';
 
 // Pinned from Firecracker CI artifacts (v1.10, kernel 5.10.223).
 // See src/rootfs/vmlinux.md for provenance and a "build your own" recipe;
-// production deployments may prefer a stricter kernel config — refer to
-// https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md
+// production deployments may prefer a stricter kernel config — refer to the
+// tag-pinned policy doc at:
+//   https://github.com/firecracker-microvm/firecracker/blob/v1.8.0/docs/kernel-policy.md
 const PINNED_VMLINUX_URL =
   'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223';
 const PINNED_VMLINUX_SHA256 =
