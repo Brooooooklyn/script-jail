@@ -26,6 +26,7 @@ import { randomBytes } from 'node:crypto';
 import { parseInputs } from './action/inputs.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './action/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
+import { resolveHostNodePrefix } from './action/host-node-prefix.js';
 import { renderDiff } from './action/diff.js';
 import { warn } from './action/log.js';
 import {
@@ -135,11 +136,19 @@ export async function main(): Promise<void> {
     http: new NodeHttpClient(),
   });
 
+  // --- Resolve host-node prefix --------------------------------------------
+  // The rootfs ships no Node binary; we pack the runner's Node install into a
+  // third ext4 disk and mount it at /opt/host-node inside the VM.  Whichever
+  // Node the user's workflow set up (typically via actions/setup-node) is the
+  // Node the audit runs against.
+  const hostNodePrefix = resolveHostNodePrefix(process.execPath);
+
   // --- Build per-run overlay ----------------------------------------------
   const overlay: OverlayResult = await makeOverlay({
     baseRootfsPath,
     repoSrcPath: repoDir,
     configPath: inputs.configPath,
+    hostNodePrefix,
   });
 
   // --- Generate unique per-run socket paths --------------------------------
@@ -166,6 +175,7 @@ export async function main(): Promise<void> {
       vmlinuxPath,
       rootfsPath: overlay.rootfsCopyPath,
       repoDiskPath: overlay.repoDiskPath,
+      hostNodeDiskPath: overlay.hostNodeDiskPath,
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,

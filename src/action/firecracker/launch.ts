@@ -69,6 +69,12 @@ export interface LaunchInput {
   rootfsPath: string;
   /** Optional second disk (repo). If provided, added as drive id "repo". */
   repoDiskPath?: string | undefined;
+  /**
+   * Optional third disk: the runner's Node install packed as ext4.
+   * Attached as drive id "host-node" (read-only); the guest's init.sh
+   * mounts it at /opt/host-node and prepends /opt/host-node/bin to PATH.
+   */
+  hostNodeDiskPath?: string | undefined;
   vcpu?: number | undefined;       // default 2
   memMB?: number | undefined;      // default 2048
   /** Guest CID for vsock (must be > 2; host CID is 2). */
@@ -132,6 +138,7 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     vmlinuxPath,
     rootfsPath,
     repoDiskPath,
+    hostNodeDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -203,6 +210,20 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
       await apiClient.put('/drives/repo', {
         drive_id: 'repo',
         path_on_host: repoDiskPath,
+        is_root_device: false,
+        is_read_only: true,
+      });
+    }
+
+    // 4c. Optional host-node disk (runner's Node install).  Registered
+    //     after the repo drive so the guest sees a stable drive ordering:
+    //     rootfs → repo → host-node (i.e. /dev/vda, /dev/vdb, /dev/vdc).
+    //     The guest's init.sh keys off the label "host-node" rather than
+    //     the device path, but consistent ordering aids debugging.
+    if (hostNodeDiskPath !== undefined) {
+      await apiClient.put('/drives/host-node', {
+        drive_id: 'host-node',
+        path_on_host: hostNodeDiskPath,
         is_root_device: false,
         is_read_only: true,
       });

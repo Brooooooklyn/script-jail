@@ -1,28 +1,36 @@
 // npm-jar — src/action/firecracker/overlay.ts
 //
-// Builds a per-run rootfs overlay and a separate repo disk for the VM.
+// Builds a per-run rootfs overlay plus side disks for the VM.
 //
-// Design: TWO-DISK APPROACH
-// ──────────────────────────
-// Rather than mounting and mutating the base ext4 in-place we use two separate
-// ext4 images:
+// Design: THREE-DISK APPROACH
+// ────────────────────────────
+// Rather than mounting and mutating the base ext4 in-place we use three
+// separate ext4 images:
 //
-//   1. rootfs.ext4  — a copy of the base image (CoW with `cp --reflink=auto`
-//                     on Linux; plain copy on macOS).  Firecracker mounts this
-//                     as the root device (read-write).  Any writes by the VM
-//                     are isolated to this per-run copy; the base image is never
-//                     touched.
+//   1. rootfs.ext4    — a copy of the base image (CoW with `cp --reflink=auto`
+//                       on Linux; plain copy on macOS).  Firecracker mounts
+//                       this as the root device (read-write).  Any writes by
+//                       the VM are isolated to this per-run copy; the base
+//                       image is never touched.
 //
-//   2. repo.ext4    — a small ext4 containing only the user's repository files
-//                     and the npm-jar config YAML.  The guest's init.sh mounts
-//                     this read-only at /work.  Building a separate disk keeps
-//                     the rootfs copy fast and predictable (same size every run)
-//                     and avoids needing `mount`/`umount` root privileges on
-//                     the host.
+//   2. repo.ext4      — a small ext4 containing only the user's repository
+//                       files and the npm-jar config YAML.  The guest's
+//                       init.sh mounts this read-only at /work.  Building a
+//                       separate disk keeps the rootfs copy fast and
+//                       predictable (same size every run) and avoids needing
+//                       `mount`/`umount` root privileges on the host.
 //
-// The repo disk is created with `mkfs.ext4 -d <dir>` on Linux or via a Docker
-// helper on macOS (same pattern as rootfs/build.ts).  On macOS the test suite
-// skips filesystem-level assertions and only verifies the file-staging logic.
+//   3. host-node.ext4 — a tiny ext4 containing the runner's Node install (the
+//                       directory tree rooted at the prefix detected by
+//                       resolveHostNodePrefix()).  Mounted by the guest at
+//                       /opt/host-node read-only.  The rootfs no longer
+//                       bundles a Node binary; whichever Node the user's
+//                       workflow set up is the Node the audit runs against.
+//
+// The side disks are created with `mkfs.ext4 -d <dir>` on Linux or via a
+// Docker helper on macOS (same pattern as rootfs/build.ts).  On macOS the
+// test suite skips filesystem-level assertions and only verifies the
+// file-staging logic.
 //
 // Cleanup contract: `overlay.cleanup()` removes the entire `workDir`.  The
 // caller MUST invoke it (via teardown.ts) whether the VM run succeeds or fails.
@@ -64,6 +72,14 @@ export interface OverlayInput {
   /** Absolute path to .npm-jar.yml on the host. */
   configPath: string;
   /**
+   * Absolute path to the runner's Node install prefix (the directory that
+   * contains bin/node, lib/, include/, etc.).  Typically derived from
+   * process.execPath at the action level via `resolveHostNodePrefix()`.
+   * The whole tree is packed into a tiny ext4 attached to the VM at
+   * /opt/host-node and mounted read-only by the guest.
+   */
+  hostNodePrefix: string;
+  /**
    * Per-run working directory.  If empty the function creates a mkdtemp dir
    * under os.tmpdir() automatically.
    */
@@ -75,7 +91,9 @@ export interface OverlayResult {
   rootfsCopyPath: string;
   /** Small ext4 containing the user's repo + npm-jar config, mounted at /work. */
   repoDiskPath: string;
-  /** The working directory (contains both ext4 images). */
+  /** Tiny ext4 containing the runner's Node install.  Mounted at /opt/host-node. */
+  hostNodeDiskPath: string;
+  /** The working directory (contains all ext4 images). */
   workDir: string;
   /** Removes the entire workDir tree.  Never throws. */
   cleanup: () => Promise<void>;
@@ -86,7 +104,13 @@ export interface OverlayResult {
 // ---------------------------------------------------------------------------
 
 export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
-  const { baseRootfsPath, repoSrcPath, configPath, workDir: maybeWorkDir } = input;
+  const {
+    baseRootfsPath,
+    repoSrcPath,
+    configPath,
+    hostNodePrefix,
+    workDir: maybeWorkDir,
+  } = input;
 
   // 1. Create per-run work dir if not supplied.
   const workDir = maybeWorkDir ?? mkdtempSync(join(tmpdir(), 'npm-jar-run-'));
@@ -121,6 +145,13 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
   const repoDiskPath = join(workDir, 'repo.ext4');
   await buildRepoDisk(repoStageDir, repoDiskPath);
 
+  // 5. Build the host-node disk ext4.  The guest mounts this at
+  //    /opt/host-node read-only and prepends /opt/host-node/bin to PATH so
+  //    that whichever Node the runner installed is the Node the audit runs
+  //    against.
+  const hostNodeDiskPath = join(workDir, 'host-node.ext4');
+  await buildHostNodeDisk(hostNodePrefix, hostNodeDiskPath);
+
   const cleanup = async (): Promise<void> => {
     try {
       await rm(workDir, { recursive: true, force: true });
@@ -129,7 +160,7 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
     }
   };
 
-  return { rootfsCopyPath, repoDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, hostNodeDiskPath, workDir, cleanup };
 }
 
 // ---------------------------------------------------------------------------
@@ -208,4 +239,104 @@ function estimateDiskSizeMB(dir: string): number {
 
   const estimatedMB = Math.ceil((totalBytes * 2) / (1024 * 1024));
   return Math.max(32, estimatedMB);
+}
+
+/**
+ * Build a tiny ext4 image containing the runner's Node install.
+ *
+ * `hostNodePrefix` is the directory that contains `bin/node` + `lib/` (etc.) —
+ * see resolveHostNodePrefix() for how it is derived from process.execPath.
+ * The whole tree is packed; the guest mounts the disk at /opt/host-node and
+ * prepends /opt/host-node/bin to PATH so that whichever Node the runner
+ * installed is the Node the audit runs against.
+ *
+ * Size: max(64 MB, 1.5× the source-tree size) — Node installs are typically
+ * ~70-100 MB so the floor matters more than the multiplier in practice.
+ *
+ * On Linux: `mkfs.ext4 -d <prefix>` (no mount required, no root).
+ * On macOS: delegate to an Alpine docker container (same as buildRepoDisk).
+ *
+ * Label is `host-node` so the guest's init.sh can identify the drive by
+ * label rather than by /dev/vdc (which depends on Firecracker's drive order).
+ */
+async function buildHostNodeDisk(hostNodePrefix: string, outPath: string): Promise<void> {
+  const sizeMB = estimateHostNodeDiskSizeMB(hostNodePrefix);
+  const sizeSpec = `${sizeMB}M`;
+
+  // Defensive: even though `hostNodePrefix` is validated by
+  // resolveHostNodePrefix() before reaching here, we use argv-form spawn so
+  // any path-with-spaces or stray shell metacharacters cannot break out.
+  // buildRepoDisk() uses the older string-form execSync; that path operates on
+  // a workDir we created via mkdtempSync() so the same risk does not apply.
+  if (platform === 'linux') {
+    const result = spawnSync(
+      'mkfs.ext4',
+      [
+        '-d', hostNodePrefix,
+        '-L', 'host-node',
+        '-O', '^has_journal',
+        '-m', '0',
+        outPath,
+        sizeSpec,
+      ],
+      { stdio: 'inherit' },
+    );
+    if (result.status !== 0) {
+      throw new Error(
+        `mkfs.ext4 for host-node disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
+      );
+    }
+  } else {
+    // macOS: use Docker Alpine helper.  Mount the prefix read-only and the
+    // out dir read-write; mkfs.ext4 runs inside the container at a fixed
+    // path so the user-controlled prefix never reaches the inner shell.
+    const outDir = join(outPath, '..');
+    const imageName = basename(outPath);
+    const result = spawnSync(
+      'docker',
+      [
+        'run', '--rm',
+        '-v', `${hostNodePrefix}:/work:ro`,
+        '-v', `${outDir}:/out`,
+        'alpine:latest',
+        'sh', '-c',
+        `apk add --no-cache e2fsprogs && mkfs.ext4 -d /work -L host-node -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}`,
+      ],
+      { stdio: 'inherit' },
+    );
+    if (result.status !== 0) {
+      throw new Error(
+        `docker mkfs.ext4 for host-node disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
+      );
+    }
+  }
+}
+
+/**
+ * Size estimator for the host-node disk: max(64 MB, 1.5× source-tree size).
+ *
+ * Separate from estimateDiskSizeMB() because the floor (64 vs 32 MB) and
+ * multiplier (1.5 vs 2) differ — Node installs are well-known in size so we
+ * don't need as much slack.
+ */
+function estimateHostNodeDiskSizeMB(dir: string): number {
+  let totalBytes = 0;
+
+  const visit = (p: string): void => {
+    try {
+      const stat = statSync(p, { bigint: false });
+      if (stat.isDirectory()) {
+        for (const child of readdirSync(p)) {
+          visit(join(p, child));
+        }
+      } else if (stat.isFile() || stat.isSymbolicLink()) {
+        totalBytes += stat.size;
+      }
+    } catch { /* ignore permission errors etc. */ }
+  };
+
+  if (existsSync(dir)) visit(dir);
+
+  const estimatedMB = Math.ceil((totalBytes * 1.5) / (1024 * 1024));
+  return Math.max(64, estimatedMB);
 }

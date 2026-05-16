@@ -175,6 +175,56 @@ describe('agent main()', () => {
     expect((finals[0]?.['yaml'] as string)).toContain('schema_version: 1');
   });
 
+  it('emits node_version sourced from the running Node (no leading v)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    // The config sets node_version: '20.0.0' but the agent should ignore it
+    // and use the running Node's version (Task #12).
+    const configPath = writeConfig(testDir, { node_version: '99.99.99' });
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: emptyStrace(),
+      nodeVersion: 'v22.4.1',
+    });
+
+    const output = getOutput();
+    const lines = output.split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finals = frames.filter((f) => f['kind'] === 'final');
+    expect(finals).toHaveLength(1);
+    const yaml = finals[0]?.['yaml'] as string;
+    // Should contain the injected version *without* the leading "v" and
+    // NOT the value from config.
+    expect(yaml).toMatch(/^node_version: 22\.4\.1$/m);
+    expect(yaml).not.toMatch(/^node_version: 99\.99\.99$/m);
+  });
+
+  it('falls back to process.version when nodeVersion is not injected', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir);
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: emptyStrace(),
+    });
+
+    const output = getOutput();
+    const lines = output.split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finals = frames.filter((f) => f['kind'] === 'final');
+    const yaml = finals[0]?.['yaml'] as string;
+    const expectedVersion = process.version.replace(/^v/, '');
+    expect(yaml).toMatch(new RegExp(`^node_version: ${expectedVersion.replace(/\./g, '\\.')}$`, 'm'));
+  });
+
   it('waits for host go signal before starting phase B', async () => {
     const { conn, hostSend } = makeConn();
     const configPath = writeConfig(testDir);

@@ -30,6 +30,7 @@ function makeOverlayResult(overrides?: Partial<OverlayResult>): OverlayResult {
   return {
     rootfsCopyPath: '/tmp/rootfs.ext4',
     repoDiskPath: '/tmp/repo.ext4',
+    hostNodeDiskPath: '/tmp/host-node.ext4',
     workDir: '/tmp/work',
     cleanup: vi.fn(async () => {}),
     ...overrides,

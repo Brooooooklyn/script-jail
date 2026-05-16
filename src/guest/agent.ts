@@ -308,6 +308,14 @@ export interface AgentInput {
   spawner?: Spawner;
   /** Used for Phase B (install under strace). Defaults to LinuxStraceRunner. */
   strace?: StraceRunner;
+  /**
+   * Override for the running Node's version string.  Defaults to
+   * `process.version` (e.g. "v20.11.0").  The leading "v" is stripped before
+   * being written into the rendered lockfile so the field contains a plain
+   * dotted version.  Exposed as an injection seam so tests don't drift across
+   * CI Node versions.
+   */
+  nodeVersion?: string;
 }
 
 export async function main(input: AgentInput): Promise<void> {
@@ -454,10 +462,20 @@ export async function main(input: AgentInput): Promise<void> {
       }
     }
 
+    // Task #12: the lockfile's `node_version` reflects the Node binary the
+    // audit *actually ran against* — i.e. the runner's Node, packed onto the
+    // host-node disk and mounted at /opt/host-node.  We source it from the
+    // running process (process.version, e.g. "v20.11.0") and strip the
+    // leading "v" for canonical YAML output.  `config.node_version` is
+    // retained in the schema for backwards compatibility but no longer
+    // authoritative.
+    const rawNodeVersion = input.nodeVersion ?? process.version;
+    const nodeVersion = rawNodeVersion.replace(/^v/, '');
+
     yaml = render({
       manager,
       manager_lockfile_sha256: sha256,
-      node_version: config.node_version,
+      node_version: nodeVersion,
       generated_at: new Date().toISOString(),
       packages,
     });
