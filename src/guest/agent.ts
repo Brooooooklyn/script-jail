@@ -499,6 +499,10 @@ const isMain =
   process.argv[1].endsWith('agent.js');
 
 if (isMain) {
+  // Production: `nodeVersion` is intentionally omitted from main()'s input so
+  // the renderer captures `process.version` of the running interpreter — which
+  // is the host-mounted Node at /opt/host-node, picked up via PATH by init.sh.
+  // That's the entire point of the host-Node mount (Task #12).
   const conn = new LinuxVsockConnection(10242);
   main({ connection: conn }).catch((err: unknown) => {
     const pt = new PassThrough();

@@ -35,15 +35,15 @@
 // Cleanup contract: `overlay.cleanup()` removes the entire `workDir`.  The
 // caller MUST invoke it (via teardown.ts) whether the VM run succeeds or fails.
 //
-// TODO(v2): The repo disk and config.yml placement only work if the guest's
-// init.sh mounts the second drive at /work and copies
-// /work/etc/npm-jar/config.yml → /etc/npm-jar/config.yml before exec-ing the
-// agent.  The current src/rootfs/init.sh does not yet do this.  Until that is
-// implemented, a real VM boot will fail because the agent cannot read its config.
-// Tracked issue: update init.sh to:
-//   1. Mount the second virtio disk (/dev/vdb) at /work.
+// TODO(Task #13): The three-disk layout only works once the guest's init.sh
+// is updated to mount and prepare each disk.  The current src/rootfs/init.sh
+// does not yet do this, so a real VM boot will fail.  Tracked checklist:
+//   1. Mount the second virtio disk (/dev/vdb, label `repo`) at /work.
 //   2. mkdir -p /etc/npm-jar && cp /work/etc/npm-jar/config.yml /etc/npm-jar/
-//   3. exec dumb-init /usr/local/bin/node /usr/local/lib/npm-jar/guest-agent.cjs
+//   3. Mount the third virtio disk (/dev/vdc, label `host-node`) read-only
+//      at /opt/host-node and prepend /opt/host-node/bin to PATH.
+//   4. exec dumb-init node /usr/local/lib/npm-jar/guest-agent.cjs (node
+//      resolves to the host-mounted binary via the prepended PATH).
 
 import {
   cpSync,
