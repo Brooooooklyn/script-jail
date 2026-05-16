@@ -36,10 +36,11 @@
 // caller MUST invoke it (via teardown.ts) whether the VM run succeeds or fails.
 //
 // Guest mount contract (closed by Task #13, see src/rootfs/init.sh):
-//   1. /dev/vdb (label `repo`)      → mounted read-only at /work.
+//   1. Disk with filesystem label `repo` (resolved via `blkid -L repo`)
+//      → mounted read-only at /work.
 //   2. /work/etc/npm-jar/config.yml → copied into /etc/npm-jar/config.yml.
-//   3. /dev/vdc (label `host-node`) → mounted read-only at /opt/host-node,
-//      /opt/host-node/bin prepended to PATH.
+//   3. Disk with filesystem label `host-node` (resolved via `blkid -L host-node`)
+//      → mounted read-only at /opt/host-node, /opt/host-node/bin prepended to PATH.
 //   4. The agent execs as `node /usr/local/lib/npm-jar/guest-agent.cjs` so
 //      `node` resolves to the host-mounted binary.
 
@@ -258,7 +259,9 @@ function estimateDiskSizeMB(dir: string): number {
  * On macOS: delegate to an Alpine docker container (same as buildRepoDisk).
  *
  * Label is `host-node` so the guest's init.sh can identify the drive by
- * label rather than by /dev/vdc (which depends on Firecracker's drive order).
+ * label (via `blkid -L host-node`) rather than by a /dev/vd* path, which
+ * depends on Firecracker's drive registration order and which drives the
+ * caller chose to register.
  */
 async function buildHostNodeDisk(hostNodePrefix: string, outPath: string): Promise<void> {
   const sizeMB = estimateHostNodeDiskSizeMB(hostNodePrefix);

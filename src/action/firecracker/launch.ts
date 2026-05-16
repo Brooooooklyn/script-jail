@@ -216,10 +216,12 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     }
 
     // 4c. Optional host-node disk (runner's Node install).  Registered
-    //     after the repo drive so the guest sees a stable drive ordering:
-    //     rootfs → repo → host-node (i.e. /dev/vda, /dev/vdb, /dev/vdc).
-    //     The guest's init.sh keys off the label "host-node" rather than
-    //     the device path, but consistent ordering aids debugging.
+    //     after the repo drive so when both drives are present the guest
+    //     sees ordering rootfs → repo → host-node (e.g. /dev/vda, /dev/vdb,
+    //     /dev/vdc — useful when reading kernel logs).  The guest's init.sh
+    //     resolves the drive by filesystem label via `blkid -L host-node`,
+    //     not by device path, so the actual /dev/vd* letter does not affect
+    //     correctness — only debugging readability.
     if (hostNodeDiskPath !== undefined) {
       await apiClient.put('/drives/host-node', {
         drive_id: 'host-node',
