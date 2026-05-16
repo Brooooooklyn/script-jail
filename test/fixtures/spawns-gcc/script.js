@@ -4,8 +4,11 @@
 // because the catch swallows the spawn error.
 const { spawnSync } = require('node:child_process');
 try {
+  // spawnSync reports ENOENT via the result's `.error` field rather than
+  // throwing, but we keep the try/catch defensively in case a future Node
+  // changes that contract — the audit signal we care about is the execve
+  // attempt, not whether the wrapper threw.
   spawnSync('gcc', ['-c', 'evil.c'], { stdio: 'ignore' });
 } catch {
-  // Intentionally swallowed; spawnSync would normally not throw on ENOENT
-  // (it sets `.error`), but we cover the throwing path too.
+  // Intentionally swallowed.
 }

@@ -5,11 +5,5 @@
 const _token = process.env.NPM_TOKEN;
 // Touch the value so a clever JS engine doesn't tree-shake the read away.
 if (_token && _token.length > 0) {
-  // No-op: an attacker would exfiltrate here. The catch is below in case
-  // the runtime decides to throw on the read for any reason.
-}
-try {
-  void _token;
-} catch {
-  // Intentionally swallowed.
+  // No-op: an attacker would exfiltrate here.
 }

@@ -12,10 +12,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# OpenSSF-recommended hardening: explicitly drop write scopes on GITHUB_TOKEN
+# so a malicious dependency that managed to escape the sandbox can't push
+# commits or comment on PRs through the runner's auth.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node-version }})
     runs-on: ${{ matrix.os }}
+    # 10 minutes is a hard ceiling — the full unit + guest + integration
+    # suite finishes in under a minute today, so anything beyond this is a
+    # hang rather than slowness.
+    timeout-minutes: 10
     strategy:
       # One failing combo should not mask the others — we want to see every
       # version regression in a single run, not chase them one at a time.
