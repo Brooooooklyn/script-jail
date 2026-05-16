@@ -68,6 +68,16 @@ export async function main(): Promise<void> {
   const repoDir = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
 
   const inputs = parseInputs({ repoDir });
+  // TODO(v2): wire `inputs.spoofPlatform`, `inputs.spoofArch`, and
+  // `inputs.cacheFirecracker` through to the VM. The first two currently
+  // live in `.npm-jar.yml` (read by the guest's platform-spoof preload);
+  // the action input should override the YAML value by rewriting the
+  // config before `makeOverlay` seals it into the repo disk. The cache
+  // flag should gate a wipe-before-ensureBinaries step. Until then these
+  // inputs are advertised in action.yml but the YAML wins.
+  void inputs.spoofPlatform;
+  void inputs.spoofArch;
+  void inputs.cacheFirecracker;
 
   // --- PM detection --------------------------------------------------------
   // BunUnsupportedError is non-fatal: emit a ::warning and exit cleanly so

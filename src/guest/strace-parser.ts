@@ -347,6 +347,14 @@ function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): R
   // On failure: ENOENT → null (nothing happened). Other errors → drop.
   // EACCES on read or write → still emit the event (we record the attempt;
   // a script probing for writable paths would otherwise leave no trace).
+  //
+  // TODO(v2): hidden-marking gap. Paths matching the user's `protected.files`
+  // config should be emitted with `hidden: true` and `<HIDDEN>` should win
+  // over the ENOENT-drop above, so a probe for `~/.ssh/id_rsa` shows up as
+  // `<HIDDEN> $HOME/.ssh/id_rsa` instead of vanishing. The policy check
+  // belongs upstream of this drop — likely in attribution.ts/emit.ts after
+  // tokenize, since the protected-paths config is matched against tokenized
+  // paths (`$HOME/...`), not raw kernel paths. See plan §"hidden marking".
   if (retVal.isError) {
     if (retVal.errno === 'ENOENT') return null;
     if (retVal.errno !== 'EACCES') return null; // other errors: drop
