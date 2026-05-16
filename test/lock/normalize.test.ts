@@ -238,7 +238,7 @@ describe('normalize', () => {
       expect(block?.external_reads.filter((x) => x === '$HOME/.npmrc').length).toBe(1);
     });
 
-    it('sorts external_reads ascending', () => {
+    it('sorts external_reads ascending by codepoint order', () => {
       const events = [
         readEv('/work/src/zzz.ts'),
         readEv('/root/.npmrc'),
@@ -247,7 +247,8 @@ describe('normalize', () => {
       const result = normalize(events, ctx);
       const block = getBlock(result);
       const reads = block?.external_reads ?? [];
-      expect(reads).toEqual([...reads].sort((a, b) => a.localeCompare(b)));
+      // Use codepoint comparator (not localeCompare) for byte-stable order.
+      expect(reads).toEqual([...reads].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)));
     });
   });
 
@@ -270,6 +271,103 @@ describe('normalize', () => {
       expect(result.has(otherPkg)).toBe(true);
       expect(result.get(pkgId)?.lifecycle['postinstall']?.external_reads).toContain('$HOME/.npmrc');
       expect(result.get(otherPkg)?.lifecycle['install']?.external_reads).toContain('$TMPDIR/lodash-tmp');
+    });
+  });
+
+  // Imp 3: missing pkgDirs entry for an fs event must throw, not silently fall back.
+  describe('missing pkgDirs entry (Imp 3)', () => {
+    it('throws for a read event from a package not in pkgDirs', () => {
+      const unknownPkg = 'unknown@1.0.0';
+      const ctxWithoutPkg: NormalizeContext = { roots, pkgDirs: new Map() };
+      const events: AttributedEvent[] = [
+        { raw: { kind: 'read', path: '/work/node_modules/unknown/index.js', pid: 1, ts: 0, hidden: false }, pkg: unknownPkg, lifecycle: 'postinstall' },
+      ];
+      expect(() => normalize(events, ctxWithoutPkg)).toThrow(/pkgDirs missing entry for unknown@1\.0\.0/);
+    });
+
+    it('throws for a write event from a package not in pkgDirs', () => {
+      const unknownPkg = 'unknown@1.0.0';
+      const ctxWithoutPkg: NormalizeContext = { roots, pkgDirs: new Map() };
+      const events: AttributedEvent[] = [
+        { raw: { kind: 'write', path: '/tmp/out.js', pid: 1, ts: 0, hidden: false }, pkg: unknownPkg, lifecycle: 'postinstall' },
+      ];
+      expect(() => normalize(events, ctxWithoutPkg)).toThrow(/pkgDirs missing entry for unknown@1\.0\.0/);
+    });
+
+    it('does NOT throw for non-fs events (spawn, env_read, connect, dlopen) without pkgDir', () => {
+      const unknownPkg = 'unknown@1.0.0';
+      const ctxWithoutPkg: NormalizeContext = { roots, pkgDirs: new Map() };
+      const events: AttributedEvent[] = [
+        { raw: { kind: 'env_read', name: 'HOME', pid: 1, ts: 0, hidden: false }, pkg: unknownPkg, lifecycle: 'postinstall' },
+        { raw: { kind: 'spawn', argv: ['node', '--version'], result: 'ok', pid: 1, ts: 0 }, pkg: unknownPkg, lifecycle: 'postinstall' },
+        { raw: { kind: 'connect', host: 'registry.npmjs.org', port: 443, result: 'ok', pid: 1, ts: 0 }, pkg: unknownPkg, lifecycle: 'postinstall' },
+        { raw: { kind: 'dlopen', filename: '/usr/lib/libssl.so', result: 'blocked', pid: 1, ts: 0 }, pkg: unknownPkg, lifecycle: 'postinstall' },
+      ];
+      expect(() => normalize(events, ctxWithoutPkg)).not.toThrow();
+      const block = normalize(events, ctxWithoutPkg).get(unknownPkg)?.lifecycle['postinstall'];
+      expect(block?.env_read).toContain('HOME');
+      expect(block?.spawn_attempts[0]).toContain('node');
+      expect(block?.network_attempts).toContain('connect registry.npmjs.org:443');
+    });
+  });
+
+  // Imp 4: argv[0] must be tokenized when absolute.
+  describe('spawn argv[0] tokenization (Imp 4)', () => {
+    it('tokenizes absolute argv[0] so node path is stable across runners', () => {
+      const events = [
+        spawnEv(['/usr/local/bin/node', '/work/node_modules/esbuild/install.js'], 'ok'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      // argv[0] is /usr/local/bin/node — not under any root so stays as-is but
+      // does NOT appear as the raw absolute path from a different runner.
+      // The second arg must be tokenized to $PKG.
+      const attempt = block?.spawn_attempts[0] ?? '';
+      expect(attempt).toContain('$PKG');
+      // argv[0] stays verbatim (not under any known root), but importantly
+      // a different absolute node path would not change the $PKG portion.
+      expect(attempt).toContain('/usr/local/bin/node');
+    });
+
+    it('tokenizes argv[0] that is inside $REPO to $REPO token', () => {
+      const events = [
+        spawnEv(['/work/scripts/runner.sh', '--flag'], 'ok'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      const attempt = block?.spawn_attempts[0] ?? '';
+      expect(attempt).toContain('$REPO/scripts/runner.sh');
+    });
+  });
+
+  // Imp 5: hidden + cross-package writes must compound both prefixes.
+  describe('compound <HIDDEN> + <CROSS_PACKAGE> tags (Imp 5)', () => {
+    it('emits <HIDDEN> <CROSS_PACKAGE> for a write that is both hidden and cross-package', () => {
+      // A write to another package's directory that is also a protected path.
+      const events = [writeEv('/work/node_modules/debug/sensitive', true)];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.escaped_writes[0]).toBe(
+        '<HIDDEN> <CROSS_PACKAGE> $NODE_MODULES/debug/sensitive',
+      );
+    });
+
+    it('emits only <HIDDEN> for a hidden write that is NOT cross-package', () => {
+      const events = [writeEv('/root/.bashrc', true)];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      const write = block?.escaped_writes[0] ?? '';
+      expect(write).toContain('<HIDDEN>');
+      expect(write).not.toContain('<CROSS_PACKAGE>');
+    });
+
+    it('emits only <CROSS_PACKAGE> for a non-hidden cross-package write', () => {
+      const events = [writeEv('/work/node_modules/debug/index.js', false)];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      const write = block?.escaped_writes[0] ?? '';
+      expect(write).toContain('<CROSS_PACKAGE>');
+      expect(write).not.toContain('<HIDDEN>');
     });
   });
 });

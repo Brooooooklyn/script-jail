@@ -160,4 +160,48 @@ describe('render', () => {
       expect(out).toContain('manager: yarn');
     });
   });
+
+  // Imp 6: inline snapshot test that asserts exact output bytes — a canary
+  // that catches yaml library upgrades and platform (locale) drift.
+  describe('exact byte snapshot (Imp 6)', () => {
+    it('produces byte-exact output for a realistic Lock value', () => {
+      const packages = new Map<string, PackageBlock>([
+        ['esbuild@0.21.5', makePkg({
+          postinstall: {
+            external_reads: ['$CACHE/esbuild/bin/<hash>'],
+            escaped_writes: [],
+            env_read: ['ESBUILD_BINARY_PATH', 'npm_config_arch'],
+            spawn_attempts: ['node $PKG/install.js'],
+            spawn_blocked: [],
+            dlopen_attempts: [],
+            network_attempts: [],
+          },
+        })],
+      ]);
+      const input: RenderInput = { ...baseInput, packages };
+      expect(render(input)).toMatchInlineSnapshot(`
+        "schema_version: 1
+        manager: pnpm
+        manager_lockfile_sha256: 4f2a1b3c
+        node_version: 20.19.0
+        generated_at: 2026-05-16T00:00:00Z
+        packages:
+          esbuild@0.21.5:
+            lifecycle:
+              postinstall:
+                external_reads:
+                  - $CACHE/esbuild/bin/<hash>
+                escaped_writes: []
+                env_read:
+                  - ESBUILD_BINARY_PATH
+                  - npm_config_arch
+                spawn_attempts:
+                  - node $PKG/install.js
+                spawn_blocked: []
+                dlopen_attempts: []
+                network_attempts: []
+        "
+      `);
+    });
+  });
 });

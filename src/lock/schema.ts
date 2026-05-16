@@ -37,7 +37,7 @@ export type EnvReadEvent = z.infer<typeof EnvReadEvent>;
 
 export const SpawnEvent = z.object({
   kind: z.literal('spawn'),
-  argv: z.array(z.string()),
+  argv: z.array(z.string()).min(1), // argv[0] is the executable; an empty argv is never valid
   // 'ok' = binary present in rootfs, exec succeeded
   // 'enoent' = binary not in rootfs (this is how we "block" native binaries)
   // 'eacces' = found but not executable
@@ -109,6 +109,10 @@ export const Lock = z.object({
   manager_lockfile_sha256: z.string(),
   node_version: z.string(),
   generated_at: z.string(),
+  // z.record(z.string(), ...) is intentionally permissive here: we accept any
+  // string key for both the package id and lifecycle stage so the schema can
+  // round-trip lockfiles produced by older or future schema versions without
+  // failing validation on unknown lifecycle stage names.
   packages: z.record(z.string(), z.object({
     lifecycle: z.record(z.string(), LifecycleBlock),
   })),

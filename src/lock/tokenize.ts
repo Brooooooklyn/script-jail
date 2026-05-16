@@ -10,7 +10,9 @@
 //   $HOME         /root
 //   $TMPDIR       /tmp
 //
-// Unstable filename patterns collapse to <hash>.
+// Hash collapsing: only applied under $TMPDIR and $CACHE prefixes. Package
+// names under $NODE_MODULES and $PKG are stable identifiers — collapsing
+// them destroys lockfile signal and causes spurious deduplication.
 // System noise (kernel/libc/ICU/proc reads) is filtered separately in
 // normalize.ts; this module is concerned only with rewriting paths it's given.
 
@@ -28,7 +30,7 @@ const TEMP_SUFFIX = /\.tmp(\.[A-Za-z0-9]+)?$/;
 export function tokenize(rawPath: string, roots: TokenizeRoots, currentPkgDir?: string): string {
   if (!rawPath.startsWith('/')) {
     // Already relative — leave alone (rare; strace usually resolves AT_FDCWD).
-    return collapseUnstable(rawPath);
+    return rawPath;
   }
   // longest-prefix wins. Order matters: $PKG (most specific) before $NODE_MODULES before $REPO.
   const prefixes: Array<[string, string] | null> = [
@@ -46,10 +48,18 @@ export function tokenize(rawPath: string, roots: TokenizeRoots, currentPkgDir?: 
   for (const [prefix, token] of sorted) {
     if (pathHasPrefix(rawPath, prefix)) {
       const tail = rawPath.slice(prefix.length) || '/';
-      return collapseUnstable(`${token}${tail === '/' ? '' : tail}`);
+      const tokenized = `${token}${tail === '/' ? '' : tail}`;
+      // Only collapse unstable content-hash filenames under $TMPDIR and $CACHE.
+      // $NODE_MODULES and $PKG paths contain package names that are stable
+      // identifiers — collapsing them destroys lockfile signal.
+      if (token === '$TMPDIR' || token === '$CACHE') {
+        return collapseUnstable(tokenized);
+      }
+      return tokenized;
     }
   }
-  return collapseUnstable(rawPath);
+  // Unmatched absolute path (e.g. /usr/bin/node) — no collapse.
+  return rawPath;
 }
 
 function pathHasPrefix(path: string, prefix: string): boolean {
@@ -62,8 +72,6 @@ function collapseUnstable(path: string): string {
   let out = path;
   if (TEMP_SUFFIX.test(out)) out = out.replace(TEMP_SUFFIX, '.tmp<hash>');
   out = out.replace(HASH_PATTERN, (match) => {
-    // Don't collapse the token itself (e.g. $PKG, $REPO) — those start with $.
-    if (match.startsWith('$')) return match;
     // Don't collapse short alphanumerics that happen to be ≥16 chars but look like words.
     if (/^[A-Z][A-Za-z]{15,}$/.test(match)) return match;
     return '<hash>';

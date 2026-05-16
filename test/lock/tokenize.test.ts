@@ -78,15 +78,15 @@ describe('tokenize', () => {
   });
 
   describe('hash collapsing', () => {
-    it('collapses 16+ char base64-ish fragments', () => {
+    it('collapses 16+ char base64-ish fragments under $TMPDIR', () => {
       const longHash = 'a'.repeat(16) + 'BCDE';
       const result = tokenize(`/tmp/${longHash}`, roots);
       expect(result).toContain('<hash>');
     });
 
-    it('collapses .tmp.<rand> suffixes to .tmp<hash>', () => {
-      const result = tokenize('/tmp/build.tmp.x7z9q', roots);
-      expect(result).toContain('.tmp<hash>');
+    it('collapses .tmp.<rand> suffixes to .tmp<hash> under $TMPDIR', () => {
+      const result = tokenize('/tmp/something.tmp.xyz123', roots);
+      expect(result).toBe('$TMPDIR/something.tmp<hash>');
     });
 
     it('does not collapse short names', () => {
@@ -101,6 +101,31 @@ describe('tokenize', () => {
       // This may or may not be collapsed depending on the heuristic — just ensure it runs
       // The SomeLongCamelCaseNameHere is 30 chars but starts with uppercase, so not collapsed
       expect(typeof result).toBe('string');
+    });
+
+    // Crit 1: package names under $NODE_MODULES must be preserved verbatim —
+    // they are stable identifiers, not content-addressable hashes.
+    it('does NOT collapse long npm package names under $NODE_MODULES', () => {
+      // eslint-plugin-react-hooks is 25 chars — would be collapsed by the old HASH_PATTERN
+      const result = tokenize('/work/node_modules/eslint-plugin-react-hooks/index.js', roots);
+      expect(result).toBe('$NODE_MODULES/eslint-plugin-react-hooks/index.js');
+    });
+
+    it('does NOT collapse babel-plugin-transform-runtime (30 chars) under $NODE_MODULES', () => {
+      const result = tokenize('/work/node_modules/babel-plugin-transform-runtime/lib/index.js', roots);
+      expect(result).toBe('$NODE_MODULES/babel-plugin-transform-runtime/lib/index.js');
+    });
+
+    it('does NOT collapse react-router-dom (16 chars) under $NODE_MODULES', () => {
+      const result = tokenize('/work/node_modules/react-router-dom/index.js', roots);
+      expect(result).toBe('$NODE_MODULES/react-router-dom/index.js');
+    });
+
+    it('collapses content-hash filenames under $CACHE', () => {
+      // A 22-char hex hash in a cache path should be collapsed
+      const result = tokenize('/root/.local/share/pnpm/store/v3/files/abcdef1234567890abcdef.bin', roots);
+      expect(result).toContain('$CACHE');
+      expect(result).toContain('<hash>');
     });
   });
 

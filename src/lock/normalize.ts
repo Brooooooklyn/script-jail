@@ -7,6 +7,8 @@
 //   - Writes that land inside $NODE_MODULES/** but outside the current $PKG
 //     get a `<CROSS_PACKAGE>` prefix.
 //   - Hidden events (protected files / env vars) are prefixed `<HIDDEN>`.
+//   - When an event is both hidden and cross-package, both prefixes are emitted:
+//     `<HIDDEN> <CROSS_PACKAGE> $NODE_MODULES/foo/bar`.
 //   - System noise (kernel, libc, ICU, /proc, /sys, /etc/ld.so.*) is dropped.
 //   - Each list is deduped and sorted ascending.
 
@@ -43,6 +45,16 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
     if (isSystemNoise(ev)) continue;
 
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
+
+    // For fs events (read/write) a missing pkgDirs entry is an error: without
+    // pkgDir the $PKG token can never form, so intra-package reads would
+    // silently leak into external_reads — the opposite of what we want.
+    if (pkgDir === undefined && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
+      throw new Error(
+        `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`,
+      );
+    }
+
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
 
     switch (ev.raw.kind) {
@@ -56,12 +68,12 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
       case 'write': {
         const tokenized = tokenize(ev.raw.path, ctx.roots, pkgDir);
         if (isInsidePkg(tokenized)) continue; // drop intra-package write
-        const prefix = ev.raw.hidden
-          ? '<HIDDEN> '
-          : isCrossPackage(tokenized)
-            ? '<CROSS_PACKAGE> '
-            : '';
-        block.escaped_writes.push(`${prefix}${tokenized}`);
+        // Both prefixes are independent: <HIDDEN> answers "was this a protected
+        // path?"; <CROSS_PACKAGE> answers "did this write escape into another
+        // package's directory?". An auditor needs both signals.
+        const hiddenPrefix = ev.raw.hidden ? '<HIDDEN> ' : '';
+        const crossPrefix = isCrossPackage(tokenized) ? '<CROSS_PACKAGE> ' : '';
+        block.escaped_writes.push(`${hiddenPrefix}${crossPrefix}${tokenized}`);
         break;
       }
       case 'env_read': {
@@ -70,8 +82,11 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         break;
       }
       case 'spawn': {
-        const tokenizedArgv = ev.raw.argv.map((a, i) =>
-          i === 0 || !a.startsWith('/') ? a : tokenize(a, ctx.roots, pkgDir),
+        // Tokenize every absolute argv entry, including argv[0]. Real install
+        // scripts spawn node via process.execPath which is an absolute path
+        // like /usr/local/bin/node — not stable across runners.
+        const tokenizedArgv = ev.raw.argv.map((a) =>
+          a.startsWith('/') ? tokenize(a, ctx.roots, pkgDir) : a,
         );
         const cmd = tokenizedArgv.join(' ');
         if (ev.raw.result === 'ok') block.spawn_attempts.push(cmd);
@@ -139,7 +154,10 @@ function sortAndDedupe(block: LifecycleBlock): void {
     'network_attempts',
   ];
   for (const f of fields) {
-    block[f] = [...new Set(block[f])].sort((a, b) => a.localeCompare(b));
+    // Use codepoint order rather than localeCompare: localeCompare is ICU-
+    // dependent and sorts '$' and '<' differently on macOS vs Linux (POSIX
+    // locale), so lockfiles committed from macOS would differ from CI output.
+    block[f] = [...new Set(block[f])].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   }
 }
 

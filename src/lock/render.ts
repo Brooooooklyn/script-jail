@@ -4,6 +4,10 @@
 import { stringify } from 'yaml';
 import type { Lock, LifecycleBlock, PackageBlock } from './schema.js';
 
+// LIFECYCLE_ORDER duplicates LifecycleStage.options from schema.ts intentionally:
+// deriving it at runtime would require importing the zod enum and calling .options,
+// which changes module load order and obscures the fact that render order is a
+// separate concern from schema validity.
 const LIFECYCLE_ORDER = ['preinstall', 'install', 'postinstall', 'prepare'] as const;
 
 const EMPTY_LIST_FIELDS: Array<keyof LifecycleBlock> = [
@@ -25,7 +29,9 @@ export interface RenderInput {
 }
 
 export function render(input: RenderInput): string {
-  const sortedPkgKeys = [...input.packages.keys()].sort((a, b) => a.localeCompare(b));
+  // Codepoint order rather than localeCompare: localeCompare is ICU-dependent
+  // and produces different byte sequences on macOS vs Linux POSIX locale.
+  const sortedPkgKeys = [...input.packages.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const packages: Record<string, unknown> = {};
   for (const k of sortedPkgKeys) {
     const pkg = input.packages.get(k);
