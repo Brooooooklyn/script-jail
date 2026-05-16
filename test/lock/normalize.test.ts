@@ -311,22 +311,29 @@ describe('normalize', () => {
     });
   });
 
-  // Imp 4: argv[0] must be tokenized when absolute.
+  // Imp 4: argv[0] must be tokenized when absolute, and well-known binary paths
+  // must be collapsed to their basename for byte-stability across rootfs variants.
   describe('spawn argv[0] tokenization (Imp 4)', () => {
-    it('tokenizes absolute argv[0] so node path is stable across runners', () => {
+    it('collapses /usr/local/bin/node to bare "node" in spawn_attempts', () => {
       const events = [
         spawnEv(['/usr/local/bin/node', '/work/node_modules/esbuild/install.js'], 'ok'),
       ];
       const result = normalize(events, ctx);
       const block = getBlock(result);
-      // argv[0] is /usr/local/bin/node — not under any root so stays as-is but
-      // does NOT appear as the raw absolute path from a different runner.
-      // The second arg must be tokenized to $PKG.
       const attempt = block?.spawn_attempts[0] ?? '';
-      expect(attempt).toContain('$PKG');
-      // argv[0] stays verbatim (not under any known root), but importantly
-      // a different absolute node path would not change the $PKG portion.
-      expect(attempt).toContain('/usr/local/bin/node');
+      // argv[0] is collapsed to the bare basename; the arg is tokenized to $PKG.
+      expect(attempt).toBe('node $PKG/install.js');
+    });
+
+    it('collapses /usr/bin/node to the same bare "node", producing byte-identical output', () => {
+      const events = [
+        spawnEv(['/usr/bin/node', '/work/node_modules/esbuild/install.js'], 'ok'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      const attempt = block?.spawn_attempts[0] ?? '';
+      // /usr/bin/node and /usr/local/bin/node must produce identical lockfile bytes.
+      expect(attempt).toBe('node $PKG/install.js');
     });
 
     it('tokenizes argv[0] that is inside $REPO to $REPO token', () => {
@@ -337,6 +344,17 @@ describe('normalize', () => {
       const block = getBlock(result);
       const attempt = block?.spawn_attempts[0] ?? '';
       expect(attempt).toContain('$REPO/scripts/runner.sh');
+    });
+
+    it('does not collapse an unrecognized binary path — passes through tokenized form', () => {
+      // /usr/local/bin/python3 is not in the normalizable set, so it stays verbatim.
+      const events = [
+        spawnEv(['/usr/local/bin/python3', '--version'], 'ok'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      const attempt = block?.spawn_attempts[0] ?? '';
+      expect(attempt).toBe('/usr/local/bin/python3 --version');
     });
   });
 

@@ -15,6 +15,21 @@
 import type { AttributedEvent, LifecycleBlock, PackageBlock } from './schema.js';
 import { isCrossPackage, isInsidePkg, tokenize, type TokenizeRoots } from './tokenize.js';
 
+// Binaries whose absolute argv[0] paths are collapsed to the bare basename in
+// spawn_attempts. Paths like /usr/local/bin/node, /usr/bin/node, and
+// /opt/node/bin/node all reduce to `node`, keeping the lockfile byte-stable
+// across rootfs variants (node 20 vs 22 vs 24) and non-VM CLI environments.
+const NORMALIZABLE_BINARIES = new Set([
+  'node',
+  'npm',
+  'pnpm',
+  'yarn',
+  'corepack',
+  'sh',
+  'bash',
+  'busybox',
+]);
+
 const SYSTEM_NOISE_PREFIXES = [
   '/usr/lib/',
   '/usr/share/',
@@ -85,9 +100,24 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // Tokenize every absolute argv entry, including argv[0]. Real install
         // scripts spawn node via process.execPath which is an absolute path
         // like /usr/local/bin/node — not stable across runners.
-        const tokenizedArgv = ev.raw.argv.map((a) =>
-          a.startsWith('/') ? tokenize(a, ctx.roots, pkgDir) : a,
-        );
+        const tokenizedArgv = ev.raw.argv.map((a, i) => {
+          if (!a.startsWith('/')) return a;
+          const tokenized = tokenize(a, ctx.roots, pkgDir);
+          // If argv[0] is still an absolute path after tokenization (i.e. it did
+          // not match any known root), collapse it to its basename when it is one
+          // of the well-known runtime binaries. This makes the lockfile byte-stable
+          // across rootfs variants (/usr/local/bin/node vs /usr/bin/node) and CLI
+          // environments where node lives outside the VM paths.
+          //
+          // Normalized binaries: node, npm, pnpm, yarn, corepack, sh, bash, busybox.
+          // These cover all common package-lifecycle script interpreters and package
+          // managers. Extend this list when new rootfs variants are added.
+          if (i === 0 && tokenized.startsWith('/')) {
+            const base = tokenized.slice(tokenized.lastIndexOf('/') + 1);
+            if (NORMALIZABLE_BINARIES.has(base)) return base;
+          }
+          return tokenized;
+        });
         const cmd = tokenizedArgv.join(' ');
         if (ev.raw.result === 'ok') block.spawn_attempts.push(cmd);
         else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${cmd}`);
