@@ -33,18 +33,24 @@ const spoofPlatform = /** @type {NodeJS.Platform} */ (PLATFORM[rawPlatform] ?? '
 const spoofArch     = /** @type {string} */ (rawArch === 'arm64' ? 'arm64' : 'x64');
 const meta          = PLATFORM_META[spoofPlatform] ?? PLATFORM_META['linux'];
 
+// Idempotency guard: if already installed (configurable === false), skip re-install.
+// This prevents TypeError when a child process requires this preload a second time
+// via NODE_OPTIONS after the parent already applied it.
+const platformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
+if (platformDesc && platformDesc.configurable === false) return;
+
 // Patch process.platform and process.arch
-Object.defineProperty(process, 'platform', { value: spoofPlatform, writable: false });
-Object.defineProperty(process, 'arch',     { value: spoofArch,     writable: false });
+Object.defineProperty(process, 'platform', { value: spoofPlatform, writable: false, configurable: false });
+Object.defineProperty(process, 'arch',     { value: spoofArch,     writable: false, configurable: false });
 
 // Patch os module getters
-Object.defineProperty(os, 'platform',    { value: () => spoofPlatform,    writable: true });
-Object.defineProperty(os, 'arch',        { value: () => spoofArch,        writable: true });
-Object.defineProperty(os, 'type',        { value: () => meta.type,        writable: true });
-Object.defineProperty(os, 'release',     { value: () => meta.release,     writable: true });
-Object.defineProperty(os, 'version',     { value: () => meta.version,     writable: true });
+Object.defineProperty(os, 'platform',    { value: () => spoofPlatform,    writable: false, configurable: false });
+Object.defineProperty(os, 'arch',        { value: () => spoofArch,        writable: false, configurable: false });
+Object.defineProperty(os, 'type',        { value: () => meta.type,        writable: false, configurable: false });
+Object.defineProperty(os, 'release',     { value: () => meta.release,     writable: false, configurable: false });
+Object.defineProperty(os, 'version',     { value: () => meta.version,     writable: false, configurable: false });
 // endianness is architecture-dependent; both x64 and arm64 are little-endian.
-Object.defineProperty(os, 'endianness',  { value: () => /** @type {'LE'|'BE'} */ ('LE'), writable: true });
+Object.defineProperty(os, 'endianness',  { value: () => /** @type {'LE'|'BE'} */ ('LE'), writable: false, configurable: false });
 
 // Self-test: verify one mapping is applied correctly (caught at load time).
 /* c8 ignore next 3 */

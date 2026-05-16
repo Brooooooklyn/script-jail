@@ -35,7 +35,7 @@ function logDlopen(filename) {
   const fd = parseInt(fdStr, 10);
   if (!isFinite(fd) || fd < 0) return;
 
-  const ts = Number(process.hrtime.bigint());
+  const ts = Number(process.hrtime.bigint() / 1_000_000n);
   const line = JSON.stringify({
     kind: 'dlopen',
     filename,
@@ -59,6 +59,12 @@ function blockedDlopen(/** @type {any} */ _module, filename) {
 function blockedBinding(/** @type {string} */ _name) {
   throw new Error(BLOCKED_MSG);
 }
+
+// Idempotency guard: if already installed (configurable === false), skip re-install.
+// This prevents TypeError when a child process requires this preload a second time
+// via NODE_OPTIONS after the parent already applied it.
+const dlopenDesc = Object.getOwnPropertyDescriptor(process, 'dlopen');
+if (dlopenDesc && dlopenDesc.configurable === false) return;
 
 // Define as non-configurable and non-writable to resist override by user code.
 // This prevents `delete process.dlopen` or `process.dlopen = origDlopen` from

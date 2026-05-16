@@ -142,6 +142,37 @@ describe('dlopen-block preload', () => {
     expect(result.stderr).toContain('DONE');
   });
 
+  it('process.dlopen is non-configurable after preload (cannot be redefined)', async () => {
+    // After the preload runs, Object.defineProperty on process.dlopen should throw
+    // TypeError because configurable: false prevents redefinition.
+    const code = `
+      try {
+        Object.defineProperty(process, 'dlopen', { value: function() {} });
+        process.stdout.write(JSON.stringify({ threw: false }));
+      } catch (e) {
+        process.stdout.write(JSON.stringify({ threw: true, name: e.constructor.name }));
+      }
+    `;
+    const result = await runWithBlock(code);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as { threw: boolean; name: string };
+    expect(out.threw).toBe(true);
+    expect(out.name).toBe('TypeError');
+  });
+
+  it('requiring the preload twice does not throw (idempotency)', async () => {
+    // A child that requires the preload once explicitly (in addition to the NODE_OPTIONS
+    // injection) must not throw a TypeError about redefining a non-configurable property.
+    const code = `
+      require(${JSON.stringify(preloadPath)});
+      process.stdout.write(JSON.stringify({ ok: true }));
+    `;
+    const result = await runWithBlock(code);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as { ok: boolean };
+    expect(out.ok).toBe(true);
+  });
+
   it('preload does not interfere with normal require calls', async () => {
     const code = `
       const path = require('path');

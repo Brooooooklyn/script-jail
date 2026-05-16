@@ -143,6 +143,73 @@ describe('platform-spoof preload', () => {
     });
   });
 
+  it('process.platform is non-configurable after preload (cannot be redefined)', async () => {
+    // After the preload runs, Object.defineProperty on process.platform should throw
+    // TypeError because configurable: false prevents redefinition.
+    const code = `
+      try {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        process.stdout.write(JSON.stringify({ threw: false }));
+      } catch (e) {
+        process.stdout.write(JSON.stringify({ threw: true, name: e.constructor.name }));
+      }
+    `;
+    return new Promise<void>((resolve, reject) => {
+      const script = writeChildScript(code);
+      const child = fork(script, [], {
+        env: {
+          ...process.env,
+          NPM_JAR_SPOOF_PLATFORM: 'linux',
+          NPM_JAR_SPOOF_ARCH: 'x64',
+          NODE_OPTIONS: `--require=${preloadPath}`,
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      let stdout = '';
+      child.stdout?.on('data', (c: Buffer) => { stdout += c.toString(); });
+      child.on('error', reject);
+      child.on('exit', (code) => {
+        if (code !== 0) { reject(new Error(`Child exited ${String(code)}: ${stdout}`)); return; }
+        const out = JSON.parse(stdout.trim()) as { threw: boolean; name: string };
+        expect(out.threw).toBe(true);
+        expect(out.name).toBe('TypeError');
+        resolve();
+      });
+    });
+  });
+
+  it('requiring the preload twice does not throw (idempotency)', async () => {
+    // A child that requires the preload once explicitly (in addition to the NODE_OPTIONS
+    // injection) must not throw a TypeError about redefining a non-configurable property.
+    const code = `
+      require(${JSON.stringify(preloadPath)});
+      const os = require('os');
+      process.stdout.write(JSON.stringify({ platform: process.platform, ok: true }));
+    `;
+    return new Promise<void>((resolve, reject) => {
+      const script = writeChildScript(code);
+      const child = fork(script, [], {
+        env: {
+          ...process.env,
+          NPM_JAR_SPOOF_PLATFORM: 'linux',
+          NPM_JAR_SPOOF_ARCH: 'x64',
+          NODE_OPTIONS: `--require=${preloadPath}`,
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      let stdout = '';
+      child.stdout?.on('data', (c: Buffer) => { stdout += c.toString(); });
+      child.on('error', reject);
+      child.on('exit', (code) => {
+        if (code !== 0) { reject(new Error(`Child exited ${String(code)}: ${stdout}`)); return; }
+        const out = JSON.parse(stdout.trim()) as { platform: string; ok: boolean };
+        expect(out.ok).toBe(true);
+        expect(out.platform).toBe('linux');
+        resolve();
+      });
+    });
+  });
+
   it('overrides are visible in required modules loaded after the preload', async () => {
     // The preload modifies os module in-place; a module required later sees the patched values.
     const code = `

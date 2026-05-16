@@ -377,7 +377,14 @@ export async function main(input: AgentInput): Promise<void> {
     new (class extends Writable {
       override _write(chunk: Buffer, _enc: string, cb: () => void): void {
         const line = chunk.toString();
-        const frame = JSON.parse(line) as Record<string, unknown>;
+        let frame: Record<string, unknown>;
+        try {
+          frame = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          // Malformed line from a trusted internal writer — skip silently.
+          cb();
+          return;
+        }
         if (frame['kind'] === 'event') {
           // Re-emit to the real emitter
           input.connection.writable.write(line);
