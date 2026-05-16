@@ -25,6 +25,7 @@ import { randomBytes } from 'node:crypto';
 
 import { parseInputs } from './action/inputs.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './action/detect-pm.js';
+import { detectRunnerImage } from './action/runner-image.js';
 import { renderDiff } from './action/diff.js';
 import { warn } from './action/log.js';
 import {
@@ -92,6 +93,15 @@ export async function main(): Promise<void> {
     }
     throw err;
   }
+  // We still call detectPm() for its validation side effects (lockfile
+  // present, not bun-only) and the lockfileSha256 it computes — the actual
+  // package-manager choice now lives in the guest agent config on the repo
+  // disk, not in the rootfs filename.  Marked `void` so noUnusedLocals stays
+  // happy until a follow-up (Task #12+) wires `pm.lockfileSha256` through.
+  void pm;
+
+  // --- Detect runner image -------------------------------------------------
+  const runnerImage = detectRunnerImage();
 
   // --- Resolve image paths -------------------------------------------------
   // imagesDir must live OUTSIDE the user's repo (we previously joined it onto
@@ -99,18 +109,21 @@ export async function main(): Promise<void> {
   // Actions runner's scratch directory — writable and cleaned between jobs.
   // os.tmpdir() is the dev/test fallback.
   //
-  // The rootfs image (`rootfs-node<MAJOR>-<MANAGER>.ext4`) is also resolved
-  // here.  Production deployments will need to provision or fetch the rootfs
-  // into this location; if it is missing, `launchVm` will fail loudly.
+  // The rootfs image (`rootfs-<runner-image>.ext4`) is also resolved here.
+  // Production deployments will need to provision or fetch the rootfs into
+  // this location; if it is missing, `launchVm` will fail loudly.
   const imagesDir = process.env['RUNNER_TEMP']
     ? join(process.env['RUNNER_TEMP'], 'npm-jar-images')
     : join(tmpdir(), 'npm-jar-images');
   mkdirSync(imagesDir, { recursive: true });
 
-  // The rootfs image is keyed by node-major + manager (e.g. rootfs-node20-pnpm.ext4).
+  // The rootfs image is keyed by runner image (e.g. rootfs-ubuntu-24.04.ext4)
+  // rather than by (node-major, package-manager): Node is bind-mounted from
+  // the host (Task #12), so the rootfs only needs to match the host's
+  // glibc / shared-library set.
   const baseRootfsPath = join(
     imagesDir,
-    `rootfs-node${inputs.nodeVersion}-${pm.manager}.ext4`,
+    `rootfs-${runnerImage}.ext4`,
   );
 
   // --- Ensure Firecracker + kernel are present -----------------------------

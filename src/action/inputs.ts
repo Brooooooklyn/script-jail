@@ -9,10 +9,13 @@
 //   deterministic behaviour.
 //
 // All path inputs are resolved against `repoDir` (a relative path becomes an
-// absolute path).  The `nodeVersion` is normalised to its MAJOR component
-// (e.g. "20") because the rootfs images are keyed by major version.
+// absolute path).
+//
+// Note on Node version: as of v2, there is no `node-version` input.  The
+// user's `actions/setup-node` step controls which Node is on the host PATH,
+// and we bind-mount that Node into the VM (see ./runner-image.ts and
+// Task #12).  The rootfs is keyed by runner image, not by Node major.
 
-import { existsSync as realExistsSync, readFileSync as realReadFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -31,8 +34,6 @@ export interface ActionInputs {
   mode: Mode;
   spoofPlatform: SpoofPlatform;
   spoofArch: SpoofArch;
-  /** Node MAJOR version as a string (e.g. "20"). */
-  nodeVersion: string;
   /** Whether to enable runner caching of the Firecracker bits. */
   cacheFirecracker: boolean;
 }
@@ -46,7 +47,7 @@ export interface ParseInput {
    * matching `@actions/core`'s convention.
    */
   getInput?: ((name: string) => string | undefined) | undefined;
-  /** Injection seam for filesystem reads (for .nvmrc / package.json). */
+  /** Injection seam for filesystem reads (reserved for future inputs). */
   fs?: {
     existsSync(p: string): boolean;
     readFileSync(p: string, enc: 'utf8'): string;
@@ -61,26 +62,23 @@ const VALID_PLATFORMS: ReadonlySet<SpoofPlatform> = new Set<SpoofPlatform>(['lin
 const VALID_ARCHES: ReadonlySet<SpoofArch> = new Set<SpoofArch>(['x64', 'arm64']);
 const VALID_MODES: ReadonlySet<Mode> = new Set<Mode>(['check', 'update']);
 
-/** Default Node major version when no signal can be found. */
-const DEFAULT_NODE_MAJOR = '20';
-
 // ---------------------------------------------------------------------------
 // parseInputs
 // ---------------------------------------------------------------------------
 
 export function parseInputs(input: ParseInput): ActionInputs {
   const getInput = input.getInput ?? defaultGetInput;
-  const fs = input.fs ?? {
-    existsSync: realExistsSync,
-    readFileSync: (p: string, enc: 'utf8'): string => realReadFileSync(p, enc),
-  };
+  // The `fs` field on `ParseInput` is currently unused — `parseInputs` no
+  // longer reads from disk now that the `node-version` resolution chain has
+  // moved to runner-image detection (see ./runner-image.ts).  We keep the
+  // seam on the interface for forward compatibility and so existing test
+  // callers that pass `fs` continue to typecheck.
 
   const rawConfig = getInput('config') ?? '';
   const rawLock = getInput('lock') ?? '';
   const rawMode = getInput('mode') ?? '';
   const rawPlatform = getInput('spoof-platform') ?? '';
   const rawArch = getInput('spoof-arch') ?? '';
-  const rawNodeVersion = getInput('node-version') ?? '';
   const rawCache = getInput('cache-firecracker') ?? '';
 
   // ---- mode -----------------------------------------------------------------
@@ -121,9 +119,6 @@ export function parseInputs(input: ParseInput): ActionInputs {
     );
   }
 
-  // ---- node-version ---------------------------------------------------------
-  const nodeVersion = resolveNodeMajor(rawNodeVersion, input.repoDir, fs);
-
   // ---- path resolution ------------------------------------------------------
   const configRel = rawConfig.trim() === '' ? '.npm-jar.yml' : rawConfig.trim();
   const lockRel = rawLock.trim() === '' ? '.npm-jar.lock.yml' : rawLock.trim();
@@ -134,7 +129,6 @@ export function parseInputs(input: ParseInput): ActionInputs {
     mode: modeStr,
     spoofPlatform: platformStr,
     spoofArch: archStr,
-    nodeVersion,
     cacheFirecracker,
   };
 }
@@ -158,68 +152,6 @@ function isSpoofArch(s: string): s is SpoofArch {
 function resolveAgainstRepo(p: string, repoDir: string): string {
   if (isAbsolute(p)) return p;
   return join(resolve(repoDir), p);
-}
-
-/**
- * Resolve the Node MAJOR version, in priority order:
- *   1. The literal `node-version` input (if non-empty).
- *   2. `<repoDir>/.nvmrc`.
- *   3. `engines.node` in `<repoDir>/package.json`.
- *   4. Default: "20".
- *
- * The returned string is always just the MAJOR component (e.g. "20"), with any
- * leading "v" or semver operator stripped.
- */
-function resolveNodeMajor(
-  rawInput: string,
-  repoDir: string,
-  fs: NonNullable<ParseInput['fs']>,
-): string {
-  const trimmed = rawInput.trim();
-  if (trimmed !== '') return majorOf(trimmed);
-
-  // .nvmrc
-  const nvmrcPath = join(repoDir, '.nvmrc');
-  if (fs.existsSync(nvmrcPath)) {
-    try {
-      const content = fs.readFileSync(nvmrcPath, 'utf8').trim();
-      if (content !== '') return majorOf(content);
-    } catch { /* fall through */ }
-  }
-
-  // engines.node
-  const pkgPath = join(repoDir, 'package.json');
-  if (fs.existsSync(pkgPath)) {
-    try {
-      const content = fs.readFileSync(pkgPath, 'utf8');
-      const parsed: unknown = JSON.parse(content);
-      if (typeof parsed === 'object' && parsed !== null) {
-        const engines = (parsed as { engines?: unknown }).engines;
-        if (typeof engines === 'object' && engines !== null) {
-          const node = (engines as { node?: unknown }).node;
-          if (typeof node === 'string' && node.trim() !== '') {
-            return majorOf(node);
-          }
-        }
-      }
-    } catch { /* malformed JSON / read failure → fall through */ }
-  }
-
-  return DEFAULT_NODE_MAJOR;
-}
-
-/**
- * Extract the MAJOR version from an arbitrary node-version-ish string.
- *
- * Accepts things like: "20", "v20", "20.10.0", ">=20.0.0", "^21.2.3", "~18".
- * Strips any leading non-digit characters (semver operators, "v") and any
- * trailing ".minor.patch".
- *
- * Returns DEFAULT_NODE_MAJOR if no digits are found.
- */
-function majorOf(s: string): string {
-  const match = s.match(/(\d+)/);
-  return match ? match[1]! : DEFAULT_NODE_MAJOR;
 }
 
 /**

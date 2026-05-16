@@ -54,7 +54,6 @@ describe('parseInputs — defaults', () => {
     expect(result.spoofPlatform).toBe('linux');
     expect(result.spoofArch).toBe('x64');
     expect(result.cacheFirecracker).toBe(true);
-    expect(result.nodeVersion).toBe('20');
     // Default config/lock paths are resolved relative to repoDir.
     expect(result.configPath).toBe(join(repoDir, '.npm-jar.yml'));
     expect(result.lockPath).toBe(join(repoDir, '.npm-jar.lock.yml'));
@@ -169,120 +168,6 @@ describe('parseInputs — cache-firecracker', () => {
       fs: makeFs(repoDir, []),
     });
     expect(r.cacheFirecracker).toBe(true);
-  });
-});
-
-describe('parseInputs — node-version resolution', () => {
-  const repoDir = '/fake/repo';
-
-  it('uses the literal node-version input when set', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({ 'node-version': '22' }),
-      fs: makeFs(repoDir, []),
-    });
-    expect(r.nodeVersion).toBe('22');
-  });
-
-  it('strips a leading "v" from the input', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({ 'node-version': 'v20' }),
-      fs: makeFs(repoDir, []),
-    });
-    expect(r.nodeVersion).toBe('20');
-  });
-
-  it('reads .nvmrc when node-version is empty', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, [{ name: '.nvmrc', contents: '18.17.0\n' }]),
-    });
-    expect(r.nodeVersion).toBe('18');
-  });
-
-  it('strips leading v from .nvmrc', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, [{ name: '.nvmrc', contents: 'v22\n' }]),
-    });
-    expect(r.nodeVersion).toBe('22');
-  });
-
-  it('falls back to engines.node when no .nvmrc', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, [
-        {
-          name: 'package.json',
-          contents: JSON.stringify({ engines: { node: '>=21.0.0' } }),
-        },
-      ]),
-    });
-    expect(r.nodeVersion).toBe('21');
-  });
-
-  it('handles caret in engines.node', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, [
-        {
-          name: 'package.json',
-          contents: JSON.stringify({ engines: { node: '^20.10.0' } }),
-        },
-      ]),
-    });
-    expect(r.nodeVersion).toBe('20');
-  });
-
-  it('prefers .nvmrc over engines.node', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, [
-        { name: '.nvmrc', contents: '18\n' },
-        {
-          name: 'package.json',
-          contents: JSON.stringify({ engines: { node: '>=22.0.0' } }),
-        },
-      ]),
-    });
-    expect(r.nodeVersion).toBe('18');
-  });
-
-  it('defaults to "20" when nothing is set', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, []),
-    });
-    expect(r.nodeVersion).toBe('20');
-  });
-
-  it('defaults to "20" when package.json has no engines.node', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, [
-        { name: 'package.json', contents: JSON.stringify({ name: 'x' }) },
-      ]),
-    });
-    expect(r.nodeVersion).toBe('20');
-  });
-
-  it('defaults to "20" when package.json is malformed', () => {
-    const r = parseInputs({
-      repoDir,
-      getInput: makeGetInput({}),
-      fs: makeFs(repoDir, [
-        { name: 'package.json', contents: 'not json' },
-      ]),
-    });
-    expect(r.nodeVersion).toBe('20');
   });
 });
 

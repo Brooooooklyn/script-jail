@@ -26,10 +26,6 @@ inputs:
     description: "Spoofed value for process.arch inside the VM. One of: x64 | arm64."
     required: false
     default: x64
-  node-version:
-    description: Node major version used inside the sandbox. Defaults to the project's `.nvmrc` or `engines.node` if unset.
-    required: false
-    default: ""
   cache-firecracker:
     description: Cache the firecracker binary + kernel + rootfs across runs.
     required: false
