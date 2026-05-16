@@ -11,8 +11,25 @@ import { stringify } from 'yaml';
 import { createConnection } from 'node:net';
 
 import { LinuxVsockConnection, main, MemoryConnection } from '../../src/guest/agent.js';
+import type { DnsLookupFn } from '../../src/guest/agent.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
 import type { StraceRunner } from '../../src/guest/phase-install.js';
+
+// Default DNS lookup fake: simulates an offline VM (ENOTFOUND).  Every
+// agent main() call in the test suite injects this so tests don't depend on
+// the host machine actually resolving registry.npmjs.org.
+const offlineLookup: DnsLookupFn = (_hostname, callback) => {
+  // Schedule a microtask-ish callback so we exercise the async path.
+  setImmediate(() => {
+    const err = new Error('getaddrinfo ENOTFOUND') as NodeJS.ErrnoException;
+    err.code = 'ENOTFOUND';
+    callback(err);
+  });
+};
+
+const onlineLookup: DnsLookupFn = (_hostname, callback) => {
+  setImmediate(() => { callback(null); });
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -124,7 +141,7 @@ describe('agent main()', () => {
     // Send the host "go" signal after a tiny delay
     setTimeout(() => hostSend('go\n'), 10);
 
-    await main({ configPath, connection: conn, spawner, strace });
+    await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
 
     // Phase A: npm ci --ignore-scripts
     expect(fetchCalls.length).toBeGreaterThanOrEqual(1);
@@ -150,7 +167,7 @@ describe('agent main()', () => {
 
     setTimeout(() => hostSend('go\n'), 10);
 
-    await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace: emptyStrace() });
+    await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace: emptyStrace(), dnsLookup: offlineLookup });
 
     const output = getOutput();
     const lines = output.split('\n').filter((l) => l.trim());
@@ -166,7 +183,7 @@ describe('agent main()', () => {
 
     setTimeout(() => hostSend('go\n'), 10);
 
-    await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace: emptyStrace() });
+    await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace: emptyStrace(), dnsLookup: offlineLookup });
 
     const output = getOutput();
     const lines = output.split('\n').filter((l) => l.trim());
@@ -191,6 +208,7 @@ describe('agent main()', () => {
       spawner: mockSpawner().spawner,
       strace: emptyStrace(),
       nodeVersion: 'v22.4.1',
+      dnsLookup: offlineLookup,
     });
 
     const output = getOutput();
@@ -216,6 +234,7 @@ describe('agent main()', () => {
       connection: conn,
       spawner: mockSpawner().spawner,
       strace: emptyStrace(),
+      dnsLookup: offlineLookup,
     });
 
     const output = getOutput();
@@ -253,7 +272,7 @@ describe('agent main()', () => {
     });
 
     await Promise.all([
-      main({ configPath, connection: conn, spawner: instrumentedSpawner, strace }),
+      main({ configPath, connection: conn, spawner: instrumentedSpawner, strace, dnsLookup: offlineLookup }),
       goDelay,
     ]);
 
@@ -277,7 +296,7 @@ describe('agent main()', () => {
     process.exit = exitSpy;
 
     try {
-      await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace: emptyStrace() });
+      await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace: emptyStrace(), dnsLookup: offlineLookup });
     } finally {
       process.exit = origExit;
     }
@@ -300,7 +319,7 @@ describe('agent main()', () => {
 
     setTimeout(() => hostSend('go\n'), 10);
 
-    await main({ configPath, connection: conn, spawner, strace: emptyStrace() });
+    await main({ configPath, connection: conn, spawner, strace: emptyStrace(), dnsLookup: offlineLookup });
 
     expect(capturedEnvs.length).toBeGreaterThan(0);
     const env = capturedEnvs[0]!;
@@ -327,7 +346,7 @@ describe('agent main()', () => {
 
     setTimeout(() => hostSend('go\n'), 10);
 
-    await main({ configPath, connection: conn, spawner, strace });
+    await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
 
     expect(fetchCalls[0]).toContain('pnpm fetch');
     expect(installCalls[0]).toContain('pnpm install');
@@ -341,7 +360,7 @@ describe('agent main()', () => {
 
     setTimeout(() => hostSend('go\n'), 10);
 
-    await main({ configPath, connection: conn, spawner, strace });
+    await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
 
     expect(fetchCalls[0]).toContain('yarn install');
     expect(installCalls[0]).toContain('yarn install --immutable --offline');
@@ -363,6 +382,7 @@ describe('agent main()', () => {
         connection: conn,
         spawner: mockSpawner().spawner,
         strace: emptyStrace(1), // Phase B fails
+        dnsLookup: offlineLookup,
       });
     } finally {
       process.exit = origExit;
@@ -386,6 +406,93 @@ describe('agent main()', () => {
     expect(errFrame?.['fatal']).toBe(true);
   });
 
+  it('proceeds to Phase B when verifyOffline reports the lookup failed (offline)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner, calls: fetchCalls } = mockSpawner();
+    const { strace, calls: installCalls } = trackingStrace();
+    const configPath = writeConfig(testDir);
+
+    const lookupCalls: string[] = [];
+    const recordingLookup: DnsLookupFn = (hostname, callback) => {
+      lookupCalls.push(hostname);
+      setImmediate(() => {
+        const err = new Error('getaddrinfo ENOTFOUND') as NodeJS.ErrnoException;
+        err.code = 'ENOTFOUND';
+        callback(err);
+      });
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner,
+      strace,
+      dnsLookup: recordingLookup,
+    });
+
+    // verifyOffline should have asked about the registry hostname between
+    // fetch and install.
+    expect(lookupCalls).toEqual(['registry.npmjs.org']);
+
+    // Both phases ran.
+    expect(fetchCalls.length).toBeGreaterThanOrEqual(1);
+    expect(installCalls.length).toBeGreaterThanOrEqual(1);
+
+    // The final lockfile was emitted (no fatal abort).
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(true);
+  });
+
+  it('aborts fatally with an error frame when DNS still resolves after go', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const { strace, calls: installCalls } = trackingStrace();
+    const configPath = writeConfig(testDir);
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner,
+        strace,
+        dnsLookup: onlineLookup, // resolver still works → host failed to disable network
+      });
+    } finally {
+      process.exit = origExit;
+    }
+
+    // Phase B must NOT have started.
+    expect(installCalls).toHaveLength(0);
+
+    // The agent should have called process.exit(1) and emitted a fatal error
+    // frame that names the offline check.
+    expect(exitedWith).toBe(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(true);
+    expect(String(errors[0]!['message'])).toMatch(/DNS still resolves/);
+
+    // And no install_done / final after the abort.
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).not.toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(false);
+  });
+
   it('order: fetch_done then events then install_done then final', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir);
@@ -397,6 +504,7 @@ describe('agent main()', () => {
       connection: conn,
       spawner: mockSpawner().spawner,
       strace: emptyStrace(),
+      dnsLookup: offlineLookup,
     });
 
     const output = getOutput();

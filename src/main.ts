@@ -35,6 +35,7 @@ import {
 } from './action/firecracker/download.js';
 import { makeOverlay } from './action/firecracker/overlay.js';
 import { launchVm, type VmHandle } from './action/firecracker/launch.js';
+import { disableNetwork } from './action/firecracker/network.js';
 import { openVsockSession, type VsockSession } from './action/firecracker/vsock.js';
 import { teardown } from './action/firecracker/teardown.js';
 import type { OverlayResult } from './action/firecracker/overlay.js';
@@ -173,9 +174,11 @@ export async function main(): Promise<void> {
 
   try {
     // --- Boot the VM -------------------------------------------------------
-    // TODO(v2): toggle network OFF after fetch_done handshake.  Phase A leaves
-    // the network on for the entire run because the current guest agent does
-    // not yet signal a phase transition the host can act on.
+    // Phase A networking is enabled at launch (tap0 + /network-interfaces/eth0
+    // in `launch.ts`) and torn down at the `fetch_done` handshake below by
+    // zeroing the eth0 rate-limiter buckets.  Firecracker has no API for
+    // removing a network interface, so the rate-limiter trick is the cleanest
+    // way to make Phase B genuinely offline without rebooting the VM.
     vm = await launchVm({
       firecrackerPath,
       vmlinuxPath,
@@ -201,6 +204,15 @@ export async function main(): Promise<void> {
       }
       if (frame.kind === 'handshake') {
         if (frame.phase === 'fetch_done') {
+          // Disable network BEFORE releasing the guest with `go`, so the
+          // moment Phase B starts the in-VM connect()s are already dead.
+          // `vm` is non-null here because we're inside the try-block that
+          // only runs after a successful `launchVm`, but narrow it anyway
+          // so the compiler is happy with strict null checks.
+          if (vm === null) {
+            throw new Error('npm-jar: vm not initialised at fetch_done');
+          }
+          await disableNetwork(vm.apiClient);
           await vsock.sendGo();
           continue;
         }

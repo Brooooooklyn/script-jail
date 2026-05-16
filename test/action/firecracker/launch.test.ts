@@ -368,6 +368,16 @@ describe('launchVm', () => {
     expect(killCalls).toHaveLength(1);
   });
 
+  it('returned VmHandle.apiClient exposes both put and patch', async () => {
+    const { client } = makeFakeApiClient();
+    const { spawner } = makeFakeSpawner();
+
+    const handle = await launchVm(makeInput({ apiClient: client, spawner }));
+
+    expect(typeof handle.apiClient.put).toBe('function');
+    expect(typeof handle.apiClient.patch).toBe('function');
+  });
+
   it('kills the process and re-throws when an API call fails mid-sequence', async () => {
     const killCalls: Array<NodeJS.Signals | number | undefined> = [];
 

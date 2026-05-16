@@ -15,6 +15,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
+import { lookup as dnsLookup } from 'node:dns';
 import { PassThrough, Writable } from 'node:stream';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
@@ -336,6 +337,17 @@ function buildChildEnv(
 // Main
 // ---------------------------------------------------------------------------
 
+/**
+ * Signature subset of `node:dns.lookup` we actually use: a single hostname
+ * argument with a node-style (err, _address) callback.  Exposed as its own
+ * type so tests can inject a deterministic fake without depending on the
+ * runtime DNS resolver.
+ */
+export type DnsLookupFn = (
+  hostname: string,
+  callback: (err: NodeJS.ErrnoException | null) => void,
+) => void;
+
 export interface AgentInput {
   configPath?: string;
   connection: Connection;
@@ -351,6 +363,31 @@ export interface AgentInput {
    * CI Node versions.
    */
   nodeVersion?: string;
+  /**
+   * Optional override for the DNS lookup used by `verifyOffline()` after the
+   * host's `go` signal.  Defaults to `node:dns.lookup`.  Tests inject a fake
+   * to deterministically exercise both "lookup fails → offline" and "lookup
+   * succeeds → fatal" branches without touching the network.
+   */
+  dnsLookup?: DnsLookupFn;
+}
+
+/**
+ * Confirm Phase B truly has no network by asking the resolver to look up a
+ * well-known registry host.  Returns:
+ *   - `true`  — lookup failed (e.g. ENOTFOUND / ECONNREFUSED) → network is
+ *               disabled as expected, safe to continue.
+ *   - `false` — lookup succeeded → host failed to drop network and any
+ *               `connect ok` events in Phase B would be FALSE NEGATIVES.
+ *               Caller MUST abort with a fatal error.
+ */
+async function verifyOffline(lookup: DnsLookupFn): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    lookup('registry.npmjs.org', (err) => {
+      // Lookup error → offline (good).  Lookup success → still online (bad).
+      resolve(err !== null);
+    });
+  });
 }
 
 export async function main(input: AgentInput): Promise<void> {
@@ -410,6 +447,27 @@ export async function main(input: AgentInput): Promise<void> {
     emitter.emitError(String(err), true);
     input.connection.close();
     process.exit(1);
+  }
+
+  // 9b. Sanity check: confirm the host actually disabled the network on the
+  //     `fetch_done` -> `go` boundary.  If DNS still resolves, the audit
+  //     would silently produce false-negative `connect ok` events for any
+  //     postinstall script that talks to the network — abort fatally.
+  //
+  //     We `return` after `process.exit(1)` so tests that stub out
+  //     `process.exit` don't fall through to Phase B; in production
+  //     `process.exit` terminates the process and the return is unreached.
+  const lookupFn: DnsLookupFn = input.dnsLookup ?? dnsLookup;
+  const offline = await verifyOffline(lookupFn);
+  if (!offline) {
+    emitter.emitError(
+      'Phase B aborted: DNS still resolves after host go signal — ' +
+        'network was not disabled, audit results would be unreliable.',
+      true,
+    );
+    input.connection.close();
+    process.exit(1);
+    return;
   }
 
   // 10. Phase B: install (network off, under strace, StraceRunner owns the process)
