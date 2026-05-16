@@ -1,0 +1,13 @@
+[
+  {
+    "raw": {
+      "kind": "dlopen",
+      "filename": "/work/node_modules/tries-dlopen/evil.node",
+      "pid": 1002,
+      "ts": 0,
+      "result": "blocked"
+    },
+    "pkg": "tries-dlopen@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

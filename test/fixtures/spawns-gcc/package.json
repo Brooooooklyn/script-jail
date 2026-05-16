@@ -1,0 +1,9 @@
+{
+  "name": "spawns-gcc",
+  "version": "1.0.0",
+  "description": "Shape fixture: postinstall execs gcc to compile a native shim. The VM rootfs ships no gcc, so execve returns ENOENT and the attempt is recorded under spawn_blocked.",
+  "private": true,
+  "scripts": {
+    "postinstall": "node script.js"
+  }
+}

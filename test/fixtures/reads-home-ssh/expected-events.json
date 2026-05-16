@@ -1,0 +1,13 @@
+[
+  {
+    "raw": {
+      "kind": "read",
+      "path": "/root/.ssh/id_rsa",
+      "pid": 1001,
+      "ts": 0,
+      "hidden": true
+    },
+    "pkg": "reads-home-ssh@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

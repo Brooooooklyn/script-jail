@@ -1,0 +1,14 @@
+[
+  {
+    "raw": {
+      "kind": "connect",
+      "host": "198.51.100.7",
+      "port": 443,
+      "pid": 1005,
+      "ts": 0,
+      "result": "blocked"
+    },
+    "pkg": "tries-network-egress@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

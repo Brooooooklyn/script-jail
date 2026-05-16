@@ -1,0 +1,9 @@
+{
+  "name": "reads-secret-env",
+  "version": "1.0.0",
+  "description": "Shape fixture: postinstall reads process.env.NPM_TOKEN. The LD_PRELOAD env shim flags NPM_TOKEN as protected and returns NULL; the attempt is recorded with hidden=true.",
+  "private": true,
+  "scripts": {
+    "postinstall": "node script.js"
+  }
+}

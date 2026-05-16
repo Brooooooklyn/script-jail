@@ -1,0 +1,13 @@
+[
+  {
+    "raw": {
+      "kind": "env_read",
+      "name": "NPM_TOKEN",
+      "pid": 1004,
+      "ts": 0,
+      "hidden": true
+    },
+    "pkg": "reads-secret-env@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

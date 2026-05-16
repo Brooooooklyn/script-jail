@@ -1,0 +1,9 @@
+{
+  "name": "tries-network-egress",
+  "version": "1.0.0",
+  "description": "Shape fixture: postinstall opens a TCP connection to 198.51.100.7:443 (TEST-NET-2). Phase B has the VM's tap interface removed, so connect() fails and the attempt is recorded under network_attempts.",
+  "private": true,
+  "scripts": {
+    "postinstall": "node script.js"
+  }
+}

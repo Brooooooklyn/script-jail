@@ -1,0 +1,13 @@
+[
+  {
+    "raw": {
+      "kind": "spawn",
+      "argv": ["gcc", "-c", "evil.c"],
+      "pid": 1003,
+      "ts": 0,
+      "result": "enoent"
+    },
+    "pkg": "spawns-gcc@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]
