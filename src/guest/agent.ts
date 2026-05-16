@@ -402,12 +402,16 @@ async function verifyOfflineWithTimeout(
   lookup: DnsLookupFn,
   timeoutMs = 2000,
 ): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
   return Promise.race([
     new Promise<boolean>((resolve) => {
-      lookup('registry.npmjs.org', (err) => { resolve(err !== null); });
+      lookup('registry.npmjs.org', (err) => {
+        if (timer !== undefined) clearTimeout(timer);
+        resolve(err !== null);
+      });
     }),
     new Promise<boolean>((resolve) => {
-      setTimeout(() => { resolve(true); }, timeoutMs);
+      timer = setTimeout(() => { resolve(true); }, timeoutMs);
     }),
   ]);
 }
