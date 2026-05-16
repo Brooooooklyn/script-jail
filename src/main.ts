@@ -35,6 +35,8 @@ import {
   ensureBinaries,
   NodeHttpClient,
 } from './action/firecracker/download.js';
+import { preFetchArtifacts } from './action/pre-fetch-artifacts.js';
+import { PINNED_MANIFEST } from './action/artifact-manifest.js';
 import { makeOverlay } from './action/firecracker/overlay.js';
 import { launchVm, type VmHandle } from './action/firecracker/launch.js';
 import { openVsockSession, type VsockSession } from './action/firecracker/vsock.js';
@@ -103,8 +105,9 @@ export async function main(): Promise<void> {
   // os.tmpdir() is the dev/test fallback.
   //
   // The rootfs image (`rootfs-<runner-image>.ext4`) is also resolved here.
-  // Production deployments will need to provision or fetch the rootfs into
-  // this location; if it is missing, `launchVm` will fail loudly.
+  // `preFetchArtifacts()` below downloads it (and libnpmjar.so) from the
+  // GitHub release matching PINNED_MANIFEST.tag; if the download or its
+  // SHA-256 check fails, the pre-fetch step throws before `launchVm` runs.
   const imagesDir = process.env['RUNNER_TEMP']
     ? join(process.env['RUNNER_TEMP'], 'npm-jar-images')
     : join(tmpdir(), 'npm-jar-images');
@@ -133,13 +136,27 @@ export async function main(): Promise<void> {
     `rootfs-${runnerImage}.ext4`,
   );
 
+  // --- Pre-fetch release artifacts (rootfs + .so) --------------------------
+  // GitHub JavaScript actions don't support `runs.pre`, so the pre-fetch
+  // happens here, inside main(), before any other VM-side work.  See
+  // `./action/pre-fetch-artifacts.ts` for the asymmetry note on libnpmjar.so
+  // (baked into the released rootfs, so the .so download is informational
+  // for the v1 production path).
+  const http = new NodeHttpClient();
+  await preFetchArtifacts({
+    imagesDir,
+    runnerImage,
+    manifest: PINNED_MANIFEST,
+    http,
+  });
+
   // --- Ensure Firecracker + kernel are present -----------------------------
   const { firecrackerPath, vmlinuxPath } = await ensureBinaries({
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
     kernelUrl: PINNED_VMLINUX_URL,
     kernelSha256: PINNED_VMLINUX_SHA256,
-    http: new NodeHttpClient(),
+    http,
   });
 
   // --- Resolve host-node prefix --------------------------------------------

@@ -9,6 +9,14 @@
 // Flags:
 //   --skip-rootfs                                skip rootfs build (e.g., when you
 //                                                only need the action bundle)
+//   --skip-bundle                                skip the esbuild action-bundle step
+//                                                (use when the bundle was already
+//                                                built in a prior invocation, e.g.
+//                                                a release workflow that builds the
+//                                                bundle once then loops over two
+//                                                runner images for rootfs builds)
+//   --skip-shim                                  skip the C-shim build step (same
+//                                                rationale as --skip-bundle)
 //   --runner-image=ubuntu-22.04|ubuntu-24.04     which Ubuntu base to build the
 //                                                rootfs against
 //   --all                                        build BOTH runner-image rootfses
@@ -47,6 +55,10 @@ const REPO_ROOT = join(__dirname, '..');
 
 interface ParsedArgs {
   skipRootfs: boolean;
+  /** Skip the esbuild action-bundle step. */
+  skipBundle: boolean;
+  /** Skip the C-shim build step. */
+  skipShim: boolean;
   /** When `--all`, build both runner-image rootfses. */
   all: boolean;
   /** Explicit `--runner-image=…` choice; ignored when `--all`. */
@@ -57,6 +69,8 @@ function parseArgs(): ParsedArgs {
   const args = process.argv.slice(2);
 
   const skipRootfs = args.includes('--skip-rootfs');
+  const skipBundle = args.includes('--skip-bundle');
+  const skipShim = args.includes('--skip-shim');
   const all = args.includes('--all');
   const runnerImage = parseRunnerImageArg(args);
 
@@ -64,13 +78,15 @@ function parseArgs(): ParsedArgs {
   for (const arg of args) {
     if (
       arg === '--skip-rootfs' ||
+      arg === '--skip-bundle' ||
+      arg === '--skip-shim' ||
       arg === '--all' ||
       /^--runner-image=/.test(arg)
     ) continue;
     console.warn(`[build] Unknown flag: ${arg}`);
   }
 
-  return { skipRootfs, all, runnerImage };
+  return { skipRootfs, skipBundle, skipShim, all, runnerImage };
 }
 
 /**
@@ -169,16 +185,24 @@ function collectSummary(artifacts: ArtifactSummary[]): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const { skipRootfs, all, runnerImage } = parseArgs();
+  const { skipRootfs, skipBundle, skipShim, all, runnerImage } = parseArgs();
 
   const artifacts: ArtifactSummary[] = [];
 
   // Step 1: action bundle
-  buildActionBundle();
+  if (skipBundle) {
+    console.log('[build] --skip-bundle passed; skipping action-bundle build.');
+  } else {
+    buildActionBundle();
+  }
   artifacts.push({ path: join(REPO_ROOT, 'dist', 'main.js') });
 
   // Step 2: C shim
-  buildShim();
+  if (skipShim) {
+    console.log('[build] --skip-shim passed; skipping C-shim build.');
+  } else {
+    buildShim();
+  }
   artifacts.push({ path: join(REPO_ROOT, 'images', 'libnpmjar.so') });
 
   // Step 3: rootfs

@@ -1,0 +1,184 @@
+# npm-jar — .github/workflows/release.yml
+#
+# Release pipeline: on every `v*.*.*` tag push, build the per-runner rootfs
+# ext4 images, the libnpmjar.so C shim, and the action bundle, then attach
+# them as release assets.
+#
+# Why this exists:
+#   The action consumes the rootfs + .so at runtime via
+#   `src/action/pre-fetch-artifacts.ts`, which downloads from
+#   https://github.com/<repo>/releases/download/<tag>/<asset> and verifies
+#   each file against a pinned SHA-256 in src/action/artifact-manifest.ts.
+#   This workflow produces those assets.
+#
+# Bootstrap caveat:
+#   The first release tagged on a fresh fork will produce real SHAs that do
+#   NOT match the placeholders in src/action/artifact-manifest.ts.  The
+#   workflow prints the real SHAs in its step summary; copy them into the
+#   manifest and cut the NEXT tag.  From the second release onward, the
+#   manifest matches each tag's assets and the action's pre-fetch step
+#   succeeds.
+#
+# Supply-chain hardening:
+#   We split into two jobs so the GITHUB_TOKEN with contents:write only
+#   exists during the final upload step:
+#     - `build` runs install / typecheck / test / build with the
+#       default-read token AND `persist-credentials: false`, so a malicious
+#       dependency lifecycle script cannot write to the repo or its
+#       releases via the runner's git credentials.
+#     - `publish` is a minimal job that only downloads the build artifacts
+#       and uploads them via softprops/action-gh-release@v2.  Only this
+#       job carries contents:write.
+
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+# Job-level permissions (set per-job below) override this default; we still
+# pin contents:read at the workflow level so any future job that forgets to
+# declare its own permissions gets the safest default.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # build — install/test/build with NO write capabilities and no persisted
+  # checkout credentials.  Hands the final artifacts off to `publish` via the
+  # standard actions/upload-artifact mechanism.
+  # ---------------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-24.04
+    # The rootfs build invokes Docker + mkfs.ext4 twice (once per runner
+    # image); 30 minutes is comfortable headroom over the typical ~10-min
+    # combined runtime.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Don't leave the GITHUB_TOKEN persisted as a git credential after
+          # checkout.  install/test/build phases run npm/pnpm lifecycle
+          # scripts and Docker — a compromised dep should not inherit a
+          # repo token, even a read-only one.
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build action bundle
+        run: pnpm build:bundle
+
+      - name: Build C shim
+        run: sh src/shim/build.sh
+
+      # Build BOTH rootfs ext4 images, reusing the bundle + shim built above.
+      # `--skip-bundle` and `--skip-shim` avoid the redundant work the build
+      # script would otherwise repeat per --runner-image invocation.
+      - name: Build rootfs (ubuntu-22.04)
+        run: pnpm build -- --runner-image=ubuntu-22.04 --skip-bundle --skip-shim
+
+      - name: Build rootfs (ubuntu-24.04)
+        run: pnpm build -- --runner-image=ubuntu-24.04 --skip-bundle --skip-shim
+
+      # Compute SHA-256 of each released artifact and surface them in the
+      # job summary so the maintainer can copy the digests into
+      # src/action/artifact-manifest.ts before cutting the next release.
+      - name: Compute SHAs
+        id: shas
+        run: |
+          set -euo pipefail
+          ROOTFS_22="$(sha256sum images/rootfs-ubuntu-22.04.ext4 | cut -d' ' -f1)"
+          ROOTFS_24="$(sha256sum images/rootfs-ubuntu-24.04.ext4 | cut -d' ' -f1)"
+          LIBSO="$(sha256sum images/libnpmjar.so | cut -d' ' -f1)"
+          echo "rootfs_22=${ROOTFS_22}" >> "$GITHUB_OUTPUT"
+          echo "rootfs_24=${ROOTFS_24}" >> "$GITHUB_OUTPUT"
+          echo "libso=${LIBSO}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Artifact SHAs"
+            echo
+            echo "Update \`src/action/artifact-manifest.ts\` with:"
+            echo
+            echo '```ts'
+            echo "export const PINNED_MANIFEST: ArtifactManifest = {"
+            echo "  repo: '${{ github.repository }}',"
+            echo "  tag: '${{ github.ref_name }}',"
+            echo "  expected: {"
+            echo "    'rootfs-ubuntu-22.04.ext4': '${ROOTFS_22}',"
+            echo "    'rootfs-ubuntu-24.04.ext4': '${ROOTFS_24}',"
+            echo "    'libnpmjar.so':              '${LIBSO}',"
+            echo "  },"
+            echo "};"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Hand artifacts to the publish job.  Using a workflow artifact (rather
+      # than a job output or cache) keeps the build job side-effect-free
+      # outside its own filesystem.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            images/rootfs-ubuntu-22.04.ext4
+            images/rootfs-ubuntu-24.04.ext4
+            images/libnpmjar.so
+            dist/main.js
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # publish — minimal job that ONLY has contents:write, downloads the assets
+  # the build job produced, and uploads them to the release.  No install,
+  # no test runs — nothing that executes third-party code.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          # download-artifact@v4 preserves the directory structure under the
+          # given path; we mirror the build job's layout so the upload step's
+          # `files:` paths line up.
+          path: .
+
+      # softprops/action-gh-release@v2 auto-creates the release for the tag
+      # (or appends to an existing one) and uploads each listed file.  We pin
+      # to the major tag — the maintainer's standard practice in this repo
+      # for actions that publish frequent patch releases.
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            images/rootfs-ubuntu-22.04.ext4
+            images/rootfs-ubuntu-24.04.ext4
+            images/libnpmjar.so
+            dist/main.js
