@@ -231,6 +231,5 @@ function majorOf(s: string): string {
  */
 function defaultGetInput(name: string): string | undefined {
   const key = `INPUT_${name.replace(/-/g, '_').toUpperCase()}`;
-  // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
   return process.env[key];
 }
