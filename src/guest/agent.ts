@@ -122,8 +122,65 @@ export class LinuxVsockConnection implements Connection {
   }
 
   close(): void {
-    this.sock.destroy();
+    // Graceful half-close instead of `destroy()`: `end()` flushes any
+    // buffered writes through the kernel send queue and sends FIN, so the
+    // host (socat → vsock) receives the trailing JSONL frame BEFORE seeing
+    // EOF.  `destroy()` aborts the connection, dropping any frame still in
+    // the libuv write queue — the exact bug behind the "vsock session ended
+    // without a final frame" with no upstream error context.
+    //
+    // The socket will be fully closed once the peer ACKs the FIN; the
+    // event loop won't exit until then (good — we want to keep the process
+    // alive long enough to flush).  For error paths that must call
+    // process.exit(N), use `flushAndExit()` below — it waits for the
+    // `end()` callback before exiting.
+    this.sock.end();
     this.server.close();
+  }
+}
+
+/**
+ * Flush any pending writes to `writable`, then `process.exit(code)`.
+ *
+ * Why this exists: previously the agent's error paths did
+ *   emitter.emitError(msg, true)
+ *   input.connection.close()
+ *   process.exit(1)
+ * with `close()` calling `sock.destroy()` and `process.exit(1)` exiting
+ * synchronously — both of which abandon bytes still in the libuv write
+ * queue.  The host saw the connection close with no error frame and
+ * surfaced the misleading "vsock session ended without a final frame".
+ *
+ * `writable.end(cb)` writes any buffered bytes, sends FIN, then invokes
+ * `cb` once the bytes are in the kernel send buffer — at which point
+ * socat (and the host) will receive them before the close.
+ *
+ * A 1 s ceiling guards against a wedged peer: a broken socket should not
+ * be able to pin the agent forever just because it can't ACK.
+ */
+function flushAndExit(writable: NodeJS.WritableStream, code: number): void {
+  // Capture the current `process.exit` so tests that swap it inside a
+  // try/finally still see their stub when this function's writable-end
+  // callback fires asynchronously, AFTER the test's `finally` has restored
+  // the real exit.  Without the capture, the restored real (or
+  // vitest-wrapped) exit terminates the test runner.
+  const exitFn = process.exit.bind(process);
+  let exited = false;
+  const exitOnce = (): void => {
+    if (exited) return;
+    exited = true;
+    exitFn(code);
+  };
+  const timer = setTimeout(exitOnce, 1000);
+  timer.unref();
+  try {
+    writable.end(() => {
+      clearTimeout(timer);
+      exitOnce();
+    });
+  } catch {
+    clearTimeout(timer);
+    exitOnce();
   }
 }
 
@@ -490,9 +547,17 @@ export async function main(input: AgentInput): Promise<void> {
   });
 
   if (!fetchResult.ok) {
+    // Also write to process.stderr so the npm error reaches ttyS0 (the
+    // VM's serial console) — `LinuxSpawner` captures the child's stderr
+    // into a string, so without this dump the only host-visible symptom
+    // would be the eventual fatal error frame.  Useful when the frame
+    // itself doesn't make it (e.g. before this flushAndExit was added).
+    process.stderr.write(
+      `[agent] Phase A (fetch) failed:\n${fetchResult.stderr}\n`,
+    );
     emitter.emitError(`Phase A (fetch) failed: ${fetchResult.stderr}`, true);
-    input.connection.close();
-    process.exit(1);
+    flushAndExit(input.connection.writable, 1);
+    return;
   }
 
   emitter.emitHandshake('fetch_done');
@@ -502,8 +567,8 @@ export async function main(input: AgentInput): Promise<void> {
     await waitForGo(input.connection.readable);
   } catch (err) {
     emitter.emitError(String(err), true);
-    input.connection.close();
-    process.exit(1);
+    flushAndExit(input.connection.writable, 1);
+    return;
   }
 
   // 9b. Before verifying offline, drop the eth0 interface from inside the
@@ -550,8 +615,7 @@ export async function main(input: AgentInput): Promise<void> {
         'network was not disabled, audit results would be unreliable.',
       true,
     );
-    input.connection.close();
-    process.exit(1);
+    flushAndExit(input.connection.writable, 1);
     return;
   }
 

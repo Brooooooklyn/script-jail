@@ -292,30 +292,52 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
 // ---------------------------------------------------------------------------
 
 /**
- * Creates a tap0 device on the host and registers it with Firecracker.
+ * Creates a tap0 device on the host (if not already present) and registers it
+ * with Firecracker.
  *
- * Requires root (or CAP_NET_ADMIN).  Logs a warning and skips if the
- * `ip` command is not found or returns a non-zero exit code.
+ * `ip tuntap add` requires CAP_NET_ADMIN — which the unprivileged GitHub-hosted
+ * runner user does NOT have by default.  The workflow is expected to pre-create
+ * tap0 with `sudo` and hand ownership to the runner user; when that has
+ * happened, this function detects the existing device and skips creation but
+ * STILL registers `/network-interfaces/eth0` so Firecracker attaches to it.
+ *
+ * If creation fails AND no pre-existing tap0 is present, we surface the `ip`
+ * command's stderr to process.stderr (was: silently `stdio: 'ignore'` +
+ * `console.warn`) so the user sees the actual error in the action log.
  *
  * TODO(v2): Dynamically allocate tap device names to support multiple
  * concurrent VMs on the same host.
  */
 async function setupTapDevice(api: FirecrackerApiClient): Promise<void> {
-  // Attempt to create the tap device.  Failures are non-fatal — the VM
-  // starts without a network interface, which is acceptable during tests.
-  const mkTap = spawnSync('ip', ['tuntap', 'add', 'tap0', 'mode', 'tap'], {
-    stdio: 'ignore',
+  // Detect pre-existing tap0.  `ip link show tap0` exits 0 when present and
+  // non-zero (with "Device 'tap0' does not exist" on stderr) when not — we
+  // only consult the exit status, never the device's link state, because
+  // a workflow may bring it up *after* this check completes.
+  const existing = spawnSync('ip', ['link', 'show', 'tap0'], {
+    stdio: ['ignore', 'ignore', 'ignore'],
   });
+  const alreadyExists = existing.status === 0;
 
-  if (mkTap.status !== 0) {
-    console.warn(
-      '[launch] tap device setup failed (ip tuntap add). ' +
-      'Network will not be available inside the VM. ' +
-      'Run as root or with CAP_NET_ADMIN to enable networking.',
-    );
-    return;
+  if (!alreadyExists) {
+    const mkTap = spawnSync('ip', ['tuntap', 'add', 'tap0', 'mode', 'tap'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (mkTap.status !== 0) {
+      const stderr = (mkTap.stderr?.toString() ?? '').trim();
+      process.stderr.write(
+        `[launch] tap device setup failed: ip tuntap add tap0 mode tap ` +
+        `exited ${mkTap.status ?? 'unknown'}${stderr ? `: ${stderr}` : ''}. ` +
+        `Network will not be available inside the VM. ` +
+        `Pre-create tap0 with sudo or run with CAP_NET_ADMIN to enable networking.\n`,
+      );
+      return;
+    }
   }
 
+  // Best-effort: bring tap0 up.  If the device was pre-created by a workflow
+  // step it may already be up, in which case this is a no-op.  Failures here
+  // are non-fatal — Firecracker will fail loudly on the API call if the host
+  // device isn't usable.
   spawnSync('ip', ['link', 'set', 'tap0', 'up'], { stdio: 'ignore' });
 
   await api.put('/network-interfaces/eth0', {

@@ -297,6 +297,12 @@ describe('agent main()', () => {
 
     try {
       await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace: emptyStrace(), dnsLookup: offlineLookup });
+      // flushAndExit() defers `exitFn()` until the writable's `end()`
+      // callback fires (next tick on PassThrough), so we need one
+      // micro/macro-task hop after `await main(...)` before asserting on
+      // the stub.  Without this, the stub is checked while the end()
+      // callback is still queued.
+      await new Promise<void>((r) => setImmediate(r));
     } finally {
       process.exit = origExit;
     }
@@ -471,6 +477,11 @@ describe('agent main()', () => {
         dropEth0: async () => { /* pretend the drop succeeded */ },
         dnsLookup: onlineLookup, // resolver still works → interface drop ineffective
       });
+      // See the comment in 'rejects non-"go"' for why we need this hop:
+      // flushAndExit() invokes the captured exit function from the
+      // writable's `end()` callback, which is one tick away on a
+      // PassThrough.  Without this await the assertion races the callback.
+      await new Promise<void>((r) => setImmediate(r));
     } finally {
       process.exit = origExit;
     }

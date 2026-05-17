@@ -80,5 +80,11 @@ fi
 #    run cleanup and propagate the agent's exit code.
 AGENT_STATUS=0
 wait "${AGENT_PID}" || AGENT_STATUS=$?
+# Make the agent's exit code visible on ttyS0 (the host's [fc:out] stream).
+# Without this echo a non-zero agent exit produces only the eventual kernel
+# panic ("Attempted to kill init! exitcode=…") on PID 1's exit — which is
+# hard to map back to which guest component failed.  Cheap to emit, pays
+# for itself the next time the agent dies before sending a final frame.
+echo "[orchestrate] agent exited with status ${AGENT_STATUS}" >&2
 cleanup
 exit "${AGENT_STATUS}"

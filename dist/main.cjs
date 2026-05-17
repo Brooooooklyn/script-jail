@@ -27880,14 +27880,22 @@ async function launchVm(input) {
   };
 }
 async function setupTapDevice(api) {
-  const mkTap = (0, import_node_child_process2.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
-    stdio: "ignore"
+  const existing = (0, import_node_child_process2.spawnSync)("ip", ["link", "show", "tap0"], {
+    stdio: ["ignore", "ignore", "ignore"]
   });
-  if (mkTap.status !== 0) {
-    console.warn(
-      "[launch] tap device setup failed (ip tuntap add). Network will not be available inside the VM. Run as root or with CAP_NET_ADMIN to enable networking."
-    );
-    return;
+  const alreadyExists = existing.status === 0;
+  if (!alreadyExists) {
+    const mkTap = (0, import_node_child_process2.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    if (mkTap.status !== 0) {
+      const stderr = (mkTap.stderr?.toString() ?? "").trim();
+      process.stderr.write(
+        `[launch] tap device setup failed: ip tuntap add tap0 mode tap exited ${mkTap.status ?? "unknown"}${stderr ? `: ${stderr}` : ""}. Network will not be available inside the VM. Pre-create tap0 with sudo or run with CAP_NET_ADMIN to enable networking.
+`
+      );
+      return;
+    }
   }
   (0, import_node_child_process2.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore" });
   await api.put("/network-interfaces/eth0", {

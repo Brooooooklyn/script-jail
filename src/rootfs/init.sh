@@ -37,6 +37,35 @@ mount -t tmpfs -o size=16m tmpfs /root 2>/dev/null || true
 busybox ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
 busybox ifconfig lo
 
+# --- eth0 (optional — only present when the host registered tap0/eth0) -------
+# When the host passes `enableNetwork: true` (Phase A) the action creates a
+# tap0 device on the host and registers it via Firecracker's
+# `/network-interfaces/eth0`; the guest kernel then exposes it as `eth0`.
+# Phase B leaves `enableNetwork: false`, in which case no eth0 exists here.
+#
+# We address eth0 statically because dhclient isn't in the rootfs (Dockerfile.base
+# deliberately ships only busybox/strace/dumb-init/socat — adding ISC dhclient
+# would pull in glibc-static and the entire init system).  The host-side NAT
+# step in .github/workflows/e2e.yml uses 172.16.0.0/24 with the gateway at
+# 172.16.0.1 (the runner's end of tap0), so the guest end gets .2.  The MAC
+# matches the value `setupTapDevice` writes via the Firecracker API
+# (06:00:AC:10:00:02) — that MAC is reverse-mapped to 172.16.0.2 by convention.
+#
+# DNS: GitHub-hosted runners forward 168.63.129.16 (Azure resolver), 1.1.1.1
+# (Cloudflare) and 8.8.8.8 (Google).  The latter two are reachable directly;
+# we don't need the Azure one inside the VM.  /etc/resolv.conf is written
+# unconditionally because the rootfs image's stub may point at 127.0.0.53
+# (systemd-resolved on the build host), which is meaningless inside the VM.
+#
+# All four commands tolerate failure (`|| true`): when eth0 is absent
+# (Phase B-only test rig, missing /network-interfaces/eth0 on host), busybox
+# prints "ifconfig: SIOCGIFFLAGS: No such device" and we continue with lo
+# only.  Phase A will fail loudly downstream if it truly needed network.
+busybox ifconfig eth0 172.16.0.2 netmask 255.255.255.0 up 2>/dev/null || true
+busybox route add default gw 172.16.0.1 2>/dev/null || true
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+busybox ifconfig eth0 2>/dev/null || true
+
 # --- Repo disk (filesystem label `repo`) --------------------------------------
 # The host always registers the repo drive when running through the action.
 # Mount it read-only at /work; the guest agent reads the user's repo from here.
