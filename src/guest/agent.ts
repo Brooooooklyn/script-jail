@@ -440,6 +440,14 @@ export interface AgentInput {
    * "lookup hangs forever → treated as offline" case.
    */
   verifyOfflineTimeoutMs?: number;
+  /**
+   * Optional sink for boot/phase breadcrumbs.  Production writes to
+   * `process.stderr` (which the rootfs routes to /dev/console = ttyS0 =
+   * host's `[fc:out]` stream) so failures surface in the action log
+   * without needing to deserialize the vsock JSONL.  Tests inject a stub
+   * to capture breadcrumbs in-process instead of polluting test stderr.
+   */
+  diag?: (msg: string) => void;
 }
 
 /**
@@ -504,8 +512,20 @@ async function defaultDropEth0(spawner: Spawner, env: NodeJS.ProcessEnv): Promis
   throw lastErr ?? new Error('script-jail agent: dropEth0 failed for unknown reason');
 }
 
+/**
+ * Boot breadcrumb writer.  Production path writes to process.stderr (which
+ * the rootfs wires to /dev/console = ttyS0 = host's `[fc:out]` stream), so
+ * each breadcrumb is visible in the action log.  Tests inject a stub via
+ * `input.diag` to capture breadcrumbs without polluting test stderr.
+ */
+function diag(input: AgentInput, msg: string): void {
+  if (input.diag) input.diag(msg);
+  else process.stderr.write(`[agent] ${msg}\n`);
+}
+
 export async function main(input: AgentInput): Promise<void> {
   const configPath = input.configPath ?? '/etc/script-jail/config.yml';
+  diag(input, `main(): configPath=${configPath}`);
 
   // 1. Read + validate config
   let rawConfig: unknown;
@@ -515,14 +535,17 @@ export async function main(input: AgentInput): Promise<void> {
   } catch (err) {
     throw new Error(`script-jail agent: failed to read config at ${configPath}: ${String(err)}`);
   }
+  diag(input, 'config read + parsed');
 
   const config = AgentConfig.parse(rawConfig);
+  diag(input, `config validated: manager=${config.manager ?? '(auto)'} work_dir=${config.work_dir}`);
 
   // 2. Build emitter pointing at the vsock connection
   const emitter = new Emitter(input.connection.writable);
 
   // 3. Detect package manager
   const manager = config.manager ?? detectManager(config.work_dir);
+  diag(input, `manager resolved: ${manager}`);
 
   // 4. Write protected-env file to a temp location
   const protectedEnvPath = '/tmp/script-jail-protected.txt';
@@ -539,12 +562,14 @@ export async function main(input: AgentInput): Promise<void> {
   const attribution = new Attribution(new LinuxProcReader());
 
   // 8. Phase A: fetch (network on, no strace)
+  diag(input, `Phase A starting: ${manager} fetch in ${config.work_dir}`);
   const fetchResult = await runFetchPhase({
     manager,
     cwd: config.work_dir,
     env: childEnv,
     spawner,
   });
+  diag(input, `Phase A finished: ok=${fetchResult.ok}`);
 
   if (!fetchResult.ok) {
     // Also write to process.stderr so the npm error reaches ttyS0 (the
@@ -763,6 +788,12 @@ const isMain =
     process.argv[1].endsWith('agent.ts'));
 
 if (isMain) {
+  // Boot breadcrumb — appears on the guest's ttyS0 console (host's [fc:out]).
+  // Without this, "did the agent start at all?" was indistinguishable from
+  // "did the agent exit immediately?" — both leave orchestrate.sh's polling
+  // loop to time out with the same generic FATAL.
+  process.stderr.write('[agent] start: pid=' + process.pid + ' node=' + process.version + ' argv1=' + String(process.argv[1]) + '\n');
+
   // Production: `nodeVersion` is intentionally omitted from main()'s input so
   // the renderer captures `process.version` of the running interpreter — which
   // is the host-mounted Node at /opt/host-node, picked up via PATH by init.sh.
@@ -773,11 +804,20 @@ if (isMain) {
   // talks to Firecracker's UDS at vsock port 10242 (see src/main.ts) — socat
   // listens on AF_VSOCK 10242 inside the VM and forwards to TCP 10243 here.
   LinuxVsockConnection.listen(10243)
-    .then((conn) => main({ connection: conn }))
+    .then((conn) => {
+      process.stderr.write('[agent] vsock peer connected, entering main()\n');
+      return main({ connection: conn });
+    })
+    .then(() => {
+      process.stderr.write('[agent] main() resolved cleanly\n');
+    })
     .catch((err: unknown) => {
-      const pt = new PassThrough();
-      const em = new Emitter(pt);
-      em.emitError(String(err), true);
+      // Dump the full error to ttyS0 so the failure mode is visible on
+      // the host's [fc:out] stream.  The previous code emitted to a stray
+      // PassThrough that nothing read — the error went /dev/null and the
+      // host saw only the generic "session ended without a final frame".
+      const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+      process.stderr.write('[agent] FATAL: ' + msg + '\n');
       process.exit(1);
     });
 }
