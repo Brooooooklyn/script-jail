@@ -200,14 +200,38 @@ jobs:
       contents: write
 
     steps:
+      # Re-checkout the tagged source on a separate runner whose filesystem
+      # has NOT seen `pnpm install`.  This gives us a clean, independently-
+      # obtained copy of src/action/artifact-manifest.ts and dist/main.js
+      # that the build job's third-party code could not have tampered with.
+      # `persist-credentials: false` keeps the GITHUB_TOKEN out of git
+      # credentials; the release upload below receives the write-scoped
+      # token via the workflow env, not via git.
+      - name: Checkout (verification source)
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: release-assets
           # download-artifact@v4 preserves the directory structure under the
-          # given path; we mirror the build job's layout so the upload step's
-          # `files:` paths line up.
-          path: .
+          # given path.  We isolate the downloaded artifacts under ./artifacts
+          # so they cannot overwrite the freshly-checked-out source tree
+          # (in particular dist/main.js, which we compare against below).
+          path: artifacts
+
+      # Independently verify the downloaded artifacts against the SHAs the
+      # tagged source committed.  See scripts/check-publish-artifacts.sh for
+      # the threat model and bootstrap-path handling.  Crucially, this runs
+      # BEFORE the upload step, so a mismatch refuses to publish.
+      - name: Verify downloaded artifacts against tagged manifest
+        run: |
+          bash scripts/check-publish-artifacts.sh \
+            --manifest src/action/artifact-manifest.ts \
+            --dir artifacts \
+            --dist-source dist/main.js
 
       # softprops/action-gh-release@v2 auto-creates the release for the tag
       # (or appends to an existing one) and uploads each listed file.  We pin
@@ -217,7 +241,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            images/rootfs-ubuntu-22.04.ext4
-            images/rootfs-ubuntu-24.04.ext4
-            images/libnpmjar.so
-            dist/main.js
+            artifacts/images/rootfs-ubuntu-22.04.ext4
+            artifacts/images/rootfs-ubuntu-24.04.ext4
+            artifacts/images/libnpmjar.so
+            artifacts/dist/main.js
