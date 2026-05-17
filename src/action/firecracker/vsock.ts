@@ -2,14 +2,20 @@
 //
 // Host-side vsock connection handler.
 //
-// Protocol (Firecracker vsock-over-UDS pattern):
-//   - Firecracker exposes the guest's vsock port as a Unix domain socket at
-//     `${udsBasePath}_${port}` on the host.
-//   - The host connects by writing the handshake line "CONNECT <port>\n" to
-//     the socket, then the guest's kernel routes traffic into the VM.
-//   - After the handshake, the guest emits JSONL frames (one JSON object per
-//     line, newline-terminated).  The host parses each frame and yields it
-//     as a typed GuestFrame.
+// Protocol (Firecracker vsock-over-UDS pattern, host-initiated mode):
+//   - When PUT /vsock is processed, Firecracker creates a Unix-domain
+//     socket at the BASE `uds_path` configured on the device (no port
+//     suffix). That socket is the host-initiated control socket.
+//   - To dial a guest vsock port, the host connects to that base socket
+//     and writes the handshake line "CONNECT <port>\n".  Firecracker
+//     replies with "OK <port>\n" and bidirectional bytes follow.
+//   - The `<uds_path>_<port>` form is for the OPPOSITE direction
+//     (guest-initiated): the host would have to pre-create + listen on
+//     that socket and the guest would dial AF_VSOCK <port>.  We do NOT
+//     use that mode — see the transport-bridge note below.
+//   - After the handshake, the guest emits JSONL frames (one JSON object
+//     per line, newline-terminated).  The host parses each frame and
+//     yields it as a typed GuestFrame.
 //   - The host signals "go" by writing "go\n" to the socket.
 //
 // The `openVsockSession` function is injectable in tests: pass any
@@ -23,9 +29,9 @@
 //   `socat VSOCK-LISTEN:10242,fork TCP:127.0.0.1:10243` *only after* the
 //   agent has bound TCP 127.0.0.1:10243 — confirmed by polling /proc/net/tcp
 //   — so the bridge cannot accept a host CONNECT before the agent is ready.
-//   The host side (this file) connects to Firecracker's UDS at
-//   `${udsPath}_${port}` and sends `CONNECT 10242\n`; Firecracker forwards
-//   that to AF_VSOCK port 10242 in the guest, where socat accepts it and
+//   The host side (this file) connects to Firecracker's BASE UDS at
+//   `${udsPath}` and sends `CONNECT 10242\n`; Firecracker forwards that
+//   to AF_VSOCK port 10242 in the guest, where socat accepts it and
 //   pipes the bytes through to TCP 127.0.0.1:10243, where the agent's
 //   `LinuxVsockConnection.listen` is waiting.  See src/rootfs/init.sh,
 //   src/rootfs/orchestrate.sh, and src/guest/agent.ts.
@@ -99,9 +105,11 @@ export async function openVsockSession(
   if (options?.duplex !== undefined) {
     duplex = options.duplex;
   } else {
-    // Production: connect to the UDS Firecracker exposes.
-    const sockPath = `${udsPath}_${port}`;
-    const sock = await connectUnixSocket(sockPath, options?.connectTimeoutMs ?? 30_000);
+    // Production: host-initiated mode — connect to the BASE UDS path
+    // Firecracker created on PUT /vsock (no `_<port>` suffix).  The
+    // `_<port>` socket is the guest-initiated path which we don't use;
+    // see the protocol comment at the top of this file.
+    const sock = await connectUnixSocket(udsPath, options?.connectTimeoutMs ?? 30_000);
     duplex = socketToDuplex(sock);
   }
 

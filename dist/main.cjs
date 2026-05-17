@@ -27992,8 +27992,7 @@ async function openVsockSession(udsPath, port, options) {
   if (options?.duplex !== void 0) {
     duplex = options.duplex;
   } else {
-    const sockPath = `${udsPath}_${port}`;
-    const sock = await connectUnixSocket(sockPath, options?.connectTimeoutMs ?? 3e4);
+    const sock = await connectUnixSocket(udsPath, options?.connectTimeoutMs ?? 3e4);
     duplex = socketToDuplex(sock);
   }
   duplex.write(`CONNECT ${port}

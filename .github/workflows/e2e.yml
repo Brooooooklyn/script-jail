@@ -112,21 +112,19 @@ jobs:
       # fails with EACCES and Firecracker's InstanceStart returns
       # HTTP 400 ("Error creating KVM object: Permission denied").
       #
-      # Install a udev rule that re-perms /dev/kvm to 0666 and retrigger
-      # so the rule applies to the already-created node.  This is the
-      # standard pattern recommended in github/runner-images discussions
-      # (issue #1183) and used by firecracker-microvm CI examples.
+      # The udev-rule + udevadm-trigger recipe (common on Linux forums)
+      # works on 24.04 but does NOT re-perm the already-created device
+      # node on 22.04 — the trigger fires but the in-kernel uevent
+      # doesn't propagate by the time the next step runs.  A direct
+      # chmod is reliable on both images.
       - name: Grant runner access to /dev/kvm
         run: |
           set -euo pipefail
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
           ls -l /dev/kvm
           # Sanity-check the runner can now open it for read+write.
           if ! test -r /dev/kvm || ! test -w /dev/kvm; then
-            echo "::error::/dev/kvm still not r/w accessible to the runner user after udev re-trigger"
+            echo "::error::/dev/kvm still not r/w accessible after chmod 0666"
             exit 1
           fi
 
