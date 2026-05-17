@@ -180,7 +180,7 @@ jobs:
       # ----------------------------------------------------------------------
 
       # `uses: ./` invokes the action from THIS checkout's action.yml.  No
-      # release is needed — the dist/main.js committed to the repo (drift-
+      # release is needed — the dist/main.cjs committed to the repo (drift-
       # guarded by .github/workflows/test.yml) is what runs.
       #
       # GITHUB_WORKSPACE override: src/main.ts uses `GITHUB_WORKSPACE` as the

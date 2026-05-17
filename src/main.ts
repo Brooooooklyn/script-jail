@@ -1,6 +1,6 @@
 // script-jail — src/main.ts
 //
-// GitHub Action entry point.  Wired in action.yml as `runs.main: dist/main.js`.
+// GitHub Action entry point.  Wired in action.yml as `runs.main: dist/main.cjs`.
 //
 // Flow:
 //   1. Parse inputs (./action/inputs.ts) and detect the PM (./action/detect-pm.ts).

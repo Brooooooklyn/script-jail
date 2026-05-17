@@ -3,8 +3,8 @@
 #
 # Publish-job gate.  Verifies the build-job artifacts about to be uploaded to
 # a GitHub release match the SHA-256 digests recorded in the tagged source's
-# `src/action/artifact-manifest.ts` and (for `dist/main.js`) the bytes of the
-# tagged `dist/main.js` itself.
+# `src/action/artifact-manifest.ts` and (for `dist/main.cjs`) the bytes of the
+# tagged `dist/main.cjs` itself.
 #
 # Why this exists:
 #   The release workflow splits into two jobs.  The `build` job runs npm/pnpm
@@ -16,7 +16,7 @@
 #
 #   This script runs in the publish job AFTER a fresh checkout of the tagged
 #   source and BEFORE the upload step.  It re-derives the expected SHAs from
-#   the in-repo manifest (and the in-repo dist/main.js), recomputes the SHAs
+#   the in-repo manifest (and the in-repo dist/main.cjs), recomputes the SHAs
 #   of the downloaded artifacts, and refuses to proceed on mismatch.
 #
 # Bootstrap path:
@@ -30,9 +30,9 @@
 #   --manifest <path>      Path to src/action/artifact-manifest.ts (required).
 #   --dir <path>           Directory containing the downloaded artifacts
 #                          (expects images/ and dist/ subdirs).
-#   --dist-source <path>   Optional path to the tagged dist/main.js to compare
-#                          the artifact's dist/main.js against.  When omitted,
-#                          dist/main.js verification is skipped (useful for
+#   --dist-source <path>   Optional path to the tagged dist/main.cjs to compare
+#                          the artifact's dist/main.cjs against.  When omitted,
+#                          dist/main.cjs verification is skipped (useful for
 #                          tests that only exercise the manifest path).
 
 set -euo pipefail
@@ -197,7 +197,7 @@ fi
 ART_ROOTFS_22="$DIR/images/rootfs-ubuntu-22.04.ext4"
 ART_ROOTFS_24="$DIR/images/rootfs-ubuntu-24.04.ext4"
 ART_LIBSO="$DIR/images/libscriptjail.so"
-ART_DIST="$DIR/dist/main.js"
+ART_DIST="$DIR/dist/main.cjs"
 
 # Artifacts must exist in BOTH modes — a missing file means the build job's
 # upload-artifact step is broken, not a bootstrap nuance.
@@ -236,9 +236,9 @@ if [ "$PLACEHOLDER_COUNT" -gt 0 ] && [ "$REAL_COUNT" -gt 0 ]; then
   exit 1
 fi
 
-# --- Verify dist/main.js (runs in BOTH normal and bootstrap modes) -----------
+# --- Verify dist/main.cjs (runs in BOTH normal and bootstrap modes) -----------
 #
-# dist/main.js is not in PINNED_MANIFEST.expected — instead it's committed to
+# dist/main.cjs is not in PINNED_MANIFEST.expected — instead it's committed to
 # the tag (Task #20).  The fresh-checkout copy is an independent source of
 # truth that doesn't depend on the manifest, so the comparison is meaningful
 # even when the manifest itself is in bootstrap placeholders.  Skipping this
@@ -261,7 +261,7 @@ if [ -n "$DIST_SOURCE" ]; then
     exit 1
   fi
   EXPECTED_DIST="$(sha_of "$DIST_SOURCE")"
-  check "dist/main.js" "$EXPECTED_DIST" "$COMPUTED_DIST"
+  check "dist/main.cjs" "$EXPECTED_DIST" "$COMPUTED_DIST"
 fi
 
 # --- Bootstrap path -----------------------------------------------------------
@@ -269,7 +269,7 @@ fi
 # All-placeholder manifest: the rootfs/libso SHAs have no trustworthy
 # reference yet (this IS the run that produces them), so we skip those
 # three comparisons and print the computed values for the maintainer to
-# paste into the manifest.  The dist/main.js comparison above still ran.
+# paste into the manifest.  The dist/main.cjs comparison above still ran.
 
 if [ "$ALL_PLACEHOLDERS" -eq 1 ]; then
   echo "::warning::check-publish-artifacts: PINNED_MANIFEST.expected is entirely placeholders; skipping SHA comparison (bootstrap path). Copy the SHAs below into src/action/artifact-manifest.ts and cut the next tag."
@@ -277,9 +277,9 @@ if [ "$ALL_PLACEHOLDERS" -eq 1 ]; then
   echo "  rootfs-ubuntu-22.04.ext4: $COMPUTED_ROOTFS_22" >&2
   echo "  rootfs-ubuntu-24.04.ext4: $COMPUTED_ROOTFS_24" >&2
   echo "  libscriptjail.so:             $COMPUTED_LIBSO" >&2
-  echo "  dist/main.js:             $COMPUTED_DIST" >&2
+  echo "  dist/main.cjs:             $COMPUTED_DIST" >&2
   if [ "${#errors[@]}" -gt 0 ]; then
-    echo "check-publish-artifacts: dist/main.js mismatch in bootstrap mode — refusing to publish." >&2
+    echo "check-publish-artifacts: dist/main.cjs mismatch in bootstrap mode — refusing to publish." >&2
     for e in "${errors[@]}"; do
       echo "  $e" >&2
     done

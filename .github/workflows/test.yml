@@ -32,7 +32,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        node-version: ['20', '22', '24']
+        node-version: ['22', '24']
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -60,16 +60,16 @@ jobs:
         run: pnpm test
 
       # Rebuild the action entry from source and verify it matches the copy
-      # committed to the repo.  action.yml's `runs.main: dist/main.js` is
+      # committed to the repo.  action.yml's `runs.main: dist/main.cjs` is
       # loaded from the tagged tree, so a source change that ships without a
       # refreshed bundle would produce a tagged action that doesn't reflect
       # the source.  Catch that drift at PR time instead of at release time.
       - name: Bundle action entry
         run: pnpm build:bundle
 
-      - name: Verify dist/main.js is up to date
+      - name: Verify dist/main.cjs is up to date
         run: |
-          if ! git diff --exit-code -- dist/main.js; then
-            echo "::error::dist/main.js is out of date. Run 'pnpm build:bundle' locally and commit the result."
+          if ! git diff --exit-code -- dist/main.cjs; then
+            echo "::error::dist/main.cjs is out of date. Run 'pnpm build:bundle' locally and commit the result."
             exit 1
           fi

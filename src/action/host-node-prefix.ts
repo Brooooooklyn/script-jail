@@ -7,7 +7,7 @@
 //
 // Why we resolve via PATH, NOT `process.execPath`:
 //   This action is wired in action.yml as `runs.using: node20`, which means
-//   GitHub spawns dist/main.js with the *runner's bundled Node20* — and that's
+//   GitHub spawns dist/main.cjs with the *runner's bundled Node20* — and that's
 //   what `process.execPath` reports.  But the entire point of this feature is
 //   to capture whichever Node the user's workflow set up (typically via
 //   `actions/setup-node`).  `actions/setup-node` prepends its toolcache `bin/`

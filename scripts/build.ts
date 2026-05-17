@@ -2,7 +2,7 @@
 // Master build coordinator. Invoked via `oxnode scripts/build.ts`.
 //
 // Steps:
-//   1. Compile the action entry: esbuild src/main.ts → dist/main.js
+//   1. Compile the action entry: esbuild src/main.ts → dist/main.cjs
 //   2. Build the C shim: src/shim/build.sh → images/libscriptjail.so (skip on macOS)
 //   3. Build the rootfs(es): src/rootfs/build.ts for the selected runner image.
 //
@@ -119,7 +119,7 @@ function defaultRunnerImage(): RunnerImage {
 // ---------------------------------------------------------------------------
 
 function buildActionBundle(): void {
-  console.log('[build] Building action bundle: src/main.ts → dist/main.js …');
+  console.log('[build] Building action bundle: src/main.ts → dist/main.cjs …');
   const esbuildBin = join(REPO_ROOT, 'node_modules', '.bin', 'esbuild');
   const mainSrc = join(REPO_ROOT, 'src', 'main.ts');
   const mainOut = join(REPO_ROOT, 'dist', 'main.js');
@@ -130,7 +130,7 @@ function buildActionBundle(): void {
     `--outfile="${mainOut}"`,
     { stdio: 'inherit', cwd: REPO_ROOT },
   );
-  console.log('[build] dist/main.js built.');
+  console.log('[build] dist/main.cjs built.');
 }
 
 // ---------------------------------------------------------------------------

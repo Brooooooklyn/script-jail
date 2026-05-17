@@ -2,8 +2,8 @@
 //
 // Unit tests for scripts/check-publish-artifacts.sh — the publish-job gate
 // that verifies the downloaded build artifacts' SHA-256 digests against the
-// tagged source's `src/action/artifact-manifest.ts` (and, for dist/main.js,
-// the tagged source's dist/main.js itself).
+// tagged source's `src/action/artifact-manifest.ts` (and, for dist/main.cjs,
+// the tagged source's dist/main.cjs itself).
 //
 // The script is shell, not TS, because the release workflow's publish job
 // deliberately runs WITHOUT `pnpm install` — see the file header in
@@ -13,7 +13,7 @@
 // Each test sets up an isolated temp directory with:
 //   - a synthetic manifest file (subset of the real artifact-manifest.ts schema),
 //   - dummy artifact files under images/ and dist/,
-//   - optionally a dist-source file to compare dist/main.js against.
+//   - optionally a dist-source file to compare dist/main.cjs against.
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -102,7 +102,7 @@ function writeArtifacts(workspace: string, bytes: ArtifactBytes): {
   writeFileSync(join(dir, 'images/rootfs-ubuntu-22.04.ext4'), bytes.rootfs22);
   writeFileSync(join(dir, 'images/rootfs-ubuntu-24.04.ext4'), bytes.rootfs24);
   writeFileSync(join(dir, 'images/libscriptjail.so'), bytes.libso);
-  writeFileSync(join(dir, 'dist/main.js'), bytes.dist);
+  writeFileSync(join(dir, 'dist/main.cjs'), bytes.dist);
   return {
     dir,
     shas: {
@@ -180,7 +180,7 @@ describe('scripts/check-publish-artifacts.sh', () => {
       libso: shas.libso,
     });
 
-    // Provide a dist-source whose contents match the artifact so dist/main.js
+    // Provide a dist-source whose contents match the artifact so dist/main.cjs
     // verification also passes.
     const distSource = join(ws, 'dist-source.js');
     writeFileSync(distSource, bytes.dist);
@@ -247,10 +247,10 @@ describe('scripts/check-publish-artifacts.sh', () => {
     expect(r.stdout).not.toMatch(/::warning::/);
   });
 
-  it('verifies dist/main.js even in bootstrap mode (mismatch hard-fails)', () => {
+  it('verifies dist/main.cjs even in bootstrap mode (mismatch hard-fails)', () => {
     // Regression test for adversarial-review finding: a build-job
-    // compromise could swap dist/main.js while the manifest is in bootstrap
-    // mode.  The fresh-checkout dist/main.js is an independent reference,
+    // compromise could swap dist/main.cjs while the manifest is in bootstrap
+    // mode.  The fresh-checkout dist/main.cjs is an independent reference,
     // so this comparison must run regardless of manifest-placeholder state.
     const ws = makeWorkspace();
     const manifestPath = writeManifest(ws, {
@@ -264,7 +264,7 @@ describe('scripts/check-publish-artifacts.sh', () => {
       libso: 'libso',
       dist: 'tampered-dist-bytes', // pretend the build job's dist was swapped
     });
-    // The fresh-checkout dist/main.js holds the trusted bytes.
+    // The fresh-checkout dist/main.cjs holds the trusted bytes.
     const distSource = join(ws, 'dist-source.js');
     writeFileSync(distSource, 'trusted-dist-bytes');
 
@@ -277,11 +277,11 @@ describe('scripts/check-publish-artifacts.sh', () => {
       distSource,
     ]);
     expect(r.status).toBe(1);
-    expect(r.stderr).toMatch(/dist\/main\.js mismatch/);
+    expect(r.stderr).toMatch(/dist\/main\.cjs mismatch/);
     expect(r.stderr).toMatch(/refusing to publish/);
   });
 
-  it('verifies dist/main.js in bootstrap mode (match exits 0 with warning)', () => {
+  it('verifies dist/main.cjs in bootstrap mode (match exits 0 with warning)', () => {
     // Companion to the test above: bootstrap mode + matching dist should
     // still succeed (otherwise the bootstrap loop is broken).
     const ws = makeWorkspace();

@@ -75,7 +75,7 @@ export interface OverlayInput {
    * contains bin/node, lib/, include/, etc.).  Derived at the action level
    * by `resolveHostNodePrefix()`, which walks PATH (NOT process.execPath —
    * that would resolve to the GitHub Actions runner's bundled Node20 used
-   * to execute dist/main.js, not the user-selected Node).  The whole tree
+   * to execute dist/main.cjs, not the user-selected Node).  The whole tree
    * is packed into a tiny ext4 attached to the VM at /opt/host-node and
    * mounted read-only by the guest.
    */

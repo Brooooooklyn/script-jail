@@ -183,7 +183,7 @@ jobs:
             images/rootfs-ubuntu-22.04.ext4
             images/rootfs-ubuntu-24.04.ext4
             images/libscriptjail.so
-            dist/main.js
+            dist/main.cjs
           if-no-files-found: error
           retention-days: 1
 
@@ -202,7 +202,7 @@ jobs:
     steps:
       # Re-checkout the tagged source on a separate runner whose filesystem
       # has NOT seen `pnpm install`.  This gives us a clean, independently-
-      # obtained copy of src/action/artifact-manifest.ts and dist/main.js
+      # obtained copy of src/action/artifact-manifest.ts and dist/main.cjs
       # that the build job's third-party code could not have tampered with.
       # `persist-credentials: false` keeps the GITHUB_TOKEN out of git
       # credentials; the release upload below receives the write-scoped
@@ -219,7 +219,7 @@ jobs:
           # download-artifact@v4 preserves the directory structure under the
           # given path.  We isolate the downloaded artifacts under ./artifacts
           # so they cannot overwrite the freshly-checked-out source tree
-          # (in particular dist/main.js, which we compare against below).
+          # (in particular dist/main.cjs, which we compare against below).
           path: artifacts
 
       # Independently verify the downloaded artifacts against the SHAs the
@@ -231,7 +231,7 @@ jobs:
           bash scripts/check-publish-artifacts.sh \
             --manifest src/action/artifact-manifest.ts \
             --dir artifacts \
-            --dist-source dist/main.js
+            --dist-source dist/main.cjs
 
       # softprops/action-gh-release@v2 auto-creates the release for the tag
       # (or appends to an existing one) and uploads each listed file.  We pin
@@ -244,4 +244,4 @@ jobs:
             artifacts/images/rootfs-ubuntu-22.04.ext4
             artifacts/images/rootfs-ubuntu-24.04.ext4
             artifacts/images/libscriptjail.so
-            artifacts/dist/main.js
+            artifacts/dist/main.cjs
