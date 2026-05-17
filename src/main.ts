@@ -37,6 +37,7 @@ import {
 } from './action/firecracker/download.js';
 import { preFetchArtifacts } from './action/pre-fetch-artifacts.js';
 import { PINNED_MANIFEST } from './action/artifact-manifest.js';
+import { validateManifest } from './action/validate-manifest.js';
 import { makeOverlay } from './action/firecracker/overlay.js';
 import { launchVm, type VmHandle } from './action/firecracker/launch.js';
 import { openVsockSession, type VsockSession } from './action/firecracker/vsock.js';
@@ -108,6 +109,13 @@ export async function main(): Promise<void> {
   // `preFetchArtifacts()` below downloads it (and libnpmjar.so) from the
   // GitHub release matching PINNED_MANIFEST.tag; if the download or its
   // SHA-256 check fails, the pre-fetch step throws before `launchVm` runs.
+  // Fail-fast: refuse to do any filesystem or network work if the action was
+  // published with placeholder (or otherwise non-canonical) artifact SHAs.
+  // Without this, the pre-fetch step would only catch the mistake AFTER
+  // downloading multi-MB release assets, and surface it as a confusing
+  // "SHA-256 mismatch" instead of "this is a packaging bug, file an issue".
+  validateManifest(PINNED_MANIFEST);
+
   const imagesDir = process.env['RUNNER_TEMP']
     ? join(process.env['RUNNER_TEMP'], 'npm-jar-images')
     : join(tmpdir(), 'npm-jar-images');

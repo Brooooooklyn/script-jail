@@ -81,6 +81,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Refuse to publish a tag whose artifact manifest still contains
+      # placeholder (or otherwise non-canonical) SHA-256 values — every
+      # consumer of such a tag would fail the action's pre-fetch hash
+      # check after wasting a multi-MB download.  Same validator runs at
+      # action startup from `src/main.ts`; running it here surfaces the
+      # bug at tag-push time instead of in every consumer's CI.
+      - name: Validate pinned artifact manifest
+        run: pnpm exec oxnode scripts/validate-manifest.ts
+
       - name: Typecheck
         run: pnpm typecheck
 

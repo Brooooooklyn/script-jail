@@ -27603,6 +27603,22 @@ var PINNED_MANIFEST = {
   }
 };
 
+// src/action/validate-manifest.ts
+var MANIFEST_PATH = "src/action/artifact-manifest.ts";
+var SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+function validateManifest(manifest) {
+  const offenders = [];
+  for (const [name, value] of Object.entries(manifest.expected)) {
+    if (!SHA256_HEX_RE.test(value)) {
+      offenders.push(name);
+    }
+  }
+  if (offenders.length === 0) return;
+  throw new Error(
+    `npm-jar: action artifact manifest at ${MANIFEST_PATH} has unpinned entries: [${offenders.join(", ")}]. This indicates the action was published without real release-asset hashes. Open a GitHub issue against the action repository (${manifest.repo}).`
+  );
+}
+
 // src/action/firecracker/overlay.ts
 var import_node_fs8 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
@@ -28183,6 +28199,7 @@ async function main() {
   }
   void pm;
   const runnerImage = detectRunnerImage();
+  validateManifest(PINNED_MANIFEST);
   const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path9.join)(process.env["RUNNER_TEMP"], "npm-jar-images") : (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), "npm-jar-images");
   (0, import_node_fs11.mkdirSync)(imagesDir, { recursive: true });
   maybeClearCache({
