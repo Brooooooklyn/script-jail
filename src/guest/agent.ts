@@ -45,7 +45,14 @@ const AgentConfig = z.object({
     platform: z.enum(['linux', 'darwin', 'win32']).default('linux'),
     arch: z.enum(['x64', 'arm64']).default('x64'),
   }).default({ platform: 'linux', arch: 'x64' }),
-  node_version: z.string().default(''),
+  // YAML happily decodes `node_version: 20` as a number; users will almost
+  // always write the bare integer (matching how every Node-related field in
+  // the rest of their CI YAML reads).  Coerce to string before Zod's `string()`
+  // gate so the config doesn't reject on a stylistic ambiguity.  The field is
+  // informational anyway — `process.version` of the running interpreter is the
+  // authoritative source the renderer captures (see comment at the
+  // `render({...})` call below).
+  node_version: z.coerce.string().default(''),
   manager_lockfile_sha256: z.string().default(''),
   /** Absolute path to the lockfile inside the VM (used to detect manager). */
   lockfile_path: z.string().default(''),
