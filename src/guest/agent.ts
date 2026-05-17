@@ -681,9 +681,22 @@ export async function main(input: AgentInput): Promise<void> {
 // Entrypoint (when run directly)
 // ---------------------------------------------------------------------------
 
+// The agent runs in three name-shapes:
+//   - production: bundled into dist/guest-agent.cjs by src/rootfs/build.ts
+//     and copied into the rootfs at /usr/local/lib/script-jail/guest-agent.cjs
+//   - local: someone running `oxnode src/guest/agent.ts` for ad-hoc debug
+//   - tests: vitest imports { main } directly — argv[1] is vitest's runner
+//     path, NOT any agent.* file, so isMain is false and this block is skipped
+//
+// The previous check (`endsWith('agent.js')`) excluded the production .cjs
+// filename, which meant Node ran the bundle, registered no work, and exited
+// with status 0. orchestrate.sh saw the immediate exit and aborted with
+// "agent exited before binding" — the most confusing possible no-op crash.
 const isMain =
   typeof process.argv[1] === 'string' &&
-  process.argv[1].endsWith('agent.js');
+  (process.argv[1].endsWith('agent.js') ||
+    process.argv[1].endsWith('agent.cjs') ||
+    process.argv[1].endsWith('agent.ts'));
 
 if (isMain) {
   // Production: `nodeVersion` is intentionally omitted from main()'s input so
