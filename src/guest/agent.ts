@@ -505,9 +505,9 @@ export class LinuxStraceRunner implements StraceRunner {
       env: opts.env,
       // fd 0: stdin  → /dev/null
       // fd 1: stdout → ignored
-      // fd 2: stderr → ignored (strace diagnostic noise; not syscall lines)
+      // fd 2: stderr → pipe  (strace diagnostics forwarded to process.stderr)
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
-      stdio: ['ignore', 'ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
     });
 
     const exitPromise = new Promise<void>((resolve) => {
@@ -521,12 +521,30 @@ export class LinuxStraceRunner implements StraceRunner {
     // child.stdio[3] is the read end of the fd-3 pipe.
     const fd3Stream = child.stdio[3] as Readable | null;
 
-    yield* runStraceTailer({
-      watchDir,
-      basePrefix,
-      fd3Stream,
-      exitPromise,
-    });
+    // Forward strace's stderr line-by-line to process.stderr with a [strace]
+    // prefix so any strace diagnostics (e.g. "strace: exec failed", ptrace
+    // permission errors) land on the guest's ttyS0 console.
+    let stderrRl: ReturnType<typeof createInterface> | null = null;
+    if (child.stderr) {
+      stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
+      stderrRl.on('line', (line: string) => {
+        process.stderr.write(`[strace] ${line}\n`);
+      });
+    }
+
+    try {
+      yield* runStraceTailer({
+        watchDir,
+        basePrefix,
+        fd3Stream,
+        exitPromise,
+      });
+    } finally {
+      if (stderrRl !== null) {
+        stderrRl.close();
+        stderrRl = null;
+      }
+    }
   }
 }
 
