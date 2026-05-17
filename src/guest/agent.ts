@@ -724,6 +724,7 @@ function buildChildEnv(
   const preloads = [
     '/usr/local/lib/script-jail/dlopen-block.cjs',
     '/usr/local/lib/script-jail/platform-spoof.cjs',
+    '/usr/local/lib/script-jail/env-spy.cjs',
   ];
 
   return {

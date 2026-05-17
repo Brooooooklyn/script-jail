@@ -28,6 +28,7 @@ COPY src/rootfs/cleanup.sh /sbin/cleanup
 COPY dist/guest-agent.cjs /usr/local/lib/script-jail/guest-agent.cjs
 COPY dist/preloads/platform-spoof.cjs /usr/local/lib/script-jail/platform-spoof.cjs
 COPY dist/preloads/dlopen-block.cjs /usr/local/lib/script-jail/dlopen-block.cjs
+COPY dist/preloads/env-spy.cjs /usr/local/lib/script-jail/env-spy.cjs
 COPY images/libscriptjail.so /lib/libscriptjail.so
 
 RUN chmod +x /sbin/init /sbin/orchestrate /sbin/cleanup

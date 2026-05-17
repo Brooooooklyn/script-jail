@@ -9,7 +9,7 @@
 //
 // Steps:
 //   1. Bundle src/guest/agent.ts → dist/guest-agent.cjs via esbuild
-//   2. Copy the two .cjs preloads to dist/preloads/
+//   2. Copy the .cjs preloads to dist/preloads/
 //   3. Ensure images/libscriptjail.so is present (build if not, skip on macOS)
 //   4. docker build → script-jail-rootfs:<runnerImage>
 //   5. docker export → tar → directory → ext4 image
@@ -144,7 +144,7 @@ function copyPreloads(): void {
   const preloadsDir = join(REPO_ROOT, 'dist', 'preloads');
   mkdirSync(preloadsDir, { recursive: true });
 
-  const files: ReadonlyArray<string> = ['platform-spoof.cjs', 'dlopen-block.cjs'];
+  const files: ReadonlyArray<string> = ['platform-spoof.cjs', 'dlopen-block.cjs', 'env-spy.cjs'];
   for (const file of files) {
     const src = join(REPO_ROOT, 'src', 'guest', file);
     const dst = join(preloadsDir, file);

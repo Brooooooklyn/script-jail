@@ -283,7 +283,7 @@ jobs:
       # Borrow the substring list from test/e2e/generate.test.ts: the
       # Layer-1 suite asserts the same markers against a faked guest, so
       # if Layer 2 sees a different rendered shape, that is a real-VM-only
-      # regression we want to flag.  All 14 assertions cover the 7 fixtures.
+      # regression we want to flag.  All 15 assertions cover the 7 fixtures.
       - name: Assert produced lockfile contains every expected marker
         run: |
           set -euo pipefail
@@ -323,13 +323,14 @@ jobs:
 
           # Attack-shape markers, mirroring test/e2e/generate.test.ts.
           assert_marker '<HIDDEN> $HOME/.ssh/id_rsa'
-          # NOTE: `<HIDDEN> NPM_TOKEN` still has a known limitation in
-          # real-VM runs — Node.js parses environ[] at startup into an
-          # in-memory Map; `process.env.NPM_TOKEN` reads from that Map
-          # without calling libc getenv, so the LD_PRELOAD env-shim does
-          # not fire for `process.env.X` reads.  Layer 1 still asserts
-          # this marker via injected events; v2 environ[] interposition
-          # would close the gap end-to-end.  See env-shim.c TODO(v2).
+          # `<HIDDEN> NPM_TOKEN` is detected by the env-spy.cjs JS preload
+          # (NODE_OPTIONS=--require).  Node.js parses environ[] at startup
+          # into an in-memory Map and serves `process.env.X` from there
+          # without re-entering libc, so the LD_PRELOAD env-shim alone
+          # cannot see `process.env.NPM_TOKEN`.  The env-spy preload wraps
+          # process.env in a Proxy that logs every read and hides values
+          # for names in the protected list — closing this gap end-to-end.
+          assert_marker '<HIDDEN> NPM_TOKEN'
           assert_marker '<ENOENT> gcc'
           assert_marker '<BLOCKED> $PKG/evil.node'
           # Network egress: src/lock/normalize.ts renders
@@ -340,7 +341,7 @@ jobs:
           assert_marker '$REPO/.bashrc'
           assert_marker '<CROSS_PACKAGE> $NODE_MODULES/victim-package/index.js'
 
-          echo "All 14 marker assertions passed."
+          echo "All 15 marker assertions passed."
 
       # ----------------------------------------------------------------------
       # Tamper path: remove a marker line and assert mode=check fails exit-1.
