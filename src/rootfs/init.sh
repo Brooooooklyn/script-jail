@@ -85,7 +85,16 @@ mkdir -p /work
 # the command-substitution's non-zero status to the assignment.  Wrap the
 # call in `if; then; else` so the non-zero branch is handled explicitly.
 if REPO_DEV="$(blkid -L repo)" && [ -n "${REPO_DEV}" ]; then
-  mount -o ro "${REPO_DEV}" /work
+  # Mount read-write: Phase A (`npm ci` / `pnpm fetch` / `yarn install`)
+  # populates a node_modules tree under /work, and Phase B then runs the
+  # lifecycle scripts against it.  A read-only mount makes npm fail with
+  # `ENOENT mkdir '/work/node_modules'` — the audit cannot proceed.
+  #
+  # Modifying the disk in-place is safe: overlay.ts builds a FRESH repo.ext4
+  # per VM run and the host destroys it during teardown (see
+  # src/action/firecracker/teardown.ts).  Any writes the in-VM tooling makes
+  # are scratch — they never touch the user's checkout on the host.
+  mount "${REPO_DEV}" /work
 else
   echo "[init] FATAL: no block device with filesystem label 'repo'" >&2
   exit 1
