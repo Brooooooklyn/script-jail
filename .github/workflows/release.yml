@@ -98,24 +98,26 @@ jobs:
       # unreachable.  Consumer protection still lives in
       # `src/action/validate-manifest.ts`, which throws unconditionally.
       - name: Validate pinned artifact manifest (bootstrap-aware)
+        # Run the validator unguarded under `set -e`: with `--warn-only-placeholders`
+        # the script exits 0 when every offender is a known bootstrap
+        # placeholder, and exits non-zero for any genuine validation
+        # failure (uppercase hex, wrong length, typo, etc.). Wrapping the
+        # invocation in `if … then … fi` would swallow that non-zero exit,
+        # so we run it directly and only the placeholder-warning text is
+        # conditional on grep.
         run: |
           set -euo pipefail
-          if pnpm exec oxnode scripts/validate-manifest.ts --warn-only-placeholders; then
-            # Script exits 0 either because the manifest is fully canonical
-            # OR because every offender is a known bootstrap placeholder.
-            # In the latter case we annotate the run so the maintainer is
-            # not surprised when consumers' CI fails for this tag.
-            if grep -q 'PLACEHOLDER_SHA256_' src/action/artifact-manifest.ts; then
-              echo "::warning::Manifest contains placeholder SHAs. This release will NOT run as an action for consumers. After publishing, copy the SHAs computed below into src/action/artifact-manifest.ts and cut the next release."
-              {
-                echo "## :warning: Manifest contains placeholder SHAs"
-                echo
-                echo "This release will **NOT** run as an action for consumers."
-                echo "After publishing, copy the SHAs printed by the"
-                echo "\"Compute SHAs\" step into \`src/action/artifact-manifest.ts\`"
-                echo "and cut the next release."
-              } >> "$GITHUB_STEP_SUMMARY"
-            fi
+          pnpm exec oxnode scripts/validate-manifest.ts --warn-only-placeholders
+          if grep -q 'PLACEHOLDER_SHA256_' src/action/artifact-manifest.ts; then
+            echo "::warning::Manifest contains placeholder SHAs. This release will NOT run as an action for consumers. After publishing, copy the SHAs computed below into src/action/artifact-manifest.ts and cut the next release."
+            {
+              echo "## :warning: Manifest contains placeholder SHAs"
+              echo
+              echo "This release will **NOT** run as an action for consumers."
+              echo "After publishing, copy the SHAs printed by the"
+              echo "\"Compute SHAs\" step into \`src/action/artifact-manifest.ts\`"
+              echo "and cut the next release."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Typecheck
