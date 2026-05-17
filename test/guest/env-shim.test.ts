@@ -176,11 +176,13 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   it('getenv calls are logged as env_read JSONL lines', (ctx) => {
     if (!shimAvailable) ctx.skip(); // cc was unavailable; skip visibly
 
-    const res = runWithShim({ cmd: 'env | head -1' });
+    // Use `node -e` rather than env(1)/printenv(1): modern GNU coreutils
+    // iterate `environ[]` directly and never call libc getenv, so they
+    // bypass the LD_PRELOAD shim. Node's libuv invokes getenv on startup
+    // and for every process.env.<X> access — guaranteed shim coverage.
+    const res = runWithShim({ cmd: `node -e 'void process.env.PATH'` });
 
-    // env(1) calls getenv or iterates environ; the shim wraps getenv.
-    // At minimum Node/sh startup calls getenv("PATH") or similar.
-    // We can assert that at least one valid JSONL line was written.
+    // Assert at least one valid JSONL line was emitted.
     expect(res.logLines.length).toBeGreaterThan(0);
 
     const first = res.logLines[0];
@@ -198,8 +200,10 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   it('a known env var (PATH) appears in log', (ctx) => {
     if (!shimAvailable) ctx.skip();
 
-    // Use printenv PATH which must call getenv("PATH").
-    const res = runWithShim({ cmd: 'printenv PATH' });
+    // printenv(1) iterates environ[] directly on modern Ubuntu and so
+    // bypasses the LD_PRELOAD shim; route through Node, whose libuv goes
+    // through libc getenv.
+    const res = runWithShim({ cmd: `node -e 'void process.env.PATH'` });
 
     const pathLines = res.logLines.filter((l: string) => {
       try {
