@@ -7,7 +7,7 @@ export default defineConfig({
         test: {
           name: 'unit',
           include: ['test/**/*.test.ts'],
-          exclude: ['test/integration/**', 'test/guest/**'],
+          exclude: ['test/integration/**', 'test/guest/**', 'test/e2e/**'],
         },
       },
       {
@@ -21,6 +21,13 @@ export default defineConfig({
           name: 'integration',
           include: ['test/integration/**/*.test.ts'],
           testTimeout: 120_000,
+        },
+      },
+      {
+        test: {
+          name: 'e2e',
+          include: ['test/e2e/**/*.test.ts'],
+          testTimeout: 30_000,
         },
       },
     ],
