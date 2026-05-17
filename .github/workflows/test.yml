@@ -59,9 +59,17 @@ jobs:
       - name: Test (unit + guest + integration)
         run: pnpm test
 
-      # Bundle the action entry so a silent regression in esbuild config or
-      # an unresolved import surfaces here instead of at consumer-install time.
-      # We don't commit dist/main.js (that lands at release time, not on every
-      # PR), but we do verify it still builds.
-      - name: Bundle action entry (smoke)
+      # Rebuild the action entry from source and verify it matches the copy
+      # committed to the repo.  action.yml's `runs.main: dist/main.js` is
+      # loaded from the tagged tree, so a source change that ships without a
+      # refreshed bundle would produce a tagged action that doesn't reflect
+      # the source.  Catch that drift at PR time instead of at release time.
+      - name: Bundle action entry
         run: pnpm build:bundle
+
+      - name: Verify dist/main.js is up to date
+        run: |
+          if ! git diff --exit-code -- dist/main.js; then
+            echo "::error::dist/main.js is out of date. Run 'pnpm build:bundle' locally and commit the result."
+            exit 1
+          fi
