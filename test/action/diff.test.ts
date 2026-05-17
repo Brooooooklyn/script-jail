@@ -187,3 +187,103 @@ describe('renderDiff — annotation format', () => {
     expect(r.annotations[0]).toMatch(/2 lines removed/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Volatile-field canonicalization (generated_at + manager_lockfile_sha256)
+// ---------------------------------------------------------------------------
+
+describe('renderDiff — volatile field canonicalization', () => {
+  it('returns match=true when only generated_at differs', () => {
+    const committed =
+      'schema_version: 1\n' +
+      'manager: npm\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages: {}\n';
+    const generated =
+      'schema_version: 1\n' +
+      'manager: npm\n' +
+      'generated_at: 2026-05-17T10:00:00.000Z\n' +
+      'packages: {}\n';
+
+    const r = renderDiff({ lockPath: '.script-jail.lock.yml', committed, generated });
+    expect(r.match).toBe(true);
+    expect(r.unified).toBe('');
+    expect(r.annotations).toEqual([]);
+  });
+
+  it('returns match=true when only manager_lockfile_sha256 differs', () => {
+    const committed =
+      'schema_version: 1\n' +
+      'manager_lockfile_sha256: "abc123"\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages: {}\n';
+    const generated =
+      'schema_version: 1\n' +
+      'manager_lockfile_sha256: "def456"\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages: {}\n';
+
+    const r = renderDiff({ lockPath: 'x.yml', committed, generated });
+    expect(r.match).toBe(true);
+    expect(r.unified).toBe('');
+    expect(r.annotations).toEqual([]);
+  });
+
+  it('returns match=true when both volatile fields differ together', () => {
+    const committed =
+      'schema_version: 1\n' +
+      'manager_lockfile_sha256: "abc123"\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages: {}\n';
+    const generated =
+      'schema_version: 1\n' +
+      'manager_lockfile_sha256: "def456"\n' +
+      'generated_at: 2026-05-17T10:00:00.000Z\n' +
+      'packages: {}\n';
+
+    const r = renderDiff({ lockPath: 'x.yml', committed, generated });
+    expect(r.match).toBe(true);
+  });
+
+  it('still reports drift when a real semantic field differs', () => {
+    // Volatile fields ALSO differ — canonicalization should not mask the
+    // real `manager` change.
+    const committed =
+      'schema_version: 1\n' +
+      'manager: npm\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages: {}\n';
+    const generated =
+      'schema_version: 1\n' +
+      'manager: pnpm\n' +
+      'generated_at: 2026-05-17T10:00:00.000Z\n' +
+      'packages: {}\n';
+
+    const r = renderDiff({ lockPath: 'x.yml', committed, generated });
+    expect(r.match).toBe(false);
+    // The unified output uses the ORIGINAL strings (with real timestamps)
+    // rather than the canonical sentinel, so reviewers see actual values.
+    expect(r.unified).toContain('manager: npm');
+    expect(r.unified).toContain('manager: pnpm');
+    expect(r.unified).toContain('2026-05-17T09:00:00.000Z');
+    expect(r.unified).toContain('2026-05-17T10:00:00.000Z');
+  });
+
+  it('does not touch values on indented lines that happen to share the key', () => {
+    // A `generated_at` line inside a deeply nested key (hypothetical) must
+    // NOT be canonicalized — the regex anchors to column 0.
+    const committed =
+      'packages:\n' +
+      '  some-pkg@1.0.0:\n' +
+      '    nested:\n' +
+      '      generated_at: when-this-record-was-collected\n';
+    const generated =
+      'packages:\n' +
+      '  some-pkg@1.0.0:\n' +
+      '    nested:\n' +
+      '      generated_at: a-different-collection-time\n';
+
+    const r = renderDiff({ lockPath: 'x.yml', committed, generated });
+    expect(r.match).toBe(false);
+  });
+});

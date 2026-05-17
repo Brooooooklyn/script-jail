@@ -10,6 +10,17 @@
 // We emit one annotation per hunk of the structured patch (each hunk targets
 // the new-file start line).  When the committed file is missing entirely
 // we emit a single "would be created" annotation at line 1.
+//
+// Volatile-field canonicalization:
+//   `generated_at` and `manager_lockfile_sha256` change on every run for
+//   reasons orthogonal to the audit's semantic content (timestamp from
+//   Date.now() and the consumer's manager lockfile bytes respectively).
+//   Without canonicalization, `mode=check` would surface a drift hunk on
+//   every honest re-run.  We collapse both fields to a fixed sentinel for
+//   the equality check; if everything ELSE matches, the result is
+//   match: true and the unified output is empty.  When there's real
+//   drift, the unified output still shows the ORIGINAL field values so
+//   reviewers see actual timestamps rather than the sentinel.
 
 import { createTwoFilesPatch, structuredPatch } from 'diff';
 
@@ -46,6 +57,16 @@ export function renderDiff(args: RenderDiffArgs): DiffResult {
 
   // Fast path: byte-equal.
   if (committed === generated) {
+    return { unified: '', annotations: [], match: true };
+  }
+
+  // Equality path: canonicalize volatile fields before comparing.  If the
+  // only delta is `generated_at` and/or `manager_lockfile_sha256`, treat
+  // as a match.  We DON'T return the canonicalized text in the unified
+  // output — reviewers want to see real values when there IS real drift.
+  const canonicalCommitted = canonicalizeVolatileFields(committed);
+  const canonicalGenerated = canonicalizeVolatileFields(generated);
+  if (canonicalCommitted === canonicalGenerated) {
     return { unified: '', annotations: [], match: true };
   }
 
@@ -105,6 +126,24 @@ export function renderDiff(args: RenderDiffArgs): DiffResult {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Replace the values of `generated_at` and `manager_lockfile_sha256` with a
+ * fixed sentinel so honest re-runs (where only those two fields change)
+ * compare equal.  Operates on string lines, not parsed YAML, to preserve
+ * exact formatting in the original file — the canonical text is only used
+ * for the equality check.
+ *
+ * Matches lines at the top-level of the YAML document (no leading
+ * whitespace).  The render() in src/lock/render.ts always emits both fields
+ * at column 0, so a strict anchor is correct here.
+ */
+function canonicalizeVolatileFields(yaml: string): string {
+  return yaml.replace(
+    /^(generated_at|manager_lockfile_sha256):.*$/gm,
+    '$1: <canonicalized>',
+  );
+}
 
 /**
  * Count the number of lines in `s`.  An empty string is 0 lines.  A trailing

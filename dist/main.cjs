@@ -27253,6 +27253,11 @@ function renderDiff(args) {
   if (committed === generated) {
     return { unified: "", annotations: [], match: true };
   }
+  const canonicalCommitted = canonicalizeVolatileFields(committed);
+  const canonicalGenerated = canonicalizeVolatileFields(generated);
+  if (canonicalCommitted === canonicalGenerated) {
+    return { unified: "", annotations: [], match: true };
+  }
   const oldLabel = `a/${lockPath}`;
   const newLabel = `b/${lockPath}`;
   const unified = createTwoFilesPatch(
@@ -27293,6 +27298,12 @@ function renderDiff(args) {
     );
   }
   return { unified, annotations, match: false };
+}
+function canonicalizeVolatileFields(yaml) {
+  return yaml.replace(
+    /^(generated_at|manager_lockfile_sha256):.*$/gm,
+    "$1: <canonicalized>"
+  );
 }
 function countLines(s) {
   if (s === "") return 0;
