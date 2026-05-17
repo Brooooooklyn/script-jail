@@ -480,8 +480,29 @@ export async function* runStraceTailer(
  * LD_PRELOAD JSONL records (env_read, dlopen) land here too, yielded as
  * `{ pid: 0, line }`.
  */
+/** Minimal subset of ChildProcess used by LinuxStraceRunner. */
+export interface SpawnResult {
+  stderr: NodeJS.ReadableStream | null;
+  /** stdio[3] is the fd-3 pipe (LD_PRELOAD JSONL). */
+  stdio: Array<NodeJS.ReadableStream | null | undefined>;
+  on(event: 'close', listener: (code: number | null) => void): this;
+  on(event: 'error', listener: (err: Error) => void): this;
+}
+
+/** Injectable spawn function for LinuxStraceRunner (default: node:child_process.spawn). */
+export type SpawnImpl = (
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: Array<string> },
+) => SpawnResult;
+
 export class LinuxStraceRunner implements StraceRunner {
   private _exitCode = 0;
+  private readonly _spawnImpl: SpawnImpl;
+
+  constructor(spawnImpl?: SpawnImpl) {
+    this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
+  }
 
   getExitCode(): number {
     return this._exitCode;
@@ -500,7 +521,7 @@ export class LinuxStraceRunner implements StraceRunner {
       ...args,
     ];
 
-    const child = spawn('strace', straceArgs, {
+    const child = this._spawnImpl('strace', straceArgs, {
       cwd: opts.cwd,
       env: opts.env,
       // fd 0: stdin  → /dev/null

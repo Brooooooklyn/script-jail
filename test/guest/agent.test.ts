@@ -3,15 +3,15 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { PassThrough } from 'node:stream';
-import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, rmSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, main, MemoryConnection, runStraceTailer } from '../../src/guest/agent.js';
-import type { DnsLookupFn } from '../../src/guest/agent.js';
+import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer } from '../../src/guest/agent.js';
+import type { DnsLookupFn, SpawnResult } from '../../src/guest/agent.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
 import type { StraceRunner } from '../../src/guest/phase-install.js';
 
@@ -996,7 +996,6 @@ describe('runStraceTailer', () => {
 
     // Append second line after a short delay.
     setTimeout(() => {
-      const { appendFileSync } = require('node:fs');
       appendFileSync(`${basePath}.777`, 'openat(AT_FDCWD, "/second", O_RDONLY) = 4\n');
       setTimeout(resolveExit, 60);
     }, 40);
@@ -1029,6 +1028,29 @@ describe('LinuxStraceRunner stderr forwarding', () => {
   });
 
   it('forwards strace stderr lines to process.stderr with [strace] prefix and does not yield them in the iterator', async () => {
+    // Build a synthetic ChildProcess-shaped object that exposes stderr (a
+    // PassThrough), a stdio[3] pipe for fd-3 JSONL, and an on('close') emitter.
+    // This is injected via the spawnImpl DI seam so LinuxStraceRunner.run() is
+    // exercised end-to-end without needing a real strace binary.
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+
+    let closeListener: ((code: number | null) => void) | undefined;
+    let errorListener: ((err: Error) => void) | undefined;
+
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        if (event === 'error') errorListener = listener as (err: Error) => void;
+        return this;
+      },
+    };
+    void errorListener; // suppress unused warning
+
+    const runner = new LinuxStraceRunner(() => fakeChild);
+
     // Spy on process.stderr.write to capture forwarded lines.
     const capturedStderr: string[] = [];
     const origWrite = process.stderr.write.bind(process.stderr);
@@ -1040,57 +1062,36 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     process.stderr.write = stderrSpy as typeof process.stderr.write;
 
     try {
-      // Use a real strace invocation on a trivially failing command so strace
-      // actually writes to stderr.  On Linux in CI strace is available; if not,
-      // the child.error path sets exitCode=1 and the iterator still completes.
-      // We inject a fake child via the DI seam instead so the test is hermetic.
-
-      // Build a fake child that emits synthetic stderr lines and exits quickly.
-      const { PassThrough: PT } = await import('node:stream');
-      const fakeStderr = new PT();
-      const fakeFd3 = new PT();
-
-      // Manually call the internal runStraceTailer with a fake fd3 + exitPromise,
-      // and exercise the stderr forwarding logic of LinuxStraceRunner by
-      // wiring the readline directly (mirrors what run() does internally).
-      const { createInterface: rlCreate } = await import('node:readline');
-
-      let resolveExit!: () => void;
-      const exitPromise = new Promise<void>((r) => { resolveExit = r; });
-
-      // Simulate what LinuxStraceRunner.run() does with child.stderr:
-      const stderrRl = rlCreate({ input: fakeStderr, crlfDelay: Infinity });
-      stderrRl.on('line', (line: string) => {
-        process.stderr.write(`[strace] ${line}\n`);
+      const basePath = `${tailerDir}/strace.out`;
+      const runIter = runner.run('npm', ['rebuild'], {
+        env: {},
+        cwd: tailerDir,
+        basePath,
       });
+
+      // Collect items from the iterator in background while we push data.
+      const itemsPromise: Promise<Array<{ pid: number; line: string }>> = (async () => {
+        const collected: Array<{ pid: number; line: string }> = [];
+        for await (const item of runIter) {
+          collected.push(item);
+        }
+        return collected;
+      })();
 
       // Emit two synthetic strace stderr lines.
       fakeStderr.push('strace: exec failed: No such file or directory\n');
-      fakeStderr.push("ptrace: Operation not permitted\n");
-      fakeStderr.push(null); // EOF
+      fakeStderr.push('ptrace: Operation not permitted\n');
+      fakeStderr.push(null); // EOF so readline closes
 
       // Emit one fd3 JSONL line (should yield through iterator with pid=0).
       const shimLine = JSON.stringify({ kind: 'env_read', name: 'HOME', pid: 1, ts: 1000, hidden: false });
       fakeFd3.push(shimLine + '\n');
       fakeFd3.push(null);
 
-      resolveExit();
+      // Signal child exit so the tailer drains and finishes.
+      setTimeout(() => { closeListener?.(0); }, 30);
 
-      const tailer = runStraceTailer({
-        watchDir: tailerDir,
-        basePrefix: 'strace.out',
-        fd3Stream: fakeFd3,
-        exitPromise,
-        pollIntervalMs: 20,
-        drainMs: 30,
-      });
-
-      const items: Array<{ pid: number; line: string }> = [];
-      for await (const item of tailer) {
-        items.push(item);
-      }
-
-      stderrRl.close();
+      const items = await itemsPromise;
 
       // The stderr lines must NOT appear in the yielded iterator items.
       const allLines = items.map((i) => i.line);
@@ -1107,6 +1108,69 @@ describe('LinuxStraceRunner stderr forwarding', () => {
       expect(forwardedLines).toContain('[strace] ptrace: Operation not permitted');
     } finally {
       process.stderr.write = origWrite;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStraceTailer cleanup (try/finally) on consumer break
+// ---------------------------------------------------------------------------
+
+describe('runStraceTailer cleanup on early break', () => {
+  let tailerDir: string;
+
+  beforeEach(() => {
+    tailerDir = join(tmpdir(), `strace-tailer-break-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(tailerDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(tailerDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('clears the poll interval when the consumer breaks out of for-await early', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    // Write one line so the tailer has something to yield before we break.
+    writeFileSync(`${basePath}.1`, 'openat(AT_FDCWD, "/first", O_RDONLY) = 3\n', 'utf8');
+
+    // Capture clearInterval calls so we can assert cleanup fired.
+    const clearedIds: Array<ReturnType<typeof setInterval>> = [];
+    const realClearInterval = clearInterval;
+    const clearIntervalSpy = (id: ReturnType<typeof setInterval> | string | number | undefined): void => {
+      if (id !== undefined) clearedIds.push(id as ReturnType<typeof setInterval>);
+      realClearInterval(id as ReturnType<typeof setInterval>);
+    };
+    // Patch the global so runStraceTailer's finally block calls our spy.
+    (globalThis as Record<string, unknown>)['clearInterval'] = clearIntervalSpy;
+
+    try {
+      // exitPromise that never resolves — only the consumer break should stop the loop.
+      const exitPromise = new Promise<void>(() => { /* never */ });
+
+      const tailer = runStraceTailer({
+        watchDir: tailerDir,
+        basePrefix: 'strace.out',
+        fd3Stream: null,
+        exitPromise,
+        pollIntervalMs: 50,
+        drainMs: 50,
+      });
+
+      // Read exactly one item then break.
+      const collected: Array<{ pid: number; line: string }> = [];
+      for await (const item of tailer) {
+        collected.push(item);
+        break; // triggers the try/finally in runStraceTailer
+      }
+
+      // We got the first line.
+      expect(collected).toHaveLength(1);
+      expect(collected[0]!.line).toContain('/first');
+
+      // The finally block must have called clearInterval at least once.
+      expect(clearedIds.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      (globalThis as Record<string, unknown>)['clearInterval'] = realClearInterval;
     }
   });
 });
