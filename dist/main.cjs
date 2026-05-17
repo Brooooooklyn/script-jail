@@ -27811,7 +27811,7 @@ async function launchVm(input) {
   const handle = spawner.spawn(
     firecrackerPath,
     ["--api-sock", socketPath],
-    { stdio: "ignore" }
+    { stdio: "forward" }
   );
   try {
     await poller.waitForSocket(socketPath, 5e3);
@@ -27898,10 +27898,15 @@ async function setupTapDevice(api) {
 }
 var NodeSpawner = class {
   spawn(cmd, args, opts) {
+    const childStdio = opts.stdio === "ignore" ? "ignore" : ["ignore", "pipe", "pipe"];
     const child = (0, import_node_child_process2.spawn)(cmd, [...args], {
-      stdio: opts.stdio,
+      stdio: childStdio,
       detached: false
     });
+    if (opts.stdio === "forward") {
+      forwardStream(child.stdout, "[fc:out] ");
+      forwardStream(child.stderr, "[fc:err] ");
+    }
     let exitCode;
     const exitPromise = new Promise((resolve2) => {
       child.on("close", (code) => {
@@ -27922,6 +27927,26 @@ var NodeSpawner = class {
     };
   }
 };
+function forwardStream(stream, prefix) {
+  if (!stream) return;
+  let buf = "";
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk) => {
+    buf += chunk;
+    let newlineIdx = buf.indexOf("\n");
+    while (newlineIdx !== -1) {
+      const line = buf.slice(0, newlineIdx);
+      process.stderr.write(`${prefix}${line}
+`);
+      buf = buf.slice(newlineIdx + 1);
+      newlineIdx = buf.indexOf("\n");
+    }
+  });
+  stream.on("end", () => {
+    if (buf.length > 0) process.stderr.write(`${prefix}${buf}
+`);
+  });
+}
 var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;

@@ -45,7 +45,7 @@ export interface Spawner {
   spawn(
     cmd: string,
     args: ReadonlyArray<string>,
-    opts: { stdio: 'ignore' },
+    opts: { stdio: 'ignore' | 'forward' },
   ): SpawnHandle;
 }
 
@@ -173,11 +173,16 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
   const apiClient: FirecrackerApiClient =
     input.apiClient ?? new UnixSocketApiClient(socketPath);
 
-  // 1. Spawn the firecracker subprocess.
+  // 1. Spawn the firecracker subprocess. `stdio: 'forward'` lets
+  // NodeSpawner tee Firecracker's stdout (which includes the guest
+  // kernel's serial console output, configured via `console=ttyS0`)
+  // to process.stderr with a `[fc]` prefix. Without this, VM boot
+  // failures and init/agent crashes are invisible — the host only
+  // sees the eventual "vsock session ended without a final frame".
   const handle = spawner.spawn(
     firecrackerPath,
     ['--api-sock', socketPath],
-    { stdio: 'ignore' },
+    { stdio: 'forward' },
   );
 
   // 2. Wait for the API socket to be ready.
@@ -328,12 +333,24 @@ class NodeSpawner implements Spawner {
   spawn(
     cmd: string,
     args: ReadonlyArray<string>,
-    opts: { stdio: 'ignore' },
+    opts: { stdio: 'ignore' | 'forward' },
   ): SpawnHandle {
+    // 'ignore' wires both stdout and stderr to /dev/null at the OS level.
+    // 'forward' pipes them so we can prefix each line and tee to our own
+    // stderr, keeping kernel boot/init/agent output visible without
+    // mixing it irrecoverably with action progress.
+    const childStdio: 'ignore' | ['ignore', 'pipe', 'pipe'] =
+      opts.stdio === 'ignore' ? 'ignore' : ['ignore', 'pipe', 'pipe'];
+
     const child = nodeSpawn(cmd, [...args], {
-      stdio: opts.stdio,
+      stdio: childStdio,
       detached: false,
     });
+
+    if (opts.stdio === 'forward') {
+      forwardStream(child.stdout, '[fc:out] ');
+      forwardStream(child.stderr, '[fc:err] ');
+    }
 
     let exitCode: number | undefined;
     const exitPromise = new Promise<number>((resolve) => {
@@ -355,6 +372,29 @@ class NodeSpawner implements Spawner {
       waitForExit: () => exitPromise,
     };
   }
+}
+
+/**
+ * Line-buffer `stream` and write each completed line to process.stderr
+ * with the given prefix. Trailing partial lines are flushed at end-of-stream.
+ */
+function forwardStream(stream: NodeJS.ReadableStream | null, prefix: string): void {
+  if (!stream) return;
+  let buf = '';
+  stream.setEncoding('utf8');
+  stream.on('data', (chunk: string) => {
+    buf += chunk;
+    let newlineIdx = buf.indexOf('\n');
+    while (newlineIdx !== -1) {
+      const line = buf.slice(0, newlineIdx);
+      process.stderr.write(`${prefix}${line}\n`);
+      buf = buf.slice(newlineIdx + 1);
+      newlineIdx = buf.indexOf('\n');
+    }
+  });
+  stream.on('end', () => {
+    if (buf.length > 0) process.stderr.write(`${prefix}${buf}\n`);
+  });
 }
 
 // ---------------------------------------------------------------------------
