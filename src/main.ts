@@ -423,6 +423,13 @@ export async function main(deps: MainDeps = {}): Promise<void> {
 
   // mode === 'update'
   writeFileSync(inputs.lockPath, finalYaml, 'utf8');
+  // Diagnostic: emit the path + byte count so the next workflow run can map
+  // an empty-on-disk lockfile back to either (a) a wrong path or (b) an
+  // empty `finalYaml`.  Cheap (one line); pays for itself the next time
+  // `test -s "$LOCK"` fails downstream.
+  process.stderr.write(
+    `[script-jail] wrote ${Buffer.byteLength(finalYaml, 'utf8')} bytes to ${inputs.lockPath}\n`,
+  );
   setOutput('lockfile', inputs.lockPath);
   setOutput('diff', '');
 }

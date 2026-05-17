@@ -28450,6 +28450,10 @@ async function main(deps = {}) {
     return;
   }
   (0, import_node_fs11.writeFileSync)(inputs.lockPath, finalYaml, "utf8");
+  process.stderr.write(
+    `[script-jail] wrote ${Buffer.byteLength(finalYaml, "utf8")} bytes to ${inputs.lockPath}
+`
+  );
   setOutput("lockfile", inputs.lockPath);
   setOutput("diff", "");
 }

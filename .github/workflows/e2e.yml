@@ -288,6 +288,13 @@ jobs:
         run: |
           set -euo pipefail
           LOCK="${{ runner.temp }}/consumer/.script-jail.lock.yml"
+          # Diagnostic: dump the staged consumer dir before asserting on
+          # the lockfile.  Saved us hours last time the lockfile wasn't
+          # at the expected path; cheap to leave in.
+          echo "--- ls of consumer dir ---"
+          ls -la "${{ runner.temp }}/consumer/" || true
+          echo "--- expected lockfile path ---"
+          echo "$LOCK"
           test -s "$LOCK"
 
           # Per-package keys (one per fixture).
