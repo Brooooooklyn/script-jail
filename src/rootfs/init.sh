@@ -25,9 +25,17 @@ mount -t tmpfs -o size=64m tmpfs /tmp 2>/dev/null || true
 mount -t tmpfs -o size=16m tmpfs /root 2>/dev/null || true
 # /dev is set up by the kernel device tree.
 
-# Loopback is brought up by the Firecracker kernel driver before PID 1
-# starts; no userspace setup needed. iproute2/net-tools are deliberately
-# omitted to keep the rootfs small.
+# Bring up the loopback interface. The kernel creates `lo` in DOWN state;
+# without an explicit `up` here the agent's listener on 127.0.0.1:10243
+# binds successfully but no traffic actually flows. socat's TCP forwarder
+# inside `orchestrate.sh` then fails with `connect(...): Network is
+# unreachable` and the host sees only "vsock session ended without a
+# final frame".  We use busybox's `ifconfig` applet since the rootfs
+# deliberately omits iproute2 / net-tools (Dockerfile.base) to keep the
+# image small.  Failure is fatal — without loopback the agent cannot
+# accept its single control connection.
+busybox ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
+busybox ifconfig lo
 
 # --- Repo disk (filesystem label `repo`) --------------------------------------
 # The host always registers the repo drive when running through the action.
