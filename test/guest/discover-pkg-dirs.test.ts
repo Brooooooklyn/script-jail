@@ -1,7 +1,7 @@
 // Tests for src/guest/discover-pkg-dirs.ts
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -161,6 +161,51 @@ describe('discoverPkgDirs()', () => {
     expect(result.get('pkg-a@1.0.0')).toBe(join(nm, 'pkg-a'));
     expect(result.get('pkg-b@1.0.0')).toBe(join(nm, 'pkg-b'));
     expect(result.get('pkg-c@2.5.3')).toBe(join(nm, 'pkg-c'));
+  });
+
+  it('discovers packages installed as symlinks (npm 7+ file: dep layout)', () => {
+    // npm 7+ installs `file:` deps as symlinks in node_modules: the source
+    // package lives elsewhere on disk and node_modules/<name> is a symlink
+    // to it.  `Dirent.isDirectory()` returns false for such entries — only
+    // `isSymbolicLink()` is true — so discoverPkgDirs must accept both.
+    const sourceDir = join(testDir, 'src-pkg');
+    writePkg(sourceDir, 'linked-pkg', '4.2.0');
+
+    const nm = join(testDir, 'node_modules');
+    mkdirSync(nm, { recursive: true });
+    symlinkSync(sourceDir, join(nm, 'linked-pkg'), 'dir');
+
+    const result = discoverPkgDirs(nm);
+
+    expect(result.size).toBe(1);
+    // The recorded path is the entry path under node_modules, not the
+    // symlink target — callers join `package.json` paths against this.
+    expect(result.get('linked-pkg@4.2.0')).toBe(join(nm, 'linked-pkg'));
+  });
+
+  it('discovers scoped packages installed as symlinks', () => {
+    const sourceDir = join(testDir, 'src-scoped');
+    writePkg(sourceDir, '@scope/linked', '0.5.0');
+
+    const nm = join(testDir, 'node_modules');
+    mkdirSync(join(nm, '@scope'), { recursive: true });
+    symlinkSync(sourceDir, join(nm, '@scope', 'linked'), 'dir');
+
+    const result = discoverPkgDirs(nm);
+
+    expect(result.size).toBe(1);
+    expect(result.get('@scope/linked@0.5.0')).toBe(join(nm, '@scope', 'linked'));
+  });
+
+  it('tolerates dangling symlinks silently', () => {
+    const nm = join(testDir, 'node_modules');
+    mkdirSync(nm, { recursive: true });
+    // Symlink to a nonexistent target — ENOENT is handled inside readAndRegister.
+    symlinkSync(join(testDir, 'nonexistent-target'), join(nm, 'broken-link'), 'dir');
+
+    expect(() => discoverPkgDirs(nm)).not.toThrow();
+    const result = discoverPkgDirs(nm);
+    expect(result.size).toBe(0);
   });
 
   it('skips dotfiles within scope directories', () => {

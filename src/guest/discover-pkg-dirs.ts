@@ -53,12 +53,17 @@ export function discoverPkgDirs(nodeModulesDir: string): Map<string, string> {
       }
       for (const scopeEntry of scopeEntries) {
         if (scopeEntry.name.startsWith('.')) continue;
-        if (!scopeEntry.isDirectory()) continue;
+        // Accept directories AND symlinks: npm 7+ installs `file:` deps as
+        // symlinks pointing at the source dir, and `Dirent.isDirectory()`
+        // returns false for them (the entry itself is a link, not a dir).
+        // The downstream `readAndRegister` is ENOENT-tolerant, so dangling
+        // links fall through silently.
+        if (!scopeEntry.isDirectory() && !scopeEntry.isSymbolicLink()) continue;
         const pkgPath = join(entryPath, scopeEntry.name);
         readAndRegister(pkgPath, result);
       }
     } else {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       readAndRegister(entryPath, result);
     }
   }
