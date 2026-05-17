@@ -106,6 +106,30 @@ jobs:
           fi
           ls -l /dev/kvm
 
+      # GitHub-hosted runners create /dev/kvm with mode 0660 owned by
+      # root:kvm.  The `runner` user is NOT in the kvm group on either
+      # ubuntu-22.04 or ubuntu-24.04 images, so opening /dev/kvm later
+      # fails with EACCES and Firecracker's InstanceStart returns
+      # HTTP 400 ("Error creating KVM object: Permission denied").
+      #
+      # Install a udev rule that re-perms /dev/kvm to 0666 and retrigger
+      # so the rule applies to the already-created node.  This is the
+      # standard pattern recommended in github/runner-images discussions
+      # (issue #1183) and used by firecracker-microvm CI examples.
+      - name: Grant runner access to /dev/kvm
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          # Sanity-check the runner can now open it for read+write.
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            echo "::error::/dev/kvm still not r/w accessible to the runner user after udev re-trigger"
+            exit 1
+          fi
+
       # Build the action bundle, C shim, AND the per-runner rootfs ext4
       # image.  The single `pnpm build -- --runner-image=…` call does all
       # three (action bundle → esbuild, shim → src/shim/build.sh, rootfs
