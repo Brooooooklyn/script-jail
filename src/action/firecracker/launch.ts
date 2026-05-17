@@ -214,13 +214,21 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
       is_read_only: false,
     });
 
-    // 4b. Optional repo disk.
+    // 4b. Optional repo disk.  Registered read-WRITE so Phase A (`npm ci` /
+    //     `pnpm fetch` / `yarn install`) can populate /work/node_modules.
+    //     The repo disk is per-run scratch — overlay.ts builds a fresh
+    //     repo.ext4 every launch and teardown destroys it, so writes
+    //     inside the VM never reach the user's checkout on the host.  If
+    //     this is `is_read_only: true`, the guest kernel marks the block
+    //     device write-protected at registration time and mount(8) in
+    //     init.sh falls back to read-only regardless of the `-o ro`
+    //     flag, producing `ENOENT mkdir /work/node_modules` from npm.
     if (repoDiskPath !== undefined) {
       await apiClient.put('/drives/repo', {
         drive_id: 'repo',
         path_on_host: repoDiskPath,
         is_root_device: false,
-        is_read_only: true,
+        is_read_only: false,
       });
     }
 

@@ -27837,7 +27837,7 @@ async function launchVm(input) {
         drive_id: "repo",
         path_on_host: repoDiskPath,
         is_root_device: false,
-        is_read_only: true
+        is_read_only: false
       });
     }
     if (hostNodeDiskPath !== void 0) {

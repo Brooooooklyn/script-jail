@@ -248,7 +248,8 @@ describe('launchVm', () => {
     expect(body['drive_id']).toBe('repo');
     expect(body['path_on_host']).toBe('/run/repo.ext4');
     expect(body['is_root_device']).toBe(false);
-    expect(body['is_read_only']).toBe(true);
+    // Repo disk is per-run scratch — Phase A needs to write /work/node_modules.
+    expect(body['is_read_only']).toBe(false);
   });
 
   it('does NOT send /drives/repo when repoDiskPath is not provided', async () => {
