@@ -380,8 +380,11 @@ jobs:
         uses: ./
         env:
           # Same workspace override as the update step above — see the long
-          # comment there for why this is necessary.
-          GITHUB_WORKSPACE: ${{ runner.temp }}/consumer
+          # comment there for why SCRIPT_JAIL_REPO_DIR (not GITHUB_WORKSPACE)
+          # is the right knob: GitHub Actions silently drops step-level
+          # GITHUB_WORKSPACE overrides, so without this the action would
+          # audit the script-jail repo itself rather than the consumer.
+          SCRIPT_JAIL_REPO_DIR: ${{ runner.temp }}/consumer
         with:
           mode: check
 
