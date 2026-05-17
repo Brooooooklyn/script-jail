@@ -501,7 +501,18 @@ async function verifyOfflineWithTimeout(
  * failure if neither worked.
  */
 async function defaultDropEth0(spawner: Spawner, env: NodeJS.ProcessEnv): Promise<void> {
+  // The rootfs (src/rootfs/Dockerfile.base) installs busybox but deliberately
+  // omits iproute2 / net-tools to keep the image small.  busybox's applets are
+  // NOT symlinked into /usr/sbin under the default `apt-get install -y --no-
+  // install-recommends busybox` recipe, so bare `ip` and `ifconfig` produce
+  // ENOENT.  Invoke through `busybox <applet>` instead.
+  //
+  // The trailing bare-binary entries are retained as best-effort fallbacks
+  // for any non-Ubuntu rootfs variant that may ship iproute2 or net-tools
+  // directly (the abstraction here is the agent, not the rootfs).
   const tries: Array<{ cmd: string; args: string[] }> = [
+    { cmd: 'busybox', args: ['ip', 'link', 'set', 'eth0', 'down'] },
+    { cmd: 'busybox', args: ['ifconfig', 'eth0', 'down'] },
     { cmd: 'ip', args: ['link', 'set', 'eth0', 'down'] },
     { cmd: 'ifconfig', args: ['eth0', 'down'] },
   ];
