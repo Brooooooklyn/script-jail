@@ -28016,12 +28016,16 @@ async function openVsockSession(udsPath, port, options) {
   let duplex;
   if (options?.duplex !== void 0) {
     duplex = options.duplex;
+    duplex.write(`CONNECT ${port}
+`);
   } else {
-    const sock = await connectUnixSocket(udsPath, options?.connectTimeoutMs ?? 3e4);
+    const sock = await dialVsockWithRetry(
+      udsPath,
+      port,
+      options?.connectTimeoutMs ?? 3e4
+    );
     duplex = socketToDuplex(sock);
   }
-  duplex.write(`CONNECT ${port}
-`);
   const events = parseFrames(duplex.readable);
   const session = {
     events,
@@ -28140,6 +28144,79 @@ function connectUnixSocket(sockPath, timeoutMs) {
       reject(err);
     });
   });
+}
+async function dialVsockWithRetry(udsPath, port, totalTimeoutMs) {
+  const deadline = Date.now() + totalTimeoutMs;
+  let attempt = 0;
+  let lastError = "no attempts made";
+  while (Date.now() < deadline) {
+    attempt++;
+    let sock;
+    try {
+      sock = await connectUnixSocket(udsPath, 5e3);
+    } catch (err) {
+      lastError = `attempt ${attempt}: UDS connect failed: ${err.message}`;
+      await sleep2(200);
+      continue;
+    }
+    sock.write(`CONNECT ${port}
+`);
+    const result = await waitForOkLine(sock, 1e3);
+    if (result.kind === "ok") {
+      if (result.remainder.length > 0) sock.unshift(result.remainder);
+      return sock;
+    }
+    sock.destroy();
+    lastError = `attempt ${attempt}: ${result.reason}`;
+    const backoff = Math.min(200 * 2 ** (attempt - 1), 2e3);
+    await sleep2(backoff);
+  }
+  throw new Error(
+    `script-jail: vsock CONNECT did not complete within ${totalTimeoutMs} ms \u2014 ${lastError}`
+  );
+}
+function waitForOkLine(sock, timeoutMs) {
+  return new Promise((resolve2) => {
+    const chunks = [];
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.off("data", onData);
+      sock.off("close", onClose);
+      sock.off("error", onError);
+      resolve2(result);
+    };
+    const onData = (chunk) => {
+      chunks.push(chunk);
+      const all = Buffer.concat(chunks);
+      const newlineIdx = all.indexOf(
+        10
+        /* \n */
+      );
+      if (newlineIdx === -1) return;
+      const line = all.subarray(0, newlineIdx).toString("utf8").trim();
+      const remainder = all.subarray(newlineIdx + 1);
+      if (line.startsWith("OK ")) {
+        finish({ kind: "ok", remainder });
+      } else {
+        finish({ kind: "fail", reason: `unexpected handshake response: "${line}"` });
+      }
+    };
+    const onClose = () => finish({ kind: "fail", reason: "socket closed before OK" });
+    const onError = (err) => finish({ kind: "fail", reason: `socket error: ${err.message}` });
+    const timer = setTimeout(
+      () => finish({ kind: "fail", reason: `timeout waiting for OK response (${timeoutMs}ms)` }),
+      timeoutMs
+    );
+    sock.on("data", onData);
+    sock.once("close", onClose);
+    sock.once("error", onError);
+  });
+}
+function sleep2(ms) {
+  return new Promise((resolve2) => setTimeout(resolve2, ms));
 }
 function socketToDuplex(sock) {
   return {

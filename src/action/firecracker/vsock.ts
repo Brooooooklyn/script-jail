@@ -104,17 +104,26 @@ export async function openVsockSession(
 
   if (options?.duplex !== undefined) {
     duplex = options.duplex;
+    // In test mode the fake duplex is "always ready"; just emit CONNECT
+    // so tests can assert on it.
+    duplex.write(`CONNECT ${port}\n`);
   } else {
     // Production: host-initiated mode — connect to the BASE UDS path
-    // Firecracker created on PUT /vsock (no `_<port>` suffix).  The
-    // `_<port>` socket is the guest-initiated path which we don't use;
-    // see the protocol comment at the top of this file.
-    const sock = await connectUnixSocket(udsPath, options?.connectTimeoutMs ?? 30_000);
+    // Firecracker created on PUT /vsock (no `_<port>` suffix).  Retry
+    // the CONNECT until the guest's AF_VSOCK listener (socat invoked by
+    // /sbin/orchestrate) is up.  Firecracker accepts the UDS connection
+    // immediately on PUT /vsock, but it replies to CONNECT with `ERR …`
+    // or closes the socket when no guest listener exists yet.  Without
+    // retry the host gives up at ~0.8s — long before the VM has even
+    // booted past kernel init.  See protocol comment at top of file.
+    const sock = await dialVsockWithRetry(
+      udsPath,
+      port,
+      options?.connectTimeoutMs ?? 30_000,
+    );
     duplex = socketToDuplex(sock);
+    // CONNECT + OK handshake already completed inside dialVsockWithRetry.
   }
-
-  // Send the vsock CONNECT handshake.
-  duplex.write(`CONNECT ${port}\n`);
 
   // Build the async iterable over JSONL frames.
   const events = parseFrames(duplex.readable);
@@ -271,6 +280,118 @@ function connectUnixSocket(sockPath: string, timeoutMs: number): Promise<Socket>
       reject(err);
     });
   });
+}
+
+/**
+ * Dial the Firecracker vsock UDS in host-initiated mode and complete the
+ * `CONNECT <port>` handshake. Retries on `ERR …`, on early-close, or on
+ * timeout-without-OK — all expected during VM boot before the guest's
+ * AF_VSOCK listener (socat) is up.  Resolves with a Socket whose first
+ * inbound bytes are the start of the guest stream (the `OK <port>\n`
+ * response has been consumed; any trailing bytes after `OK` are unshifted
+ * back so the downstream JSONL parser doesn't miss them).
+ */
+async function dialVsockWithRetry(
+  udsPath: string,
+  port: number,
+  totalTimeoutMs: number,
+): Promise<Socket> {
+  const deadline = Date.now() + totalTimeoutMs;
+  let attempt = 0;
+  let lastError = 'no attempts made';
+
+  while (Date.now() < deadline) {
+    attempt++;
+    let sock: Socket;
+    try {
+      // 5 s per-attempt UDS connect.  The UDS file is created at
+      // PUT /vsock so this almost always succeeds immediately; the
+      // failure modes we retry are CONNECT-level, not connect-level.
+      sock = await connectUnixSocket(udsPath, 5_000);
+    } catch (err) {
+      lastError = `attempt ${attempt}: UDS connect failed: ${(err as Error).message}`;
+      await sleep(200);
+      continue;
+    }
+
+    sock.write(`CONNECT ${port}\n`);
+
+    const result = await waitForOkLine(sock, 1_000);
+    if (result.kind === 'ok') {
+      // Put any bytes that arrived after the OK newline back into the
+      // socket's readable side so the downstream parser sees them.
+      if (result.remainder.length > 0) sock.unshift(result.remainder);
+      return sock;
+    }
+
+    sock.destroy();
+    lastError = `attempt ${attempt}: ${result.reason}`;
+    const backoff = Math.min(200 * 2 ** (attempt - 1), 2000);
+    await sleep(backoff);
+  }
+
+  throw new Error(
+    `script-jail: vsock CONNECT did not complete within ${totalTimeoutMs} ms — ${lastError}`,
+  );
+}
+
+/**
+ * Reads bytes from `sock` until either:
+ *   - the first newline arrives: return { ok: true, remainder: rest }
+ *     if the line begins with `OK `, otherwise { ok: false, reason: … }.
+ *   - the socket closes or errors: return { ok: false, reason: 'closed' / 'error' }.
+ *   - timeoutMs elapses: return { ok: false, reason: 'timeout' }.
+ *
+ * All listeners are removed before resolving so the caller can safely
+ * reuse the socket (on OK) or destroy it (on failure).
+ */
+function waitForOkLine(
+  sock: Socket,
+  timeoutMs: number,
+): Promise<{ kind: 'ok'; remainder: Buffer } | { kind: 'fail'; reason: string }> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let settled = false;
+
+    const finish = (result: { kind: 'ok'; remainder: Buffer } | { kind: 'fail'; reason: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.off('data', onData);
+      sock.off('close', onClose);
+      sock.off('error', onError);
+      resolve(result);
+    };
+
+    const onData = (chunk: Buffer) => {
+      chunks.push(chunk);
+      const all = Buffer.concat(chunks);
+      const newlineIdx = all.indexOf(0x0a /* \n */);
+      if (newlineIdx === -1) return;
+      const line = all.subarray(0, newlineIdx).toString('utf8').trim();
+      const remainder = all.subarray(newlineIdx + 1);
+      if (line.startsWith('OK ')) {
+        finish({ kind: 'ok', remainder });
+      } else {
+        finish({ kind: 'fail', reason: `unexpected handshake response: "${line}"` });
+      }
+    };
+    const onClose = (): void => finish({ kind: 'fail', reason: 'socket closed before OK' });
+    const onError = (err: Error): void => finish({ kind: 'fail', reason: `socket error: ${err.message}` });
+
+    const timer = setTimeout(
+      () => finish({ kind: 'fail', reason: `timeout waiting for OK response (${timeoutMs}ms)` }),
+      timeoutMs,
+    );
+
+    sock.on('data', onData);
+    sock.once('close', onClose);
+    sock.once('error', onError);
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function socketToDuplex(sock: Socket): VsockDuplex {
