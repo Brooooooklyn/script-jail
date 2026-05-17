@@ -12,7 +12,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const preloadPath = join(__dirname, '../../src/guest/dlopen-block.cjs');
 
 function writeChildScript(code: string): string {
-  const dir = join(tmpdir(), 'npm-jar-test');
+  const dir = join(tmpdir(), 'script-jail-test');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `child-dlopen-${Date.now()}-${Math.random().toString(36).slice(2)}.cjs`);
   writeFileSync(path, `'use strict';\n${code}\n`);
@@ -70,7 +70,7 @@ describe('dlopen-block preload', () => {
     expect(result.exitCode).toBe(0);
     const out = JSON.parse(result.stdout) as { threw: boolean; message: string };
     expect(out.threw).toBe(true);
-    expect(out.message).toBe('npm-jar: native addons are blocked at install time');
+    expect(out.message).toBe('script-jail: native addons are blocked at install time');
   });
 
   it('process.binding throws with the expected message', async () => {
@@ -86,10 +86,10 @@ describe('dlopen-block preload', () => {
     expect(result.exitCode).toBe(0);
     const out = JSON.parse(result.stdout) as { threw: boolean; message: string };
     expect(out.threw).toBe(true);
-    expect(out.message).toBe('npm-jar: native addons are blocked at install time');
+    expect(out.message).toBe('script-jail: native addons are blocked at install time');
   });
 
-  it('does not crash when NPM_JAR_LOG_FD is unset', async () => {
+  it('does not crash when SCRIPT_JAIL_LOG_FD is unset', async () => {
     const code = `
       try {
         process.dlopen({}, '/tmp/test.node');
@@ -98,8 +98,8 @@ describe('dlopen-block preload', () => {
       }
     `;
     const env: Record<string, string | undefined> = { ...process.env };
-    delete env['NPM_JAR_LOG_FD'];
-    const result = await runWithBlock(code, { NPM_JAR_LOG_FD: undefined });
+    delete env['SCRIPT_JAIL_LOG_FD'];
+    const result = await runWithBlock(code, { SCRIPT_JAIL_LOG_FD: undefined });
     expect(result.exitCode).toBe(0);
     const out = JSON.parse(result.stdout) as { ok: boolean };
     expect(out.ok).toBe(true);
@@ -124,8 +124,8 @@ describe('dlopen-block preload', () => {
     expect(out.allSame).toBe(true);
   });
 
-  it('does not crash when NPM_JAR_LOG_FD is an invalid (out-of-range) fd', async () => {
-    // NPM_JAR_LOG_FD is read at preload load time. An invalid fd (e.g. 999)
+  it('does not crash when SCRIPT_JAIL_LOG_FD is an invalid (out-of-range) fd', async () => {
+    // SCRIPT_JAIL_LOG_FD is read at preload load time. An invalid fd (e.g. 999)
     // causes writeSync to throw, which is caught internally. The throw from
     // process.dlopen still happens regardless of logging success.
     const code = `
@@ -136,7 +136,7 @@ describe('dlopen-block preload', () => {
       }
       process.stderr.write('DONE\\n');
     `;
-    const result = await runWithBlock(code, { NPM_JAR_LOG_FD: '999' });
+    const result = await runWithBlock(code, { SCRIPT_JAIL_LOG_FD: '999' });
     // fd 999 is invalid but should not crash the process
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain('DONE');

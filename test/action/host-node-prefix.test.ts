@@ -1,4 +1,4 @@
-// npm-jar — test/action/host-node-prefix.test.ts
+// script-jail — test/action/host-node-prefix.test.ts
 //
 // Unit tests for `resolveHostNodeExecPath` and `resolveHostNodePrefix`.
 //
@@ -105,7 +105,7 @@ describe('resolveHostNodeExecPath', () => {
     // Spin up a tmp PATH segment containing a fake executable `node`.  This
     // proves the default `which` implementation walks segments and only
     // accepts executable regular files.
-    const tmpRoot = mkdtempSync(join(tmpdir(), 'npm-jar-pathwalk-'));
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'script-jail-pathwalk-'));
     try {
       const segA = join(tmpRoot, 'a-bin');
       const segB = join(tmpRoot, 'b-bin');
@@ -125,7 +125,7 @@ describe('resolveHostNodeExecPath', () => {
   });
 
   it('skips a directory named `node` in a PATH segment (real fs)', () => {
-    const tmpRoot = mkdtempSync(join(tmpdir(), 'npm-jar-pathwalk-dir-'));
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'script-jail-pathwalk-dir-'));
     try {
       const segA = join(tmpRoot, 'a-bin');
       const segB = join(tmpRoot, 'b-bin');
@@ -144,7 +144,7 @@ describe('resolveHostNodeExecPath', () => {
   });
 
   it('skips a non-executable `node` file in a PATH segment (real fs)', () => {
-    const tmpRoot = mkdtempSync(join(tmpdir(), 'npm-jar-pathwalk-noexec-'));
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'script-jail-pathwalk-noexec-'));
     try {
       const segA = join(tmpRoot, 'a-bin');
       const segB = join(tmpRoot, 'b-bin');
@@ -167,7 +167,7 @@ describe('resolveHostNodeExecPath', () => {
     // setup-node sometimes resolves through symlinks; we must use the
     // realpath when deriving the prefix so a symlinked shim in one tree
     // can't be misclassified as living in that tree's `bin/`.
-    const tmpRoot = mkdtempSync(join(tmpdir(), 'npm-jar-pathwalk-symlink-'));
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'script-jail-pathwalk-symlink-'));
     try {
       const realPrefix = join(tmpRoot, 'real-node-prefix');
       const realBinDir = join(realPrefix, 'bin');
@@ -327,7 +327,7 @@ describe('resolveHostNodePrefix', () => {
   });
 
   it('accepts a tmp-prefix path with BOTH marker files present', () => {
-    const tmpRoot = mkdtempSync(join(tmpdir(), 'npm-jar-prefix-ok-'));
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'script-jail-prefix-ok-'));
     try {
       const prefix = join(tmpRoot, 'node-prefix');
       mkdirSync(join(prefix, 'bin'), { recursive: true });

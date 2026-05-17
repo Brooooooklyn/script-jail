@@ -5,7 +5,7 @@
 // This proves the lockfile we emit is shape-stable and validator-clean: any
 // drift in renderer output that would break the zod schema fails here loud
 // and early, instead of only manifesting when a host loads a committed
-// .npm-jar.lock.yml from disk.
+// .script-jail.lock.yml from disk.
 
 import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';

@@ -1,4 +1,4 @@
-// npm-jar — test/action/diff.test.ts
+// script-jail — test/action/diff.test.ts
 //
 // Tests for renderDiff() — unified diff + GitHub Actions annotation formatter.
 
@@ -14,7 +14,7 @@ describe('renderDiff — match', () => {
   it('returns empty diff and match=true when inputs are byte-equal', () => {
     const content = 'line1\nline2\nline3\n';
     const r = renderDiff({
-      lockPath: '.npm-jar.lock.yml',
+      lockPath: '.script-jail.lock.yml',
       committed: content,
       generated: content,
     });
@@ -40,19 +40,19 @@ describe('renderDiff — single hunk', () => {
     const committed = 'a\nb\nc\nd\ne\n';
     const generated = 'a\nb\nC\nd\ne\n'; // line 3 changed (c → C)
     const r = renderDiff({
-      lockPath: '.npm-jar.lock.yml',
+      lockPath: '.script-jail.lock.yml',
       committed,
       generated,
     });
 
     expect(r.match).toBe(false);
     expect(r.unified).not.toBe('');
-    expect(r.unified).toContain('a/.npm-jar.lock.yml');
-    expect(r.unified).toContain('b/.npm-jar.lock.yml');
+    expect(r.unified).toContain('a/.script-jail.lock.yml');
+    expect(r.unified).toContain('b/.script-jail.lock.yml');
 
     expect(r.annotations.length).toBe(1);
     const ann = r.annotations[0]!;
-    expect(ann).toMatch(/^::error file=\.npm-jar\.lock\.yml,line=\d+::/);
+    expect(ann).toMatch(/^::error file=\.script-jail\.lock\.yml,line=\d+::/);
     expect(ann).toContain('lockfile drifted');
   });
 });
@@ -61,7 +61,7 @@ describe('renderDiff — missing committed', () => {
   it('emits a "would be created" annotation at line 1', () => {
     const generated = 'line1\nline2\nline3\n';
     const r = renderDiff({
-      lockPath: '.npm-jar.lock.yml',
+      lockPath: '.script-jail.lock.yml',
       committed: '',
       generated,
     });
@@ -70,7 +70,7 @@ describe('renderDiff — missing committed', () => {
     expect(r.unified).not.toBe('');
     expect(r.annotations.length).toBe(1);
     const ann = r.annotations[0]!;
-    expect(ann).toMatch(/^::error file=\.npm-jar\.lock\.yml,line=1::/);
+    expect(ann).toMatch(/^::error file=\.script-jail\.lock\.yml,line=1::/);
     expect(ann).toContain('lockfile missing');
     expect(ann).toContain('would be created');
     expect(ann).toMatch(/\(3 lines\)/);

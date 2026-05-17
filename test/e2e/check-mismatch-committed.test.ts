@@ -1,4 +1,4 @@
-// npm-jar — test/e2e/check-mismatch-committed.test.ts
+// script-jail — test/e2e/check-mismatch-committed.test.ts
 //
 // mode=check "committed-file tampered" scenario: the guest emits the canonical
 // YAML, but the committed file in the consumer was edited to drop a marker

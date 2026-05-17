@@ -16,14 +16,14 @@ const isLinux = process.platform === 'linux';
 // __dirname is undefined in ESM; use import.meta.url instead.
 const repoRoot = new URL('../../', import.meta.url).pathname.replace(/\/$/, '');
 const shimSrc  = join(repoRoot, 'src/shim/env-shim.c');
-const shimSo   = join(repoRoot, 'images/libnpmjar.so');
+const shimSo   = join(repoRoot, 'images/libscriptjail.so');
 const buildSh  = join(repoRoot, 'src/shim/build.sh');
 
 // Temp files created during tests; cleaned up in afterEach.
 const tempFiles: string[] = [];
 
 function makeTempFile(content: string, suffix = ''): string {
-  const dir  = mkdtempSync(join(tmpdir(), 'npm-jar-shim-'));
+  const dir  = mkdtempSync(join(tmpdir(), 'script-jail-shim-'));
   const path = join(dir, `tmp${suffix}`);
   writeFileSync(path, content, 'utf8');
   tempFiles.push(path);
@@ -103,7 +103,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     const readelf = spawnSync('readelf', ['-Ws', '--dyn-syms', shimSo], { encoding: 'utf8' });
     if (readelf.status === 0 && !readelf.error) {
       if (!/\bgetenv\b/.test(readelf.stdout)) {
-        throw new Error('libnpmjar.so does not export getenv as a dynamic symbol — check -fvisibility=hidden and __attribute__((visibility("default")))');
+        throw new Error('libscriptjail.so does not export getenv as a dynamic symbol — check -fvisibility=hidden and __attribute__((visibility("default")))');
       }
     }
     // readelf unavailable: skip the assertion (don't fail)
@@ -119,7 +119,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   /**
    * Spawns `cmd` (via `/bin/sh -c`) with:
    *  - LD_PRELOAD=shimSo
-   *  - NPM_JAR_LOG_FD=3
+   *  - SCRIPT_JAIL_LOG_FD=3
    *  - any additional `env` entries merged in
    *
    * FD 3 is captured via a temporary file (spawnSync can't redirect arbitrary fds,
@@ -134,11 +134,11 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
     const extraEnv: Record<string, string> = {
       LD_PRELOAD:       shimSo,
-      NPM_JAR_LOG_FD:   '3',
+      SCRIPT_JAIL_LOG_FD:   '3',
       ...opts.env,
     };
     if (opts.protectFile !== undefined) {
-      extraEnv['NPM_JAR_PROTECTED_ENV_FILE'] = opts.protectFile;
+      extraEnv['SCRIPT_JAIL_PROTECTED_ENV_FILE'] = opts.protectFile;
     }
 
     // Build env string for sh: "KEY=VAL KEY2=VAL2 ..."
@@ -315,18 +315,18 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     expect(res.exitCode).toBe(0);
   });
 
-  // ── Test 6: shim is silent when NPM_JAR_LOG_FD is unset ──────────────────
+  // ── Test 6: shim is silent when SCRIPT_JAIL_LOG_FD is unset ──────────────────
 
-  it('shim does not crash when NPM_JAR_LOG_FD is unset', (ctx) => {
+  it('shim does not crash when SCRIPT_JAIL_LOG_FD is unset', (ctx) => {
     if (!shimAvailable) ctx.skip();
 
-    // Run without NPM_JAR_LOG_FD; the shim should be silent (no log output)
+    // Run without SCRIPT_JAIL_LOG_FD; the shim should be silent (no log output)
     // and not crash the child process.
     const result = spawnSync('/bin/sh', ['-c', 'printenv PATH'], {
       env: {
         PATH:       process.env['PATH'] ?? '/usr/bin:/bin',
         LD_PRELOAD: shimSo,
-        // NPM_JAR_LOG_FD intentionally omitted
+        // SCRIPT_JAIL_LOG_FD intentionally omitted
       },
       encoding: 'utf8',
       timeout: 5_000,

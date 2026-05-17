@@ -1,4 +1,4 @@
-// npm-jar — src/action/inputs.ts
+// script-jail — src/action/inputs.ts
 //
 // Parses the GitHub Action's inputs into a typed, validated ActionInputs object.
 //
@@ -27,7 +27,7 @@ export type SpoofPlatform = 'linux' | 'darwin' | 'win32';
 export type SpoofArch = 'x64' | 'arm64';
 
 export interface ActionInputs {
-  /** Absolute path to the npm-jar config YAML. */
+  /** Absolute path to the script-jail config YAML. */
   configPath: string;
   /** Absolute path to the install-lock YAML (existing or to be created). */
   lockPath: string;
@@ -85,7 +85,7 @@ export function parseInputs(input: ParseInput): ActionInputs {
   const modeStr = rawMode.trim() === '' ? 'check' : rawMode.trim();
   if (!isMode(modeStr)) {
     throw new Error(
-      `npm-jar: invalid value for input "mode": "${modeStr}". Expected "check" or "update".`,
+      `script-jail: invalid value for input "mode": "${modeStr}". Expected "check" or "update".`,
     );
   }
 
@@ -93,7 +93,7 @@ export function parseInputs(input: ParseInput): ActionInputs {
   const platformStr = rawPlatform.trim() === '' ? 'linux' : rawPlatform.trim();
   if (!isSpoofPlatform(platformStr)) {
     throw new Error(
-      `npm-jar: invalid value for input "spoof-platform": "${platformStr}". ` +
+      `script-jail: invalid value for input "spoof-platform": "${platformStr}". ` +
       `Expected one of: linux, darwin, win32.`,
     );
   }
@@ -102,7 +102,7 @@ export function parseInputs(input: ParseInput): ActionInputs {
   const archStr = rawArch.trim() === '' ? 'x64' : rawArch.trim();
   if (!isSpoofArch(archStr)) {
     throw new Error(
-      `npm-jar: invalid value for input "spoof-arch": "${archStr}". ` +
+      `script-jail: invalid value for input "spoof-arch": "${archStr}". ` +
       `Expected one of: x64, arm64.`,
     );
   }
@@ -114,14 +114,14 @@ export function parseInputs(input: ParseInput): ActionInputs {
   else if (cacheStr === 'false') cacheFirecracker = false;
   else {
     throw new Error(
-      `npm-jar: invalid value for input "cache-firecracker": "${cacheStr}". ` +
+      `script-jail: invalid value for input "cache-firecracker": "${cacheStr}". ` +
       `Expected "true" or "false".`,
     );
   }
 
   // ---- path resolution ------------------------------------------------------
-  const configRel = rawConfig.trim() === '' ? '.npm-jar.yml' : rawConfig.trim();
-  const lockRel = rawLock.trim() === '' ? '.npm-jar.lock.yml' : rawLock.trim();
+  const configRel = rawConfig.trim() === '' ? '.script-jail.yml' : rawConfig.trim();
+  const lockRel = rawLock.trim() === '' ? '.script-jail.lock.yml' : rawLock.trim();
 
   return {
     configPath: resolveAgainstRepo(configRel, input.repoDir),

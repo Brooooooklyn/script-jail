@@ -1,4 +1,4 @@
-// npm-jar — src/action/log.ts
+// script-jail — src/action/log.ts
 //
 // One-function logging helper that emits a GitHub Actions `::warning::`
 // annotation to stdout.  Centralised so every part of the action surfaces

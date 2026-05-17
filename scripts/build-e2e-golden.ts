@@ -1,6 +1,6 @@
-// npm-jar — scripts/build-e2e-golden.ts
+// script-jail — scripts/build-e2e-golden.ts
 //
-// Produces a REFERENCE `.npm-jar.lock.yml` by running the e2e test harness's
+// Produces a REFERENCE `.script-jail.lock.yml` by running the e2e test harness's
 // normalize() + render() pipeline over every fixture's expected-events.json.
 // The output is byte-identical to what the production guest agent would emit
 // for the same merged event stream, save for two fields the harness pins:
@@ -19,7 +19,7 @@
 // for marker-substring assertions in the Layer 2 workflow (Task #28).
 //
 // Regenerate workflow:
-//   oxnode scripts/build-e2e-golden.ts > test/e2e/consumer/.npm-jar.lock.yml.reference
+//   oxnode scripts/build-e2e-golden.ts > test/e2e/consumer/.script-jail.lock.yml.reference
 //
 // (We do NOT name the file `.golden` because that name historically implies
 //  byte-equality is asserted somewhere; this file is purely informational.)

@@ -1,4 +1,4 @@
-// npm-jar — test/e2e/bun-skipped.test.ts
+// script-jail — test/e2e/bun-skipped.test.ts
 //
 // A consumer whose only lockfile is `bun.lock` must trigger the v1
 // BunUnsupportedError handler in main(): emit a ::warning:: annotation and
@@ -37,6 +37,6 @@ describe.sequential('e2e: bun consumer skipped with warning', () => {
     // The `warn` helper writes `::warning::<msg>\n` to stdout.  The exact
     // message comes from BunUnsupportedError in src/action/detect-pm.ts.
     expect(result.stdout).toContain('::warning::');
-    expect(result.stdout).toContain('npm-jar v1 does not support bun');
+    expect(result.stdout).toContain('script-jail v1 does not support bun');
   });
 });

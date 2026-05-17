@@ -1,4 +1,4 @@
-// npm-jar — src/action/firecracker/vsock.ts
+// script-jail — src/action/firecracker/vsock.ts
 //
 // Host-side vsock connection handler.
 //
@@ -168,7 +168,7 @@ async function* parseFrames(
     } catch {
       yield {
         kind: 'error',
-        message: `npm-jar vsock: malformed JSON frame: ${trimmed.slice(0, 200)}`,
+        message: `script-jail vsock: malformed JSON frame: ${trimmed.slice(0, 200)}`,
         fatal: false,
       };
       continue;
@@ -177,7 +177,7 @@ async function* parseFrames(
     if (typeof raw !== 'object' || raw === null) {
       yield {
         kind: 'error',
-        message: `npm-jar vsock: expected JSON object, got: ${trimmed.slice(0, 200)}`,
+        message: `script-jail vsock: expected JSON object, got: ${trimmed.slice(0, 200)}`,
         fatal: false,
       };
       continue;
@@ -208,7 +208,7 @@ function classifyFrame(obj: Record<string, unknown>): GuestFrame {
       }
       return {
         kind: 'error',
-        message: `npm-jar vsock: unknown handshake phase: ${String(phase)}`,
+        message: `script-jail vsock: unknown handshake phase: ${String(phase)}`,
         fatal: false,
       };
     }
@@ -225,7 +225,7 @@ function classifyFrame(obj: Record<string, unknown>): GuestFrame {
       if (typeof obj['yaml'] !== 'string') {
         return {
           kind: 'error',
-          message: `npm-jar vsock: "final" frame missing "yaml" string field`,
+          message: `script-jail vsock: "final" frame missing "yaml" string field`,
           fatal: false,
         };
       }
@@ -235,7 +235,7 @@ function classifyFrame(obj: Record<string, unknown>): GuestFrame {
     default: {
       return {
         kind: 'error',
-        message: `npm-jar vsock: unknown frame kind: ${String(kind)}`,
+        message: `script-jail vsock: unknown frame kind: ${String(kind)}`,
         fatal: false,
       };
     }

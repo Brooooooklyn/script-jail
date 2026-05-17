@@ -1,4 +1,4 @@
-# npm-jar config. Hides these files/env vars from the lifecycle scripts running
+# script-jail config. Hides these files/env vars from the lifecycle scripts running
 # inside the Firecracker VM. Note: $HOME is an empty tmpfs in the VM regardless;
 # entries here are still useful for repo-local paths and for documenting intent.
 

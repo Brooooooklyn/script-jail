@@ -1,10 +1,10 @@
 // @ts-check
-// npm-jar — dlopen-block.cjs
+// script-jail — dlopen-block.cjs
 // NODE_OPTIONS=--require preload: replaces process.dlopen with a function that
 // throws before any native addon can load, and emits a JSONL audit line.
 //
 // Env vars:
-//   NPM_JAR_LOG_FD — integer fd open for writing; JSONL audit lines go here.
+//   SCRIPT_JAIL_LOG_FD — integer fd open for writing; JSONL audit lines go here.
 //                    If unset or invalid, the throw still happens (no logging).
 //
 // SECURITY NOTES:
@@ -23,14 +23,14 @@
 
 const fs = require('fs');
 
-const BLOCKED_MSG = 'npm-jar: native addons are blocked at install time';
+const BLOCKED_MSG = 'script-jail: native addons are blocked at install time';
 
 /**
- * Write a JSONL audit line to NPM_JAR_LOG_FD.
+ * Write a JSONL audit line to SCRIPT_JAIL_LOG_FD.
  * @param {string} filename
  */
 function logDlopen(filename) {
-  const fdStr = process.env['NPM_JAR_LOG_FD'];
+  const fdStr = process.env['SCRIPT_JAIL_LOG_FD'];
   if (fdStr === undefined || fdStr === '') return;
   const fd = parseInt(fdStr, 10);
   if (!isFinite(fd) || fd < 0) return;

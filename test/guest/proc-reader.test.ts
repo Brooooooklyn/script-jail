@@ -15,7 +15,7 @@ import { LinuxProcReader } from '../../src/guest/proc-reader.js';
 let fakeRoot: string;
 
 function makeFakeProc(): string {
-  fakeRoot = mkdtempSync(join(tmpdir(), 'npm-jar-proc-'));
+  fakeRoot = mkdtempSync(join(tmpdir(), 'script-jail-proc-'));
   return fakeRoot;
 }
 

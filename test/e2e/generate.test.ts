@@ -1,7 +1,7 @@
-// npm-jar — test/e2e/generate.test.ts
+// script-jail — test/e2e/generate.test.ts
 //
 // Layer 1 end-to-end test: drives main() with mode=update against all seven
-// fixtures and asserts the resulting `.npm-jar.lock.yml` contains every
+// fixtures and asserts the resulting `.script-jail.lock.yml` contains every
 // expected package id and attack-shape marker.
 //
 // Uses the harness from test/e2e/harness.ts; no real VM, no /dev/kvm.  The

@@ -1,4 +1,4 @@
-// npm-jar — src/action/firecracker/overlay.ts
+// script-jail — src/action/firecracker/overlay.ts
 //
 // Builds a per-run rootfs overlay plus side disks for the VM.
 //
@@ -14,7 +14,7 @@
 //                       image is never touched.
 //
 //   2. repo.ext4      — a small ext4 containing only the user's repository
-//                       files and the npm-jar config YAML.  The guest's
+//                       files and the script-jail config YAML.  The guest's
 //                       init.sh mounts this read-only at /work.  Building a
 //                       separate disk keeps the rootfs copy fast and
 //                       predictable (same size every run) and avoids needing
@@ -38,10 +38,10 @@
 // Guest mount contract (closed by Task #13, see src/rootfs/init.sh):
 //   1. Disk with filesystem label `repo` (resolved via `blkid -L repo`)
 //      → mounted read-only at /work.
-//   2. /work/etc/npm-jar/config.yml → copied into /etc/npm-jar/config.yml.
+//   2. /work/etc/script-jail/config.yml → copied into /etc/script-jail/config.yml.
 //   3. Disk with filesystem label `host-node` (resolved via `blkid -L host-node`)
 //      → mounted read-only at /opt/host-node, /opt/host-node/bin prepended to PATH.
-//   4. The agent execs as `node /usr/local/lib/npm-jar/guest-agent.cjs` so
+//   4. The agent execs as `node /usr/local/lib/script-jail/guest-agent.cjs` so
 //      `node` resolves to the host-mounted binary.
 
 import {
@@ -68,7 +68,7 @@ export interface OverlayInput {
   baseRootfsPath: string;
   /** Absolute path to the user's repository on the host. */
   repoSrcPath: string;
-  /** Absolute path to .npm-jar.yml on the host. */
+  /** Absolute path to .script-jail.yml on the host. */
   configPath: string;
   /**
    * Absolute path to the runner's Node install prefix (the directory that
@@ -90,7 +90,7 @@ export interface OverlayInput {
 export interface OverlayResult {
   /** Per-run rootfs copy that Firecracker mounts as the root device. */
   rootfsCopyPath: string;
-  /** Small ext4 containing the user's repo + npm-jar config, mounted at /work. */
+  /** Small ext4 containing the user's repo + script-jail config, mounted at /work. */
   repoDiskPath: string;
   /** Tiny ext4 containing the runner's Node install.  Mounted at /opt/host-node. */
   hostNodeDiskPath: string;
@@ -114,7 +114,7 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
   } = input;
 
   // 1. Create per-run work dir if not supplied.
-  const workDir = maybeWorkDir ?? mkdtempSync(join(tmpdir(), 'npm-jar-run-'));
+  const workDir = maybeWorkDir ?? mkdtempSync(join(tmpdir(), 'script-jail-run-'));
   mkdirSync(workDir, { recursive: true });
 
   // 2. Copy the base rootfs (CoW where supported, plain copy otherwise).
@@ -129,16 +129,16 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
   // Copy repository files.
   cpSync(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
 
-  // Overlay the npm-jar config at the path the guest agent expects:
-  //   /etc/npm-jar/config.yml  →  inside the repo stage dir we write it at
-  //   repo-stage/etc/npm-jar/config.yml so it is accessible after the guest
+  // Overlay the script-jail config at the path the guest agent expects:
+  //   /etc/script-jail/config.yml  →  inside the repo stage dir we write it at
+  //   repo-stage/etc/script-jail/config.yml so it is accessible after the guest
   //   mounts this disk at /work.
   //
   // NOTE: The guest's init.sh mounts the repo disk at /work, so paths inside
   // the disk are relative to /work.  The agent reads config from
-  // /etc/npm-jar/config.yml which is on the rootfs; the init.sh copies it
-  // from /work/etc/npm-jar/config.yml into /etc/npm-jar/ at boot.
-  const configDestDir = join(repoStageDir, 'etc', 'npm-jar');
+  // /etc/script-jail/config.yml which is on the rootfs; the init.sh copies it
+  // from /work/etc/script-jail/config.yml into /etc/script-jail/ at boot.
+  const configDestDir = join(repoStageDir, 'etc', 'script-jail');
   mkdirSync(configDestDir, { recursive: true });
   copyFileSync(configPath, join(configDestDir, 'config.yml'));
 

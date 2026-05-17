@@ -1,5 +1,5 @@
-name: npm-jar
-description: Firecracker-sandboxed audit of package-manager lifecycle scripts. Runs on lockfile changes; emits a human-readable .npm-jar.lock.yml; fails the PR if the audit diverges from the committed lockfile.
+name: script-jail
+description: Firecracker-sandboxed audit of package-manager lifecycle scripts. Runs on lockfile changes; emits a human-readable .script-jail.lock.yml; fails the PR if the audit diverges from the committed lockfile.
 author: brooklyn
 branding:
   icon: lock
@@ -7,13 +7,13 @@ branding:
 
 inputs:
   config:
-    description: Path to the npm-jar config file.
+    description: Path to the script-jail config file.
     required: false
-    default: .npm-jar.yml
+    default: .script-jail.yml
   lock:
     description: Path to the install-lock file to compare/regenerate.
     required: false
-    default: .npm-jar.lock.yml
+    default: .script-jail.lock.yml
   mode:
     description: "`check` (default) fails on diff; `update` regenerates the lockfile in place."
     required: false

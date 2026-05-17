@@ -1,6 +1,6 @@
 # vmlinux — kernel image pin
 
-npm-jar boots a Firecracker microVM using a precompiled `vmlinux` kernel
+script-jail boots a Firecracker microVM using a precompiled `vmlinux` kernel
 image. The image is fetched at action runtime by `ensureBinaries`
 (`src/action/firecracker/download.ts`) and verified against a pinned SHA-256
 before use.

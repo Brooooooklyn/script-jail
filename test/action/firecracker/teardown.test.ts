@@ -1,4 +1,4 @@
-// npm-jar — test/action/firecracker/teardown.test.ts
+// script-jail — test/action/firecracker/teardown.test.ts
 //
 // Tests for teardown().  All handles are mocks; no real filesystem or
 // subprocess interaction happens here.
@@ -133,7 +133,7 @@ describe('teardown', () => {
   });
 
   it('removes the API socket file when apiSocketPath is set', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'npm-jar-teardown-test-'));
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-teardown-test-'));
     const apiSocketPath = join(dir, 'fc.sock');
     writeFileSync(apiSocketPath, ''); // create the file
 
@@ -155,7 +155,7 @@ describe('teardown', () => {
   });
 
   it('removes the vsock UDS file when vsockUdsPath is set', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'npm-jar-teardown-vsock-'));
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-teardown-vsock-'));
     const vsockUdsPath = join(dir, 'vsock.sock');
     writeFileSync(vsockUdsPath, '');
 

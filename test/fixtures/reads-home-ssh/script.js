@@ -4,7 +4,7 @@
 // continues. The point is that the *attempt* is recorded by the audit shim.
 //
 // The golden event has `hidden: true` because `~/.ssh/**` is listed under
-// `.npm-jar.yml` `protected.files`. The pipeline marks reads of protected
+// `.script-jail.yml` `protected.files`. The pipeline marks reads of protected
 // paths as hidden *before* applying the ENOENT-drop rule in strace-parser,
 // so attempts to read protected files are always surfaced (otherwise an
 // attacker could probe for credentials with zero audit trail by relying on

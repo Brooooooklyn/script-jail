@@ -19,16 +19,16 @@ RUN apt-get update && \
 # Build dirs the agent + init script expect.  /opt/host-node is pre-created so
 # the runtime mount has a mountpoint without init.sh having to mkdir it under
 # a read-only rootfs (rootfs is mounted rw, but pre-creating is cheaper).
-RUN mkdir -p /work /etc/npm-jar /usr/local/lib/npm-jar /usr/local/bin /opt/host-node
+RUN mkdir -p /work /etc/script-jail /usr/local/lib/script-jail /usr/local/bin /opt/host-node
 
 # Init + agent + JS preloads (copied at build time from the host build context)
 COPY src/rootfs/init.sh /sbin/init
 COPY src/rootfs/orchestrate.sh /sbin/orchestrate
 COPY src/rootfs/cleanup.sh /sbin/cleanup
-COPY dist/guest-agent.cjs /usr/local/lib/npm-jar/guest-agent.cjs
-COPY dist/preloads/platform-spoof.cjs /usr/local/lib/npm-jar/platform-spoof.cjs
-COPY dist/preloads/dlopen-block.cjs /usr/local/lib/npm-jar/dlopen-block.cjs
-COPY images/libnpmjar.so /lib/libnpmjar.so
+COPY dist/guest-agent.cjs /usr/local/lib/script-jail/guest-agent.cjs
+COPY dist/preloads/platform-spoof.cjs /usr/local/lib/script-jail/platform-spoof.cjs
+COPY dist/preloads/dlopen-block.cjs /usr/local/lib/script-jail/dlopen-block.cjs
+COPY images/libscriptjail.so /lib/libscriptjail.so
 
 RUN chmod +x /sbin/init /sbin/orchestrate /sbin/cleanup
 

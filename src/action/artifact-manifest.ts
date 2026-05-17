@@ -1,4 +1,4 @@
-// npm-jar — src/action/artifact-manifest.ts
+// script-jail — src/action/artifact-manifest.ts
 //
 // Pinned manifest of release artifacts the action downloads at runtime.
 // See `./pre-fetch-artifacts.ts` for the download logic and
@@ -8,7 +8,7 @@
 // Manifest-update workflow:
 //
 //   1. Cut a new tag (e.g. `v0.2.0`).  The release workflow runs, builds the
-//      rootfs ext4 (per runner image) and libnpmjar.so, uploads them to the
+//      rootfs ext4 (per runner image) and libscriptjail.so, uploads them to the
 //      release, and prints a SHA summary in the job's GITHUB_STEP_SUMMARY.
 //   2. Copy the SHAs from the job summary into the `expected` map below.
 //   3. Bump `tag` to match the new release.
@@ -31,11 +31,11 @@ import type { ArtifactManifest } from './pre-fetch-artifacts.js';
  * new release.  See the file header for the full update workflow.
  */
 export const PINNED_MANIFEST: ArtifactManifest = {
-  repo: 'brooklyn/npm-jar', // update when forked
+  repo: 'brooklyn/script-jail', // update when forked
   tag: 'v0.1.0',
   expected: {
     'rootfs-ubuntu-22.04.ext4': 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_22_04',
     'rootfs-ubuntu-24.04.ext4': 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_24_04',
-    'libnpmjar.so':              'PLACEHOLDER_SHA256_LIBNPMJAR_SO',
+    'libscriptjail.so':              'PLACEHOLDER_SHA256_LIBSCRIPTJAIL_SO',
   },
 };

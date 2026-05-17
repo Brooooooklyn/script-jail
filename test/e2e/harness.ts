@@ -1,4 +1,4 @@
-// npm-jar — test/e2e/harness.ts
+// script-jail — test/e2e/harness.ts
 //
 // Layer 1 end-to-end test harness.  Drives src/main.ts in-process by:
 //   1. Materialising a temp consumer project on disk (setUpConsumer).
@@ -59,7 +59,7 @@ export interface SetUpConsumerInput {
   fixtures: ReadonlyArray<FixtureName>;
   /**
    * Optional lockfile contents.  When provided, written verbatim to the
-   * consumer's .npm-jar.lock.yml — used by check-* tests to plant a specific
+   * consumer's .script-jail.lock.yml — used by check-* tests to plant a specific
    * committed lockfile.
    */
   committedLockYaml?: string;
@@ -68,9 +68,9 @@ export interface SetUpConsumerInput {
 export interface SetUpConsumerResult {
   /** Absolute path to the consumer dir (in os.tmpdir(); OS auto-cleans). */
   consumerDir: string;
-  /** Absolute path to the consumer's .npm-jar.lock.yml. */
+  /** Absolute path to the consumer's .script-jail.lock.yml. */
   lockPath: string;
-  /** Absolute path to the consumer's .npm-jar.yml config. */
+  /** Absolute path to the consumer's .script-jail.yml config. */
   configPath: string;
 }
 
@@ -231,11 +231,11 @@ const LOCK_FILES_BY_PM: Readonly<Record<SetUpConsumerInput['pm'], { readonly fil
   bun: { file: 'bun.lock', contents: () => '' },
 };
 
-// Default .npm-jar.yml mirrors the canonical repo config.  Kept inline rather
+// Default .script-jail.yml mirrors the canonical repo config.  Kept inline rather
 // than read from the repo root so the harness has no implicit dependency on
 // the action's own config file shape evolving.  When the canonical defaults
-// change, update this string in lockstep with the project root .npm-jar.yml.
-const DEFAULT_NPM_JAR_YML = `# npm-jar config (test-harness defaults).
+// change, update this string in lockstep with the project root .script-jail.yml.
+const DEFAULT_SCRIPT_JAIL_YML = `# script-jail config (test-harness defaults).
 protected:
   files:
     - ~/.ssh/**
@@ -263,8 +263,8 @@ node_version: 20
 `;
 
 export function setUpConsumer(input: SetUpConsumerInput): SetUpConsumerResult {
-  const consumerDir = mkdtempSync(join(tmpdir(), 'npm-jar-e2e-'));
-  const consumerName = `npm-jar-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const consumerDir = mkdtempSync(join(tmpdir(), 'script-jail-e2e-'));
+  const consumerName = `script-jail-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // ---- package.json -------------------------------------------------------
   // Use ABSOLUTE `file:` URIs to the fixture dirs — the consumer lives in
@@ -294,12 +294,12 @@ export function setUpConsumer(input: SetUpConsumerInput): SetUpConsumerResult {
   const lock = LOCK_FILES_BY_PM[input.pm];
   writeFileSync(join(consumerDir, lock.file), lock.contents(consumerName), 'utf8');
 
-  // ---- .npm-jar.yml ------------------------------------------------------
-  const configPath = join(consumerDir, '.npm-jar.yml');
-  writeFileSync(configPath, DEFAULT_NPM_JAR_YML, 'utf8');
+  // ---- .script-jail.yml ------------------------------------------------------
+  const configPath = join(consumerDir, '.script-jail.yml');
+  writeFileSync(configPath, DEFAULT_SCRIPT_JAIL_YML, 'utf8');
 
   // ---- optional pre-planted lockfile -------------------------------------
-  const lockPath = join(consumerDir, '.npm-jar.lock.yml');
+  const lockPath = join(consumerDir, '.script-jail.lock.yml');
   if (input.committedLockYaml !== undefined) {
     writeFileSync(lockPath, input.committedLockYaml, 'utf8');
   }
@@ -383,7 +383,7 @@ export function fakeVmFactory(input: FakeVmFactoryInput): FakeVmFactoryResult {
   // makeOverlay returns a Promise<OverlayResult>.  We resolve a workDir under
   // os.tmpdir() so the fake paths look plausible to a casual debugger trace.
   const fakeMakeOverlay = async (): Promise<OverlayResult> => {
-    const workDir = mkdtempSync(join(tmpdir(), 'npm-jar-fake-overlay-'));
+    const workDir = mkdtempSync(join(tmpdir(), 'script-jail-fake-overlay-'));
     return makeFakeOverlay(workDir);
   };
 
@@ -481,7 +481,7 @@ let cachedFakeNodePrefix: string | null = null;
 
 function ensureFakeNodePrefix(): string {
   if (cachedFakeNodePrefix !== null) return cachedFakeNodePrefix;
-  const prefix = mkdtempSync(join(tmpdir(), 'npm-jar-fake-node-'));
+  const prefix = mkdtempSync(join(tmpdir(), 'script-jail-fake-node-'));
   const binDir = join(prefix, 'bin');
   mkdirSync(binDir, { recursive: true });
   const nodePath = join(binDir, 'node');
@@ -546,7 +546,7 @@ async function loadMain(): Promise<(deps: MainDeps) => Promise<void>> {
   // Set env so the default main() invocation can't even reach launchVm.
   // INPUT_MODE=invalid_mode_for_harness_import → parseInputs throws → caught
   // by main()'s .catch → stubbed exit.  Whole flow takes microseconds.
-  process.env['INPUT_MODE'] = '__npm_jar_e2e_harness_load__';
+  process.env['INPUT_MODE'] = '__script_jail_e2e_harness_load__';
 
   // Suppress the inevitable unhandled rejection from the default main()'s
   // .catch chain firing the stubbed exit.  We attach the handler BEFORE the
@@ -653,7 +653,7 @@ export async function runMain(input: RunMainInput): Promise<RunMainResult> {
   // tmp tree rather than the test runner's RUNNER_TEMP (which may not exist
   // outside CI).
   if (process.env['RUNNER_TEMP'] === undefined || process.env['RUNNER_TEMP'] === '') {
-    process.env['RUNNER_TEMP'] = mkdtempSync(join(tmpdir(), 'npm-jar-runner-temp-'));
+    process.env['RUNNER_TEMP'] = mkdtempSync(join(tmpdir(), 'script-jail-runner-temp-'));
   }
 
   // ---- Install captures + injected deps -----------------------------------

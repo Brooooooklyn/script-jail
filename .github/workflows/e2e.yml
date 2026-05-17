@@ -1,4 +1,4 @@
-# npm-jar — .github/workflows/e2e.yml
+# script-jail — .github/workflows/e2e.yml
 #
 # Layer 2 end-to-end workflow: on every PR + push-to-main, spin up a real
 # Linux runner, build the action + rootfs locally, then invoke the action
@@ -14,7 +14,7 @@
 #   microVM on every PR so a guest-side regression (mount table, capability
 #   drop, agent protocol) is caught before release.
 #
-# Why no committed `.npm-jar.lock.yml.golden`:
+# Why no committed `.script-jail.lock.yml.golden`:
 #   `src/action/diff.ts` is byte-exact, and `src/guest/agent.ts`'s
 #   `generated_at` field is set per VM run.  A static golden could NEVER
 #   match a freshly generated lockfile — even on a clean run with no
@@ -57,10 +57,10 @@ jobs:
     # the manifest in src/action/artifact-manifest.ts contains placeholder
     # SHAs (real ones are computed at release tag time — see release.yml).
     # The flag is documented inline in src/main.ts and is intentionally
-    # NOT exposed as an action input; only the npm-jar repo's own e2e
+    # NOT exposed as an action input; only the script-jail repo's own e2e
     # workflow sets it.
     env:
-      NPM_JAR_E2E_SELF_TEST: '1'
+      SCRIPT_JAIL_E2E_SELF_TEST: '1'
 
     strategy:
       # We want a regression visible on either matrix leg, not just whichever
@@ -113,19 +113,19 @@ jobs:
       - name: Build action + shim + rootfs (${{ matrix.os }})
         run: pnpm build -- --runner-image=${{ matrix.os }}
 
-      # `preFetchArtifacts` is skipped under NPM_JAR_E2E_SELF_TEST, so the
+      # `preFetchArtifacts` is skipped under SCRIPT_JAIL_E2E_SELF_TEST, so the
       # action will NOT download the rootfs / .so from a release.  Instead
       # it looks for `rootfs-<runner-image>.ext4` at
-      # `${RUNNER_TEMP}/npm-jar-images/`.  Copy the locally-built artifacts
+      # `${RUNNER_TEMP}/script-jail-images/`.  Copy the locally-built artifacts
       # into that exact path so the rest of main.ts (overlay → launch)
       # finds them without any further code changes.
-      - name: Stage local artifacts under $RUNNER_TEMP/npm-jar-images
+      - name: Stage local artifacts under $RUNNER_TEMP/script-jail-images
         run: |
           set -euo pipefail
-          IMAGES_DIR="${RUNNER_TEMP}/npm-jar-images"
+          IMAGES_DIR="${RUNNER_TEMP}/script-jail-images"
           mkdir -p "${IMAGES_DIR}"
           cp images/rootfs-${{ matrix.os }}.ext4 "${IMAGES_DIR}/"
-          cp images/libnpmjar.so "${IMAGES_DIR}/"
+          cp images/libscriptjail.so "${IMAGES_DIR}/"
           ls -l "${IMAGES_DIR}"
 
       # ----------------------------------------------------------------------
@@ -160,8 +160,8 @@ jobs:
           # victim-package; copying the whole tree keeps the workflow
           # forward-compatible with new fixtures).
           cp -R test/fixtures/. "${STAGED}/fixtures/"
-          # Copy the consumer's npm-jar config verbatim.
-          cp test/e2e/consumer/.npm-jar.yml "${STAGED}/.npm-jar.yml"
+          # Copy the consumer's script-jail config verbatim.
+          cp test/e2e/consumer/.script-jail.yml "${STAGED}/.script-jail.yml"
           # Rewrite the consumer's package.json to point at the vendored
           # fixtures.  The committed file uses `file:../../fixtures/<name>`;
           # `./fixtures/<name>` resolves relative to the staged dir.
@@ -187,7 +187,7 @@ jobs:
       # repo root for `detectPm()`, `parseInputs()` (relative path
       # resolution), and `makeOverlay()` (which copies the entire dir into
       # the VM mounted at /work).  Without this override the action would
-      # audit the npm-jar repo itself (whose `pnpm-lock.yaml` would be
+      # audit the script-jail repo itself (whose `pnpm-lock.yaml` would be
       # detected as the consumer's lockfile), not the consumer fixture.
       # The action has no `working-directory` input today; overriding
       # GITHUB_WORKSPACE is the narrowest way to point at the staged
@@ -196,16 +196,16 @@ jobs:
       #
       # Action paths resolved under the override: with GITHUB_WORKSPACE
       # pointing at the staged consumer dir, the action's default `config`
-      # and `lock` inputs (`.npm-jar.yml`, `.npm-jar.lock.yml`) resolve to
+      # and `lock` inputs (`.script-jail.yml`, `.script-jail.lock.yml`) resolve to
       # files inside the staged dir, exactly what we want.
       #
       # The action is deliberately invoked WITHOUT any of the consumer's
-      # protected env vars in scope.  The consumer's `.npm-jar.yml` lists
+      # protected env vars in scope.  The consumer's `.script-jail.yml` lists
       # NPM_TOKEN / NODE_AUTH_TOKEN / GITHUB_TOKEN / etc; exporting any of
       # those here would let the guest scrub-via-emit them legitimately and
       # change the rendered <HIDDEN> NAME marker (e.g. mark a previously
       # unset var as "found").  Keep the env clean.
-      - name: Run npm-jar against consumer (mode=update)
+      - name: Run script-jail against consumer (mode=update)
         id: update
         uses: ./
         env:
@@ -220,7 +220,7 @@ jobs:
       - name: Assert produced lockfile contains every expected marker
         run: |
           set -euo pipefail
-          LOCK="${{ runner.temp }}/consumer/.npm-jar.lock.yml"
+          LOCK="${{ runner.temp }}/consumer/.script-jail.lock.yml"
           test -s "$LOCK"
 
           # Per-package keys (one per fixture).
@@ -254,7 +254,7 @@ jobs:
       - name: Tamper the produced lockfile
         run: |
           set -euo pipefail
-          LOCK="${{ runner.temp }}/consumer/.npm-jar.lock.yml"
+          LOCK="${{ runner.temp }}/consumer/.script-jail.lock.yml"
           # Drop the `<HIDDEN> NPM_TOKEN` line.  It is a YAML sequence entry
           # like `        - <HIDDEN> NPM_TOKEN` — sed's pattern matches the
           # payload regardless of indent.
@@ -267,7 +267,7 @@ jobs:
           fi
           rm -f "$LOCK.bak"
 
-      - name: Re-run npm-jar against the tampered lockfile (mode=check)
+      - name: Re-run script-jail against the tampered lockfile (mode=check)
         id: tampered
         continue-on-error: true
         uses: ./

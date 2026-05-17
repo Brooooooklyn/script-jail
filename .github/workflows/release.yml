@@ -1,7 +1,7 @@
-# npm-jar — .github/workflows/release.yml
+# script-jail — .github/workflows/release.yml
 #
 # Release pipeline: on every `v*.*.*` tag push, build the per-runner rootfs
-# ext4 images, the libnpmjar.so C shim, and the action bundle, then attach
+# ext4 images, the libscriptjail.so C shim, and the action bundle, then attach
 # them as release assets.
 #
 # Why this exists:
@@ -150,7 +150,7 @@ jobs:
           set -euo pipefail
           ROOTFS_22="$(sha256sum images/rootfs-ubuntu-22.04.ext4 | cut -d' ' -f1)"
           ROOTFS_24="$(sha256sum images/rootfs-ubuntu-24.04.ext4 | cut -d' ' -f1)"
-          LIBSO="$(sha256sum images/libnpmjar.so | cut -d' ' -f1)"
+          LIBSO="$(sha256sum images/libscriptjail.so | cut -d' ' -f1)"
           echo "rootfs_22=${ROOTFS_22}" >> "$GITHUB_OUTPUT"
           echo "rootfs_24=${ROOTFS_24}" >> "$GITHUB_OUTPUT"
           echo "libso=${LIBSO}" >> "$GITHUB_OUTPUT"
@@ -166,7 +166,7 @@ jobs:
             echo "  expected: {"
             echo "    'rootfs-ubuntu-22.04.ext4': '${ROOTFS_22}',"
             echo "    'rootfs-ubuntu-24.04.ext4': '${ROOTFS_24}',"
-            echo "    'libnpmjar.so':              '${LIBSO}',"
+            echo "    'libscriptjail.so':              '${LIBSO}',"
             echo "  },"
             echo "};"
             echo '```'
@@ -182,7 +182,7 @@ jobs:
           path: |
             images/rootfs-ubuntu-22.04.ext4
             images/rootfs-ubuntu-24.04.ext4
-            images/libnpmjar.so
+            images/libscriptjail.so
             dist/main.js
           if-no-files-found: error
           retention-days: 1
@@ -243,5 +243,5 @@ jobs:
           files: |
             artifacts/images/rootfs-ubuntu-22.04.ext4
             artifacts/images/rootfs-ubuntu-24.04.ext4
-            artifacts/images/libnpmjar.so
+            artifacts/images/libscriptjail.so
             artifacts/dist/main.js

@@ -1,4 +1,4 @@
-// npm-jar — test/rootfs/build-config.test.ts
+// script-jail — test/rootfs/build-config.test.ts
 // Unit tests for the pure-function helpers in src/rootfs/build.ts.
 // These tests do NOT invoke docker, mkfs.ext4, or any filesystem mutation;
 // they only verify input-shape parsing and output-path computation.
@@ -73,15 +73,15 @@ describe('imageOutputPath', () => {
 // ---------------------------------------------------------------------------
 
 describe('dockerTag', () => {
-  it('formats the tag as npm-jar-rootfs:<runner-image>', () => {
+  it('formats the tag as script-jail-rootfs:<runner-image>', () => {
     expect(dockerTag({ runnerImage: 'ubuntu-22.04' })).toBe(
-      'npm-jar-rootfs:ubuntu-22.04',
+      'script-jail-rootfs:ubuntu-22.04',
     );
   });
 
   it('produces a distinct tag for ubuntu-24.04', () => {
     expect(dockerTag({ runnerImage: 'ubuntu-24.04' })).toBe(
-      'npm-jar-rootfs:ubuntu-24.04',
+      'script-jail-rootfs:ubuntu-24.04',
     );
   });
 

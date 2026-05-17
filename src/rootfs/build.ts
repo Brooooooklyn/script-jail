@@ -1,4 +1,4 @@
-// npm-jar — src/rootfs/build.ts
+// script-jail — src/rootfs/build.ts
 // Orchestrates building the Firecracker rootfs ext4 image.
 //
 // In v2 the rootfs is keyed by Ubuntu major (`ubuntu-22.04`, `ubuntu-24.04`)
@@ -10,8 +10,8 @@
 // Steps:
 //   1. Bundle src/guest/agent.ts → dist/guest-agent.cjs via esbuild
 //   2. Copy the two .cjs preloads to dist/preloads/
-//   3. Ensure images/libnpmjar.so is present (build if not, skip on macOS)
-//   4. docker build → npm-jar-rootfs:<runnerImage>
+//   3. Ensure images/libscriptjail.so is present (build if not, skip on macOS)
+//   4. docker build → script-jail-rootfs:<runnerImage>
 //   5. docker export → tar → directory → ext4 image
 //   6. Write images/rootfs-<runnerImage>.ext4
 //   7. Report size; warn if > 200 MB
@@ -61,7 +61,7 @@ export function imageOutputPath(input: BuildInput): string {
 
 /** Docker image tag for this runner image. */
 export function dockerTag(input: Pick<BuildInput, 'runnerImage'>): string {
-  return `npm-jar-rootfs:${input.runnerImage}`;
+  return `script-jail-rootfs:${input.runnerImage}`;
 }
 
 /** Map a runner image to its `ubuntu:<version>` base tag. */
@@ -154,27 +154,27 @@ function copyPreloads(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Step 3 — Ensure libnpmjar.so
+// Step 3 — Ensure libscriptjail.so
 // ---------------------------------------------------------------------------
 
 function ensureShim(): boolean {
-  const shimOut = join(REPO_ROOT, 'images', 'libnpmjar.so');
+  const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
 
   if (existsSync(shimOut)) {
-    console.log(`[rootfs] libnpmjar.so already present.`);
+    console.log(`[rootfs] libscriptjail.so already present.`);
     return true;
   }
 
   if (isMacOS()) {
     console.warn(
-      '[rootfs] WARNING: Running on macOS — cannot build libnpmjar.so (requires Linux cc).\n' +
+      '[rootfs] WARNING: Running on macOS — cannot build libscriptjail.so (requires Linux cc).\n' +
       '[rootfs]          Skipping shim build. The docker build step will also be skipped.\n' +
       '[rootfs]          To build the full rootfs, run this script on a Linux host or CI.',
     );
     return false;
   }
 
-  console.log(`[rootfs] Building libnpmjar.so via src/shim/build.sh …`);
+  console.log(`[rootfs] Building libscriptjail.so via src/shim/build.sh …`);
   const buildSh = join(REPO_ROOT, 'src', 'shim', 'build.sh');
   run(`sh "${buildSh}"`);
 
@@ -246,7 +246,7 @@ function exportAndConvert(input: BuildInput): void {
 
   // Create a temp directory to hold the exported filesystem tree.
   const tmpBase = tmpdir();
-  const tmpDir = join(tmpBase, `npm-jar-rootfs-${randomBytes(6).toString('hex')}`);
+  const tmpDir = join(tmpBase, `script-jail-rootfs-${randomBytes(6).toString('hex')}`);
   mkdirSync(tmpDir, { recursive: true });
 
   try {
@@ -335,7 +335,7 @@ export async function buildRootfs(input: BuildInput): Promise<void> {
     // On macOS without the .so we cannot build the docker image because the
     // Dockerfile COPY would fail. Emit a clear warning and return.
     console.warn(
-      '[rootfs] Skipping docker build and ext4 conversion (libnpmjar.so not available on macOS).',
+      '[rootfs] Skipping docker build and ext4 conversion (libscriptjail.so not available on macOS).',
     );
     return;
   }

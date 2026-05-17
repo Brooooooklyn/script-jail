@@ -1,13 +1,13 @@
-// npm-jar — test/e2e/spoof-input.test.ts
+// script-jail — test/e2e/spoof-input.test.ts
 //
 // Verifies the input-wiring boundary introduced by Task #18: when the action
 // is invoked with `INPUT_SPOOF-PLATFORM=darwin`, the value reaches
 // buildEffectiveConfig() and is written into the per-run config file that
 // main() feeds to makeOverlay().
 //
-// The on-host source `.npm-jar.yml` is set to `spoof.platform: linux`; the
+// The on-host source `.script-jail.yml` is set to `spoof.platform: linux`; the
 // override should win, producing `platform: darwin` in the effective config
-// file under `${RUNNER_TEMP}/npm-jar-images/config.yml`.
+// file under `${RUNNER_TEMP}/script-jail-images/config.yml`.
 
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, readFileSync } from 'node:fs';
@@ -30,8 +30,8 @@ describe.sequential('e2e: spoof-platform input wiring', () => {
 
     // Force RUNNER_TEMP to a directory we own so we can find the effective
     // config file deterministically.  main() joins this with
-    // `npm-jar-images/config.yml`.  We restore the prior value in `finally`.
-    const ownedRunnerTemp = mkdtempSync(join(tmpdir(), 'npm-jar-spoof-test-'));
+    // `script-jail-images/config.yml`.  We restore the prior value in `finally`.
+    const ownedRunnerTemp = mkdtempSync(join(tmpdir(), 'script-jail-spoof-test-'));
     const priorRunnerTemp = process.env['RUNNER_TEMP'];
     process.env['RUNNER_TEMP'] = ownedRunnerTemp;
 
@@ -50,7 +50,7 @@ describe.sequential('e2e: spoof-platform input wiring', () => {
       expect(result.error).toBeUndefined();
       expect(result.exit).toBeNull();
 
-      const effectivePath = join(ownedRunnerTemp, 'npm-jar-images', 'config.yml');
+      const effectivePath = join(ownedRunnerTemp, 'script-jail-images', 'config.yml');
       const effective = readFileSync(effectivePath, 'utf8');
 
       // YAML `stringify` emits `platform: darwin` (no quotes for a bare

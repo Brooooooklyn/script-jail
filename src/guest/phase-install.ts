@@ -1,4 +1,4 @@
-// npm-jar — phase-install.ts
+// script-jail — phase-install.ts
 // Phase B: network-off audited install under strace.
 //
 // Per-manager commands:
@@ -65,7 +65,7 @@ export interface PhaseInstallInput {
   emitter: Emitter;
   /**
    * Base path prefix for strace per-pid output files.
-   * e.g. `/tmp/npm-jar-strace/strace.out` → strace writes .out.<pid> files.
+   * e.g. `/tmp/script-jail-strace/strace.out` → strace writes .out.<pid> files.
    */
   straceBasePath?: string;
   /**
@@ -136,7 +136,7 @@ export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
   const { cmd, args } = INSTALL_CMD[input.manager];
-  const basePath = input.straceBasePath ?? '/tmp/npm-jar-strace/strace.out';
+  const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`
   // short-circuits to false, so ENOENT events get dropped exactly like the

@@ -1,4 +1,4 @@
-// npm-jar — src/main.ts
+// script-jail — src/main.ts
 //
 // GitHub Action entry point.  Wired in action.yml as `runs.main: dist/main.js`.
 //
@@ -109,19 +109,19 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   //
   //   * The Layer 2 workflow runs `pnpm build -- --runner-image=…` on
   //     the runner BEFORE invoking the action, which places real rootfs
-  //     + libnpmjar.so files under `imagesDir`.  `preFetchArtifacts`
+  //     + libscriptjail.so files under `imagesDir`.  `preFetchArtifacts`
   //     would then SHA-check those locally-built files against the
   //     placeholder manifest, see a mismatch, and try to re-download
   //     from a release that does not yet exist.
   //
-  // `NPM_JAR_E2E_SELF_TEST=1` skips BOTH gates so the e2e workflow can
+  // `SCRIPT_JAIL_E2E_SELF_TEST=1` skips BOTH gates so the e2e workflow can
   // exercise the action's real boot path against its own working tree.
   // The variable is intentionally NOT exposed as an action input — only
   // the workflow that owns this repo sets it, and consumers' workflows
   // never see it (GitHub Actions only inherits `env:` you explicitly
   // declare on the step or job).  Setting it in a consumer workflow
   // would disable the manifest-validation safety net and is unsupported.
-  const selfTest = process.env['NPM_JAR_E2E_SELF_TEST'] === '1';
+  const selfTest = process.env['SCRIPT_JAIL_E2E_SELF_TEST'] === '1';
 
   if (!selfTest) {
     // Fail-fast: refuse to do ANY work if the action was published with
@@ -171,13 +171,13 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // os.tmpdir() is the dev/test fallback.
   //
   // The rootfs image (`rootfs-<runner-image>.ext4`) is also resolved here.
-  // `preFetchArtifacts()` below downloads it (and libnpmjar.so) from the
+  // `preFetchArtifacts()` below downloads it (and libscriptjail.so) from the
   // GitHub release matching PINNED_MANIFEST.tag; if the download or its
   // SHA-256 check fails, the pre-fetch step throws before `launchVm` runs.
 
   const imagesDir = process.env['RUNNER_TEMP']
-    ? join(process.env['RUNNER_TEMP'], 'npm-jar-images')
-    : join(tmpdir(), 'npm-jar-images');
+    ? join(process.env['RUNNER_TEMP'], 'script-jail-images')
+    : join(tmpdir(), 'script-jail-images');
   mkdirSync(imagesDir, { recursive: true });
 
   // --- Honour `cache-firecracker: false` -----------------------------------
@@ -206,14 +206,14 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // --- Pre-fetch release artifacts (rootfs + .so) --------------------------
   // GitHub JavaScript actions don't support `runs.pre`, so the pre-fetch
   // happens here, inside main(), before any other VM-side work.  See
-  // `./action/pre-fetch-artifacts.ts` for the asymmetry note on libnpmjar.so
+  // `./action/pre-fetch-artifacts.ts` for the asymmetry note on libscriptjail.so
   // (baked into the released rootfs, so the .so download is informational
   // for the v1 production path).
   const http = new NodeHttpClient();
   if (!selfTest) {
-    // See the `NPM_JAR_E2E_SELF_TEST` block at the top of this function for
+    // See the `SCRIPT_JAIL_E2E_SELF_TEST` block at the top of this function for
     // why this is skipped under self-test.  In short: the workflow has
-    // already placed real rootfs + libnpmjar.so files under `imagesDir`
+    // already placed real rootfs + libscriptjail.so files under `imagesDir`
     // via `pnpm build`, but they will fail the manifest SHA check because
     // the manifest still holds placeholders until the first real release.
     await doPreFetchArtifacts({
@@ -248,13 +248,13 @@ export async function main(deps: MainDeps = {}): Promise<void> {
 
   // --- Apply spoof-platform / spoof-arch overrides -------------------------
   // The user's config YAML ships `spoof.platform` and `spoof.arch`, which the
-  // guest agent reads and exports as NPM_JAR_SPOOF_PLATFORM / _ARCH for the
+  // guest agent reads and exports as SCRIPT_JAIL_SPOOF_PLATFORM / _ARCH for the
   // platform-spoof preload (see src/guest/agent.ts and platform-spoof.cjs).
   // The action also advertises `spoof-platform` / `spoof-arch` inputs and
   // users supplying them expect them to take precedence over whatever is on
   // disk.  We materialise an effective copy of the config to a per-run temp
   // path, applying the overrides, and feed that path into makeOverlay() so
-  // the override lands in the VM's repo disk at /etc/npm-jar/config.yml.
+  // the override lands in the VM's repo disk at /etc/script-jail/config.yml.
   // The user's source file on the host is never modified.
   // Pass `imagesDir` as the workDir so the rewritten config lives under the
   // same RUNNER_TEMP-rooted tree we already use for binaries.  GitHub Actions
@@ -280,8 +280,8 @@ export async function main(deps: MainDeps = {}): Promise<void> {
 
   // --- Generate unique per-run socket paths --------------------------------
   const runId = randomBytes(4).toString('hex');
-  const apiSocketPath = join(tmpdir(), `npm-jar-fc-api-${runId}.sock`);
-  const vsockUdsPath = join(tmpdir(), `npm-jar-vsock-${runId}`);
+  const apiSocketPath = join(tmpdir(), `script-jail-fc-api-${runId}.sock`);
+  const vsockUdsPath = join(tmpdir(), `script-jail-vsock-${runId}`);
 
   let vm: VmHandle | null = null;
   let vsock: VsockSession | null = null;
@@ -342,14 +342,14 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       }
       if (frame.kind === 'error') {
         if (frame.fatal) {
-          fatalError = new Error(`npm-jar guest fatal: ${frame.message}`);
+          fatalError = new Error(`script-jail guest fatal: ${frame.message}`);
           break;
         }
         // Non-fatal errors are surfaced as warnings AND retained so that, if
         // the stream ends without a final frame, we can attach them to the
         // diagnostic message instead of throwing a context-free error.
         nonFatalErrors.push(frame.message);
-        warn(`npm-jar guest: ${frame.message}`);
+        warn(`script-jail guest: ${frame.message}`);
         continue;
       }
       if (frame.kind === 'final') {
@@ -374,7 +374,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
         ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(', ')}]`
         : '';
     throw new Error(
-      `npm-jar: vsock session ended without a final frame.${tail}`,
+      `script-jail: vsock session ended without a final frame.${tail}`,
     );
   }
 

@@ -1,4 +1,4 @@
-// npm-jar — test/scripts/check-publish-artifacts.test.ts
+// script-jail — test/scripts/check-publish-artifacts.test.ts
 //
 // Unit tests for scripts/check-publish-artifacts.sh — the publish-job gate
 // that verifies the downloaded build artifacts' SHA-256 digests against the
@@ -47,7 +47,7 @@ afterAll(() => {
 });
 
 function makeWorkspace(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'npm-jar-checkpub-'));
+  const dir = mkdtempSync(join(tmpdir(), 'script-jail-checkpub-'));
   tempDirs.push(dir);
   mkdirSync(join(dir, 'src/action'), { recursive: true });
   mkdirSync(join(dir, 'art/images'), { recursive: true });
@@ -73,12 +73,12 @@ function writeManifest(workspace: string, entries: ManifestEntries): string {
     "import type { ArtifactManifest } from './pre-fetch-artifacts.js';",
     '',
     'export const PINNED_MANIFEST: ArtifactManifest = {',
-    "  repo: 'brooklyn/npm-jar',",
+    "  repo: 'brooklyn/script-jail',",
     "  tag: 'v0.0.0',",
     '  expected: {',
     `    'rootfs-ubuntu-22.04.ext4': '${entries.rootfs22}',`,
     `    'rootfs-ubuntu-24.04.ext4': '${entries.rootfs24}',`,
-    `    'libnpmjar.so':              '${entries.libso}',`,
+    `    'libscriptjail.so':              '${entries.libso}',`,
     '  },',
     '};',
     '',
@@ -101,7 +101,7 @@ function writeArtifacts(workspace: string, bytes: ArtifactBytes): {
   const dir = join(workspace, 'art');
   writeFileSync(join(dir, 'images/rootfs-ubuntu-22.04.ext4'), bytes.rootfs22);
   writeFileSync(join(dir, 'images/rootfs-ubuntu-24.04.ext4'), bytes.rootfs24);
-  writeFileSync(join(dir, 'images/libnpmjar.so'), bytes.libso);
+  writeFileSync(join(dir, 'images/libscriptjail.so'), bytes.libso);
   writeFileSync(join(dir, 'dist/main.js'), bytes.dist);
   return {
     dir,
@@ -149,7 +149,7 @@ describe('scripts/check-publish-artifacts.sh', () => {
     const manifestPath = writeManifest(ws, {
       rootfs22: 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_22_04',
       rootfs24: 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_24_04',
-      libso: 'PLACEHOLDER_SHA256_LIBNPMJAR_SO',
+      libso: 'PLACEHOLDER_SHA256_LIBSCRIPTJAIL_SO',
     });
     const { dir } = writeArtifacts(ws, {
       rootfs22: 'r22',
@@ -170,7 +170,7 @@ describe('scripts/check-publish-artifacts.sh', () => {
     const bytes: ArtifactBytes = {
       rootfs22: 'rootfs22-bytes',
       rootfs24: 'rootfs24-bytes',
-      libso: 'libnpmjar-bytes',
+      libso: 'libscriptjail-bytes',
       dist: 'dist-main-bytes',
     };
     const { dir, shas } = writeArtifacts(ws, bytes);
@@ -202,7 +202,7 @@ describe('scripts/check-publish-artifacts.sh', () => {
     const bytes: ArtifactBytes = {
       rootfs22: 'actual-22-bytes',
       rootfs24: 'rootfs24-bytes',
-      libso: 'libnpmjar-bytes',
+      libso: 'libscriptjail-bytes',
       dist: 'dist-main-bytes',
     };
     const { dir, shas } = writeArtifacts(ws, bytes);
@@ -256,7 +256,7 @@ describe('scripts/check-publish-artifacts.sh', () => {
     const manifestPath = writeManifest(ws, {
       rootfs22: 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_22_04',
       rootfs24: 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_24_04',
-      libso: 'PLACEHOLDER_SHA256_LIBNPMJAR_SO',
+      libso: 'PLACEHOLDER_SHA256_LIBSCRIPTJAIL_SO',
     });
     const { dir } = writeArtifacts(ws, {
       rootfs22: 'r22',
@@ -288,7 +288,7 @@ describe('scripts/check-publish-artifacts.sh', () => {
     const manifestPath = writeManifest(ws, {
       rootfs22: 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_22_04',
       rootfs24: 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_24_04',
-      libso: 'PLACEHOLDER_SHA256_LIBNPMJAR_SO',
+      libso: 'PLACEHOLDER_SHA256_LIBSCRIPTJAIL_SO',
     });
     const distBytes = 'trusted-dist-bytes';
     const { dir } = writeArtifacts(ws, {
@@ -329,13 +329,13 @@ describe('scripts/check-publish-artifacts.sh', () => {
     const manifestPath = join(ws, 'src/action/artifact-manifest.ts');
     const contents = [
       'export const PINNED_MANIFEST: ArtifactManifest = {',
-      "  repo: 'brooklyn/npm-jar',",
+      "  repo: 'brooklyn/script-jail',",
       "  tag: 'v0.0.0',",
       '  expected: {',
       `    'rootfs-ubuntu-22.04.ext4': '${shas.rootfs22}',`,
       `    'rootfs-ubuntu-22.04.ext4': '${'f'.repeat(64)}',`, // duplicate
       `    'rootfs-ubuntu-24.04.ext4': '${shas.rootfs24}',`,
-      `    'libnpmjar.so':              '${shas.libso}',`,
+      `    'libscriptjail.so':              '${shas.libso}',`,
       '  },',
       '};',
       '',
@@ -370,12 +370,12 @@ describe('scripts/check-publish-artifacts.sh', () => {
       "//   'rootfs-ubuntu-22.04.ext4': 'PLACEHOLDER_SHA256_DECOY',",
       '',
       'export const PINNED_MANIFEST: ArtifactManifest = {',
-      "  repo: 'brooklyn/npm-jar',",
+      "  repo: 'brooklyn/script-jail',",
       "  tag: 'v0.0.0',",
       '  expected: {',
       `    'rootfs-ubuntu-22.04.ext4': '${shas.rootfs22}',`,
       `    'rootfs-ubuntu-24.04.ext4': '${shas.rootfs24}',`,
-      `    'libnpmjar.so':              '${shas.libso}',`,
+      `    'libscriptjail.so':              '${shas.libso}',`,
       '  },',
       '};',
       '',

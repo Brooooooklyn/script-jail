@@ -1,4 +1,4 @@
-// npm-jar — test/action/validate-manifest.test.ts
+// script-jail — test/action/validate-manifest.test.ts
 //
 // Unit tests for validateManifest() — the fail-fast startup check that
 // refuses to run the action when `PINNED_MANIFEST.expected` still contains
@@ -24,7 +24,7 @@ function manifestWith(
   expected: Readonly<Record<string, string>>,
 ): ArtifactManifest {
   return {
-    repo: 'brooklyn/npm-jar',
+    repo: 'brooklyn/script-jail',
     tag: 'v0.1.0',
     expected,
   };
@@ -39,7 +39,7 @@ describe('validateManifest', () => {
     const m = manifestWith({
       'rootfs-ubuntu-22.04.ext4': REAL_SHA_A,
       'rootfs-ubuntu-24.04.ext4': REAL_SHA_B,
-      'libnpmjar.so': REAL_SHA_C,
+      'libscriptjail.so': REAL_SHA_C,
     });
     expect(() => validateManifest(m)).not.toThrow();
   });
@@ -48,7 +48,7 @@ describe('validateManifest', () => {
     const m = manifestWith({
       'rootfs-ubuntu-22.04.ext4': 'PLACEHOLDER_SHA256_ROOTFS_UBUNTU_22_04',
       'rootfs-ubuntu-24.04.ext4': REAL_SHA_B,
-      'libnpmjar.so': REAL_SHA_C,
+      'libscriptjail.so': REAL_SHA_C,
     });
     expect(() => validateManifest(m)).toThrowError(
       /src\/action\/artifact-manifest\.ts/,
@@ -57,14 +57,14 @@ describe('validateManifest', () => {
       /rootfs-ubuntu-22\.04\.ext4/,
     );
     // The error should also surface the repo so the user knows where to file.
-    expect(() => validateManifest(m)).toThrowError(/brooklyn\/npm-jar/);
+    expect(() => validateManifest(m)).toThrowError(/brooklyn\/script-jail/);
   });
 
   it('throws when a value is hex but the wrong length (e.g. 63 chars)', () => {
     const m = manifestWith({
       'rootfs-ubuntu-22.04.ext4': 'a'.repeat(63), // one char short
       'rootfs-ubuntu-24.04.ext4': REAL_SHA_B,
-      'libnpmjar.so': REAL_SHA_C,
+      'libscriptjail.so': REAL_SHA_C,
     });
     expect(() => validateManifest(m)).toThrowError(
       /rootfs-ubuntu-22\.04\.ext4/,
@@ -75,7 +75,7 @@ describe('validateManifest', () => {
     const m = manifestWith({
       'rootfs-ubuntu-22.04.ext4': 'A'.repeat(64), // uppercase
       'rootfs-ubuntu-24.04.ext4': REAL_SHA_B,
-      'libnpmjar.so': REAL_SHA_C,
+      'libscriptjail.so': REAL_SHA_C,
     });
     expect(() => validateManifest(m)).toThrowError(
       /rootfs-ubuntu-22\.04\.ext4/,

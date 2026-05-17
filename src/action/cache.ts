@@ -1,4 +1,4 @@
-// npm-jar — src/action/cache.ts
+// script-jail — src/action/cache.ts
 //
 // Honors the `cache-firecracker` action input.
 //

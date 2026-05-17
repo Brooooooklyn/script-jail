@@ -38,7 +38,7 @@ const onlineLookup: DnsLookupFn = (_hostname, callback) => {
 let testDir: string;
 
 beforeEach(() => {
-  testDir = join(tmpdir(), `npm-jar-agent-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  testDir = join(tmpdir(), `script-jail-agent-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(testDir, { recursive: true });
 });
 
@@ -323,12 +323,12 @@ describe('agent main()', () => {
 
     expect(capturedEnvs.length).toBeGreaterThan(0);
     const env = capturedEnvs[0]!;
-    expect(env['LD_PRELOAD']).toBe('/lib/libnpmjar.so');
-    expect(env['NPM_JAR_SPOOF_PLATFORM']).toBe('darwin');
-    expect(env['NPM_JAR_SPOOF_ARCH']).toBe('arm64');
+    expect(env['LD_PRELOAD']).toBe('/lib/libscriptjail.so');
+    expect(env['SCRIPT_JAIL_SPOOF_PLATFORM']).toBe('darwin');
+    expect(env['SCRIPT_JAIL_SPOOF_ARCH']).toBe('arm64');
     expect(env['NODE_OPTIONS']).toContain('dlopen-block.cjs');
     expect(env['NODE_OPTIONS']).toContain('platform-spoof.cjs');
-    expect(env['NPM_JAR_LOG_FD']).toBe('3');
+    expect(env['SCRIPT_JAIL_LOG_FD']).toBe('3');
   });
 
   it('throws when config file does not exist', async () => {

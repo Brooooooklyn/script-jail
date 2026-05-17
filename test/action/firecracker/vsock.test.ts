@@ -1,4 +1,4 @@
-// npm-jar — test/action/firecracker/vsock.test.ts
+// script-jail — test/action/firecracker/vsock.test.ts
 //
 // Tests for openVsockSession() using pipe-based fake duplexes.
 //

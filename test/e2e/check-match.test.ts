@@ -1,4 +1,4 @@
-// npm-jar — test/e2e/check-match.test.ts
+// script-jail — test/e2e/check-match.test.ts
 //
 // mode=check happy path: the consumer ships a committed lockfile byte-equal
 // to what the guest agent would emit.  main() should:

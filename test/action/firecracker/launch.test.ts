@@ -1,4 +1,4 @@
-// npm-jar — test/action/firecracker/launch.test.ts
+// script-jail — test/action/firecracker/launch.test.ts
 //
 // Unit tests for launchVm().  All OS interaction is injected:
 //   - FakeSpawner: records spawn calls and returns a fake handle.
@@ -424,7 +424,7 @@ function withFakeFirecrackerServer(
   test: (socketPath: string) => Promise<void>,
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'npm-jar-api-test-'));
+    const tmpDir = mkdtempSync(join(tmpdir(), 'script-jail-api-test-'));
     const socketPath = join(tmpDir, 'fc.sock');
 
     const server = createServer((sock) => {

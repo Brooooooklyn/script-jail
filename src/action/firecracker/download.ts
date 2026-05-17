@@ -1,4 +1,4 @@
-// npm-jar — src/action/firecracker/download.ts
+// script-jail — src/action/firecracker/download.ts
 //
 // Downloads the Firecracker binary (from a GitHub release tarball) and a
 // precompiled vmlinux kernel image, caches both under `imagesDir`, and
@@ -92,7 +92,7 @@ export async function ensureBinaries(input: DownloadInput): Promise<DownloadResu
   const expectedTarSha = KNOWN_VERSIONS[firecrackerVersion];
   if (expectedTarSha === undefined) {
     throw new Error(
-      `npm-jar: unknown Firecracker version "${firecrackerVersion}". ` +
+      `script-jail: unknown Firecracker version "${firecrackerVersion}". ` +
       `Add it (with a pinned SHA-256) to KNOWN_VERSIONS in src/action/firecracker/download.ts.`,
     );
   }
@@ -197,7 +197,7 @@ async function extractFirecrackerBinary(
 ): Promise<void> {
   const tmpOut = join(
     tmpdir(),
-    `npm-jar-fc-${randomBytes(4).toString('hex')}`,
+    `script-jail-fc-${randomBytes(4).toString('hex')}`,
   );
 
   // Target entry inside the tarball (strip the leading directory component).
@@ -239,7 +239,7 @@ async function extractFirecrackerBinary(
       if (outStream) outStream.close();
       if (!foundEntry) {
         reject(new Error(
-          `npm-jar: entry "${targetEntry}" not found in tarball ${tarPath}`,
+          `script-jail: entry "${targetEntry}" not found in tarball ${tarPath}`,
         ));
         return;
       }

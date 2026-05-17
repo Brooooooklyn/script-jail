@@ -1,4 +1,4 @@
-// npm-jar — test/e2e/check-mismatch-fixture.test.ts
+// script-jail — test/e2e/check-mismatch-fixture.test.ts
 //
 // mode=check "fixture drifted" scenario: the guest emits a different YAML
 // than what the consumer committed.  Simulated by supplying a

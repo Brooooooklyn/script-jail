@@ -1,4 +1,4 @@
-// npm-jar — test/action/runner-image.test.ts
+// script-jail — test/action/runner-image.test.ts
 //
 // Tests for detectRunnerImage() — runner-image detection used to pick the
 // matching rootfs.  All tests use injection seams so no real process.env or
@@ -139,7 +139,7 @@ describe('detectRunnerImage — error paths', () => {
         fs: makeFs({}),
       }),
     ).toThrow(
-      'npm-jar: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
+      'script-jail: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
     );
   });
 
@@ -153,7 +153,7 @@ describe('detectRunnerImage — error paths', () => {
     expect(() =>
       detectRunnerImage({ imageOsEnv: undefined, fs }),
     ).toThrow(
-      'npm-jar: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
+      'script-jail: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
     );
   });
 

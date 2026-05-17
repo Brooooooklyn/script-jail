@@ -26448,19 +26448,19 @@ function parseInputs(input) {
   const modeStr = rawMode.trim() === "" ? "check" : rawMode.trim();
   if (!isMode(modeStr)) {
     throw new Error(
-      `npm-jar: invalid value for input "mode": "${modeStr}". Expected "check" or "update".`
+      `script-jail: invalid value for input "mode": "${modeStr}". Expected "check" or "update".`
     );
   }
   const platformStr = rawPlatform.trim() === "" ? "linux" : rawPlatform.trim();
   if (!isSpoofPlatform(platformStr)) {
     throw new Error(
-      `npm-jar: invalid value for input "spoof-platform": "${platformStr}". Expected one of: linux, darwin, win32.`
+      `script-jail: invalid value for input "spoof-platform": "${platformStr}". Expected one of: linux, darwin, win32.`
     );
   }
   const archStr = rawArch.trim() === "" ? "x64" : rawArch.trim();
   if (!isSpoofArch(archStr)) {
     throw new Error(
-      `npm-jar: invalid value for input "spoof-arch": "${archStr}". Expected one of: x64, arm64.`
+      `script-jail: invalid value for input "spoof-arch": "${archStr}". Expected one of: x64, arm64.`
     );
   }
   const cacheStr = rawCache.trim();
@@ -26469,11 +26469,11 @@ function parseInputs(input) {
   else if (cacheStr === "false") cacheFirecracker = false;
   else {
     throw new Error(
-      `npm-jar: invalid value for input "cache-firecracker": "${cacheStr}". Expected "true" or "false".`
+      `script-jail: invalid value for input "cache-firecracker": "${cacheStr}". Expected "true" or "false".`
     );
   }
-  const configRel = rawConfig.trim() === "" ? ".npm-jar.yml" : rawConfig.trim();
-  const lockRel = rawLock.trim() === "" ? ".npm-jar.lock.yml" : rawLock.trim();
+  const configRel = rawConfig.trim() === "" ? ".script-jail.yml" : rawConfig.trim();
+  const lockRel = rawLock.trim() === "" ? ".script-jail.lock.yml" : rawLock.trim();
   return {
     configPath: resolveAgainstRepo(configRel, input.repoDir),
     lockPath: resolveAgainstRepo(lockRel, input.repoDir),
@@ -26517,7 +26517,7 @@ function warn(msg, write = (s) => {
 // src/action/detect-pm.ts
 var BunUnsupportedError = class extends Error {
   constructor() {
-    super("npm-jar v1 does not support bun. Use npm/pnpm/yarn, or wait for v2.");
+    super("script-jail v1 does not support bun. Use npm/pnpm/yarn, or wait for v2.");
     this.name = "BunUnsupportedError";
   }
 };
@@ -26543,7 +26543,7 @@ function detectPm(input) {
     );
     if (hasBun) throw new BunUnsupportedError();
     throw new Error(
-      `npm-jar: no lockfile found in ${input.repoDir}. Expected one of: package-lock.json, pnpm-lock.yaml, yarn.lock, npm-shrinkwrap.json.`
+      `script-jail: no lockfile found in ${input.repoDir}. Expected one of: package-lock.json, pnpm-lock.yaml, yarn.lock, npm-shrinkwrap.json.`
     );
   }
   const chosen = found[0];
@@ -26593,7 +26593,7 @@ function detectRunnerImage(input) {
   }
   if (!fs3.existsSync(OS_RELEASE_PATH)) {
     throw new Error(
-      "npm-jar: cannot detect runner image \u2014 ImageOS env not set and /etc/os-release missing/unreadable."
+      "script-jail: cannot detect runner image \u2014 ImageOS env not set and /etc/os-release missing/unreadable."
     );
   }
   let raw;
@@ -26601,7 +26601,7 @@ function detectRunnerImage(input) {
     raw = fs3.readFileSync(OS_RELEASE_PATH, "utf8");
   } catch {
     throw new Error(
-      "npm-jar: cannot detect runner image \u2014 ImageOS env not set and /etc/os-release missing/unreadable."
+      "script-jail: cannot detect runner image \u2014 ImageOS env not set and /etc/os-release missing/unreadable."
     );
   }
   const parsed = parseOsRelease(raw);
@@ -26612,7 +26612,7 @@ function detectRunnerImage(input) {
     if (mapped !== void 0) return mapped;
   }
   throw new UnsupportedRunnerImageError(
-    `npm-jar: unsupported runner image (ID=${id}, VERSION_ID=${versionId}). Supported: ubuntu-22.04, ubuntu-24.04.`
+    `script-jail: unsupported runner image (ID=${id}, VERSION_ID=${versionId}). Supported: ubuntu-22.04, ubuntu-24.04.`
   );
 }
 function parseOsRelease(raw) {
@@ -26654,7 +26654,7 @@ function resolveHostNodeExecPath(opts) {
   const resolved = which2("node", segments);
   if (resolved === null) {
     throw new Error(
-      "npm-jar: no `node` was found on PATH. Add `actions/setup-node` before this action so the chosen Node version is on PATH."
+      "script-jail: no `node` was found on PATH. Add `actions/setup-node` before this action so the chosen Node version is on PATH."
     );
   }
   return resolved;
@@ -26694,7 +26694,7 @@ function resolveHostNodePrefix(opts) {
   });
   if (RUNNER_BUNDLED_NODE_RE.test(execPath)) {
     throw new Error(
-      "npm-jar: refusing to mount the GitHub Actions runner's bundled Node. Add `actions/setup-node` before this action so the chosen Node version is used."
+      "script-jail: refusing to mount the GitHub Actions runner's bundled Node. Add `actions/setup-node` before this action so the chosen Node version is used."
     );
   }
   const prefix = (0, import_node_path3.dirname)((0, import_node_path3.dirname)(execPath));
@@ -26702,7 +26702,7 @@ function resolveHostNodePrefix(opts) {
   const blockedRoot = findBlockedRoot(prefix);
   if (blockedRoot !== null) {
     throw new Error(
-      `npm-jar: refusing to pack ${blockedRoot} \u2014 looks like a system-wide install. Use actions/setup-node so Node lives in an isolated toolcache directory.`
+      `script-jail: refusing to pack ${blockedRoot} \u2014 looks like a system-wide install. Use actions/setup-node so Node lives in an isolated toolcache directory.`
     );
   }
   if (execPath.startsWith(HOSTED_TOOLCACHE_PREFIX)) return prefix;
@@ -26718,7 +26718,7 @@ function resolveHostNodePrefix(opts) {
   const hasDocs = fs3.existsSync((0, import_node_path3.join)(prefix, "share", "doc", "node"));
   if (hasHeader && hasDocs) return prefix;
   throw new Error(
-    `npm-jar: ${execPath} does not appear to be a self-contained Node install (missing include/node/node.h and/or share/doc/node). Use actions/setup-node before calling this action.`
+    `script-jail: ${execPath} does not appear to be a self-contained Node install (missing include/node/node.h and/or share/doc/node). Use actions/setup-node before calling this action.`
   );
 }
 function withTrailingSlash(p) {
@@ -27319,7 +27319,7 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
-  const outDir = input.workDir ?? (0, import_node_fs4.mkdtempSync)((0, import_node_path4.join)((0, import_node_os2.tmpdir)(), "npm-jar-config-"));
+  const outDir = input.workDir ?? (0, import_node_fs4.mkdtempSync)((0, import_node_path4.join)((0, import_node_os2.tmpdir)(), "script-jail-config-"));
   const outPath = (0, import_node_path4.join)(outDir, "config.yml");
   (0, import_node_fs4.writeFileSync)(outPath, (0, import_yaml.stringify)(config), "utf8");
   return outPath;
@@ -27363,7 +27363,7 @@ async function ensureBinaries(input) {
   const expectedTarSha = KNOWN_VERSIONS[firecrackerVersion];
   if (expectedTarSha === void 0) {
     throw new Error(
-      `npm-jar: unknown Firecracker version "${firecrackerVersion}". Add it (with a pinned SHA-256) to KNOWN_VERSIONS in src/action/firecracker/download.ts.`
+      `script-jail: unknown Firecracker version "${firecrackerVersion}". Add it (with a pinned SHA-256) to KNOWN_VERSIONS in src/action/firecracker/download.ts.`
     );
   }
   (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
@@ -27405,7 +27405,7 @@ async function ensureFile(http, url, destPath, expectedSha256) {
 async function extractFirecrackerBinary(tarPath, destPath, version) {
   const tmpOut = (0, import_node_path6.join)(
     (0, import_node_os3.tmpdir)(),
-    `npm-jar-fc-${(0, import_node_crypto2.randomBytes)(4).toString("hex")}`
+    `script-jail-fc-${(0, import_node_crypto2.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version}-x86_64`;
   await new Promise((resolve2, reject) => {
@@ -27433,7 +27433,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version) {
       if (outStream) outStream.close();
       if (!foundEntry) {
         reject(new Error(
-          `npm-jar: entry "${targetEntry}" not found in tarball ${tarPath}`
+          `script-jail: entry "${targetEntry}" not found in tarball ${tarPath}`
         ));
         return;
       }
@@ -27538,14 +27538,14 @@ var import_node_path7 = require("node:path");
 function rootfsAssetName(runnerImage) {
   return `rootfs-${runnerImage}.ext4`;
 }
-var LIBNPMJAR_ASSET = "libnpmjar.so";
+var LIBSCRIPTJAIL_ASSET = "libscriptjail.so";
 async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
   (0, import_node_fs7.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName(runnerImage);
   const assets = [
     { name: wantedRootfs, expected: requireExpected(manifest, wantedRootfs) },
-    { name: LIBNPMJAR_ASSET, expected: requireExpected(manifest, LIBNPMJAR_ASSET) }
+    { name: LIBSCRIPTJAIL_ASSET, expected: requireExpected(manifest, LIBSCRIPTJAIL_ASSET) }
   ];
   await Promise.all(
     assets.map(
@@ -27565,7 +27565,7 @@ function requireExpected(manifest, asset) {
   const sha = manifest.expected[asset];
   if (sha === void 0) {
     throw new Error(
-      `npm-jar: artifact manifest is missing an expected SHA-256 for "${asset}". Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`
+      `script-jail: artifact manifest is missing an expected SHA-256 for "${asset}". Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`
     );
   }
   return sha;
@@ -27593,13 +27593,13 @@ async function sha256File2(filePath) {
 
 // src/action/artifact-manifest.ts
 var PINNED_MANIFEST = {
-  repo: "brooklyn/npm-jar",
+  repo: "brooklyn/script-jail",
   // update when forked
   tag: "v0.1.0",
   expected: {
     "rootfs-ubuntu-22.04.ext4": "PLACEHOLDER_SHA256_ROOTFS_UBUNTU_22_04",
     "rootfs-ubuntu-24.04.ext4": "PLACEHOLDER_SHA256_ROOTFS_UBUNTU_24_04",
-    "libnpmjar.so": "PLACEHOLDER_SHA256_LIBNPMJAR_SO"
+    "libscriptjail.so": "PLACEHOLDER_SHA256_LIBSCRIPTJAIL_SO"
   }
 };
 
@@ -27615,7 +27615,7 @@ function validateManifest(manifest) {
   }
   if (offenders.length === 0) return;
   throw new Error(
-    `npm-jar: action artifact manifest at ${MANIFEST_PATH} has unpinned entries: [${offenders.join(", ")}]. This indicates the action was published without real release-asset hashes. Open a GitHub issue against the action repository (${manifest.repo}).`
+    `script-jail: action artifact manifest at ${MANIFEST_PATH} has unpinned entries: [${offenders.join(", ")}]. This indicates the action was published without real release-asset hashes. Open a GitHub issue against the action repository (${manifest.repo}).`
   );
 }
 
@@ -27634,14 +27634,14 @@ async function makeOverlay(input) {
     hostNodePrefix,
     workDir: maybeWorkDir
   } = input;
-  const workDir = maybeWorkDir ?? (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)((0, import_node_os4.tmpdir)(), "npm-jar-run-"));
+  const workDir = maybeWorkDir ?? (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
   (0, import_node_fs8.mkdirSync)(workDir, { recursive: true });
   const rootfsCopyPath = (0, import_node_path8.join)(workDir, "rootfs.ext4");
   copyRootfs(baseRootfsPath, rootfsCopyPath);
   const repoStageDir = (0, import_node_path8.join)(workDir, "repo-stage");
   (0, import_node_fs8.mkdirSync)(repoStageDir, { recursive: true });
   (0, import_node_fs8.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
-  const configDestDir = (0, import_node_path8.join)(repoStageDir, "etc", "npm-jar");
+  const configDestDir = (0, import_node_path8.join)(repoStageDir, "etc", "script-jail");
   (0, import_node_fs8.mkdirSync)(configDestDir, { recursive: true });
   (0, import_node_fs8.copyFileSync)(configPath, (0, import_node_path8.join)(configDestDir, "config.yml"));
   const repoDiskPath = (0, import_node_path8.join)(workDir, "repo.ext4");
@@ -27796,12 +27796,12 @@ async function launchVm(input) {
   if (!input.spawner) {
     if (import_node_process2.platform !== "linux") {
       throw new Error(
-        `npm-jar: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
+        `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
     if (!(0, import_node_fs9.existsSync)("/dev/kvm")) {
       throw new Error(
-        "npm-jar: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
+        "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
     }
   }
@@ -27818,7 +27818,7 @@ async function launchVm(input) {
   } catch (err) {
     handle.kill("SIGKILL");
     throw new Error(
-      `npm-jar: firecracker API socket did not appear at ${socketPath} within 5 s. Inner error: ${String(err)}`
+      `script-jail: firecracker API socket did not appear at ${socketPath} within 5 s. Inner error: ${String(err)}`
     );
   }
   try {
@@ -28035,7 +28035,7 @@ async function* parseFrames(readable) {
     } catch {
       yield {
         kind: "error",
-        message: `npm-jar vsock: malformed JSON frame: ${trimmed.slice(0, 200)}`,
+        message: `script-jail vsock: malformed JSON frame: ${trimmed.slice(0, 200)}`,
         fatal: false
       };
       continue;
@@ -28043,7 +28043,7 @@ async function* parseFrames(readable) {
     if (typeof raw !== "object" || raw === null) {
       yield {
         kind: "error",
-        message: `npm-jar vsock: expected JSON object, got: ${trimmed.slice(0, 200)}`,
+        message: `script-jail vsock: expected JSON object, got: ${trimmed.slice(0, 200)}`,
         fatal: false
       };
       continue;
@@ -28067,7 +28067,7 @@ function classifyFrame(obj) {
       }
       return {
         kind: "error",
-        message: `npm-jar vsock: unknown handshake phase: ${String(phase)}`,
+        message: `script-jail vsock: unknown handshake phase: ${String(phase)}`,
         fatal: false
       };
     }
@@ -28082,7 +28082,7 @@ function classifyFrame(obj) {
       if (typeof obj["yaml"] !== "string") {
         return {
           kind: "error",
-          message: `npm-jar vsock: "final" frame missing "yaml" string field`,
+          message: `script-jail vsock: "final" frame missing "yaml" string field`,
           fatal: false
         };
       }
@@ -28091,7 +28091,7 @@ function classifyFrame(obj) {
     default: {
       return {
         kind: "error",
-        message: `npm-jar vsock: unknown frame kind: ${String(kind)}`,
+        message: `script-jail vsock: unknown frame kind: ${String(kind)}`,
         fatal: false
       };
     }
@@ -28195,7 +28195,7 @@ async function main(deps = {}) {
     teardown: doTeardown = teardown,
     exitProcess = process.exit
   } = deps;
-  const selfTest = process.env["NPM_JAR_E2E_SELF_TEST"] === "1";
+  const selfTest = process.env["SCRIPT_JAIL_E2E_SELF_TEST"] === "1";
   if (!selfTest) {
     doValidateManifest(PINNED_MANIFEST);
   }
@@ -28213,7 +28213,7 @@ async function main(deps = {}) {
   }
   void pm;
   const runnerImage = detectRunnerImage();
-  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path9.join)(process.env["RUNNER_TEMP"], "npm-jar-images") : (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), "npm-jar-images");
+  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path9.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
   (0, import_node_fs11.mkdirSync)(imagesDir, { recursive: true });
   maybeClearCache({
     imagesDir,
@@ -28256,8 +28256,8 @@ async function main(deps = {}) {
     hostNodePrefix
   });
   const runId = (0, import_node_crypto4.randomBytes)(4).toString("hex");
-  const apiSocketPath = (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), `npm-jar-fc-api-${runId}.sock`);
-  const vsockUdsPath = (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), `npm-jar-vsock-${runId}`);
+  const apiSocketPath = (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
+  const vsockUdsPath = (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), `script-jail-vsock-${runId}`);
   let vm = null;
   let vsock = null;
   let finalYaml = null;
@@ -28289,11 +28289,11 @@ async function main(deps = {}) {
       }
       if (frame.kind === "error") {
         if (frame.fatal) {
-          fatalError = new Error(`npm-jar guest fatal: ${frame.message}`);
+          fatalError = new Error(`script-jail guest fatal: ${frame.message}`);
           break;
         }
         nonFatalErrors.push(frame.message);
-        warn(`npm-jar guest: ${frame.message}`);
+        warn(`script-jail guest: ${frame.message}`);
         continue;
       }
       if (frame.kind === "final") {
@@ -28314,7 +28314,7 @@ async function main(deps = {}) {
   if (finalYaml === null) {
     const tail = nonFatalErrors.length > 0 ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(", ")}]` : "";
     throw new Error(
-      `npm-jar: vsock session ended without a final frame.${tail}`
+      `script-jail: vsock session ended without a final frame.${tail}`
     );
   }
   if (inputs.mode === "check") {

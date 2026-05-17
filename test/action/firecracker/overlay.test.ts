@@ -1,4 +1,4 @@
-// npm-jar — test/action/firecracker/overlay.test.ts
+// script-jail — test/action/firecracker/overlay.test.ts
 //
 // Tests for makeOverlay().
 //
@@ -36,7 +36,7 @@ let repoDir: string;
 let hostNodePrefixDir: string;
 
 beforeEach(() => {
-  testDir = mkdtempSync(join(tmpdir(), 'npm-jar-overlay-test-'));
+  testDir = mkdtempSync(join(tmpdir(), 'script-jail-overlay-test-'));
   repoDir = join(testDir, 'repo');
   mkdirSync(repoDir, { recursive: true });
 
@@ -61,9 +61,9 @@ function fakeBaseRootfs(dir: string): string {
   return p;
 }
 
-/** Create a fake .npm-jar.yml config file. */
+/** Create a fake .script-jail.yml config file. */
 function fakeConfig(dir: string): string {
-  const p = join(dir, '.npm-jar.yml');
+  const p = join(dir, '.script-jail.yml');
   writeFileSync(p, 'manager: pnpm\nnode_version: "20"\n');
   return p;
 }
@@ -81,8 +81,8 @@ function fakeConfig(dir: string): string {
 describe('makeOverlay — staging (no ext4 build)', () => {
   it('copies the base rootfs to rootfsCopyPath', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);
-    fakeConfig(testDir); // creates .npm-jar.yml in testDir (side-effect only)
-    const workDir = mkdtempSync(join(tmpdir(), 'npm-jar-overlay-work-'));
+    fakeConfig(testDir); // creates .script-jail.yml in testDir (side-effect only)
+    const workDir = mkdtempSync(join(tmpdir(), 'script-jail-overlay-work-'));
 
     // Intercept the ext4 build by using a workDir that already contains a
     // fake rootfs.  We cannot fully skip mkfs.ext4 without more invasive
@@ -115,15 +115,15 @@ describe('makeOverlay — staging (no ext4 build)', () => {
     expect(existsSync(join(stageDir, 'index.js'))).toBe(true);
   });
 
-  it('places config.yml under etc/npm-jar/ in the stage dir', () => {
+  it('places config.yml under etc/script-jail/ in the stage dir', () => {
     // Simulate the config placement logic.
     const stageDir = join(testDir, 'stage');
     const configPath = fakeConfig(testDir);
-    const configDestDir = join(stageDir, 'etc', 'npm-jar');
+    const configDestDir = join(stageDir, 'etc', 'script-jail');
     mkdirSync(configDestDir, { recursive: true });
     writeFileSync(join(configDestDir, 'config.yml'), readFileSync(configPath));
 
-    const placed = join(stageDir, 'etc', 'npm-jar', 'config.yml');
+    const placed = join(stageDir, 'etc', 'script-jail', 'config.yml');
     expect(existsSync(placed)).toBe(true);
     expect(readFileSync(placed, 'utf8')).toContain('pnpm');
   });
@@ -131,7 +131,7 @@ describe('makeOverlay — staging (no ext4 build)', () => {
   it('cleanup() removes the workDir', async () => {
     // We skip the full makeOverlay call (requires mkfs.ext4) and test
     // the cleanup contract directly.
-    const workDir = mkdtempSync(join(tmpdir(), 'npm-jar-cleanup-test-'));
+    const workDir = mkdtempSync(join(tmpdir(), 'script-jail-cleanup-test-'));
     writeFileSync(join(workDir, 'dummy.txt'), 'hello');
 
     const { rm } = await import('node:fs/promises');

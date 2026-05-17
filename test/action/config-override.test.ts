@@ -1,4 +1,4 @@
-// npm-jar — test/action/config-override.test.ts
+// script-jail — test/action/config-override.test.ts
 //
 // Tests for `buildEffectiveConfig`.  Each test writes a user-config YAML to
 // a fresh tmpdir, calls the helper with explicit overrides, and reads back
@@ -32,8 +32,8 @@ let userConfigPath: string;
 let workDir: string;
 
 beforeEach(() => {
-  testDir = mkdtempSync(join(tmpdir(), 'npm-jar-cfg-override-'));
-  userConfigPath = join(testDir, '.npm-jar.yml');
+  testDir = mkdtempSync(join(tmpdir(), 'script-jail-cfg-override-'));
+  userConfigPath = join(testDir, '.script-jail.yml');
   workDir = join(testDir, 'work');
   mkdirSync(workDir, { recursive: true });
 });

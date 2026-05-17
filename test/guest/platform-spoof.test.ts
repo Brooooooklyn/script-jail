@@ -13,7 +13,7 @@ const preloadPath = join(__dirname, '../../src/guest/platform-spoof.cjs');
 
 /** Write a small CJS helper script to tmp and return its path. */
 function writeChildScript(code: string): string {
-  const dir = join(tmpdir(), 'npm-jar-test');
+  const dir = join(tmpdir(), 'script-jail-test');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `child-${Date.now()}-${Math.random().toString(36).slice(2)}.cjs`);
   writeFileSync(path, `'use strict';\n${code}\n`);
@@ -70,8 +70,8 @@ process.stdout.write(JSON.stringify({
 describe('platform-spoof preload', () => {
   it('linux + x64 (no-op defaults): values should be overridden to linux/x64', async () => {
     const out = await runWithSpoof(PROBE_CODE, {
-      NPM_JAR_SPOOF_PLATFORM: 'linux',
-      NPM_JAR_SPOOF_ARCH: 'x64',
+      SCRIPT_JAIL_SPOOF_PLATFORM: 'linux',
+      SCRIPT_JAIL_SPOOF_ARCH: 'x64',
     });
     expect(out['platform']).toBe('linux');
     expect(out['arch']).toBe('x64');
@@ -83,8 +83,8 @@ describe('platform-spoof preload', () => {
 
   it('darwin + arm64: overrides to darwin/arm64', async () => {
     const out = await runWithSpoof(PROBE_CODE, {
-      NPM_JAR_SPOOF_PLATFORM: 'darwin',
-      NPM_JAR_SPOOF_ARCH: 'arm64',
+      SCRIPT_JAIL_SPOOF_PLATFORM: 'darwin',
+      SCRIPT_JAIL_SPOOF_ARCH: 'arm64',
     });
     expect(out['platform']).toBe('darwin');
     expect(out['arch']).toBe('arm64');
@@ -96,8 +96,8 @@ describe('platform-spoof preload', () => {
 
   it('win32 + x64: overrides to win32/x64', async () => {
     const out = await runWithSpoof(PROBE_CODE, {
-      NPM_JAR_SPOOF_PLATFORM: 'win32',
-      NPM_JAR_SPOOF_ARCH: 'x64',
+      SCRIPT_JAIL_SPOOF_PLATFORM: 'win32',
+      SCRIPT_JAIL_SPOOF_ARCH: 'x64',
     });
     expect(out['platform']).toBe('win32');
     expect(out['arch']).toBe('x64');
@@ -109,8 +109,8 @@ describe('platform-spoof preload', () => {
   it('endianness is LE for both x64 and arm64', async () => {
     for (const arch of ['x64', 'arm64'] as const) {
       const out = await runWithSpoof(PROBE_CODE, {
-        NPM_JAR_SPOOF_PLATFORM: 'linux',
-        NPM_JAR_SPOOF_ARCH: arch,
+        SCRIPT_JAIL_SPOOF_PLATFORM: 'linux',
+        SCRIPT_JAIL_SPOOF_ARCH: arch,
       });
       expect(out['osEndianness']).toBe('LE');
     }
@@ -121,8 +121,8 @@ describe('platform-spoof preload', () => {
     return new Promise<void>((resolve, reject) => {
       const script = writeChildScript(PROBE_CODE);
       const childEnv = { ...process.env };
-      delete childEnv['NPM_JAR_SPOOF_PLATFORM'];
-      delete childEnv['NPM_JAR_SPOOF_ARCH'];
+      delete childEnv['SCRIPT_JAIL_SPOOF_PLATFORM'];
+      delete childEnv['SCRIPT_JAIL_SPOOF_ARCH'];
 
       const child = fork(script, [], {
         env: { ...childEnv, NODE_OPTIONS: `--require=${preloadPath}` },
@@ -159,8 +159,8 @@ describe('platform-spoof preload', () => {
       const child = fork(script, [], {
         env: {
           ...process.env,
-          NPM_JAR_SPOOF_PLATFORM: 'linux',
-          NPM_JAR_SPOOF_ARCH: 'x64',
+          SCRIPT_JAIL_SPOOF_PLATFORM: 'linux',
+          SCRIPT_JAIL_SPOOF_ARCH: 'x64',
           NODE_OPTIONS: `--require=${preloadPath}`,
         },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -191,8 +191,8 @@ describe('platform-spoof preload', () => {
       const child = fork(script, [], {
         env: {
           ...process.env,
-          NPM_JAR_SPOOF_PLATFORM: 'linux',
-          NPM_JAR_SPOOF_ARCH: 'x64',
+          SCRIPT_JAIL_SPOOF_PLATFORM: 'linux',
+          SCRIPT_JAIL_SPOOF_ARCH: 'x64',
           NODE_OPTIONS: `--require=${preloadPath}`,
         },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -219,8 +219,8 @@ describe('platform-spoof preload', () => {
       process.stdout.write(JSON.stringify(result));
     `;
     const out = await runWithSpoof(code, {
-      NPM_JAR_SPOOF_PLATFORM: 'darwin',
-      NPM_JAR_SPOOF_ARCH: 'x64',
+      SCRIPT_JAIL_SPOOF_PLATFORM: 'darwin',
+      SCRIPT_JAIL_SPOOF_ARCH: 'x64',
     });
     expect(out['platform']).toBe('darwin');
     expect(out['type']).toBe('Darwin');

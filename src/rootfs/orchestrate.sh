@@ -29,7 +29,7 @@ trap cleanup TERM INT
 
 # 1. Start the agent.  `node` resolves through PATH to /opt/host-node/bin/node,
 #    which init.sh prepended.
-node /usr/local/lib/npm-jar/guest-agent.cjs &
+node /usr/local/lib/script-jail/guest-agent.cjs &
 AGENT_PID=$!
 
 # 2. Wait for the TCP listener on 127.0.0.1:10243 to appear in /proc/net/tcp.

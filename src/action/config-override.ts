@@ -1,12 +1,12 @@
-// npm-jar — src/action/config-override.ts
+// script-jail — src/action/config-override.ts
 //
-// Builds a per-run effective copy of the user's npm-jar config YAML with the
+// Builds a per-run effective copy of the user's script-jail config YAML with the
 // action's `spoof-platform` and `spoof-arch` inputs applied as overrides.
 //
 // Why this exists:
 //   The guest agent reads `spoof.platform` / `spoof.arch` from
-//   /etc/npm-jar/config.yml and exports them as NPM_JAR_SPOOF_PLATFORM /
-//   NPM_JAR_SPOOF_ARCH for the platform-spoof preload (see
+//   /etc/script-jail/config.yml and exports them as SCRIPT_JAIL_SPOOF_PLATFORM /
+//   SCRIPT_JAIL_SPOOF_ARCH for the platform-spoof preload (see
 //   src/guest/agent.ts buildChildEnv + src/guest/platform-spoof.cjs).
 //   The action also advertises `spoof-platform` / `spoof-arch` inputs and
 //   users supplying them expect the input to win over whatever is on disk.
@@ -39,7 +39,7 @@ export interface ConfigOverrides {
 }
 
 export interface BuildEffectiveConfigInput {
-  /** Absolute path to the user's npm-jar config YAML on the host. */
+  /** Absolute path to the user's script-jail config YAML on the host. */
   userConfigPath: string;
   /** Action-input overrides to apply on top of the YAML. */
   overrides: ConfigOverrides;
@@ -57,7 +57,7 @@ export interface BuildEffectiveConfigInput {
  *
  * The user's source file is never modified.  The returned path is intended
  * for `makeOverlay({ configPath })` so the override lands in the VM's
- * config disk at /etc/npm-jar/config.yml.
+ * config disk at /etc/script-jail/config.yml.
  */
 export function buildEffectiveConfig(input: BuildEffectiveConfigInput): string {
   const text = readFileSync(input.userConfigPath, 'utf8');
@@ -88,7 +88,7 @@ export function buildEffectiveConfig(input: BuildEffectiveConfigInput): string {
   };
 
   const outDir =
-    input.workDir ?? mkdtempSync(join(tmpdir(), 'npm-jar-config-'));
+    input.workDir ?? mkdtempSync(join(tmpdir(), 'script-jail-config-'));
   const outPath = join(outDir, 'config.yml');
 
   // stringifyYaml emits a trailing newline; the agent's parseYaml handles

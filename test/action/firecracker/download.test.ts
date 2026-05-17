@@ -1,4 +1,4 @@
-// npm-jar — test/action/firecracker/download.test.ts
+// script-jail — test/action/firecracker/download.test.ts
 //
 // Unit tests for ensureBinaries().  All filesystem and network I/O is mocked;
 // these tests never touch the real filesystem beyond a tmp dir.
@@ -24,7 +24,7 @@ import {
 let testDir: string;
 
 beforeEach(() => {
-  testDir = mkdtempSync(join(tmpdir(), 'npm-jar-dl-test-'));
+  testDir = mkdtempSync(join(tmpdir(), 'script-jail-dl-test-'));
 });
 
 afterEach(() => {

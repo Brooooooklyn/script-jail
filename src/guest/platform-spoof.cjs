@@ -1,11 +1,11 @@
 // @ts-check
-// npm-jar — platform-spoof.cjs
+// script-jail — platform-spoof.cjs
 // NODE_OPTIONS=--require preload: redefines process.platform, process.arch,
 // and os.* getters to return spoofed values for cross-platform install audits.
 //
 // Env vars:
-//   NPM_JAR_SPOOF_PLATFORM — one of: linux | darwin | win32  (default: linux)
-//   NPM_JAR_SPOOF_ARCH     — one of: x64 | arm64             (default: x64)
+//   SCRIPT_JAIL_SPOOF_PLATFORM — one of: linux | darwin | win32  (default: linux)
+//   SCRIPT_JAIL_SPOOF_ARCH     — one of: x64 | arm64             (default: x64)
 //
 // This file is deliberately plain CommonJS (no build step needed).
 
@@ -26,8 +26,8 @@ const PLATFORM_META = {
   win32:  { type: 'Windows_NT', release: '10.0.0', version: 'Windows NT 10.0.0' },
 };
 
-const rawPlatform = process.env['NPM_JAR_SPOOF_PLATFORM'] ?? 'linux';
-const rawArch     = process.env['NPM_JAR_SPOOF_ARCH']     ?? 'x64';
+const rawPlatform = process.env['SCRIPT_JAIL_SPOOF_PLATFORM'] ?? 'linux';
+const rawArch     = process.env['SCRIPT_JAIL_SPOOF_ARCH']     ?? 'x64';
 
 const spoofPlatform = /** @type {NodeJS.Platform} */ (PLATFORM[rawPlatform] ?? 'linux');
 const spoofArch     = /** @type {string} */ (rawArch === 'arm64' ? 'arm64' : 'x64');
@@ -55,5 +55,5 @@ Object.defineProperty(os, 'endianness',  { value: () => /** @type {'LE'|'BE'} */
 // Self-test: verify one mapping is applied correctly (caught at load time).
 /* c8 ignore next 3 */
 if (process.platform !== spoofPlatform) {
-  throw new Error(`npm-jar platform-spoof: self-test failed (expected ${spoofPlatform}, got ${process.platform})`);
+  throw new Error(`script-jail platform-spoof: self-test failed (expected ${spoofPlatform}, got ${process.platform})`);
 }

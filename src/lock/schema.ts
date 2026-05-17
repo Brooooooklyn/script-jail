@@ -1,7 +1,7 @@
 // Shared event + lockfile schemas. The guest agent emits RawEvent objects
 // (JSONL over vsock); the host normalizes them into AttributedEvent records
 // and renders the canonical Lock YAML committed to the repo as
-// .npm-jar.lock.yml.
+// .script-jail.lock.yml.
 
 import { z } from 'zod';
 

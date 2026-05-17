@@ -1,5 +1,5 @@
 /*
- * npm-jar — env-shim.c
+ * script-jail — env-shim.c
  * LD_PRELOAD shim: wraps getenv/secure_getenv to audit env-var reads and
  * hide protected names. Licensed under the MIT License.
  */
@@ -101,9 +101,9 @@ static void write_all(int fd, const char *buf, size_t len)
 /* ── constructor: load protect-list + log-fd ─────────────────────────────── */
 
 /*
- * Security note (v1 limitation): NPM_JAR_PROTECTED_ENV_FILE is read from the
+ * Security note (v1 limitation): SCRIPT_JAIL_PROTECTED_ENV_FILE is read from the
  * guest-visible environment.  A guest process that spawns a child with
- * LD_PRELOAD still set but NPM_JAR_PROTECTED_ENV_FILE unset or pointing at an
+ * LD_PRELOAD still set but SCRIPT_JAIL_PROTECTED_ENV_FILE unset or pointing at an
  * empty file will inherit no protected names.  In v1 the host is responsible
  * for making this env var read-only at the container boundary (e.g. via
  * seccomp/landlock preventing unsetenv, or passing policy through a sealed
@@ -131,7 +131,7 @@ static void do_init(void)
 
     /* Read log FD from env. */
     {
-        const char *fd_str = real_getenv ? real_getenv("NPM_JAR_LOG_FD") : NULL;
+        const char *fd_str = real_getenv ? real_getenv("SCRIPT_JAIL_LOG_FD") : NULL;
         if (fd_str && *fd_str) {
             char *end = NULL;
             long fd = strtol(fd_str, &end, 10);
@@ -142,7 +142,7 @@ static void do_init(void)
 
     /* Load protect-list file. */
     {
-        const char *path = real_getenv ? real_getenv("NPM_JAR_PROTECTED_ENV_FILE") : NULL;
+        const char *path = real_getenv ? real_getenv("SCRIPT_JAIL_PROTECTED_ENV_FILE") : NULL;
 
         if (path && *path) {
             FILE *f = fopen(path, "r");
@@ -374,7 +374,7 @@ char *secure_getenv(const char *name)
             val = real_secure_getenv(name);
         else if (real_getenv)
             val = real_getenv(name); /* musl fallback: secure_getenv absent, but
-                                      * npm-jar guests are never setuid, so
+                                      * script-jail guests are never setuid, so
                                       * secure_getenv == getenv semantically. */
     }
 

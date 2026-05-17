@@ -13,8 +13,8 @@ images/*.so
 # Test + coverage
 coverage/
 *.log
-.npm-jar.log
-.npm-jar.events.jsonl
+.script-jail.log
+.script-jail.events.jsonl
 
 # Editor
 .vscode/

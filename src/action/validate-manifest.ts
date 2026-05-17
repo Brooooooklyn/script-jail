@@ -1,4 +1,4 @@
-// npm-jar — src/action/validate-manifest.ts
+// script-jail — src/action/validate-manifest.ts
 //
 // Fail-fast startup check for `PINNED_MANIFEST`.  Every value in
 // `manifest.expected` must be a canonical 64-char lowercase-hex SHA-256
@@ -44,7 +44,7 @@ export function validateManifest(manifest: ArtifactManifest): void {
   if (offenders.length === 0) return;
 
   throw new Error(
-    `npm-jar: action artifact manifest at ${MANIFEST_PATH} has unpinned ` +
+    `script-jail: action artifact manifest at ${MANIFEST_PATH} has unpinned ` +
       `entries: [${offenders.join(', ')}]. This indicates the action was ` +
       `published without real release-asset hashes. Open a GitHub issue ` +
       `against the action repository (${manifest.repo}).`,

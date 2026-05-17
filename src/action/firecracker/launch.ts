@@ -1,4 +1,4 @@
-// npm-jar — src/action/firecracker/launch.ts
+// script-jail — src/action/firecracker/launch.ts
 //
 // Boots a Firecracker microVM via its REST API (a Unix socket).
 //
@@ -152,13 +152,13 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
   if (!input.spawner) {
     if (platform !== 'linux') {
       throw new Error(
-        `npm-jar: Firecracker requires Linux. Current platform: ${platform}. ` +
+        `script-jail: Firecracker requires Linux. Current platform: ${platform}. ` +
         `Run this action in a Linux environment or inject a test spawner.`,
       );
     }
     if (!existsSync('/dev/kvm')) {
       throw new Error(
-        'npm-jar: /dev/kvm not found. Firecracker requires KVM. ' +
+        'script-jail: /dev/kvm not found. Firecracker requires KVM. ' +
         'Ensure the runner has hardware virtualisation enabled.',
       );
     }
@@ -182,7 +182,7 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
   } catch (err) {
     handle.kill('SIGKILL');
     throw new Error(
-      `npm-jar: firecracker API socket did not appear at ${socketPath} within 5 s. ` +
+      `script-jail: firecracker API socket did not appear at ${socketPath} within 5 s. ` +
       `Inner error: ${String(err)}`,
     );
   }

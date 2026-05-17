@@ -1,4 +1,4 @@
-// npm-jar — test/action/pre-fetch-artifacts.test.ts
+// script-jail — test/action/pre-fetch-artifacts.test.ts
 //
 // Unit tests for preFetchArtifacts().  All filesystem I/O is sandboxed to a
 // per-test tmp dir; the HttpClient is a fake that writes a fixed payload
@@ -29,7 +29,7 @@ import type { HttpClient } from '../../src/action/firecracker/download.js';
 let testDir: string;
 
 beforeEach(() => {
-  testDir = mkdtempSync(join(tmpdir(), 'npm-jar-prefetch-test-'));
+  testDir = mkdtempSync(join(tmpdir(), 'script-jail-prefetch-test-'));
 });
 
 afterEach(() => {
@@ -74,7 +74,7 @@ function mockHttpClient(payloads: Readonly<Record<string, string>>): MockHttp {
   return { client, calls };
 }
 
-const REPO = 'brooklyn/npm-jar';
+const REPO = 'brooklyn/script-jail';
 const TAG = 'v0.1.0';
 
 function urlFor(asset: string): string {
@@ -84,7 +84,7 @@ function urlFor(asset: string): string {
 // Realistic payloads + matching SHAs.
 const ROOTFS_22_CONTENT = 'fake-rootfs-ubuntu-22.04-bytes';
 const ROOTFS_24_CONTENT = 'fake-rootfs-ubuntu-24.04-bytes';
-const LIB_CONTENT = 'fake-libnpmjar-so-bytes';
+const LIB_CONTENT = 'fake-libscriptjail-so-bytes';
 
 function manifest(): ArtifactManifest {
   return {
@@ -93,7 +93,7 @@ function manifest(): ArtifactManifest {
     expected: {
       'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
       'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
-      'libnpmjar.so': sha(LIB_CONTENT),
+      'libscriptjail.so': sha(LIB_CONTENT),
     },
   };
 }
@@ -102,7 +102,7 @@ function defaultPayloads(): Record<string, string> {
   return {
     [urlFor('rootfs-ubuntu-22.04.ext4')]: ROOTFS_22_CONTENT,
     [urlFor('rootfs-ubuntu-24.04.ext4')]: ROOTFS_24_CONTENT,
-    [urlFor('libnpmjar.so')]: LIB_CONTENT,
+    [urlFor('libscriptjail.so')]: LIB_CONTENT,
   };
 }
 
@@ -111,7 +111,7 @@ function defaultPayloads(): Record<string, string> {
 // ---------------------------------------------------------------------------
 
 describe('preFetchArtifacts', () => {
-  it('downloads the rootfs for the requested runner image and libnpmjar.so', async () => {
+  it('downloads the rootfs for the requested runner image and libscriptjail.so', async () => {
     const { client, calls } = mockHttpClient(defaultPayloads());
 
     await preFetchArtifacts({
@@ -122,7 +122,7 @@ describe('preFetchArtifacts', () => {
     });
 
     const rootfsPath = join(testDir, 'rootfs-ubuntu-24.04.ext4');
-    const libPath = join(testDir, 'libnpmjar.so');
+    const libPath = join(testDir, 'libscriptjail.so');
     expect(existsSync(rootfsPath)).toBe(true);
     expect(existsSync(libPath)).toBe(true);
     expect(readFileSync(rootfsPath, 'utf8')).toBe(ROOTFS_24_CONTENT);
@@ -132,7 +132,7 @@ describe('preFetchArtifacts', () => {
     expect(calls).toHaveLength(2);
     const urls = calls.map((c) => c.url).sort();
     expect(urls).toEqual([
-      urlFor('libnpmjar.so'),
+      urlFor('libscriptjail.so'),
       urlFor('rootfs-ubuntu-24.04.ext4'),
     ]);
   });
@@ -159,7 +159,7 @@ describe('preFetchArtifacts', () => {
   it('cache hit: skips download when files already exist with correct hash', async () => {
     // Pre-create both files with matching content.
     writeFileSync(join(testDir, 'rootfs-ubuntu-22.04.ext4'), ROOTFS_22_CONTENT);
-    writeFileSync(join(testDir, 'libnpmjar.so'), LIB_CONTENT);
+    writeFileSync(join(testDir, 'libscriptjail.so'), LIB_CONTENT);
 
     const { client, calls } = mockHttpClient(defaultPayloads());
 
@@ -177,8 +177,8 @@ describe('preFetchArtifacts', () => {
   it('re-downloads when a cached file has the wrong hash', async () => {
     // Pre-create the rootfs with WRONG content (different hash).
     writeFileSync(join(testDir, 'rootfs-ubuntu-22.04.ext4'), 'tampered-bytes');
-    // libnpmjar.so is fine.
-    writeFileSync(join(testDir, 'libnpmjar.so'), LIB_CONTENT);
+    // libscriptjail.so is fine.
+    writeFileSync(join(testDir, 'libscriptjail.so'), LIB_CONTENT);
 
     const { client, calls } = mockHttpClient(defaultPayloads());
 
@@ -189,7 +189,7 @@ describe('preFetchArtifacts', () => {
       http: client,
     });
 
-    // Only the rootfs was re-fetched; libnpmjar.so was a cache hit.
+    // Only the rootfs was re-fetched; libscriptjail.so was a cache hit.
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe(urlFor('rootfs-ubuntu-22.04.ext4'));
 
@@ -223,7 +223,7 @@ describe('preFetchArtifacts', () => {
       repo: REPO,
       tag: TAG,
       expected: {
-        // libnpmjar.so missing on purpose.
+        // libscriptjail.so missing on purpose.
         'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
         'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
       },
@@ -238,7 +238,7 @@ describe('preFetchArtifacts', () => {
         manifest: incomplete,
         http: client,
       }),
-    ).rejects.toThrow(/missing an expected SHA-256 for "libnpmjar\.so"/);
+    ).rejects.toThrow(/missing an expected SHA-256 for "libscriptjail\.so"/);
   });
 
   it('creates imagesDir if it does not exist', async () => {
@@ -263,13 +263,13 @@ describe('preFetchArtifacts', () => {
       expected: {
         'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
         'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
-        'libnpmjar.so': sha(LIB_CONTENT),
+        'libscriptjail.so': sha(LIB_CONTENT),
       },
     };
     const altPayloads: Record<string, string> = {
       'https://github.com/someone/elsewhere/releases/download/v9.9.9/rootfs-ubuntu-22.04.ext4':
         ROOTFS_22_CONTENT,
-      'https://github.com/someone/elsewhere/releases/download/v9.9.9/libnpmjar.so':
+      'https://github.com/someone/elsewhere/releases/download/v9.9.9/libscriptjail.so':
         LIB_CONTENT,
     };
 
@@ -284,7 +284,7 @@ describe('preFetchArtifacts', () => {
 
     const urls = calls.map((c) => c.url).sort();
     expect(urls).toEqual([
-      'https://github.com/someone/elsewhere/releases/download/v9.9.9/libnpmjar.so',
+      'https://github.com/someone/elsewhere/releases/download/v9.9.9/libscriptjail.so',
       'https://github.com/someone/elsewhere/releases/download/v9.9.9/rootfs-ubuntu-22.04.ext4',
     ]);
   });

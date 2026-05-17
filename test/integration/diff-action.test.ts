@@ -92,7 +92,7 @@ describe('diff-action path: dropped fixture is surfaced', () => {
     expect(committedYaml).not.toBe(generatedYaml);
 
     const diff = renderDiff({
-      lockPath: '.npm-jar.lock.yml',
+      lockPath: '.script-jail.lock.yml',
       committed: committedYaml,
       generated: generatedYaml,
     });
@@ -107,7 +107,7 @@ describe('diff-action path: dropped fixture is surfaced', () => {
     expect(diff.annotations.length).toBeGreaterThan(0);
     // GitHub Actions ::error syntax with the lockfile path.
     for (const ann of diff.annotations) {
-      expect(ann).toMatch(/^::error file=\.npm-jar\.lock\.yml,line=\d+::/);
+      expect(ann).toMatch(/^::error file=\.script-jail\.lock\.yml,line=\d+::/);
     }
   });
 
@@ -117,7 +117,7 @@ describe('diff-action path: dropped fixture is surfaced', () => {
     const all = listFixtures().flatMap(loadEvents);
     const yaml = renderYaml(all);
     const diff = renderDiff({
-      lockPath: '.npm-jar.lock.yml',
+      lockPath: '.script-jail.lock.yml',
       committed: yaml,
       generated: yaml,
     });

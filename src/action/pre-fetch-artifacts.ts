@@ -1,8 +1,8 @@
-// npm-jar — src/action/pre-fetch-artifacts.ts
+// script-jail — src/action/pre-fetch-artifacts.ts
 //
 // Action-side pre-fetch step.  At action runtime (inside `main.ts`, before
 // `ensureBinaries` is called), this module downloads the per-runner rootfs
-// ext4 plus the libnpmjar.so shim from the GitHub release matching the
+// ext4 plus the libscriptjail.so shim from the GitHub release matching the
 // pinned manifest (`./artifact-manifest.ts`) and caches them under
 // `imagesDir`.
 //
@@ -11,13 +11,13 @@
 //   `runs.pre`.  The pre-fetch must therefore happen inside `main.ts` itself,
 //   before the orchestrator's real work.  This file is the helper it calls.
 //
-// Asymmetry note (libnpmjar.so):
+// Asymmetry note (libscriptjail.so):
 //   The .so is baked INTO the released rootfs ext4 at rootfs-build time
-//   (Dockerfile: `COPY images/libnpmjar.so /lib/libnpmjar.so`).  At action
+//   (Dockerfile: `COPY images/libscriptjail.so /lib/libscriptjail.so`).  At action
 //   runtime the .so is therefore strictly informational for the v1 production
 //   path that consumes the released rootfs as-is.  We still download it for
 //   symmetry and to support a future "build your own rootfs from this release"
-//   workflow where the .so lands in `imagesDir/libnpmjar.so` and is referenced
+//   workflow where the .so lands in `imagesDir/libscriptjail.so` and is referenced
 //   by a user-driven rootfs rebuild.
 //
 // Cache policy mirrors `ensureBinaries`: file present + SHA-256 matches → skip
@@ -37,7 +37,7 @@ import type { RunnerImage } from './runner-image.js';
 // ---------------------------------------------------------------------------
 
 export interface ArtifactManifest {
-  /** GitHub repo "owner/name" for the release.  E.g. "brooklyn/npm-jar". */
+  /** GitHub repo "owner/name" for the release.  E.g. "brooklyn/script-jail". */
   repo: string;
   /** Release tag, e.g. "v1.0.0". */
   tag: string;
@@ -61,14 +61,14 @@ function rootfsAssetName(runnerImage: RunnerImage): string {
   return `rootfs-${runnerImage}.ext4`;
 }
 
-const LIBNPMJAR_ASSET = 'libnpmjar.so';
+const LIBSCRIPTJAIL_ASSET = 'libscriptjail.so';
 
 // ---------------------------------------------------------------------------
 // preFetchArtifacts — main export
 // ---------------------------------------------------------------------------
 
 /**
- * Ensure the per-runner rootfs ext4 and libnpmjar.so are present and valid
+ * Ensure the per-runner rootfs ext4 and libscriptjail.so are present and valid
  * in `imagesDir`.  Downloads from
  *   https://github.com/<repo>/releases/download/<tag>/<asset>
  * and verifies against the manifest's pinned SHA-256.
@@ -89,7 +89,7 @@ export async function preFetchArtifacts(input: PreFetchInput): Promise<void> {
   // Build the list of (asset, destPath, expectedSha) tuples we actually need.
   const assets: ReadonlyArray<{ name: string; expected: string }> = [
     { name: wantedRootfs, expected: requireExpected(manifest, wantedRootfs) },
-    { name: LIBNPMJAR_ASSET, expected: requireExpected(manifest, LIBNPMJAR_ASSET) },
+    { name: LIBSCRIPTJAIL_ASSET, expected: requireExpected(manifest, LIBSCRIPTJAIL_ASSET) },
   ];
 
   // Download all assets in parallel; each call is independently idempotent.
@@ -120,7 +120,7 @@ function requireExpected(manifest: ArtifactManifest, asset: string): string {
   const sha = manifest.expected[asset];
   if (sha === undefined) {
     throw new Error(
-      `npm-jar: artifact manifest is missing an expected SHA-256 for "${asset}". ` +
+      `script-jail: artifact manifest is missing an expected SHA-256 for "${asset}". ` +
       `Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`,
     );
   }

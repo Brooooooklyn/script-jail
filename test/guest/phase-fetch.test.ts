@@ -23,7 +23,7 @@ function mockSpawner(exitCode = 0): { spawner: Spawner; calls: SpawnCall[] } {
 
 const BASE_ENV: NodeJS.ProcessEnv = {
   PATH: '/usr/bin',
-  LD_PRELOAD: '/lib/libnpmjar.so',
+  LD_PRELOAD: '/lib/libscriptjail.so',
 };
 
 describe('runFetchPhase', () => {
@@ -93,8 +93,8 @@ describe('runFetchPhase', () => {
       const env: NodeJS.ProcessEnv = {
         PATH: '/usr/bin:/usr/local/bin',
         HOME: '/root',
-        LD_PRELOAD: '/lib/libnpmjar.so',
-        NPM_JAR_SPOOF_PLATFORM: 'darwin',
+        LD_PRELOAD: '/lib/libscriptjail.so',
+        SCRIPT_JAIL_SPOOF_PLATFORM: 'darwin',
       };
       const { spawner, calls } = mockSpawner();
       await runFetchPhase({ manager: 'npm', cwd: '/work', env, spawner });

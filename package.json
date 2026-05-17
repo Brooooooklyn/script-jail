@@ -1,5 +1,5 @@
 {
-  "name": "npm-jar",
+  "name": "script-jail",
   "version": "0.0.0",
   "description": "Firecracker-sandboxed install auditor for npm/pnpm/yarn lifecycle scripts.",
   "type": "module",

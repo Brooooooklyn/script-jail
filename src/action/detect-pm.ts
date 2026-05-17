@@ -1,4 +1,4 @@
-// npm-jar — src/action/detect-pm.ts
+// script-jail — src/action/detect-pm.ts
 //
 // Detects the package manager from lockfile presence in the repository root.
 //
@@ -9,7 +9,7 @@
 //   4. npm-shrinkwrap.json → npm
 //
 // Bun handling: if `bun.lock` or `bun.lockb` is the ONLY lockfile present,
-// throw `BunUnsupportedError`.  npm-jar v1 only supports npm/pnpm/yarn.
+// throw `BunUnsupportedError`.  script-jail v1 only supports npm/pnpm/yarn.
 //
 // When multiple supported lockfiles are present we log a warning (via the
 // shared `warn` helper from ./log.ts so it shows up as a GitHub Actions
@@ -70,12 +70,12 @@ export interface DetectInput {
  * Thrown when only a bun lockfile (`bun.lock` or `bun.lockb`) is found and no
  * supported lockfile (npm/pnpm/yarn) is present.
  *
- * npm-jar v1 does not support bun because the guest agent only ships strace
+ * script-jail v1 does not support bun because the guest agent only ships strace
  * shims for the npm/pnpm/yarn CLIs.  Tracking issue: v2 will add bun support.
  */
 export class BunUnsupportedError extends Error {
   constructor() {
-    super('npm-jar v1 does not support bun. Use npm/pnpm/yarn, or wait for v2.');
+    super('script-jail v1 does not support bun. Use npm/pnpm/yarn, or wait for v2.');
     this.name = 'BunUnsupportedError';
   }
 }
@@ -123,7 +123,7 @@ export function detectPm(input: DetectInput): DetectedPm {
     if (hasBun) throw new BunUnsupportedError();
 
     throw new Error(
-      `npm-jar: no lockfile found in ${input.repoDir}. ` +
+      `script-jail: no lockfile found in ${input.repoDir}. ` +
       `Expected one of: package-lock.json, pnpm-lock.yaml, yarn.lock, npm-shrinkwrap.json.`,
     );
   }

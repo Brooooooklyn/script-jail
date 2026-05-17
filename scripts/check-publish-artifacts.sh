@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# npm-jar — scripts/check-publish-artifacts.sh
+# script-jail — scripts/check-publish-artifacts.sh
 #
 # Publish-job gate.  Verifies the build-job artifacts about to be uploaded to
 # a GitHub release match the SHA-256 digests recorded in the tagged source's
@@ -162,7 +162,7 @@ fi
 if ! EXPECTED_ROOTFS_24="$(extract_expected 'rootfs-ubuntu-24.04.ext4')"; then
   exit 1
 fi
-if ! EXPECTED_LIBSO="$(extract_expected 'libnpmjar.so')"; then
+if ! EXPECTED_LIBSO="$(extract_expected 'libscriptjail.so')"; then
   exit 1
 fi
 
@@ -196,7 +196,7 @@ fi
 
 ART_ROOTFS_22="$DIR/images/rootfs-ubuntu-22.04.ext4"
 ART_ROOTFS_24="$DIR/images/rootfs-ubuntu-24.04.ext4"
-ART_LIBSO="$DIR/images/libnpmjar.so"
+ART_LIBSO="$DIR/images/libscriptjail.so"
 ART_DIST="$DIR/dist/main.js"
 
 # Artifacts must exist in BOTH modes — a missing file means the build job's
@@ -276,7 +276,7 @@ if [ "$ALL_PLACEHOLDERS" -eq 1 ]; then
   echo "check-publish-artifacts: bootstrap mode — manifest entries are placeholders." >&2
   echo "  rootfs-ubuntu-22.04.ext4: $COMPUTED_ROOTFS_22" >&2
   echo "  rootfs-ubuntu-24.04.ext4: $COMPUTED_ROOTFS_24" >&2
-  echo "  libnpmjar.so:             $COMPUTED_LIBSO" >&2
+  echo "  libscriptjail.so:             $COMPUTED_LIBSO" >&2
   echo "  dist/main.js:             $COMPUTED_DIST" >&2
   if [ "${#errors[@]}" -gt 0 ]; then
     echo "check-publish-artifacts: dist/main.js mismatch in bootstrap mode — refusing to publish." >&2
@@ -292,7 +292,7 @@ fi
 
 check "rootfs-ubuntu-22.04.ext4" "$EXPECTED_ROOTFS_22" "$COMPUTED_ROOTFS_22"
 check "rootfs-ubuntu-24.04.ext4" "$EXPECTED_ROOTFS_24" "$COMPUTED_ROOTFS_24"
-check "libnpmjar.so"             "$EXPECTED_LIBSO"     "$COMPUTED_LIBSO"
+check "libscriptjail.so"             "$EXPECTED_LIBSO"     "$COMPUTED_LIBSO"
 
 if [ "${#errors[@]}" -gt 0 ]; then
   echo "check-publish-artifacts: SHA mismatch — refusing to publish." >&2

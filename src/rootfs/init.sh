@@ -14,7 +14,7 @@
 #
 # Responsibilities: mount /proc /sys /tmp /root, mount the two auxiliary
 # filesystems, copy the user's config into the rootfs's canonical
-# /etc/npm-jar/, prepend the host Node's bin/ to PATH, then exec the agent
+# /etc/script-jail/, prepend the host Node's bin/ to PATH, then exec the agent
 # under that Node.
 
 set -eu
@@ -55,18 +55,18 @@ else
 fi
 
 # Copy the user's config from the repo disk into the rootfs's canonical
-# /etc/npm-jar/config.yml so the agent can read it regardless of /work staying
-# mounted.  overlay.ts stages the config at /work/etc/npm-jar/config.yml.
+# /etc/script-jail/config.yml so the agent can read it regardless of /work staying
+# mounted.  overlay.ts stages the config at /work/etc/script-jail/config.yml.
 #
 # Fail fast if the host overlay didn't stage it: the agent has no useful
 # behaviour without a config, and a clear FATAL line is far easier to debug
 # than the downstream YAML/parse errors we'd otherwise see.
-mkdir -p /etc/npm-jar
-if [ ! -f /work/etc/npm-jar/config.yml ]; then
-  echo "[init] FATAL: /work/etc/npm-jar/config.yml not staged by host overlay" >&2
+mkdir -p /etc/script-jail
+if [ ! -f /work/etc/script-jail/config.yml ]; then
+  echo "[init] FATAL: /work/etc/script-jail/config.yml not staged by host overlay" >&2
   exit 1
 fi
-cp /work/etc/npm-jar/config.yml /etc/npm-jar/config.yml
+cp /work/etc/script-jail/config.yml /etc/script-jail/config.yml
 
 # --- Host-Node disk (filesystem label `host-node`) ----------------------------
 # Mount the runner's packed Node install read-only at /opt/host-node, then
@@ -88,7 +88,7 @@ fi
 export PATH="/opt/host-node/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 
 # Strace output directory used by phase B.
-mkdir -p /tmp/npm-jar-strace
+mkdir -p /tmp/script-jail-strace
 
 # Hand off to the orchestrator under dumb-init.  dumb-init becomes PID 1 and
 # reaps the two children (the agent and socat); orchestrate.sh is responsible

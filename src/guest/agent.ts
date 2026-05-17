@@ -1,8 +1,8 @@
-// npm-jar — agent.ts
+// script-jail — agent.ts
 // Guest orchestrator. Runs inside the Firecracker microVM.
 //
 // Flow:
-//   1. Read + validate /etc/npm-jar/config.yml
+//   1. Read + validate /etc/script-jail/config.yml
 //   2. Detect package manager from lockfile presence
 //   3. Build env dict for child processes
 //   4. Connect to host via vsock (or injected Connection in tests)
@@ -287,13 +287,13 @@ async function waitForGo(readable: Readable): Promise<void> {
         resolve();
       } else {
         cleanup();
-        reject(new Error(`npm-jar agent: unexpected control signal from host: ${JSON.stringify(trimmed)}`));
+        reject(new Error(`script-jail agent: unexpected control signal from host: ${JSON.stringify(trimmed)}`));
       }
     };
 
     const onClose = (): void => {
       cleanup();
-      reject(new Error('npm-jar agent: host closed connection before sending "go" signal'));
+      reject(new Error('script-jail agent: host closed connection before sending "go" signal'));
     };
 
     rl.on('line', onLine);
@@ -315,17 +315,17 @@ function buildChildEnv(
   protectedEnvFilePath: string,
 ): NodeJS.ProcessEnv {
   const preloads = [
-    '/usr/local/lib/npm-jar/dlopen-block.cjs',
-    '/usr/local/lib/npm-jar/platform-spoof.cjs',
+    '/usr/local/lib/script-jail/dlopen-block.cjs',
+    '/usr/local/lib/script-jail/platform-spoof.cjs',
   ];
 
   return {
     ...baseEnv,
-    LD_PRELOAD: '/lib/libnpmjar.so',
-    NPM_JAR_LOG_FD: String(config.log_fd),
-    NPM_JAR_PROTECTED_ENV_FILE: protectedEnvFilePath,
-    NPM_JAR_SPOOF_PLATFORM: config.spoof.platform,
-    NPM_JAR_SPOOF_ARCH: config.spoof.arch,
+    LD_PRELOAD: '/lib/libscriptjail.so',
+    SCRIPT_JAIL_LOG_FD: String(config.log_fd),
+    SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedEnvFilePath,
+    SCRIPT_JAIL_SPOOF_PLATFORM: config.spoof.platform,
+    SCRIPT_JAIL_SPOOF_ARCH: config.spoof.arch,
     NODE_OPTIONS: [
       ...(baseEnv['NODE_OPTIONS'] ? [baseEnv['NODE_OPTIONS']] : []),
       ...preloads.map((p) => `--require=${p}`),
@@ -444,11 +444,11 @@ async function defaultDropEth0(spawner: Spawner, env: NodeJS.ProcessEnv): Promis
       lastErr = err instanceof Error ? err : new Error(String(err));
     }
   }
-  throw lastErr ?? new Error('npm-jar agent: dropEth0 failed for unknown reason');
+  throw lastErr ?? new Error('script-jail agent: dropEth0 failed for unknown reason');
 }
 
 export async function main(input: AgentInput): Promise<void> {
-  const configPath = input.configPath ?? '/etc/npm-jar/config.yml';
+  const configPath = input.configPath ?? '/etc/script-jail/config.yml';
 
   // 1. Read + validate config
   let rawConfig: unknown;
@@ -456,7 +456,7 @@ export async function main(input: AgentInput): Promise<void> {
     const text = readFileSync(configPath, 'utf8');
     rawConfig = parseYaml(text);
   } catch (err) {
-    throw new Error(`npm-jar agent: failed to read config at ${configPath}: ${String(err)}`);
+    throw new Error(`script-jail agent: failed to read config at ${configPath}: ${String(err)}`);
   }
 
   const config = AgentConfig.parse(rawConfig);
@@ -468,7 +468,7 @@ export async function main(input: AgentInput): Promise<void> {
   const manager = config.manager ?? detectManager(config.work_dir);
 
   // 4. Write protected-env file to a temp location
-  const protectedEnvPath = '/tmp/npm-jar-protected.txt';
+  const protectedEnvPath = '/tmp/script-jail-protected.txt';
   writeFileSync(protectedEnvPath, config.protected.env.join('\n') + '\n', 'utf8');
 
   // 5. Build child environment
@@ -524,7 +524,7 @@ export async function main(input: AgentInput): Promise<void> {
     }
   } catch (err) {
     emitter.emitError(
-      `npm-jar agent: failed to drop eth0 from inside the guest: ${String(err)}`,
+      `script-jail agent: failed to drop eth0 from inside the guest: ${String(err)}`,
       false,
     );
   }
@@ -611,7 +611,7 @@ export async function main(input: AgentInput): Promise<void> {
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
-    straceBasePath: '/tmp/npm-jar-strace/strace.out',
+    straceBasePath: '/tmp/script-jail-strace/strace.out',
     protectedPaths,
   });
 

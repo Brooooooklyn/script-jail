@@ -1,4 +1,4 @@
-// npm-jar — src/action/firecracker/teardown.ts
+// script-jail — src/action/firecracker/teardown.ts
 //
 // Safe cleanup for a Firecracker microVM run.
 //
@@ -87,7 +87,7 @@ export async function teardown(handles: TeardownHandles): Promise<void> {
     // Remove the exact path (may be the base path itself).
     await safeRun('remove vsock UDS (base)', () => removeIfExists(base));
     // Also try the port-suffixed variant Firecracker creates.
-    // Port 10242 is the default npm-jar vsock port.
+    // Port 10242 is the default script-jail vsock port.
     await safeRun('remove vsock UDS (port suffix)', () => removeIfExists(`${base}_10242`));
   }
 

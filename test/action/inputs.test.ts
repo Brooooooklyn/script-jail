@@ -1,4 +1,4 @@
-// npm-jar — test/action/inputs.test.ts
+// script-jail — test/action/inputs.test.ts
 //
 // Tests for parseInputs().  All tests use the injection seams so no real
 // process.env or filesystem is touched.
@@ -55,8 +55,8 @@ describe('parseInputs — defaults', () => {
     expect(result.spoofArch).toBe('x64');
     expect(result.cacheFirecracker).toBe(true);
     // Default config/lock paths are resolved relative to repoDir.
-    expect(result.configPath).toBe(join(repoDir, '.npm-jar.yml'));
-    expect(result.lockPath).toBe(join(repoDir, '.npm-jar.lock.yml'));
+    expect(result.configPath).toBe(join(repoDir, '.script-jail.yml'));
+    expect(result.lockPath).toBe(join(repoDir, '.script-jail.lock.yml'));
     expect(isAbsolute(result.configPath)).toBe(true);
     expect(isAbsolute(result.lockPath)).toBe(true);
   });

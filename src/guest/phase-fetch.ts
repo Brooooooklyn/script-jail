@@ -1,4 +1,4 @@
-// npm-jar — phase-fetch.ts
+// script-jail — phase-fetch.ts
 // Phase A: fetch packages with network ON.
 //
 // Per-manager command notes:

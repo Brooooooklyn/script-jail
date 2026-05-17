@@ -1,4 +1,4 @@
-// npm-jar — test/action/cache.test.ts
+// script-jail — test/action/cache.test.ts
 //
 // Tests for `maybeClearCache`.  We use the `fs` injection seam exclusively so
 // the tests assert call ordering and arguments without touching the real
@@ -9,7 +9,7 @@ import { join } from 'node:path';
 
 import { maybeClearCache } from '../../src/action/cache.js';
 
-const imagesDir = '/tmp/npm-jar-images';
+const imagesDir = '/tmp/script-jail-images';
 const firecrackerVersion = '1.8.0';
 const tarPath = join(imagesDir, `firecracker-v${firecrackerVersion}-x86_64.tgz`);
 const fcBinPath = join(imagesDir, `firecracker-v${firecrackerVersion}`);

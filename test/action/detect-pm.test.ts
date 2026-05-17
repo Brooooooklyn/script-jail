@@ -1,4 +1,4 @@
-// npm-jar — test/action/detect-pm.test.ts
+// script-jail — test/action/detect-pm.test.ts
 //
 // Tests for detectPm() — lockfile-based package-manager detection.
 //

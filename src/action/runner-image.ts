@@ -1,4 +1,4 @@
-// npm-jar — src/action/runner-image.ts
+// script-jail — src/action/runner-image.ts
 //
 // Detects which Ubuntu runner image we are running on, so the host can pick
 // a rootfs whose glibc/library set matches the host kernel + userland.
@@ -50,7 +50,7 @@ export interface DetectRunnerImageInput {
 // ---------------------------------------------------------------------------
 
 /**
- * Thrown when `/etc/os-release` parses cleanly but reports an OS that npm-jar
+ * Thrown when `/etc/os-release` parses cleanly but reports an OS that script-jail
  * does not (yet) ship a rootfs for.  The error message includes the parsed
  * `ID` and `VERSION_ID` so users can see exactly what was detected.
  */
@@ -106,7 +106,7 @@ export function detectRunnerImage(input?: DetectRunnerImageInput): RunnerImage {
   // ---- 2. /etc/os-release fallback -----------------------------------------
   if (!fs.existsSync(OS_RELEASE_PATH)) {
     throw new Error(
-      'npm-jar: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
+      'script-jail: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
     );
   }
 
@@ -115,7 +115,7 @@ export function detectRunnerImage(input?: DetectRunnerImageInput): RunnerImage {
     raw = fs.readFileSync(OS_RELEASE_PATH, 'utf8');
   } catch {
     throw new Error(
-      'npm-jar: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
+      'script-jail: cannot detect runner image — ImageOS env not set and /etc/os-release missing/unreadable.',
     );
   }
 
@@ -129,7 +129,7 @@ export function detectRunnerImage(input?: DetectRunnerImageInput): RunnerImage {
   }
 
   throw new UnsupportedRunnerImageError(
-    `npm-jar: unsupported runner image (ID=${id}, VERSION_ID=${versionId}). ` +
+    `script-jail: unsupported runner image (ID=${id}, VERSION_ID=${versionId}). ` +
     'Supported: ubuntu-22.04, ubuntu-24.04.',
   );
 }

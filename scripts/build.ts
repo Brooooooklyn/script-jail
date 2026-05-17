@@ -1,9 +1,9 @@
-// npm-jar — scripts/build.ts
+// script-jail — scripts/build.ts
 // Master build coordinator. Invoked via `oxnode scripts/build.ts`.
 //
 // Steps:
 //   1. Compile the action entry: esbuild src/main.ts → dist/main.js
-//   2. Build the C shim: src/shim/build.sh → images/libnpmjar.so (skip on macOS)
+//   2. Build the C shim: src/shim/build.sh → images/libscriptjail.so (skip on macOS)
 //   3. Build the rootfs(es): src/rootfs/build.ts for the selected runner image.
 //
 // Flags:
@@ -146,16 +146,16 @@ function buildShim(): void {
     return;
   }
 
-  const shimOut = join(REPO_ROOT, 'images', 'libnpmjar.so');
+  const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
   if (existsSync(shimOut)) {
-    console.log('[build] images/libnpmjar.so already present, skipping shim build.');
+    console.log('[build] images/libscriptjail.so already present, skipping shim build.');
     return;
   }
 
   console.log('[build] Building C shim: src/shim/build.sh …');
   const buildSh = join(REPO_ROOT, 'src', 'shim', 'build.sh');
   execSync(`sh "${buildSh}"`, { stdio: 'inherit', cwd: REPO_ROOT });
-  console.log('[build] images/libnpmjar.so built.');
+  console.log('[build] images/libscriptjail.so built.');
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +203,7 @@ async function main(): Promise<void> {
   } else {
     buildShim();
   }
-  artifacts.push({ path: join(REPO_ROOT, 'images', 'libnpmjar.so') });
+  artifacts.push({ path: join(REPO_ROOT, 'images', 'libscriptjail.so') });
 
   // Step 3: rootfs
   if (skipRootfs) {

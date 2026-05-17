@@ -1,4 +1,4 @@
-// npm-jar — scripts/validate-manifest.ts
+// script-jail — scripts/validate-manifest.ts
 //
 // Release-workflow gate.  Invoked from `.github/workflows/release.yml` at
 // the top of the `build` job to report on `PINNED_MANIFEST.expected`.

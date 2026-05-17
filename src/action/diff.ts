@@ -1,4 +1,4 @@
-// npm-jar — src/action/diff.ts
+// script-jail — src/action/diff.ts
 //
 // Renders a unified diff between the committed and generated install-lock
 // YAML files, plus a set of GitHub Actions error annotations the runner UI

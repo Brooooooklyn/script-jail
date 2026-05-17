@@ -1,4 +1,4 @@
-// npm-jar — emit.ts
+// script-jail — emit.ts
 // JSONL emitter for the vsock channel between the guest agent and the host.
 //
 // All methods serialize one frame as a single JSON line terminated by '\n'.

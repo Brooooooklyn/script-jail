@@ -1,4 +1,4 @@
-// npm-jar — src/action/host-node-prefix.ts
+// script-jail — src/action/host-node-prefix.ts
 //
 // Resolves the user-selected Node installation prefix for the host-Node mount
 // feature (Task #12).  The host packs the resolved prefix into a small ext4
@@ -150,7 +150,7 @@ export function resolveHostNodeExecPath(
   const resolved = which('node', segments);
   if (resolved === null) {
     throw new Error(
-      'npm-jar: no `node` was found on PATH. Add `actions/setup-node` before ' +
+      'script-jail: no `node` was found on PATH. Add `actions/setup-node` before ' +
         'this action so the chosen Node version is on PATH.',
     );
   }
@@ -233,7 +233,7 @@ export function resolveHostNodePrefix(
   // prefix because the error message should name the binary, not the prefix.
   if (RUNNER_BUNDLED_NODE_RE.test(execPath)) {
     throw new Error(
-      "npm-jar: refusing to mount the GitHub Actions runner's bundled Node. " +
+      "script-jail: refusing to mount the GitHub Actions runner's bundled Node. " +
         'Add `actions/setup-node` before this action so the chosen Node version is used.',
     );
   }
@@ -256,7 +256,7 @@ export function resolveHostNodePrefix(
   const blockedRoot = findBlockedRoot(prefix);
   if (blockedRoot !== null) {
     throw new Error(
-      `npm-jar: refusing to pack ${blockedRoot} — looks like a system-wide ` +
+      `script-jail: refusing to pack ${blockedRoot} — looks like a system-wide ` +
         'install. Use actions/setup-node so Node lives in an isolated ' +
         'toolcache directory.',
     );
@@ -295,7 +295,7 @@ export function resolveHostNodePrefix(
   if (hasHeader && hasDocs) return prefix;
 
   throw new Error(
-    `npm-jar: ${execPath} does not appear to be a self-contained Node ` +
+    `script-jail: ${execPath} does not appear to be a self-contained Node ` +
       'install (missing include/node/node.h and/or share/doc/node). ' +
       'Use actions/setup-node before calling this action.',
   );
