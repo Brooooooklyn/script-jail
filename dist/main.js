@@ -28185,6 +28185,7 @@ var PINNED_VMLINUX_SHA256 = "22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f
 var VSOCK_PORT = 10242;
 var GUEST_CID = 3;
 async function main() {
+  validateManifest(PINNED_MANIFEST);
   const repoDir = process.env["GITHUB_WORKSPACE"] ?? process.cwd();
   const inputs = parseInputs({ repoDir });
   let pm;
@@ -28199,7 +28200,6 @@ async function main() {
   }
   void pm;
   const runnerImage = detectRunnerImage();
-  validateManifest(PINNED_MANIFEST);
   const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path9.join)(process.env["RUNNER_TEMP"], "npm-jar-images") : (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), "npm-jar-images");
   (0, import_node_fs11.mkdirSync)(imagesDir, { recursive: true });
   maybeClearCache({

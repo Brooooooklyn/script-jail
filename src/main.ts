@@ -72,6 +72,18 @@ const GUEST_CID = 3;
 // ---------------------------------------------------------------------------
 
 export async function main(): Promise<void> {
+  // Fail-fast: refuse to do ANY work if the action was published with
+  // placeholder (or otherwise non-canonical) artifact SHAs.  This MUST be
+  // the first executable statement of main() — earlier ordering placed it
+  // after parseInputs()/detectPm(), so a packaging bug could be masked by
+  // a lockfile-missing error or by the BunUnsupportedError clean-exit
+  // (process.exit(0)) below, neither of which surface the real issue.
+  // Without this gate, the pre-fetch step would only catch the mistake
+  // AFTER downloading multi-MB release assets, and surface it as a
+  // confusing "SHA-256 mismatch" instead of "this is a packaging bug,
+  // file an issue".
+  validateManifest(PINNED_MANIFEST);
+
   const repoDir = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
 
   const inputs = parseInputs({ repoDir });
@@ -109,12 +121,6 @@ export async function main(): Promise<void> {
   // `preFetchArtifacts()` below downloads it (and libnpmjar.so) from the
   // GitHub release matching PINNED_MANIFEST.tag; if the download or its
   // SHA-256 check fails, the pre-fetch step throws before `launchVm` runs.
-  // Fail-fast: refuse to do any filesystem or network work if the action was
-  // published with placeholder (or otherwise non-canonical) artifact SHAs.
-  // Without this, the pre-fetch step would only catch the mistake AFTER
-  // downloading multi-MB release assets, and surface it as a confusing
-  // "SHA-256 mismatch" instead of "this is a packaging bug, file an issue".
-  validateManifest(PINNED_MANIFEST);
 
   const imagesDir = process.env['RUNNER_TEMP']
     ? join(process.env['RUNNER_TEMP'], 'npm-jar-images')
