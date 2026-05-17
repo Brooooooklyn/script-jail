@@ -263,6 +263,14 @@ export interface StraceTailerOptions {
    */
   fd3Stream: Readable | null;
   /**
+   * Absolute path of a shared JSONL events file produced by the env-shim and
+   * dlopen-block preload (production channel — see {@link EVENTS_FILE_PATH}).
+   * Tailed alongside per-pid strace files; lines arrive with pid=0 (the same
+   * synthetic pid we use for fd3 lines, since attribution happens later from
+   * the embedded pid field).  When undefined, no events-file polling is done.
+   */
+  eventsFilePath?: string;
+  /**
    * Promise that resolves when the traced child process has exited.
    * The tailer waits for this, then does one final drain poll, then ends.
    */
@@ -372,6 +380,61 @@ export async function* runStraceTailer(
     }
   }
 
+  // ---- events-file tailer --------------------------------------------------
+  //
+  // Distinct from per-pid strace files because the events file lives outside
+  // watchDir and a single absolute path (rather than a "prefix.PID" pattern)
+  // is enough to identify it.  Position + partial-line buffer mirror the
+  // per-pid logic in drainFile().
+  let eventsPos = 0;
+  let eventsBuf = '';
+  function drainEventsFile(): void {
+    const path = opts.eventsFilePath;
+    if (path === undefined || path === '') return;
+
+    let size = 0;
+    try {
+      size = statSync(path).size;
+    } catch {
+      return; // file not yet created or unreadable
+    }
+    if (size <= eventsPos) return;
+
+    const toRead = size - eventsPos;
+    const buf = Buffer.allocUnsafe(toRead);
+    let fd = -1;
+    let bytesRead = 0;
+    try {
+      fd = openSync(path, 'r');
+      bytesRead = readSync(fd, buf, 0, toRead, eventsPos);
+    } catch {
+      if (fd >= 0) { try { closeSync(fd); } catch { /* ignore */ } }
+      return;
+    }
+    closeSync(fd);
+
+    eventsPos += bytesRead;
+
+    const chunk = eventsBuf + buf.slice(0, bytesRead).toString('utf8');
+    const newlineIdx = chunk.lastIndexOf('\n');
+    if (newlineIdx === -1) {
+      eventsBuf = chunk;
+      return;
+    }
+
+    const complete = chunk.slice(0, newlineIdx);
+    eventsBuf = chunk.slice(newlineIdx + 1);
+
+    for (const line of complete.split('\n')) {
+      if (line.length > 0) {
+        // pid=0 matches the fd3Stream convention: attribution will read the
+        // pid field embedded in the JSONL payload, not this synthetic one.
+        queue.push({ pid: 0, line });
+      }
+    }
+    wake();
+  }
+
   // ---- fd 3 readline -------------------------------------------------------
 
   let fd3Done = false;
@@ -407,6 +470,7 @@ export async function* runStraceTailer(
   // Poll on a fixed interval as fallback / complement to fs.watch.
   let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
     pollDir();
+    drainEventsFile();
     wake();
   }, pollIntervalMs);
 
@@ -417,6 +481,7 @@ export async function* runStraceTailer(
     setTimeout(() => {
       // Final poll
       pollDir();
+      drainEventsFile();
       // Flush any partial lines in per-pid buffers (strace may omit final \n).
       for (const [name, partial] of fileBuf) {
         if (partial.length > 0) {
@@ -424,6 +489,13 @@ export async function* runStraceTailer(
           queue.push({ pid, line: partial });
           fileBuf.set(name, '');
         }
+      }
+      // Same for the events-file partial buffer (defensive — writers always
+      // emit \n-terminated lines, but POSIX doesn't require atomic writes
+      // across newlines so a partial chunk is technically possible).
+      if (eventsBuf.length > 0) {
+        queue.push({ pid: 0, line: eventsBuf });
+        eventsBuf = '';
       }
       // Stop the poll timer.
       if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
@@ -514,6 +586,17 @@ export class LinuxStraceRunner implements StraceRunner {
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
   ): AsyncIterable<{ pid: number; line: string }> {
+    // Ensure the events file is created empty before any writer can open it.
+    // The shim and dlopen-block preload open with O_APPEND|O_CREAT, so a
+    // pre-existing file from a previous Phase B run would otherwise leak.
+    try {
+      writeFileSync(EVENTS_FILE_PATH, '', 'utf8');
+    } catch {
+      // Non-fatal: if /tmp isn't writable, the writers will just hit EACCES
+      // and the events file path is silently inert.  Phase B continues —
+      // strace events still flow through the per-pid files.
+    }
+
     const straceArgs = [
       '-ff',
       '-e', 'trace=openat,execve,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
@@ -559,6 +642,7 @@ export class LinuxStraceRunner implements StraceRunner {
         watchDir,
         basePrefix,
         fd3Stream,
+        eventsFilePath: EVENTS_FILE_PATH,
         exitPromise,
       });
     } finally {
@@ -645,6 +729,14 @@ function buildChildEnv(
   return {
     ...baseEnv,
     LD_PRELOAD: '/lib/libscriptjail.so',
+    // The file path is the production channel: npm spawns lifecycle node
+    // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
+    // fd 3 (SCRIPT_JAIL_LOG_FD) is closed in the lifecycle child, so the
+    // env-shim and dlopen-block preload need a destination that survives
+    // the spawn — a known file path.  Both writers use O_WRONLY|O_APPEND
+    // so concurrent writes don't race on file offset; POSIX makes writes
+    // smaller than PIPE_BUF atomic on regular files.
+    SCRIPT_JAIL_LOG_FILE: EVENTS_FILE_PATH,
     SCRIPT_JAIL_LOG_FD: String(config.log_fd),
     SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedEnvFilePath,
     SCRIPT_JAIL_SPOOF_PLATFORM: config.spoof.platform,
@@ -655,6 +747,13 @@ function buildChildEnv(
     ].join(' '),
   };
 }
+
+/**
+ * Absolute path of the shared JSONL events file.  The shim and the dlopen-block
+ * preload append events here; the agent tails this file alongside the per-pid
+ * strace output files.  Lives under /tmp (rootfs tmpfs) so it's reset per VM.
+ */
+export const EVENTS_FILE_PATH = '/tmp/script-jail-events.jsonl';
 
 // ---------------------------------------------------------------------------
 // Main

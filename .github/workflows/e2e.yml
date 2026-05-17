@@ -323,25 +323,15 @@ jobs:
 
           # Attack-shape markers, mirroring test/e2e/generate.test.ts.
           assert_marker '<HIDDEN> $HOME/.ssh/id_rsa'
-          # NOTE: `<HIDDEN> NPM_TOKEN` is NOT asserted in Layer 2.
-          # The LD_PRELOAD env shim (src/shim/env-shim.c) wraps libc
-          # getenv/secure_getenv, but Node.js parses environ[] at startup
-          # into an in-memory Map; `process.env.NPM_TOKEN` reads from that
-          # Map without calling libc getenv, so the shim never fires.
-          # Layer 1 (test/e2e/generate.test.ts) still asserts this marker
-          # because it injects expected-events.json directly.  Real-VM
-          # detection requires v2 environ[] interposition — see the
-          # `TODO(v2)` comment near env-shim.c:315.
+          # NOTE: `<HIDDEN> NPM_TOKEN` still has a known limitation in
+          # real-VM runs — Node.js parses environ[] at startup into an
+          # in-memory Map; `process.env.NPM_TOKEN` reads from that Map
+          # without calling libc getenv, so the LD_PRELOAD env-shim does
+          # not fire for `process.env.X` reads.  Layer 1 still asserts
+          # this marker via injected events; v2 environ[] interposition
+          # would close the gap end-to-end.  See env-shim.c TODO(v2).
           assert_marker '<ENOENT> gcc'
-          # NOTE: `<BLOCKED> $PKG/evil.node` (dlopen) and `<HIDDEN> NPM_TOKEN`
-          # (env_read) both depend on JSONL events written to fd 3 by the
-          # LD_PRELOAD env-shim and the dlopen-block.cjs preload.  npm
-          # spawns lifecycle node processes with default `stdio: 'inherit'`
-          # which only propagates fds 0–2; fd 3 is closed in the child, so
-          # writes get EBADF and are silently dropped.  The shim and
-          # preload are correct in isolation — the channel needs to move
-          # off fd 3 (file path or AF_UNIX socket).  Tracked separately.
-          # Layer 1 still asserts both markers via injected events.
+          assert_marker '<BLOCKED> $PKG/evil.node'
           # Network egress: src/lock/normalize.ts renders
           #   `<BLOCKED> connect <host>:<port>`
           # We match the stable prefix only — the fixture uses

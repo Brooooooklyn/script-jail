@@ -7,11 +7,13 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -129,8 +131,28 @@ static void do_init(void)
     /* Resolve real function pointers. */
     pthread_once(&resolve_once, resolve_syms);
 
-    /* Read log FD from env. */
+    /*
+     * Resolve the log destination.  Prefer SCRIPT_JAIL_LOG_FILE (file path,
+     * required in production because npm spawns lifecycle node processes
+     * with `stdio: 'inherit'`, which only propagates fds 0-2 — fd 3 is
+     * closed in the child).  Fall back to SCRIPT_JAIL_LOG_FD for tests
+     * that wire a pipe directly.
+     *
+     * One open per process: each LD_PRELOAD instance gets its own fd via
+     * O_APPEND so concurrent writers don't race on file offset.  POSIX
+     * guarantees atomic writes for messages smaller than PIPE_BUF on
+     * regular files; our JSONL lines fit comfortably in JSONL_BUF (4096).
+     */
     {
+        const char *path = real_getenv ? real_getenv("SCRIPT_JAIL_LOG_FILE") : NULL;
+        if (path && *path) {
+            int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+            if (fd >= 0) log_fd = fd;
+            /* On failure (EACCES, ENOENT for a missing dir, etc.) fall through
+             * to SCRIPT_JAIL_LOG_FD so tests still work. */
+        }
+    }
+    if (log_fd < 0) {
         const char *fd_str = real_getenv ? real_getenv("SCRIPT_JAIL_LOG_FD") : NULL;
         if (fd_str && *fd_str) {
             char *end = NULL;

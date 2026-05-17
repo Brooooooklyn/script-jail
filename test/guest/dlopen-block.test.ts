@@ -184,4 +184,59 @@ describe('dlopen-block preload', () => {
     const out = JSON.parse(result.stdout) as { result: string };
     expect(out.result).toBe('/a/b/c');
   });
+
+  it('logs to SCRIPT_JAIL_LOG_FILE when set, in preference to SCRIPT_JAIL_LOG_FD', async () => {
+    // The fd-3 production channel doesn't survive npm's `stdio: 'inherit'`
+    // lifecycle spawn (only fds 0-2 propagate), so the preload must prefer
+    // SCRIPT_JAIL_LOG_FILE — a path that any descendant process can open
+    // independently with O_APPEND.
+    const logFile = join(
+      tmpdir(),
+      `script-jail-events-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+    );
+    // Pre-create empty so the preload's `fs.openSync(..., 'a')` works.
+    writeFileSync(logFile, '');
+
+    const code = `
+      try {
+        process.dlopen({ exports: {} }, '/nonexistent/file.node');
+      } catch {}
+      // Allow the writeSync to flush before exit.
+    `;
+    const result = await runWithBlock(code, { SCRIPT_JAIL_LOG_FILE: logFile });
+    expect(result.exitCode).toBe(0);
+
+    const { readFileSync } = await import('node:fs');
+    const contents = readFileSync(logFile, 'utf8');
+    const lines = contents.split('\n').filter((l) => l.length > 0);
+    expect(lines.length).toBe(1);
+
+    const entry = JSON.parse(lines[0]!) as {
+      kind: string;
+      filename: string;
+      result: string;
+    };
+    expect(entry.kind).toBe('dlopen');
+    expect(entry.filename).toBe('/nonexistent/file.node');
+    expect(entry.result).toBe('blocked');
+  });
+
+  it('falls back to SCRIPT_JAIL_LOG_FD when SCRIPT_JAIL_LOG_FILE is unset', async () => {
+    // The legacy fd-3 path must continue to work for tests / non-production
+    // callers that wire a pipe directly.  We can't easily wire a real pipe
+    // through fork(), so the assertion is structural: setting LOG_FILE to ''
+    // should leave the preload using the (default) fd 3 — which, with no
+    // pipe attached on fd 3 in this fork(), means writeSync EBADF-drops.
+    // The throw still happens; the fixture's catch keeps the exit clean.
+    const code = `
+      try {
+        process.dlopen({ exports: {} }, '/nonexistent/file.node');
+      } catch {}
+    `;
+    const result = await runWithBlock(code, {
+      SCRIPT_JAIL_LOG_FILE: '',
+      SCRIPT_JAIL_LOG_FD: '99', // bogus fd; writes silently drop
+    });
+    expect(result.exitCode).toBe(0);
+  });
 });

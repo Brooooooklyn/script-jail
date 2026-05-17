@@ -3,9 +3,17 @@
 // NODE_OPTIONS=--require preload: replaces process.dlopen with a function that
 // throws before any native addon can load, and emits a JSONL audit line.
 //
-// Env vars:
-//   SCRIPT_JAIL_LOG_FD — integer fd open for writing; JSONL audit lines go here.
-//                    If unset or invalid, the throw still happens (no logging).
+// Env vars (checked in order, first match wins):
+//   SCRIPT_JAIL_LOG_FILE — absolute path to a JSONL events file. Each call
+//                          appends one line via O_APPEND (atomic for writes
+//                          smaller than PIPE_BUF on regular files).  Required
+//                          in production because npm spawns lifecycle node
+//                          processes with `stdio: 'inherit'` which only
+//                          propagates fds 0-2 — fd 3 is closed in the child.
+//   SCRIPT_JAIL_LOG_FD   — integer fd open for writing; legacy fd-3 path,
+//                          kept for tests that wire a pipe directly.
+//                          If neither is set, the throw still happens
+//                          (no logging).
 //
 // SECURITY NOTES:
 //   - This preload blocks the documented process.dlopen and process.binding APIs.
@@ -26,14 +34,43 @@ const fs = require('fs');
 const BLOCKED_MSG = 'script-jail: native addons are blocked at install time';
 
 /**
- * Write a JSONL audit line to SCRIPT_JAIL_LOG_FD.
+ * Cached fd for the events file.  Resolved lazily on first call; -1 means
+ * "tried and failed" (don't retry).  Module-local, shared across all logDlopen
+ * invocations in this process.
+ * @type {number | null}
+ */
+let cachedFileFd = null;
+
+/**
+ * Resolve the output fd for this process.  Prefers SCRIPT_JAIL_LOG_FILE (one
+ * append-mode open per process, cached); falls back to SCRIPT_JAIL_LOG_FD.
+ * @returns {number} fd to write to, or -1 if no destination is configured
+ */
+function resolveLogFd() {
+  const filePath = process.env['SCRIPT_JAIL_LOG_FILE'];
+  if (filePath !== undefined && filePath !== '') {
+    if (cachedFileFd !== null) return cachedFileFd;
+    try {
+      cachedFileFd = fs.openSync(filePath, 'a');
+    } catch {
+      cachedFileFd = -1;
+    }
+    return cachedFileFd;
+  }
+  const fdStr = process.env['SCRIPT_JAIL_LOG_FD'];
+  if (fdStr === undefined || fdStr === '') return -1;
+  const fd = parseInt(fdStr, 10);
+  if (!isFinite(fd) || fd < 0) return -1;
+  return fd;
+}
+
+/**
+ * Write a JSONL audit line to the resolved log destination.
  * @param {string} filename
  */
 function logDlopen(filename) {
-  const fdStr = process.env['SCRIPT_JAIL_LOG_FD'];
-  if (fdStr === undefined || fdStr === '') return;
-  const fd = parseInt(fdStr, 10);
-  if (!isFinite(fd) || fd < 0) return;
+  const fd = resolveLogFd();
+  if (fd < 0) return;
 
   const ts = Number(process.hrtime.bigint() / 1_000_000n);
   const line = JSON.stringify({

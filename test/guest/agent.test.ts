@@ -1009,6 +1009,118 @@ describe('runStraceTailer', () => {
     const secondIdx = lines.indexOf('openat(AT_FDCWD, "/second", O_RDONLY) = 4');
     expect(firstIdx).toBeLessThan(secondIdx);
   });
+
+  // -------------------------------------------------------------------------
+  // Events-file tail tests (the production channel for shim + dlopen-block)
+  // -------------------------------------------------------------------------
+
+  it('yields JSONL lines from a pre-written events file as pid=0', async () => {
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    writeFileSync(
+      eventsPath,
+      '{"kind":"env_read","name":"NPM_TOKEN","pid":1001,"ts":0,"hidden":true}\n' +
+      '{"kind":"dlopen","filename":"/work/node_modules/x/evil.node","pid":1002,"ts":1,"result":"blocked"}\n',
+      'utf8',
+    );
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out', // no per-pid files exist; only the events file
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    resolveExit();
+
+    const items = await collect(tailer);
+    expect(items).toHaveLength(2);
+    // Both lines carry the same synthetic pid=0 the fd3Stream uses; the
+    // real per-event pid is inside the JSON payload.
+    expect(items[0]).toEqual({
+      pid: 0,
+      line: '{"kind":"env_read","name":"NPM_TOKEN","pid":1001,"ts":0,"hidden":true}',
+    });
+    expect(items[1]).toEqual({
+      pid: 0,
+      line: '{"kind":"dlopen","filename":"/work/node_modules/x/evil.node","pid":1002,"ts":1,"result":"blocked"}',
+    });
+  });
+
+  it('picks up events-file lines appended after the tailer starts', async () => {
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    writeFileSync(eventsPath, '', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Append after a brief delay (after the tailer has started polling).
+    setTimeout(() => {
+      writeFileSync(
+        eventsPath,
+        '{"kind":"env_read","name":"GITHUB_TOKEN","pid":2001,"ts":5,"hidden":true}\n',
+        { encoding: 'utf8', flag: 'a' },
+      );
+      setTimeout(resolveExit, 80);
+    }, 40);
+
+    const items = await collect(tailer, 4000);
+    expect(items.length).toBe(1);
+    expect(items[0]?.line).toContain('GITHUB_TOKEN');
+    expect(items[0]?.pid).toBe(0);
+  });
+
+  it('reads the events file incrementally without re-reading prior content', async () => {
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    writeFileSync(eventsPath, '{"kind":"env_read","name":"A","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Append a second line after the initial drain.
+    setTimeout(() => {
+      writeFileSync(
+        eventsPath,
+        '{"kind":"env_read","name":"B","pid":2,"ts":1,"hidden":false}\n',
+        { encoding: 'utf8', flag: 'a' },
+      );
+      setTimeout(resolveExit, 80);
+    }, 40);
+
+    const items = await collect(tailer, 4000);
+    const names = items.map((i) => {
+      try { return (JSON.parse(i.line) as { name?: string }).name; } catch { return undefined; }
+    });
+    // Each name should appear exactly once — no duplicate reads from
+    // re-scanning the file.
+    expect(names.filter((n) => n === 'A')).toHaveLength(1);
+    expect(names.filter((n) => n === 'B')).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
