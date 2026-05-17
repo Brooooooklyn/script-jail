@@ -1,0 +1,13 @@
+[
+  {
+    "raw": {
+      "kind": "write",
+      "path": "/work/.bashrc",
+      "pid": 1001,
+      "ts": 0,
+      "hidden": false
+    },
+    "pkg": "writes-into-repo@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

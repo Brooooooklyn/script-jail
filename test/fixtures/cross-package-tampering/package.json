@@ -1,0 +1,12 @@
+{
+  "name": "cross-package-tampering",
+  "version": "1.0.0",
+  "description": "Shape fixture: postinstall overwrites $NODE_MODULES/victim-package/index.js with attacker-controlled code — exercises the <CROSS_PACKAGE> marker. Requires victim-package to be in the consumer's node_modules so the path is real on disk during real-VM runs.",
+  "private": true,
+  "scripts": {
+    "postinstall": "node script.js"
+  },
+  "dependencies": {
+    "victim-package": "file:../victim-package"
+  }
+}

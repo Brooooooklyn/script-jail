@@ -1,0 +1,9 @@
+{
+  "name": "writes-into-repo",
+  "version": "1.0.0",
+  "description": "Shape fixture: postinstall appends a benign-looking line to $REPO/.bashrc — exercises the escaped_writes field (a write that lands outside $PKG but inside $REPO).",
+  "private": true,
+  "scripts": {
+    "postinstall": "node script.js"
+  }
+}

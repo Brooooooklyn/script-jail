@@ -122,3 +122,25 @@ describe('fixture: tries-network-egress', () => {
     expect(yaml).toContain('<BLOCKED> connect 198.51.100.7:443');
   });
 });
+
+describe('fixture: writes-into-repo', () => {
+  it('renders $REPO/.bashrc under escaped_writes', () => {
+    const yaml = renderFixtureYaml('writes-into-repo');
+    expect(yaml).toContain('writes-into-repo@1.0.0:');
+    expect(yaml).toContain('postinstall:');
+    expect(yaml).toContain('escaped_writes:');
+    expect(yaml).toContain('$REPO/.bashrc');
+    // sanity: should NOT show the <CROSS_PACKAGE> prefix
+    expect(yaml).not.toMatch(/<CROSS_PACKAGE>.*\.bashrc/);
+  });
+});
+
+describe('fixture: cross-package-tampering', () => {
+  it('renders <CROSS_PACKAGE> $NODE_MODULES/victim-package/index.js under escaped_writes', () => {
+    const yaml = renderFixtureYaml('cross-package-tampering');
+    expect(yaml).toContain('cross-package-tampering@1.0.0:');
+    expect(yaml).toContain('postinstall:');
+    expect(yaml).toContain('escaped_writes:');
+    expect(yaml).toContain('<CROSS_PACKAGE> $NODE_MODULES/victim-package/index.js');
+  });
+});

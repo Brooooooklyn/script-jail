@@ -5,7 +5,7 @@
 // missing package plus a GitHub Actions ::error annotation.
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,8 +29,12 @@ const ROOTS = {
 };
 
 function listFixtures(): string[] {
+  // Skip passive-companion fixtures (e.g. victim-package): those exist only to
+  // make a path real on disk during real-VM runs and ship no expected-events.json
+  // because they have no lifecycle hooks of their own.
   return readdirSync(FIXTURES_DIR, { withFileTypes: true })
     .filter((d) => d.isDirectory())
+    .filter((d) => existsSync(join(FIXTURES_DIR, d.name, 'expected-events.json')))
     .map((d) => d.name)
     .sort();
 }

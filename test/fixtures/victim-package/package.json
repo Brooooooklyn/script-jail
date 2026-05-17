@@ -1,0 +1,7 @@
+{
+  "name": "victim-package",
+  "version": "1.0.0",
+  "description": "Passive companion to cross-package-tampering. Ships only an empty index.js so the consumer's node_modules/victim-package/ exists on disk during real-VM runs. No lifecycle scripts.",
+  "private": true,
+  "main": "index.js"
+}
