@@ -137,7 +137,22 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     doValidateManifest(PINNED_MANIFEST);
   }
 
-  const repoDir = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
+  // Source of truth for "where is the user's repo?" is the SCRIPT_JAIL_REPO_DIR
+  // env var if set, then the action step's working-directory (process.cwd()),
+  // and only as a final fallback GITHUB_WORKSPACE.  GitHub Actions reserves
+  // GITHUB_WORKSPACE as a default environment variable and silently ignores
+  // step-level `env: GITHUB_WORKSPACE: …` overrides — so the e2e self-test
+  // workflow (which needs to point the action at a staged consumer dir under
+  // RUNNER_TEMP, not at the checkout) cannot use that mechanism.  Honoring
+  // `working-directory:` (which Actions DOES respect for JS actions by
+  // chdir-ing the spawned Node process) gives a reliable knob without
+  // introducing a new action input.  For ordinary consumers, the action's
+  // cwd equals GITHUB_WORKSPACE so behaviour is unchanged.
+  const repoDir =
+    process.env['SCRIPT_JAIL_REPO_DIR'] ??
+    process.cwd() ??
+    process.env['GITHUB_WORKSPACE'] ??
+    '';
 
   const inputs = parseInputs({ repoDir });
 

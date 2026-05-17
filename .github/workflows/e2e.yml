@@ -266,7 +266,17 @@ jobs:
         id: update
         uses: ./
         env:
-          GITHUB_WORKSPACE: ${{ runner.temp }}/consumer
+          # GitHub Actions reserves GITHUB_WORKSPACE and silently drops a
+          # step-level override of it, so the action couldn't be pointed at
+          # the staged consumer dir that way.  SCRIPT_JAIL_REPO_DIR is the
+          # documented escape hatch in src/main.ts:140; it takes precedence
+          # over both GITHUB_WORKSPACE and process.cwd() and is documented
+          # inline at the read site.  Without this override the action
+          # would copy the script-jail repo root into /work (where its
+          # pnpm-lock.yaml triggers `manager=pnpm` detection — and `pnpm`
+          # isn't on the host-node disk, producing `spawn pnpm ENOENT`
+          # inside the VM).
+          SCRIPT_JAIL_REPO_DIR: ${{ runner.temp }}/consumer
         with:
           mode: update
 

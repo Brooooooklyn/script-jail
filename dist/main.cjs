@@ -28311,7 +28311,7 @@ async function main(deps = {}) {
   if (!selfTest) {
     doValidateManifest(PINNED_MANIFEST);
   }
-  const repoDir = process.env["GITHUB_WORKSPACE"] ?? process.cwd();
+  const repoDir = process.env["SCRIPT_JAIL_REPO_DIR"] ?? process.cwd() ?? process.env["GITHUB_WORKSPACE"] ?? "";
   const inputs = parseInputs({ repoDir });
   let pm;
   try {

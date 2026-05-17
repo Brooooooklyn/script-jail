@@ -439,6 +439,7 @@ interface ExitCalledSignal {
 // ---- Environment snapshot helpers -----------------------------------------
 
 const TRACKED_ENV_KEYS: ReadonlyArray<string> = [
+  'SCRIPT_JAIL_REPO_DIR',
   'GITHUB_WORKSPACE',
   'INPUT_CONFIG',
   'INPUT_LOCK',
@@ -614,6 +615,11 @@ export async function runMain(input: RunMainInput): Promise<RunMainResult> {
   }) as typeof process.stderr.write;
 
   // ---- Wire env -----------------------------------------------------------
+  // src/main.ts:140 prefers SCRIPT_JAIL_REPO_DIR over process.cwd() and
+  // GITHUB_WORKSPACE because GitHub Actions silently ignores step-level
+  // overrides of GITHUB_WORKSPACE.  The harness keeps GITHUB_WORKSPACE in
+  // sync for backwards compatibility with code that still reads it.
+  process.env['SCRIPT_JAIL_REPO_DIR'] = input.consumerDir;
   process.env['GITHUB_WORKSPACE'] = input.consumerDir;
   process.env['INPUT_CONFIG'] = input.inputs.config;
   process.env['INPUT_LOCK'] = input.inputs.lock;
