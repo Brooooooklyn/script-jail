@@ -12,13 +12,14 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
-import { PassThrough, Writable } from 'node:stream';
+import { PassThrough, Writable, type Readable } from 'node:stream';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+import { dirname, basename } from 'node:path';
 
 import { Attribution } from './attribution.js';
 import { LinuxProcReader } from './proc-reader.js';
@@ -28,7 +29,6 @@ import { runInstallPhase, type StraceRunner } from './phase-install.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
-import type { Readable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
@@ -243,20 +243,242 @@ export class LinuxSpawner implements Spawner {
 // Production StraceRunner
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// StraceTailer — exported for unit tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for StraceTailer. The `fd3Stream` seam lets tests inject a fake
+ * Readable instead of an actual child-process pipe.
+ */
+export interface StraceTailerOptions {
+  /** Directory to watch for new per-pid strace output files. */
+  watchDir: string;
+  /** Basename prefix of per-pid files (e.g. "strace.out" → files like "strace.out.12345"). */
+  basePrefix: string;
+  /**
+   * Readable stream representing the child's fd 3 (LD_PRELOAD JSONL).
+   * When null, no fd-3 lines are emitted (useful when the child doesn't write to fd 3).
+   */
+  fd3Stream: Readable | null;
+  /**
+   * Promise that resolves when the traced child process has exited.
+   * The tailer waits for this, then does one final drain poll, then ends.
+   */
+  exitPromise: Promise<void>;
+  /** Poll interval in ms for directory scan and file growth checks (default 50). */
+  pollIntervalMs?: number;
+  /** Extra drain time in ms after child exit to catch final writes (default 100). */
+  drainMs?: number;
+}
+
+/**
+ * StraceTailer merges:
+ *   1. Lines from per-pid strace output files  → { pid: <pid>, line }
+ *   2. JSONL lines from the fd3Stream pipe      → { pid: 0, line }
+ *
+ * The async generator ends once the child has exited and all trailing writes
+ * have been drained.
+ *
+ * Exported separately so tests can exercise it without spawning real strace.
+ */
+export async function* runStraceTailer(
+  opts: StraceTailerOptions,
+): AsyncGenerator<{ pid: number; line: string }> {
+  const pollIntervalMs = opts.pollIntervalMs ?? 50;
+  const drainMs = opts.drainMs ?? 100;
+
+  // Shared queue: all sources push here; the generator drains it.
+  const queue: Array<{ pid: number; line: string }> = [];
+  let done = false; // set true once the child has exited and drain is complete
+
+  // Notify the generator loop that new items are available or done changed.
+  let wakeResolve: (() => void) | null = null;
+  function wake(): void {
+    if (wakeResolve) { const r = wakeResolve; wakeResolve = null; r(); }
+  }
+
+  // ---- per-pid file tailers -------------------------------------------------
+
+  // Map from filename → current read position in that file.
+  const filePos = new Map<string, number>();
+  // Map from filename → partial (unterminated) line buffer.
+  const fileBuf = new Map<string, string>();
+
+  function parsePidFromFilename(name: string): number {
+    const suffix = name.slice(opts.basePrefix.length + 1); // strip "strace.out."
+    const n = parseInt(suffix, 10);
+    return isFinite(n) ? n : 0;
+  }
+
+  function drainFile(name: string): void {
+    const fullPath = `${opts.watchDir}/${name}`;
+    const pid = parsePidFromFilename(name);
+    const pos = filePos.get(name) ?? 0;
+
+    let size = 0;
+    try {
+      size = statSync(fullPath).size;
+    } catch {
+      return; // file disappeared — ignore
+    }
+    if (size <= pos) return; // no new bytes
+
+    const toRead = size - pos;
+    const buf = Buffer.allocUnsafe(toRead);
+    let fd = -1;
+    let bytesRead = 0;
+    try {
+      fd = openSync(fullPath, 'r');
+      bytesRead = readSync(fd, buf, 0, toRead, pos);
+    } catch {
+      if (fd >= 0) { try { closeSync(fd); } catch { /* ignore */ } }
+      return;
+    }
+    closeSync(fd);
+
+    filePos.set(name, pos + bytesRead);
+
+    const chunk = (fileBuf.get(name) ?? '') + buf.slice(0, bytesRead).toString('utf8');
+    const newlineIdx = chunk.lastIndexOf('\n');
+    if (newlineIdx === -1) {
+      fileBuf.set(name, chunk);
+      return;
+    }
+
+    const complete = chunk.slice(0, newlineIdx);
+    const remainder = chunk.slice(newlineIdx + 1);
+    fileBuf.set(name, remainder);
+
+    for (const line of complete.split('\n')) {
+      if (line.length > 0) {
+        queue.push({ pid, line });
+      }
+    }
+    wake();
+  }
+
+  function pollDir(): void {
+    let entries: string[];
+    try {
+      entries = readdirSync(opts.watchDir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      if (!name.startsWith(opts.basePrefix + '.')) continue;
+      drainFile(name);
+    }
+  }
+
+  // ---- fd 3 readline -------------------------------------------------------
+
+  let fd3Done = false;
+
+  if (opts.fd3Stream !== null) {
+    const rl = createInterface({ input: opts.fd3Stream, crlfDelay: Infinity });
+    rl.on('line', (line: string) => {
+      if (line.length > 0) {
+        queue.push({ pid: 0, line });
+        wake();
+      }
+    });
+    rl.on('close', () => {
+      fd3Done = true;
+      wake();
+    });
+  } else {
+    fd3Done = true;
+  }
+
+  // ---- fs.watch + polling loop ---------------------------------------------
+
+  let watcher: ReturnType<typeof fsWatch> | null = null;
+  try {
+    watcher = fsWatch(opts.watchDir, (_event, _filename) => {
+      pollDir();
+    });
+    watcher.on('error', () => { /* ignore — polling is the fallback */ });
+  } catch {
+    // fs.watch not available on this fs — polling only
+  }
+
+  // Poll on a fixed interval as fallback / complement to fs.watch.
+  let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    pollDir();
+    wake();
+  }, pollIntervalMs);
+
+  // ---- wait for child exit, then drain -------------------------------------
+
+  opts.exitPromise.then(() => {
+    // Give strace one more drain interval to flush trailing writes.
+    setTimeout(() => {
+      // Final poll
+      pollDir();
+      // Flush any partial lines in per-pid buffers (strace may omit final \n).
+      for (const [name, partial] of fileBuf) {
+        if (partial.length > 0) {
+          const pid = parsePidFromFilename(name);
+          queue.push({ pid, line: partial });
+          fileBuf.set(name, '');
+        }
+      }
+      // Stop the poll timer.
+      if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+      // Stop fs.watch.
+      if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+      done = true;
+      wake();
+    }, drainMs);
+  }).catch(() => {
+    done = true;
+    wake();
+  });
+
+  // ---- generator loop ------------------------------------------------------
+
+  try {
+    while (true) {
+      // Drain the queue first.
+      while (queue.length > 0) {
+        yield queue.shift()!;
+      }
+
+      // If we've set done AND fd3 is done AND queue is empty → finished.
+      if (done && fd3Done && queue.length === 0) break;
+
+      // Wait for a wake signal.
+      await new Promise<void>((resolve) => { wakeResolve = resolve; });
+    }
+  } finally {
+    // Cleanup on early consumer break (try/finally).
+    if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+    if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+    // Drain any remaining partial lines (best-effort).
+    for (const [name, partial] of fileBuf) {
+      if (partial.length > 0) {
+        const pid = parsePidFromFilename(name);
+        queue.push({ pid, line: partial });
+        fileBuf.set(name, '');
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Production StraceRunner
+// ---------------------------------------------------------------------------
+
 /**
  * Production strace runner.
  *
- * NOTE (v1 limitation): The production impl uses strace -o <basePath> which
- * writes per-pid files. A complete production impl would tail those files
- * while the traced processes are alive. This skeleton collects strace's own
- * stderr output (diagnostic messages only) and emits no per-pid syscall lines.
- *
- * TODO(v2): Implement per-pid file tailing:
- *   - After spawning strace, watch basePath.* files with inotify/fs.watch.
- *   - Tail each file as it grows, parsing lines and yielding (pid, line).
- *   - Also open fd 3 as a pipe to merge LD_PRELOAD JSONL records.
- *   - Fail the phase if strace itself exits with a non-zero code.
- *   - Use the per-pid file suffix as pid (reliable vs. strace's -P mode).
+ * Spawns strace with `-ff -o <basePath>` which writes per-pid syscall files
+ * at `<basePath>.<pid>`. While strace is running, `StraceTailer` watches the
+ * output directory and tails each per-pid file as it grows, yielding
+ * `{ pid, line }` records. The child's fd 3 is wired as a pipe so that
+ * LD_PRELOAD JSONL records (env_read, dlopen) land here too, yielded as
+ * `{ pid: 0, line }`.
  */
 export class LinuxStraceRunner implements StraceRunner {
   private _exitCode = 0;
@@ -270,7 +492,6 @@ export class LinuxStraceRunner implements StraceRunner {
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
   ): AsyncIterable<{ pid: number; line: string }> {
-    // strace -ff: follow forks, write per-pid files <basePath>.<pid>
     const straceArgs = [
       '-ff',
       '-e', 'trace=openat,execve,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
@@ -279,35 +500,33 @@ export class LinuxStraceRunner implements StraceRunner {
       ...args,
     ];
 
-    const collectedLines: string[] = [];
-
     const child = spawn('strace', straceArgs, {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      // fd 0: stdin  → /dev/null
+      // fd 1: stdout → ignored
+      // fd 2: stderr → ignored (strace diagnostic noise; not syscall lines)
+      // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
+      stdio: ['ignore', 'ignore', 'ignore', 'pipe'],
     });
 
-    // Collect any strace diagnostic output from stderr.
-    // Per-pid syscall lines go to the -o files; this only catches strace errors.
-    child.stderr?.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString().split('\n')) {
-        if (line.trim()) collectedLines.push(line);
-      }
-    });
-
-    await new Promise<void>((resolve) => {
+    const exitPromise = new Promise<void>((resolve) => {
       child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });
       child.on('error', () => { this._exitCode = 1; resolve(); });
     });
 
-    // TODO(v2): tail per-pid strace output files here instead.
-    // For now yield any diagnostic lines collected from stderr.
-    const pidMatch = /^(\d+)\s+/;
-    for (const line of collectedLines) {
-      const m = pidMatch.exec(line);
-      const pid = m ? parseInt(m[1] ?? '0', 10) : 0;
-      yield { pid, line };
-    }
+    const watchDir = dirname(opts.basePath);
+    const basePrefix = basename(opts.basePath);
+
+    // child.stdio[3] is the read end of the fd-3 pipe.
+    const fd3Stream = child.stdio[3] as Readable | null;
+
+    yield* runStraceTailer({
+      watchDir,
+      basePrefix,
+      fd3Stream,
+      exitPromise,
+    });
   }
 }
 

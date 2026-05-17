@@ -10,7 +10,7 @@ import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, main, MemoryConnection } from '../../src/guest/agent.js';
+import { LinuxVsockConnection, main, MemoryConnection, runStraceTailer } from '../../src/guest/agent.js';
 import type { DnsLookupFn } from '../../src/guest/agent.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
 import type { StraceRunner } from '../../src/guest/phase-install.js';
@@ -762,5 +762,252 @@ describe('LinuxVsockConnection', () => {
     probeClient.destroy();
     conn.close();
     client.destroy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStraceTailer unit tests
+// ---------------------------------------------------------------------------
+
+describe('runStraceTailer', () => {
+  let tailerDir: string;
+
+  beforeEach(() => {
+    tailerDir = join(tmpdir(), `strace-tailer-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(tailerDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(tailerDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  /** Collect all items from an async iterable with a timeout guard. */
+  async function collect(
+    iter: AsyncIterable<{ pid: number; line: string }>,
+    timeoutMs = 3000,
+  ): Promise<Array<{ pid: number; line: string }>> {
+    const results: Array<{ pid: number; line: string }> = [];
+    await Promise.race([
+      (async () => {
+        for await (const item of iter) {
+          results.push(item);
+        }
+      })(),
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error('collect() timed out')), timeoutMs),
+      ),
+    ]);
+    return results;
+  }
+
+  it('yields lines from a pre-written per-pid strace file', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    // Write the per-pid file before the tailer starts.
+    writeFileSync(`${basePath}.1234`, 'openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3\nexecve("/bin/sh", ["sh"], ...) = 0\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Resolve exit immediately so the tailer drains and finishes.
+    resolveExit();
+
+    const items = await collect(tailer);
+    expect(items.length).toBe(2);
+    expect(items[0]).toEqual({ pid: 1234, line: 'openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3' });
+    expect(items[1]).toEqual({ pid: 1234, line: 'execve("/bin/sh", ["sh"], ...) = 0' });
+  });
+
+  it('yields lines from multiple per-pid files with correct pids', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    writeFileSync(`${basePath}.100`, 'openat(AT_FDCWD, "/a", O_RDONLY) = 3\n', 'utf8');
+    writeFileSync(`${basePath}.200`, 'openat(AT_FDCWD, "/b", O_RDONLY) = 4\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    resolveExit();
+
+    const items = await collect(tailer);
+    expect(items).toHaveLength(2);
+
+    const pid100 = items.find((i) => i.pid === 100);
+    const pid200 = items.find((i) => i.pid === 200);
+    expect(pid100?.line).toContain('/a');
+    expect(pid200?.line).toContain('/b');
+  });
+
+  it('picks up per-pid files written after the tailer starts', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Write the file after a short delay (simulates strace writing during run).
+    setTimeout(() => {
+      writeFileSync(`${basePath}.9999`, 'openat(AT_FDCWD, "/late", O_RDONLY) = 5\n', 'utf8');
+      setTimeout(resolveExit, 30);
+    }, 40);
+
+    const items = await collect(tailer);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toEqual({ pid: 9999, line: 'openat(AT_FDCWD, "/late", O_RDONLY) = 5' });
+  });
+
+  it('yields JSONL lines from fd3Stream with pid=0', async () => {
+    const fd3 = new PassThrough();
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: fd3,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    const shimLine = JSON.stringify({ kind: 'env_read', name: 'HOME', pid: 42, ts: 1000, hidden: false });
+    fd3.push(shimLine + '\n');
+    fd3.push(null); // EOF
+
+    resolveExit();
+
+    const items = await collect(tailer);
+    const fd3Items = items.filter((i) => i.pid === 0);
+    expect(fd3Items).toHaveLength(1);
+    expect(fd3Items[0]!.line).toBe(shimLine);
+  });
+
+  it('yields both per-pid strace lines and fd3 JSONL in a single run', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    writeFileSync(`${basePath}.555`, 'openat(AT_FDCWD, "/x", O_RDONLY) = 3\n', 'utf8');
+
+    const fd3 = new PassThrough();
+    const shimLine = JSON.stringify({ kind: 'dlopen', filename: '/tmp/foo.node', result: 'blocked', pid: 555, ts: 2000 });
+    fd3.push(shimLine + '\n');
+    fd3.push(null);
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: fd3,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    resolveExit();
+
+    const items = await collect(tailer);
+    expect(items.length).toBe(2);
+    expect(items.some((i) => i.pid === 555 && i.line.includes('openat'))).toBe(true);
+    expect(items.some((i) => i.pid === 0 && i.line.includes('dlopen'))).toBe(true);
+  });
+
+  it('completes cleanly when there are no strace files and fd3 is null', async () => {
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    resolveExit();
+
+    const items = await collect(tailer);
+    expect(items).toHaveLength(0);
+  });
+
+  it('does not yield lines from files that do not match the base prefix', async () => {
+    // Write a file with a wrong prefix — should be ignored.
+    writeFileSync(join(tailerDir, 'other.out.1111'), 'should-not-appear\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    resolveExit();
+
+    const items = await collect(tailer);
+    expect(items).toHaveLength(0);
+  });
+
+  it('handles incremental file growth: yields new lines appended after initial read', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    // Write first line before tailer starts.
+    writeFileSync(`${basePath}.777`, 'openat(AT_FDCWD, "/first", O_RDONLY) = 3\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 80,
+    });
+
+    // Append second line after a short delay.
+    setTimeout(() => {
+      const { appendFileSync } = require('node:fs');
+      appendFileSync(`${basePath}.777`, 'openat(AT_FDCWD, "/second", O_RDONLY) = 4\n');
+      setTimeout(resolveExit, 60);
+    }, 40);
+
+    const items = await collect(tailer, 4000);
+    const lines = items.map((i) => i.line);
+    expect(lines).toContain('openat(AT_FDCWD, "/first", O_RDONLY) = 3');
+    expect(lines).toContain('openat(AT_FDCWD, "/second", O_RDONLY) = 4');
+    // Order within one file must be preserved.
+    const firstIdx = lines.indexOf('openat(AT_FDCWD, "/first", O_RDONLY) = 3');
+    const secondIdx = lines.indexOf('openat(AT_FDCWD, "/second", O_RDONLY) = 4');
+    expect(firstIdx).toBeLessThan(secondIdx);
   });
 });
