@@ -71,8 +71,12 @@ export interface LaunchInput {
   repoDiskPath?: string | undefined;
   /**
    * Optional third disk: the runner's Node install packed as ext4.
-   * Attached as drive id "host-node" (read-only); the guest's init.sh
-   * mounts it at /opt/host-node and prepends /opt/host-node/bin to PATH.
+   * Attached as drive id "host_node" — the underscore form is required
+   * because Firecracker's API server runs checked_id (^[A-Za-z0-9_]+$)
+   * on the URL path and rejects hyphens with HTTP 400 InvalidID. The
+   * guest still identifies the drive by its ext4 LABEL "host-node"
+   * (set in overlay.ts), so the mount point /opt/host-node and the
+   * `blkid -L host-node` lookup stay unchanged.
    */
   hostNodeDiskPath?: string | undefined;
   vcpu?: number | undefined;       // default 2
@@ -223,8 +227,13 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     //     not by device path, so the actual /dev/vd* letter does not affect
     //     correctness — only debugging readability.
     if (hostNodeDiskPath !== undefined) {
-      await apiClient.put('/drives/host-node', {
-        drive_id: 'host-node',
+      // drive_id MUST be alphanumeric/underscore: Firecracker's checked_id
+      // (src/firecracker/src/api_server/parsed_request.rs) runs on the URL
+      // path component before the body is parsed; a hyphen yields HTTP 400.
+      // The guest still finds this disk via `blkid -L host-node` (the ext4
+      // LABEL, set in overlay.ts), so user-visible names stay hyphenated.
+      await apiClient.put('/drives/host_node', {
+        drive_id: 'host_node',
         path_on_host: hostNodeDiskPath,
         is_root_device: false,
         is_read_only: true,
@@ -403,13 +412,19 @@ export class UnixSocketApiClient implements FirecrackerApiClient {
           },
         },
         (res) => {
-          // Drain the response body.
-          res.resume();
+          // Accumulate the body so non-2xx errors can include Firecracker's
+          // fault_message (it returns JSON like {"fault_message":"Invalid ID"})
+          // instead of just the status code. On 2xx the body is drained the
+          // same way — `res.on('data')` keeps the stream flowing.
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
           res.on('end', () => {
             if (res.statusCode === undefined || res.statusCode < 200 || res.statusCode >= 300) {
+              const body = Buffer.concat(chunks).toString('utf8').trim();
+              const detail = body.length > 0 ? `: ${body}` : '';
               reject(
                 new Error(
-                  `Firecracker API ${method} ${path} returned HTTP ${res.statusCode ?? '?'}`,
+                  `Firecracker API ${method} ${path} returned HTTP ${res.statusCode ?? '?'}${detail}`,
                 ),
               );
             } else {

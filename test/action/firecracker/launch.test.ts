@@ -261,7 +261,7 @@ describe('launchVm', () => {
     expect(repoDrive).toBeUndefined();
   });
 
-  it('sends PUT /drives/host-node when hostNodeDiskPath is provided', async () => {
+  it('sends PUT /drives/host_node when hostNodeDiskPath is provided', async () => {
     const { client, calls } = makeFakeApiClient();
     const { spawner } = makeFakeSpawner();
 
@@ -271,17 +271,19 @@ describe('launchVm', () => {
       hostNodeDiskPath: '/run/host-node.ext4',
     }));
 
-    const hostNodeDrive = calls.find((c) => c.path === '/drives/host-node');
+    // The URL path uses host_node (underscore): Firecracker's checked_id
+    // regex /^[A-Za-z0-9_]+$/ rejects hyphens on the URL component.
+    const hostNodeDrive = calls.find((c) => c.path === '/drives/host_node');
     expect(hostNodeDrive).toBeDefined();
     expect(hostNodeDrive!.method).toBe('PUT');
     const body = hostNodeDrive!.body as Record<string, unknown>;
-    expect(body['drive_id']).toBe('host-node');
+    expect(body['drive_id']).toBe('host_node');
     expect(body['path_on_host']).toBe('/run/host-node.ext4');
     expect(body['is_root_device']).toBe(false);
     expect(body['is_read_only']).toBe(true);
   });
 
-  it('does NOT send /drives/host-node when hostNodeDiskPath is not provided', async () => {
+  it('does NOT send /drives/host_node when hostNodeDiskPath is not provided', async () => {
     const { client, calls } = makeFakeApiClient();
     const { spawner } = makeFakeSpawner();
 
@@ -291,11 +293,11 @@ describe('launchVm', () => {
       hostNodeDiskPath: undefined,
     }));
 
-    const hostNodeDrive = calls.find((c) => c.path === '/drives/host-node');
+    const hostNodeDrive = calls.find((c) => c.path === '/drives/host_node');
     expect(hostNodeDrive).toBeUndefined();
   });
 
-  it('registers host-node drive after the repo drive when both are provided', async () => {
+  it('registers host_node drive after the repo drive when both are provided', async () => {
     const { client, calls } = makeFakeApiClient();
     const { spawner } = makeFakeSpawner();
 
@@ -308,7 +310,7 @@ describe('launchVm', () => {
 
     const paths = calls.map((c) => c.path);
     const repoIdx = paths.indexOf('/drives/repo');
-    const hostNodeIdx = paths.indexOf('/drives/host-node');
+    const hostNodeIdx = paths.indexOf('/drives/host_node');
 
     expect(repoIdx).toBeGreaterThanOrEqual(0);
     expect(hostNodeIdx).toBeGreaterThanOrEqual(0);

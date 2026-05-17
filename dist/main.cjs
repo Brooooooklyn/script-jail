@@ -27841,8 +27841,8 @@ async function launchVm(input) {
       });
     }
     if (hostNodeDiskPath !== void 0) {
-      await apiClient.put("/drives/host-node", {
-        drive_id: "host-node",
+      await apiClient.put("/drives/host_node", {
+        drive_id: "host_node",
         path_on_host: hostNodeDiskPath,
         is_root_device: false,
         is_read_only: true
@@ -27960,12 +27960,15 @@ var UnixSocketApiClient = class {
           }
         },
         (res) => {
-          res.resume();
+          const chunks = [];
+          res.on("data", (chunk) => chunks.push(chunk));
           res.on("end", () => {
             if (res.statusCode === void 0 || res.statusCode < 200 || res.statusCode >= 300) {
+              const body2 = Buffer.concat(chunks).toString("utf8").trim();
+              const detail = body2.length > 0 ? `: ${body2}` : "";
               reject(
                 new Error(
-                  `Firecracker API ${method} ${path} returned HTTP ${res.statusCode ?? "?"}`
+                  `Firecracker API ${method} ${path} returned HTTP ${res.statusCode ?? "?"}${detail}`
                 )
               );
             } else {
