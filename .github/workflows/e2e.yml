@@ -296,28 +296,43 @@ jobs:
           echo "--- expected lockfile path ---"
           echo "$LOCK"
           test -s "$LOCK"
+          echo "--- full lockfile content ---"
+          cat "$LOCK"
+          echo "--- begin marker assertions ---"
+
+          # Each grep prints a helpful label first so the failing one
+          # is obvious in the log (bash `set -e` exits on first failure).
+          assert_marker() {
+            local marker="$1"
+            if grep -qF "$marker" "$LOCK"; then
+              echo "  ✓ $marker"
+            else
+              echo "::error::missing marker: $marker"
+              return 1
+            fi
+          }
 
           # Per-package keys (one per fixture).
-          grep -qF 'reads-home-ssh@1.0.0:'         "$LOCK"
-          grep -qF 'reads-secret-env@1.0.0:'       "$LOCK"
-          grep -qF 'spawns-gcc@1.0.0:'             "$LOCK"
-          grep -qF 'tries-dlopen@1.0.0:'           "$LOCK"
-          grep -qF 'tries-network-egress@1.0.0:'   "$LOCK"
-          grep -qF 'writes-into-repo@1.0.0:'       "$LOCK"
-          grep -qF 'cross-package-tampering@1.0.0:' "$LOCK"
+          assert_marker 'reads-home-ssh@1.0.0:'
+          assert_marker 'reads-secret-env@1.0.0:'
+          assert_marker 'spawns-gcc@1.0.0:'
+          assert_marker 'tries-dlopen@1.0.0:'
+          assert_marker 'tries-network-egress@1.0.0:'
+          assert_marker 'writes-into-repo@1.0.0:'
+          assert_marker 'cross-package-tampering@1.0.0:'
 
           # Attack-shape markers, mirroring test/e2e/generate.test.ts.
-          grep -qF '<HIDDEN> $HOME/.ssh/id_rsa' "$LOCK"
-          grep -qF '<HIDDEN> NPM_TOKEN'         "$LOCK"
-          grep -qF '<ENOENT> gcc'               "$LOCK"
-          grep -qF '<BLOCKED> $PKG/evil.node'   "$LOCK"
+          assert_marker '<HIDDEN> $HOME/.ssh/id_rsa'
+          assert_marker '<HIDDEN> NPM_TOKEN'
+          assert_marker '<ENOENT> gcc'
+          assert_marker '<BLOCKED> $PKG/evil.node'
           # Network egress: src/lock/normalize.ts renders
           #   `<BLOCKED> connect <host>:<port>`
           # We match the stable prefix only — the fixture uses
           # 198.51.100.7:443 today but the host/port could change.
-          grep -qF '<BLOCKED> connect '         "$LOCK"
-          grep -qF '$REPO/.bashrc'              "$LOCK"
-          grep -qF '<CROSS_PACKAGE> $NODE_MODULES/victim-package/index.js' "$LOCK"
+          assert_marker '<BLOCKED> connect '
+          assert_marker '$REPO/.bashrc'
+          assert_marker '<CROSS_PACKAGE> $NODE_MODULES/victim-package/index.js'
 
           echo "All 14 marker assertions passed."
 
