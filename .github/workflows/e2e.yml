@@ -1,0 +1,311 @@
+# npm-jar — .github/workflows/e2e.yml
+#
+# Layer 2 end-to-end workflow: on every PR + push-to-main, spin up a real
+# Linux runner, build the action + rootfs locally, then invoke the action
+# (via `uses: ./`) against `test/e2e/consumer/` inside a real Firecracker
+# microVM.  Asserts that the produced lockfile contains every expected
+# attack-shape marker, then tampers the lockfile and re-runs the action in
+# `mode=check` to assert it fails.
+#
+# Why this exists:
+#   The Layer 1 suite (test/e2e/*.test.ts) drives main() in-process with a
+#   fake VsockSession.  It catches every host-side wiring regression but
+#   never boots a VM.  Layer 2 is the inverse: it boots a real Firecracker
+#   microVM on every PR so a guest-side regression (mount table, capability
+#   drop, agent protocol) is caught before release.
+#
+# Why no committed `.npm-jar.lock.yml.golden`:
+#   `src/action/diff.ts` is byte-exact, and `src/guest/agent.ts`'s
+#   `generated_at` field is set per VM run.  A static golden could NEVER
+#   match a freshly generated lockfile — even on a clean run with no
+#   regression.  Instead, we run `mode=update` first to produce the
+#   canonical lockfile, assert on marker SUBSTRINGS, then sed-tamper a
+#   line and re-run `mode=check` to assert exit-1.
+
+name: e2e
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel an in-flight run when a new commit lands on the same branch / PR —
+# saves runner minutes (this workflow is the expensive one — it builds a
+# rootfs ext4 image and boots a microVM on each matrix leg).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# OpenSSF-recommended hardening: the e2e workflow runs untrusted-ish code
+# (npm-install lifecycle scripts on fixtures, inside a sandboxed VM) and
+# must never carry write capabilities.
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # 20 minutes covers worst-case: cold pnpm install + Docker rootfs build
+    # (~8 min on ubuntu-22.04) + two VM boots.  Typical run is ~12 min.
+    timeout-minutes: 20
+
+    # Self-test escape hatch.  This env var disables BOTH the manifest
+    # validation gate and the release-artifact pre-fetch step in
+    # `src/main.ts`.  Without it, the action would refuse to run because
+    # the manifest in src/action/artifact-manifest.ts contains placeholder
+    # SHAs (real ones are computed at release tag time — see release.yml).
+    # The flag is documented inline in src/main.ts and is intentionally
+    # NOT exposed as an action input; only the npm-jar repo's own e2e
+    # workflow sets it.
+    env:
+      NPM_JAR_E2E_SELF_TEST: '1'
+
+    strategy:
+      # We want a regression visible on either matrix leg, not just whichever
+      # finishes first — `fail-fast: false` keeps both legs running.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # The action invokes itself via `uses: ./` further down.  We don't
+          # need git credentials persisted on disk for that — and dropping
+          # them blocks a malicious fixture from `git push`-ing through the
+          # runner's token if it somehow escaped the sandbox.
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Pinned to the same version as `packageManager` in package.json.
+          version: 11.1.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Sanity-check that KVM is available BEFORE we spend ~8 minutes
+      # building a rootfs we wouldn't be able to use.  Both ubuntu-22.04
+      # and ubuntu-24.04 GitHub-hosted runners expose /dev/kvm; this guard
+      # protects against silent regressions in the runner image.
+      - name: Verify /dev/kvm is present
+        run: |
+          if [ ! -c /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing on ${{ matrix.os }} — Firecracker cannot boot."
+            exit 1
+          fi
+          ls -l /dev/kvm
+
+      # Build the action bundle, C shim, AND the per-runner rootfs ext4
+      # image.  The single `pnpm build -- --runner-image=…` call does all
+      # three (action bundle → esbuild, shim → src/shim/build.sh, rootfs
+      # → Docker + mkfs.ext4 via scripts/build.ts → src/rootfs/build.ts).
+      - name: Build action + shim + rootfs (${{ matrix.os }})
+        run: pnpm build -- --runner-image=${{ matrix.os }}
+
+      # `preFetchArtifacts` is skipped under NPM_JAR_E2E_SELF_TEST, so the
+      # action will NOT download the rootfs / .so from a release.  Instead
+      # it looks for `rootfs-<runner-image>.ext4` at
+      # `${RUNNER_TEMP}/npm-jar-images/`.  Copy the locally-built artifacts
+      # into that exact path so the rest of main.ts (overlay → launch)
+      # finds them without any further code changes.
+      - name: Stage local artifacts under $RUNNER_TEMP/npm-jar-images
+        run: |
+          set -euo pipefail
+          IMAGES_DIR="${RUNNER_TEMP}/npm-jar-images"
+          mkdir -p "${IMAGES_DIR}"
+          cp images/rootfs-${{ matrix.os }}.ext4 "${IMAGES_DIR}/"
+          cp images/libnpmjar.so "${IMAGES_DIR}/"
+          ls -l "${IMAGES_DIR}"
+
+      # ----------------------------------------------------------------------
+      # Stage a self-contained consumer project.
+      # ----------------------------------------------------------------------
+      # The committed `test/e2e/consumer/` references its fixtures via
+      # `file:../../fixtures/<name>`.  Those paths only resolve against the
+      # original checkout layout — but `makeOverlay()` copies only
+      # `GITHUB_WORKSPACE` into the VM (mounted at `/work`), so anything
+      # outside the consumer dir is invisible inside the VM.  Running
+      # `npm ci` in the guest would fail with "ENOENT ../../fixtures/...".
+      #
+      # We stage a self-contained mirror under `$RUNNER_TEMP/consumer/` that
+      # vendors each fixture under `./fixtures/<name>`, rewrites the
+      # consumer's `package.json` to point at the vendored copies, then
+      # regenerates `package-lock.json` against the new paths.  Pointing
+      # `GITHUB_WORKSPACE` at this staged dir gives `detectPm()`,
+      # `parseInputs()`, and `makeOverlay()` a consistent, copyable root.
+      #
+      # Why not just symlink: the overlay's `cpSync({ dereference: false })`
+      # would copy the symlinks themselves into the VM, which then dangle.
+      # Why not regenerate the lock at commit time: the lockfile would still
+      # bake the original `../../fixtures/...` paths in, defeating the
+      # purpose of the rewrite.
+      - name: Stage self-contained consumer project under $RUNNER_TEMP/consumer
+        run: |
+          set -euo pipefail
+          STAGED="${RUNNER_TEMP}/consumer"
+          rm -rf "${STAGED}"
+          mkdir -p "${STAGED}/fixtures"
+          # Copy fixtures (the consumer depends on 7 attack fixtures +
+          # victim-package; copying the whole tree keeps the workflow
+          # forward-compatible with new fixtures).
+          cp -R test/fixtures/. "${STAGED}/fixtures/"
+          # Copy the consumer's npm-jar config verbatim.
+          cp test/e2e/consumer/.npm-jar.yml "${STAGED}/.npm-jar.yml"
+          # Rewrite the consumer's package.json to point at the vendored
+          # fixtures.  The committed file uses `file:../../fixtures/<name>`;
+          # `./fixtures/<name>` resolves relative to the staged dir.
+          sed 's|file:\.\./\.\./fixtures/|file:./fixtures/|g' \
+            test/e2e/consumer/package.json > "${STAGED}/package.json"
+          # Regenerate package-lock.json so it reflects the rewritten paths.
+          # `--ignore-scripts` is critical: we must NOT run the fixtures'
+          # lifecycle scripts on the runner — they are the very payloads the
+          # VM is supposed to audit.
+          (cd "${STAGED}" && npm install --package-lock-only --ignore-scripts)
+          ls -la "${STAGED}"
+          cat "${STAGED}/package.json"
+
+      # ----------------------------------------------------------------------
+      # Happy path: mode=update produces a lockfile containing every marker.
+      # ----------------------------------------------------------------------
+
+      # `uses: ./` invokes the action from THIS checkout's action.yml.  No
+      # release is needed — the dist/main.js committed to the repo (drift-
+      # guarded by .github/workflows/test.yml) is what runs.
+      #
+      # GITHUB_WORKSPACE override: src/main.ts uses `GITHUB_WORKSPACE` as the
+      # repo root for `detectPm()`, `parseInputs()` (relative path
+      # resolution), and `makeOverlay()` (which copies the entire dir into
+      # the VM mounted at /work).  Without this override the action would
+      # audit the npm-jar repo itself (whose `pnpm-lock.yaml` would be
+      # detected as the consumer's lockfile), not the consumer fixture.
+      # The action has no `working-directory` input today; overriding
+      # GITHUB_WORKSPACE is the narrowest way to point at the staged
+      # consumer dir without adding new public API.  ${{ runner.temp }} is
+      # the GitHub Actions per-job scratch directory, cleared between jobs.
+      #
+      # Action paths resolved under the override: with GITHUB_WORKSPACE
+      # pointing at the staged consumer dir, the action's default `config`
+      # and `lock` inputs (`.npm-jar.yml`, `.npm-jar.lock.yml`) resolve to
+      # files inside the staged dir, exactly what we want.
+      #
+      # The action is deliberately invoked WITHOUT any of the consumer's
+      # protected env vars in scope.  The consumer's `.npm-jar.yml` lists
+      # NPM_TOKEN / NODE_AUTH_TOKEN / GITHUB_TOKEN / etc; exporting any of
+      # those here would let the guest scrub-via-emit them legitimately and
+      # change the rendered <HIDDEN> NAME marker (e.g. mark a previously
+      # unset var as "found").  Keep the env clean.
+      - name: Run npm-jar against consumer (mode=update)
+        id: update
+        uses: ./
+        env:
+          GITHUB_WORKSPACE: ${{ runner.temp }}/consumer
+        with:
+          mode: update
+
+      # Borrow the substring list from test/e2e/generate.test.ts: the
+      # Layer-1 suite asserts the same markers against a faked guest, so
+      # if Layer 2 sees a different rendered shape, that is a real-VM-only
+      # regression we want to flag.  All 14 assertions cover the 7 fixtures.
+      - name: Assert produced lockfile contains every expected marker
+        run: |
+          set -euo pipefail
+          LOCK="${{ runner.temp }}/consumer/.npm-jar.lock.yml"
+          test -s "$LOCK"
+
+          # Per-package keys (one per fixture).
+          grep -qF 'reads-home-ssh@1.0.0:'         "$LOCK"
+          grep -qF 'reads-secret-env@1.0.0:'       "$LOCK"
+          grep -qF 'spawns-gcc@1.0.0:'             "$LOCK"
+          grep -qF 'tries-dlopen@1.0.0:'           "$LOCK"
+          grep -qF 'tries-network-egress@1.0.0:'   "$LOCK"
+          grep -qF 'writes-into-repo@1.0.0:'       "$LOCK"
+          grep -qF 'cross-package-tampering@1.0.0:' "$LOCK"
+
+          # Attack-shape markers, mirroring test/e2e/generate.test.ts.
+          grep -qF '<HIDDEN> $HOME/.ssh/id_rsa' "$LOCK"
+          grep -qF '<HIDDEN> NPM_TOKEN'         "$LOCK"
+          grep -qF '<ENOENT> gcc'               "$LOCK"
+          grep -qF '<BLOCKED> $PKG/evil.node'   "$LOCK"
+          # Network egress: src/lock/normalize.ts renders
+          #   `<BLOCKED> connect <host>:<port>`
+          # We match the stable prefix only — the fixture uses
+          # 198.51.100.7:443 today but the host/port could change.
+          grep -qF '<BLOCKED> connect '         "$LOCK"
+          grep -qF '$REPO/.bashrc'              "$LOCK"
+          grep -qF '<CROSS_PACKAGE> $NODE_MODULES/victim-package/index.js' "$LOCK"
+
+          echo "All 14 marker assertions passed."
+
+      # ----------------------------------------------------------------------
+      # Tamper path: remove a marker line and assert mode=check fails exit-1.
+      # ----------------------------------------------------------------------
+
+      - name: Tamper the produced lockfile
+        run: |
+          set -euo pipefail
+          LOCK="${{ runner.temp }}/consumer/.npm-jar.lock.yml"
+          # Drop the `<HIDDEN> NPM_TOKEN` line.  It is a YAML sequence entry
+          # like `        - <HIDDEN> NPM_TOKEN` — sed's pattern matches the
+          # payload regardless of indent.
+          sed -i.bak '/<HIDDEN> NPM_TOKEN/d' "$LOCK"
+          # Confirm the line is actually gone (and not just commented out).
+          remaining="$(grep -c '<HIDDEN> NPM_TOKEN' "$LOCK" || true)"
+          if [ "$remaining" != "0" ]; then
+            echo "::error::Tamper step left $remaining matching line(s) in $LOCK"
+            exit 1
+          fi
+          rm -f "$LOCK.bak"
+
+      - name: Re-run npm-jar against the tampered lockfile (mode=check)
+        id: tampered
+        continue-on-error: true
+        uses: ./
+        env:
+          # Same workspace override as the update step above — see the long
+          # comment there for why this is necessary.
+          GITHUB_WORKSPACE: ${{ runner.temp }}/consumer
+        with:
+          mode: check
+
+      # Two-part assertion: (a) the action exited non-zero, AND (b) the
+      # failure was because of the diff we induced — not a boot failure or
+      # other infrastructure problem.  The action's `diff` output is the
+      # unified diff between committed and generated lockfiles; it is set
+      # BEFORE the action exits 1 in mode=check, so it is reliably populated
+      # on this code path.  We grep for the marker line that we deleted —
+      # the diff will contain a `+` line re-introducing it.
+      - name: Assert the tampered mode=check run failed for the expected reason
+        # Pass the diff via env (rather than interpolating into the script
+        # body) so multi-line content with shell metacharacters is preserved
+        # safely without heredoc-escaping gymnastics.  This is the GitHub-
+        # recommended pattern for consuming multi-line step outputs.
+        env:
+          TAMPERED_OUTCOME: ${{ steps.tampered.outcome }}
+          TAMPERED_DIFF: ${{ steps.tampered.outputs.diff }}
+        run: |
+          set -euo pipefail
+          if [ "$TAMPERED_OUTCOME" != "failure" ]; then
+            echo "::error::tampered mode=check should have failed, but outcome=$TAMPERED_OUTCOME"
+            exit 1
+          fi
+          if [ -z "$TAMPERED_DIFF" ]; then
+            echo "::error::tampered mode=check failed but produced an empty diff output (probable infra failure, not a real mismatch)"
+            exit 1
+          fi
+          if ! printf '%s' "$TAMPERED_DIFF" | grep -qF '<HIDDEN> NPM_TOKEN'; then
+            echo "::error::tampered mode=check failed but the diff does not reference the deleted '<HIDDEN> NPM_TOKEN' line"
+            printf '%s\n' "$TAMPERED_DIFF"
+            exit 1
+          fi
+          echo "tampered mode=check correctly failed with the expected diff."

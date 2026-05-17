@@ -94,17 +94,48 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     exitProcess = process.exit as (code: number) => never,
   } = deps;
 
-  // Fail-fast: refuse to do ANY work if the action was published with
-  // placeholder (or otherwise non-canonical) artifact SHAs.  This MUST be
-  // the first executable statement of main() — earlier ordering placed it
-  // after parseInputs()/detectPm(), so a packaging bug could be masked by
-  // a lockfile-missing error or by the BunUnsupportedError clean-exit
-  // (process.exit(0)) below, neither of which surface the real issue.
-  // Without this gate, the pre-fetch step would only catch the mistake
-  // AFTER downloading multi-MB release assets, and surface it as a
-  // confusing "SHA-256 mismatch" instead of "this is a packaging bug,
-  // file an issue".
-  doValidateManifest(PINNED_MANIFEST);
+  // ---------------------------------------------------------------------
+  // E2E self-test escape hatch
+  // ---------------------------------------------------------------------
+  // The Layer 2 e2e workflow (`.github/workflows/e2e.yml`) invokes this
+  // very action against itself via `uses: ./` on every PR/main push.  At
+  // that point:
+  //
+  //   * `PINNED_MANIFEST` still carries `PLACEHOLDER_SHA256_*` entries
+  //     (real SHAs only land in the manifest AFTER the first tagged
+  //     release computes them — see release.yml's "Compute SHAs" step).
+  //     `validateManifest` would therefore reject startup before any
+  //     useful work happens.
+  //
+  //   * The Layer 2 workflow runs `pnpm build -- --runner-image=…` on
+  //     the runner BEFORE invoking the action, which places real rootfs
+  //     + libnpmjar.so files under `imagesDir`.  `preFetchArtifacts`
+  //     would then SHA-check those locally-built files against the
+  //     placeholder manifest, see a mismatch, and try to re-download
+  //     from a release that does not yet exist.
+  //
+  // `NPM_JAR_E2E_SELF_TEST=1` skips BOTH gates so the e2e workflow can
+  // exercise the action's real boot path against its own working tree.
+  // The variable is intentionally NOT exposed as an action input — only
+  // the workflow that owns this repo sets it, and consumers' workflows
+  // never see it (GitHub Actions only inherits `env:` you explicitly
+  // declare on the step or job).  Setting it in a consumer workflow
+  // would disable the manifest-validation safety net and is unsupported.
+  const selfTest = process.env['NPM_JAR_E2E_SELF_TEST'] === '1';
+
+  if (!selfTest) {
+    // Fail-fast: refuse to do ANY work if the action was published with
+    // placeholder (or otherwise non-canonical) artifact SHAs.  This MUST be
+    // the first real executable statement of main() — earlier ordering placed
+    // it after parseInputs()/detectPm(), so a packaging bug could be masked by
+    // a lockfile-missing error or by the BunUnsupportedError clean-exit
+    // (process.exit(0)) below, neither of which surface the real issue.
+    // Without this gate, the pre-fetch step would only catch the mistake
+    // AFTER downloading multi-MB release assets, and surface it as a
+    // confusing "SHA-256 mismatch" instead of "this is a packaging bug,
+    // file an issue".
+    doValidateManifest(PINNED_MANIFEST);
+  }
 
   const repoDir = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
 
@@ -179,12 +210,19 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // (baked into the released rootfs, so the .so download is informational
   // for the v1 production path).
   const http = new NodeHttpClient();
-  await doPreFetchArtifacts({
-    imagesDir,
-    runnerImage,
-    manifest: PINNED_MANIFEST,
-    http,
-  });
+  if (!selfTest) {
+    // See the `NPM_JAR_E2E_SELF_TEST` block at the top of this function for
+    // why this is skipped under self-test.  In short: the workflow has
+    // already placed real rootfs + libnpmjar.so files under `imagesDir`
+    // via `pnpm build`, but they will fail the manifest SHA check because
+    // the manifest still holds placeholders until the first real release.
+    await doPreFetchArtifacts({
+      imagesDir,
+      runnerImage,
+      manifest: PINNED_MANIFEST,
+      http,
+    });
+  }
 
   // --- Ensure Firecracker + kernel are present -----------------------------
   const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({

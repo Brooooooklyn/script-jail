@@ -28195,7 +28195,10 @@ async function main(deps = {}) {
     teardown: doTeardown = teardown,
     exitProcess = process.exit
   } = deps;
-  doValidateManifest(PINNED_MANIFEST);
+  const selfTest = process.env["NPM_JAR_E2E_SELF_TEST"] === "1";
+  if (!selfTest) {
+    doValidateManifest(PINNED_MANIFEST);
+  }
   const repoDir = process.env["GITHUB_WORKSPACE"] ?? process.cwd();
   const inputs = parseInputs({ repoDir });
   let pm;
@@ -28222,12 +28225,14 @@ async function main(deps = {}) {
     `rootfs-${runnerImage}.ext4`
   );
   const http = new NodeHttpClient();
-  await doPreFetchArtifacts({
-    imagesDir,
-    runnerImage,
-    manifest: PINNED_MANIFEST,
-    http
-  });
+  if (!selfTest) {
+    await doPreFetchArtifacts({
+      imagesDir,
+      runnerImage,
+      manifest: PINNED_MANIFEST,
+      http
+    });
+  }
   const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
