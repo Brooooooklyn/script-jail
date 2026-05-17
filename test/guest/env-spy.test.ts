@@ -273,6 +273,39 @@ describe('env-spy preload', () => {
     expect(out.bHidden).toBe(true);
   });
 
+  it('does not break child_process.spawn (Proxy receiver compatibility)', async () => {
+    // Regression guard: an earlier version of this preload passed the Proxy
+    // itself as the receiver to Reflect.get / Reflect.set when forwarding to
+    // process.env.  process.env is a special EnvironmentVariableNamespace
+    // whose getter/setter use `this` to find the underlying environ store;
+    // passing the Proxy as receiver made child_process.spawn fail silently
+    // because the child's env table couldn't be materialized.  This test
+    // spawns a real subprocess through the proxied process.env and verifies
+    // it returns the expected exit code and inherited env.
+    const code = `
+      const r = require('child_process').spawnSync(
+        process.execPath,
+        ['-e', 'process.stdout.write(JSON.stringify({inherited: process.env.MARKER_ENV}))'],
+      );
+      process.stdout.write(JSON.stringify({
+        status: r.status,
+        stdout: r.stdout.toString(),
+        errored: r.error ? r.error.message : null,
+      }));
+    `;
+    const result = await runWithSpy(code, { MARKER_ENV: 'visible-to-child' });
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      status: number;
+      stdout: string;
+      errored: string | null;
+    };
+    expect(out.status).toBe(0);
+    expect(out.errored).toBeNull();
+    const inherited = JSON.parse(out.stdout) as { inherited: string };
+    expect(inherited.inherited).toBe('visible-to-child');
+  });
+
   it('symbol property access passes through without logging', async () => {
     const logFile = freshLogFile();
     const code = `

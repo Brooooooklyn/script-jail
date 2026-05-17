@@ -116,18 +116,30 @@ function logEnvRead(name, hidden) {
 }
 
 // ── Install the Proxy ────────────────────────────────────────────────────────
+// CRITICAL: when forwarding to `target`, we MUST pass `target` (not the Proxy)
+// as the receiver argument to Reflect.get / Reflect.set.  process.env is a
+// special "EnvironmentVariableNamespace" object whose property reads are
+// implemented as host-side accessors in Node's C++ layer; those accessors use
+// `this` (the receiver) to find the underlying environment store.  When the
+// receiver is our Proxy instead of the original env, Node can't locate the
+// store and reads silently return wrong values, which makes child_process
+// spawn fail with no diagnostic output.  Equivalently, `target[prop]` works
+// (the legacy member-access form passes `target` as the receiver).
 const origEnv = process.env;
 
 const envProxy = new Proxy(origEnv, {
-  get(target, prop, receiver) {
+  get(target, prop) {
     // Non-string keys (Symbols, etc.) pass through without logging.
     if (typeof prop !== 'string') {
-      return Reflect.get(target, prop, receiver);
+      return Reflect.get(target, prop, target);
     }
     const hidden = protectedNames.has(prop);
     logEnvRead(prop, hidden);
     if (hidden) return undefined;
-    return Reflect.get(target, prop, receiver);
+    return Reflect.get(target, prop, target);
+  },
+  set(target, prop, value) {
+    return Reflect.set(target, prop, value, target);
   },
   has(target, prop) {
     if (typeof prop === 'string' && protectedNames.has(prop)) return false;
