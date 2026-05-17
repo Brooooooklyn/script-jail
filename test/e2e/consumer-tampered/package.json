@@ -1,0 +1,16 @@
+{
+  "name": "npm-jar-e2e-consumer-tampered",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Layer 2 e2e consumer (mismatch path). Identical project to test/e2e/consumer/ — the Layer 2 workflow runs `mode=update` to produce a real lockfile, mutates it (e.g., removes a known marker line), then runs `mode=check` against the mutated file and asserts exit 1 + a `::error file=` annotation. No committed golden: src/action/diff.ts is byte-exact and the lockfile's generated_at field varies per run, so the tampering MUST happen at workflow time against the just-produced lockfile, not against a static fixture.",
+  "dependencies": {
+    "reads-home-ssh": "file:../../fixtures/reads-home-ssh",
+    "reads-secret-env": "file:../../fixtures/reads-secret-env",
+    "spawns-gcc": "file:../../fixtures/spawns-gcc",
+    "tries-dlopen": "file:../../fixtures/tries-dlopen",
+    "tries-network-egress": "file:../../fixtures/tries-network-egress",
+    "writes-into-repo": "file:../../fixtures/writes-into-repo",
+    "cross-package-tampering": "file:../../fixtures/cross-package-tampering",
+    "victim-package": "file:../../fixtures/victim-package"
+  }
+}
