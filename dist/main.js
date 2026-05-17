@@ -28184,8 +28184,18 @@ var PINNED_VMLINUX_URL = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/
 var PINNED_VMLINUX_SHA256 = "22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65";
 var VSOCK_PORT = 10242;
 var GUEST_CID = 3;
-async function main() {
-  validateManifest(PINNED_MANIFEST);
+async function main(deps = {}) {
+  const {
+    validateManifest: doValidateManifest = validateManifest,
+    preFetchArtifacts: doPreFetchArtifacts = preFetchArtifacts,
+    ensureBinaries: doEnsureBinaries = ensureBinaries,
+    makeOverlay: doMakeOverlay = makeOverlay,
+    launchVm: doLaunchVm = launchVm,
+    openVsockSession: doOpenVsockSession = openVsockSession,
+    teardown: doTeardown = teardown,
+    exitProcess = process.exit
+  } = deps;
+  doValidateManifest(PINNED_MANIFEST);
   const repoDir = process.env["GITHUB_WORKSPACE"] ?? process.cwd();
   const inputs = parseInputs({ repoDir });
   let pm;
@@ -28194,7 +28204,7 @@ async function main() {
   } catch (err) {
     if (err instanceof BunUnsupportedError) {
       warn(err.message);
-      process.exit(0);
+      exitProcess(0);
     }
     throw err;
   }
@@ -28212,13 +28222,13 @@ async function main() {
     `rootfs-${runnerImage}.ext4`
   );
   const http = new NodeHttpClient();
-  await preFetchArtifacts({
+  await doPreFetchArtifacts({
     imagesDir,
     runnerImage,
     manifest: PINNED_MANIFEST,
     http
   });
-  const { firecrackerPath, vmlinuxPath } = await ensureBinaries({
+  const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
     kernelUrl: PINNED_VMLINUX_URL,
@@ -28234,7 +28244,7 @@ async function main() {
     },
     workDir: imagesDir
   });
-  const overlay = await makeOverlay({
+  const overlay = await doMakeOverlay({
     baseRootfsPath,
     repoSrcPath: repoDir,
     configPath: effectiveConfigPath,
@@ -28249,7 +28259,7 @@ async function main() {
   let fatalError = null;
   const nonFatalErrors = [];
   try {
-    vm = await launchVm({
+    vm = await doLaunchVm({
       firecrackerPath,
       vmlinuxPath,
       rootfsPath: overlay.rootfsCopyPath,
@@ -28260,7 +28270,7 @@ async function main() {
       enableNetwork: true,
       socketPath: apiSocketPath
     });
-    vsock = await openVsockSession(vsockUdsPath, VSOCK_PORT);
+    vsock = await doOpenVsockSession(vsockUdsPath, VSOCK_PORT);
     for await (const frame of vsock.events) {
       if (frame.kind === "event") {
         continue;
@@ -28287,7 +28297,7 @@ async function main() {
       }
     }
   } finally {
-    await teardown({
+    await doTeardown({
       vm,
       overlay,
       vsock,
@@ -28319,7 +28329,7 @@ async function main() {
     }
     setOutput("lockfile", inputs.lockPath);
     setOutput("diff", diff.unified);
-    if (!diff.match) process.exit(1);
+    if (!diff.match) exitProcess(1);
     return;
   }
   (0, import_node_fs11.writeFileSync)(inputs.lockPath, finalYaml, "utf8");

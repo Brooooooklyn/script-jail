@@ -71,7 +71,29 @@ const GUEST_CID = 3;
 // main
 // ---------------------------------------------------------------------------
 
-export async function main(): Promise<void> {
+export interface MainDeps {
+  validateManifest?: typeof validateManifest;
+  preFetchArtifacts?: typeof preFetchArtifacts;
+  ensureBinaries?: typeof ensureBinaries;
+  makeOverlay?: typeof makeOverlay;
+  launchVm?: typeof launchVm;
+  openVsockSession?: typeof openVsockSession;
+  teardown?: typeof teardown;
+  exitProcess?: (code: number) => never;
+}
+
+export async function main(deps: MainDeps = {}): Promise<void> {
+  const {
+    validateManifest: doValidateManifest = validateManifest,
+    preFetchArtifacts: doPreFetchArtifacts = preFetchArtifacts,
+    ensureBinaries: doEnsureBinaries = ensureBinaries,
+    makeOverlay: doMakeOverlay = makeOverlay,
+    launchVm: doLaunchVm = launchVm,
+    openVsockSession: doOpenVsockSession = openVsockSession,
+    teardown: doTeardown = teardown,
+    exitProcess = process.exit as (code: number) => never,
+  } = deps;
+
   // Fail-fast: refuse to do ANY work if the action was published with
   // placeholder (or otherwise non-canonical) artifact SHAs.  This MUST be
   // the first executable statement of main() — earlier ordering placed it
@@ -82,7 +104,7 @@ export async function main(): Promise<void> {
   // AFTER downloading multi-MB release assets, and surface it as a
   // confusing "SHA-256 mismatch" instead of "this is a packaging bug,
   // file an issue".
-  validateManifest(PINNED_MANIFEST);
+  doValidateManifest(PINNED_MANIFEST);
 
   const repoDir = process.env['GITHUB_WORKSPACE'] ?? process.cwd();
 
@@ -97,7 +119,7 @@ export async function main(): Promise<void> {
   } catch (err) {
     if (err instanceof BunUnsupportedError) {
       warn(err.message);
-      process.exit(0);
+      exitProcess(0);
     }
     throw err;
   }
@@ -157,7 +179,7 @@ export async function main(): Promise<void> {
   // (baked into the released rootfs, so the .so download is informational
   // for the v1 production path).
   const http = new NodeHttpClient();
-  await preFetchArtifacts({
+  await doPreFetchArtifacts({
     imagesDir,
     runnerImage,
     manifest: PINNED_MANIFEST,
@@ -165,7 +187,7 @@ export async function main(): Promise<void> {
   });
 
   // --- Ensure Firecracker + kernel are present -----------------------------
-  const { firecrackerPath, vmlinuxPath } = await ensureBinaries({
+  const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
     kernelUrl: PINNED_VMLINUX_URL,
@@ -211,7 +233,7 @@ export async function main(): Promise<void> {
   });
 
   // --- Build per-run overlay ----------------------------------------------
-  const overlay: OverlayResult = await makeOverlay({
+  const overlay: OverlayResult = await doMakeOverlay({
     baseRootfsPath,
     repoSrcPath: repoDir,
     configPath: effectiveConfigPath,
@@ -242,7 +264,7 @@ export async function main(): Promise<void> {
     // here — its `size: 0` is interpreted as "rate limiter disabled" (i.e.
     // unlimited), not "no bandwidth", so a host-side patch would be a silent
     // no-op.  The guest is the source of truth for interface state.
-    vm = await launchVm({
+    vm = await doLaunchVm({
       firecrackerPath,
       vmlinuxPath,
       rootfsPath: overlay.rootfsCopyPath,
@@ -255,7 +277,7 @@ export async function main(): Promise<void> {
     });
 
     // --- Open vsock session -----------------------------------------------
-    vsock = await openVsockSession(vsockUdsPath, VSOCK_PORT);
+    vsock = await doOpenVsockSession(vsockUdsPath, VSOCK_PORT);
 
     // --- Drive the protocol -----------------------------------------------
     for await (const frame of vsock.events) {
@@ -298,7 +320,7 @@ export async function main(): Promise<void> {
       }
     }
   } finally {
-    await teardown({
+    await doTeardown({
       vm,
       overlay,
       vsock,
@@ -342,7 +364,7 @@ export async function main(): Promise<void> {
     setOutput('lockfile', inputs.lockPath);
     setOutput('diff', diff.unified);
 
-    if (!diff.match) process.exit(1);
+    if (!diff.match) exitProcess(1);
     return;
   }
 
