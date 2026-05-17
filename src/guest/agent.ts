@@ -29,6 +29,7 @@ import { runInstallPhase, type StraceRunner } from './phase-install.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
+import { discoverPkgDirs } from './discover-pkg-dirs.js';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
@@ -863,6 +864,23 @@ export async function main(input: AgentInput): Promise<void> {
 
   emitter.emitHandshake('fetch_done');
 
+  // Auto-discover installed packages from node_modules so normalize() can
+  // resolve every fs-event's pkg→dir mapping without requiring the consumer
+  // to hand-curate pkg_dirs in .script-jail.yml.
+  //
+  // This runs AFTER Phase A's fetch_done handshake (npm ci has populated
+  // node_modules) and BEFORE Phase B (install under strace), so the map
+  // is ready when collectedEvents are normalized at the end.
+  const nodeModulesDir = `${config.work_dir}/node_modules`;
+  const discoveredPkgDirs = discoverPkgDirs(nodeModulesDir);
+  diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
+
+  // Merge: user-supplied pkg_dirs override wins on conflict — preserves the
+  // escape hatch for hand-curated audits, even though consumers typically
+  // leave pkg_dirs empty.
+  const pkgDirs = new Map<string, string>(discoveredPkgDirs);
+  for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
+
   // 9. Wait for host "go" signal (exact string "go\n" required)
   try {
     await waitForGo(input.connection.readable);
@@ -995,8 +1013,6 @@ export async function main(input: AgentInput): Promise<void> {
   emitter.emitHandshake('install_done');
 
   // 12. Normalize + render
-  const pkgDirs = new Map(Object.entries(config.pkg_dirs));
-
   const ctx: NormalizeContext = { roots, pkgDirs };
 
   let yaml: string;
