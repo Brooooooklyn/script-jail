@@ -97,6 +97,29 @@ function blockedBinding(/** @type {string} */ _name) {
   throw new Error(BLOCKED_MSG);
 }
 
+// Diagnostic: emit a one-shot loaded marker as soon as this preload runs,
+// regardless of whether the idempotency guard then short-circuits.  Surfaces
+// as an env_read of `__SCRIPT_JAIL_DLOPEN_PRELOAD_LOADED__` in the lockfile
+// when the preload is actually being --require'd by Node.  Cheap noise that
+// pays for itself: without it, "no dlopen events" could mean either the
+// preload didn't load or the wrap didn't fire, and those are very different
+// bugs to chase.
+try {
+  const fd = resolveLogFd();
+  if (fd >= 0) {
+    const ts = Number(process.hrtime.bigint() / 1_000_000n);
+    fs.writeSync(fd, JSON.stringify({
+      kind: 'env_read',
+      name: '__SCRIPT_JAIL_DLOPEN_PRELOAD_LOADED__',
+      pid: process.pid,
+      ts,
+      hidden: false,
+    }) + '\n');
+  }
+} catch {
+  // Diagnostic only — never let logging failure block install.
+}
+
 // Idempotency guard: if already installed (configurable === false), skip re-install.
 // This prevents TypeError when a child process requires this preload a second time
 // via NODE_OPTIONS after the parent already applied it.

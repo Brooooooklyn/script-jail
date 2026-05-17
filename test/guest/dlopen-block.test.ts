@@ -208,10 +208,16 @@ describe('dlopen-block preload', () => {
 
     const { readFileSync } = await import('node:fs');
     const contents = readFileSync(logFile, 'utf8');
-    const lines = contents.split('\n').filter((l) => l.length > 0);
-    expect(lines.length).toBe(1);
+    // Filter to dlopen events only — the preload also emits a one-shot
+    // `__SCRIPT_JAIL_DLOPEN_PRELOAD_LOADED__` env_read marker on load.
+    const dlopenLines = contents
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o['kind'] === 'dlopen');
+    expect(dlopenLines.length).toBe(1);
 
-    const entry = JSON.parse(lines[0]!) as {
+    const entry = dlopenLines[0]! as {
       kind: string;
       filename: string;
       result: string;
