@@ -25,7 +25,7 @@ import { Attribution } from './attribution.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { Emitter } from './emit.js';
 import { runFetchPhase, type Spawner } from './phase-fetch.js';
-import { runInstallPhase, type StraceRunner } from './phase-install.js';
+import { runInstallPhase, type LineSource, type StraceRunner } from './phase-install.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
@@ -331,8 +331,14 @@ export interface StraceTailerOptions {
 
 /**
  * StraceTailer merges:
- *   1. Lines from per-pid strace output files  → { pid: <pid>, line }
- *   2. JSONL lines from the fd3Stream pipe      → { pid: 0, line }
+ *   1. Lines from per-pid strace output files  → { pid: <pid>, line, source: 'strace' }
+ *   2. JSONL lines from the fd3Stream pipe      → { pid: 0, line, source: 'shim' }
+ *   3. JSONL lines from the events file path    → { pid: 0, line, source: 'shim' }
+ *
+ * The `source` discriminator lets the caller dispatch parsers safely: the
+ * trusted shim channel never falls back to the strace text parser (which
+ * would mask a partial-line poisoning attack — see {@link LineSource}),
+ * and the strace channel never gets fed to the strict JSONL parser.
  *
  * The async generator ends once the child has exited and all trailing writes
  * have been drained.
@@ -341,12 +347,12 @@ export interface StraceTailerOptions {
  */
 export async function* runStraceTailer(
   opts: StraceTailerOptions,
-): AsyncGenerator<{ pid: number; line: string }> {
+): AsyncGenerator<{ pid: number; line: string; source: LineSource }> {
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const drainMs = opts.drainMs ?? 100;
 
   // Shared queue: all sources push here; the generator drains it.
-  const queue: Array<{ pid: number; line: string }> = [];
+  const queue: Array<{ pid: number; line: string; source: LineSource }> = [];
   let done = false; // set true once the child has exited and drain is complete
 
   // Notify the generator loop that new items are available or done changed.
@@ -409,7 +415,10 @@ export async function* runStraceTailer(
 
     for (const line of complete.split('\n')) {
       if (line.length > 0) {
-        queue.push({ pid, line });
+        // Per-pid strace files carry strace's text format — tagged
+        // `'strace'` so the install-phase dispatcher never tries to
+        // JSON.parse them.
+        queue.push({ pid, line, source: 'strace' });
       }
     }
     wake();
@@ -586,7 +595,10 @@ export async function* runStraceTailer(
       if (line.length > 0) {
         // pid=0 matches the fd3Stream convention: attribution will read the
         // pid field embedded in the JSONL payload, not this synthetic one.
-        queue.push({ pid: 0, line });
+        // Tagged `'shim'` because the events file is written by trusted
+        // shim/preload code under SCRIPT_JAIL_LOG_FILE; the dispatcher
+        // treats parse failures here as fatal tamper.
+        queue.push({ pid: 0, line, source: 'shim' });
       }
     }
     wake();
@@ -600,7 +612,8 @@ export async function* runStraceTailer(
     const rl = createInterface({ input: opts.fd3Stream, crlfDelay: Infinity });
     rl.on('line', (line: string) => {
       if (line.length > 0) {
-        queue.push({ pid: 0, line });
+        // fd-3 is the preload-owned pipe — tagged `'shim'`.
+        queue.push({ pid: 0, line, source: 'shim' });
         wake();
       }
     });
@@ -728,7 +741,7 @@ export async function* runStraceTailer(
       for (const [name, partial] of fileBuf) {
         if (partial.length > 0) {
           const pid = parsePidFromFilename(name);
-          queue.push({ pid, line: partial });
+          queue.push({ pid, line: partial, source: 'strace' });
           fileBuf.set(name, '');
         }
       }
@@ -736,7 +749,14 @@ export async function* runStraceTailer(
       // emit \n-terminated lines, but POSIX doesn't require atomic writes
       // across newlines so a partial chunk is technically possible).
       if (eventsBuf.length > 0) {
-        queue.push({ pid: 0, line: eventsBuf });
+        // A trailing partial chunk on the shim channel is unusual but not
+        // necessarily malicious (writer crashed mid-line, kernel buffer
+        // boundary, etc.).  Still tag it `'shim'` so the install-phase
+        // dispatcher routes it to the shim parser; a parse failure there
+        // will record tamper, which is the right outcome — we cannot
+        // distinguish a benign torn write from a deliberate prefix
+        // injection at this layer.
+        queue.push({ pid: 0, line: eventsBuf, source: 'shim' });
         eventsBuf = '';
       }
       // Stop the poll timer.
@@ -778,7 +798,7 @@ export async function* runStraceTailer(
     for (const [name, partial] of fileBuf) {
       if (partial.length > 0) {
         const pid = parsePidFromFilename(name);
-        queue.push({ pid, line: partial });
+        queue.push({ pid, line: partial, source: 'strace' });
         fileBuf.set(name, '');
       }
     }
@@ -851,11 +871,24 @@ export class LinuxStraceRunner implements StraceRunner {
     return this._tamperRef.reason;
   }
 
+  /**
+   * Plumb a tamper reason from {@link runInstallPhase} (specifically: shim-
+   * channel JSONL parse failures) into the same `_tamperRef` slot that the
+   * events-file watcher uses.  First-writer-wins — once `_tamperRef.reason`
+   * is non-null, subsequent calls are dropped so the earliest signal (which
+   * is most likely the root cause) is preserved.
+   */
+  recordTamper(reason: string): void {
+    if (this._tamperRef.reason === null) {
+      this._tamperRef.reason = reason;
+    }
+  }
+
   async *run(
     cmd: string,
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
-  ): AsyncIterable<{ pid: number; line: string }> {
+  ): AsyncIterable<{ pid: number; line: string; source: LineSource }> {
     const straceArgs = [
       '-ff',
       '-e', 'trace=openat,execve,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',

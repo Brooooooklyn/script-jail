@@ -39,11 +39,40 @@ import {
  * exited. Callers obtain the install command exit code via `getExitCode()`
  * after the iterable drains.
  */
+/**
+ * Source channel of a yielded line.
+ *
+ *   `'shim'`   — line came from a trusted JSONL writer: the fd-3 pipe (env-spy
+ *                / dlopen-block preloads writing directly into the
+ *                LinuxStraceRunner-owned pipe) OR the per-VM events file
+ *                (SCRIPT_JAIL_LOG_FILE) the Rust LD_PRELOAD shim writes into
+ *                with `O_APPEND`.  Only `parseShimLine` is consulted for these
+ *                lines.  A parse failure here is fatal: lifecycle scripts can
+ *                technically open the events file (the path leaks through the
+ *                child env so descendants can find it) and write a
+ *                partial-line prefix that, on the next legitimate shim write,
+ *                concatenates into garbage and gets dropped silently.  We
+ *                fail closed via `recordTamper()` instead.
+ *
+ *   `'strace'` — line came from strace's per-pid `-ff -o <basePath>.<pid>`
+ *                text output.  Only `parseStraceLine` is consulted.  Parse
+ *                failures here are best-effort drops — strace's format is
+ *                unstable across versions, lines can be split across reads
+ *                under load, and the channel is noisy by design (we trace
+ *                openat/execve/connect/readlinkat/statx/etc.).  A strict
+ *                fail-closed here would block every install.
+ */
+export type LineSource = 'shim' | 'strace';
+
 export interface StraceRunner {
   /**
    * Spawn `strace -ff -e trace=... -o <basePath> <cmd> <args>` and return an
-   * async iterable of {pid, line} records. The iterable completes when the
-   * traced process and all its children have exited.
+   * async iterable of {pid, line, source} records. The iterable completes
+   * when the traced process and all its children have exited.
+   *
+   * The `source` discriminator tells the caller whether the line came from
+   * the trusted JSONL shim channel (fd-3 pipe or SCRIPT_JAIL_LOG_FILE) or
+   * from strace's stdout text format.  See {@link LineSource}.
    *
    * After the iterable is fully consumed, `getExitCode()` returns the exit
    * code of the traced root process.
@@ -52,7 +81,7 @@ export interface StraceRunner {
     cmd: string,
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
-  ): AsyncIterable<{ pid: number; line: string }>;
+  ): AsyncIterable<{ pid: number; line: string; source: LineSource }>;
 
   /**
    * Returns the exit code of the most recently run process.
@@ -63,9 +92,10 @@ export interface StraceRunner {
   /**
    * Returns a human-readable tamper reason if the runner observed any
    * integrity violation in the audit pipeline (e.g. events-file unlink,
-   * inode swap, mtime regression, parent-directory rename), or `null` if
-   * everything looked clean.  Only meaningful after the async iterable from
-   * `run()` has been fully consumed.
+   * inode swap, mtime regression, parent-directory rename, OR a
+   * shim-channel JSONL line that failed to parse), or `null` if
+   * everything looked clean.  Only meaningful after the async iterable
+   * from `run()` has been fully consumed.
    *
    * Part of the contract — NOT a class-identity check — so wrappers,
    * decorators, and test fakes can opt into fail-closed semantics by
@@ -79,6 +109,23 @@ export interface StraceRunner {
    * legitimate reason to fail closed.
    */
   getTamperReason(): string | null;
+
+  /**
+   * Record a tamper reason from outside the runner — typically from
+   * {@link runInstallPhase} when a shim-channel JSONL line fails to parse
+   * (malformed JSON, unknown `kind`, or schema-rejected payload).  The
+   * runner stores this in the same `tamperRef.reason` slot that the
+   * events-file watcher uses, so the agent's `main()` post-install gate
+   * (which reads `getTamperReason()`) fails closed regardless of which
+   * layer detected the violation.
+   *
+   * Implementations that don't have a tamper sink may no-op, but in
+   * production this is the wire-up between the parse layer in phase-install
+   * and the fail-closed gate in agent.main().  First-writer-wins:
+   * subsequent calls with a reason already recorded should be ignored so
+   * the earliest signal survives.
+   */
+  recordTamper(reason: string): void;
 }
 
 export interface PhaseInstallInput {
@@ -198,14 +245,49 @@ export async function runInstallPhase(
 
   // StraceRunner is the SOLE owner of the install process.
   // We do NOT call a separate spawner here — that would run install twice.
-  for await (const { pid, line } of input.strace.run(cmd, args, {
+  //
+  // Dispatch is keyed on `source`, NOT on a parse-and-fall-through pattern.
+  // The previous design — try `parseShimLine`, fall through to `parseStraceLine`
+  // on null — masked a critical-severity audit bypass: a lifecycle script that
+  // open()s SCRIPT_JAIL_LOG_FILE in append mode can write a JSONL prefix
+  // WITHOUT a trailing newline, then trigger a legitimate shim write whose
+  // bytes append directly onto the attacker's prefix.  The resulting line
+  // fails JSON.parse, falls through to parseStraceLine (which fails too on a
+  // mangled-JSON fragment), and gets silently dropped — eliminating the real
+  // audit event.  By dispatching on `source` and treating shim-channel parse
+  // failures as fatal tamper, we close that gap while keeping strace's
+  // best-effort drop for its noisy text format.
+  for await (const { pid, line, source } of input.strace.run(cmd, args, {
     env: input.env,
     cwd: input.cwd,
     basePath,
   })) {
-    // First check if this is a shim JSONL line (from LD_PRELOAD or dlopen-block).
-    const shimEvent = parseShimLine(line);
-    if (shimEvent !== null) {
+    if (source === 'shim') {
+      // Trusted JSONL channel — fd-3 pipe or SCRIPT_JAIL_LOG_FILE.  Parse
+      // failures here are NEVER strace text and must NEVER fall through to
+      // parseStraceLine; they indicate the channel was poisoned by a writer
+      // that should not have access (a lifecycle script writing partial
+      // lines into the events file), OR a writer producing a payload our
+      // schema doesn't recognise (which is itself suspicious — every legit
+      // writer is owned by us).  Either way, fail closed: record tamper so
+      // the agent's main() post-install gate aborts before emitting a
+      // lockfile that would whitelist the bypassed events.
+      const shimEvent = parseShimLine(line);
+      if (shimEvent === null) {
+        // Truncate the offending prefix in the error reason — the line
+        // could be partially attacker-controlled and may contain secret-
+        // like content (e.g. a partial NPM_TOKEN value picked up by the
+        // shim's getenv interceptor).  100 bytes is enough to debug a
+        // legitimate format drift without exfiltrating the full payload.
+        const MAX_PREFIX = 100;
+        const prefix = line.length > MAX_PREFIX
+          ? `${line.slice(0, MAX_PREFIX)}…`
+          : line;
+        input.strace.recordTamper(
+          `shim channel had unparseable JSONL line (pid=${pid}): ${JSON.stringify(prefix)}`,
+        );
+        continue;
+      }
       const result = input.attribution.attribute(shimEvent.pid);
       if (result !== null) {
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
@@ -213,9 +295,14 @@ export async function runInstallPhase(
       continue;
     }
 
-    // Otherwise treat as a strace line.
-    // The StraceRunner owns the ts counter implicitly via file ordering;
-    // we call parseStraceLine with ts=0 and let per-file ordering serve as ts.
+    // source === 'strace' — best-effort text parse.  Failures here are
+    // expected and dropped silently: strace lines can be split across
+    // reads, the format varies across versions, and the channel emits
+    // many syscall families we don't care to extract events from.  A
+    // strict gate here would mean every install hits noise-driven
+    // tamper.  The StraceRunner owns the ts counter implicitly via file
+    // ordering; we call parseStraceLine with ts=0 and let per-file
+    // ordering serve as ts.
     const straceEvents: RawEvent[] | null = parseStraceLine(line, pid, 0);
     if (straceEvents === null) continue;
 

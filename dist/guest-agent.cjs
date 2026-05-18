@@ -25668,13 +25668,21 @@ async function runInstallPhase(input) {
     input.emitter.emitEvent(filtered);
     eventCount++;
   };
-  for await (const { pid, line } of input.strace.run(cmd, args, {
+  for await (const { pid, line, source } of input.strace.run(cmd, args, {
     env: input.env,
     cwd: input.cwd,
     basePath
   })) {
-    const shimEvent = parseShimLine(line);
-    if (shimEvent !== null) {
+    if (source === "shim") {
+      const shimEvent = parseShimLine(line);
+      if (shimEvent === null) {
+        const MAX_PREFIX = 100;
+        const prefix = line.length > MAX_PREFIX ? `${line.slice(0, MAX_PREFIX)}\u2026` : line;
+        input.strace.recordTamper(
+          `shim channel had unparseable JSONL line (pid=${pid}): ${JSON.stringify(prefix)}`
+        );
+        continue;
+      }
       const result = input.attribution.attribute(shimEvent.pid);
       if (result !== null) {
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
@@ -26164,7 +26172,7 @@ async function* runStraceTailer(opts) {
     fileBuf.set(name, remainder);
     for (const line of complete.split("\n")) {
       if (line.length > 0) {
-        queue.push({ pid, line });
+        queue.push({ pid, line, source: "strace" });
       }
     }
     wake();
@@ -26280,7 +26288,7 @@ async function* runStraceTailer(opts) {
     eventsBuf = chunk.slice(newlineIdx + 1);
     for (const line of complete.split("\n")) {
       if (line.length > 0) {
-        queue.push({ pid: 0, line });
+        queue.push({ pid: 0, line, source: "shim" });
       }
     }
     wake();
@@ -26290,7 +26298,7 @@ async function* runStraceTailer(opts) {
     const rl = (0, import_node_readline.createInterface)({ input: opts.fd3Stream, crlfDelay: Infinity });
     rl.on("line", (line) => {
       if (line.length > 0) {
-        queue.push({ pid: 0, line });
+        queue.push({ pid: 0, line, source: "shim" });
         wake();
       }
     });
@@ -26356,12 +26364,12 @@ async function* runStraceTailer(opts) {
       for (const [name, partial2] of fileBuf) {
         if (partial2.length > 0) {
           const pid = parsePidFromFilename(name);
-          queue.push({ pid, line: partial2 });
+          queue.push({ pid, line: partial2, source: "strace" });
           fileBuf.set(name, "");
         }
       }
       if (eventsBuf.length > 0) {
-        queue.push({ pid: 0, line: eventsBuf });
+        queue.push({ pid: 0, line: eventsBuf, source: "shim" });
         eventsBuf = "";
       }
       if (pollTimer !== null) {
@@ -26435,7 +26443,7 @@ async function* runStraceTailer(opts) {
     for (const [name, partial2] of fileBuf) {
       if (partial2.length > 0) {
         const pid = parsePidFromFilename(name);
-        queue.push({ pid, line: partial2 });
+        queue.push({ pid, line: partial2, source: "strace" });
         fileBuf.set(name, "");
       }
     }
@@ -26472,6 +26480,18 @@ var LinuxStraceRunner = class {
    */
   getTamperReason() {
     return this._tamperRef.reason;
+  }
+  /**
+   * Plumb a tamper reason from {@link runInstallPhase} (specifically: shim-
+   * channel JSONL parse failures) into the same `_tamperRef` slot that the
+   * events-file watcher uses.  First-writer-wins — once `_tamperRef.reason`
+   * is non-null, subsequent calls are dropped so the earliest signal (which
+   * is most likely the root cause) is preserved.
+   */
+  recordTamper(reason) {
+    if (this._tamperRef.reason === null) {
+      this._tamperRef.reason = reason;
+    }
   }
   async *run(cmd, args, opts) {
     const straceArgs = [

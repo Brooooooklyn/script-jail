@@ -31,25 +31,41 @@ function makeEmitter(): { emitter: Emitter; lines: string[] } {
  * A StraceRunner that yields pre-canned (pid, line) records and reports a
  * configurable exit code. The StraceRunner is the sole owner of the install
  * process — no separate Spawner is used in Phase B.
+ *
+ * Records may carry an explicit `source` ('shim' | 'strace'); when omitted,
+ * we heuristically infer 'shim' for lines that look like JSONL (start with
+ * `{`) and 'strace' for everything else.  This keeps the bulk of pre-
+ * existing tests (which omit `source`) working unchanged while letting new
+ * tests pin the channel deliberately.
  */
 function cannedStraceRunner(
-  records: Array<{ pid: number; line: string }>,
+  records: Array<{ pid: number; line: string; source?: 'shim' | 'strace' }>,
   exitCode = 0,
-): StraceRunner {
+): StraceRunner & { recordedTamper(): string | null } {
   let _exitCode = exitCode;
+  let _tamperReason: string | null = null;
   return {
     async *run() {
-      for (const r of records) yield r;
-      // Finalize exit code after yielding all records
+      for (const r of records) {
+        const source: 'shim' | 'strace' =
+          r.source ?? (r.line.startsWith('{') ? 'shim' : 'strace');
+        yield { pid: r.pid, line: r.line, source };
+      }
     },
     getExitCode() { return _exitCode; },
     // Finding D: tamper reporting is part of the StraceRunner contract;
-    // canned runners don't audit a real events file so they always report
-    // clean.
-    getTamperReason() { return null; },
+    // canned runners don't audit a real events file but we DO record any
+    // tamper plumbed through `recordTamper()` so tests can assert on it.
+    getTamperReason() { return _tamperReason; },
+    recordTamper(reason: string) {
+      if (_tamperReason === null) _tamperReason = reason;
+    },
+    // Exposed for tests.  Same value as `getTamperReason()` but named
+    // explicitly to make the assertion intent obvious at the call site.
+    recordedTamper() { return _tamperReason; },
     // Allow tests to change exitCode after construction
     _setExitCode(code: number) { _exitCode = code; },
-  } as unknown as StraceRunner;
+  } as unknown as StraceRunner & { recordedTamper(): string | null };
 }
 
 /** A ProcReader backed by a simple in-memory map. */
@@ -82,6 +98,7 @@ describe('runInstallPhase', () => {
         async *run(cmd, args) { calls.push({ cmd, args }); },
         getExitCode() { return 0; },
         getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
       };
       const proc = mockProcReader({});
       const attr = new Attribution(proc);
@@ -107,6 +124,7 @@ describe('runInstallPhase', () => {
         async *run(cmd, args) { calls.push({ cmd, args }); },
         getExitCode() { return 0; },
         getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -129,6 +147,7 @@ describe('runInstallPhase', () => {
         async *run(cmd, args) { calls.push({ cmd, args }); },
         getExitCode() { return 0; },
         getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -149,6 +168,7 @@ describe('runInstallPhase', () => {
         async *run() { callCount++; },
         getExitCode() { return 0; },
         getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -526,6 +546,195 @@ describe('runInstallPhase', () => {
       expect(raw['kind']).toBe('dlopen');
       expect(raw['filename']).toBe('/tmp/foo.node');
       expect(raw['result']).toBe('blocked');
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Shim-channel parse-failure fail-closed (critical-severity fix)
+  //
+  // Threat model: SCRIPT_JAIL_LOG_FILE leaks through the child env, so a
+  // lifecycle script can open the events file in append mode and write a
+  // partial JSONL prefix (no trailing newline). When the Rust shim's next
+  // legitimate write lands, the bytes concatenate onto the attacker's prefix,
+  // JSON.parse fails on the corrupted line, and (under the OLD fall-through
+  // design) parseStraceLine fails too — silently dropping the real event.
+  //
+  // Fix: the install-phase dispatcher keys on `source`, never falls through,
+  // and treats any shim-channel parse failure as fatal tamper.  Strace-channel
+  // failures stay silent (best-effort) because strace's text format is noisy
+  // and lines can split across reads.
+  // ─────────────────────────────────────────────────────────────────────────
+  describe('shim-channel parse failure → fail-closed (tamper)', () => {
+    const proc = mockProcReader({
+      88: {
+        ppid: 1,
+        env: {
+          npm_package_name: 'evil-pkg',
+          npm_package_version: '1.0.0',
+          npm_lifecycle_event: 'postinstall',
+        },
+      },
+    });
+
+    it('records tamper for a shim-channel line with unknown kind (JSON.parse succeeds)', async () => {
+      // Well-formed JSON, but `kind` is not in our enum. parseShimLine
+      // returns null. Old design: silently drop. New design: tamper.
+      const strace = cannedStraceRunner([
+        { pid: 88, line: JSON.stringify({ kind: 'totally_made_up', pid: 88, ts: 1 }), source: 'shim' },
+      ]);
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // No event emitted; tamper recorded for main()'s post-install gate.
+      expect(lines).toHaveLength(0);
+      expect(result.eventCount).toBe(0);
+      expect(strace.getTamperReason()).not.toBeNull();
+      expect(strace.getTamperReason()).toMatch(/shim channel had unparseable JSONL line/);
+    });
+
+    it('records tamper for a shim-channel line that fails JSON.parse (malformed)', async () => {
+      // Simulates the partial-prefix concat attack: attacker wrote
+      // `{"kind":"env_read","name":"PARTIAL` without a newline; the next
+      // legitimate shim write produced one mangled line on read.
+      const malformed =
+        '{"kind":"env_read","name":"PARTIAL{"kind":"env_read","name":"NPM_TOKEN","pid":88,"ts":99,"hidden":true}';
+      const strace = cannedStraceRunner([
+        { pid: 88, line: malformed, source: 'shim' },
+      ]);
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(0);
+      expect(result.eventCount).toBe(0);
+      const reason = strace.getTamperReason();
+      expect(reason).not.toBeNull();
+      expect(reason).toMatch(/shim channel had unparseable JSONL line/);
+      // Reason must reference the originating pid so a triager can correlate.
+      expect(reason).toMatch(/pid=88/);
+    });
+
+    it('truncates the offending prefix in the tamper reason (≤ ~100 bytes)', async () => {
+      // A 500-byte payload — the agent should NOT echo all of it back into
+      // its error reason (could contain secret-like content captured by the
+      // shim's getenv interceptor before the parse failure).
+      const longPayload = 'X'.repeat(500);
+      const strace = cannedStraceRunner([
+        { pid: 88, line: longPayload, source: 'shim' },
+      ]);
+      const { emitter } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const reason = strace.getTamperReason();
+      expect(reason).not.toBeNull();
+      // The reason should not contain the full 500-X payload.
+      expect((reason ?? '').length).toBeLessThan(500);
+      // It should include a truncation marker.
+      expect(reason).toMatch(/…/);
+    });
+
+    it('does NOT record tamper for a valid shim-channel event (happy path)', async () => {
+      // env_read, exec, env_tamper, dlopen — all four shapes must be
+      // accepted without tamper.
+      const lines: Array<{ pid: number; line: string; source: 'shim' }> = [
+        { pid: 88, source: 'shim', line: JSON.stringify({ kind: 'env_read', name: 'HOME', pid: 88, ts: 1, hidden: false }) },
+        { pid: 88, source: 'shim', line: JSON.stringify({ kind: 'exec', prog: '/bin/ls', argv0: 'ls', envp_alloc_failed: false, pid: 88, ts: 2 }) },
+        { pid: 88, source: 'shim', line: JSON.stringify({ kind: 'env_tamper', op: 'unsetenv', name: 'LD_PRELOAD', refused: true, pid: 88, ts: 3 }) },
+        { pid: 88, source: 'shim', line: JSON.stringify({ kind: 'dlopen', filename: '/tmp/x.node', result: 'blocked', pid: 88, ts: 4 }) },
+      ];
+
+      const strace = cannedStraceRunner(lines);
+      const { emitter, lines: emitted } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // All four reach normalize.
+      expect(emitted).toHaveLength(4);
+      expect(result.eventCount).toBe(4);
+      expect(strace.getTamperReason()).toBeNull();
+    });
+
+    it('strace-channel parse failure is silently dropped (no tamper)', async () => {
+      // Strace's text format is noisy: signal-delivered lines, partial
+      // lines split across reads, unhandled syscall families.  A strict
+      // gate here would break every install.  We assert that an
+      // un-parseable strace line does NOT record tamper and does NOT
+      // emit an event.
+      const strace = cannedStraceRunner([
+        { pid: 88, source: 'strace', line: '--- this is not a recognized strace syscall record ---' },
+      ]);
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(0);
+      expect(result.eventCount).toBe(0);
+      expect(strace.getTamperReason()).toBeNull();
+    });
+
+    it('shim-channel line is never fed to the strace parser', async () => {
+      // Regression guard for the original bug: a malformed JSON fragment
+      // that ALSO happens to vaguely match a strace pattern must not be
+      // emitted as a strace event when arriving on the shim channel.
+      // Instead, it must record tamper.
+      //
+      // (Construct a string that looks somewhat like a syscall but is
+      // invalid JSON when delivered on the shim channel.)
+      const strace = cannedStraceRunner([
+        { pid: 88, source: 'shim', line: 'openat(AT_FDCWD, "/x", O_RDONLY) = 3' },
+      ]);
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // The would-be openat event must NOT have been emitted — shim
+      // channel never falls through to the strace parser.
+      expect(lines).toHaveLength(0);
+      expect(strace.getTamperReason()).not.toBeNull();
     });
   });
 

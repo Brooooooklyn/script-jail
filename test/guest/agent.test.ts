@@ -111,6 +111,7 @@ function emptyStrace(exitCode = 0): StraceRunner {
     // Finding D: tamper reporting is part of the StraceRunner contract.
     // Test fakes that don't audit a shared events file return null.
     getTamperReason() { return null; },
+    recordTamper(_reason: string) { /* no-op for test fakes */ },
   };
 }
 
@@ -132,7 +133,7 @@ class TamperingStraceRunner extends LinuxStraceRunner {
     this._reason = reason;
     this._stubExitCode = exitCode;
   }
-  override async *run(_cmd: string, _args: string[]): AsyncIterable<{ pid: number; line: string }> {
+  override async *run(_cmd: string, _args: string[]): AsyncIterable<{ pid: number; line: string; source: 'shim' | 'strace' }> {
     void _cmd; void _args;
   }
   override getExitCode(): number {
@@ -150,10 +151,15 @@ class TamperingStraceRunner extends LinuxStraceRunner {
  * class identity, so any contract-conforming runner can force fail-closed.
  */
 function tamperingPlainStrace(reason: string, exitCode = 0): StraceRunner {
+  let currentReason = reason;
   return {
     async *run() { /* yield nothing */ },
     getExitCode() { return exitCode; },
-    getTamperReason() { return reason; },
+    getTamperReason() { return currentReason; },
+    recordTamper(r: string) {
+      // First-writer-wins parity with LinuxStraceRunner.
+      if (currentReason === '' || currentReason === null) currentReason = r;
+    },
   };
 }
 
@@ -171,6 +177,7 @@ function trackingStrace(exitCode = 0): { strace: StraceRunner; calls: string[] }
       getExitCode() { return exitCode; },
       // Finding D: tamper reporting is part of the StraceRunner contract.
       getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op for test fakes */ },
     },
   };
 }
@@ -1020,10 +1027,10 @@ describe('runStraceTailer', () => {
 
   /** Collect all items from an async iterable with a timeout guard. */
   async function collect(
-    iter: AsyncIterable<{ pid: number; line: string }>,
+    iter: AsyncIterable<{ pid: number; line: string; source: 'shim' | 'strace' }>,
     timeoutMs = 3000,
-  ): Promise<Array<{ pid: number; line: string }>> {
-    const results: Array<{ pid: number; line: string }> = [];
+  ): Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> {
+    const results: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
     await Promise.race([
       (async () => {
         for await (const item of iter) {
@@ -1059,8 +1066,8 @@ describe('runStraceTailer', () => {
 
     const items = await collect(tailer);
     expect(items.length).toBe(2);
-    expect(items[0]).toEqual({ pid: 1234, line: 'openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3' });
-    expect(items[1]).toEqual({ pid: 1234, line: 'execve("/bin/sh", ["sh"], ...) = 0' });
+    expect(items[0]).toEqual({ pid: 1234, line: 'openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3', source: 'strace' });
+    expect(items[1]).toEqual({ pid: 1234, line: 'execve("/bin/sh", ["sh"], ...) = 0', source: 'strace' });
   });
 
   it('yields lines from multiple per-pid files with correct pids', async () => {
@@ -1114,7 +1121,7 @@ describe('runStraceTailer', () => {
 
     const items = await collect(tailer);
     expect(items).toHaveLength(1);
-    expect(items[0]).toEqual({ pid: 9999, line: 'openat(AT_FDCWD, "/late", O_RDONLY) = 5' });
+    expect(items[0]).toEqual({ pid: 9999, line: 'openat(AT_FDCWD, "/late", O_RDONLY) = 5', source: 'strace' });
   });
 
   it('yields JSONL lines from fd3Stream with pid=0', async () => {
@@ -1282,10 +1289,12 @@ describe('runStraceTailer', () => {
     expect(items[0]).toEqual({
       pid: 0,
       line: '{"kind":"env_read","name":"NPM_TOKEN","pid":1001,"ts":0,"hidden":true}',
+      source: 'shim',
     });
     expect(items[1]).toEqual({
       pid: 0,
       line: '{"kind":"dlopen","filename":"/work/node_modules/x/evil.node","pid":1002,"ts":1,"result":"blocked"}',
+      source: 'shim',
     });
   });
 
@@ -1704,8 +1713,8 @@ describe('LinuxStraceRunner stderr forwarding', () => {
       });
 
       // Collect items from the iterator in background while we push data.
-      const itemsPromise: Promise<Array<{ pid: number; line: string }>> = (async () => {
-        const collected: Array<{ pid: number; line: string }> = [];
+      const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
+        const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
         for await (const item of runIter) {
           collected.push(item);
         }
@@ -1791,7 +1800,7 @@ describe('runStraceTailer cleanup on early break', () => {
       });
 
       // Read exactly one item then break.
-      const collected: Array<{ pid: number; line: string }> = [];
+      const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
       for await (const item of tailer) {
         collected.push(item);
         break; // triggers the try/finally in runStraceTailer
