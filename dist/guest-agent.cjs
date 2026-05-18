@@ -26451,7 +26451,7 @@ async function runInstallPhase(input) {
             }
           }
           const detachCwd = (flagsBits & CLONE_FS) !== 0 || (flagsBits & CLONE_NEWNS) !== 0 || (flagsBits & CLONE_NEWUSER) !== 0;
-          const detachFds = (flagsBits & CLONE_FILES) !== 0 || (flagsBits & CLONE_NEWUSER) !== 0;
+          const detachFds = (flagsBits & CLONE_FILES) !== 0;
           if (detachFds) {
             detachFdGroup(pid);
           }

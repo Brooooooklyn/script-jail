@@ -1869,22 +1869,31 @@ export async function runInstallPhase(
       // OR a numeric (hex/decimal) bitmask.  Linux defines many CLONE_*
       // bits; we model the explicit CLONE_FILES (0x400) and CLONE_FS
       // (0x200) bits AND the namespace bits that the kernel implicitly
-      // unshares fs_struct / files_struct for:
+      // unshares fs_struct for:
       //
-      //   - CLONE_NEWNS (0x20000)   → kernel implies CLONE_FS
-      //   - CLONE_NEWUSER (0x10000000) → kernel implies CLONE_FS AND
-      //     CLONE_FILES (Linux 3.8+).
+      //   - CLONE_NEWNS   (0x20000)    → kernel implies CLONE_FS
+      //   - CLONE_NEWUSER (0x10000000) → kernel implies CLONE_FS only
+      //     (and CLONE_THREAD, which we don't model).  CLONE_NEWUSER
+      //     does NOT imply CLONE_FILES — `kernel/fork.c::ksys_unshare`
+      //     only calls `unshare_fd` when CLONE_FILES is explicitly set
+      //     in the user-supplied flags.  See unshare(2).
       //
-      // Pre-fix we only honored the literal CLONE_FS / CLONE_FILES
-      // bits, so a process that ran `clone(CLONE_FS); unshare(CLONE_NEWNS)`
-      // stayed modeled as shared-cwd with the parent and subsequent
-      // chdirs on either side leaked across the (kernel-detached) group.
+      // Pre-fix (earlier in this series) we only honored the literal
+      // CLONE_FS / CLONE_FILES bits, so a process that ran
+      // `clone(CLONE_FS); unshare(CLONE_NEWNS)` stayed modeled as
+      // shared-cwd with the parent and subsequent chdirs on either
+      // side leaked across the (kernel-detached) group.  An earlier
+      // attempt over-corrected and treated CLONE_NEWUSER as implying
+      // CLONE_FILES too; that detached the fd group when the kernel
+      // actually keeps it shared, so later child dup/close stopped
+      // propagating to the parent's modeled state.  This revision
+      // matches the kernel: fd detach iff explicit CLONE_FILES.
       //
       // Wire formats:
       //   unshare(CLONE_FILES) = 0
       //   unshare(CLONE_FS|CLONE_FILES) = 0
       //   unshare(CLONE_NEWNS) = 0                ← implies CLONE_FS
-      //   unshare(CLONE_NEWUSER) = 0              ← implies CLONE_FS|CLONE_FILES
+      //   unshare(CLONE_NEWUSER) = 0              ← implies CLONE_FS only
       //   unshare(0x400) = 0                     ← hex CLONE_FILES
       //   unshare(0x20000) = 0                   ← hex CLONE_NEWNS
       //   unshare(1024) = 0                      ← decimal CLONE_FILES
@@ -1941,14 +1950,14 @@ export async function runInstallPhase(
           }
           // Kernel-implied detaches:
           //   CLONE_NEWNS    → implies CLONE_FS
-          //   CLONE_NEWUSER  → implies CLONE_FS AND CLONE_FILES
+          //   CLONE_NEWUSER  → implies CLONE_FS only (NOT CLONE_FILES;
+          //                    see ksys_unshare in kernel/fork.c — fd
+          //                    detach requires explicit CLONE_FILES).
           const detachCwd =
             (flagsBits & CLONE_FS) !== 0 ||
             (flagsBits & CLONE_NEWNS) !== 0 ||
             (flagsBits & CLONE_NEWUSER) !== 0;
-          const detachFds =
-            (flagsBits & CLONE_FILES) !== 0 ||
-            (flagsBits & CLONE_NEWUSER) !== 0;
+          const detachFds = (flagsBits & CLONE_FILES) !== 0;
           if (detachFds) {
             detachFdGroup(pid);
           }
