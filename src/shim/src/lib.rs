@@ -1569,10 +1569,21 @@ pub unsafe extern "C" fn execv(
         return real_execve_raw(prog, argv, environ_ptr());
     }
     set_in_shim(true);
-    // execv inherits environ.  We rewrite the inherited env so the child sees
-    // our injected LD_PRELOAD etc., then forward to real_execve (since execv
-    // doesn't take envp, but the rewritten env must reach the child).
-    let rc = dispatch_exec(RealExecForward::Execve, prog, argv, environ_ptr());
+    // execv inherits environ.  Environ in the parent already has our canonical
+    // LD_PRELOAD / NODE_OPTIONS / SCRIPT_JAIL_* (the shim was loaded from it,
+    // and Task 5's env-mutator wrappers refuse in-process tampering on those
+    // names), so a rewrite would just allocate a copy of an already-canonical
+    // env.  Skip the rewrite, emit the audit event for visibility, and forward
+    // to real_execv so glibc's exec semantics are preserved.  Matches execvp.
+    let argv0 = if argv.is_null() { ptr::null() } else { *argv };
+    emit_exec(prog, argv0, false);
+    let p = REAL_EXECV.load(Ordering::Acquire);
+    let rc = if !p.is_null() {
+        let f: ExecvFn = transmute(p);
+        f(prog, argv)
+    } else {
+        real_execve_raw(prog, argv, environ_ptr())
+    };
     set_in_shim(false);
     rc
 }
