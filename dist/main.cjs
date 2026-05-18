@@ -41829,9 +41829,13 @@ var ExecEvent = external_exports.object({
 });
 var EnvTamperEvent = external_exports.object({
   kind: external_exports.literal("env_tamper"),
-  op: external_exports.enum(["setenv", "unsetenv", "putenv", "clearenv"]),
-  // Omitted for clearenv (whole-environ wipe — no single name).
+  op: external_exports.enum(["setenv", "unsetenv", "putenv", "clearenv", "audit_fd_lost"]),
+  // Omitted for clearenv (whole-environ wipe — no single name) and for
+  // audit_fd_lost (preload-side fd-tamper signal — no env-var name).
   name: external_exports.string().optional(),
+  // Optional human-readable detail for audit_fd_lost (the reason string the
+  // preload built — e.g. "reopen of /tmp/.../events.jsonl failed: EBADF").
+  reason: external_exports.string().optional(),
   refused: external_exports.literal(true),
   pid: external_exports.number(),
   ts: external_exports.number()

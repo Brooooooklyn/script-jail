@@ -181,6 +181,20 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // attempt itself: a script tried to wipe LD_PRELOAD, NODE_OPTIONS,
         // or any SCRIPT_JAIL_* sticky var. clearenv has no `name` (whole-env
         // wipe) — render that as `<REFUSED> clearenv` with no name tail.
+        //
+        // Audit-trust Finding 4 (2026-05-18): `audit_fd_lost` is a different
+        // beast — it signals the JS preload's cached events-file fd was
+        // closed (almost certainly by a hostile lifecycle script scanning
+        // /proc/self/fd/) and the reopen-by-path retry also failed.  At
+        // that point we cannot trust any subsequent events from this pid;
+        // surface it as `<AUDIT_FD_LOST>` under `audit_bypass` so the
+        // host-side `findAuditBypass` scan in src/action/diff.ts catches
+        // it and hard-fails the lockfile diff.  Same severity classification
+        // as `<EXEC_FAIL_OPEN>`.
+        if (ev.raw.op === 'audit_fd_lost') {
+          block.audit_bypass.push('<AUDIT_FD_LOST>');
+          break;
+        }
         const name = ev.raw.name;
         const entry = name !== undefined
           ? `<REFUSED> ${ev.raw.op} ${name}`

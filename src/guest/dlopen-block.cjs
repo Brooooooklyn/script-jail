@@ -40,9 +40,17 @@ const BLOCKED_MSG = 'script-jail: native addons are blocked at install time';
  * Cached fd for the events file.  Resolved lazily on first call; -1 means
  * "tried and failed" (don't retry).  Module-local, shared across all logDlopen
  * invocations in this process.
+ *
+ * Audit-trust Finding 4 (2026-05-18): we additionally remember the file
+ * PATH (cachedFilePath) so that on EBADF (a lifecycle script close()'d our
+ * fd via /proc/self/fd/) the next logDlopen call can reopen by path and
+ * retry once.  Without the reopen, an attacker that closes the fd silences
+ * every subsequent dlopen audit event from this process.
  * @type {number | null}
  */
 let cachedFileFd = null;
+/** @type {string | null} */
+let cachedFilePath = null;
 
 /**
  * Resolve the output fd for this process.  Prefers SCRIPT_JAIL_LOG_FILE (one
@@ -52,6 +60,7 @@ let cachedFileFd = null;
 function resolveLogFd() {
   const filePath = process.env['SCRIPT_JAIL_LOG_FILE'];
   if (filePath !== undefined && filePath !== '') {
+    cachedFilePath = filePath;
     if (cachedFileFd !== null) return cachedFileFd;
     try {
       cachedFileFd = fs.openSync(filePath, 'a');
@@ -68,7 +77,51 @@ function resolveLogFd() {
 }
 
 /**
+ * Emit a fail-closed env_tamper signal and exit non-zero.  Called when the
+ * cached events-file fd is unusable AND the reopen retry fails — at that
+ * point the audit trail is unrecoverably broken in this process, so the
+ * safest action is to stop running and let the agent's post-install
+ * normalize/diff pipeline surface this as `audit_bypass` via the
+ * env_tamper event.  Matches the symmetric behaviour in env-spy.cjs.
+ *
+ * @param {string} reason
+ */
+function emitAuditFdLostAndExit(reason) {
+  const ts = Number(process.hrtime.bigint() / 1_000_000n);
+  const line = JSON.stringify({
+    kind: 'env_tamper',
+    op: 'audit_fd_lost',
+    refused: true,
+    reason,
+    pid: process.pid,
+    ts,
+  }) + '\n';
+  if (cachedFilePath) {
+    try {
+      const fd = fs.openSync(cachedFilePath, 'a');
+      try { fs.writeSync(fd, line); } catch { /* ignored */ }
+      try { fs.closeSync(fd); } catch { /* ignored */ }
+    } catch { /* ignored */ }
+  }
+  try {
+    process.stderr.write(
+      `script-jail/dlopen-block: fatal — cached events-file fd is unusable and reopen failed (${reason}); aborting to avoid silent audit loss\n`,
+    );
+  } catch { /* ignored */ }
+  process.exit(91);
+}
+
+/**
  * Write a JSONL audit line to the resolved log destination.
+ *
+ * Audit-trust Finding 4 (2026-05-18): on write failure (e.g. EBADF after a
+ * lifecycle script closed our cached fd), we re-open the events file by
+ * path and retry once.  If the path is unknown (only SCRIPT_JAIL_LOG_FD
+ * was set) or the reopen itself fails, we treat the audit chain as
+ * unrecoverably broken and exit non-zero via emitAuditFdLostAndExit so
+ * the agent's post-install gate aborts before producing a misleadingly-
+ * clean lockfile.
+ *
  * @param {string} filename
  */
 function logDlopen(filename) {
@@ -84,10 +137,47 @@ function logDlopen(filename) {
     ts,
   }) + '\n';
 
+  let firstErr;
   try {
     fs.writeSync(fd, line);
-  } catch {
-    // Logging failure must never prevent the throw below.
+    return;
+  } catch (err) {
+    firstErr = err;
+  }
+
+  // Recovery only applies to the SCRIPT_JAIL_LOG_FILE branch — that's the
+  // production channel and we know the path so we can reopen.  Tests (and
+  // the legacy code path) use SCRIPT_JAIL_LOG_FD pointing at a pipe / a
+  // possibly-bogus fd; for those callers a write failure is non-fatal
+  // (matching the pre-Finding-4 behaviour) so we silently swallow.
+  if (cachedFilePath === null) {
+    // Legacy SCRIPT_JAIL_LOG_FD path; no file to reopen.  Logging failure
+    // here must never affect user code.
+    return;
+  }
+  let newFd;
+  try {
+    newFd = fs.openSync(cachedFilePath, 'a');
+  } catch (openErr) {
+    emitAuditFdLostAndExit(
+      `reopen of ${cachedFilePath} failed: ${
+        (openErr && openErr.code) || 'unknown'
+      }`,
+    );
+    return;
+  }
+  if (cachedFileFd !== null && cachedFileFd >= 0) {
+    try { fs.closeSync(cachedFileFd); } catch { /* ignored */ }
+  }
+  cachedFileFd = newFd;
+  try {
+    fs.writeSync(newFd, line);
+  } catch (retryErr) {
+    emitAuditFdLostAndExit(
+      `retry write after reopen failed: ${
+        (retryErr && retryErr.code) || 'unknown'
+      }`,
+    );
   }
 }
 

@@ -115,11 +115,25 @@ export type ExecEvent = z.infer<typeof ExecEvent>;
 // to setenv/unsetenv/putenv/clearenv a protected name (LD_PRELOAD,
 // NODE_OPTIONS, SCRIPT_JAIL_*). The call is silently refused (returns 0 to
 // the caller) and this event records the attempt.
+//
+// Audit-trust Finding 4 (2026-05-18): `audit_fd_lost` is emitted by the JS
+// preloads (env-spy.cjs / dlopen-block.cjs) when a lifecycle script closes
+// the cached events-file fd via /proc/self/fd/<N> and the preload's
+// reopen-by-path retry also fails.  The preload then exits the Node process
+// non-zero so the install command itself fails — but the JSONL line also
+// surfaces in the events file so the host-side `findAuditBypass` scan can
+// turn it into an audit_bypass entry in the rendered lockfile.  Unlike the
+// libc-wrapper-sourced ops, `audit_fd_lost` has no `name` (it's not a
+// per-name refusal).
 export const EnvTamperEvent = z.object({
   kind: z.literal('env_tamper'),
-  op: z.enum(['setenv', 'unsetenv', 'putenv', 'clearenv']),
-  // Omitted for clearenv (whole-environ wipe — no single name).
+  op: z.enum(['setenv', 'unsetenv', 'putenv', 'clearenv', 'audit_fd_lost']),
+  // Omitted for clearenv (whole-environ wipe — no single name) and for
+  // audit_fd_lost (preload-side fd-tamper signal — no env-var name).
   name: z.string().optional(),
+  // Optional human-readable detail for audit_fd_lost (the reason string the
+  // preload built — e.g. "reopen of /tmp/.../events.jsonl failed: EBADF").
+  reason: z.string().optional(),
   refused: z.literal(true),
   pid: z.number(),
   ts: z.number(),

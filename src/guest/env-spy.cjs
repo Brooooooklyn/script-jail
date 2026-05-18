@@ -89,12 +89,21 @@ const protectedNames = new Set();
 // ── Resolve log destination ONCE, before installing Proxy ────────────────────
 // Pre-resolving avoids a recursive Proxy entry from inside the get-handler's
 // own logEnvRead implementation.
+//
+// Audit-trust Finding 4 (2026-05-18): we capture the file PATH separately
+// from the cached fd so write failures (EBADF after a malicious lifecycle
+// script closes the fd via /proc/self/fd/) can reopen the same file and
+// retry.  Without this, an attacker that scans /proc/self/fd for descriptors
+// pointing at the events file and `close()`s them would silence every
+// subsequent env_read entry from this process — the try/catch below would
+// eat the EBADF and the audit trail would be missing exactly the events the
+// attacker cared about.
+const logFilePath = process.env['SCRIPT_JAIL_LOG_FILE'] || null;
 let logFd = -1;
 {
-  const filePath = process.env['SCRIPT_JAIL_LOG_FILE'];
-  if (filePath) {
+  if (logFilePath) {
     try {
-      logFd = fs.openSync(filePath, 'a');
+      logFd = fs.openSync(logFilePath, 'a');
     } catch {
       logFd = -1;
     }
@@ -109,7 +118,72 @@ let logFd = -1;
 }
 
 /**
+ * Emit a single audit_fd_lost env_tamper line and exit non-zero.  Called
+ * when the cached events-file fd is closed underneath us AND the reopen
+ * retry fails — at that point the audit trail is unrecoverably broken in
+ * this process, so the safest action is to stop running and let the agent's
+ * post-install normalize/diff pipeline surface this as `audit_bypass` via
+ * the env_tamper event (the host-side `findAuditBypass` scan reads
+ * audit_bypass + env_tamper from the rendered lockfile and fails the diff).
+ *
+ * We do NOT route through the Proxy / process.env reads — the line is
+ * written via a freshly-opened fd path so even a wholesale fd-table wipe
+ * cannot eat this final signal.  If even that open fails, abort with a
+ * non-zero exit so the lifecycle script's child sees a hard failure.
+ *
+ * @param {string} reason — debug detail, surfaced in the JSONL line.
+ */
+function emitAuditFdLostAndExit(reason) {
+  const ts = Number(process.hrtime.bigint() / 1_000_000n);
+  const line = JSON.stringify({
+    kind: 'env_tamper',
+    op: 'audit_fd_lost',
+    refused: true,
+    reason,
+    pid: process.pid,
+    ts,
+  }) + '\n';
+  // Best-effort write via a fresh open: bypasses any cached-fd table the
+  // attacker may have tampered with.  If logFilePath is null we lose the
+  // event but still exit hard so the user can correlate the missing audit
+  // line with a non-zero exit.
+  if (logFilePath) {
+    try {
+      const fd = fs.openSync(logFilePath, 'a');
+      try { fs.writeSync(fd, line); } catch { /* swallowed; we exit below */ }
+      try { fs.closeSync(fd); } catch { /* swallowed; we exit below */ }
+    } catch { /* swallowed; we exit below */ }
+  }
+  // Write a human-readable line to stderr so an interactive run also
+  // surfaces the failure.  process.exit with a non-zero code propagates
+  // through npm/pnpm/yarn's lifecycle-script handling to the install
+  // command's exit code, which the agent then treats as a fatal install
+  // failure.  We use 91 (an uncommon code) so accidentally-overlapping
+  // exit codes from user code don't collide with this signal.
+  try {
+    process.stderr.write(
+      `script-jail/env-spy: fatal — cached events-file fd is unusable and reopen failed (${reason}); aborting to avoid silent audit loss\n`,
+    );
+  } catch { /* ignored */ }
+  process.exit(91);
+}
+
+/**
  * Emit one JSONL env_read line for a single property access.
+ *
+ * Audit-trust Finding 4 (2026-05-18): on EBADF (or any other write
+ * failure that comes from a closed/invalid fd) we re-open the events file
+ * by path and retry once.  If the reopen path is unset (logFilePath ===
+ * null — only happens in test setups that use SCRIPT_JAIL_LOG_FD without a
+ * file path) or the reopen itself fails, we treat the audit chain as
+ * unrecoverably broken and emit a fail-closed signal via
+ * `emitAuditFdLostAndExit` before exiting non-zero.
+ *
+ * The recovery is bounded to a SINGLE retry per failed write: if the
+ * reopened fd also fails immediately, that is the unrecoverable-tamper
+ * path and we exit hard.  This avoids any infinite-retry loop a hostile
+ * script could induce by repeatedly re-closing the fd.
+ *
  * @param {string} name
  * @param {boolean} hidden
  */
@@ -125,8 +199,40 @@ function logEnvRead(name, hidden) {
   }) + '\n';
   try {
     fs.writeSync(logFd, line);
-  } catch {
-    // Logging failure must never affect user code.
+    return;
+  } catch { /* fall through to recovery */ }
+
+  // Recovery only applies to the SCRIPT_JAIL_LOG_FILE branch — that's the
+  // production channel and we know the path so we can reopen.  The legacy
+  // SCRIPT_JAIL_LOG_FD-only path (used by some unit tests with a pipe fd)
+  // has no path to reopen; a write failure there is non-fatal and
+  // silently dropped, matching the pre-Finding-4 behaviour.
+  if (logFilePath === null) return;
+
+  let newFd;
+  try {
+    newFd = fs.openSync(logFilePath, 'a');
+  } catch (openErr) {
+    emitAuditFdLostAndExit(
+      `reopen of ${logFilePath} failed: ${
+        (openErr && openErr.code) || 'unknown'
+      }`,
+    );
+    return;
+  }
+  // Best-effort: close the stale fd so we don't accumulate leaked fds
+  // when an attacker repeatedly tampers.  closeSync on an already-invalid
+  // fd will throw EBADF; swallow it.
+  try { fs.closeSync(logFd); } catch { /* ignored */ }
+  logFd = newFd;
+  try {
+    fs.writeSync(logFd, line);
+  } catch (retryErr) {
+    emitAuditFdLostAndExit(
+      `retry write after reopen failed: ${
+        (retryErr && retryErr.code) || 'unknown'
+      }`,
+    );
   }
 }
 

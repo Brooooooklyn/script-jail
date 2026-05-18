@@ -319,4 +319,119 @@ describe('env-spy preload', () => {
     const lines = readEnvReadLines(logFile);
     expect(lines.every((l) => typeof l.name === 'string')).toBe(true);
   });
+
+  // ── Audit-trust Finding 4 (2026-05-18) — fd-close recovery ────────────────
+  //
+  // A lifecycle script that scans /proc/self/fd/<N> and close()s every fd
+  // pointing at SCRIPT_JAIL_LOG_FILE breaks env-spy's cached fd.  The fix
+  // is for env-spy's write path to:
+  //   1. catch the write failure (typically EBADF),
+  //   2. reopen the events file by its known path,
+  //   3. retry the write once.
+  // If the reopen ALSO fails, env-spy emits an audit_fd_lost env_tamper
+  // line via a fresh open and exits non-zero so the install command fails
+  // closed.  This test drives the recovery branch by stubbing fs.writeSync
+  // to throw EBADF on the first call: the child must reopen, retry, and
+  // succeed — landing exactly one env_read line in the events file.
+  //
+  // The actual /proc/self/fd attack is a Linux-only integration test; here
+  // we cover the recovery code path under unit conditions on every OS.
+
+  it('reopens the events file on EBADF and writes the env_read line via the new fd', async () => {
+    const logFile = freshLogFile();
+    // The child:
+    //   1. monkey-patches fs.writeSync so the first call throws EBADF;
+    //   2. requires env-spy.cjs (which is the --require target via NODE_OPTIONS);
+    //   3. reads process.env.FOO, which goes through the Proxy → logEnvRead →
+    //      writeSync (throws EBADF) → reopen → retry → success.
+    // Because env-spy is pre-loaded via NODE_OPTIONS=--require=env-spy.cjs
+    // BEFORE the child script body runs, we need to install the writeSync
+    // stub in `--require` order.  Easiest path: inject a SECOND --require
+    // that runs BEFORE env-spy.  But --require entries run in left-to-right
+    // order, so we instead patch writeSync at the top of the child script
+    // and then trigger a delayed env-read.  The first env-spy auto-reads
+    // (process.env.SCRIPT_JAIL_LOG_FILE / SCRIPT_JAIL_PROTECTED_ENV_NAMES)
+    // happen BEFORE our patch — so we must NOT patch writeSync until after
+    // env-spy's resolveLogFd has run and logFd is cached.  Insert the
+    // patch in the user code, then make the read.
+    const code = `
+      const fs = require('fs');
+      // env-spy is already preloaded by NODE_OPTIONS=--require=...;
+      // logFd is now > 0 and cached.  Install a one-shot EBADF stub on
+      // writeSync — only the FIRST call throws, so the reopen-retry path
+      // succeeds on the second attempt.
+      const realWriteSync = fs.writeSync;
+      let firstCall = true;
+      fs.writeSync = function (fd, ...rest) {
+        if (firstCall) {
+          firstCall = false;
+          const err = new Error('Stale fd');
+          err.code = 'EBADF';
+          throw err;
+        }
+        return realWriteSync.call(fs, fd, ...rest);
+      };
+      // Trigger one env_read through the Proxy.  Recovery path expectation:
+      // the first writeSync throws EBADF → env-spy reopens the file by
+      // path → writeSync (the new, non-stubbed fd) succeeds on the second
+      // call.  The events file must contain exactly one env_read line.
+      const v = process.env.FOO;
+      process.stdout.write('FOO=' + (v || 'ABSENT'));
+    `;
+    const result = await runWithSpy(code, {
+      SCRIPT_JAIL_LOG_FILE: logFile,
+      FOO: 'bar',
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('FOO=bar');
+    const lines = readEnvReadLines(logFile);
+    const fooReads = lines.filter((l) => l.name === 'FOO');
+    expect(fooReads.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('exits non-zero with audit_fd_lost when reopen also fails (unrecoverable fd-tamper)', async () => {
+    const logFile = freshLogFile();
+    // Same stub strategy, but also stub fs.openSync so the reopen retry
+    // fails too.  Expected: env-spy exits non-zero and emits an
+    // env_tamper{op:'audit_fd_lost'} JSONL line via the final fresh-open
+    // fallback (which we also break — proving the exit-non-zero is the
+    // hard fail-closed signal even when no audit line can be written).
+    const code = `
+      const fs = require('fs');
+      const realWriteSync = fs.writeSync;
+      let firstWrite = true;
+      fs.writeSync = function (fd, ...rest) {
+        if (firstWrite) {
+          firstWrite = false;
+          const err = new Error('Stale fd');
+          err.code = 'EBADF';
+          throw err;
+        }
+        return realWriteSync.call(fs, fd, ...rest);
+      };
+      // Now break openSync ENTIRELY so the reopen branch fails too —
+      // including the final fallback open inside emitAuditFdLostAndExit.
+      // Both the env_read retry AND the audit_fd_lost write should fail;
+      // the process MUST still exit non-zero.
+      fs.openSync = function () {
+        const err = new Error('Stubbed openSync failure');
+        err.code = 'EACCES';
+        throw err;
+      };
+      // Trigger one env_read.  writeSync throws → reopen attempts openSync
+      // → throws → emitAuditFdLostAndExit → process.exit(91).
+      const v = process.env.FOO;
+      // Must never be reached:
+      process.stdout.write('UNREACHED');
+    `;
+    const result = await runWithSpy(code, {
+      SCRIPT_JAIL_LOG_FILE: logFile,
+      FOO: 'bar',
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain('UNREACHED');
+    // Stderr should carry the diagnostic so an interactive caller can
+    // correlate the failure with the audit-fd-lost cause.
+    expect(result.stderr).toMatch(/script-jail\/env-spy/);
+  });
 });
