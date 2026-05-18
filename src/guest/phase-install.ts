@@ -1867,16 +1867,29 @@ export async function runInstallPhase(
       //
       // Strace renders flags as either a `|`-separated identifier list
       // OR a numeric (hex/decimal) bitmask.  Linux defines many CLONE_*
-      // bits; we only care about CLONE_FILES (0x400) and CLONE_FS
-      // (0x200) — other bits (CLONE_NEWNS, CLONE_NEWUTS, …) describe
-      // namespace separations our model doesn't track.
+      // bits; we model the explicit CLONE_FILES (0x400) and CLONE_FS
+      // (0x200) bits AND the namespace bits that the kernel implicitly
+      // unshares fs_struct / files_struct for:
+      //
+      //   - CLONE_NEWNS (0x20000)   → kernel implies CLONE_FS
+      //   - CLONE_NEWUSER (0x10000000) → kernel implies CLONE_FS AND
+      //     CLONE_FILES (Linux 3.8+).
+      //
+      // Pre-fix we only honored the literal CLONE_FS / CLONE_FILES
+      // bits, so a process that ran `clone(CLONE_FS); unshare(CLONE_NEWNS)`
+      // stayed modeled as shared-cwd with the parent and subsequent
+      // chdirs on either side leaked across the (kernel-detached) group.
       //
       // Wire formats:
       //   unshare(CLONE_FILES) = 0
       //   unshare(CLONE_FS|CLONE_FILES) = 0
+      //   unshare(CLONE_NEWNS) = 0                ← implies CLONE_FS
+      //   unshare(CLONE_NEWUSER) = 0              ← implies CLONE_FS|CLONE_FILES
       //   unshare(0x400) = 0                     ← hex CLONE_FILES
+      //   unshare(0x20000) = 0                   ← hex CLONE_NEWNS
       //   unshare(1024) = 0                      ← decimal CLONE_FILES
-      //   unshare(CLONE_NEWUTS) = 0              ← unknown bit (no-op)
+      //   unshare(268435456) = 0                 ← decimal CLONE_NEWUSER
+      //   unshare(CLONE_NEWUTS) = 0              ← unmodeled bit (no-op)
       //   unshare(CLONE_FILES) = -1 EINVAL       ← failure (no-op)
       const unshareMatch = line.match(/^unshare\(([^)]*)\)\s*=\s*(-?\d+)\b/);
       if (unshareMatch !== null) {
@@ -1885,14 +1898,21 @@ export async function runInstallPhase(
           const flagsStr = (unshareMatch[1] ?? '').trim();
           const CLONE_FS = 0x200;
           const CLONE_FILES = 0x400;
+          const CLONE_NEWNS = 0x20000;
+          const CLONE_NEWUSER = 0x10000000;
+          const parseSymbol = (t: string): number => {
+            if (t === 'CLONE_FILES') return CLONE_FILES;
+            if (t === 'CLONE_FS') return CLONE_FS;
+            if (t === 'CLONE_NEWNS') return CLONE_NEWNS;
+            if (t === 'CLONE_NEWUSER') return CLONE_NEWUSER;
+            return 0;
+          };
           let flagsBits = 0;
           if (flagsStr.length > 0) {
             if (/^[A-Z_|\s]+$/.test(flagsStr)) {
               // Pure symbolic identifier list.
               for (const tok of flagsStr.split('|')) {
-                const t = tok.trim();
-                if (t === 'CLONE_FILES') flagsBits |= CLONE_FILES;
-                else if (t === 'CLONE_FS') flagsBits |= CLONE_FS;
+                flagsBits |= parseSymbol(tok.trim());
               }
             } else if (flagsStr.startsWith('0x') || flagsStr.startsWith('0X')) {
               const n = parseInt(flagsStr, 16);
@@ -1906,9 +1926,10 @@ export async function runInstallPhase(
               // parsers above.
               for (const tok of flagsStr.split('|')) {
                 const t = tok.trim();
-                if (t === 'CLONE_FILES') flagsBits |= CLONE_FILES;
-                else if (t === 'CLONE_FS') flagsBits |= CLONE_FS;
-                else if (t.startsWith('0x') || t.startsWith('0X')) {
+                const sym = parseSymbol(t);
+                if (sym !== 0) {
+                  flagsBits |= sym;
+                } else if (t.startsWith('0x') || t.startsWith('0X')) {
                   const n = parseInt(t, 16);
                   if (Number.isFinite(n)) flagsBits |= n;
                 } else if (/^-?\d+$/.test(t)) {
@@ -1918,10 +1939,20 @@ export async function runInstallPhase(
               }
             }
           }
-          if ((flagsBits & CLONE_FILES) !== 0) {
+          // Kernel-implied detaches:
+          //   CLONE_NEWNS    → implies CLONE_FS
+          //   CLONE_NEWUSER  → implies CLONE_FS AND CLONE_FILES
+          const detachCwd =
+            (flagsBits & CLONE_FS) !== 0 ||
+            (flagsBits & CLONE_NEWNS) !== 0 ||
+            (flagsBits & CLONE_NEWUSER) !== 0;
+          const detachFds =
+            (flagsBits & CLONE_FILES) !== 0 ||
+            (flagsBits & CLONE_NEWUSER) !== 0;
+          if (detachFds) {
             detachFdGroup(pid);
           }
-          if ((flagsBits & CLONE_FS) !== 0) {
+          if (detachCwd) {
             detachCwdGroup(pid);
           }
         }

@@ -7222,5 +7222,449 @@ describe('runInstallPhase', () => {
       });
       expect(stale).toHaveLength(0);
     });
+
+    // Codex follow-up (high, 2026-05-19): unshare(2) kernel-implied
+    // detaches.  unshare(CLONE_NEWNS) makes the kernel implicitly call
+    // unshare_fs for the caller (the new mount namespace must own a
+    // private fs_struct).  unshare(CLONE_NEWUSER) implicitly unshares
+    // BOTH fs_struct and files_struct on Linux 3.8+ — the new user
+    // namespace needs private caches.  Pre-fix the unshare flag parser
+    // only honored the literal CLONE_FS / CLONE_FILES bits, so a
+    // `clone(CLONE_FS); unshare(CLONE_NEWNS)` chain stayed modeled as
+    // shared-cwd and subsequent chdirs leaked across the (kernel-
+    // detached) cwd group.
+
+    // Test #7 — clone(CLONE_FS) + unshare(CLONE_NEWNS).  Parent + child
+    // share cwd via clone(CLONE_FS).  Child unshare(CLONE_NEWNS) →
+    // kernel implies CLONE_FS detach.  Child chdir(/B), parent
+    // chdir(/A).  Post-fix: AT_FDCWD-relative openat resolves through
+    // each pid's private cwd.
+    it('unshare(CLONE_NEWNS) implies CLONE_FS detach (kernel-implied)', async () => {
+      const proc = mockProcReader({
+        10001: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-newns-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        10002: {
+          ppid: 10001,
+          env: {
+            npm_package_name: 'unshare-newns-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Seed pid 10001 with a known cwd state.
+        {
+          pid: 10001,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FS → cwd shared.
+        {
+          pid: 10001,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 10002',
+          source: 'strace',
+        },
+        // Child unshare(CLONE_NEWNS) — kernel implies CLONE_FS detach.
+        {
+          pid: 10002,
+          line: 'unshare(CLONE_NEWNS) = 0',
+          source: 'strace',
+        },
+        // Child chdirs to /B — MUST NOT leak into the parent.
+        {
+          pid: 10002,
+          line: 'chdir("/B") = 0',
+          source: 'strace',
+        },
+        // Parent chdirs to /A — MUST NOT leak into the child.
+        {
+          pid: 10001,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        // Parent AT_FDCWD-relative openat — must resolve through /A.
+        {
+          pid: 10001,
+          line: 'openat(AT_FDCWD, "file.parent", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child AT_FDCWD-relative openat — must resolve through /B.
+        {
+          pid: 10002,
+          line: 'openat(AT_FDCWD, "file.child", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 10001 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file.parent' && r['pid'] === 10001;
+      });
+      expect(parentRead).toHaveLength(1);
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file.child' && r['pid'] === 10002;
+      });
+      expect(childRead).toHaveLength(1);
+      // Sanity: parent MUST NOT see /B (child chdir leaked).
+      const bleed = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file.parent' && r['pid'] === 10001;
+      });
+      expect(bleed).toHaveLength(0);
+    });
+
+    // Test #8 — clone(CLONE_FS|CLONE_FILES) + unshare(CLONE_NEWUSER).
+    // Parent + child share both cwd and fd table.  Child
+    // unshare(CLONE_NEWUSER) → kernel implies BOTH CLONE_FS and
+    // CLONE_FILES detach.  Child chdir(/B) + open fd 7→/B, parent
+    // chdir(/A) + open fd 8→/A.  Post-fix: cwds and fd tables are
+    // disjoint.
+    it('unshare(CLONE_NEWUSER) implies CLONE_FS+CLONE_FILES detach (kernel-implied)', async () => {
+      const proc = mockProcReader({
+        10101: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-newuser-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        10102: {
+          ppid: 10101,
+          env: {
+            npm_package_name: 'unshare-newuser-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Seed pid 10101 with a known cwd state.
+        {
+          pid: 10101,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FS|CLONE_FILES → cwd + fd table shared.
+        {
+          pid: 10101,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 10102',
+          source: 'strace',
+        },
+        // Child unshare(CLONE_NEWUSER) — kernel implies CLONE_FS AND
+        // CLONE_FILES detach.
+        {
+          pid: 10102,
+          line: 'unshare(CLONE_NEWUSER) = 0',
+          source: 'strace',
+        },
+        // Child chdirs to /B and opens /B → fd 7 in its NEW private
+        // groups.  Neither should leak into the parent.
+        { pid: 10102, line: 'chdir("/B") = 0', source: 'strace' },
+        {
+          pid: 10102,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent chdirs to /A and opens /A → fd 8 in its (still
+        // original) groups.  Neither should leak into the child.
+        { pid: 10101, line: 'chdir("/A") = 0', source: 'strace' },
+        {
+          pid: 10101,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // Parent AT_FDCWD-relative openat — must resolve through /A.
+        {
+          pid: 10101,
+          line: 'openat(AT_FDCWD, "file.parent", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child AT_FDCWD-relative openat — must resolve through /B.
+        {
+          pid: 10102,
+          line: 'openat(AT_FDCWD, "file.child", O_RDONLY) = 5',
+          source: 'strace',
+        },
+        // Parent openat(8, "p") — fd 8 is parent-private; must resolve.
+        {
+          pid: 10101,
+          line: 'openat(8, "p", O_RDONLY) = 6',
+          source: 'strace',
+        },
+        // Child openat(7, "c") — fd 7 is child-private; must resolve.
+        {
+          pid: 10102,
+          line: 'openat(7, "c", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Parent attempts openat(7, "x") — fd 7 is child-private after
+        // the detach so parent has NO fd 7 (the dirfd lookup fails,
+        // producing a fail-closed read or no event).
+        {
+          pid: 10101,
+          line: 'openat(7, "x", O_RDONLY) = -1 EBADF (Bad file descriptor)',
+          source: 'strace',
+        },
+        // Child attempts openat(8, "y") — fd 8 is parent-private; child
+        // has NO fd 8.
+        {
+          pid: 10102,
+          line: 'openat(8, "y", O_RDONLY) = -1 EBADF (Bad file descriptor)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 10101 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const parentReadCwd = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file.parent' && r['pid'] === 10101;
+      });
+      expect(parentReadCwd).toHaveLength(1);
+      const childReadCwd = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file.child' && r['pid'] === 10102;
+      });
+      expect(childReadCwd).toHaveLength(1);
+      // Parent's fd 8 must resolve to /A/p.
+      const parentReadFd8 = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/p' && r['pid'] === 10101;
+      });
+      expect(parentReadFd8).toHaveLength(1);
+      // Child's fd 7 must resolve to /B/c.
+      const childReadFd7 = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/c' && r['pid'] === 10102;
+      });
+      expect(childReadFd7).toHaveLength(1);
+      // Sanity: cwds didn't leak.
+      const bleedCwd = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          ((r['path'] === '/B/file.parent' && r['pid'] === 10101) ||
+            (r['path'] === '/A/file.child' && r['pid'] === 10102))
+        );
+      });
+      expect(bleedCwd).toHaveLength(0);
+      // Sanity: fd tables didn't leak.  Parent must NOT have an fd 7
+      // entry pointing at /B (it was opened by the child AFTER detach);
+      // child must NOT have an fd 8 entry pointing at /A.
+      const bleedFd = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          ((r['path'] === '/B/x' && r['pid'] === 10101) ||
+            (r['path'] === '/A/y' && r['pid'] === 10102))
+        );
+      });
+      expect(bleedFd).toHaveLength(0);
+    });
+
+    // Test #9 — unshare(CLONE_NEWNS) in hex form (0x20000).  The numeric
+    // path of the flag parser must recognise the bit and trigger the
+    // implicit CLONE_FS detach.
+    it('unshare(0x20000 = CLONE_NEWNS) implies CLONE_FS detach via numeric parse', async () => {
+      const proc = mockProcReader({
+        10201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-newns-hex-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        10202: {
+          ppid: 10201,
+          env: {
+            npm_package_name: 'unshare-newns-hex-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 10201,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        {
+          pid: 10201,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 10202',
+          source: 'strace',
+        },
+        // Hex-encoded CLONE_NEWNS (= 0x20000).
+        { pid: 10202, line: 'unshare(0x20000) = 0', source: 'strace' },
+        { pid: 10202, line: 'chdir("/B") = 0', source: 'strace' },
+        { pid: 10201, line: 'chdir("/A") = 0', source: 'strace' },
+        {
+          pid: 10201,
+          line: 'openat(AT_FDCWD, "file.parent", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        {
+          pid: 10202,
+          line: 'openat(AT_FDCWD, "file.child", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 10201 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file.parent' && r['pid'] === 10201;
+      });
+      expect(parentRead).toHaveLength(1);
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file.child' && r['pid'] === 10202;
+      });
+      expect(childRead).toHaveLength(1);
+      const bleed = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file.parent' && r['pid'] === 10201;
+      });
+      expect(bleed).toHaveLength(0);
+    });
+
+    // Test #10 — unshare(CLONE_NEWUSER) in decimal form (268435456).
+    // The numeric path must recognise the bit and trigger BOTH the
+    // implicit CLONE_FS and CLONE_FILES detaches.
+    it('unshare(268435456 = CLONE_NEWUSER) implies CLONE_FS+CLONE_FILES detach via decimal parse', async () => {
+      const proc = mockProcReader({
+        10301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-newuser-dec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        10302: {
+          ppid: 10301,
+          env: {
+            npm_package_name: 'unshare-newuser-dec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 10301,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Parent clones with both CLONE_FS and CLONE_FILES → shared.
+        {
+          pid: 10301,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 10302',
+          source: 'strace',
+        },
+        // Decimal-encoded CLONE_NEWUSER (= 0x10000000 = 268435456).
+        { pid: 10302, line: 'unshare(268435456) = 0', source: 'strace' },
+        // Child chdir(/B) + open /B → fd 7 (private).
+        { pid: 10302, line: 'chdir("/B") = 0', source: 'strace' },
+        {
+          pid: 10302,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent chdir(/A) + open /A → fd 8 (private).
+        { pid: 10301, line: 'chdir("/A") = 0', source: 'strace' },
+        {
+          pid: 10301,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        {
+          pid: 10301,
+          line: 'openat(8, "p", O_RDONLY) = 6',
+          source: 'strace',
+        },
+        {
+          pid: 10302,
+          line: 'openat(7, "c", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Cross-pid fd lookups must fail closed (no event).
+        {
+          pid: 10301,
+          line: 'openat(7, "x", O_RDONLY) = -1 EBADF (Bad file descriptor)',
+          source: 'strace',
+        },
+        {
+          pid: 10302,
+          line: 'openat(8, "y", O_RDONLY) = -1 EBADF (Bad file descriptor)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 10301 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent fd 8 → /A/p, child fd 7 → /B/c.
+      const parentReadFd8 = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/p' && r['pid'] === 10301;
+      });
+      expect(parentReadFd8).toHaveLength(1);
+      const childReadFd7 = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/c' && r['pid'] === 10302;
+      });
+      expect(childReadFd7).toHaveLength(1);
+      // Sanity: no cross-pid fd bleed.
+      const bleedFd = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          ((r['path'] === '/B/x' && r['pid'] === 10301) ||
+            (r['path'] === '/A/y' && r['pid'] === 10302))
+        );
+      });
+      expect(bleedFd).toHaveLength(0);
+    });
   });
 });

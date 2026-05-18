@@ -26413,13 +26413,20 @@ async function runInstallPhase(input) {
           const flagsStr = (unshareMatch[1] ?? "").trim();
           const CLONE_FS = 512;
           const CLONE_FILES = 1024;
+          const CLONE_NEWNS = 131072;
+          const CLONE_NEWUSER = 268435456;
+          const parseSymbol = (t) => {
+            if (t === "CLONE_FILES") return CLONE_FILES;
+            if (t === "CLONE_FS") return CLONE_FS;
+            if (t === "CLONE_NEWNS") return CLONE_NEWNS;
+            if (t === "CLONE_NEWUSER") return CLONE_NEWUSER;
+            return 0;
+          };
           let flagsBits = 0;
           if (flagsStr.length > 0) {
             if (/^[A-Z_|\s]+$/.test(flagsStr)) {
               for (const tok of flagsStr.split("|")) {
-                const t = tok.trim();
-                if (t === "CLONE_FILES") flagsBits |= CLONE_FILES;
-                else if (t === "CLONE_FS") flagsBits |= CLONE_FS;
+                flagsBits |= parseSymbol(tok.trim());
               }
             } else if (flagsStr.startsWith("0x") || flagsStr.startsWith("0X")) {
               const n = parseInt(flagsStr, 16);
@@ -26430,9 +26437,10 @@ async function runInstallPhase(input) {
             } else {
               for (const tok of flagsStr.split("|")) {
                 const t = tok.trim();
-                if (t === "CLONE_FILES") flagsBits |= CLONE_FILES;
-                else if (t === "CLONE_FS") flagsBits |= CLONE_FS;
-                else if (t.startsWith("0x") || t.startsWith("0X")) {
+                const sym = parseSymbol(t);
+                if (sym !== 0) {
+                  flagsBits |= sym;
+                } else if (t.startsWith("0x") || t.startsWith("0X")) {
                   const n = parseInt(t, 16);
                   if (Number.isFinite(n)) flagsBits |= n;
                 } else if (/^-?\d+$/.test(t)) {
@@ -26442,10 +26450,12 @@ async function runInstallPhase(input) {
               }
             }
           }
-          if ((flagsBits & CLONE_FILES) !== 0) {
+          const detachCwd = (flagsBits & CLONE_FS) !== 0 || (flagsBits & CLONE_NEWNS) !== 0 || (flagsBits & CLONE_NEWUSER) !== 0;
+          const detachFds = (flagsBits & CLONE_FILES) !== 0 || (flagsBits & CLONE_NEWUSER) !== 0;
+          if (detachFds) {
             detachFdGroup(pid);
           }
-          if ((flagsBits & CLONE_FS) !== 0) {
+          if (detachCwd) {
             detachCwdGroup(pid);
           }
         }
