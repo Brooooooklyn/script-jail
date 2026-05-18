@@ -25850,6 +25850,9 @@ async function runInstallPhase(input) {
       const straceEvents = parseStraceLine(line, pid, 0);
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
+        if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          shimLoadedPids.delete(rawEvent.pid);
+        }
         const result = input.attribution.attribute(rawEvent.pid);
         if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.errno === void 0 && rawEvent.retFd !== void 0) {
           const canonicalForFd = canonicalizeOpenTarget(

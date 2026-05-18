@@ -726,6 +726,35 @@ export async function runInstallPhase(
       if (straceEvents === null) continue;
 
       for (const rawEvent of straceEvents) {
+        // Audit-trust Finding (high, 2026-05-19): clear the shim-trust
+        // bit on any successful spawn (execve/execveat) BEFORE doing
+        // anything else for this event.  Rationale: a pid gains
+        // shim-trust when strace observes an openat of
+        // `/lib/libscriptjail.so` from that pid — that proves ld.so
+        // mapped the shim into the ORIGINAL process image.  A
+        // subsequent successful execve REPLACES the address space; the
+        // shim mapping is gone, and unless ld.so re-maps the shim into
+        // the new image (which produces its own openat line) the new
+        // image is unshimmed.  If we kept the trust bit across exec, a
+        // raw `syscall(SYS_execve, argv, scrubbed_envp)` from a
+        // pre-trusted pid would land in an unshimmed image but still
+        // be exempted from the events-file forgery detector — letting
+        // the attacker forge JSONL into the trusted channel and cancel
+        // the strace-vs-shim exec delta.
+        //
+        // Why FIRST in the per-event handler: the dispatcher processes
+        // strace lines one at a time, so a later openat-write line
+        // arriving from the same pid is processed in a separate
+        // iteration anyway — but doing the clear at the top of THIS
+        // iteration makes the invariant explicit and robust against
+        // future refactors that batch multiple events per line.
+        // `pidCwd` is intentionally NOT cleared here: kernel CWD
+        // survives execve (per execve(2)), so the attacker's
+        // chdir(events-dir) before the exec still applies after.
+        if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
+          shimLoadedPids.delete(rawEvent.pid);
+        }
+
         const result = input.attribution.attribute(rawEvent.pid);
 
         // Audit-trust Finding A (high, 2026-05-18): kernel-observed

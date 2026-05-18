@@ -2527,6 +2527,292 @@ describe('runInstallPhase', () => {
       });
     });
 
+    // Audit-trust Finding (high, 2026-05-19) — shim-trust must NOT survive
+    // exec image replacement.  A pid becomes shim-trusted when ld.so maps
+    // `/lib/libscriptjail.so` into the ORIGINAL process image.  A
+    // subsequent successful execve replaces the address space; unless the
+    // new image is also LD_PRELOADed (which produces a fresh openat of
+    // libscriptjail.so), the new image is unshimmed.  Without clearing
+    // the trust bit on the exec syscall, the new (unshimmed) image
+    // remains exempt from the events-file forgery detector — letting
+    // the attacker forge JSONL into the trusted channel from a
+    // post-exec image.
+    describe('shim-trust cleared on successful exec (Finding, 2026-05-19)', () => {
+      it('pid loads shim, then execve to /bin/sh, then writes events file → forgery flagged', async () => {
+        const proc = mockProcReader({
+          701: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'exec-trust-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // 1. Pid 701 ld.so loads libscriptjail.so → shim-trusted.
+        // 2. Pid 701 successful execve to /bin/sh → trust cleared.
+        // 3. Pid 701 (now unshimmed; no fresh shim openat after exec)
+        //    writes events file → flagged as forgery.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 701,
+            line: `openat(AT_FDCWD, "${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 701,
+            line: 'execve("/bin/sh", ["sh"], 0x7ffd... /* 0 vars */) = 0',
+            source: 'strace',
+          },
+          {
+            pid: 701,
+            line: `openat(AT_FDCWD, "${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+      });
+
+      it('shim re-loaded after exec → trust re-established → no forgery', async () => {
+        const proc = mockProcReader({
+          702: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'shim-reloaded-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // A legitimate exec where the new image is ALSO LD_PRELOADed
+        // (LD_PRELOAD survives the exec via the inherited env, and ld.so
+        // re-maps libscriptjail.so into the new image — producing a
+        // fresh openat line).  No forgery: trust is cleared on the
+        // exec and immediately re-granted by the new openat.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 702,
+            line: `openat(AT_FDCWD, "${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 702,
+            line: 'execve("/usr/bin/node", ["node", "install.js"], 0x7ffd... /* 38 vars */) = 0',
+            source: 'strace',
+          },
+          {
+            pid: 702,
+            // ld.so in the new image re-maps the shim — trust restored.
+            line: `openat(AT_FDCWD, "${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 702,
+            line: `openat(AT_FDCWD, "${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(0);
+      });
+
+      it('failed execve does NOT clear trust (no image replacement)', async () => {
+        const proc = mockProcReader({
+          703: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'failed-exec-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // execve that returns -1 ENOENT does NOT replace the address
+        // space, so the shim mapping is still in place and trust should
+        // remain.  Only `result === 'ok'` spawns clear trust.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 703,
+            line: `openat(AT_FDCWD, "${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 703,
+            line: 'execve("/no/such/bin", ["x"], 0x7ffd...) = -1 ENOENT (No such file or directory)',
+            source: 'strace',
+          },
+          {
+            pid: 703,
+            line: `openat(AT_FDCWD, "${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(0);
+      });
+
+      it('execveat (successful) also clears trust (not just execve)', async () => {
+        const proc = mockProcReader({
+          704: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'execveat-trust-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // Same threat as execve: an attacker pid that was shim-trusted
+        // issues a raw `syscall(SYS_execveat, ...)` to swap to an
+        // unshimmed image, then forges into the events file.  The
+        // dispatcher must treat the resulting spawn event identically
+        // to execve and clear trust.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 704,
+            line: `openat(AT_FDCWD, "${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 704,
+            line: 'execveat(AT_FDCWD, "/bin/sh", ["sh"], 0x7ffd... /* 0 vars */, 0) = 0',
+            source: 'strace',
+          },
+          {
+            pid: 704,
+            line: `openat(AT_FDCWD, "${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+      });
+
+      it('pidCwd survives execve (cwd is preserved across image replacement)', async () => {
+        const proc = mockProcReader({
+          705: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'cwd-survives-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // chdir(events-dir) sets the kernel cwd.  execve preserves the
+        // cwd (per execve(2)).  After the successful exec, the
+        // post-exec image is unshimmed (trust cleared) AND can use the
+        // inherited cwd to issue a cwd-relative openat that the
+        // canonicalizer resolves to the canonical events path — so
+        // Layer 2 still catches the forgery.  If we cleared pidCwd on
+        // exec we'd miss this and only Layer 1 (basename) would catch
+        // it; this test pins that pidCwd is intentionally preserved.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 705,
+            line: `openat(AT_FDCWD, "${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 705,
+            line: 'chdir("/tmp/script-jail-events") = 0',
+            source: 'strace',
+          },
+          {
+            pid: 705,
+            line: 'execve("/bin/sh", ["sh"], 0x7ffd... /* 0 vars */) = 0',
+            source: 'strace',
+          },
+          {
+            pid: 705,
+            line: 'openat(AT_FDCWD, "events.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7',
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+        const raw = forgeries[0]!['raw'] as Record<string, unknown>;
+        // Layer 2 (canonical) resolved via inherited cwd → canonical events path.
+        expect(raw['prog']).toBe(EVENTS_FILE);
+      });
+    });
+
     it('events_file_forgery renders to <EVENTS_FILE_FORGERY> in audit_bypass via normalize', async () => {
       const ev: AttributedEvent = {
         raw: {
