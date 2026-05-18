@@ -4971,6 +4971,579 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // ===================================================================
+  // Codex follow-up regression tests (high, 2026-05-19):
+  //   #1 — root pid race: child's first event arrives before parent's
+  //   #2 — union reconciles pre-existing per-group state
+  //   #3 — close_range honours CLOSE_RANGE_UNSHARE
+  // ===================================================================
+  describe('codex follow-up #1/#2/#3 regression', () => {
+    const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
+
+    // Bug #1 — race revisited at the dispatcher layer (not the
+    // /proc/<strace_pid>/task/.../children layer, which is exercised in
+    // the runner unit tests).  The dispatcher's contract is that ONLY
+    // the runner-reported root pid receives the input.cwd seed; a child
+    // whose event arrives BEFORE the parent's MUST NOT be silently
+    // certified.
+    it('root-pid race: child event before parent does NOT mis-seed child cwd (bug #1, dispatcher contract)', async () => {
+      const proc = mockProcReader({
+        7001: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7002: {
+          ppid: 7001,
+          env: {
+            npm_package_name: 'race-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      // Runner reports pid 7001 as the root; child 7002 emits FIRST.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child's relative openat lands before parent's strace lines.
+        // Pre-fix the "first observed pid wins" heuristic would seed
+        // pidCwd[7002] = /work, resolving to /work/.ssh/id_rsa.  Post-
+        // fix the child gets no seed (the runner says 7001 is root,
+        // and 7002 has no observed clone parent yet) and the openat
+        // fails closed.
+        {
+          pid: 7002,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // Parent's first event arrives later.  The seed lands on 7001.
+        {
+          pid: 7001,
+          line: 'openat(AT_FDCWD, "package.json", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7001 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child's probe was NOT silently certified as /work/.ssh/id_rsa.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa' && r['pid'] === 7002;
+      });
+      expect(stale).toHaveLength(0);
+      // Parent's relative open resolved against input.cwd → /work/package.json.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/package.json' && r['pid'] === 7001;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child's openat surfaced as <UNRESOLVED_PATH>.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7002;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Bug #2 — union reconciliation:
+    //  (a) child chdir before parent's clone — child's cwd MUST be
+    //      adopted into the merged group rather than orphaned.  The
+    //      parent here is NOT the install root (rootPid=7100, never
+    //      yielded) so it carries no input.cwd seed; this isolates the
+    //      "child-only state pre-union" case the codex spec calls out.
+    it('union reconciles: child chdir before parent clone(CLONE_FS) keeps child cwd (bug #2.a)', async () => {
+      const proc = mockProcReader({
+        7101: {
+          ppid: 7100,
+          env: {
+            npm_package_name: 'union-recon-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7102: {
+          ppid: 7101,
+          env: {
+            npm_package_name: 'union-recon-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child chdir BEFORE the clone line is observed.  Pre-fix this
+        // landed under pidCwd[<child-pre-union-root>] and was orphaned
+        // when the parent's clone CLONE_FS arrived.  Post-fix the
+        // union reconciles the child's cwd into the merged group.
+        {
+          pid: 7102,
+          line: 'chdir("/root") = 0',
+          source: 'strace',
+        },
+        // Parent's CLONE_FS clone is observed AFTER the child's chdir.
+        {
+          pid: 7101,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD, child_tidptr=0x7f...) = 7102',
+          source: 'strace',
+        },
+        // Parent's AT_FDCWD-relative openat MUST resolve through /root
+        // (shared cwd group adopted the child's /root cwd).
+        {
+          pid: 7101,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        // rootPid 7100 is never yielded, so neither 7101 nor 7102
+        // receives the input.cwd seed — we isolate the union state
+        // reconciliation logic.
+        strace: cannedStraceRunner(records, 0, { rootPid: 7100 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent's probe MUST resolve to /root/.ssh/id_rsa with hidden=true.
+      const hits = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          r['path'] === '/root/.ssh/id_rsa' &&
+          r['pid'] === 7101 &&
+          r['hidden'] === true
+        );
+      });
+      expect(hits).toHaveLength(1);
+      // Pre-fix the orphaned child cwd would have left the parent with
+      // NO tracked cwd — relative openat would have failed closed.
+      // Post-fix the union adopted /root → parent resolves correctly.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+    });
+
+    //  (b) differing cwds on both sides → merged group is cwdUnknown,
+    //      subsequent relative open fails closed.
+    it('union reconciles: differing parent/child cwds before clone(CLONE_FS) → cwdUnknown (bug #2.b)', async () => {
+      const proc = mockProcReader({
+        7201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'union-ambig-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7202: {
+          ppid: 7201,
+          env: {
+            npm_package_name: 'union-ambig-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 7201,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Both pids chdir to DIFFERENT absolute paths BEFORE the clone
+        // CLONE_FS line.  Post-union the merged group is cwdUnknown.
+        {
+          pid: 7201,
+          line: 'chdir("/B") = 0',
+          source: 'strace',
+        },
+        {
+          pid: 7202,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        {
+          pid: 7201,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES, child_tidptr=0x7f...) = 7202',
+          source: 'strace',
+        },
+        // Parent's AT_FDCWD-relative openat now fails closed
+        // (cwdUnknown → canonicalizeForEmit returns null).
+        {
+          pid: 7201,
+          line: 'openat(AT_FDCWD, "secret.key", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7201 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Relative open MUST NOT be certified against either /A or /B or /work.
+      const certified = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          (r['path'] === '/A/secret.key' || r['path'] === '/B/secret.key' || r['path'] === '/work/secret.key')
+        );
+      });
+      expect(certified).toHaveLength(0);
+      // <UNRESOLVED_PATH> is surfaced via the exec audit_bypass synth.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7201;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    //  (c) fd-table union — child opens fd 7→/A, parent opens fd 8→/B,
+    //      then clone(CLONE_FILES).  Merged group has BOTH entries.
+    it('union reconciles fd table: child fd7→/A + parent fd8→/B + clone(CLONE_FILES) → both keys live (bug #2 fd)', async () => {
+      const proc = mockProcReader({
+        7301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fd-union-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7302: {
+          ppid: 7301,
+          env: {
+            npm_package_name: 'fd-union-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child opens /A as fd 7 BEFORE clone is observed.
+        {
+          pid: 7302,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent opens /B as fd 8.
+        {
+          pid: 7301,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // Clone with CLONE_FILES merges the fd tables.
+        {
+          pid: 7301,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD, child_tidptr=0x7f...) = 7302',
+          source: 'strace',
+        },
+        // Parent reads via fd 7 (child's entry) — resolves to /A.
+        {
+          pid: 7301,
+          line: 'openat(7, "leaf-a", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child reads via fd 8 (parent's entry) — resolves to /B.
+        {
+          pid: 7302,
+          line: 'openat(8, "leaf-b", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7301 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const aHit = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/leaf-a' && r['pid'] === 7301;
+      });
+      expect(aHit).toHaveLength(1);
+      const bHit = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/leaf-b' && r['pid'] === 7302;
+      });
+      expect(bHit).toHaveLength(1);
+    });
+
+    //  (d) fd conflict — both sides have fd 7 mapped to different
+    //      paths.  Merged entry is dropped → openat(7, ...) fails
+    //      closed.
+    it('union reconciles fd table: same fd / different paths → entry dropped (bug #2 fd-conflict)', async () => {
+      const proc = mockProcReader({
+        7401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fd-conflict-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7402: {
+          ppid: 7401,
+          env: {
+            npm_package_name: 'fd-conflict-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child opens /A as fd 7.
+        {
+          pid: 7402,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent opens /B as fd 7 (same fd, different dir) — only
+        // possible because the two pids are NOT yet in a shared fd
+        // group; once we observe the clone CLONE_FILES line we have
+        // a conflict.
+        {
+          pid: 7401,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Clone with CLONE_FILES — union encounters conflicting fd 7.
+        {
+          pid: 7401,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 7402',
+          source: 'strace',
+        },
+        // Parent's openat(7, ...) MUST fail closed post-union.
+        {
+          pid: 7401,
+          line: 'openat(7, "leaf", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7401 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const certified = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && (r['path'] === '/A/leaf' || r['path'] === '/B/leaf');
+      });
+      expect(certified).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7401;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #3 — CLOSE_RANGE_UNSHARE:
+    //  parent + child share fd table; child close_range(... UNSHARE).
+    //  Parent retains its fd; child loses it.
+    it('close_range(... CLOSE_RANGE_UNSHARE) detaches caller — parent fd survives, child fd dies (bug #3)', async () => {
+      const proc = mockProcReader({
+        7501: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7502: {
+          ppid: 7501,
+          env: {
+            npm_package_name: 'unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /pkg as fd 7.
+        {
+          pid: 7501,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FILES → child shares fd table.
+        {
+          pid: 7501,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 7502',
+          source: 'strace',
+        },
+        // Child detaches via close_range(3, INT_MAX, CLOSE_RANGE_UNSHARE).
+        {
+          pid: 7502,
+          line: 'close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0',
+          source: 'strace',
+        },
+        // Parent's openat(7, ...) MUST still resolve to /pkg.
+        {
+          pid: 7501,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child's openat(7, ...) MUST fail closed.
+        {
+          pid: 7502,
+          line: 'openat(7, "file", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7501 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file' && r['pid'] === 7501;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child's openat(7, ...) was dropped; <UNRESOLVED_PATH> surfaced.
+      const childCertified = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file' && r['pid'] === 7502;
+      });
+      expect(childCertified).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7502;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #3 — close_range WITHOUT UNSHARE on a shared fd group: BOTH
+    // sides lose the fd.
+    it('close_range(... 0) on shared group: BOTH parent and child lose fd (bug #3 sanity)', async () => {
+      const proc = mockProcReader({
+        7601: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'no-unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7602: {
+          ppid: 7601,
+          env: {
+            npm_package_name: 'no-unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 7601,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        {
+          pid: 7601,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 7602',
+          source: 'strace',
+        },
+        // close_range without UNSHARE — both sides lose fd 7.
+        {
+          pid: 7602,
+          line: 'close_range(3, 4294967295, 0) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 7601,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        {
+          pid: 7602,
+          line: 'openat(7, "file", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7601 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const certified = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file';
+      });
+      expect(certified).toHaveLength(0);
+      // Both pids surface <UNRESOLVED_PATH>.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'exec' &&
+          r['unresolved_path'] === true &&
+          (r['pid'] === 7601 || r['pid'] === 7602)
+        );
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
   describe('parseShimLine (exported for testing)', () => {
     it('parses env_read lines', async () => {
       // Import parseShimLine directly

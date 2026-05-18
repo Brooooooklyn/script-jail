@@ -2125,6 +2125,11 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     const fakeChild: SpawnResult = {
       stderr: fakeStderr,
       stdio: [null, null, fakeStderr, fakeFd3],
+      // bug #1 (2026-05-19): SpawnResult now exposes pid so the runner
+      // can read /proc/<pid>/task/<pid>/children to identify strace's
+      // direct child.  undefined here keeps the runner on the fallback
+      // path (the per-pid file observation heuristic).
+      pid: undefined,
       on(event: string, listener: unknown) {
         if (event === 'close') closeListener = listener as (code: number | null) => void;
         if (event === 'error') errorListener = listener as (err: Error) => void;
@@ -2256,5 +2261,31 @@ describe('runStraceTailer cleanup on early break', () => {
     } finally {
       (globalThis as Record<string, unknown>)['clearInterval'] = realClearInterval;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex follow-up (bug #1, 2026-05-19): readStraceChildPid — deterministic
+// resolution of strace's direct child pid via /proc/<pid>/task/<pid>/children
+// ---------------------------------------------------------------------------
+
+describe('readStraceChildPid', () => {
+  it('returns null when /proc is unavailable for the given pid', async () => {
+    // Pid 0 is not a real process on Linux; /proc/0 does not exist, so
+    // every readFileSync attempt will throw and the loop will exit
+    // after the deadline.  Set a short deadline to keep the test fast.
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    const result = readStraceChildPid(0, 15);
+    expect(result).toBeNull();
+  });
+
+  it('returns null when the deadline expires (very short deadline)', async () => {
+    // Pass a pid that almost certainly has no children (process.pid
+    // itself is the test runner; the children file may be non-empty
+    // BUT we use a 0ms deadline so the loop exits on the first
+    // Date.now() check without reading anything).
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    const result = readStraceChildPid(process.pid, 0);
+    expect(result).toBeNull();
   });
 });

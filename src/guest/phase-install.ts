@@ -520,21 +520,123 @@ export async function runInstallPhase(
     compressFd(pid, r);
     return r;
   }
-  // Union two pids into the same group.  Caller chooses semantics:
-  // for cwd vs fd groups they may differ.  We always union the
-  // CHILD's root onto the PARENT's root (so the parent's existing
-  // group state is preserved).
+  // Union two pids into the same group.  We always union the CHILD's
+  // root onto the PARENT's root so the parent's group remains the
+  // canonical representative.
+  //
+  // Codex follow-up (bug #2, high, 2026-05-19): the original
+  // implementations only re-pointed the parent-pointer map.  Per-key
+  // state already accumulated under the CHILD's pre-union root was
+  // silently orphaned — any pidCwd / pidCwdUnknown / dirfdTable /
+  // dirfdStateUnknown entries keyed on the child's old root became
+  // unreachable after the union, because every accessor now resolves
+  // both pids to the parent's root.
+  //
+  // Why this matters: strace per-pid files are drained out of order by
+  // the production tailer (readdirSync + fs.watch is FS-dependent).  A
+  // child can emit `chdir("/root")` BEFORE the parent's
+  // `clone(..., CLONE_FS, ...)` line is observed.  Pre-fix we'd:
+  //   1. set pidCwd[<child-old-root>] = "/root"
+  //   2. later observe the clone, run `cwdParent[<child-old-root>] =
+  //      <parent-root>` — the cwd entry under the old key is now
+  //      orphaned, and cwdGet(child) returns undefined (or
+  //      input.cwd from the parent's seed) → wrong.
+  // Post-fix we reconcile per-key state INTO the parent's group at
+  // union time.
+  //
+  // Reconciliation rules:
+  //   - cwd: child-only → keep child value; parent-only → keep parent's
+  //     (already in place); both & equal → keep; both & differ → set
+  //     cwdUnknown (state ambiguity is a fail-closed signal); unknown
+  //     on EITHER side propagates to the merged group.
+  //   - dirfdTable: union of entries; same fd / same path → keep; same
+  //     fd / different paths → drop that fd (downstream openat(<fd>,
+  //     ...) fails closed via the missing-entry path); fdUnknown on
+  //     EITHER side propagates.
   function unionCwd(parentPid: number, childPid: number): void {
     const pr = rootedCwd(parentPid);
     const cr = rootedCwd(childPid);
     if (pr === cr) return;
+    // Snapshot pre-union state on both sides.  `pidCwd`/`pidCwdUnknown`
+    // are keyed by group root (the SAME map slot the accessors below
+    // resolve to).
+    const parentCwd = pidCwd.get(pr);
+    const childCwd = pidCwd.get(cr);
+    const parentUnknown = pidCwdUnknown.has(pr);
+    const childUnknown = pidCwdUnknown.has(cr);
+    // Re-point first so subsequent set/delete operations resolve into
+    // the merged group (parent's root).
     cwdParent.set(cr, pr);
+    // Remove the orphaned child-root entries — they would otherwise
+    // remain in the map and waste memory, and become "live" again if a
+    // future pid happens to be assigned the same number.
+    if (childCwd !== undefined) pidCwd.delete(cr);
+    if (childUnknown) pidCwdUnknown.delete(cr);
+    // Reconcile cwd value.
+    if (childCwd !== undefined && parentCwd === undefined) {
+      // Child-only: adopt child's cwd into merged group.
+      pidCwd.set(pr, childCwd);
+    } else if (childCwd !== undefined && parentCwd !== undefined) {
+      if (childCwd !== parentCwd) {
+        // Ambiguous (parent and child saw different cwds before the
+        // shared-fs declaration).  Fail closed: drop the value and
+        // mark unknown.
+        pidCwd.delete(pr);
+        pidCwdUnknown.add(pr);
+      }
+      // else: equal → already in place, nothing to do.
+    }
+    // Unknown bit propagates.
+    if (childUnknown || parentUnknown) pidCwdUnknown.add(pr);
   }
   function unionFd(parentPid: number, childPid: number): void {
     const pr = rootedFd(parentPid);
     const cr = rootedFd(childPid);
     if (pr === cr) return;
+    // Snapshot pre-union fd-table entries on both sides.  Keys are
+    // formatted `<root>:<fd>` — collect by root prefix.
+    const parentPrefix = `${pr}:`;
+    const childPrefix = `${cr}:`;
+    const parentFds = new Map<string, string>(); // fd-suffix → path
+    const childFds = new Map<string, string>();
+    for (const [key, val] of dirfdTable) {
+      if (key.startsWith(parentPrefix)) {
+        parentFds.set(key.slice(parentPrefix.length), val);
+      } else if (key.startsWith(childPrefix)) {
+        childFds.set(key.slice(childPrefix.length), val);
+        // Delete child-root entries; they'll be re-keyed under the
+        // merged root below.
+        dirfdTable.delete(key);
+      }
+    }
+    const childFdUnknown = dirfdStateUnknown.has(cr);
+    const parentFdUnknown = dirfdStateUnknown.has(pr);
+    // Re-point parent pointer after we've finished iterating the map
+    // (so the iteration above sees the pre-union roots).
     fdParent.set(cr, pr);
+    // Merge child-only fds into the parent group.
+    for (const [fdSuffix, childVal] of childFds) {
+      const mergedKey = `${pr}:${fdSuffix}`;
+      const parentVal = parentFds.get(fdSuffix);
+      if (parentVal === undefined) {
+        // Child-only fd → adopt unchanged.
+        dirfdTable.set(mergedKey, childVal);
+      } else if (parentVal === childVal) {
+        // Same fd, same path on both sides — parent's entry is already
+        // in `dirfdTable` under `mergedKey` (parentPrefix === merged
+        // prefix), so nothing to do.
+      } else {
+        // Same fd, DIFFERENT paths — ambiguous.  Fail closed: drop the
+        // entry entirely.  Subsequent openat(<fd>, ...) returns
+        // `undefined` from dirfdTable.get and canonicalizes to null,
+        // producing a `<UNRESOLVED_PATH>` synth.
+        dirfdTable.delete(mergedKey);
+      }
+    }
+    // dirfdStateUnknown propagation: either side's unknown bit taints
+    // the merged group.
+    if (childFdUnknown) dirfdStateUnknown.delete(cr);
+    if (childFdUnknown || parentFdUnknown) dirfdStateUnknown.add(pr);
   }
 
   // Per-pid (really per-fd-group) fd table: maps a kernel-assigned file
@@ -1363,30 +1465,146 @@ export async function runInstallPhase(
         }
         continue;
       }
+      // Codex follow-up (bug #3, high, 2026-05-19): parse the optional
+      // flags argument too.  `close_range(2)` (Linux 5.9+) defines:
+      //   CLOSE_RANGE_UNSHARE  — detach the caller's fd table from any
+      //                          shared group BEFORE closing.
+      //   CLOSE_RANGE_CLOEXEC  — set FD_CLOEXEC instead of closing
+      //                          (we don't model FD_CLOEXEC; it has no
+      //                          effect on our dirfdTable).
+      // Strace renders the flags as a `|`-separated identifier list:
+      //   close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0
+      //   close_range(3, ~0U, CLOSE_RANGE_CLOEXEC|CLOSE_RANGE_UNSHARE) = 0
+      //   close_range(3, 4294967295, 0) = 0
+      //   close_range(3, 4294967295) = 0   (no flags arg — older kernels)
+      // We capture the bare flags string and parse it for UNSHARE
+      // membership.
       const closeRangeMatch = line.match(
-        /^close_range\((-?\d+)\s*,\s*(-?\d+|0x[0-9a-fA-F]+)(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/,
+        /^close_range\((-?\d+)\s*,\s*(-?\d+|0x[0-9a-fA-F]+|~?\d+U?)(?:\s*,\s*([^)]*))?\)\s*=\s*(-?\d+)\b/,
       );
       if (closeRangeMatch !== null) {
-        const rc = parseInt(closeRangeMatch[3] ?? '', 10);
+        const rc = parseInt(closeRangeMatch[4] ?? '', 10);
         if (Number.isFinite(rc) && rc === 0) {
           const first = parseInt(closeRangeMatch[1] ?? '', 10);
           const lastRaw = closeRangeMatch[2] ?? '';
-          const last = lastRaw.startsWith('0x')
-            ? parseInt(lastRaw, 16)
-            : parseInt(lastRaw, 10);
+          // Accept hex (0x...), decimal, and the strace `~0U` shorthand
+          // for UINT_MAX (which some glibc builds emit instead of the
+          // raw decimal 4294967295).
+          let last: number;
+          if (lastRaw.startsWith('0x')) {
+            last = parseInt(lastRaw, 16);
+          } else if (lastRaw === '~0U' || lastRaw === '~0' || lastRaw === '~0u') {
+            last = 0xffffffff;
+          } else {
+            last = parseInt(lastRaw, 10);
+          }
+          // Parse flags token.  Empty / missing → flags = 0.  Numeric
+          // (decimal or hex) is treated as a bit-set test.  Identifier
+          // form is a pipe-separated set we check by name.
+          const flagsStr = (closeRangeMatch[3] ?? '').trim();
+          let hasUnshare = false;
+          if (flagsStr.length > 0 && flagsStr !== '0') {
+            // Identifier form.
+            for (const tok of flagsStr.split('|')) {
+              const t = tok.trim();
+              if (t === 'CLOSE_RANGE_UNSHARE') hasUnshare = true;
+              // CLOSE_RANGE_CLOEXEC: ignored (we don't model
+              // FD_CLOEXEC; the kernel sets the bit, fds remain in the
+              // table until exec() processes them, but our dirfdTable
+              // only tracks O_DIRECTORY mappings created via openat
+              // — close_range with CLOEXEC is functionally a no-op
+              // for our resolution).
+            }
+            // Hex bitmask form (e.g. `0x2`): test the UNSHARE bit
+            // (CLOSE_RANGE_UNSHARE = 1<<1 = 0x2).
+            if (flagsStr.startsWith('0x')) {
+              const n = parseInt(flagsStr, 16);
+              if (Number.isFinite(n) && (n & 0x2) !== 0) hasUnshare = true;
+            }
+          }
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
-            // Iterate over the MAP entries for this fd-group only —
-            // avoid O(last) work when last is UINT_MAX (4294967295),
-            // the common "close all fds above first" idiom.  Keys are
-            // formatted as `<fdGroupRoot>:<fd>`, so we anchor on the
-            // resolved root for this pid.
-            const groupPrefix = `${rootedFd(pid)}:`;
-            for (const key of dirfdTable.keys()) {
-              if (!key.startsWith(groupPrefix)) continue;
-              const fdStr = key.slice(groupPrefix.length);
-              const fd = parseInt(fdStr, 10);
-              if (Number.isFinite(fd) && fd >= first && fd <= last) {
-                dirfdTable.delete(key);
+            if (hasUnshare) {
+              // Detach the caller into a private fd group BEFORE
+              // closing.  Semantics: the kernel allocates a fresh
+              // `struct files_struct` for the calling task, copies the
+              // shared group's fd table into it, then performs the
+              // close range on the private copy.  The old shared group
+              // (now without this pid) keeps its full state intact —
+              // siblings can still use any fds that were closed only
+              // in the caller's new private group.
+              //
+              // Implementation:
+              //   1. Snapshot the SHARED group's dirfdTable + state
+              //      flags.
+              //   2. Re-parent the caller to itself (becomes its own
+              //      fd-group root).
+              //   3. Copy the snapshotted state into the new private
+              //      group.
+              //   4. Apply the close range to the new private group
+              //      only.
+              const sharedRoot = rootedFd(pid);
+              const callerCurrentParent = fdParent.get(pid);
+              if (sharedRoot !== pid) {
+                // Snapshot shared-group state under sharedRoot.
+                const sharedPrefix = `${sharedRoot}:`;
+                const snapshot: Array<[string, string]> = [];
+                for (const [key, val] of dirfdTable) {
+                  if (key.startsWith(sharedPrefix)) {
+                    snapshot.push([key.slice(sharedPrefix.length), val]);
+                  }
+                }
+                const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+                // Detach: pid becomes its own root.  fdParent.delete
+                // is enough — findFdRoot returns the pid itself when
+                // there's no parent pointer.
+                fdParent.delete(pid);
+                // Copy snapshot into pid's NEW private group.
+                for (const [fdSuffix, val] of snapshot) {
+                  dirfdTable.set(`${pid}:${fdSuffix}`, val);
+                }
+                if (sharedUnknown) dirfdStateUnknown.add(pid);
+                // NOTE: we do NOT touch the shared group's entries —
+                // sharedRoot still maps to all the original fds; any
+                // sibling pid that resolves via findFdRoot to
+                // sharedRoot retains full access.  This is the whole
+                // point of CLOSE_RANGE_UNSHARE.
+              }
+              // (If sharedRoot === pid, the caller was ALREADY its
+              // own root — nothing to detach.  Fall through and
+              // close on its own group.)
+              // Now close the range against the caller's group (which
+              // is either the brand-new private group or the original
+              // singleton group).
+              const groupPrefix = `${rootedFd(pid)}:`;
+              for (const key of dirfdTable.keys()) {
+                if (!key.startsWith(groupPrefix)) continue;
+                const fdStr = key.slice(groupPrefix.length);
+                const fd = parseInt(fdStr, 10);
+                if (Number.isFinite(fd) && fd >= first && fd <= last) {
+                  dirfdTable.delete(key);
+                }
+              }
+              // Suppress unused-warning for callerCurrentParent — we
+              // captured it for diagnostic clarity in the comment
+              // above; the value isn't otherwise needed because
+              // fdParent.delete handles all the union-find bookkeeping.
+              void callerCurrentParent;
+            } else {
+              // Pre-existing behaviour: close the range on the caller's
+              // (possibly shared) group.  Siblings observe the closes.
+              // Iterate over the MAP entries for this fd-group only —
+              // avoid O(last) work when last is UINT_MAX (4294967295),
+              // the common "close all fds above first" idiom.  Keys are
+              // formatted as `<fdGroupRoot>:<fd>`, so we anchor on the
+              // resolved root for this pid.
+              const groupPrefix = `${rootedFd(pid)}:`;
+              for (const key of dirfdTable.keys()) {
+                if (!key.startsWith(groupPrefix)) continue;
+                const fdStr = key.slice(groupPrefix.length);
+                const fd = parseInt(fdStr, 10);
+                if (Number.isFinite(fd) && fd >= first && fd <= last) {
+                  dirfdTable.delete(key);
+                }
               }
             }
           }

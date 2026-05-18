@@ -962,6 +962,16 @@ export interface SpawnResult {
   stderr: NodeJS.ReadableStream | null;
   /** stdio[3] is the fd-3 pipe (LD_PRELOAD JSONL). */
   stdio: Array<NodeJS.ReadableStream | null | undefined>;
+  /**
+   * The strace process pid.  Used by the runner (bug #1 fix,
+   * 2026-05-19) to query `/proc/<pid>/task/<pid>/children` and
+   * deterministically resolve the install command's pid (strace's
+   * direct child) without depending on per-pid strace file discovery
+   * order.  `undefined` when spawn failed catastrophically (e.g.
+   * ENOENT on the strace binary) — the runner falls back to the
+   * tailer's "first per-pid file observed" heuristic in that case.
+   */
+  pid: number | undefined;
   on(event: 'close', listener: (code: number | null) => void): this;
   on(event: 'error', listener: (err: Error) => void): this;
 }
@@ -972,6 +982,78 @@ export type SpawnImpl = (
   args: string[],
   opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: Array<string> },
 ) => SpawnResult;
+
+/**
+ * Codex follow-up (bug #1, high, 2026-05-19): deterministically resolve the
+ * pid of strace's direct child by polling
+ * `/proc/<stracePid>/task/<stracePid>/children` for ≤ `deadlineMs` (default
+ * 50ms, ≤10 iterations).  Strace's direct child IS the install command —
+ * `execve(install_cmd, ...)` happens under `PTRACE_TRACEME` immediately
+ * after fork() — so as soon as the children file contains exactly one pid
+ * we have the install root.
+ *
+ * Returns:
+ *   - the child pid on success,
+ *   - `null` when the deadline expires without a single pid appearing,
+ *   - `null` when MORE THAN ONE pid appears (ambiguous, e.g. strace itself
+ *     spawned a helper thread; the dispatcher's null path is the safe
+ *     conservative behaviour),
+ *   - `null` when `/proc` is unavailable (some test sandboxes, non-Linux
+ *     reads).
+ *
+ * Blocking is intentional: this runs ONCE per install, at agent startup
+ * before any user-visible work, in a sub-100ms window.  The event loop
+ * isn't carrying meaningful traffic at this point — the strace child has
+ * just been fork()'d and hasn't yet emitted any per-pid file output for
+ * the tailer to drain.
+ *
+ * Exported only so unit tests can exercise the parser without spawning
+ * a real strace.
+ */
+export function readStraceChildPid(
+  stracePid: number,
+  deadlineMs = 50,
+): number | null {
+  const start = Date.now();
+  // Cap iterations defensively in case `Date.now()` is somehow non-
+  // monotonic in the runtime (a virtualisation quirk we don't see today
+  // but is cheap to guard against).
+  for (let iter = 0; iter < 10; iter++) {
+    if (Date.now() - start >= deadlineMs) break;
+    let raw: string;
+    try {
+      raw = readFileSync(
+        `/proc/${stracePid}/task/${stracePid}/children`,
+        'utf8',
+      ).trim();
+    } catch {
+      // strace hasn't yet fork'd its child, or /proc is unavailable.
+      // Brief synchronous backoff via a tight busy-wait keyed on
+      // Date.now(); the deadline check above bounds total time.
+      const sleepStart = Date.now();
+      while (Date.now() - sleepStart < 5) { /* spin */ }
+      continue;
+    }
+    if (raw.length === 0) {
+      // No child observed yet — wait briefly and re-poll.  Same backoff
+      // strategy as the catch branch above.
+      const sleepStart = Date.now();
+      while (Date.now() - sleepStart < 5) { /* spin */ }
+      continue;
+    }
+    const pids = raw
+      .split(/\s+/)
+      .filter((s) => s.length > 0)
+      .map((s) => parseInt(s, 10))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (pids.length === 1) return pids[0] ?? null;
+    // Ambiguous (multiple children) — fail closed.
+    if (pids.length > 1) return null;
+    const sleepStart = Date.now();
+    while (Date.now() - sleepStart < 5) { /* spin */ }
+  }
+  return null;
+}
 
 export class LinuxStraceRunner implements StraceRunner {
   private _exitCode = 0;
@@ -1150,6 +1232,46 @@ export class LinuxStraceRunner implements StraceRunner {
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
       stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
     });
+
+    // Codex follow-up (bug #1, high, 2026-05-19): deterministically capture
+    // the install command's pid by reading `/proc/<strace_pid>/task/<strace_
+    // pid>/children` immediately after spawn.  strace's direct child IS the
+    // install command (strace exec'd it under PTRACE_TRACEME), so as soon as
+    // exactly one pid appears in the children file we have the install root.
+    //
+    // Why this beats the prior "first per-pid file observed" heuristic:
+    // strace writes one file per traced pid via `-ff -o <basePath>`.  The
+    // tailer polls the directory with readdirSync() + fs.watch(); readdir
+    // order is filesystem-dependent and fs.watch events are coalesced by
+    // the kernel.  Under load — or simply on tmpfs where dirents come back
+    // in inode order — a forked child's per-pid file can be discovered
+    // BEFORE the strace-root's.  Pre-fix we'd seed pidCwd[<child>] =
+    // input.cwd, certifying a wrong cwd for the child (whose actual cwd
+    // was inherited from a chdir'd parent) and slipping AT_FDCWD-relative
+    // probes past protected-paths.
+    //
+    // The /proc query is bounded (≤50ms / ≤10 iterations).  On the
+    // production guest, strace forks its child within a single scheduler
+    // quantum, so the loop usually completes on the first iteration.  We
+    // fall back to the per-pid-file heuristic (kept intact below) when:
+    //   - child.pid is undefined (spawn failed catastrophically),
+    //   - /proc is unavailable (some test sandboxes),
+    //   - children remains empty for the full deadline,
+    //   - or multiple children appear simultaneously (ambiguous → fail
+    //     closed; the dispatcher's missing-rootPid path resolves nothing
+    //     for cwd seeding and every pid falls through to clone-propagation
+    //     or the conservative `<UNRESOLVED_PATH>` synth).
+    //
+    // First-writer-wins between the /proc path and the file-observation
+    // fallback: whichever sets `this._rootPid` first sticks.  Typically
+    // the /proc path wins because the children file is populated by the
+    // kernel during clone(), well before strace has had a chance to
+    // PTRACE_SYSCALL through to the install command's first userspace
+    // syscall.
+    if (child.pid !== undefined && this._rootPid === null) {
+      const pid = readStraceChildPid(child.pid);
+      if (pid !== null) this._rootPid = pid;
+    }
 
     const exitPromise = new Promise<void>((resolve) => {
       child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });

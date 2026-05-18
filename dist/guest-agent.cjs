@@ -10354,6 +10354,7 @@ __export(agent_exports, {
   buildChildEnv: () => buildChildEnv,
   createEventsFile: () => createEventsFile,
   main: () => main,
+  readStraceChildPid: () => readStraceChildPid,
   runStraceTailer: () => runStraceTailer
 });
 module.exports = __toCommonJS(agent_exports);
@@ -25942,13 +25943,54 @@ async function runInstallPhase(input) {
     const pr = rootedCwd(parentPid);
     const cr = rootedCwd(childPid);
     if (pr === cr) return;
+    const parentCwd = pidCwd.get(pr);
+    const childCwd = pidCwd.get(cr);
+    const parentUnknown = pidCwdUnknown.has(pr);
+    const childUnknown = pidCwdUnknown.has(cr);
     cwdParent.set(cr, pr);
+    if (childCwd !== void 0) pidCwd.delete(cr);
+    if (childUnknown) pidCwdUnknown.delete(cr);
+    if (childCwd !== void 0 && parentCwd === void 0) {
+      pidCwd.set(pr, childCwd);
+    } else if (childCwd !== void 0 && parentCwd !== void 0) {
+      if (childCwd !== parentCwd) {
+        pidCwd.delete(pr);
+        pidCwdUnknown.add(pr);
+      }
+    }
+    if (childUnknown || parentUnknown) pidCwdUnknown.add(pr);
   }
   function unionFd(parentPid, childPid) {
     const pr = rootedFd(parentPid);
     const cr = rootedFd(childPid);
     if (pr === cr) return;
+    const parentPrefix = `${pr}:`;
+    const childPrefix = `${cr}:`;
+    const parentFds = /* @__PURE__ */ new Map();
+    const childFds = /* @__PURE__ */ new Map();
+    for (const [key, val] of dirfdTable) {
+      if (key.startsWith(parentPrefix)) {
+        parentFds.set(key.slice(parentPrefix.length), val);
+      } else if (key.startsWith(childPrefix)) {
+        childFds.set(key.slice(childPrefix.length), val);
+        dirfdTable.delete(key);
+      }
+    }
+    const childFdUnknown = dirfdStateUnknown.has(cr);
+    const parentFdUnknown = dirfdStateUnknown.has(pr);
     fdParent.set(cr, pr);
+    for (const [fdSuffix, childVal] of childFds) {
+      const mergedKey = `${pr}:${fdSuffix}`;
+      const parentVal = parentFds.get(fdSuffix);
+      if (parentVal === void 0) {
+        dirfdTable.set(mergedKey, childVal);
+      } else if (parentVal === childVal) {
+      } else {
+        dirfdTable.delete(mergedKey);
+      }
+    }
+    if (childFdUnknown) dirfdStateUnknown.delete(cr);
+    if (childFdUnknown || parentFdUnknown) dirfdStateUnknown.add(pr);
   }
   const dirfdTable = /* @__PURE__ */ new Map();
   const fdKey = (pid, fd) => `${rootedFd(pid)}:${fd}`;
@@ -26172,22 +26214,71 @@ async function runInstallPhase(input) {
         continue;
       }
       const closeRangeMatch = line.match(
-        /^close_range\((-?\d+)\s*,\s*(-?\d+|0x[0-9a-fA-F]+)(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/
+        /^close_range\((-?\d+)\s*,\s*(-?\d+|0x[0-9a-fA-F]+|~?\d+U?)(?:\s*,\s*([^)]*))?\)\s*=\s*(-?\d+)\b/
       );
       if (closeRangeMatch !== null) {
-        const rc = parseInt(closeRangeMatch[3] ?? "", 10);
+        const rc = parseInt(closeRangeMatch[4] ?? "", 10);
         if (Number.isFinite(rc) && rc === 0) {
           const first = parseInt(closeRangeMatch[1] ?? "", 10);
           const lastRaw = closeRangeMatch[2] ?? "";
-          const last = lastRaw.startsWith("0x") ? parseInt(lastRaw, 16) : parseInt(lastRaw, 10);
+          let last;
+          if (lastRaw.startsWith("0x")) {
+            last = parseInt(lastRaw, 16);
+          } else if (lastRaw === "~0U" || lastRaw === "~0" || lastRaw === "~0u") {
+            last = 4294967295;
+          } else {
+            last = parseInt(lastRaw, 10);
+          }
+          const flagsStr = (closeRangeMatch[3] ?? "").trim();
+          let hasUnshare = false;
+          if (flagsStr.length > 0 && flagsStr !== "0") {
+            for (const tok of flagsStr.split("|")) {
+              const t = tok.trim();
+              if (t === "CLOSE_RANGE_UNSHARE") hasUnshare = true;
+            }
+            if (flagsStr.startsWith("0x")) {
+              const n = parseInt(flagsStr, 16);
+              if (Number.isFinite(n) && (n & 2) !== 0) hasUnshare = true;
+            }
+          }
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
-            const groupPrefix = `${rootedFd(pid)}:`;
-            for (const key of dirfdTable.keys()) {
-              if (!key.startsWith(groupPrefix)) continue;
-              const fdStr = key.slice(groupPrefix.length);
-              const fd = parseInt(fdStr, 10);
-              if (Number.isFinite(fd) && fd >= first && fd <= last) {
-                dirfdTable.delete(key);
+            if (hasUnshare) {
+              const sharedRoot = rootedFd(pid);
+              const callerCurrentParent = fdParent.get(pid);
+              if (sharedRoot !== pid) {
+                const sharedPrefix = `${sharedRoot}:`;
+                const snapshot = [];
+                for (const [key, val] of dirfdTable) {
+                  if (key.startsWith(sharedPrefix)) {
+                    snapshot.push([key.slice(sharedPrefix.length), val]);
+                  }
+                }
+                const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+                fdParent.delete(pid);
+                for (const [fdSuffix, val] of snapshot) {
+                  dirfdTable.set(`${pid}:${fdSuffix}`, val);
+                }
+                if (sharedUnknown) dirfdStateUnknown.add(pid);
+              }
+              const groupPrefix = `${rootedFd(pid)}:`;
+              for (const key of dirfdTable.keys()) {
+                if (!key.startsWith(groupPrefix)) continue;
+                const fdStr = key.slice(groupPrefix.length);
+                const fd = parseInt(fdStr, 10);
+                if (Number.isFinite(fd) && fd >= first && fd <= last) {
+                  dirfdTable.delete(key);
+                }
+              }
+              void callerCurrentParent;
+            } else {
+              const groupPrefix = `${rootedFd(pid)}:`;
+              for (const key of dirfdTable.keys()) {
+                if (!key.startsWith(groupPrefix)) continue;
+                const fdStr = key.slice(groupPrefix.length);
+                const fd = parseInt(fdStr, 10);
+                if (Number.isFinite(fd) && fd >= first && fd <= last) {
+                  dirfdTable.delete(key);
+                }
               }
             }
           }
@@ -27168,6 +27259,37 @@ async function* runStraceTailer(opts) {
     }
   }
 }
+function readStraceChildPid(stracePid, deadlineMs = 50) {
+  const start = Date.now();
+  for (let iter = 0; iter < 10; iter++) {
+    if (Date.now() - start >= deadlineMs) break;
+    let raw;
+    try {
+      raw = (0, import_node_fs3.readFileSync)(
+        `/proc/${stracePid}/task/${stracePid}/children`,
+        "utf8"
+      ).trim();
+    } catch {
+      const sleepStart2 = Date.now();
+      while (Date.now() - sleepStart2 < 5) {
+      }
+      continue;
+    }
+    if (raw.length === 0) {
+      const sleepStart2 = Date.now();
+      while (Date.now() - sleepStart2 < 5) {
+      }
+      continue;
+    }
+    const pids = raw.split(/\s+/).filter((s) => s.length > 0).map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n) && n > 0);
+    if (pids.length === 1) return pids[0] ?? null;
+    if (pids.length > 1) return null;
+    const sleepStart = Date.now();
+    while (Date.now() - sleepStart < 5) {
+    }
+  }
+  return null;
+}
 var LinuxStraceRunner = class {
   _exitCode = 0;
   _spawnImpl;
@@ -27246,6 +27368,10 @@ var LinuxStraceRunner = class {
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
       stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
+    if (child.pid !== void 0 && this._rootPid === null) {
+      const pid = readStraceChildPid(child.pid);
+      if (pid !== null) this._rootPid = pid;
+    }
     const exitPromise = new Promise((resolve2) => {
       child.on("close", (code) => {
         this._exitCode = code ?? 1;
@@ -27688,6 +27814,7 @@ if (isMain) {
   buildChildEnv,
   createEventsFile,
   main,
+  readStraceChildPid,
   runStraceTailer
 });
 /*! Bundled license information:
