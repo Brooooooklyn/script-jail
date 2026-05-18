@@ -5967,6 +5967,512 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // =====================================================================
+  // codex follow-up #5 (2026-05-19) — close_range decimal flag parsing
+  // and CLOEXEC fd tracking across execve.
+  //
+  // Two bugs:
+  //   #1 — close_range flags rendered as a DECIMAL bitmask (`2`, `3`,
+  //        `6`) were silently treated as the non-UNSHARE branch.
+  //        Pre-fix the parser only recognised the symbolic identifier
+  //        list (`CLOSE_RANGE_UNSHARE|CLOSE_RANGE_CLOEXEC`) and the
+  //        `0x`-prefixed hex form; a decimal token like `2` slipped
+  //        past both checks.  The result was that, on kernels/strace
+  //        builds rendering flags numerically, `close_range(3, ~0,
+  //        CLOSE_RANGE_UNSHARE) = 0` would render as
+  //        `close_range(3, 4294967295, 2) = 0` and the dispatcher
+  //        deleted from the SHARED group's dirfdTable instead of
+  //        detaching the caller.
+  //
+  //   #2 — dirfdTable entries opened with O_CLOEXEC survived execve.
+  //        The kernel auto-closes FD_CLOEXEC fds on successful exec,
+  //        but our model kept them.  A subsequent
+  //        openat(<stale-fd>, "../../root/.ssh/id_rsa", ...) resolved
+  //        through the dirfdTable to the package's directory, missing
+  //        the protected-paths match.  Also: fcntl(2) was completely
+  //        untraced, so F_DUPFD / F_DUPFD_CLOEXEC / F_SETFD changes
+  //        were invisible.
+  // =====================================================================
+  describe('codex follow-up #5 regression', () => {
+    const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
+
+    // Bug #1 — decimal CLOSE_RANGE_UNSHARE (`2`).  Parent + child share
+    // an fd group; child issues close_range(3, INT_MAX, 2) (decimal).
+    // The bit value 2 IS CLOSE_RANGE_UNSHARE, so the child must detach
+    // BEFORE closing.  The parent's fd 7→/A entry must survive.
+    it('close_range with decimal UNSHARE flag (`2`) detaches caller; sibling fd survives (bug #1)', async () => {
+      const proc = mockProcReader({
+        7001: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'decimal-unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7002: {
+          ppid: 7001,
+          env: {
+            npm_package_name: 'decimal-unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7.
+        {
+          pid: 7001,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent CLONE_FILES with child — they share the fd group.
+        {
+          pid: 7001,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 7002',
+          source: 'strace',
+        },
+        // Child detaches via decimal CLOSE_RANGE_UNSHARE (bit 2 in the
+        // flags arg, rendered as the bare decimal `2` by some strace
+        // builds).  Pre-fix this was ignored and the dispatcher
+        // deleted the SHARED group's fd entries.
+        {
+          pid: 7002,
+          line: 'close_range(3, 4294967295, 2) = 0',
+          source: 'strace',
+        },
+        // Parent's fd 7 MUST still resolve through /A (the unshare
+        // copied the table into the child's private group, then
+        // closed; the parent's group is untouched).
+        {
+          pid: 7001,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child's fd 7 MUST be closed (in its private group).
+        {
+          pid: 7002,
+          line: 'openat(7, "file", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7001 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 7001;
+      });
+      expect(parentRead).toHaveLength(1);
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 7002;
+      });
+      expect(childRead).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7002;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #2 — openat with O_CLOEXEC is dropped from the dirfdTable on
+    // execve.  A subsequent openat(<closed-fd>, ...) MUST fail closed.
+    it('O_CLOEXEC dirfd is swept on execve → post-exec openat fails closed (bug #2)', async () => {
+      const proc = mockProcReader({
+        7101: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'cloexec-sweep-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /pkg with O_CLOEXEC → fd 7.
+        {
+          pid: 7101,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 7',
+          source: 'strace',
+        },
+        // Successful execve replaces the address space.  Kernel
+        // auto-closes fd 7 (FD_CLOEXEC).  Our dirfdTable must too.
+        {
+          pid: 7101,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "x"], 0x7ffd...) = 0',
+          source: 'strace',
+        },
+        // Post-exec openat(7, ...) MUST NOT resolve to /pkg/file.
+        {
+          pid: 7101,
+          line: 'openat(7, "file", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7101 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file';
+      });
+      expect(stale).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7101;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #2 control — open WITHOUT O_CLOEXEC survives execve.  Asserts
+    // the sweep doesn't over-delete.
+    it('non-CLOEXEC dirfd survives execve → post-exec openat resolves (bug #2 control)', async () => {
+      const proc = mockProcReader({
+        7201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'no-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /pkg WITHOUT O_CLOEXEC → fd 7.
+        {
+          pid: 7201,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Successful execve.  Kernel keeps fd 7 (not CLOEXEC).
+        {
+          pid: 7201,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "x"], 0x7ffd...) = 0',
+          source: 'strace',
+        },
+        // Post-exec openat(7, "file") MUST resolve to /pkg/file.
+        {
+          pid: 7201,
+          line: 'openat(7, "file", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7201 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file' && r['pid'] === 7201;
+      });
+      expect(reads).toHaveLength(1);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7201;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Bug #2 — fcntl(F_SETFD, FD_CLOEXEC) sets cloexec on an existing
+    // non-CLOEXEC fd; the next execve sweeps it.
+    it('fcntl(F_SETFD FD_CLOEXEC) sets cloexec → exec sweeps fd → post-exec open fails closed (bug #2)', async () => {
+      const proc = mockProcReader({
+        7301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fcntl-setfd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /pkg WITHOUT O_CLOEXEC → fd 7.
+        {
+          pid: 7301,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Set FD_CLOEXEC via fcntl.
+        {
+          pid: 7301,
+          line: 'fcntl(7, F_SETFD, FD_CLOEXEC) = 0',
+          source: 'strace',
+        },
+        // Exec — kernel closes fd 7.
+        {
+          pid: 7301,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "x"], 0x7ffd...) = 0',
+          source: 'strace',
+        },
+        // Post-exec openat(7, ...) MUST fail closed.
+        {
+          pid: 7301,
+          line: 'openat(7, "file", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7301 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file';
+      });
+      expect(stale).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7301;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #2 — fcntl(F_DUPFD_CLOEXEC) creates a CLOEXEC duplicate; the
+    // next execve sweeps the duplicate; the source fd may also be
+    // cloexec/not depending on its prior bit (here it isn't).
+    it('fcntl(F_DUPFD_CLOEXEC) duplicate is CLOEXEC → swept on exec (bug #2)', async () => {
+      const proc = mockProcReader({
+        7401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fcntl-dupfd-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /pkg → fd 7 (non-CLOEXEC).
+        {
+          pid: 7401,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Duplicate fd 7 with CLOEXEC → fd 12 (cloexec=true).
+        {
+          pid: 7401,
+          line: 'fcntl(7, F_DUPFD_CLOEXEC, 10) = 12',
+          source: 'strace',
+        },
+        // Exec — kernel closes fd 12 (CLOEXEC) and keeps fd 7 (no CLOEXEC).
+        {
+          pid: 7401,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "x"], 0x7ffd...) = 0',
+          source: 'strace',
+        },
+        // Post-exec openat(12, ...) MUST fail closed.
+        {
+          pid: 7401,
+          line: 'openat(12, "secret", O_RDONLY) = 8',
+          source: 'strace',
+        },
+        // Post-exec openat(7, ...) MUST resolve (fd 7 was not CLOEXEC).
+        {
+          pid: 7401,
+          line: 'openat(7, "file", O_RDONLY) = 9',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7401 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // fd 12 → /pkg/secret stale resolution MUST NOT occur.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/secret';
+      });
+      expect(stale).toHaveLength(0);
+      // fd 7 → /pkg/file MUST resolve.
+      const live = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file' && r['pid'] === 7401;
+      });
+      expect(live).toHaveLength(1);
+      // <UNRESOLVED_PATH> for the fd-12 open.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7401;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #2 — close_range CLOSE_RANGE_CLOEXEC marks (does not delete).
+    // Before exec, the fd still resolves; after exec, it doesn't.
+    it('close_range with CLOSE_RANGE_CLOEXEC (flag 4) marks not deletes; swept on exec (bug #2)', async () => {
+      const proc = mockProcReader({
+        7501: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'close-range-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /pkg → fd 7 (non-CLOEXEC).
+        {
+          pid: 7501,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // close_range(3, INT_MAX, 4) — CLOSE_RANGE_CLOEXEC alone (no
+        // UNSHARE).  Mark fd 7's entry cloexec=true; the fd itself
+        // remains open until exec.
+        {
+          pid: 7501,
+          line: 'close_range(3, 4294967295, 4) = 0',
+          source: 'strace',
+        },
+        // Before exec: openat(7, ...) MUST resolve to /pkg/file (fd
+        // still open, just FD_CLOEXEC).
+        {
+          pid: 7501,
+          line: 'openat(7, "file", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Exec — kernel closes fd 7 (CLOEXEC was set by close_range).
+        {
+          pid: 7501,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "x"], 0x7ffd...) = 0',
+          source: 'strace',
+        },
+        // Post-exec: openat(7, ...) MUST fail closed.
+        {
+          pid: 7501,
+          line: 'openat(7, "other", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7501 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The pre-exec /pkg/file read MUST appear (fd still open).
+      const preExecRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file' && r['pid'] === 7501;
+      });
+      expect(preExecRead).toHaveLength(1);
+      // The post-exec /pkg/other read MUST NOT appear (fd swept).
+      const postStale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/other';
+      });
+      expect(postStale).toHaveLength(0);
+      // <UNRESOLVED_PATH> for the post-exec attempt.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7501;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #2 — dup3 with O_CLOEXEC creates a CLOEXEC duplicate; the
+    // next execve sweeps it.
+    it('dup3 with O_CLOEXEC marks newfd cloexec → swept on exec (bug #2)', async () => {
+      const proc = mockProcReader({
+        7601: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'dup3-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /pkg → fd 7 (non-CLOEXEC).
+        {
+          pid: 7601,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // dup3(7, 9, O_CLOEXEC) → fd 9 with cloexec=true.
+        {
+          pid: 7601,
+          line: 'dup3(7, 9, O_CLOEXEC) = 9',
+          source: 'strace',
+        },
+        // Exec — kernel closes fd 9 (CLOEXEC); fd 7 survives.
+        {
+          pid: 7601,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "x"], 0x7ffd...) = 0',
+          source: 'strace',
+        },
+        // Post-exec openat(9, ...) MUST fail closed.
+        {
+          pid: 7601,
+          line: 'openat(9, "secret", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7601 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // fd 9 → /pkg/secret stale MUST NOT occur.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/secret';
+      });
+      expect(stale).toHaveLength(0);
+      // <UNRESOLVED_PATH> for the fd-9 open.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7601;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
   describe('parseShimLine (exported for testing)', () => {
     it('parses env_read lines', async () => {
       // Import parseShimLine directly

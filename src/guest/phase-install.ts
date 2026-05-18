@@ -597,8 +597,8 @@ export async function runInstallPhase(
     // formatted `<root>:<fd>` — collect by root prefix.
     const parentPrefix = `${pr}:`;
     const childPrefix = `${cr}:`;
-    const parentFds = new Map<string, string>(); // fd-suffix → path
-    const childFds = new Map<string, string>();
+    const parentFds = new Map<string, { path: string; cloexec: boolean }>(); // fd-suffix → entry
+    const childFds = new Map<string, { path: string; cloexec: boolean }>();
     for (const [key, val] of dirfdTable) {
       if (key.startsWith(parentPrefix)) {
         parentFds.set(key.slice(parentPrefix.length), val);
@@ -621,10 +621,17 @@ export async function runInstallPhase(
       if (parentVal === undefined) {
         // Child-only fd → adopt unchanged.
         dirfdTable.set(mergedKey, childVal);
-      } else if (parentVal === childVal) {
-        // Same fd, same path on both sides — parent's entry is already
-        // in `dirfdTable` under `mergedKey` (parentPrefix === merged
-        // prefix), so nothing to do.
+      } else if (parentVal.path === childVal.path && parentVal.cloexec === childVal.cloexec) {
+        // Same fd, identical entry on both sides — parent's entry is
+        // already in `dirfdTable` under `mergedKey` (parentPrefix ===
+        // merged prefix), so nothing to do.
+      } else if (parentVal.path === childVal.path) {
+        // Same fd, same path — but cloexec bits differ (one side set
+        // FD_CLOEXEC via fcntl independently from the other).  Keep
+        // the path; OR the cloexec bits so the kernel-observable
+        // post-exec sweep is conservative (if either side considered
+        // it CLOEXEC, the next exec drops it).
+        dirfdTable.set(mergedKey, { path: parentVal.path, cloexec: parentVal.cloexec || childVal.cloexec });
       } else {
         // Same fd, DIFFERENT paths — ambiguous.  Fail closed: drop the
         // entry entirely.  Subsequent openat(<fd>, ...) returns
@@ -655,7 +662,25 @@ export async function runInstallPhase(
   //
   // Keyed by fd-group root (`findFdRoot(pid)`) — see CLONE_FILES
   // discussion above.
-  const dirfdTable = new Map<string, string>();
+  //
+  // Audit-trust Finding (high, 2026-05-19, codex follow-up): the value
+  // type is `{ path; cloexec }` rather than a bare `string`.  The
+  // `cloexec` bit is set by openat/openat2/open if the flags argument
+  // includes O_CLOEXEC (= 0o2000000), by `dup3(oldfd, newfd, O_CLOEXEC)`,
+  // by `fcntl(fd, F_DUPFD_CLOEXEC, …)`, and by
+  // `fcntl(fd, F_SETFD, FD_CLOEXEC)`.  It's CLEARED by
+  // `fcntl(fd, F_SETFD, 0)`, by `dup`/`dup2` (which never set FD_CLOEXEC
+  // on the duplicate), and by close_range with CLOSE_RANGE_CLOEXEC
+  // (which sets it).  On a successful execve we sweep the fd-group's
+  // dirfdTable: entries with cloexec=true are deleted (the kernel
+  // closed them), entries with cloexec=false survive (the kernel kept
+  // them).  Pre-fix we never tracked cloexec, so a script that did
+  // `openat(AT_FDCWD, "/pkg", O_RDONLY|O_CLOEXEC) = 7` + exec + a raw
+  // `openat(7, "../../root/.ssh/id_rsa", …)` would resolve through the
+  // stale `/pkg` mapping (kernel had already closed fd 7 on exec, so
+  // the post-exec openat actually got EBADF or aliased an unrelated fd
+  // the new image opened — either way our resolution was wrong).
+  const dirfdTable = new Map<string, { path: string; cloexec: boolean }>();
   const fdKey = (pid: number, fd: number): string => `${rootedFd(pid)}:${fd}`;
 
   // Audit-trust Finding (high, 2026-05-19): per-pid CWD table for Layer-2
@@ -743,15 +768,17 @@ export async function runInstallPhase(
   // The kernel resolves step (4) through `/root` (fd 7 now points at
   // `/root` after the dup2), but the dirfdTable still says fd 7 → /pkg.
   // Pre-fix, we resolved to `/pkg/.ssh/id_rsa` and missed the
-  // protected-paths match.  Post-fix, observing an `fcntl(...)` (the
-  // one fd-mutating syscall we can't fully parse subcommands for)
-  // marks the pid here, so step (4) returns `null` and the raw event
-  // is dropped + a `<UNRESOLVED_PATH>` synth event is surfaced.
+  // protected-paths match.  Post-fix, we trace `dup`/`dup2`/`dup3`,
+  // `close`/`close_range`, and `fcntl` so the dirfdTable reflects each
+  // mutation directly.  Anything we observe but cannot fully model
+  // (e.g. a fcntl subcommand we don't recognise on a successful return)
+  // lands in this set so subsequent numeric-dirfd opens fail closed.
   //
-  // We DO fully parse `dup`/`dup2`/`dup3`/`close`/`close_range` below
+  // We DO fully parse `dup`/`dup2`/`dup3`/`close`/`close_range`, plus
+  // the F_DUPFD / F_DUPFD_CLOEXEC / F_SETFD subcommands of fcntl below
   // — those propagate / invalidate the dirfdTable directly instead of
-  // entering this set.  Only `fcntl` (which we may add later) and any
-  // future state-violating syscall we observe but cannot model
+  // entering this set.  Only fcntl subcommands we don't recognise and
+  // any future state-violating syscall we observe but cannot model
   // populate this set.
   //
   // NOTE: this set is INTENTIONALLY orthogonal to `pidCwdUnknown` —
@@ -870,9 +897,9 @@ export async function runInstallPhase(
     // Layer-1 basename safety net instead of trusting a possibly
     // stale mapping.
     if (fdUnknownHas(pid)) return null;
-    const dirPath = dirfdTable.get(fdKey(pid, dirfd));
-    if (dirPath === undefined) return null;
-    return path.resolve(dirPath, targetPath);
+    const dirEntry = dirfdTable.get(fdKey(pid, dirfd));
+    if (dirEntry === undefined) return null;
+    return path.resolve(dirEntry.path, targetPath);
   };
 
   // Audit-trust Finding (high, 2026-05-19): a separate canonicalizer for
@@ -950,9 +977,9 @@ export async function runInstallPhase(
     // Codex follow-up #2 (high, 2026-05-19): fail closed on stale fd
     // tables — see comments on `dirfdStateUnknown` above.
     if (fdUnknownHas(pid)) return null;
-    const dirPath = dirfdTable.get(fdKey(pid, dirfd));
-    if (dirPath === undefined) return null;
-    return path.resolve(dirPath, targetPath);
+    const dirEntry = dirfdTable.get(fdKey(pid, dirfd));
+    if (dirEntry === undefined) return null;
+    return path.resolve(dirEntry.path, targetPath);
   };
 
   const shimLoadedPids = new Set<number>();
@@ -1250,9 +1277,9 @@ export async function runInstallPhase(
       if (fchdirMatch !== null) {
         const fd = parseInt(fchdirMatch[1] ?? '', 10);
         if (Number.isFinite(fd)) {
-          const dirPath = dirfdTable.get(fdKey(pid, fd));
-          if (dirPath !== undefined) {
-            cwdSet(pid, dirPath);
+          const dirEntry = dirfdTable.get(fdKey(pid, fd));
+          if (dirEntry !== undefined) {
+            cwdSet(pid, dirEntry.path);
             // Successful fchdir to a KNOWN fd: re-establish confidence.
             cwdUnknownDelete(pid);
           } else {
@@ -1470,11 +1497,11 @@ export async function runInstallPhase(
       // our dirfdTable might still have a stale entry from a prior
       // unobserved close — deleting on EBADF is no-op-safe.
       const dupMatch = line.match(
-        /^(dup3?|dup2)\((-?\d+)(?:\s*,\s*(-?\d+))?(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/,
+        /^(dup3?|dup2)\((-?\d+)(?:\s*,\s*(-?\d+))?(?:\s*,\s*([^)]*))?\)\s*=\s*(-?\d+)\b/,
       );
       if (dupMatch !== null) {
         const op = dupMatch[1] ?? '';
-        const rc = parseInt(dupMatch[4] ?? '', 10);
+        const rc = parseInt(dupMatch[5] ?? '', 10);
         if (Number.isFinite(rc) && rc >= 0) {
           const oldFd = parseInt(dupMatch[2] ?? '', 10);
           const newFd = op === 'dup' ? rc : parseInt(dupMatch[3] ?? '', 10);
@@ -1483,7 +1510,34 @@ export async function runInstallPhase(
             const newKey = fdKey(pid, newFd);
             const oldVal = dirfdTable.get(oldKey);
             if (oldVal !== undefined) {
-              dirfdTable.set(newKey, oldVal);
+              // Audit-trust Finding (high, 2026-05-19, codex follow-up):
+              // determine the new fd's CLOEXEC bit per dup-variant
+              // semantics:
+              //   - dup(oldfd) = newfd       — newfd cloexec=false
+              //                                (POSIX: dup never sets
+              //                                FD_CLOEXEC).
+              //   - dup2(oldfd, newfd)        — newfd cloexec=false (same).
+              //   - dup3(oldfd, newfd, flags) — newfd cloexec=true iff
+              //                                flags contains O_CLOEXEC
+              //                                (numeric bit 0o2000000 or
+              //                                the symbolic token).
+              let newCloexec = false;
+              if (op === 'dup3') {
+                const flagsTok = (dupMatch[4] ?? '').trim();
+                if (flagsTok.length > 0) {
+                  if (flagsTok.includes('O_CLOEXEC')) newCloexec = true;
+                  else {
+                    // Numeric form (decimal or hex).  O_CLOEXEC = 0o2000000.
+                    const n = flagsTok.startsWith('0x')
+                      ? parseInt(flagsTok, 16)
+                      : flagsTok.startsWith('0o') || /^0\d/.test(flagsTok)
+                        ? parseInt(flagsTok, 8)
+                        : parseInt(flagsTok, 10);
+                    if (Number.isFinite(n) && (n & 0o2000000) !== 0) newCloexec = true;
+                  }
+                }
+              }
+              dirfdTable.set(newKey, { path: oldVal.path, cloexec: newCloexec });
             } else {
               // oldfd has no tracked dir mapping → newfd must NOT
               // retain its previous mapping either (it now aliases
@@ -1505,20 +1559,25 @@ export async function runInstallPhase(
         }
         continue;
       }
-      // Codex follow-up (bug #3, high, 2026-05-19): parse the optional
-      // flags argument too.  `close_range(2)` (Linux 5.9+) defines:
+      // Codex follow-up (bug #3, high, 2026-05-19) + follow-up (high,
+      // 2026-05-19, decimal-flag fix + CLOEXEC marking):
+      // `close_range(2)` (Linux 5.9+) defines:
       //   CLOSE_RANGE_UNSHARE  — detach the caller's fd table from any
       //                          shared group BEFORE closing.
-      //   CLOSE_RANGE_CLOEXEC  — set FD_CLOEXEC instead of closing
-      //                          (we don't model FD_CLOEXEC; it has no
-      //                          effect on our dirfdTable).
-      // Strace renders the flags as a `|`-separated identifier list:
+      //   CLOSE_RANGE_CLOEXEC  — set FD_CLOEXEC on the range instead of
+      //                          closing.  We DO model this now: matching
+      //                          dirfdTable entries are flipped to
+      //                          cloexec=true so the next successful
+      //                          execve sweeps them.
+      // Strace renders the flags as either a `|`-separated identifier
+      // list OR a numeric (hex/decimal) bitmask:
       //   close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0
       //   close_range(3, ~0U, CLOSE_RANGE_CLOEXEC|CLOSE_RANGE_UNSHARE) = 0
       //   close_range(3, 4294967295, 0) = 0
-      //   close_range(3, 4294967295) = 0   (no flags arg — older kernels)
-      // We capture the bare flags string and parse it for UNSHARE
-      // membership.
+      //   close_range(3, 4294967295, 2) = 0        ← decimal UNSHARE
+      //   close_range(3, 4294967295, 6) = 0        ← decimal CLOEXEC|UNSHARE
+      //   close_range(3, 4294967295, 0x2) = 0      ← hex UNSHARE
+      //   close_range(3, 4294967295) = 0           (no flags arg — older kernels)
       const closeRangeMatch = line.match(
         /^close_range\((-?\d+)\s*,\s*(-?\d+|0x[0-9a-fA-F]+|~?\d+U?)(?:\s*,\s*([^)]*))?\)\s*=\s*(-?\d+)\b/,
       );
@@ -1538,30 +1597,61 @@ export async function runInstallPhase(
           } else {
             last = parseInt(lastRaw, 10);
           }
-          // Parse flags token.  Empty / missing → flags = 0.  Numeric
-          // (decimal or hex) is treated as a bit-set test.  Identifier
-          // form is a pipe-separated set we check by name.
+          // Parse flags token.  Three accepted forms (codex bug-fix:
+          // decimal numeric was treated as the non-UNSHARE branch
+          // pre-fix because the parser only checked the `0x` prefix
+          // and the identifier-name set):
+          //   1. symbolic list  — `CLOSE_RANGE_UNSHARE`,
+          //                       `CLOSE_RANGE_UNSHARE|CLOSE_RANGE_CLOEXEC`
+          //   2. hex bitmask    — `0x2`, `0x6`
+          //   3. decimal bitmask — `0`, `2`, `3`, `6`
+          // In all three forms we compute the bitwise OR over
+          //   CLOSE_RANGE_UNSHARE = 1<<1 = 0x2
+          //   CLOSE_RANGE_CLOEXEC = 1<<2 = 0x4
+          // and gate on each bit independently.
           const flagsStr = (closeRangeMatch[3] ?? '').trim();
-          let hasUnshare = false;
-          if (flagsStr.length > 0 && flagsStr !== '0') {
-            // Identifier form.
-            for (const tok of flagsStr.split('|')) {
-              const t = tok.trim();
-              if (t === 'CLOSE_RANGE_UNSHARE') hasUnshare = true;
-              // CLOSE_RANGE_CLOEXEC: ignored (we don't model
-              // FD_CLOEXEC; the kernel sets the bit, fds remain in the
-              // table until exec() processes them, but our dirfdTable
-              // only tracks O_DIRECTORY mappings created via openat
-              // — close_range with CLOEXEC is functionally a no-op
-              // for our resolution).
-            }
-            // Hex bitmask form (e.g. `0x2`): test the UNSHARE bit
-            // (CLOSE_RANGE_UNSHARE = 1<<1 = 0x2).
-            if (flagsStr.startsWith('0x')) {
+          const CLOSE_RANGE_UNSHARE = 0x2;
+          const CLOSE_RANGE_CLOEXEC = 0x4;
+          let flagsBits = 0;
+          if (flagsStr.length > 0) {
+            if (/^[A-Z_|\s]+$/.test(flagsStr)) {
+              // Identifier form (pure symbolic).
+              for (const tok of flagsStr.split('|')) {
+                const t = tok.trim();
+                if (t === 'CLOSE_RANGE_UNSHARE') flagsBits |= CLOSE_RANGE_UNSHARE;
+                else if (t === 'CLOSE_RANGE_CLOEXEC') flagsBits |= CLOSE_RANGE_CLOEXEC;
+              }
+            } else if (flagsStr.startsWith('0x')) {
               const n = parseInt(flagsStr, 16);
-              if (Number.isFinite(n) && (n & 0x2) !== 0) hasUnshare = true;
+              if (Number.isFinite(n)) flagsBits = n;
+            } else if (/^-?\d+$/.test(flagsStr)) {
+              // Decimal numeric.  Pre-fix this branch was dead — the
+              // identifier-form loop didn't match (`2` isn't a known
+              // token) and the `0x`-prefix branch didn't either.  So
+              // `close_range(3, 4294967295, 2) = 0` was treated as
+              // hasUnshare=false and the dispatcher deleted shared-
+              // group entries instead of detaching the caller.
+              const n = parseInt(flagsStr, 10);
+              if (Number.isFinite(n)) flagsBits = n;
+            } else {
+              // Mixed form (e.g. `CLOSE_RANGE_UNSHARE|0x4`): try both
+              // identifier tokens and any hex/decimal tokens.
+              for (const tok of flagsStr.split('|')) {
+                const t = tok.trim();
+                if (t === 'CLOSE_RANGE_UNSHARE') flagsBits |= CLOSE_RANGE_UNSHARE;
+                else if (t === 'CLOSE_RANGE_CLOEXEC') flagsBits |= CLOSE_RANGE_CLOEXEC;
+                else if (t.startsWith('0x')) {
+                  const n = parseInt(t, 16);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                } else if (/^-?\d+$/.test(t)) {
+                  const n = parseInt(t, 10);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                }
+              }
             }
           }
+          const hasUnshare = (flagsBits & CLOSE_RANGE_UNSHARE) !== 0;
+          const hasCloexec = (flagsBits & CLOSE_RANGE_CLOEXEC) !== 0;
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
             if (hasUnshare) {
               // Detach the caller into a private fd group BEFORE
@@ -1589,7 +1679,7 @@ export async function runInstallPhase(
               // member) OR to migrate the shared group's state to a new
               // root pid (caller WAS the representative).
               const sharedPrefix = `${sharedRoot}:`;
-              const snapshot: Array<[string, string]> = [];
+              const snapshot: Array<[string, { path: string; cloexec: boolean }]> = [];
               for (const [key, val] of dirfdTable) {
                 if (key.startsWith(sharedPrefix)) {
                   snapshot.push([key.slice(sharedPrefix.length), val]);
@@ -1690,36 +1780,175 @@ export async function runInstallPhase(
                 // in the dirfdTable, and the close-range below applies
                 // to it directly.  No action needed.
               }
-              // Now close the range against the caller's group (which
-              // is either the brand-new private group or the original
-              // singleton group).
+              // Apply the range against the caller's group (which is
+              // either the brand-new private group or the original
+              // singleton group).  CLOSE_RANGE_CLOEXEC and CLOSE_RANGE
+              // (no CLOEXEC) differ in disposition: CLOEXEC marks the
+              // fds for sweep at next exec instead of closing them now.
               const groupPrefix = `${rootedFd(pid)}:`;
-              for (const key of dirfdTable.keys()) {
+              for (const key of [...dirfdTable.keys()]) {
                 if (!key.startsWith(groupPrefix)) continue;
                 const fdStr = key.slice(groupPrefix.length);
                 const fd = parseInt(fdStr, 10);
                 if (Number.isFinite(fd) && fd >= first && fd <= last) {
-                  dirfdTable.delete(key);
+                  if (hasCloexec) {
+                    // Mark cloexec=true; entry survives until the next
+                    // successful execve sweep deletes it.
+                    const cur = dirfdTable.get(key);
+                    if (cur !== undefined) {
+                      dirfdTable.set(key, { path: cur.path, cloexec: true });
+                    }
+                  } else {
+                    dirfdTable.delete(key);
+                  }
                 }
               }
             } else {
               // Pre-existing behaviour: close the range on the caller's
-              // (possibly shared) group.  Siblings observe the closes.
-              // Iterate over the MAP entries for this fd-group only —
-              // avoid O(last) work when last is UINT_MAX (4294967295),
-              // the common "close all fds above first" idiom.  Keys are
-              // formatted as `<fdGroupRoot>:<fd>`, so we anchor on the
-              // resolved root for this pid.
+              // (possibly shared) group.  Siblings observe the closes
+              // (UNSHARE wasn't requested).  Iterate over the MAP
+              // entries for this fd-group only — avoid O(last) work
+              // when last is UINT_MAX (4294967295), the common "close
+              // all fds above first" idiom.  Keys are formatted as
+              // `<fdGroupRoot>:<fd>`, so we anchor on the resolved
+              // root for this pid.
+              //
+              // Audit-trust Finding (high, 2026-05-19, codex follow-up):
+              // honour CLOSE_RANGE_CLOEXEC even without UNSHARE.  The
+              // kernel sets FD_CLOEXEC on each matched fd; we mark our
+              // dirfdTable entries cloexec=true so the next successful
+              // execve sweep drops them.  Pre-fix, our `0x4` /
+              // `CLOSE_RANGE_CLOEXEC` branch was a no-op and the fds
+              // survived our model indefinitely.
               const groupPrefix = `${rootedFd(pid)}:`;
-              for (const key of dirfdTable.keys()) {
+              for (const key of [...dirfdTable.keys()]) {
                 if (!key.startsWith(groupPrefix)) continue;
                 const fdStr = key.slice(groupPrefix.length);
                 const fd = parseInt(fdStr, 10);
                 if (Number.isFinite(fd) && fd >= first && fd <= last) {
-                  dirfdTable.delete(key);
+                  if (hasCloexec) {
+                    const cur = dirfdTable.get(key);
+                    if (cur !== undefined) {
+                      dirfdTable.set(key, { path: cur.path, cloexec: true });
+                    }
+                  } else {
+                    dirfdTable.delete(key);
+                  }
                 }
               }
             }
+          }
+        }
+        continue;
+      }
+
+      // Audit-trust Finding (high, 2026-05-19, codex follow-up): pre-parse
+      // fcntl/fcntl64 so the dirfdTable's CLOEXEC bookkeeping survives
+      // FD_CLOEXEC mutations done outside of openat/dup3.  Strace wire
+      // formats we recognise:
+      //
+      //   fcntl(7, F_DUPFD, 10) = 12              (newfd cloexec=false)
+      //   fcntl(7, F_DUPFD_CLOEXEC, 10) = 12      (newfd cloexec=true)
+      //   fcntl(7, F_SETFD, FD_CLOEXEC) = 0       (set fd 7's cloexec=true)
+      //   fcntl(7, F_SETFD, 0) = 0                (clear fd 7's cloexec)
+      //   fcntl(7, F_GETFD) = N                   (no state change)
+      //   fcntl(7, F_GETFL) = N                   (no state change)
+      //   fcntl(7, F_SETFL, ...) = 0              (no fd-table change)
+      //
+      // Any OTHER successful fcntl subcommand we don't recognise marks
+      // the pid's fd-group dirfdStateUnknown — the kernel may have
+      // mutated the fd state in a way we can't model.  Failures
+      // (rc < 0) are a no-op.  fcntl64 has identical semantics on
+      // 32-bit arches and is handled the same way.
+      const fcntlMatch = line.match(
+        /^(fcntl|fcntl64)\((-?\d+)\s*,\s*([A-Z_0-9]+)(?:\s*,\s*([^)]*))?\)\s*=\s*(-?\d+)\b/,
+      );
+      if (fcntlMatch !== null) {
+        const fd = parseInt(fcntlMatch[2] ?? '', 10);
+        const cmd = fcntlMatch[3] ?? '';
+        const arg = (fcntlMatch[4] ?? '').trim();
+        const rc = parseInt(fcntlMatch[5] ?? '', 10);
+        if (Number.isFinite(fd) && Number.isFinite(rc) && rc >= 0) {
+          const oldKey = fdKey(pid, fd);
+          if (cmd === 'F_DUPFD' || cmd === 'F_DUPFD_CLOEXEC') {
+            // Duplicate fd → newfd (`rc`) with explicit CLOEXEC behaviour.
+            const oldVal = dirfdTable.get(oldKey);
+            const newKey = fdKey(pid, rc);
+            if (oldVal !== undefined) {
+              dirfdTable.set(newKey, {
+                path: oldVal.path,
+                cloexec: cmd === 'F_DUPFD_CLOEXEC',
+              });
+            } else {
+              // Unknown source fd → invalidate any prior mapping at the
+              // new fd (mirrors the dup-family behaviour).
+              dirfdTable.delete(newKey);
+            }
+          } else if (cmd === 'F_SETFD') {
+            // Mutate fd's FD_CLOEXEC bit per the arg.  Strace renders
+            // the arg as `FD_CLOEXEC` (= 1) when set or `0` when not.
+            // Numeric forms may appear under -x.  Anything else we
+            // don't fully understand → fail closed.
+            const cur = dirfdTable.get(oldKey);
+            let newCloexec: boolean | null = null;
+            if (arg === 'FD_CLOEXEC') newCloexec = true;
+            else if (arg === '0') newCloexec = false;
+            else if (arg.startsWith('0x')) {
+              const n = parseInt(arg, 16);
+              if (Number.isFinite(n)) newCloexec = (n & 0x1) !== 0;
+            } else if (/^-?\d+$/.test(arg)) {
+              const n = parseInt(arg, 10);
+              if (Number.isFinite(n)) newCloexec = (n & 0x1) !== 0;
+            } else if (arg.length > 0) {
+              // Mixed/unknown symbolic form (e.g. `FD_CLOEXEC|<other>`).
+              // Tokens we recognise contribute to the OR; if anything
+              // looks unknown, fall back to unknown.
+              let unrecognised = false;
+              let bits = 0;
+              for (const tok of arg.split('|')) {
+                const t = tok.trim();
+                if (t === 'FD_CLOEXEC') bits |= 0x1;
+                else if (t === '0') {/* nothing */}
+                else if (/^0x[0-9a-fA-F]+$/.test(t)) {
+                  const n = parseInt(t, 16);
+                  if (Number.isFinite(n)) bits |= n;
+                } else if (/^-?\d+$/.test(t)) {
+                  const n = parseInt(t, 10);
+                  if (Number.isFinite(n)) bits |= n;
+                } else {
+                  unrecognised = true;
+                }
+              }
+              if (!unrecognised) newCloexec = (bits & 0x1) !== 0;
+            }
+            if (newCloexec !== null) {
+              if (cur !== undefined) {
+                dirfdTable.set(oldKey, { path: cur.path, cloexec: newCloexec });
+              }
+              // If cur is undefined we don't have a tracked path for
+              // this fd — nothing to flip.  No state to corrupt.
+            } else {
+              // Unrecognised SETFD arg — fail closed: mark fd-group
+              // unknown so subsequent openat(<fd>, ...) returns null.
+              fdUnknownAdd(pid);
+            }
+          } else if (cmd === 'F_GETFD' || cmd === 'F_GETFL' || cmd === 'F_SETFL') {
+            // Read-only or non-fd-table-mutating subcommands.  Ignored.
+          } else if (
+            cmd === 'F_SETLK' || cmd === 'F_SETLKW' || cmd === 'F_GETLK' ||
+            cmd === 'F_SETOWN' || cmd === 'F_GETOWN' ||
+            cmd === 'F_SETSIG' || cmd === 'F_GETSIG' ||
+            cmd === 'F_SETLEASE' || cmd === 'F_GETLEASE' ||
+            cmd === 'F_NOTIFY' || cmd === 'F_SETPIPE_SZ' || cmd === 'F_GETPIPE_SZ' ||
+            cmd === 'F_ADD_SEALS' || cmd === 'F_GET_SEALS'
+          ) {
+            // Other documented subcommands that don't affect the
+            // <fd → directory> mapping or the FD_CLOEXEC bit.  No-op.
+          } else {
+            // Unrecognised subcommand on a successful fcntl call.
+            // Fail closed: mark the pid's fd-group unknown so
+            // subsequent openat(<fd>, ...) returns null.
+            fdUnknownAdd(pid);
           }
         }
         continue;
@@ -1764,6 +1993,30 @@ export async function runInstallPhase(
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
           shimLoadedPids.delete(rawEvent.pid);
+          // Audit-trust Finding (high, 2026-05-19, codex follow-up): on a
+          // successful execve the kernel auto-closes every fd whose
+          // FD_CLOEXEC bit is set.  Sweep the fd-group's dirfdTable:
+          // entries with cloexec=true are deleted (the kernel closed
+          // them), entries with cloexec=false survive (the kernel kept
+          // them and the post-exec image can openat(<fd>, …) through
+          // them).  Pre-fix we never tracked CLOEXEC, so a script that
+          // did `openat(AT_FDCWD, "/pkg", O_RDONLY|O_CLOEXEC) = 7`
+          // followed by exec + `openat(7, "../../root/.ssh/id_rsa", …)`
+          // would resolve through the stale `/pkg` mapping — the
+          // kernel had already closed fd 7 on exec, but our table
+          // still trusted it.
+          //
+          // We DO NOT touch entries in other fd groups (other
+          // CLONE_FILES groups continue with their own state).
+          const execRoot = rootedFd(rawEvent.pid);
+          const execPrefix = `${execRoot}:`;
+          for (const key of [...dirfdTable.keys()]) {
+            if (!key.startsWith(execPrefix)) continue;
+            const entry = dirfdTable.get(key);
+            if (entry !== undefined && entry.cloexec) {
+              dirfdTable.delete(key);
+            }
+          }
         }
 
         const result = input.attribution.attribute(rawEvent.pid);
@@ -1810,7 +2063,50 @@ export async function runInstallPhase(
             rawEvent.dirfd,
           );
           if (canonicalForFd !== null) {
-            dirfdTable.set(fdKey(rawEvent.pid, rawEvent.retFd), canonicalForFd);
+            // Audit-trust Finding (high, 2026-05-19, codex follow-up):
+            // detect O_CLOEXEC at openat/openat2/open time so the next
+            // successful execve sweep correctly drops kernel-closed fds.
+            // creat(2) NEVER sets FD_CLOEXEC on its return fd, so a
+            // creat-sourced event must always be cloexec=false.  We
+            // distinguish creat from open by leading-token match on the
+            // raw line — the strace parser doesn't expose the original
+            // syscall name on the RawEvent.  Numeric flag form
+            // (`0o2000000` / `0x80000` etc) is not common from strace
+            // (which renders symbolic identifiers by default for known
+            // flags), but we include a numeric check for defence in
+            // depth.
+            const isCreat = line.startsWith('creat(');
+            let cloexec = false;
+            if (!isCreat) {
+              // Strip the quoted path string from the line before
+              // testing for O_CLOEXEC: if a user opens a file whose
+              // path literally contains the bytes `O_CLOEXEC` (exotic
+              // but legal), we don't want that to leak into the flag
+              // detection.  Strace renders the path as a double-quoted
+              // C-style string; we conservatively blank out anything
+              // inside the first quoted region.
+              const firstQuote = line.indexOf('"');
+              let scanLine: string;
+              if (firstQuote === -1) {
+                scanLine = line;
+              } else {
+                // Find the matching closing quote, skipping escapes.
+                let j = firstQuote + 1;
+                while (j < line.length) {
+                  if (line[j] === '\\') { j += 2; continue; }
+                  if (line[j] === '"') break;
+                  j++;
+                }
+                scanLine = line.slice(0, firstQuote) + line.slice(j + 1);
+              }
+              if (scanLine.includes('O_CLOEXEC')) {
+                cloexec = true;
+              }
+            }
+            dirfdTable.set(fdKey(rawEvent.pid, rawEvent.retFd), {
+              path: canonicalForFd,
+              cloexec,
+            });
           }
         }
 

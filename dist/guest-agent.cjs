@@ -25984,7 +25984,9 @@ async function runInstallPhase(input) {
       const parentVal = parentFds.get(fdSuffix);
       if (parentVal === void 0) {
         dirfdTable.set(mergedKey, childVal);
-      } else if (parentVal === childVal) {
+      } else if (parentVal.path === childVal.path && parentVal.cloexec === childVal.cloexec) {
+      } else if (parentVal.path === childVal.path) {
+        dirfdTable.set(mergedKey, { path: parentVal.path, cloexec: parentVal.cloexec || childVal.cloexec });
       } else {
         dirfdTable.delete(mergedKey);
       }
@@ -26033,9 +26035,9 @@ async function runInstallPhase(input) {
       return path.resolve(cwd, targetPath);
     }
     if (fdUnknownHas(pid)) return null;
-    const dirPath = dirfdTable.get(fdKey(pid, dirfd));
-    if (dirPath === void 0) return null;
-    return path.resolve(dirPath, targetPath);
+    const dirEntry = dirfdTable.get(fdKey(pid, dirfd));
+    if (dirEntry === void 0) return null;
+    return path.resolve(dirEntry.path, targetPath);
   };
   const canonicalizeForEmit = (pid, targetPath, dirfd) => {
     if (dirfd === void 0) {
@@ -26050,9 +26052,9 @@ async function runInstallPhase(input) {
       return null;
     }
     if (fdUnknownHas(pid)) return null;
-    const dirPath = dirfdTable.get(fdKey(pid, dirfd));
-    if (dirPath === void 0) return null;
-    return path.resolve(dirPath, targetPath);
+    const dirEntry = dirfdTable.get(fdKey(pid, dirfd));
+    if (dirEntry === void 0) return null;
+    return path.resolve(dirEntry.path, targetPath);
   };
   const shimLoadedPids = /* @__PURE__ */ new Set();
   const forgerySamples = [];
@@ -26119,9 +26121,9 @@ async function runInstallPhase(input) {
       if (fchdirMatch !== null) {
         const fd = parseInt(fchdirMatch[1] ?? "", 10);
         if (Number.isFinite(fd)) {
-          const dirPath = dirfdTable.get(fdKey(pid, fd));
-          if (dirPath !== void 0) {
-            cwdSet(pid, dirPath);
+          const dirEntry = dirfdTable.get(fdKey(pid, fd));
+          if (dirEntry !== void 0) {
+            cwdSet(pid, dirEntry.path);
             cwdUnknownDelete(pid);
           } else {
             cwdUnknownAdd(pid);
@@ -26186,11 +26188,11 @@ async function runInstallPhase(input) {
         continue;
       }
       const dupMatch = line.match(
-        /^(dup3?|dup2)\((-?\d+)(?:\s*,\s*(-?\d+))?(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/
+        /^(dup3?|dup2)\((-?\d+)(?:\s*,\s*(-?\d+))?(?:\s*,\s*([^)]*))?\)\s*=\s*(-?\d+)\b/
       );
       if (dupMatch !== null) {
         const op = dupMatch[1] ?? "";
-        const rc = parseInt(dupMatch[4] ?? "", 10);
+        const rc = parseInt(dupMatch[5] ?? "", 10);
         if (Number.isFinite(rc) && rc >= 0) {
           const oldFd = parseInt(dupMatch[2] ?? "", 10);
           const newFd = op === "dup" ? rc : parseInt(dupMatch[3] ?? "", 10);
@@ -26199,7 +26201,18 @@ async function runInstallPhase(input) {
             const newKey = fdKey(pid, newFd);
             const oldVal = dirfdTable.get(oldKey);
             if (oldVal !== void 0) {
-              dirfdTable.set(newKey, oldVal);
+              let newCloexec = false;
+              if (op === "dup3") {
+                const flagsTok = (dupMatch[4] ?? "").trim();
+                if (flagsTok.length > 0) {
+                  if (flagsTok.includes("O_CLOEXEC")) newCloexec = true;
+                  else {
+                    const n = flagsTok.startsWith("0x") ? parseInt(flagsTok, 16) : flagsTok.startsWith("0o") || /^0\d/.test(flagsTok) ? parseInt(flagsTok, 8) : parseInt(flagsTok, 10);
+                    if (Number.isFinite(n) && (n & 524288) !== 0) newCloexec = true;
+                  }
+                }
+              }
+              dirfdTable.set(newKey, { path: oldVal.path, cloexec: newCloexec });
             } else {
               dirfdTable.delete(newKey);
             }
@@ -26232,17 +26245,39 @@ async function runInstallPhase(input) {
             last = parseInt(lastRaw, 10);
           }
           const flagsStr = (closeRangeMatch[3] ?? "").trim();
-          let hasUnshare = false;
-          if (flagsStr.length > 0 && flagsStr !== "0") {
-            for (const tok of flagsStr.split("|")) {
-              const t = tok.trim();
-              if (t === "CLOSE_RANGE_UNSHARE") hasUnshare = true;
-            }
-            if (flagsStr.startsWith("0x")) {
+          const CLOSE_RANGE_UNSHARE = 2;
+          const CLOSE_RANGE_CLOEXEC = 4;
+          let flagsBits = 0;
+          if (flagsStr.length > 0) {
+            if (/^[A-Z_|\s]+$/.test(flagsStr)) {
+              for (const tok of flagsStr.split("|")) {
+                const t = tok.trim();
+                if (t === "CLOSE_RANGE_UNSHARE") flagsBits |= CLOSE_RANGE_UNSHARE;
+                else if (t === "CLOSE_RANGE_CLOEXEC") flagsBits |= CLOSE_RANGE_CLOEXEC;
+              }
+            } else if (flagsStr.startsWith("0x")) {
               const n = parseInt(flagsStr, 16);
-              if (Number.isFinite(n) && (n & 2) !== 0) hasUnshare = true;
+              if (Number.isFinite(n)) flagsBits = n;
+            } else if (/^-?\d+$/.test(flagsStr)) {
+              const n = parseInt(flagsStr, 10);
+              if (Number.isFinite(n)) flagsBits = n;
+            } else {
+              for (const tok of flagsStr.split("|")) {
+                const t = tok.trim();
+                if (t === "CLOSE_RANGE_UNSHARE") flagsBits |= CLOSE_RANGE_UNSHARE;
+                else if (t === "CLOSE_RANGE_CLOEXEC") flagsBits |= CLOSE_RANGE_CLOEXEC;
+                else if (t.startsWith("0x")) {
+                  const n = parseInt(t, 16);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                } else if (/^-?\d+$/.test(t)) {
+                  const n = parseInt(t, 10);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                }
+              }
             }
           }
+          const hasUnshare = (flagsBits & CLOSE_RANGE_UNSHARE) !== 0;
+          const hasCloexec = (flagsBits & CLOSE_RANGE_CLOEXEC) !== 0;
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
             if (hasUnshare) {
               const sharedRoot = rootedFd(pid);
@@ -26292,25 +26327,105 @@ async function runInstallPhase(input) {
                 }
               }
               const groupPrefix = `${rootedFd(pid)}:`;
-              for (const key of dirfdTable.keys()) {
+              for (const key of [...dirfdTable.keys()]) {
                 if (!key.startsWith(groupPrefix)) continue;
                 const fdStr = key.slice(groupPrefix.length);
                 const fd = parseInt(fdStr, 10);
                 if (Number.isFinite(fd) && fd >= first && fd <= last) {
-                  dirfdTable.delete(key);
+                  if (hasCloexec) {
+                    const cur = dirfdTable.get(key);
+                    if (cur !== void 0) {
+                      dirfdTable.set(key, { path: cur.path, cloexec: true });
+                    }
+                  } else {
+                    dirfdTable.delete(key);
+                  }
                 }
               }
             } else {
               const groupPrefix = `${rootedFd(pid)}:`;
-              for (const key of dirfdTable.keys()) {
+              for (const key of [...dirfdTable.keys()]) {
                 if (!key.startsWith(groupPrefix)) continue;
                 const fdStr = key.slice(groupPrefix.length);
                 const fd = parseInt(fdStr, 10);
                 if (Number.isFinite(fd) && fd >= first && fd <= last) {
-                  dirfdTable.delete(key);
+                  if (hasCloexec) {
+                    const cur = dirfdTable.get(key);
+                    if (cur !== void 0) {
+                      dirfdTable.set(key, { path: cur.path, cloexec: true });
+                    }
+                  } else {
+                    dirfdTable.delete(key);
+                  }
                 }
               }
             }
+          }
+        }
+        continue;
+      }
+      const fcntlMatch = line.match(
+        /^(fcntl|fcntl64)\((-?\d+)\s*,\s*([A-Z_0-9]+)(?:\s*,\s*([^)]*))?\)\s*=\s*(-?\d+)\b/
+      );
+      if (fcntlMatch !== null) {
+        const fd = parseInt(fcntlMatch[2] ?? "", 10);
+        const cmd2 = fcntlMatch[3] ?? "";
+        const arg = (fcntlMatch[4] ?? "").trim();
+        const rc = parseInt(fcntlMatch[5] ?? "", 10);
+        if (Number.isFinite(fd) && Number.isFinite(rc) && rc >= 0) {
+          const oldKey = fdKey(pid, fd);
+          if (cmd2 === "F_DUPFD" || cmd2 === "F_DUPFD_CLOEXEC") {
+            const oldVal = dirfdTable.get(oldKey);
+            const newKey = fdKey(pid, rc);
+            if (oldVal !== void 0) {
+              dirfdTable.set(newKey, {
+                path: oldVal.path,
+                cloexec: cmd2 === "F_DUPFD_CLOEXEC"
+              });
+            } else {
+              dirfdTable.delete(newKey);
+            }
+          } else if (cmd2 === "F_SETFD") {
+            const cur = dirfdTable.get(oldKey);
+            let newCloexec = null;
+            if (arg === "FD_CLOEXEC") newCloexec = true;
+            else if (arg === "0") newCloexec = false;
+            else if (arg.startsWith("0x")) {
+              const n = parseInt(arg, 16);
+              if (Number.isFinite(n)) newCloexec = (n & 1) !== 0;
+            } else if (/^-?\d+$/.test(arg)) {
+              const n = parseInt(arg, 10);
+              if (Number.isFinite(n)) newCloexec = (n & 1) !== 0;
+            } else if (arg.length > 0) {
+              let unrecognised = false;
+              let bits = 0;
+              for (const tok of arg.split("|")) {
+                const t = tok.trim();
+                if (t === "FD_CLOEXEC") bits |= 1;
+                else if (t === "0") {
+                } else if (/^0x[0-9a-fA-F]+$/.test(t)) {
+                  const n = parseInt(t, 16);
+                  if (Number.isFinite(n)) bits |= n;
+                } else if (/^-?\d+$/.test(t)) {
+                  const n = parseInt(t, 10);
+                  if (Number.isFinite(n)) bits |= n;
+                } else {
+                  unrecognised = true;
+                }
+              }
+              if (!unrecognised) newCloexec = (bits & 1) !== 0;
+            }
+            if (newCloexec !== null) {
+              if (cur !== void 0) {
+                dirfdTable.set(oldKey, { path: cur.path, cloexec: newCloexec });
+              }
+            } else {
+              fdUnknownAdd(pid);
+            }
+          } else if (cmd2 === "F_GETFD" || cmd2 === "F_GETFL" || cmd2 === "F_SETFL") {
+          } else if (cmd2 === "F_SETLK" || cmd2 === "F_SETLKW" || cmd2 === "F_GETLK" || cmd2 === "F_SETOWN" || cmd2 === "F_GETOWN" || cmd2 === "F_SETSIG" || cmd2 === "F_GETSIG" || cmd2 === "F_SETLEASE" || cmd2 === "F_GETLEASE" || cmd2 === "F_NOTIFY" || cmd2 === "F_SETPIPE_SZ" || cmd2 === "F_GETPIPE_SZ" || cmd2 === "F_ADD_SEALS" || cmd2 === "F_GET_SEALS") {
+          } else {
+            fdUnknownAdd(pid);
           }
         }
         continue;
@@ -26320,6 +26435,15 @@ async function runInstallPhase(input) {
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           shimLoadedPids.delete(rawEvent.pid);
+          const execRoot = rootedFd(rawEvent.pid);
+          const execPrefix = `${execRoot}:`;
+          for (const key of [...dirfdTable.keys()]) {
+            if (!key.startsWith(execPrefix)) continue;
+            const entry = dirfdTable.get(key);
+            if (entry !== void 0 && entry.cloexec) {
+              dirfdTable.delete(key);
+            }
+          }
         }
         const result = input.attribution.attribute(rawEvent.pid);
         if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.errno === void 0 && rawEvent.retFd !== void 0) {
@@ -26329,7 +26453,33 @@ async function runInstallPhase(input) {
             rawEvent.dirfd
           );
           if (canonicalForFd !== null) {
-            dirfdTable.set(fdKey(rawEvent.pid, rawEvent.retFd), canonicalForFd);
+            const isCreat = line.startsWith("creat(");
+            let cloexec = false;
+            if (!isCreat) {
+              const firstQuote = line.indexOf('"');
+              let scanLine;
+              if (firstQuote === -1) {
+                scanLine = line;
+              } else {
+                let j = firstQuote + 1;
+                while (j < line.length) {
+                  if (line[j] === "\\") {
+                    j += 2;
+                    continue;
+                  }
+                  if (line[j] === '"') break;
+                  j++;
+                }
+                scanLine = line.slice(0, firstQuote) + line.slice(j + 1);
+              }
+              if (scanLine.includes("O_CLOEXEC")) {
+                cloexec = true;
+              }
+            }
+            dirfdTable.set(fdKey(rawEvent.pid, rawEvent.retFd), {
+              path: canonicalForFd,
+              cloexec
+            });
           }
         }
         if (rawEvent.kind === "read" && rawEvent.path === SHIM_LIBRARY_PATH) {
@@ -27383,7 +27533,7 @@ var LinuxStraceRunner = class {
       "-s",
       "4096",
       "-e",
-      "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range",
+      "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64",
       "-o",
       opts.basePath,
       cmd,

@@ -1208,16 +1208,23 @@ export class LinuxStraceRunner implements StraceRunner {
     // protected-paths matcher.  After tracing them, phase-install
     // propagates / invalidates the dirfdTable entry at the dup/close,
     // and the openat either resolves correctly or fails closed via
-    // the `<UNRESOLVED_PATH>` audit_bypass entry.  We intentionally
-    // do NOT trace `fcntl` here — F_DUPFD/F_DUPFD_CLOEXEC subcommands
-    // require parsing the cmd token and we defer that to a follow-up;
-    // phase-install treats any `fcntl` we DO observe (none today) as
-    // a state-violating syscall that marks the pid's dirfd state
-    // unknown.
+    // the `<UNRESOLVED_PATH>` audit_bypass entry.
+    //
+    // Audit-trust Finding (high, 2026-05-19, codex follow-up):
+    // include `fcntl` (and the 32-bit-arch variant `fcntl64`).  Pre-fix
+    // we deliberately omitted these because the cmd subcommand variety
+    // is large; phase-install now models the subcommands we care about
+    // (F_DUPFD / F_DUPFD_CLOEXEC / F_SETFD / F_GETFD) and falls back to
+    // `dirfdStateUnknown` for anything it doesn't recognise.  This
+    // closes the post-exec-CLOEXEC bypass: a script that opens a dirfd
+    // with O_CLOEXEC and then execs sees the kernel close the fd, but
+    // our dirfdTable would have kept the stale entry indefinitely
+    // without tracking the CLOEXEC bit + sweeping on exec.  Also catches
+    // F_SETFD FD_CLOEXEC mutations on previously-non-CLOEXEC fds.
     const straceArgs = [
       '-ff',
       '-s', '4096',
-      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range',
+      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64',
       '-o', opts.basePath,
       cmd,
       ...args,
