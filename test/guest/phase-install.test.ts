@@ -11882,5 +11882,381 @@ describe('runInstallPhase', () => {
       });
       expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex follow-up (high, 2026-05-19, bug #6 — execve CLOEXEC sweep
+    // must transition post-marker fd lifecycle from 'open' to
+    // 'closed' so the delayed-clone reconciler's copy-pass skips
+    // parent's stale shared-baseline entry for the same fd number):
+    //   1. parent opens fd 7 → /A (non-CLOEXEC; shared via
+    //      CLONE_FILES)
+    //   2. child unshare(CLONE_FILES) [marker]
+    //   3. child openat(AT_FDCWD, "/B", O_CLOEXEC) = 7 [post-marker
+    //      reuse, lifecycle 'open', child's entry cloexec=true]
+    //   4. child execve [the in-line sweep deletes child fd 7 →
+    //      lifecycle MUST transition to 'closed']
+    //   5. delayed parent clone(CLONE_FILES) = child
+    // Expected: child openat(7, "x") fails closed (kernel-closed);
+    //           parent openat(7, "x") resolves to /A/x.
+    //
+    // Pre-fix: the sweep deleted child's dirfdTable fd 7 but left
+    // lifecycle = 'open'.  Reconciler's `childPostMarkerFdClosed`
+    // did NOT include 7, so the copy-pass copied parent's fd 7 →
+    // /A into the child group.  Subsequent child openat(7, "x")
+    // emitted /A/x — wrong (the kernel returns EBADF).
+    it('execve sweep of post-marker O_CLOEXEC fd transitions lifecycle to closed — parent fd not resurrected (bug #6 O_CLOEXEC)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'execve-cloexec-sweep-open-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'execve-cloexec-sweep-open-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7 (non-CLOEXEC; shared via CLONE_FILES).
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child unshare(CLONE_FILES) — singleton detach, marker seeded.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // POST-marker child openat with O_CLOEXEC → fd 7 = /B
+        // (lifecycle 'open', cloexec=true).
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 7',
+          source: 'strace',
+        },
+        // Child execve — in-line sweep deletes child fd 7 (cloexec).
+        // Post-fix: lifecycle transitions 'open' → 'closed'.
+        {
+          pid: 1001,
+          line: 'execve("/bin/sh", ["/bin/sh"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  Copy-pass MUST
+        // skip parent's fd 7 → /A because fd 7 is in
+        // childPostMarkerFdClosed.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed (kernel-closed at
+        // exec).
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /A/x (parent's
+        // table is untouched by the child's private post-unshare
+        // CLOEXEC sweep).
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: NO /A/x certified (bug #6 resurrection); also NO /B/x
+      // certified (kernel closed fd 7 at exec).
+      const childLeakA = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeakA).toHaveLength(0);
+      const childLeakB = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(childLeakB).toHaveLength(0);
+      // Child: <UNRESOLVED_PATH> on the failing openat(7, "x").
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (high, 2026-05-19, bug #6 — F_SETFD path):
+    // same lifecycle invariant when the cloexec bit is set via
+    // fcntl(F_SETFD, FD_CLOEXEC) AFTER a post-marker non-CLOEXEC
+    // open.  fcntl(F_SETFD) does NOT close the fd by itself; the
+    // actual close happens at the next execve.
+    //   1. parent opens fd 7 → /A
+    //   2. child unshare(CLONE_FILES) [marker]
+    //   3. child openat(AT_FDCWD, "/B") = 7 [lifecycle 'open',
+    //      cloexec=false]
+    //   4. child fcntl(7, F_SETFD, FD_CLOEXEC) [child's fd 7 entry
+    //      now cloexec=true; lifecycle remains 'open' — fcntl does
+    //      not close]
+    //   5. child execve [in-line sweep deletes child fd 7; lifecycle
+    //      MUST transition to 'closed']
+    //   6. delayed parent clone(CLONE_FILES) = child
+    // Expected: child openat(7, "x") fails closed; parent
+    //           openat(7, "x") resolves to /A/x.
+    it('execve sweep of post-marker fcntl(F_SETFD,FD_CLOEXEC) fd transitions lifecycle to closed (bug #6 F_SETFD)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'execve-cloexec-sweep-setfd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'execve-cloexec-sweep-setfd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7 (non-CLOEXEC).
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child unshare(CLONE_FILES) — singleton marker.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // POST-marker child openat (no O_CLOEXEC) → fd 7 = /B
+        // (lifecycle 'open', cloexec=false).
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // POST-marker fcntl(7, F_SETFD, FD_CLOEXEC).  Sets cloexec
+        // bit on child's fd 7 entry; lifecycle remains 'open' (no
+        // close yet).
+        {
+          pid: 1001,
+          line: 'fcntl(7, F_SETFD, FD_CLOEXEC) = 0',
+          source: 'strace',
+        },
+        // Child execve — in-line sweep deletes child fd 7 (cloexec=true).
+        // Post-fix: lifecycle transitions to 'closed'.
+        {
+          pid: 1001,
+          line: 'execve("/bin/sh", ["/bin/sh"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  Copy-pass MUST
+        // skip parent's fd 7 → /A.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /A/x.
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: NO /A/x, NO /B/x.
+      const childLeakA = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeakA).toHaveLength(0);
+      const childLeakB = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(childLeakB).toHaveLength(0);
+      // Child: <UNRESOLVED_PATH> on the failing openat(7, "x").
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (high, 2026-05-19, bug #6 —
+    // close_range(CLOSE_RANGE_CLOEXEC) path): CLOSE_RANGE_CLOEXEC
+    // sets the cloexec bit WITHOUT closing immediately; the real
+    // close happens at the subsequent execve.
+    //   1. parent opens fd 7 → /A (non-CLOEXEC)
+    //   2. child unshare(CLONE_FILES) [marker]
+    //   3. child openat(AT_FDCWD, "/B") = 7 [lifecycle 'open',
+    //      cloexec=false]
+    //   4. child close_range(7, 7, CLOSE_RANGE_CLOEXEC) [child's fd
+    //      7 entry now cloexec=true; lifecycle 'open']
+    //   5. child execve [in-line sweep deletes fd 7; lifecycle
+    //      MUST transition to 'closed']
+    //   6. delayed parent clone(CLONE_FILES) = child
+    // Expected: child openat(7, "x") fails closed; parent
+    //           openat(7, "x") resolves to /A/x.
+    it('execve sweep after close_range(CLOSE_RANGE_CLOEXEC) transitions lifecycle to closed (bug #6 close_range cloexec)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'execve-cloexec-sweep-range-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'execve-cloexec-sweep-range-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7 (non-CLOEXEC).
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child unshare(CLONE_FILES) — singleton marker.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // POST-marker child openat (no O_CLOEXEC) → fd 7 = /B
+        // (lifecycle 'open', cloexec=false).
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // POST-marker close_range(7, 7, CLOSE_RANGE_CLOEXEC).  Sets
+        // FD_CLOEXEC on fd 7; the kernel does NOT close yet.
+        // Lifecycle remains 'open'.
+        {
+          pid: 1001,
+          line: 'close_range(7, 7, CLOSE_RANGE_CLOEXEC) = 0',
+          source: 'strace',
+        },
+        // Child execve — in-line sweep deletes fd 7 (cloexec=true).
+        // Post-fix: lifecycle transitions to 'closed'.
+        {
+          pid: 1001,
+          line: 'execve("/bin/sh", ["/bin/sh"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  Copy-pass MUST
+        // skip parent's fd 7 → /A.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /A/x.
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: NO /A/x, NO /B/x.
+      const childLeakA = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeakA).toHaveLength(0);
+      const childLeakB = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(childLeakB).toHaveLength(0);
+      // Child: <UNRESOLVED_PATH> on the failing openat(7, "x").
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

@@ -27090,6 +27090,11 @@ async function runInstallPhase(input) {
             const entry = dirfdTable.get(key);
             if (entry !== void 0 && entry.cloexec) {
               dirfdTable.delete(key);
+              const fdSuffix = key.slice(execPrefix.length);
+              const fdNum = parseInt(fdSuffix, 10);
+              if (Number.isFinite(fdNum)) {
+                recordPostMarkerFdClose(rawEvent.pid, fdNum);
+              }
             }
           }
           if (execFdSnap !== null) {

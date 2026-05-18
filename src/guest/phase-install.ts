@@ -3737,6 +3737,27 @@ export async function runInstallPhase(
             const entry = dirfdTable.get(key);
             if (entry !== undefined && entry.cloexec) {
               dirfdTable.delete(key);
+              // Codex follow-up (high, 2026-05-19, bug #6 — execve
+              // CLOEXEC sweep doesn't transition post-marker
+              // lifecycle): the kernel ACTUALLY closes the fd here
+              // (this is the one site where FD_CLOEXEC translates
+              // into a real close — fcntl(F_SETFD) and
+              // close_range(CLOSE_RANGE_CLOEXEC) only SET the bit
+              // and defer the close to the next exec).  Transition
+              // matching post-marker reuse lifecycle entries from
+              // 'open' → 'closed' so the delayed-clone reconciler's
+              // copy-pass treats fd as kernel-closed and skips the
+              // parent's stale shared-baseline entry.  Without this,
+              // a post-marker O_CLOEXEC reopen followed by exec lets
+              // the parent's same-numbered fd silently resurrect in
+              // the child copy, and subsequent child openat(<fd>, …)
+              // resolves through the parent's path even though the
+              // kernel returns EBADF.
+              const fdSuffix = key.slice(execPrefix.length);
+              const fdNum = parseInt(fdSuffix, 10);
+              if (Number.isFinite(fdNum)) {
+                recordPostMarkerFdClose(rawEvent.pid, fdNum);
+              }
             }
           }
           if (execFdSnap !== null) {
