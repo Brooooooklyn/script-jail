@@ -1038,10 +1038,43 @@ export class LinuxStraceRunner implements StraceRunner {
     // O_TRUNC, mode)`); the dirfdTable in phase-install consumes
     // `retFd` exactly like openat so a follow-up
     // `openat(<creat-fd>, ...)` resolves correctly.
+    //
+    // Audit-trust Finding (high, 2026-05-19, codex follow-up): include
+    // `clone`, `clone3`, `vfork`, and `fork` so phase-install can
+    // propagate per-pid cwd and dirfd-table state to forked children at
+    // the moment the kernel creates them.  Without these, a child pid
+    // that inherits a parent's `chdir("/root")` produces an
+    // AT_FDCWD-relative openat that the dispatcher resolves with NO
+    // tracked cwd — pre-fix that fell back to `input.cwd`, silently
+    // dropping a `.ssh/id_rsa` probe.  Strace renders the syscalls as
+    //   `clone(child_stack=..., flags=...) = <child_pid>`,
+    //   `clone3({flags=..., ...}, <size>) = <child_pid>`,
+    //   `vfork() = <child_pid>`, `fork() = <child_pid>`.
+    // On the host's modern glibc, every fork goes through `clone` or
+    // `clone3`, but tracing all four costs nothing and immunises us
+    // against alpine/musl rootfs variants that still expose `fork(2)`.
+    //
+    // Audit-trust Finding (high, 2026-05-19, codex follow-up): include
+    // `dup`, `dup2`, `dup3`, `close`, and `close_range` so the dirfdTable
+    // can be invalidated when a pid mutates its fd table.  A process
+    // can `openat(AT_FDCWD, "/pkg", O_DIRECTORY) = 7`, then
+    // `openat(AT_FDCWD, "/root", O_DIRECTORY) = 8`, then untraced
+    // `dup2(8, 7)`, then `openat(7, ".ssh/id_rsa", O_RDONLY)`.  Without
+    // tracing the fd mutations the dirfdTable still maps `7 -> /pkg`,
+    // so the openat resolves to `/pkg/.ssh/id_rsa` and bypasses the
+    // protected-paths matcher.  After tracing them, phase-install
+    // propagates / invalidates the dirfdTable entry at the dup/close,
+    // and the openat either resolves correctly or fails closed via
+    // the `<UNRESOLVED_PATH>` audit_bypass entry.  We intentionally
+    // do NOT trace `fcntl` here — F_DUPFD/F_DUPFD_CLOEXEC subcommands
+    // require parsing the cmd token and we defer that to a follow-up;
+    // phase-install treats any `fcntl` we DO observe (none today) as
+    // a state-violating syscall that marks the pid's dirfd state
+    // unknown.
     const straceArgs = [
       '-ff',
       '-s', '4096',
-      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir',
+      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range',
       '-o', opts.basePath,
       cmd,
       ...args,

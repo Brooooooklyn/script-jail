@@ -25908,6 +25908,8 @@ async function runInstallPhase(input) {
   const fdKey = (pid, fd) => `${pid}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
   const pidCwdUnknown = /* @__PURE__ */ new Set();
+  const dirfdStateUnknown = /* @__PURE__ */ new Set();
+  let installRootSeeded = false;
   const canonicalizeOpenTarget = (pid, targetPath, dirfd) => {
     if (dirfd === void 0) {
       if (path.isAbsolute(targetPath)) {
@@ -25917,6 +25919,7 @@ async function runInstallPhase(input) {
       if (cwd === void 0) return null;
       return path.resolve(cwd, targetPath);
     }
+    if (dirfdStateUnknown.has(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === void 0) return null;
     return path.resolve(dirPath, targetPath);
@@ -25930,9 +25933,9 @@ async function runInstallPhase(input) {
       if (tracked !== void 0) {
         return path.resolve(tracked, targetPath);
       }
-      if (pidCwdUnknown.has(pid)) return null;
-      return path.resolve(input.cwd, targetPath);
+      return null;
     }
+    if (dirfdStateUnknown.has(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === void 0) return null;
     return path.resolve(dirPath, targetPath);
@@ -25951,6 +25954,10 @@ async function runInstallPhase(input) {
     cwd: input.cwd,
     basePath
   })) {
+    if (!installRootSeeded) {
+      installRootSeeded = true;
+      pidCwd.set(pid, path.resolve(input.cwd));
+    }
     if (source === "shim") {
       const shimEvent = parseShimLine(line);
       if (shimEvent === null) {
@@ -26002,6 +26009,89 @@ async function runInstallPhase(input) {
           } else {
             pidCwdUnknown.add(pid);
             pidCwd.delete(pid);
+          }
+        }
+        continue;
+      }
+      const cloneMatch = line.match(/^(?:clone3?|vfork|fork)\b/);
+      if (cloneMatch !== null) {
+        const rcMatch = line.match(/=\s*(\d+)\b/);
+        if (rcMatch !== null) {
+          const childPid = parseInt(rcMatch[1] ?? "", 10);
+          if (Number.isFinite(childPid) && childPid > 0) {
+            const parentCwd = pidCwd.get(pid);
+            if (parentCwd !== void 0) {
+              pidCwd.set(childPid, parentCwd);
+            }
+            if (pidCwdUnknown.has(pid)) {
+              pidCwdUnknown.add(childPid);
+            }
+            const parentPrefix = `${pid}:`;
+            for (const [key, val] of dirfdTable) {
+              if (key.startsWith(parentPrefix)) {
+                const suffix = key.slice(parentPrefix.length);
+                dirfdTable.set(`${childPid}:${suffix}`, val);
+              }
+            }
+            if (dirfdStateUnknown.has(pid)) {
+              dirfdStateUnknown.add(childPid);
+            }
+            if (shimLoadedPids.has(pid)) {
+              shimLoadedPids.add(childPid);
+            }
+          }
+        }
+        continue;
+      }
+      const dupMatch = line.match(
+        /^(dup3?|dup2)\((-?\d+)(?:\s*,\s*(-?\d+))?(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/
+      );
+      if (dupMatch !== null) {
+        const op = dupMatch[1] ?? "";
+        const rc = parseInt(dupMatch[4] ?? "", 10);
+        if (Number.isFinite(rc) && rc >= 0) {
+          const oldFd = parseInt(dupMatch[2] ?? "", 10);
+          const newFd = op === "dup" ? rc : parseInt(dupMatch[3] ?? "", 10);
+          if (Number.isFinite(oldFd) && Number.isFinite(newFd)) {
+            const oldKey = fdKey(pid, oldFd);
+            const newKey = fdKey(pid, newFd);
+            const oldVal = dirfdTable.get(oldKey);
+            if (oldVal !== void 0) {
+              dirfdTable.set(newKey, oldVal);
+            } else {
+              dirfdTable.delete(newKey);
+            }
+          }
+        }
+        continue;
+      }
+      const closeMatch = line.match(/^close\((-?\d+)\)\s*=\s*(-?\d+)\b/);
+      if (closeMatch !== null) {
+        const fd = parseInt(closeMatch[1] ?? "", 10);
+        if (Number.isFinite(fd)) {
+          dirfdTable.delete(fdKey(pid, fd));
+        }
+        continue;
+      }
+      const closeRangeMatch = line.match(
+        /^close_range\((-?\d+)\s*,\s*(-?\d+|0x[0-9a-fA-F]+)(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/
+      );
+      if (closeRangeMatch !== null) {
+        const rc = parseInt(closeRangeMatch[3] ?? "", 10);
+        if (Number.isFinite(rc) && rc === 0) {
+          const first = parseInt(closeRangeMatch[1] ?? "", 10);
+          const lastRaw = closeRangeMatch[2] ?? "";
+          const last = lastRaw.startsWith("0x") ? parseInt(lastRaw, 16) : parseInt(lastRaw, 10);
+          if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
+            const pidPrefix = `${pid}:`;
+            for (const key of dirfdTable.keys()) {
+              if (!key.startsWith(pidPrefix)) continue;
+              const fdStr = key.slice(pidPrefix.length);
+              const fd = parseInt(fdStr, 10);
+              if (Number.isFinite(fd) && fd >= first && fd <= last) {
+                dirfdTable.delete(key);
+              }
+            }
           }
         }
         continue;
@@ -27022,7 +27112,7 @@ var LinuxStraceRunner = class {
       "-s",
       "4096",
       "-e",
-      "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir",
+      "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range",
       "-o",
       opts.basePath,
       cmd,

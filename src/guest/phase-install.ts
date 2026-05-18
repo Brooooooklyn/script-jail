@@ -477,6 +477,72 @@ export async function runInstallPhase(
   // re-established because absolute chdir doesn't depend on prior cwd.
   const pidCwdUnknown = new Set<number>();
 
+  // Audit-trust Finding (high, 2026-05-19, codex follow-up #2): set of
+  // pids whose fd-table integrity we cannot guarantee.  Membership is
+  // sticky: once a pid lands here, any subsequent
+  // `openat(<numeric-dirfd>, ...)` from that pid fails closed in
+  // `canonicalizeForEmit` / `canonicalizeOpenTarget` and emits a
+  // `<UNRESOLVED_PATH>` audit_bypass entry instead of trusting the
+  // stale dirfdTable mapping.  The codex attack closed here is:
+  //
+  //   1. parent: `openat(AT_FDCWD, "/pkg",  O_DIRECTORY) = 7`
+  //   2. parent: `openat(AT_FDCWD, "/root", O_DIRECTORY) = 8`
+  //   3. parent: <untraced fd mutation, e.g. raw `dup2(8,7)` via
+  //              `syscall(SYS_dup2, ...)`>
+  //   4. parent: `openat(7, ".ssh/id_rsa", O_RDONLY)`
+  //
+  // The kernel resolves step (4) through `/root` (fd 7 now points at
+  // `/root` after the dup2), but the dirfdTable still says fd 7 → /pkg.
+  // Pre-fix, we resolved to `/pkg/.ssh/id_rsa` and missed the
+  // protected-paths match.  Post-fix, observing an `fcntl(...)` (the
+  // one fd-mutating syscall we can't fully parse subcommands for)
+  // marks the pid here, so step (4) returns `null` and the raw event
+  // is dropped + a `<UNRESOLVED_PATH>` synth event is surfaced.
+  //
+  // We DO fully parse `dup`/`dup2`/`dup3`/`close`/`close_range` below
+  // — those propagate / invalidate the dirfdTable directly instead of
+  // entering this set.  Only `fcntl` (which we may add later) and any
+  // future state-violating syscall we observe but cannot model
+  // populate this set.
+  //
+  // NOTE: this set is INTENTIONALLY orthogonal to `pidCwdUnknown` —
+  // cwd state and fd-table state are corrupted by different syscalls
+  // and a pid can be cwd-known + fd-unknown (or vice-versa).
+  const dirfdStateUnknown = new Set<number>();
+
+  // Audit-trust Finding (high, 2026-05-19, codex follow-up #1): the
+  // install command's root pid (the process strace exec's into) is the
+  // ONE pid in the audit tree that doesn't have an observable
+  // clone/fork parent — it was spawned by the agent (not by another
+  // traced process) and so inherits its cwd from `input.cwd` directly.
+  // Every OTHER pid we observe is either a strace-traced descendant of
+  // the root (whose pidCwd is propagated at clone time, see the
+  // clone/clone3 pre-parser below) or a victim of an unobservable fork
+  // (in which case `canonicalizeForEmit` correctly fails closed via
+  // the missing-pidCwd path).
+  //
+  // We seed the root's pidCwd on the very FIRST observed event in the
+  // dispatcher loop (`installRootSeeded` flips at that point).  This
+  // is a "first observed pid wins" heuristic; it is robust in practice
+  // because strace -ff writes the install root's per-pid file
+  // strictly before any of its children's files (the parent must call
+  // clone/execve to spawn a child, and those syscalls are written to
+  // the parent's file BEFORE the child runs its first syscall to be
+  // written to its own file).  The alternative — plumbing the strace
+  // child's pid through `StraceRunner.run()` — would force a tighter
+  // coupling between the runner and the dispatcher that isn't needed
+  // for any other purpose.
+  //
+  // Why this isn't a fallback in `canonicalizeForEmit` itself:
+  // applying `input.cwd` to ANY untracked pid is the exact codex
+  // finding #1 bug — children that inherited a chdir'd cwd from a
+  // parent would be wrongly resolved against `input.cwd`.  Seeding
+  // ONLY the install root and letting clone propagation handle every
+  // descendant preserves correctness without flooding `audit_bypass`
+  // for the install's own AT_FDCWD-relative opens (npm/pnpm/yarn
+  // typically issue many of those against `input.cwd`).
+  let installRootSeeded = false;
+
   /**
    * Canonicalize the target path of an openat write event for comparison
    * against `eventsFilePathCanonical`.  Returns the canonical absolute
@@ -519,6 +585,12 @@ export async function runInstallPhase(
       if (cwd === undefined) return null;
       return path.resolve(cwd, targetPath);
     }
+    // Codex follow-up (high, 2026-05-19): if the pid's dirfd table
+    // integrity is unknown, treat ANY numeric-dirfd lookup as
+    // unresolvable so the forgery detector falls through to the
+    // Layer-1 basename safety net instead of trusting a possibly
+    // stale mapping.
+    if (dirfdStateUnknown.has(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === undefined) return null;
     return path.resolve(dirPath, targetPath);
@@ -526,39 +598,38 @@ export async function runInstallPhase(
 
   // Audit-trust Finding (high, 2026-05-19): a separate canonicalizer for
   // the *emit* path (NOT the events-file forgery detector).  Same logic
-  // as `canonicalizeOpenTarget`, with one difference: when a pid has
-  // no tracked cwd AND we have NOT observed an unresolvable state
-  // mutation for that pid, we fall back to `input.cwd` — the install
-  // command's initial working directory.  This is the natural inherited
-  // cwd for the install command's pid tree when no explicit chdir was
-  // issued.  Without this fallback, every AT_FDCWD-relative read/write
-  // from the install command itself would route through the unresolved
-  // fail-closed path and flood `audit_bypass` with `<UNRESOLVED_PATH>`
-  // entries.
+  // as `canonicalizeOpenTarget`, with one historical difference: pre-
+  // codex-follow-up, when a pid had no tracked cwd AND no observed
+  // state mutation, we fell back to `input.cwd` to keep the install
+  // root's own AT_FDCWD-relative opens resolving without flooding
+  // `audit_bypass` with `<UNRESOLVED_PATH>` entries.
   //
-  // Codex follow-up (high, 2026-05-19): the fallback is GATED on
-  // `pidCwdUnknown` not containing the pid.  Membership means we
-  // observed a chdir/fchdir that we couldn't resolve — in that state
-  // the kernel's cwd has moved to *somewhere*, but not to `input.cwd`.
-  // Falling back to `input.cwd` would silently certify a wrong
-  // absolute path; the strict fail-closed behavior catches the:
-  //   (a) `chdir("<relative>")` from an untracked pid → kernel cwd is
-  //       parent_cwd/relative, which is NOT input.cwd unless the
-  //       parent never moved.
-  //   (b) `fchdir(<unknown-fd>)` → kernel cwd is wherever that fd's
-  //       directory was, completely opaque to us.
+  // Codex follow-up #1 (high, 2026-05-19): the `input.cwd` fallback is
+  // GONE.  It was the direct cause of codex finding #1: forked
+  // children inherit their cwd from the parent, but the cwd map was
+  // keyed only by pid and the strace trace set did not include
+  // fork/clone propagation.  A parent that `chdir("/root")`'d and
+  // then `clone(...) = <child>`'d a child whose `openat(AT_FDCWD,
+  // ".ssh/id_rsa", O_RDONLY)` arrived first would resolve through the
+  // child's missing pidCwd → `input.cwd`, producing `/work/.ssh/id_rsa`
+  // — wrong (the kernel-observed path is `/root/.ssh/id_rsa`) and
+  // unprotected by the `$HOME/.ssh/**` matcher.
   //
-  // The events-file forgery detector deliberately does NOT use this
-  // fallback: there `null` from canonicalize means "drop the
-  // canonical-equality check, fall back to Layer-1 basename match" —
-  // a conservative posture that pairs with the unguessable per-run
-  // random basename for safety.  Using `input.cwd` as a fallback in
-  // the forgery detector would risk false positives if any pid wrote
-  // to `$INPUT_CWD/<random-basename>` for legitimate reasons.
+  // Replacement: clone/clone3/vfork/fork propagation copies the
+  // parent's pidCwd/pidCwdUnknown/dirfdTable entries to the child at
+  // observation time (see the dispatcher pre-parser below).  Plus, the
+  // install root pid itself is seeded with `path.resolve(input.cwd)`
+  // on first observation — it's the only pid that doesn't have an
+  // observable clone parent in our trace.
   //
-  // dirfd opens with an unknown dirfd entry still return `null` here —
-  // that case is the actual codex attack vector (a numeric dirfd we
-  // never saw opened) and must fail closed.
+  // Codex follow-up #2 (high, 2026-05-19): numeric-dirfd lookups now
+  // honour `dirfdStateUnknown` — a pid that observed an fd-mutating
+  // syscall we couldn't fully model (fcntl etc.) fails closed on
+  // every subsequent numeric dirfd, preventing stale-fd certification.
+  //
+  // The events-file forgery detector (`canonicalizeOpenTarget`) shares
+  // both gates — it has always returned `null` on unknown state and
+  // falls back to the Layer-1 basename safety net at the call site.
   const canonicalizeForEmit = (
     pid: number,
     targetPath: string,
@@ -572,14 +643,21 @@ export async function runInstallPhase(
       if (tracked !== undefined) {
         return path.resolve(tracked, targetPath);
       }
-      // No tracked cwd.  If we observed an unresolvable state mutation
-      // for this pid, fail closed — `input.cwd` is NOT the kernel's
-      // current cwd in that case.
-      if (pidCwdUnknown.has(pid)) return null;
-      // No state mutations observed → safe to use input.cwd as the
-      // inherited-cwd fallback for the install process's pid tree.
-      return path.resolve(input.cwd, targetPath);
+      // No tracked cwd → fail closed.  Pre-codex-follow-up this branch
+      // fell back to `input.cwd` for the convenience of the install
+      // root's children that hadn't chdir'd; that fallback was wrong
+      // for cloned children that inherited a parent's chdir (codex
+      // finding #1).  After this fix, the install root is seeded
+      // explicitly on first observation and cloned children inherit
+      // via the clone/clone3 pre-parser; any pid that reaches this
+      // branch genuinely has unknown cwd state, so we drop the raw
+      // event and surface a `<UNRESOLVED_PATH>` synth in the post-
+      // loop pass.
+      return null;
     }
+    // Codex follow-up #2 (high, 2026-05-19): fail closed on stale fd
+    // tables — see comments on `dirfdStateUnknown` above.
+    if (dirfdStateUnknown.has(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === undefined) return null;
     return path.resolve(dirPath, targetPath);
@@ -697,6 +775,19 @@ export async function runInstallPhase(
     cwd: input.cwd,
     basePath,
   })) {
+    // Codex follow-up #1 (high, 2026-05-19): seed the install root pid's
+    // cwd with `input.cwd` on the FIRST observed event.  See the
+    // `installRootSeeded` comment above for why this targets exactly
+    // one pid rather than every untracked one.  We deliberately seed
+    // BEFORE any per-source dispatch so even a leading shim-channel
+    // event (which carries the same pid) seeds the root — although in
+    // practice the first observation is overwhelmingly a strace
+    // syscall on the install command.
+    if (!installRootSeeded) {
+      installRootSeeded = true;
+      pidCwd.set(pid, path.resolve(input.cwd));
+    }
+
     if (source === 'shim') {
       // Trusted JSONL channel — fd-3 pipe or SCRIPT_JAIL_LOG_FILE.  Parse
       // failures here are NEVER strace text and must NEVER fall through to
@@ -866,6 +957,187 @@ export async function runInstallPhase(
             // subsequent AT_FDCWD-relative opens fail closed.
             pidCwdUnknown.add(pid);
             pidCwd.delete(pid);
+          }
+        }
+        continue;
+      }
+
+      // Codex follow-up #1 (high, 2026-05-19): pre-parse fork/clone/vfork
+      // /clone3 to propagate per-pid state to the new child pid.  Strace
+      // wire formats (modern Linux):
+      //
+      //   clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|..., parent_tid=..., child_tid=..., tls=...) = 12345
+      //   clone3({flags=CLONE_VM|..., child_tid=..., parent_tid=..., exit_signal=SIGCHLD, stack=..., stack_size=...}, 88) = 12345
+      //   vfork()                                                                                                     = 12345
+      //   fork()                                                                                                       = 12345
+      //
+      // Failure case (rc < 0, e.g. ENOMEM): does NOT create a child, so we
+      // skip propagation.
+      //
+      // What we propagate (forward only — pre-clone state of the parent at
+      // the moment we observe the clone line):
+      //   - pidCwd[parent] → pidCwd[child]  (cwd is inherited per clone(2))
+      //   - pidCwdUnknown membership        (so a parent with unknown cwd
+      //                                      propagates that uncertainty)
+      //   - dirfdTable entries keyed by parent → child  (fd table is
+      //                                      inherited per clone(2) unless
+      //                                      CLONE_FILES is unset, which
+      //                                      we don't reliably observe;
+      //                                      treating inheritance as the
+      //                                      default is conservative — a
+      //                                      false-positive matched fd
+      //                                      would still produce a correct
+      //                                      absolute path because the
+      //                                      caller can't issue an
+      //                                      openat(<fd>, ...) on an fd
+      //                                      that wasn't actually
+      //                                      inherited)
+      //   - dirfdStateUnknown membership    (propagate fd-table uncertainty)
+      //   - shimLoadedPids membership       (shim mapping is preserved
+      //                                      across fork — the executable
+      //                                      image is shared)
+      //
+      // Race with the child's first event (codex spec note): if the child
+      // races ahead and emits a syscall BEFORE we observe the parent's
+      // clone line, the child's early events resolve through
+      // canonicalizeForEmit's fail-closed branch (no pidCwd entry, not
+      // pidCwdUnknown → returns null → `<UNRESOLVED_PATH>`).  Forward
+      // propagation alone does NOT retroactively rewrite — that's the
+      // conservative outcome the codex spec asked for.
+      const cloneMatch = line.match(/^(?:clone3?|vfork|fork)\b/);
+      if (cloneMatch !== null) {
+        // Locate the trailing "= <rc>" and gate on success (positive rc).
+        // We match the rc as a decimal integer; clone/clone3 never return
+        // hex or symbolic forms.  Negative rc (e.g. "-1 ENOMEM") fails
+        // the regex and the propagation is skipped — correct, since no
+        // child pid exists in that case.
+        const rcMatch = line.match(/=\s*(\d+)\b/);
+        if (rcMatch !== null) {
+          const childPid = parseInt(rcMatch[1] ?? '', 10);
+          if (Number.isFinite(childPid) && childPid > 0) {
+            // pidCwd / pidCwdUnknown propagation.
+            const parentCwd = pidCwd.get(pid);
+            if (parentCwd !== undefined) {
+              pidCwd.set(childPid, parentCwd);
+            }
+            if (pidCwdUnknown.has(pid)) {
+              pidCwdUnknown.add(childPid);
+            }
+            // dirfdTable propagation — copy every entry whose key is
+            // `<parentPid>:<fd>` to the new key `<childPid>:<fd>`.  The
+            // map is small in practice (~hundreds of entries max for a
+            // realistic install) and propagation only runs once per
+            // clone observation, so the O(N) sweep is fine.
+            const parentPrefix = `${pid}:`;
+            for (const [key, val] of dirfdTable) {
+              if (key.startsWith(parentPrefix)) {
+                const suffix = key.slice(parentPrefix.length);
+                dirfdTable.set(`${childPid}:${suffix}`, val);
+              }
+            }
+            // dirfdStateUnknown propagation.
+            if (dirfdStateUnknown.has(pid)) {
+              dirfdStateUnknown.add(childPid);
+            }
+            // shim-load propagation — the parent's address-space mapping
+            // of /lib/libscriptjail.so is shared with the child until
+            // the child execve's (which clears the bit, see the
+            // existing post-spawn handler below).
+            if (shimLoadedPids.has(pid)) {
+              shimLoadedPids.add(childPid);
+            }
+          }
+        }
+        continue;
+      }
+
+      // Codex follow-up #2 (high, 2026-05-19): pre-parse fd-mutation
+      // syscalls so the dirfdTable reflects the kernel's actual fd
+      // table at the moment of the next openat.
+      //
+      // Strace wire formats:
+      //   dup(oldfd)                     = newfd
+      //   dup2(oldfd, newfd)             = newfd
+      //   dup3(oldfd, newfd, flags)      = newfd
+      //   close(fd)                      = 0       (or -1 EBADF, ignored)
+      //   close_range(first, last, flags) = 0
+      //
+      // dup/dup2/dup3 — copy the dirfdTable entry from oldfd to newfd
+      // (replacing any stale entry at newfd).  If oldfd has no entry,
+      // we DELETE newfd to invalidate any prior mapping; the kernel
+      // would still have a mapping there (fds are content-addressable
+      // by the file table), but we don't know its directory target,
+      // so the next openat(<newfd>, ...) MUST fail closed instead of
+      // trusting a stale entry.
+      //
+      // close/close_range — delete the affected entries.  close_range
+      // with last == UINT_MAX (4294967295) is the "close everything
+      // above first" idiom; we iterate over existing entries rather
+      // than the full integer range to avoid O(UINT_MAX) blowup.  We
+      // also tolerate the EBADF case (rc != 0) for close: the syscall
+      // returning EBADF means the fd wasn't open in the kernel, but
+      // our dirfdTable might still have a stale entry from a prior
+      // unobserved close — deleting on EBADF is no-op-safe.
+      const dupMatch = line.match(
+        /^(dup3?|dup2)\((-?\d+)(?:\s*,\s*(-?\d+))?(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/,
+      );
+      if (dupMatch !== null) {
+        const op = dupMatch[1] ?? '';
+        const rc = parseInt(dupMatch[4] ?? '', 10);
+        if (Number.isFinite(rc) && rc >= 0) {
+          const oldFd = parseInt(dupMatch[2] ?? '', 10);
+          const newFd = op === 'dup' ? rc : parseInt(dupMatch[3] ?? '', 10);
+          if (Number.isFinite(oldFd) && Number.isFinite(newFd)) {
+            const oldKey = fdKey(pid, oldFd);
+            const newKey = fdKey(pid, newFd);
+            const oldVal = dirfdTable.get(oldKey);
+            if (oldVal !== undefined) {
+              dirfdTable.set(newKey, oldVal);
+            } else {
+              // oldfd has no tracked dir mapping → newfd must NOT
+              // retain its previous mapping either (it now aliases
+              // wherever oldfd actually points, which we don't know).
+              dirfdTable.delete(newKey);
+            }
+          }
+        }
+        continue;
+      }
+      const closeMatch = line.match(/^close\((-?\d+)\)\s*=\s*(-?\d+)\b/);
+      if (closeMatch !== null) {
+        const fd = parseInt(closeMatch[1] ?? '', 10);
+        if (Number.isFinite(fd)) {
+          // Delete unconditionally: even on EBADF, our stale entry (if
+          // any) is invalidated — the kernel's reply tells us the fd
+          // is no longer valid for openat(<fd>, ...).
+          dirfdTable.delete(fdKey(pid, fd));
+        }
+        continue;
+      }
+      const closeRangeMatch = line.match(
+        /^close_range\((-?\d+)\s*,\s*(-?\d+|0x[0-9a-fA-F]+)(?:\s*,[^)]*)?\)\s*=\s*(-?\d+)\b/,
+      );
+      if (closeRangeMatch !== null) {
+        const rc = parseInt(closeRangeMatch[3] ?? '', 10);
+        if (Number.isFinite(rc) && rc === 0) {
+          const first = parseInt(closeRangeMatch[1] ?? '', 10);
+          const lastRaw = closeRangeMatch[2] ?? '';
+          const last = lastRaw.startsWith('0x')
+            ? parseInt(lastRaw, 16)
+            : parseInt(lastRaw, 10);
+          if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
+            // Iterate over the MAP entries for this pid only — avoid
+            // O(last) work when last is UINT_MAX (4294967295), the
+            // common "close all fds above first" idiom.
+            const pidPrefix = `${pid}:`;
+            for (const key of dirfdTable.keys()) {
+              if (!key.startsWith(pidPrefix)) continue;
+              const fdStr = key.slice(pidPrefix.length);
+              const fd = parseInt(fdStr, 10);
+              if (Number.isFinite(fd) && fd >= first && fd <= last) {
+                dirfdTable.delete(key);
+              }
+            }
           }
         }
         continue;

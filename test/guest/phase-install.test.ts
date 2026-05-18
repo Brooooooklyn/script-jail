@@ -2435,6 +2435,18 @@ describe('runInstallPhase', () => {
 
       it('cwd-relative open with no chdir but basename matches → forgery via Layer-1 basename match', async () => {
         const proc = mockProcReader({
+          // Codex follow-up #1 (2026-05-19): a dummy first observed
+          // event from pid 0 (a sentinel pid that has no proc entry)
+          // burns the install-root-seeded flag so pid 604 in this
+          // test scenario does NOT inherit `input.cwd` from the
+          // install-root seeding path.  Without this, pid 604 would
+          // be the first observed pid → pidCwd[604]=/work → canonical
+          // resolution succeeds with /work/events.jsonl, which is
+          // still Layer-1 flagged (basename matches) but the
+          // forensic forgery path would be the resolved /work path
+          // rather than the canonical EVENTS_FILE.  The test wants
+          // to exercise the *Layer-1 fallback* path where canonical
+          // resolution returns null.
           604: {
             ppid: 1,
             env: {
@@ -2448,6 +2460,15 @@ describe('runInstallPhase', () => {
         // so canonical resolution returns null.  Layer-1 basename
         // safety net catches the open.
         const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          // Burn the install-root-seeded flag with a benign
+          // observation on a different pid (the simulated install
+          // root) so pid 604 reaches the dispatcher WITHOUT being
+          // seeded.  See the comment above.
+          {
+            pid: 1,
+            line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+            source: 'strace',
+          },
           {
             pid: 604,
             line: 'openat(AT_FDCWD, "events.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7',
@@ -2610,7 +2631,18 @@ describe('runInstallPhase', () => {
         // returns a path that doesn't equal the canonical events file,
         // but Layer 1 still catches it because the basename matches the
         // unguessable random tag.
+        //
+        // Codex follow-up #1 (2026-05-19): a benign first event on a
+        // different pid burns the install-root-seeded flag so pid 802
+        // doesn't get pidCwd=/work via that path — canonical
+        // resolution must return null for the Layer-1 fallback test
+        // to be meaningful.
         const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 1,
+            line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+            source: 'strace',
+          },
           {
             pid: 802,
             line: `openat(AT_FDCWD, "events-${RANDOM_TAG}.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
@@ -3875,6 +3907,18 @@ describe('runInstallPhase', () => {
         },
       });
       const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Codex follow-up #1 (2026-05-19): burn the install-root-seeded
+        // flag with a benign first observation on a different pid so
+        // pid 910 reaches the dispatcher genuinely "untracked".
+        // Without this, pid 910 would inherit pidCwd=/work via the
+        // install-root seeding path, and the relative chdir test
+        // would resolve against /work/subdir — bypassing the
+        // codex-finding fail-closed branch we are exercising.
+        {
+          pid: 1,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
         // Relative chdir from a pid with no prior tracked cwd.
         // Kernel cwd moves to parent_cwd/subdir — which we don't know.
         {
@@ -4103,6 +4147,506 @@ describe('runInstallPhase', () => {
       expect(unresolved).toHaveLength(1);
       const raw = unresolved[0]!['raw'] as Record<string, unknown>;
       expect(raw['prog']).toBe('write:evil');
+    });
+
+    // ===================================================================
+    // Codex audit findings #1 + #2 (high, 2026-05-19) — fork/clone cwd
+    // and fd inheritance propagation + dup/close fd-table mutation
+    // + removal of the `input.cwd` fallback in canonicalizeForEmit.
+    // ===================================================================
+
+    // Codex finding #1: a parent that chdir'd then forked produces a
+    // child whose AT_FDCWD-relative open MUST resolve against the
+    // parent's cwd at fork time, not against `input.cwd`.  Pre-fix
+    // (with the input.cwd fallback) a child that `openat(AT_FDCWD,
+    // ".ssh/id_rsa", O_RDONLY) = -1 ENOENT` would resolve to
+    // `/work/.ssh/id_rsa`, miss the `$HOME/.ssh/**` matcher, and be
+    // dropped as an unprotected ENOENT.  Post-fix, the clone
+    // propagator copies parent's cwd to the child so the resolved
+    // path is `/root/.ssh/id_rsa` and the matcher fires.
+    it('clone propagates parent cwd → child resolves AT_FDCWD-relative correctly (codex finding #1)', async () => {
+      const proc = mockProcReader({
+        2001: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fork-parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2002: {
+          ppid: 2001,
+          env: {
+            npm_package_name: 'fork-parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent (pid 2001) chdirs to $HOME.
+        {
+          pid: 2001,
+          line: 'chdir("/root") = 0',
+          source: 'strace',
+        },
+        // Parent clones — child pid 2002 inherits cwd /root.
+        {
+          pid: 2001,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 2002',
+          source: 'strace',
+        },
+        // Child probes $HOME/.ssh/id_rsa — kernel resolves through
+        // its inherited cwd /root, sees ENOENT.  Our dispatcher must
+        // resolve to /root/.ssh/id_rsa so the matcher catches it.
+        {
+          pid: 2002,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The child's probe must surface as a read with the absolute
+      // path and hidden=true (matched the protected pattern).
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/root/.ssh/id_rsa');
+      expect(raw['hidden']).toBe(true);
+      // No <UNRESOLVED_PATH> for the child — clone propagated cwd.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Codex finding #1: a parent's fd-table is copied to the child at
+    // fork.  The child can use an INHERITED dirfd in subsequent
+    // openat(<fd>, "relative", …) calls; the dispatcher must
+    // resolve via the propagated dirfdTable entry.
+    it('clone propagates parent dirfdTable → child openat(<inherited-fd>, ...) resolves (codex finding #1)', async () => {
+      const proc = mockProcReader({
+        2101: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fork-fd-parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2102: {
+          ppid: 2101,
+          env: {
+            npm_package_name: 'fork-fd-parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const SOME_DIR = '/var/lib/secrets';
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /var/lib/secrets → fd 7.
+        {
+          pid: 2101,
+          line: `openat(AT_FDCWD, "${SOME_DIR}", O_RDONLY|O_DIRECTORY) = 7`,
+          source: 'strace',
+        },
+        // Parent clones — child pid 2102 inherits fd 7 → SOME_DIR.
+        {
+          pid: 2101,
+          line: 'clone(child_stack=NULL, flags=SIGCHLD) = 2102',
+          source: 'strace',
+        },
+        // Child uses inherited fd 7 for a relative open.
+        {
+          pid: 2102,
+          line: 'openat(7, "passwords.txt", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The child's read MUST resolve to /var/lib/secrets/passwords.txt
+      // — the inherited dirfd's directory + the relative basename.
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === `${SOME_DIR}/passwords.txt`;
+      });
+      expect(reads).toHaveLength(1);
+      // And no <UNRESOLVED_PATH> for the child.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2102;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Codex finding #2: dup2 over a tracked dirfd MUST propagate the
+    // dirfd mapping from the source fd.  Without dup2 tracing, the
+    // dirfdTable still maps the original fd to the original directory,
+    // so a later openat(<dup'd-fd>, "relative", ...) resolves through
+    // the WRONG directory.  This test pins that dup2 replaces the
+    // mapping correctly so the openat resolves against /root, matching
+    // the kernel's behaviour after the dup2.
+    it('dup2 over tracked dirfd → openat resolves through the new directory (codex finding #2)', async () => {
+      const proc = mockProcReader({
+        2201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'dup2-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /pkg → fd 7.
+        {
+          pid: 2201,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Open /root → fd 8.
+        {
+          pid: 2201,
+          line: 'openat(AT_FDCWD, "/root", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // dup2(8, 7): fd 7 now aliases /root.
+        {
+          pid: 2201,
+          line: 'dup2(8, 7) = 7',
+          source: 'strace',
+        },
+        // openat(7, ...): kernel resolves through /root.
+        {
+          pid: 2201,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['hidden']).toBe(true);
+      // And NO read with the stale /pkg resolution.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+    });
+
+    // Codex finding #2: close(fd) invalidates the dirfdTable entry.  A
+    // subsequent openat(<closed-fd>, ...) must fail closed — without
+    // close tracing the table would still map the fd to its old
+    // directory.
+    it('close invalidates dirfdTable → subsequent openat(<closed-fd>, ...) fails closed (codex finding #2)', async () => {
+      const proc = mockProcReader({
+        2301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'close-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 2301,
+          line: 'openat(AT_FDCWD, "/some/dir", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        {
+          pid: 2301,
+          line: 'close(7) = 0',
+          source: 'strace',
+        },
+        // openat through the (now stale) fd — kernel would either
+        // return EBADF or, if another fd was opened in the meantime,
+        // resolve through that.  We can't know without further
+        // tracing, so fail closed.
+        {
+          pid: 2301,
+          line: 'openat(7, "file", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No plain read with /some/dir/file (the stale resolution).
+      const stale = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === '/some/dir/file';
+      });
+      expect(stale).toHaveLength(0);
+      // <UNRESOLVED_PATH> entry MUST be surfaced.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(1);
+      const raw = unresolved[0]!['raw'] as Record<string, unknown>;
+      expect(raw['prog']).toBe('read:file');
+    });
+
+    // Codex finding #2: close_range(first, last, flags) invalidates a
+    // range of fds.  We must iterate over existing table entries
+    // rather than the full numeric range (last can be UINT_MAX, the
+    // common "close everything above first" idiom).
+    it('close_range invalidates dirfds in range → openat fails closed (codex finding #2)', async () => {
+      const proc = mockProcReader({
+        2401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'close-range-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 2401,
+          line: 'openat(AT_FDCWD, "/dir-a", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        {
+          pid: 2401,
+          line: 'openat(AT_FDCWD, "/dir-b", O_RDONLY|O_DIRECTORY) = 9',
+          source: 'strace',
+        },
+        // close_range(3, UINT_MAX, 0): close all fds >= 3 — wipes
+        // fds 7 and 9 from our table.
+        {
+          pid: 2401,
+          line: 'close_range(3, 4294967295, 0) = 0',
+          source: 'strace',
+        },
+        // openat through fd 7 (no longer tracked).
+        {
+          pid: 2401,
+          line: 'openat(7, "secret-a", O_RDONLY) = 8',
+          source: 'strace',
+        },
+        // openat through fd 9 (also no longer tracked).
+        {
+          pid: 2401,
+          line: 'openat(9, "secret-b", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No stale reads for either secret.
+      const stale = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return (
+          raw['kind'] === 'read' &&
+          (raw['path'] === '/dir-a/secret-a' || raw['path'] === '/dir-b/secret-b')
+        );
+      });
+      expect(stale).toHaveLength(0);
+      // Two <UNRESOLVED_PATH> entries — one per stale openat.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(2);
+    });
+
+    // Codex finding #1: a pid that emerges with NO observed chdir and
+    // NO observed clone parent (e.g. a strace -ff line that arrived
+    // out-of-order) must fail closed for AT_FDCWD-relative opens.
+    // The pre-fix `input.cwd` fallback would have silently produced
+    // a wrong absolute path.
+    it('untracked pid with no observed parent → AT_FDCWD-relative opens fail closed (codex finding #1)', async () => {
+      const proc = mockProcReader({
+        2501: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'orphan-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Burn the install-root-seeded flag with a benign event on
+        // the simulated install root (pid 1) so pid 2501 is NOT the
+        // first observed and DOES NOT get the input.cwd seed.
+        {
+          pid: 1,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Pid 2501 has no observed chdir, no observed clone parent.
+        // Its AT_FDCWD-relative open MUST fail closed.
+        {
+          pid: 2501,
+          line: 'openat(AT_FDCWD, "leak.txt", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No plain read for leak.txt under input.cwd.
+      const stale = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === '/work/leak.txt';
+      });
+      expect(stale).toHaveLength(0);
+      // <UNRESOLVED_PATH> MUST be surfaced — pid 2501 is genuinely
+      // unrooted in our trace.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2501;
+      });
+      expect(unresolved).toHaveLength(1);
+      const raw = unresolved[0]!['raw'] as Record<string, unknown>;
+      expect(raw['prog']).toBe('read:leak.txt');
+    });
+
+    // Codex finding #1, exception path: the install root pid (the FIRST
+    // observed pid in the dispatcher) IS seeded with `input.cwd`, since
+    // it has no observable clone parent in our trace (it was spawned
+    // by the agent directly).  This test pins that the install root
+    // resolves its own AT_FDCWD-relative opens correctly.
+    it('install root pid resolves AT_FDCWD-relative against input.cwd (codex finding #1, root exception)', async () => {
+      const proc = mockProcReader({
+        2601: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'root-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Pid 2601 IS the first observed pid → install root → gets
+        // pidCwd seeded to /work via the installRootSeeded path.
+        {
+          pid: 2601,
+          line: 'openat(AT_FDCWD, "package.json", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The install root resolves package.json against /work.
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === '/work/package.json';
+      });
+      expect(reads).toHaveLength(1);
+      // No <UNRESOLVED_PATH> for the install root.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
     });
   });
 
