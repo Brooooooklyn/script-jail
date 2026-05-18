@@ -119,3 +119,42 @@ The pinned kernel (Linux 5.10.223 from AWS Firecracker CI) lives outside the roo
 - `mode=update` — generated lockfile is written in place. Used to regenerate after a legitimate dependency change.
 
 `generated_at` and `manager_lockfile_sha256` change every run by design; the diff path canonicalizes them so they don't cause false positives. See `src/action/diff.ts`.
+
+## Threat model and known gaps
+
+### Same-UID audit-channel limitation
+
+The audit events file (`SCRIPT_JAIL_LOG_FILE`) is owned and writable by the
+same UID as the audited process. A malicious lifecycle script with that UID can:
+
+1. Open the events file directly (bypassing the shim emit path) and append
+   forged JSONL records. The `<EVENTS_FILE_FORGERY>` audit_bypass detector
+   catches the canonical attack via strace openat cross-check, but a process
+   already trusted by the detector (one that has libscriptjail.so mapped)
+   can still write to the file from inside its address space.
+
+2. Discover existing audit fds via `/proc/self/fd/N` and write directly to
+   them, which strace's openat trace cannot detect.
+
+3. Use `openat(dirfd, basename, ...)` or path aliases (`/tmp/foo/../events-dir/./events.jsonl`)
+   to open the file via spellings the path-equality detector may miss. (The
+   strace parser now canonicalizes these; see commit 7a4a281.)
+
+These gaps are accepted in v1 because:
+- The microVM is single-use and discarded after install.
+- Network is off during install (Phase B), so exfiltration is bounded.
+- Strace observes process spawns and syscalls regardless of forged events.
+- The audit_bypass gate is defense-in-depth, not the primary security guarantee.
+
+A future v2 may add UID separation: run the audited process as a different
+UID than the agent, so the events file is read-only to the audited process
+and write-only to the shim's process group. This requires:
+- A separate init step to create a sandboxed UID with no write access to
+  agent-owned paths.
+- The events file owned by the agent UID, group-owned by the shim's UID,
+  mode 0640.
+- The shim runs with setegid into the shim's UID for events-file writes.
+
+Until then, the audit_bypass gate is best-effort detection of canonical
+attacks (envp scrubbing, raw syscall exec, file unlink/truncate/rename,
+mtime/ctime tamper). It is not a cryptographic integrity check.
