@@ -487,25 +487,33 @@ export async function runInstallPhase(
   const cwdParent = new Map<number, number>();
   const fdParent = new Map<number, number>();
 
-  // Codex follow-up (high, 2026-05-19): pending unshare-detach markers.
-  // strace `-ff` writes per-pid files separately; the production tailer
-  // drains them in arbitrary order, so a child's `unshare(...)` line CAN
-  // be observed BEFORE the parent's `clone(... CLONE_FS|CLONE_FILES ...)
-  // = <child>` line.  In that order the immediate `detachCwdGroup` /
-  // `detachFdGroup` calls in the unshare handler are no-ops (child is
-  // still a singleton group at that point), and the later clone
-  // reconciliation would `unionCwd` / `unionFd` the kernel-detached
-  // child back INTO the parent's group — wrong direction.
+  // Codex follow-up (high, 2026-05-19; refined medium, 2026-05-19):
+  // pending unshare-detach markers.  strace `-ff` writes per-pid files
+  // separately; the production tailer drains them in arbitrary order,
+  // so a child's `unshare(...)` line CAN be observed BEFORE the
+  // parent's `clone(... CLONE_FS|CLONE_FILES ...) = <child>` line.  In
+  // that order the immediate `detachCwdGroup` / `detachFdGroup` calls
+  // in the unshare handler are no-ops (child is still a singleton
+  // group at that point), and a naive clone reconciliation would
+  // `unionCwd` / `unionFd` the kernel-detached child back INTO the
+  // parent's group — wrong direction.
   //
   // Fix: when we observe `unshare(...)` we ALSO add the pid to a
-  // pending-detach set; the clone reconciliation consults the set
-  // before unioning and SKIPS the union if the child has already
-  // explicitly detached.  Markers persist across events (we don't track
-  // pid exits — stale entries are harmless: the next clone wiring with
-  // the same pid would honor an obsolete intent, but pids are recycled
-  // monotonically and within a single install run reuse is rare; if it
-  // happens, the conservative direction is "do not share" which is
-  // safer than "incorrectly share").
+  // pending-detach set; the clone reconciliation consults the set and
+  // takes the COPY branch (parent → child snapshot) instead of the
+  // UNION branch when the marker is present.  That matches the
+  // kernel's `clone(... CLONE_FS|CLONE_FILES); unshare(...)` order:
+  // the child first inherits the parent's state, then the kernel
+  // detaches the child's fs_struct/files_struct into a private copy
+  // whose initial value equals the shared state at unshare time.
+  // After the copy, future mutations on either side stay private to
+  // their own group (no shared mutation propagation).
+  //
+  // Markers persist across events (we don't track pid exits — stale
+  // entries are harmless: the next clone wiring with the same pid
+  // would honor an obsolete intent, but pids are recycled
+  // monotonically and within a single install run reuse is rare; if
+  // it happens, taking the copy branch is conservative).
   const pendingCwdDetach = new Set<number>();
   const pendingFdDetach = new Set<number>();
 
@@ -1551,71 +1559,121 @@ export async function runInstallPhase(
             }
 
             // --- cwd group: union if CLONE_FS, else copy. -----------
-            if (cloneFs) {
-              // Codex follow-up (high, 2026-05-19): if we already
-              // observed the child's `unshare(CLONE_FS|CLONE_NEWNS|
-              // CLONE_NEWUSER)` line out-of-order BEFORE this clone
-              // line, the kernel has already detached the child's
-              // fs_struct.  Honor that explicit detach: SKIP the
-              // union so the child keeps its own private cwd group.
-              // Per-pid state previously seeded under the child's
-              // pid stays addressable.  Without this guard the union
-              // below would silently re-merge the kernel-detached
-              // child back into the parent's group.
-              if (pendingCwdDetach.has(childPid)) {
-                pendingCwdDetach.delete(childPid);
-              } else {
-                // Union the two pids into the same cwd group.  Subsequent
-                // chdir on either pid mutates the shared state.
-                unionCwd(pid, childPid);
-                // No need to copy cwd / pidCwdUnknown — they are already
-                // visible to the child via the shared root.
-              }
+            //
+            // Codex follow-up (medium, 2026-05-19): when a pending
+            // unshare-detach marker is present on the child, we must
+            // emulate the kernel's clone+private-copy semantic instead
+            // of merely skipping the union.  At the kernel level the
+            // syscall order is always:
+            //   1. clone(...)            — child created; if CLONE_FS
+            //                              is set, child shares the
+            //                              parent's fs_struct.
+            //   2. unshare(...)          — kernel detaches the child's
+            //                              fs_struct into a private
+            //                              copy whose initial state
+            //                              equals the shared state at
+            //                              the moment of unshare.
+            // Strace per-pid file ordering may surface these lines in
+            // either order to our dispatcher.  When we observe the
+            // unshare line first we set a pending marker; when the
+            // matching clone reconciliation arrives, we must INSTALL
+            // the parent's cwd/fd state into the child's private group
+            // (copy semantic) rather than dropping it.  Without the
+            // copy, legitimate inherited paths surface as
+            // `<UNRESOLVED_PATH>` audit_bypass entries and break
+            // installs.
+            //
+            // Conflict reconciliation: if the child has ALREADY emitted
+            // state of its own (e.g. it raced ahead with a `chdir`
+            // before we processed the clone+marker), we fail closed on
+            // disagreement — different cwd values → mark cwdUnknown;
+            // different fd→path values → drop the fd entry.
+            const childHadPendingCwdDetach = pendingCwdDetach.delete(childPid);
+            const childHadPendingFdDetach = pendingFdDetach.delete(childPid);
+            if (cloneFs && !childHadPendingCwdDetach) {
+              // Union the two pids into the same cwd group.  Subsequent
+              // chdir on either pid mutates the shared state.
+              unionCwd(pid, childPid);
+              // No need to copy cwd / pidCwdUnknown — they are already
+              // visible to the child via the shared root.
             } else {
-              // Copy branch: independent fs struct.  Snapshot the
-              // parent's cwd / unknown bit into the child's NEW group.
-              // We deliberately do NOT pre-union the child — leaving
-              // it as its own root means future chdir in the child
-              // mutates only the child's pidCwd entry.
+              // Copy branch: independent fs struct.  Either the parent
+              // did NOT set CLONE_FS (fork/vfork/clone without that
+              // flag) OR the child later unshared its fs_struct (we
+              // observed the unshare line first; pending marker now
+              // consumed).  Snapshot the parent's cwd / unknown bit
+              // into the child's NEW group, reconciling against any
+              // state the child has already accumulated.
               const parentCwd = cwdGet(pid);
-              if (parentCwd !== undefined) {
+              const parentCwdUnknown = cwdUnknownHas(pid);
+              const childCwd = cwdGet(childPid);
+              const childCwdUnknown = cwdUnknownHas(childPid);
+              if (parentCwdUnknown || childCwdUnknown) {
+                cwdUnknownAdd(childPid);
+                // Don't seed pidCwd; cwdUnknown dominates the lookup.
+              } else if (parentCwd !== undefined && childCwd !== undefined) {
+                if (parentCwd !== childCwd) {
+                  // Conflict: child already had its own cwd that
+                  // disagrees with the parent's pre-clone cwd.  Fail
+                  // closed.
+                  cwdDelete(childPid);
+                  cwdUnknownAdd(childPid);
+                }
+                // else: equal — leave child's value in place.
+              } else if (parentCwd !== undefined) {
                 cwdSet(childPid, parentCwd);
               }
-              if (cwdUnknownHas(pid)) {
-                cwdUnknownAdd(childPid);
-              }
+              // else: parent has no known cwd; leave child's state
+              // (possibly undefined) untouched.
             }
 
             // --- fd group: union if CLONE_FILES, else copy. ---------
-            if (cloneFiles) {
-              // Codex follow-up (high, 2026-05-19): mirror the cwd
-              // path above.  If a child's `unshare(CLONE_FILES)` line
-              // was observed first (out-of-order tail drain), the
-              // kernel has already detached the child's fd table —
-              // SKIP the union so the child stays a singleton fd
-              // group rather than getting re-merged into the parent.
-              if (pendingFdDetach.has(childPid)) {
-                pendingFdDetach.delete(childPid);
-              } else {
-                unionFd(pid, childPid);
-                // No per-key copy needed — fd lookups resolve to the
-                // shared group root.
-              }
+            if (cloneFiles && !childHadPendingFdDetach) {
+              unionFd(pid, childPid);
+              // No per-key copy needed — fd lookups resolve to the
+              // shared group root.
             } else {
-              // Copy branch: independent fd table.  Sweep over the
-              // parent's keys and re-key into the child's NEW fd
-              // group.  `fdKey(parent, fd)` resolves to
-              // `<parentRoot>:<fd>`; `fdKey(child, fd)` resolves to
-              // `<childRoot>:<fd>` (the child is its own root pre-
-              // sweep because we haven't unioned it).
+              // Copy branch: independent fd table.  Either the parent
+              // did NOT set CLONE_FILES OR the child later unshared
+              // its files_struct.  Sweep over the parent's keys and
+              // re-key into the child's NEW fd group.  `fdKey(parent,
+              // fd)` resolves to `<parentRoot>:<fd>`; `fdKey(child,
+              // fd)` resolves to `<childRoot>:<fd>` (the child is its
+              // own root pre-sweep because we haven't unioned it).
+              //
+              // Conflict reconciliation: if the child has already
+              // observed its own fd entries (e.g. an out-of-order
+              // openat before this clone reconciliation), reconcile
+              // per fd:
+              //   - parent-only fd → copy.
+              //   - same fd, same path → keep child's entry; OR the
+              //     cloexec bits so the next exec is conservative.
+              //   - same fd, different paths → drop the entry (fail
+              //     closed on subsequent openat(<fd>, ...)).
               const parentRoot = rootedFd(pid);
               const childRoot = rootedFd(childPid);
               if (parentRoot !== childRoot) {
                 const parentPrefix = `${parentRoot}:`;
+                const childPrefix = `${childRoot}:`;
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
                     const suffix = key.slice(parentPrefix.length);
-                    dirfdTable.set(`${childRoot}:${suffix}`, val);
+                    const childKey = `${childPrefix}${suffix}`;
+                    const existing = dirfdTable.get(childKey);
+                    if (existing === undefined) {
+                      dirfdTable.set(childKey, val);
+                    } else if (existing.path === val.path) {
+                      // Same fd, same path — keep, OR cloexec bits.
+                      if (existing.cloexec !== val.cloexec) {
+                        dirfdTable.set(childKey, {
+                          path: existing.path,
+                          cloexec: existing.cloexec || val.cloexec,
+                        });
+                      }
+                    } else {
+                      // Same fd, different paths — fail closed.
+                      dirfdTable.delete(childKey);
+                    }
                   }
                 }
                 if (fdUnknownHas(pid)) {

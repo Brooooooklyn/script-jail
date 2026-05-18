@@ -26240,36 +26240,51 @@ async function runInstallPhase(input) {
                 }
               }
             }
-            if (cloneFs) {
-              if (pendingCwdDetach.has(childPid)) {
-                pendingCwdDetach.delete(childPid);
-              } else {
-                unionCwd(pid, childPid);
-              }
+            const childHadPendingCwdDetach = pendingCwdDetach.delete(childPid);
+            const childHadPendingFdDetach = pendingFdDetach.delete(childPid);
+            if (cloneFs && !childHadPendingCwdDetach) {
+              unionCwd(pid, childPid);
             } else {
               const parentCwd = cwdGet(pid);
-              if (parentCwd !== void 0) {
+              const parentCwdUnknown = cwdUnknownHas(pid);
+              const childCwd = cwdGet(childPid);
+              const childCwdUnknown = cwdUnknownHas(childPid);
+              if (parentCwdUnknown || childCwdUnknown) {
+                cwdUnknownAdd(childPid);
+              } else if (parentCwd !== void 0 && childCwd !== void 0) {
+                if (parentCwd !== childCwd) {
+                  cwdDelete(childPid);
+                  cwdUnknownAdd(childPid);
+                }
+              } else if (parentCwd !== void 0) {
                 cwdSet(childPid, parentCwd);
               }
-              if (cwdUnknownHas(pid)) {
-                cwdUnknownAdd(childPid);
-              }
             }
-            if (cloneFiles) {
-              if (pendingFdDetach.has(childPid)) {
-                pendingFdDetach.delete(childPid);
-              } else {
-                unionFd(pid, childPid);
-              }
+            if (cloneFiles && !childHadPendingFdDetach) {
+              unionFd(pid, childPid);
             } else {
               const parentRoot = rootedFd(pid);
               const childRoot = rootedFd(childPid);
               if (parentRoot !== childRoot) {
                 const parentPrefix = `${parentRoot}:`;
+                const childPrefix = `${childRoot}:`;
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
                     const suffix = key.slice(parentPrefix.length);
-                    dirfdTable.set(`${childRoot}:${suffix}`, val);
+                    const childKey = `${childPrefix}${suffix}`;
+                    const existing = dirfdTable.get(childKey);
+                    if (existing === void 0) {
+                      dirfdTable.set(childKey, val);
+                    } else if (existing.path === val.path) {
+                      if (existing.cloexec !== val.cloexec) {
+                        dirfdTable.set(childKey, {
+                          path: existing.path,
+                          cloexec: existing.cloexec || val.cloexec
+                        });
+                      }
+                    } else {
+                      dirfdTable.delete(childKey);
+                    }
                   }
                 }
                 if (fdUnknownHas(pid)) {

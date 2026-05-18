@@ -7749,10 +7749,11 @@ describe('runInstallPhase', () => {
     });
   });
 
-  // Codex follow-up (high, 2026-05-19): out-of-order unshare BEFORE
-  // clone reconciliation.  strace `-ff` writes per-pid files separately
-  // and the production tailer drains them in arbitrary order, so a
-  // child's `unshare(CLONE_NEWUSER|CLONE_FILES|...)` line CAN reach the
+  // Codex follow-up (high, 2026-05-19; refined medium, 2026-05-19):
+  // out-of-order unshare BEFORE clone reconciliation.  strace `-ff`
+  // writes per-pid files separately and the production tailer drains
+  // them in arbitrary order, so a child's
+  // `unshare(CLONE_NEWUSER|CLONE_FILES|...)` line CAN reach the
   // dispatcher BEFORE the parent's `clone(... CLONE_FS|CLONE_FILES ...)
   // = <child>` line that pairs them.
   //
@@ -7763,20 +7764,29 @@ describe('runInstallPhase', () => {
   //      child into the SAME cwd/fd group — re-merging the kernel-
   //      detached child back into the parent's state.
   //
-  // Post-fix: the unshare handler records a pending-detach marker on
-  // the pid; clone reconciliation honors the marker by SKIPPING the
-  // union (cwd or fd, depending on which marker is present).  Child
-  // stays in its own private group, matching kernel semantics.
+  // Initial fix (commit 69006d2): clone reconciliation SKIPS the
+  // union when a pending-detach marker is present.  That stopped the
+  // re-merge bug but introduced a new false-positive: the child's
+  // group ended up EMPTY (no cwd, no fd entries), so legitimate child
+  // code that uses INHERITED paths emitted `<UNRESOLVED_PATH>`
+  // audit_bypass entries.
+  //
+  // Refined fix (medium, 2026-05-19): clone reconciliation takes the
+  // COPY branch when the marker is present — parent's cwd/fd state is
+  // snapshotted into the child's PRIVATE group.  This emulates the
+  // real kernel order (clone → child inherits → unshare → kernel
+  // detaches into a private copy whose initial value equals the
+  // pre-unshare shared state).  Future mutations on either side stay
+  // private to their own group.
   describe('pending unshare-detach honored by delayed clone reconciliation', () => {
     const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
 
     // Test 1: child unshare(CLONE_NEWUSER) is observed BEFORE the
-    // parent's clone(CLONE_FS) line.  Post-fix the parent's clone
-    // reconciliation MUST skip `unionCwd` because the kernel has
-    // already detached the child's fs_struct.  Subsequent AT_FDCWD-
-    // relative openat from the child has no tracked cwd → fails closed
-    // (<UNRESOLVED_PATH>).
-    it('child unshare(CLONE_NEWUSER) before parent clone(CLONE_FS) → union skipped, child opens fail closed', async () => {
+    // parent's clone(CLONE_FS) line.  Post-refined-fix the parent's
+    // pre-clone cwd MUST be copied into the child's private group
+    // (kernel clone+private-copy semantic).  Parent's LATER chdir
+    // must not affect the child's inherited cwd.
+    it('child unshare(CLONE_NEWUSER) before parent clone(CLONE_FS) → inherited cwd copied to child, parent mutation does not leak', async () => {
       const proc = mockProcReader({
         1000: {
           ppid: 1,
@@ -7807,27 +7817,25 @@ describe('runInstallPhase', () => {
           source: 'strace',
         },
         // Parent's clone(CLONE_FS) line arrives LATER.  Pre-fix this
-        // would `unionCwd(parent, child)` and re-merge the kernel-
-        // detached child back into the parent's cwd group.  Post-fix
-        // the pending marker on pid 1001 causes the union to be
-        // skipped — child stays its own root.
+        // would `unionCwd(parent, child)`; initial-fix would SKIP the
+        // union (leaving child with no cwd → false positives).  The
+        // refined fix copies parent's cwd (= input.cwd seed = /work)
+        // into the child's private group.
         {
           pid: 1000,
           line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
           source: 'strace',
         },
-        // Parent chdirs to /A.  If the union HAD happened, this would
-        // also bind the child's cwd to /A (shared group).  Post-fix
-        // the groups are separate; child has no tracked cwd.
+        // Parent chdirs to /A.  This mutates ONLY parent's group;
+        // child's private cwd remains /work (kernel detach semantic).
         {
           pid: 1000,
           line: 'chdir("/A") = 0',
           source: 'strace',
         },
-        // Child AT_FDCWD-relative openat.  The child's cwd group is
-        // its own singleton with no chdir ever observed for it (and
-        // no `input.cwd` seed because rootPid is the parent), so the
-        // resolution fails closed and surfaces <UNRESOLVED_PATH>.
+        // Child AT_FDCWD-relative openat.  Resolves through the
+        // child's inherited cwd (/work), NOT the parent's post-clone
+        // cwd (/A).
         {
           pid: 1001,
           line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
@@ -7844,20 +7852,26 @@ describe('runInstallPhase', () => {
         emitter,
       });
       const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
-      // The child's openat MUST NOT have been certified to /A/x — that
-      // would be the pre-fix bug: union re-merged the detached child
-      // back into the parent's /A-rooted cwd group.
+      // The child's openat MUST NOT resolve to /A/x — that would be
+      // the union bug (parent's post-clone chdir leaking into the
+      // detached child).
       const leaked = events.filter((e) => {
         const r = e['raw'] as Record<string, unknown>;
         return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
       });
       expect(leaked).toHaveLength(0);
-      // <UNRESOLVED_PATH> audit_bypass surfaced for the child.
+      // Child's openat MUST resolve to /work/x via the inherited cwd.
+      const inherited = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/x' && r['pid'] === 1001;
+      });
+      expect(inherited).toHaveLength(1);
+      // No <UNRESOLVED_PATH> for the child — copy succeeded.
       const unresolved = events.filter((e) => {
         const r = e['raw'] as Record<string, unknown>;
         return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
       });
-      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+      expect(unresolved).toHaveLength(0);
     });
 
     // Test 2: child unshare(CLONE_FILES) is observed BEFORE the parent's
@@ -8005,6 +8019,338 @@ describe('runInstallPhase', () => {
         return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
       });
       expect(unresolved).toHaveLength(0);
+    });
+
+    // Regression test 1 (medium, 2026-05-19): inherited cwd survives a
+    // child-first unshare.  Parent chdirs to /A FIRST, then we observe
+    // the child's unshare out-of-order, then the parent's clone(CLONE_FS).
+    // Post-refined-fix: child inherits /A (kernel clone+private-copy
+    // semantic — child's private fs_struct starts as a copy of the
+    // shared state at unshare time, which equals parent's cwd at clone
+    // time since the parent didn't chdir between clone and unshare).
+    it('inherited cwd survives child-first unshare: parent chdir before clone copies to child private group', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'inherit-cwd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'inherit-cwd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent chdir(/A) BEFORE the clone.  At kernel time, the
+        // child clone will inherit /A; the later unshare detaches
+        // child's fs_struct into a private copy that ALSO starts at
+        // /A.
+        {
+          pid: 1000,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        // Out-of-order: child unshare(CLONE_NEWUSER) arrives before
+        // the parent clone line.  Pending marker recorded.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_NEWUSER) = 0',
+          source: 'strace',
+        },
+        // Parent clone(CLONE_FS) — reconciliation consumes the pending
+        // marker and takes the COPY branch (parent's cwd /A → child).
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(AT_FDCWD, "x") — resolves through inherited /A.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Regression test 2 (medium, 2026-05-19): inherited dirfd entries
+    // survive a child-first unshare(CLONE_FILES).  Parent opens fd 7 →
+    // /somedir BEFORE the clone; child unshare arrives out-of-order;
+    // parent clone(CLONE_FILES) reconciles.  Post-refined-fix: child's
+    // private fd table starts as a copy of the shared fd table; child
+    // openat(7, "file") MUST resolve through the inherited entry.
+    it('inherited dirfd survives child-first unshare: parent fd opened before clone copies to child private group', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'inherit-fd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'inherit-fd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /somedir as fd 7 BEFORE the clone.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/somedir", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Out-of-order: child unshare(CLONE_FILES) before clone.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Parent clone(CLONE_FILES) — reconciliation consumes the
+        // pending fd-detach marker, takes the COPY branch, snapshots
+        // parent's dirfd table (fd 7 → /somedir) into child's private
+        // group.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "file") — resolves through inherited fd 7.
+        {
+          pid: 1001,
+          line: 'openat(7, "file", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/somedir/file' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Regression test 3 (medium, 2026-05-19): parent's post-unshare
+    // mutation does NOT propagate to the child (detach semantic).
+    // After the pending-detach copy: parent chdirs to /B and observes
+    // its own openat resolving to /B/x; a SECOND child openat(y) still
+    // resolves through the child's inherited /A cwd, NOT /B.
+    it('post-unshare parent mutation does not affect child: groups are private after copy', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'post-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'post-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 1000,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_NEWUSER) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent chdir(/B) AFTER the child has its own private group.
+        {
+          pid: 1000,
+          line: 'chdir("/B") = 0',
+          source: 'strace',
+        },
+        // Parent open(x) resolves through /B.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
+          source: 'strace',
+        },
+        // Child open(y) STILL resolves through /A (its inherited cwd
+        // at clone-time — parent's later chdir does not propagate).
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "y", O_RDONLY) = 6',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent's openat resolves to /B/x.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child's openat resolves to /A/y (NOT /B/y).
+      const childAReads = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/y' && r['pid'] === 1001;
+      });
+      expect(childAReads).toHaveLength(1);
+      const childBLeaks = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/y' && r['pid'] === 1001;
+      });
+      expect(childBLeaks).toHaveLength(0);
+    });
+
+    // Regression test 4 (medium, 2026-05-19): conflicting child state
+    // BEFORE the clone reconciliation triggers conservative fail-closed.
+    // Parent chdir(/A), child chdir(/B) (raced ahead with its own
+    // syscall), child unshare, parent clone(CLONE_FS) — the copy
+    // branch sees parent=/A and child=/B disagreeing.  Fail closed:
+    // mark child cwdUnknown; subsequent openat surfaces
+    // <UNRESOLVED_PATH>.
+    it('conflicting child state before pending-detach copy → cwdUnknown, openat fails closed', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'conflict-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'conflict-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent chdir(/A) FIRST.
+        {
+          pid: 1000,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        // Child has already chdir'd to /B independently.
+        {
+          pid: 1001,
+          line: 'chdir("/B") = 0',
+          source: 'strace',
+        },
+        // Child unshare arrives out-of-order before clone.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_NEWUSER) = 0',
+          source: 'strace',
+        },
+        // Parent clone(CLONE_FS) — copy branch reconciles parent=/A
+        // vs child=/B.  Conflict → mark child cwdUnknown.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat — cwdUnknown dominates → fail closed.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No certified read at /A/x or /B/x for the child.
+      const aRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(aRead).toHaveLength(0);
+      const bRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(bRead).toHaveLength(0);
+      // <UNRESOLVED_PATH> surfaced for the child.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
     });
   });
 });
