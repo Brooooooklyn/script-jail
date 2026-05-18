@@ -2122,6 +2122,46 @@ unsafe fn is_audit_protected_env_name(name: *const c_char) -> bool {
     false
 }
 
+/// Copy the NAME portion of a `putenv` argument (everything before the first
+/// `=`, or the entire string if no `=` is present) into `dst` and
+/// NUL-terminate it.  Returns Some(written_excluding_nul) on success, or
+/// None if `dst` is too small to hold the name + trailing NUL.
+///
+/// SECURITY: the audit pipeline emits the original `putenv` argument
+/// straight into the lockfile.  When that argument is `NAME=<long
+/// attacker-controlled-or-secret value>`, leaking the VALUE component into
+/// a committed YAML file is a real attack surface (poison-leakage and
+/// data-exfil).  This helper lets the putenv wrapper hand emit_tamper a
+/// stack-buffer-backed C string that contains ONLY the name, matching the
+/// shape used by setenv/unsetenv events.
+unsafe fn putenv_copy_name(string: *const c_char, dst: &mut [u8]) -> Option<usize> {
+    if string.is_null() {
+        return None;
+    }
+    // Reserve one byte for the trailing NUL.
+    let cap = dst.len().checked_sub(1)?;
+    let mut n = 0usize;
+    while n < cap {
+        let b = *string.add(n) as u8;
+        if b == 0 || b == b'=' {
+            break;
+        }
+        dst[n] = b;
+        n += 1;
+    }
+    // If we hit `cap` without seeing '=' or NUL, the name is longer than
+    // our buffer can hold — refuse to truncate (a truncated name would be
+    // worse than no name at all for downstream interpretation).
+    if n == cap {
+        let next = *string.add(n) as u8;
+        if next != 0 && next != b'=' {
+            return None;
+        }
+    }
+    dst[n] = 0;
+    Some(n)
+}
+
 /// For `putenv("NAME=VALUE")` or `putenv("NAME")` (bare, treated as unsetenv):
 /// check whether the NAME portion (up to '=' or NUL) is in the protected set.
 ///
@@ -2356,7 +2396,23 @@ pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
     }
     set_in_shim(true);
     if is_putenv_name_protected(string) {
-        emit_tamper(b"putenv", Some(string as *const c_char));
+        // Copy the bare name into a stack buffer so emit_tamper only ever
+        // sees `NAME` — never `NAME=<attacker-controlled value>`.  All
+        // protected names in AUDIT_PROTECTED_NAMES are short ASCII
+        // identifiers; 256 bytes is comfortably above the worst case.
+        let mut name_buf: [u8; 256] = [0; 256];
+        let name_ptr = match putenv_copy_name(string as *const c_char, &mut name_buf) {
+            Some(_) => name_buf.as_ptr() as *const c_char,
+            // Buffer too small (shouldn't happen for AUDIT_PROTECTED_NAMES,
+            // but degrade safely by omitting the name field rather than
+            // leaking the full string).
+            None => ptr::null(),
+        };
+        if name_ptr.is_null() {
+            emit_tamper(b"putenv", None);
+        } else {
+            emit_tamper(b"putenv", Some(name_ptr));
+        }
         set_in_shim(false);
         return 0;
     }

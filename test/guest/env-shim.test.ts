@@ -503,4 +503,72 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     expect(res.stdout).not.toContain('/tmp/evil');
   });
 
+  // ── Test 12 (Finding C): putenv tamper emits bare NAME, not NAME=VALUE ────
+  //
+  // The Node-side `process.env.X = "value"` path uses setenv() and is
+  // already covered by Test 8.  putenv() is harder to invoke from Node, so
+  // we drive it via a small C compile via `cc -x c -`.  If `cc` is not
+  // available, skip — the test is informational on Linux runners that
+  // lack a C toolchain.
+  it('putenv("NODE_OPTIONS=<long value>") emits env_tamper with name="NODE_OPTIONS" (Finding C)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    // Probe for cc.
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    // Build a tiny binary that calls putenv() then exits.  The string is
+    // intentionally long + contains a recognizable secret-shape so we can
+    // assert it does NOT appear in the audit event's name field.
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-putenv-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'putenv_attack');
+    const src = `
+      #include <stdlib.h>
+      int main(void) {
+        /* The argument MUST be retained for putenv's lifetime — use a
+           static buffer.  Glibc keeps a pointer into this string. */
+        static char poison[] =
+          "NODE_OPTIONS=--require=/tmp/evil.js SECRET_LEAK_abcdef_NOT_IN_LOG";
+        putenv(poison);
+        return 0;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) {
+      // Compiler errored — treat as environment-skip, not a test failure.
+      ctx.skip();
+    }
+
+    const res = runWithShim({ cmd: bin });
+
+    const putenvEvents = res.logLines
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((e): e is Record<string, unknown> =>
+        e !== null && e['kind'] === 'env_tamper' && e['op'] === 'putenv',
+      );
+
+    expect(putenvEvents.length).toBeGreaterThan(0);
+    // Name must be the bare protected identifier.
+    expect(putenvEvents[0]?.['name']).toBe('NODE_OPTIONS');
+    // Critically: the attacker-controlled VALUE must NOT leak into the
+    // event payload.
+    for (const ev of putenvEvents) {
+      const name = ev['name'];
+      if (typeof name === 'string') {
+        expect(name).not.toContain('SECRET_LEAK');
+        expect(name).not.toContain('=');
+      }
+    }
+    // And the full log line must also not carry the secret as the name field.
+    for (const l of res.logLines) {
+      // Allow the secret to appear elsewhere (it shouldn't anywhere, but
+      // pin the audited claim: the *name* field is not the full string).
+      // A simpler guarantee: the full poison string is not present.
+      expect(l).not.toContain('SECRET_LEAK_abcdef_NOT_IN_LOG');
+    }
+  });
 });
