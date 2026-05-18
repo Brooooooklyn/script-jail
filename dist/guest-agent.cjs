@@ -25438,6 +25438,17 @@ function _parseStraceLine(line, pid, ts) {
   switch (syscallName) {
     case "openat":
       return parseOpenat(args, retVal, pid, ts);
+    // Audit-trust Finding (high, 2026-05-19): openat2 is a Linux 5.6+
+    // variant of openat that takes a `struct open_how` instead of bare
+    // flags + mode.  Without parsing it, a raw `syscall(SYS_openat2,
+    // AT_FDCWD, path, &how, sizeof(how))` opening the events file for
+    // write produces a strace line our parser drops — the forgery
+    // detector then sees nothing and the bypass is silent.  We emit
+    // the same `read`/`write` RawEvent shape as `parseOpenat` so all
+    // downstream consumers (dirfdTable, shim-trust set, events-file
+    // forgery detector) behave identically.
+    case "openat2":
+      return parseOpenat2(args, retVal, pid, ts);
     case "execve":
       return parseExecve(args, retVal, pid, ts);
     // Audit-trust Finding 2 (high, 2026-05-18): execveat must be parsed
@@ -25485,6 +25496,44 @@ function parseOpenat(args, retVal, pid, ts) {
   if (r === null) return null;
   const [path2] = r;
   const flags = args[2] ?? "";
+  const isWrite = flagsImplyWrite(flags);
+  let errno;
+  if (retVal.isError) {
+    if (retVal.errno === "ENOENT") errno = "ENOENT";
+    else if (retVal.errno === "EACCES") errno = "EACCES";
+    else return null;
+  }
+  let retFd;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith("0x") ? parseInt(retVal.raw, 16) : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
+  }
+  const base = { path: path2, pid, ts, hidden: false };
+  const optional2 = {};
+  if (errno !== void 0) optional2.errno = errno;
+  if (dirfd !== void 0) optional2.dirfd = dirfd;
+  if (retFd !== void 0) optional2.retFd = retFd;
+  if (isWrite) {
+    return [{ kind: "write", ...base, ...optional2 }];
+  }
+  return [{ kind: "read", ...base, ...optional2 }];
+}
+function parseOpenat2(args, retVal, pid, ts) {
+  const dirfdToken = args[0] ?? "";
+  let dirfd;
+  if (dirfdToken !== "AT_FDCWD") {
+    const m = dirfdToken.match(/^(-?\d+)/);
+    if (m === null) return null;
+    dirfd = parseInt(m[1] ?? "", 10);
+    if (!Number.isFinite(dirfd)) return null;
+  }
+  const pathToken = args[1] ?? "";
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const [path2] = r;
+  const howToken = args[2] ?? "";
+  const flagsMatch = howToken.match(/flags=([^,}]+)/);
+  const flags = flagsMatch !== null ? (flagsMatch[1] ?? "").trim() : "";
   const isWrite = flagsImplyWrite(flags);
   let errno;
   if (retVal.isError) {
@@ -26815,7 +26864,7 @@ var LinuxStraceRunner = class {
       "-s",
       "4096",
       "-e",
-      "trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir",
+      "trace=openat,openat2,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir",
       "-o",
       opts.basePath,
       cmd,

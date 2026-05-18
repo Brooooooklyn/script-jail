@@ -340,6 +340,16 @@ function _parseStraceLine(line: string, pid: number, ts: number): RawEvent[] | n
 
   switch (syscallName) {
     case 'openat':      return parseOpenat(args, retVal, pid, ts);
+    // Audit-trust Finding (high, 2026-05-19): openat2 is a Linux 5.6+
+    // variant of openat that takes a `struct open_how` instead of bare
+    // flags + mode.  Without parsing it, a raw `syscall(SYS_openat2,
+    // AT_FDCWD, path, &how, sizeof(how))` opening the events file for
+    // write produces a strace line our parser drops — the forgery
+    // detector then sees nothing and the bypass is silent.  We emit
+    // the same `read`/`write` RawEvent shape as `parseOpenat` so all
+    // downstream consumers (dirfdTable, shim-trust set, events-file
+    // forgery detector) behave identically.
+    case 'openat2':     return parseOpenat2(args, retVal, pid, ts);
     case 'execve':      return parseExecve(args, retVal, pid, ts);
     // Audit-trust Finding 2 (high, 2026-05-18): execveat must be parsed
     // because the agent's strace invocation now also passes -e trace=execveat.
@@ -440,6 +450,83 @@ function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): R
   // exactOptionalPropertyTypes doesn't treat `field: undefined` as
   // "explicitly undefined" (downstream code reads `field === undefined`
   // to mean absent — same convention as `errno`).
+  const optional: { errno?: 'ENOENT' | 'EACCES'; dirfd?: number; retFd?: number } = {};
+  if (errno !== undefined) optional.errno = errno;
+  if (dirfd !== undefined) optional.dirfd = dirfd;
+  if (retFd !== undefined) optional.retFd = retFd;
+
+  if (isWrite) {
+    return [{ kind: 'write', ...base, ...optional }];
+  }
+  return [{ kind: 'read', ...base, ...optional }];
+}
+
+// Audit-trust Finding (high, 2026-05-19): parser for the Linux 5.6+ openat2
+// syscall.  Strace wire format:
+//
+//   openat2(AT_FDCWD, "events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=0x0}, 16) = 7
+//   openat2(5, "events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=RESOLVE_BENEATH}, 24) = 7
+//   openat2(AT_FDCWD, "/lib/libc.so", {flags=O_RDONLY|O_CLOEXEC, mode=0, resolve=0x0}, 24) = 3
+//
+// Args:
+//   args[0] dirfd       — AT_FDCWD or a numeric fd (same as openat)
+//   args[1] pathname    — quoted string
+//   args[2] open_how    — `{flags=..., mode=..., resolve=...}` struct
+//   args[3] size        — sizeof(struct open_how), ignored
+//
+// The `flags=...` field inside the struct is the only token we need for
+// the write-bit determination; everything else is informational.  We
+// emit the same RawEvent shape as parseOpenat (read or write event,
+// errno on failure, dirfd/retFd transport-only fields when applicable)
+// so all downstream code paths in src/guest/phase-install.ts (dirfdTable
+// population, shim-trust set, events-file forgery detector) treat the
+// two syscalls identically.  Failure handling mirrors parseOpenat:
+// ENOENT/EACCES emit events stamped with errno; other errors drop.
+function parseOpenat2(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
+  const dirfdToken = args[0] ?? '';
+  let dirfd: number | undefined;
+  if (dirfdToken !== 'AT_FDCWD') {
+    const m = dirfdToken.match(/^(-?\d+)/);
+    if (m === null) return null;
+    dirfd = parseInt(m[1] ?? '', 10);
+    if (!Number.isFinite(dirfd)) return null;
+  }
+
+  const pathToken = args[1] ?? '';
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const [path] = r;
+
+  // Extract the `flags=...` field from the open_how struct.  The struct
+  // is rendered with comma-separated key=value pairs inside braces;
+  // splitArgs has already returned the entire `{...}` token as args[2].
+  // We match `flags=<token>` where the value extends to the next comma
+  // or closing brace.  Falling back to an empty flags string is safe:
+  // flagsImplyWrite returns false on an empty input, so we'd classify
+  // as read — a more conservative classification that loses the write
+  // signal for a malformed line.  In practice strace always renders
+  // the flags field; this is defence in depth.
+  const howToken = args[2] ?? '';
+  const flagsMatch = howToken.match(/flags=([^,}]+)/);
+  const flags = flagsMatch !== null ? (flagsMatch[1] ?? '').trim() : '';
+  const isWrite = flagsImplyWrite(flags);
+
+  let errno: 'ENOENT' | 'EACCES' | undefined;
+  if (retVal.isError) {
+    if (retVal.errno === 'ENOENT') errno = 'ENOENT';
+    else if (retVal.errno === 'EACCES') errno = 'EACCES';
+    else return null;
+  }
+
+  let retFd: number | undefined;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith('0x')
+      ? parseInt(retVal.raw, 16)
+      : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
+  }
+
+  const base = { path, pid, ts, hidden: false } as const;
   const optional: { errno?: 'ENOENT' | 'EACCES'; dirfd?: number; retFd?: number } = {};
   if (errno !== undefined) optional.errno = errno;
   if (dirfd !== undefined) optional.dirfd = dirfd;

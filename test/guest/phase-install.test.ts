@@ -2813,6 +2813,188 @@ describe('runInstallPhase', () => {
       });
     });
 
+    // Audit-trust Finding (high, 2026-05-19) — openat2 (Linux 5.6+) forgery.
+    // A raw `syscall(SYS_openat2, ...)` would previously slip past both
+    // the strace `-e trace=` filter AND the parser dispatch.  These tests
+    // pin the full path: agent traces openat2, parser emits a write event,
+    // forgery detector flags it the same way it flags openat.
+    describe('openat2 forgery detection (Finding, 2026-05-19)', () => {
+      it('absolute-path openat2 write from non-shim-loaded pid → forgery', async () => {
+        const proc = mockProcReader({
+          801: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'openat2-abs-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 801,
+            line: `openat2(AT_FDCWD, "${EVENTS_FILE}", {flags=O_WRONLY|O_APPEND|O_CREAT, mode=0644, resolve=0x0}, 24) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+        const raw = forgeries[0]!['raw'] as Record<string, unknown>;
+        expect(raw['prog']).toBe(EVENTS_FILE);
+      });
+
+      it('cwd-relative openat2 write after chdir(events-dir) from non-shim-loaded pid → forgery (Layer 2)', async () => {
+        const proc = mockProcReader({
+          802: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'openat2-cwd-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 802,
+            line: 'chdir("/tmp/script-jail-events") = 0',
+            source: 'strace',
+          },
+          {
+            pid: 802,
+            line: 'openat2(AT_FDCWD, "events.jsonl", {flags=O_WRONLY|O_APPEND|O_CREAT, mode=0644, resolve=0x0}, 24) = 7',
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+        const raw = forgeries[0]!['raw'] as Record<string, unknown>;
+        expect(raw['prog']).toBe(EVENTS_FILE);
+      });
+
+      it('dirfd-relative openat2 write via openat2(<events-dir-fd>, "events.jsonl", ...) → forgery', async () => {
+        const proc = mockProcReader({
+          803: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'openat2-dirfd-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        const EVENTS_DIR = '/tmp/script-jail-events';
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 803,
+            line: `openat2(AT_FDCWD, "${EVENTS_DIR}", {flags=O_RDONLY|O_DIRECTORY, mode=0, resolve=0x0}, 24) = 9`,
+            source: 'strace',
+          },
+          {
+            pid: 803,
+            line: 'openat2(9, "events.jsonl", {flags=O_WRONLY|O_APPEND|O_CREAT, mode=0644, resolve=0x0}, 24) = 10',
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+        const raw = forgeries[0]!['raw'] as Record<string, unknown>;
+        expect(raw['prog']).toBe(EVENTS_FILE);
+      });
+
+      it('openat2 of /lib/libscriptjail.so grants shim-trust just like openat', async () => {
+        // Defence in depth: ld.so on a system that prefers openat2 (Linux
+        // 5.6+ with glibc 2.36+) would map the shim via openat2 instead
+        // of openat.  The shim-trust set must include the pid in either
+        // case — otherwise legitimate writes by shim_init would be
+        // flagged as forgery.
+        const proc = mockProcReader({
+          804: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'openat2-shim-loaded-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 804,
+            line: `openat2(AT_FDCWD, "${SHIM_PATH}", {flags=O_RDONLY|O_CLOEXEC, mode=0, resolve=0x0}, 24) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 804,
+            line: `openat2(AT_FDCWD, "${EVENTS_FILE}", {flags=O_WRONLY|O_APPEND|O_CREAT, mode=0644, resolve=0x0}, 24) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(0);
+      });
+    });
+
     it('events_file_forgery renders to <EVENTS_FILE_FORGERY> in audit_bypass via normalize', async () => {
       const ev: AttributedEvent = {
         raw: {

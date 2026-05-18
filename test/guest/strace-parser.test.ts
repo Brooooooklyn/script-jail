@@ -141,6 +141,134 @@ describe('openat', () => {
   });
 });
 
+// ── openat2 ─────────────────────────────────────────────────────────────────
+//
+// Audit-trust Finding (high, 2026-05-19): openat2 (Linux 5.6+) is a more
+// capable variant of openat — it takes a `struct open_how` instead of bare
+// flags + mode.  A raw `syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how))`
+// from a lifecycle script previously escaped the parser (no case in the
+// dispatch switch) AND was not in the agent's strace -e trace= set; both
+// gaps are now closed.  The parser must produce the same RawEvent shape as
+// parseOpenat so the dirfdTable, shim-trust set, and events-file forgery
+// detector all behave identically.
+
+describe('openat2', () => {
+  it('O_RDONLY in open_how struct → read event', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 42, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 42, ts: 0, hidden: false, retFd: 3 }]);
+  });
+
+  it('O_WRONLY|O_APPEND in open_how struct → write event with retFd', () => {
+    const line = 'openat2(AT_FDCWD, "/tmp/script-jail-events/events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=0x0}, 24) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write',
+      path: '/tmp/script-jail-events/events.jsonl',
+      pid: 1, ts: 0, hidden: false, retFd: 7,
+    }]);
+  });
+
+  it('O_CREAT|O_WRONLY|O_TRUNC → write event', () => {
+    const line = 'openat2(AT_FDCWD, "/tmp/build.log", {flags=O_CREAT|O_WRONLY|O_TRUNC, mode=0666, resolve=0x0}, 24) = 5';
+    const evs = parseStraceLine(line, 1, 1);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/build.log', pid: 1, ts: 1, hidden: false, retFd: 5 }]);
+  });
+
+  it('O_RDWR|O_APPEND → write event (write wins)', () => {
+    const line = 'openat2(AT_FDCWD, "/var/log/app.log", {flags=O_RDWR|O_APPEND, mode=0, resolve=0x0}, 24) = 4';
+    const evs = parseStraceLine(line, 1, 2);
+    expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false, retFd: 4 }]);
+  });
+
+  it('ENOENT on O_RDONLY → read event stamped with errno', () => {
+    const line = 'openat2(AT_FDCWD, "/nonexistent", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/nonexistent', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
+  });
+
+  it('ENOENT on O_WRONLY → write event stamped with errno', () => {
+    const line = 'openat2(AT_FDCWD, "/no/dir/file", {flags=O_WRONLY|O_CREAT, mode=0644, resolve=0x0}, 24) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/no/dir/file', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
+  });
+
+  it('EACCES on O_WRONLY → write event stamped with errno=EACCES', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/shadow", {flags=O_WRONLY|O_CREAT, mode=0644, resolve=0x0}, 24) = -1 EACCES (Permission denied)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/etc/shadow', pid: 1, ts: 0, hidden: false, errno: 'EACCES' }]);
+  });
+
+  it('successful openat2 does NOT carry an errno field (no exactOptional `undefined`)', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).not.toHaveProperty('errno');
+  });
+
+  it('numeric dir-fd (write) → write event with dirfd + retFd carried for downstream resolve', () => {
+    // The dirfd-relative form is critical: an attacker can openat2(<events-dir-fd>,
+    // "events.jsonl", {flags=O_WRONLY|O_APPEND, ...}) to bypass an absolute-path check.
+    const line = 'openat2(5, "events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=0x0}, 24) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write', path: 'events.jsonl', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 7,
+    }]);
+  });
+
+  it('numeric dir-fd (read) → read event with dirfd + retFd', () => {
+    const line = 'openat2(5, "relative.txt", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 6';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'relative.txt', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 6,
+    }]);
+  });
+
+  it('AT_FDCWD on success → retFd present, dirfd absent', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: '/etc/hostname', pid: 1, ts: 0, hidden: false,
+      retFd: 3,
+    }]);
+  });
+
+  it('numeric dir-fd ENOENT → emits read with errno + dirfd (no retFd on failure)', () => {
+    const line = 'openat2(5, "missing.txt", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'missing.txt', pid: 1, ts: 0, hidden: false,
+      errno: 'ENOENT', dirfd: 5,
+    }]);
+  });
+
+  it('garbage dirfd token (not AT_FDCWD, not numeric) → null', () => {
+    const line = 'openat2(GARBAGE, "foo", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    expect(parseStraceLine(line, 1, 0)).toBeNull();
+  });
+
+  it('open_how with RESOLVE_BENEATH (sandboxing flag) is parsed correctly', () => {
+    // RESOLVE_BENEATH constrains the path resolution; the flags field is
+    // still what we care about for the audit decision.
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY|O_CLOEXEC, mode=0, resolve=RESOLVE_BENEATH}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 1, ts: 0, hidden: false, retFd: 3 }]);
+  });
+
+  it('open_how with field order variation (mode before flags) — fallback when no flags= field', () => {
+    // If for any reason strace renders the struct without a `flags=` field
+    // we degrade to a read classification (the more conservative choice
+    // when we cannot prove write intent).  This is defence in depth — in
+    // practice strace always renders flags first.
+    const line = 'openat2(AT_FDCWD, "/some/path", {mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'read', path: '/some/path' });
+  });
+});
+
 // ── execve ───────────────────────────────────────────────────────────────────
 
 describe('execve', () => {

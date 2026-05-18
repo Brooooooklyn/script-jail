@@ -1011,10 +1011,21 @@ export class LinuxStraceRunner implements StraceRunner {
     // `<EVENTS_FILE_FORGERY>` signal.  With `chdir`/`fchdir` traced, the
     // dispatcher in `runInstallPhase` updates a `pidCwd` map and resolves
     // AT_FDCWD-relative openat targets against the attacker's actual cwd.
+    // Audit-trust Finding (high, 2026-05-19): include `openat2` in the
+    // trace set.  Linux 5.6+ added openat2 as a more capable variant of
+    // openat (it takes a `struct open_how` instead of bare flags + mode
+    // and supports the RESOLVE_* sandboxing flags).  A raw-syscall
+    // child can `syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how))`
+    // to open the events file for write; without tracing openat2 the
+    // events-file forgery detector sees no openat line and the
+    // forgery slips past.  The strace parser learned `parseOpenat2` in
+    // lockstep so the wire-format struct argument is decoded for the
+    // flags field (write-bit detection) and the same RawEvent shape as
+    // openat is emitted.
     const straceArgs = [
       '-ff',
       '-s', '4096',
-      '-e', 'trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir',
+      '-e', 'trace=openat,openat2,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir',
       '-o', opts.basePath,
       cmd,
       ...args,
