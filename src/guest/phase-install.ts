@@ -285,6 +285,48 @@ export async function runInstallPhase(
     eventCount++;
   };
 
+  // Audit-trust Finding 1 (2026-05-18): cross-check strace execve against
+  // shim exec events to detect raw-syscall bypass.  The shim interposes
+  // libc symbols only (execve, execv, execvp, execvpe, execveat, fexecve,
+  // posix_spawn, posix_spawnp).  A native lifecycle script that issues
+  // `syscall(SYS_execve, …)` directly bypasses every libc wrapper, so the
+  // child runs WITHOUT our env envelope (no LD_PRELOAD re-injection, no
+  // SCRIPT_JAIL_* re-injection); strace still observes the syscall, but
+  // the shim emits no `exec` event because no libc wrapper was entered.
+  //
+  // Bookkeeping: per pid, count successful execve syscalls seen via strace
+  // and successful libc-exec events seen via shim.  Any positive
+  // `strace - shim` delta after the iterator drains is a bypass count for
+  // that pid.  We emit one synthesised ExecEvent per excess strace execve
+  // (with `syscall_bypass: true`) so normalize.ts can fold it into the
+  // package's `audit_bypass` array via the existing pipeline — that array
+  // is what `findAuditBypass` in src/action/diff.ts scans to hard-fail
+  // the lockfile diff.
+  //
+  // Why per-pid counts (not pid-set membership): pid reuse across the
+  // install is possible — a `pnpm install` that spawns many node children
+  // can recycle pids after exit — and a single pid can legitimately exec
+  // multiple times (sh / busybox / corepack chains).  We match counts so
+  // each strace execve has a 1:1 corresponding shim exec event; anything
+  // unmatched is a real bypass.
+  //
+  // We track the most recent strace observation (argv0/prog/ts) per pid so
+  // the synthesised audit_bypass entry can carry useful forensic context
+  // (the strace-observed argv[0] of the bypassed exec).  Strace can record
+  // multiple execs for a pid; we keep a small ring of the trailing entries
+  // so the audit_bypass list points at the right ones even if some were
+  // matched by shim events out of order.
+  interface StraceExecSample {
+    argv0: string;
+    prog: string;
+    pid: number;
+    ts: number;
+    pkg: string;
+    lifecycle: AttributedEvent['lifecycle'];
+  }
+  const straceExecsByPid = new Map<number, StraceExecSample[]>();
+  const shimExecCountByPid = new Map<number, number>();
+
   // StraceRunner is the SOLE owner of the install process.
   // We do NOT call a separate spawner here — that would run install twice.
   //
@@ -339,6 +381,20 @@ export async function runInstallPhase(
         continue;
       }
       const result = input.attribution.attribute(shimEvent.pid);
+      // Audit-trust Finding 1: track the shim's exec events per pid so
+      // the post-loop cross-check can pair each strace execve with a
+      // shim exec.  We count regardless of whether attribution succeeded
+      // (a shim event without attribution still proves the shim wrapper
+      // ran for that pid, which is the invariant we are checking).  We
+      // ALSO ignore `envp_alloc_failed` here — that's a different bypass
+      // (rewrite_envp ran but allocation failed); it still proves the
+      // libc wrapper entered the shim path.
+      if (shimEvent.kind === 'exec') {
+        shimExecCountByPid.set(
+          shimEvent.pid,
+          (shimExecCountByPid.get(shimEvent.pid) ?? 0) + 1,
+        );
+      }
       if (result !== null) {
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
@@ -360,6 +416,34 @@ export async function runInstallPhase(
       for (const rawEvent of straceEvents) {
         const result = input.attribution.attribute(rawEvent.pid);
         if (result === null) continue;
+        // Audit-trust Finding 1: capture strace-observed successful
+        // execve syscalls so the post-loop cross-check can detect a
+        // syscall-bypass (strace saw the execve but the shim did not
+        // emit a matching `exec` event, which means no libc wrapper
+        // ran — almost certainly `syscall(SYS_execve, …)` directly).
+        // parseStraceLine emits a `spawn` RawEvent for execve, with the
+        // syscall return classified into ok/enoent/eacces.  Only the
+        // 'ok' case counts: a failed execve does NOT replace the
+        // process image and the shim wrapper would have observed it
+        // too, so unsuccessful execve doesn't tell us anything about
+        // the bypass invariant.
+        if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
+          const argv0 = rawEvent.argv[0] ?? '';
+          // For execve(pathname, argv, envp) the syscall path arg IS
+          // argv[0] in our parser's output (the parser falls back to
+          // the path when argv is empty), so prog/argv0 alias here.
+          const prog = argv0;
+          const samples = straceExecsByPid.get(rawEvent.pid) ?? [];
+          samples.push({
+            argv0,
+            prog,
+            pid: rawEvent.pid,
+            ts: rawEvent.ts,
+            pkg: result.pkg,
+            lifecycle: result.lifecycle,
+          });
+          straceExecsByPid.set(rawEvent.pid, samples);
+        }
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -385,6 +469,48 @@ export async function runInstallPhase(
       `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). ` +
         'Audit-pipeline contract requires source ∈ {"shim","strace"}.',
     );
+  }
+
+  // Audit-trust Finding 1 (2026-05-18): post-loop cross-check.  For each
+  // pid we count successful strace execve syscalls vs shim libc exec
+  // events.  Any positive `strace - shim` delta is unaccounted for and
+  // can only be explained by a raw `syscall(SYS_execve, …)` bypass — the
+  // child therefore ran without the shim's re-injected env envelope.
+  // We synthesise one `exec` event (`syscall_bypass: true`) per excess
+  // strace execve so normalize.ts folds it into the package's
+  // `audit_bypass` list via the existing pipeline.  The
+  // `findAuditBypass` scan in src/action/diff.ts then hard-fails the
+  // lockfile diff on the resulting `<SYSCALL_EXEC_BYPASS> …` entry.
+  //
+  // Selection of which strace samples to surface: we surface the LAST N
+  // samples (where N = delta).  Rationale: shim exec events arrive in the
+  // same temporal order as their strace counterparts for the matched
+  // pairs, so the unmatched tail is the most likely bypass.  This is a
+  // best-effort heuristic for the forensic argv0 — the audit-bypass
+  // signal itself is correctly populated for ANY non-zero delta.
+  for (const [pid, samples] of straceExecsByPid) {
+    const straceCount = samples.length;
+    const shimCount = shimExecCountByPid.get(pid) ?? 0;
+    if (straceCount <= shimCount) continue;
+    const bypassCount = straceCount - shimCount;
+    // Take the tail samples (most-recent execve calls on this pid).
+    const tail = samples.slice(straceCount - bypassCount);
+    for (const sample of tail) {
+      const synthetic: RawEvent = {
+        kind: 'exec',
+        prog: sample.prog,
+        argv0: sample.argv0.length > 0 ? sample.argv0 : null,
+        envp_alloc_failed: false,
+        syscall_bypass: true,
+        pid: sample.pid,
+        ts: sample.ts,
+      };
+      emit({
+        raw: synthetic,
+        pkg: sample.pkg,
+        lifecycle: sample.lifecycle,
+      });
+    }
   }
 
   // Exit code is owned by the StraceRunner (it ran the only install process).

@@ -24939,6 +24939,9 @@ var ExecEvent = external_exports.object({
   prog: external_exports.string(),
   argv0: external_exports.string().nullable(),
   envp_alloc_failed: external_exports.boolean(),
+  // Default false for shim-sourced events.  Only set true by the
+  // synthesized cross-check pass in runInstallPhase (Finding 1).
+  syscall_bypass: external_exports.boolean().default(false),
   pid: external_exports.number(),
   ts: external_exports.number()
 });
@@ -25674,6 +25677,8 @@ async function runInstallPhase(input) {
     input.emitter.emitEvent(filtered);
     eventCount++;
   };
+  const straceExecsByPid = /* @__PURE__ */ new Map();
+  const shimExecCountByPid = /* @__PURE__ */ new Map();
   for await (const { pid, line, source } of input.strace.run(cmd, args, {
     env: input.env,
     cwd: input.cwd,
@@ -25690,6 +25695,12 @@ async function runInstallPhase(input) {
         continue;
       }
       const result = input.attribution.attribute(shimEvent.pid);
+      if (shimEvent.kind === "exec") {
+        shimExecCountByPid.set(
+          shimEvent.pid,
+          (shimExecCountByPid.get(shimEvent.pid) ?? 0) + 1
+        );
+      }
       if (result !== null) {
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
@@ -25701,6 +25712,20 @@ async function runInstallPhase(input) {
       for (const rawEvent of straceEvents) {
         const result = input.attribution.attribute(rawEvent.pid);
         if (result === null) continue;
+        if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          const argv0 = rawEvent.argv[0] ?? "";
+          const prog = argv0;
+          const samples = straceExecsByPid.get(rawEvent.pid) ?? [];
+          samples.push({
+            argv0,
+            prog,
+            pid: rawEvent.pid,
+            ts: rawEvent.ts,
+            pkg: result.pkg,
+            lifecycle: result.lifecycle
+          });
+          straceExecsByPid.set(rawEvent.pid, samples);
+        }
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -25711,6 +25736,29 @@ async function runInstallPhase(input) {
     setPhaseTamper(
       `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). Audit-pipeline contract requires source \u2208 {"shim","strace"}.`
     );
+  }
+  for (const [pid, samples] of straceExecsByPid) {
+    const straceCount = samples.length;
+    const shimCount = shimExecCountByPid.get(pid) ?? 0;
+    if (straceCount <= shimCount) continue;
+    const bypassCount = straceCount - shimCount;
+    const tail = samples.slice(straceCount - bypassCount);
+    for (const sample of tail) {
+      const synthetic = {
+        kind: "exec",
+        prog: sample.prog,
+        argv0: sample.argv0.length > 0 ? sample.argv0 : null,
+        envp_alloc_failed: false,
+        syscall_bypass: true,
+        pid: sample.pid,
+        ts: sample.ts
+      };
+      emit({
+        raw: synthetic,
+        pkg: sample.pkg,
+        lifecycle: sample.lifecycle
+      });
+    }
   }
   const exitCode = input.strace.getExitCode();
   return { exitCode, eventCount, tamperReason: phaseTamperReason };
@@ -25801,9 +25849,15 @@ function normalize(events, ctx) {
         break;
       }
       case "exec": {
-        if (!ev.raw.envp_alloc_failed) break;
-        const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
-        block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
+        if (ev.raw.envp_alloc_failed) {
+          const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
+          block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
+        }
+        if (ev.raw.syscall_bypass) {
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
+          const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
+          block.audit_bypass.push(`<SYSCALL_EXEC_BYPASS> ${tokenized}`);
+        }
         break;
       }
       case "env_tamper": {

@@ -41821,6 +41821,9 @@ var ExecEvent = external_exports.object({
   prog: external_exports.string(),
   argv0: external_exports.string().nullable(),
   envp_alloc_failed: external_exports.boolean(),
+  // Default false for shim-sourced events.  Only set true by the
+  // synthesized cross-check pass in runInstallPhase (Finding 1).
+  syscall_bypass: external_exports.boolean().default(false),
   pid: external_exports.number(),
   ts: external_exports.number()
 });

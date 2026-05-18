@@ -997,6 +997,258 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // Audit-trust Finding 1 (2026-05-18) — raw-syscall execve bypass detection
+  //
+  // The shim interposes libc symbols only.  A lifecycle script that issues
+  // `syscall(SYS_execve, …)` directly bypasses every libc wrapper: the child
+  // runs without our re-injected LD_PRELOAD / NODE_OPTIONS / SCRIPT_JAIL_*
+  // envelope but strace still observes the execve syscall.  runInstallPhase
+  // must cross-check: each strace-source `spawn` (execve) must be matched by
+  // a shim-source `exec` event for the same pid; unmatched strace execve
+  // calls are surfaced as a synthesised `exec` event with
+  // `syscall_bypass: true`, which normalize.ts emits as a
+  // `<SYSCALL_EXEC_BYPASS> …` entry under `audit_bypass`.
+  describe('Finding 1 — strace execve without shim ack → syscall-bypass synthesised', () => {
+    it('emits a syscall_bypass exec event when a strace execve has no matching shim exec', async () => {
+      const proc = mockProcReader({
+        101: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'bypass-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // One strace-source execve, NO shim-source exec event for pid 101.
+      // The post-loop pass should synthesise an exec event with
+      // syscall_bypass:true.
+      const straceLines = [
+        {
+          pid: 101,
+          line: 'execve("/usr/bin/curl", ["curl", "https://evil.example"], 0x1234 /* 0 vars */) = 0',
+          source: 'strace' as const,
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // Two events: the original spawn (from strace) + the synthesised
+      // exec (from the post-loop cross-check).
+      expect(lines.length).toBeGreaterThanOrEqual(2);
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synthExec = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synthExec).toBeDefined();
+      const raw = synthExec!['raw'] as Record<string, unknown>;
+      expect(raw['pid']).toBe(101);
+      expect(raw['argv0']).toBe('curl');
+      expect(raw['envp_alloc_failed']).toBe(false);
+      expect(synthExec!['pkg']).toBe('bypass-pkg@1.0.0');
+    });
+
+    it('does NOT emit syscall_bypass when shim exec count matches strace count', async () => {
+      const proc = mockProcReader({
+        102: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'happy-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // Strace sees execve; shim sees a matching exec event for the same
+      // pid.  The bookkeeping is per-pid counts, so this should NOT
+      // synthesise any bypass entry.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 102,
+          line: 'execve("/usr/bin/node", ["node", "-e", "1"], 0x1234 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 102,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/node',
+            argv0: 'node',
+            envp_alloc_failed: false,
+            pid: 102,
+            ts: 7777,
+          }),
+          source: 'shim',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synthExec = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synthExec).toBeUndefined();
+    });
+
+    it('emits N synthetic bypass events when strace count exceeds shim count by N', async () => {
+      const proc = mockProcReader({
+        103: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'multi-bypass-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // 3 strace execve, 1 shim exec → 2 synthetic bypass events.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 103,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "a"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 103,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/sh',
+            argv0: 'sh',
+            envp_alloc_failed: false,
+            pid: 103,
+            ts: 1,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 103,
+          line: 'execve("/usr/bin/curl", ["curl", "x"], 0x2 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 103,
+          line: 'execve("/usr/bin/wget", ["wget", "y"], 0x3 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synthExecs = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synthExecs).toHaveLength(2);
+      // The TAIL samples (most-recent execve calls on this pid) are the
+      // ones surfaced: curl + wget.  The first sh exec matched the single
+      // shim event.
+      const argv0s = synthExecs
+        .map((e) => ((e['raw'] as Record<string, unknown>)['argv0']) as string)
+        .sort();
+      expect(argv0s).toEqual(['curl', 'wget']);
+    });
+
+    it('failed execve (ENOENT) does NOT count toward the bypass delta', async () => {
+      const proc = mockProcReader({
+        104: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'enoent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // strace observes ENOENT execve (no exec actually happened); shim
+      // also won't see one (no successful libc wrapper return).  The
+      // bypass-count delta must therefore be 0.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 104,
+          line:
+            'execve("/usr/bin/missing", ["missing"], 0x1 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synthExec = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synthExec).toBeUndefined();
+    });
+
+    it('syscall_bypass exec event renders to <SYSCALL_EXEC_BYPASS> in audit_bypass via normalize', async () => {
+      // End-to-end through normalize.ts: the synthesised exec event with
+      // syscall_bypass:true must land as `<SYSCALL_EXEC_BYPASS> …` under
+      // audit_bypass.  This is the exact entry shape `findAuditBypass` in
+      // src/action/diff.ts scans for.
+      const ev: AttributedEvent = {
+        raw: {
+          kind: 'exec',
+          prog: '/usr/bin/curl',
+          argv0: 'curl',
+          envp_alloc_failed: false,
+          syscall_bypass: true,
+          pid: 1,
+          ts: 0,
+        },
+        pkg: 'bypass-pkg@1.0.0',
+        lifecycle: 'postinstall',
+      };
+      const ctx: NormalizeContext = {
+        roots: { repo: '/work', nodeModules: '/work/node_modules', home: '/root', tmp: '/tmp', cache: '/cache' },
+        pkgDirs: new Map([['bypass-pkg@1.0.0', '/work/node_modules/bypass-pkg']]),
+      };
+      const out = normalize([ev], ctx);
+      const block = out.get('bypass-pkg@1.0.0')!.lifecycle.postinstall!;
+      expect(block.audit_bypass).toContain('<SYSCALL_EXEC_BYPASS> curl');
+    });
+  });
+
   describe('exit code propagation via StraceRunner.getExitCode()', () => {
     it('returns non-zero exitCode when StraceRunner reports failure', async () => {
       const { emitter } = makeEmitter();

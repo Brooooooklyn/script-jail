@@ -135,18 +135,44 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
       }
       case 'exec': {
         // Most exec events ARE redundant with the strace-observed execve
-        // syscall already feeding spawn_attempts. The only signal worth
-        // surfacing is `envp_alloc_failed=true`: it means the shim's
-        // re-injection of LD_PRELOAD / NODE_OPTIONS / SCRIPT_JAIL_* into the
-        // child's envp could not allocate, so the child ran OUTSIDE the audit
-        // envelope. strace still sees the syscall but the shim is no longer
-        // loaded in that pid — anything getenv/dlopen-shaped inside the child
-        // is therefore invisible. Silently dropping this signal makes the
-        // lockfile diff stay clean even when audit was bypassed, which is the
-        // worst possible outcome for an auditor.
-        if (!ev.raw.envp_alloc_failed) break;
-        const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
-        block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
+        // syscall already feeding spawn_attempts. Two signals are worth
+        // surfacing — both as `audit_bypass` entries:
+        //
+        //   1. `envp_alloc_failed=true`: the shim's re-injection of
+        //      LD_PRELOAD / NODE_OPTIONS / SCRIPT_JAIL_* into the child's
+        //      envp could not allocate, so the child ran OUTSIDE the audit
+        //      envelope.  strace still sees the syscall but the shim is no
+        //      longer loaded in that pid — anything getenv/dlopen-shaped
+        //      inside the child is therefore invisible.
+        //
+        //   2. `syscall_bypass=true` (audit-trust Finding 1, 2026-05-18):
+        //      synthesized by runInstallPhase when a strace execve has no
+        //      matching shim exec event.  That gap is only possible when
+        //      the lifecycle script issued `syscall(SYS_execve, …)`
+        //      directly, bypassing every libc-level wrapper.  The child
+        //      ran without our env envelope for the same reason: the
+        //      kernel syscall does NOT go through our rewrite_envp.
+        //
+        // Silently dropping either signal makes the lockfile diff stay
+        // clean even when audit was bypassed, which is the worst possible
+        // outcome for an auditor.
+        if (ev.raw.envp_alloc_failed) {
+          const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
+          block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
+        }
+        if (ev.raw.syscall_bypass) {
+          // Prefer argv0 (the syscall's first argv entry, which is the
+          // most attacker-visible identifier of the spawned program); fall
+          // back to the strace-observed `prog` (the syscall path arg) when
+          // argv0 is null/empty.
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0
+            ? ev.raw.argv0
+            : ev.raw.prog;
+          const tokenized = ident.startsWith('/')
+            ? tokenize(ident, ctx.roots, pkgDir)
+            : ident;
+          block.audit_bypass.push(`<SYSCALL_EXEC_BYPASS> ${tokenized}`);
+        }
         break;
       }
       case 'env_tamper': {

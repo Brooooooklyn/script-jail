@@ -87,11 +87,25 @@ export type NetworkEvent = z.infer<typeof NetworkEvent>;
 // strace-observed execve syscalls at the kernel level, so currently dropped
 // in normalize.ts and not surfaced in the rendered lockfile; available in
 // the raw audit JSONL for forensic inspection.
+//
+// Audit-trust Finding 1 (2026-05-18): an additional, synthesized variant is
+// produced by `runInstallPhase` (NOT by the shim) when a strace-observed
+// `execve` syscall has no matching shim-source `exec` event.  That gap is
+// only possible when the lifecycle script bypassed the shim's libc wrappers
+// (i.e. issued `syscall(SYS_execve, …)` directly), so the child ran without
+// our env envelope.  The `syscall_bypass: true` flag on the synthesized
+// event drives `normalize.ts` to emit a `<SYSCALL_EXEC_BYPASS>` entry under
+// `audit_bypass`, which the host-side `findAuditBypass` scan hard-fails on.
+// `argv0` carries the strace-observed argv[0] for forensic context; the
+// other shim-only fields default to neutral values.
 export const ExecEvent = z.object({
   kind: z.literal('exec'),
   prog: z.string(),
   argv0: z.string().nullable(),
   envp_alloc_failed: z.boolean(),
+  // Default false for shim-sourced events.  Only set true by the
+  // synthesized cross-check pass in runInstallPhase (Finding 1).
+  syscall_bypass: z.boolean().default(false),
   pid: z.number(),
   ts: z.number(),
 });

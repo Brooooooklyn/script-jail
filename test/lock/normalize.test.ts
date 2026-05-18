@@ -40,7 +40,7 @@ function dlopenEv(filename: string): AttributedEvent {
 
 function execEv(prog: string, envp_alloc_failed: boolean, argv0: string | null = null): AttributedEvent {
   return {
-    raw: { kind: 'exec', prog, argv0, envp_alloc_failed, pid: 1, ts: 0 },
+    raw: { kind: 'exec', prog, argv0, envp_alloc_failed, syscall_bypass: false, pid: 1, ts: 0 },
     pkg: pkgId,
     lifecycle: 'postinstall',
   };
