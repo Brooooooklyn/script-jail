@@ -597,13 +597,32 @@ unsafe fn make_entry(name: &[u8], value: &[u8]) -> *mut c_char {
     buf as *mut c_char
 }
 
-/// Ensure `name` is set in buf to a value that contains `to_append`.
+/// Whether `append_path_env` writes the new chunk at the front or back of
+/// the existing value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// Result: `existing + sep + new`.  Idempotency check matches a trailing
+    /// `sep + new`.  Use when ordering is semantically left-to-right and
+    /// existing entries should win first.  Retained as part of the helper's
+    /// contract so future call sites have an obvious knob — current call
+    /// sites all prepend.
+    #[allow(dead_code)]
+    Append,
+    /// Result: `new + sep + existing`.  Idempotency check matches a leading
+    /// `new + sep`.  Use for vars where ld.so / Node load left-to-right and
+    /// our injection must take precedence over caller-supplied entries
+    /// (LD_PRELOAD, NODE_OPTIONS).
+    Prepend,
+}
+
+/// Ensure `name` is set in buf to a value that includes `to_append`,
+/// concatenated at the position dictated by `order`.
 ///
 /// - If `to_append` is empty, return true immediately (no-op).
 /// - If `name` is absent: add a new `name=to_append` entry.
-/// - If `name` is present but already ends with `to_append` (accounting for
-///   the separator): leave it unchanged (idempotent).
-/// - Otherwise: concatenate `existing + separator + to_append`.
+/// - If `name` is present and already contains `to_append` at the correct
+///   end (trailing for Append, leading for Prepend): leave it unchanged.
+/// - Otherwise: concatenate per `order`, separated by `separator`.
 ///
 /// Returns false only on malloc failure.
 unsafe fn append_path_env(
@@ -611,6 +630,7 @@ unsafe fn append_path_env(
     name: &[u8],
     to_append: &[u8],
     separator: u8,
+    order: Order,
 ) -> bool {
     if to_append.is_empty() {
         return true;
@@ -641,19 +661,34 @@ unsafe fn append_path_env(
             }
             let existing = core::slice::from_raw_parts(val_ptr as *const u8, val_len);
 
-            // Idempotency: already exactly to_append, or ends with sep+to_append.
+            // Idempotency: already exactly to_append.
             if existing == to_append {
                 return true;
             }
-            if val_len >= to_append.len() + 1 {
-                let tail = &existing[val_len - to_append.len() - 1..];
-                if tail[0] == separator && &tail[1..] == to_append {
-                    return true;
+            // Order-specific idempotency: trailing for Append, leading for
+            // Prepend.  In both cases we require the separator immediately
+            // adjacent to the to_append slice.
+            match order {
+                Order::Append => {
+                    if val_len >= to_append.len() + 1 {
+                        let tail = &existing[val_len - to_append.len() - 1..];
+                        if tail[0] == separator && &tail[1..] == to_append {
+                            return true;
+                        }
+                    }
+                }
+                Order::Prepend => {
+                    if val_len >= to_append.len() + 1
+                        && &existing[..to_append.len()] == to_append
+                        && existing[to_append.len()] == separator
+                    {
+                        return true;
+                    }
                 }
             }
 
-            // Build new value: existing + separator + to_append.
-            // But only add separator if existing is non-empty.
+            // Build new value.  When existing is non-empty we need a
+            // separator between the two halves.
             let sep_len = if val_len > 0 { 1usize } else { 0usize };
             let new_val_len = val_len + sep_len + to_append.len();
             let total = name.len() + 1 + new_val_len + 1;
@@ -668,14 +703,44 @@ unsafe fn append_path_env(
             off += name.len();
             *raw_buf.add(off) = b'=';
             off += 1;
-            if val_len > 0 {
-                core::ptr::copy_nonoverlapping(val_ptr as *const u8, raw_buf.add(off), val_len);
-                off += val_len;
-                *raw_buf.add(off) = separator;
-                off += 1;
+            match order {
+                Order::Append => {
+                    if val_len > 0 {
+                        core::ptr::copy_nonoverlapping(
+                            val_ptr as *const u8,
+                            raw_buf.add(off),
+                            val_len,
+                        );
+                        off += val_len;
+                        *raw_buf.add(off) = separator;
+                        off += 1;
+                    }
+                    core::ptr::copy_nonoverlapping(
+                        to_append.as_ptr(),
+                        raw_buf.add(off),
+                        to_append.len(),
+                    );
+                    off += to_append.len();
+                }
+                Order::Prepend => {
+                    core::ptr::copy_nonoverlapping(
+                        to_append.as_ptr(),
+                        raw_buf.add(off),
+                        to_append.len(),
+                    );
+                    off += to_append.len();
+                    if val_len > 0 {
+                        *raw_buf.add(off) = separator;
+                        off += 1;
+                        core::ptr::copy_nonoverlapping(
+                            val_ptr as *const u8,
+                            raw_buf.add(off),
+                            val_len,
+                        );
+                        off += val_len;
+                    }
+                }
             }
-            core::ptr::copy_nonoverlapping(to_append.as_ptr(), raw_buf.add(off), to_append.len());
-            off += to_append.len();
             *raw_buf.add(off) = 0u8;
 
             if !envbuf_set_at(buf, idx, raw_buf as *mut c_char) {
@@ -687,19 +752,38 @@ unsafe fn append_path_env(
     }
 }
 
-/// Ensure `name` is set in buf.  If already present, leave it unchanged.
-/// If absent, add `name=value`.  Returns false only on malloc failure.
-unsafe fn ensure_env(buf: &mut EnvBuf, name: &[u8], value: &[u8]) -> bool {
-    if envbuf_find(buf, name).is_some() {
-        return true; // preserve caller's value, do not overwrite.
-    }
+/// Overwrite `name` in buf with the canonical `value`.
+///
+/// - If `name` is present: replace the entry at the existing slot with a
+///   freshly-malloc'd `name=value` string (the previous entry pointer was
+///   either from the caller's envp_in or from a prior owned alloc — in
+///   either case we just swap the slot pointer, and the new alloc joins
+///   the owned tracker so free_envbuf reclaims it).
+/// - If `name` is absent: push a new entry.
+///
+/// Unlike ensure_env (which preserved the caller's value), this enforces
+/// that the audit chain's runtime config (SCRIPT_JAIL_LOG_FILE, log fd,
+/// preload path, etc.) cannot be redirected by a malicious envp_in.
+///
+/// Returns false only on malloc failure.
+unsafe fn overwrite_env(buf: &mut EnvBuf, name: &[u8], value: &[u8]) -> bool {
     let entry = make_entry(name, value);
     if entry.is_null() {
         return false;
     }
-    if !envbuf_push(buf, entry) {
-        free_entry(entry);
-        return false;
+    match envbuf_find(buf, name) {
+        Some(idx) => {
+            if !envbuf_set_at(buf, idx, entry) {
+                free_entry(entry);
+                return false;
+            }
+        }
+        None => {
+            if !envbuf_push(buf, entry) {
+                free_entry(entry);
+                return false;
+            }
+        }
     }
     true
 }
@@ -1308,13 +1392,17 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
 
     let mut buf = envbuf_from(envp_in)?;
 
-    // Re-inject LD_PRELOAD and NODE_OPTIONS.  append_path_env is a no-op for
-    // empty `to_append`, so if a canon buf is empty this contributes nothing.
-    if !append_path_env(&mut buf, b"LD_PRELOAD", preload, b':') {
+    // Re-inject LD_PRELOAD and NODE_OPTIONS.  Both ld.so and Node consume
+    // these left-to-right with first-symbol/first-require winning, so a
+    // caller-supplied prefix (e.g. an attacker `LD_PRELOAD=/tmp/evil.so:...`)
+    // would shadow our wrappers if we appended.  Prepend instead so our
+    // entries take precedence.  append_path_env is a no-op for empty
+    // to_append, so if a canon buf is empty this contributes nothing.
+    if !append_path_env(&mut buf, b"LD_PRELOAD", preload, b':', Order::Prepend) {
         free_envbuf(&mut buf);
         return None;
     }
-    if !append_path_env(&mut buf, b"NODE_OPTIONS", node_opts, b' ') {
+    if !append_path_env(&mut buf, b"NODE_OPTIONS", node_opts, b' ', Order::Prepend) {
         free_envbuf(&mut buf);
         return None;
     }
@@ -1322,8 +1410,12 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
     // Re-inject SCRIPT_JAIL_* sticky values from the current process env.
     // The shim itself was loaded with these values, so the current process's
     // env carries the canonical state.
+    //
+    // Use overwrite_env (not ensure_env) so a malicious caller cannot pass
+    // e.g. `SCRIPT_JAIL_LOG_FILE=/dev/null` in envp_in and redirect the
+    // child's audit log.  The shim's own value is authoritative.
     for name_z in STICKY_NAMES {
-        // Strip the trailing NUL for envbuf_find / ensure_env.
+        // Strip the trailing NUL for envbuf_find / overwrite_env.
         let name = &name_z[..name_z.len() - 1];
         set_in_shim(true);
         let val_ptr = real_getenv_raw(name_z.as_ptr() as *const c_char);
@@ -1336,7 +1428,7 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
             vlen += 1;
         }
         let val = core::slice::from_raw_parts(val_ptr as *const u8, vlen);
-        if !ensure_env(&mut buf, name, val) {
+        if !overwrite_env(&mut buf, name, val) {
             free_envbuf(&mut buf);
             return None;
         }
