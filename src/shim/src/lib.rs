@@ -95,7 +95,19 @@ static CANON_LOG_FD: CanonBuf = CanonBuf {
     len: AtomicUsize::new(0),
 };
 
-static CANON_PROTECTED_ENV_FILE: CanonBuf = CanonBuf {
+// Finding 4 (audit-trust): the protected-env list lives directly inside an
+// env var (`SCRIPT_JAIL_PROTECTED_ENV_NAMES=NAME1,NAME2,…`) snapshotted into
+// this CanonBuf at shim_init.  The previous design (load from a `/tmp` file
+// pointed at by SCRIPT_JAIL_PROTECTED_ENV_FILE) was vulnerable to a same-UID
+// lifecycle script overwriting / truncating the file before spawning a
+// child; that child's shim would then load the attacker's weakened list at
+// its own shim_init and stop hiding NPM_TOKEN / GH_TOKEN / etc.
+//
+// Inline-in-env removes the file entirely.  STICKY_VARS re-injects the
+// canonical value on every exec (overwrite_env), so a descendant cannot
+// strip or shorten the list either.  AUDIT_PROTECTED_NAMES additionally
+// refuses setenv/unsetenv/putenv on the var name itself.
+static CANON_PROTECTED_ENV_NAMES: CanonBuf = CanonBuf {
     bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
     len: AtomicUsize::new(0),
 };
@@ -300,34 +312,47 @@ unsafe fn is_protected(name: *const c_char) -> bool {
 
 // ── protect-list loader ────────────────────────────────────────────────────
 
-// Behaviour: reads the file line by line. Lines beginning with '#' and blank
-// lines are skipped. Lines longer than NAME_MAX_LEN-1 bytes are discarded
-// (matches the C "overlong" drain path for entries that straddle fgets reads;
-// the C path additionally truncated names of exactly NAME_MAX_LEN-1..=257
-// bytes within a single fgets call — this Rust impl discards them uniformly).
-unsafe fn load_protect_list(path: *const c_char) {
-    let fd = libc::open(path, libc::O_RDONLY);
-    if fd < 0 {
-        return;
-    }
-
-    let mut chunk = [0u8; 4096];
-    let mut line = [0u8; NAME_MAX_LEN];
-    let mut line_len: usize = 0;
+// Finding 4 (audit-trust): the protected-env list is parsed from
+// `SCRIPT_JAIL_PROTECTED_ENV_NAMES` — a comma-separated, init-time-captured
+// env var — not from a /tmp file path that any same-UID lifecycle script
+// could overwrite.  See the CANON_PROTECTED_ENV_NAMES static for the
+// security rationale.
+//
+// Behaviour: the input is a byte slice (the contents of a CanonBuf, sans
+// trailing NUL).  Entries are separated by ',' or '\n' (the latter only as
+// belt-and-braces for any future config-file fallback — production agents
+// emit comma-separated).  Empty entries and leading-'#' entries are
+// skipped.  Entries longer than NAME_MAX_LEN-1 bytes are dropped entirely
+// (matching the original file-based behaviour for "overlong" lines).
+//
+// Each commit writes into `PROTECTED.names` and bumps `count`; the caller
+// MUST observe `INIT_DONE == false` for the duration so no concurrent
+// reader trips on the partial write.  `shim_init` enforces this — it's the
+// only caller and runs entirely before INIT_DONE flips.
+unsafe fn load_protect_list_from_bytes(bytes: &[u8]) {
+    let mut entry = [0u8; NAME_MAX_LEN];
+    let mut entry_len: usize = 0;
     let mut overlong = false;
     let mut count: usize = 0;
 
-    fn commit(
-        line: &[u8],
-        len: usize,
-        count: &mut usize,
-    ) {
-        // Strip trailing CR (LF was already the line terminator).
+    fn commit(entry: &[u8], len: usize, count: &mut usize) {
+        // Strip trailing CR (in case of CRLF-fed input).
         let mut len = len;
-        while len > 0 && line[len - 1] == b'\r' {
+        while len > 0 && entry[len - 1] == b'\r' {
             len -= 1;
         }
-        if len == 0 || line[0] == b'#' {
+        // Strip leading and trailing ASCII whitespace.  Comma-separated
+        // configs are often written `NAME1, NAME2, NAME3` for readability;
+        // accept that.
+        let mut start = 0usize;
+        while start < len && (entry[start] == b' ' || entry[start] == b'\t') {
+            start += 1;
+        }
+        while len > start && (entry[len - 1] == b' ' || entry[len - 1] == b'\t') {
+            len -= 1;
+        }
+        let slice_len = len - start;
+        if slice_len == 0 || entry[start] == b'#' {
             return;
         }
         if *count < MAX_PROTECTED {
@@ -336,54 +361,42 @@ unsafe fn load_protect_list(path: *const c_char) {
             unsafe {
                 let table = &mut *PROTECTED.names.get();
                 let dst = &mut table[*count];
-                let take = len.min(NAME_MAX_LEN - 1);
-                dst[..take].copy_from_slice(&line[..take]);
+                let take = slice_len.min(NAME_MAX_LEN - 1);
+                dst[..take].copy_from_slice(&entry[start..start + take]);
                 dst[take] = 0;
             }
             *count += 1;
         }
     }
 
-    loop {
-        let n = loop {
-            let r = libc::read(fd, chunk.as_mut_ptr() as *mut c_void, chunk.len());
-            if r < 0 && errno() == libc::EINTR {
+    for &byte in bytes {
+        // Treat both ',' and '\n' as entry separators.  '\n' is unlikely to
+        // appear in the env-var-encoded channel but cheap to support.
+        if byte == b',' || byte == b'\n' {
+            if overlong {
+                overlong = false;
+                entry_len = 0;
                 continue;
             }
-            break r;
-        };
-        if n <= 0 {
-            break;
-        }
-        let n = n as usize;
-        for &byte in &chunk[..n] {
-            if byte == b'\n' {
-                if overlong {
-                    overlong = false;
-                    line_len = 0;
-                    continue;
-                }
-                commit(&line, line_len, &mut count);
-                line_len = 0;
-            } else {
-                if overlong {
-                    continue;
-                }
-                if line_len >= NAME_MAX_LEN {
-                    overlong = true;
-                    line_len = 0;
-                    continue;
-                }
-                line[line_len] = byte;
-                line_len += 1;
+            commit(&entry, entry_len, &mut count);
+            entry_len = 0;
+        } else {
+            if overlong {
+                continue;
             }
+            if entry_len >= NAME_MAX_LEN {
+                overlong = true;
+                entry_len = 0;
+                continue;
+            }
+            entry[entry_len] = byte;
+            entry_len += 1;
         }
     }
-    // Trailing line without newline at EOF.
-    if !overlong && line_len > 0 {
-        commit(&line, line_len, &mut count);
+    // Trailing entry without separator at EOF.
+    if !overlong && entry_len > 0 {
+        commit(&entry, entry_len, &mut count);
     }
-    let _ = libc::close(fd);
 
     PROTECTED.count.store(count, Ordering::Release);
 }
@@ -1010,16 +1023,13 @@ unsafe fn shim_init() {
     }
     LOG_FD.store(log_fd, Ordering::Release);
 
-    // 5. Load protect-list.
-    let list_path =
-        real_getenv_raw(b"SCRIPT_JAIL_PROTECTED_ENV_FILE\0".as_ptr() as *const c_char);
-    if !cstr_is_empty(list_path) {
-        load_protect_list(list_path);
-    }
-
-    // 6. Capture canonical sticky env-var values for exec wrappers (Task 4/5).
-    //    Must happen after the protect-list is loaded and before INIT_DONE is
-    //    set, so exec wrappers can read them safely via Acquire on INIT_DONE.
+    // 5. Capture canonical sticky env-var values for exec wrappers (Task 4/5).
+    //    Must happen before the protect-list is loaded so we can source the
+    //    protected names from CANON_PROTECTED_ENV_NAMES (Finding 4 — the
+    //    list lives directly in an env var, not in a /tmp file).  Both
+    //    canon-capture and the resulting protect-list load run before
+    //    INIT_DONE is set, so exec wrappers can read them safely via
+    //    Acquire on INIT_DONE.
     unsafe fn capture_canon(buf: &CanonBuf, name: *const c_char) {
         let val = real_getenv_raw(name);
         if val.is_null() || *val as u8 == 0 {
@@ -1082,8 +1092,8 @@ unsafe fn shim_init() {
         b"SCRIPT_JAIL_LOG_FD\0".as_ptr() as *const c_char,
     );
     capture_canon(
-        &CANON_PROTECTED_ENV_FILE,
-        b"SCRIPT_JAIL_PROTECTED_ENV_FILE\0".as_ptr() as *const c_char,
+        &CANON_PROTECTED_ENV_NAMES,
+        b"SCRIPT_JAIL_PROTECTED_ENV_NAMES\0".as_ptr() as *const c_char,
     );
     capture_canon(
         &CANON_SPOOF_PLATFORM,
@@ -1093,6 +1103,17 @@ unsafe fn shim_init() {
         &CANON_SPOOF_ARCH,
         b"SCRIPT_JAIL_SPOOF_ARCH\0".as_ptr() as *const c_char,
     );
+
+    // 6. Load the protect-list FROM the captured env-var snapshot (Finding 4).
+    //    Reading the names directly out of CANON_PROTECTED_ENV_NAMES means
+    //    no /tmp file is involved at any point — same-UID lifecycle scripts
+    //    cannot weaken the list because the bytes live inside the shim's
+    //    private CanonBuf (written exactly once here, observed by every
+    //    descendant via overwrite_env at exec-time).
+    let proto_bytes = canon_bytes(&CANON_PROTECTED_ENV_NAMES);
+    if !proto_bytes.is_empty() {
+        load_protect_list_from_bytes(proto_bytes);
+    }
 
     // 7. Open for business.
     INIT_DONE.store(true, Ordering::Release);
@@ -1379,8 +1400,8 @@ const STICKY_VARS: &[StickyVar] = &[
         canon: &CANON_LOG_FD,
     },
     StickyVar {
-        name: b"SCRIPT_JAIL_PROTECTED_ENV_FILE",
-        canon: &CANON_PROTECTED_ENV_FILE,
+        name: b"SCRIPT_JAIL_PROTECTED_ENV_NAMES",
+        canon: &CANON_PROTECTED_ENV_NAMES,
     },
     StickyVar {
         name: b"SCRIPT_JAIL_SPOOF_PLATFORM",
@@ -1983,7 +2004,7 @@ static AUDIT_PROTECTED_NAMES: &[&[u8]] = &[
     b"NODE_OPTIONS",
     b"SCRIPT_JAIL_LOG_FILE",
     b"SCRIPT_JAIL_LOG_FD",
-    b"SCRIPT_JAIL_PROTECTED_ENV_FILE",
+    b"SCRIPT_JAIL_PROTECTED_ENV_NAMES",
     b"SCRIPT_JAIL_SPOOF_PLATFORM",
     b"SCRIPT_JAIL_SPOOF_ARCH",
     b"SCRIPT_JAIL_PRELOAD_PATH",

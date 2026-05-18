@@ -158,7 +158,15 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   function runWithShim(opts: {
     cmd:         string;
     env?:        Record<string, string>;
-    protectFile?: string;
+    /**
+     * Finding 4 (audit-trust): the protected-env list now ships inline as a
+     * comma-separated env var (`SCRIPT_JAIL_PROTECTED_ENV_NAMES`) — no more
+     * `/tmp/script-jail-protected.txt`.  Tests pass `protectNames` as a list
+     * of bare env-var names; the helper joins them with ',' and forwards to
+     * the shim through the new env var.  The legacy `protectFile` option
+     * is intentionally absent: there is no longer a file path to point at.
+     */
+    protectNames?: ReadonlyArray<string>;
   }): ShimResult {
     const logFile = makeTempFile('', '.jsonl');
 
@@ -167,8 +175,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
       SCRIPT_JAIL_LOG_FD:   '3',
       ...opts.env,
     };
-    if (opts.protectFile !== undefined) {
-      extraEnv['SCRIPT_JAIL_PROTECTED_ENV_FILE'] = opts.protectFile;
+    if (opts.protectNames !== undefined) {
+      extraEnv['SCRIPT_JAIL_PROTECTED_ENV_NAMES'] = opts.protectNames.join(',');
     }
 
     // Build env string for sh: "KEY=VAL KEY2=VAL2 ..."
@@ -254,13 +262,11 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   it('protected env var is hidden and logged with hidden:true', (ctx) => {
     if (!shimAvailable) ctx.skip();
 
-    const protectFile = makeTempFile('NPM_TOKEN\n', '.txt');
-
     // node: exit 0 if NPM_TOKEN is undefined, exit 1 if it is defined.
     const res = runWithShim({
       cmd: `node -e 'process.exit(process.env.NPM_TOKEN === undefined ? 0 : 1)'`,
       env: { NPM_TOKEN: 'super-secret' },
-      protectFile,
+      protectNames: ['NPM_TOKEN'],
     });
 
     // The node process should see NPM_TOKEN as undefined (getenv returns NULL).
@@ -284,20 +290,16 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   // too costly for the v1 test suite.  The escaping logic in src/shim/src/lib.rs
   // is unit-testable in isolation.
 
-  // ── Test 4: comments and blank lines in protect-list are ignored ──────────
-
-  it('protect-list respects comments and blank lines', (ctx) => {
+  // ── Test 4: comma-separated protect-list with whitespace/empty entries ───
+  //
+  // Finding 4 (audit-trust): the protect-list now arrives as a comma-
+  // separated env var.  Defensive parser behaviour we want to keep working:
+  //   * leading / trailing ASCII whitespace per entry is stripped
+  //   * empty entries are silently ignored
+  //   * entries starting with '#' are skipped (allows future templating)
+  // This test exercises all three at once.
+  it('protect-list parses comma-separated names with whitespace + empty entries', (ctx) => {
     if (!shimAvailable) ctx.skip();
-
-    const protectContent = [
-      '# comment line',
-      'NPM_TOKEN',
-      '',
-      'GITHUB_TOKEN',
-      '  # indented comment is NOT a comment (no leading-space trim)',
-    ].join('\n') + '\n';
-
-    const protectFile = makeTempFile(protectContent, '.txt');
 
     // Both NPM_TOKEN and GITHUB_TOKEN should be hidden.
     // node exits 0 iff both are undefined.
@@ -312,7 +314,11 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
         NPM_TOKEN:    'secret1',
         GITHUB_TOKEN: 'secret2',
       },
-      protectFile,
+      // Mix in:
+      //   - leading + trailing space around entries (stripped)
+      //   - empty entries from doubled commas (skipped)
+      //   - a leading-'#' entry (skipped)
+      protectNames: ['NPM_TOKEN', '', '  GITHUB_TOKEN  ', '#comment'],
     });
 
     expect(res.exitCode).toBe(0);
@@ -335,8 +341,6 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   it('non-protected env var value is passed through unchanged', (ctx) => {
     if (!shimAvailable) ctx.skip();
 
-    const protectFile = makeTempFile('HIDDEN_VAR\n', '.txt');
-
     // MY_VAR is not in the protect list — it should be visible.
     const res = runWithShim({
       cmd: `node -e 'process.exit(process.env.MY_VAR === "hello" ? 0 : 1)'`,
@@ -344,7 +348,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
         MY_VAR:     'hello',
         HIDDEN_VAR: 'secret',
       },
-      protectFile,
+      protectNames: ['HIDDEN_VAR'],
     });
 
     expect(res.exitCode).toBe(0);

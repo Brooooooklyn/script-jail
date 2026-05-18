@@ -25662,6 +25662,11 @@ async function runInstallPhase(input) {
     roots: { repo: "", nodeModules: "", home: "", tmp: "", cache: "" }
   });
   let eventCount = 0;
+  let phaseTamperReason = null;
+  const setPhaseTamper = (reason) => {
+    if (phaseTamperReason === null) phaseTamperReason = reason;
+    input.strace.recordTamper(reason);
+  };
   const emit = (ev) => {
     const filtered = applyProtectedPathsPolicy(ev, matcher);
     if (filtered === null) return;
@@ -25678,7 +25683,7 @@ async function runInstallPhase(input) {
       if (shimEvent === null) {
         const MAX_PREFIX = 100;
         const prefix = line.length > MAX_PREFIX ? `${line.slice(0, MAX_PREFIX)}\u2026` : line;
-        input.strace.recordTamper(
+        setPhaseTamper(
           `shim channel had unparseable JSONL line (pid=${pid}): ${JSON.stringify(prefix)}`
         );
         continue;
@@ -25689,16 +25694,25 @@ async function runInstallPhase(input) {
       }
       continue;
     }
-    const straceEvents = parseStraceLine(line, pid, 0);
-    if (straceEvents === null) continue;
-    for (const rawEvent of straceEvents) {
-      const result = input.attribution.attribute(rawEvent.pid);
-      if (result === null) continue;
-      emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
+    if (source === "strace") {
+      const straceEvents = parseStraceLine(line, pid, 0);
+      if (straceEvents === null) continue;
+      for (const rawEvent of straceEvents) {
+        const result = input.attribution.attribute(rawEvent.pid);
+        if (result === null) continue;
+        emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
+      }
+      continue;
     }
+    const sourceStr = typeof source === "string" ? source : `<${typeof source}>`;
+    const MAX_SRC = 40;
+    const sourceForReason = sourceStr.length > MAX_SRC ? `${sourceStr.slice(0, MAX_SRC)}\u2026` : sourceStr;
+    setPhaseTamper(
+      `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). Audit-pipeline contract requires source \u2208 {"shim","strace"}.`
+    );
   }
   const exitCode = input.strace.getExitCode();
-  return { exitCode, eventCount };
+  return { exitCode, eventCount, tamperReason: phaseTamperReason };
 }
 
 // src/lock/normalize.ts
@@ -26590,7 +26604,7 @@ async function waitForGo(readable) {
     });
   });
 }
-function buildChildEnv(baseEnv, config2, protectedEnvFilePath, eventsFilePath) {
+function buildChildEnv(baseEnv, config2, eventsFilePath) {
   const preloads = [
     "/usr/local/lib/script-jail/dlopen-block.cjs",
     "/usr/local/lib/script-jail/platform-spoof.cjs",
@@ -26599,6 +26613,7 @@ function buildChildEnv(baseEnv, config2, protectedEnvFilePath, eventsFilePath) {
   const noAddons = "--no-addons";
   const requireFlags = preloads.map((p) => `--require=${p}`);
   const childNodeOptions = [noAddons, ...requireFlags].join(" ");
+  const protectedNames = config2.protected.env.join(",");
   return {
     ...baseEnv,
     LD_PRELOAD: "/lib/libscriptjail.so",
@@ -26617,7 +26632,7 @@ function buildChildEnv(baseEnv, config2, protectedEnvFilePath, eventsFilePath) {
     // a malicious lifecycle script.  See {@link createEventsFile}.
     SCRIPT_JAIL_LOG_FILE: eventsFilePath,
     SCRIPT_JAIL_LOG_FD: String(config2.log_fd),
-    SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedEnvFilePath,
+    SCRIPT_JAIL_PROTECTED_ENV_NAMES: protectedNames,
     SCRIPT_JAIL_PRELOAD_PATH: "/lib/libscriptjail.so",
     SCRIPT_JAIL_SPOOF_PLATFORM: config2.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config2.spoof.arch,
@@ -26709,8 +26724,6 @@ async function main(input) {
   const emitter = new Emitter(input.connection.writable);
   const manager = config2.manager ?? detectManager(config2.work_dir);
   diag(input, `manager resolved: ${manager}`);
-  const protectedEnvPath = "/tmp/script-jail-protected.txt";
-  (0, import_node_fs3.writeFileSync)(protectedEnvPath, config2.protected.env.join("\n") + "\n", "utf8");
   const makeEventsFile = input.createEventsFile ?? createEventsFile;
   let eventsFile;
   try {
@@ -26725,7 +26738,7 @@ async function main(input) {
     return;
   }
   const eventsFilePath = eventsFile.path;
-  const childEnv = buildChildEnv(process.env, config2, protectedEnvPath, eventsFilePath);
+  const childEnv = buildChildEnv(process.env, config2, eventsFilePath);
   const spawner = input.spawner ?? new LinuxSpawner();
   const straceRunner = input.strace ?? new LinuxStraceRunner(void 0, eventsFile);
   const attribution = new Attribution(new LinuxProcReader());
@@ -26841,7 +26854,7 @@ ${fetchResult.stderr}
     process.exitCode = installResult.exitCode;
     return;
   }
-  const tamperReason = straceRunner.getTamperReason();
+  const tamperReason = installResult.tamperReason ?? straceRunner.getTamperReason();
   if (tamperReason !== null) {
     emitter.emitError(
       `audit pipeline tampered with: ${tamperReason}. Refusing to emit a final lockfile \u2014 a clean diff would be untrustworthy.`,

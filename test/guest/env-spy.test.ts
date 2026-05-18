@@ -30,13 +30,15 @@ function freshLogFile(): string {
   return p;
 }
 
-function freshProtectedFile(names: string[]): string {
-  const p = join(
-    tmpdir(),
-    `script-jail-protected-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
-  );
-  writeFileSync(p, names.join('\n') + '\n');
-  return p;
+/**
+ * Finding 4 (audit-trust): the protected-env list ships as a comma-separated
+ * env var (`SCRIPT_JAIL_PROTECTED_ENV_NAMES`), not a file path.  This helper
+ * exists so the test bodies don't repeat the `.join(',')` boilerplate; tests
+ * also pass the value directly when they want to exercise odd whitespace /
+ * comment / empty-entry behaviour.
+ */
+function joinProtected(names: ReadonlyArray<string>): string {
+  return names.join(',');
 }
 
 interface ChildResult {
@@ -110,7 +112,6 @@ describe('env-spy preload', () => {
 
   it('hides protected names: read returns undefined and is logged with hidden=true', async () => {
     const logFile = freshLogFile();
-    const protectedFile = freshProtectedFile(['NPM_TOKEN']);
     const code = `
       const tok = process.env.NPM_TOKEN;
       // Treat the read as "undefined" explicitly so JSON survives.
@@ -118,7 +119,7 @@ describe('env-spy preload', () => {
     `;
     const result = await runWithSpy(code, {
       SCRIPT_JAIL_LOG_FILE: logFile,
-      SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedFile,
+      SCRIPT_JAIL_PROTECTED_ENV_NAMES: joinProtected(['NPM_TOKEN']),
       NPM_TOKEN: 'super-secret',
     });
     expect(result.exitCode).toBe(0);
@@ -133,7 +134,6 @@ describe('env-spy preload', () => {
 
   it('hides protected names from `in` and Object.keys / ownKeys', async () => {
     const logFile = freshLogFile();
-    const protectedFile = freshProtectedFile(['NPM_TOKEN']);
     const code = `
       const has = 'NPM_TOKEN' in process.env;
       const keys = Object.keys(process.env);
@@ -146,7 +146,7 @@ describe('env-spy preload', () => {
     `;
     const result = await runWithSpy(code, {
       SCRIPT_JAIL_LOG_FILE: logFile,
-      SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedFile,
+      SCRIPT_JAIL_PROTECTED_ENV_NAMES: joinProtected(['NPM_TOKEN']),
       NPM_TOKEN: 'super-secret',
     });
     expect(result.exitCode).toBe(0);
@@ -173,7 +173,7 @@ describe('env-spy preload', () => {
     expect(result.exitCode).toBe(0);
   });
 
-  it('does not crash when SCRIPT_JAIL_PROTECTED_ENV_FILE points to a missing path', async () => {
+  it('does not crash when SCRIPT_JAIL_PROTECTED_ENV_NAMES is empty', async () => {
     const logFile = freshLogFile();
     const code = `
       const x = process.env.PATH;
@@ -181,7 +181,7 @@ describe('env-spy preload', () => {
     `;
     const result = await runWithSpy(code, {
       SCRIPT_JAIL_LOG_FILE: logFile,
-      SCRIPT_JAIL_PROTECTED_ENV_FILE: '/nonexistent/path/protected.txt',
+      SCRIPT_JAIL_PROTECTED_ENV_NAMES: '',
     });
     expect(result.exitCode).toBe(0);
     const out = JSON.parse(result.stdout) as { ok: boolean };
@@ -222,7 +222,6 @@ describe('env-spy preload', () => {
 
   it('reads for unprotected names go through to the underlying value', async () => {
     const logFile = freshLogFile();
-    const protectedFile = freshProtectedFile(['NPM_TOKEN']);
     const code = `
       const safe = process.env.SAFE_VAR;
       const tok = process.env.NPM_TOKEN;
@@ -233,7 +232,7 @@ describe('env-spy preload', () => {
     `;
     const result = await runWithSpy(code, {
       SCRIPT_JAIL_LOG_FILE: logFile,
-      SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedFile,
+      SCRIPT_JAIL_PROTECTED_ENV_NAMES: joinProtected(['NPM_TOKEN']),
       SAFE_VAR: 'visible',
       NPM_TOKEN: 'secret',
     });
@@ -243,16 +242,12 @@ describe('env-spy preload', () => {
     expect(out.tokHidden).toBe(true);
   });
 
-  it('ignores comment lines (#) and blank lines in the protected-names file', async () => {
+  it('parses comma-separated entries with whitespace, empties, and # comments', async () => {
+    // Finding 4 (audit-trust): the env-var-encoded protect-list parses the
+    // same shape the Rust shim accepts: ',' or '\n' separators, leading and
+    // trailing ASCII whitespace stripped, empty entries and '#'-prefixed
+    // entries silently skipped.
     const logFile = freshLogFile();
-    const protectedFile = join(
-      tmpdir(),
-      `script-jail-protected-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
-    );
-    writeFileSync(
-      protectedFile,
-      '# comment line\n\nNPM_TOKEN\n# another comment\n  \nGITHUB_TOKEN\n',
-    );
     const code = `
       const a = process.env.NPM_TOKEN;
       const b = process.env.GITHUB_TOKEN;
@@ -263,7 +258,8 @@ describe('env-spy preload', () => {
     `;
     const result = await runWithSpy(code, {
       SCRIPT_JAIL_LOG_FILE: logFile,
-      SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedFile,
+      SCRIPT_JAIL_PROTECTED_ENV_NAMES:
+        '#comment, NPM_TOKEN ,, GITHUB_TOKEN ,,#another',
       NPM_TOKEN: 'x',
       GITHUB_TOKEN: 'y',
     });

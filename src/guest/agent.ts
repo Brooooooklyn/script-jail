@@ -12,7 +12,7 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, constants as fsConstants, type Stats } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
@@ -1017,7 +1017,6 @@ async function waitForGo(readable: Readable): Promise<void> {
 function buildChildEnv(
   baseEnv: NodeJS.ProcessEnv,
   config: AgentConfig,
-  protectedEnvFilePath: string,
   eventsFilePath: string,
 ): NodeJS.ProcessEnv {
   const preloads = [
@@ -1044,6 +1043,27 @@ function buildChildEnv(
   const requireFlags = preloads.map((p) => `--require=${p}`);
   const childNodeOptions = [noAddons, ...requireFlags].join(' ');
 
+  // Finding 4 (audit-trust): the protected-env list used to be written to
+  // `/tmp/script-jail-protected.txt` and the path leaked through the child
+  // env via `SCRIPT_JAIL_PROTECTED_ENV_FILE`.  A lifecycle script running
+  // as the same UID could truncate or overwrite the file before spawning a
+  // child; the child's shim would then load the attacker's weakened list at
+  // `shim_init` time and stop hiding NPM_TOKEN / GH_TOKEN / etc.
+  //
+  // The replacement encodes the list directly as a comma-separated env var
+  // (`SCRIPT_JAIL_PROTECTED_ENV_NAMES`).  The shim captures it into a
+  // CanonBuf at `shim_init` (before any audited code runs) and the existing
+  // exec-rewrite (`STICKY_VARS` in src/shim/src/lib.rs) re-injects the
+  // canonical value on every exec — so attackers cannot strip the entry from
+  // a descendant's envp either.  The name itself is also added to
+  // `AUDIT_PROTECTED_NAMES`, so setenv/unsetenv/putenv attempts to mutate it
+  // are refused and audited.
+  //
+  // Comma is the separator: per shim-side parsing, names containing ',' are
+  // not valid POSIX env-var names anyway (POSIX permits [A-Za-z_][A-Za-z0-9_]*),
+  // so the channel is unambiguous.
+  const protectedNames = config.protected.env.join(',');
+
   return {
     ...baseEnv,
     LD_PRELOAD: '/lib/libscriptjail.so',
@@ -1062,7 +1082,7 @@ function buildChildEnv(
     // a malicious lifecycle script.  See {@link createEventsFile}.
     SCRIPT_JAIL_LOG_FILE: eventsFilePath,
     SCRIPT_JAIL_LOG_FD: String(config.log_fd),
-    SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedEnvFilePath,
+    SCRIPT_JAIL_PROTECTED_ENV_NAMES: protectedNames,
     SCRIPT_JAIL_PRELOAD_PATH: '/lib/libscriptjail.so',
     SCRIPT_JAIL_SPOOF_PLATFORM: config.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config.spoof.arch,
@@ -1329,11 +1349,7 @@ export async function main(input: AgentInput): Promise<void> {
   const manager = config.manager ?? detectManager(config.work_dir);
   diag(input, `manager resolved: ${manager}`);
 
-  // 4. Write protected-env file to a temp location
-  const protectedEnvPath = '/tmp/script-jail-protected.txt';
-  writeFileSync(protectedEnvPath, config.protected.env.join('\n') + '\n', 'utf8');
-
-  // 4b. Create the audit-events file under a per-VM 0700 tmpdir BEFORE the
+  // 4. Create the audit-events file under a per-VM 0700 tmpdir BEFORE the
   //     child env is built so SCRIPT_JAIL_LOG_FILE points at this fresh path.
   //     The file's {inode, device} baseline is recorded and re-checked by the
   //     tailer on every drain cycle (Finding A).  If anything inside the VM
@@ -1377,7 +1393,7 @@ export async function main(input: AgentInput): Promise<void> {
   const eventsFilePath = eventsFile.path;
 
   // 5. Build child environment
-  const childEnv = buildChildEnv(process.env, config, protectedEnvPath, eventsFilePath);
+  const childEnv = buildChildEnv(process.env, config, eventsFilePath);
 
   // 6. Set up spawner (Phase A) and strace runner (Phase B)
   const spawner: Spawner = input.spawner ?? new LinuxSpawner();

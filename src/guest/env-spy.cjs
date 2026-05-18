@@ -13,11 +13,24 @@
 //   undetectable.
 //
 // Env vars (resolved at load time, before the Proxy is installed):
-//   SCRIPT_JAIL_PROTECTED_ENV_FILE — file containing one protected name per
-//                                    line; '#' lines are comments.  Names
-//                                    appearing here are hidden (the Proxy's
-//                                    `get` returns undefined) and the read
-//                                    is logged with `hidden: true`.
+//   SCRIPT_JAIL_PROTECTED_ENV_NAMES — comma-separated list of protected
+//                                    env-var names.  Names appearing here
+//                                    are hidden (the Proxy's `get` returns
+//                                    undefined) and the read is logged with
+//                                    `hidden: true`.  Entries starting with
+//                                    '#' and empty entries are skipped, and
+//                                    whitespace around entries is stripped
+//                                    (mirrors the Rust shim parser).
+//
+//                                    Finding 4 (audit-trust): this used to
+//                                    be SCRIPT_JAIL_PROTECTED_ENV_FILE
+//                                    pointing at /tmp/script-jail-protected.txt;
+//                                    a same-UID lifecycle script could
+//                                    truncate that file before spawning a
+//                                    child and weaken the list.  The Rust
+//                                    shim's STICKY_VARS re-injects the env
+//                                    var on every exec, so descendants
+//                                    cannot strip the list either.
 //   SCRIPT_JAIL_LOG_FILE           — preferred sink for JSONL events (one
 //                                    line per env access), opened once with
 //                                    O_APPEND so concurrent writers don't
@@ -52,21 +65,23 @@ process[SENTINEL] = true;
 
 // ── Read protected name list ────────────────────────────────────────────────
 // Reads happen on the ORIGINAL process.env (no Proxy yet), so no recursion.
+//
+// Finding 4 (audit-trust): the list ships inline as a comma-separated env
+// var (SCRIPT_JAIL_PROTECTED_ENV_NAMES), captured by the parent agent
+// before any audited code runs and re-injected by the Rust shim's
+// STICKY_VARS on every exec.  This eliminates the previous /tmp file path
+// that same-UID lifecycle scripts could overwrite.  Parsing here matches
+// the Rust shim's `load_protect_list_from_bytes` rules: ',' or '\n'
+// separators, leading/trailing whitespace stripped, '#'-prefixed and
+// empty entries skipped.
 const protectedNames = new Set();
 {
-  const path = process.env['SCRIPT_JAIL_PROTECTED_ENV_FILE'];
-  if (path) {
-    try {
-      const content = fs.readFileSync(path, 'utf8');
-      for (const raw of content.split('\n')) {
-        const line = raw.trim();
-        if (!line || line.startsWith('#')) continue;
-        protectedNames.add(line);
-      }
-    } catch {
-      // Missing or unreadable list — Proxy still logs every read but nothing
-      // is hidden.  Matches the env-shim's behaviour when the file is
-      // absent.
+  const raw = process.env['SCRIPT_JAIL_PROTECTED_ENV_NAMES'];
+  if (raw) {
+    for (const part of raw.split(/[,\n]/)) {
+      const name = part.trim();
+      if (!name || name.startsWith('#')) continue;
+      protectedNames.add(name);
     }
   }
 }
