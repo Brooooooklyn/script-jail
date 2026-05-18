@@ -505,11 +505,34 @@ export async function runInstallPhase(
       // correct result.  We count `ok - failed` here to obtain the
       // true successful-libc-exec count.
       if (shimEvent.kind === 'exec') {
-        const delta = shimEvent.result === 'failed' ? -1 : 1;
-        shimExecCountByPid.set(
-          shimEvent.pid,
-          (shimExecCountByPid.get(shimEvent.pid) ?? 0) + delta,
-        );
+        // Audit-trust Finding C (medium, 2026-05-18): saturating
+        // subtraction.  A `result:'failed'` event from the shim may
+        // be either (a) the post-call counterpart to a prior
+        // optimistic 'ok' (where the libc wrapper returned an error
+        // — net should be 0), or (b) a STANDALONE failure with no
+        // prior 'ok' to cancel (posix_spawn that returned rc != 0
+        // before the child was created; envp_alloc_failed wrappers
+        // that emit 'failed' without 'ok').  Case (b) does NOT have
+        // a paired strace observation, so allowing the counter to
+        // go negative incorrectly inflates the strace/shim delta
+        // for the NEXT legitimate wrapped exec on the same pid —
+        // producing a spurious `<SYSCALL_EXEC_BYPASS>` entry that
+        // hard-fails clean installs.
+        //
+        // Clamping the decrement at zero protects against this: a
+        // `failed` event only cancels an outstanding `ok` and is
+        // otherwise a no-op.  Equivalent to "only count failures
+        // that pair with a prior optimistic ok in the same pid",
+        // implemented as saturating subtraction rather than a
+        // separate history-tracking pass.
+        const current = shimExecCountByPid.get(shimEvent.pid) ?? 0;
+        const next =
+          shimEvent.result === 'failed'
+            ? current > 0
+              ? current - 1
+              : 0
+            : current + 1;
+        shimExecCountByPid.set(shimEvent.pid, next);
       }
       if (result !== null) {
         // Finding 3 (audit-trust): snapshot attribution for this pid the
@@ -686,7 +709,15 @@ export async function runInstallPhase(
   // signal itself is correctly populated for ANY non-zero delta.
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
-    const shimCount = shimExecCountByPid.get(pid) ?? 0;
+    // Audit-trust Finding C (medium, 2026-05-18): per-event saturating
+    // subtraction in the dispatcher loop guarantees `shimExecCountByPid`
+    // is non-negative, so a redundant `max(0, …)` here is defence in
+    // depth against any future refactor that re-introduces unbounded
+    // decrements.  The invariant being enforced is "did the kernel see
+    // more successful execs on this pid than the libc wrapper recorded
+    // successful ones?".
+    const shimNet = shimExecCountByPid.get(pid) ?? 0;
+    const shimCount = shimNet < 0 ? 0 : shimNet;
     if (straceCount <= shimCount) continue;
     const bypassCount = straceCount - shimCount;
     // Take the tail samples (most-recent execve calls on this pid).

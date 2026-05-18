@@ -1676,6 +1676,212 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // Audit-trust Finding C (medium, 2026-05-18) — standalone failed shim
+  // exec events (no paired optimistic 'ok' on the same pid) drive the
+  // per-pid net counter NEGATIVE.  A subsequent legitimate wrapped exec
+  // from the same pid then incorrectly produces
+  // `straceCount - shimNet > 0` and a spurious `<SYSCALL_EXEC_BYPASS>`
+  // entry — a false positive that would hard-fail clean installs.
+  //
+  // Fix: clamp the net at zero before the strace comparison.  The
+  // invariant being enforced is "every successful strace execve has a
+  // matching successful shim wrapper event"; an unbounded NEGATIVE
+  // delta has no semantic content and must not contribute to the
+  // bypass count.
+  describe('Finding C — clamp shim-exec delta at zero', () => {
+    it('1 standalone failed posix_spawn + 1 successful wrapped exec → 0 bypass entries', async () => {
+      const proc = mockProcReader({
+        401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'clamp-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // Pre-fix: shim emits a `result:'failed'` event for the
+      // standalone posix_spawn rc!=0 with no prior optimistic 'ok',
+      // driving the per-pid net to -1.  A subsequent legitimate
+      // wrapped exec emits a pre-call 'ok' (raising net to 0); strace
+      // also observes the successful execve (straceCount=1).  The
+      // post-loop `straceCount > shimCount` test then yields 1 > 0
+      // → 1 spurious `<SYSCALL_EXEC_BYPASS>` entry against a clean
+      // install.
+      //
+      // Post-fix: the dispatcher's per-event saturating subtraction
+      // clamps the failed-delta at the floor 0, so the standalone
+      // failed event leaves the counter at 0, the subsequent 'ok'
+      // raises it to 1, and `straceCount > shimCount` yields 1 > 1
+      // → no bypass synthesised.  The shim's libc-wrapper net
+      // correctly reflects "1 successful libc exec", matching the
+      // single strace observation.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Standalone failed posix_spawn (rc!=0 — no child created, no
+        // strace pair).  Shim emits a single failed event with no
+        // prior optimistic 'ok'.
+        {
+          pid: 401,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/missing',
+            argv0: 'missing',
+            envp_alloc_failed: false,
+            result: 'failed',
+            pid: 401,
+            ts: 1,
+          }),
+          source: 'shim',
+        },
+        // Then a legitimate wrapped exec on the same pid.  Shim emits
+        // pre-call 'ok'; post-call 'failed' does NOT fire because the
+        // exec succeeded.  Strace observes one successful execve.
+        {
+          pid: 401,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/node',
+            argv0: 'node',
+            envp_alloc_failed: false,
+            result: 'ok',
+            pid: 401,
+            ts: 2,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 401,
+          line: 'execve("/usr/bin/node", ["node", "build.js"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(0);
+    });
+
+    it('3 standalone failures + 1 successful wrapped exec → 0 bypass entries', async () => {
+      const proc = mockProcReader({
+        402: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'multi-clamp-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
+      for (let i = 0; i < 3; i++) {
+        // Each standalone failed posix_spawn has no paired 'ok'.
+        records.push({
+          pid: 402,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/missing',
+            argv0: `attempt-${i}`,
+            envp_alloc_failed: false,
+            result: 'failed',
+            pid: 402,
+            ts: i + 1,
+          }),
+          source: 'shim',
+        });
+      }
+      // One legitimate wrapped exec — emits a single 'ok' event.
+      records.push({
+        pid: 402,
+        line: JSON.stringify({
+          kind: 'exec',
+          prog: '/usr/bin/sh',
+          argv0: 'sh',
+          envp_alloc_failed: false,
+          result: 'ok',
+          pid: 402,
+          ts: 10,
+        }),
+        source: 'shim',
+      });
+      // Strace sees one successful execve on the same pid.
+      records.push({
+        pid: 402,
+        line: 'execve("/usr/bin/sh", ["sh", "-c", "echo ok"], 0x1 /* 0 vars */) = 0',
+        source: 'strace',
+      });
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(0);
+    });
+
+    it('regression: 0 shim events + 1 strace execve → 1 bypass entry', async () => {
+      const proc = mockProcReader({
+        403: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pure-bypass-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 403,
+          line: 'execve("/usr/bin/curl", ["curl", "evil"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(1);
+    });
+  });
+
   // Audit-trust Finding A (high, 2026-05-18) — events-file write forgery
   // detection.  A lifecycle script that issues a raw-syscall exec with
   // a scrubbed envp will not have ld.so map `/lib/libscriptjail.so`
