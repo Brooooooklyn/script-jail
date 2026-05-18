@@ -1118,6 +1118,106 @@ describe('buildChildEnv protect-list entry-count and per-entry-length gates', ()
   });
 });
 
+describe('buildChildEnv protect-list strict env-var name gate (Finding 5)', () => {
+  // Audit-trust Finding 5 (medium, 2026-05-18): the prior count cap
+  // validated `config.protected.env.length` (YAML array length), but the
+  // shim and env-spy parsers split the wire format on ',' and '\n' at
+  // runtime.  A single YAML entry `"FOO,BAR,...,A65"` containing 65
+  // names would pass the entry-count gate (1 entry) yet trigger
+  // silent truncation inside the shim's `load_protect_list_from_bytes`.
+  //
+  // The fix rejects any YAML entry whose value does not match the
+  // strict env-var name grammar `[A-Za-z_][A-Za-z0-9_]*`.  These tests
+  // pin the gate so the audit chain cannot be defeated by smuggling
+  // separators into individual entries.
+
+  function makeConfig(protectedEnv: string[]): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: protectedEnv },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('rejects an entry containing a comma (the wire separator)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['FOO,BAR']), '/tmp/events.jsonl')).toThrow(
+      /entry \[0\] \("FOO,BAR"\) must not contain a comma/,
+    );
+  });
+
+  it('rejects an entry containing a newline (the alternate wire separator)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['FOO\nBAR']), '/tmp/events.jsonl')).toThrow(
+      /must not contain a newline/,
+    );
+  });
+
+  it('rejects a single entry that smuggles 65 comma-joined names past the entry-count cap', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
+    // A single YAML entry composed of MAX+1 valid env-var names joined
+    // by commas.  The OLD count check would see 1 entry (passes) but
+    // the shim parser would split it into 65 names at runtime, then
+    // silently truncate the 65th.  The strict gate rejects this at
+    // configuration time.
+    const smuggled = Array.from(
+      { length: MAX_PROTECTED_ENV_NAMES + 1 },
+      (_, i) => `N${i}`,
+    ).join(',');
+    expect(() => buildChildEnv({}, makeConfig([smuggled]), '/tmp/events.jsonl')).toThrow(
+      /must not contain a comma/,
+    );
+  });
+
+  it('rejects an entry with leading whitespace', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig([' FOO']), '/tmp/events.jsonl')).toThrow(
+      /must match \^\[A-Za-z_\]\[A-Za-z0-9_\]\*\$/,
+    );
+  });
+
+  it('rejects an entry starting with #', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // The shim parser skips '#'-prefixed entries entirely — accepting
+    // them in YAML would silently drop the secret the operator meant
+    // to protect.
+    expect(() => buildChildEnv({}, makeConfig(['#FOO']), '/tmp/events.jsonl')).toThrow(
+      /must match \^\[A-Za-z_\]\[A-Za-z0-9_\]\*\$/,
+    );
+  });
+
+  it('rejects an empty string entry', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['']), '/tmp/events.jsonl')).toThrow(
+      /is empty or not a string/,
+    );
+  });
+
+  it('rejects an entry starting with a digit (POSIX env-var name grammar)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['1FOO']), '/tmp/events.jsonl')).toThrow(
+      /must match \^\[A-Za-z_\]\[A-Za-z0-9_\]\*\$/,
+    );
+  });
+
+  it('accepts plain ASCII env-var names', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // Sanity check: the strict gate must not break legitimate configs.
+    const env = buildChildEnv(
+      {},
+      makeConfig(['NPM_TOKEN', 'GITHUB_TOKEN', '_PRIVATE']),
+      '/tmp/events.jsonl',
+    );
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe('NPM_TOKEN,GITHUB_TOKEN,_PRIVATE');
+  });
+});
+
 describe('MemoryConnection', () => {
   it('readable and writable are the passed streams', () => {
     const r = new PassThrough();

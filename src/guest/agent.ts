@@ -1168,6 +1168,66 @@ export function buildChildEnv(
   // Comma is the separator: per shim-side parsing, names containing ',' are
   // not valid POSIX env-var names anyway (POSIX permits [A-Za-z_][A-Za-z0-9_]*),
   // so the channel is unambiguous.
+  //
+  // Audit-trust Finding 5 (medium, 2026-05-18): validate each entry as a
+  // strict env-var name BEFORE applying the entry-count and byte-length
+  // caps.  Previously the count check counted YAML array entries, but the
+  // shim and env-spy parsers split on ',' and '\n' at runtime — a single
+  // YAML string `"FOO,BAR,...,A65"` containing 65 names would pass the
+  // entry-count gate (1 entry) but the shim's
+  // `load_protect_list_from_bytes` would silently truncate after entry 64
+  // and the dropped names would leak unannotated.
+  //
+  // The chosen alternative is the stricter form: refuse any entry that
+  // does not match the POSIX env-var name grammar
+  // `[A-Za-z_][A-Za-z0-9_]*`.  This rejects:
+  //   * entries containing ',' (the wire separator).
+  //   * entries containing '\n' (the alternate wire separator).
+  //   * entries containing whitespace, '#', or any other byte that the
+  //     shim parser would strip / interpret specially.
+  // It also rejects leading-digit names — those would parse via the wire
+  // format but cannot be set via the shell anyway (POSIX shells refuse
+  // `1FOO=bar` assignment), so accepting them would be misleading.
+  //
+  // We fire this check FIRST so the error message points at the offending
+  // YAML entry rather than at a downstream symptom (count cap, byte cap).
+  // An empty entry is also rejected — those would be silently skipped by
+  // the shim parser and the operator would not learn that the secret
+  // they meant to protect never made it into the list.
+  const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  for (const [idx, name] of config.protected.env.entries()) {
+    if (typeof name !== 'string' || name.length === 0) {
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] is empty or not a string; ` +
+          `each \`protected.env\` entry must be a non-empty env-var name matching ` +
+          `${ENV_NAME_RE.source}.`,
+      );
+    }
+    if (!ENV_NAME_RE.test(name)) {
+      // Surface a specific diagnostic for the two highest-signal cases
+      // (comma / newline) since those produce the silent-truncation
+      // bypass Finding 5 fixes.
+      let detail: string;
+      if (name.includes(',')) {
+        detail =
+          'must not contain a comma — the shim parser splits the wire format on `,` ' +
+          'and would treat the entry as multiple names, defeating the entry-count cap.';
+      } else if (name.includes('\n')) {
+        detail =
+          'must not contain a newline — the shim parser splits the wire format on `\\n` ' +
+          'and would treat the entry as multiple names, defeating the entry-count cap.';
+      } else {
+        detail =
+          `must match ${ENV_NAME_RE.source} (POSIX env-var name grammar).  ` +
+          'Whitespace, comments, and non-ASCII bytes are rejected to avoid silent ' +
+          'splitting / stripping inside the shim parser.';
+      }
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] (${JSON.stringify(name)}) ${detail}`,
+      );
+    }
+  }
+
   const protectedNames = config.protected.env.join(',');
 
   // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list

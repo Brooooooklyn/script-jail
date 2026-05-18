@@ -26736,6 +26736,27 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
   const noAddons = "--no-addons";
   const requireFlags = preloads.map((p) => `--require=${p}`);
   const childNodeOptions = [noAddons, ...requireFlags].join(" ");
+  const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  for (const [idx, name] of config2.protected.env.entries()) {
+    if (typeof name !== "string" || name.length === 0) {
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] is empty or not a string; each \`protected.env\` entry must be a non-empty env-var name matching ${ENV_NAME_RE.source}.`
+      );
+    }
+    if (!ENV_NAME_RE.test(name)) {
+      let detail;
+      if (name.includes(",")) {
+        detail = "must not contain a comma \u2014 the shim parser splits the wire format on `,` and would treat the entry as multiple names, defeating the entry-count cap.";
+      } else if (name.includes("\n")) {
+        detail = "must not contain a newline \u2014 the shim parser splits the wire format on `\\n` and would treat the entry as multiple names, defeating the entry-count cap.";
+      } else {
+        detail = `must match ${ENV_NAME_RE.source} (POSIX env-var name grammar).  Whitespace, comments, and non-ASCII bytes are rejected to avoid silent splitting / stripping inside the shim parser.`;
+      }
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] (${JSON.stringify(name)}) ${detail}`
+      );
+    }
+  }
   const protectedNames = config2.protected.env.join(",");
   if (config2.protected.env.length > MAX_PROTECTED_ENV_NAMES) {
     throw new Error(
