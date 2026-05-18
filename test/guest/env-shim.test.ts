@@ -730,4 +730,147 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     expect(result.stdout).not.toContain('/tmp/evil-one');
     expect(result.stdout).not.toContain('/tmp/evil-two');
   });
+
+  // ── Finding (high): duplicate LD_PRELOAD survives the idempotent branch ──
+  //
+  // Even when the FIRST LD_PRELOAD entry is already canonical (matches the
+  // sticky SCRIPT_JAIL_PRELOAD_PATH), a SECOND attacker-controlled
+  // LD_PRELOAD entry in the raw envp must also be stripped.  Previously
+  // append_path_env returned early on the idempotent prefix match, leaving
+  // the duplicate live for ld.so to honor.
+  it('duplicate LD_PRELOAD entries collapse to one canonical entry when first is already canonical', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-dup-ldp-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'dup_ldp');
+    // The child Node script counts how many LD_PRELOAD entries the kernel
+    // handed it (via /proc/self/environ — process.env dedupes on read, so
+    // we cannot use it for the count) and prints the resolved value.
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const ldp = entries.filter(e => e.startsWith('LD_PRELOAD='));"
+          "process.stdout.write('count='+ldp.length+'/value='+(process.env.LD_PRELOAD||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          /* FIRST entry: already canonical — exactly the SCRIPT_JAIL_PRELOAD_PATH
+             value the parent will set below.  The idempotency check will fire. */
+          "LD_PRELOAD=${shimSo}",
+          /* SECOND entry: attacker-controlled.  Must be stripped. */
+          "LD_PRELOAD=/tmp/evil-ldp.so",
+          "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        SCRIPT_JAIL_PRELOAD_PATH: shimSo,
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // Exactly one LD_PRELOAD entry in the child's environ.  The canonical
+    // shim path survives; the attacker's /tmp/evil-ldp.so is gone.
+    expect(result.stdout).toContain('count=1');
+    expect(result.stdout).toContain(`value=${shimSo}`);
+    expect(result.stdout).not.toContain('/tmp/evil-ldp.so');
+  });
+
+  // ── Finding (high): duplicate NODE_OPTIONS survives the idempotent branch ─
+  it('duplicate NODE_OPTIONS entries collapse to one canonical entry when first is already canonical', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-dup-nodeopts-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'dup_nodeopts');
+    // Pick a NODE_OPTIONS value Node accepts without spawning a preload
+    // module (which would have to exist on disk).  --no-warnings is a
+    // built-in, no file required.  This is the value the parent passes
+    // via SCRIPT_JAIL_NODE_OPTIONS so the shim's append_path_env sees
+    // the first entry as already canonical.
+    const canonNodeOpts = '--no-warnings';
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const opt = entries.filter(e => e.startsWith('NODE_OPTIONS='));"
+          "process.stdout.write('count='+opt.length+'/value='+(process.env.NODE_OPTIONS||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          "LD_PRELOAD=${shimSo}",
+          /* FIRST: already canonical (matches SCRIPT_JAIL_NODE_OPTIONS). */
+          "NODE_OPTIONS=${canonNodeOpts}",
+          /* SECOND: attacker --require= pointing at a nonexistent file.
+             Must be stripped.  If it survived Node would fail to start. */
+          "NODE_OPTIONS=--require=/tmp/evil-nodeopt.js",
+          "SCRIPT_JAIL_NODE_OPTIONS=${canonNodeOpts}",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        SCRIPT_JAIL_NODE_OPTIONS: canonNodeOpts,
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // Exactly one NODE_OPTIONS entry — only canonical --no-warnings remains.
+    // The attacker --require=/tmp/evil-nodeopt.js must be gone.
+    expect(result.stdout).toContain('count=1');
+    expect(result.stdout).toContain(`value=${canonNodeOpts}`);
+    expect(result.stdout).not.toContain('/tmp/evil-nodeopt.js');
+    expect(result.stdout).not.toContain('--require=');
+  });
 });

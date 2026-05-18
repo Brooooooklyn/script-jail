@@ -702,9 +702,24 @@ enum Order {
 ///
 /// - If `to_append` is empty, return true immediately (no-op).
 /// - If `name` is absent: add a new `name=to_append` entry.
-/// - If `name` is present and already contains `to_append` at the correct
-///   end (trailing for Append, leading for Prepend): leave it unchanged.
-/// - Otherwise: concatenate per `order`, separated by `separator`.
+/// - If `name` is present and the FIRST existing value already has
+///   `to_append` at the correct end (trailing for Append, leading for
+///   Prepend): the canonical value to keep is that first value as-is.
+/// - Otherwise: the canonical value is the FIRST existing value with
+///   `to_append` concatenated per `order`, separated by `separator`.
+///
+/// In ALL cases (present, absent, idempotent, rebuild) the function ends
+/// by exhaustively removing every entry whose name matches and pushing
+/// exactly one freshly-malloc'd canonical entry.
+///
+/// SECURITY: any envp_in under attacker control may contain duplicate
+/// `LD_PRELOAD=`/`NODE_OPTIONS=` entries.  envbuf_find only locates the
+/// first, so an earlier implementation that returned early when the first
+/// value was idempotent left subsequent attacker duplicates live in the
+/// child's envp.  The remove-all-then-push pattern below is the same
+/// invariant that overwrite_env relies on — it must hold for all branches.
+/// The extra malloc/free per exec in the previously-idempotent path is
+/// negligible.
 ///
 /// Returns false only on malloc failure.
 unsafe fn append_path_env(
@@ -718,21 +733,19 @@ unsafe fn append_path_env(
         return true;
     }
 
-    match envbuf_find(buf, name) {
+    // Step 1: look up the FIRST matching entry.  This is used purely to
+    // compute what the canonical value should be (idempotent existing
+    // value vs. rebuilt merged value).  Subsequent duplicates do not
+    // participate in the merge — they are stripped wholesale below.
+    let entry: *mut c_char = match envbuf_find(buf, name) {
         None => {
-            // Not present — add a fresh entry.
-            let entry = make_entry(name, to_append);
-            if entry.is_null() {
-                return false;
-            }
-            if !envbuf_push(buf, entry) {
-                free_entry(entry);
-                return false;
-            }
-            true
+            // Absent: canonical value is just `name=to_append`.
+            make_entry(name, to_append)
         }
         Some(idx) => {
-            // Present — get a slice of the existing value (after the '=').
+            // Present: extract the first existing value to decide whether
+            // the canonical value is the existing one (idempotent) or a
+            // merged rewrite.
             let raw = *buf.ptrs.add(idx);
             // Advance past `name=`.
             let val_ptr = raw.add(name.len() + 1);
@@ -743,105 +756,109 @@ unsafe fn append_path_env(
             }
             let existing = core::slice::from_raw_parts(val_ptr as *const u8, val_len);
 
-            // Idempotency: already exactly to_append.
-            if existing == to_append {
-                return true;
-            }
-            // Order-specific idempotency: trailing for Append, leading for
-            // Prepend.  In both cases we require the separator immediately
-            // adjacent to the to_append slice.
-            match order {
-                Order::Append => {
-                    if val_len >= to_append.len() + 1 {
-                        let tail = &existing[val_len - to_append.len() - 1..];
-                        if tail[0] == separator && &tail[1..] == to_append {
-                            return true;
+            // Determine whether the first existing value is already
+            // canonical w.r.t. to_append and order.
+            let idempotent = if existing == to_append {
+                true
+            } else {
+                match order {
+                    Order::Append => {
+                        val_len >= to_append.len() + 1
+                            && existing[val_len - to_append.len() - 1] == separator
+                            && &existing[val_len - to_append.len()..] == to_append
+                    }
+                    Order::Prepend => {
+                        val_len >= to_append.len() + 1
+                            && &existing[..to_append.len()] == to_append
+                            && existing[to_append.len()] == separator
+                    }
+                }
+            };
+
+            if idempotent {
+                // Canonical value is the existing first value, preserved
+                // verbatim.  Capture it in a fresh malloc up front so we
+                // can safely envbuf_remove (which frees the original).
+                make_entry(name, existing)
+            } else {
+                // Canonical value is the merged value.  Build it by
+                // concatenating per `order`, with a separator between
+                // the two halves when existing is non-empty.
+                let sep_len = if val_len > 0 { 1usize } else { 0usize };
+                let new_val_len = val_len + sep_len + to_append.len();
+                let total = name.len() + 1 + new_val_len + 1;
+                set_in_shim(true);
+                let raw_buf = libc::malloc(total) as *mut u8;
+                set_in_shim(false);
+                if raw_buf.is_null() {
+                    ptr::null_mut()
+                } else {
+                    let mut off = 0usize;
+                    core::ptr::copy_nonoverlapping(name.as_ptr(), raw_buf, name.len());
+                    off += name.len();
+                    *raw_buf.add(off) = b'=';
+                    off += 1;
+                    match order {
+                        Order::Append => {
+                            if val_len > 0 {
+                                core::ptr::copy_nonoverlapping(
+                                    val_ptr as *const u8,
+                                    raw_buf.add(off),
+                                    val_len,
+                                );
+                                off += val_len;
+                                *raw_buf.add(off) = separator;
+                                off += 1;
+                            }
+                            core::ptr::copy_nonoverlapping(
+                                to_append.as_ptr(),
+                                raw_buf.add(off),
+                                to_append.len(),
+                            );
+                            off += to_append.len();
+                        }
+                        Order::Prepend => {
+                            core::ptr::copy_nonoverlapping(
+                                to_append.as_ptr(),
+                                raw_buf.add(off),
+                                to_append.len(),
+                            );
+                            off += to_append.len();
+                            if val_len > 0 {
+                                *raw_buf.add(off) = separator;
+                                off += 1;
+                                core::ptr::copy_nonoverlapping(
+                                    val_ptr as *const u8,
+                                    raw_buf.add(off),
+                                    val_len,
+                                );
+                                off += val_len;
+                            }
                         }
                     }
-                }
-                Order::Prepend => {
-                    if val_len >= to_append.len() + 1
-                        && &existing[..to_append.len()] == to_append
-                        && existing[to_append.len()] == separator
-                    {
-                        return true;
-                    }
+                    *raw_buf.add(off) = 0u8;
+                    raw_buf as *mut c_char
                 }
             }
-
-            // Build new value.  When existing is non-empty we need a
-            // separator between the two halves.
-            let sep_len = if val_len > 0 { 1usize } else { 0usize };
-            let new_val_len = val_len + sep_len + to_append.len();
-            let total = name.len() + 1 + new_val_len + 1;
-            set_in_shim(true);
-            let raw_buf = libc::malloc(total) as *mut u8;
-            set_in_shim(false);
-            if raw_buf.is_null() {
-                return false;
-            }
-            let mut off = 0usize;
-            core::ptr::copy_nonoverlapping(name.as_ptr(), raw_buf, name.len());
-            off += name.len();
-            *raw_buf.add(off) = b'=';
-            off += 1;
-            match order {
-                Order::Append => {
-                    if val_len > 0 {
-                        core::ptr::copy_nonoverlapping(
-                            val_ptr as *const u8,
-                            raw_buf.add(off),
-                            val_len,
-                        );
-                        off += val_len;
-                        *raw_buf.add(off) = separator;
-                        off += 1;
-                    }
-                    core::ptr::copy_nonoverlapping(
-                        to_append.as_ptr(),
-                        raw_buf.add(off),
-                        to_append.len(),
-                    );
-                    off += to_append.len();
-                }
-                Order::Prepend => {
-                    core::ptr::copy_nonoverlapping(
-                        to_append.as_ptr(),
-                        raw_buf.add(off),
-                        to_append.len(),
-                    );
-                    off += to_append.len();
-                    if val_len > 0 {
-                        *raw_buf.add(off) = separator;
-                        off += 1;
-                        core::ptr::copy_nonoverlapping(
-                            val_ptr as *const u8,
-                            raw_buf.add(off),
-                            val_len,
-                        );
-                        off += val_len;
-                    }
-                }
-            }
-            *raw_buf.add(off) = 0u8;
-
-            // SECURITY: same duplicate-survival concern as overwrite_env —
-            // if envp_in contains two `LD_PRELOAD=`/`NODE_OPTIONS=` entries
-            // (raw envp under attacker control), envbuf_find returned only
-            // the first, and updating that slot leaves the second copy live
-            // for ld.so / Node to honor.  Remove EVERY existing entry for
-            // `name` first, then push the freshly-built one so the result
-            // is unambiguously the single authoritative value.  We've
-            // already pre-computed raw_buf from the original existing value
-            // captured before the remove.
-            let _ = envbuf_remove(buf, name);
-            if !envbuf_push(buf, raw_buf as *mut c_char) {
-                free_entry(raw_buf as *mut c_char);
-                return false;
-            }
-            true
         }
+    };
+
+    if entry.is_null() {
+        return false;
     }
+
+    // Step 2: exhaustively remove EVERY existing entry whose name matches.
+    // envbuf_remove is exhaustive per commit 0ea645c, but we use the
+    // explicit while-loop form to make the invariant self-evident at the
+    // call site as well.  No-op if there were none.
+    while envbuf_remove(buf, name) {}
+
+    // Step 3: push exactly one canonical entry.
+    if !envbuf_push(buf, entry) {
+        free_entry(entry);
+        return false;
+    }
+    true
 }
 
 /// Overwrite `name` in buf with the canonical `value`, leaving exactly one
