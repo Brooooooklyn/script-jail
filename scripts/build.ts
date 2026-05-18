@@ -3,7 +3,7 @@
 //
 // Steps:
 //   1. Compile the action entry: esbuild src/main.ts → dist/main.cjs
-//   2. Build the C shim: src/shim/build.sh → images/libscriptjail.so (skip on macOS)
+//   2. Build the Rust shim: cargo build src/shim/Cargo.toml → images/libscriptjail.so (skip on macOS)
 //   3. Build the rootfs(es): src/rootfs/build.ts for the selected runner image.
 //
 // Flags:
@@ -15,7 +15,7 @@
 //                                                a release workflow that builds the
 //                                                bundle once then loops over two
 //                                                runner images for rootfs builds)
-//   --skip-shim                                  skip the C-shim build step (same
+//   --skip-shim                                  skip the Rust-shim build step (same
 //                                                rationale as --skip-bundle)
 //   --runner-image=ubuntu-22.04|ubuntu-24.04     which Ubuntu base to build the
 //                                                rootfs against
@@ -27,7 +27,7 @@
 // (e.g. on macOS dev hosts).
 
 import { execSync } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -57,7 +57,7 @@ interface ParsedArgs {
   skipRootfs: boolean;
   /** Skip the esbuild action-bundle step. */
   skipBundle: boolean;
-  /** Skip the C-shim build step. */
+  /** Skip the Rust-shim build step. */
   skipShim: boolean;
   /** When `--all`, build both runner-image rootfses. */
   all: boolean;
@@ -134,13 +134,13 @@ function buildActionBundle(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Step 2 — Build C shim
+// Step 2 — Build Rust shim
 // ---------------------------------------------------------------------------
 
 function buildShim(): void {
   if (process.platform === 'darwin') {
     console.warn(
-      '[build] WARNING: Running on macOS — skipping src/shim/build.sh (requires Linux cc).\n' +
+      '[build] WARNING: Running on macOS — skipping shim build (requires Linux toolchain).\n' +
       '[build]          The .so is not needed for macOS development; build in CI or Linux.',
     );
     return;
@@ -152,9 +152,18 @@ function buildShim(): void {
     return;
   }
 
-  console.log('[build] Building C shim: src/shim/build.sh …');
-  const buildSh = join(REPO_ROOT, 'src', 'shim', 'build.sh');
-  execSync(`sh "${buildSh}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+  console.log('[build] Building Rust shim via cargo …');
+  const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
+  execSync(
+    `cargo build --release --manifest-path "${manifest}"`,
+    { stdio: 'inherit', cwd: REPO_ROOT },
+  );
+
+  mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
+  copyFileSync(
+    join(REPO_ROOT, 'src', 'shim', 'target', 'release', 'libscriptjail.so'),
+    shimOut,
+  );
   console.log('[build] images/libscriptjail.so built.');
 }
 
@@ -197,9 +206,9 @@ async function main(): Promise<void> {
   }
   artifacts.push({ path: join(REPO_ROOT, 'dist', 'main.js') });
 
-  // Step 2: C shim
+  // Step 2: Rust shim
   if (skipShim) {
-    console.log('[build] --skip-shim passed; skipping C-shim build.');
+    console.log('[build] --skip-shim passed; skipping Rust-shim build.');
   } else {
     buildShim();
   }

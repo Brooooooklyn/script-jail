@@ -1,4 +1,4 @@
-// Tests for src/shim/env-shim.c
+// Tests for src/shim/src/lib.rs
 // Uses vitest project: "guest" (see vitest.config.ts)
 //
 // Skipped entirely on non-Linux: LD_PRELOAD semantics differ significantly on
@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, unlinkSync, existsSync, statSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, unlinkSync, existsSync, statSync, rmSync, readFileSync, copyFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,9 +15,9 @@ const isLinux = process.platform === 'linux';
 // Paths relative to the repo root (resolved from __dirname = test/guest/).
 // __dirname is undefined in ESM; use import.meta.url instead.
 const repoRoot = new URL('../../', import.meta.url).pathname.replace(/\/$/, '');
-const shimSrc  = join(repoRoot, 'src/shim/env-shim.c');
-const shimSo   = join(repoRoot, 'images/libscriptjail.so');
-const buildSh  = join(repoRoot, 'src/shim/build.sh');
+const shimSo        = join(repoRoot, 'images/libscriptjail.so');
+const cargoManifest = join(repoRoot, 'src/shim/Cargo.toml');
+const libRs         = join(repoRoot, 'src/shim/src/lib.rs');
 
 // Temp files created during tests; cleaned up in afterEach.
 const tempFiles: string[] = [];
@@ -47,15 +47,15 @@ afterEach(() => {
 // ── Build helper ─────────────────────────────────────────────────────────────
 
 /**
- * Returns true if the .so is up-to-date (exists and newer than the source and
- * the build script).
+ * Returns true if the .so is up-to-date (exists and newer than the Rust crate
+ * manifest and the library source file).
  */
 function soIsUpToDate(): boolean {
-  if (!existsSync(shimSo) || !existsSync(shimSrc) || !existsSync(buildSh)) return false;
-  const soMtime  = statSync(shimSo).mtimeMs;
-  const srcMtime = statSync(shimSrc).mtimeMs;
-  const shMtime  = statSync(buildSh).mtimeMs;
-  return soMtime >= srcMtime && soMtime >= shMtime;
+  if (!existsSync(shimSo) || !existsSync(cargoManifest) || !existsSync(libRs)) return false;
+  const soMtime    = statSync(shimSo).mtimeMs;
+  const cargoMtime = statSync(cargoManifest).mtimeMs;
+  const libMtime   = statSync(libRs).mtimeMs;
+  return soMtime >= cargoMtime && soMtime >= libMtime;
 }
 
 // ── Suite ─────────────────────────────────────────────────────────────────────
@@ -70,14 +70,14 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   // ── beforeAll: compile .so if stale ─────────────────────────────────────
   //
   // On Linux we treat a build failure as a hard error so that CI cannot go
-  // green without actually exercising the shim.  Only an unavailable C
-  // compiler is treated as a skip condition.
+  // green without actually exercising the shim.  Only an unavailable Rust
+  // toolchain is treated as a skip condition.
 
   beforeAll(() => {
-    // Check that a C compiler is available.
-    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
-    if (cc.status !== 0 || cc.error) {
-      // No C compiler — leave shimAvailable = false so all tests are skipped.
+    // Check that the Rust toolchain (cargo) is available.
+    const cargo = spawnSync('cargo', ['--version'], { encoding: 'utf8' });
+    if (cargo.status !== 0 || cargo.error) {
+      // No cargo — leave shimAvailable = false so all tests are skipped.
       return;
     }
 
@@ -86,14 +86,24 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
       return;
     }
 
-    const result = spawnSync('sh', [buildSh], {
-      encoding: 'utf8',
-      cwd: repoRoot,
-    });
+    const result = spawnSync(
+      'cargo',
+      ['build', '--release', '--manifest-path', cargoManifest],
+      { encoding: 'utf8', cwd: repoRoot },
+    );
 
     if (result.status !== 0) {
-      throw new Error(`build.sh failed:\n${result.stderr}\n${result.stdout}`);
+      throw new Error(`cargo build failed:\n${result.stderr}\n${result.stdout}`);
     }
+
+    // Stage the freshly built cdylib into images/ so the rest of the suite
+    // (and any downstream consumer of images/libscriptjail.so) finds it at
+    // the canonical path.
+    mkdirSync(join(repoRoot, 'images'), { recursive: true });
+    copyFileSync(
+      join(repoRoot, 'src/shim/target/release/libscriptjail.so'),
+      shimSo,
+    );
 
     shimAvailable = true;
 
@@ -103,7 +113,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     const readelf = spawnSync('readelf', ['-Ws', '--dyn-syms', shimSo], { encoding: 'utf8' });
     if (readelf.status === 0 && !readelf.error) {
       if (!/\bgetenv\b/.test(readelf.stdout)) {
-        throw new Error('libscriptjail.so does not export getenv as a dynamic symbol — check -fvisibility=hidden and __attribute__((visibility("default")))');
+        throw new Error('libscriptjail.so does not export getenv as a dynamic symbol — check the `#[no_mangle] pub extern "C"` exports and the Rust cdylib default-hidden-visibility behavior');
       }
     }
     // readelf unavailable: skip the assertion (don't fail)
@@ -250,8 +260,8 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   // TODO(v2): Test that names containing `"`, `\`, and control characters are
   // properly JSON-escaped in the JSONL output.  This requires invoking getenv()
   // directly from a small compiled C program (to pass such a name), which is
-  // too costly for the v1 test suite.  The escaping logic in env-shim.c is
-  // unit-testable in isolation.
+  // too costly for the v1 test suite.  The escaping logic in src/shim/src/lib.rs
+  // is unit-testable in isolation.
 
   // ── Test 4: comments and blank lines in protect-list are ignored ──────────
 

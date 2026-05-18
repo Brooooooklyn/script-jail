@@ -91,6 +91,14 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
+      # `pnpm build` below invokes `cargo build --release` to produce the
+      # Rust LD_PRELOAD shim (`images/libscriptjail.so`).  The version pin
+      # mirrors `src/shim/rust-toolchain.toml` so both code paths resolve
+      # to the same toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -163,10 +171,11 @@ jobs:
           sudo iptables -A FORWARD -i "${UPLINK}" -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
           ip -br link show tap0
 
-      # Build the action bundle, C shim, AND the per-runner rootfs ext4
+      # Build the action bundle, Rust shim, AND the per-runner rootfs ext4
       # image.  The single `pnpm build -- --runner-image=…` call does all
-      # three (action bundle → esbuild, shim → src/shim/build.sh, rootfs
-      # → Docker + mkfs.ext4 via scripts/build.ts → src/rootfs/build.ts).
+      # three (action bundle → esbuild, shim → cargo build via
+      # `src/shim/Cargo.toml`, rootfs → Docker + mkfs.ext4 via
+      # scripts/build.ts → src/rootfs/build.ts).
       - name: Build action + shim + rootfs (${{ matrix.os }})
         run: pnpm build -- --runner-image=${{ matrix.os }}
 

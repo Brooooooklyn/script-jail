@@ -50,6 +50,14 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: 'pnpm'
 
+      # The Rust shim (`src/shim/`) is compiled by the guest test suite via
+      # `cargo build`.  The matrix only contains Linux runners today, so this
+      # toolchain install runs on every leg.  The version here matches the
+      # pin in `src/shim/rust-toolchain.toml` (belt-and-braces).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

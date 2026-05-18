@@ -167,19 +167,25 @@ function ensureShim(): boolean {
 
   if (isMacOS()) {
     console.warn(
-      '[rootfs] WARNING: Running on macOS — cannot build libscriptjail.so (requires Linux cc).\n' +
+      '[rootfs] WARNING: Running on macOS — cannot build libscriptjail.so (requires Linux toolchain).\n' +
       '[rootfs]          Skipping shim build. The docker build step will also be skipped.\n' +
       '[rootfs]          To build the full rootfs, run this script on a Linux host or CI.',
     );
     return false;
   }
 
-  console.log(`[rootfs] Building libscriptjail.so via src/shim/build.sh …`);
-  const buildSh = join(REPO_ROOT, 'src', 'shim', 'build.sh');
-  run(`sh "${buildSh}"`);
+  console.log(`[rootfs] Building libscriptjail.so via cargo …`);
+  const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
+  run(`cargo build --release --manifest-path "${manifest}"`);
+
+  mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
+  copyFileSync(
+    join(REPO_ROOT, 'src', 'shim', 'target', 'release', 'libscriptjail.so'),
+    shimOut,
+  );
 
   if (!existsSync(shimOut)) {
-    throw new Error(`[rootfs] src/shim/build.sh ran but ${shimOut} was not produced.`);
+    throw new Error(`[rootfs] cargo build ran but ${shimOut} was not produced.`);
   }
   return true;
 }

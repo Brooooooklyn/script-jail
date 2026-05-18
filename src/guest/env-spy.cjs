@@ -4,7 +4,7 @@
 // every read and hides values for names in the protected list.
 //
 // Why this exists:
-//   The LD_PRELOAD env-shim (src/shim/env-shim.c) wraps libc getenv and
+//   The LD_PRELOAD env-shim (src/shim/src/lib.rs) wraps libc getenv and
 //   secure_getenv.  That catches getenv calls from C code (Node itself, libuv,
 //   etc.) but NOT `process.env.X` reads from JavaScript — Node parses
 //   environ[] at startup into an in-memory Map and serves all `process.env`

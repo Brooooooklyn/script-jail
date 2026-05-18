@@ -1,8 +1,8 @@
 # script-jail — .github/workflows/release.yml
 #
 # Release pipeline: on every `v*.*.*` tag push, build the per-runner rootfs
-# ext4 images, the libscriptjail.so C shim, and the action bundle, then attach
-# them as release assets.
+# ext4 images, the libscriptjail.so Rust shim, and the action bundle, then
+# attach them as release assets.
 #
 # Why this exists:
 #   The action consumes the rootfs + .so at runtime via
@@ -78,6 +78,13 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
+      # The shim is a Rust cdylib (`src/shim/`); cargo is required before
+      # `pnpm build` or the explicit shim-build step further down.  The
+      # version pin matches `src/shim/rust-toolchain.toml`.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -129,8 +136,10 @@ jobs:
       - name: Build action bundle
         run: pnpm build:bundle
 
-      - name: Build C shim
-        run: sh src/shim/build.sh
+      - name: Build Rust shim
+        run: |
+          cargo build --release --manifest-path src/shim/Cargo.toml
+          cp src/shim/target/release/libscriptjail.so images/libscriptjail.so
 
       # Build BOTH rootfs ext4 images, reusing the bundle + shim built above.
       # `--skip-bundle` and `--skip-shim` avoid the redundant work the build
