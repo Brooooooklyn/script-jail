@@ -106,6 +106,24 @@ export const ExecEvent = z.object({
   // Default false for shim-sourced events.  Only set true by the
   // synthesized cross-check pass in runInstallPhase (Finding 1).
   syscall_bypass: z.boolean().default(false),
+  // Audit-trust Finding (high, 2026-05-18): the shim emits one event
+  // BEFORE calling real_execve (with result='ok' — optimistic, since
+  // successful execs never return) and a SECOND event with
+  // result='failed' AFTER real_execve returns (a return at all proves
+  // the exec failed).  posix_spawn emits a single event tagged with
+  // the actual outcome.  The phase-install cross-check counts
+  // `okEvents - failedEvents` per pid so failed-attempt libc wrappers
+  // cancel out and only true successful execs contribute to the
+  // strace/shim pairing.  Without this, an attacker could pad shim
+  // exec count with failed wrapped execves (e.g. `execve("/missing",
+  // …)`) and a paired raw-syscall bypass would produce a zero delta
+  // — silently disabling the `<SYSCALL_EXEC_BYPASS>` detector.
+  //
+  // Default 'ok' preserves backwards compatibility with pre-fix shim
+  // builds that emit the event without a `result` field (older
+  // libscriptjail.so + new agent).  CI verifies the shim and agent
+  // are built together but this gives us a safety net.
+  result: z.enum(['ok', 'failed']).default('ok'),
   pid: z.number(),
   ts: z.number(),
 });

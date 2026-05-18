@@ -433,10 +433,30 @@ export async function runInstallPhase(
       // ALSO ignore `envp_alloc_failed` here — that's a different bypass
       // (rewrite_envp ran but allocation failed); it still proves the
       // libc wrapper entered the shim path.
+      //
+      // Audit-trust Finding (high, 2026-05-18): only `result:'ok'` shim
+      // events count toward the strace-pairing denominator; failed
+      // attempts are subtracted out so we end up with the NET successful
+      // libc-wrapper exec count for this pid.  Before this fix, every
+      // shim exec event (including failed wrapped execves) incremented
+      // the counter — an attacker could trivially pad the shim count
+      // with `execve("/missing", argv, envp)` calls (each shim wrapper
+      // emits a pre-call event with the optimistic 'ok' tag, and that
+      // event survived even when real_execve returned -1 ENOENT).  Then
+      // a raw `syscall(SYS_execve, …)` for the same pid produced a
+      // matching successful strace observation; the cross-check delta
+      // was 0 and no `<SYSCALL_EXEC_BYPASS>` event was synthesised.
+      //
+      // The shim now emits a `result:'failed'` event AFTER real_execve
+      // returns (which only happens on failure since success replaces
+      // the image); for posix_spawn it emits a single event with the
+      // correct result.  We count `ok - failed` here to obtain the
+      // true successful-libc-exec count.
       if (shimEvent.kind === 'exec') {
+        const delta = shimEvent.result === 'failed' ? -1 : 1;
         shimExecCountByPid.set(
           shimEvent.pid,
-          (shimExecCountByPid.get(shimEvent.pid) ?? 0) + 1,
+          (shimExecCountByPid.get(shimEvent.pid) ?? 0) + delta,
         );
       }
       if (result !== null) {
@@ -584,6 +604,12 @@ export async function runInstallPhase(
         argv0: sample.argv0.length > 0 ? sample.argv0 : null,
         envp_alloc_failed: false,
         syscall_bypass: true,
+        // The synthesised event represents a strace-observed successful
+        // execve syscall; tag it `result:'ok'` so it matches the shape
+        // of a real successful exec.  This field isn't consumed by
+        // normalize.ts for the synth path (which keys on
+        // `syscall_bypass`) but the schema requires it.
+        result: 'ok',
         pid: sample.pid,
         ts: sample.ts,
       };

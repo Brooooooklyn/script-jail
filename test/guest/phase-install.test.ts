@@ -1233,6 +1233,7 @@ describe('runInstallPhase', () => {
           argv0: 'curl',
           envp_alloc_failed: false,
           syscall_bypass: true,
+          result: 'ok',
           pid: 1,
           ts: 0,
         },
@@ -1374,6 +1375,303 @@ describe('runInstallPhase', () => {
       // The synth event must carry the snapshot's pkg, not <unattributed>.
       expect(synths[0]!['pkg']).toBe('snapshot-pkg@2.0.0');
       expect(synths[0]!['lifecycle']).toBe('install');
+    });
+  });
+
+  // Audit-trust Finding (high, 2026-05-18) — shim exec events carry a
+  // `result: 'ok' | 'failed'` field so the cross-check can ignore failed
+  // wrapped execves when pairing against successful strace observations.
+  //
+  // The threat: the shim's pre-fix behaviour was to emit ONE event per
+  // libc-exec call BEFORE forwarding to real_execve.  That meant a failed
+  // `execve("/missing", argv, envp)` still contributed +1 to
+  // `shimExecCountByPid`, while strace correctly recorded the failure
+  // (result=-1 ENOENT) and contributed +0 to `straceExecsByPid`.  An
+  // attacker could thus pad the shim count with N failed wrapped execves
+  // and then perform N successful raw `syscall(SYS_execve, …)` calls
+  // (which the shim never sees) — the cross-check delta was 0 and no
+  // `<SYSCALL_EXEC_BYPASS>` was synthesised.
+  //
+  // Fix: the shim now emits a `result:'failed'` event AFTER real_execve
+  // returns (which only happens on failure since success replaces the
+  // image); for posix_spawn it emits a single event with the outcome
+  // tagged.  The cross-check computes `okEvents - failedEvents` per pid
+  // so failed-attempt libc wrappers cancel out, and only true successful
+  // libc-wrapper exec calls contribute to the strace/shim pairing.
+  describe('Finding — shim exec result field cancels failed wrapped execs', () => {
+    it('failed wrapped execve + successful raw syscall in same pid → 1 bypass', async () => {
+      const proc = mockProcReader({
+        301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fail-pad-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // Scenario: attacker calls execve("/missing") via libc — shim emits
+      // result:'ok' pre-call and result:'failed' post-call (net 0).  Then
+      // attacker issues a raw syscall(SYS_execve, "/usr/bin/node", …) —
+      // strace observes one successful execve, shim sees nothing.
+      // Cross-check: shimOkNet=0, straceOk=1 → 1 bypass synthesised.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 301,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/missing',
+            argv0: 'missing',
+            envp_alloc_failed: false,
+            result: 'ok',
+            pid: 301,
+            ts: 1,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 301,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/missing',
+            argv0: 'missing',
+            envp_alloc_failed: false,
+            result: 'failed',
+            pid: 301,
+            ts: 2,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 301,
+          line: 'execve("/usr/bin/node", ["node", "-e", "evil()"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(1);
+      const raw = synths[0]!['raw'] as Record<string, unknown>;
+      expect(raw['argv0']).toBe('node');
+      expect(synths[0]!['pkg']).toBe('fail-pad-pkg@1.0.0');
+    });
+
+    it('5 failed wrapped + 3 successful raw → 3 bypass entries', async () => {
+      const proc = mockProcReader({
+        302: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'multi-fail-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // 5 failed wrapped execves → 5 'ok' + 5 'failed' shim events (net 0).
+      // 3 successful raw syscalls → 3 strace 'ok' observations, 0 shim.
+      // Cross-check: 3 - 0 = 3 bypass entries.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
+      for (let i = 0; i < 5; i++) {
+        records.push({
+          pid: 302,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/missing',
+            argv0: `attempt-${i}`,
+            envp_alloc_failed: false,
+            result: 'ok',
+            pid: 302,
+            ts: i * 2 + 1,
+          }),
+          source: 'shim',
+        });
+        records.push({
+          pid: 302,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/missing',
+            argv0: `attempt-${i}`,
+            envp_alloc_failed: false,
+            result: 'failed',
+            pid: 302,
+            ts: i * 2 + 2,
+          }),
+          source: 'shim',
+        });
+      }
+      const rawProgs = ['curl', 'wget', 'sh'];
+      for (const argv0 of rawProgs) {
+        records.push({
+          pid: 302,
+          line: `execve("/usr/bin/${argv0}", ["${argv0}", "x"], 0x1 /* 0 vars */) = 0`,
+          source: 'strace',
+        });
+      }
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(3);
+      const argv0s = synths
+        .map((e) => ((e['raw'] as Record<string, unknown>)['argv0']) as string)
+        .sort();
+      expect(argv0s).toEqual(['curl', 'sh', 'wget']);
+    });
+
+    it('2 successful wrapped + 0 raw → 0 bypass entries', async () => {
+      const proc = mockProcReader({
+        303: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'happy-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // 2 successful wrapped execves → 2 shim 'ok' events, no 'failed'
+      // (real_execve never returned because the image was replaced).
+      // 2 strace 'ok' observations.  Cross-check: 2 - 2 = 0, no bypass.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 303,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/sh',
+            argv0: 'sh',
+            envp_alloc_failed: false,
+            result: 'ok',
+            pid: 303,
+            ts: 1,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 303,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "a"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 303,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/node',
+            argv0: 'node',
+            envp_alloc_failed: false,
+            result: 'ok',
+            pid: 303,
+            ts: 2,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 303,
+          line: 'execve("/usr/bin/node", ["node", "-v"], 0x2 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(0);
+    });
+
+    it('legacy shim events without result field default to ok', async () => {
+      // Backwards-compat check: an older shim build (or any test fixture
+      // that doesn't include `result`) should still cross-check correctly
+      // — the zod default makes the missing field equivalent to
+      // `result:'ok'`, so a single legacy shim event + a single strace
+      // execve still pairs to 0 bypasses.
+      const proc = mockProcReader({
+        304: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'legacy-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 304,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/node',
+            argv0: 'node',
+            envp_alloc_failed: false,
+            // No `result` field — legacy shim build.
+            pid: 304,
+            ts: 1,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 304,
+          line: 'execve("/usr/bin/node", ["node", "-v"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(0);
     });
   });
 

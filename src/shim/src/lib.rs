@@ -1284,13 +1284,41 @@ unsafe fn environ_ptr() -> *const *const c_char {
 
 // ── audit emit for exec events ─────────────────────────────────────────────
 
+// Audit-trust Finding (high, 2026-05-18): the shim's exec event carries an
+// explicit `result` field so the phase-install cross-check can ignore
+// failed-attempt shim events when pairing against successful strace
+// execves.  Before this fix, `dispatch_exec` emitted exactly one event
+// BEFORE calling real_execve (the only place the calling pid is still
+// known) — and that event counted toward `shimExecCountByPid` even when
+// real_execve subsequently returned -1 ENOENT.  An attacker could then
+// pad the shim count with failed wrapped execves and the matching
+// strace count from a real raw-syscall bypass produced no positive
+// delta — the bypass detector synthesised zero `<SYSCALL_EXEC_BYPASS>`
+// entries and the lockfile diff stayed clean.
+//
+// Wire shape: the shim emits a pre-call event with `result:"ok"`
+// (`dispatch_exec`) or a post-call success event with `result:"ok"`
+// (`dispatch_spawn` on rc==0).  On failure return (only reachable for
+// `dispatch_exec` when real_execve returns and for `dispatch_spawn`
+// when rc!=0 or envp_alloc_failed), the shim emits an additional event
+// with `result:"failed"`.  The phase-install cross-check computes
+// `okEvents - failedEvents` per pid; failed-attempt shim events thus
+// cancel out and only true successful libc-wrapper paths contribute to
+// the cross-check denominator.
+#[repr(u8)]
+enum ExecResult {
+    Ok,
+    Failed,
+}
+
 unsafe fn emit_exec(
     prog: *const c_char,
     argv0: *const c_char,
     envp_alloc_failed: bool,
+    result: ExecResult,
 ) {
     let pid = libc::getpid();
-    emit_exec_for_pid(prog, argv0, envp_alloc_failed, pid);
+    emit_exec_for_pid(prog, argv0, envp_alloc_failed, pid, result);
 }
 
 // Audit-trust Finding 1 (high): posix_spawn dispatch must emit the shim
@@ -1306,6 +1334,7 @@ unsafe fn emit_exec_for_pid(
     argv0: *const c_char,
     envp_alloc_failed: bool,
     pid: libc::pid_t,
+    result: ExecResult,
 ) {
     let log_fd = LOG_FD.load(Ordering::Acquire);
     if log_fd < 0 {
@@ -1320,8 +1349,11 @@ unsafe fn emit_exec_for_pid(
     let mut pos = 0usize;
 
     // Reserve trailing budget for the suffix: closing argv0 quote (or "null"),
-    // ","pid":<20>,"ts":<20>,"envp_alloc_failed":<5>}\n.
-    const SUFFIX_RESERVE: usize = 96;
+    // ","pid":<20>,"ts":<20>,"envp_alloc_failed":<5>,"result":"failed"}\n.
+    // The "result":"failed" tail is the widest variant (16 bytes including
+    // the leading comma and quotes); SUFFIX_RESERVE was 96 — bumping to 128
+    // gives a comfortable margin without crowding the prog/argv0 budget.
+    const SUFFIX_RESERVE: usize = 128;
 
     let prefix = br#"{"kind":"exec","prog":""#;
     if prefix.len() > buf.len() {
@@ -1389,11 +1421,25 @@ unsafe fn emit_exec_for_pid(
     buf[pos..pos + mid3.len()].copy_from_slice(mid3);
     pos += mid3.len();
     let bool_str: &[u8] = if envp_alloc_failed { b"true" } else { b"false" };
-    if pos + bool_str.len() + 2 > buf.len() {
+    if pos + bool_str.len() > buf.len() {
         return;
     }
     buf[pos..pos + bool_str.len()].copy_from_slice(bool_str);
     pos += bool_str.len();
+
+    // Audit-trust Finding (2026-05-18): emit `"result":"ok"` or
+    // `"result":"failed"` so the phase-install cross-check can ignore
+    // failed-attempt shim events when pairing against strace's
+    // successful-execve count.  See `enum ExecResult` for context.
+    let result_tail: &[u8] = match result {
+        ExecResult::Ok => br#","result":"ok""#,
+        ExecResult::Failed => br#","result":"failed""#,
+    };
+    if pos + result_tail.len() + 2 > buf.len() {
+        return;
+    }
+    buf[pos..pos + result_tail.len()].copy_from_slice(result_tail);
+    pos += result_tail.len();
 
     buf[pos] = b'}';
     pos += 1;
@@ -1699,10 +1745,22 @@ unsafe fn dispatch_exec(
             // Re-assert the recursion guard: rewrite_envp's helpers cleared
             // it on each malloc, so we are now `in_shim==false`.
             set_in_shim(true);
-            emit_exec(prog, argv0, false);
+            // Audit-trust Finding (2026-05-18): emit `result:"ok"` BEFORE
+            // forward_to_real.  Successful execs replace the process image
+            // and never return here, so this is the only opportunity to
+            // record the attempt with the calling pid (the pid strace
+            // records the execve under).  If real_* returns at all, the
+            // exec FAILED — we emit a second event with `result:"failed"`
+            // below so the phase-install cross-check can cancel out the
+            // pre-call optimistic event when computing per-pid counts.
+            emit_exec(prog, argv0, false, ExecResult::Ok);
             let rewritten = buf.ptrs as *const *const c_char;
             let rc = forward_to_real(&kind, prog, argv, rewritten);
-            // real_* only returns on failure.
+            // real_* only returns on failure.  Emit the failure marker
+            // BEFORE freeing the envbuf so any allocator-side errno
+            // change inside free_envbuf can't clobber the value strace
+            // reports for the failed exec.
+            emit_exec(prog, argv0, false, ExecResult::Failed);
             free_envbuf(&mut buf);
             set_in_shim(false);
             rc
@@ -1715,8 +1773,11 @@ unsafe fn dispatch_exec(
             // without LD_PRELOAD/NODE_OPTIONS/SCRIPT_JAIL_* re-injected).
             // Emit the audit event so the attempt is visible, then return
             // -1 with errno=ENOMEM to refuse the exec.
+            //
+            // This path never reaches a real exec (we refuse), so the
+            // event is tagged `result:"failed"` — the child never ran.
             set_in_shim(true);
-            emit_exec(prog, argv0, true);
+            emit_exec(prog, argv0, true, ExecResult::Failed);
             set_errno(libc::ENOMEM);
             set_in_shim(false);
             -1
@@ -1785,7 +1846,19 @@ unsafe fn dispatch_spawn(
                 } else {
                     libc::getpid()
                 };
-                emit_exec_for_pid(path, argv0, false, child_pid);
+                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok);
+            } else {
+                // Audit-trust Finding (2026-05-18): record failed
+                // posix_spawn attempts so the phase-install cross-check
+                // doesn't conflate them with successful libc-wrapper
+                // execs.  No child pid is available (rc != 0 means
+                // posix_spawn never wrote *pid), so the failure event
+                // is tagged with the parent pid.  Strace will never
+                // record an execve under the parent pid for this
+                // attempt (no child was created), so this event is
+                // purely a forensic marker and contributes 0 net to
+                // the cross-check (no matching strace observation).
+                emit_exec(path, argv0, false, ExecResult::Failed);
             }
             free_envbuf(&mut buf);
             set_in_shim(false);
@@ -1804,7 +1877,7 @@ unsafe fn dispatch_spawn(
             // separate signal (`envp_alloc_failed`), not as part of the
             // strace/shim pairing for `<SYSCALL_EXEC_BYPASS>`.
             set_in_shim(true);
-            emit_exec(path, argv0, true);
+            emit_exec(path, argv0, true, ExecResult::Failed);
             set_in_shim(false);
             libc::ENOMEM
         }
