@@ -543,9 +543,11 @@ export async function runInstallPhase(
   }
   // FdSnapshot's `entries` field captures the child's modeled fd table
   // (by fd suffix only — fd-group root is implicit) at the moment the
-  // marker was set.  `action` records what the kernel did to the
-  // caller's now-private fd table AT detach time so the reconciler can
-  // replay it onto the COPIED-from-parent child group:
+  // marker was FIRST set (the baseline parent-shared state under
+  // CLONE_FILES).  `actions` is an ordered LIST of the kernel mutations
+  // observed on the caller's now-private fd table during the pre-detach
+  // singleton window; the reconciler replays them in the same order
+  // onto the COPIED-from-parent child group:
   //   - 'none'           — plain unshare(CLONE_FILES).  No replay
   //                        action; the kernel only detached, didn't
   //                        otherwise mutate the table.
@@ -556,24 +558,102 @@ export async function runInstallPhase(
   //   - 'execveCloexec'  — successful execve performed a CLOEXEC sweep
   //                        on the caller's private fd table.  Replay:
   //                        drop entries with cloexec=true.
+  //
+  // Codex follow-up (high, 2026-05-19, bug #1): pre-fix the singleton-
+  // pending-fd-detach handlers stored ONE FdDetachAction in the Map
+  // entry; a later detach call OVERWROTE the prior action.  Failure
+  // mode: child close_range(UNSHARE) → then execve.  execve overwrote
+  // the close_range action; reconciliation replayed only the CLOEXEC
+  // sweep and the closed fds came back.  Fix: ordered list, append on
+  // every detach call (push, don't overwrite), replay in order.  The
+  // `entries` baseline stays from the FIRST detach (parent-state-at-
+  // first-detach is the right basis for parent-taint).
+  //
+  // Codex follow-up (high, 2026-05-19, bug #2): `tombstones` records
+  // fd-specific mutations done on UNTRACKED fds during the singleton
+  // pre-detach window.  When the operation targets an fd NOT in
+  // `dirfdTable`, the prior fast-path just no-op'd — but in delayed-
+  // clone order an absent child entry can mean "inherited from parent
+  // who's not yet reconciled".  The child's close / SETFD-CLOEXEC
+  // legitimately mutated the shared kernel state; the reconciler must
+  // replay the mutation after copying parent's fds into the child
+  // group.  Each tombstone is keyed by raw fd number; replay semantics
+  // depend on `kind`:
+  //   - 'close'   — kernel closed the shared fd.  Drop the entry in
+  //                 the child's copied table AND drop the parent's
+  //                 matching entry (the shared mutation propagated
+  //                 to the parent under CLONE_FILES); mark both
+  //                 groups fd-unknown for that fd region.
+  //   - 'cloexec' — kernel set FD_CLOEXEC on the shared fd.  Mark the
+  //                 child's copied entry cloexec=true so the
+  //                 subsequent execveCloexec action in the list (if
+  //                 any) sweeps it.
   type FdDetachAction =
     | { kind: 'none' }
     | { kind: 'closeRange'; first: number; last: number; cloexec: boolean }
     | { kind: 'execveCloexec' };
+  type FdTombstone = { kind: 'close' } | { kind: 'cloexec' };
   interface FdSnapshot {
     entries: Array<[string /* fd suffix */, { path: string; cloexec: boolean }]>;
     unknown: boolean;
-    action: FdDetachAction;
+    actions: FdDetachAction[];
+    tombstones: Map<number, FdTombstone>;
   }
   const pendingCwdDetach = new Map<number, CwdSnapshot>();
   const pendingFdDetach = new Map<number, FdSnapshot>();
+  // Codex follow-up (high, 2026-05-19, bug #2): pre-marker tombstones.
+  // close()/fcntl(F_SETFD,FD_CLOEXEC) called on UNTRACKED inherited fds
+  // BEFORE the singleton pid has any pending-fd-detach marker.  When a
+  // marker is eventually created (snapshotFd / appendFdAction), it
+  // absorbs the entries from this map; if a clone reconciliation
+  // consumes the marker first, the tombstones are folded in there.  No
+  // pending-marker, no detach: in that case we leave the dirfdTable
+  // delete (close) already-applied as the only effect, and the
+  // tombstone bucket is discarded at marker creation or stays as a
+  // best-effort record for later detach events.
+  const pendingFdTombstones = new Map<number, Map<number, FdTombstone>>();
+  function recordFdTombstone(pid: number, fd: number, tomb: FdTombstone): void {
+    // Singleton-only gate: tombstones describe the singleton pid's
+    // post-detach private mutations.  A non-singleton pid's mutations
+    // would also affect siblings in the SAME fd group right now and
+    // need no replay path — the dirfdTable already reflects them.
+    if (!isFdSingleton(pid)) return;
+    const existingSnap = pendingFdDetach.get(pid);
+    if (existingSnap !== undefined) {
+      // Fold directly into the existing marker.  Later tombstones for
+      // the SAME fd overwrite earlier ones; close beats cloexec because
+      // a closed fd has nothing left to mark cloexec.
+      existingSnap.tombstones.set(fd, tomb);
+      return;
+    }
+    let bucket = pendingFdTombstones.get(pid);
+    if (bucket === undefined) {
+      bucket = new Map();
+      pendingFdTombstones.set(pid, bucket);
+    }
+    bucket.set(fd, tomb);
+  }
+  // Fold any pre-marker tombstones into a fresh/extended marker so the
+  // reconciler sees them through the marker's `tombstones` field.
+  function absorbPendingTombstones(pid: number, snap: FdSnapshot): void {
+    const bucket = pendingFdTombstones.get(pid);
+    if (bucket === undefined) return;
+    for (const [fd, tomb] of bucket) snap.tombstones.set(fd, tomb);
+    pendingFdTombstones.delete(pid);
+  }
 
   // Helper: snapshot the child's CURRENT cwd state for a pending marker.
   function snapshotCwd(pid: number): CwdSnapshot {
     return { cwd: cwdGet(pid), unknown: cwdUnknownHas(pid) };
   }
   // Helper: snapshot the child's CURRENT fd-table state + the detach-
-  // time replay action.
+  // time replay action.  The returned snapshot has a SINGLE action in
+  // its `actions` list (the caller-provided one) and an empty tombstone
+  // map.  Subsequent detach calls on the same pid APPEND to `actions`
+  // via `appendFdAction` rather than calling `snapshotFd` again — the
+  // `entries` baseline must stay frozen at the first-detach moment so
+  // the reconciler's parent-taint pass measures against the parent-
+  // shared state that existed at first detach, not at the last one.
   function snapshotFd(pid: number, action: FdDetachAction): FdSnapshot {
     const root = rootedFd(pid);
     const prefix = `${root}:`;
@@ -583,7 +663,28 @@ export async function runInstallPhase(
         entries.push([key.slice(prefix.length), val]);
       }
     }
-    return { entries, unknown: dirfdStateUnknown.has(root), action };
+    const snap: FdSnapshot = {
+      entries,
+      unknown: dirfdStateUnknown.has(root),
+      actions: [action],
+      tombstones: new Map(),
+    };
+    absorbPendingTombstones(pid, snap);
+    return snap;
+  }
+  // Helper: extend an existing pending-fd-detach marker with a new
+  // action without disturbing its `entries`/`unknown` baseline.  Used
+  // by the close_range UNSHARE and execve handlers when the pid
+  // ALREADY has a pending marker — appending preserves ordering for
+  // replay (close_range BEFORE execve, etc.).  Returns the snapshot
+  // we extended, or `null` if none exists for `pid`.  Also absorbs
+  // any pre-marker tombstones recorded since the prior detach.
+  function appendFdAction(pid: number, action: FdDetachAction): FdSnapshot | null {
+    const snap = pendingFdDetach.get(pid);
+    if (snap === undefined) return null;
+    snap.actions.push(action);
+    absorbPendingTombstones(pid, snap);
+    return snap;
   }
   // Helper: is `pid` currently the sole member of its fd group?  Used
   // by close_range/execve to gate the pending-marker recording — when
@@ -1682,6 +1783,15 @@ export async function runInstallPhase(
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
+            // Drop any pre-marker tombstones for this child; if a
+            // marker existed, those tombstones have already been
+            // folded in by absorbPendingTombstones during snapshot
+            // creation, so the bucket is stale.  If no marker existed,
+            // the bucket is best-effort and not consumed here (the
+            // tombstones would need a marker-less reconciliation path
+            // we deliberately don't implement — see comment above the
+            // `pendingFdTombstones` declaration).
+            pendingFdTombstones.delete(childPid);
             const childHadPendingCwdDetach = childCwdSnap !== undefined;
             const childHadPendingFdDetach = childFdSnap !== undefined;
             if (cloneFs && !childHadPendingCwdDetach) {
@@ -1984,47 +2094,90 @@ export async function runInstallPhase(
                   fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
-                // Codex follow-up (medium, 2026-05-19, bug #3): replay
-                // the detach-time action onto the child's private group
-                // AFTER the copy.  Without this, a close_range UNSHARE
-                // or execve CLOEXEC sweep that fired on a singleton
-                // child gets overwritten by the parent-state copy
-                // above, and child openats through closed/swept fds
-                // would falsely certify against parent's stale path.
+                // Codex follow-up (medium, 2026-05-19, bug #3) + (high,
+                // 2026-05-19, bug #1 + #2): apply tombstones FIRST then
+                // replay detach-time actions in order onto the child's
+                // private group AFTER the copy.
+                //
+                // Bug #1: pre-fix the singleton-pending-fd-detach path
+                // stored ONE action and a later detach overwrote it.
+                // Now we replay the full ordered LIST so a
+                // close_range UNSHARE followed by an execve replays
+                // both — the closed fds stay closed, and the CLOEXEC
+                // sweep runs on what remains.
+                //
+                // Bug #2: tombstones record close / cloexec mutations
+                // done on UNTRACKED fds during the singleton window.
+                // After copying parent state in, replay them so the
+                // child's copied fds reflect kernel reality.  For
+                // 'close' tombstones, we ALSO drop the parent's
+                // matching entry (the shared mutation propagated to
+                // the parent under CLONE_FILES) and mark BOTH groups
+                // fd-unknown for that fd.
                 if (childFdSnap !== undefined && childHadPendingFdDetach) {
-                  const action = childFdSnap.action;
                   const childGroupPrefix = `${rootedFd(childPid)}:`;
-                  if (action.kind === 'closeRange') {
-                    for (const k of [...dirfdTable.keys()]) {
-                      if (!k.startsWith(childGroupPrefix)) continue;
-                      const fdStr = k.slice(childGroupPrefix.length);
-                      const fdNum = parseInt(fdStr, 10);
-                      if (
-                        Number.isFinite(fdNum) &&
-                        fdNum >= action.first &&
-                        fdNum <= action.last
-                      ) {
-                        if (action.cloexec) {
-                          const cur = dirfdTable.get(k);
-                          if (cur !== undefined) {
-                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                  // Apply tombstones BEFORE actions so subsequent
+                  // close_range/execve replays operate on the
+                  // post-tombstone child table.
+                  for (const [fd, tomb] of childFdSnap.tombstones) {
+                    const childKey = `${childGroupPrefix}${fd}`;
+                    const parentKey = `${parentPrefix}${fd}`;
+                    if (tomb.kind === 'close') {
+                      // Kernel closed the shared fd.  Drop both sides
+                      // and fail closed for future numeric-dirfd opens
+                      // on that fd in either group (the kernel slot
+                      // is gone; later opens at this fd number land
+                      // on whatever the next allocator returns).
+                      dirfdTable.delete(childKey);
+                      if (fdPendingDetachShared) {
+                        dirfdTable.delete(parentKey);
+                        fdUnknownAdd(pid);
+                        fdUnknownAdd(childPid);
+                      }
+                    } else if (tomb.kind === 'cloexec') {
+                      // Kernel set FD_CLOEXEC on the shared fd.  Flip
+                      // child's copied entry so the subsequent
+                      // execveCloexec action in the replay list (if
+                      // any) sweeps it.
+                      const cur = dirfdTable.get(childKey);
+                      if (cur !== undefined) {
+                        dirfdTable.set(childKey, { path: cur.path, cloexec: true });
+                      }
+                    }
+                  }
+                  for (const action of childFdSnap.actions) {
+                    if (action.kind === 'closeRange') {
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(childGroupPrefix)) continue;
+                        const fdStr = k.slice(childGroupPrefix.length);
+                        const fdNum = parseInt(fdStr, 10);
+                        if (
+                          Number.isFinite(fdNum) &&
+                          fdNum >= action.first &&
+                          fdNum <= action.last
+                        ) {
+                          if (action.cloexec) {
+                            const cur = dirfdTable.get(k);
+                            if (cur !== undefined) {
+                              dirfdTable.set(k, { path: cur.path, cloexec: true });
+                            }
+                          } else {
+                            dirfdTable.delete(k);
                           }
-                        } else {
+                        }
+                      }
+                    } else if (action.kind === 'execveCloexec') {
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(childGroupPrefix)) continue;
+                        const entry = dirfdTable.get(k);
+                        if (entry !== undefined && entry.cloexec) {
                           dirfdTable.delete(k);
                         }
                       }
                     }
-                  } else if (action.kind === 'execveCloexec') {
-                    for (const k of [...dirfdTable.keys()]) {
-                      if (!k.startsWith(childGroupPrefix)) continue;
-                      const entry = dirfdTable.get(k);
-                      if (entry !== undefined && entry.cloexec) {
-                        dirfdTable.delete(k);
-                      }
-                    }
+                    // action.kind === 'none' (plain unshare(CLONE_FILES))
+                    // → no replay needed.
                   }
-                  // action.kind === 'none' (plain unshare(CLONE_FILES))
-                  // → no replay needed.
                 }
               }
             }
@@ -2149,7 +2302,26 @@ export async function runInstallPhase(
       const closeMatch = line.match(/^close\((-?\d+)\)\s*=\s*(-?\d+)\b/);
       if (closeMatch !== null) {
         const fd = parseInt(closeMatch[1] ?? '', 10);
+        const rc = parseInt(closeMatch[2] ?? '', 10);
         if (Number.isFinite(fd)) {
+          // Codex follow-up (high, 2026-05-19, bug #2): if the fd is
+          // NOT in `dirfdTable`, the pid is currently a singleton, and
+          // we're in the pre-detach window of an out-of-order delayed
+          // clone (parent's clone(CLONE_FILES) line hasn't surfaced),
+          // record a 'close' tombstone.  At delayed-clone reconciliation
+          // the tombstone fires AFTER copying parent's fd table into
+          // the child group, dropping the just-copied fd and tainting
+          // both groups' fd-state-unknown for it (the shared-kernel
+          // mutation propagates to the parent under CLONE_FILES).
+          // Successful close only (rc === 0); EBADF means the fd
+          // wasn't valid in the kernel and the inherited mapping
+          // (if any) is unchanged.
+          if (Number.isFinite(rc) && rc === 0) {
+            const key = fdKey(pid, fd);
+            if (!dirfdTable.has(key)) {
+              recordFdTombstone(pid, fd, { kind: 'close' });
+            }
+          }
           // Delete unconditionally: even on EBADF, our stale entry (if
           // any) is invalidated — the kernel's reply tells us the fd
           // is no longer valid for openat(<fd>, ...).
@@ -2284,7 +2456,19 @@ export async function runInstallPhase(
                 last,
                 cloexec: hasCloexec,
               };
-              const fdSnap = fdSingleton ? snapshotFd(pid, action) : null;
+              // Codex follow-up (high, 2026-05-19, bug #1): if a pending
+              // marker already exists for this pid (e.g. a prior
+              // unshare(CLONE_FILES) or close_range UNSHARE on the same
+              // singleton), APPEND the action instead of overwriting.
+              // The reconciler replays the list in order; overwriting
+              // would lose the earlier mutation.
+              let fdSnap: FdSnapshot | null = null;
+              if (fdSingleton) {
+                fdSnap = appendFdAction(pid, action);
+                if (fdSnap === null) {
+                  fdSnap = snapshotFd(pid, action);
+                }
+              }
               detachFdGroup(pid);
               // Apply the range against the caller's group (which is
               // either the brand-new private group or the original
@@ -2461,7 +2645,15 @@ export async function runInstallPhase(
             // mutations stay private and don't leak into the reconciler.
             // unshare itself doesn't mutate the fd table (only detaches
             // it), so the replay action is 'none'.
-            const fdSnap = snapshotFd(pid, { kind: 'none' });
+            //
+            // Codex follow-up (high, 2026-05-19, bug #1): if a prior
+            // pending marker already exists for this pid, APPEND the
+            // 'none' action so any later replay still sees the full
+            // ordered list of detach mutations.  The first marker's
+            // `entries` baseline (parent-shared state at first detach)
+            // is preserved.
+            const existing = appendFdAction(pid, { kind: 'none' });
+            const fdSnap = existing ?? snapshotFd(pid, { kind: 'none' });
             detachFdGroup(pid);
             // Codex follow-up (high, 2026-05-19): record the intent.
             // If a later-arriving `clone(... CLONE_FILES ...) = <this
@@ -2578,9 +2770,21 @@ export async function runInstallPhase(
             if (newCloexec !== null) {
               if (cur !== undefined) {
                 dirfdTable.set(oldKey, { path: cur.path, cloexec: newCloexec });
+              } else if (newCloexec) {
+                // Codex follow-up (high, 2026-05-19, bug #2): cur is
+                // undefined so we have no tracked entry to flip, but
+                // the kernel may have set FD_CLOEXEC on a real
+                // inherited fd whose mapping the parent's pending
+                // clone(CLONE_FILES) will later copy into us.  Record
+                // a 'cloexec' tombstone so the delayed-clone
+                // reconciliation flips the COPIED entry post-copy and
+                // any subsequent execveCloexec sweep drops it.  Only
+                // record when actually SETTING CLOEXEC; CLEARING
+                // CLOEXEC on an untracked fd is deferred (residual
+                // gap; rare in practice and would require an inverse
+                // tombstone type).
+                recordFdTombstone(pid, fd, { kind: 'cloexec' });
               }
-              // If cur is undefined we don't have a tracked path for
-              // this fd — nothing to flip.  No state to corrupt.
             } else {
               // Unrecognised SETFD arg — fail closed: mark fd-group
               // unknown so subsequent openat(<fd>, ...) returns null.
@@ -2671,10 +2875,22 @@ export async function runInstallPhase(
           // pre-detach state with an execve-CLOEXEC replay action so
           // the reconciler can copy parent state into child, then
           // replay the sweep on the child's private group.
+          // Codex follow-up (high, 2026-05-19, bug #1): APPEND the
+          // execveCloexec action to any existing pending marker rather
+          // than overwriting.  Failure mode pre-fix: child
+          // close_range(UNSHARE) [pending action 1] → child execve
+          // [pending action 2].  The Map.set call overwrote the
+          // close_range action; reconciliation then replayed only the
+          // CLOEXEC sweep and the close_range-closed fds came back to
+          // life.
           const execFdSingleton = isFdSingleton(rawEvent.pid);
-          const execFdSnap = execFdSingleton
-            ? snapshotFd(rawEvent.pid, { kind: 'execveCloexec' })
-            : null;
+          let execFdSnap: FdSnapshot | null = null;
+          if (execFdSingleton) {
+            execFdSnap = appendFdAction(rawEvent.pid, { kind: 'execveCloexec' });
+            if (execFdSnap === null) {
+              execFdSnap = snapshotFd(rawEvent.pid, { kind: 'execveCloexec' });
+            }
+          }
           detachFdGroup(rawEvent.pid);
           // Audit-trust Finding (high, 2026-05-19, codex follow-up): on a
           // successful execve the kernel auto-closes every fd whose

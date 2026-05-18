@@ -25909,6 +25909,27 @@ async function runInstallPhase(input) {
   const fdParent = /* @__PURE__ */ new Map();
   const pendingCwdDetach = /* @__PURE__ */ new Map();
   const pendingFdDetach = /* @__PURE__ */ new Map();
+  const pendingFdTombstones = /* @__PURE__ */ new Map();
+  function recordFdTombstone(pid, fd, tomb) {
+    if (!isFdSingleton(pid)) return;
+    const existingSnap = pendingFdDetach.get(pid);
+    if (existingSnap !== void 0) {
+      existingSnap.tombstones.set(fd, tomb);
+      return;
+    }
+    let bucket = pendingFdTombstones.get(pid);
+    if (bucket === void 0) {
+      bucket = /* @__PURE__ */ new Map();
+      pendingFdTombstones.set(pid, bucket);
+    }
+    bucket.set(fd, tomb);
+  }
+  function absorbPendingTombstones(pid, snap) {
+    const bucket = pendingFdTombstones.get(pid);
+    if (bucket === void 0) return;
+    for (const [fd, tomb] of bucket) snap.tombstones.set(fd, tomb);
+    pendingFdTombstones.delete(pid);
+  }
   function snapshotCwd(pid) {
     return { cwd: cwdGet(pid), unknown: cwdUnknownHas(pid) };
   }
@@ -25921,7 +25942,21 @@ async function runInstallPhase(input) {
         entries.push([key.slice(prefix.length), val]);
       }
     }
-    return { entries, unknown: dirfdStateUnknown.has(root), action };
+    const snap = {
+      entries,
+      unknown: dirfdStateUnknown.has(root),
+      actions: [action],
+      tombstones: /* @__PURE__ */ new Map()
+    };
+    absorbPendingTombstones(pid, snap);
+    return snap;
+  }
+  function appendFdAction(pid, action) {
+    const snap = pendingFdDetach.get(pid);
+    if (snap === void 0) return null;
+    snap.actions.push(action);
+    absorbPendingTombstones(pid, snap);
+    return snap;
   }
   function isFdSingleton(pid) {
     const root = rootedFd(pid);
@@ -26267,6 +26302,7 @@ async function runInstallPhase(input) {
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
+            pendingFdTombstones.delete(childPid);
             const childHadPendingCwdDetach = childCwdSnap !== void 0;
             const childHadPendingFdDetach = childFdSnap !== void 0;
             if (cloneFs && !childHadPendingCwdDetach) {
@@ -26365,30 +26401,48 @@ async function runInstallPhase(input) {
                   fdUnknownAdd(childPid);
                 }
                 if (childFdSnap !== void 0 && childHadPendingFdDetach) {
-                  const action = childFdSnap.action;
                   const childGroupPrefix = `${rootedFd(childPid)}:`;
-                  if (action.kind === "closeRange") {
-                    for (const k of [...dirfdTable.keys()]) {
-                      if (!k.startsWith(childGroupPrefix)) continue;
-                      const fdStr = k.slice(childGroupPrefix.length);
-                      const fdNum = parseInt(fdStr, 10);
-                      if (Number.isFinite(fdNum) && fdNum >= action.first && fdNum <= action.last) {
-                        if (action.cloexec) {
-                          const cur = dirfdTable.get(k);
-                          if (cur !== void 0) {
-                            dirfdTable.set(k, { path: cur.path, cloexec: true });
-                          }
-                        } else {
-                          dirfdTable.delete(k);
-                        }
+                  for (const [fd, tomb] of childFdSnap.tombstones) {
+                    const childKey = `${childGroupPrefix}${fd}`;
+                    const parentKey = `${parentPrefix}${fd}`;
+                    if (tomb.kind === "close") {
+                      dirfdTable.delete(childKey);
+                      if (fdPendingDetachShared) {
+                        dirfdTable.delete(parentKey);
+                        fdUnknownAdd(pid);
+                        fdUnknownAdd(childPid);
+                      }
+                    } else if (tomb.kind === "cloexec") {
+                      const cur = dirfdTable.get(childKey);
+                      if (cur !== void 0) {
+                        dirfdTable.set(childKey, { path: cur.path, cloexec: true });
                       }
                     }
-                  } else if (action.kind === "execveCloexec") {
-                    for (const k of [...dirfdTable.keys()]) {
-                      if (!k.startsWith(childGroupPrefix)) continue;
-                      const entry = dirfdTable.get(k);
-                      if (entry !== void 0 && entry.cloexec) {
-                        dirfdTable.delete(k);
+                  }
+                  for (const action of childFdSnap.actions) {
+                    if (action.kind === "closeRange") {
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(childGroupPrefix)) continue;
+                        const fdStr = k.slice(childGroupPrefix.length);
+                        const fdNum = parseInt(fdStr, 10);
+                        if (Number.isFinite(fdNum) && fdNum >= action.first && fdNum <= action.last) {
+                          if (action.cloexec) {
+                            const cur = dirfdTable.get(k);
+                            if (cur !== void 0) {
+                              dirfdTable.set(k, { path: cur.path, cloexec: true });
+                            }
+                          } else {
+                            dirfdTable.delete(k);
+                          }
+                        }
+                      }
+                    } else if (action.kind === "execveCloexec") {
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(childGroupPrefix)) continue;
+                        const entry = dirfdTable.get(k);
+                        if (entry !== void 0 && entry.cloexec) {
+                          dirfdTable.delete(k);
+                        }
                       }
                     }
                   }
@@ -26439,7 +26493,14 @@ async function runInstallPhase(input) {
       const closeMatch = line.match(/^close\((-?\d+)\)\s*=\s*(-?\d+)\b/);
       if (closeMatch !== null) {
         const fd = parseInt(closeMatch[1] ?? "", 10);
+        const rc = parseInt(closeMatch[2] ?? "", 10);
         if (Number.isFinite(fd)) {
+          if (Number.isFinite(rc) && rc === 0) {
+            const key = fdKey(pid, fd);
+            if (!dirfdTable.has(key)) {
+              recordFdTombstone(pid, fd, { kind: "close" });
+            }
+          }
           dirfdTable.delete(fdKey(pid, fd));
         }
         continue;
@@ -26503,7 +26564,13 @@ async function runInstallPhase(input) {
                 last,
                 cloexec: hasCloexec
               };
-              const fdSnap = fdSingleton ? snapshotFd(pid, action) : null;
+              let fdSnap = null;
+              if (fdSingleton) {
+                fdSnap = appendFdAction(pid, action);
+                if (fdSnap === null) {
+                  fdSnap = snapshotFd(pid, action);
+                }
+              }
               detachFdGroup(pid);
               const groupPrefix = `${rootedFd(pid)}:`;
               for (const key of [...dirfdTable.keys()]) {
@@ -26593,7 +26660,8 @@ async function runInstallPhase(input) {
           const detachCwd = (flagsBits & CLONE_FS) !== 0 || (flagsBits & CLONE_NEWNS) !== 0 || (flagsBits & CLONE_NEWUSER) !== 0;
           const detachFds = (flagsBits & CLONE_FILES) !== 0;
           if (detachFds) {
-            const fdSnap = snapshotFd(pid, { kind: "none" });
+            const existing = appendFdAction(pid, { kind: "none" });
+            const fdSnap = existing ?? snapshotFd(pid, { kind: "none" });
             detachFdGroup(pid);
             pendingFdDetach.set(pid, fdSnap);
           }
@@ -26660,6 +26728,8 @@ async function runInstallPhase(input) {
             if (newCloexec !== null) {
               if (cur !== void 0) {
                 dirfdTable.set(oldKey, { path: cur.path, cloexec: newCloexec });
+              } else if (newCloexec) {
+                recordFdTombstone(pid, fd, { kind: "cloexec" });
               }
             } else {
               fdUnknownAdd(pid);
@@ -26678,7 +26748,13 @@ async function runInstallPhase(input) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           shimLoadedPids.delete(rawEvent.pid);
           const execFdSingleton = isFdSingleton(rawEvent.pid);
-          const execFdSnap = execFdSingleton ? snapshotFd(rawEvent.pid, { kind: "execveCloexec" }) : null;
+          let execFdSnap = null;
+          if (execFdSingleton) {
+            execFdSnap = appendFdAction(rawEvent.pid, { kind: "execveCloexec" });
+            if (execFdSnap === null) {
+              execFdSnap = snapshotFd(rawEvent.pid, { kind: "execveCloexec" });
+            }
+          }
           detachFdGroup(rawEvent.pid);
           const execRoot = rootedFd(rawEvent.pid);
           const execPrefix = `${execRoot}:`;
