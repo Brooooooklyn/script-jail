@@ -416,8 +416,27 @@ export async function* runStraceTailer(
   // closed.  Without this gate, a `rm /tmp/script-jail-events.jsonl`
   // followed by `envp_alloc_failed` would erase the `audit_bypass` signal
   // and let the action's check mode return clean.
+  //
+  // Append-then-truncate defence (Finding A): a polling tailer with a 50ms
+  // window can MISS an intermediate `append → grow → truncate-back` cycle
+  // entirely, because the next poll observes `size === eventsPos` again and
+  // the new bytes are gone.  Two cross-checks plug the hole:
+  //   1. `lastMtime` — kernel updates st_mtim on EVERY write; truncate(2)
+  //      counts as a write.  If poll N sees mtime > lastMtime but the file
+  //      is the same size as at the previous read position, bytes were
+  //      written and then discarded between polls.
+  //   2. `maxSeenSize` — monotonically tracks the largest size ever observed
+  //      across polls.  A poll that observes `size < maxSeenSize` (even when
+  //      `size >= eventsPos`) means the file was truncated.  This catches
+  //      the case where a poll happens to land between an append and the
+  //      truncation that follows.
+  // We also wire `fs.watch` (inotify on Linux) on the events file inode so
+  // truncate(2) / open(O_TRUNC) generate `change` events the polling loop
+  // would otherwise have to race to observe.
   let eventsPos = 0;
   let eventsBuf = '';
+  let lastMtime: bigint = -1n; // -1n until first successful stat
+  let maxSeenSize = 0;
   function recordTamper(reason: string): void {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -464,6 +483,34 @@ export async function* runStraceTailer(
       recordTamper(`events file shrank (size=${sizeNum} < eventsPos=${eventsPos}): ${path}`);
       return;
     }
+    // Max-size monotonicity: even when `size >= eventsPos`, a regression
+    // below `maxSeenSize` means an earlier poll (or fs.watch fire) saw a
+    // larger size that has since been truncated away.  Without this gate,
+    // append-then-truncate-to-same-pos cycles would pass undetected because
+    // the polling loop can lose the intermediate growth between ticks.
+    if (sizeNum < maxSeenSize) {
+      recordTamper(
+        `events file shrank below max-seen (size=${sizeNum} < maxSeenSize=${maxSeenSize}): ${path}`,
+      );
+      return;
+    }
+    if (sizeNum > maxSeenSize) maxSeenSize = sizeNum;
+
+    // mtime monotonicity: every write — append OR truncate — bumps st_mtim.
+    // If mtime has advanced since the previous successful stat but the size
+    // is still at `eventsPos` (i.e. no new bytes for us to consume), bytes
+    // were written and then discarded between our polls.  That's the
+    // append-then-truncate canary: the new mtime is the only durable trace
+    // of the writes the attacker tried to erase.
+    const mtimeBig = (stat as unknown as { mtimeNs: bigint }).mtimeNs;
+    if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
+      recordTamper(
+        `events file mtime advanced without new bytes (mtimeNs=${mtimeBig} > last=${lastMtime}, size=${sizeNum} == eventsPos): ${path}`,
+      );
+      return;
+    }
+    lastMtime = mtimeBig;
+
     if (sizeNum <= eventsPos) return;
 
     const toRead = sizeNum - eventsPos;
@@ -550,6 +597,32 @@ export async function* runStraceTailer(
     // fs.watch not available on this fs — polling only
   }
 
+  // Inotify-backed watch on the events file inode itself (Finding A).  On
+  // Linux `fs.watch` translates to inotify, which fires on EVERY write
+  // including truncate(2) and open(O_TRUNC).  Triggering an immediate drain
+  // on each fire collapses the polling-window race during which an
+  // append-then-truncate cycle could otherwise erase evidence between two
+  // 50ms ticks — the post-drain `mtime` and `maxSeenSize` checks then
+  // observe the now-discarded growth and flag tamper.
+  let eventsWatcher: ReturnType<typeof fsWatch> | null = null;
+  if (opts.eventsFilePath !== undefined && opts.eventsFilePath !== '') {
+    try {
+      eventsWatcher = fsWatch(opts.eventsFilePath, { persistent: false }, () => {
+        drainEventsFile();
+        wake();
+      });
+      // Inotify reports IN_DELETE_SELF / IN_MOVE_SELF as a watcher 'rename'
+      // event followed by EPERM on subsequent reads on some kernels.  The
+      // drainEventsFile() polling fallback (above) will catch those via
+      // stat() returning ENOENT or the inode-mismatch check, so a watcher
+      // error here is non-fatal — just drop the watch.
+      eventsWatcher.on('error', () => { /* polling is the fallback */ });
+    } catch {
+      // fs.watch unavailable on this fs (e.g. tmpfs in some test setups) —
+      // mtime + max-size monotonicity in drainEventsFile() remains active.
+    }
+  }
+
   // Poll on a fixed interval as fallback / complement to fs.watch.
   let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
     pollDir();
@@ -584,6 +657,7 @@ export async function* runStraceTailer(
       if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
       // Stop fs.watch.
       if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+      if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
       done = true;
       wake();
     }, drainMs);
@@ -611,6 +685,7 @@ export async function* runStraceTailer(
     // Cleanup on early consumer break (try/finally).
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
     if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+    if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
     // Drain any remaining partial lines (best-effort).
     for (const [name, partial] of fileBuf) {
       if (partial.length > 0) {

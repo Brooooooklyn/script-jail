@@ -1361,6 +1361,79 @@ describe('runStraceTailer', () => {
     expect(tamperRef.reason).not.toBeNull();
     expect(tamperRef.reason).toMatch(/shrank|inode mismatch/);
   });
+
+  // Finding A: append-then-truncate-to-same-size cycle.
+  //
+  // An attacker who knows the polling interval can race the tailer:
+  //   1. Read the file's current size (== eventsPos after the last drain).
+  //   2. Append a sensitive event line, growing the file.
+  //   3. Truncate the file back to the size from step 1, BEFORE the next
+  //      poll observes the growth.
+  // A naive size-shrink check (`size < eventsPos`) misses this because the
+  // size has been restored.  The fix uses mtime monotonicity (every write,
+  // including truncate, advances mtime) plus max-seen-size monotonicity
+  // (any poll that observes a smaller size than a prior poll is tamper)
+  // plus an inotify watch on the file inode that triggers an immediate
+  // drain on every kernel-reported modification.
+  it('records a tamper reason on an append-then-truncate-to-same-size cycle', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, truncateSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    // Pre-populate with one line so eventsPos advances on first drain.
+    const firstLine = '{"kind":"env_read","name":"FIRST","pid":1,"ts":0,"hidden":false}\n';
+    writeSyncFn(eventsPath, firstLine, { encoding: 'utf8', flag: 'a' });
+    const baselineSize = Buffer.byteLength(firstLine, 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      // Slightly longer poll interval — we want there to be a real polling
+      // window even on a slow CI runner.  The mtime + maxSeenSize checks
+      // still fire even when the polling races losing the intermediate
+      // growth observation.
+      pollIntervalMs: 30,
+      drainMs: 80,
+    });
+
+    // After eventsPos advances past the first line, append a "sensitive"
+    // line and immediately truncate back to baselineSize.  Sleep briefly
+    // between operations so the kernel definitely bumps mtime.
+    setTimeout(() => {
+      writeSyncFn(
+        eventsPath,
+        '{"kind":"audit_bypass","name":"NPM_TOKEN","pid":99,"ts":1,"hidden":false}\n',
+        { encoding: 'utf8', flag: 'a' },
+      );
+      // Tight loop, then truncate — replicates the racing-attacker scenario.
+      setTimeout(() => {
+        truncateSync(eventsPath, baselineSize);
+        setTimeout(resolveExit, 200);
+      }, 5);
+    }, 120);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    // Either signal is acceptable: a poll caught the intermediate grow (→
+    // max-seen mismatch), or it landed on the post-truncate state (→ mtime
+    // advanced without new bytes), or the inotify watch forced a drain that
+    // observed the larger size.
+    expect(tamperRef.reason).toMatch(
+      /shrank below max-seen|mtime advanced without new bytes|shrank/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
