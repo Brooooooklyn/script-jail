@@ -570,27 +570,9 @@ unsafe fn free_entry(entry: *mut c_char) {
     set_in_shim(false);
 }
 
-/// Replace ptrs[idx] with new_entry and push new_entry onto owned[].
-/// Caller must have malloc'd new_entry already (via make_entry).
-/// Returns false if the owned tracker is full — in that case the slot is
-/// NOT updated and the caller is responsible for freeing new_entry, because
-/// otherwise free_envbuf would never reach the leaked entry on exec failure.
-unsafe fn envbuf_set_at(buf: &mut EnvBuf, idx: usize, new_entry: *mut c_char) -> bool {
-    // Owned-tracker capacity is sized as MAX_ENVP_GROWTH + 1, generous against
-    // the at-most-MAX_ENVP_GROWTH writes per envbuf. Bail loudly rather than
-    // silently leaking on overflow.
-    if buf.owned_count >= buf.owned_cap {
-        return false;
-    }
-    *buf.ptrs.add(idx) = new_entry as *const c_char;
-    *buf.owned.add(buf.owned_count) = new_entry;
-    buf.owned_count += 1;
-    true
-}
-
 /// Append a new entry to buf.ptrs[], bump count, re-NUL-terminate, push onto owned[].
 /// Returns false if either the ptrs cap or the owned tracker would be exceeded.
-/// On false return the caller is responsible for freeing new_entry — see envbuf_set_at.
+/// On false return the caller is responsible for freeing new_entry.
 unsafe fn envbuf_push(buf: &mut EnvBuf, new_entry: *mut c_char) -> bool {
     // Need count + 1 entries + 1 NUL terminator <= cap.
     if buf.count + 1 >= buf.cap {
@@ -607,60 +589,72 @@ unsafe fn envbuf_push(buf: &mut EnvBuf, new_entry: *mut c_char) -> bool {
     true
 }
 
-/// Remove the entry whose `NAME=` prefix matches `name` from buf.  Returns
-/// true if an entry was found and removed.  If the entry was owned (i.e.
-/// previously inserted via envbuf_set_at / envbuf_push), it is freed and
-/// removed from the owned tracker.  The ptrs[] slot is shifted down to
-/// preserve density and the new tail slot is re-NUL-terminated.
+/// Remove EVERY entry whose `NAME=` prefix matches `name` from buf.  Returns
+/// true if at least one entry was found and removed.  If a removed entry
+/// was owned (i.e. previously inserted via envbuf_set_at / envbuf_push), it
+/// is freed and removed from the owned tracker.  The ptrs[] slots are
+/// shifted down to preserve density and the new tail slot is re-NUL-terminated.
 ///
-/// SECURITY: this exists so the sticky-var re-injection loop can delete a
-/// caller-supplied entry when the canonical buffer is empty.  Without it, a
-/// malicious envp_in entry (e.g. `SCRIPT_JAIL_LOG_FILE=/tmp/evil`) would
-/// survive into the child whenever the parent did not snapshot that var at
-/// shim_init time.
+/// SECURITY: must be exhaustive over duplicates.  A naive raw envp produced
+/// by an attacker can contain multiple `SCRIPT_JAIL_LOG_FILE=…` entries; if
+/// only the first match were removed, the second (attacker-controlled) value
+/// would survive into the child and the audit log would be redirected.  The
+/// sticky-var re-injection loop relies on this being exhaustive so that
+/// `overwrite_env` (which itself rebuilds via remove-all + push) lands the
+/// canonical value in exactly one slot.
 ///
 /// Recursion-guard contract: callers MUST hold set_in_shim(true) only for
 /// the libc::free call, which this helper wraps internally — matching the
 /// pattern used by free_entry / free_envbuf.
 unsafe fn envbuf_remove(buf: &mut EnvBuf, name: &[u8]) -> bool {
-    let idx = match envbuf_find(buf, name) {
-        Some(i) => i,
-        None => return false,
-    };
+    let mut removed_any = false;
+    // Re-scan from index 0 on every iteration: removing an entry shifts the
+    // tail down, so a fresh scan is the simplest correct way to find the
+    // next duplicate without book-keeping the prior position.  envp arrays
+    // are short (bounded by MAX_ENVP_GROWTH + the caller's envp_in size),
+    // so the O(n^2) worst case here is negligible.
+    loop {
+        let idx = match envbuf_find(buf, name) {
+            Some(i) => i,
+            None => break,
+        };
 
-    let entry = *buf.ptrs.add(idx);
+        let entry = *buf.ptrs.add(idx);
 
-    // If this entry was owned (we malloc'd it earlier in this same envbuf),
-    // free it and compact the owned tracker.  Compare by raw pointer
-    // equality — that is the same identity the owned table records.
-    if !entry.is_null() {
-        for j in 0..buf.owned_count {
-            let owned_ptr = *buf.owned.add(j) as *const c_char;
-            if owned_ptr == entry {
-                // Free the entry under the recursion guard, then shift the
-                // remaining owned entries down one slot.
-                set_in_shim(true);
-                libc::free(*buf.owned.add(j) as *mut c_void);
-                set_in_shim(false);
-                for k in j..buf.owned_count - 1 {
-                    *buf.owned.add(k) = *buf.owned.add(k + 1);
+        // If this entry was owned (we malloc'd it earlier in this same
+        // envbuf, e.g. via envbuf_push), free it and compact the owned
+        // tracker.  Compare by raw pointer equality — that is the same
+        // identity the owned table records.
+        if !entry.is_null() {
+            for j in 0..buf.owned_count {
+                let owned_ptr = *buf.owned.add(j) as *const c_char;
+                if owned_ptr == entry {
+                    // Free the entry under the recursion guard, then shift the
+                    // remaining owned entries down one slot.
+                    set_in_shim(true);
+                    libc::free(*buf.owned.add(j) as *mut c_void);
+                    set_in_shim(false);
+                    for k in j..buf.owned_count - 1 {
+                        *buf.owned.add(k) = *buf.owned.add(k + 1);
+                    }
+                    buf.owned_count -= 1;
+                    // NULL the now-stale tail so any subsequent free_envbuf
+                    // walk does not double-free.
+                    *buf.owned.add(buf.owned_count) = ptr::null_mut();
+                    break;
                 }
-                buf.owned_count -= 1;
-                // NULL the now-stale tail so any subsequent free_envbuf
-                // walk does not double-free.
-                *buf.owned.add(buf.owned_count) = ptr::null_mut();
-                break;
             }
         }
-    }
 
-    // Shift ptrs[idx+1..count] down by one slot, then re-NUL-terminate.
-    for k in idx..buf.count - 1 {
-        *buf.ptrs.add(k) = *buf.ptrs.add(k + 1);
+        // Shift ptrs[idx+1..count] down by one slot, then re-NUL-terminate.
+        for k in idx..buf.count - 1 {
+            *buf.ptrs.add(k) = *buf.ptrs.add(k + 1);
+        }
+        buf.count -= 1;
+        *buf.ptrs.add(buf.count) = ptr::null();
+        removed_any = true;
     }
-    buf.count -= 1;
-    *buf.ptrs.add(buf.count) = ptr::null();
-    true
+    removed_any
 }
 
 /// Malloc a new `NAME=VALUE\0` C string.  Returns NULL on malloc failure.
@@ -831,7 +825,17 @@ unsafe fn append_path_env(
             }
             *raw_buf.add(off) = 0u8;
 
-            if !envbuf_set_at(buf, idx, raw_buf as *mut c_char) {
+            // SECURITY: same duplicate-survival concern as overwrite_env —
+            // if envp_in contains two `LD_PRELOAD=`/`NODE_OPTIONS=` entries
+            // (raw envp under attacker control), envbuf_find returned only
+            // the first, and updating that slot leaves the second copy live
+            // for ld.so / Node to honor.  Remove EVERY existing entry for
+            // `name` first, then push the freshly-built one so the result
+            // is unambiguously the single authoritative value.  We've
+            // already pre-computed raw_buf from the original existing value
+            // captured before the remove.
+            let _ = envbuf_remove(buf, name);
+            if !envbuf_push(buf, raw_buf as *mut c_char) {
                 free_entry(raw_buf as *mut c_char);
                 return false;
             }
@@ -840,38 +844,38 @@ unsafe fn append_path_env(
     }
 }
 
-/// Overwrite `name` in buf with the canonical `value`.
+/// Overwrite `name` in buf with the canonical `value`, leaving exactly one
+/// `name=value` entry behind.
 ///
-/// - If `name` is present: replace the entry at the existing slot with a
-///   freshly-malloc'd `name=value` string (the previous entry pointer was
-///   either from the caller's envp_in or from a prior owned alloc — in
-///   either case we just swap the slot pointer, and the new alloc joins
-///   the owned tracker so free_envbuf reclaims it).
-/// - If `name` is absent: push a new entry.
+/// SECURITY: a raw envp produced by an attacker can contain multiple
+/// `NAME=…` entries.  Replacing only the first match (envbuf_find returns
+/// the first index) would leave any subsequent attacker-controlled
+/// duplicates intact, and execve/posix_spawn pass the whole array through —
+/// the child sees the duplicate and (depending on libc) may resolve to
+/// either value.  To make the canonical value authoritative we first remove
+/// EVERY existing entry for `name`, then push the freshly-malloc'd
+/// `name=value`.  The exhaustive removal lives in envbuf_remove.
 ///
 /// Unlike ensure_env (which preserved the caller's value), this enforces
 /// that the audit chain's runtime config (SCRIPT_JAIL_LOG_FILE, log fd,
 /// preload path, etc.) cannot be redirected by a malicious envp_in.
 ///
-/// Returns false only on malloc failure.
+/// Returns false only on malloc/push failure (the in-place rewrite is
+/// best-effort: if push fails after the removals succeed, the buffer has
+/// no entry for `name` at all, which is still safer than leaving an
+/// attacker-supplied duplicate live).
 unsafe fn overwrite_env(buf: &mut EnvBuf, name: &[u8], value: &[u8]) -> bool {
     let entry = make_entry(name, value);
     if entry.is_null() {
         return false;
     }
-    match envbuf_find(buf, name) {
-        Some(idx) => {
-            if !envbuf_set_at(buf, idx, entry) {
-                free_entry(entry);
-                return false;
-            }
-        }
-        None => {
-            if !envbuf_push(buf, entry) {
-                free_entry(entry);
-                return false;
-            }
-        }
+    // Remove all existing matches so we cannot leak a duplicate.  Discard
+    // the return value: zero existing entries is fine — we're about to
+    // push the canonical one.
+    let _ = envbuf_remove(buf, name);
+    if !envbuf_push(buf, entry) {
+        free_entry(entry);
+        return false;
     }
     true
 }

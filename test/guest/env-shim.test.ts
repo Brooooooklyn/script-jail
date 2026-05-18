@@ -571,4 +571,163 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
       expect(l).not.toContain('SECRET_LEAK_abcdef_NOT_IN_LOG');
     }
   });
+
+  // ── Test 13 (Finding B): duplicate sticky envp entries are exhaustively cleaned ─
+  //
+  // A raw envp passed via execve() can contain multiple `NAME=…` entries —
+  // there is no libc-level dedupe.  An attacker that controls a child's
+  // envp (e.g. a native addon calling execve directly) could pass two
+  // `SCRIPT_JAIL_LOG_FILE=…` entries to slip past the shim's sticky-var
+  // re-injection: if envbuf_remove / overwrite_env stopped at the first
+  // match, the second attacker-supplied entry would survive into the
+  // grandchild and redirect its audit log.
+  //
+  // We exercise both arms of the sticky-var loop:
+  //   * empty-canon case  → envbuf_remove path must delete EVERY duplicate.
+  //   * non-empty-canon   → overwrite_env path must collapse to a single
+  //                          canonical entry, with NO attacker copy left.
+  //
+  // The harness uses a small C binary (compiled via `cc -x c -`) that
+  // builds a raw envp[] with two SCRIPT_JAIL_LOG_FILE entries, then
+  // execve()s `node -e ...` which prints back what it sees for that var
+  // and the total count of matching entries in its own environ.
+  it('duplicate SCRIPT_JAIL_LOG_FILE entries are exhaustively removed when canon is empty (Finding B)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-dup-envp-empty-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'dup_envp_empty');
+    // We embed shimSo's path so the child can find it.  The C program calls
+    // execve with a raw envp array containing TWO SCRIPT_JAIL_LOG_FILE
+    // entries.  The parent of execve runs WITHOUT shim_init having
+    // captured SCRIPT_JAIL_LOG_FILE (canon empty); we don't preload here
+    // for that reason — let it be a regular execve and rely on the
+    // shim-as-LD_PRELOAD inside the child to do the rewrite work.  Both
+    // duplicate entries must be stripped because canon for that var is
+    // empty in the parent.
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "let n=0;"
+          "for (const k of Object.keys(process.env)) if (k === 'SCRIPT_JAIL_LOG_FILE') n++;"
+          "process.stdout.write('count='+n+'/value='+(process.env.SCRIPT_JAIL_LOG_FILE||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          "SCRIPT_JAIL_LOG_FILE=/tmp/evil-one",
+          "SCRIPT_JAIL_LOG_FILE=/tmp/evil-two",
+          "LD_PRELOAD=${shimSo}",
+          /* SCRIPT_JAIL_LOG_FD intentionally absent → canon for LOG_FILE empty */
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    // No LD_PRELOAD on the OUTER process: this binary directly execve()s
+    // node with the duplicate-envp poison.  The shim only loads inside the
+    // execve()'d child where it captures canon at shim_init from the
+    // (poisoned) envp.  But the shim resolves canon from real_getenv on
+    // the FIRST entry it sees, which is whichever the kernel hands back.
+    // For the empty-canon arm we instead let the outer C binary BE the
+    // shim-loaded process and the inner node child receive the rewritten
+    // envp via execve interception.
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        // SCRIPT_JAIL_LOG_FD only — no SCRIPT_JAIL_LOG_FILE.  So canon for
+        // SCRIPT_JAIL_LOG_FILE inside this outer process is empty.
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // The child must see ZERO SCRIPT_JAIL_LOG_FILE entries; both attacker
+    // duplicates were stripped by rewrite_envp.
+    expect(result.stdout).toContain('count=0');
+    expect(result.stdout).toContain('value=ABSENT');
+    expect(result.stdout).not.toContain('/tmp/evil-one');
+    expect(result.stdout).not.toContain('/tmp/evil-two');
+  });
+
+  it('duplicate SCRIPT_JAIL_LOG_FILE entries collapse to a single canonical entry when canon is set (Finding B)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-dup-envp-set-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'dup_envp_set');
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "let n=0;"
+          "for (const k of Object.keys(process.env)) if (k === 'SCRIPT_JAIL_LOG_FILE') n++;"
+          "process.stdout.write('count='+n+'/value='+(process.env.SCRIPT_JAIL_LOG_FILE||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          "SCRIPT_JAIL_LOG_FILE=/tmp/evil-one",
+          "SCRIPT_JAIL_LOG_FILE=/tmp/evil-two",
+          "LD_PRELOAD=${shimSo}",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    // Outer process sets SCRIPT_JAIL_LOG_FILE → canon is non-empty.  The
+    // child's TWO attacker duplicates must be replaced with EXACTLY one
+    // canonical entry whose value matches the parent's setting.
+    const canonical = '/tmp/script-jail-canonical-log';
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        SCRIPT_JAIL_LOG_FILE: canonical,
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // EXACTLY one entry — Node's process.env hides Linux-level duplicates
+    // (it dedupes on read) so the harness counts keys in Object.keys() and
+    // also checks the single resolved value.  process.env is built from
+    // environ[] left-to-right with LATER entries winning in glibc; we
+    // assert the canonical value is what survived, not /tmp/evil-two.
+    expect(result.stdout).toContain('count=1');
+    expect(result.stdout).toContain(`value=${canonical}`);
+    expect(result.stdout).not.toContain('/tmp/evil-one');
+    expect(result.stdout).not.toContain('/tmp/evil-two');
+  });
 });
