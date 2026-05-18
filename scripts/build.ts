@@ -28,7 +28,7 @@
 
 import { execSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -143,6 +143,71 @@ function buildActionBundle(): void {
 // Step 2 — Build Rust shim
 // ---------------------------------------------------------------------------
 
+/**
+ * Files whose mtime gates whether `images/libscriptjail.so` is fresh enough
+ * to reuse. Touching any of these makes `buildShim` rebuild from cargo.
+ *
+ * Kept narrow on purpose: these are the inputs cargo actually consumes for
+ * the `script-jail-shim` crate. Adding more (e.g. an entire src/shim tree
+ * glob) would be more thorough but would also force a rebuild on unrelated
+ * edits — `Cargo.toml` already declares the source layout.
+ */
+export function shimSourceInputs(repoRoot: string = REPO_ROOT): ReadonlyArray<string> {
+  return [
+    join(repoRoot, 'src', 'shim', 'Cargo.toml'),
+    join(repoRoot, 'src', 'shim', 'Cargo.lock'),
+    join(repoRoot, 'src', 'shim', 'rust-toolchain.toml'),
+    join(repoRoot, 'src', 'shim', 'src', 'lib.rs'),
+  ];
+}
+
+/**
+ * Pure decision helper for "is the cached `libscriptjail.so` stale?".
+ *
+ * `artifactMtimeMs` is `null` when the artifact doesn't exist (→ rebuild).
+ * `sourceMtimesMs` is the list of mtimes for every shim source input that
+ * exists on disk; empty when none are found (→ rebuild defensively).
+ *
+ * Returns `true` when ANY of:
+ *   - the artifact does not exist;
+ *   - no shim sources can be found (degenerate / broken checkout);
+ *   - any source is newer than the artifact.
+ *
+ * Pure / no IO — separated from `shimArtifactIsStale` to make it
+ * straightforward to unit-test the comparison rules without touching the
+ * filesystem.
+ */
+export function decideShimRebuild(
+  artifactMtimeMs: number | null,
+  sourceMtimesMs: ReadonlyArray<number>,
+): boolean {
+  if (artifactMtimeMs === null) return true;
+  if (sourceMtimesMs.length === 0) return true;
+  const latestSource = Math.max(...sourceMtimesMs);
+  return latestSource > artifactMtimeMs;
+}
+
+/**
+ * Inspect the filesystem and decide whether `libscriptjail.so` needs to be
+ * rebuilt. See `decideShimRebuild` for the rule.
+ *
+ * Missing source files are skipped silently — they cannot have been an input
+ * to whatever produced the artifact, so treating them as "ancient" would be
+ * misleading.
+ */
+export function shimArtifactIsStale(
+  shimOut: string,
+  sources: ReadonlyArray<string> = shimSourceInputs(),
+): boolean {
+  const artifactMtime = existsSync(shimOut) ? statSync(shimOut).mtimeMs : null;
+  const sourceMtimes: number[] = [];
+  for (const path of sources) {
+    if (!existsSync(path)) continue;
+    sourceMtimes.push(statSync(path).mtimeMs);
+  }
+  return decideShimRebuild(artifactMtime, sourceMtimes);
+}
+
 function buildShim(): void {
   if (process.platform === 'darwin') {
     console.warn(
@@ -153,12 +218,31 @@ function buildShim(): void {
   }
 
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
-  if (existsSync(shimOut)) {
-    console.log('[build] images/libscriptjail.so already present, skipping shim build.');
+
+  // Freshness check: only reuse `images/libscriptjail.so` when every shim
+  // input (Cargo.toml/Cargo.lock/rust-toolchain.toml/src/lib.rs) is older
+  // than the artifact. Any source edit forces a rebuild.
+  //
+  // Defence in depth: the rootfs build also runs `validateShimFile` to catch
+  // *malformed* artifacts (wrong arch, truncated header, no PT_DYNAMIC). This
+  // mtime check protects against the *silently-stale* case that validation
+  // cannot detect — a structurally-valid .so produced from out-of-date source.
+  if (!shimArtifactIsStale(shimOut)) {
+    console.log(
+      '[build] images/libscriptjail.so is up-to-date relative to shim sources; ' +
+      'skipping shim build.',
+    );
     return;
   }
 
-  console.log('[build] Building Rust shim via cargo …');
+  if (existsSync(shimOut)) {
+    console.log(
+      '[build] images/libscriptjail.so is older than shim sources; rebuilding via cargo …',
+    );
+  } else {
+    console.log('[build] Building Rust shim via cargo …');
+  }
+
   const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
   execSync(
     `cargo build --release --manifest-path "${manifest}"`,
@@ -243,7 +327,16 @@ async function main(): Promise<void> {
   collectSummary(artifacts);
 }
 
-main().catch((err: unknown) => {
-  console.error(String(err instanceof Error ? err.stack ?? err.message : err));
-  process.exit(1);
-});
+// Only run main() when this file is the CLI entry point. Tests import the
+// exported `decideShimRebuild` / `shimArtifactIsStale` helpers; they must NOT
+// trigger a full build at import time.
+const isMain =
+  typeof process.argv[1] === 'string' &&
+  resolve(process.argv[1]) === __filename;
+
+if (isMain) {
+  main().catch((err: unknown) => {
+    console.error(String(err instanceof Error ? err.stack ?? err.message : err));
+    process.exit(1);
+  });
+}
