@@ -1233,6 +1233,7 @@ describe('runInstallPhase', () => {
           argv0: 'curl',
           envp_alloc_failed: false,
           syscall_bypass: true,
+          events_file_forgery: false,
           result: 'ok',
           pid: 1,
           ts: 0,
@@ -1672,6 +1673,192 @@ describe('runInstallPhase', () => {
         return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
       });
       expect(synths).toHaveLength(0);
+    });
+  });
+
+  // Audit-trust Finding A (high, 2026-05-18) — events-file write forgery
+  // detection.  A lifecycle script that issues a raw-syscall exec with
+  // a scrubbed envp will not have ld.so map `/lib/libscriptjail.so`
+  // into the child process; so the child is NOT in the trusted writer
+  // set and any openat-write of `SCRIPT_JAIL_LOG_FILE` from that pid
+  // is forgery.  We surface the attempt as `<EVENTS_FILE_FORGERY>`
+  // under audit_bypass so findAuditBypass hard-fails the lockfile.
+  describe('Finding A — events-file write forgery detection', () => {
+    const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
+    const SHIM_PATH = '/lib/libscriptjail.so';
+
+    it('non-shim-loaded pid opens events file for write → 1 forgery entry', async () => {
+      const proc = mockProcReader({
+        501: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'forge-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // Pid 501 never opens libscriptjail.so (raw-syscall exec
+      // bypassed ld.so), then attempts to openat the events file for
+      // write to inject a forged JSONL line.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 501,
+          line: `openat(AT_FDCWD, "${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+      });
+      expect(synths).toHaveLength(1);
+      const raw = synths[0]!['raw'] as Record<string, unknown>;
+      expect(raw['prog']).toBe(EVENTS_FILE);
+      expect(synths[0]!['pkg']).toBe('forge-pkg@1.0.0');
+    });
+
+    it('shim-loaded pid opens events file for write → 0 forgery entries (legitimate)', async () => {
+      const proc = mockProcReader({
+        502: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'shim-loaded-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // Pid 502 first opens libscriptjail.so (ld.so does this on
+      // every LD_PRELOAD-honoured process startup), then the shim's
+      // shim_init opens the events file for write.  This is the
+      // legitimate flow — no forgery entry.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 502,
+          line: `openat(AT_FDCWD, "${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+          source: 'strace',
+        },
+        {
+          pid: 502,
+          line: `openat(AT_FDCWD, "${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+      });
+      expect(synths).toHaveLength(0);
+    });
+
+    it('forgery + raw-syscall exec on same pid → both audit_bypass entries', async () => {
+      const proc = mockProcReader({
+        503: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'combined-attack-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // Pid 503 issued a raw `syscall(SYS_execve, …)` with scrubbed
+      // envp (ld.so never loaded the shim) AND attempted to forge a
+      // shim event by writing to the events file.  Both signals must
+      // surface so findAuditBypass hard-fails.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 503,
+          line: `openat(AT_FDCWD, "${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+          source: 'strace',
+        },
+        {
+          pid: 503,
+          line: 'execve("/usr/bin/curl", ["curl", "evil"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const forgeries = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+      });
+      const syscallBypasses = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(forgeries).toHaveLength(1);
+      expect(syscallBypasses).toHaveLength(1);
+    });
+
+    it('events_file_forgery renders to <EVENTS_FILE_FORGERY> in audit_bypass via normalize', async () => {
+      const ev: AttributedEvent = {
+        raw: {
+          kind: 'exec',
+          prog: EVENTS_FILE,
+          argv0: EVENTS_FILE,
+          envp_alloc_failed: false,
+          syscall_bypass: false,
+          events_file_forgery: true,
+          result: 'ok',
+          pid: 1,
+          ts: 0,
+        },
+        pkg: 'forge-pkg@1.0.0',
+        lifecycle: 'postinstall',
+      };
+      const ctx: NormalizeContext = {
+        roots: {
+          repo: '/work',
+          nodeModules: '/work/node_modules',
+          home: '/root',
+          tmp: '/tmp',
+          cache: '/cache',
+        },
+        pkgDirs: new Map([['forge-pkg@1.0.0', '/work/node_modules/forge-pkg']]),
+      };
+      const out = normalize([ev], ctx);
+      const block = out.get('forge-pkg@1.0.0')!.lifecycle.postinstall!;
+      expect(block.audit_bypass.some((e) => e.startsWith('<EVENTS_FILE_FORGERY>'))).toBe(true);
     });
   });
 

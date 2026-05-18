@@ -106,6 +106,17 @@ export const ExecEvent = z.object({
   // Default false for shim-sourced events.  Only set true by the
   // synthesized cross-check pass in runInstallPhase (Finding 1).
   syscall_bypass: z.boolean().default(false),
+  // Default false for shim-sourced events.  Only set true by the
+  // events-file forgery detector in runInstallPhase (Finding A,
+  // 2026-05-18): strace observed a `write`-mode openat of the per-VM
+  // SCRIPT_JAIL_LOG_FILE path from a pid that never loaded
+  // `/lib/libscriptjail.so` (i.e. a lifecycle script that bypassed
+  // LD_PRELOAD via raw-syscall exec + scrubbed envp and is now trying
+  // to forge shim events into the trusted JSONL channel).  Producing a
+  // synthetic exec event with this flag drives normalize.ts to emit
+  // `<EVENTS_FILE_FORGERY>` under `audit_bypass`, which the host-side
+  // `findAuditBypass` scan hard-fails on.
+  events_file_forgery: z.boolean().default(false),
   // Audit-trust Finding (high, 2026-05-18): the shim emits one event
   // BEFORE calling real_execve (with result='ok' — optimistic, since
   // successful execs never return) and a SECOND event with

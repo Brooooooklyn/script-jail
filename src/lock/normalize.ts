@@ -173,6 +173,24 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
             : ident;
           block.audit_bypass.push(`<SYSCALL_EXEC_BYPASS> ${tokenized}`);
         }
+        // Audit-trust Finding A (high, 2026-05-18): a non-shim-loaded pid
+        // opened SCRIPT_JAIL_LOG_FILE in write mode — i.e. a lifecycle
+        // script bypassed LD_PRELOAD via raw-syscall exec + scrubbed envp
+        // and is now writing forged events into the trusted JSONL
+        // channel.  Surface as `<EVENTS_FILE_FORGERY> …` under
+        // `audit_bypass` so the host-side `findAuditBypass` scan in
+        // src/action/diff.ts hard-fails the lockfile diff.  Tokenisation
+        // follows the same rules as `<SYSCALL_EXEC_BYPASS>` (prefer
+        // argv0 for forensic context).
+        if (ev.raw.events_file_forgery) {
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0
+            ? ev.raw.argv0
+            : ev.raw.prog;
+          const tokenized = ident.startsWith('/')
+            ? tokenize(ident, ctx.roots, pkgDir)
+            : ident;
+          block.audit_bypass.push(`<EVENTS_FILE_FORGERY> ${tokenized}`);
+        }
         break;
       }
       case 'env_tamper': {

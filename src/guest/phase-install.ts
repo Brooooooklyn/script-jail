@@ -327,6 +327,58 @@ export async function runInstallPhase(
   const straceExecsByPid = new Map<number, StraceExecSample[]>();
   const shimExecCountByPid = new Map<number, number>();
 
+  // Audit-trust Finding A (high, 2026-05-18): events-file write forgery
+  // detection.  A lifecycle script can read `SCRIPT_JAIL_LOG_FILE` from
+  // /proc/self/environ, open the file in write mode, and append a forged
+  // JSONL line (e.g. a fabricated `{"kind":"exec","result":"ok",…}` to
+  // cancel out the post-loop cross-check against a paired raw `execve`
+  // syscall bypass).  The trusted-channel parser then accepts the line
+  // and the bypass detector goes silent.
+  //
+  // Trust model: the ONLY processes that should write to the events file
+  // are processes that have loaded `/lib/libscriptjail.so` via the dynamic
+  // linker (LD_PRELOAD).  Strace's `openat(AT_FDCWD, "/lib/libscriptjail.so",
+  // O_RDONLY|O_CLOEXEC) = <fd>` line is the kernel-observed signal that
+  // ld.so is mapping the shim into a new process — this is the SAME pid
+  // that, microseconds later, the shim's `shim_init` runs in and opens
+  // the events file for write.  We build the `shimLoadedPids` set from
+  // these openat-read observations (parsed as `RawEvent.kind === 'read'`
+  // with `path === SHIM_LIBRARY_PATH`) and treat any openat-write of the
+  // events file from a pid NOT in the set as forgery.
+  //
+  // Why strace and not the file-sourced JSONL?  An attacker can ALSO
+  // forge a `{"kind":"shim_init",...}` line, so a trust set built from
+  // file-sourced events is also forgeable.  Strace's openat stream comes
+  // from the kernel ptrace channel, not user-space writes, so it cannot
+  // be lied about by a same-UID attacker.  This is defence-in-depth
+  // against the canonical "raw-syscall exec with scrubbed envp" attack:
+  // a child spawned that way never has ld.so map libscriptjail.so, so
+  // it is never added to `shimLoadedPids`, so any forged write attempt
+  // from that pid is caught.
+  //
+  // Caveat: an attacker inside an already-shim-loaded pid CAN still
+  // write to the events file (their pid is trusted), and a same-uid
+  // attacker that read SCRIPT_JAIL_LOG_FILE before any libc-exec ran
+  // could in principle forge from such a pid.  That is a more advanced
+  // attack and out of scope for this fix — the canonical, demonstrated
+  // attack pattern (raw-syscall exec + scrubbed envp + forged JSONL)
+  // is what we are closing.
+  const SHIM_LIBRARY_PATH = '/lib/libscriptjail.so';
+  const eventsFilePathRaw = input.env['SCRIPT_JAIL_LOG_FILE'];
+  const eventsFilePath: string | null =
+    typeof eventsFilePathRaw === 'string' && eventsFilePathRaw.length > 0
+      ? eventsFilePathRaw
+      : null;
+  const shimLoadedPids = new Set<number>();
+  interface ForgerySample {
+    pid: number;
+    ts: number;
+    path: string;
+    pkg: string;
+    lifecycle: AttributedEvent['lifecycle'];
+  }
+  const forgerySamples: ForgerySample[] = [];
+
   // Audit-trust Finding 3 (high, 2026-05-18): a raw `syscall(SYS_execve, …)`
   // bypass with an attacker-controlled `envp` produces a child whose
   // `/proc/<pid>/environ` is missing the npm_package_name /
@@ -485,6 +537,48 @@ export async function runInstallPhase(
       for (const rawEvent of straceEvents) {
         const result = input.attribution.attribute(rawEvent.pid);
 
+        // Audit-trust Finding A (high, 2026-05-18): kernel-observed
+        // openat trust signals — these run BEFORE the attribution gate
+        // (and BEFORE the spawn-bookkeeping below) so we can build the
+        // trusted-pid set even for pids the attacker has scrubbed
+        // /proc/<pid>/environ on (raw-syscall exec with custom envp).
+        //
+        //   (a) An openat of `/lib/libscriptjail.so` proves ld.so is
+        //       mapping the shim into this pid — i.e. LD_PRELOAD was
+        //       honoured and `shim_init` is about to run.  Add the pid
+        //       to the trusted-writer set so its subsequent openat of
+        //       the events file is not flagged as forgery.  We add on
+        //       ANY openat (read or write — ld.so opens RDONLY, but
+        //       robustness against future shim load paths is cheap).
+        //
+        //   (b) An openat-write of the per-VM SCRIPT_JAIL_LOG_FILE path
+        //       from a pid NOT in the trusted set is forgery: only the
+        //       shim itself (via shim_init) should ever write to this
+        //       file path.  We collect a forgery sample per offending
+        //       pid so the post-loop synthesis pass emits one
+        //       `<EVENTS_FILE_FORGERY>` audit_bypass entry per attempt.
+        //       The sample carries the attribution snapshot so the
+        //       entry surfaces under the right package even when the
+        //       attacker has scrubbed the environ.
+        if (rawEvent.kind === 'read' && rawEvent.path === SHIM_LIBRARY_PATH) {
+          shimLoadedPids.add(rawEvent.pid);
+        }
+        if (
+          eventsFilePath !== null &&
+          rawEvent.kind === 'write' &&
+          rawEvent.path === eventsFilePath &&
+          !shimLoadedPids.has(rawEvent.pid)
+        ) {
+          const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+          forgerySamples.push({
+            pid: rawEvent.pid,
+            ts: rawEvent.ts,
+            path: rawEvent.path,
+            pkg: result?.pkg ?? snapshot?.pkg ?? '<unattributed>',
+            lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? 'install',
+          });
+        }
+
         // Audit-trust Finding 3 (high, 2026-05-18): bypass counting
         // runs BEFORE the attribution gate.  Strace observing a
         // successful execve syscall on a pid is proof the kernel ran
@@ -604,6 +698,7 @@ export async function runInstallPhase(
         argv0: sample.argv0.length > 0 ? sample.argv0 : null,
         envp_alloc_failed: false,
         syscall_bypass: true,
+        events_file_forgery: false,
         // The synthesised event represents a strace-observed successful
         // execve syscall; tag it `result:'ok'` so it matches the shape
         // of a real successful exec.  This field isn't consumed by
@@ -619,6 +714,34 @@ export async function runInstallPhase(
         lifecycle: sample.lifecycle,
       });
     }
+  }
+
+  // Audit-trust Finding A (high, 2026-05-18): emit one synthetic exec
+  // event per detected events-file forgery attempt.  The
+  // `events_file_forgery: true` flag drives normalize.ts to surface the
+  // entry as `<EVENTS_FILE_FORGERY> …` under `audit_bypass`, which the
+  // host-side `findAuditBypass` scan in src/action/diff.ts hard-fails
+  // on.  We use the snapshot's pkg / lifecycle so the entry lands in
+  // the right package even when the attacker has scrubbed
+  // /proc/<pid>/environ (the strace-observed openat is proof of the
+  // forgery even when attribution from /proc fails).
+  for (const sample of forgerySamples) {
+    const synthetic: RawEvent = {
+      kind: 'exec',
+      prog: sample.path,
+      argv0: sample.path,
+      envp_alloc_failed: false,
+      syscall_bypass: false,
+      events_file_forgery: true,
+      result: 'ok',
+      pid: sample.pid,
+      ts: sample.ts,
+    };
+    emit({
+      raw: synthetic,
+      pkg: sample.pkg,
+      lifecycle: sample.lifecycle,
+    });
   }
 
   // Exit code is owned by the StraceRunner (it ran the only install process).
