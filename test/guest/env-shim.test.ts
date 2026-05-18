@@ -112,8 +112,27 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     // (skip if absent rather than failing).
     const readelf = spawnSync('readelf', ['-Ws', '--dyn-syms', shimSo], { encoding: 'utf8' });
     if (readelf.status === 0 && !readelf.error) {
-      if (!/\bgetenv\b/.test(readelf.stdout)) {
-        throw new Error('libscriptjail.so does not export getenv as a dynamic symbol — check the `#[no_mangle] pub extern "C"` exports and the Rust cdylib default-hidden-visibility behavior');
+      const requiredSymbols = [
+        'getenv',
+        'secure_getenv',
+        'execve',
+        'execv',
+        'execvp',
+        'execvpe',
+        'execveat',
+        'fexecve',
+        'posix_spawn',
+        'posix_spawnp',
+        'setenv',
+        'unsetenv',
+        'putenv',
+        'clearenv',
+      ];
+      const missing = requiredSymbols.filter((sym) => !new RegExp(`\\b${sym}\\b`).test(readelf.stdout));
+      if (missing.length > 0) {
+        throw new Error(
+          `libscriptjail.so is missing dynamic symbols: ${missing.join(', ')} — check the \`#[no_mangle] pub extern "C"\` exports and the Rust cdylib default-hidden-visibility behavior`,
+        );
       }
     }
     // readelf unavailable: skip the assertion (don't fail)
@@ -124,6 +143,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   interface ShimResult {
     exitCode:  number | null;
     logLines:  string[];  // JSONL lines captured from log fd
+    stdout:    string;    // combined stdout of the spawned process
   }
 
   /**
@@ -178,6 +198,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     return {
       exitCode: result.status,
       logLines,
+      stdout: result.stdout ?? '',
     };
   }
 
@@ -348,5 +369,104 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
     expect(result.status).toBe(0);
     expect(result.stderr).toBe(''); // shim must not write to stderr
+  });
+
+  // ── Test 7: LD_PRELOAD re-injection on cleared envp ───────────────────────
+
+  it('LD_PRELOAD is re-injected when child is spawned with a cleared envp', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    // Outer process has LD_PRELOAD set.  The Node script spawns a child with
+    // env: { PATH } only.  The shim's posix_spawn wrapper should re-inject the
+    // canonical LD_PRELOAD value back into the child's envp so the child also
+    // runs under audit.  We verify two things:
+    //   1. The child's stdout contains the shim path (not "MISSING").
+    //   2. The audit log contains at least one exec event from posix_spawn.
+    const res = runWithShim({
+      cmd: `node -e 'const cp = require("node:child_process");
+                     const r = cp.spawnSync("node",
+                       ["-e", "process.stdout.write(process.env.LD_PRELOAD || \\"MISSING\\")"],
+                       { env: { PATH: process.env.PATH || "/usr/bin:/bin" } });
+                     process.stdout.write(r.stdout.toString());'`,
+      env: {
+        SCRIPT_JAIL_PRELOAD_PATH: shimSo, // canonical preload path the shim re-injects
+      },
+    });
+
+    // The child's stdout should contain the shim path (i.e. not "MISSING").
+    expect(res.stdout).toContain(shimSo);
+
+    // The audit log should also contain at least one exec event from posix_spawn.
+    const execEvents = res.logLines.filter((l) => {
+      try { return (JSON.parse(l) as Record<string, unknown>)['kind'] === 'exec'; }
+      catch { return false; }
+    });
+    expect(execEvents.length).toBeGreaterThan(0);
+  });
+
+  // ── Test 8: setenv on protected name is refused + audited ─────────────────
+
+  it('setenv("LD_PRELOAD", "evil") is refused and audited', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    // Node's `process.env.X = value` assignment compiles to a libc setenv()
+    // call, so we can exercise the shim's setenv guard directly from Node.
+    const res = runWithShim({
+      cmd: `node -e 'process.env.LD_PRELOAD = "/evil/path";
+                     console.log("LDP=" + process.env.LD_PRELOAD);'`,
+    });
+
+    // Audit event for the refused setenv.
+    const tamperEvents = res.logLines
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((e): e is Record<string, unknown> => e !== null && e['kind'] === 'env_tamper');
+
+    // At least one tamper event for LD_PRELOAD.
+    const ldpTamper = tamperEvents.filter((e) => e['name'] === 'LD_PRELOAD');
+    expect(ldpTamper.length).toBeGreaterThan(0);
+
+    // op should be setenv (Node's `process.env.X = ...` uses setenv).
+    expect(ldpTamper[0]?.['op']).toBe('setenv');
+    expect(ldpTamper[0]?.['refused']).toBe(true);
+  });
+
+  // ── Test 9: unsetenv on protected name is refused + audited ──────────────
+
+  it('delete process.env.LD_PRELOAD (unsetenv) is refused and audited', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const res = runWithShim({
+      cmd: `node -e 'delete process.env.LD_PRELOAD;
+                     console.log("LDP=" + (process.env.LD_PRELOAD || "GONE"));'`,
+    });
+
+    const tamperEvents = res.logLines
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((e): e is Record<string, unknown> =>
+        e !== null && e['kind'] === 'env_tamper' && e['op'] === 'unsetenv' && e['name'] === 'LD_PRELOAD',
+      );
+
+    expect(tamperEvents.length).toBeGreaterThan(0);
+    expect(tamperEvents[0]?.['refused']).toBe(true);
+  });
+
+  // ── Test 10: non-protected setenv is forwarded normally ───────────────────
+
+  it('setenv on a non-protected name is forwarded without an env_tamper event', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const res = runWithShim({
+      cmd: `node -e 'process.env.MY_HARMLESS_VAR = "hello";
+                     console.log("V=" + process.env.MY_HARMLESS_VAR);'`,
+    });
+
+    // No env_tamper event for MY_HARMLESS_VAR.
+    const tamperEvents = res.logLines
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((e): e is Record<string, unknown> =>
+        e !== null && e['kind'] === 'env_tamper' && e['name'] === 'MY_HARMLESS_VAR',
+      );
+
+    expect(tamperEvents.length).toBe(0);
   });
 });
