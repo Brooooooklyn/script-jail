@@ -2995,6 +2995,189 @@ describe('runInstallPhase', () => {
       });
     });
 
+    // Audit-trust Finding (high, 2026-05-19) — legacy `open` / `creat`
+    // forgery.  A raw `syscall(SYS_open, "/tmp/.../events.jsonl",
+    // O_WRONLY|O_APPEND)` or `syscall(SYS_creat, path, mode)` would
+    // previously slip past both the strace `-e trace=` filter AND the
+    // parser dispatch.  These tests pin the full path: agent traces
+    // open/creat, parser emits a write event, forgery detector flags
+    // it the same way it flags openat.
+    describe('legacy open/creat forgery detection (Finding, 2026-05-19)', () => {
+      it('absolute-path legacy open write from non-shim-loaded pid → forgery', async () => {
+        const proc = mockProcReader({
+          901: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'legacy-open-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 901,
+            line: `open("${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+        const raw = forgeries[0]!['raw'] as Record<string, unknown>;
+        expect(raw['prog']).toBe(EVENTS_FILE);
+      });
+
+      it('absolute-path legacy creat from non-shim-loaded pid → forgery', async () => {
+        const proc = mockProcReader({
+          902: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'legacy-creat-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // creat(path, mode) is equivalent to open(path, O_WRONLY|O_CREAT|
+        // O_TRUNC, mode) — always a write.  parseCreat unconditionally
+        // emits a write event so the forgery detector flags it.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 902,
+            line: `creat("${EVENTS_FILE}", 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+        const raw = forgeries[0]!['raw'] as Record<string, unknown>;
+        expect(raw['prog']).toBe(EVENTS_FILE);
+      });
+
+      it('cwd-relative legacy open write after chdir(events-dir) from non-shim-loaded pid → forgery (Layer 2)', async () => {
+        const proc = mockProcReader({
+          903: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'legacy-open-cwd-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 903,
+            line: 'chdir("/tmp/script-jail-events") = 0',
+            source: 'strace',
+          },
+          {
+            pid: 903,
+            line: 'open("events.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7',
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(1);
+        const raw = forgeries[0]!['raw'] as Record<string, unknown>;
+        expect(raw['prog']).toBe(EVENTS_FILE);
+      });
+
+      it('legacy open of /lib/libscriptjail.so grants shim-trust just like openat', async () => {
+        // Defence in depth: a pid that reads the shim via legacy open
+        // (rather than openat) must still be admitted to the trusted
+        // writer set; otherwise legitimate writes would be flagged as
+        // forgery.  This pins the parser → forgery-detector contract:
+        // parseOpen emits a `read` RawEvent with `path === SHIM_PATH`,
+        // and the same shimLoadedPids grant arm in phase-install
+        // applies.
+        const proc = mockProcReader({
+          904: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'legacy-shim-loaded-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 904,
+            line: `open("${SHIM_PATH}", O_RDONLY|O_CLOEXEC) = 3`,
+            source: 'strace',
+          },
+          {
+            pid: 904,
+            line: `open("${EVENTS_FILE}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const forgeries = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(forgeries).toHaveLength(0);
+      });
+    });
+
     it('events_file_forgery renders to <EVENTS_FILE_FORGERY> in audit_bypass via normalize', async () => {
       const ev: AttributedEvent = {
         raw: {

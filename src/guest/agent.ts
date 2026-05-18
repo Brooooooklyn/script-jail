@@ -1022,10 +1022,26 @@ export class LinuxStraceRunner implements StraceRunner {
     // lockstep so the wire-format struct argument is decoded for the
     // flags field (write-bit detection) and the same RawEvent shape as
     // openat is emitted.
+    // Audit-trust Finding (high, 2026-05-19): include legacy `open` and
+    // `creat` in the trace set.  glibc routes every userspace `open(...)`
+    // and `creat(...)` call through `openat(AT_FDCWD, ...)` on Linux, so
+    // most lifecycle scripts never invoke the legacy syscalls directly.
+    // BUT a native attacker can still issue raw `syscall(SYS_open,
+    // "/tmp/script-jail-events-XXX/events.jsonl", O_WRONLY|O_APPEND)`
+    // or `syscall(SYS_creat, path, mode)` to bypass the libc wrappers.
+    // Without tracing these syscalls strace sees nothing, the parser
+    // never emits a write RawEvent, and the events-file forgery
+    // detector is silently defeated.  The strace parser gained
+    // `parseOpen` and `parseCreat` in lockstep so each line produces
+    // the same `read`/`write` RawEvent shape as openat (creat is
+    // always a write — equivalent to `open(path, O_WRONLY|O_CREAT|
+    // O_TRUNC, mode)`); the dirfdTable in phase-install consumes
+    // `retFd` exactly like openat so a follow-up
+    // `openat(<creat-fd>, ...)` resolves correctly.
     const straceArgs = [
       '-ff',
       '-s', '4096',
-      '-e', 'trace=openat,openat2,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir',
+      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir',
       '-o', opts.basePath,
       cmd,
       ...args,

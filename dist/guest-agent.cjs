@@ -25449,6 +25449,24 @@ function _parseStraceLine(line, pid, ts) {
     // forgery detector) behave identically.
     case "openat2":
       return parseOpenat2(args, retVal, pid, ts);
+    // Audit-trust Finding (high, 2026-05-19): legacy `open` and `creat`.
+    // glibc routes most userspace calls through `openat(AT_FDCWD, ...)`,
+    // but a native attacker can still issue
+    // `syscall(SYS_open, "/tmp/.../events.jsonl", O_WRONLY|O_APPEND)`
+    // or `syscall(SYS_creat, path, mode)` directly.  Without these
+    // dispatch entries (and the matching `-e trace=open,creat` flags
+    // in `src/guest/agent.ts`) the events-file forgery detector sees
+    // nothing.  `creat(path, mode)` is semantically equivalent to
+    // `open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)` — always a write —
+    // so `parseCreat` synthesises that classification.  Both emit the
+    // same RawEvent shape as parseOpenat (with `retFd` for the
+    // dirfdTable in phase-install), so the downstream forgery
+    // detector, dirfdTable, and shim-trust set treat the legacy
+    // syscalls identically to openat.
+    case "open":
+      return parseOpen(args, retVal, pid, ts);
+    case "creat":
+      return parseCreat(args, retVal, pid, ts);
     case "execve":
       return parseExecve(args, retVal, pid, ts);
     // Audit-trust Finding 2 (high, 2026-05-18): execveat must be parsed
@@ -25555,6 +25573,55 @@ function parseOpenat2(args, retVal, pid, ts) {
     return [{ kind: "write", ...base, ...optional2 }];
   }
   return [{ kind: "read", ...base, ...optional2 }];
+}
+function parseOpen(args, retVal, pid, ts) {
+  const pathToken = args[0] ?? "";
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const [path2] = r;
+  const flags = args[1] ?? "";
+  const isWrite = flagsImplyWrite(flags);
+  let errno;
+  if (retVal.isError) {
+    if (retVal.errno === "ENOENT") errno = "ENOENT";
+    else if (retVal.errno === "EACCES") errno = "EACCES";
+    else return null;
+  }
+  let retFd;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith("0x") ? parseInt(retVal.raw, 16) : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
+  }
+  const base = { path: path2, pid, ts, hidden: false };
+  const optional2 = {};
+  if (errno !== void 0) optional2.errno = errno;
+  if (retFd !== void 0) optional2.retFd = retFd;
+  if (isWrite) {
+    return [{ kind: "write", ...base, ...optional2 }];
+  }
+  return [{ kind: "read", ...base, ...optional2 }];
+}
+function parseCreat(args, retVal, pid, ts) {
+  const pathToken = args[0] ?? "";
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const [path2] = r;
+  let errno;
+  if (retVal.isError) {
+    if (retVal.errno === "ENOENT") errno = "ENOENT";
+    else if (retVal.errno === "EACCES") errno = "EACCES";
+    else return null;
+  }
+  let retFd;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith("0x") ? parseInt(retVal.raw, 16) : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
+  }
+  const base = { path: path2, pid, ts, hidden: false };
+  const optional2 = {};
+  if (errno !== void 0) optional2.errno = errno;
+  if (retFd !== void 0) optional2.retFd = retFd;
+  return [{ kind: "write", ...base, ...optional2 }];
 }
 function parseExecve(args, retVal, pid, ts) {
   const pathToken = args[0] ?? "";
@@ -26864,7 +26931,7 @@ var LinuxStraceRunner = class {
       "-s",
       "4096",
       "-e",
-      "trace=openat,openat2,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir",
+      "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir",
       "-o",
       opts.basePath,
       cmd,
