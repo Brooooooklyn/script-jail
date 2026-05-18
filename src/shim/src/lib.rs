@@ -35,6 +35,7 @@ const MAX_PROTECTED: usize = 64;
 const NAME_MAX_LEN: usize = 256;
 const JSONL_BUF: usize = 4096;
 const TRUNC_MARKER: &[u8] = b"<truncated>";
+const CANON_BUF_LEN: usize = 1024;
 
 // ── protect-list (fixed-size, written once at constructor time) ────────────
 
@@ -51,6 +52,26 @@ static PROTECTED: ProtectedList = ProtectedList {
     count: AtomicUsize::new(0),
 };
 
+// ── canonical sticky env-var buffers (written once at constructor time) ─────
+
+struct CanonBuf {
+    bytes: core::cell::UnsafeCell<[u8; CANON_BUF_LEN]>,
+    len: AtomicUsize,
+}
+// SAFETY: writes to `bytes` happen exclusively in the ctor before INIT_DONE is
+// set; readers only access it after observing INIT_DONE via Acquire.
+unsafe impl Sync for CanonBuf {}
+
+static CANON_NODE_OPTIONS: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+static CANON_PRELOAD_PATH: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
 // ── log fd ─────────────────────────────────────────────────────────────────
 
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
@@ -59,8 +80,15 @@ static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 
 type GetenvFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 
+static REAL_CLEARENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_EXECVE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REAL_GETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_POSIX_SPAWN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_POSIX_SPAWNP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_PUTENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REAL_SECURE_GETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_SETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_UNSETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 unsafe fn real_getenv_raw(name: *const c_char) -> *mut c_char {
     let p = REAL_GETENV.load(Ordering::Acquire);
@@ -504,6 +532,29 @@ unsafe fn shim_init() {
     }
     REAL_SECURE_GETENV.store(sec_ptr as *mut c_void, Ordering::Release);
 
+    let clearenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"clearenv\0".as_ptr() as *const c_char);
+    REAL_CLEARENV.store(clearenv_ptr as *mut c_void, Ordering::Release);
+
+    let execve_ptr = libc::dlsym(libc::RTLD_NEXT, b"execve\0".as_ptr() as *const c_char);
+    REAL_EXECVE.store(execve_ptr as *mut c_void, Ordering::Release);
+
+    let posix_spawn_ptr =
+        libc::dlsym(libc::RTLD_NEXT, b"posix_spawn\0".as_ptr() as *const c_char);
+    REAL_POSIX_SPAWN.store(posix_spawn_ptr as *mut c_void, Ordering::Release);
+
+    let posix_spawnp_ptr =
+        libc::dlsym(libc::RTLD_NEXT, b"posix_spawnp\0".as_ptr() as *const c_char);
+    REAL_POSIX_SPAWNP.store(posix_spawnp_ptr as *mut c_void, Ordering::Release);
+
+    let putenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"putenv\0".as_ptr() as *const c_char);
+    REAL_PUTENV.store(putenv_ptr as *mut c_void, Ordering::Release);
+
+    let setenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"setenv\0".as_ptr() as *const c_char);
+    REAL_SETENV.store(setenv_ptr as *mut c_void, Ordering::Release);
+
+    let unsetenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"unsetenv\0".as_ptr() as *const c_char);
+    REAL_UNSETENV.store(unsetenv_ptr as *mut c_void, Ordering::Release);
+
     // Without a working pthread key we cannot safely guard recursion in the
     // audit path; degrade to transparent passthrough by leaving INIT_DONE
     // false so all wrapper calls forward to the resolved real symbol.
@@ -544,7 +595,35 @@ unsafe fn shim_init() {
         load_protect_list(list_path);
     }
 
-    // 6. Open for business.
+    // 6. Capture canonical sticky env-var values for exec wrappers (Task 4/5).
+    //    Must happen after the protect-list is loaded and before INIT_DONE is
+    //    set, so exec wrappers can read them safely via Acquire on INIT_DONE.
+    unsafe fn capture_canon(buf: &CanonBuf, name: *const c_char) {
+        let val = real_getenv_raw(name);
+        if val.is_null() || *val == 0 {
+            return;
+        }
+        // Walk to NUL, copy at most CANON_BUF_LEN-1 bytes, NUL-terminate.
+        let mut n = 0usize;
+        while n < CANON_BUF_LEN - 1 && *val.add(n) != 0 {
+            n += 1;
+        }
+        let dst = &mut *buf.bytes.get();
+        // SAFETY: ctor-only writer; no concurrent readers (INIT_DONE is false).
+        core::ptr::copy_nonoverlapping(val as *const u8, dst.as_mut_ptr(), n);
+        dst[n] = 0;
+        buf.len.store(n, Ordering::Release);
+    }
+    capture_canon(
+        &CANON_NODE_OPTIONS,
+        b"SCRIPT_JAIL_NODE_OPTIONS\0".as_ptr() as *const c_char,
+    );
+    capture_canon(
+        &CANON_PRELOAD_PATH,
+        b"SCRIPT_JAIL_PRELOAD_PATH\0".as_ptr() as *const c_char,
+    );
+
+    // 7. Open for business.
     INIT_DONE.store(true, Ordering::Release);
     set_in_shim(false);
 }
