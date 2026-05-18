@@ -108,15 +108,21 @@ function emptyStrace(exitCode = 0): StraceRunner {
       void cmd;
     },
     getExitCode() { return exitCode; },
+    // Finding D: tamper reporting is part of the StraceRunner contract.
+    // Test fakes that don't audit a shared events file return null.
+    getTamperReason() { return null; },
   };
 }
 
 /**
  * A LinuxStraceRunner subclass that emits no records, succeeds with the
- * supplied exit code, and reports a fixed tamper reason.  Used to exercise
- * the agent's Finding-A fail-closed gate (which dispatches on
- * `instanceof LinuxStraceRunner` so a plain duck-typed runner would not
- * trigger the gate even if it carried `getTamperReason`).
+ * supplied exit code, and reports a fixed tamper reason.  Historically this
+ * existed because the agent's fail-closed gate dispatched on
+ * `instanceof LinuxStraceRunner` — Finding D moved that gate onto the
+ * `StraceRunner` interface contract, so a plain object literal works too
+ * (see `tamperingPlainStrace` below).  Keep the subclass variant around
+ * to exercise the inheritance path for any future LinuxStraceRunner
+ * decorator subclasses that ride on it.
  */
 class TamperingStraceRunner extends LinuxStraceRunner {
   private readonly _reason: string;
@@ -138,6 +144,20 @@ class TamperingStraceRunner extends LinuxStraceRunner {
 }
 
 /**
+ * A plain object-literal `StraceRunner` (NOT a `LinuxStraceRunner`
+ * subclass) that reports a fixed tamper reason.  Used to verify Finding D:
+ * the agent's tamper gate must dispatch on the interface contract, not on
+ * class identity, so any contract-conforming runner can force fail-closed.
+ */
+function tamperingPlainStrace(reason: string, exitCode = 0): StraceRunner {
+  return {
+    async *run() { /* yield nothing */ },
+    getExitCode() { return exitCode; },
+    getTamperReason() { return reason; },
+  };
+}
+
+/**
  * A StraceRunner that also tracks which cmd was run.
  */
 function trackingStrace(exitCode = 0): { strace: StraceRunner; calls: string[] } {
@@ -149,6 +169,8 @@ function trackingStrace(exitCode = 0): { strace: StraceRunner; calls: string[] }
         calls.push(`${cmd} ${args.join(' ')}`);
       },
       getExitCode() { return exitCode; },
+      // Finding D: tamper reporting is part of the StraceRunner contract.
+      getTamperReason() { return null; },
     },
   };
 }
@@ -632,8 +654,9 @@ describe('agent main()', () => {
     const { spawner } = mockSpawner();
     const configPath = writeConfig(testDir);
 
-    // Subclass LinuxStraceRunner so `main()`'s `instanceof LinuxStraceRunner`
-    // gate matches AND `getTamperReason()` returns a fixed non-null value.
+    // LinuxStraceRunner subclass — exercises the inheritance path.  The
+    // Finding-D refactor moved the gate onto the contract so a plain
+    // object literal works too (see the test immediately below).
     const strace = new TamperingStraceRunner('events file disappeared: /tmp/events.jsonl');
 
     const origExit = process.exit.bind(process);
@@ -667,6 +690,57 @@ describe('agent main()', () => {
     // Critically: NO `install_done` handshake and NO `final` lockfile.
     // Without this, the host's check mode would diff a possibly-clean
     // YAML and pass on tampered audit data.
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).not.toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(false);
+  });
+
+  // ── Finding D: tamper gate dispatches on contract, not class identity ───
+  //
+  // The previous gate was `straceRunner instanceof LinuxStraceRunner`, which
+  // silently skipped the tamper check for ANY runner that wasn't a direct
+  // subclass — wrappers, decorators, alternative production implementations,
+  // or test fakes that carried a legitimate tamper reason were all ignored.
+  // Finding D moved tamper reporting onto the StraceRunner interface so the
+  // gate is now `straceRunner.getTamperReason()`.  A plain object literal
+  // that conforms to the contract MUST trigger fail-closed.
+  it('honors getTamperReason() from a plain-object StraceRunner (no LinuxStraceRunner subclass)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const configPath = writeConfig(testDir);
+
+    // Plain object literal — NOT an instance of LinuxStraceRunner.  Under
+    // the old `instanceof` gate this would have been silently ignored and
+    // the agent would have emitted a clean final lockfile.
+    const strace = tamperingPlainStrace('events file inode mismatch: dev=42 ino=99');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    expect(exitedWith).toBe(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(true);
+    expect(String(errors[0]!['message'])).toMatch(/tampered/);
+    expect(String(errors[0]!['message'])).toMatch(/inode mismatch/);
+
     const kinds = frames.map((f) => f['kind']);
     expect(kinds).not.toContain('final');
     expect(

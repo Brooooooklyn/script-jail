@@ -1499,28 +1499,32 @@ export async function main(input: AgentInput): Promise<void> {
     return;
   }
 
-  // 11b. Events-file tamper check (Finding A): the tailer baseline-stats the
-  //      SCRIPT_JAIL_LOG_FILE path on every drain cycle and records any
-  //      anomaly (unlink, inode mismatch, truncate, EACCES).  An audit
-  //      bypass that erased its own `audit_bypass` entry would still leave
-  //      this tamper signal because the inode/dev pair is captured BEFORE
-  //      any audited code runs.  Fail closed here — the host sees this as
-  //      "vsock session ended without a final frame" + the error frame.
+  // 11b. Events-file tamper check (Findings A + B): the tailer baseline-
+  //      stats the SCRIPT_JAIL_LOG_FILE path on every drain cycle and records
+  //      any anomaly (unlink, inode mismatch, truncate, EACCES, parent-dir
+  //      rename, mtime regression, max-seen-size shrink).  An audit bypass
+  //      that erased its own `audit_bypass` entry would still leave this
+  //      tamper signal because the inode/dev pair is captured BEFORE any
+  //      audited code runs.  Fail closed — the host sees this as "vsock
+  //      session ended without a final frame" plus the error frame.
   //
-  //      Only meaningful when we created an events file AND the production
-  //      strace runner is in use; test-injected runners do not own the
-  //      events-file watcher and report no tamper status.
-  if (eventsFile !== null && straceRunner instanceof LinuxStraceRunner) {
-    const tamperReason = straceRunner.getTamperReason();
-    if (tamperReason !== null) {
-      emitter.emitError(
-        `audit pipeline tampered with: ${tamperReason}. ` +
-          'Refusing to emit a final lockfile — a clean diff would be untrustworthy.',
-        true,
-      );
-      flushAndExit(input.connection.writable, 1);
-      return;
-    }
+  //      Finding D: the gate dispatches on the `StraceRunner` interface
+  //      contract (`getTamperReason()`), NOT on `instanceof
+  //      LinuxStraceRunner`.  Any runner implementation — wrapper,
+  //      decorator, alternative production runner — that observes tamper
+  //      can report it and force a fail-closed path through `main()`
+  //      without subclassing the canonical Linux runner.  Tests that don't
+  //      audit a shared events file simply return `null` and the gate is
+  //      a no-op for them.
+  const tamperReason = straceRunner.getTamperReason();
+  if (tamperReason !== null) {
+    emitter.emitError(
+      `audit pipeline tampered with: ${tamperReason}. ` +
+        'Refusing to emit a final lockfile — a clean diff would be untrustworthy.',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
   }
 
   emitter.emitHandshake('install_done');

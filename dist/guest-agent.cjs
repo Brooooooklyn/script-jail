@@ -26815,16 +26815,14 @@ ${fetchResult.stderr}
     process.exitCode = installResult.exitCode;
     return;
   }
-  if (eventsFile !== null && straceRunner instanceof LinuxStraceRunner) {
-    const tamperReason = straceRunner.getTamperReason();
-    if (tamperReason !== null) {
-      emitter.emitError(
-        `audit pipeline tampered with: ${tamperReason}. Refusing to emit a final lockfile \u2014 a clean diff would be untrustworthy.`,
-        true
-      );
-      flushAndExit(input.connection.writable, 1);
-      return;
-    }
+  const tamperReason = straceRunner.getTamperReason();
+  if (tamperReason !== null) {
+    emitter.emitError(
+      `audit pipeline tampered with: ${tamperReason}. Refusing to emit a final lockfile \u2014 a clean diff would be untrustworthy.`,
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
   }
   emitter.emitHandshake("install_done");
   const ctx = { roots, pkgDirs };

@@ -43,6 +43,10 @@ function cannedStraceRunner(
       // Finalize exit code after yielding all records
     },
     getExitCode() { return _exitCode; },
+    // Finding D: tamper reporting is part of the StraceRunner contract;
+    // canned runners don't audit a real events file so they always report
+    // clean.
+    getTamperReason() { return null; },
     // Allow tests to change exitCode after construction
     _setExitCode(code: number) { _exitCode = code; },
   } as unknown as StraceRunner;
@@ -77,6 +81,7 @@ describe('runInstallPhase', () => {
       const strace: StraceRunner = {
         async *run(cmd, args) { calls.push({ cmd, args }); },
         getExitCode() { return 0; },
+        getTamperReason() { return null; },
       };
       const proc = mockProcReader({});
       const attr = new Attribution(proc);
@@ -101,6 +106,7 @@ describe('runInstallPhase', () => {
       const strace: StraceRunner = {
         async *run(cmd, args) { calls.push({ cmd, args }); },
         getExitCode() { return 0; },
+        getTamperReason() { return null; },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -122,6 +128,7 @@ describe('runInstallPhase', () => {
       const strace: StraceRunner = {
         async *run(cmd, args) { calls.push({ cmd, args }); },
         getExitCode() { return 0; },
+        getTamperReason() { return null; },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -141,6 +148,7 @@ describe('runInstallPhase', () => {
       const strace: StraceRunner = {
         async *run() { callCount++; },
         getExitCode() { return 0; },
+        getTamperReason() { return null; },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({

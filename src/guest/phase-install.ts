@@ -59,6 +59,26 @@ export interface StraceRunner {
    * Only valid after the async iterable from `run()` has been fully consumed.
    */
   getExitCode(): number;
+
+  /**
+   * Returns a human-readable tamper reason if the runner observed any
+   * integrity violation in the audit pipeline (e.g. events-file unlink,
+   * inode swap, mtime regression, parent-directory rename), or `null` if
+   * everything looked clean.  Only meaningful after the async iterable from
+   * `run()` has been fully consumed.
+   *
+   * Part of the contract — NOT a class-identity check — so wrappers,
+   * decorators, and test fakes can opt into fail-closed semantics by
+   * carrying a real tamper reason through `main()` without subclassing
+   * `LinuxStraceRunner`.  Implementations that don't audit a shared events
+   * file should return `null` unconditionally.
+   *
+   * Finding D (security-review): previously `main()` gated on
+   * `straceRunner instanceof LinuxStraceRunner`, which silently skipped
+   * the tamper check for any other implementation even when it had a
+   * legitimate reason to fail closed.
+   */
+  getTamperReason(): string | null;
 }
 
 export interface PhaseInstallInput {
