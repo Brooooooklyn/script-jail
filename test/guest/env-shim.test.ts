@@ -1380,4 +1380,172 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     expect(result.stdout).toContain('count=1');
     expect(result.stdout).toContain(`value=${shimSo}`);
   });
+
+  // ── Audit-trust Finding 2 (2026-05-18) — LD_AUDIT / LD_LIBRARY_PATH ────────
+  //
+  // glibc honors LD_AUDIT and LD_LIBRARY_PATH at process startup independently
+  // of LD_PRELOAD.  LD_AUDIT loads an attacker-supplied DSO via the rtld-audit
+  // API BEFORE any LD_PRELOAD module's constructor runs, and LD_LIBRARY_PATH
+  // diverts ld.so's library search to attacker-controlled directories.
+  // rewrite_envp must strip both names from every exec'd child's envp; the
+  // setenv/unsetenv/putenv wrappers must refuse to set them in-process so a
+  // descendant cannot restore them between the strip and the next exec.
+
+  it('caller-supplied LD_AUDIT is stripped from the child env (Finding 2)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-ldaudit-strip-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'ldaudit_strip');
+    // Native execve()s into `env node` with LD_AUDIT in the envp; the Node
+    // child reads /proc/self/environ to count LD_AUDIT entries the kernel
+    // actually delivered.  Expectation: zero.
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const aud = entries.filter(e => e.startsWith('LD_AUDIT='));"
+          "process.stdout.write('count='+aud.length);",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          "LD_PRELOAD=${shimSo}",
+          "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
+          /* Attacker-controlled audit DSO. */
+          "LD_AUDIT=/tmp/evil-audit.so",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        SCRIPT_JAIL_PRELOAD_PATH: shimSo,
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // Child sees zero LD_AUDIT entries — the attacker payload never reaches
+    // ld.so's audit hook.
+    expect(result.stdout).toContain('count=0');
+    expect(result.stdout).not.toContain('/tmp/evil-audit.so');
+  });
+
+  it('caller-supplied LD_LIBRARY_PATH is stripped from the child env (Finding 2)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-ldlibpath-strip-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'ldlibpath_strip');
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const lp = entries.filter(e => e.startsWith('LD_LIBRARY_PATH='));"
+          "process.stdout.write('count='+lp.length);",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          "LD_PRELOAD=${shimSo}",
+          "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
+          /* Attacker-controlled library search path. */
+          "LD_LIBRARY_PATH=/tmp/attacker_libs:",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        SCRIPT_JAIL_PRELOAD_PATH: shimSo,
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('count=0');
+    expect(result.stdout).not.toContain('/tmp/attacker_libs');
+  });
+
+  it('setenv("LD_AUDIT", "/tmp/evil.so") is refused and audited (Finding 2)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const result = runWithShim({
+      cmd: `node -e 'process.env.LD_AUDIT = "/tmp/evil-audit.so";
+                     console.log("LDA=" + (process.env.LD_AUDIT || "GONE"));'`,
+    });
+
+    expect(result.exitCode).toBe(0);
+    // setenv was refused inside libc, but the JS Proxy's `set` trap (which
+    // doesn't go through the shim) still updates the in-Node env Map; what
+    // matters here is that the shim emitted env_tamper and refused the libc
+    // call.  Other tests assert the env_shim wrappers themselves; here we
+    // only check the audit event was emitted.
+    const tamperEvents = result.logLines
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((e): e is Record<string, unknown> => e !== null && e['kind'] === 'env_tamper');
+    const lda = tamperEvents.filter((e) => e['name'] === 'LD_AUDIT');
+    expect(lda.length).toBeGreaterThanOrEqual(1);
+    expect(lda.every((e) => e['refused'] === true)).toBe(true);
+  });
+
+  it('setenv("LD_LIBRARY_PATH", "/tmp/evil") is refused and audited (Finding 2)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const result = runWithShim({
+      cmd: `node -e 'process.env.LD_LIBRARY_PATH = "/tmp/attacker_libs";
+                     console.log("LLP=" + (process.env.LD_LIBRARY_PATH || "GONE"));'`,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const tamperEvents = result.logLines
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((e): e is Record<string, unknown> => e !== null && e['kind'] === 'env_tamper');
+    const llp = tamperEvents.filter((e) => e['name'] === 'LD_LIBRARY_PATH');
+    expect(llp.length).toBeGreaterThanOrEqual(1);
+    expect(llp.every((e) => e['refused'] === true)).toBe(true);
+  });
 });

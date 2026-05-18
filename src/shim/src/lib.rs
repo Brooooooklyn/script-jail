@@ -1483,6 +1483,33 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
         return None;
     }
 
+    // Audit-trust Finding 2 (2026-05-18): LD_AUDIT and LD_LIBRARY_PATH survive
+    // env rewriting unless we strip them explicitly.
+    //
+    //   - `LD_AUDIT=/tmp/evil.so` makes glibc's ld.so load the named DSO via
+    //     the rtld-audit API BEFORE any LD_PRELOAD entries and before the
+    //     program's own constructor.  Even though our shim is the canonical
+    //     LD_PRELOAD, an attacker-controlled audit module runs first and can
+    //     do anything the process can — read protected env, intercept syscalls,
+    //     exfiltrate secrets, etc.
+    //   - `LD_LIBRARY_PATH=/tmp/attacker_libs:` is searched by ld.so BEFORE
+    //     the canonical RUNPATH/DT_NEEDED resolution, so dropping a same-name
+    //     .so under that prefix can shadow legitimate libraries the audited
+    //     install relies on (libcurl, libcrypto, libz, etc.).
+    //
+    // There is no legitimate reason for an npm lifecycle script to set either
+    // var inside this microVM — the audit envelope owns the dynamic-linker
+    // surface end-to-end.  Strip exhaustively (envbuf_remove walks every
+    // duplicate, not just the first match).  envbuf_remove with no value to
+    // push cannot fail.
+    //
+    // Both names are also added to AUDIT_PROTECTED_NAMES so the env-mutator
+    // wrappers (setenv/unsetenv/putenv) refuse to set them in-process; this
+    // closes the in-process mutation path that would otherwise let a script
+    // restore the value AFTER the shim's exec-time strip.
+    envbuf_remove(&mut buf, b"LD_AUDIT");
+    envbuf_remove(&mut buf, b"LD_LIBRARY_PATH");
+
     // Re-inject SCRIPT_JAIL_* sticky values from the init-time CanonBufs.
     //
     // SECURITY: do NOT read these via libc::getenv / real_getenv_raw at
@@ -2017,6 +2044,14 @@ static AUDIT_PROTECTED_NAMES: &[&[u8]] = &[
     b"SCRIPT_JAIL_SPOOF_ARCH",
     b"SCRIPT_JAIL_PRELOAD_PATH",
     b"SCRIPT_JAIL_NODE_OPTIONS",
+    // Audit-trust Finding 2 (2026-05-18): LD_AUDIT loads an attacker-supplied
+    // DSO BEFORE LD_PRELOAD via the rtld-audit API; LD_LIBRARY_PATH redirects
+    // ld.so's library lookup to attacker-controlled directories.  Both are
+    // stripped from the child envp by rewrite_envp at exec-time AND refused
+    // in-process via the setenv/unsetenv/putenv guards below, so a script
+    // cannot restore them between the strip and the next exec.
+    b"LD_AUDIT",
+    b"LD_LIBRARY_PATH",
 ];
 
 /// Compare a C-string against a Rust byte slice (no NUL in `bytes`).
