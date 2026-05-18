@@ -23,7 +23,7 @@ import * as path from 'node:path';
 
 import type { Emitter } from './emit.js';
 import type { Attribution } from './attribution.js';
-import { parseStraceLine } from './strace-parser.js';
+import { parseStraceLine, unescapeStraceString } from './strace-parser.js';
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
 import {
   ExecEvent,
@@ -403,6 +403,22 @@ export async function runInstallPhase(
     }
   })();
 
+  // Audit-trust Finding (high, 2026-05-19): basename of the canonical
+  // events file, used as a Layer-1 safety net for the cwd-relative
+  // openat-forgery attack.  Even when per-pid CWD tracking fails (Layer
+  // 2 below — strace dropped the chdir line, fchdir resolved against an
+  // unknown fd, etc.), a non-shim-loaded pid that opens ANY file whose
+  // basename matches the events file is suspicious in the controlled
+  // rootfs.  The basename `events.jsonl` is unique to this audit
+  // channel in the microVM; lifecycle scripts have no business writing
+  // to a file by that name.  If we ever need to harden this further we
+  // can rename the events file to include a per-VM random suffix so
+  // the basename itself is unique.
+  const eventsFileBasename: string | null =
+    eventsFilePathCanonical !== null
+      ? path.basename(eventsFilePathCanonical)
+      : null;
+
   // Per-pid fd table: maps a kernel-assigned file descriptor (from a
   // successful openat) to the canonical absolute path of the directory
   // (or file) it points at.  Used to resolve subsequent
@@ -418,6 +434,20 @@ export async function runInstallPhase(
   // at most for a real install).
   const dirfdTable = new Map<string, string>();
   const fdKey = (pid: number, fd: number): string => `${pid}:${fd}`;
+
+  // Audit-trust Finding (high, 2026-05-19): per-pid CWD table for Layer-2
+  // resolution of AT_FDCWD-relative openat targets.  Updated from strace
+  // `chdir(...)` and `fchdir(...)` lines parsed BELOW in the dispatcher
+  // loop (see the `chdirRe` / `fchdirRe` block).  Without this, a non-
+  // shim-loaded attacker pid could:
+  //   1. `chdir("/tmp/script-jail-events-XXX")`
+  //   2. `openat(AT_FDCWD, "events.jsonl", O_APPEND|O_WRONLY)`
+  // and the canonicalizer would resolve the relative target against the
+  // AGENT process's cwd (NOT the attacker's), producing a path that
+  // does not equal `eventsFilePathCanonical` — silently dropping the
+  // forgery signal.  Layer 1 (basename match above) is the safety net;
+  // this map is the proper resolution.
+  const pidCwd = new Map<number, string>();
 
   /**
    * Canonicalize the target path of an openat write event for comparison
@@ -437,18 +467,29 @@ export async function runInstallPhase(
     dirfd: number | undefined,
   ): string | null => {
     if (dirfd === undefined) {
-      // AT_FDCWD opens — resolve against the CWD of the install process.
-      // We don't have a strict "CWD" anchor per pid (it can chdir at any
-      // time), but the openat path is usually absolute, and `path.resolve`
-      // on an already-absolute path is a no-op aside from `.`/`..`
-      // collapse.  For relative paths it resolves against process.cwd(),
-      // which IS the agent's cwd, not the lifecycle script's — so a
-      // relative-path attempt to write the events file from a child cwd
-      // would resolve to a different absolute path and not match.  That's
-      // an accepted limitation: the canonical events file path is always
-      // absolute (set via env var), so the relative-path attack vector
-      // is exotic.
-      return path.resolve(targetPath);
+      // AT_FDCWD opens.  For absolute paths, `path.resolve` collapses
+      // `.`/`..` segments and is the answer regardless of CWD.  For
+      // RELATIVE paths, we need the attacker's actual CWD — not the
+      // agent process's CWD — or we miss the cwd-relative forgery
+      // attack:
+      //   chdir("/tmp/script-jail-events-XXX") +
+      //   openat(AT_FDCWD, "events.jsonl", O_APPEND|O_WRONLY)
+      // would otherwise resolve to <agent_cwd>/events.jsonl and not
+      // string-equal the canonical events file path.
+      //
+      // The `pidCwd` map is updated from strace `chdir(...)` and
+      // `fchdir(...)` lines in the dispatcher loop below.  When we
+      // don't have a tracked CWD for this pid (strace dropped the
+      // chdir line, or the pid never chdir'd from its inherited cwd),
+      // we return `null` so the equality-check path drops the
+      // comparison — the basename safety net (Layer 1) catches the
+      // common case at the call site.
+      if (path.isAbsolute(targetPath)) {
+        return path.resolve(targetPath);
+      }
+      const cwd = pidCwd.get(pid);
+      if (cwd === undefined) return null;
+      return path.resolve(cwd, targetPath);
     }
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === undefined) return null;
@@ -632,6 +673,47 @@ export async function runInstallPhase(
     }
 
     if (source === 'strace') {
+      // Audit-trust Finding (high, 2026-05-19): pre-parse `chdir(...)` and
+      // `fchdir(...)` lines to maintain the per-pid CWD table.  These
+      // syscalls don't produce a RawEvent (they're transport-only state
+      // for the events-file forgery detector), so we handle them inline
+      // here rather than threading a new event kind through the schema.
+      //
+      // Strace wire format:
+      //   `chdir("/tmp/script-jail-events-XXX") = 0`
+      //   `fchdir(5) = 0`
+      //
+      // We only consume successful calls (`= 0`); failures don't change
+      // the kernel's cwd state and so don't update our map.  For
+      // `fchdir`, the fd must already be in our `dirfdTable` (otherwise
+      // we don't know what directory it points at — strace dropped the
+      // earlier openat, or the fd was inherited across exec).  On
+      // unknown fds we leave the map untouched, which means the
+      // canonicalizer will fall back to the Layer-1 basename safety net
+      // for any subsequent AT_FDCWD-relative openat from that pid.
+      const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
+      if (chdirMatch !== null) {
+        const rawTarget = chdirMatch[1] ?? '';
+        const decoded = unescapeStraceString(rawTarget);
+        const current = pidCwd.get(pid);
+        const resolved = current !== undefined && !path.isAbsolute(decoded)
+          ? path.resolve(current, decoded)
+          : path.resolve(decoded);
+        pidCwd.set(pid, resolved);
+        continue;
+      }
+      const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
+      if (fchdirMatch !== null) {
+        const fd = parseInt(fchdirMatch[1] ?? '', 10);
+        if (Number.isFinite(fd)) {
+          const dirPath = dirfdTable.get(fdKey(pid, fd));
+          if (dirPath !== undefined) {
+            pidCwd.set(pid, dirPath);
+          }
+        }
+        continue;
+      }
+
       // source === 'strace' — best-effort text parse.  Failures here are
       // expected and dropped silently: strace lines can be split across
       // reads, the format varies across versions, and the channel emits
@@ -697,6 +779,7 @@ export async function runInstallPhase(
         }
         if (
           eventsFilePathCanonical !== null &&
+          eventsFileBasename !== null &&
           rawEvent.kind === 'write' &&
           !shimLoadedPids.has(rawEvent.pid)
         ) {
@@ -710,26 +793,55 @@ export async function runInstallPhase(
           //       `openat(<dirfd-of-events-dir>, "events.jsonl", O_WRONLY)`
           //       resolves to the same string as the configured events
           //       file path.
+          //   (c) (Layer 2) cwd-relative AT_FDCWD opens — the
+          //       canonicalizer resolves a relative target against the
+          //       attacker's tracked CWD from `pidCwd` (populated by
+          //       the chdir/fchdir pre-parser above), so
+          //       `chdir(events-dir) + openat(AT_FDCWD, "events.jsonl",
+          //       O_WRONLY)` resolves to the canonical events file
+          //       path.
           // If canonicalization fails (numeric dirfd whose source we
           // never observed — could happen if strace -ff missed an
-          // earlier line under load), we DON'T flag forgery: a false
-          // positive here hard-fails clean installs, and the agent's
-          // other invariants (shim event vs strace exec count) still
-          // catch the canonical attack patterns.
+          // earlier line under load), the canonical-equality arm
+          // returns false; we fall through to the Layer-1 basename
+          // safety net.
           const canonicalTarget = canonicalizeOpenTarget(
             rawEvent.pid,
             rawEvent.path,
             rawEvent.dirfd,
           );
-          if (canonicalTarget === eventsFilePathCanonical) {
+
+          // Audit-trust Finding (high, 2026-05-19): Layer-1 basename
+          // safety net.  Even when canonical resolution fails or
+          // disagrees, an openat-write whose basename equals the
+          // events file basename from a non-shim-loaded pid in the
+          // controlled rootfs is suspicious.  The basename
+          // `events.jsonl` is unique to this audit channel; lifecycle
+          // scripts have no business writing to a file by that name.
+          // This catches:
+          //   - cwd-relative opens after `chdir(events-dir)` when
+          //     strace dropped the chdir line and Layer 2 doesn't
+          //     have a cwd entry for this pid.
+          //   - dirfd-relative opens where the dirfd's source was
+          //     missed by strace.
+          const targetBasename = path.basename(rawEvent.path);
+          const isCanonicalMatch = canonicalTarget === eventsFilePathCanonical;
+          const isBasenameMatch = targetBasename === eventsFileBasename;
+
+          if (isCanonicalMatch || isBasenameMatch) {
             const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+            // Forensic path: prefer the canonically-resolved target
+            // when we have one (most informative); otherwise fall
+            // back to the canonical events file path (the basename
+            // match implies the attacker INTENDED that target).
+            const forensicPath = canonicalTarget ?? eventsFilePathCanonical;
             forgerySamples.push({
               pid: rawEvent.pid,
               ts: rawEvent.ts,
               // Carry the canonical path in the forensic sample so the
               // synthesised audit_bypass entry shows the resolved
               // target, not a relative basename or aliased form.
-              path: canonicalTarget,
+              path: forensicPath,
               pkg: result?.pkg ?? snapshot?.pkg ?? '<unattributed>',
               lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? 'install',
             });

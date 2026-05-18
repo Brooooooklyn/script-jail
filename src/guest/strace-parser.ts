@@ -42,7 +42,15 @@ import type { RawEvent } from '../lock/schema.js';
  * (everything between the opening and closing double-quote).
  * Handles: \\ \" \n \t \r \a \b \f \v \0NN (octal) \xNN (hex).
  * Unrecognised escapes are left as-is (the backslash is kept).
+ *
+ * Exported as {@link unescapeStraceString} so call sites that do their
+ * own line-level regex matching (e.g. the `chdir(...)` pre-parser in
+ * `src/guest/phase-install.ts`) get the same escape handling as the
+ * full syscall parser below.
  */
+export function unescapeStraceString(s: string): string {
+  return unescape(s);
+}
 function unescape(s: string): string {
   return s.replace(/\\(\\|"|n|t|r|a|b|f|v|x[0-9a-fA-F]{1,2}|[0-7]{1,3})/g, (_, esc: string) => {
     switch (esc[0]) {

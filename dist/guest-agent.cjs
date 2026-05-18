@@ -25226,6 +25226,9 @@ var fs = __toESM(require("node:fs"), 1);
 var path = __toESM(require("node:path"), 1);
 
 // src/guest/strace-parser.ts
+function unescapeStraceString(s) {
+  return unescape(s);
+}
 function unescape(s) {
   return s.replace(/\\(\\|"|n|t|r|a|b|f|v|x[0-9a-fA-F]{1,2}|[0-7]{1,3})/g, (_, esc2) => {
     switch (esc2[0]) {
@@ -25771,11 +25774,18 @@ async function runInstallPhase(input) {
       return path.resolve(eventsFilePath);
     }
   })();
+  const eventsFileBasename = eventsFilePathCanonical !== null ? path.basename(eventsFilePathCanonical) : null;
   const dirfdTable = /* @__PURE__ */ new Map();
   const fdKey = (pid, fd) => `${pid}:${fd}`;
+  const pidCwd = /* @__PURE__ */ new Map();
   const canonicalizeOpenTarget = (pid, targetPath, dirfd) => {
     if (dirfd === void 0) {
-      return path.resolve(targetPath);
+      if (path.isAbsolute(targetPath)) {
+        return path.resolve(targetPath);
+      }
+      const cwd = pidCwd.get(pid);
+      if (cwd === void 0) return null;
+      return path.resolve(cwd, targetPath);
     }
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === void 0) return null;
@@ -25817,6 +25827,26 @@ async function runInstallPhase(input) {
       continue;
     }
     if (source === "strace") {
+      const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
+      if (chdirMatch !== null) {
+        const rawTarget = chdirMatch[1] ?? "";
+        const decoded = unescapeStraceString(rawTarget);
+        const current = pidCwd.get(pid);
+        const resolved = current !== void 0 && !path.isAbsolute(decoded) ? path.resolve(current, decoded) : path.resolve(decoded);
+        pidCwd.set(pid, resolved);
+        continue;
+      }
+      const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
+      if (fchdirMatch !== null) {
+        const fd = parseInt(fchdirMatch[1] ?? "", 10);
+        if (Number.isFinite(fd)) {
+          const dirPath = dirfdTable.get(fdKey(pid, fd));
+          if (dirPath !== void 0) {
+            pidCwd.set(pid, dirPath);
+          }
+        }
+        continue;
+      }
       const straceEvents = parseStraceLine(line, pid, 0);
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
@@ -25834,21 +25864,25 @@ async function runInstallPhase(input) {
         if (rawEvent.kind === "read" && rawEvent.path === SHIM_LIBRARY_PATH) {
           shimLoadedPids.add(rawEvent.pid);
         }
-        if (eventsFilePathCanonical !== null && rawEvent.kind === "write" && !shimLoadedPids.has(rawEvent.pid)) {
+        if (eventsFilePathCanonical !== null && eventsFileBasename !== null && rawEvent.kind === "write" && !shimLoadedPids.has(rawEvent.pid)) {
           const canonicalTarget = canonicalizeOpenTarget(
             rawEvent.pid,
             rawEvent.path,
             rawEvent.dirfd
           );
-          if (canonicalTarget === eventsFilePathCanonical) {
+          const targetBasename = path.basename(rawEvent.path);
+          const isCanonicalMatch = canonicalTarget === eventsFilePathCanonical;
+          const isBasenameMatch = targetBasename === eventsFileBasename;
+          if (isCanonicalMatch || isBasenameMatch) {
             const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+            const forensicPath = canonicalTarget ?? eventsFilePathCanonical;
             forgerySamples.push({
               pid: rawEvent.pid,
               ts: rawEvent.ts,
               // Carry the canonical path in the forensic sample so the
               // synthesised audit_bypass entry shows the resolved
               // target, not a relative basename or aliased form.
-              path: canonicalTarget,
+              path: forensicPath,
               pkg: result?.pkg ?? snapshot?.pkg ?? "<unattributed>",
               lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? "install"
             });
@@ -26778,7 +26812,7 @@ var LinuxStraceRunner = class {
       "-s",
       "4096",
       "-e",
-      "trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2",
+      "trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir",
       "-o",
       opts.basePath,
       cmd,

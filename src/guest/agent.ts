@@ -1000,10 +1000,21 @@ export class LinuxStraceRunner implements StraceRunner {
     // 4096 covers every realistic events-file path AND every
     // realistic exec argv — and forgery detection only depends on the
     // openat path being intact.
+    // Audit-trust Finding (high, 2026-05-19): include `chdir` and `fchdir`
+    // in the trace set so phase-install can maintain a per-pid CWD table.
+    // Without per-pid CWD tracking, a non-shim-loaded attacker pid could
+    // `chdir("/tmp/script-jail-events-XXX")` and then issue
+    // `openat(AT_FDCWD, "events.jsonl", O_APPEND|O_WRONLY)`; the
+    // canonicalizer would resolve the relative target against the AGENT's
+    // cwd (not the attacker's) and miss the equality check against the
+    // canonical events file path — silently dropping the
+    // `<EVENTS_FILE_FORGERY>` signal.  With `chdir`/`fchdir` traced, the
+    // dispatcher in `runInstallPhase` updates a `pidCwd` map and resolves
+    // AT_FDCWD-relative openat targets against the attacker's actual cwd.
     const straceArgs = [
       '-ff',
       '-s', '4096',
-      '-e', 'trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
+      '-e', 'trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir',
       '-o', opts.basePath,
       cmd,
       ...args,
