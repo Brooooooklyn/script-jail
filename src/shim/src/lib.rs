@@ -1289,6 +1289,24 @@ unsafe fn emit_exec(
     argv0: *const c_char,
     envp_alloc_failed: bool,
 ) {
+    let pid = libc::getpid();
+    emit_exec_for_pid(prog, argv0, envp_alloc_failed, pid);
+}
+
+// Audit-trust Finding 1 (high): posix_spawn dispatch must emit the shim
+// `exec` event tagged with the CHILD pid (the one strace records the
+// child's execve under), not the parent pid.  Otherwise the
+// per-pid strace-vs-shim cross-check in phase-install treats every
+// successful posix_spawn as a syscall bypass (`<SYSCALL_EXEC_BYPASS>`).
+// `dispatch_spawn` uses this helper after `real_posix_spawn_raw`
+// returns; `dispatch_exec` keeps using `emit_exec` (the calling pid IS
+// the pid strace records the execve under for execve/execv/execvp/…).
+unsafe fn emit_exec_for_pid(
+    prog: *const c_char,
+    argv0: *const c_char,
+    envp_alloc_failed: bool,
+    pid: libc::pid_t,
+) {
     let log_fd = LOG_FD.load(Ordering::Acquire);
     if log_fd < 0 {
         return;
@@ -1297,7 +1315,6 @@ unsafe fn emit_exec(
     let mut ts: libc::timespec = core::mem::zeroed();
     libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     let ns: i64 = (ts.tv_sec as i64) * 1_000_000_000i64 + ts.tv_nsec as i64;
-    let pid = libc::getpid();
 
     let mut buf = [0u8; JSONL_BUF];
     let mut pos = 0usize;
@@ -1730,8 +1747,22 @@ unsafe fn dispatch_spawn(
 
     match rewrite_envp(envp_in as *const *const c_char) {
         Some(mut buf) => {
+            // Audit-trust Finding 1 (high, 2026-05-18): defer the audit
+            // event until AFTER `real_posix_spawn_raw` returns.  Unlike
+            // execve (which replaces the process image, so the calling
+            // pid IS the pid strace records the execve under),
+            // posix_spawn forks a child and writes the child pid into
+            // `*pid`.  Strace records the child's execve under that
+            // child pid.  If we emit the shim event using the parent
+            // pid here, the per-pid strace-vs-shim cross-check in
+            // src/guest/phase-install.ts treats every legitimate
+            // posix_spawn / posix_spawnp as `<SYSCALL_EXEC_BYPASS>`.
+            //
+            // On failure (`rc != 0`) we emit NO audit event — that
+            // matches the existing dispatch_exec failure path (the
+            // shim doesn't emit when execve returns -1 either, because
+            // the child never runs).
             set_in_shim(true);
-            emit_exec(path, argv0, false);
             let rc = real_posix_spawn_raw(
                 real_slot,
                 pid,
@@ -1741,6 +1772,21 @@ unsafe fn dispatch_spawn(
                 argv,
                 buf.ptrs as *const *mut c_char,
             );
+            if rc == 0 {
+                // `pid` is the user-provided `pid_t *` output param.
+                // posix_spawn is required to write the spawned child's
+                // pid here on success.  When the caller passes NULL
+                // (allowed by POSIX), there is no way to recover the
+                // child pid, so fall back to the parent pid; this is
+                // a degraded but better-than-nothing audit signal and
+                // matches the pre-fix behaviour for that rare case.
+                let child_pid = if !pid.is_null() {
+                    *pid
+                } else {
+                    libc::getpid()
+                };
+                emit_exec_for_pid(path, argv0, false, child_pid);
+            }
             free_envbuf(&mut buf);
             set_in_shim(false);
             rc
@@ -1751,6 +1797,12 @@ unsafe fn dispatch_spawn(
             // chain.  Emit the audit event with envp_alloc_failed:true and
             // return ENOMEM.  posix_spawn returns the errno code as int
             // (does NOT set errno + return -1), so just return libc::ENOMEM.
+            //
+            // No child pid is available here (the spawn never ran), so
+            // we emit with the parent pid.  The cross-check in
+            // phase-install treats envp_alloc_failed=true events as a
+            // separate signal (`envp_alloc_failed`), not as part of the
+            // strace/shim pairing for `<SYSCALL_EXEC_BYPASS>`.
             set_in_shim(true);
             emit_exec(path, argv0, true);
             set_in_shim(false);
