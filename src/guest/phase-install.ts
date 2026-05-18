@@ -597,10 +597,30 @@ export async function runInstallPhase(
   //                 child's copied entry cloexec=true so the
   //                 subsequent execveCloexec action in the list (if
   //                 any) sweeps it.
+  // Codex follow-up (high, 2026-05-19, bug #4 — execveCloexec
+  // generation-aware sweep): `execveCloexec` carries a per-action
+  // EXCLUSION set of fds opened AFTER this specific exec (and before
+  // any subsequent exec).  Replay sweeps every cloexec entry in the
+  // child copy EXCEPT those in this set.  Pre-fix the replay swept
+  // every cloexec entry, which incorrectly clobbered fds the child
+  // opened with O_CLOEXEC AFTER this exec but BEFORE the delayed
+  // clone — the kernel wouldn't close those until the NEXT exec.
+  //
+  // Why exclusion (option b) instead of an inclusion snapshot
+  // (option a): at child-singleton-exec time, the child's group is
+  // empty in our model (the parent's clone(CLONE_FILES) line hasn't
+  // arrived yet, so we haven't unioned parent fds in).  A snapshot
+  // of cloexec fds in the child's group at exec time would be
+  // empty even though the kernel's actual files_struct (shared with
+  // the parent pre-unshare) contained parent-installed cloexec fds.
+  // Reconciliation copies parent fds into the child AFTER this
+  // snapshot would have been taken — so the snapshot misses them.
+  // Exclusion sweeps after the copy and correctly drops the parent-
+  // copied cloexec fds while sparing post-exec child reopens.
   type FdDetachAction =
     | { kind: 'none' }
     | { kind: 'closeRange'; first: number; last: number; cloexec: boolean }
-    | { kind: 'execveCloexec' };
+    | { kind: 'execveCloexec'; excludeFds: Set<string> };
   // Codex follow-up (high, 2026-05-19, bug #1 + #2 follow-ups):
   // tombstones now carry an optional RANGE so close_range mutations on
   // untracked fds (the singleton-pre-detach case) can be replayed at
@@ -657,6 +677,50 @@ export async function runInstallPhase(
   // delete (close) already-applied as the only effect, and the bucket
   // is discarded at marker creation.
   const pendingFdTombstones = new Map<number, FdTombstone[]>();
+  // Codex follow-up (high, 2026-05-19, bug #3 — post-marker fd reuse
+  // exclusion): once a singleton pid has a pending-fd-detach marker
+  // (i.e., the kernel already unshared/execed and we're waiting for
+  // the delayed parent clone(CLONE_FILES) line), the child can
+  // legitimately REOPEN an fd whose pre-detach state had a `close` /
+  // `cloexec` / `closeRange` tombstone in `preDetachTombstones[]`.
+  // The pre-detach tombstone correctly applies to the PARENT (shared-
+  // files_struct kernel mutation propagated to the parent's view),
+  // but for the CHILD copy the post-marker reopen installed a fresh
+  // private fd that the kernel did NOT close — the tombstone must
+  // NOT apply to that fd on the child side.
+  //
+  // Track each post-marker fd reuse here; the reconciliation child-
+  // side replay of `preDetachTombstones` skips tombstones targeting
+  // these fds (range tombstones get split around them).  The set is
+  // cleared when the marker is consumed at delayed-clone reconcile.
+  const postMarkerFdReuses = new Map<number, Set<number>>();
+  function recordPostMarkerFdReuse(pid: number, fd: number): void {
+    // Only track when a marker is actively pending — otherwise there's
+    // no future reconciliation that needs the exclusion.
+    const snap = pendingFdDetach.get(pid);
+    if (snap === undefined) return;
+    let set = postMarkerFdReuses.get(pid);
+    if (set === undefined) {
+      set = new Set();
+      postMarkerFdReuses.set(pid, set);
+    }
+    set.add(fd);
+    // Codex follow-up (high, 2026-05-19, bug #4 — generation-aware
+    // execveCloexec): add `fd` to the exclude set of every
+    // execveCloexec action ALREADY in this marker's postDetachLog.
+    // The kernel sweeps cloexec only at exec-time; a post-marker
+    // reopen happens AFTER any execve actions already queued, so
+    // those execs did NOT see `fd` and the replay must not sweep it.
+    // FUTURE execveCloexec appends start with an empty exclude set
+    // (their kernel sweep DOES include this fd because the open
+    // happened BEFORE that future exec).
+    const fdSuffix = String(fd);
+    for (const entry of snap.postDetachLog) {
+      if (entry.kind === 'action' && entry.action.kind === 'execveCloexec') {
+        entry.action.excludeFds.add(fdSuffix);
+      }
+    }
+  }
   function recordFdTombstone(pid: number, tomb: FdTombstone): void {
     // Singleton-only gate: tombstones describe the singleton pid's
     // pre/post-detach mutations on UNTRACKED inherited fds.  A
@@ -825,7 +889,10 @@ export async function runInstallPhase(
         continue;
       }
       // Other actions (`none`, `execveCloexec`) don't reference fd
-      // numbers; preserve them verbatim.
+      // numbers from a TOMBSTONE-cancellation perspective.  The
+      // `execveCloexec` action's exclude-set is mutated by
+      // `recordPostMarkerFdReuse` directly (called alongside this
+      // helper at each reopen site).
       nextLog.push(entry);
     }
     snap.postDetachLog = nextLog;
@@ -1974,6 +2041,12 @@ export async function runInstallPhase(
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
+            // Codex follow-up (high, 2026-05-19, bug #3 — post-marker
+            // fd reuse exclusion): consume the per-pid reuse set
+            // alongside the marker; reconcile reads it before the
+            // delete returns it stale-safe via the snapshot below.
+            const childPostMarkerFdReuses = postMarkerFdReuses.get(childPid);
+            postMarkerFdReuses.delete(childPid);
             // Pre-marker tombstones for this child.  When a marker
             // already exists, those tombstones have already been
             // folded into `preDetachTombstones[]` by
@@ -2296,6 +2369,22 @@ export async function runInstallPhase(
                         });
                       }
                     } else {
+                      // Codex follow-up (high, 2026-05-19, bug #3 —
+                      // post-marker fd reuse): if the child's fd was
+                      // reopened AFTER the unshare/exec marker, the
+                      // child's entry reflects a private post-detach
+                      // open and is authoritative for the child side.
+                      // Keep it; the parent's stale-shared mapping at
+                      // the same fd was already dropped (or about to
+                      // be) by the pre-detach tombstone replay.
+                      const fdNum = parseInt(suffix, 10);
+                      const reusedPostMarker =
+                        Number.isFinite(fdNum) &&
+                        childPostMarkerFdReuses !== undefined &&
+                        childPostMarkerFdReuses.has(fdNum);
+                      if (reusedPostMarker) {
+                        continue;
+                      }
                       // Same fd, different paths — fail closed on the
                       // child side.  This handles plain fork conflicts
                       // (no pending marker — child raced ahead with
@@ -2395,19 +2484,52 @@ export async function runInstallPhase(
                   //      kernel-observed ordering so a CLOEXEC
                   //      tombstone followed by an execveCloexec
                   //      action correctly marks-then-sweeps.
+                  // Codex follow-up (high, 2026-05-19, bug #3 — post-
+                  // marker fd reuse exclusion): child-side tombstone
+                  // replay (whether pre-detach OR post-detach) must
+                  // skip fds the child reopened AFTER its
+                  // unshare/exec marker was recorded.  Those reopens
+                  // installed fresh private fds in the child's
+                  // post-detach group; the kernel-shared tombstone
+                  // describes a pre-unshare mutation and does NOT
+                  // apply to the post-marker private reopen.  Parent-
+                  // side replay (shared-files_struct propagation) is
+                  // unaffected — the kernel did close/cloexec the
+                  // parent's shared view at pre-unshare time, and any
+                  // subsequent post-unshare reopen happened in the
+                  // CHILD's private group, not the parent's.
+                  const childReuseExclude = childPostMarkerFdReuses;
                   const applyPointTombstone = (
                     fd: number,
                     kind: 'close' | 'cloexec',
                     toParent: boolean,
+                    toChild: boolean,
                   ): void => {
                     const childKey = `${childGroupPrefix}${fd}`;
                     const parentKey = `${parentPrefix}${fd}`;
                     if (kind === 'close') {
-                      dirfdTable.delete(childKey);
+                      if (toChild) dirfdTable.delete(childKey);
                       if (toParent) {
                         dirfdTable.delete(parentKey);
+                        // Parent group-taint always applies under
+                        // shared CLONE_FILES — preserves historic
+                        // conservative semantics for inherited fds
+                        // we may not have modeled.
                         fdUnknownAdd(pid);
-                        fdUnknownAdd(childPid);
+                        // Codex follow-up (high, 2026-05-19, bug #3 —
+                        // post-marker fd reuse): when the child has a
+                        // KNOWN post-marker reopen for this fd, skip
+                        // the CHILD group-wide taint — the kernel-
+                        // shared close affected only this specific
+                        // fd, and the child has a fresh private
+                        // mapping for it.  Tainting the child group-
+                        // wide would clobber the very mapping we're
+                        // trying to preserve.  Without the post-
+                        // marker reuse signal (toChild=true) we keep
+                        // the historic conservative child taint.
+                        if (toChild) {
+                          fdUnknownAdd(childPid);
+                        }
                       }
                     } else {
                       // cloexec — flip the child's copied entry; under
@@ -2415,9 +2537,11 @@ export async function runInstallPhase(
                       // FD_CLOEXEC on the parent's view of the shared
                       // fd, so flip the parent's entry too.  The
                       // parent's next execve sweep then drops it.
-                      const cur = dirfdTable.get(childKey);
-                      if (cur !== undefined) {
-                        dirfdTable.set(childKey, { path: cur.path, cloexec: true });
+                      if (toChild) {
+                        const cur = dirfdTable.get(childKey);
+                        if (cur !== undefined) {
+                          dirfdTable.set(childKey, { path: cur.path, cloexec: true });
+                        }
                       }
                       if (toParent) {
                         const pcur = dirfdTable.get(parentKey);
@@ -2432,30 +2556,37 @@ export async function runInstallPhase(
                     last: number,
                     cloexec: boolean,
                     toParent: boolean,
+                    toChild: boolean,
+                    excludeChildFds: Set<number> | undefined,
                   ): void => {
                     // Iterate copied entries in the child group within
-                    // [first, last] — child copy always.
-                    for (const k of [...dirfdTable.keys()]) {
-                      if (!k.startsWith(childGroupPrefix)) continue;
-                      const fdStr = k.slice(childGroupPrefix.length);
-                      const fdNum = parseInt(fdStr, 10);
-                      if (
-                        Number.isFinite(fdNum) &&
-                        fdNum >= first &&
-                        fdNum <= last
-                      ) {
-                        if (cloexec) {
-                          const cur = dirfdTable.get(k);
-                          if (cur !== undefined) {
-                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                    // [first, last] — skipping any fd in
+                    // `excludeChildFds` (post-marker private reopens).
+                    if (toChild) {
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(childGroupPrefix)) continue;
+                        const fdStr = k.slice(childGroupPrefix.length);
+                        const fdNum = parseInt(fdStr, 10);
+                        if (
+                          Number.isFinite(fdNum) &&
+                          fdNum >= first &&
+                          fdNum <= last &&
+                          (excludeChildFds === undefined || !excludeChildFds.has(fdNum))
+                        ) {
+                          if (cloexec) {
+                            const cur = dirfdTable.get(k);
+                            if (cur !== undefined) {
+                              dirfdTable.set(k, { path: cur.path, cloexec: true });
+                            }
+                          } else {
+                            dirfdTable.delete(k);
                           }
-                        } else {
-                          dirfdTable.delete(k);
                         }
                       }
                     }
                     if (toParent) {
                       let touched = false;
+                      let onlyExcludedTouched = true;
                       for (const k of [...dirfdTable.keys()]) {
                         if (!k.startsWith(parentPrefix)) continue;
                         const fdStr = k.slice(parentPrefix.length);
@@ -2474,27 +2605,65 @@ export async function runInstallPhase(
                             dirfdTable.delete(k);
                           }
                           touched = true;
+                          if (
+                            excludeChildFds === undefined ||
+                            !excludeChildFds.has(fdNum)
+                          ) {
+                            onlyExcludedTouched = false;
+                          }
                         }
                       }
+                      // Codex follow-up (high, 2026-05-19, bug #3 —
+                      // post-marker fd reuse): skip the group-wide
+                      // child taint when every fd touched by this
+                      // range tombstone has a post-marker reopen on
+                      // the child side.  The child's view of those
+                      // fds is concretely known (the reopen
+                      // established a fresh private mapping); the
+                      // kernel-shared close affected only those
+                      // specific fds, so other fds in the child
+                      // group remain trustworthy.  Parent taint is
+                      // unchanged (the kernel did mutate parent's
+                      // shared view of those fds).
                       if (touched && !cloexec) {
                         fdUnknownAdd(pid);
-                        fdUnknownAdd(childPid);
+                        if (!onlyExcludedTouched) {
+                          fdUnknownAdd(childPid);
+                        }
                       }
                     }
                   };
-                  // (1) Pre-detach tombstones.
+                  // (1) Pre-detach tombstones.  Parent side gets every
+                  // tombstone unconditionally under fdPendingDetach-
+                  // Shared (kernel mutated the shared files_struct
+                  // pre-unshare).  Child side EXCLUDES fds reopened
+                  // post-marker — those are private to the child's
+                  // post-detach group and the kernel did not clobber
+                  // them at pre-unshare time.
                   for (const tomb of childFdSnap.preDetachTombstones) {
                     if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
-                      applyPointTombstone(tomb.fd, tomb.kind, fdPendingDetachShared);
+                      const childExcluded =
+                        childReuseExclude !== undefined &&
+                        childReuseExclude.has(tomb.fd);
+                      applyPointTombstone(
+                        tomb.fd,
+                        tomb.kind,
+                        fdPendingDetachShared,
+                        !childExcluded,
+                      );
                     } else {
                       // closeRange tombstone (bug #2 follow-up): range
                       // close / CLOEXEC mark replayed against parent +
-                      // child copy under shared CLONE_FILES.
+                      // child copy under shared CLONE_FILES.  Child
+                      // side iterates per-fd and honours the exclude
+                      // set inline (bug #3 follow-up).
                       applyRangeTombstone(
                         tomb.first,
                         tomb.last,
                         tomb.cloexec,
                         fdPendingDetachShared,
+                        true,
+                        childReuseExclude,
                       );
                     }
                   }
@@ -2540,8 +2709,19 @@ export async function runInstallPhase(
                           }
                         }
                       } else if (action.kind === 'execveCloexec') {
+                        // Codex follow-up (high, 2026-05-19, bug #4 —
+                        // generation-aware execveCloexec): sweep
+                        // every cloexec=true entry in the child copy
+                        // EXCEPT those in this action's exclude set.
+                        // The exclude set accumulates fds reopened
+                        // AFTER this exec via
+                        // `recordPostMarkerFdReuse`; the kernel only
+                        // sweeps fds that existed at exec-time, so
+                        // post-exec reopens must survive.
                         for (const k of [...dirfdTable.keys()]) {
                           if (!k.startsWith(childGroupPrefix)) continue;
+                          const fdStr = k.slice(childGroupPrefix.length);
+                          if (action.excludeFds.has(fdStr)) continue;
                           const ent = dirfdTable.get(k);
                           if (ent !== undefined && ent.cloexec) {
                             dirfdTable.delete(k);
@@ -2552,10 +2732,31 @@ export async function runInstallPhase(
                       // → no replay needed.
                     } else {
                       const tomb = entry.tombstone;
+                      // Post-detach tombstones replay against the
+                      // CHILD copy only (toParent=false).  Like pre-
+                      // detach, post-marker fd reuses must NOT be
+                      // clobbered on the child side — a tombstone
+                      // queued AFTER the marker followed by a reopen
+                      // AFTER the tombstone is already cancelled via
+                      // cancelPendingTombstonesForFd at the reopen
+                      // site, but range tombstones queued AFTER the
+                      // marker AND containing a fd reopened later
+                      // also need exclusion.  We funnel everything
+                      // through the same exclude set for safety.
                       if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
-                        applyPointTombstone(tomb.fd, tomb.kind, false);
+                        const childExcluded =
+                          childReuseExclude !== undefined &&
+                          childReuseExclude.has(tomb.fd);
+                        applyPointTombstone(tomb.fd, tomb.kind, false, !childExcluded);
                       } else {
-                        applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
+                        applyRangeTombstone(
+                          tomb.first,
+                          tomb.last,
+                          tomb.cloexec,
+                          false,
+                          true,
+                          childReuseExclude,
+                        );
                       }
                     }
                   }
@@ -2707,6 +2908,14 @@ export async function runInstallPhase(
               // this fd so the delayed-clone reconciler doesn't
               // delete the entry after unionFd merges it.
               cancelPendingTombstonesForFd(pid, newFd);
+              // Codex follow-up (high, 2026-05-19, bug #3 — post-marker
+              // fd reuse exclusion): if a marker is already pending,
+              // a fresh dup install on `newFd` is a child-private
+              // reopen AFTER the kernel-level unshare/exec.  Pre-
+              // detach tombstones targeting `newFd` describe the
+              // pre-unshare shared mutation; the child's reconciled
+              // copy must EXCLUDE `newFd` from those tombstones.
+              recordPostMarkerFdReuse(pid, newFd);
             } else {
               // oldfd has no tracked dir mapping → newfd must NOT
               // retain its previous mapping either (it now aliases
@@ -3178,6 +3387,9 @@ export async function runInstallPhase(
               // targeting fd `rc` for this pid; mirrors the same fix
               // at the dup-family and openat success sites.
               cancelPendingTombstonesForFd(pid, rc);
+              // Codex follow-up (high, 2026-05-19, bug #3 — post-marker
+              // fd reuse exclusion): mirrors the dup-family fix.
+              recordPostMarkerFdReuse(pid, rc);
             } else {
               // Unknown source fd → invalidate any prior mapping at the
               // new fd (mirrors the dup-family behaviour).
@@ -3349,9 +3561,20 @@ export async function runInstallPhase(
           const execFdSingleton = isFdSingleton(rawEvent.pid);
           let execFdSnap: FdSnapshot | null = null;
           if (execFdSingleton) {
-            execFdSnap = appendFdAction(rawEvent.pid, { kind: 'execveCloexec' });
+            // Codex follow-up (high, 2026-05-19, bug #4 — generation-
+            // aware execveCloexec): seed the exclusion set empty.
+            // Subsequent post-marker fd reuses (open/openat/openat2/
+            // creat/dup*/F_DUPFD) add their newFd to THIS action's
+            // exclude set so the reconciler doesn't sweep an fd that
+            // wasn't open at this exec's instant.  See
+            // `recordPostMarkerFdReuse` for the wiring.
+            const execAction: FdDetachAction = {
+              kind: 'execveCloexec',
+              excludeFds: new Set<string>(),
+            };
+            execFdSnap = appendFdAction(rawEvent.pid, execAction);
             if (execFdSnap === null) {
-              execFdSnap = snapshotFd(rawEvent.pid, { kind: 'execveCloexec' });
+              execFdSnap = snapshotFd(rawEvent.pid, execAction);
             }
           }
           detachFdGroup(rawEvent.pid);
@@ -3476,6 +3699,13 @@ export async function runInstallPhase(
             // AFTER unionFd merges this valid mapping into the
             // parent's group.
             cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
+            // Codex follow-up (high, 2026-05-19, bug #3 — post-marker
+            // fd reuse exclusion): mirrors the dup-family + fcntl
+            // F_DUPFD fix.  A fresh open AFTER the kernel-level
+            // unshare/exec installs a child-private fd; pre-detach
+            // tombstones targeting this fd describe the pre-unshare
+            // shared mutation and must NOT clobber the child copy.
+            recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
           }
         }
 

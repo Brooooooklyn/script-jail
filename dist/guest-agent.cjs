@@ -25910,6 +25910,23 @@ async function runInstallPhase(input) {
   const pendingCwdDetach = /* @__PURE__ */ new Map();
   const pendingFdDetach = /* @__PURE__ */ new Map();
   const pendingFdTombstones = /* @__PURE__ */ new Map();
+  const postMarkerFdReuses = /* @__PURE__ */ new Map();
+  function recordPostMarkerFdReuse(pid, fd) {
+    const snap = pendingFdDetach.get(pid);
+    if (snap === void 0) return;
+    let set2 = postMarkerFdReuses.get(pid);
+    if (set2 === void 0) {
+      set2 = /* @__PURE__ */ new Set();
+      postMarkerFdReuses.set(pid, set2);
+    }
+    set2.add(fd);
+    const fdSuffix = String(fd);
+    for (const entry of snap.postDetachLog) {
+      if (entry.kind === "action" && entry.action.kind === "execveCloexec") {
+        entry.action.excludeFds.add(fdSuffix);
+      }
+    }
+  }
   function recordFdTombstone(pid, tomb) {
     if (!isFdSingleton(pid)) return;
     const existingSnap = pendingFdDetach.get(pid);
@@ -26385,6 +26402,8 @@ async function runInstallPhase(input) {
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
+            const childPostMarkerFdReuses = postMarkerFdReuses.get(childPid);
+            postMarkerFdReuses.delete(childPid);
             const standaloneFdTombstones = childFdSnap === void 0 ? pendingFdTombstones.get(childPid) : void 0;
             pendingFdTombstones.delete(childPid);
             const childHadPendingCwdDetach = childCwdSnap !== void 0;
@@ -26497,6 +26516,11 @@ async function runInstallPhase(input) {
                         });
                       }
                     } else {
+                      const fdNum = parseInt(suffix, 10);
+                      const reusedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdReuses !== void 0 && childPostMarkerFdReuses.has(fdNum);
+                      if (reusedPostMarker) {
+                        continue;
+                      }
                       dirfdTable.delete(childKey);
                     }
                   }
@@ -26524,20 +26548,25 @@ async function runInstallPhase(input) {
                 }
                 if (childFdSnap !== void 0 && childHadPendingFdDetach) {
                   const childGroupPrefix = `${rootedFd(childPid)}:`;
-                  const applyPointTombstone = (fd, kind, toParent) => {
+                  const childReuseExclude = childPostMarkerFdReuses;
+                  const applyPointTombstone = (fd, kind, toParent, toChild) => {
                     const childKey = `${childGroupPrefix}${fd}`;
                     const parentKey = `${parentPrefix}${fd}`;
                     if (kind === "close") {
-                      dirfdTable.delete(childKey);
+                      if (toChild) dirfdTable.delete(childKey);
                       if (toParent) {
                         dirfdTable.delete(parentKey);
                         fdUnknownAdd(pid);
-                        fdUnknownAdd(childPid);
+                        if (toChild) {
+                          fdUnknownAdd(childPid);
+                        }
                       }
                     } else {
-                      const cur = dirfdTable.get(childKey);
-                      if (cur !== void 0) {
-                        dirfdTable.set(childKey, { path: cur.path, cloexec: true });
+                      if (toChild) {
+                        const cur = dirfdTable.get(childKey);
+                        if (cur !== void 0) {
+                          dirfdTable.set(childKey, { path: cur.path, cloexec: true });
+                        }
                       }
                       if (toParent) {
                         const pcur = dirfdTable.get(parentKey);
@@ -26547,24 +26576,27 @@ async function runInstallPhase(input) {
                       }
                     }
                   };
-                  const applyRangeTombstone = (first, last, cloexec, toParent) => {
-                    for (const k of [...dirfdTable.keys()]) {
-                      if (!k.startsWith(childGroupPrefix)) continue;
-                      const fdStr = k.slice(childGroupPrefix.length);
-                      const fdNum = parseInt(fdStr, 10);
-                      if (Number.isFinite(fdNum) && fdNum >= first && fdNum <= last) {
-                        if (cloexec) {
-                          const cur = dirfdTable.get(k);
-                          if (cur !== void 0) {
-                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                  const applyRangeTombstone = (first, last, cloexec, toParent, toChild, excludeChildFds) => {
+                    if (toChild) {
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(childGroupPrefix)) continue;
+                        const fdStr = k.slice(childGroupPrefix.length);
+                        const fdNum = parseInt(fdStr, 10);
+                        if (Number.isFinite(fdNum) && fdNum >= first && fdNum <= last && (excludeChildFds === void 0 || !excludeChildFds.has(fdNum))) {
+                          if (cloexec) {
+                            const cur = dirfdTable.get(k);
+                            if (cur !== void 0) {
+                              dirfdTable.set(k, { path: cur.path, cloexec: true });
+                            }
+                          } else {
+                            dirfdTable.delete(k);
                           }
-                        } else {
-                          dirfdTable.delete(k);
                         }
                       }
                     }
                     if (toParent) {
                       let touched = false;
+                      let onlyExcludedTouched = true;
                       for (const k of [...dirfdTable.keys()]) {
                         if (!k.startsWith(parentPrefix)) continue;
                         const fdStr = k.slice(parentPrefix.length);
@@ -26579,23 +26611,36 @@ async function runInstallPhase(input) {
                             dirfdTable.delete(k);
                           }
                           touched = true;
+                          if (excludeChildFds === void 0 || !excludeChildFds.has(fdNum)) {
+                            onlyExcludedTouched = false;
+                          }
                         }
                       }
                       if (touched && !cloexec) {
                         fdUnknownAdd(pid);
-                        fdUnknownAdd(childPid);
+                        if (!onlyExcludedTouched) {
+                          fdUnknownAdd(childPid);
+                        }
                       }
                     }
                   };
                   for (const tomb of childFdSnap.preDetachTombstones) {
                     if (tomb.kind === "close" || tomb.kind === "cloexec") {
-                      applyPointTombstone(tomb.fd, tomb.kind, fdPendingDetachShared);
+                      const childExcluded = childReuseExclude !== void 0 && childReuseExclude.has(tomb.fd);
+                      applyPointTombstone(
+                        tomb.fd,
+                        tomb.kind,
+                        fdPendingDetachShared,
+                        !childExcluded
+                      );
                     } else {
                       applyRangeTombstone(
                         tomb.first,
                         tomb.last,
                         tomb.cloexec,
-                        fdPendingDetachShared
+                        fdPendingDetachShared,
+                        true,
+                        childReuseExclude
                       );
                     }
                   }
@@ -26621,6 +26666,8 @@ async function runInstallPhase(input) {
                       } else if (action.kind === "execveCloexec") {
                         for (const k of [...dirfdTable.keys()]) {
                           if (!k.startsWith(childGroupPrefix)) continue;
+                          const fdStr = k.slice(childGroupPrefix.length);
+                          if (action.excludeFds.has(fdStr)) continue;
                           const ent = dirfdTable.get(k);
                           if (ent !== void 0 && ent.cloexec) {
                             dirfdTable.delete(k);
@@ -26630,9 +26677,17 @@ async function runInstallPhase(input) {
                     } else {
                       const tomb = entry.tombstone;
                       if (tomb.kind === "close" || tomb.kind === "cloexec") {
-                        applyPointTombstone(tomb.fd, tomb.kind, false);
+                        const childExcluded = childReuseExclude !== void 0 && childReuseExclude.has(tomb.fd);
+                        applyPointTombstone(tomb.fd, tomb.kind, false, !childExcluded);
                       } else {
-                        applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
+                        applyRangeTombstone(
+                          tomb.first,
+                          tomb.last,
+                          tomb.cloexec,
+                          false,
+                          true,
+                          childReuseExclude
+                        );
                       }
                     }
                   }
@@ -26703,6 +26758,7 @@ async function runInstallPhase(input) {
               }
               dirfdTable.set(newKey, { path: oldVal.path, cloexec: newCloexec });
               cancelPendingTombstonesForFd(pid, newFd);
+              recordPostMarkerFdReuse(pid, newFd);
             } else {
               dirfdTable.delete(newKey);
               fdUnknownAdd(pid);
@@ -26921,6 +26977,7 @@ async function runInstallPhase(input) {
                 cloexec: cmd2 === "F_DUPFD_CLOEXEC"
               });
               cancelPendingTombstonesForFd(pid, rc);
+              recordPostMarkerFdReuse(pid, rc);
             } else {
               dirfdTable.delete(newKey);
               fdUnknownAdd(pid);
@@ -26980,9 +27037,13 @@ async function runInstallPhase(input) {
           const execFdSingleton = isFdSingleton(rawEvent.pid);
           let execFdSnap = null;
           if (execFdSingleton) {
-            execFdSnap = appendFdAction(rawEvent.pid, { kind: "execveCloexec" });
+            const execAction = {
+              kind: "execveCloexec",
+              excludeFds: /* @__PURE__ */ new Set()
+            };
+            execFdSnap = appendFdAction(rawEvent.pid, execAction);
             if (execFdSnap === null) {
-              execFdSnap = snapshotFd(rawEvent.pid, { kind: "execveCloexec" });
+              execFdSnap = snapshotFd(rawEvent.pid, execAction);
             }
           }
           detachFdGroup(rawEvent.pid);
@@ -27035,6 +27096,7 @@ async function runInstallPhase(input) {
               cloexec
             });
             cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
+            recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
           }
         }
         if (rawEvent.kind === "read" && rawEvent.path === SHIM_LIBRARY_PATH) {
