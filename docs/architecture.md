@@ -140,6 +140,16 @@ same UID as the audited process. A malicious lifecycle script with that UID can:
    to open the file via spellings the path-equality detector may miss. (The
    strace parser now canonicalizes these; see commit 7a4a281.)
 
+4. Spoof the shim-trust signal by `open("/lib/libscriptjail.so", O_RDONLY)`
+   without actually loading it. The forgery detector grants shim-trust to
+   any pid that reads the .so file because we have no cheap kernel-side
+   signal that ld.so actually mapped the segment. The truly unforgeable
+   signal would be the kernel-side mmap of the .so as executable
+   (`PROT_EXEC`), but tracing every `mmap` syscall is prohibitively
+   expensive for an interactive install. A shim-emitted runtime event
+   after init would be same-UID forgeable (see gap 1). The only
+   complete fix is UID separation (see below).
+
 These gaps are accepted in v1 because:
 - The microVM is single-use and discarded after install.
 - Network is off during install (Phase B), so exfiltration is bounded.
