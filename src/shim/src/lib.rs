@@ -171,6 +171,20 @@ unsafe fn errno() -> c_int {
     0
 }
 
+/// Set errno to `e` (no-op on platforms without a known location).  Caller
+/// must hold the recursion guard if there is any risk of the underlying
+/// thread-local accessor calling back into a shim wrapper.
+#[cfg(target_os = "linux")]
+unsafe fn set_errno(e: c_int) {
+    *libc::__errno_location() = e;
+}
+#[cfg(target_os = "macos")]
+unsafe fn set_errno(e: c_int) {
+    *libc::__error() = e;
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+unsafe fn set_errno(_e: c_int) {}
+
 // ── string helpers ─────────────────────────────────────────────────────────
 
 unsafe fn cstr_eq(a: *const c_char, b: *const c_char) -> bool {
@@ -1466,12 +1480,18 @@ unsafe fn dispatch_exec(
             rc
         }
         None => {
-            // Couldn't rewrite — forward the original envp untouched.
+            // Fail closed: rewrite_envp returned None because either the
+            // input envp exceeded MAX_ENVP_SANITY or an allocation failed.
+            // Forwarding the unmodified attacker envp would let a hostile
+            // script bypass the audit chain entirely (the child would run
+            // without LD_PRELOAD/NODE_OPTIONS/SCRIPT_JAIL_* re-injected).
+            // Emit the audit event so the attempt is visible, then return
+            // -1 with errno=ENOMEM to refuse the exec.
             set_in_shim(true);
             emit_exec(prog, argv0, true);
-            let rc = forward_to_real(&kind, prog, argv, envp_in);
+            set_errno(libc::ENOMEM);
             set_in_shim(false);
-            rc
+            -1
         }
     }
 }
@@ -1515,11 +1535,15 @@ unsafe fn dispatch_spawn(
             rc
         }
         None => {
+            // Fail closed: rewrite_envp returned None, so spawning with the
+            // unmodified attacker envp would let the child bypass the audit
+            // chain.  Emit the audit event with envp_alloc_failed:true and
+            // return ENOMEM.  posix_spawn returns the errno code as int
+            // (does NOT set errno + return -1), so just return libc::ENOMEM.
             set_in_shim(true);
             emit_exec(path, argv0, true);
-            let rc = real_posix_spawn_raw(real_slot, pid, path, file_actions, attrp, argv, envp_in);
             set_in_shim(false);
-            rc
+            libc::ENOMEM
         }
     }
 }
