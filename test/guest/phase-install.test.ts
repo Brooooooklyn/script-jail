@@ -8959,5 +8959,391 @@ describe('runInstallPhase', () => {
       });
       expect(parentUnresolved).toHaveLength(0);
     });
+
+    // Codex follow-up (high, 2026-05-19, bug #1 fcntl): fcntl with
+    // F_DUPFD / F_DUPFD_CLOEXEC from an untracked source fd must mark
+    // the pid's fd-group state-unknown, mirroring the dup/dup2/dup3
+    // untracked-source path.  Without this, the
+    // pending-detach-AND-CLONE_FILES reconciliation can't propagate
+    // the unknown bit to the parent and a stale parent fd entry
+    // certifies through the wrong directory.
+    //
+    // Sequence:
+    //   1. parent: openat → fd 7 = /safe
+    //   2. child:  fcntl(99, F_DUPFD, 7) = 7  — oldfd 99 untracked,
+    //              new fd 7 must mark child fd-state-unknown.
+    //   3. child:  unshare(CLONE_FILES) — pending fd-detach marker.
+    //   4. (out-of-order) parent clone(CLONE_FILES) reconciliation.
+    //   5. parent: openat(7, ".ssh/id_rsa") — MUST fail closed.
+    it('pending-fd-detach + child fcntl(F_DUPFD) from untracked source taints BOTH (bug #1)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fcntl-untracked-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'fcntl-untracked-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /safe → fd 7.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child fcntl(99, F_DUPFD, 7) = 7 — fd 99 untracked.  Post-fix
+        // marks the child group fd-state-unknown.
+        { pid: 1001, line: 'fcntl(99, F_DUPFD, 7) = 7', source: 'strace' },
+        // Child unshare(CLONE_FILES) — pendingFdDetach.
+        { pid: 1001, line: 'unshare(CLONE_FILES) = 0', source: 'strace' },
+        // Delayed parent clone(CLONE_FILES) — propagate unknown bit
+        // through the snapshot, drop parent fd entries, mark both
+        // groups unknown.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent openat(7, ".ssh/id_rsa") — MUST fail closed.
+        {
+          pid: 1000,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/safe/.ssh/id_rsa' && r['pid'] === 1000;
+      });
+      expect(leaked).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1000;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (medium, 2026-05-19, bug #2 snapshot): the
+    // pending CWD detach marker captures the child's state AT
+    // UNSHARE TIME; post-unshare child mutations stay private to the
+    // child's group and MUST NOT taint the parent at clone
+    // reconciliation.
+    //
+    // Sequence:
+    //   1. parent: chdir(/A) — parent cwd = /A.
+    //   2. child:  unshare(CLONE_NEWUSER) — snapshot is empty (child
+    //              had no prior cwd state).
+    //   3. child:  chdir(/B) — POST-unshare mutation, private to
+    //              child's group.  In our model child now has cwd /B.
+    //   4. (out-of-order) parent clone(CLONE_FS) reconciliation.
+    //
+    // Pre-fix (without snapshot): the reconciler read the CHILD's
+    // current cwd (/B) at reconcile time and treated parent=/A vs
+    // child=/B as a conflict under pendingDetachShared → tainted
+    // BOTH.  Parent's subsequent openat(AT_FDCWD, ...) failed closed
+    // even though parent's modeled cwd /A was correct.
+    //
+    // Post-fix (with snapshot): the reconciler reads snapshot.cwd =
+    // undefined (child had no cwd at unshare time).  No conflict
+    // against parent's /A → parent stays trustworthy.  Child's /B
+    // (its post-detach private mutation) is preserved.
+    it('post-unshare child chdir does not taint parent (bug #2 snapshot)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'post-unshare-chdir-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'post-unshare-chdir-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent chdir(/A).
+        { pid: 1000, line: 'chdir("/A") = 0', source: 'strace' },
+        // Child unshare(CLONE_NEWUSER) — snapshot child state (empty)
+        // at this moment.  CLONE_NEWUSER implies CLONE_FS detach.
+        { pid: 1001, line: 'unshare(CLONE_NEWUSER) = 0', source: 'strace' },
+        // Child chdir(/B) — POST-unshare mutation.  In a snapshot-
+        // less world this would have been read at reconcile time and
+        // mistaken for a pre-unshare shared-state mutation.
+        { pid: 1001, line: 'chdir("/B") = 0', source: 'strace' },
+        // Delayed parent clone(CLONE_FS).
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent AT_FDCWD openat — must resolve to /A/x (parent
+        // cwd NOT tainted because snapshot showed no child mutation
+        // at unshare time).
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
+          source: 'strace',
+        },
+        // Child AT_FDCWD openat — should resolve to /B/y (child's
+        // private post-unshare chdir is preserved).
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "y", O_RDONLY) = 6',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: /B/y certified.
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/y' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // Parent must NOT have <UNRESOLVED_PATH>.
+      const parentUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1000;
+      });
+      expect(parentUnresolved).toHaveLength(0);
+    });
+
+    // Codex follow-up (medium, 2026-05-19, bug #3 close_range
+    // UNSHARE): a singleton child that calls close_range(...,
+    // CLOSE_RANGE_UNSHARE) MUST record a pending marker so that a
+    // delayed parent clone(CLONE_FILES) reconciliation:
+    //   (a) does not re-merge child into parent's group,
+    //   (b) copies parent fds into child's private group,
+    //   (c) replays the close_range action onto the child copy.
+    //
+    // Result: child fd 7 → fails closed (kernel close_range honored).
+    //         parent fd 7 → resolves through /A (parent retains table).
+    it('close_range UNSHARE before delayed clone honors private close (bug #3 close_range)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'close-range-singleton-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'close-range-singleton-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7 BEFORE any clone reconciliation.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child close_range(3, INT_MAX, CLOSE_RANGE_UNSHARE) at
+        // singleton time.  Pre-fix: detach no-op, range applied to
+        // empty singleton table — no effect.  Then delayed parent
+        // clone(CLONE_FILES) unions child back into parent's group,
+        // and child fd 7 (= /A) is "alive" again.  Post-fix: pending
+        // marker with replay action records the close_range; clone
+        // reconciliation copies parent's fd 7 into child group then
+        // replays the close → child's fd 7 dropped.
+        {
+          pid: 1001,
+          line: 'close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES).
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed (close_range
+        // dropped fd 7 in child's private group).
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 8',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /A/x (parent
+        // retains its own fd 7 entry; close_range was private to
+        // child).
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: NO /A/x certified (its fd 7 was closed by the replay).
+      const childLeaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeaked).toHaveLength(0);
+      // Child: <UNRESOLVED_PATH> for the failing openat.
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (medium, 2026-05-19, bug #3 execve): a
+    // singleton child that execve()s with a CLOEXEC fd inherited
+    // from the parent MUST record a pending marker so that the
+    // delayed parent clone(CLONE_FILES) reconciliation:
+    //   (a) does not re-merge child into parent's group,
+    //   (b) copies parent fds into child's private group,
+    //   (c) replays the CLOEXEC sweep onto the child copy.
+    //
+    // Result: child fd 7 → fails closed (CLOEXEC swept).
+    //         parent fd 7 → resolves through /A (parent didn't execve).
+    it('execve before delayed clone sweeps CLOEXEC on child only (bug #3 execve)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'execve-singleton-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'execve-singleton-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7 with O_CLOEXEC.  At kernel time
+        // this fd is shared with the (yet-to-be-cloned) child;
+        // execve from the child triggers a CLOEXEC sweep on the
+        // child's private copy only.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 7',
+          source: 'strace',
+        },
+        // Child execve at singleton.  Snapshot captures pre-detach
+        // state with replay action = execveCloexec.
+        {
+          pid: 1001,
+          line: 'execve("/bin/sh", ["/bin/sh"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES).
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed (CLOEXEC swept fd
+        // 7 in child's private group).
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 8',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /A/x (parent did
+        // not execve; CLOEXEC sweep is private to child).
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: NO /A/x certified.
+      const childLeaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeaked).toHaveLength(0);
+      // Child: <UNRESOLVED_PATH> for the failing openat.
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

@@ -25907,8 +25907,31 @@ async function runInstallPhase(input) {
   const eventsFileBasename = eventsFilePathCanonical !== null ? path.basename(eventsFilePathCanonical) : null;
   const cwdParent = /* @__PURE__ */ new Map();
   const fdParent = /* @__PURE__ */ new Map();
-  const pendingCwdDetach = /* @__PURE__ */ new Set();
-  const pendingFdDetach = /* @__PURE__ */ new Set();
+  const pendingCwdDetach = /* @__PURE__ */ new Map();
+  const pendingFdDetach = /* @__PURE__ */ new Map();
+  function snapshotCwd(pid) {
+    return { cwd: cwdGet(pid), unknown: cwdUnknownHas(pid) };
+  }
+  function snapshotFd(pid, action) {
+    const root = rootedFd(pid);
+    const prefix = `${root}:`;
+    const entries = [];
+    for (const [key, val] of dirfdTable) {
+      if (key.startsWith(prefix)) {
+        entries.push([key.slice(prefix.length), val]);
+      }
+    }
+    return { entries, unknown: dirfdStateUnknown.has(root), action };
+  }
+  function isFdSingleton(pid) {
+    const root = rootedFd(pid);
+    if (root !== pid) return false;
+    for (const memberPid of fdParent.keys()) {
+      if (memberPid === pid) continue;
+      if (findFdRoot(memberPid) === pid) return false;
+    }
+    return true;
+  }
   function findCwdRoot(pid) {
     let cur = pid;
     while (true) {
@@ -26240,15 +26263,20 @@ async function runInstallPhase(input) {
                 }
               }
             }
-            const childHadPendingCwdDetach = pendingCwdDetach.delete(childPid);
-            const childHadPendingFdDetach = pendingFdDetach.delete(childPid);
+            const childCwdSnap = pendingCwdDetach.get(childPid);
+            pendingCwdDetach.delete(childPid);
+            const childFdSnap = pendingFdDetach.get(childPid);
+            pendingFdDetach.delete(childPid);
+            const childHadPendingCwdDetach = childCwdSnap !== void 0;
+            const childHadPendingFdDetach = childFdSnap !== void 0;
             if (cloneFs && !childHadPendingCwdDetach) {
               unionCwd(pid, childPid);
             } else {
               const parentCwd = cwdGet(pid);
               const parentCwdUnknown = cwdUnknownHas(pid);
-              const childCwd = cwdGet(childPid);
-              const childCwdUnknown = cwdUnknownHas(childPid);
+              const childCwd = childCwdSnap !== void 0 ? childCwdSnap.cwd : cwdGet(childPid);
+              const childCwdUnknown = childCwdSnap !== void 0 ? childCwdSnap.unknown : cwdUnknownHas(childPid);
+              const currentChildCwd = cwdGet(childPid);
               const pendingDetachShared = childHadPendingCwdDetach && cloneFs;
               if (parentCwdUnknown || childCwdUnknown) {
                 cwdUnknownAdd(childPid);
@@ -26266,7 +26294,7 @@ async function runInstallPhase(input) {
                     cwdUnknownAdd(pid);
                   }
                 }
-              } else if (parentCwd !== void 0) {
+              } else if (parentCwd !== void 0 && currentChildCwd === void 0) {
                 cwdSet(childPid, parentCwd);
               }
             }
@@ -26279,8 +26307,23 @@ async function runInstallPhase(input) {
                 const parentPrefix = `${parentRoot}:`;
                 const childPrefix = `${childRoot}:`;
                 const fdPendingDetachShared = childHadPendingFdDetach && cloneFiles;
-                const childFdUnknownPre = fdUnknownHas(childPid);
-                const parentDeletes = [];
+                const snapEntries = /* @__PURE__ */ new Map();
+                if (childFdSnap !== void 0) {
+                  for (const [k, v] of childFdSnap.entries) snapEntries.set(k, v);
+                }
+                const snapUnknown = childFdSnap !== void 0 ? childFdSnap.unknown : fdUnknownHas(childPid);
+                const childFdUnknownPre = fdPendingDetachShared ? snapUnknown : fdUnknownHas(childPid);
+                let snapshotConflict = false;
+                if (fdPendingDetachShared) {
+                  for (const [fdSuffix, snapVal] of snapEntries) {
+                    const parentKey = `${parentPrefix}${fdSuffix}`;
+                    const parentVal = dirfdTable.get(parentKey);
+                    if (parentVal !== void 0 && parentVal.path !== snapVal.path) {
+                      snapshotConflict = true;
+                      break;
+                    }
+                  }
+                }
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
                     const suffix = key.slice(parentPrefix.length);
@@ -26297,20 +26340,21 @@ async function runInstallPhase(input) {
                       }
                     } else {
                       dirfdTable.delete(childKey);
-                      if (fdPendingDetachShared) {
-                        parentDeletes.push(key);
-                      }
                     }
                   }
                 }
-                for (const key of parentDeletes) {
-                  dirfdTable.delete(key);
-                }
-                if (fdUnknownHas(pid)) {
+                if (fdPendingDetachShared && snapshotConflict) {
+                  for (const [fdSuffix, snapVal] of snapEntries) {
+                    const parentKey = `${parentPrefix}${fdSuffix}`;
+                    const parentVal = dirfdTable.get(parentKey);
+                    if (parentVal !== void 0 && parentVal.path !== snapVal.path) {
+                      dirfdTable.delete(parentKey);
+                    }
+                  }
+                  fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
-                if (fdPendingDetachShared && parentDeletes.length > 0) {
-                  fdUnknownAdd(pid);
+                if (fdUnknownHas(pid)) {
                   fdUnknownAdd(childPid);
                 }
                 if (fdPendingDetachShared && childFdUnknownPre) {
@@ -26319,6 +26363,35 @@ async function runInstallPhase(input) {
                   }
                   fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
+                }
+                if (childFdSnap !== void 0 && childHadPendingFdDetach) {
+                  const action = childFdSnap.action;
+                  const childGroupPrefix = `${rootedFd(childPid)}:`;
+                  if (action.kind === "closeRange") {
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(childGroupPrefix)) continue;
+                      const fdStr = k.slice(childGroupPrefix.length);
+                      const fdNum = parseInt(fdStr, 10);
+                      if (Number.isFinite(fdNum) && fdNum >= action.first && fdNum <= action.last) {
+                        if (action.cloexec) {
+                          const cur = dirfdTable.get(k);
+                          if (cur !== void 0) {
+                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                          }
+                        } else {
+                          dirfdTable.delete(k);
+                        }
+                      }
+                    }
+                  } else if (action.kind === "execveCloexec") {
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(childGroupPrefix)) continue;
+                      const entry = dirfdTable.get(k);
+                      if (entry !== void 0 && entry.cloexec) {
+                        dirfdTable.delete(k);
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -26423,6 +26496,14 @@ async function runInstallPhase(input) {
           const hasCloexec = (flagsBits & CLOSE_RANGE_CLOEXEC) !== 0;
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
             if (hasUnshare) {
+              const fdSingleton = isFdSingleton(pid);
+              const action = {
+                kind: "closeRange",
+                first,
+                last,
+                cloexec: hasCloexec
+              };
+              const fdSnap = fdSingleton ? snapshotFd(pid, action) : null;
               detachFdGroup(pid);
               const groupPrefix = `${rootedFd(pid)}:`;
               for (const key of [...dirfdTable.keys()]) {
@@ -26439,6 +26520,9 @@ async function runInstallPhase(input) {
                     dirfdTable.delete(key);
                   }
                 }
+              }
+              if (fdSnap !== null) {
+                pendingFdDetach.set(pid, fdSnap);
               }
             } else {
               const groupPrefix = `${rootedFd(pid)}:`;
@@ -26509,12 +26593,14 @@ async function runInstallPhase(input) {
           const detachCwd = (flagsBits & CLONE_FS) !== 0 || (flagsBits & CLONE_NEWNS) !== 0 || (flagsBits & CLONE_NEWUSER) !== 0;
           const detachFds = (flagsBits & CLONE_FILES) !== 0;
           if (detachFds) {
+            const fdSnap = snapshotFd(pid, { kind: "none" });
             detachFdGroup(pid);
-            pendingFdDetach.add(pid);
+            pendingFdDetach.set(pid, fdSnap);
           }
           if (detachCwd) {
+            const cwdSnap = snapshotCwd(pid);
             detachCwdGroup(pid);
-            pendingCwdDetach.add(pid);
+            pendingCwdDetach.set(pid, cwdSnap);
           }
         }
         continue;
@@ -26539,6 +26625,7 @@ async function runInstallPhase(input) {
               });
             } else {
               dirfdTable.delete(newKey);
+              fdUnknownAdd(pid);
             }
           } else if (cmd2 === "F_SETFD") {
             const cur = dirfdTable.get(oldKey);
@@ -26590,6 +26677,8 @@ async function runInstallPhase(input) {
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           shimLoadedPids.delete(rawEvent.pid);
+          const execFdSingleton = isFdSingleton(rawEvent.pid);
+          const execFdSnap = execFdSingleton ? snapshotFd(rawEvent.pid, { kind: "execveCloexec" }) : null;
           detachFdGroup(rawEvent.pid);
           const execRoot = rootedFd(rawEvent.pid);
           const execPrefix = `${execRoot}:`;
@@ -26599,6 +26688,9 @@ async function runInstallPhase(input) {
             if (entry !== void 0 && entry.cloexec) {
               dirfdTable.delete(key);
             }
+          }
+          if (execFdSnap !== null) {
+            pendingFdDetach.set(rawEvent.pid, execFdSnap);
           }
         }
         const result = input.attribution.attribute(rawEvent.pid);

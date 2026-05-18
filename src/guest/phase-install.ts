@@ -514,8 +514,91 @@ export async function runInstallPhase(
   // would honor an obsolete intent, but pids are recycled
   // monotonically and within a single install run reuse is rare; if
   // it happens, taking the copy branch is conservative).
-  const pendingCwdDetach = new Set<number>();
-  const pendingFdDetach = new Set<number>();
+  //
+  // Codex follow-up (medium, 2026-05-19, bug #2): pending markers are
+  // SNAPSHOTS of the child's state at unshare/close_range-UNSHARE/execve
+  // time — NOT references that read child state at reconcile time.
+  // Reading at reconcile time would conflate the child's pre-detach
+  // state (visible to the parent under shared CLONE_FS/CLONE_FILES) with
+  // its post-detach private mutations (which by definition the kernel
+  // hid from the parent).  The reconciler uses the snapshot for parent-
+  // taint decisions; the child's current state stays as-is unless
+  // there's a snapshot-vs-parent conflict.
+  //
+  // Codex follow-up (medium, 2026-05-19, bug #3): close_range with
+  // CLOSE_RANGE_UNSHARE and successful execve also detach the caller's
+  // fd table from any shared CLONE_FILES group at kernel level.  When
+  // the caller is a singleton at the moment the line is observed, the
+  // immediate detach call is a no-op AND the action that follows
+  // (close_range fd-close / execve CLOEXEC-sweep) only mutates the
+  // caller's table — under-modeling the kernel's behavior when a
+  // delayed parent clone(CLONE_FILES) line arrives later.  We capture
+  // the "detach-time action" in the snapshot so the reconciler can
+  // replay it onto the child's private group AFTER copying parent
+  // state.  The parent's table stays intact (per real-kernel semantics:
+  // unshare detaches the caller's struct only).
+  interface CwdSnapshot {
+    cwd: string | undefined;
+    unknown: boolean;
+  }
+  // FdSnapshot's `entries` field captures the child's modeled fd table
+  // (by fd suffix only — fd-group root is implicit) at the moment the
+  // marker was set.  `action` records what the kernel did to the
+  // caller's now-private fd table AT detach time so the reconciler can
+  // replay it onto the COPIED-from-parent child group:
+  //   - 'none'           — plain unshare(CLONE_FILES).  No replay
+  //                        action; the kernel only detached, didn't
+  //                        otherwise mutate the table.
+  //   - 'closeRange'     — close_range applied to caller AFTER the
+  //                        kernel-level detach.  Replay: drop entries
+  //                        in [first, last] (or mark cloexec if the
+  //                        action carried CLOSE_RANGE_CLOEXEC).
+  //   - 'execveCloexec'  — successful execve performed a CLOEXEC sweep
+  //                        on the caller's private fd table.  Replay:
+  //                        drop entries with cloexec=true.
+  type FdDetachAction =
+    | { kind: 'none' }
+    | { kind: 'closeRange'; first: number; last: number; cloexec: boolean }
+    | { kind: 'execveCloexec' };
+  interface FdSnapshot {
+    entries: Array<[string /* fd suffix */, { path: string; cloexec: boolean }]>;
+    unknown: boolean;
+    action: FdDetachAction;
+  }
+  const pendingCwdDetach = new Map<number, CwdSnapshot>();
+  const pendingFdDetach = new Map<number, FdSnapshot>();
+
+  // Helper: snapshot the child's CURRENT cwd state for a pending marker.
+  function snapshotCwd(pid: number): CwdSnapshot {
+    return { cwd: cwdGet(pid), unknown: cwdUnknownHas(pid) };
+  }
+  // Helper: snapshot the child's CURRENT fd-table state + the detach-
+  // time replay action.
+  function snapshotFd(pid: number, action: FdDetachAction): FdSnapshot {
+    const root = rootedFd(pid);
+    const prefix = `${root}:`;
+    const entries: Array<[string, { path: string; cloexec: boolean }]> = [];
+    for (const [key, val] of dirfdTable) {
+      if (key.startsWith(prefix)) {
+        entries.push([key.slice(prefix.length), val]);
+      }
+    }
+    return { entries, unknown: dirfdStateUnknown.has(root), action };
+  }
+  // Helper: is `pid` currently the sole member of its fd group?  Used
+  // by close_range/execve to gate the pending-marker recording — when
+  // pid is already in a multi-member group, the immediate
+  // `detachFdGroup` call really does detach (the parent's clone has
+  // already been processed) and no delayed reconciliation is needed.
+  function isFdSingleton(pid: number): boolean {
+    const root = rootedFd(pid);
+    if (root !== pid) return false;
+    for (const memberPid of fdParent.keys()) {
+      if (memberPid === pid) continue;
+      if (findFdRoot(memberPid) === pid) return false;
+    }
+    return true;
+  }
 
   function findCwdRoot(pid: number): number {
     let cur = pid;
@@ -1588,8 +1671,19 @@ export async function runInstallPhase(
             // before we processed the clone+marker), we fail closed on
             // disagreement — different cwd values → mark cwdUnknown;
             // different fd→path values → drop the fd entry.
-            const childHadPendingCwdDetach = pendingCwdDetach.delete(childPid);
-            const childHadPendingFdDetach = pendingFdDetach.delete(childPid);
+            // Codex follow-up (medium, 2026-05-19, bug #2): consume the
+            // pending markers as SNAPSHOTS of the child's state at
+            // detach time, not as boolean flags.  The reconciler uses
+            // the snapshot for parent-taint decisions so post-detach
+            // child mutations (e.g. a chdir AFTER unshare(CLONE_FS))
+            // stay private to the child and don't leak into the
+            // parent's modeled state.
+            const childCwdSnap = pendingCwdDetach.get(childPid);
+            pendingCwdDetach.delete(childPid);
+            const childFdSnap = pendingFdDetach.get(childPid);
+            pendingFdDetach.delete(childPid);
+            const childHadPendingCwdDetach = childCwdSnap !== undefined;
+            const childHadPendingFdDetach = childFdSnap !== undefined;
             if (cloneFs && !childHadPendingCwdDetach) {
               // Union the two pids into the same cwd group.  Subsequent
               // chdir on either pid mutates the shared state.
@@ -1606,8 +1700,23 @@ export async function runInstallPhase(
               // state the child has already accumulated.
               const parentCwd = cwdGet(pid);
               const parentCwdUnknown = cwdUnknownHas(pid);
-              const childCwd = cwdGet(childPid);
-              const childCwdUnknown = cwdUnknownHas(childPid);
+              // Codex follow-up (medium, 2026-05-19, bug #2): parent-
+              // taint decisions use the SNAPSHOT (child state at
+              // detach time) — NOT current child state.  Child's
+              // post-detach mutations are private to the child's
+              // group and didn't propagate to the parent under the
+              // kernel's CLONE_FS/CLONE_FILES sharing.  The current
+              // child state is still consulted for the COPY step
+              // below, but a conflict measured against current state
+              // would over-taint the parent.
+              //
+              // When there's no pending marker we fall back to current
+              // child state — same as before (covers the plain
+              // fork-without-CLONE_FS conflict case).
+              const childCwd = childCwdSnap !== undefined ? childCwdSnap.cwd : cwdGet(childPid);
+              const childCwdUnknown =
+                childCwdSnap !== undefined ? childCwdSnap.unknown : cwdUnknownHas(childPid);
+              const currentChildCwd = cwdGet(childPid);
               // Codex follow-up (high, 2026-05-19, bug #1 + bug #3): the
               // pending-detach parent-taint gate is BOTH:
               //   1. `childHadPendingCwdDetach` — the child observed an
@@ -1693,11 +1802,18 @@ export async function runInstallPhase(
                   }
                 }
                 // else: equal — leave child's value in place.
-              } else if (parentCwd !== undefined) {
+              } else if (parentCwd !== undefined && currentChildCwd === undefined) {
+                // Child has no cwd of its own (neither at detach time
+                // nor now) — seed the child's private group from the
+                // parent.  This is the canonical kernel-clone+private-
+                // copy semantic.  Note: we guard on CURRENT child cwd
+                // (not snapshot) because a child that chdir'd AFTER
+                // unshare has its own cwd value we must preserve.
                 cwdSet(childPid, parentCwd);
               }
-              // else: parent has no known cwd; leave child's state
-              // (possibly undefined) untouched.
+              // else: parent has no known cwd; OR child has its own
+              // post-detach cwd that we leave alone (private mutation
+              // semantic per kernel detach).
             }
 
             // --- fd group: union if CLONE_FILES, else copy. ---------
@@ -1741,23 +1857,58 @@ export async function runInstallPhase(
                 // needs reconciling and the parent's modeled fds
                 // remain trustworthy.
                 const fdPendingDetachShared = childHadPendingFdDetach && cloneFiles;
-                // Snapshot the child group's fd-state-unknown bit
-                // BEFORE the copy iteration.  Codex follow-up (high,
-                // 2026-05-19, bug #2 fix part B): when the child group
-                // observed a dup(untracked, fd) or other untraceable
-                // fd-table mutation, it carries fd-state-unknown.
-                // Under shared CLONE_FILES, that mutation hit the
-                // parent's fds too — the parent's modeled entries are
-                // no longer guaranteed to match the kernel.  Taint
-                // BOTH groups so subsequent openat(<fd>, ...) on
-                // either side fails closed.
-                const childFdUnknownPre = fdUnknownHas(childPid);
-                // Collect parent-side keys to delete after iteration —
-                // the conflict-on-pending-detach branch needs to drop
-                // BOTH sides' entries (see below), but mutating the
-                // map mid-iteration risks skipping entries on some JS
-                // engines.  Defer deletes.
-                const parentDeletes: string[] = [];
+                // Codex follow-up (medium, 2026-05-19, bug #2): when
+                // a snapshot is present, parent-taint decisions use
+                // the SNAPSHOT (state at detach time) — NOT the
+                // child's current state.  Child mutations that
+                // happened AFTER unshare are private to the child's
+                // group; they didn't propagate to the parent under
+                // shared CLONE_FILES and so cannot taint the parent.
+                //
+                // Build a map of snapshot entries (fdSuffix → entry)
+                // for O(1) snapshot lookup during conflict detection.
+                const snapEntries = new Map<string, { path: string; cloexec: boolean }>();
+                if (childFdSnap !== undefined) {
+                  for (const [k, v] of childFdSnap.entries) snapEntries.set(k, v);
+                }
+                const snapUnknown =
+                  childFdSnap !== undefined ? childFdSnap.unknown : fdUnknownHas(childPid);
+                // The "effective child unknown" used for parent-taint
+                // is the snapshot bit when present; otherwise the
+                // current bit (covers the no-marker copy-branch case
+                // — e.g. plain fork without CLONE_FILES).
+                const childFdUnknownPre = fdPendingDetachShared
+                  ? snapUnknown
+                  : fdUnknownHas(childPid);
+                // First pass: detect parent-vs-snapshot conflicts (for
+                // parent-taint).  We can't compute this from the copy
+                // pass below because the copy pass examines the
+                // child's CURRENT state, which may include post-detach
+                // mutations invisible to the parent at kernel level.
+                let snapshotConflict = false;
+                if (fdPendingDetachShared) {
+                  for (const [fdSuffix, snapVal] of snapEntries) {
+                    const parentKey = `${parentPrefix}${fdSuffix}`;
+                    const parentVal = dirfdTable.get(parentKey);
+                    if (parentVal !== undefined && parentVal.path !== snapVal.path) {
+                      snapshotConflict = true;
+                      break;
+                    }
+                  }
+                }
+                // Copy pass: iterate parent's fds, populate child's
+                // group with parent's entries.  Child's CURRENT
+                // entries are preserved (post-detach private copies).
+                //
+                // Conflict resolution per fd between parent and the
+                // child's CURRENT entry:
+                //   - parent-only fd → copy.
+                //   - same fd, same path → keep child's entry; OR
+                //     cloexec bits.
+                //   - same fd, different paths → drop the child key
+                //     (fail closed on subsequent openat(<fd>, ...)
+                //     from the child).  Parent's entry is preserved
+                //     unless the SNAPSHOT-based taint pass fires.
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
                     const suffix = key.slice(parentPrefix.length);
@@ -1774,56 +1925,31 @@ export async function runInstallPhase(
                         });
                       }
                     } else {
-                      // Same fd, different paths — fail closed on
-                      // the child side.
-                      //
-                      // Codex follow-up (high, 2026-05-19): in the
-                      // pending-detach-AND-CLONE_FILES case
-                      // (`fdPendingDetachShared`), the real kernel
-                      // order was:
-                      //
-                      //   1. clone(CLONE_FILES) — parent + child share
-                      //      files_struct.
-                      //   2. one side dup/close mutates the shared
-                      //      table — BOTH observe the change.
-                      //   3. child unshare(CLONE_FILES) — kernel
-                      //      copies the shared table into two
-                      //      private copies that start at the same
-                      //      shared state.
-                      //
-                      // If strace surfaces these out of order and we
-                      // reconcile at step (1) with parent fd K → /A
-                      // and child fd K → /B disagreeing, the post-
-                      // step-2 shared entry is unrecoverable from the
-                      // model.  Taint BOTH sides: drop the child key
-                      // AND the parent key so subsequent
-                      // openat(<K>, ...) on either side fails closed.
-                      //
-                      // In the non-pending case — or pending-detach
-                      // but clone WITHOUT CLONE_FILES (codex bug #3)
-                      // — the two groups were never shared at kernel
-                      // level; only the child's stale state needs
-                      // dropping.
+                      // Same fd, different paths — fail closed on the
+                      // child side.  This handles plain fork conflicts
+                      // (no pending marker — child raced ahead with
+                      // its own opens).
                       dirfdTable.delete(childKey);
-                      if (fdPendingDetachShared) {
-                        parentDeletes.push(key);
-                      }
                     }
                   }
                 }
-                for (const key of parentDeletes) {
-                  dirfdTable.delete(key);
-                }
-                if (fdUnknownHas(pid)) {
+                // Parent-taint: drop parent fd entries that conflict
+                // with the SNAPSHOT under pendingDetachShared.  The
+                // real-kernel order was clone(CLONE_FILES) → shared
+                // mutation → unshare; the shared mutation made
+                // parent's modeled value stale.
+                if (fdPendingDetachShared && snapshotConflict) {
+                  for (const [fdSuffix, snapVal] of snapEntries) {
+                    const parentKey = `${parentPrefix}${fdSuffix}`;
+                    const parentVal = dirfdTable.get(parentKey);
+                    if (parentVal !== undefined && parentVal.path !== snapVal.path) {
+                      dirfdTable.delete(parentKey);
+                    }
+                  }
+                  fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
-                // Pending-detach conflict also taints the parent's
-                // fd-group unknown bit — any open-by-numeric-fd we
-                // can't model accurately must fail closed.  Gated on
-                // CLONE_FILES per bug #3 (no kernel sharing → no
-                // shared-state mutation to leak).
-                if (fdPendingDetachShared && parentDeletes.length > 0) {
-                  fdUnknownAdd(pid);
+                if (fdUnknownHas(pid)) {
                   fdUnknownAdd(childPid);
                 }
                 // Codex follow-up (high, 2026-05-19, bug #2 fix part B):
@@ -1857,6 +1983,48 @@ export async function runInstallPhase(
                   }
                   fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
+                }
+                // Codex follow-up (medium, 2026-05-19, bug #3): replay
+                // the detach-time action onto the child's private group
+                // AFTER the copy.  Without this, a close_range UNSHARE
+                // or execve CLOEXEC sweep that fired on a singleton
+                // child gets overwritten by the parent-state copy
+                // above, and child openats through closed/swept fds
+                // would falsely certify against parent's stale path.
+                if (childFdSnap !== undefined && childHadPendingFdDetach) {
+                  const action = childFdSnap.action;
+                  const childGroupPrefix = `${rootedFd(childPid)}:`;
+                  if (action.kind === 'closeRange') {
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(childGroupPrefix)) continue;
+                      const fdStr = k.slice(childGroupPrefix.length);
+                      const fdNum = parseInt(fdStr, 10);
+                      if (
+                        Number.isFinite(fdNum) &&
+                        fdNum >= action.first &&
+                        fdNum <= action.last
+                      ) {
+                        if (action.cloexec) {
+                          const cur = dirfdTable.get(k);
+                          if (cur !== undefined) {
+                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                          }
+                        } else {
+                          dirfdTable.delete(k);
+                        }
+                      }
+                    }
+                  } else if (action.kind === 'execveCloexec') {
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(childGroupPrefix)) continue;
+                      const entry = dirfdTable.get(k);
+                      if (entry !== undefined && entry.cloexec) {
+                        dirfdTable.delete(k);
+                      }
+                    }
+                  }
+                  // action.kind === 'none' (plain unshare(CLONE_FILES))
+                  // → no replay needed.
                 }
               }
             }
@@ -2095,6 +2263,28 @@ export async function runInstallPhase(
               //
               // Shared with unshare(CLONE_FILES) and execve via the
               // `detachFdGroup` helper above.
+              //
+              // Codex follow-up (medium, 2026-05-19, bug #3): if the
+              // pid is a singleton at the moment we observe this line,
+              // the immediate detach is a no-op AND the close_range
+              // below mutates only the singleton group.  When the
+              // parent's clone(CLONE_FILES) = <pid> line arrives later,
+              // the reconciliation needs to know to (a) skip union,
+              // (b) copy parent state into child, (c) replay this
+              // close_range on the child's private group.  Snapshot
+              // here so the reconciler can do (c).  If the pid is
+              // NOT a singleton (multi-member group), the detach
+              // actually does separate the group and no delayed
+              // reconciliation is needed — the parent's clone has
+              // already been processed.
+              const fdSingleton = isFdSingleton(pid);
+              const action: FdDetachAction = {
+                kind: 'closeRange',
+                first,
+                last,
+                cloexec: hasCloexec,
+              };
+              const fdSnap = fdSingleton ? snapshotFd(pid, action) : null;
               detachFdGroup(pid);
               // Apply the range against the caller's group (which is
               // either the brand-new private group or the original
@@ -2118,6 +2308,9 @@ export async function runInstallPhase(
                     dirfdTable.delete(key);
                   }
                 }
+              }
+              if (fdSnap !== null) {
+                pendingFdDetach.set(pid, fdSnap);
               }
             } else {
               // Pre-existing behaviour: close the range on the caller's
@@ -2261,6 +2454,14 @@ export async function runInstallPhase(
             (flagsBits & CLONE_NEWUSER) !== 0;
           const detachFds = (flagsBits & CLONE_FILES) !== 0;
           if (detachFds) {
+            // Codex follow-up (medium, 2026-05-19, bug #2): snapshot
+            // the child's CURRENT fd state BEFORE detach.  The snapshot
+            // captures what was visible to the parent under shared
+            // CLONE_FILES at the unshare instant; post-unshare child
+            // mutations stay private and don't leak into the reconciler.
+            // unshare itself doesn't mutate the fd table (only detaches
+            // it), so the replay action is 'none'.
+            const fdSnap = snapshotFd(pid, { kind: 'none' });
             detachFdGroup(pid);
             // Codex follow-up (high, 2026-05-19): record the intent.
             // If a later-arriving `clone(... CLONE_FILES ...) = <this
@@ -2270,11 +2471,16 @@ export async function runInstallPhase(
             // parent's group.  The marker is consumed when the clone
             // line is reconciled; if no such clone arrives it stays
             // (harmless: pids aren't reused mid-run in practice).
-            pendingFdDetach.add(pid);
+            pendingFdDetach.set(pid, fdSnap);
           }
           if (detachCwd) {
+            // Codex follow-up (medium, 2026-05-19, bug #2): snapshot
+            // child's CURRENT cwd state BEFORE detach (parent-taint
+            // decisions at reconcile time must use this, NOT the child's
+            // post-unshare state).
+            const cwdSnap = snapshotCwd(pid);
             detachCwdGroup(pid);
-            pendingCwdDetach.add(pid);
+            pendingCwdDetach.set(pid, cwdSnap);
           }
         }
         continue;
@@ -2321,6 +2527,16 @@ export async function runInstallPhase(
               // Unknown source fd → invalidate any prior mapping at the
               // new fd (mirrors the dup-family behaviour).
               dirfdTable.delete(newKey);
+              // Codex follow-up (high, 2026-05-19, bug #1): mark the
+              // pid's fd-group as state-unknown.  Mirrors the dup/dup2/
+              // dup3 fix at line ~1975: the kernel installed a real fd
+              // at `rc` whose directory target is opaque to us (because
+              // the source oldfd was never tracked).  Same hazard, same
+              // remediation — fail closed on subsequent numeric-dirfd
+              // lookups via the fd-unknown bit, and propagate the bit
+              // to the parent's group at any pending-detach
+              // reconciliation under shared CLONE_FILES.
+              fdUnknownAdd(pid);
             }
           } else if (cmd === 'F_SETFD') {
             // Mutate fd's FD_CLOEXEC bit per the arg.  Strace renders
@@ -2446,6 +2662,19 @@ export async function runInstallPhase(
           // preserved across exec and the kernel keeps the shared
           // `struct fs`).  We deliberately do NOT detach the cwd group
           // here — that's the unshare(CLONE_FS) path.
+          // Codex follow-up (medium, 2026-05-19, bug #3): if the pid
+          // is a singleton at execve time, the immediate detach is a
+          // no-op AND the CLOEXEC sweep below mutates only the
+          // singleton group.  A delayed parent clone(CLONE_FILES) =
+          // <pid> line would then re-merge the kernel-detached child
+          // into the parent — wrong direction.  Snapshot the child's
+          // pre-detach state with an execve-CLOEXEC replay action so
+          // the reconciler can copy parent state into child, then
+          // replay the sweep on the child's private group.
+          const execFdSingleton = isFdSingleton(rawEvent.pid);
+          const execFdSnap = execFdSingleton
+            ? snapshotFd(rawEvent.pid, { kind: 'execveCloexec' })
+            : null;
           detachFdGroup(rawEvent.pid);
           // Audit-trust Finding (high, 2026-05-19, codex follow-up): on a
           // successful execve the kernel auto-closes every fd whose
@@ -2466,6 +2695,9 @@ export async function runInstallPhase(
             if (entry !== undefined && entry.cloexec) {
               dirfdTable.delete(key);
             }
+          }
+          if (execFdSnap !== null) {
+            pendingFdDetach.set(rawEvent.pid, execFdSnap);
           }
         }
 
