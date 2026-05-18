@@ -351,6 +351,17 @@ unsafe fn load_protect_list(path: *const c_char) {
 //
 // EnvBuf is stack-local, used exclusively by a single exec wrapper call on
 // one thread.  No Send/Sync impls needed.
+//
+// Recursion-guard scope:
+//   These helpers wrap each individual libc::malloc / libc::free in
+//   set_in_shim(true/false) so glibc malloc's internal getenv calls
+//   (MALLOC_* knobs) hit the early-return path.  set_in_shim is a flat
+//   overwrite — there is NO save/restore of the prior state.  Therefore
+//   exec wrappers must NOT rely on the guard being held across calls to
+//   envbuf_from / append_path_env / ensure_env: after they return, in_shim()
+//   is false.  Any real_getenv_raw call the wrapper needs (e.g. PATH for
+//   execvp) MUST happen before envbuf_from is invoked, OR be wrapped in
+//   its own set_in_shim(true/false) pair.
 
 struct EnvBuf {
     ptrs: *mut *const c_char, // libc::malloc'd; NULL-terminated.
@@ -495,32 +506,51 @@ unsafe fn envbuf_find(buf: &EnvBuf, name: &[u8]) -> Option<usize> {
     None
 }
 
+/// Free a single malloc'd entry — used on push/set failure paths so the
+/// caller does not leak the just-allocated string.
+unsafe fn free_entry(entry: *mut c_char) {
+    if entry.is_null() {
+        return;
+    }
+    set_in_shim(true);
+    libc::free(entry as *mut c_void);
+    set_in_shim(false);
+}
+
 /// Replace ptrs[idx] with new_entry and push new_entry onto owned[].
 /// Caller must have malloc'd new_entry already (via make_entry).
-unsafe fn envbuf_set_at(buf: &mut EnvBuf, idx: usize, new_entry: *mut c_char) {
-    *buf.ptrs.add(idx) = new_entry as *const c_char;
-    // Track it for freeing.
-    if buf.owned_count < buf.owned_cap {
-        *buf.owned.add(buf.owned_count) = new_entry;
-        buf.owned_count += 1;
+/// Returns false if the owned tracker is full — in that case the slot is
+/// NOT updated and the caller is responsible for freeing new_entry, because
+/// otherwise free_envbuf would never reach the leaked entry on exec failure.
+unsafe fn envbuf_set_at(buf: &mut EnvBuf, idx: usize, new_entry: *mut c_char) -> bool {
+    // Owned-tracker capacity is sized as MAX_ENVP_GROWTH + 1, generous against
+    // the at-most-MAX_ENVP_GROWTH writes per envbuf. Bail loudly rather than
+    // silently leaking on overflow.
+    if buf.owned_count >= buf.owned_cap {
+        return false;
     }
+    *buf.ptrs.add(idx) = new_entry as *const c_char;
+    *buf.owned.add(buf.owned_count) = new_entry;
+    buf.owned_count += 1;
+    true
 }
 
 /// Append a new entry to buf.ptrs[], bump count, re-NUL-terminate, push onto owned[].
-/// Returns false if there is no room (cap would be exceeded).
+/// Returns false if either the ptrs cap or the owned tracker would be exceeded.
+/// On false return the caller is responsible for freeing new_entry — see envbuf_set_at.
 unsafe fn envbuf_push(buf: &mut EnvBuf, new_entry: *mut c_char) -> bool {
     // Need count + 1 entries + 1 NUL terminator <= cap.
     if buf.count + 1 >= buf.cap {
         return false;
     }
+    if buf.owned_count >= buf.owned_cap {
+        return false;
+    }
     *buf.ptrs.add(buf.count) = new_entry as *const c_char;
     buf.count += 1;
     *buf.ptrs.add(buf.count) = ptr::null(); // re-NUL-terminate.
-    // Track it for freeing.
-    if buf.owned_count < buf.owned_cap {
-        *buf.owned.add(buf.owned_count) = new_entry;
-        buf.owned_count += 1;
-    }
+    *buf.owned.add(buf.owned_count) = new_entry;
+    buf.owned_count += 1;
     true
 }
 
@@ -572,7 +602,11 @@ unsafe fn append_path_env(
             if entry.is_null() {
                 return false;
             }
-            envbuf_push(buf, entry)
+            if !envbuf_push(buf, entry) {
+                free_entry(entry);
+                return false;
+            }
+            true
         }
         Some(idx) => {
             // Present — get a slice of the existing value (after the '=').
@@ -623,7 +657,10 @@ unsafe fn append_path_env(
             off += to_append.len();
             *raw_buf.add(off) = 0u8;
 
-            envbuf_set_at(buf, idx, raw_buf as *mut c_char);
+            if !envbuf_set_at(buf, idx, raw_buf as *mut c_char) {
+                free_entry(raw_buf as *mut c_char);
+                return false;
+            }
             true
         }
     }
@@ -639,7 +676,11 @@ unsafe fn ensure_env(buf: &mut EnvBuf, name: &[u8], value: &[u8]) -> bool {
     if entry.is_null() {
         return false;
     }
-    envbuf_push(buf, entry)
+    if !envbuf_push(buf, entry) {
+        free_entry(entry);
+        return false;
+    }
+    true
 }
 
 // ── JSON escape ────────────────────────────────────────────────────────────
