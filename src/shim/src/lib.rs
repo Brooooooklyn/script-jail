@@ -699,7 +699,21 @@ unsafe fn make_entry(name: &[u8], value: &[u8]) -> *mut c_char {
 /// best-effort: if push fails after the removals succeed, the buffer has
 /// no entry for `name` at all, which is still safer than leaving an
 /// attacker-supplied duplicate live).
+///
+/// EMPTY VALUE: when `value` is empty, this collapses to an exhaustive
+/// remove with no push — mirrors the sticky-var loop's "empty canon →
+/// strip caller entries" semantics so a single overwrite_env call is the
+/// uniform mechanism for "make canonical authoritative" regardless of
+/// whether the canonical itself is empty.  Always returns true in that
+/// case (envbuf_remove cannot fail).
 unsafe fn overwrite_env(buf: &mut EnvBuf, name: &[u8], value: &[u8]) -> bool {
+    if value.is_empty() {
+        // Exhaustively remove every entry for `name`; pushing an empty
+        // `NAME=` would leak an empty-valued entry into the child, which
+        // is a different observable shape than "name is unset".
+        let _ = envbuf_remove(buf, name);
+        return true;
+    }
     let entry = make_entry(name, value);
     if entry.is_null() {
         return false;
@@ -1030,6 +1044,32 @@ unsafe fn shim_init() {
         &CANON_PRELOAD_PATH,
         b"SCRIPT_JAIL_PRELOAD_PATH\0".as_ptr() as *const c_char,
     );
+    // Fallback canon for launcher/test paths that load the shim via
+    // LD_PRELOAD only (no SCRIPT_JAIL_PRELOAD_PATH / SCRIPT_JAIL_NODE_OPTIONS
+    // explicit canonicals).  Capturing here is safe: shim_init runs at
+    // LD_PRELOAD load time, before any user code has had a chance to mutate
+    // `environ`, so the values read via real_getenv_raw are trustworthy.
+    //
+    // SECURITY: without this fallback, rewrite_envp's empty-canon branch
+    // would preserve a caller-supplied `LD_PRELOAD=/tmp/evil.so` (or
+    // `LD_PRELOAD=/lib/libscriptjail.so:/tmp/evil.so`) verbatim.  With the
+    // fallback, CANON_PRELOAD_PATH is non-empty whenever the shim was
+    // actually loaded by the parent — the only way both canons stay empty
+    // is when the parent never set either var, which means the shim is not
+    // expected to propagate and the empty-canon → "remove all" branch is
+    // the correct behavior.
+    if CANON_PRELOAD_PATH.len.load(Ordering::Acquire) == 0 {
+        capture_canon(
+            &CANON_PRELOAD_PATH,
+            b"LD_PRELOAD\0".as_ptr() as *const c_char,
+        );
+    }
+    if CANON_NODE_OPTIONS.len.load(Ordering::Acquire) == 0 {
+        capture_canon(
+            &CANON_NODE_OPTIONS,
+            b"NODE_OPTIONS\0".as_ptr() as *const c_char,
+        );
+    }
     // The remaining sticky SCRIPT_JAIL_* vars are also snapshotted here so
     // exec-time rewrite_envp never has to consult the (mutable) live environ.
     // See the CANON_LOG_FILE / CANON_LOG_FD / ... static defs for rationale.
@@ -1395,25 +1435,21 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
     // strips every existing entry for the name and pushes exactly one
     // canonical entry.
     //
-    // EMPTY CANON: when the parent never set SCRIPT_JAIL_PRELOAD_PATH /
-    // SCRIPT_JAIL_NODE_OPTIONS, leave any caller-supplied entries alone.
-    // Unlike the sticky-var empty-canon path (where we strip caller
-    // entries so attackers cannot redirect SCRIPT_JAIL_LOG_FILE etc.),
-    // LD_PRELOAD is the shim's only propagation mechanism: stripping a
-    // caller-supplied `LD_PRELOAD=libscriptjail.so` would break the
-    // audit chain at the first execve in any process launched without
-    // the full env contract.  The guest agent always sets
-    // SCRIPT_JAIL_PRELOAD_PATH in production (src/guest/agent.ts), so
-    // this preservation branch only matters in misconfigured launcher
-    // paths and tests that exercise the shim with LD_PRELOAD only.
-    // The original prepend-merge code was also a no-op in this case
-    // (append_path_env returned early on empty `to_append`), so this
-    // preserves the only correct legacy behavior we relied on.
-    if !preload.is_empty() && !overwrite_env(&mut buf, b"LD_PRELOAD", preload) {
+    // EMPTY CANON: shim_init captures the parent's LD_PRELOAD /
+    // NODE_OPTIONS as fallback canonicals when the explicit
+    // SCRIPT_JAIL_PRELOAD_PATH / SCRIPT_JAIL_NODE_OPTIONS are unset.
+    // So in practice the canon is non-empty whenever the shim was
+    // actually loaded by the parent.  The only way both canons stay
+    // empty is when the parent never set either var — in that case
+    // overwrite_env's empty-value branch exhaustively removes any
+    // caller-supplied entry, which is the desired behavior (we won't
+    // honor an attacker-controlled LD_PRELOAD/NODE_OPTIONS that the
+    // parent never sanctioned).  No special-casing in this function.
+    if !overwrite_env(&mut buf, b"LD_PRELOAD", preload) {
         free_envbuf(&mut buf);
         return None;
     }
-    if !node_opts.is_empty() && !overwrite_env(&mut buf, b"NODE_OPTIONS", node_opts) {
+    if !overwrite_env(&mut buf, b"NODE_OPTIONS", node_opts) {
         free_envbuf(&mut buf);
         return None;
     }
