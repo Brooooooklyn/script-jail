@@ -154,6 +154,28 @@ export interface PhaseInstallInput {
 export interface PhaseInstallResult {
   exitCode: number;
   eventCount: number;
+  /**
+   * Human-readable tamper reason owned by `runInstallPhase` itself.  Set when
+   * the install-phase dispatcher detects an integrity violation in the audit
+   * pipeline that the runner-side `recordTamper()` may or may not have
+   * surfaced (Finding 2 — runner contract allows no-op implementations).
+   *
+   * Currently populated by:
+   *   - Shim-channel JSONL parse failures (malformed JSON, unknown `kind`,
+   *     schema-rejected payload).  Same condition the dispatcher previously
+   *     reported ONLY via `strace.recordTamper()`, which the StraceRunner
+   *     contract allows to be a no-op.
+   *   - Unknown / invalid `LineSource` discriminator values (Finding 1 —
+   *     runtime-exhaustive dispatch; any non-'shim'/'strace' value is treated
+   *     as an audit-pipeline contract breach).
+   *
+   * `null` when the install phase completed without observing tamper.  The
+   * agent's `main()` post-install gate MUST treat any non-null value as fatal
+   * — in addition to the existing `strace.getTamperReason()` check, which
+   * covers events-file file-tamper signals (unlink/inode-swap/etc.).  The two
+   * checks are defence-in-depth: each may catch tampering the other misses.
+   */
+  tamperReason: string | null;
 }
 
 const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
@@ -236,6 +258,26 @@ export async function runInstallPhase(
 
   let eventCount = 0;
 
+  // Tamper reason owned by runInstallPhase itself (Finding 2).  The
+  // StraceRunner.recordTamper() contract allows no-op implementations, so the
+  // dispatcher must NOT delegate fail-closed decisions to optional runner side
+  // state — it has to carry the signal through its own return value.  We keep
+  // the runner-side recordTamper() call as defence-in-depth (so a runner that
+  // does audit a shared events file still picks up the same reason), but the
+  // canonical signal for `main()` is this local variable, exposed through
+  // PhaseInstallResult.tamperReason.  First-writer-wins: once set, subsequent
+  // failures don't overwrite the earliest reason.
+  let phaseTamperReason: string | null = null;
+  const setPhaseTamper = (reason: string): void => {
+    if (phaseTamperReason === null) phaseTamperReason = reason;
+    // Belt-and-braces: also surface through the runner contract for any
+    // implementation that wants to consume it via getTamperReason().  No-op
+    // runners (most tests, and any wrapper that didn't bother) simply drop
+    // the reason on the floor — and that's exactly why we need our own owned
+    // slot above.
+    input.strace.recordTamper(reason);
+  };
+
   const emit = (ev: AttributedEvent): void => {
     const filtered = applyProtectedPathsPolicy(ev, matcher);
     if (filtered === null) return;
@@ -291,7 +333,7 @@ export async function runInstallPhase(
         const prefix = line.length > MAX_PREFIX
           ? `${line.slice(0, MAX_PREFIX)}…`
           : line;
-        input.strace.recordTamper(
+        setPhaseTamper(
           `shim channel had unparseable JSONL line (pid=${pid}): ${JSON.stringify(prefix)}`,
         );
         continue;
@@ -339,7 +381,7 @@ export async function runInstallPhase(
     const sourceForReason = sourceStr.length > MAX_SRC
       ? `${sourceStr.slice(0, MAX_SRC)}…`
       : sourceStr;
-    input.strace.recordTamper(
+    setPhaseTamper(
       `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). ` +
         'Audit-pipeline contract requires source ∈ {"shim","strace"}.',
     );
@@ -347,5 +389,5 @@ export async function runInstallPhase(
 
   // Exit code is owned by the StraceRunner (it ran the only install process).
   const exitCode = input.strace.getExitCode();
-  return { exitCode, eventCount };
+  return { exitCode, eventCount, tamperReason: phaseTamperReason };
 }

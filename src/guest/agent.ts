@@ -1575,7 +1575,18 @@ export async function main(input: AgentInput): Promise<void> {
   //      without subclassing the canonical Linux runner.  Tests that don't
   //      audit a shared events file simply return `null` and the gate is
   //      a no-op for them.
-  const tamperReason = straceRunner.getTamperReason();
+  //
+  //      Finding 2 (audit-trust): we ALSO consult
+  //      `installResult.tamperReason`, owned directly by `runInstallPhase`.
+  //      The StraceRunner.recordTamper() contract allows no-op
+  //      implementations, so the install-phase dispatcher cannot rely on
+  //      the runner to surface shim-channel parse failures or unknown
+  //      LineSource discriminator values via getTamperReason().  Treat
+  //      either signal as fatal — defence in depth.  First-non-null wins
+  //      so the earliest, most specific reason makes it into the error
+  //      frame.
+  const tamperReason =
+    installResult.tamperReason ?? straceRunner.getTamperReason();
   if (tamperReason !== null) {
     emitter.emitError(
       `audit pipeline tampered with: ${tamperReason}. ` +

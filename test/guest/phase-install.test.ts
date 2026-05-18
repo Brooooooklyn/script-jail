@@ -860,6 +860,143 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Finding 2 (audit-trust): runInstallPhase owns its own tamper signal.
+  // The StraceRunner.recordTamper() contract allows no-op implementations,
+  // so the dispatcher MUST surface shim-channel parse failures (and unknown
+  // LineSource values) via PhaseInstallResult.tamperReason — not just via
+  // optional runner side state.  agent.main() consumes this slot as the
+  // canonical fail-closed signal alongside straceRunner.getTamperReason().
+  // ─────────────────────────────────────────────────────────────────────────
+  describe('Finding 2 — runInstallPhase owns tamperReason in PhaseInstallResult', () => {
+    const proc = mockProcReader({
+      88: {
+        ppid: 1,
+        env: {
+          npm_package_name: 'evil-pkg',
+          npm_package_version: '1.0.0',
+          npm_lifecycle_event: 'postinstall',
+        },
+      },
+    });
+
+    /**
+     * A StraceRunner whose `recordTamper` is intentionally a no-op — models
+     * a wrapper / decorator / test fake whose author decided not to bother
+     * surfacing tamper through the runner contract.  Even with this no-op
+     * runner, runInstallPhase MUST still report tamper through its return
+     * value.  This is the defence-in-depth gap that Finding 2 closes.
+     */
+    function noopTamperRunner(
+      records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }>,
+    ): StraceRunner {
+      return {
+        async *run() {
+          for (const r of records) yield r;
+        },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* deliberately no-op */ },
+      };
+    }
+
+    it('no-op recordTamper runner: shim parse fails → result.tamperReason is non-null', async () => {
+      const strace = noopTamperRunner([
+        { pid: 88, source: 'shim', line: '{not json' },
+      ]);
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // No event reached the emitter.
+      expect(lines).toHaveLength(0);
+      // Runner has no record of the tamper (its recordTamper is a no-op).
+      expect(strace.getTamperReason()).toBeNull();
+      // BUT runInstallPhase itself surfaces it via PhaseInstallResult — this
+      // is the slot main() consults as the canonical fail-closed signal.
+      expect(result.tamperReason).not.toBeNull();
+      expect(result.tamperReason).toMatch(/shim channel had unparseable JSONL line/);
+    });
+
+    it('no-op recordTamper runner: unknown LineSource → result.tamperReason is non-null', async () => {
+      const strace: StraceRunner = {
+        async *run() {
+          yield { pid: 88, line: 'x', source: 'definitely-not-real' as 'shim' };
+        },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* deliberately no-op */ },
+      };
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(0);
+      expect(strace.getTamperReason()).toBeNull();
+      expect(result.tamperReason).not.toBeNull();
+      expect(result.tamperReason).toMatch(/unknown LineSource/);
+    });
+
+    it('runner with working recordTamper still receives the reason (defence in depth)', async () => {
+      // The canned runner records tamper through its own sink as well —
+      // both PhaseInstallResult.tamperReason AND strace.getTamperReason()
+      // should be non-null and carry the same reason.
+      const strace = cannedStraceRunner([
+        { pid: 88, source: 'shim', line: '{"kind":"made_up","pid":88,"ts":1}' },
+      ]);
+      const { emitter } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(result.tamperReason).not.toBeNull();
+      expect(strace.getTamperReason()).not.toBeNull();
+      // First-writer-wins on both sides — same reason in both slots.
+      expect(strace.getTamperReason()).toBe(result.tamperReason);
+    });
+
+    it('happy path: result.tamperReason is null', async () => {
+      const strace = cannedStraceRunner([
+        {
+          pid: 88, source: 'shim',
+          line: JSON.stringify({ kind: 'env_read', name: 'HOME', pid: 88, ts: 1, hidden: false }),
+        },
+      ]);
+      const { emitter } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(result.tamperReason).toBeNull();
+    });
+  });
+
   describe('exit code propagation via StraceRunner.getExitCode()', () => {
     it('returns non-zero exitCode when StraceRunner reports failure', async () => {
       const { emitter } = makeEmitter();
