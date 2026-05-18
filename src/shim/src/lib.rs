@@ -1947,7 +1947,12 @@ unsafe fn emit_tamper(op: &[u8], name: Option<*const c_char>) {
         pos += mid.len();
 
         // Reserve space for closing quote + ,"refused":true,"pid":...,"ts":...}\n
+        // Worst case suffix is ~71 B; 80 leaves 9 B of margin.
         const SUFFIX_RESERVE: usize = 80;
+        const _: () = assert!(
+            SUFFIX_RESERVE >= 71,
+            "emit_tamper SUFFIX_RESERVE too small for closing fields",
+        );
         let budget_end = JSONL_BUF.saturating_sub(SUFFIX_RESERVE);
         if pos < budget_end {
             let written = json_escape(&mut buf[pos..budget_end], name_ptr);
