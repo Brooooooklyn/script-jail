@@ -1434,6 +1434,58 @@ describe('runStraceTailer', () => {
       /shrank below max-seen|mtime advanced without new bytes|shrank/,
     );
   });
+
+  // Finding B: parent-directory rename watch.
+  //
+  // The transient-rename attack: rename the events file aside, drop a
+  // decoy at the same path, let a child open the decoy, then rename the
+  // original back.  The inode baseline is restored before the next drain
+  // so the existing dev/ino check passes — but the child's writes never
+  // reach the file the tailer reads from.  Inotify on the parent dir
+  // catches the IN_MOVED_FROM / IN_MOVED_TO / IN_CREATE events even when
+  // the polling loop misses the window.
+  it('records a tamper reason when the events file is renamed away in its parent directory', async () => {
+    const { renameSync, openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      // Finding-B inputs: watch the parent directory for renames affecting
+      // the events file's basename.
+      eventsDirPath: tailerDir,
+      eventsFileBasename: 'events.jsonl',
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 30,
+      drainMs: 80,
+    });
+
+    // Rename the events file aside.  The parent-dir watcher should fire a
+    // 'rename' event with filename='events.jsonl' and record tamper, even
+    // if the polling loop happens to miss the gap before exit.
+    setTimeout(() => {
+      renameSync(eventsPath, join(tailerDir, 'events.bak'));
+      setTimeout(resolveExit, 200);
+    }, 60);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(
+      /parent directory rename|events file disappeared|inode mismatch/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, constants as fsConstants, type Stats } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
@@ -283,6 +283,33 @@ export interface StraceTailerOptions {
    * tamper checking is performed (used by tests that supply a private path).
    */
   eventsBaseline?: { ino: bigint; dev: bigint };
+  /**
+   * Absolute path of the parent directory that contains the events file
+   * (Finding B).  When provided the tailer attaches a second `fs.watch` to
+   * this directory and treats any `rename` event affecting the events-file
+   * basename as tamper.
+   *
+   * Why this exists in addition to the inode-baseline check on the events
+   * file itself: a hostile lifecycle script can `rename(events.jsonl,
+   * events.bak)` aside, create a decoy at the same path, spawn a child that
+   * `open()`s the decoy, then `rename(events.bak, events.jsonl)` back.  By
+   * the time the next drain re-stats the path, the baseline inode is back —
+   * but the child's fd is wired to the decoy and the original file's events
+   * (including any `audit_bypass`) are dropped for that child.  The
+   * directory-level inotify watch catches the transient swap because the
+   * kernel reports IN_MOVED_FROM / IN_MOVED_TO regardless of timing.
+   *
+   * Test runners that supply a fake StraceRunner and want the watcher
+   * inactive simply omit this option.
+   */
+  eventsDirPath?: string;
+  /**
+   * Basename of the events file inside `eventsDirPath`.  Used to filter the
+   * directory watcher's `rename` events; the watcher only flags tamper when
+   * a rename affects this exact basename.  Defaults to the basename of
+   * `eventsFilePath` when both are provided.
+   */
+  eventsFileBasename?: string;
   /**
    * Optional sink for tamper detection.  When the tailer detects events-file
    * tampering it writes a human-readable reason here; the agent's main loop
@@ -623,6 +650,65 @@ export async function* runStraceTailer(
     }
   }
 
+  // Inotify-backed watch on the events file's PARENT DIRECTORY (Finding B).
+  // The directory mode is 0700 (mkdtemp + explicit chmod in createEventsFile),
+  // so under normal operation no non-root caller can rename/create/unlink
+  // anything inside.  This watcher is the defense-in-depth signal for the
+  // corner case where the directory perms are weakened — or for a future
+  // change to a shared parent — and catches the transient-rename trick:
+  //
+  //   mv events.jsonl events.bak                # rename away
+  //   <create decoy at events.jsonl>            # IN_CREATE on basename
+  //   <child opens events.jsonl via path>       # child fd → decoy
+  //   mv events.bak events.jsonl                # rename back, baseline OK
+  //
+  // The inode-baseline check on the events file alone misses this because
+  // by the next drain cycle the original inode is back at the path.  The
+  // kernel's IN_MOVED_FROM / IN_MOVED_TO / IN_CREATE fire regardless of
+  // when the polling loop ticks, so the directory watcher captures the
+  // transient swap.  Any `rename`-flavoured event whose filename matches
+  // the events-file basename (or is null on some kernels — be conservative
+  // and treat the event as tamper rather than ignore) records tamper.
+  let eventsDirWatcher: ReturnType<typeof fsWatch> | null = null;
+  if (
+    opts.eventsDirPath !== undefined &&
+    opts.eventsDirPath !== '' &&
+    opts.eventsFilePath !== undefined &&
+    opts.eventsFilePath !== ''
+  ) {
+    const expectedBasename =
+      opts.eventsFileBasename ?? opts.eventsFilePath.slice(opts.eventsFilePath.lastIndexOf('/') + 1);
+    try {
+      eventsDirWatcher = fsWatch(
+        opts.eventsDirPath,
+        { persistent: false },
+        (event, filename) => {
+          // Inotify maps `IN_MOVED_FROM`, `IN_MOVED_TO`, `IN_CREATE`,
+          // `IN_DELETE` to Node's "rename" event.  Any rename on our
+          // expected basename — or a null filename which Linux emits when
+          // the kernel cannot supply the name — is treated as tamper.
+          // `change` events on a sibling file (none should exist in the
+          // 0700 mkdtemp dir, but be defensive) are ignored.
+          if (event !== 'rename') return;
+          if (filename !== null && filename !== expectedBasename) return;
+          recordTamper(
+            `events file parent directory rename detected (filename=${filename ?? '<null>'}): ${opts.eventsDirPath}`,
+          );
+          // Also trigger an immediate drain — if the swap was a brief
+          // rename-aside/back, the file content visible to the tailer may
+          // have shifted, and the post-drain inode/mtime checks will pick
+          // up any additional mismatch.
+          drainEventsFile();
+          wake();
+        },
+      );
+      eventsDirWatcher.on('error', () => { /* polling is the fallback */ });
+    } catch {
+      // fs.watch unavailable on this fs — directory-level guard is best-
+      // effort; inode/mtime/size checks remain the primary line of defense.
+    }
+  }
+
   // Poll on a fixed interval as fallback / complement to fs.watch.
   let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
     pollDir();
@@ -658,6 +744,7 @@ export async function* runStraceTailer(
       // Stop fs.watch.
       if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
       if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
+      if (eventsDirWatcher !== null) { try { eventsDirWatcher.close(); } catch { /* ignore */ } eventsDirWatcher = null; }
       done = true;
       wake();
     }, drainMs);
@@ -686,6 +773,7 @@ export async function* runStraceTailer(
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
     if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
     if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
+    if (eventsDirWatcher !== null) { try { eventsDirWatcher.close(); } catch { /* ignore */ } eventsDirWatcher = null; }
     // Drain any remaining partial lines (best-effort).
     for (const [name, partial] of fileBuf) {
       if (partial.length > 0) {
@@ -816,6 +904,8 @@ export class LinuxStraceRunner implements StraceRunner {
         ...(this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
+          eventsDirPath: this._eventsFile.dirPath,
+          eventsFileBasename: basename(this._eventsFile.path),
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,
@@ -973,11 +1063,25 @@ export interface EventsFile {
  */
 export function createEventsFile(parentDir: string = '/tmp'): EventsFile {
   const dirPath = mkdtempSync(joinPath(parentDir, 'script-jail-events-'));
+  // mkdtempSync is defined by POSIX to create with mode 0700 (umask is
+  // not applied), but enforce it explicitly so the Finding-B parent-
+  // directory guard does not rely on platform-default behaviour.  A
+  // weakened mode here would let a non-root caller create decoy files at
+  // a colliding path inside the watched directory.
+  chmodSync(dirPath, 0o700);
   const path = joinPath(dirPath, 'events.jsonl');
+  // O_NOFOLLOW refuses to traverse a symlink at the final path component.
+  // Defends a future code path that creates the events file in a less-
+  // restricted location: if anything has dropped a symlink at our path
+  // before we open(), open() fails with ELOOP rather than rebinding our
+  // writers to an attacker-chosen target.  O_EXCL already protects this
+  // specific create call (mkdtemp + unique name), but O_NOFOLLOW costs
+  // nothing and closes the door to a class of TOCTOU-via-symlink swaps
+  // on any future variant that reuses this helper.
   const fd = openSync(
     path,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition
-    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL,
+    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
     0o600,
   );
   let baseline: { ino: bigint; dev: bigint };

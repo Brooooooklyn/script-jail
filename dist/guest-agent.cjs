@@ -26322,6 +26322,28 @@ async function* runStraceTailer(opts) {
     } catch {
     }
   }
+  let eventsDirWatcher = null;
+  if (opts.eventsDirPath !== void 0 && opts.eventsDirPath !== "" && opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
+    const expectedBasename = opts.eventsFileBasename ?? opts.eventsFilePath.slice(opts.eventsFilePath.lastIndexOf("/") + 1);
+    try {
+      eventsDirWatcher = (0, import_node_fs3.watch)(
+        opts.eventsDirPath,
+        { persistent: false },
+        (event, filename) => {
+          if (event !== "rename") return;
+          if (filename !== null && filename !== expectedBasename) return;
+          recordTamper(
+            `events file parent directory rename detected (filename=${filename ?? "<null>"}): ${opts.eventsDirPath}`
+          );
+          drainEventsFile();
+          wake();
+        }
+      );
+      eventsDirWatcher.on("error", () => {
+      });
+    } catch {
+    }
+  }
   let pollTimer = setInterval(() => {
     pollDir();
     drainEventsFile();
@@ -26360,6 +26382,13 @@ async function* runStraceTailer(opts) {
         }
         eventsWatcher = null;
       }
+      if (eventsDirWatcher !== null) {
+        try {
+          eventsDirWatcher.close();
+        } catch {
+        }
+        eventsDirWatcher = null;
+      }
       done = true;
       wake();
     }, drainMs);
@@ -26395,6 +26424,13 @@ async function* runStraceTailer(opts) {
       } catch {
       }
       eventsWatcher = null;
+    }
+    if (eventsDirWatcher !== null) {
+      try {
+        eventsDirWatcher.close();
+      } catch {
+      }
+      eventsDirWatcher = null;
     }
     for (const [name, partial2] of fileBuf) {
       if (partial2.length > 0) {
@@ -26485,6 +26521,8 @@ var LinuxStraceRunner = class {
         ...this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
+          eventsDirPath: this._eventsFile.dirPath,
+          eventsFileBasename: (0, import_node_path2.basename)(this._eventsFile.path),
           tamperRef: this._tamperRef
         } : {},
         exitPromise
@@ -26569,11 +26607,12 @@ function buildChildEnv(baseEnv, config2, protectedEnvFilePath, eventsFilePath) {
 }
 function createEventsFile(parentDir = "/tmp") {
   const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path2.join)(parentDir, "script-jail-events-"));
+  (0, import_node_fs3.chmodSync)(dirPath, 448);
   const path = (0, import_node_path2.join)(dirPath, "events.jsonl");
   const fd = (0, import_node_fs3.openSync)(
     path,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition
-    import_node_fs3.constants.O_RDWR | import_node_fs3.constants.O_CREAT | import_node_fs3.constants.O_EXCL,
+    import_node_fs3.constants.O_RDWR | import_node_fs3.constants.O_CREAT | import_node_fs3.constants.O_EXCL | import_node_fs3.constants.O_NOFOLLOW,
     384
   );
   let baseline;
