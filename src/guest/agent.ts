@@ -1224,7 +1224,7 @@ export class LinuxStraceRunner implements StraceRunner {
     const straceArgs = [
       '-ff',
       '-s', '4096',
-      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64',
+      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64,unshare',
       '-o', opts.basePath,
       cmd,
       ...args,

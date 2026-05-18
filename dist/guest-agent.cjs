@@ -25994,6 +25994,93 @@ async function runInstallPhase(input) {
     if (childFdUnknown) dirfdStateUnknown.delete(cr);
     if (childFdUnknown || parentFdUnknown) dirfdStateUnknown.add(pr);
   }
+  function detachFdGroup(pid) {
+    const sharedRoot = rootedFd(pid);
+    const sharedPrefix = `${sharedRoot}:`;
+    const snapshot = [];
+    for (const [key, val] of dirfdTable) {
+      if (key.startsWith(sharedPrefix)) {
+        snapshot.push([key.slice(sharedPrefix.length), val]);
+      }
+    }
+    const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+    if (sharedRoot !== pid) {
+      fdParent.delete(pid);
+      for (const [fdSuffix, val] of snapshot) {
+        dirfdTable.set(`${pid}:${fdSuffix}`, val);
+      }
+      if (sharedUnknown) dirfdStateUnknown.add(pid);
+      return;
+    }
+    const otherMembers = [];
+    for (const memberPid of fdParent.keys()) {
+      if (memberPid === pid) continue;
+      if (findFdRoot(memberPid) === pid) {
+        otherMembers.push(memberPid);
+      }
+    }
+    if (otherMembers.length === 0) {
+      return;
+    }
+    otherMembers.sort((a, b) => a - b);
+    const newRoot = otherMembers[0];
+    fdParent.delete(newRoot);
+    for (const member of otherMembers) {
+      if (member === newRoot) continue;
+      fdParent.set(member, newRoot);
+    }
+    const oldPrefix = `${pid}:`;
+    for (const [fdSuffix, val] of snapshot) {
+      dirfdTable.set(`${newRoot}:${fdSuffix}`, val);
+      dirfdTable.delete(`${oldPrefix}${fdSuffix}`);
+    }
+    if (sharedUnknown) {
+      dirfdStateUnknown.delete(pid);
+      dirfdStateUnknown.add(newRoot);
+    }
+    for (const [fdSuffix, val] of snapshot) {
+      dirfdTable.set(`${pid}:${fdSuffix}`, val);
+    }
+    if (sharedUnknown) dirfdStateUnknown.add(pid);
+  }
+  function detachCwdGroup(pid) {
+    const sharedRoot = rootedCwd(pid);
+    const sharedCwd = pidCwd.get(sharedRoot);
+    const sharedUnknown = pidCwdUnknown.has(sharedRoot);
+    if (sharedRoot !== pid) {
+      cwdParent.delete(pid);
+      if (sharedCwd !== void 0) pidCwd.set(pid, sharedCwd);
+      if (sharedUnknown) pidCwdUnknown.add(pid);
+      return;
+    }
+    const otherMembers = [];
+    for (const memberPid of cwdParent.keys()) {
+      if (memberPid === pid) continue;
+      if (findCwdRoot(memberPid) === pid) {
+        otherMembers.push(memberPid);
+      }
+    }
+    if (otherMembers.length === 0) {
+      return;
+    }
+    otherMembers.sort((a, b) => a - b);
+    const newRoot = otherMembers[0];
+    cwdParent.delete(newRoot);
+    for (const member of otherMembers) {
+      if (member === newRoot) continue;
+      cwdParent.set(member, newRoot);
+    }
+    if (sharedCwd !== void 0) {
+      pidCwd.set(newRoot, sharedCwd);
+      pidCwd.delete(pid);
+    }
+    if (sharedUnknown) {
+      pidCwdUnknown.delete(pid);
+      pidCwdUnknown.add(newRoot);
+    }
+    if (sharedCwd !== void 0) pidCwd.set(pid, sharedCwd);
+    if (sharedUnknown) pidCwdUnknown.add(pid);
+  }
   const dirfdTable = /* @__PURE__ */ new Map();
   const fdKey = (pid, fd) => `${rootedFd(pid)}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
@@ -26280,52 +26367,7 @@ async function runInstallPhase(input) {
           const hasCloexec = (flagsBits & CLOSE_RANGE_CLOEXEC) !== 0;
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
             if (hasUnshare) {
-              const sharedRoot = rootedFd(pid);
-              const sharedPrefix = `${sharedRoot}:`;
-              const snapshot = [];
-              for (const [key, val] of dirfdTable) {
-                if (key.startsWith(sharedPrefix)) {
-                  snapshot.push([key.slice(sharedPrefix.length), val]);
-                }
-              }
-              const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
-              if (sharedRoot !== pid) {
-                fdParent.delete(pid);
-                for (const [fdSuffix, val] of snapshot) {
-                  dirfdTable.set(`${pid}:${fdSuffix}`, val);
-                }
-                if (sharedUnknown) dirfdStateUnknown.add(pid);
-              } else {
-                const otherMembers = [];
-                for (const memberPid of fdParent.keys()) {
-                  if (memberPid === pid) continue;
-                  if (findFdRoot(memberPid) === pid) {
-                    otherMembers.push(memberPid);
-                  }
-                }
-                if (otherMembers.length > 0) {
-                  otherMembers.sort((a, b) => a - b);
-                  const newRoot = otherMembers[0];
-                  fdParent.delete(newRoot);
-                  for (const member of otherMembers) {
-                    if (member === newRoot) continue;
-                    fdParent.set(member, newRoot);
-                  }
-                  const oldPrefix = `${pid}:`;
-                  for (const [fdSuffix, val] of snapshot) {
-                    dirfdTable.set(`${newRoot}:${fdSuffix}`, val);
-                    dirfdTable.delete(`${oldPrefix}${fdSuffix}`);
-                  }
-                  if (sharedUnknown) {
-                    dirfdStateUnknown.delete(pid);
-                    dirfdStateUnknown.add(newRoot);
-                  }
-                  for (const [fdSuffix, val] of snapshot) {
-                    dirfdTable.set(`${pid}:${fdSuffix}`, val);
-                  }
-                  if (sharedUnknown) dirfdStateUnknown.add(pid);
-                }
-              }
+              detachFdGroup(pid);
               const groupPrefix = `${rootedFd(pid)}:`;
               for (const key of [...dirfdTable.keys()]) {
                 if (!key.startsWith(groupPrefix)) continue;
@@ -26360,6 +26402,51 @@ async function runInstallPhase(input) {
                 }
               }
             }
+          }
+        }
+        continue;
+      }
+      const unshareMatch = line.match(/^unshare\(([^)]*)\)\s*=\s*(-?\d+)\b/);
+      if (unshareMatch !== null) {
+        const rc = parseInt(unshareMatch[2] ?? "", 10);
+        if (Number.isFinite(rc) && rc === 0) {
+          const flagsStr = (unshareMatch[1] ?? "").trim();
+          const CLONE_FS = 512;
+          const CLONE_FILES = 1024;
+          let flagsBits = 0;
+          if (flagsStr.length > 0) {
+            if (/^[A-Z_|\s]+$/.test(flagsStr)) {
+              for (const tok of flagsStr.split("|")) {
+                const t = tok.trim();
+                if (t === "CLONE_FILES") flagsBits |= CLONE_FILES;
+                else if (t === "CLONE_FS") flagsBits |= CLONE_FS;
+              }
+            } else if (flagsStr.startsWith("0x") || flagsStr.startsWith("0X")) {
+              const n = parseInt(flagsStr, 16);
+              if (Number.isFinite(n)) flagsBits = n;
+            } else if (/^-?\d+$/.test(flagsStr)) {
+              const n = parseInt(flagsStr, 10);
+              if (Number.isFinite(n)) flagsBits = n;
+            } else {
+              for (const tok of flagsStr.split("|")) {
+                const t = tok.trim();
+                if (t === "CLONE_FILES") flagsBits |= CLONE_FILES;
+                else if (t === "CLONE_FS") flagsBits |= CLONE_FS;
+                else if (t.startsWith("0x") || t.startsWith("0X")) {
+                  const n = parseInt(t, 16);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                } else if (/^-?\d+$/.test(t)) {
+                  const n = parseInt(t, 10);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                }
+              }
+            }
+          }
+          if ((flagsBits & CLONE_FILES) !== 0) {
+            detachFdGroup(pid);
+          }
+          if ((flagsBits & CLONE_FS) !== 0) {
+            detachCwdGroup(pid);
           }
         }
         continue;
@@ -26435,6 +26522,7 @@ async function runInstallPhase(input) {
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           shimLoadedPids.delete(rawEvent.pid);
+          detachFdGroup(rawEvent.pid);
           const execRoot = rootedFd(rawEvent.pid);
           const execPrefix = `${execRoot}:`;
           for (const key of [...dirfdTable.keys()]) {
@@ -27533,7 +27621,7 @@ var LinuxStraceRunner = class {
       "-s",
       "4096",
       "-e",
-      "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64",
+      "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64,unshare",
       "-o",
       opts.basePath,
       cmd,

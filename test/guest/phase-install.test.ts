@@ -6613,4 +6613,614 @@ describe('runInstallPhase', () => {
       expect(parseShimLine(line)).toBeNull();
     });
   });
+
+  // =====================================================================
+  // Codex follow-up regression tests (high, 2026-05-19):
+  //
+  //   #1 — execve detaches the caller from a shared CLONE_FILES fd group
+  //        BEFORE the kernel sweeps CLOEXEC.  Sibling fd mutations after
+  //        the exec must NOT bleed into the exec'd image's modeled state.
+  //   #2 — execve still sweeps CLOEXEC in the now-private fd group
+  //        without disturbing the sibling's view of the SHARED group.
+  //   #3 — unshare(CLONE_FILES) detaches the caller from a shared
+  //        CLONE_FILES group.  Subsequent dup/close in the caller must
+  //        NOT mutate the sibling's modeled fd table.
+  //   #4 — unshare(CLONE_FS) detaches the caller from a shared CLONE_FS
+  //        cwd group.  Subsequent chdir in the caller must NOT mutate
+  //        the sibling's modeled cwd.
+  //   #5 — unshare flags parser accepts decimal and hex numeric forms
+  //        (CLONE_FILES = 0x400 = 1024) so kernels / libc combos that
+  //        emit numeric flags still trigger the detach.
+  //   #6 — unshare with flag bits we don't model (CLONE_NEWUTS, etc) is
+  //        ignored — no spurious detach.
+  // =====================================================================
+  describe('execve detaches CLONE_FILES + unshare(2) modeling (codex follow-up)', () => {
+    const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
+
+    // Test #1 — execve detaches CLONE_FILES: parent + child share fd
+    // table; child execve's; AFTER the exec, parent dup2(8→7) where 8
+    // was opened to /B BEFORE the clone.  Assert:
+    //   - child's modeled fd 7 still maps to /A (the exec snapshot).
+    //   - parent's modeled fd 7 maps to /B (post-detach mutation in the
+    //     parent's group only).
+    // Pre-fix the parent's dup2 mutated the shared dirfdTable, so the
+    // child's post-exec openat(7, ...) would also resolve through /B.
+    it('execve detaches caller from shared fd group: parent dup2 after exec does not affect child (bug #1)', async () => {
+      const proc = mockProcReader({
+        9301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'exec-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9302: {
+          ppid: 9301,
+          env: {
+            npm_package_name: 'exec-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7 (without O_CLOEXEC so it survives exec).
+        {
+          pid: 9301,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent opens /B → fd 8 BEFORE the clone (so the snapshot
+        // entering the child includes fd 8 too).
+        {
+          pid: 9301,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FILES → child shares fd table.
+        {
+          pid: 9301,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9302',
+          source: 'strace',
+        },
+        // Child execve's → kernel calls unshare_files_struct.  Our
+        // model must detach the child's fd group from the parent's.
+        {
+          pid: 9302,
+          line: 'execve("/usr/bin/cat", ["cat"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Parent dup2(8, 7) — in the parent's group only.  Post-fix
+        // this MUST NOT affect the child's modeled fd 7.
+        {
+          pid: 9301,
+          line: 'dup2(8, 7) = 7',
+          source: 'strace',
+        },
+        // Parent openat(7, "file") — resolves through /B (the new
+        // mapping in the parent's private group).
+        {
+          pid: 9301,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child openat(7, "file") — must resolve through /A (the
+        // exec'd image's snapshot, unchanged by the parent's dup2).
+        {
+          pid: 9302,
+          line: 'openat(7, "file", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9301 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent's openat(7, ...) MUST resolve to /B/file (post-dup2 path).
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file' && r['pid'] === 9301;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child's openat(7, ...) MUST resolve to /A/file (exec snapshot,
+      // not the parent's post-detach /B).
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 9302;
+      });
+      expect(childRead).toHaveLength(1);
+      // Sanity: child MUST NOT see /B/file (parent's mutation leaked).
+      const bleed = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file' && r['pid'] === 9302;
+      });
+      expect(bleed).toHaveLength(0);
+    });
+
+    // Test #2 — execve sweeps CLOEXEC in the now-private group only.
+    // Parent opens fd 7→/pkg with O_CLOEXEC; clone(CLONE_FILES); child
+    // execs.  Post-fix: child's modeled fd 7 is cleared (kernel closed
+    // CLOEXEC), parent's modeled fd 7 still resolves to /pkg.
+    it('execve sweeps CLOEXEC in private group only: parent fd survives, child fd dies (bug #1)', async () => {
+      const proc = mockProcReader({
+        9401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'exec-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9402: {
+          ppid: 9401,
+          env: {
+            npm_package_name: 'exec-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /pkg with O_CLOEXEC → fd 7 (cloexec=true).
+        {
+          pid: 9401,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 7',
+          source: 'strace',
+        },
+        // Parent clones CLONE_FILES → child shares fd table.
+        {
+          pid: 9401,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 9402',
+          source: 'strace',
+        },
+        // Child execve's → kernel sweeps CLOEXEC in the child's
+        // private fd table.  Our model must:
+        //   1. Detach the child from the shared group.
+        //   2. Sweep cloexec=true entries in the child's private group.
+        //   3. Leave the parent's (formerly shared, now solo) group
+        //      with fd 7 → /pkg intact.
+        {
+          pid: 9402,
+          line: 'execve("/usr/bin/cat", ["cat"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Parent openat(7, ...) — must still resolve through /pkg.
+        {
+          pid: 9401,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child openat(7, ...) — must fail closed (CLOEXEC swept).
+        {
+          pid: 9402,
+          line: 'openat(7, "file", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9401 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent's read certified through /pkg.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file' && r['pid'] === 9401;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child's read MUST NOT certify through /pkg — fd was swept.
+      const childCertified = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/file' && r['pid'] === 9402;
+      });
+      expect(childCertified).toHaveLength(0);
+      // Child's openat fails closed → surfaced as <UNRESOLVED_PATH>.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 9402;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Test #3 — unshare(CLONE_FILES) detaches.  Parent + child share fd
+    // table; parent opens /A → fd 7; child unshare(CLONE_FILES); child
+    // opens /B → fd 8 then dup2(8, 7).  Post-fix: parent fd 7 still
+    // /A, child fd 7 → /B.
+    it('unshare(CLONE_FILES) detaches caller: child dup2 does not affect parent (bug #2)', async () => {
+      const proc = mockProcReader({
+        9501: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9502: {
+          ppid: 9501,
+          env: {
+            npm_package_name: 'unshare-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A → fd 7.
+        {
+          pid: 9501,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FILES → child shares fd table.
+        {
+          pid: 9501,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 9502',
+          source: 'strace',
+        },
+        // Child explicitly detaches via unshare(CLONE_FILES).
+        {
+          pid: 9502,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Child opens /B → fd 8 in its NEW private group.
+        {
+          pid: 9502,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // Child dup2(8, 7) — fd 7 now aliases /B in the CHILD's private
+        // group only.  Pre-fix this mutated the shared dirfdTable and
+        // the parent's openat(7) below would resolve through /B.
+        {
+          pid: 9502,
+          line: 'dup2(8, 7) = 7',
+          source: 'strace',
+        },
+        // Parent openat(7, "file") — MUST still resolve through /A.
+        {
+          pid: 9501,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child openat(7, "file") — resolves through /B (post-dup2).
+        {
+          pid: 9502,
+          line: 'openat(7, "file", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9501 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 9501;
+      });
+      expect(parentRead).toHaveLength(1);
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file' && r['pid'] === 9502;
+      });
+      expect(childRead).toHaveLength(1);
+      // Sanity: parent MUST NOT see /B/file (child mutation leaked).
+      const bleed = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file' && r['pid'] === 9501;
+      });
+      expect(bleed).toHaveLength(0);
+    });
+
+    // Test #4 — unshare(CLONE_FS) detaches cwd.  Parent + child share
+    // `struct fs` via clone(CLONE_FS); parent chdir(/A); child
+    // unshare(CLONE_FS); child chdir(/B).  Post-fix: parent's cwd is
+    // /A, child's cwd is /B (proven by an AT_FDCWD-relative openat
+    // resolving against the per-pid cwd).
+    it('unshare(CLONE_FS) detaches caller: child chdir does not affect parent (bug #2)', async () => {
+      const proc = mockProcReader({
+        9601: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-fs-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9602: {
+          ppid: 9601,
+          env: {
+            npm_package_name: 'unshare-fs-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Seed pid 9601 with a known cwd state.
+        {
+          pid: 9601,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FS → cwd is shared.
+        {
+          pid: 9601,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 9602',
+          source: 'strace',
+        },
+        // Parent chdirs to /A — under shared CLONE_FS this would also
+        // be the child's cwd.
+        {
+          pid: 9601,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        // Child detaches its cwd group via unshare(CLONE_FS).
+        {
+          pid: 9602,
+          line: 'unshare(CLONE_FS) = 0',
+          source: 'strace',
+        },
+        // Child chdirs to /B — kernel mutates ONLY the child's now-
+        // private fs struct.  Pre-fix this would also rebind the
+        // parent's cwd (shared group).
+        {
+          pid: 9602,
+          line: 'chdir("/B") = 0',
+          source: 'strace',
+        },
+        // Parent AT_FDCWD-relative openat — must resolve through /A.
+        {
+          pid: 9601,
+          line: 'openat(AT_FDCWD, "file.parent", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child AT_FDCWD-relative openat — must resolve through /B.
+        {
+          pid: 9602,
+          line: 'openat(AT_FDCWD, "file.child", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9601 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file.parent' && r['pid'] === 9601;
+      });
+      expect(parentRead).toHaveLength(1);
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file.child' && r['pid'] === 9602;
+      });
+      expect(childRead).toHaveLength(1);
+      // Sanity: parent MUST NOT see /B (child mutation leaked).
+      const bleed = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file.parent' && r['pid'] === 9601;
+      });
+      expect(bleed).toHaveLength(0);
+    });
+
+    // Test #5 — unshare with numeric flags.  Strace (or a libc on a
+    // kernel without symbolic flag knowledge) may render the flag as
+    // hex (`0x400`) or decimal (`1024`).  Both forms MUST trigger the
+    // CLONE_FILES detach.
+    it('unshare(2) accepts numeric (hex + decimal) CLONE_FILES flags (bug #2)', async () => {
+      // ---------- hex form (0x400) ----------
+      const procHex = mockProcReader({
+        9701: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-hex-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9702: {
+          ppid: 9701,
+          env: {
+            npm_package_name: 'unshare-hex-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const hexRecords: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 9701,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        {
+          pid: 9701,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 9702',
+          source: 'strace',
+        },
+        // Hex-encoded CLONE_FILES.
+        { pid: 9702, line: 'unshare(0x400) = 0', source: 'strace' },
+        {
+          pid: 9702,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        { pid: 9702, line: 'dup2(8, 7) = 7', source: 'strace' },
+        { pid: 9701, line: 'openat(7, "file", O_RDONLY) = 4', source: 'strace' },
+      ];
+      const hexEmit = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(hexRecords, 0, { rootPid: 9701 }),
+        attribution: new Attribution(procHex),
+        emitter: hexEmit.emitter,
+      });
+      const hexEvents = hexEmit.lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Detach happened → parent's fd 7 still /A.
+      const hexParentRead = hexEvents.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 9701;
+      });
+      expect(hexParentRead).toHaveLength(1);
+
+      // ---------- decimal form (1024) ----------
+      const procDec = mockProcReader({
+        9801: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-dec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9802: {
+          ppid: 9801,
+          env: {
+            npm_package_name: 'unshare-dec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const decRecords: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 9801,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        {
+          pid: 9801,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 9802',
+          source: 'strace',
+        },
+        // Decimal-encoded CLONE_FILES (= 0x400 = 1024).
+        { pid: 9802, line: 'unshare(1024) = 0', source: 'strace' },
+        {
+          pid: 9802,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        { pid: 9802, line: 'dup2(8, 7) = 7', source: 'strace' },
+        { pid: 9801, line: 'openat(7, "file", O_RDONLY) = 4', source: 'strace' },
+      ];
+      const decEmit = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(decRecords, 0, { rootPid: 9801 }),
+        attribution: new Attribution(procDec),
+        emitter: decEmit.emitter,
+      });
+      const decEvents = decEmit.lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const decParentRead = decEvents.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 9801;
+      });
+      expect(decParentRead).toHaveLength(1);
+    });
+
+    // Test #6 — unshare with flag bits we don't model (e.g. a namespace
+    // bit like CLONE_NEWUTS = 0x4000000) MUST be ignored.  The fd
+    // group stays shared; a subsequent dup2 in the caller still
+    // mutates the sibling's view.
+    it('unshare(2) with unknown flag bits is a no-op (bug #2)', async () => {
+      const proc = mockProcReader({
+        9901: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-noop-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9902: {
+          ppid: 9901,
+          env: {
+            npm_package_name: 'unshare-noop-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 9901,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        {
+          pid: 9901,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 9902',
+          source: 'strace',
+        },
+        // Unknown bit (0x4000000 = CLONE_NEWUTS).  Our model does NOT
+        // track namespace separations — the fd group should remain
+        // shared and the dup2 below should mutate the sibling's view.
+        { pid: 9902, line: 'unshare(0x4000000) = 0', source: 'strace' },
+        {
+          pid: 9902,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // dup2 in the (still-shared) group — both pids' fd 7 now aliases /B.
+        { pid: 9902, line: 'dup2(8, 7) = 7', source: 'strace' },
+        // Parent openat(7) — resolves through /B (proves no detach).
+        { pid: 9901, line: 'openat(7, "file", O_RDONLY) = 4', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9901 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent's openat(7) resolves through /B → /B/file: detach
+      // didn't happen, fd group stayed shared.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/file' && r['pid'] === 9901;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Sanity: there's no read of /A/file (which would indicate a
+      // bogus detach kept the parent's pre-dup view).
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 9901;
+      });
+      expect(stale).toHaveLength(0);
+    });
+  });
 });

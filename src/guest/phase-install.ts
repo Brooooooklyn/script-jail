@@ -646,6 +646,134 @@ export async function runInstallPhase(
     if (childFdUnknown || parentFdUnknown) dirfdStateUnknown.add(pr);
   }
 
+  // Codex follow-up (high, 2026-05-19): shared detach helpers used by
+  // CLOSE_RANGE_UNSHARE, unshare(CLONE_FILES) / unshare(CLONE_FS), and
+  // successful execve.  Each helper detaches the caller pid from any
+  // multi-member group it is currently a member of, seeding a private
+  // copy of the group's per-pid state into the new singleton group.
+  //
+  // Semantics shared by both:
+  //   - If the pid is the sole member of its group (no other pid
+  //     resolves to it via the parent map), no-op: the pid already owns
+  //     the group state.
+  //   - If the pid is a NON-ROOT member, simply clear its parent pointer
+  //     (so it becomes its own root) and copy the shared state into the
+  //     new key prefix.  The shared group is unaffected; its remaining
+  //     members continue to resolve to the unchanged root.
+  //   - If the pid IS the group representative AND there are other
+  //     members: promote the smallest-pid remaining member to the new
+  //     root, re-point all other members at it, migrate the shared
+  //     per-pid state keys, then seed the caller's NEW singleton group
+  //     with a copy.
+  //
+  // The execve path needs the fd-group detach BEFORE its CLOEXEC sweep
+  // because the kernel's `unshare_files_struct` runs inside `do_execve`
+  // — exec dup's the fd table into a private copy and then closes the
+  // CLOEXEC fds.  Without the detach, our post-exec sweep mutates the
+  // shared dirfdTable, bleeding state changes into siblings.
+  //
+  // The unshare(CLONE_FS) path needs the cwd-group detach so a child
+  // that calls `unshare(CLONE_FS); chdir(...)` no longer affects the
+  // parent's modeled cwd (the kernel breaks CLONE_FS at the unshare).
+  function detachFdGroup(pid: number): void {
+    const sharedRoot = rootedFd(pid);
+    const sharedPrefix = `${sharedRoot}:`;
+    const snapshot: Array<[string, { path: string; cloexec: boolean }]> = [];
+    for (const [key, val] of dirfdTable) {
+      if (key.startsWith(sharedPrefix)) {
+        snapshot.push([key.slice(sharedPrefix.length), val]);
+      }
+    }
+    const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+    if (sharedRoot !== pid) {
+      // Non-root member detach: clear parent pointer, copy snapshot
+      // into private group.  Shared group state stays intact.
+      fdParent.delete(pid);
+      for (const [fdSuffix, val] of snapshot) {
+        dirfdTable.set(`${pid}:${fdSuffix}`, val);
+      }
+      if (sharedUnknown) dirfdStateUnknown.add(pid);
+      return;
+    }
+    // Caller IS the representative.  Find other members.
+    const otherMembers: number[] = [];
+    for (const memberPid of fdParent.keys()) {
+      if (memberPid === pid) continue;
+      if (findFdRoot(memberPid) === pid) {
+        otherMembers.push(memberPid);
+      }
+    }
+    if (otherMembers.length === 0) {
+      // Singleton group — nothing to detach against; state already
+      // lives under `pid:<fd>`.
+      return;
+    }
+    // Promote smallest-pid remaining member to new root.
+    otherMembers.sort((a, b) => a - b);
+    const newRoot = otherMembers[0]!;
+    fdParent.delete(newRoot);
+    for (const member of otherMembers) {
+      if (member === newRoot) continue;
+      fdParent.set(member, newRoot);
+    }
+    const oldPrefix = `${pid}:`;
+    for (const [fdSuffix, val] of snapshot) {
+      dirfdTable.set(`${newRoot}:${fdSuffix}`, val);
+      dirfdTable.delete(`${oldPrefix}${fdSuffix}`);
+    }
+    if (sharedUnknown) {
+      dirfdStateUnknown.delete(pid);
+      dirfdStateUnknown.add(newRoot);
+    }
+    // Seed caller's NEW singleton group from snapshot.
+    for (const [fdSuffix, val] of snapshot) {
+      dirfdTable.set(`${pid}:${fdSuffix}`, val);
+    }
+    if (sharedUnknown) dirfdStateUnknown.add(pid);
+  }
+
+  function detachCwdGroup(pid: number): void {
+    const sharedRoot = rootedCwd(pid);
+    const sharedCwd = pidCwd.get(sharedRoot);
+    const sharedUnknown = pidCwdUnknown.has(sharedRoot);
+    if (sharedRoot !== pid) {
+      cwdParent.delete(pid);
+      if (sharedCwd !== undefined) pidCwd.set(pid, sharedCwd);
+      if (sharedUnknown) pidCwdUnknown.add(pid);
+      return;
+    }
+    // Caller IS the representative.
+    const otherMembers: number[] = [];
+    for (const memberPid of cwdParent.keys()) {
+      if (memberPid === pid) continue;
+      if (findCwdRoot(memberPid) === pid) {
+        otherMembers.push(memberPid);
+      }
+    }
+    if (otherMembers.length === 0) {
+      // Singleton — no-op.
+      return;
+    }
+    otherMembers.sort((a, b) => a - b);
+    const newRoot = otherMembers[0]!;
+    cwdParent.delete(newRoot);
+    for (const member of otherMembers) {
+      if (member === newRoot) continue;
+      cwdParent.set(member, newRoot);
+    }
+    if (sharedCwd !== undefined) {
+      pidCwd.set(newRoot, sharedCwd);
+      pidCwd.delete(pid);
+    }
+    if (sharedUnknown) {
+      pidCwdUnknown.delete(pid);
+      pidCwdUnknown.add(newRoot);
+    }
+    // Seed caller's NEW singleton group.
+    if (sharedCwd !== undefined) pidCwd.set(pid, sharedCwd);
+    if (sharedUnknown) pidCwdUnknown.add(pid);
+  }
+
   // Per-pid (really per-fd-group) fd table: maps a kernel-assigned file
   // descriptor (from a successful openat) to the canonical absolute path
   // of the directory (or file) it points at.  Used to resolve subsequent
@@ -1663,123 +1791,9 @@ export async function runInstallPhase(
               // siblings can still use any fds that were closed only
               // in the caller's new private group.
               //
-              // Implementation:
-              //   1. Snapshot the SHARED group's dirfdTable + state
-              //      flags.
-              //   2. Re-parent the caller to itself (becomes its own
-              //      fd-group root).
-              //   3. Copy the snapshotted state into the new private
-              //      group.
-              //   4. Apply the close range to the new private group
-              //      only.
-              const sharedRoot = rootedFd(pid);
-              // Snapshot shared-group state under sharedRoot.  We need
-              // this in BOTH detach branches below: either to seed the
-              // caller's new private group (caller was a non-root
-              // member) OR to migrate the shared group's state to a new
-              // root pid (caller WAS the representative).
-              const sharedPrefix = `${sharedRoot}:`;
-              const snapshot: Array<[string, { path: string; cloexec: boolean }]> = [];
-              for (const [key, val] of dirfdTable) {
-                if (key.startsWith(sharedPrefix)) {
-                  snapshot.push([key.slice(sharedPrefix.length), val]);
-                }
-              }
-              const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
-              if (sharedRoot !== pid) {
-                // Caller is a NON-ROOT member of the shared group.
-                // Detach: pid becomes its own root.  fdParent.delete
-                // is enough — findFdRoot returns the pid itself when
-                // there's no parent pointer.  The shared group's
-                // representative stays unchanged; remaining members
-                // (root + any other non-root members) keep resolving
-                // to sharedRoot.
-                fdParent.delete(pid);
-                // Copy snapshot into pid's NEW private group.
-                for (const [fdSuffix, val] of snapshot) {
-                  dirfdTable.set(`${pid}:${fdSuffix}`, val);
-                }
-                if (sharedUnknown) dirfdStateUnknown.add(pid);
-                // NOTE: we do NOT touch the shared group's entries —
-                // sharedRoot still maps to all the original fds; any
-                // sibling pid that resolves via findFdRoot to
-                // sharedRoot retains full access.  This is the whole
-                // point of CLOSE_RANGE_UNSHARE.
-              } else {
-                // Codex follow-up (bug #1, high, 2026-05-19): caller IS
-                // the group representative.  Pre-fix this branch was a
-                // silent no-op (the prior code only entered the detach
-                // arm when `sharedRoot !== pid`).  That left every
-                // remaining sibling resolving to `sharedRoot === pid`
-                // and the close-range below mutated the shared group's
-                // dirfdTable entries — siblings then saw deletions they
-                // shouldn't, and if the caller reused the deleted fds
-                // via subsequent openat, sibling opens via the OLD fd
-                // would resolve through the caller's new path.
-                //
-                // Find the remaining members of the shared group (all
-                // pids `p !== pid` whose `findFdRoot(p) === pid`).
-                // Iterate `fdParent` keys — any pid present in the map
-                // resolves through its parent chain to a root; pids
-                // not in the map are their own root.  Path compression
-                // means most members point directly at `sharedRoot`,
-                // but we re-resolve via findFdRoot to be safe.
-                const otherMembers: number[] = [];
-                for (const memberPid of fdParent.keys()) {
-                  if (memberPid === pid) continue;
-                  if (findFdRoot(memberPid) === pid) {
-                    otherMembers.push(memberPid);
-                  }
-                }
-                if (otherMembers.length > 0) {
-                  // Promote the first remaining member to be the new
-                  // root.  Re-point every other member's parent to it,
-                  // migrate the shared dirfdTable / dirfdStateUnknown
-                  // entries from the OLD root (`pid`) to the new root,
-                  // then detach the caller into a private group.
-                  //
-                  // Why "first" arbitrarily: union-find groups are
-                  // unordered sets; any member is a valid root.  We
-                  // pick the smallest pid for determinism (helps any
-                  // future debugging based on transcript dumps).
-                  otherMembers.sort((a, b) => a - b);
-                  const newRoot = otherMembers[0]!;
-                  // Re-point every other member to newRoot.  Also
-                  // clear newRoot's own parent pointer (it becomes a
-                  // self-root).
-                  fdParent.delete(newRoot);
-                  for (const member of otherMembers) {
-                    if (member === newRoot) continue;
-                    fdParent.set(member, newRoot);
-                  }
-                  // Migrate dirfdTable entries: shared group keys
-                  // were `${pid}:<fd>` (because sharedRoot === pid).
-                  // Move each to `${newRoot}:<fd>`.
-                  const oldPrefix = `${pid}:`;
-                  for (const [fdSuffix, val] of snapshot) {
-                    dirfdTable.set(`${newRoot}:${fdSuffix}`, val);
-                    dirfdTable.delete(`${oldPrefix}${fdSuffix}`);
-                  }
-                  // Migrate dirfdStateUnknown membership.
-                  if (sharedUnknown) {
-                    dirfdStateUnknown.delete(pid);
-                    dirfdStateUnknown.add(newRoot);
-                  }
-                  // Now the caller (`pid`) has no fdParent entry and
-                  // no shared dirfdTable entries — it's a singleton
-                  // root.  Seed its private group from the snapshot so
-                  // the close-range below applies to a private copy.
-                  for (const [fdSuffix, val] of snapshot) {
-                    dirfdTable.set(`${pid}:${fdSuffix}`, val);
-                  }
-                  if (sharedUnknown) dirfdStateUnknown.add(pid);
-                }
-                // If there are NO other members, the "shared" group is
-                // a singleton (just the caller).  Nothing to detach
-                // against — the snapshot already lives under `pid:<fd>`
-                // in the dirfdTable, and the close-range below applies
-                // to it directly.  No action needed.
-              }
+              // Shared with unshare(CLONE_FILES) and execve via the
+              // `detachFdGroup` helper above.
+              detachFdGroup(pid);
               // Apply the range against the caller's group (which is
               // either the brand-new private group or the original
               // singleton group).  CLOSE_RANGE_CLOEXEC and CLOSE_RANGE
@@ -1837,6 +1851,78 @@ export async function runInstallPhase(
                 }
               }
             }
+          }
+        }
+        continue;
+      }
+
+      // Codex follow-up (high, 2026-05-19): pre-parse `unshare(2)` so a
+      // process can explicitly break its CLONE_FILES / CLONE_FS sharing
+      // mid-run.  Pre-fix this syscall was invisible to the model: a
+      // child that ran `clone(CLONE_FILES); unshare(CLONE_FILES)` and
+      // then called `close(7)` would mutate the shared dirfdTable, so
+      // a sibling's subsequent `openat(7, ...)` would fail closed even
+      // though the kernel still had fd 7 valid in the sibling's table.
+      // Same shape for CLONE_FS / chdir.
+      //
+      // Strace renders flags as either a `|`-separated identifier list
+      // OR a numeric (hex/decimal) bitmask.  Linux defines many CLONE_*
+      // bits; we only care about CLONE_FILES (0x400) and CLONE_FS
+      // (0x200) — other bits (CLONE_NEWNS, CLONE_NEWUTS, …) describe
+      // namespace separations our model doesn't track.
+      //
+      // Wire formats:
+      //   unshare(CLONE_FILES) = 0
+      //   unshare(CLONE_FS|CLONE_FILES) = 0
+      //   unshare(0x400) = 0                     ← hex CLONE_FILES
+      //   unshare(1024) = 0                      ← decimal CLONE_FILES
+      //   unshare(CLONE_NEWUTS) = 0              ← unknown bit (no-op)
+      //   unshare(CLONE_FILES) = -1 EINVAL       ← failure (no-op)
+      const unshareMatch = line.match(/^unshare\(([^)]*)\)\s*=\s*(-?\d+)\b/);
+      if (unshareMatch !== null) {
+        const rc = parseInt(unshareMatch[2] ?? '', 10);
+        if (Number.isFinite(rc) && rc === 0) {
+          const flagsStr = (unshareMatch[1] ?? '').trim();
+          const CLONE_FS = 0x200;
+          const CLONE_FILES = 0x400;
+          let flagsBits = 0;
+          if (flagsStr.length > 0) {
+            if (/^[A-Z_|\s]+$/.test(flagsStr)) {
+              // Pure symbolic identifier list.
+              for (const tok of flagsStr.split('|')) {
+                const t = tok.trim();
+                if (t === 'CLONE_FILES') flagsBits |= CLONE_FILES;
+                else if (t === 'CLONE_FS') flagsBits |= CLONE_FS;
+              }
+            } else if (flagsStr.startsWith('0x') || flagsStr.startsWith('0X')) {
+              const n = parseInt(flagsStr, 16);
+              if (Number.isFinite(n)) flagsBits = n;
+            } else if (/^-?\d+$/.test(flagsStr)) {
+              const n = parseInt(flagsStr, 10);
+              if (Number.isFinite(n)) flagsBits = n;
+            } else {
+              // Mixed form (e.g. `CLONE_FILES|0x40000000`): OR over each
+              // token using the union of identifier / hex / decimal
+              // parsers above.
+              for (const tok of flagsStr.split('|')) {
+                const t = tok.trim();
+                if (t === 'CLONE_FILES') flagsBits |= CLONE_FILES;
+                else if (t === 'CLONE_FS') flagsBits |= CLONE_FS;
+                else if (t.startsWith('0x') || t.startsWith('0X')) {
+                  const n = parseInt(t, 16);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                } else if (/^-?\d+$/.test(t)) {
+                  const n = parseInt(t, 10);
+                  if (Number.isFinite(n)) flagsBits |= n;
+                }
+              }
+            }
+          }
+          if ((flagsBits & CLONE_FILES) !== 0) {
+            detachFdGroup(pid);
+          }
+          if ((flagsBits & CLONE_FS) !== 0) {
+            detachCwdGroup(pid);
           }
         }
         continue;
@@ -1993,21 +2079,33 @@ export async function runInstallPhase(
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
           shimLoadedPids.delete(rawEvent.pid);
+          // Codex follow-up (high, 2026-05-19): execve detaches the
+          // caller from any shared CLONE_FILES fd group BEFORE the
+          // kernel sweeps CLOEXEC.  The kernel's `do_execve` path calls
+          // `unshare_files_struct` — exec dup's the fd table into a
+          // private copy.  Pre-fix we swept CLOEXEC on the SHARED
+          // dirfdTable, so any post-exec dup/close in the exec'd image
+          // mutated state visible to the surviving sibling members.
+          // Post-fix we detach FIRST so the CLOEXEC sweep and all
+          // subsequent fd-mutating syscalls from the exec'd image apply
+          // only to the caller's now-private group.
+          //
+          // NOTE on cwd: execve does NOT break CLONE_FS (cwd is
+          // preserved across exec and the kernel keeps the shared
+          // `struct fs`).  We deliberately do NOT detach the cwd group
+          // here — that's the unshare(CLONE_FS) path.
+          detachFdGroup(rawEvent.pid);
           // Audit-trust Finding (high, 2026-05-19, codex follow-up): on a
           // successful execve the kernel auto-closes every fd whose
-          // FD_CLOEXEC bit is set.  Sweep the fd-group's dirfdTable:
-          // entries with cloexec=true are deleted (the kernel closed
-          // them), entries with cloexec=false survive (the kernel kept
-          // them and the post-exec image can openat(<fd>, …) through
-          // them).  Pre-fix we never tracked CLOEXEC, so a script that
-          // did `openat(AT_FDCWD, "/pkg", O_RDONLY|O_CLOEXEC) = 7`
+          // FD_CLOEXEC bit is set.  Sweep the (now-private) fd-group's
+          // dirfdTable: entries with cloexec=true are deleted (the
+          // kernel closed them), entries with cloexec=false survive
+          // (the kernel kept them and the post-exec image can
+          // openat(<fd>, …) through them).  Pre-fix we never tracked
+          // CLOEXEC, so a script that did
+          // `openat(AT_FDCWD, "/pkg", O_RDONLY|O_CLOEXEC) = 7`
           // followed by exec + `openat(7, "../../root/.ssh/id_rsa", …)`
-          // would resolve through the stale `/pkg` mapping — the
-          // kernel had already closed fd 7 on exec, but our table
-          // still trusted it.
-          //
-          // We DO NOT touch entries in other fd groups (other
-          // CLONE_FILES groups continue with their own state).
+          // would resolve through the stale `/pkg` mapping.
           const execRoot = rootedFd(rawEvent.pid);
           const execPrefix = `${execRoot}:`;
           for (const key of [...dirfdTable.keys()]) {
