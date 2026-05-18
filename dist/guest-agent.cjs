@@ -25914,16 +25914,34 @@ async function runInstallPhase(input) {
   function recordPostMarkerFdReuse(pid, fd) {
     const snap = pendingFdDetach.get(pid);
     if (snap === void 0) return;
-    let set2 = postMarkerFdReuses.get(pid);
-    if (set2 === void 0) {
-      set2 = /* @__PURE__ */ new Set();
-      postMarkerFdReuses.set(pid, set2);
+    let lifecycle = postMarkerFdReuses.get(pid);
+    if (lifecycle === void 0) {
+      lifecycle = /* @__PURE__ */ new Map();
+      postMarkerFdReuses.set(pid, lifecycle);
     }
-    set2.add(fd);
+    lifecycle.set(fd, "open");
     const fdSuffix = String(fd);
     for (const entry of snap.postDetachLog) {
       if (entry.kind === "action" && entry.action.kind === "execveCloexec") {
         entry.action.excludeFds.add(fdSuffix);
+      }
+    }
+  }
+  function recordPostMarkerFdClose(pid, fd) {
+    if (pendingFdDetach.get(pid) === void 0) return;
+    const lifecycle = postMarkerFdReuses.get(pid);
+    if (lifecycle === void 0) return;
+    if (lifecycle.get(fd) === "open") {
+      lifecycle.set(fd, "closed");
+    }
+  }
+  function recordPostMarkerFdRangeClose(pid, first, last) {
+    if (pendingFdDetach.get(pid) === void 0) return;
+    const lifecycle = postMarkerFdReuses.get(pid);
+    if (lifecycle === void 0) return;
+    for (const [fd, state] of lifecycle) {
+      if (fd >= first && fd <= last && state === "open") {
+        lifecycle.set(fd, "closed");
       }
     }
   }
@@ -26402,8 +26420,17 @@ async function runInstallPhase(input) {
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
-            const childPostMarkerFdReuses = postMarkerFdReuses.get(childPid);
+            const childPostMarkerLifecycle = postMarkerFdReuses.get(childPid);
             postMarkerFdReuses.delete(childPid);
+            const childPostMarkerFdTouched = childPostMarkerLifecycle === void 0 ? void 0 : new Set(childPostMarkerLifecycle.keys());
+            const childPostMarkerFdClosed = (() => {
+              if (childPostMarkerLifecycle === void 0) return void 0;
+              const closed = /* @__PURE__ */ new Set();
+              for (const [fd, state] of childPostMarkerLifecycle) {
+                if (state === "closed") closed.add(fd);
+              }
+              return closed;
+            })();
             const standaloneFdTombstones = childFdSnap === void 0 ? pendingFdTombstones.get(childPid) : void 0;
             pendingFdTombstones.delete(childPid);
             const childHadPendingCwdDetach = childCwdSnap !== void 0;
@@ -26506,7 +26533,10 @@ async function runInstallPhase(input) {
                     const suffix = key.slice(parentPrefix.length);
                     const childKey = `${childPrefix}${suffix}`;
                     const existing = dirfdTable.get(childKey);
+                    const fdNum = parseInt(suffix, 10);
+                    const closedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdClosed !== void 0 && childPostMarkerFdClosed.has(fdNum);
                     if (existing === void 0) {
+                      if (closedPostMarker) continue;
                       dirfdTable.set(childKey, val);
                     } else if (existing.path === val.path) {
                       if (existing.cloexec !== val.cloexec) {
@@ -26516,8 +26546,7 @@ async function runInstallPhase(input) {
                         });
                       }
                     } else {
-                      const fdNum = parseInt(suffix, 10);
-                      const reusedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdReuses !== void 0 && childPostMarkerFdReuses.has(fdNum);
+                      const reusedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdTouched !== void 0 && childPostMarkerFdTouched.has(fdNum);
                       if (reusedPostMarker) {
                         continue;
                       }
@@ -26548,7 +26577,7 @@ async function runInstallPhase(input) {
                 }
                 if (childFdSnap !== void 0 && childHadPendingFdDetach) {
                   const childGroupPrefix = `${rootedFd(childPid)}:`;
-                  const childReuseExclude = childPostMarkerFdReuses;
+                  const childReuseExclude = childPostMarkerFdTouched;
                   const applyPointTombstone = (fd, kind, toParent, toChild) => {
                     const childKey = `${childGroupPrefix}${fd}`;
                     const parentKey = `${parentPrefix}${fd}`;
@@ -26777,6 +26806,7 @@ async function runInstallPhase(input) {
             if (!dirfdTable.has(key)) {
               recordFdTombstone(pid, { kind: "close", fd });
             }
+            recordPostMarkerFdClose(pid, fd);
           }
           dirfdTable.delete(fdKey(pid, fd));
         }
@@ -26868,6 +26898,9 @@ async function runInstallPhase(input) {
               if (fdSnap !== null) {
                 pendingFdDetach.set(pid, fdSnap);
               }
+              if (!hasCloexec) {
+                recordPostMarkerFdRangeClose(pid, first, last);
+              }
             } else {
               const groupPrefix = `${rootedFd(pid)}:`;
               for (const key of [...dirfdTable.keys()]) {
@@ -26892,6 +26925,9 @@ async function runInstallPhase(input) {
                   last,
                   cloexec: hasCloexec
                 });
+              }
+              if (!hasCloexec) {
+                recordPostMarkerFdRangeClose(pid, first, last);
               }
             }
           }

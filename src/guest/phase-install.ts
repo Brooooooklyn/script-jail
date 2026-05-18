@@ -689,22 +689,49 @@ export async function runInstallPhase(
   // private fd that the kernel did NOT close — the tombstone must
   // NOT apply to that fd on the child side.
   //
-  // Track each post-marker fd reuse here; the reconciliation child-
-  // side replay of `preDetachTombstones` skips tombstones targeting
-  // these fds (range tombstones get split around them).  The set is
-  // cleared when the marker is consumed at delayed-clone reconcile.
-  const postMarkerFdReuses = new Map<number, Set<number>>();
+  // Codex follow-up (high, 2026-05-19, bug #5 — post-marker
+  // close-of-reuse): a post-marker reuse fd can also be CLOSED
+  // post-marker.  The dirfdTable.delete in the close handler drops
+  // the child's freshly-reopened entry — but the reconciler's copy-
+  // pass sees `existing === undefined` for that child key and copies
+  // the parent's stale shared-baseline entry back in, resurrecting
+  // a path the kernel has confirmed closed.  Lifecycle the per-pid
+  // entry as a state machine instead of a flat Set:
+  //
+  //   - 'open'   — fd is currently a known post-marker reuse; the
+  //                child copy holds a private mapping the
+  //                reconciler must preserve (skip parent copy on
+  //                conflict, skip tombstone replay).
+  //   - 'closed' — fd was a post-marker reuse but the child later
+  //                closed it post-marker; the kernel-known state is
+  //                "closed" in the child's private group.  The
+  //                reconciler must NOT copy the parent's stale
+  //                shared-baseline entry into the child copy (would
+  //                resurrect a closed fd) AND must skip tombstone
+  //                replay (the child already knows it's closed; the
+  //                pre-detach tombstone would just over-taint the
+  //                child group).
+  //
+  // Transitions: post-marker open/dup/F_DUPFD → 'open'.  Post-marker
+  // close of a fd in 'open' → 'closed'.  Post-marker reopen of a fd
+  // in 'closed' → back to 'open'.  Post-marker close_range covering
+  // a fd in 'open' → 'closed' for that fd (range-walks the per-pid
+  // map; unknown fds in the range are handled by the existing
+  // post-detach range tombstone logic).
+  const postMarkerFdReuses = new Map<number, Map<number, 'open' | 'closed'>>();
   function recordPostMarkerFdReuse(pid: number, fd: number): void {
     // Only track when a marker is actively pending — otherwise there's
     // no future reconciliation that needs the exclusion.
     const snap = pendingFdDetach.get(pid);
     if (snap === undefined) return;
-    let set = postMarkerFdReuses.get(pid);
-    if (set === undefined) {
-      set = new Set();
-      postMarkerFdReuses.set(pid, set);
+    let lifecycle = postMarkerFdReuses.get(pid);
+    if (lifecycle === undefined) {
+      lifecycle = new Map();
+      postMarkerFdReuses.set(pid, lifecycle);
     }
-    set.add(fd);
+    // Transition: 'open' or absent → 'open'; 'closed' → 'open' (reopen
+    // cancels the earlier post-marker close).
+    lifecycle.set(fd, 'open');
     // Codex follow-up (high, 2026-05-19, bug #4 — generation-aware
     // execveCloexec): add `fd` to the exclude set of every
     // execveCloexec action ALREADY in this marker's postDetachLog.
@@ -718,6 +745,36 @@ export async function runInstallPhase(
     for (const entry of snap.postDetachLog) {
       if (entry.kind === 'action' && entry.action.kind === 'execveCloexec') {
         entry.action.excludeFds.add(fdSuffix);
+      }
+    }
+  }
+  // Codex follow-up (high, 2026-05-19, bug #5 — post-marker close of
+  // a reused fd): transition the per-pid lifecycle entry for `fd`
+  // from 'open' → 'closed'.  Only meaningful when a marker is
+  // pending AND `fd` was previously recorded as an 'open' reuse —
+  // otherwise no entry exists / the close is governed by the
+  // existing pre-marker / post-marker untracked-fd tombstone paths.
+  function recordPostMarkerFdClose(pid: number, fd: number): void {
+    if (pendingFdDetach.get(pid) === undefined) return;
+    const lifecycle = postMarkerFdReuses.get(pid);
+    if (lifecycle === undefined) return;
+    if (lifecycle.get(fd) === 'open') {
+      lifecycle.set(fd, 'closed');
+    }
+  }
+  // Codex follow-up (high, 2026-05-19, bug #5 — post-marker
+  // close_range over a range that may include reused fds): walk the
+  // per-pid lifecycle map and transition every fd in [first, last]
+  // currently in 'open' → 'closed'.  Range covers reused fds only;
+  // unknown fds in the range are still tracked by the existing
+  // post-detach range tombstone logic on `postDetachLog`.
+  function recordPostMarkerFdRangeClose(pid: number, first: number, last: number): void {
+    if (pendingFdDetach.get(pid) === undefined) return;
+    const lifecycle = postMarkerFdReuses.get(pid);
+    if (lifecycle === undefined) return;
+    for (const [fd, state] of lifecycle) {
+      if (fd >= first && fd <= last && state === 'open') {
+        lifecycle.set(fd, 'closed');
       }
     }
   }
@@ -2042,11 +2099,34 @@ export async function runInstallPhase(
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
             // Codex follow-up (high, 2026-05-19, bug #3 — post-marker
-            // fd reuse exclusion): consume the per-pid reuse set
-            // alongside the marker; reconcile reads it before the
-            // delete returns it stale-safe via the snapshot below.
-            const childPostMarkerFdReuses = postMarkerFdReuses.get(childPid);
+            // fd reuse exclusion) + (high, 2026-05-19, bug #5 — post-
+            // marker close-of-reuse lifecycle): consume the per-pid
+            // lifecycle map alongside the marker.  The reconciler
+            // needs two derived views:
+            //   - childPostMarkerFdTouched: union of OPEN + CLOSED
+            //     fds.  Used as the tombstone exclude set — for
+            //     pre-detach tombstones, the child's view of these
+            //     fds is established post-marker (open or closed)
+            //     and the kernel-shared mutation in the tombstone
+            //     was already overlaid by the post-marker activity.
+            //   - childPostMarkerFdClosed: only fds in 'closed'
+            //     state.  Used by the copy-pass to skip parent
+            //     entries that would resurrect a kernel-closed fd
+            //     in the child copy.
+            const childPostMarkerLifecycle = postMarkerFdReuses.get(childPid);
             postMarkerFdReuses.delete(childPid);
+            const childPostMarkerFdTouched =
+              childPostMarkerLifecycle === undefined
+                ? undefined
+                : new Set(childPostMarkerLifecycle.keys());
+            const childPostMarkerFdClosed = (() => {
+              if (childPostMarkerLifecycle === undefined) return undefined;
+              const closed = new Set<number>();
+              for (const [fd, state] of childPostMarkerLifecycle) {
+                if (state === 'closed') closed.add(fd);
+              }
+              return closed;
+            })();
             // Pre-marker tombstones for this child.  When a marker
             // already exists, those tombstones have already been
             // folded into `preDetachTombstones[]` by
@@ -2358,7 +2438,23 @@ export async function runInstallPhase(
                     const suffix = key.slice(parentPrefix.length);
                     const childKey = `${childPrefix}${suffix}`;
                     const existing = dirfdTable.get(childKey);
+                    const fdNum = parseInt(suffix, 10);
+                    const closedPostMarker =
+                      Number.isFinite(fdNum) &&
+                      childPostMarkerFdClosed !== undefined &&
+                      childPostMarkerFdClosed.has(fdNum);
                     if (existing === undefined) {
+                      // Codex follow-up (high, 2026-05-19, bug #5 —
+                      // post-marker close-of-reuse): if the child
+                      // post-marker CLOSED this fd, the kernel's
+                      // private group view is "closed".  Copying
+                      // parent's stale shared-baseline entry in
+                      // would resurrect a closed fd — subsequent
+                      // child openat(<fd>, "x") would resolve
+                      // through parent's path when the kernel
+                      // returns EBADF.  Skip the copy; the child
+                      // group key stays absent.
+                      if (closedPostMarker) continue;
                       dirfdTable.set(childKey, val);
                     } else if (existing.path === val.path) {
                       // Same fd, same path — keep, OR cloexec bits.
@@ -2377,11 +2473,10 @@ export async function runInstallPhase(
                       // Keep it; the parent's stale-shared mapping at
                       // the same fd was already dropped (or about to
                       // be) by the pre-detach tombstone replay.
-                      const fdNum = parseInt(suffix, 10);
                       const reusedPostMarker =
                         Number.isFinite(fdNum) &&
-                        childPostMarkerFdReuses !== undefined &&
-                        childPostMarkerFdReuses.has(fdNum);
+                        childPostMarkerFdTouched !== undefined &&
+                        childPostMarkerFdTouched.has(fdNum);
                       if (reusedPostMarker) {
                         continue;
                       }
@@ -2498,7 +2593,20 @@ export async function runInstallPhase(
                   // parent's shared view at pre-unshare time, and any
                   // subsequent post-unshare reopen happened in the
                   // CHILD's private group, not the parent's.
-                  const childReuseExclude = childPostMarkerFdReuses;
+                  //
+                  // Codex follow-up (high, 2026-05-19, bug #5 —
+                  // post-marker close-of-reuse): exclude both
+                  // 'open' AND 'closed' post-marker fds from child-
+                  // side tombstone replay.  For 'closed' fds, the
+                  // child's view is already concretely known (the
+                  // post-marker close left the child's dirfdTable
+                  // key absent); replaying a pre-detach close would
+                  // be a no-op for deletion but `applyPointTombstone`
+                  // also taints `childPid`'s fd-group unknown bit,
+                  // which would over-taint a child whose view of
+                  // the kernel-closed fd is unambiguous.  Same
+                  // reasoning for range tombstones.
+                  const childReuseExclude = childPostMarkerFdTouched;
                   const applyPointTombstone = (
                     fd: number,
                     kind: 'close' | 'cloexec',
@@ -2967,6 +3075,14 @@ export async function runInstallPhase(
             if (!dirfdTable.has(key)) {
               recordFdTombstone(pid, { kind: 'close', fd });
             }
+            // Codex follow-up (high, 2026-05-19, bug #5 — post-
+            // marker close-of-reuse): if a marker is pending AND
+            // this fd was a post-marker reuse, transition the
+            // lifecycle entry from 'open' → 'closed'.  This signals
+            // the reconciler's copy-pass to skip the parent's
+            // stale shared-baseline entry instead of resurrecting
+            // a kernel-closed fd in the child copy.
+            recordPostMarkerFdClose(pid, fd);
           }
           // Delete unconditionally: even on EBADF, our stale entry (if
           // any) is invalidated — the kernel's reply tells us the fd
@@ -3142,6 +3258,20 @@ export async function runInstallPhase(
               if (fdSnap !== null) {
                 pendingFdDetach.set(pid, fdSnap);
               }
+              // Codex follow-up (high, 2026-05-19, bug #5 — post-
+              // marker close-of-reuse, range form): if this
+              // close_range is itself a post-marker action (i.e.,
+              // `appendFdAction` found an existing marker rather
+              // than seeding a fresh one), any post-marker reuse
+              // fds in [first, last] just got closed by the kernel.
+              // Transition their lifecycle entries 'open' → 'closed'
+              // so the reconciler's copy-pass skips the parent's
+              // stale entries for those fds.  CLOEXEC variant
+              // doesn't close until the next execve; lifecycle
+              // stays 'open' until then.
+              if (!hasCloexec) {
+                recordPostMarkerFdRangeClose(pid, first, last);
+              }
             } else {
               // Pre-existing behaviour: close the range on the caller's
               // (possibly shared) group.  Siblings observe the closes
@@ -3195,6 +3325,17 @@ export async function runInstallPhase(
                   last,
                   cloexec: hasCloexec,
                 });
+              }
+              // Codex follow-up (high, 2026-05-19, bug #5 — post-
+              // marker close-of-reuse, range form, no-UNSHARE
+              // branch): mirrors the UNSHARE branch above.  When
+              // this close_range is observed after a marker is
+              // pending, any post-marker reuse fds in [first, last]
+              // are now kernel-closed in the child's view; mark
+              // them 'closed' so the reconciler's copy-pass skips
+              // resurrecting them from the parent's stale entries.
+              if (!hasCloexec) {
+                recordPostMarkerFdRangeClose(pid, first, last);
               }
             }
           }
