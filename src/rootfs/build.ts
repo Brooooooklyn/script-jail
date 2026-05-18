@@ -119,19 +119,42 @@ export const SIZE_WARN_THRESHOLD_BYTES = 200 * 1024 * 1024; // 200 MB
 // If the host devloop produced a macOS Mach-O dylib (or some other non-ELF
 // blob) and somebody renamed it to `.so`, the dynamic linker inside the VM
 // silently refuses to load it, leaving the env-read audit chain absent.
-// We therefore validate the magic bytes of the on-disk file BEFORE accepting
-// it. The check is intentionally minimal — only what's needed to distinguish
-// a Linux ELF shared object for the current rootfs target (x86-64) from the
-// shapes we know can be confused with it (Mach-O, empty file, scripts).
+// We therefore validate the on-disk file BEFORE accepting it.
+//
+// Validation depth is "loadability", not just the prefix: a 20-byte blob with
+// a valid ELF magic prefix passes a magic check but ld.so cannot load it
+// (no program headers, no PT_DYNAMIC, no symbol table). To catch that, we:
+//   1. Verify the ELF identification bytes (magic, class, endianness).
+//   2. Verify e_type / e_machine match a shared object for the rootfs target.
+//   3. Read the program header table off `e_phoff` and require it to fit in
+//      the file (e_phoff > 0, e_phoff + e_phnum * e_phentsize <= file_size).
+//   4. Walk the program headers and require at least one PT_DYNAMIC entry.
+//      A loadable shared object must have a dynamic section — that is what
+//      ld.so consults for SONAME / DT_NEEDED / symbol resolution.
 //
 // Reference (ELF64 header, little-endian):
-//   bytes 0..3   = 0x7F 'E' 'L' 'F'           (ELF magic)
-//   byte  4      = EI_CLASS  (2 = ELFCLASS64)
-//   byte  5      = EI_DATA   (1 = ELFDATA2LSB, little-endian)
-//   bytes 16..17 = e_type    (3 = ET_DYN, shared object)
-//   bytes 18..19 = e_machine (62 = EM_X86_64, 183 = EM_AARCH64)
+//   bytes 0..3     = 0x7F 'E' 'L' 'F'           (ELF magic)
+//   byte  4        = EI_CLASS  (2 = ELFCLASS64)
+//   byte  5        = EI_DATA   (1 = ELFDATA2LSB, little-endian)
+//   bytes 16..17   = e_type    (3 = ET_DYN, shared object)
+//   bytes 18..19   = e_machine (62 = EM_X86_64, 183 = EM_AARCH64)
+//   bytes 32..39   = e_phoff   (u64, file offset of program header table)
+//   bytes 54..55   = e_phentsize (u16, size of each phdr entry; 56 for ELF64)
+//   bytes 56..57   = e_phnum   (u16, number of phdr entries)
+//
+// Program header entry (ELF64, 56 bytes):
+//   bytes 0..3     = p_type    (u32; 1 = PT_LOAD, 2 = PT_DYNAMIC)
 //
 // All numeric ELF header fields above are stored little-endian per EI_DATA=1.
+
+/** Size of the ELF64 header. */
+export const ELF64_EHDR_SIZE = 64;
+/** Size of a single ELF64 program header entry. */
+export const ELF64_PHDR_SIZE = 56;
+
+/** Program header types we care about. */
+export const PT_LOAD = 1;
+export const PT_DYNAMIC = 2;
 
 /** ELF e_machine values we recognise.  Currently only x86-64 ships. */
 export const EM_X86_64 = 62;
@@ -153,11 +176,17 @@ export function machineLabel(machine: number): string {
 }
 
 /**
- * Validate that `buf` (at least 20 bytes of the start of a file) looks like a
+ * Validate that `buf` (the start of a file, at least 20 bytes) looks like a
  * Linux ELF64 little-endian shared object for the given machine. Returns
  * `null` on success or a descriptive error string on any mismatch.
  *
- * Pure / no IO — the file-reading wrapper lives in `validateShimFile`.
+ * This is the prefix-only check used to identify clearly-wrong file shapes
+ * (Mach-O, scripts, 32-bit ELF, big-endian ELF, wrong architecture). It does
+ * NOT verify loadability — for that, callers must additionally inspect the
+ * program header table via `validateElfProgramHeaders` (or, end-to-end, use
+ * `validateShimFile`, which reads the full header and walks the phdrs).
+ *
+ * Pure / no IO.
  */
 export function validateElfShimHeader(
   buf: Uint8Array,
@@ -221,11 +250,123 @@ export function validateElfShimHeader(
   return null;
 }
 
+/** Read a little-endian unsigned 16-bit integer from `buf` at `off`. */
+function readU16LE(buf: Uint8Array, off: number): number {
+  return (buf[off]! | (buf[off + 1]! << 8)) >>> 0;
+}
+
+/** Read a little-endian unsigned 32-bit integer from `buf` at `off`. */
+function readU32LE(buf: Uint8Array, off: number): number {
+  return (
+    (buf[off]! |
+      (buf[off + 1]! << 8) |
+      (buf[off + 2]! << 16) |
+      (buf[off + 3]! << 24)) >>>
+    0
+  );
+}
+
 /**
- * Read the first 20 bytes of `path` and validate them with
- * `validateElfShimHeader`. Returns `null` on success or a descriptive error
- * string. Surfaces `read` / `open` errors as strings rather than throwing so
- * the caller can fold them into a single error message.
+ * Read a little-endian unsigned 64-bit integer from `buf` at `off` as a
+ * JavaScript number. We use Number rather than BigInt because ELF offsets in
+ * a < 4 GiB shared object fit comfortably in a double's 53-bit mantissa, and
+ * the rest of the validation does plain arithmetic. Returns `null` when the
+ * value exceeds Number.MAX_SAFE_INTEGER (would indicate a corrupt header).
+ */
+function readU64LEAsNumber(buf: Uint8Array, off: number): number | null {
+  const lo = readU32LE(buf, off);
+  const hi = readU32LE(buf, off + 4);
+  // hi * 2^32 + lo. Reject anything that would lose precision.
+  if (hi > 0x001fffff) return null;
+  return hi * 0x100000000 + lo;
+}
+
+/**
+ * Walk the program header table and require at least one PT_DYNAMIC entry.
+ * `ehdr` is the first 64 bytes of the file (the ELF64 header). `phdrs` is the
+ * raw bytes of the program header table, exactly `phnum * phentsize` long.
+ *
+ * Returns `null` on success or a descriptive error string. Pure / no IO.
+ *
+ * The check is intentionally strict — a shared object that ld.so can load
+ * MUST have a PT_DYNAMIC segment (that is what supplies SONAME, DT_NEEDED,
+ * and the dynamic symbol table). We also require at least one PT_LOAD, which
+ * supplies the actual mapped code/data: an .so with no PT_LOAD is meaningless.
+ */
+export function validateElfProgramHeaders(
+  ehdr: Uint8Array,
+  phdrs: Uint8Array,
+  fileSize: number,
+): string | null {
+  if (ehdr.length < ELF64_EHDR_SIZE) {
+    return `ELF header too short (${ehdr.length} bytes; need ${ELF64_EHDR_SIZE})`;
+  }
+
+  const ePhoff = readU64LEAsNumber(ehdr, 32);
+  const ePhentsize = readU16LE(ehdr, 54);
+  const ePhnum = readU16LE(ehdr, 56);
+
+  if (ePhoff === null) {
+    return 'e_phoff is unreasonably large (overflow / corrupt header)';
+  }
+  if (ePhoff === 0) {
+    return 'no program header table (e_phoff=0); not a loadable shared object';
+  }
+  if (ePhnum === 0) {
+    return 'no program header entries (e_phnum=0); not a loadable shared object';
+  }
+  if (ePhentsize !== ELF64_PHDR_SIZE) {
+    return (
+      `unsupported e_phentsize=${ePhentsize} ` +
+      `(expected ${ELF64_PHDR_SIZE} for ELF64)`
+    );
+  }
+
+  const phdrEnd = ePhoff + ePhnum * ePhentsize;
+  if (phdrEnd > fileSize) {
+    return (
+      `program header table runs past end of file ` +
+      `(e_phoff=${ePhoff} + ${ePhnum}*${ePhentsize} = ${phdrEnd}, file_size=${fileSize})`
+    );
+  }
+  if (phdrs.length < ePhnum * ePhentsize) {
+    return (
+      `program header buffer truncated ` +
+      `(got ${phdrs.length} bytes; need ${ePhnum * ePhentsize})`
+    );
+  }
+
+  let sawDynamic = false;
+  let sawLoad = false;
+  for (let i = 0; i < ePhnum; i++) {
+    const off = i * ePhentsize;
+    const pType = readU32LE(phdrs, off);
+    if (pType === PT_DYNAMIC) sawDynamic = true;
+    if (pType === PT_LOAD) sawLoad = true;
+  }
+  if (!sawLoad) {
+    return 'no PT_LOAD segment; not a loadable shared object';
+  }
+  if (!sawDynamic) {
+    return (
+      'no PT_DYNAMIC segment; ld.so cannot resolve symbols ' +
+      '(stale / corrupt artifact?)'
+    );
+  }
+  return null;
+}
+
+/**
+ * Read `path` and validate that it is a Linux ELF64 little-endian shared
+ * object for `expectedMachine` AND that it is loadable (has a program header
+ * table containing at least one PT_DYNAMIC segment). Returns `null` on
+ * success or a descriptive error string. Surfaces `read` / `open` errors as
+ * strings rather than throwing so the caller can fold them into a single
+ * error message.
+ *
+ * Validates loadability, not just the prefix: a 20-byte file with the right
+ * magic was previously accepted but ld.so cannot load it; that escape is now
+ * closed.
  */
 export function validateShimFile(path: string, expectedMachine: number): string | null {
   let fd: number;
@@ -235,12 +376,65 @@ export function validateShimFile(path: string, expectedMachine: number): string 
     return `cannot open: ${err instanceof Error ? err.message : String(err)}`;
   }
   try {
-    const buf = Buffer.alloc(20);
-    const n = readSync(fd, buf, 0, 20, 0);
-    if (n < 20) {
-      return `header too short (${n} bytes; need ≥ 20)`;
+    // 1. Read the full ELF64 header (64 bytes).
+    const ehdr = Buffer.alloc(ELF64_EHDR_SIZE);
+    const n = readSync(fd, ehdr, 0, ELF64_EHDR_SIZE, 0);
+    if (n < ELF64_EHDR_SIZE) {
+      return `header too short (${n} bytes; need ≥ ${ELF64_EHDR_SIZE})`;
     }
-    return validateElfShimHeader(buf, expectedMachine);
+
+    // 2. Prefix check (magic + class + endian + e_type + e_machine).
+    const prefixErr = validateElfShimHeader(ehdr, expectedMachine);
+    if (prefixErr !== null) return prefixErr;
+
+    // 3. Inspect the program header table for PT_DYNAMIC / PT_LOAD.
+    let fileSize: number;
+    try {
+      fileSize = statSync(path).size;
+    } catch (err) {
+      return `cannot stat: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    const ePhoff = readU64LEAsNumber(ehdr, 32);
+    const ePhentsize = readU16LE(ehdr, 54);
+    const ePhnum = readU16LE(ehdr, 56);
+
+    // Quick-fail before the second read so the error matches what
+    // validateElfProgramHeaders would report.
+    if (ePhoff === null) {
+      return 'e_phoff is unreasonably large (overflow / corrupt header)';
+    }
+    if (ePhoff === 0) {
+      return 'no program header table (e_phoff=0); not a loadable shared object';
+    }
+    if (ePhnum === 0) {
+      return 'no program header entries (e_phnum=0); not a loadable shared object';
+    }
+    if (ePhentsize !== ELF64_PHDR_SIZE) {
+      return (
+        `unsupported e_phentsize=${ePhentsize} ` +
+        `(expected ${ELF64_PHDR_SIZE} for ELF64)`
+      );
+    }
+
+    const phdrBytes = ePhnum * ePhentsize;
+    if (ePhoff + phdrBytes > fileSize) {
+      return (
+        `program header table runs past end of file ` +
+        `(e_phoff=${ePhoff} + ${ePhnum}*${ePhentsize} = ${ePhoff + phdrBytes}, file_size=${fileSize})`
+      );
+    }
+
+    const phdrs = Buffer.alloc(phdrBytes);
+    const m = readSync(fd, phdrs, 0, phdrBytes, ePhoff);
+    if (m < phdrBytes) {
+      return (
+        `short read of program header table ` +
+        `(got ${m} bytes; need ${phdrBytes} at offset ${ePhoff})`
+      );
+    }
+
+    return validateElfProgramHeaders(ehdr, phdrs, fileSize);
   } finally {
     try { closeSync(fd); } catch { /* ignore */ }
   }
