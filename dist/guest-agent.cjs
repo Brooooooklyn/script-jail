@@ -26249,13 +26249,19 @@ async function runInstallPhase(input) {
               const parentCwdUnknown = cwdUnknownHas(pid);
               const childCwd = cwdGet(childPid);
               const childCwdUnknown = cwdUnknownHas(childPid);
+              const pendingDetachShared = childHadPendingCwdDetach && cloneFs;
               if (parentCwdUnknown || childCwdUnknown) {
                 cwdUnknownAdd(childPid);
+                if (pendingDetachShared) {
+                  cwdDelete(childPid);
+                  cwdDelete(pid);
+                  cwdUnknownAdd(pid);
+                }
               } else if (parentCwd !== void 0 && childCwd !== void 0) {
                 if (parentCwd !== childCwd) {
                   cwdDelete(childPid);
                   cwdUnknownAdd(childPid);
-                  if (childHadPendingCwdDetach) {
+                  if (pendingDetachShared) {
                     cwdDelete(pid);
                     cwdUnknownAdd(pid);
                   }
@@ -26272,6 +26278,8 @@ async function runInstallPhase(input) {
               if (parentRoot !== childRoot) {
                 const parentPrefix = `${parentRoot}:`;
                 const childPrefix = `${childRoot}:`;
+                const fdPendingDetachShared = childHadPendingFdDetach && cloneFiles;
+                const childFdUnknownPre = fdUnknownHas(childPid);
                 const parentDeletes = [];
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
@@ -26289,7 +26297,7 @@ async function runInstallPhase(input) {
                       }
                     } else {
                       dirfdTable.delete(childKey);
-                      if (childHadPendingFdDetach) {
+                      if (fdPendingDetachShared) {
                         parentDeletes.push(key);
                       }
                     }
@@ -26301,7 +26309,14 @@ async function runInstallPhase(input) {
                 if (fdUnknownHas(pid)) {
                   fdUnknownAdd(childPid);
                 }
-                if (childHadPendingFdDetach && parentDeletes.length > 0) {
+                if (fdPendingDetachShared && parentDeletes.length > 0) {
+                  fdUnknownAdd(pid);
+                  fdUnknownAdd(childPid);
+                }
+                if (fdPendingDetachShared && childFdUnknownPre) {
+                  for (const key of [...dirfdTable.keys()]) {
+                    if (key.startsWith(parentPrefix)) dirfdTable.delete(key);
+                  }
                   fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
@@ -26342,6 +26357,7 @@ async function runInstallPhase(input) {
               dirfdTable.set(newKey, { path: oldVal.path, cloexec: newCloexec });
             } else {
               dirfdTable.delete(newKey);
+              fdUnknownAdd(pid);
             }
           }
         }

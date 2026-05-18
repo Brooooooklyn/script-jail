@@ -1608,8 +1608,44 @@ export async function runInstallPhase(
               const parentCwdUnknown = cwdUnknownHas(pid);
               const childCwd = cwdGet(childPid);
               const childCwdUnknown = cwdUnknownHas(childPid);
+              // Codex follow-up (high, 2026-05-19, bug #1 + bug #3): the
+              // pending-detach parent-taint gate is BOTH:
+              //   1. `childHadPendingCwdDetach` — the child observed an
+              //      unshare AND we recorded a marker for the delayed
+              //      reconciliation;
+              //   2. `cloneFs` — the deferred clone actually had
+              //      CLONE_FS (parent + child shared the fs_struct at
+              //      kernel level pre-unshare).
+              // Without (2), the parent was never sharing state with
+              // the child; the kernel-level invariant we are modeling
+              // (shared-state mutation requires shared state) does not
+              // apply, so a model-side conflict is just stale per-side
+              // bookkeeping and only the child should be tainted.
+              const pendingDetachShared = childHadPendingCwdDetach && cloneFs;
               if (parentCwdUnknown || childCwdUnknown) {
                 cwdUnknownAdd(childPid);
+                // Codex follow-up (high, 2026-05-19, bug #1): when the
+                // parent-cwd state is unknown OR the child-cwd state
+                // is unknown AND the clone had CLONE_FS (so the kernel
+                // truly shared fs_struct), the shared-time chdir was
+                // applied to BOTH sides at kernel level.  Our model
+                // can't tell which side mutated; either way, the
+                // shared mutation makes the parent's modeled cwd
+                // stale.  Drop the parent's modeled value and mark
+                // unknown so AT_FDCWD-relative opens on the parent
+                // fail closed until it re-establishes cwd via an
+                // absolute chdir.
+                //
+                // The child-cwdUnknown case is the codex-finding gap:
+                // a child `chdir(<relative>)` from an untracked cwd
+                // marks the child cwdUnknown.  Under shared fs_struct
+                // that relative chdir mutated parent's cwd too.  Pre-
+                // fix, this branch only tainted the child.
+                if (pendingDetachShared) {
+                  cwdDelete(childPid);
+                  cwdDelete(pid);
+                  cwdUnknownAdd(pid);
+                }
                 // Don't seed pidCwd; cwdUnknown dominates the lookup.
               } else if (parentCwd !== undefined && childCwd !== undefined) {
                 if (parentCwd !== childCwd) {
@@ -1617,8 +1653,8 @@ export async function runInstallPhase(
                   // disagrees with the parent's pre-clone cwd.
                   //
                   // Codex follow-up (high, 2026-05-19): in the
-                  // pending-detach case (childHadPendingCwdDetach),
-                  // the real kernel order was:
+                  // pending-detach-AND-CLONE_FS case
+                  // (`pendingDetachShared`), the real kernel order was:
                   //
                   //   1. clone(CLONE_FS) — parent + child share fs_struct.
                   //   2. one of them chdir(<...>) — mutation hits the
@@ -1643,13 +1679,15 @@ export async function runInstallPhase(
                   // absolute chdir.
                   //
                   // In the non-pending case (plain fork without
-                  // CLONE_FS), parent and child were never shared,
-                  // so a disagreement just means the child raced
-                  // ahead with its own chdir — only the child needs
-                  // tainting.
+                  // CLONE_FS) — or in the pending-detach-but-clone-
+                  // WITHOUT-CLONE_FS case (codex bug #3) — parent and
+                  // child were never shared at kernel level, so a
+                  // disagreement just means the child raced ahead with
+                  // its own chdir; only the child needs tainting and
+                  // the parent's modeled cwd remains trustworthy.
                   cwdDelete(childPid);
                   cwdUnknownAdd(childPid);
-                  if (childHadPendingCwdDetach) {
+                  if (pendingDetachShared) {
                     cwdDelete(pid);
                     cwdUnknownAdd(pid);
                   }
@@ -1690,6 +1728,30 @@ export async function runInstallPhase(
               if (parentRoot !== childRoot) {
                 const parentPrefix = `${parentRoot}:`;
                 const childPrefix = `${childRoot}:`;
+                // Codex follow-up (high, 2026-05-19, bug #3): the
+                // pending-detach parent-taint gate is BOTH:
+                //   1. `childHadPendingFdDetach` — the child observed
+                //      an unshare AND we recorded a marker for the
+                //      delayed reconciliation;
+                //   2. `cloneFiles` — the deferred clone actually had
+                //      CLONE_FILES (parent + child shared the
+                //      files_struct at kernel level pre-unshare).
+                // Without (2), the parent's fd table was never shared
+                // with the child; only the child's per-side state
+                // needs reconciling and the parent's modeled fds
+                // remain trustworthy.
+                const fdPendingDetachShared = childHadPendingFdDetach && cloneFiles;
+                // Snapshot the child group's fd-state-unknown bit
+                // BEFORE the copy iteration.  Codex follow-up (high,
+                // 2026-05-19, bug #2 fix part B): when the child group
+                // observed a dup(untracked, fd) or other untraceable
+                // fd-table mutation, it carries fd-state-unknown.
+                // Under shared CLONE_FILES, that mutation hit the
+                // parent's fds too — the parent's modeled entries are
+                // no longer guaranteed to match the kernel.  Taint
+                // BOTH groups so subsequent openat(<fd>, ...) on
+                // either side fails closed.
+                const childFdUnknownPre = fdUnknownHas(childPid);
                 // Collect parent-side keys to delete after iteration —
                 // the conflict-on-pending-detach branch needs to drop
                 // BOTH sides' entries (see below), but mutating the
@@ -1716,8 +1778,9 @@ export async function runInstallPhase(
                       // the child side.
                       //
                       // Codex follow-up (high, 2026-05-19): in the
-                      // pending-detach case (childHadPendingFdDetach),
-                      // the real kernel order was:
+                      // pending-detach-AND-CLONE_FILES case
+                      // (`fdPendingDetachShared`), the real kernel
+                      // order was:
                       //
                       //   1. clone(CLONE_FILES) — parent + child share
                       //      files_struct.
@@ -1736,11 +1799,13 @@ export async function runInstallPhase(
                       // AND the parent key so subsequent
                       // openat(<K>, ...) on either side fails closed.
                       //
-                      // In the non-pending case the two groups were
-                      // never shared; only the child's stale state
-                      // needs dropping.
+                      // In the non-pending case — or pending-detach
+                      // but clone WITHOUT CLONE_FILES (codex bug #3)
+                      // — the two groups were never shared at kernel
+                      // level; only the child's stale state needs
+                      // dropping.
                       dirfdTable.delete(childKey);
-                      if (childHadPendingFdDetach) {
+                      if (fdPendingDetachShared) {
                         parentDeletes.push(key);
                       }
                     }
@@ -1754,8 +1819,42 @@ export async function runInstallPhase(
                 }
                 // Pending-detach conflict also taints the parent's
                 // fd-group unknown bit — any open-by-numeric-fd we
-                // can't model accurately must fail closed.
-                if (childHadPendingFdDetach && parentDeletes.length > 0) {
+                // can't model accurately must fail closed.  Gated on
+                // CLONE_FILES per bug #3 (no kernel sharing → no
+                // shared-state mutation to leak).
+                if (fdPendingDetachShared && parentDeletes.length > 0) {
+                  fdUnknownAdd(pid);
+                  fdUnknownAdd(childPid);
+                }
+                // Codex follow-up (high, 2026-05-19, bug #2 fix part B):
+                // child-group fd-state-unknown taints the parent under
+                // the pending-detach-AND-CLONE_FILES gate.  The
+                // motivating sequence:
+                //
+                //   1. parent:   openat → fd 7 = /safe
+                //   2. (kernel)  clone(CLONE_FILES) — share files_struct
+                //   3. child:    dup2(<untracked>, 7) — kernel rewrites
+                //                shared fd 7 to point at <opaque>; our
+                //                dup-untracked handler set
+                //                `dirfdStateUnknown` on the child group.
+                //   4. child:    unshare(CLONE_FILES) — kernel detach.
+                //   5. strace surfaces clone line LAST → we reach here.
+                //
+                // Pre-fix, the copy loop saw no parent-vs-child fd
+                // conflict (child had no modeled fd 7 entry — the dup
+                // deleted it), so parent's fd 7 → /safe persisted and
+                // a subsequent parent openat(7, ".ssh/id_rsa", ...)
+                // resolved to /safe/.ssh/id_rsa, missing the
+                // protected-paths match in the kernel-real target.
+                //
+                // Drop parent's fd entries we just copied (so the next
+                // openat(<fd>, ...) finds no entry) AND mark BOTH
+                // groups fd-unknown so `canonicalize*` returns null
+                // for any numeric-dirfd open.
+                if (fdPendingDetachShared && childFdUnknownPre) {
+                  for (const key of [...dirfdTable.keys()]) {
+                    if (key.startsWith(parentPrefix)) dirfdTable.delete(key);
+                  }
                   fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
@@ -1855,6 +1954,25 @@ export async function runInstallPhase(
               // retain its previous mapping either (it now aliases
               // wherever oldfd actually points, which we don't know).
               dirfdTable.delete(newKey);
+              // Codex follow-up (high, 2026-05-19, bug #2 fix part A):
+              // mark the pid's fd-group as state-unknown.  The kernel
+              // has installed a real fd at `newFd` whose directory
+              // target is opaque to us (because the source oldfd was
+              // never tracked).  Without this marker:
+              //   1. parent: openat → fd 7 = /safe
+              //   2. clone(CLONE_FILES) — child shares parent's table
+              //   3. child: dup2(<untracked>, 7) — kernel rewrites
+              //      shared fd 7 to point at <untracked-target>
+              //   4. child: unshare(CLONE_FILES) — detach
+              //   5. parent: openat(7, ...) — kernel resolves via
+              //      <untracked-target>, model trusts /safe.
+              // If strace surfaces (3)+(4) before the clone line in
+              // (2), the pending-detach reconciliation needs a signal
+              // that the child's fd table is no longer trustworthy —
+              // this `fdUnknownAdd` is that signal.  The reconciliation
+              // path consumes it to taint the parent's fd group too,
+              // so parent's subsequent openat(7, ...) fails closed.
+              fdUnknownAdd(pid);
             }
           }
         }
