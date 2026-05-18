@@ -112,6 +112,32 @@ function emptyStrace(exitCode = 0): StraceRunner {
 }
 
 /**
+ * A LinuxStraceRunner subclass that emits no records, succeeds with the
+ * supplied exit code, and reports a fixed tamper reason.  Used to exercise
+ * the agent's Finding-A fail-closed gate (which dispatches on
+ * `instanceof LinuxStraceRunner` so a plain duck-typed runner would not
+ * trigger the gate even if it carried `getTamperReason`).
+ */
+class TamperingStraceRunner extends LinuxStraceRunner {
+  private readonly _reason: string;
+  private readonly _stubExitCode: number;
+  constructor(reason: string, exitCode = 0) {
+    super(undefined, null);
+    this._reason = reason;
+    this._stubExitCode = exitCode;
+  }
+  override async *run(_cmd: string, _args: string[]): AsyncIterable<{ pid: number; line: string }> {
+    void _cmd; void _args;
+  }
+  override getExitCode(): number {
+    return this._stubExitCode;
+  }
+  override getTamperReason(): string | null {
+    return this._reason;
+  }
+}
+
+/**
  * A StraceRunner that also tracks which cmd was run.
  */
 function trackingStrace(exitCode = 0): { strace: StraceRunner; calls: string[] } {
@@ -579,6 +605,60 @@ describe('agent main()', () => {
     expect(
       frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
     ).toBe(true);
+  });
+
+  // ── Finding A: agent fails closed when the events file was tampered ─────
+  //
+  // The tailer records a tamper reason whenever the events file disappears,
+  // is replaced, or shrinks.  main() must convert that into a fatal error
+  // frame and refuse to emit a final lockfile — otherwise a hostile
+  // lifecycle script that `rm`s the events file (erasing audit_bypass
+  // evidence) could pair its evasion with a clean YAML diff.
+  it('aborts fatally with an error frame when the strace runner reports events-file tampering', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const configPath = writeConfig(testDir);
+
+    // Subclass LinuxStraceRunner so `main()`'s `instanceof LinuxStraceRunner`
+    // gate matches AND `getTamperReason()` returns a fixed non-null value.
+    const strace = new TamperingStraceRunner('events file disappeared: /tmp/events.jsonl');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
+      // flushAndExit's callback fires one tick later.
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    expect(exitedWith).toBe(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The fatal error must name the tamper reason verbatim, so the host's
+    // log surfaces what happened.
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(true);
+    expect(String(errors[0]!['message'])).toMatch(/tampered/);
+    expect(String(errors[0]!['message'])).toMatch(/events file disappeared/);
+
+    // Critically: NO `install_done` handshake and NO `final` lockfile.
+    // Without this, the host's check mode would diff a possibly-clean
+    // YAML and pass on tampered audit data.
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).not.toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(false);
   });
 
   it('treats a hung DNS lookup as offline once the verify timeout fires', async () => {
@@ -1120,6 +1200,166 @@ describe('runStraceTailer', () => {
     // re-scanning the file.
     expect(names.filter((n) => n === 'A')).toHaveLength(1);
     expect(names.filter((n) => n === 'B')).toHaveLength(1);
+  });
+
+  // ── Finding A: events-file tamper detection ─────────────────────────────
+  //
+  // The tailer baseline-stats SCRIPT_JAIL_LOG_FILE at startup (passed in via
+  // eventsBaseline) and re-checks {dev, ino} on every drain cycle.  Any
+  // mismatch — unlink, replace, truncate, EACCES — must record a tamper
+  // reason into tamperRef so the agent fails closed at install-end.
+
+  it('records a tamper reason when the events file is unlinked mid-run', async () => {
+    const { statSync, openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, unlinkSync, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    // Create file with O_EXCL like the production agent does.
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Unlink the events file mid-run.  The polling loop must observe this
+    // and record a tamper reason.
+    setTimeout(() => {
+      unlinkSync(eventsPath);
+      setTimeout(resolveExit, 100);
+    }, 40);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/events file (disappeared|became unreadable|inode mismatch)/);
+    // Defensive: also reference statSync to keep the (linter-suppressed) import warm.
+    expect(typeof statSync).toBe('function');
+  });
+
+  it('records a tamper reason when the events file is replaced with a different inode', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, unlinkSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Replace the file with a fresh one at the same path — new inode.
+    setTimeout(() => {
+      unlinkSync(eventsPath);
+      writeSyncFn(eventsPath, '{"kind":"env_read","name":"INJECTED","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+      setTimeout(resolveExit, 100);
+    }, 40);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/inode mismatch|disappeared/);
+  });
+
+  it('does NOT record tamper when the events file is untouched (happy path)', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, appendFileSync: appendSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    setTimeout(() => {
+      // Legitimate append — same inode, growing size.
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"OK","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+      setTimeout(resolveExit, 100);
+    }, 40);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
+    // The legitimate appended line must still be yielded.
+    expect(items.some((i) => i.line.includes('"name":"OK"'))).toBe(true);
+  });
+
+  it('records a tamper reason when the events file is truncated below the read position', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, truncateSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    // Pre-populate with a line so the tailer advances eventsPos > 0.
+    writeSyncFn(
+      eventsPath,
+      '{"kind":"env_read","name":"FIRST","pid":1,"ts":0,"hidden":false}\n',
+      { encoding: 'utf8', flag: 'a' },
+    );
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Wait for first drain to advance eventsPos, then truncate to 0.
+    setTimeout(() => {
+      truncateSync(eventsPath, 0);
+      setTimeout(resolveExit, 120);
+    }, 80);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/shrank|inode mismatch/);
   });
 });
 

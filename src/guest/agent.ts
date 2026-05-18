@@ -12,14 +12,14 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, constants as fsConstants, type Stats } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
 import { PassThrough, Writable, type Readable } from 'node:stream';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { dirname, basename } from 'node:path';
+import { dirname, basename, join as joinPath } from 'node:path';
 
 import { Attribution } from './attribution.js';
 import { LinuxProcReader } from './proc-reader.js';
@@ -264,12 +264,33 @@ export interface StraceTailerOptions {
   fd3Stream: Readable | null;
   /**
    * Absolute path of a shared JSONL events file produced by the env-shim and
-   * dlopen-block preload (production channel — see {@link EVENTS_FILE_PATH}).
+   * dlopen-block preload (production channel — see {@link createEventsFile}).
    * Tailed alongside per-pid strace files; lines arrive with pid=0 (the same
    * synthetic pid we use for fd3 lines, since attribution happens later from
    * the embedded pid field).  When undefined, no events-file polling is done.
    */
   eventsFilePath?: string;
+  /**
+   * Baseline {inode, device} captured at events-file creation time.  On every
+   * drain cycle the tailer re-stats the path and compares against this
+   * baseline; any mismatch (replacement, deletion, EACCES, size shrinkage)
+   * is recorded into `tamperRef.reason` so the agent can fail closed at
+   * post-install time.
+   *
+   * SECURITY: this is the only barrier against a malicious lifecycle script
+   * that unlinks / truncates / replaces the events file to erase
+   * `audit_bypass` evidence before the tailer reads it.  When undefined no
+   * tamper checking is performed (used by tests that supply a private path).
+   */
+  eventsBaseline?: { ino: bigint; dev: bigint };
+  /**
+   * Optional sink for tamper detection.  When the tailer detects events-file
+   * tampering it writes a human-readable reason here; the agent's main loop
+   * reads this after install completes and fails closed if it is non-empty.
+   * Using a ref-object so the writer (tailer) and reader (main) share state
+   * without forcing an extra parameter through the StraceRunner interface.
+   */
+  tamperRef?: { reason: string | null };
   /**
    * Promise that resolves when the traced child process has exited.
    * The tailer waits for this, then does one final drain poll, then ends.
@@ -386,29 +407,91 @@ export async function* runStraceTailer(
   // watchDir and a single absolute path (rather than a "prefix.PID" pattern)
   // is enough to identify it.  Position + partial-line buffer mirror the
   // per-pid logic in drainFile().
+  //
+  // SECURITY: every drain cycle re-stats the path and compares inode/device
+  // against `opts.eventsBaseline`.  Any mismatch (the audited script
+  // unlinked + recreated the file, replaced it with a symlink, truncated
+  // it, or made it unreadable) is recorded into `opts.tamperRef.reason`.
+  // The agent's main loop reads that after install completes and fails
+  // closed.  Without this gate, a `rm /tmp/script-jail-events.jsonl`
+  // followed by `envp_alloc_failed` would erase the `audit_bypass` signal
+  // and let the action's check mode return clean.
   let eventsPos = 0;
   let eventsBuf = '';
+  function recordTamper(reason: string): void {
+    if (opts.tamperRef && opts.tamperRef.reason === null) {
+      opts.tamperRef.reason = reason;
+    }
+  }
   function drainEventsFile(): void {
     const path = opts.eventsFilePath;
     if (path === undefined || path === '') return;
 
-    let size = 0;
+    let stat: Stats;
     try {
-      size = statSync(path).size;
-    } catch {
-      return; // file not yet created or unreadable
+      stat = statSync(path, { bigint: true }) as unknown as Stats;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        recordTamper(`events file disappeared: ${path}`);
+      } else if (code === 'EACCES' || code === 'EPERM') {
+        recordTamper(`events file became unreadable (${code}): ${path}`);
+      }
+      return;
     }
-    if (size <= eventsPos) return;
 
-    const toRead = size - eventsPos;
+    // Baseline identity check: any change in {dev, ino} means the file
+    // path has been rebound to a different inode (unlink + recreate,
+    // rename-over, symlink swap) — the original audit trail is unreachable.
+    const baseline = opts.eventsBaseline;
+    if (baseline !== undefined) {
+      const statIno = (stat as unknown as { ino: bigint }).ino;
+      const statDev = (stat as unknown as { dev: bigint }).dev;
+      if (statIno !== baseline.ino || statDev !== baseline.dev) {
+        recordTamper(
+          `events file inode mismatch (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${statDev} ino=${statIno}): ${path}`,
+        );
+        return;
+      }
+    }
+
+    const sizeBig = (stat as unknown as { size: bigint }).size;
+    // Detect truncation: a regular file's size MUST be monotonically
+    // non-decreasing across our reads (writers use O_APPEND).  A shrink
+    // means somebody ftruncate()/open(O_TRUNC)'d the file mid-run.
+    const sizeNum = Number(sizeBig);
+    if (sizeNum < eventsPos) {
+      recordTamper(`events file shrank (size=${sizeNum} < eventsPos=${eventsPos}): ${path}`);
+      return;
+    }
+    if (sizeNum <= eventsPos) return;
+
+    const toRead = sizeNum - eventsPos;
     const buf = Buffer.allocUnsafe(toRead);
     let fd = -1;
     let bytesRead = 0;
     try {
       fd = openSync(path, 'r');
+      // Verify the just-opened fd is still the SAME inode the stat above
+      // resolved — guards against a race where the file is unlinked between
+      // the stat and the open and a new file with the same path now exists.
+      if (baseline !== undefined) {
+        const fdStat = fstatSync(fd, { bigint: true });
+        if (fdStat.ino !== baseline.ino || fdStat.dev !== baseline.dev) {
+          closeSync(fd);
+          recordTamper(
+            `events file fd-stat mismatch on open (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${fdStat.dev} ino=${fdStat.ino}): ${path}`,
+          );
+          return;
+        }
+      }
       bytesRead = readSync(fd, buf, 0, toRead, eventsPos);
-    } catch {
+    } catch (err) {
       if (fd >= 0) { try { closeSync(fd); } catch { /* ignore */ } }
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'EACCES' || code === 'EPERM') {
+        recordTamper(`events file became unreadable on open (${code}): ${path}`);
+      }
       return;
     }
     closeSync(fd);
@@ -572,13 +655,37 @@ export type SpawnImpl = (
 export class LinuxStraceRunner implements StraceRunner {
   private _exitCode = 0;
   private readonly _spawnImpl: SpawnImpl;
+  private readonly _eventsFile: EventsFile | null;
+  private readonly _tamperRef: { reason: string | null } = { reason: null };
 
-  constructor(spawnImpl?: SpawnImpl) {
+  /**
+   * @param spawnImpl  Injection seam for tests.  Production passes through
+   *                   to `node:child_process.spawn`.
+   * @param eventsFile Per-VM events-file handle (path + baseline inode/dev)
+   *                   created by the agent before strace launches.  When
+   *                   `null`, the runner does not point any writer at a
+   *                   shared events file — used by tests that supply a
+   *                   pre-set environment via the `opts.env` passed to
+   *                   `run()`.
+   */
+  constructor(spawnImpl?: SpawnImpl, eventsFile?: EventsFile | null) {
     this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
+    this._eventsFile = eventsFile ?? null;
   }
 
   getExitCode(): number {
     return this._exitCode;
+  }
+
+  /**
+   * Returns the human-readable tamper reason recorded by the tailer's
+   * events-file watcher, or null if no tampering was observed.  Only
+   * meaningful after `run()` has been fully consumed.  Surface this in
+   * `main()` to force-fail check mode when an audited process unlinked or
+   * replaced the events file mid-install (Finding A).
+   */
+  getTamperReason(): string | null {
+    return this._tamperRef.reason;
   }
 
   async *run(
@@ -586,17 +693,6 @@ export class LinuxStraceRunner implements StraceRunner {
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
   ): AsyncIterable<{ pid: number; line: string }> {
-    // Ensure the events file is created empty before any writer can open it.
-    // The shim and dlopen-block preload open with O_APPEND|O_CREAT, so a
-    // pre-existing file from a previous Phase B run would otherwise leak.
-    try {
-      writeFileSync(EVENTS_FILE_PATH, '', 'utf8');
-    } catch {
-      // Non-fatal: if /tmp isn't writable, the writers will just hit EACCES
-      // and the events file path is silently inert.  Phase B continues —
-      // strace events still flow through the per-pid files.
-    }
-
     const straceArgs = [
       '-ff',
       '-e', 'trace=openat,execve,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
@@ -642,7 +738,11 @@ export class LinuxStraceRunner implements StraceRunner {
         watchDir,
         basePrefix,
         fd3Stream,
-        eventsFilePath: EVENTS_FILE_PATH,
+        ...(this._eventsFile !== null ? {
+          eventsFilePath: this._eventsFile.path,
+          eventsBaseline: this._eventsFile.baseline,
+          tamperRef: this._tamperRef,
+        } : {}),
         exitPromise,
       });
     } finally {
@@ -720,6 +820,7 @@ function buildChildEnv(
   baseEnv: NodeJS.ProcessEnv,
   config: AgentConfig,
   protectedEnvFilePath: string,
+  eventsFilePath: string,
 ): NodeJS.ProcessEnv {
   const preloads = [
     '/usr/local/lib/script-jail/dlopen-block.cjs',
@@ -737,7 +838,13 @@ function buildChildEnv(
     // the spawn — a known file path.  Both writers use O_WRONLY|O_APPEND
     // so concurrent writes don't race on file offset; POSIX makes writes
     // smaller than PIPE_BUF atomic on regular files.
-    SCRIPT_JAIL_LOG_FILE: EVENTS_FILE_PATH,
+    //
+    // The path is generated per-VM via `createEventsFile` (mkdtemp + 0700
+    // dir + O_EXCL file) so its name is unguessable; the agent also
+    // captures the file's inode/device at creation and the tailer re-stats
+    // on every drain cycle to detect unlink/replace/truncate attempts by
+    // a malicious lifecycle script.  See {@link createEventsFile}.
+    SCRIPT_JAIL_LOG_FILE: eventsFilePath,
     SCRIPT_JAIL_LOG_FD: String(config.log_fd),
     SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedEnvFilePath,
     SCRIPT_JAIL_PRELOAD_PATH: '/lib/libscriptjail.so',
@@ -752,11 +859,61 @@ function buildChildEnv(
 }
 
 /**
- * Absolute path of the shared JSONL events file.  The shim and the dlopen-block
- * preload append events here; the agent tails this file alongside the per-pid
- * strace output files.  Lives under /tmp (rootfs tmpfs) so it's reset per VM.
+ * Per-VM events-file handle.  The path is randomized (mkdtemp under /tmp) and
+ * the directory mode is 0700; the file itself is opened with O_CREAT|O_EXCL
+ * so we know nothing pre-existed.  `baseline` captures the {inode, device}
+ * pair at creation so the tailer can re-stat on every drain cycle and detect
+ * unlink / replace / truncate / symlink-swap by an audited lifecycle script.
+ *
+ * SECURITY: the static `/tmp/script-jail-events.jsonl` path that preceded
+ * this was a trivial target — `rm /tmp/script-jail-events.jsonl` from a
+ * postinstall script erased the audit trail before the agent could read it,
+ * and the file's only consumer (the tailer) treated ENOENT as a silent no-op.
+ * Randomizing the path raises the bar against blind-target attacks, and the
+ * inode/dev baseline + tailer fail-closed gate catches the case where an
+ * attacker discovers the path via /proc/self/environ.
  */
-export const EVENTS_FILE_PATH = '/tmp/script-jail-events.jsonl';
+export interface EventsFile {
+  /** Absolute path of the JSONL events file inside the VM. */
+  path: string;
+  /** Directory containing the file (mode 0700, mkdtemp-generated). */
+  dirPath: string;
+  /** Baseline inode + device pair, captured at creation via fstat. */
+  baseline: { ino: bigint; dev: bigint };
+}
+
+/**
+ * Create the per-VM events file under a fresh 0700 tmpdir and return its
+ * handle.  Called by `main()` BEFORE strace launches so the path is set in
+ * `SCRIPT_JAIL_LOG_FILE` (via `buildChildEnv`) and the baseline can be
+ * compared on every drain cycle.
+ *
+ * Implementation notes:
+ *   - `mkdtempSync` returns a path with mode 0700 by default.
+ *   - The file is opened with O_RDWR|O_CREAT|O_EXCL so we know we hold the
+ *     fresh inode; if the path somehow already exists (it shouldn't, mkdtemp
+ *     is unique), we fail rather than rebind to a foreign file.
+ *   - fstat-on-fd captures dev+ino atomically with the create; nothing can
+ *     race the create-then-stat pair.
+ */
+export function createEventsFile(parentDir: string = '/tmp'): EventsFile {
+  const dirPath = mkdtempSync(joinPath(parentDir, 'script-jail-events-'));
+  const path = joinPath(dirPath, 'events.jsonl');
+  const fd = openSync(
+    path,
+    // eslint-disable-next-line no-bitwise -- POSIX open flag composition
+    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL,
+    0o600,
+  );
+  let baseline: { ino: bigint; dev: bigint };
+  try {
+    const s = fstatSync(fd, { bigint: true });
+    baseline = { ino: s.ino, dev: s.dev };
+  } finally {
+    closeSync(fd);
+  }
+  return { path, dirPath, baseline };
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -930,12 +1087,39 @@ export async function main(input: AgentInput): Promise<void> {
   const protectedEnvPath = '/tmp/script-jail-protected.txt';
   writeFileSync(protectedEnvPath, config.protected.env.join('\n') + '\n', 'utf8');
 
+  // 4b. Create the audit-events file under a per-VM 0700 tmpdir BEFORE the
+  //     child env is built so SCRIPT_JAIL_LOG_FILE points at this fresh path.
+  //     The file's {inode, device} baseline is recorded and re-checked by the
+  //     tailer on every drain cycle (Finding A).  If anything inside the VM
+  //     unlinks / replaces / truncates the file, the agent fails closed and
+  //     never emits a final lockfile — `findAuditBypass` cannot help if the
+  //     evidence of an `envp_alloc_failed` was erased before the agent saw it.
+  //
+  //     Tests inject a custom strace runner via `input.strace`; in that path
+  //     we still create the events file (and pass its path via childEnv) so
+  //     test environments using the production env-shim see a usable sink.
+  //     The injected runner is free to ignore the path entirely.
+  let eventsFile: EventsFile | null;
+  try {
+    eventsFile = createEventsFile();
+  } catch (err) {
+    // Creating the events file is non-fatal in test/CI environments where
+    // /tmp may be read-only or otherwise unwritable — fall back to a NULL
+    // path so the production env-shim's SCRIPT_JAIL_LOG_FILE branch is
+    // skipped and writers fall through to SCRIPT_JAIL_LOG_FD.  We
+    // deliberately do NOT bail here because the audit pipeline has other
+    // signals (strace, fd 3) and the events file is one of several inputs.
+    diag(input, `events-file create failed (non-fatal): ${String(err)}`);
+    eventsFile = null;
+  }
+  const eventsFilePath = eventsFile !== null ? eventsFile.path : '';
+
   // 5. Build child environment
-  const childEnv = buildChildEnv(process.env, config, protectedEnvPath);
+  const childEnv = buildChildEnv(process.env, config, protectedEnvPath, eventsFilePath);
 
   // 6. Set up spawner (Phase A) and strace runner (Phase B)
   const spawner: Spawner = input.spawner ?? new LinuxSpawner();
-  const straceRunner: StraceRunner = input.strace ?? new LinuxStraceRunner();
+  const straceRunner: StraceRunner = input.strace ?? new LinuxStraceRunner(undefined, eventsFile);
 
   // 7. Attribution (reads /proc; real ProcReader in production)
   const attribution = new Attribution(new LinuxProcReader());
@@ -1110,6 +1294,30 @@ export async function main(input: AgentInput): Promise<void> {
     input.connection.close();
     process.exitCode = installResult.exitCode;
     return;
+  }
+
+  // 11b. Events-file tamper check (Finding A): the tailer baseline-stats the
+  //      SCRIPT_JAIL_LOG_FILE path on every drain cycle and records any
+  //      anomaly (unlink, inode mismatch, truncate, EACCES).  An audit
+  //      bypass that erased its own `audit_bypass` entry would still leave
+  //      this tamper signal because the inode/dev pair is captured BEFORE
+  //      any audited code runs.  Fail closed here — the host sees this as
+  //      "vsock session ended without a final frame" + the error frame.
+  //
+  //      Only meaningful when we created an events file AND the production
+  //      strace runner is in use; test-injected runners do not own the
+  //      events-file watcher and report no tamper status.
+  if (eventsFile !== null && straceRunner instanceof LinuxStraceRunner) {
+    const tamperReason = straceRunner.getTamperReason();
+    if (tamperReason !== null) {
+      emitter.emitError(
+        `audit pipeline tampered with: ${tamperReason}. ` +
+          'Refusing to emit a final lockfile — a clean diff would be untrustworthy.',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
   }
 
   emitter.emitHandshake('install_done');
