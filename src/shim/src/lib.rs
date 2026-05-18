@@ -1661,6 +1661,17 @@ pub unsafe extern "C" fn execve(
 }
 
 // ── execv(prog, argv) ──────────────────────────────────────────────────────
+//
+// The audit invariant is that every exec-family entry goes through
+// rewrite_envp so the child's env is sanitised before it runs.  Native code
+// can poison the parent's environ directly (e.g. `environ[i] =
+// "LD_PRELOAD=/tmp/evil.so"`) without touching our setenv/unsetenv/putenv
+// guards, then call execv("node", argv) and the unmodified environ would
+// carry the poison into the child.  Snapshot environ here and route through
+// dispatch_exec so the snapshot is rewritten and the audit chain survives.
+// We forward to real_execve (not real_execv) so the rewritten envp is the
+// one the child sees; execv historically just calls execve with environ
+// under the hood, so this preserves API semantics.
 
 #[no_mangle]
 pub unsafe extern "C" fn execv(
@@ -1685,26 +1696,18 @@ pub unsafe extern "C" fn execv(
         return real_execve_raw(prog, argv, environ_ptr());
     }
     set_in_shim(true);
-    // execv inherits environ.  Environ in the parent already has our canonical
-    // LD_PRELOAD / NODE_OPTIONS / SCRIPT_JAIL_* (the shim was loaded from it,
-    // and Task 5's env-mutator wrappers refuse in-process tampering on those
-    // names), so a rewrite would just allocate a copy of an already-canonical
-    // env.  Skip the rewrite, emit the audit event for visibility, and forward
-    // to real_execv so glibc's exec semantics are preserved.  Matches execvp.
-    let argv0 = if argv.is_null() { ptr::null() } else { *argv };
-    emit_exec(prog, argv0, false);
-    let p = REAL_EXECV.load(Ordering::Acquire);
-    let rc = if !p.is_null() {
-        let f: ExecvFn = transmute(p);
-        f(prog, argv)
-    } else {
-        real_execve_raw(prog, argv, environ_ptr())
-    };
+    let rc = dispatch_exec(RealExecForward::Execve, prog, argv, environ_ptr());
     set_in_shim(false);
     rc
 }
 
 // ── execvp(file, argv) ─────────────────────────────────────────────────────
+//
+// Same rationale as execv: snapshot environ, run it through rewrite_envp,
+// then forward through real_execvpe so glibc's PATH search semantics
+// (ENOEXEC fallback, EACCES preservation, multi-candidate retry) still
+// apply.  Skipping rewrite_envp here would let a native script bypass the
+// audit chain by mutating environ directly and then calling execvp.
 
 #[no_mangle]
 pub unsafe extern "C" fn execvp(
@@ -1728,27 +1731,7 @@ pub unsafe extern "C" fn execvp(
         return real_execve_raw(file, argv, environ_ptr());
     }
     set_in_shim(true);
-    // execvp uses libc's PATH search via real_execvp, but real_execvp inherits
-    // the *current* environ — which already contains our shim values.  So we
-    // do not rewrite envp at the API level; we ensure environ stays canonical
-    // by definition (the shim was loaded with it).  However the rest of the
-    // shim's exec audit pipeline relies on rewriting envp.  To preserve glibc
-    // PATH-search semantics (ENOEXEC shell fallback, EACCES preservation,
-    // multi-candidate retry), we forward to real_execvp directly.
-    //
-    // The child will inherit environ from the parent; environ in the parent
-    // already has LD_PRELOAD/NODE_OPTIONS/SCRIPT_JAIL_* set (since the shim
-    // was loaded from them).  So no envp rewrite is strictly required to keep
-    // the chain alive.  We still emit an exec audit event for visibility.
-    let argv0 = if argv.is_null() { ptr::null() } else { *argv };
-    emit_exec(file, argv0, false);
-    let p = REAL_EXECVP.load(Ordering::Acquire);
-    let rc = if !p.is_null() {
-        let f: ExecvFn = transmute(p);
-        f(file, argv)
-    } else {
-        real_execve_raw(file, argv, environ_ptr())
-    };
+    let rc = dispatch_exec(RealExecForward::Execvpe, file, argv, environ_ptr());
     set_in_shim(false);
     rc
 }
