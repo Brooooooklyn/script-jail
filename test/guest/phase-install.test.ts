@@ -10022,5 +10022,321 @@ describe('runInstallPhase', () => {
       });
       expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex follow-up (high, 2026-05-19, bug #1 final): interleaved
+    // post-detach replay log.  The child's post-detach mutations
+    // arrive as a sequence: F_SETFD CLOEXEC (tombstone), then execve
+    // (action: execveCloexec).  Pre-fix the reconciler walked
+    // actions then tombstones in separate phases, so the CLOEXEC
+    // mark applied AFTER the sweep — entry survived.  Post-fix the
+    // single interleaved log replays in observed order: mark
+    // CLOEXEC, then sweep drops it.  Test asserts child fd 7
+    // resolves to <UNRESOLVED_PATH>; parent fd 7 keeps /A/x because
+    // BOTH mutations were post-detach (private to the child).
+    it('post-detach CLOEXEC tombstone before execve sweep replays in order (bug #1 interleaving)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'post-detach-interleave-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'post-detach-interleave-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens fd 7 → /A (non-CLOEXEC).
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child unshare(CLONE_FILES) at singleton time — snapshot
+        // captures `entries=[]` (child has no own fds yet), seeds
+        // postDetachLog with action(none).
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Child fcntl(7, F_SETFD, FD_CLOEXEC) on UNTRACKED fd —
+        // marker exists → tombstone is POST-detach.  Pushed onto
+        // postDetachLog at position N (after the unshare action).
+        {
+          pid: 1001,
+          line: 'fcntl(7, F_SETFD, FD_CLOEXEC) = 0',
+          source: 'strace',
+        },
+        // Child execve at singleton — pushes action(execveCloexec)
+        // onto postDetachLog at position N+1.
+        {
+          pid: 1001,
+          line: 'execve("/bin/sh", ["/bin/sh"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES).  Reconciler:
+        //   (a) copy parent fd 7 → child fd 7 (path=/A,
+        //       cloexec=false),
+        //   (b) postDetachLog walk in order:
+        //         action(none)      — no-op
+        //         tombstone(cloexec, fd=7) — mark child fd 7
+        //                          cloexec=true, parent untouched
+        //         action(execveCloexec) — sweep cloexec=true in
+        //                          child group, fd 7 deleted.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed (entry swept by
+        // execveCloexec after CLOEXEC mark applied first).
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 8',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /A/x.  BOTH the
+        // CLOEXEC mark AND the sweep were post-detach mutations
+        // private to the child; parent's fd 7 was never tainted.
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: NO /A/x certified — interleaved replay marked
+      // CLOEXEC first, then execve sweep dropped the entry.
+      const childLeaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeaked).toHaveLength(0);
+      // Child: surfaces <UNRESOLVED_PATH>.
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (high, 2026-05-19, bug #2 final): marker-less
+    // standalone tombstone consumption.  child close_range(3, 10, 0)
+    // mutates the SHARED files_struct (CLONE_FILES) but no
+    // subsequent unshare/execve marker was created.  Pre-fix the
+    // pre-marker tombstone bucket was silently deleted at clone
+    // reconciliation; the kernel-shared close didn't propagate to
+    // the parent's modeled state, so the parent's openat(7, "x")
+    // resolved through the stale entry.  Post-fix the standalone
+    // tombstone is applied to the now-unified group with
+    // shared-kernel propagation: fd 7 dropped both sides,
+    // fd-unknown marked both sides.
+    it('marker-less singleton close_range tombstone propagates to parent under shared CLONE_FILES (bug #2 standalone)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'standalone-close-range-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'standalone-close-range-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens fd 7 → /A (shared with the child via the
+        // delayed CLONE_FILES that will surface last).
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child close_range(3, 10, 0) — singleton, NO marker yet.
+        // Pre-marker range tombstone recorded; the kernel's shared
+        // close hit BOTH sides.
+        {
+          pid: 1001,
+          line: 'close_range(3, 10, 0) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) — NO unshare/execve
+        // marker on the child.  Reconciler enters the union branch
+        // (cloneFiles && no marker), then applies the standalone
+        // tombstone to the unified group: drop fd 7 (in [3,10]),
+        // mark fd-unknown both sides.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST fail closed.
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Neither side resolves /A/x.
+      const parentLeaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentLeaked).toHaveLength(0);
+      const childLeaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeaked).toHaveLength(0);
+      // BOTH sides surface <UNRESOLVED_PATH>.
+      const parentUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1000;
+      });
+      expect(parentUnresolved.length).toBeGreaterThanOrEqual(1);
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (high, 2026-05-19, bug #2 final): non-shared
+    // clone with pre-marker tombstone.  The clone has NO CLONE_FILES,
+    // so the kernel did NOT share files_struct at clone time — the
+    // child's close(7) was private to its own pre-clone fd table.
+    // Standalone tombstone applies to child's copied entry only;
+    // parent is untainted.
+    it('marker-less close tombstone with non-shared clone applies to child only (bug #2 standalone non-shared)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'standalone-private-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'standalone-private-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens fd 7 → /A.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child close(7) — singleton, NO marker.  Pre-marker close
+        // tombstone recorded.  Because the eventual clone has NO
+        // CLONE_FILES, the kernel-shared semantic does not apply;
+        // the tombstone applies to the child's copied entry only.
+        {
+          pid: 1001,
+          line: 'close(7) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone WITHOUT CLONE_FILES.  Reconciler
+        // enters the copy branch (no CLONE_FILES); the copy pass
+        // copies fd 7 → child group, then the standalone tombstone
+        // drops the child's copy.  Parent fd 7 untouched.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /A/x.
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 8',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST fail closed.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /A/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: NO /A/x certified.
+      const childLeaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childLeaked).toHaveLength(0);
+      // Child: surfaces <UNRESOLVED_PATH>.
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

@@ -544,10 +544,10 @@ export async function runInstallPhase(
   // FdSnapshot's `entries` field captures the child's modeled fd table
   // (by fd suffix only — fd-group root is implicit) at the moment the
   // marker was FIRST set (the baseline parent-shared state under
-  // CLONE_FILES).  `actions` is an ordered LIST of the kernel mutations
-  // observed on the caller's now-private fd table during the pre-detach
-  // singleton window; the reconciler replays them in the same order
-  // onto the COPIED-from-parent child group:
+  // CLONE_FILES).  `postDetachLog` is an ordered LIST that interleaves
+  // detach actions and post-detach tombstones in their observed order;
+  // the reconciler replays it in the same order onto the COPIED-from-
+  // parent child group.  Detach action kinds:
   //   - 'none'           — plain unshare(CLONE_FILES).  No replay
   //                        action; the kernel only detached, didn't
   //                        otherwise mutate the table.
@@ -568,6 +568,15 @@ export async function runInstallPhase(
   // every detach call (push, don't overwrite), replay in order.  The
   // `entries` baseline stays from the FIRST detach (parent-state-at-
   // first-detach is the right basis for parent-taint).
+  //
+  // Codex follow-up (high, 2026-05-19, bug #1 final): post-detach
+  // tombstones are now ALSO appended to the same ordered log so an
+  // interleaved sequence (tombstone, action, tombstone, action, ...)
+  // replays in the OBSERVED order.  Pre-fix used a separate
+  // `postDetachTombstones[]` list that was replayed AFTER every
+  // action, so a CLOEXEC tombstone observed BEFORE a subsequent
+  // execveCloexec action ended up applied AFTER the sweep (stale entry
+  // survived).
   //
   // Codex follow-up (high, 2026-05-19, bug #2): `tombstones` records
   // fd-specific mutations done on UNTRACKED fds during the singleton
@@ -605,18 +614,37 @@ export async function runInstallPhase(
   // Codex follow-up (medium, 2026-05-19, bug #3 follow-up): split
   // tombstones into PRE-detach and POST-detach buckets.  Pre-detach
   // tombstones were recorded BEFORE any detach action queued onto
-  // `actions[]`; under shared CLONE_FILES the kernel mutation hit the
-  // SHARED files_struct and propagated to the parent, so the reconciler
-  // must flip BOTH parent and child copy.  Post-detach tombstones were
-  // recorded AFTER at least one detach action was queued; the kernel
-  // had already unshared (or was about to via execve) so the mutation
-  // is private and only the child copy reflects it.
+  // `postDetachLog[]`; under shared CLONE_FILES the kernel mutation hit
+  // the SHARED files_struct and propagated to the parent, so the
+  // reconciler must flip BOTH parent and child copy.  Post-detach
+  // tombstones were recorded AFTER at least one detach action was
+  // queued; the kernel had already unshared (or was about to via
+  // execve) so the mutation is private and only the child copy
+  // reflects it.
+  //
+  // Codex follow-up (high, 2026-05-19, bug #1 final): the prior
+  // bookkeeping kept post-detach tombstones in a SEPARATE list from
+  // `actions` and replayed them in two phases — actions first, then
+  // tombstones.  That order was wrong: a CLOEXEC tombstone observed
+  // BEFORE a subsequent execveCloexec action must apply first (mark
+  // fd cloexec) so the sweep can drop the entry.  Two-phase replay
+  // applied the CLOEXEC mark POST-sweep, leaving the entry intact.
+  // Fix: interleave actions and post-detach tombstones into a SINGLE
+  // ordered log; the reconciler walks it in observed order.  Pre-
+  // detach tombstones still live in `preDetachTombstones[]` and apply
+  // BEFORE the log replay (with shared-kernel propagation to parent
+  // under shared CLONE_FILES).
+  type FdLogEntry =
+    | { kind: 'action'; action: FdDetachAction }
+    | { kind: 'tombstone'; tombstone: FdTombstone };
   interface FdSnapshot {
     entries: Array<[string /* fd suffix */, { path: string; cloexec: boolean }]>;
     unknown: boolean;
-    actions: FdDetachAction[];
+    // Ordered interleaved log of detach actions and post-detach
+    // tombstones.  Always begins with at least one action (snapshotFd
+    // seeds the first action; appendFdAction pushes subsequent ones).
+    postDetachLog: FdLogEntry[];
     preDetachTombstones: FdTombstone[];
-    postDetachTombstones: FdTombstone[];
   }
   const pendingCwdDetach = new Map<number, CwdSnapshot>();
   const pendingFdDetach = new Map<number, FdSnapshot>();
@@ -639,10 +667,10 @@ export async function runInstallPhase(
     const existingSnap = pendingFdDetach.get(pid);
     if (existingSnap !== undefined) {
       // Marker already exists → tombstone is POST-detach (recorded
-      // after at least one detach action has been queued).  Append to
-      // postDetachTombstones; ordering preserved so the reconciler
-      // applies them in observed order.
-      existingSnap.postDetachTombstones.push(tomb);
+      // after at least one detach action has been queued).  Push into
+      // the interleaved postDetachLog so the reconciler replays it in
+      // observed order relative to other actions / tombstones.
+      existingSnap.postDetachLog.push({ kind: 'tombstone', tombstone: tomb });
       return;
     }
     // No marker yet → tombstone is PRE-detach.  Queue in the bucket;
@@ -669,10 +697,12 @@ export async function runInstallPhase(
     return { cwd: cwdGet(pid), unknown: cwdUnknownHas(pid) };
   }
   // Helper: snapshot the child's CURRENT fd-table state + the detach-
-  // time replay action.  The returned snapshot has a SINGLE action in
-  // its `actions` list (the caller-provided one) and an empty tombstone
-  // map.  Subsequent detach calls on the same pid APPEND to `actions`
-  // via `appendFdAction` rather than calling `snapshotFd` again — the
+  // time replay action.  The returned snapshot's `postDetachLog`
+  // contains a SINGLE entry — the caller-provided action — and empty
+  // pre-detach tombstones.  Subsequent detach calls on the same pid
+  // APPEND to `postDetachLog` via `appendFdAction` (and any post-
+  // detach tombstones recorded between actions also append via
+  // `recordFdTombstone`) rather than calling `snapshotFd` again — the
   // `entries` baseline must stay frozen at the first-detach moment so
   // the reconciler's parent-taint pass measures against the parent-
   // shared state that existed at first detach, not at the last one.
@@ -688,9 +718,8 @@ export async function runInstallPhase(
     const snap: FdSnapshot = {
       entries,
       unknown: dirfdStateUnknown.has(root),
-      actions: [action],
+      postDetachLog: [{ kind: 'action', action }],
       preDetachTombstones: [],
-      postDetachTombstones: [],
     };
     absorbPendingTombstones(pid, snap);
     return snap;
@@ -705,7 +734,7 @@ export async function runInstallPhase(
   function appendFdAction(pid: number, action: FdDetachAction): FdSnapshot | null {
     const snap = pendingFdDetach.get(pid);
     if (snap === undefined) return null;
-    snap.actions.push(action);
+    snap.postDetachLog.push({ kind: 'action', action });
     absorbPendingTombstones(pid, snap);
     return snap;
   }
@@ -1806,14 +1835,25 @@ export async function runInstallPhase(
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
-            // Drop any pre-marker tombstones for this child; if a
-            // marker existed, those tombstones have already been
-            // folded in by absorbPendingTombstones during snapshot
-            // creation, so the bucket is stale.  If no marker existed,
-            // the bucket is best-effort and not consumed here (the
-            // tombstones would need a marker-less reconciliation path
-            // we deliberately don't implement — see comment above the
-            // `pendingFdTombstones` declaration).
+            // Pre-marker tombstones for this child.  When a marker
+            // already exists, those tombstones have already been
+            // folded into `preDetachTombstones[]` by
+            // `absorbPendingTombstones` during snapshot creation —
+            // the bucket here is stale and gets discarded.
+            //
+            // Codex follow-up (high, 2026-05-19, bug #2 final): when
+            // NO marker exists, we used to silently drop the bucket.
+            // That left a hole: a singleton child's pre-marker
+            // close/close_range/F_SETFD on UNTRACKED inherited fds
+            // mutated the shared files_struct (under CLONE_FILES)
+            // BEFORE the parent's clone line surfaced.  Without
+            // marker-less consumption, the reconciler copied parent
+            // fds in untouched, missing the shared-kernel mutation.
+            // The standaloneFdTombstones path below consumes them
+            // when no marker exists (singleton close_range / close /
+            // SETFD with no subsequent unshare/execve marker).
+            const standaloneFdTombstones =
+              childFdSnap === undefined ? pendingFdTombstones.get(childPid) : undefined;
             pendingFdTombstones.delete(childPid);
             const childHadPendingCwdDetach = childCwdSnap !== undefined;
             const childHadPendingFdDetach = childFdSnap !== undefined;
@@ -1954,6 +1994,65 @@ export async function runInstallPhase(
               unionFd(pid, childPid);
               // No per-key copy needed — fd lookups resolve to the
               // shared group root.
+              //
+              // Codex follow-up (high, 2026-05-19, bug #2 final):
+              // marker-less standalone tombstone replay.  When the
+              // child did close/close_range/F_SETFD on UNTRACKED
+              // inherited fds BEFORE the parent's clone line surfaced
+              // — and never followed up with an unshare/execve marker
+              // — the kernel ALREADY mutated the shared files_struct
+              // (CLONE_FILES is real at the kernel level).  Pre-fix
+              // these tombstones were discarded silently; parent's
+              // openat(<fd>, ...) then resolved through a stale
+              // inherited entry.  Apply tombstones to the now-unified
+              // group with shared-kernel propagation: closes drop
+              // entries and mark fd-unknown both sides, cloexec marks
+              // the entry cloexec=true on both sides, range close
+              // drops in [first,last] on both sides.
+              if (standaloneFdTombstones !== undefined && standaloneFdTombstones.length > 0) {
+                const groupPrefix = `${rootedFd(pid)}:`;
+                for (const tomb of standaloneFdTombstones) {
+                  if (tomb.kind === 'close') {
+                    dirfdTable.delete(`${groupPrefix}${tomb.fd}`);
+                    fdUnknownAdd(pid);
+                    fdUnknownAdd(childPid);
+                  } else if (tomb.kind === 'cloexec') {
+                    const key = `${groupPrefix}${tomb.fd}`;
+                    const cur = dirfdTable.get(key);
+                    if (cur !== undefined) {
+                      dirfdTable.set(key, { path: cur.path, cloexec: true });
+                    }
+                  } else {
+                    // closeRange tombstone — drop / mark cloexec
+                    // entries in [first, last] on the unified group.
+                    let touched = false;
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(groupPrefix)) continue;
+                      const fdStr = k.slice(groupPrefix.length);
+                      const fdNum = parseInt(fdStr, 10);
+                      if (
+                        Number.isFinite(fdNum) &&
+                        fdNum >= tomb.first &&
+                        fdNum <= tomb.last
+                      ) {
+                        if (tomb.cloexec) {
+                          const cur = dirfdTable.get(k);
+                          if (cur !== undefined) {
+                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                          }
+                        } else {
+                          dirfdTable.delete(k);
+                        }
+                        touched = true;
+                      }
+                    }
+                    if (touched && !tomb.cloexec) {
+                      fdUnknownAdd(pid);
+                      fdUnknownAdd(childPid);
+                    }
+                  }
+                }
+              }
             } else {
               // Copy branch: independent fd table.  Either the parent
               // did NOT set CLONE_FILES OR the child later unshared
@@ -2148,12 +2247,15 @@ export async function runInstallPhase(
                   // kernel had already unshared by then so the
                   // mutation is private).
                   //
-                  // Pre-detach tombstone replay order:
+                  // Replay order:
                   //   1. preDetachTombstones (parent + child copy under
                   //      fdPendingDetachShared, else child-only)
-                  //   2. actions (in order; child copy only — actions
-                  //      ARE the detach events)
-                  //   3. postDetachTombstones (child copy only)
+                  //   2. postDetachLog — interleaved actions and post-
+                  //      detach tombstones in OBSERVED order (child
+                  //      copy only).  Single-pass walk preserves the
+                  //      kernel-observed ordering so a CLOEXEC
+                  //      tombstone followed by an execveCloexec
+                  //      action correctly marks-then-sweeps.
                   const applyPointTombstone = (
                     fd: number,
                     kind: 'close' | 'cloexec',
@@ -2257,21 +2359,106 @@ export async function runInstallPhase(
                       );
                     }
                   }
-                  // (2) Detach actions, in queue order — child copy
-                  // only (these are the kernel detach events that
-                  // mutate ONLY the caller's now-private group).
-                  for (const action of childFdSnap.actions) {
-                    if (action.kind === 'closeRange') {
+                  // (2) Interleaved post-detach log — actions and
+                  // post-detach tombstones replayed in OBSERVED order,
+                  // child copy only.
+                  //
+                  // Codex follow-up (high, 2026-05-19, bug #1 final):
+                  // pre-fix the reconciler walked actions and post-
+                  // detach tombstones in two separate phases (all
+                  // actions, then all tombstones).  A CLOEXEC
+                  // tombstone observed BEFORE a subsequent execveCloexec
+                  // action ended up applied AFTER the sweep, leaving
+                  // the entry intact.  Fix: single-pass walk over the
+                  // interleaved log preserves the kernel-observed
+                  // ordering — CLOEXEC mark applied first, sweep
+                  // drops it.
+                  //
+                  // Post-detach mutations MUST NOT taint the parent
+                  // (the kernel had already unshared by then), so
+                  // tombstones in this phase pass `toParent=false`.
+                  for (const entry of childFdSnap.postDetachLog) {
+                    if (entry.kind === 'action') {
+                      const action = entry.action;
+                      if (action.kind === 'closeRange') {
+                        for (const k of [...dirfdTable.keys()]) {
+                          if (!k.startsWith(childGroupPrefix)) continue;
+                          const fdStr = k.slice(childGroupPrefix.length);
+                          const fdNum = parseInt(fdStr, 10);
+                          if (
+                            Number.isFinite(fdNum) &&
+                            fdNum >= action.first &&
+                            fdNum <= action.last
+                          ) {
+                            if (action.cloexec) {
+                              const cur = dirfdTable.get(k);
+                              if (cur !== undefined) {
+                                dirfdTable.set(k, { path: cur.path, cloexec: true });
+                              }
+                            } else {
+                              dirfdTable.delete(k);
+                            }
+                          }
+                        }
+                      } else if (action.kind === 'execveCloexec') {
+                        for (const k of [...dirfdTable.keys()]) {
+                          if (!k.startsWith(childGroupPrefix)) continue;
+                          const ent = dirfdTable.get(k);
+                          if (ent !== undefined && ent.cloexec) {
+                            dirfdTable.delete(k);
+                          }
+                        }
+                      }
+                      // action.kind === 'none' (plain unshare(CLONE_FILES))
+                      // → no replay needed.
+                    } else {
+                      const tomb = entry.tombstone;
+                      if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
+                        applyPointTombstone(tomb.fd, tomb.kind, false);
+                      } else {
+                        applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
+                      }
+                    }
+                  }
+                }
+                // Codex follow-up (high, 2026-05-19, bug #2 final):
+                // marker-less standalone tombstones in the COPY branch.
+                // The clone had no CLONE_FILES (cloneFiles=false) OR
+                // the child had no pending fd detach marker on the
+                // copy side — but the child still recorded pre-marker
+                // tombstones from singleton close/close_range/F_SETFD
+                // on UNTRACKED fds.
+                //
+                // Because cloneFiles is false here, the kernel did NOT
+                // share files_struct at clone time; the child's
+                // pre-marker close/close_range happened on its private
+                // pre-clone fd table.  Tombstones apply to the child's
+                // copied entries only — parent is untainted.
+                if (
+                  standaloneFdTombstones !== undefined &&
+                  standaloneFdTombstones.length > 0
+                ) {
+                  const childGroupPrefix = `${rootedFd(childPid)}:`;
+                  for (const tomb of standaloneFdTombstones) {
+                    if (tomb.kind === 'close') {
+                      dirfdTable.delete(`${childGroupPrefix}${tomb.fd}`);
+                    } else if (tomb.kind === 'cloexec') {
+                      const key = `${childGroupPrefix}${tomb.fd}`;
+                      const cur = dirfdTable.get(key);
+                      if (cur !== undefined) {
+                        dirfdTable.set(key, { path: cur.path, cloexec: true });
+                      }
+                    } else {
                       for (const k of [...dirfdTable.keys()]) {
                         if (!k.startsWith(childGroupPrefix)) continue;
                         const fdStr = k.slice(childGroupPrefix.length);
                         const fdNum = parseInt(fdStr, 10);
                         if (
                           Number.isFinite(fdNum) &&
-                          fdNum >= action.first &&
-                          fdNum <= action.last
+                          fdNum >= tomb.first &&
+                          fdNum <= tomb.last
                         ) {
-                          if (action.cloexec) {
+                          if (tomb.cloexec) {
                             const cur = dirfdTable.get(k);
                             if (cur !== undefined) {
                               dirfdTable.set(k, { path: cur.path, cloexec: true });
@@ -2281,29 +2468,6 @@ export async function runInstallPhase(
                           }
                         }
                       }
-                    } else if (action.kind === 'execveCloexec') {
-                      for (const k of [...dirfdTable.keys()]) {
-                        if (!k.startsWith(childGroupPrefix)) continue;
-                        const entry = dirfdTable.get(k);
-                        if (entry !== undefined && entry.cloexec) {
-                          dirfdTable.delete(k);
-                        }
-                      }
-                    }
-                    // action.kind === 'none' (plain unshare(CLONE_FILES))
-                    // → no replay needed.
-                  }
-                  // (3) Post-detach tombstones — child copy only.
-                  // These were recorded AFTER at least one detach
-                  // action was queued, so the kernel had already
-                  // unshared (or was about to via execve).  The
-                  // mutation is private to the child and MUST NOT
-                  // taint the parent.
-                  for (const tomb of childFdSnap.postDetachTombstones) {
-                    if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
-                      applyPointTombstone(tomb.fd, tomb.kind, false);
-                    } else {
-                      applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
                     }
                   }
                 }

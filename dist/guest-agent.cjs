@@ -25914,7 +25914,7 @@ async function runInstallPhase(input) {
     if (!isFdSingleton(pid)) return;
     const existingSnap = pendingFdDetach.get(pid);
     if (existingSnap !== void 0) {
-      existingSnap.postDetachTombstones.push(tomb);
+      existingSnap.postDetachLog.push({ kind: "tombstone", tombstone: tomb });
       return;
     }
     let bucket = pendingFdTombstones.get(pid);
@@ -25945,9 +25945,8 @@ async function runInstallPhase(input) {
     const snap = {
       entries,
       unknown: dirfdStateUnknown.has(root),
-      actions: [action],
-      preDetachTombstones: [],
-      postDetachTombstones: []
+      postDetachLog: [{ kind: "action", action }],
+      preDetachTombstones: []
     };
     absorbPendingTombstones(pid, snap);
     return snap;
@@ -25955,7 +25954,7 @@ async function runInstallPhase(input) {
   function appendFdAction(pid, action) {
     const snap = pendingFdDetach.get(pid);
     if (snap === void 0) return null;
-    snap.actions.push(action);
+    snap.postDetachLog.push({ kind: "action", action });
     absorbPendingTombstones(pid, snap);
     return snap;
   }
@@ -26303,6 +26302,7 @@ async function runInstallPhase(input) {
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
+            const standaloneFdTombstones = childFdSnap === void 0 ? pendingFdTombstones.get(childPid) : void 0;
             pendingFdTombstones.delete(childPid);
             const childHadPendingCwdDetach = childCwdSnap !== void 0;
             const childHadPendingFdDetach = childFdSnap !== void 0;
@@ -26337,6 +26337,44 @@ async function runInstallPhase(input) {
             }
             if (cloneFiles && !childHadPendingFdDetach) {
               unionFd(pid, childPid);
+              if (standaloneFdTombstones !== void 0 && standaloneFdTombstones.length > 0) {
+                const groupPrefix = `${rootedFd(pid)}:`;
+                for (const tomb of standaloneFdTombstones) {
+                  if (tomb.kind === "close") {
+                    dirfdTable.delete(`${groupPrefix}${tomb.fd}`);
+                    fdUnknownAdd(pid);
+                    fdUnknownAdd(childPid);
+                  } else if (tomb.kind === "cloexec") {
+                    const key = `${groupPrefix}${tomb.fd}`;
+                    const cur = dirfdTable.get(key);
+                    if (cur !== void 0) {
+                      dirfdTable.set(key, { path: cur.path, cloexec: true });
+                    }
+                  } else {
+                    let touched = false;
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(groupPrefix)) continue;
+                      const fdStr = k.slice(groupPrefix.length);
+                      const fdNum = parseInt(fdStr, 10);
+                      if (Number.isFinite(fdNum) && fdNum >= tomb.first && fdNum <= tomb.last) {
+                        if (tomb.cloexec) {
+                          const cur = dirfdTable.get(k);
+                          if (cur !== void 0) {
+                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                          }
+                        } else {
+                          dirfdTable.delete(k);
+                        }
+                        touched = true;
+                      }
+                    }
+                    if (touched && !tomb.cloexec) {
+                      fdUnknownAdd(pid);
+                      fdUnknownAdd(childPid);
+                    }
+                  }
+                }
+              }
             } else {
               const parentRoot = rootedFd(pid);
               const childRoot = rootedFd(childPid);
@@ -26478,14 +26516,62 @@ async function runInstallPhase(input) {
                       );
                     }
                   }
-                  for (const action of childFdSnap.actions) {
-                    if (action.kind === "closeRange") {
+                  for (const entry of childFdSnap.postDetachLog) {
+                    if (entry.kind === "action") {
+                      const action = entry.action;
+                      if (action.kind === "closeRange") {
+                        for (const k of [...dirfdTable.keys()]) {
+                          if (!k.startsWith(childGroupPrefix)) continue;
+                          const fdStr = k.slice(childGroupPrefix.length);
+                          const fdNum = parseInt(fdStr, 10);
+                          if (Number.isFinite(fdNum) && fdNum >= action.first && fdNum <= action.last) {
+                            if (action.cloexec) {
+                              const cur = dirfdTable.get(k);
+                              if (cur !== void 0) {
+                                dirfdTable.set(k, { path: cur.path, cloexec: true });
+                              }
+                            } else {
+                              dirfdTable.delete(k);
+                            }
+                          }
+                        }
+                      } else if (action.kind === "execveCloexec") {
+                        for (const k of [...dirfdTable.keys()]) {
+                          if (!k.startsWith(childGroupPrefix)) continue;
+                          const ent = dirfdTable.get(k);
+                          if (ent !== void 0 && ent.cloexec) {
+                            dirfdTable.delete(k);
+                          }
+                        }
+                      }
+                    } else {
+                      const tomb = entry.tombstone;
+                      if (tomb.kind === "close" || tomb.kind === "cloexec") {
+                        applyPointTombstone(tomb.fd, tomb.kind, false);
+                      } else {
+                        applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
+                      }
+                    }
+                  }
+                }
+                if (standaloneFdTombstones !== void 0 && standaloneFdTombstones.length > 0) {
+                  const childGroupPrefix = `${rootedFd(childPid)}:`;
+                  for (const tomb of standaloneFdTombstones) {
+                    if (tomb.kind === "close") {
+                      dirfdTable.delete(`${childGroupPrefix}${tomb.fd}`);
+                    } else if (tomb.kind === "cloexec") {
+                      const key = `${childGroupPrefix}${tomb.fd}`;
+                      const cur = dirfdTable.get(key);
+                      if (cur !== void 0) {
+                        dirfdTable.set(key, { path: cur.path, cloexec: true });
+                      }
+                    } else {
                       for (const k of [...dirfdTable.keys()]) {
                         if (!k.startsWith(childGroupPrefix)) continue;
                         const fdStr = k.slice(childGroupPrefix.length);
                         const fdNum = parseInt(fdStr, 10);
-                        if (Number.isFinite(fdNum) && fdNum >= action.first && fdNum <= action.last) {
-                          if (action.cloexec) {
+                        if (Number.isFinite(fdNum) && fdNum >= tomb.first && fdNum <= tomb.last) {
+                          if (tomb.cloexec) {
                             const cur = dirfdTable.get(k);
                             if (cur !== void 0) {
                               dirfdTable.set(k, { path: cur.path, cloexec: true });
@@ -26495,21 +26581,6 @@ async function runInstallPhase(input) {
                           }
                         }
                       }
-                    } else if (action.kind === "execveCloexec") {
-                      for (const k of [...dirfdTable.keys()]) {
-                        if (!k.startsWith(childGroupPrefix)) continue;
-                        const entry = dirfdTable.get(k);
-                        if (entry !== void 0 && entry.cloexec) {
-                          dirfdTable.delete(k);
-                        }
-                      }
-                    }
-                  }
-                  for (const tomb of childFdSnap.postDetachTombstones) {
-                    if (tomb.kind === "close" || tomb.kind === "cloexec") {
-                      applyPointTombstone(tomb.fd, tomb.kind, false);
-                    } else {
-                      applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
                     }
                   }
                 }
