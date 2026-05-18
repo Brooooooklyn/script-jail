@@ -26,25 +26,27 @@ describe('openat', () => {
   it('O_RDONLY → read event', () => {
     const line = 'openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 42, 0);
-    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 42, ts: 0, hidden: false }]);
+    // retFd carries the openat return value (3) for the phase-install
+    // fd-table; see Finding 2 in strace-parser.ts.
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 42, ts: 0, hidden: false, retFd: 3 }]);
   });
 
   it('O_WRONLY → write event', () => {
     const line = 'openat(AT_FDCWD, "/tmp/out.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 5';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'write', path: '/tmp/out.txt', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/out.txt', pid: 1, ts: 0, hidden: false, retFd: 5 }]);
   });
 
   it('O_CREAT|O_WRONLY|O_TRUNC → write event', () => {
     const line = 'openat(AT_FDCWD, "/tmp/build.log", O_CREAT|O_WRONLY|O_TRUNC, 0666) = 7';
     const evs = parseStraceLine(line, 1, 1);
-    expect(evs).toEqual([{ kind: 'write', path: '/tmp/build.log', pid: 1, ts: 1, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/build.log', pid: 1, ts: 1, hidden: false, retFd: 7 }]);
   });
 
   it('O_RDWR|O_APPEND → write event (write wins)', () => {
     const line = 'openat(AT_FDCWD, "/var/log/app.log", O_RDWR|O_APPEND) = 4';
     const evs = parseStraceLine(line, 1, 2);
-    expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false, retFd: 4 }]);
   });
 
   it('ENOENT on O_RDONLY → read event stamped with errno (policy filter decides downstream)', () => {
@@ -82,18 +84,59 @@ describe('openat', () => {
     // A file named "a)b" must not confuse the outer-paren depth counter.
     const line = 'openat(AT_FDCWD, "/work/pkg/a)b", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a)b', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a)b', pid: 1, ts: 0, hidden: false, retFd: 3 }]);
   });
 
   it('path containing literal ( is parsed correctly (quote-aware paren scan)', () => {
     // A file named "a(b" must not push the depth counter to 2.
     const line = 'openat(AT_FDCWD, "/work/pkg/a(b", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a(b', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a(b', pid: 1, ts: 0, hidden: false, retFd: 3 }]);
   });
 
-  it('numeric dir-fd → null (v1 limitation)', () => {
+  // Audit-trust Finding 2 (high, 2026-05-18): numeric dir-fd opens MUST be
+  // emitted so phase-install can resolve the relative path against its
+  // per-pid fd table.  Previously these were dropped, creating an
+  // events-file forgery bypass (open the dir, then openat(<dirfd>,
+  // "events.jsonl", O_WRONLY|O_APPEND) was invisible to the pipeline).
+  it('numeric dir-fd (read) → read event with dirfd + retFd carried for downstream resolve', () => {
     const line = 'openat(5, "relative.txt", O_RDONLY) = 6';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'relative.txt', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 6,
+    }]);
+  });
+
+  it('numeric dir-fd (write) → write event with dirfd + retFd', () => {
+    const line = 'openat(5, "events.jsonl", O_WRONLY|O_APPEND) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write', path: 'events.jsonl', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 7,
+    }]);
+  });
+
+  it('AT_FDCWD on success → retFd present, dirfd absent', () => {
+    const line = 'openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: '/etc/hostname', pid: 1, ts: 0, hidden: false,
+      retFd: 3,
+    }]);
+  });
+
+  it('numeric dir-fd ENOENT → emits read with errno + dirfd (no retFd on failure)', () => {
+    const line = 'openat(5, "missing.txt", O_RDONLY) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'missing.txt', pid: 1, ts: 0, hidden: false,
+      errno: 'ENOENT', dirfd: 5,
+    }]);
+  });
+
+  it('garbage dirfd token (not AT_FDCWD, not numeric) → null', () => {
+    const line = 'openat(GARBAGE, "foo", O_RDONLY) = 3';
     expect(parseStraceLine(line, 1, 0)).toBeNull();
   });
 });
@@ -530,7 +573,7 @@ describe('real captured strace output', () => {
   it('[real] openat /etc/hostname O_RDONLY → read event', () => {
     const line = 'openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 12345, 1);
-    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 12345, ts: 1, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 12345, ts: 1, hidden: false, retFd: 3 }]);
   });
 
   // Real: statx of a file that doesn't exist

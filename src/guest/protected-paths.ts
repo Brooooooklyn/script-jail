@@ -58,47 +58,58 @@ export class ProtectedPathsMatcher {
 /**
  * Apply the protected-paths policy to an AttributedEvent before emission.
  *
- *   - Non-fs events, or fs events without `errno` (successful syscalls):
- *     returned unchanged.
+ *   - Non-fs events: returned unchanged.
+ *   - fs events without `errno` (successful syscalls): transport-only
+ *     fields (`dirfd`, `retFd`) are stripped and the event is returned.
  *   - fs events with `errno` whose path is PROTECTED: re-emitted with
- *     `hidden: true` and `errno` stripped. The hidden flag is what
- *     lock/normalize.ts turns into `<HIDDEN> $HOME/...`.
+ *     `hidden: true` and transport-only fields stripped. The hidden flag is
+ *     what lock/normalize.ts turns into `<HIDDEN> $HOME/...`.
  *   - fs events with `errno === 'ENOENT'` whose path is NOT protected:
  *     dropped (`null`). This preserves the original noise filter -- nearly
  *     every install does thousands of ENOENT probes against $PATH lookups,
  *     library search paths, etc.
  *   - fs events with `errno === 'EACCES'` whose path is NOT protected:
- *     emitted with `errno` stripped (the attempt is still useful audit signal).
+ *     emitted with transport-only fields stripped (the attempt is still
+ *     useful audit signal).
  *
- * `errno` is always stripped before the event leaves this function; it must
- * never reach lock/normalize.ts (which doesn't reference it) or lock/render.ts
- * (which would write it into the YAML output).
+ * Transport-only fields (`errno`, `dirfd`, `retFd`) are always stripped
+ * before the event leaves this function; they must never reach
+ * lock/normalize.ts (which doesn't reference them) or lock/render.ts
+ * (which would write them into the YAML output).  See Finding 2 in
+ * src/lock/schema.ts for the `dirfd`/`retFd` contract.
  */
 export function applyProtectedPathsPolicy(
   ev: AttributedEvent,
   matcher: ProtectedPathsMatcher,
 ): AttributedEvent | null {
   if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') return ev;
-  if (ev.raw.errno === undefined) return ev;
+  if (ev.raw.errno === undefined) {
+    // Successful syscall — no errno-based filtering, but we still must
+    // strip the transport-only fd-table fields so they don't leak into
+    // the rendered lockfile.  Cheap: most fs events have neither.
+    if (ev.raw.dirfd === undefined && ev.raw.retFd === undefined) return ev;
+    return { ...ev, raw: stripTransport(ev.raw) };
+  }
 
   const isProtected = matcher.isProtected(ev.raw.path);
   if (isProtected) {
-    return { ...ev, raw: stripErrno({ ...ev.raw, hidden: true }) };
+    return { ...ev, raw: stripTransport({ ...ev.raw, hidden: true }) };
   }
 
   if (ev.raw.errno === 'ENOENT') return null;
-  return { ...ev, raw: stripErrno(ev.raw) };
+  return { ...ev, raw: stripTransport(ev.raw) };
 }
 
 /**
- * Return a clone of the fs event without the `errno` property. We rely on
- * destructuring rather than `errno: undefined` because exactOptionalPropertyTypes
- * treats the latter as "errno is explicitly undefined" rather than absent --
- * and downstream code reads `errno === undefined` as "no failure to report".
- * Stripping cleanly avoids the distinction leaking out.
+ * Return a clone of the fs event without the transport-only properties
+ * (`errno`, `dirfd`, `retFd`).  We rely on destructuring rather than
+ * `field: undefined` because exactOptionalPropertyTypes treats the latter
+ * as "explicitly undefined" rather than absent -- and downstream code
+ * reads `field === undefined` as "no value to report".  Stripping cleanly
+ * avoids the distinction leaking out.
  */
-function stripErrno<T extends FsReadEvent | FsWriteEvent>(ev: T): T {
-  const { errno: _errno, ...rest } = ev;
+function stripTransport<T extends FsReadEvent | FsWriteEvent>(ev: T): T {
+  const { errno: _errno, dirfd: _dirfd, retFd: _retFd, ...rest } = ev;
   return rest as T;
 }
 

@@ -19,6 +19,24 @@ export type LifecycleStage = z.infer<typeof LifecycleStage>;
 // With exactOptionalPropertyTypes enabled, we OMIT the field entirely when the
 // syscall succeeds (rather than setting it to `undefined`). Downstream code
 // reads `errno === undefined` to mean "no failure to report."
+//
+// Audit-trust Finding 2 (high, 2026-05-18): `dirfd` and `retFd` are
+// transport-only fields used by the events-file forgery detector in
+// `phase-install.ts` to canonicalize paths before the equality check.
+//
+//   - `dirfd` is set on openat events where the dirfd argument was NOT
+//     AT_FDCWD (i.e. a numeric file descriptor pointing at a directory
+//     opened earlier).  The phase-install dispatcher uses its per-pid
+//     fd-table (built from prior `retFd` observations) to resolve the
+//     relative path against the dirfd's directory.
+//
+//   - `retFd` is the return value of a successful openat (the new fd).
+//     phase-install records `<pid, retFd>` → canonical path so subsequent
+//     openat-with-dirfd events on the same pid can be resolved.
+//
+// Both fields are STRIPPED before the event leaves `runInstallPhase`
+// (alongside `errno`).  They never appear in the rendered lockfile or
+// vsock JSONL stream — they exist solely for path canonicalization.
 export const FsReadEvent = z.object({
   kind: z.literal('read'),
   path: z.string(),
@@ -26,6 +44,8 @@ export const FsReadEvent = z.object({
   ts: z.number(),
   hidden: z.boolean(),
   errno: z.enum(['ENOENT', 'EACCES']).optional(),
+  dirfd: z.number().optional(),
+  retFd: z.number().optional(),
 });
 export type FsReadEvent = z.infer<typeof FsReadEvent>;
 
@@ -36,6 +56,8 @@ export const FsWriteEvent = z.object({
   ts: z.number(),
   hidden: z.boolean(),
   errno: z.enum(['ENOENT', 'EACCES']).optional(),
+  dirfd: z.number().optional(),
+  retFd: z.number().optional(),
 });
 export type FsWriteEvent = z.infer<typeof FsWriteEvent>;
 

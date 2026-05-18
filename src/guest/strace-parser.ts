@@ -5,9 +5,13 @@
 // module directly, but it can be unit-tested in vitest on the host.
 //
 // LIMITATIONS (v1):
-//   - Only handles `openat(AT_FDCWD, ...)` -- openat with a numeric dir-fd is
-//     dropped with null (the relative-path base is unknowable without fd table
-//     tracking).
+//   - openat with a numeric dir-fd is emitted with the literal relative
+//     `path` and the `dirfd`/`retFd` transport-only fields filled in;
+//     phase-install resolves the relative path against its per-pid fd
+//     table before the events-file forgery check.  Other consumers
+//     (protected-paths, normalize, render) ignore the unresolved
+//     relative path — they care about absolute syscall paths and have
+//     no business inspecting fd-relative names.
 //   - Unfinished/resumed pairs (<unfinished ...> / <... foo resumed>) are both
 //     dropped; we lose those syscall outcomes entirely in v1.
 //   - We expect `strace -ff` WITHOUT `-t`/`-tt`. Timestamp prefixes are
@@ -356,10 +360,35 @@ function _parseStraceLine(line: string, pid: number, ts: number): RawEvent[] | n
 // -- per-syscall parsers -------------------------------------------------------
 
 function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
-  // openat(AT_FDCWD, "path", flags[, mode]) = fd
-  // v1 limitation: only AT_FDCWD is handled; numeric dir-fds are dropped.
+  // openat(dirfd, "path", flags[, mode]) = fd
+  //
+  // Audit-trust Finding 2 (high, 2026-05-18): historically we dropped any
+  // openat whose dirfd was a numeric fd (rather than AT_FDCWD), which
+  // created an audit-bypass channel: a process could
+  // `openat(AT_FDCWD, "/tmp/.../dir", O_DIRECTORY) = <fd>` and then
+  // `openat(<fd>, "events.jsonl", O_WRONLY|O_APPEND) = <fd2>` — the
+  // second call was invisible to our pipeline, so it could not be
+  // caught by the events-file forgery detector.
+  //
+  // We now emit events for both cases.  The `dirfd` transport-only field
+  // is attached when the dirfd is a numeric fd; phase-install carries a
+  // per-pid <fd → canonical dir path> table built from `retFd` and
+  // resolves the relative path before doing the equality check against
+  // SCRIPT_JAIL_LOG_FILE.  `retFd` is the openat return value on
+  // success; it's how phase-install grows its fd table for the next
+  // openat-with-numeric-dirfd on the same pid.
   const dirfdToken = args[0] ?? '';
-  if (dirfdToken !== 'AT_FDCWD') return null;
+  let dirfd: number | undefined;
+  if (dirfdToken !== 'AT_FDCWD') {
+    // Parse the numeric dirfd.  strace renders dir-fds as bare integers
+    // ("5"), occasionally with a "</path>" comment for -y mode.  We
+    // only accept a leading integer here; the rest of the token is
+    // ignored.
+    const m = dirfdToken.match(/^(-?\d+)/);
+    if (m === null) return null; // not AT_FDCWD and not parseable as an int — drop
+    dirfd = parseInt(m[1] ?? '', 10);
+    if (!Number.isFinite(dirfd)) return null;
+  }
 
   const pathToken = args[1] ?? '';
   const r = extractQuotedString(pathToken, 0);
@@ -385,14 +414,33 @@ function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): R
     else return null; // other errors: drop
   }
 
-  if (isWrite) {
-    return [errno === undefined
-      ? { kind: 'write', path, pid, ts, hidden: false }
-      : { kind: 'write', path, pid, ts, hidden: false, errno }];
+  // Audit-trust Finding 2: `retFd` on success carries the kernel-assigned
+  // fd so phase-install can grow its <pid, fd> → directory map.  The
+  // openat return value is a small positive integer for success.  We
+  // tolerate hex form ("0x5") even though strace renders these as
+  // decimal in practice.
+  let retFd: number | undefined;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith('0x')
+      ? parseInt(retVal.raw, 16)
+      : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
   }
-  return [errno === undefined
-    ? { kind: 'read', path, pid, ts, hidden: false }
-    : { kind: 'read', path, pid, ts, hidden: false, errno }];
+
+  const base = { path, pid, ts, hidden: false } as const;
+  // Build the event with optional fields included only when present, so
+  // exactOptionalPropertyTypes doesn't treat `field: undefined` as
+  // "explicitly undefined" (downstream code reads `field === undefined`
+  // to mean absent — same convention as `errno`).
+  const optional: { errno?: 'ENOENT' | 'EACCES'; dirfd?: number; retFd?: number } = {};
+  if (errno !== undefined) optional.errno = errno;
+  if (dirfd !== undefined) optional.dirfd = dirfd;
+  if (retFd !== undefined) optional.retFd = retFd;
+
+  if (isWrite) {
+    return [{ kind: 'write', ...base, ...optional }];
+  }
+  return [{ kind: 'read', ...base, ...optional }];
 }
 
 function parseExecve(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {

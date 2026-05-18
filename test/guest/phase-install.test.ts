@@ -2036,6 +2036,198 @@ describe('runInstallPhase', () => {
       expect(syscallBypasses).toHaveLength(1);
     });
 
+    // Audit-trust Finding 2 (high, 2026-05-18): path-alias forgery —
+    // a `..`/`.` or extra-slash spelling of the events file path that
+    // path.resolve collapses to the canonical form.  Exact-string
+    // comparison would miss these; canonicalization catches them.
+    it('path-alias forgery (dot-dot, dot, extra slash) is caught via canonicalization', async () => {
+      const proc = mockProcReader({
+        511: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'alias-forge-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      // Same canonical path as EVENTS_FILE, but spelled differently.
+      // path.resolve('/tmp/foo/../script-jail-events/./events.jsonl')
+      // collapses to '/tmp/script-jail-events/events.jsonl'.
+      const ALIASED = '/tmp/foo/../script-jail-events/./events.jsonl';
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 511,
+          line: `openat(AT_FDCWD, "${ALIASED}", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+      });
+      expect(synths).toHaveLength(1);
+      const raw = synths[0]!['raw'] as Record<string, unknown>;
+      // The forensic prog is the canonical resolved path, not the aliased form.
+      expect(raw['prog']).toBe(EVENTS_FILE);
+    });
+
+    // Audit-trust Finding 2: dirfd-relative open of the events file —
+    // open the parent directory, then openat(<dirfd>, "events.jsonl",
+    // O_WRONLY|O_APPEND).  The dirfd→path table built from the prior
+    // openat must resolve the relative path to the canonical events
+    // file path.
+    it('dirfd-relative forgery via openat(<dirfd>, "events.jsonl") is caught', async () => {
+      const proc = mockProcReader({
+        512: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'dirfd-forge-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      // EVENTS_FILE is '/tmp/script-jail-events/events.jsonl'; the parent
+      // dir is '/tmp/script-jail-events'.  Pid 512 opens that dir → fd 9,
+      // then `openat(9, "events.jsonl", O_WRONLY|O_APPEND) = 10`.
+      const EVENTS_DIR = '/tmp/script-jail-events';
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 512,
+          line: `openat(AT_FDCWD, "${EVENTS_DIR}", O_RDONLY|O_DIRECTORY) = 9`,
+          source: 'strace',
+        },
+        {
+          pid: 512,
+          line: 'openat(9, "events.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 10',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+      });
+      expect(synths).toHaveLength(1);
+      const raw = synths[0]!['raw'] as Record<string, unknown>;
+      // The forensic prog carries the canonical absolute events file path.
+      expect(raw['prog']).toBe(EVENTS_FILE);
+    });
+
+    // Audit-trust Finding 2: dirfd-relative open of an UNRELATED file
+    // (not the events file) must NOT be flagged as forgery.
+    it('dirfd-relative open of unrelated file → 0 forgery entries', async () => {
+      const proc = mockProcReader({
+        513: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'innocent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 513,
+          line: 'openat(AT_FDCWD, "/work", O_RDONLY|O_DIRECTORY) = 9',
+          source: 'strace',
+        },
+        {
+          pid: 513,
+          line: 'openat(9, "build.log", O_WRONLY|O_APPEND|O_CREAT, 0644) = 10',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+      });
+      expect(synths).toHaveLength(0);
+    });
+
+    // Audit-trust Finding 2: dirfd whose source we never observed
+    // (e.g. inherited across exec, or strace -ff dropped a line) →
+    // we DON'T flag forgery (would produce false positives on clean
+    // installs).  The conservative drop is intentional; defense in
+    // depth comes from the shim/strace exec count cross-check.
+    it('dirfd whose openat source is missing → no forgery (conservative)', async () => {
+      const proc = mockProcReader({
+        514: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'orphan-dirfd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // No prior openat for fd 9 on this pid.  The agent has no way
+        // to know what fd 9 points at, so it cannot make the equality
+        // comparison and we deliberately do NOT synthesise forgery.
+        {
+          pid: 514,
+          line: 'openat(9, "events.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 10',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+      });
+      expect(synths).toHaveLength(0);
+    });
+
     it('events_file_forgery renders to <EVENTS_FILE_FORGERY> in audit_bypass via normalize', async () => {
       const ev: AttributedEvent = {
         raw: {

@@ -18,6 +18,9 @@
 // records while the process runs and resolves its async iterable with the
 // exit code via the final sentinel record.
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
 import type { Emitter } from './emit.js';
 import type { Attribution } from './attribution.js';
 import { parseStraceLine } from './strace-parser.js';
@@ -369,6 +372,89 @@ export async function runInstallPhase(
     typeof eventsFilePathRaw === 'string' && eventsFilePathRaw.length > 0
       ? eventsFilePathRaw
       : null;
+
+  // Audit-trust Finding 2 (high, 2026-05-18): canonicalize the events-file
+  // path ONCE at agent startup so an attacker can't defeat the equality
+  // check with a path alias (`/tmp/..././script-jail-events-XXX/events.jsonl`
+  // has the same realpath as the canonical form but does not string-equal it).
+  //
+  // We prefer `fs.realpathSync` because it resolves symlinks AND collapses
+  // `.`/`..` segments — but realpath requires the file to exist.  At the
+  // time `runInstallPhase` starts the file may already exist (the shim
+  // opens it eagerly via shim_init in the agent), but to be safe we fall
+  // back to `path.resolve` if realpath throws.  Subsequent realpath calls
+  // on attacker-supplied paths are NOT performed — we resolve those with
+  // `path.resolve` only.  Otherwise a malicious symlink (e.g.
+  // `/tmp/innocent -> /tmp/.../events.jsonl` created by the attacker)
+  // would canonicalize TO the events file and we'd flag the wrong
+  // syscall.  The trust direction is: anchor on the realpath of our own
+  // configured path; canonicalize attacker-supplied paths via
+  // `path.resolve` only (which collapses redundant separators and `..`
+  // but does NOT follow symlinks).
+  const eventsFilePathCanonical: string | null = (() => {
+    if (eventsFilePath === null) return null;
+    try {
+      return fs.realpathSync(eventsFilePath);
+    } catch {
+      // File doesn't exist yet (or stat permission error) — fall back to
+      // a lexical canonicalization that still collapses `.`/`..` segments
+      // so a process can't escape via `/tmp/..././events-dir/file.jsonl`.
+      return path.resolve(eventsFilePath);
+    }
+  })();
+
+  // Per-pid fd table: maps a kernel-assigned file descriptor (from a
+  // successful openat) to the canonical absolute path of the directory
+  // (or file) it points at.  Used to resolve subsequent
+  // `openat(<dirfd>, "relative", ...)` events.  We resolve at INSERT
+  // time using `path.resolve` on the openat's path argument — strace
+  // gives us the literal path from userspace, which is what we need to
+  // anchor the relative resolve to.  We don't bother with realpath on
+  // attacker-supplied dirfd paths (see note above).
+  //
+  // Memory bound: pids that exit aren't pruned explicitly; the install
+  // is a single-pass loop and the table is GC'd when the function
+  // returns.  In practice the table is small (~hundreds of fds per pid
+  // at most for a real install).
+  const dirfdTable = new Map<string, string>();
+  const fdKey = (pid: number, fd: number): string => `${pid}:${fd}`;
+
+  /**
+   * Canonicalize the target path of an openat write event for comparison
+   * against `eventsFilePathCanonical`.  Returns the canonical absolute
+   * path, or `null` if the path cannot be resolved (numeric dirfd whose
+   * target wasn't observed earlier — drop the comparison to avoid false
+   * positives).
+   *
+   * Canonicalization is LEXICAL only on the attacker-supplied portion:
+   * `path.resolve` collapses `.`/`..` and redundant separators but does
+   * NOT follow symlinks.  Symlink-following is intentionally avoided —
+   * see comments above on the trust direction.
+   */
+  const canonicalizeOpenTarget = (
+    pid: number,
+    targetPath: string,
+    dirfd: number | undefined,
+  ): string | null => {
+    if (dirfd === undefined) {
+      // AT_FDCWD opens — resolve against the CWD of the install process.
+      // We don't have a strict "CWD" anchor per pid (it can chdir at any
+      // time), but the openat path is usually absolute, and `path.resolve`
+      // on an already-absolute path is a no-op aside from `.`/`..`
+      // collapse.  For relative paths it resolves against process.cwd(),
+      // which IS the agent's cwd, not the lifecycle script's — so a
+      // relative-path attempt to write the events file from a child cwd
+      // would resolve to a different absolute path and not match.  That's
+      // an accepted limitation: the canonical events file path is always
+      // absolute (set via env var), so the relative-path attack vector
+      // is exotic.
+      return path.resolve(targetPath);
+    }
+    const dirPath = dirfdTable.get(fdKey(pid, dirfd));
+    if (dirPath === undefined) return null;
+    return path.resolve(dirPath, targetPath);
+  };
+
   const shimLoadedPids = new Set<number>();
   interface ForgerySample {
     pid: number;
@@ -583,23 +669,71 @@ export async function runInstallPhase(
         //       The sample carries the attribution snapshot so the
         //       entry surfaces under the right package even when the
         //       attacker has scrubbed the environ.
+        // Audit-trust Finding 2 (high, 2026-05-18): grow the per-pid
+        // <fd → canonical path> table from any successful openat (read
+        // or write, AT_FDCWD or numeric dirfd).  Subsequent
+        // openat-with-numeric-dirfd events on the same pid resolve
+        // their relative path against this table.  We resolve the
+        // OPENED path lexically (path.resolve) — see comment on the
+        // `canonicalizeOpenTarget` helper for why we don't realpath
+        // attacker-supplied dirfd paths.
+        if (
+          (rawEvent.kind === 'read' || rawEvent.kind === 'write') &&
+          rawEvent.errno === undefined &&
+          rawEvent.retFd !== undefined
+        ) {
+          const canonicalForFd = canonicalizeOpenTarget(
+            rawEvent.pid,
+            rawEvent.path,
+            rawEvent.dirfd,
+          );
+          if (canonicalForFd !== null) {
+            dirfdTable.set(fdKey(rawEvent.pid, rawEvent.retFd), canonicalForFd);
+          }
+        }
+
         if (rawEvent.kind === 'read' && rawEvent.path === SHIM_LIBRARY_PATH) {
           shimLoadedPids.add(rawEvent.pid);
         }
         if (
-          eventsFilePath !== null &&
+          eventsFilePathCanonical !== null &&
           rawEvent.kind === 'write' &&
-          rawEvent.path === eventsFilePath &&
           !shimLoadedPids.has(rawEvent.pid)
         ) {
-          const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
-          forgerySamples.push({
-            pid: rawEvent.pid,
-            ts: rawEvent.ts,
-            path: rawEvent.path,
-            pkg: result?.pkg ?? snapshot?.pkg ?? '<unattributed>',
-            lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? 'install',
-          });
+          // Canonicalize the openat target BEFORE comparing.  This catches:
+          //   (a) Path-alias attacks like `/tmp/..././events-dir/events.jsonl`
+          //       (path.resolve collapses `..././` to a no-op so the result
+          //       string-matches the canonical events file path).
+          //   (b) dirfd opens — the canonicalizer joins the dirfd's
+          //       directory (from the per-pid fd table) with the
+          //       relative path before resolving, so
+          //       `openat(<dirfd-of-events-dir>, "events.jsonl", O_WRONLY)`
+          //       resolves to the same string as the configured events
+          //       file path.
+          // If canonicalization fails (numeric dirfd whose source we
+          // never observed — could happen if strace -ff missed an
+          // earlier line under load), we DON'T flag forgery: a false
+          // positive here hard-fails clean installs, and the agent's
+          // other invariants (shim event vs strace exec count) still
+          // catch the canonical attack patterns.
+          const canonicalTarget = canonicalizeOpenTarget(
+            rawEvent.pid,
+            rawEvent.path,
+            rawEvent.dirfd,
+          );
+          if (canonicalTarget === eventsFilePathCanonical) {
+            const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+            forgerySamples.push({
+              pid: rawEvent.pid,
+              ts: rawEvent.ts,
+              // Carry the canonical path in the forensic sample so the
+              // synthesised audit_bypass entry shows the resolved
+              // target, not a relative basename or aliased form.
+              path: canonicalTarget,
+              pkg: result?.pkg ?? snapshot?.pkg ?? '<unattributed>',
+              lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? 'install',
+            });
+          }
         }
 
         // Audit-trust Finding 3 (high, 2026-05-18): bypass counting

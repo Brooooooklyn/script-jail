@@ -41771,7 +41771,9 @@ var FsReadEvent = external_exports.object({
   pid: external_exports.number(),
   ts: external_exports.number(),
   hidden: external_exports.boolean(),
-  errno: external_exports.enum(["ENOENT", "EACCES"]).optional()
+  errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
+  dirfd: external_exports.number().optional(),
+  retFd: external_exports.number().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -41779,7 +41781,9 @@ var FsWriteEvent = external_exports.object({
   pid: external_exports.number(),
   ts: external_exports.number(),
   hidden: external_exports.boolean(),
-  errno: external_exports.enum(["ENOENT", "EACCES"]).optional()
+  errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
+  dirfd: external_exports.number().optional(),
+  retFd: external_exports.number().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
