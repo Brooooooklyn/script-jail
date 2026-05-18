@@ -7748,4 +7748,263 @@ describe('runInstallPhase', () => {
       expect(bleedCwd).toHaveLength(0);
     });
   });
+
+  // Codex follow-up (high, 2026-05-19): out-of-order unshare BEFORE
+  // clone reconciliation.  strace `-ff` writes per-pid files separately
+  // and the production tailer drains them in arbitrary order, so a
+  // child's `unshare(CLONE_NEWUSER|CLONE_FILES|...)` line CAN reach the
+  // dispatcher BEFORE the parent's `clone(... CLONE_FS|CLONE_FILES ...)
+  // = <child>` line that pairs them.
+  //
+  // Pre-fix wire-order:
+  //   1. Child unshare line arrives.  Child is still a singleton group
+  //      (its own pid) so the immediate detach is a no-op.
+  //   2. Parent clone line arrives.  Reconciliation unions parent and
+  //      child into the SAME cwd/fd group — re-merging the kernel-
+  //      detached child back into the parent's state.
+  //
+  // Post-fix: the unshare handler records a pending-detach marker on
+  // the pid; clone reconciliation honors the marker by SKIPPING the
+  // union (cwd or fd, depending on which marker is present).  Child
+  // stays in its own private group, matching kernel semantics.
+  describe('pending unshare-detach honored by delayed clone reconciliation', () => {
+    const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
+
+    // Test 1: child unshare(CLONE_NEWUSER) is observed BEFORE the
+    // parent's clone(CLONE_FS) line.  Post-fix the parent's clone
+    // reconciliation MUST skip `unionCwd` because the kernel has
+    // already detached the child's fs_struct.  Subsequent AT_FDCWD-
+    // relative openat from the child has no tracked cwd → fails closed
+    // (<UNRESOLVED_PATH>).
+    it('child unshare(CLONE_NEWUSER) before parent clone(CLONE_FS) → union skipped, child opens fail closed', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pending-cwd-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'pending-cwd-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Out-of-order: child's unshare(CLONE_NEWUSER) reaches the
+        // dispatcher FIRST.  CLONE_NEWUSER kernel-implies CLONE_FS
+        // detach.  Child is still a singleton group at this point so
+        // the immediate detach is a no-op — the pending marker is the
+        // only state that matters here.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_NEWUSER) = 0',
+          source: 'strace',
+        },
+        // Parent's clone(CLONE_FS) line arrives LATER.  Pre-fix this
+        // would `unionCwd(parent, child)` and re-merge the kernel-
+        // detached child back into the parent's cwd group.  Post-fix
+        // the pending marker on pid 1001 causes the union to be
+        // skipped — child stays its own root.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent chdirs to /A.  If the union HAD happened, this would
+        // also bind the child's cwd to /A (shared group).  Post-fix
+        // the groups are separate; child has no tracked cwd.
+        {
+          pid: 1000,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        // Child AT_FDCWD-relative openat.  The child's cwd group is
+        // its own singleton with no chdir ever observed for it (and
+        // no `input.cwd` seed because rootPid is the parent), so the
+        // resolution fails closed and surfaces <UNRESOLVED_PATH>.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The child's openat MUST NOT have been certified to /A/x — that
+      // would be the pre-fix bug: union re-merged the detached child
+      // back into the parent's /A-rooted cwd group.
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(leaked).toHaveLength(0);
+      // <UNRESOLVED_PATH> audit_bypass surfaced for the child.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Test 2: child unshare(CLONE_FILES) is observed BEFORE the parent's
+    // clone(CLONE_FILES) line.  Post-fix the fd-group union is skipped.
+    // The parent's later-opened fd 7 must NOT be visible to the child.
+    it('child unshare(CLONE_FILES) before parent clone(CLONE_FILES) → fd union skipped, child openat(fd) fails closed', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pending-fd-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'pending-fd-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Out-of-order: child's unshare(CLONE_FILES) reaches the
+        // dispatcher FIRST.  No-op detach at this moment (child is
+        // its own singleton), but the pending marker is recorded.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Parent's clone(CLONE_FILES) arrives LATER.  Pre-fix this
+        // would `unionFd(parent, child)` and re-merge the kernel-
+        // detached child back into the parent's fd group.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent opens /A → fd 7 in its (post-skip) private fd group.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child openat(7, ...).  Pre-fix the union would have made
+        // fd 7 visible to the child via the shared root, certifying
+        // the read to /A/file.  Post-fix fd 7 is NOT in the child's
+        // group → dirfdTable miss → fail closed.
+        {
+          pid: 1001,
+          line: 'openat(7, "file", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Pre-fix the child would have certified a read to /A/file.
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 1001;
+      });
+      expect(leaked).toHaveLength(0);
+      // <UNRESOLVED_PATH> audit_bypass surfaced for the child.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Test 3: regression — normal clone(CLONE_FS) WITHOUT a pending
+    // marker still unions correctly.  The pending-detach guard must
+    // not break the happy path.
+    it('normal clone(CLONE_FS) without pending marker still unions cwd group', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'no-pending-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'no-pending-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent clones with CLONE_FS — no prior unshare on either side.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent chdirs to /A — shared cwd group, so child's AT_FDCWD
+        // resolves through /A too.
+        {
+          pid: 1000,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        // Child AT_FDCWD-relative openat — MUST resolve to /A/x via
+        // the union'd cwd group.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child's openat must resolve to /A/x (union happened).
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // No <UNRESOLVED_PATH> for the child — union succeeded.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+  });
 });

@@ -25907,6 +25907,8 @@ async function runInstallPhase(input) {
   const eventsFileBasename = eventsFilePathCanonical !== null ? path.basename(eventsFilePathCanonical) : null;
   const cwdParent = /* @__PURE__ */ new Map();
   const fdParent = /* @__PURE__ */ new Map();
+  const pendingCwdDetach = /* @__PURE__ */ new Set();
+  const pendingFdDetach = /* @__PURE__ */ new Set();
   function findCwdRoot(pid) {
     let cur = pid;
     while (true) {
@@ -26239,7 +26241,11 @@ async function runInstallPhase(input) {
               }
             }
             if (cloneFs) {
-              unionCwd(pid, childPid);
+              if (pendingCwdDetach.has(childPid)) {
+                pendingCwdDetach.delete(childPid);
+              } else {
+                unionCwd(pid, childPid);
+              }
             } else {
               const parentCwd = cwdGet(pid);
               if (parentCwd !== void 0) {
@@ -26250,7 +26256,11 @@ async function runInstallPhase(input) {
               }
             }
             if (cloneFiles) {
-              unionFd(pid, childPid);
+              if (pendingFdDetach.has(childPid)) {
+                pendingFdDetach.delete(childPid);
+              } else {
+                unionFd(pid, childPid);
+              }
             } else {
               const parentRoot = rootedFd(pid);
               const childRoot = rootedFd(childPid);
@@ -26454,9 +26464,11 @@ async function runInstallPhase(input) {
           const detachFds = (flagsBits & CLONE_FILES) !== 0;
           if (detachFds) {
             detachFdGroup(pid);
+            pendingFdDetach.add(pid);
           }
           if (detachCwd) {
             detachCwdGroup(pid);
+            pendingCwdDetach.add(pid);
           }
         }
         continue;

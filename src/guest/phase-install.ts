@@ -487,6 +487,28 @@ export async function runInstallPhase(
   const cwdParent = new Map<number, number>();
   const fdParent = new Map<number, number>();
 
+  // Codex follow-up (high, 2026-05-19): pending unshare-detach markers.
+  // strace `-ff` writes per-pid files separately; the production tailer
+  // drains them in arbitrary order, so a child's `unshare(...)` line CAN
+  // be observed BEFORE the parent's `clone(... CLONE_FS|CLONE_FILES ...)
+  // = <child>` line.  In that order the immediate `detachCwdGroup` /
+  // `detachFdGroup` calls in the unshare handler are no-ops (child is
+  // still a singleton group at that point), and the later clone
+  // reconciliation would `unionCwd` / `unionFd` the kernel-detached
+  // child back INTO the parent's group — wrong direction.
+  //
+  // Fix: when we observe `unshare(...)` we ALSO add the pid to a
+  // pending-detach set; the clone reconciliation consults the set
+  // before unioning and SKIPS the union if the child has already
+  // explicitly detached.  Markers persist across events (we don't track
+  // pid exits — stale entries are harmless: the next clone wiring with
+  // the same pid would honor an obsolete intent, but pids are recycled
+  // monotonically and within a single install run reuse is rare; if it
+  // happens, the conservative direction is "do not share" which is
+  // safer than "incorrectly share").
+  const pendingCwdDetach = new Set<number>();
+  const pendingFdDetach = new Set<number>();
+
   function findCwdRoot(pid: number): number {
     let cur = pid;
     while (true) {
@@ -1530,11 +1552,25 @@ export async function runInstallPhase(
 
             // --- cwd group: union if CLONE_FS, else copy. -----------
             if (cloneFs) {
-              // Union the two pids into the same cwd group.  Subsequent
-              // chdir on either pid mutates the shared state.
-              unionCwd(pid, childPid);
-              // No need to copy cwd / pidCwdUnknown — they are already
-              // visible to the child via the shared root.
+              // Codex follow-up (high, 2026-05-19): if we already
+              // observed the child's `unshare(CLONE_FS|CLONE_NEWNS|
+              // CLONE_NEWUSER)` line out-of-order BEFORE this clone
+              // line, the kernel has already detached the child's
+              // fs_struct.  Honor that explicit detach: SKIP the
+              // union so the child keeps its own private cwd group.
+              // Per-pid state previously seeded under the child's
+              // pid stays addressable.  Without this guard the union
+              // below would silently re-merge the kernel-detached
+              // child back into the parent's group.
+              if (pendingCwdDetach.has(childPid)) {
+                pendingCwdDetach.delete(childPid);
+              } else {
+                // Union the two pids into the same cwd group.  Subsequent
+                // chdir on either pid mutates the shared state.
+                unionCwd(pid, childPid);
+                // No need to copy cwd / pidCwdUnknown — they are already
+                // visible to the child via the shared root.
+              }
             } else {
               // Copy branch: independent fs struct.  Snapshot the
               // parent's cwd / unknown bit into the child's NEW group.
@@ -1552,9 +1588,19 @@ export async function runInstallPhase(
 
             // --- fd group: union if CLONE_FILES, else copy. ---------
             if (cloneFiles) {
-              unionFd(pid, childPid);
-              // No per-key copy needed — fd lookups resolve to the
-              // shared group root.
+              // Codex follow-up (high, 2026-05-19): mirror the cwd
+              // path above.  If a child's `unshare(CLONE_FILES)` line
+              // was observed first (out-of-order tail drain), the
+              // kernel has already detached the child's fd table —
+              // SKIP the union so the child stays a singleton fd
+              // group rather than getting re-merged into the parent.
+              if (pendingFdDetach.has(childPid)) {
+                pendingFdDetach.delete(childPid);
+              } else {
+                unionFd(pid, childPid);
+                // No per-key copy needed — fd lookups resolve to the
+                // shared group root.
+              }
             } else {
               // Copy branch: independent fd table.  Sweep over the
               // parent's keys and re-key into the child's NEW fd
@@ -1960,9 +2006,19 @@ export async function runInstallPhase(
           const detachFds = (flagsBits & CLONE_FILES) !== 0;
           if (detachFds) {
             detachFdGroup(pid);
+            // Codex follow-up (high, 2026-05-19): record the intent.
+            // If a later-arriving `clone(... CLONE_FILES ...) = <this
+            // pid>` line is observed (out-of-order tail drain), the
+            // clone reconciliation will SKIP `unionFd` instead of
+            // re-merging the kernel-detached child back into the
+            // parent's group.  The marker is consumed when the clone
+            // line is reconciled; if no such clone arrives it stays
+            // (harmless: pids aren't reused mid-run in practice).
+            pendingFdDetach.add(pid);
           }
           if (detachCwd) {
             detachCwdGroup(pid);
+            pendingCwdDetach.add(pid);
           }
         }
         continue;
