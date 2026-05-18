@@ -873,4 +873,298 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     expect(result.stdout).not.toContain('/tmp/evil-nodeopt.js');
     expect(result.stdout).not.toContain('--require=');
   });
+
+  // ── Critical: attacker LD_PRELOAD is overwritten, not merged ───────────────
+  //
+  // The previous implementation prepended canonical to caller-supplied
+  // (result: `canonical:attacker_value`) so our wrappers' symbols would
+  // shadow at runtime — but ld.so still ran the attacker .so's ELF
+  // constructor before any of our wrappers initialised.  rewrite_envp now
+  // uses overwrite_env for LD_PRELOAD: the attacker's path must NOT
+  // appear anywhere in the child's effective LD_PRELOAD.
+  it('caller-supplied LD_PRELOAD is overwritten (attacker .so never loads)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-ldp-overwrite-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'ldp_overwrite');
+    // Single attacker LD_PRELOAD entry (NOT a duplicate of canonical).  If
+    // the shim still merged we'd see "LD_PRELOAD=<shimSo>:/tmp/evil.so";
+    // with overwrite_env the attacker path is completely gone.
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const ldp = entries.filter(e => e.startsWith('LD_PRELOAD='));"
+          "process.stdout.write('count='+ldp.length+'/value='+(process.env.LD_PRELOAD||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          /* Pure attacker payload — not a duplicate, not canonical. */
+          "LD_PRELOAD=/tmp/evil.so",
+          "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        SCRIPT_JAIL_PRELOAD_PATH: shimSo,
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // Effective LD_PRELOAD is EXACTLY the canonical shim path — no
+    // suffix/prefix from the attacker's value.
+    expect(result.stdout).toContain('count=1');
+    expect(result.stdout).toContain(`value=${shimSo}`);
+    expect(result.stdout).not.toContain('/tmp/evil.so');
+    // Specifically guard against the old prepend-merge format.
+    expect(result.stdout).not.toContain(`${shimSo}:/tmp/evil.so`);
+    expect(result.stdout).not.toContain(`/tmp/evil.so:${shimSo}`);
+  });
+
+  // ── Critical: attacker NODE_OPTIONS is overwritten, not merged ─────────────
+  //
+  // Same reasoning as LD_PRELOAD: caller-supplied --require=/tmp/evil.js
+  // would still load (just after ours) under the old prepend-merge code.
+  // The legitimate --max-old-space-size=1024 is dropped too — the audit
+  // envelope owns NODE_OPTIONS end-to-end.
+  it('caller-supplied NODE_OPTIONS is overwritten (attacker --require never runs)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-nodeopts-overwrite-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'nodeopts_overwrite');
+    const canonNodeOpts = '--no-warnings';
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const opt = entries.filter(e => e.startsWith('NODE_OPTIONS='));"
+          "process.stdout.write('count='+opt.length+'/value='+(process.env.NODE_OPTIONS||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          "LD_PRELOAD=${shimSo}",
+          /* Pure attacker payload: --require points at a non-existent
+             file (so if it survived, Node would fail to start with a
+             MODULE_NOT_FOUND error) plus a legitimate-looking flag.
+             Both must be stripped. */
+          "NODE_OPTIONS=--require=/tmp/evil.js --max-old-space-size=1024",
+          "SCRIPT_JAIL_NODE_OPTIONS=${canonNodeOpts}",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        // Set BOTH canons so rewrite_envp exercises overwrite_env for
+        // each: without SCRIPT_JAIL_PRELOAD_PATH, LD_PRELOAD canon would
+        // be empty and the test would silently accept the caller's
+        // LD_PRELOAD=shimSo passthrough instead of asserting overwrite.
+        SCRIPT_JAIL_PRELOAD_PATH: shimSo,
+        SCRIPT_JAIL_NODE_OPTIONS: canonNodeOpts,
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // Effective NODE_OPTIONS is EXACTLY canonical — no attacker payload
+    // anywhere, and the legitimate --max-old-space-size is also dropped.
+    expect(result.stdout).toContain('count=1');
+    expect(result.stdout).toContain(`value=${canonNodeOpts}`);
+    expect(result.stdout).not.toContain('--require=');
+    expect(result.stdout).not.toContain('/tmp/evil.js');
+    expect(result.stdout).not.toContain('--max-old-space-size');
+  });
+
+  // ── Critical: both LD_PRELOAD and NODE_OPTIONS overwritten together ────────
+  //
+  // Cross-check: a single execve with attacker entries for BOTH names
+  // must scrub both.  The two overwrite_env calls in rewrite_envp are
+  // independent — assert they compose correctly.
+  it('caller-supplied LD_PRELOAD and NODE_OPTIONS are both overwritten', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-both-overwrite-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'both_overwrite');
+    const canonNodeOpts = '--no-warnings';
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const ldp = entries.filter(e => e.startsWith('LD_PRELOAD='));"
+          "const opt = entries.filter(e => e.startsWith('NODE_OPTIONS='));"
+          "process.stdout.write("
+          "  'ldp_count='+ldp.length+"
+          "  '/ldp_value='+(process.env.LD_PRELOAD||'ABSENT')+"
+          "  '/opt_count='+opt.length+"
+          "  '/opt_value='+(process.env.NODE_OPTIONS||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          "LD_PRELOAD=/tmp/evil.so",
+          "NODE_OPTIONS=--require=/tmp/evil.js",
+          "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
+          "SCRIPT_JAIL_NODE_OPTIONS=${canonNodeOpts}",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        SCRIPT_JAIL_PRELOAD_PATH: shimSo,
+        SCRIPT_JAIL_NODE_OPTIONS: canonNodeOpts,
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // Both vars: exactly one entry, exactly the canonical value, no
+    // attacker payload anywhere in the child's environ.
+    expect(result.stdout).toContain('ldp_count=1');
+    expect(result.stdout).toContain(`ldp_value=${shimSo}`);
+    expect(result.stdout).toContain('opt_count=1');
+    expect(result.stdout).toContain(`opt_value=${canonNodeOpts}`);
+    expect(result.stdout).not.toContain('/tmp/evil.so');
+    expect(result.stdout).not.toContain('/tmp/evil.js');
+    expect(result.stdout).not.toContain('--require=');
+  });
+
+  // ── Regression: empty-canon LD_PRELOAD must NOT be stripped ────────────────
+  //
+  // When the parent never set SCRIPT_JAIL_PRELOAD_PATH the canon for
+  // LD_PRELOAD is empty.  An earlier attempt at this fix stripped any
+  // caller-supplied LD_PRELOAD in that case, mirroring the sticky-var
+  // empty-canon path — but LD_PRELOAD is the shim's only propagation
+  // mechanism, so stripping it broke the audit chain at the first
+  // execve in any process launched with only `LD_PRELOAD=libscriptjail.so`.
+  // The original prepend-merge code was a no-op in this case, and we
+  // must preserve that.
+  it('caller-supplied LD_PRELOAD is preserved when canon is empty (audit chain)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+    const cc = spawnSync('cc', ['--version'], { encoding: 'utf8' });
+    if (cc.status !== 0 || cc.error) ctx.skip();
+
+    const dir = mkdtempSync(join(tmpdir(), 'script-jail-ldp-empty-canon-'));
+    tempFiles.push(dir);
+    const bin = join(dir, 'ldp_empty_canon');
+    const src = `
+      #include <unistd.h>
+      extern char **environ;
+      int main(void) {
+        char *argv[] = {
+          "env",
+          "node",
+          "-e",
+          "const fs = require('fs');"
+          "const buf = fs.readFileSync('/proc/self/environ');"
+          "const entries = buf.toString('utf8').split('\\\\0').filter(s => s.length > 0);"
+          "const ldp = entries.filter(e => e.startsWith('LD_PRELOAD='));"
+          "process.stdout.write('count='+ldp.length+'/value='+(process.env.LD_PRELOAD||'ABSENT'));",
+          0,
+        };
+        char *envp[] = {
+          "PATH=/usr/bin:/bin",
+          /* Caller passes LD_PRELOAD=shimSo so the child stays under
+             audit.  No SCRIPT_JAIL_PRELOAD_PATH on the parent so canon
+             is empty.  Rewrite must leave this entry alone. */
+          "LD_PRELOAD=${shimSo}",
+          0,
+        };
+        execve("/usr/bin/env", argv, envp);
+        return 1;
+      }
+    `;
+    const compile = spawnSync(
+      'cc', ['-x', 'c', '-o', bin, '-'],
+      { input: src, encoding: 'utf8' },
+    );
+    if (compile.status !== 0) ctx.skip();
+
+    const result = spawnSync(bin, [], {
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        LD_PRELOAD: shimSo,
+        // Deliberately NO SCRIPT_JAIL_PRELOAD_PATH → CANON_PRELOAD_PATH empty.
+        SCRIPT_JAIL_LOG_FD: '1',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    // LD_PRELOAD survives intact — shim chain still propagates.
+    expect(result.stdout).toContain('count=1');
+    expect(result.stdout).toContain(`value=${shimSo}`);
+  });
 });

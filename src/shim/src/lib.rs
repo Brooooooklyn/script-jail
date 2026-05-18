@@ -411,7 +411,7 @@ unsafe fn load_protect_list(path: *const c_char) {
 //   (MALLOC_* knobs) hit the early-return path.  set_in_shim is a flat
 //   overwrite — there is NO save/restore of the prior state.  Therefore
 //   exec wrappers must NOT rely on the guard being held across calls to
-//   envbuf_from / append_path_env / ensure_env: after they return, in_shim()
+//   envbuf_from / overwrite_env / ensure_env: after they return, in_shim()
 //   is false.  Any real_getenv_raw call the wrapper needs (e.g. PATH for
 //   execvp) MUST happen before envbuf_from is invoked, OR be wrapped in
 //   its own set_in_shim(true/false) pair.
@@ -677,188 +677,6 @@ unsafe fn make_entry(name: &[u8], value: &[u8]) -> *mut c_char {
     }
     *buf.add(name.len() + 1 + value.len()) = 0u8;
     buf as *mut c_char
-}
-
-/// Whether `append_path_env` writes the new chunk at the front or back of
-/// the existing value.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Order {
-    /// Result: `existing + sep + new`.  Idempotency check matches a trailing
-    /// `sep + new`.  Use when ordering is semantically left-to-right and
-    /// existing entries should win first.  Retained as part of the helper's
-    /// contract so future call sites have an obvious knob — current call
-    /// sites all prepend.
-    #[allow(dead_code)]
-    Append,
-    /// Result: `new + sep + existing`.  Idempotency check matches a leading
-    /// `new + sep`.  Use for vars where ld.so / Node load left-to-right and
-    /// our injection must take precedence over caller-supplied entries
-    /// (LD_PRELOAD, NODE_OPTIONS).
-    Prepend,
-}
-
-/// Ensure `name` is set in buf to a value that includes `to_append`,
-/// concatenated at the position dictated by `order`.
-///
-/// - If `to_append` is empty, return true immediately (no-op).
-/// - If `name` is absent: add a new `name=to_append` entry.
-/// - If `name` is present and the FIRST existing value already has
-///   `to_append` at the correct end (trailing for Append, leading for
-///   Prepend): the canonical value to keep is that first value as-is.
-/// - Otherwise: the canonical value is the FIRST existing value with
-///   `to_append` concatenated per `order`, separated by `separator`.
-///
-/// In ALL cases (present, absent, idempotent, rebuild) the function ends
-/// by exhaustively removing every entry whose name matches and pushing
-/// exactly one freshly-malloc'd canonical entry.
-///
-/// SECURITY: any envp_in under attacker control may contain duplicate
-/// `LD_PRELOAD=`/`NODE_OPTIONS=` entries.  envbuf_find only locates the
-/// first, so an earlier implementation that returned early when the first
-/// value was idempotent left subsequent attacker duplicates live in the
-/// child's envp.  The remove-all-then-push pattern below is the same
-/// invariant that overwrite_env relies on — it must hold for all branches.
-/// The extra malloc/free per exec in the previously-idempotent path is
-/// negligible.
-///
-/// Returns false only on malloc failure.
-unsafe fn append_path_env(
-    buf: &mut EnvBuf,
-    name: &[u8],
-    to_append: &[u8],
-    separator: u8,
-    order: Order,
-) -> bool {
-    if to_append.is_empty() {
-        return true;
-    }
-
-    // Step 1: look up the FIRST matching entry.  This is used purely to
-    // compute what the canonical value should be (idempotent existing
-    // value vs. rebuilt merged value).  Subsequent duplicates do not
-    // participate in the merge — they are stripped wholesale below.
-    let entry: *mut c_char = match envbuf_find(buf, name) {
-        None => {
-            // Absent: canonical value is just `name=to_append`.
-            make_entry(name, to_append)
-        }
-        Some(idx) => {
-            // Present: extract the first existing value to decide whether
-            // the canonical value is the existing one (idempotent) or a
-            // merged rewrite.
-            let raw = *buf.ptrs.add(idx);
-            // Advance past `name=`.
-            let val_ptr = raw.add(name.len() + 1);
-            // Compute value length.
-            let mut val_len = 0usize;
-            while *val_ptr.add(val_len) != 0 {
-                val_len += 1;
-            }
-            let existing = core::slice::from_raw_parts(val_ptr as *const u8, val_len);
-
-            // Determine whether the first existing value is already
-            // canonical w.r.t. to_append and order.
-            let idempotent = if existing == to_append {
-                true
-            } else {
-                match order {
-                    Order::Append => {
-                        val_len >= to_append.len() + 1
-                            && existing[val_len - to_append.len() - 1] == separator
-                            && &existing[val_len - to_append.len()..] == to_append
-                    }
-                    Order::Prepend => {
-                        val_len >= to_append.len() + 1
-                            && &existing[..to_append.len()] == to_append
-                            && existing[to_append.len()] == separator
-                    }
-                }
-            };
-
-            if idempotent {
-                // Canonical value is the existing first value, preserved
-                // verbatim.  Capture it in a fresh malloc up front so we
-                // can safely envbuf_remove (which frees the original).
-                make_entry(name, existing)
-            } else {
-                // Canonical value is the merged value.  Build it by
-                // concatenating per `order`, with a separator between
-                // the two halves when existing is non-empty.
-                let sep_len = if val_len > 0 { 1usize } else { 0usize };
-                let new_val_len = val_len + sep_len + to_append.len();
-                let total = name.len() + 1 + new_val_len + 1;
-                set_in_shim(true);
-                let raw_buf = libc::malloc(total) as *mut u8;
-                set_in_shim(false);
-                if raw_buf.is_null() {
-                    ptr::null_mut()
-                } else {
-                    let mut off = 0usize;
-                    core::ptr::copy_nonoverlapping(name.as_ptr(), raw_buf, name.len());
-                    off += name.len();
-                    *raw_buf.add(off) = b'=';
-                    off += 1;
-                    match order {
-                        Order::Append => {
-                            if val_len > 0 {
-                                core::ptr::copy_nonoverlapping(
-                                    val_ptr as *const u8,
-                                    raw_buf.add(off),
-                                    val_len,
-                                );
-                                off += val_len;
-                                *raw_buf.add(off) = separator;
-                                off += 1;
-                            }
-                            core::ptr::copy_nonoverlapping(
-                                to_append.as_ptr(),
-                                raw_buf.add(off),
-                                to_append.len(),
-                            );
-                            off += to_append.len();
-                        }
-                        Order::Prepend => {
-                            core::ptr::copy_nonoverlapping(
-                                to_append.as_ptr(),
-                                raw_buf.add(off),
-                                to_append.len(),
-                            );
-                            off += to_append.len();
-                            if val_len > 0 {
-                                *raw_buf.add(off) = separator;
-                                off += 1;
-                                core::ptr::copy_nonoverlapping(
-                                    val_ptr as *const u8,
-                                    raw_buf.add(off),
-                                    val_len,
-                                );
-                                off += val_len;
-                            }
-                        }
-                    }
-                    *raw_buf.add(off) = 0u8;
-                    raw_buf as *mut c_char
-                }
-            }
-        }
-    };
-
-    if entry.is_null() {
-        return false;
-    }
-
-    // Step 2: exhaustively remove EVERY existing entry whose name matches.
-    // envbuf_remove is exhaustive per commit 0ea645c, but we use the
-    // explicit while-loop form to make the invariant self-evident at the
-    // call site as well.  No-op if there were none.
-    while envbuf_remove(buf, name) {}
-
-    // Step 3: push exactly one canonical entry.
-    if !envbuf_push(buf, entry) {
-        free_entry(entry);
-        return false;
-    }
-    true
 }
 
 /// Overwrite `name` in buf with the canonical `value`, leaving exactly one
@@ -1561,17 +1379,41 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
 
     let mut buf = envbuf_from(envp_in)?;
 
-    // Re-inject LD_PRELOAD and NODE_OPTIONS.  Both ld.so and Node consume
-    // these left-to-right with first-symbol/first-require winning, so a
-    // caller-supplied prefix (e.g. an attacker `LD_PRELOAD=/tmp/evil.so:...`)
-    // would shadow our wrappers if we appended.  Prepend instead so our
-    // entries take precedence.  append_path_env is a no-op for empty
-    // to_append, so if a canon buf is empty this contributes nothing.
-    if !append_path_env(&mut buf, b"LD_PRELOAD", preload, b':', Order::Prepend) {
+    // Re-inject LD_PRELOAD and NODE_OPTIONS.  We OVERWRITE rather than
+    // merge: an earlier implementation prepended the canonical value to
+    // whatever the caller supplied (so our wrappers' symbols / require
+    // modules would still load first).  That was unsafe — ld.so still
+    // executes the ELF constructor of any attacker-supplied .so before
+    // our wrappers shadow its symbols, and Node still loads any
+    // attacker-supplied `--require=` module right after ours.  Either is
+    // enough for arbitrary code to run inside the audit envelope.
+    //
+    // There is no legitimate reason for an npm lifecycle script to set
+    // LD_PRELOAD, and no realistic legitimate reason inside this microVM
+    // to honor caller-supplied NODE_OPTIONS — the audit envelope is the
+    // whole point.  Drop caller-supplied values for both; overwrite_env
+    // strips every existing entry for the name and pushes exactly one
+    // canonical entry.
+    //
+    // EMPTY CANON: when the parent never set SCRIPT_JAIL_PRELOAD_PATH /
+    // SCRIPT_JAIL_NODE_OPTIONS, leave any caller-supplied entries alone.
+    // Unlike the sticky-var empty-canon path (where we strip caller
+    // entries so attackers cannot redirect SCRIPT_JAIL_LOG_FILE etc.),
+    // LD_PRELOAD is the shim's only propagation mechanism: stripping a
+    // caller-supplied `LD_PRELOAD=libscriptjail.so` would break the
+    // audit chain at the first execve in any process launched without
+    // the full env contract.  The guest agent always sets
+    // SCRIPT_JAIL_PRELOAD_PATH in production (src/guest/agent.ts), so
+    // this preservation branch only matters in misconfigured launcher
+    // paths and tests that exercise the shim with LD_PRELOAD only.
+    // The original prepend-merge code was also a no-op in this case
+    // (append_path_env returned early on empty `to_append`), so this
+    // preserves the only correct legacy behavior we relied on.
+    if !preload.is_empty() && !overwrite_env(&mut buf, b"LD_PRELOAD", preload) {
         free_envbuf(&mut buf);
         return None;
     }
-    if !append_path_env(&mut buf, b"NODE_OPTIONS", node_opts, b' ', Order::Prepend) {
+    if !node_opts.is_empty() && !overwrite_env(&mut buf, b"NODE_OPTIONS", node_opts) {
         free_envbuf(&mut buf);
         return None;
     }
