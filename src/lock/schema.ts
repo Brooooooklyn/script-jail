@@ -139,6 +139,20 @@ export const LifecycleBlock = z.object({
   spawn_blocked: z.array(z.string()).default([]),
   dlopen_attempts: z.array(z.string()).default([]),
   network_attempts: z.array(z.string()).default([]),
+  // Populated when the LD_PRELOAD shim's libc-exec wrapper could not allocate
+  // a re-injected envp for the child (`exec.envp_alloc_failed=true`). The
+  // child therefore ran OUTSIDE the audit envelope — strace sees the execve
+  // but no shim is loaded into the child, so getenv/dlopen/etc. inside that
+  // process are invisible. Surfacing the bypass into the lockfile is the only
+  // way an auditor can tell a clean diff from a silenced one.
+  // Format: "<EXEC_FAIL_OPEN> <tokenized_prog>". Rare and intentionally noisy.
+  audit_bypass: z.array(z.string()).default([]),
+  // Populated by `env_tamper` events: a script attempted to mutate a
+  // sticky/protected env var via libc (LD_PRELOAD, NODE_OPTIONS,
+  // SCRIPT_JAIL_*). The shim refuses the call so prod state is intact, but
+  // the attempt itself is hostile intent worth surfacing.
+  // Format: "<REFUSED> <op>[ <name>]". `clearenv` has no name component.
+  env_tamper: z.array(z.string()).default([]),
 });
 export type LifecycleBlock = z.infer<typeof LifecycleBlock>;
 

@@ -133,15 +133,33 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         block.network_attempts.push(`${tag}connect ${ev.raw.host}:${ev.raw.port}`);
         break;
       }
-      case 'exec':
+      case 'exec': {
+        // Most exec events ARE redundant with the strace-observed execve
+        // syscall already feeding spawn_attempts. The only signal worth
+        // surfacing is `envp_alloc_failed=true`: it means the shim's
+        // re-injection of LD_PRELOAD / NODE_OPTIONS / SCRIPT_JAIL_* into the
+        // child's envp could not allocate, so the child ran OUTSIDE the audit
+        // envelope. strace still sees the syscall but the shim is no longer
+        // loaded in that pid — anything getenv/dlopen-shaped inside the child
+        // is therefore invisible. Silently dropping this signal makes the
+        // lockfile diff stay clean even when audit was bypassed, which is the
+        // worst possible outcome for an auditor.
+        if (!ev.raw.envp_alloc_failed) break;
+        const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
+        block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
+        break;
+      }
       case 'env_tamper': {
-        // Libc-level audit signals emitted by the LD_PRELOAD shim. They live
-        // in the raw audit JSONL for forensic inspection but are intentionally
-        // not surfaced in the rendered lockfile yet — exec is redundant with
-        // the strace-observed execve syscall already feeding spawn_attempts,
-        // and env_tamper is informational (the operation was refused, the
-        // attacker did not change anything). Future work may add dedicated
-        // LifecycleBlock fields if these signals prove useful as policy deltas.
+        // The shim REFUSED the call (refused:true is the only legal value
+        // today), so prod env state is untouched. The audit value is the
+        // attempt itself: a script tried to wipe LD_PRELOAD, NODE_OPTIONS,
+        // or any SCRIPT_JAIL_* sticky var. clearenv has no `name` (whole-env
+        // wipe) — render that as `<REFUSED> clearenv` with no name tail.
+        const name = ev.raw.name;
+        const entry = name !== undefined
+          ? `<REFUSED> ${ev.raw.op} ${name}`
+          : `<REFUSED> ${ev.raw.op}`;
+        block.env_tamper.push(entry);
         break;
       }
     }
@@ -177,6 +195,8 @@ function getLifecycleBlock(
       spawn_blocked: [],
       dlopen_attempts: [],
       network_attempts: [],
+      audit_bypass: [],
+      env_tamper: [],
     };
     pkgBlock.lifecycle[lifecycle] = newLifecycleBlock;
     block = newLifecycleBlock;
@@ -193,6 +213,8 @@ function sortAndDedupe(block: LifecycleBlock): void {
     'spawn_blocked',
     'dlopen_attempts',
     'network_attempts',
+    'audit_bypass',
+    'env_tamper',
   ];
   for (const f of fields) {
     // Use codepoint order rather than localeCompare: localeCompare is ICU-

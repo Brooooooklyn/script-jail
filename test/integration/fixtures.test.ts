@@ -144,3 +144,30 @@ describe('fixture: cross-package-tampering', () => {
     expect(yaml).toContain('<CROSS_PACKAGE> $NODE_MODULES/victim-package/index.js');
   });
 });
+
+describe('fixture: strips-ld-preload', () => {
+  it('does not emit audit_bypass or env_tamper for a normal exec (envp_alloc_failed=false)', () => {
+    const yaml = renderFixtureYaml('strips-ld-preload');
+    expect(yaml).toContain('strips-ld-preload@1.0.0:');
+    expect(yaml).toContain('postinstall:');
+    // The fixture's exec event has envp_alloc_failed=false — re-injection
+    // succeeded, so there is nothing to surface. Both optional lists must
+    // be absent (we render them only when non-empty).
+    expect(yaml).not.toContain('audit_bypass:');
+    expect(yaml).not.toContain('env_tamper:');
+  });
+});
+
+describe('fixture: unsets-ld-preload', () => {
+  it('renders <REFUSED> unsetenv LD_PRELOAD and NODE_OPTIONS under env_tamper', () => {
+    const yaml = renderFixtureYaml('unsets-ld-preload');
+    expect(yaml).toContain('unsets-ld-preload@1.0.0:');
+    expect(yaml).toContain('postinstall:');
+    expect(yaml).toContain('env_tamper:');
+    expect(yaml).toContain('<REFUSED> unsetenv LD_PRELOAD');
+    expect(yaml).toContain('<REFUSED> unsetenv NODE_OPTIONS');
+    // The exec event in the fixture has envp_alloc_failed=false, so the
+    // audit_bypass list stays empty and must not be rendered.
+    expect(yaml).not.toContain('audit_bypass:');
+  });
+});

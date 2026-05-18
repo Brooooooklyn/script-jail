@@ -38,6 +38,21 @@ function dlopenEv(filename: string): AttributedEvent {
   return { raw: { kind: 'dlopen', filename, result: 'blocked', pid: 1, ts: 0 }, pkg: pkgId, lifecycle: 'postinstall' };
 }
 
+function execEv(prog: string, envp_alloc_failed: boolean, argv0: string | null = null): AttributedEvent {
+  return {
+    raw: { kind: 'exec', prog, argv0, envp_alloc_failed, pid: 1, ts: 0 },
+    pkg: pkgId,
+    lifecycle: 'postinstall',
+  };
+}
+
+function tamperEv(op: 'setenv' | 'unsetenv' | 'putenv' | 'clearenv', name?: string): AttributedEvent {
+  const raw = name !== undefined
+    ? { kind: 'env_tamper' as const, op, name, refused: true as const, pid: 1, ts: 0 }
+    : { kind: 'env_tamper' as const, op, refused: true as const, pid: 1, ts: 0 };
+  return { raw, pkg: pkgId, lifecycle: 'postinstall' };
+}
+
 function networkEv(host: string, port: number, result: 'ok' | 'blocked'): AttributedEvent {
   return { raw: { kind: 'connect', host, port, result, pid: 1, ts: 0 }, pkg: pkgId, lifecycle: 'postinstall' };
 }
@@ -355,6 +370,92 @@ describe('normalize', () => {
       const block = getBlock(result);
       const attempt = block?.spawn_attempts[0] ?? '';
       expect(attempt).toBe('/usr/local/bin/python3 --version');
+    });
+  });
+
+  describe('exec events (Finding 4: envp_alloc_failed → audit_bypass)', () => {
+    it('drops exec events when envp_alloc_failed=false (redundant with strace execve)', () => {
+      const events = [execEv('/usr/bin/node', false)];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      // The exec arm should produce no output for the common (success) case;
+      // strace already records the execve syscall, so duplicating here would
+      // churn every lockfile diff without adding signal.
+      expect(block?.audit_bypass ?? []).toEqual([]);
+      expect(block?.spawn_attempts ?? []).toEqual([]);
+    });
+
+    it('records audit_bypass when envp_alloc_failed=true (shim re-injection failed)', () => {
+      const events = [execEv('/usr/bin/node', true)];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.audit_bypass).toEqual(['<EXEC_FAIL_OPEN> /usr/bin/node']);
+    });
+
+    it('tokenizes prog inside $PKG when emitting audit_bypass', () => {
+      const events = [execEv(`${pkgDir}/scripts/runner`, true)];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.audit_bypass).toEqual(['<EXEC_FAIL_OPEN> $PKG/scripts/runner']);
+    });
+
+    it('dedupes + sorts audit_bypass entries', () => {
+      const events = [
+        execEv('/usr/bin/zsh', true),
+        execEv('/usr/bin/node', true),
+        execEv('/usr/bin/node', true), // duplicate
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.audit_bypass).toEqual([
+        '<EXEC_FAIL_OPEN> /usr/bin/node',
+        '<EXEC_FAIL_OPEN> /usr/bin/zsh',
+      ]);
+    });
+  });
+
+  describe('env_tamper events (Finding 4: refused tampering → env_tamper)', () => {
+    it('records unsetenv LD_PRELOAD as <REFUSED> unsetenv LD_PRELOAD', () => {
+      const events = [tamperEv('unsetenv', 'LD_PRELOAD')];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.env_tamper).toEqual(['<REFUSED> unsetenv LD_PRELOAD']);
+    });
+
+    it('records putenv NODE_OPTIONS as <REFUSED> putenv NODE_OPTIONS', () => {
+      const events = [tamperEv('putenv', 'NODE_OPTIONS')];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.env_tamper).toEqual(['<REFUSED> putenv NODE_OPTIONS']);
+    });
+
+    it('records clearenv with no name as bare <REFUSED> clearenv', () => {
+      const events = [tamperEv('clearenv')];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.env_tamper).toEqual(['<REFUSED> clearenv']);
+    });
+
+    it('dedupes + sorts env_tamper entries', () => {
+      const events = [
+        tamperEv('unsetenv', 'NODE_OPTIONS'),
+        tamperEv('unsetenv', 'LD_PRELOAD'),
+        tamperEv('unsetenv', 'LD_PRELOAD'), // duplicate
+        tamperEv('clearenv'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.env_tamper).toEqual([
+        '<REFUSED> clearenv',
+        '<REFUSED> unsetenv LD_PRELOAD',
+        '<REFUSED> unsetenv NODE_OPTIONS',
+      ]);
+    });
+
+    it('does not throw when env_tamper carries no pkgDir (non-fs event)', () => {
+      const ctxWithoutPkg: NormalizeContext = { roots, pkgDirs: new Map() };
+      const events = [tamperEv('unsetenv', 'LD_PRELOAD')];
+      expect(() => normalize(events, ctxWithoutPkg)).not.toThrow();
     });
   });
 

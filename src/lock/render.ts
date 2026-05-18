@@ -10,6 +10,8 @@ import type { Lock, LifecycleBlock, PackageBlock } from './schema.js';
 // separate concern from schema validity.
 const LIFECYCLE_ORDER = ['preinstall', 'install', 'postinstall', 'prepare'] as const;
 
+// Always rendered, even when empty — these seven fields shape every block
+// the historical schema produces, so existing fixtures stay byte-stable.
 const EMPTY_LIST_FIELDS: Array<keyof LifecycleBlock> = [
   'external_reads',
   'escaped_writes',
@@ -18,6 +20,16 @@ const EMPTY_LIST_FIELDS: Array<keyof LifecycleBlock> = [
   'spawn_blocked',
   'dlopen_attempts',
   'network_attempts',
+];
+
+// Rendered only when non-empty. These signals are rare (a successful audit
+// run produces neither), and emitting them as empty lists would churn every
+// existing fixture without adding information. Order matches the order they
+// were added to LifecycleBlock — append, do not reorder, to keep diffs
+// across schema-change PRs minimal.
+const OPTIONAL_LIST_FIELDS: Array<keyof LifecycleBlock> = [
+  'audit_bypass',
+  'env_tamper',
 ];
 
 export interface RenderInput {
@@ -75,6 +87,14 @@ function renderBlock(block: LifecycleBlock): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   for (const f of EMPTY_LIST_FIELDS) {
     out[f] = block[f];
+  }
+  // Optional fields are appended after the always-rendered seven, in the
+  // order declared in OPTIONAL_LIST_FIELDS. Skip empties so existing
+  // fixtures keep their current byte layout when no exec/tamper signal is
+  // present (the common case).
+  for (const f of OPTIONAL_LIST_FIELDS) {
+    const v = block[f];
+    if (v.length > 0) out[f] = v;
   }
   return out;
 }
