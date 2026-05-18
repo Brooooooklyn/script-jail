@@ -1249,6 +1249,134 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // Audit-trust Finding 3 (2026-05-18) — bypass counting must NOT gate on
+  // attribution.  The most damaging variant of the raw-syscall bypass is
+  // `syscall(SYS_execve, ..., attacker_envp)`: the child runs WITHOUT
+  // npm_package_name / npm_lifecycle_event in its environ, so
+  // `Attribution.attribute` returns null, and the pre-fix code
+  // `continue`'d before incrementing the per-pid strace exec counter.
+  // The strace observation was thus silently dropped and the lockfile
+  // looked clean.
+  //
+  // The fix has two halves: (a) count BEFORE the attribution gate, (b)
+  // use a snapshot of the FIRST attribution success for that pid so
+  // synthesised events still carry a meaningful pkg / lifecycle.
+  describe('Finding 3 — bypass-count fires even when attribution returns null', () => {
+    it('synthesises bypass entry for raw-execve child whose environ was scrubbed', async () => {
+      // Pid 105 has NO env entries (the raw execve wiped the env), AND no
+      // ppid mapping — Attribution will return null.  Before the fix the
+      // bypass counter would `continue` past this strace observation and
+      // emit no audit_bypass entry.  After the fix the synth event still
+      // fires, attributed to "<unattributed>" so the lockfile diff still
+      // contains a <SYSCALL_EXEC_BYPASS> entry the host can hard-fail on.
+      const proc = mockProcReader({});
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 105,
+          line: 'execve("/usr/bin/curl", ["curl", "https://evil"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synth = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synth).toBeDefined();
+      const raw = synth!['raw'] as Record<string, unknown>;
+      expect(raw['pid']).toBe(105);
+      expect(raw['argv0']).toBe('curl');
+      // pkg falls back to the "<unattributed>" sentinel when no prior
+      // snapshot existed.  The audit_bypass entry must still appear in
+      // the lockfile diff so findAuditBypass in src/action/diff.ts can
+      // hard-fail the PR.
+      expect(synth!['pkg']).toBe('<unattributed>');
+    });
+
+    it('reuses snapshot attribution from earlier shim event for later raw-execve from same pid', async () => {
+      // The pid had a successful shim exec earlier (when env was still
+      // intact) — we snapshot that attribution.  Then the script does
+      // a raw syscall(SYS_execve) with a scrubbed envp.  Attribution
+      // now returns null for the strace observation, but the bypass
+      // detector must still fire with the snapshot's pkg, not the
+      // <unattributed> sentinel.
+      const proc = mockProcReader({
+        // First call: env is intact (snapshot succeeds).
+        // Subsequent calls go through the Attribution cache, so we
+        // don't actually need to flip the env mid-test — the cache
+        // captured the result already.
+        201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'snapshot-pkg',
+            npm_package_version: '2.0.0',
+            npm_lifecycle_event: 'install',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // First a shim event so the attribution succeeds (and the
+        // snapshot is recorded).
+        {
+          pid: 201,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/node',
+            argv0: 'node',
+            envp_alloc_failed: false,
+            pid: 201,
+            ts: 1,
+          }),
+          source: 'shim',
+        },
+        // Then TWO strace execves on the same pid (only one shim
+        // event was paired).  The unmatched one becomes the
+        // synthesised bypass entry — attributed via the snapshot.
+        {
+          pid: 201,
+          line: 'execve("/usr/bin/node", ["node", "-e", "1"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 201,
+          line: 'execve("/usr/bin/curl", ["curl", "x"], 0x2 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synths = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synths).toHaveLength(1);
+      // The synth event must carry the snapshot's pkg, not <unattributed>.
+      expect(synths[0]!['pkg']).toBe('snapshot-pkg@2.0.0');
+      expect(synths[0]!['lifecycle']).toBe('install');
+    });
+  });
+
   describe('exit code propagation via StraceRunner.getExitCode()', () => {
     it('returns non-zero exitCode when StraceRunner reports failure', async () => {
       const { emitter } = makeEmitter();

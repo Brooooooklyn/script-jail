@@ -327,6 +327,50 @@ export async function runInstallPhase(
   const straceExecsByPid = new Map<number, StraceExecSample[]>();
   const shimExecCountByPid = new Map<number, number>();
 
+  // Audit-trust Finding 3 (high, 2026-05-18): a raw `syscall(SYS_execve, …)`
+  // bypass with an attacker-controlled `envp` produces a child whose
+  // `/proc/<pid>/environ` is missing the npm_package_name /
+  // npm_lifecycle_event vars Attribution depends on.  The pre-fix flow
+  // gated bypass counting on attribution succeeding, so the most damaging
+  // case (raw exec + scrubbed envp) silently skipped the bypass detector
+  // and produced a clean lockfile.
+  //
+  // The fix has two halves:
+  //
+  //   (a) Snapshot lifecycle attribution per-pid the FIRST time we see
+  //       attribution succeed for that pid (or any event with a known
+  //       attribution result).  Strace observes pids in spawn-order, so
+  //       the very first event we see for a pid is normally from BEFORE
+  //       the child has had a chance to overwrite its own environ.  We
+  //       cache that snapshot here and prefer it over re-reading
+  //       /proc/<pid>/environ at bypass-count time.
+  //
+  //   (b) Decouple bypass counting (and synthetic-event emission) from
+  //       attribution success.  The strace observation of an execve is
+  //       proof-of-bypass when no matching shim event exists, regardless
+  //       of whether we can still attribute the pid to a package.  When
+  //       the snapshot is empty (attribution NEVER succeeded for this
+  //       pid — strange but possible) we fall back to a "<unknown>"
+  //       pkg + lifecycle so the audit_bypass entry still surfaces in
+  //       the lockfile diff and the `findAuditBypass` scan in
+  //       src/action/diff.ts hard-fails the PR.
+  //
+  // The map is keyed by pid; entries are written once (first observation)
+  // and never overwritten, so a later attribution failure can't tamper
+  // with an earlier successful snapshot.
+  const attributionSnapshotByPid: Map<
+    number,
+    { pkg: string; lifecycle: AttributedEvent['lifecycle'] }
+  > = new Map();
+  const recordAttribution = (
+    pid: number,
+    attr: { pkg: string; lifecycle: AttributedEvent['lifecycle'] },
+  ): void => {
+    if (!attributionSnapshotByPid.has(pid)) {
+      attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
+    }
+  };
+
   // StraceRunner is the SOLE owner of the install process.
   // We do NOT call a separate spawner here — that would run install twice.
   //
@@ -396,6 +440,11 @@ export async function runInstallPhase(
         );
       }
       if (result !== null) {
+        // Finding 3 (audit-trust): snapshot attribution for this pid the
+        // first time we see it.  A later raw execve from the same pid
+        // with a scrubbed envp would otherwise lose the lifecycle
+        // context and slip past the bypass detector.
+        recordAttribution(shimEvent.pid, result);
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -415,35 +464,68 @@ export async function runInstallPhase(
 
       for (const rawEvent of straceEvents) {
         const result = input.attribution.attribute(rawEvent.pid);
-        if (result === null) continue;
-        // Audit-trust Finding 1: capture strace-observed successful
-        // execve syscalls so the post-loop cross-check can detect a
-        // syscall-bypass (strace saw the execve but the shim did not
-        // emit a matching `exec` event, which means no libc wrapper
-        // ran — almost certainly `syscall(SYS_execve, …)` directly).
-        // parseStraceLine emits a `spawn` RawEvent for execve, with the
-        // syscall return classified into ok/enoent/eacces.  Only the
-        // 'ok' case counts: a failed execve does NOT replace the
-        // process image and the shim wrapper would have observed it
-        // too, so unsuccessful execve doesn't tell us anything about
-        // the bypass invariant.
+
+        // Audit-trust Finding 3 (high, 2026-05-18): bypass counting
+        // runs BEFORE the attribution gate.  Strace observing a
+        // successful execve syscall on a pid is proof the kernel ran
+        // it — if no matching shim libc-wrapper event arrives, that
+        // is a raw-syscall bypass regardless of whether we can still
+        // attribute the pid to a package.  The attacker's most
+        // damaging variant (raw `syscall(SYS_execve, ...)` with a
+        // scrubbed envp) leaves /proc/<pid>/environ without
+        // npm_package_name / npm_lifecycle_event, so attribution
+        // returns null and, pre-fix, the bypass counter skipped the
+        // sample entirely — eliminating the detector.
+        //
+        // We snapshot attribution per pid on FIRST success and prefer
+        // the snapshot at bypass-emission time so the synthesised
+        // audit_bypass entry can still carry a meaningful pkg /
+        // lifecycle label.  parseStraceLine emits a `spawn` RawEvent
+        // for execve and execveat (Finding 2), with the syscall
+        // return classified into ok/enoent/eacces.  Only the 'ok'
+        // case counts: a failed execve does NOT replace the process
+        // image and the shim wrapper would have observed it too, so
+        // unsuccessful execve doesn't tell us anything about the
+        // bypass invariant.
+        if (result !== null) {
+          recordAttribution(rawEvent.pid, result);
+        }
+
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
           const argv0 = rawEvent.argv[0] ?? '';
           // For execve(pathname, argv, envp) the syscall path arg IS
           // argv[0] in our parser's output (the parser falls back to
           // the path when argv is empty), so prog/argv0 alias here.
           const prog = argv0;
+          // Use the snapshot if attribution failed this call but
+          // succeeded earlier on the same pid; otherwise fall through
+          // to a "<unattributed>" sentinel so the audit_bypass entry
+          // still appears in the lockfile.  We deliberately do NOT
+          // drop the sample on attribution failure — the bypass
+          // counter MUST run regardless (Finding 3).
+          const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+          const pkg =
+            result?.pkg ?? snapshot?.pkg ?? '<unattributed>';
+          const lifecycle =
+            result?.lifecycle ?? snapshot?.lifecycle ?? 'install';
           const samples = straceExecsByPid.get(rawEvent.pid) ?? [];
           samples.push({
             argv0,
             prog,
             pid: rawEvent.pid,
             ts: rawEvent.ts,
-            pkg: result.pkg,
-            lifecycle: result.lifecycle,
+            pkg,
+            lifecycle,
           });
           straceExecsByPid.set(rawEvent.pid, samples);
         }
+
+        // Regular event emission still requires successful attribution
+        // — emitting unattributed openat / connect / etc. would flood
+        // the lockfile with noise from system processes that happen to
+        // get traced.  The bypass synthesis path above is the deliberate
+        // exception: an unattributable raw execve IS the signal.
+        if (result === null) continue;
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
