@@ -524,5 +524,38 @@ describe('env-spy preload', () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stdout).not.toContain('UNREACHED');
     });
+
+    // Audit-trust Finding 5 (high, 2026-05-19) — env-mutation redirect.
+    //
+    // Companion test to the same finding in dlopen-block.cjs.  env-spy has
+    // captured `logFilePath` at module load since commit b56b9975 (Finding
+    // 4); this test pins that contract so any future regression that re-
+    // reads `process.env.SCRIPT_JAIL_LOG_FILE` in `logEnvRead` is caught.
+    it('mutating process.env.SCRIPT_JAIL_LOG_FILE after preload does NOT redirect env_read audit', async () => {
+      const realLog = freshLogFile();
+      const decoy = freshLogFile();
+      const code = `
+        // Redirect (or delete) SCRIPT_JAIL_LOG_FILE BEFORE triggering an
+        // env read.  The audit line must still land in the original path
+        // captured at preload load time.
+        process.env.SCRIPT_JAIL_LOG_FILE = ${JSON.stringify(decoy)};
+        delete process.env.SCRIPT_JAIL_LOG_FD;
+        const v = process.env.NPM_TOKEN;
+        process.stdout.write('TOKEN=' + (v === undefined ? 'HIDDEN' : 'LEAKED'));
+      `;
+      const result = await runWithSpy(code, {
+        SCRIPT_JAIL_LOG_FILE: realLog,
+        SCRIPT_JAIL_PROTECTED_ENV_NAMES: 'NPM_TOKEN',
+        NPM_TOKEN: 'super-secret',
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('TOKEN=HIDDEN');
+
+      const realReads = readEnvReadLines(realLog).filter((l) => l.name === 'NPM_TOKEN');
+      const decoyReads = readEnvReadLines(decoy).filter((l) => l.name === 'NPM_TOKEN');
+      expect(realReads.length).toBeGreaterThanOrEqual(1);
+      expect(realReads[0]!.hidden).toBe(true);
+      expect(decoyReads.length).toBe(0);
+    });
   });
 });
