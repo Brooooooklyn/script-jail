@@ -26576,6 +26576,9 @@ function buildChildEnv(baseEnv, config2, protectedEnvFilePath, eventsFilePath) {
     "/usr/local/lib/script-jail/platform-spoof.cjs",
     "/usr/local/lib/script-jail/env-spy.cjs"
   ];
+  const noAddons = "--no-addons";
+  const requireFlags = preloads.map((p) => `--require=${p}`);
+  const childNodeOptions = [noAddons, ...requireFlags].join(" ");
   return {
     ...baseEnv,
     LD_PRELOAD: "/lib/libscriptjail.so",
@@ -26598,10 +26601,16 @@ function buildChildEnv(baseEnv, config2, protectedEnvFilePath, eventsFilePath) {
     SCRIPT_JAIL_PRELOAD_PATH: "/lib/libscriptjail.so",
     SCRIPT_JAIL_SPOOF_PLATFORM: config2.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config2.spoof.arch,
-    SCRIPT_JAIL_NODE_OPTIONS: preloads.map((p) => `--require=${p}`).join(" "),
+    // Canonical sticky value the Rust shim's `shim_init` captures into
+    // CANON_NODE_OPTIONS via real_getenv_raw() and re-injects on every exec
+    // (see src/shim/src/lib.rs).  --no-addons is included so descendants
+    // inherit the bypass-block at every fork+exec boundary, even when the
+    // immediate caller scrubs NODE_OPTIONS.
+    SCRIPT_JAIL_NODE_OPTIONS: childNodeOptions,
     NODE_OPTIONS: [
       ...baseEnv["NODE_OPTIONS"] ? [baseEnv["NODE_OPTIONS"]] : [],
-      ...preloads.map((p) => `--require=${p}`)
+      noAddons,
+      ...requireFlags
     ].join(" ")
   };
 }

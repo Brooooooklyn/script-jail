@@ -993,6 +993,24 @@ function buildChildEnv(
     '/usr/local/lib/script-jail/env-spy.cjs',
   ];
 
+  // `--no-addons` (Finding C) disables native-addon loading at the V8 level:
+  // process.dlopen throws and `internalBinding('process_methods').dlopen`
+  // refuses to load any `.node` file.  Without this flag a lifecycle script
+  // run as `node --expose-internals ...` could reach the internalBinding
+  // dlopen path directly, bypassing the JS `dlopen-block.cjs` preload (which
+  // only patches process.dlopen / process.binding).  The Rust shim never
+  // sees the syscall because Node-loaded .node files come through dlopen()
+  // already-resolved through the runtime, but the audit chain only catches
+  // the JS-surface call.  Setting --no-addons closes the bypass at the
+  // engine level.
+  //
+  // Order matters: we PREPEND --no-addons so it can never be neutralised by
+  // an attacker-controlled flag that comes earlier in NODE_OPTIONS.  The
+  // existing --require entries follow it.
+  const noAddons = '--no-addons';
+  const requireFlags = preloads.map((p) => `--require=${p}`);
+  const childNodeOptions = [noAddons, ...requireFlags].join(' ');
+
   return {
     ...baseEnv,
     LD_PRELOAD: '/lib/libscriptjail.so',
@@ -1015,10 +1033,16 @@ function buildChildEnv(
     SCRIPT_JAIL_PRELOAD_PATH: '/lib/libscriptjail.so',
     SCRIPT_JAIL_SPOOF_PLATFORM: config.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config.spoof.arch,
-    SCRIPT_JAIL_NODE_OPTIONS: preloads.map((p) => `--require=${p}`).join(' '),
+    // Canonical sticky value the Rust shim's `shim_init` captures into
+    // CANON_NODE_OPTIONS via real_getenv_raw() and re-injects on every exec
+    // (see src/shim/src/lib.rs).  --no-addons is included so descendants
+    // inherit the bypass-block at every fork+exec boundary, even when the
+    // immediate caller scrubs NODE_OPTIONS.
+    SCRIPT_JAIL_NODE_OPTIONS: childNodeOptions,
     NODE_OPTIONS: [
       ...(baseEnv['NODE_OPTIONS'] ? [baseEnv['NODE_OPTIONS']] : []),
-      ...preloads.map((p) => `--require=${p}`),
+      noAddons,
+      ...requireFlags,
     ].join(' '),
   };
 }

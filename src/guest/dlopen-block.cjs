@@ -17,11 +17,14 @@
 //
 // SECURITY NOTES:
 //   - This preload blocks the documented process.dlopen and process.binding APIs.
-//     It does NOT block internalBinding('process_methods').dlopen, which requires
-//     --expose-internals to access. To fully prevent native addons, the VM must
-//     also enforce --no-addons at the Node launcher level or via seccomp.
-//     TODO(v2): Add --no-addons to NODE_OPTIONS in agent.ts to make native addon
-//     loading fail at the engine level before reaching any JS preload code.
+//     It does NOT — and need not — block internalBinding('process_methods').dlopen
+//     because the agent prepends `--no-addons` to NODE_OPTIONS (and to the sticky
+//     SCRIPT_JAIL_NODE_OPTIONS the Rust shim re-injects across exec).  --no-addons
+//     disables native-addon loading at the V8 level, so even
+//     `node --expose-internals` cannot reach a working dlopen via internalBinding.
+//     This preload remains as defense-in-depth and as the channel that emits the
+//     blocked-attempt events for `process.dlopen` callers that don't trip on the
+//     engine flag (e.g. attempts caught before V8 boots the addon loader).
 //   - Properties are defined as non-configurable, non-writable to prevent
 //     user code from restoring the originals via Object.defineProperty or delete.
 //

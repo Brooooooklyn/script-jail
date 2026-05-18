@@ -361,6 +361,19 @@ describe('agent main()', () => {
     expect(env['NODE_OPTIONS']).toContain('dlopen-block.cjs');
     expect(env['NODE_OPTIONS']).toContain('platform-spoof.cjs');
     expect(env['SCRIPT_JAIL_LOG_FD']).toBe('3');
+    // Finding C: --no-addons disables Node's native-addon loading at the
+    // V8 level so `node --expose-internals` cannot reach the internalBinding
+    // dlopen path that bypasses our JS dlopen-block preload.  Must be
+    // present in BOTH the live NODE_OPTIONS and the sticky
+    // SCRIPT_JAIL_NODE_OPTIONS the Rust shim re-injects across exec().
+    expect(env['NODE_OPTIONS']).toContain('--no-addons');
+    expect(env['SCRIPT_JAIL_NODE_OPTIONS']).toContain('--no-addons');
+    // Order: --no-addons MUST precede any --require= entry so an attacker-
+    // controlled trailing flag in NODE_OPTIONS can never neutralise it.
+    const noAddonsIdx = String(env['NODE_OPTIONS']).indexOf('--no-addons');
+    const firstRequireIdx = String(env['NODE_OPTIONS']).indexOf('--require=');
+    expect(noAddonsIdx).toBeGreaterThanOrEqual(0);
+    expect(firstRequireIdx).toBeGreaterThan(noAddonsIdx);
   });
 
   it('throws when config file does not exist', async () => {
