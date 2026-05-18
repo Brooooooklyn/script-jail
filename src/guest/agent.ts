@@ -340,6 +340,31 @@ export interface StraceTailerOptions {
   pollIntervalMs?: number;
   /** Extra drain time in ms after child exit to catch final writes (default 100). */
   drainMs?: number;
+  /**
+   * Optional callback invoked once with the pid of the FIRST per-pid
+   * strace output file discovered during tailing — i.e. the install
+   * command's pid (strace's direct child).  Used by
+   * `LinuxStraceRunner.getRootPid()` to expose the audit root to the
+   * dispatcher in {@link runInstallPhase} so it can seed cwd state
+   * for EXACTLY one pid instead of relying on a "first observed pid
+   * wins" heuristic that could mis-seed a child whose strace per-pid
+   * file is drained before the parent's.
+   *
+   * Strace's `-ff -o <basePath>` writes per-pid files in the order
+   * the kernel creates the pids; the install command's pid is the
+   * first one created (it's strace's direct child).  Polling /
+   * inotify may yield those files in a different order than they
+   * were created, but the FIRST file ever observed during the
+   * tailing loop is overwhelmingly the install command's — there's
+   * a small window during which no events have been written yet to
+   * any per-pid file.  When the first poll/watch fires, the only
+   * file present is the install command's.  We capture that pid
+   * here.
+   *
+   * If no file is ever discovered (strace failed to spawn), the
+   * callback is never invoked.
+   */
+  recordRootPid?(pid: number): void;
 }
 
 /**
@@ -380,6 +405,13 @@ export async function* runStraceTailer(
   const filePos = new Map<string, number>();
   // Map from filename → partial (unterminated) line buffer.
   const fileBuf = new Map<string, string>();
+  // Tracks whether we've already invoked opts.recordRootPid.  The FIRST
+  // per-pid file ever discovered (by `pollDir` or `fs.watch`) is the
+  // install command's strace output — strace writes the install root's
+  // file before any of its descendants' files are created.  When this
+  // flag is false and a parseable pid is encountered in `drainFile`,
+  // we report the pid and flip the flag.
+  let rootPidReported = false;
 
   function parsePidFromFilename(name: string): number {
     const suffix = name.slice(opts.basePrefix.length + 1); // strip "strace.out."
@@ -390,6 +422,21 @@ export async function* runStraceTailer(
   function drainFile(name: string): void {
     const fullPath = `${opts.watchDir}/${name}`;
     const pid = parsePidFromFilename(name);
+    // Report the FIRST observed per-pid file's pid as the install root.
+    // We check `filePos.has(name)` rather than `pos === 0` because a pid
+    // observation BEFORE the file has any bytes is still a valid signal
+    // — the file existed, the kernel chose that pid, that's enough to
+    // pin the install root.  Subsequent drainFile calls for OTHER
+    // filenames are descendants and must not overwrite the root.
+    if (!rootPidReported && pid > 0 && !filePos.has(name)) {
+      rootPidReported = true;
+      try {
+        opts.recordRootPid?.(pid);
+      } catch {
+        // Recording is best-effort; a callback throw must not abort
+        // the tailer.  In practice the recorder just sets a field.
+      }
+    }
     const pos = filePos.get(name) ?? 0;
 
     let size = 0;
@@ -931,6 +978,16 @@ export class LinuxStraceRunner implements StraceRunner {
   private readonly _spawnImpl: SpawnImpl;
   private readonly _eventsFile: EventsFile | null;
   private readonly _tamperRef: { reason: string | null } = { reason: null };
+  // Codex follow-up (bug #1, high, 2026-05-19): pid of the install
+  // command (strace's direct child) — captured the first time a
+  // per-pid strace output file is observed in `runStraceTailer`.
+  // Exposed via `getRootPid()` so the install-phase dispatcher can
+  // seed `pidCwd` for EXACTLY this pid instead of relying on a "first
+  // event yielded" heuristic that could mis-seed a child whose
+  // per-pid file happens to be drained before the parent's.  Null
+  // until the first per-pid file is observed (and remains null if
+  // strace failed to spawn).
+  private _rootPid: number | null = null;
 
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
@@ -973,6 +1030,10 @@ export class LinuxStraceRunner implements StraceRunner {
     if (this._tamperRef.reason === null) {
       this._tamperRef.reason = reason;
     }
+  }
+
+  getRootPid(): number | null {
+    return this._rootPid;
   }
 
   async *run(
@@ -1125,6 +1186,14 @@ export class LinuxStraceRunner implements StraceRunner {
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,
+        // Pin the install root pid from the first per-pid strace
+        // output file we ever observe (bug-fix #1 — see field docs
+        // and StraceTailerOptions.recordRootPid).  First-writer wins:
+        // the tailer's flag ensures only the very first file's pid
+        // reaches this callback.
+        recordRootPid: (pid) => {
+          if (this._rootPid === null) this._rootPid = pid;
+        },
       });
     } finally {
       if (stderrRl !== null) {

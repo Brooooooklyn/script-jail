@@ -37,13 +37,34 @@ function makeEmitter(): { emitter: Emitter; lines: string[] } {
  * `{`) and 'strace' for everything else.  This keeps the bulk of pre-
  * existing tests (which omit `source`) working unchanged while letting new
  * tests pin the channel deliberately.
+ *
+ * `opts.rootPid` (codex bug-fix #1, 2026-05-19) is exposed via
+ * `getRootPid()` so the install-phase dispatcher seeds `pidCwd` for
+ * EXACTLY that pid (rather than the first pid yielded — which could be
+ * a forked child whose strace per-pid file was drained before the
+ * parent's, in the real `LinuxStraceRunner`).  When omitted, defaults
+ * to the first record's pid (mirrors the pre-fix "first observed pid
+ * wins" heuristic, which most legacy tests assume).  Tests that
+ * specifically exercise the root-pid bug fix pass `rootPid` explicitly
+ * (or `null` to opt out of seeding entirely).
  */
 function cannedStraceRunner(
   records: Array<{ pid: number; line: string; source?: 'shim' | 'strace' }>,
   exitCode = 0,
+  opts: { rootPid?: number | null } = {},
 ): StraceRunner & { recordedTamper(): string | null } {
   let _exitCode = exitCode;
   let _tamperReason: string | null = null;
+  // Default root: first record's pid (legacy "first observed pid wins"
+  // for tests written before the bug-fix).  Explicit `null` opts out.
+  // Explicit numeric pid pins the root regardless of yield order — this
+  // is the test seam for the bug-#1 regression test.
+  const rootPid: number | null = (() => {
+    if (Object.prototype.hasOwnProperty.call(opts, 'rootPid')) {
+      return opts.rootPid ?? null;
+    }
+    return records[0]?.pid ?? null;
+  })();
   return {
     async *run() {
       for (const r of records) {
@@ -60,6 +81,7 @@ function cannedStraceRunner(
     recordTamper(reason: string) {
       if (_tamperReason === null) _tamperReason = reason;
     },
+    getRootPid() { return rootPid; },
     // Exposed for tests.  Same value as `getTamperReason()` but named
     // explicitly to make the assertion intent obvious at the call site.
     recordedTamper() { return _tamperReason; },
@@ -99,6 +121,7 @@ describe('runInstallPhase', () => {
         getExitCode() { return 0; },
         getTamperReason() { return null; },
         recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
       };
       const proc = mockProcReader({});
       const attr = new Attribution(proc);
@@ -125,6 +148,7 @@ describe('runInstallPhase', () => {
         getExitCode() { return 0; },
         getTamperReason() { return null; },
         recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -148,6 +172,7 @@ describe('runInstallPhase', () => {
         getExitCode() { return 0; },
         getTamperReason() { return null; },
         recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -169,6 +194,7 @@ describe('runInstallPhase', () => {
         getExitCode() { return 0; },
         getTamperReason() { return null; },
         recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
       };
       const { emitter } = makeEmitter();
       await runInstallPhase({
@@ -780,6 +806,7 @@ describe('runInstallPhase', () => {
         recordTamper(reason: string) {
           if (_tamperReason === null) _tamperReason = reason;
         },
+        getRootPid() { return records[0]?.pid ?? null; },
         recordedTamper() { return _tamperReason; },
       } as unknown as StraceRunner & { recordedTamper(): string | null };
     }
@@ -897,6 +924,7 @@ describe('runInstallPhase', () => {
         getExitCode() { return 0; },
         getTamperReason() { return null; },
         recordTamper(_reason: string) { /* deliberately no-op */ },
+        getRootPid() { return records[0]?.pid ?? null; },
       };
     }
 
@@ -933,6 +961,7 @@ describe('runInstallPhase', () => {
         getExitCode() { return 0; },
         getTamperReason() { return null; },
         recordTamper(_reason: string) { /* deliberately no-op */ },
+        getRootPid() { return 88; },
       };
       const { emitter, lines } = makeEmitter();
 
@@ -4647,6 +4676,298 @@ describe('runInstallPhase', () => {
         return r['kind'] === 'exec' && r['unresolved_path'] === true;
       });
       expect(unresolved).toHaveLength(0);
+    });
+
+    // ===================================================================
+    // Bug-fix regression tests (high, 2026-05-19):
+    //   #1 — root pid plumbing (runner-reported, not "first observed")
+    //   #2 — CLONE_FS shared cwd group (parent ↔ child cwd is shared)
+    //   #3 — CLONE_FILES shared fd-table group (dup/close affects both)
+    // ===================================================================
+
+    // Bug #1: pre-fix the dispatcher seeded `pidCwd[<first-yielded-pid>]
+    // = input.cwd` on the FIRST yielded event.  The production
+    // `StraceTailer` watches per-pid files via readdir + fs.watch; the
+    // watcher may report a forked child's file BEFORE the parent's, in
+    // which case the child (whose real cwd is whatever the parent
+    // chdir'd to) silently gets the WRONG cwd seed and AT_FDCWD-
+    // relative opens leak past protected-paths.  Post-fix: only the
+    // runner-reported root pid is ever seeded.
+    it('child-first event arrival does NOT seed child cwd with input.cwd (bug #1)', async () => {
+      const proc = mockProcReader({
+        9001: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9002: {
+          ppid: 9001,
+          env: {
+            npm_package_name: 'parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Simulate the race: the CHILD's strace per-pid file is drained
+        // first by the watcher.  Pre-fix this would set pidCwd[9002] =
+        // '/work', so a subsequent openat for ".ssh/id_rsa" from pid
+        // 9002 would resolve to /work/.ssh/id_rsa — wrong (the kernel
+        // resolves through the parent's chdir'd cwd which we don't yet
+        // know) and unprotected.
+        {
+          pid: 9002,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        // Runner reports pid 9001 as the install root — but pid 9001 is
+        // never yielded.  The dispatcher MUST NOT seed pid 9002 with
+        // input.cwd just because it's the first observed pid.
+        strace: cannedStraceRunner(records, 0, { rootPid: 9001 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The probe must NOT have been silently certified as /work/.ssh/id_rsa.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // A <UNRESOLVED_PATH> entry MUST be surfaced — pid 9002 had no
+      // observable parent clone and the runner's root pid is 9001.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 9002;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Bug #2: CLONE_FS makes parent and child share `struct fs` (cwd).
+    // A chdir in EITHER pid mutates the shared cwd; subsequent
+    // AT_FDCWD-relative opens in the OTHER pid resolve through the
+    // new cwd.  Pre-fix, copy-on-clone snapshotted parent's cwd into
+    // child's INDEPENDENT entry; a child chdir then mutated only the
+    // child's cwd, and a parent openat resolved against the parent's
+    // stale snapshot — leaking past protected-paths.
+    it('clone with CLONE_FS unions cwd group: child chdir affects parent openat (bug #2)', async () => {
+      const proc = mockProcReader({
+        9101: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'clone-fs-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9102: {
+          ppid: 9101,
+          env: {
+            npm_package_name: 'clone-fs-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Seed the install-root path with a no-op event from pid 9101
+        // so it gets the input.cwd seed.
+        {
+          pid: 9101,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FS → parent and child share cwd.
+        {
+          pid: 9101,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tidptr=0x7f...) = 9102',
+          source: 'strace',
+        },
+        // CHILD chdirs to $HOME — kernel mutates the SHARED fs struct,
+        // so the parent's effective cwd is now /root too.
+        {
+          pid: 9102,
+          line: 'chdir("/root") = 0',
+          source: 'strace',
+        },
+        // PARENT issues AT_FDCWD-relative openat.  Kernel resolves
+        // through /root because cwd is shared.  Post-fix the matcher
+        // sees /root/.ssh/id_rsa.
+        {
+          pid: 9101,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9101 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The parent's probe MUST surface as /root/.ssh/id_rsa with
+      // hidden=true (matched the protected pattern) — proving the
+      // child's chdir mutated the shared cwd.
+      const protectedReads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return (
+          raw['kind'] === 'read' &&
+          raw['path'] === '/root/.ssh/id_rsa' &&
+          raw['pid'] === 9101 &&
+          raw['hidden'] === true
+        );
+      });
+      expect(protectedReads).toHaveLength(1);
+      // The pre-fix (independent cwd snapshot) would have resolved to
+      // /work/.ssh/id_rsa and dropped it as unprotected ENOENT.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+    });
+
+    // Bug #3: CLONE_FILES makes parent and child share the fd table.
+    // A dup2 in EITHER pid mutates the shared fd table; subsequent
+    // openat(<fd>, "relative", ...) in the OTHER pid resolves through
+    // the new fd's directory.  Pre-fix, copy-on-clone snapshotted
+    // parent's dirfdTable into child's INDEPENDENT keys; a child
+    // dup2 then mutated only the child's table, and a parent
+    // openat(<dup'd-fd>, ...) resolved against the parent's stale
+    // entry — missing the protected-paths match.
+    it('clone with CLONE_FILES unions fd-table group: child dup2 affects parent openat (bug #3)', async () => {
+      const proc = mockProcReader({
+        9201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'clone-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9202: {
+          ppid: 9201,
+          env: {
+            npm_package_name: 'clone-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /pkg → fd 7.
+        {
+          pid: 9201,
+          line: 'openat(AT_FDCWD, "/pkg", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent opens /root → fd 8.
+        {
+          pid: 9201,
+          line: 'openat(AT_FDCWD, "/root", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FILES → fd table is shared.
+        {
+          pid: 9201,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS, child_tidptr=0x7f...) = 9202',
+          source: 'strace',
+        },
+        // CHILD dup2(8, 7): fd 7 now aliases /root in the SHARED table.
+        {
+          pid: 9202,
+          line: 'dup2(8, 7) = 7',
+          source: 'strace',
+        },
+        // PARENT openat(7, ...): kernel resolves through /root because
+        // the fd table is shared and fd 7 now points at /root.
+        {
+          pid: 9201,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9201 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The parent's openat MUST resolve through /root (the new dirfd
+      // target) — proving the child's dup2 mutated the shared fd
+      // table.  The protected pattern matches → hidden=true.
+      const protectedReads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return (
+          raw['kind'] === 'read' &&
+          raw['path'] === '/root/.ssh/id_rsa' &&
+          raw['pid'] === 9201 &&
+          raw['hidden'] === true
+        );
+      });
+      expect(protectedReads).toHaveLength(1);
+      // The pre-fix (independent fd-table snapshot) would have
+      // resolved through the parent's stale fd 7 → /pkg → /pkg/.ssh/
+      // id_rsa.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/pkg/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
     });
   });
 

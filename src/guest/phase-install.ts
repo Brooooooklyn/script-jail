@@ -129,6 +129,29 @@ export interface StraceRunner {
    * the earliest signal survives.
    */
   recordTamper(reason: string): void;
+
+  /**
+   * Returns the pid of the install command — i.e. strace's direct child,
+   * the process the audited install command was exec'd into — or `null`
+   * if the runner has not yet observed any pid (or strace failed to
+   * spawn).
+   *
+   * Used by {@link runInstallPhase} to seed `pidCwd` for EXACTLY one pid:
+   * the install root.  Pre-fix, the dispatcher seeded the cwd of the
+   * first pid it observed — a forked child whose strace per-pid file
+   * happened to be drained before the parent's would have been seeded
+   * with `input.cwd`, silently certifying a wrong cwd.  Pinning the
+   * seed to the runner-reported root pid eliminates that race.
+   *
+   * Implementations that cannot identify the root pid (e.g. a fake
+   * runner that emits canned records) MAY return the first pid in
+   * their record sequence, or `null` to opt out of seeding entirely.
+   * The production `LinuxStraceRunner` records the pid of the first
+   * per-pid strace output file it observes — strace writes the
+   * install root's file strictly before any of its descendants', so
+   * this is the install command's pid.
+   */
+  getRootPid(): number | null;
 }
 
 export interface PhaseInstallInput {
@@ -422,9 +445,101 @@ export async function runInstallPhase(
       ? path.basename(eventsFilePathCanonical)
       : null;
 
-  // Per-pid fd table: maps a kernel-assigned file descriptor (from a
-  // successful openat) to the canonical absolute path of the directory
-  // (or file) it points at.  Used to resolve subsequent
+  // ===================================================================
+  // Codex audit follow-up (high, 2026-05-19): CLONE_FS / CLONE_FILES
+  // group modelling via union-find.
+  //
+  // The kernel's clone(2) flags determine whether the child shares
+  // parent state or gets an independent copy:
+  //   - CLONE_FS    → parent and child share `struct fs` (cwd, root,
+  //                   umask).  A chdir(2) in either pid mutates the
+  //                   OTHER pid's effective cwd, since both pids point
+  //                   at the same kernel structure.
+  //   - CLONE_FILES → parent and child share the file descriptor table.
+  //                   A dup/close in either pid mutates the OTHER pid's
+  //                   fd table.  (Threads created via pthread_create
+  //                   ALWAYS share both, since glibc passes
+  //                   CLONE_FS|CLONE_FILES|CLONE_VM.)
+  //
+  // Without modelling this sharing, copy-on-clone produces silently
+  // wrong audits: a CLONE_FS-cloned pair where the CHILD chdir's
+  // produces a parent whose effective cwd has ALSO moved, but our
+  // pidCwd[parent] still points at the parent's pre-clone cwd.  A
+  // subsequent `openat(AT_FDCWD, ".ssh/id_rsa", ...)` in the parent
+  // then resolves against the WRONG cwd, slipping past the
+  // protected-paths matcher.
+  //
+  // The fix: model cwd state and fd-table state as PER-GROUP rather
+  // than per-pid, with the group represented by a union-find
+  // structure.  On every read/write of `pidCwd`, `pidCwdUnknown`,
+  // `dirfdTable`, and `dirfdStateUnknown`, we replace the pid key
+  // with `findCwdRoot(pid)` / `findFdRoot(pid)` to resolve to the
+  // group's canonical representative.  Clone propagation either
+  // unions the parent/child into the same group (CLONE_FS /
+  // CLONE_FILES set) or creates an independent copy for the child
+  // (flag unset, the default for plain fork/clone).
+  // ===================================================================
+
+  // Union-find parent-pointer maps for cwd sharing groups and fd-table
+  // sharing groups.  A pid not in the map is its own root (lazy init).
+  // Path compression is applied during `find` to keep amortized lookup
+  // near O(1).
+  const cwdParent = new Map<number, number>();
+  const fdParent = new Map<number, number>();
+
+  function findCwdRoot(pid: number): number {
+    let cur = pid;
+    while (true) {
+      const next = cwdParent.get(cur);
+      if (next === undefined || next === cur) return cur;
+      cur = next;
+    }
+  }
+  function findFdRoot(pid: number): number {
+    let cur = pid;
+    while (true) {
+      const next = fdParent.get(cur);
+      if (next === undefined || next === cur) return cur;
+      cur = next;
+    }
+  }
+  // Path compression: set `pid`'s parent pointer to the resolved root.
+  function compressCwd(pid: number, root: number): void {
+    if (pid !== root) cwdParent.set(pid, root);
+  }
+  function compressFd(pid: number, root: number): void {
+    if (pid !== root) fdParent.set(pid, root);
+  }
+  function rootedCwd(pid: number): number {
+    const r = findCwdRoot(pid);
+    compressCwd(pid, r);
+    return r;
+  }
+  function rootedFd(pid: number): number {
+    const r = findFdRoot(pid);
+    compressFd(pid, r);
+    return r;
+  }
+  // Union two pids into the same group.  Caller chooses semantics:
+  // for cwd vs fd groups they may differ.  We always union the
+  // CHILD's root onto the PARENT's root (so the parent's existing
+  // group state is preserved).
+  function unionCwd(parentPid: number, childPid: number): void {
+    const pr = rootedCwd(parentPid);
+    const cr = rootedCwd(childPid);
+    if (pr === cr) return;
+    cwdParent.set(cr, pr);
+  }
+  function unionFd(parentPid: number, childPid: number): void {
+    const pr = rootedFd(parentPid);
+    const cr = rootedFd(childPid);
+    if (pr === cr) return;
+    fdParent.set(cr, pr);
+  }
+
+  // Per-pid (really per-fd-group) fd table: maps a kernel-assigned file
+  // descriptor (from a successful openat) to the canonical absolute path
+  // of the directory (or file) it points at.  Used to resolve subsequent
   // `openat(<dirfd>, "relative", ...)` events.  We resolve at INSERT
   // time using `path.resolve` on the openat's path argument — strace
   // gives us the literal path from userspace, which is what we need to
@@ -435,8 +550,11 @@ export async function runInstallPhase(
   // is a single-pass loop and the table is GC'd when the function
   // returns.  In practice the table is small (~hundreds of fds per pid
   // at most for a real install).
+  //
+  // Keyed by fd-group root (`findFdRoot(pid)`) — see CLONE_FILES
+  // discussion above.
   const dirfdTable = new Map<string, string>();
-  const fdKey = (pid: number, fd: number): string => `${pid}:${fd}`;
+  const fdKey = (pid: number, fd: number): string => `${rootedFd(pid)}:${fd}`;
 
   // Audit-trust Finding (high, 2026-05-19): per-pid CWD table for Layer-2
   // resolution of AT_FDCWD-relative openat targets.  Updated from strace
@@ -450,6 +568,11 @@ export async function runInstallPhase(
   // does not equal `eventsFilePathCanonical` — silently dropping the
   // forgery signal.  Layer 1 (basename match above) is the safety net;
   // this map is the proper resolution.
+  //
+  // Keyed by cwd-group root (`findCwdRoot(pid)`) — see CLONE_FS
+  // discussion in the union-find section above.  All access goes
+  // through `cwdGet` / `cwdSet` / `cwdDelete` helpers below to ensure
+  // the key is always a group root.
   const pidCwd = new Map<number, string>();
 
   // Audit-trust Finding (high, 2026-05-19, codex follow-up): set of pids
@@ -475,7 +598,31 @@ export async function runInstallPhase(
   // A subsequent `chdir("/absolute")` removes the pid from the set and
   // re-seeds `pidCwd` with the absolute path — confidence is
   // re-established because absolute chdir doesn't depend on prior cwd.
+  //
+  // Keyed by cwd-group root (CLONE_FS — see union-find section above).
+  // All access goes through `cwdUnknownHas` / `cwdUnknownAdd` /
+  // `cwdUnknownDelete` helpers below.
   const pidCwdUnknown = new Set<number>();
+
+  // ---- group-aware accessors for cwd state -------------------------
+  function cwdGet(pid: number): string | undefined {
+    return pidCwd.get(rootedCwd(pid));
+  }
+  function cwdSet(pid: number, value: string): void {
+    pidCwd.set(rootedCwd(pid), value);
+  }
+  function cwdDelete(pid: number): void {
+    pidCwd.delete(rootedCwd(pid));
+  }
+  function cwdUnknownHas(pid: number): boolean {
+    return pidCwdUnknown.has(rootedCwd(pid));
+  }
+  function cwdUnknownAdd(pid: number): void {
+    pidCwdUnknown.add(rootedCwd(pid));
+  }
+  function cwdUnknownDelete(pid: number): void {
+    pidCwdUnknown.delete(rootedCwd(pid));
+  }
 
   // Audit-trust Finding (high, 2026-05-19, codex follow-up #2): set of
   // pids whose fd-table integrity we cannot guarantee.  Membership is
@@ -508,39 +655,57 @@ export async function runInstallPhase(
   // NOTE: this set is INTENTIONALLY orthogonal to `pidCwdUnknown` —
   // cwd state and fd-table state are corrupted by different syscalls
   // and a pid can be cwd-known + fd-unknown (or vice-versa).
+  //
+  // Keyed by fd-group root (CLONE_FILES — see union-find section
+  // above).  All access goes through `fdUnknownHas` / `fdUnknownAdd`
+  // helpers below.
   const dirfdStateUnknown = new Set<number>();
 
-  // Audit-trust Finding (high, 2026-05-19, codex follow-up #1): the
-  // install command's root pid (the process strace exec's into) is the
-  // ONE pid in the audit tree that doesn't have an observable
-  // clone/fork parent — it was spawned by the agent (not by another
-  // traced process) and so inherits its cwd from `input.cwd` directly.
-  // Every OTHER pid we observe is either a strace-traced descendant of
-  // the root (whose pidCwd is propagated at clone time, see the
-  // clone/clone3 pre-parser below) or a victim of an unobservable fork
-  // (in which case `canonicalizeForEmit` correctly fails closed via
-  // the missing-pidCwd path).
+  // ---- group-aware accessors for fd-table-unknown state ------------
+  function fdUnknownHas(pid: number): boolean {
+    return dirfdStateUnknown.has(rootedFd(pid));
+  }
+  function fdUnknownAdd(pid: number): void {
+    dirfdStateUnknown.add(rootedFd(pid));
+  }
+
+  // Audit-trust Finding (high, 2026-05-19, codex follow-up #1) +
+  // refinement (high, 2026-05-19, bug #1): the install command's root
+  // pid (the process strace exec's into) is the ONE pid in the audit
+  // tree that doesn't have an observable clone/fork parent — it was
+  // spawned by the agent (not by another traced process) and so
+  // inherits its cwd from `input.cwd` directly.  Every OTHER pid we
+  // observe is either a strace-traced descendant of the root (whose
+  // pidCwd is propagated at clone time, see the clone/clone3
+  // pre-parser below) or a victim of an unobservable fork (in which
+  // case `canonicalizeForEmit` correctly fails closed via the missing-
+  // pidCwd path).
   //
-  // We seed the root's pidCwd on the very FIRST observed event in the
-  // dispatcher loop (`installRootSeeded` flips at that point).  This
-  // is a "first observed pid wins" heuristic; it is robust in practice
-  // because strace -ff writes the install root's per-pid file
-  // strictly before any of its children's files (the parent must call
-  // clone/execve to spawn a child, and those syscalls are written to
-  // the parent's file BEFORE the child runs its first syscall to be
-  // written to its own file).  The alternative — plumbing the strace
-  // child's pid through `StraceRunner.run()` — would force a tighter
-  // coupling between the runner and the dispatcher that isn't needed
-  // for any other purpose.
+  // Pre-refinement we seeded `pidCwd[<first-yielded-pid>] = input.cwd`
+  // on the very first event yielded by the runner.  That was a "first
+  // observed pid wins" heuristic.  The production `StraceTailer` polls
+  // per-pid strace files via `readdirSync()` + `fs.watch`, and there
+  // is NO guarantee that the strace root pid's file is yielded
+  // first — a forked child's file might be drained earlier if the
+  // watcher reports it sooner.  Pre-fix that would have silently
+  // seeded the WRONG pid (a child whose actual cwd was inherited from
+  // a chdir'd parent) with `input.cwd`, certifying a wrong cwd and
+  // letting subsequent AT_FDCWD-relative opens leak past
+  // protected-paths.
   //
-  // Why this isn't a fallback in `canonicalizeForEmit` itself:
-  // applying `input.cwd` to ANY untracked pid is the exact codex
-  // finding #1 bug — children that inherited a chdir'd cwd from a
-  // parent would be wrongly resolved against `input.cwd`.  Seeding
-  // ONLY the install root and letting clone propagation handle every
-  // descendant preserves correctness without flooding `audit_bypass`
-  // for the install's own AT_FDCWD-relative opens (npm/pnpm/yarn
-  // typically issue many of those against `input.cwd`).
+  // Refinement: the `StraceRunner` interface now exposes a
+  // `getRootPid()` accessor.  The production runner records the pid
+  // of the FIRST per-pid strace output file discovered (strace writes
+  // its direct child's file before any descendants') and exposes it
+  // here.  The dispatcher consults `getRootPid()` on every event and
+  // seeds `pidCwd` ONLY for that exact pid number.  Pids that don't
+  // have that number get no seed — they must either inherit via
+  // clone propagation (CLONE_FS or copy) or fail closed.
+  //
+  // EDGE CASE: if the runner returns null (strace failed to spawn,
+  // or the runner is a test fake that doesn't track root), no seeding
+  // happens.  This is the safe default — every pid then falls through
+  // to clone-propagation or the fail-closed path.
   let installRootSeeded = false;
 
   /**
@@ -581,7 +746,7 @@ export async function runInstallPhase(
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
-      const cwd = pidCwd.get(pid);
+      const cwd = cwdGet(pid);
       if (cwd === undefined) return null;
       return path.resolve(cwd, targetPath);
     }
@@ -590,7 +755,7 @@ export async function runInstallPhase(
     // unresolvable so the forgery detector falls through to the
     // Layer-1 basename safety net instead of trusting a possibly
     // stale mapping.
-    if (dirfdStateUnknown.has(pid)) return null;
+    if (fdUnknownHas(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === undefined) return null;
     return path.resolve(dirPath, targetPath);
@@ -639,7 +804,7 @@ export async function runInstallPhase(
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
-      const tracked = pidCwd.get(pid);
+      const tracked = cwdGet(pid);
       if (tracked !== undefined) {
         return path.resolve(tracked, targetPath);
       }
@@ -657,7 +822,7 @@ export async function runInstallPhase(
     }
     // Codex follow-up #2 (high, 2026-05-19): fail closed on stale fd
     // tables — see comments on `dirfdStateUnknown` above.
-    if (dirfdStateUnknown.has(pid)) return null;
+    if (fdUnknownHas(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === undefined) return null;
     return path.resolve(dirPath, targetPath);
@@ -775,17 +940,30 @@ export async function runInstallPhase(
     cwd: input.cwd,
     basePath,
   })) {
-    // Codex follow-up #1 (high, 2026-05-19): seed the install root pid's
-    // cwd with `input.cwd` on the FIRST observed event.  See the
-    // `installRootSeeded` comment above for why this targets exactly
-    // one pid rather than every untracked one.  We deliberately seed
-    // BEFORE any per-source dispatch so even a leading shim-channel
-    // event (which carries the same pid) seeds the root — although in
-    // practice the first observation is overwhelmingly a strace
-    // syscall on the install command.
+    // Codex follow-up #1 (high, 2026-05-19) + bug-fix refinement (high,
+    // 2026-05-19): seed the install root pid's cwd with `input.cwd`
+    // EXACTLY ONCE, for EXACTLY the pid the runner reports as the
+    // strace root (the install command's pid — strace's direct
+    // child).  See the `installRootSeeded` comment above for why this
+    // targets exactly one pid rather than every untracked one.  We
+    // deliberately seed BEFORE any per-source dispatch so even a
+    // leading shim-channel event (which carries the same pid) seeds
+    // the root.
+    //
+    // Pre-refinement this was a "first observed pid wins" heuristic
+    // which silently mis-seeded a forked child whose per-pid strace
+    // file was yielded before the parent's.  Now the runner
+    // explicitly identifies the root pid; non-root pids never receive
+    // an `input.cwd` seed here.  If the runner cannot identify a root
+    // (`getRootPid()` returns null — strace failed to spawn, or a
+    // test fake opted out), no seeding happens and every pid falls
+    // through to clone-propagation or the fail-closed path.
     if (!installRootSeeded) {
-      installRootSeeded = true;
-      pidCwd.set(pid, path.resolve(input.cwd));
+      const rootPid = input.strace.getRootPid();
+      if (rootPid !== null && pid === rootPid) {
+        installRootSeeded = true;
+        cwdSet(pid, path.resolve(input.cwd));
+      }
     }
 
     if (source === 'shim') {
@@ -909,8 +1087,11 @@ export async function runInstallPhase(
         if (path.isAbsolute(decoded)) {
           // Absolute chdir: resolve to canonical absolute form,
           // re-establish confidence (remove unknown-state mark).
-          pidCwd.set(pid, path.resolve(decoded));
-          pidCwdUnknown.delete(pid);
+          // The cwdSet/cwdUnknownDelete helpers route through the
+          // cwd-group root, so a CLONE_FS sibling's chdir mutates
+          // the shared cwd as the kernel would.
+          cwdSet(pid, path.resolve(decoded));
+          cwdUnknownDelete(pid);
         } else {
           // Relative chdir.  Codex follow-up (high, 2026-05-19): pre-
           // fix, we computed `path.resolve(current ?? '', decoded)` —
@@ -924,15 +1105,15 @@ export async function runInstallPhase(
           // tracked prior cwd.  Otherwise mark the pid's cwd state
           // unknown so the emit canonicalizer fails closed on later
           // relative opens.
-          const current = pidCwd.get(pid);
+          const current = cwdGet(pid);
           if (current !== undefined) {
-            pidCwd.set(pid, path.resolve(current, decoded));
+            cwdSet(pid, path.resolve(current, decoded));
             // Keep pidCwdUnknown unchanged: a relative chdir on top
             // of a known cwd produces a known cwd.
           } else {
-            pidCwdUnknown.add(pid);
-            // Do NOT pidCwd.set(...) here — leaving the entry absent
-            // means canonicalizeForEmit consults pidCwdUnknown and
+            cwdUnknownAdd(pid);
+            // Do NOT cwdSet here — leaving the entry absent means
+            // canonicalizeForEmit consults pidCwdUnknown and
             // returns null.
           }
         }
@@ -944,9 +1125,9 @@ export async function runInstallPhase(
         if (Number.isFinite(fd)) {
           const dirPath = dirfdTable.get(fdKey(pid, fd));
           if (dirPath !== undefined) {
-            pidCwd.set(pid, dirPath);
+            cwdSet(pid, dirPath);
             // Successful fchdir to a KNOWN fd: re-establish confidence.
-            pidCwdUnknown.delete(pid);
+            cwdUnknownDelete(pid);
           } else {
             // Codex follow-up (high, 2026-05-19): successful fchdir to
             // an UNKNOWN fd means the kernel's cwd has moved to
@@ -955,16 +1136,17 @@ export async function runInstallPhase(
             // (or absent) and letting canonicalizeForEmit fall back
             // to input.cwd, which is wrong.  Mark cwd unknown so
             // subsequent AT_FDCWD-relative opens fail closed.
-            pidCwdUnknown.add(pid);
-            pidCwd.delete(pid);
+            cwdUnknownAdd(pid);
+            cwdDelete(pid);
           }
         }
         continue;
       }
 
-      // Codex follow-up #1 (high, 2026-05-19): pre-parse fork/clone/vfork
-      // /clone3 to propagate per-pid state to the new child pid.  Strace
-      // wire formats (modern Linux):
+      // Codex follow-up #1 (high, 2026-05-19) + refinement (bugs #2 & #3,
+      // 2026-05-19): pre-parse fork/clone/vfork/clone3 to propagate
+      // per-pid state to the new child pid.  Strace wire formats
+      // (modern Linux):
       //
       //   clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|..., parent_tid=..., child_tid=..., tls=...) = 12345
       //   clone3({flags=CLONE_VM|..., child_tid=..., parent_tid=..., exit_signal=SIGCHLD, stack=..., stack_size=...}, 88) = 12345
@@ -974,28 +1156,42 @@ export async function runInstallPhase(
       // Failure case (rc < 0, e.g. ENOMEM): does NOT create a child, so we
       // skip propagation.
       //
-      // What we propagate (forward only — pre-clone state of the parent at
-      // the moment we observe the clone line):
+      // CLONE_FS / CLONE_FILES sharing semantics (bugs #2, #3):
+      //   - CLONE_FS    → parent and child share `struct fs` (cwd, root,
+      //                   umask).  We UNION the cwd group so a chdir in
+      //                   either pid mutates the other's effective cwd.
+      //   - CLONE_FILES → parent and child share the file descriptor
+      //                   table.  We UNION the fd group so dup/close in
+      //                   either pid mutates the other's table.
+      //   - Neither flag set (default for plain fork/vfork, but vfork
+      //                   does set CLONE_VM): child gets an independent
+      //                   COPY of the parent's state at clone time.
+      //                   Subsequent chdir/dup/close in either pid
+      //                   diverges from the other.  This is our copy-on-
+      //                   clone branch.
+      //
+      // We extract the flags string from `flags=CLONE_VM|CLONE_FS|...`
+      // (clone) or `{flags=CLONE_VM|..., ...}` (clone3) and check for
+      // the literal identifiers `CLONE_FS` and `CLONE_FILES`.  Plain
+      // `fork()` and `vfork()` use NEITHER flag, so the copy branch
+      // is taken.
+      //
+      // What we propagate forward (copy branch):
       //   - pidCwd[parent] → pidCwd[child]  (cwd is inherited per clone(2))
       //   - pidCwdUnknown membership        (so a parent with unknown cwd
       //                                      propagates that uncertainty)
       //   - dirfdTable entries keyed by parent → child  (fd table is
-      //                                      inherited per clone(2) unless
-      //                                      CLONE_FILES is unset, which
-      //                                      we don't reliably observe;
-      //                                      treating inheritance as the
-      //                                      default is conservative — a
-      //                                      false-positive matched fd
-      //                                      would still produce a correct
-      //                                      absolute path because the
-      //                                      caller can't issue an
-      //                                      openat(<fd>, ...) on an fd
-      //                                      that wasn't actually
-      //                                      inherited)
+      //                                      inherited per clone(2))
       //   - dirfdStateUnknown membership    (propagate fd-table uncertainty)
       //   - shimLoadedPids membership       (shim mapping is preserved
       //                                      across fork — the executable
       //                                      image is shared)
+      //
+      // Share branch (CLONE_FS / CLONE_FILES set): a single union(pid,
+      // childPid) replaces the per-key copy.  After the union, every
+      // cwdGet/cwdSet/fdKey on either pid resolves to the same group
+      // root, so the kernel-shared state is modelled with a single
+      // backing entry.
       //
       // Race with the child's first event (codex spec note): if the child
       // races ahead and emits a syscall BEFORE we observe the parent's
@@ -1004,8 +1200,9 @@ export async function runInstallPhase(
       // pidCwdUnknown → returns null → `<UNRESOLVED_PATH>`).  Forward
       // propagation alone does NOT retroactively rewrite — that's the
       // conservative outcome the codex spec asked for.
-      const cloneMatch = line.match(/^(?:clone3?|vfork|fork)\b/);
+      const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
       if (cloneMatch !== null) {
+        const syscallName = cloneMatch[1] ?? '';
         // Locate the trailing "= <rc>" and gate on success (positive rc).
         // We match the rc as a decimal integer; clone/clone3 never return
         // hex or symbolic forms.  Negative rc (e.g. "-1 ENOMEM") fails
@@ -1015,34 +1212,86 @@ export async function runInstallPhase(
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? '', 10);
           if (Number.isFinite(childPid) && childPid > 0) {
-            // pidCwd / pidCwdUnknown propagation.
-            const parentCwd = pidCwd.get(pid);
-            if (parentCwd !== undefined) {
-              pidCwd.set(childPid, parentCwd);
-            }
-            if (pidCwdUnknown.has(pid)) {
-              pidCwdUnknown.add(childPid);
-            }
-            // dirfdTable propagation — copy every entry whose key is
-            // `<parentPid>:<fd>` to the new key `<childPid>:<fd>`.  The
-            // map is small in practice (~hundreds of entries max for a
-            // realistic install) and propagation only runs once per
-            // clone observation, so the O(N) sweep is fine.
-            const parentPrefix = `${pid}:`;
-            for (const [key, val] of dirfdTable) {
-              if (key.startsWith(parentPrefix)) {
-                const suffix = key.slice(parentPrefix.length);
-                dirfdTable.set(`${childPid}:${suffix}`, val);
+            // Extract the clone-flag identifier list.  For `clone(...)`
+            // strace renders `flags=CLONE_VM|CLONE_FS|...`; for
+            // `clone3({...})` it renders the same `flags=...|...` but
+            // INSIDE the struct literal.  A single regex matches both
+            // because the leading `flags=` token is the same.  Plain
+            // fork/vfork have no flags field.
+            let cloneFs = false;
+            let cloneFiles = false;
+            if (syscallName === 'clone' || syscallName === 'clone3') {
+              const flagsMatch = line.match(/flags=([A-Z0-9_|]+)/);
+              if (flagsMatch !== null) {
+                const flagTokens = (flagsMatch[1] ?? '').split('|');
+                for (const tok of flagTokens) {
+                  if (tok === 'CLONE_FS') cloneFs = true;
+                  else if (tok === 'CLONE_FILES') cloneFiles = true;
+                }
               }
             }
-            // dirfdStateUnknown propagation.
-            if (dirfdStateUnknown.has(pid)) {
-              dirfdStateUnknown.add(childPid);
+
+            // --- cwd group: union if CLONE_FS, else copy. -----------
+            if (cloneFs) {
+              // Union the two pids into the same cwd group.  Subsequent
+              // chdir on either pid mutates the shared state.
+              unionCwd(pid, childPid);
+              // No need to copy cwd / pidCwdUnknown — they are already
+              // visible to the child via the shared root.
+            } else {
+              // Copy branch: independent fs struct.  Snapshot the
+              // parent's cwd / unknown bit into the child's NEW group.
+              // We deliberately do NOT pre-union the child — leaving
+              // it as its own root means future chdir in the child
+              // mutates only the child's pidCwd entry.
+              const parentCwd = cwdGet(pid);
+              if (parentCwd !== undefined) {
+                cwdSet(childPid, parentCwd);
+              }
+              if (cwdUnknownHas(pid)) {
+                cwdUnknownAdd(childPid);
+              }
             }
+
+            // --- fd group: union if CLONE_FILES, else copy. ---------
+            if (cloneFiles) {
+              unionFd(pid, childPid);
+              // No per-key copy needed — fd lookups resolve to the
+              // shared group root.
+            } else {
+              // Copy branch: independent fd table.  Sweep over the
+              // parent's keys and re-key into the child's NEW fd
+              // group.  `fdKey(parent, fd)` resolves to
+              // `<parentRoot>:<fd>`; `fdKey(child, fd)` resolves to
+              // `<childRoot>:<fd>` (the child is its own root pre-
+              // sweep because we haven't unioned it).
+              const parentRoot = rootedFd(pid);
+              const childRoot = rootedFd(childPid);
+              if (parentRoot !== childRoot) {
+                const parentPrefix = `${parentRoot}:`;
+                for (const [key, val] of dirfdTable) {
+                  if (key.startsWith(parentPrefix)) {
+                    const suffix = key.slice(parentPrefix.length);
+                    dirfdTable.set(`${childRoot}:${suffix}`, val);
+                  }
+                }
+                if (fdUnknownHas(pid)) {
+                  fdUnknownAdd(childPid);
+                }
+              }
+            }
+
             // shim-load propagation — the parent's address-space mapping
             // of /lib/libscriptjail.so is shared with the child until
             // the child execve's (which clears the bit, see the
-            // existing post-spawn handler below).
+            // existing post-spawn handler below).  Address-space sharing
+            // is governed by CLONE_VM, not CLONE_FS / CLONE_FILES; we
+            // intentionally do NOT model CLONE_VM as a union because
+            // the shim mapping is established at ld.so time (before any
+            // user syscalls run) and our per-pid set is functionally
+            // identical for shared and copied address spaces in our
+            // use case.  Conservative copy here mirrors the historical
+            // behaviour.
             if (shimLoadedPids.has(pid)) {
               shimLoadedPids.add(childPid);
             }
@@ -1126,13 +1375,15 @@ export async function runInstallPhase(
             ? parseInt(lastRaw, 16)
             : parseInt(lastRaw, 10);
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
-            // Iterate over the MAP entries for this pid only — avoid
-            // O(last) work when last is UINT_MAX (4294967295), the
-            // common "close all fds above first" idiom.
-            const pidPrefix = `${pid}:`;
+            // Iterate over the MAP entries for this fd-group only —
+            // avoid O(last) work when last is UINT_MAX (4294967295),
+            // the common "close all fds above first" idiom.  Keys are
+            // formatted as `<fdGroupRoot>:<fd>`, so we anchor on the
+            // resolved root for this pid.
+            const groupPrefix = `${rootedFd(pid)}:`;
             for (const key of dirfdTable.keys()) {
-              if (!key.startsWith(pidPrefix)) continue;
-              const fdStr = key.slice(pidPrefix.length);
+              if (!key.startsWith(groupPrefix)) continue;
+              const fdStr = key.slice(groupPrefix.length);
               const fd = parseInt(fdStr, 10);
               if (Number.isFinite(fd) && fd >= first && fd <= last) {
                 dirfdTable.delete(key);

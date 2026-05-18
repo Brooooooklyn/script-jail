@@ -25904,22 +25904,92 @@ async function runInstallPhase(input) {
     }
   })();
   const eventsFileBasename = eventsFilePathCanonical !== null ? path.basename(eventsFilePathCanonical) : null;
+  const cwdParent = /* @__PURE__ */ new Map();
+  const fdParent = /* @__PURE__ */ new Map();
+  function findCwdRoot(pid) {
+    let cur = pid;
+    while (true) {
+      const next = cwdParent.get(cur);
+      if (next === void 0 || next === cur) return cur;
+      cur = next;
+    }
+  }
+  function findFdRoot(pid) {
+    let cur = pid;
+    while (true) {
+      const next = fdParent.get(cur);
+      if (next === void 0 || next === cur) return cur;
+      cur = next;
+    }
+  }
+  function compressCwd(pid, root) {
+    if (pid !== root) cwdParent.set(pid, root);
+  }
+  function compressFd(pid, root) {
+    if (pid !== root) fdParent.set(pid, root);
+  }
+  function rootedCwd(pid) {
+    const r = findCwdRoot(pid);
+    compressCwd(pid, r);
+    return r;
+  }
+  function rootedFd(pid) {
+    const r = findFdRoot(pid);
+    compressFd(pid, r);
+    return r;
+  }
+  function unionCwd(parentPid, childPid) {
+    const pr = rootedCwd(parentPid);
+    const cr = rootedCwd(childPid);
+    if (pr === cr) return;
+    cwdParent.set(cr, pr);
+  }
+  function unionFd(parentPid, childPid) {
+    const pr = rootedFd(parentPid);
+    const cr = rootedFd(childPid);
+    if (pr === cr) return;
+    fdParent.set(cr, pr);
+  }
   const dirfdTable = /* @__PURE__ */ new Map();
-  const fdKey = (pid, fd) => `${pid}:${fd}`;
+  const fdKey = (pid, fd) => `${rootedFd(pid)}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
   const pidCwdUnknown = /* @__PURE__ */ new Set();
+  function cwdGet(pid) {
+    return pidCwd.get(rootedCwd(pid));
+  }
+  function cwdSet(pid, value) {
+    pidCwd.set(rootedCwd(pid), value);
+  }
+  function cwdDelete(pid) {
+    pidCwd.delete(rootedCwd(pid));
+  }
+  function cwdUnknownHas(pid) {
+    return pidCwdUnknown.has(rootedCwd(pid));
+  }
+  function cwdUnknownAdd(pid) {
+    pidCwdUnknown.add(rootedCwd(pid));
+  }
+  function cwdUnknownDelete(pid) {
+    pidCwdUnknown.delete(rootedCwd(pid));
+  }
   const dirfdStateUnknown = /* @__PURE__ */ new Set();
+  function fdUnknownHas(pid) {
+    return dirfdStateUnknown.has(rootedFd(pid));
+  }
+  function fdUnknownAdd(pid) {
+    dirfdStateUnknown.add(rootedFd(pid));
+  }
   let installRootSeeded = false;
   const canonicalizeOpenTarget = (pid, targetPath, dirfd) => {
     if (dirfd === void 0) {
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
-      const cwd = pidCwd.get(pid);
+      const cwd = cwdGet(pid);
       if (cwd === void 0) return null;
       return path.resolve(cwd, targetPath);
     }
-    if (dirfdStateUnknown.has(pid)) return null;
+    if (fdUnknownHas(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === void 0) return null;
     return path.resolve(dirPath, targetPath);
@@ -25929,13 +25999,13 @@ async function runInstallPhase(input) {
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
-      const tracked = pidCwd.get(pid);
+      const tracked = cwdGet(pid);
       if (tracked !== void 0) {
         return path.resolve(tracked, targetPath);
       }
       return null;
     }
-    if (dirfdStateUnknown.has(pid)) return null;
+    if (fdUnknownHas(pid)) return null;
     const dirPath = dirfdTable.get(fdKey(pid, dirfd));
     if (dirPath === void 0) return null;
     return path.resolve(dirPath, targetPath);
@@ -25955,8 +26025,11 @@ async function runInstallPhase(input) {
     basePath
   })) {
     if (!installRootSeeded) {
-      installRootSeeded = true;
-      pidCwd.set(pid, path.resolve(input.cwd));
+      const rootPid = input.strace.getRootPid();
+      if (rootPid !== null && pid === rootPid) {
+        installRootSeeded = true;
+        cwdSet(pid, path.resolve(input.cwd));
+      }
     }
     if (source === "shim") {
       const shimEvent = parseShimLine(line);
@@ -25986,14 +26059,14 @@ async function runInstallPhase(input) {
         const rawTarget = chdirMatch[1] ?? "";
         const decoded = unescapeStraceString(rawTarget);
         if (path.isAbsolute(decoded)) {
-          pidCwd.set(pid, path.resolve(decoded));
-          pidCwdUnknown.delete(pid);
+          cwdSet(pid, path.resolve(decoded));
+          cwdUnknownDelete(pid);
         } else {
-          const current = pidCwd.get(pid);
+          const current = cwdGet(pid);
           if (current !== void 0) {
-            pidCwd.set(pid, path.resolve(current, decoded));
+            cwdSet(pid, path.resolve(current, decoded));
           } else {
-            pidCwdUnknown.add(pid);
+            cwdUnknownAdd(pid);
           }
         }
         continue;
@@ -26004,37 +26077,62 @@ async function runInstallPhase(input) {
         if (Number.isFinite(fd)) {
           const dirPath = dirfdTable.get(fdKey(pid, fd));
           if (dirPath !== void 0) {
-            pidCwd.set(pid, dirPath);
-            pidCwdUnknown.delete(pid);
+            cwdSet(pid, dirPath);
+            cwdUnknownDelete(pid);
           } else {
-            pidCwdUnknown.add(pid);
-            pidCwd.delete(pid);
+            cwdUnknownAdd(pid);
+            cwdDelete(pid);
           }
         }
         continue;
       }
-      const cloneMatch = line.match(/^(?:clone3?|vfork|fork)\b/);
+      const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
       if (cloneMatch !== null) {
+        const syscallName = cloneMatch[1] ?? "";
         const rcMatch = line.match(/=\s*(\d+)\b/);
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
           if (Number.isFinite(childPid) && childPid > 0) {
-            const parentCwd = pidCwd.get(pid);
-            if (parentCwd !== void 0) {
-              pidCwd.set(childPid, parentCwd);
-            }
-            if (pidCwdUnknown.has(pid)) {
-              pidCwdUnknown.add(childPid);
-            }
-            const parentPrefix = `${pid}:`;
-            for (const [key, val] of dirfdTable) {
-              if (key.startsWith(parentPrefix)) {
-                const suffix = key.slice(parentPrefix.length);
-                dirfdTable.set(`${childPid}:${suffix}`, val);
+            let cloneFs = false;
+            let cloneFiles = false;
+            if (syscallName === "clone" || syscallName === "clone3") {
+              const flagsMatch = line.match(/flags=([A-Z0-9_|]+)/);
+              if (flagsMatch !== null) {
+                const flagTokens = (flagsMatch[1] ?? "").split("|");
+                for (const tok of flagTokens) {
+                  if (tok === "CLONE_FS") cloneFs = true;
+                  else if (tok === "CLONE_FILES") cloneFiles = true;
+                }
               }
             }
-            if (dirfdStateUnknown.has(pid)) {
-              dirfdStateUnknown.add(childPid);
+            if (cloneFs) {
+              unionCwd(pid, childPid);
+            } else {
+              const parentCwd = cwdGet(pid);
+              if (parentCwd !== void 0) {
+                cwdSet(childPid, parentCwd);
+              }
+              if (cwdUnknownHas(pid)) {
+                cwdUnknownAdd(childPid);
+              }
+            }
+            if (cloneFiles) {
+              unionFd(pid, childPid);
+            } else {
+              const parentRoot = rootedFd(pid);
+              const childRoot = rootedFd(childPid);
+              if (parentRoot !== childRoot) {
+                const parentPrefix = `${parentRoot}:`;
+                for (const [key, val] of dirfdTable) {
+                  if (key.startsWith(parentPrefix)) {
+                    const suffix = key.slice(parentPrefix.length);
+                    dirfdTable.set(`${childRoot}:${suffix}`, val);
+                  }
+                }
+                if (fdUnknownHas(pid)) {
+                  fdUnknownAdd(childPid);
+                }
+              }
             }
             if (shimLoadedPids.has(pid)) {
               shimLoadedPids.add(childPid);
@@ -26083,10 +26181,10 @@ async function runInstallPhase(input) {
           const lastRaw = closeRangeMatch[2] ?? "";
           const last = lastRaw.startsWith("0x") ? parseInt(lastRaw, 16) : parseInt(lastRaw, 10);
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
-            const pidPrefix = `${pid}:`;
+            const groupPrefix = `${rootedFd(pid)}:`;
             for (const key of dirfdTable.keys()) {
-              if (!key.startsWith(pidPrefix)) continue;
-              const fdStr = key.slice(pidPrefix.length);
+              if (!key.startsWith(groupPrefix)) continue;
+              const fdStr = key.slice(groupPrefix.length);
               const fd = parseInt(fdStr, 10);
               if (Number.isFinite(fd) && fd >= first && fd <= last) {
                 dirfdTable.delete(key);
@@ -26721,6 +26819,7 @@ async function* runStraceTailer(opts) {
   }
   const filePos = /* @__PURE__ */ new Map();
   const fileBuf = /* @__PURE__ */ new Map();
+  let rootPidReported = false;
   function parsePidFromFilename(name) {
     const suffix = name.slice(opts.basePrefix.length + 1);
     const n = parseInt(suffix, 10);
@@ -26729,6 +26828,13 @@ async function* runStraceTailer(opts) {
   function drainFile(name) {
     const fullPath = `${opts.watchDir}/${name}`;
     const pid = parsePidFromFilename(name);
+    if (!rootPidReported && pid > 0 && !filePos.has(name)) {
+      rootPidReported = true;
+      try {
+        opts.recordRootPid?.(pid);
+      } catch {
+      }
+    }
     const pos = filePos.get(name) ?? 0;
     let size = 0;
     try {
@@ -27067,6 +27173,16 @@ var LinuxStraceRunner = class {
   _spawnImpl;
   _eventsFile;
   _tamperRef = { reason: null };
+  // Codex follow-up (bug #1, high, 2026-05-19): pid of the install
+  // command (strace's direct child) — captured the first time a
+  // per-pid strace output file is observed in `runStraceTailer`.
+  // Exposed via `getRootPid()` so the install-phase dispatcher can
+  // seed `pidCwd` for EXACTLY this pid instead of relying on a "first
+  // event yielded" heuristic that could mis-seed a child whose
+  // per-pid file happens to be drained before the parent's.  Null
+  // until the first per-pid file is observed (and remains null if
+  // strace failed to spawn).
+  _rootPid = null;
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
    *                   to `node:child_process.spawn`.
@@ -27105,6 +27221,9 @@ var LinuxStraceRunner = class {
     if (this._tamperRef.reason === null) {
       this._tamperRef.reason = reason;
     }
+  }
+  getRootPid() {
+    return this._rootPid;
   }
   async *run(cmd, args, opts) {
     const straceArgs = [
@@ -27160,7 +27279,15 @@ var LinuxStraceRunner = class {
           eventsFileBasename: (0, import_node_path2.basename)(this._eventsFile.path),
           tamperRef: this._tamperRef
         } : {},
-        exitPromise
+        exitPromise,
+        // Pin the install root pid from the first per-pid strace
+        // output file we ever observe (bug-fix #1 — see field docs
+        // and StraceTailerOptions.recordRootPid).  First-writer wins:
+        // the tailer's flag ensures only the very first file's pid
+        // reaches this callback.
+        recordRootPid: (pid) => {
+          if (this._rootPid === null) this._rootPid = pid;
+        }
       });
     } finally {
       if (stderrRl !== null) {

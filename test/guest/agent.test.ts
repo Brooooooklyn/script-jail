@@ -112,6 +112,7 @@ function emptyStrace(exitCode = 0): StraceRunner {
     // Test fakes that don't audit a shared events file return null.
     getTamperReason() { return null; },
     recordTamper(_reason: string) { /* no-op for test fakes */ },
+    getRootPid() { return null; },
   };
 }
 
@@ -160,6 +161,7 @@ function tamperingPlainStrace(reason: string, exitCode = 0): StraceRunner {
       // First-writer-wins parity with LinuxStraceRunner.
       if (currentReason === '' || currentReason === null) currentReason = r;
     },
+    getRootPid() { return null; },
   };
 }
 
@@ -178,6 +180,7 @@ function trackingStrace(exitCode = 0): { strace: StraceRunner; calls: string[] }
       // Finding D: tamper reporting is part of the StraceRunner contract.
       getTamperReason() { return null; },
       recordTamper(_reason: string) { /* no-op for test fakes */ },
+      getRootPid() { return null; },
     },
   };
 }
