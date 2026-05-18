@@ -691,6 +691,61 @@ export async function runInstallPhase(
     for (const tomb of bucket) snap.preDetachTombstones.push(tomb);
     pendingFdTombstones.delete(pid);
   }
+  // Codex follow-up (medium, 2026-05-19, bug #2 — stale-tombstone-on-
+  // reopen): cancel any PRE-marker fd tombstones for `pid` whose target
+  // fd matches `newFd`.  Strace ordering can surface a close/cloexec/
+  // close_range BEFORE a subsequent open/dup/F_DUPFD that reuses the
+  // same fd number — without cancellation, the delayed-clone
+  // reconciler would replay the stale tombstone AFTER unionFd merges
+  // the freshly-reopened mapping into the parent group, deleting the
+  // valid entry on BOTH sides.
+  //
+  // For point tombstones (`close` / `cloexec`) targeting `newFd` we
+  // simply drop them.  For range tombstones (`closeRange`) covering
+  // `newFd` we surgically excise `newFd` from the range — splitting
+  // into [first, newFd-1] and [newFd+1, last] when the range had more
+  // than one entry — so other fds in the range remain tombstoned.
+  // Empty / inverted sub-ranges are pruned.
+  //
+  // Only PRE-marker tombstones (in `pendingFdTombstones`) are
+  // mutated; once a marker exists, tombstones live in the snapshot's
+  // `preDetachTombstones[]` (frozen at marker time) or the
+  // `postDetachLog[]` (private to the child's group already).
+  function cancelPendingTombstonesForFd(pid: number, newFd: number): void {
+    const bucket = pendingFdTombstones.get(pid);
+    if (bucket === undefined) return;
+    const next: FdTombstone[] = [];
+    for (const tomb of bucket) {
+      if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
+        if (tomb.fd === newFd) continue; // drop stale point tombstone
+        next.push(tomb);
+      } else {
+        // closeRange — split around newFd if it falls inside.
+        if (newFd < tomb.first || newFd > tomb.last) {
+          next.push(tomb);
+          continue;
+        }
+        if (tomb.first <= newFd - 1) {
+          next.push({
+            kind: 'closeRange',
+            first: tomb.first,
+            last: newFd - 1,
+            cloexec: tomb.cloexec,
+          });
+        }
+        if (newFd + 1 <= tomb.last) {
+          next.push({
+            kind: 'closeRange',
+            first: newFd + 1,
+            last: tomb.last,
+            cloexec: tomb.cloexec,
+          });
+        }
+      }
+    }
+    if (next.length === 0) pendingFdTombstones.delete(pid);
+    else pendingFdTombstones.set(pid, next);
+  }
 
   // Helper: snapshot the child's CURRENT cwd state for a pending marker.
   function snapshotCwd(pid: number): CwdSnapshot {
@@ -2562,6 +2617,12 @@ export async function runInstallPhase(
                 }
               }
               dirfdTable.set(newKey, { path: oldVal.path, cloexec: newCloexec });
+              // Codex follow-up (medium, 2026-05-19, bug #2 — stale-
+              // tombstone-on-reopen): newfd now points at a valid
+              // mapping; cancel any pre-marker tombstone targeting
+              // this fd so the delayed-clone reconciler doesn't
+              // delete the entry after unionFd merges it.
+              cancelPendingTombstonesForFd(pid, newFd);
             } else {
               // oldfd has no tracked dir mapping → newfd must NOT
               // retain its previous mapping either (it now aliases
@@ -3028,6 +3089,11 @@ export async function runInstallPhase(
                 path: oldVal.path,
                 cloexec: cmd === 'F_DUPFD_CLOEXEC',
               });
+              // Codex follow-up (medium, 2026-05-19, bug #2 — stale-
+              // tombstone-on-reopen): cancel any pre-marker tombstone
+              // targeting fd `rc` for this pid; mirrors the same fix
+              // at the dup-family and openat success sites.
+              cancelPendingTombstonesForFd(pid, rc);
             } else {
               // Unknown source fd → invalidate any prior mapping at the
               // new fd (mirrors the dup-family behaviour).
@@ -3318,6 +3384,14 @@ export async function runInstallPhase(
               path: canonicalForFd,
               cloexec,
             });
+            // Codex follow-up (medium, 2026-05-19, bug #2 — stale-
+            // tombstone-on-reopen): a fresh open/openat/openat2/creat
+            // reusing a fd that earlier had a close/cloexec tombstone
+            // queued (pre-marker) supersedes that tombstone.  Cancel
+            // it so the delayed-clone reconciler doesn't replay it
+            // AFTER unionFd merges this valid mapping into the
+            // parent's group.
+            cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
           }
         }
 

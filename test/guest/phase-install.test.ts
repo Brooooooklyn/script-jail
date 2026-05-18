@@ -10338,5 +10338,331 @@ describe('runInstallPhase', () => {
       });
       expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex follow-up (medium, 2026-05-19, bug #2 — stale-tombstone-
+    // on-reopen, no marker): the singleton child close(7) records a
+    // pre-marker `close` tombstone for the (untracked) inherited fd
+    // 7.  The child then opens /B as fd 7, which (post-fix) cancels
+    // the stale tombstone.  When the delayed parent clone(CLONE_FILES)
+    // arrives WITHOUT any intervening detach marker, the union
+    // branch's standalone-tombstone replay finds an empty bucket →
+    // nothing to apply.  unionFd brings the child's fd 7 → /B into
+    // the unified group; subsequent openat(7, ...) on either pid
+    // resolves through /B.
+    //
+    // Pre-fix bug: the standalone replay applied the stale close
+    // tombstone AFTER unionFd, dropping the merged /B mapping and
+    // tainting both groups fd-unknown.  Post-fix: parent + child
+    // openat(7, "x") both resolve to /B/x.
+    it('close-then-reopen-before-delayed-clone cancels stale tombstone, no marker (bug #2 stale-tombstone-on-reopen)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'tombstone-cancel-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'tombstone-cancel-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child close(7) — singleton, no parent fd 7 entry tracked
+        // (untracked inherited).  Pre-marker `close` tombstone
+        // recorded for fd 7.
+        {
+          pid: 1001,
+          line: 'close(7) = 0',
+          source: 'strace',
+        },
+        // Child opens /B as fd 7 — cancels the stale tombstone
+        // (post-fix) and installs the child-group entry.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES).  Reconciler enters the
+        // union branch; unionFd merges child's fd 7 → /B into the
+        // parent group.  Standalone tombstone replay finds an empty
+        // bucket → nothing to apply (post-fix).  fd 7 → /B survives.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — MUST resolve to /B/x.
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 9',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST resolve to /B/x.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent: /B/x certified.
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1000;
+      });
+      expect(parentRead).toHaveLength(1);
+      // Child: /B/x certified.
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // Neither side fails closed via <UNRESOLVED_PATH> for the openat.
+      const unresolvedFromOpen = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolvedFromOpen).toHaveLength(0);
+    });
+
+    // Codex follow-up (medium, 2026-05-19, bug #2 — stale-tombstone-
+    // on-reopen, with subsequent unshare):
+    //   1. child close(7) [pre-marker close tombstone for fd 7]
+    //   2. child opens /B as fd 7 [cancels pre-marker tombstone]
+    //   3. child unshare(CLONE_FILES) [snapshot captures fd 7 → /B;
+    //      preDetachTombstones empty post-cancel]
+    //   4. delayed parent clone(CLONE_FILES) = child
+    // Reconciler: copy branch (childHadPendingFdDetach=true).  Snapshot
+    // entries: fd 7 → /B.  preDetachTombstones empty.  No parent
+    // entry for fd 7 → no snapshot conflict.  Copy pass leaves the
+    // child's current /B entry in place.  Both sides openat(7) →
+    // /B/x.
+    //
+    // Pre-fix: the absorbed pre-detach close tombstone for fd 7
+    // would have replayed at reconciliation, dropping the child's
+    // /B entry from its post-detach group (and tainting parent
+    // under shared CLONE_FILES); both sides would fail closed
+    // through fd-unknown.  Post-fix: tombstone cancelled at reopen
+    // → /B/x certified.
+    it('close-then-reopen-with-unshare cancels pre-marker tombstone (bug #2 stale-tombstone-on-reopen with marker)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'tombstone-cancel-marker-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'tombstone-cancel-marker-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child close(7) — singleton with no parent fd 7 entry
+        // (untracked inherited).  Pre-marker `close` tombstone
+        // recorded for fd 7.
+        {
+          pid: 1001,
+          line: 'close(7) = 0',
+          source: 'strace',
+        },
+        // Child opens /B as fd 7 — cancels the pre-marker tombstone
+        // (post-fix).  Child-rooted entry: fd 7 → /B.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child unshare(CLONE_FILES) — singleton detach.  snapshotFd
+        // captures fd 7 → /B; absorbPendingTombstones sees an empty
+        // bucket → preDetachTombstones is empty.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES).  Copy branch.  Parent
+        // has no fd 7 entry, so no snapshot conflict.  Child's
+        // current fd 7 → /B is preserved.  Pre-fix: stale close
+        // tombstone in preDetachTombstones would now fire,
+        // dropping fd 7 and tainting fd-unknown both sides.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST resolve to /B/x.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child: /B/x certified.
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // No <UNRESOLVED_PATH> surfaced from the openat(7, ...) above.
+      const unresolvedFromOpen = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolvedFromOpen).toHaveLength(0);
+    });
+
+    // Codex follow-up (medium, 2026-05-19, bug #2 — range-tombstone
+    // surgery): child close_range(3, 10, 0) records a pre-marker
+    // range tombstone covering [3, 10].  Child then opens /B as fd
+    // 7 (in range).  Post-fix the cancel helper splits the range
+    // into [3, 6] and [8, 10], leaving fd 7's reopen intact while
+    // tombstones for fds 3-6 and 8-10 continue to apply.
+    //
+    // The test exercises BOTH paths: parent fd 7 (reopen, NOT
+    // tombstoned) resolves to /B/x; parent fd 8 (in remaining
+    // [8, 10] range, still tombstoned) fails closed under
+    // fd-unknown.
+    it('close_range-then-reopen-in-range splits range tombstone (bug #2 range surgery)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'tombstone-range-cancel-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'tombstone-range-cancel-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A as fd 7 AND /C as fd 8 (both in [3,10]).
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/C", O_RDONLY|O_DIRECTORY) = 8',
+          source: 'strace',
+        },
+        // Child close_range(3, 10, 0) — pre-marker range tombstone
+        // covering [3, 10].
+        {
+          pid: 1001,
+          line: 'close_range(3, 10, 0) = 0',
+          source: 'strace',
+        },
+        // Child opens /B as fd 7 — splits the range tombstone into
+        // [3, 6] and [8, 10].  fd 7 NOT tombstoned.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES).  Reconciler enters the
+        // union branch (no marker); standalone tombstone replay
+        // applies the SPLIT ranges to the unified group: drop entries
+        // in [3, 6] (none tracked — no-op) and [8, 10] (drops fd 8).
+        // fd 7 → /B survives because it isn't covered.  Both groups
+        // marked fd-unknown because at least one closeRange touched
+        // (fd 8).
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent openat(7, "x") — surfaced under fd-unknown fail-
+        // closed even though fd 7 itself wasn't tombstoned: any
+        // touched range tombstone taints the whole group's
+        // fd-unknown bit.  Acceptable conservative behaviour; the
+        // important property is /A/x is NOT certified.
+        {
+          pid: 1000,
+          line: 'openat(7, "x", O_RDONLY) = 11',
+          source: 'strace',
+        },
+        // Parent openat(8, "x") — fd 8 was in the [8, 10] surviving
+        // range; entry dropped and group fd-unknown.  MUST fail
+        // closed.
+        {
+          pid: 1000,
+          line: 'openat(8, "x", O_RDONLY) = 12',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Critical property: /A/x is NEVER certified (fd 7 was
+      // /A in parent's table before child reopened to /B — the
+      // reopen overwrites the entry in the shared group AND any
+      // stale /A mapping is gone).
+      const parentLeakedA = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1000;
+      });
+      expect(parentLeakedA).toHaveLength(0);
+      // /C/x (fd 8's parent path) must also NOT be certified — fd
+      // 8 was in the surviving [8, 10] sub-range and got dropped.
+      const parentLeakedC = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/C/x' && r['pid'] === 1000;
+      });
+      expect(parentLeakedC).toHaveLength(0);
+      // Parent's fd 8 surfaces <UNRESOLVED_PATH>.
+      const parentUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1000;
+      });
+      expect(parentUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

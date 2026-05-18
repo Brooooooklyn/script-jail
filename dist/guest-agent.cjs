@@ -25930,6 +25930,40 @@ async function runInstallPhase(input) {
     for (const tomb of bucket) snap.preDetachTombstones.push(tomb);
     pendingFdTombstones.delete(pid);
   }
+  function cancelPendingTombstonesForFd(pid, newFd) {
+    const bucket = pendingFdTombstones.get(pid);
+    if (bucket === void 0) return;
+    const next = [];
+    for (const tomb of bucket) {
+      if (tomb.kind === "close" || tomb.kind === "cloexec") {
+        if (tomb.fd === newFd) continue;
+        next.push(tomb);
+      } else {
+        if (newFd < tomb.first || newFd > tomb.last) {
+          next.push(tomb);
+          continue;
+        }
+        if (tomb.first <= newFd - 1) {
+          next.push({
+            kind: "closeRange",
+            first: tomb.first,
+            last: newFd - 1,
+            cloexec: tomb.cloexec
+          });
+        }
+        if (newFd + 1 <= tomb.last) {
+          next.push({
+            kind: "closeRange",
+            first: newFd + 1,
+            last: tomb.last,
+            cloexec: tomb.cloexec
+          });
+        }
+      }
+    }
+    if (next.length === 0) pendingFdTombstones.delete(pid);
+    else pendingFdTombstones.set(pid, next);
+  }
   function snapshotCwd(pid) {
     return { cwd: cwdGet(pid), unknown: cwdUnknownHas(pid) };
   }
@@ -26619,6 +26653,7 @@ async function runInstallPhase(input) {
                 }
               }
               dirfdTable.set(newKey, { path: oldVal.path, cloexec: newCloexec });
+              cancelPendingTombstonesForFd(pid, newFd);
             } else {
               dirfdTable.delete(newKey);
               fdUnknownAdd(pid);
@@ -26836,6 +26871,7 @@ async function runInstallPhase(input) {
                 path: oldVal.path,
                 cloexec: cmd2 === "F_DUPFD_CLOEXEC"
               });
+              cancelPendingTombstonesForFd(pid, rc);
             } else {
               dirfdTable.delete(newKey);
               fdUnknownAdd(pid);
@@ -26949,6 +26985,7 @@ async function runInstallPhase(input) {
               path: canonicalForFd,
               cloexec
             });
+            cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
           }
         }
         if (rawEvent.kind === "read" && rawEvent.path === SHIM_LIBRARY_PATH) {
