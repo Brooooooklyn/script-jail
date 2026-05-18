@@ -25910,24 +25910,24 @@ async function runInstallPhase(input) {
   const pendingCwdDetach = /* @__PURE__ */ new Map();
   const pendingFdDetach = /* @__PURE__ */ new Map();
   const pendingFdTombstones = /* @__PURE__ */ new Map();
-  function recordFdTombstone(pid, fd, tomb) {
+  function recordFdTombstone(pid, tomb) {
     if (!isFdSingleton(pid)) return;
     const existingSnap = pendingFdDetach.get(pid);
     if (existingSnap !== void 0) {
-      existingSnap.tombstones.set(fd, tomb);
+      existingSnap.postDetachTombstones.push(tomb);
       return;
     }
     let bucket = pendingFdTombstones.get(pid);
     if (bucket === void 0) {
-      bucket = /* @__PURE__ */ new Map();
+      bucket = [];
       pendingFdTombstones.set(pid, bucket);
     }
-    bucket.set(fd, tomb);
+    bucket.push(tomb);
   }
   function absorbPendingTombstones(pid, snap) {
     const bucket = pendingFdTombstones.get(pid);
     if (bucket === void 0) return;
-    for (const [fd, tomb] of bucket) snap.tombstones.set(fd, tomb);
+    for (const tomb of bucket) snap.preDetachTombstones.push(tomb);
     pendingFdTombstones.delete(pid);
   }
   function snapshotCwd(pid) {
@@ -25946,7 +25946,8 @@ async function runInstallPhase(input) {
       entries,
       unknown: dirfdStateUnknown.has(root),
       actions: [action],
-      tombstones: /* @__PURE__ */ new Map()
+      preDetachTombstones: [],
+      postDetachTombstones: []
     };
     absorbPendingTombstones(pid, snap);
     return snap;
@@ -26402,21 +26403,79 @@ async function runInstallPhase(input) {
                 }
                 if (childFdSnap !== void 0 && childHadPendingFdDetach) {
                   const childGroupPrefix = `${rootedFd(childPid)}:`;
-                  for (const [fd, tomb] of childFdSnap.tombstones) {
+                  const applyPointTombstone = (fd, kind, toParent) => {
                     const childKey = `${childGroupPrefix}${fd}`;
                     const parentKey = `${parentPrefix}${fd}`;
-                    if (tomb.kind === "close") {
+                    if (kind === "close") {
                       dirfdTable.delete(childKey);
-                      if (fdPendingDetachShared) {
+                      if (toParent) {
                         dirfdTable.delete(parentKey);
                         fdUnknownAdd(pid);
                         fdUnknownAdd(childPid);
                       }
-                    } else if (tomb.kind === "cloexec") {
+                    } else {
                       const cur = dirfdTable.get(childKey);
                       if (cur !== void 0) {
                         dirfdTable.set(childKey, { path: cur.path, cloexec: true });
                       }
+                      if (toParent) {
+                        const pcur = dirfdTable.get(parentKey);
+                        if (pcur !== void 0) {
+                          dirfdTable.set(parentKey, { path: pcur.path, cloexec: true });
+                        }
+                      }
+                    }
+                  };
+                  const applyRangeTombstone = (first, last, cloexec, toParent) => {
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(childGroupPrefix)) continue;
+                      const fdStr = k.slice(childGroupPrefix.length);
+                      const fdNum = parseInt(fdStr, 10);
+                      if (Number.isFinite(fdNum) && fdNum >= first && fdNum <= last) {
+                        if (cloexec) {
+                          const cur = dirfdTable.get(k);
+                          if (cur !== void 0) {
+                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                          }
+                        } else {
+                          dirfdTable.delete(k);
+                        }
+                      }
+                    }
+                    if (toParent) {
+                      let touched = false;
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(parentPrefix)) continue;
+                        const fdStr = k.slice(parentPrefix.length);
+                        const fdNum = parseInt(fdStr, 10);
+                        if (Number.isFinite(fdNum) && fdNum >= first && fdNum <= last) {
+                          if (cloexec) {
+                            const cur = dirfdTable.get(k);
+                            if (cur !== void 0) {
+                              dirfdTable.set(k, { path: cur.path, cloexec: true });
+                            }
+                          } else {
+                            dirfdTable.delete(k);
+                          }
+                          touched = true;
+                        }
+                      }
+                      if (touched && !cloexec) {
+                        fdUnknownAdd(pid);
+                        fdUnknownAdd(childPid);
+                      }
+                    }
+                  };
+                  for (const tomb of childFdSnap.preDetachTombstones) {
+                    if (tomb.kind === "close" || tomb.kind === "cloexec") {
+                      applyPointTombstone(tomb.fd, tomb.kind, fdPendingDetachShared);
+                    } else {
+                      applyRangeTombstone(
+                        tomb.first,
+                        tomb.last,
+                        tomb.cloexec,
+                        fdPendingDetachShared
+                      );
                     }
                   }
                   for (const action of childFdSnap.actions) {
@@ -26444,6 +26503,13 @@ async function runInstallPhase(input) {
                           dirfdTable.delete(k);
                         }
                       }
+                    }
+                  }
+                  for (const tomb of childFdSnap.postDetachTombstones) {
+                    if (tomb.kind === "close" || tomb.kind === "cloexec") {
+                      applyPointTombstone(tomb.fd, tomb.kind, false);
+                    } else {
+                      applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
                     }
                   }
                 }
@@ -26498,7 +26564,7 @@ async function runInstallPhase(input) {
           if (Number.isFinite(rc) && rc === 0) {
             const key = fdKey(pid, fd);
             if (!dirfdTable.has(key)) {
-              recordFdTombstone(pid, fd, { kind: "close" });
+              recordFdTombstone(pid, { kind: "close", fd });
             }
           }
           dirfdTable.delete(fdKey(pid, fd));
@@ -26607,6 +26673,14 @@ async function runInstallPhase(input) {
                     dirfdTable.delete(key);
                   }
                 }
+              }
+              if (isFdSingleton(pid)) {
+                recordFdTombstone(pid, {
+                  kind: "closeRange",
+                  first,
+                  last,
+                  cloexec: hasCloexec
+                });
               }
             }
           }
@@ -26729,7 +26803,7 @@ async function runInstallPhase(input) {
               if (cur !== void 0) {
                 dirfdTable.set(oldKey, { path: cur.path, cloexec: newCloexec });
               } else if (newCloexec) {
-                recordFdTombstone(pid, fd, { kind: "cloexec" });
+                recordFdTombstone(pid, { kind: "cloexec", fd });
               }
             } else {
               fdUnknownAdd(pid);

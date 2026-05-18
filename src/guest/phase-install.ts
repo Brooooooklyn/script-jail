@@ -592,53 +592,75 @@ export async function runInstallPhase(
     | { kind: 'none' }
     | { kind: 'closeRange'; first: number; last: number; cloexec: boolean }
     | { kind: 'execveCloexec' };
-  type FdTombstone = { kind: 'close' } | { kind: 'cloexec' };
+  // Codex follow-up (high, 2026-05-19, bug #1 + #2 follow-ups):
+  // tombstones now carry an optional RANGE so close_range mutations on
+  // untracked fds (the singleton-pre-detach case) can be replayed at
+  // delayed-clone reconciliation without enumerating every fd in
+  // [first, last] (UINT_MAX-fd loops would blow up).  Point tombstones
+  // (single `fd`) retain prior semantics.
+  type FdTombstone =
+    | { kind: 'close'; fd: number }
+    | { kind: 'cloexec'; fd: number }
+    | { kind: 'closeRange'; first: number; last: number; cloexec: boolean };
+  // Codex follow-up (medium, 2026-05-19, bug #3 follow-up): split
+  // tombstones into PRE-detach and POST-detach buckets.  Pre-detach
+  // tombstones were recorded BEFORE any detach action queued onto
+  // `actions[]`; under shared CLONE_FILES the kernel mutation hit the
+  // SHARED files_struct and propagated to the parent, so the reconciler
+  // must flip BOTH parent and child copy.  Post-detach tombstones were
+  // recorded AFTER at least one detach action was queued; the kernel
+  // had already unshared (or was about to via execve) so the mutation
+  // is private and only the child copy reflects it.
   interface FdSnapshot {
     entries: Array<[string /* fd suffix */, { path: string; cloexec: boolean }]>;
     unknown: boolean;
     actions: FdDetachAction[];
-    tombstones: Map<number, FdTombstone>;
+    preDetachTombstones: FdTombstone[];
+    postDetachTombstones: FdTombstone[];
   }
   const pendingCwdDetach = new Map<number, CwdSnapshot>();
   const pendingFdDetach = new Map<number, FdSnapshot>();
   // Codex follow-up (high, 2026-05-19, bug #2): pre-marker tombstones.
-  // close()/fcntl(F_SETFD,FD_CLOEXEC) called on UNTRACKED inherited fds
-  // BEFORE the singleton pid has any pending-fd-detach marker.  When a
-  // marker is eventually created (snapshotFd / appendFdAction), it
-  // absorbs the entries from this map; if a clone reconciliation
-  // consumes the marker first, the tombstones are folded in there.  No
+  // close()/fcntl(F_SETFD,FD_CLOEXEC)/close_range called on UNTRACKED
+  // inherited fds BEFORE the singleton pid has any pending-fd-detach
+  // marker.  When a marker is eventually created (snapshotFd), it
+  // absorbs the entries from this list into `preDetachTombstones`.  No
   // pending-marker, no detach: in that case we leave the dirfdTable
-  // delete (close) already-applied as the only effect, and the
-  // tombstone bucket is discarded at marker creation or stays as a
-  // best-effort record for later detach events.
-  const pendingFdTombstones = new Map<number, Map<number, FdTombstone>>();
-  function recordFdTombstone(pid: number, fd: number, tomb: FdTombstone): void {
+  // delete (close) already-applied as the only effect, and the bucket
+  // is discarded at marker creation.
+  const pendingFdTombstones = new Map<number, FdTombstone[]>();
+  function recordFdTombstone(pid: number, tomb: FdTombstone): void {
     // Singleton-only gate: tombstones describe the singleton pid's
-    // post-detach private mutations.  A non-singleton pid's mutations
-    // would also affect siblings in the SAME fd group right now and
-    // need no replay path — the dirfdTable already reflects them.
+    // pre/post-detach mutations on UNTRACKED inherited fds.  A
+    // non-singleton pid's mutations already hit the shared dirfdTable
+    // directly via the standard close/close_range/fcntl handlers and
+    // need no replay path.
     if (!isFdSingleton(pid)) return;
     const existingSnap = pendingFdDetach.get(pid);
     if (existingSnap !== undefined) {
-      // Fold directly into the existing marker.  Later tombstones for
-      // the SAME fd overwrite earlier ones; close beats cloexec because
-      // a closed fd has nothing left to mark cloexec.
-      existingSnap.tombstones.set(fd, tomb);
+      // Marker already exists → tombstone is POST-detach (recorded
+      // after at least one detach action has been queued).  Append to
+      // postDetachTombstones; ordering preserved so the reconciler
+      // applies them in observed order.
+      existingSnap.postDetachTombstones.push(tomb);
       return;
     }
+    // No marker yet → tombstone is PRE-detach.  Queue in the bucket;
+    // `snapshotFd` will absorb the bucket into preDetachTombstones.
     let bucket = pendingFdTombstones.get(pid);
     if (bucket === undefined) {
-      bucket = new Map();
+      bucket = [];
       pendingFdTombstones.set(pid, bucket);
     }
-    bucket.set(fd, tomb);
+    bucket.push(tomb);
   }
-  // Fold any pre-marker tombstones into a fresh/extended marker so the
-  // reconciler sees them through the marker's `tombstones` field.
+  // Fold any pre-marker tombstones into a fresh marker's preDetach
+  // bucket so the reconciler sees them through the marker's
+  // `preDetachTombstones` field.
   function absorbPendingTombstones(pid: number, snap: FdSnapshot): void {
     const bucket = pendingFdTombstones.get(pid);
     if (bucket === undefined) return;
-    for (const [fd, tomb] of bucket) snap.tombstones.set(fd, tomb);
+    for (const tomb of bucket) snap.preDetachTombstones.push(tomb);
     pendingFdTombstones.delete(pid);
   }
 
@@ -667,7 +689,8 @@ export async function runInstallPhase(
       entries,
       unknown: dirfdStateUnknown.has(root),
       actions: [action],
-      tombstones: new Map(),
+      preDetachTombstones: [],
+      postDetachTombstones: [],
     };
     absorbPendingTombstones(pid, snap);
     return snap;
@@ -2116,35 +2139,127 @@ export async function runInstallPhase(
                 // fd-unknown for that fd.
                 if (childFdSnap !== undefined && childHadPendingFdDetach) {
                   const childGroupPrefix = `${rootedFd(childPid)}:`;
-                  // Apply tombstones BEFORE actions so subsequent
-                  // close_range/execve replays operate on the
-                  // post-tombstone child table.
-                  for (const [fd, tomb] of childFdSnap.tombstones) {
+                  // Codex follow-up (medium, 2026-05-19, bug #3 +
+                  // high, bug #1 follow-up): tombstones split into
+                  // PRE-detach (applied to BOTH parent and child copy
+                  // under shared CLONE_FILES — kernel mutation hit the
+                  // shared files_struct and propagated to the parent)
+                  // and POST-detach (applied to child copy only — the
+                  // kernel had already unshared by then so the
+                  // mutation is private).
+                  //
+                  // Pre-detach tombstone replay order:
+                  //   1. preDetachTombstones (parent + child copy under
+                  //      fdPendingDetachShared, else child-only)
+                  //   2. actions (in order; child copy only — actions
+                  //      ARE the detach events)
+                  //   3. postDetachTombstones (child copy only)
+                  const applyPointTombstone = (
+                    fd: number,
+                    kind: 'close' | 'cloexec',
+                    toParent: boolean,
+                  ): void => {
                     const childKey = `${childGroupPrefix}${fd}`;
                     const parentKey = `${parentPrefix}${fd}`;
-                    if (tomb.kind === 'close') {
-                      // Kernel closed the shared fd.  Drop both sides
-                      // and fail closed for future numeric-dirfd opens
-                      // on that fd in either group (the kernel slot
-                      // is gone; later opens at this fd number land
-                      // on whatever the next allocator returns).
+                    if (kind === 'close') {
                       dirfdTable.delete(childKey);
-                      if (fdPendingDetachShared) {
+                      if (toParent) {
                         dirfdTable.delete(parentKey);
                         fdUnknownAdd(pid);
                         fdUnknownAdd(childPid);
                       }
-                    } else if (tomb.kind === 'cloexec') {
-                      // Kernel set FD_CLOEXEC on the shared fd.  Flip
-                      // child's copied entry so the subsequent
-                      // execveCloexec action in the replay list (if
-                      // any) sweeps it.
+                    } else {
+                      // cloexec — flip the child's copied entry; under
+                      // shared CLONE_FILES the kernel ALSO set
+                      // FD_CLOEXEC on the parent's view of the shared
+                      // fd, so flip the parent's entry too.  The
+                      // parent's next execve sweep then drops it.
                       const cur = dirfdTable.get(childKey);
                       if (cur !== undefined) {
                         dirfdTable.set(childKey, { path: cur.path, cloexec: true });
                       }
+                      if (toParent) {
+                        const pcur = dirfdTable.get(parentKey);
+                        if (pcur !== undefined) {
+                          dirfdTable.set(parentKey, { path: pcur.path, cloexec: true });
+                        }
+                      }
+                    }
+                  };
+                  const applyRangeTombstone = (
+                    first: number,
+                    last: number,
+                    cloexec: boolean,
+                    toParent: boolean,
+                  ): void => {
+                    // Iterate copied entries in the child group within
+                    // [first, last] — child copy always.
+                    for (const k of [...dirfdTable.keys()]) {
+                      if (!k.startsWith(childGroupPrefix)) continue;
+                      const fdStr = k.slice(childGroupPrefix.length);
+                      const fdNum = parseInt(fdStr, 10);
+                      if (
+                        Number.isFinite(fdNum) &&
+                        fdNum >= first &&
+                        fdNum <= last
+                      ) {
+                        if (cloexec) {
+                          const cur = dirfdTable.get(k);
+                          if (cur !== undefined) {
+                            dirfdTable.set(k, { path: cur.path, cloexec: true });
+                          }
+                        } else {
+                          dirfdTable.delete(k);
+                        }
+                      }
+                    }
+                    if (toParent) {
+                      let touched = false;
+                      for (const k of [...dirfdTable.keys()]) {
+                        if (!k.startsWith(parentPrefix)) continue;
+                        const fdStr = k.slice(parentPrefix.length);
+                        const fdNum = parseInt(fdStr, 10);
+                        if (
+                          Number.isFinite(fdNum) &&
+                          fdNum >= first &&
+                          fdNum <= last
+                        ) {
+                          if (cloexec) {
+                            const cur = dirfdTable.get(k);
+                            if (cur !== undefined) {
+                              dirfdTable.set(k, { path: cur.path, cloexec: true });
+                            }
+                          } else {
+                            dirfdTable.delete(k);
+                          }
+                          touched = true;
+                        }
+                      }
+                      if (touched && !cloexec) {
+                        fdUnknownAdd(pid);
+                        fdUnknownAdd(childPid);
+                      }
+                    }
+                  };
+                  // (1) Pre-detach tombstones.
+                  for (const tomb of childFdSnap.preDetachTombstones) {
+                    if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
+                      applyPointTombstone(tomb.fd, tomb.kind, fdPendingDetachShared);
+                    } else {
+                      // closeRange tombstone (bug #2 follow-up): range
+                      // close / CLOEXEC mark replayed against parent +
+                      // child copy under shared CLONE_FILES.
+                      applyRangeTombstone(
+                        tomb.first,
+                        tomb.last,
+                        tomb.cloexec,
+                        fdPendingDetachShared,
+                      );
                     }
                   }
+                  // (2) Detach actions, in queue order — child copy
+                  // only (these are the kernel detach events that
+                  // mutate ONLY the caller's now-private group).
                   for (const action of childFdSnap.actions) {
                     if (action.kind === 'closeRange') {
                       for (const k of [...dirfdTable.keys()]) {
@@ -2177,6 +2292,19 @@ export async function runInstallPhase(
                     }
                     // action.kind === 'none' (plain unshare(CLONE_FILES))
                     // → no replay needed.
+                  }
+                  // (3) Post-detach tombstones — child copy only.
+                  // These were recorded AFTER at least one detach
+                  // action was queued, so the kernel had already
+                  // unshared (or was about to via execve).  The
+                  // mutation is private to the child and MUST NOT
+                  // taint the parent.
+                  for (const tomb of childFdSnap.postDetachTombstones) {
+                    if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
+                      applyPointTombstone(tomb.fd, tomb.kind, false);
+                    } else {
+                      applyRangeTombstone(tomb.first, tomb.last, tomb.cloexec, false);
+                    }
                   }
                 }
               }
@@ -2319,7 +2447,7 @@ export async function runInstallPhase(
           if (Number.isFinite(rc) && rc === 0) {
             const key = fdKey(pid, fd);
             if (!dirfdTable.has(key)) {
-              recordFdTombstone(pid, fd, { kind: 'close' });
+              recordFdTombstone(pid, { kind: 'close', fd });
             }
           }
           // Delete unconditionally: even on EBADF, our stale entry (if
@@ -2528,6 +2656,27 @@ export async function runInstallPhase(
                     dirfdTable.delete(key);
                   }
                 }
+              }
+              // Codex follow-up (high, 2026-05-19, bug #2): when the
+              // caller is a singleton at observation time, the
+              // dirfdTable iteration above only finds entries already
+              // copied into the singleton's root group.  In delayed-
+              // clone order (parent's clone(CLONE_FILES) line hasn't
+              // arrived yet), inherited parent fds are NOT yet keyed
+              // under the child's root — the iteration finds nothing
+              // for those fds.  Record a RANGE tombstone so the
+              // delayed-clone reconciliation can replay the close /
+              // CLOEXEC mark against the parent-copied entries it
+              // brings into the child group.  Range form avoids
+              // enumerating UINT_MAX fds for the common "close all
+              // above first" idiom.
+              if (isFdSingleton(pid)) {
+                recordFdTombstone(pid, {
+                  kind: 'closeRange',
+                  first,
+                  last,
+                  cloexec: hasCloexec,
+                });
               }
             }
           }
@@ -2783,7 +2932,7 @@ export async function runInstallPhase(
                 // CLOEXEC on an untracked fd is deferred (residual
                 // gap; rare in practice and would require an inverse
                 // tombstone type).
-                recordFdTombstone(pid, fd, { kind: 'cloexec' });
+                recordFdTombstone(pid, { kind: 'cloexec', fd });
               }
             } else {
               // Unrecognised SETFD arg — fail closed: mark fd-group
