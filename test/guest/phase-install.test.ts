@@ -738,6 +738,128 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Finding 1 (audit-trust): runtime-exhaustive LineSource dispatch.
+  // `LineSource` is only a TypeScript type; the install-phase dispatcher must
+  // not fall through to the strace parser when the runtime value is anything
+  // other than 'shim' or 'strace'.  Any other discriminator (undefined, a
+  // typo, a future-renamed channel) is treated as an audit-pipeline contract
+  // breach and recorded as fatal tamper.
+  // ─────────────────────────────────────────────────────────────────────────
+  describe('Finding 1 — unknown LineSource → fail-closed (tamper)', () => {
+    const proc = mockProcReader({
+      88: {
+        ppid: 1,
+        env: {
+          npm_package_name: 'evil-pkg',
+          npm_package_version: '1.0.0',
+          npm_lifecycle_event: 'postinstall',
+        },
+      },
+    });
+
+    /**
+     * cannedStraceRunner heuristically infers `source` when it's omitted.
+     * For these tests we have to bypass that helper so we can yield a
+     * record whose runtime `source` field is literally `undefined`,
+     * `'shim '` (trailing space — looks shim-y but isn't equal to 'shim'),
+     * or a totally unknown value.
+     */
+    function rawRunner(
+      records: Array<{ pid: number; line: string; source: unknown }>,
+    ): StraceRunner & { recordedTamper(): string | null } {
+      let _tamperReason: string | null = null;
+      return {
+        async *run() {
+          for (const r of records) {
+            yield { pid: r.pid, line: r.line, source: r.source as 'shim' | 'strace' };
+          }
+        },
+        getExitCode() { return 0; },
+        getTamperReason() { return _tamperReason; },
+        recordTamper(reason: string) {
+          if (_tamperReason === null) _tamperReason = reason;
+        },
+        recordedTamper() { return _tamperReason; },
+      } as unknown as StraceRunner & { recordedTamper(): string | null };
+    }
+
+    it('source: undefined carrying shim JSONL → fatal tamper', async () => {
+      // Looks like a legitimate shim env_read, but `source` is undefined —
+      // the dispatcher MUST NOT trust it as a shim line and MUST NOT fall
+      // through to the strace parser.
+      const shimLine = JSON.stringify({
+        kind: 'env_read', name: 'NPM_TOKEN', pid: 88, ts: 1, hidden: true,
+      });
+      const strace = rawRunner([{ pid: 88, line: shimLine, source: undefined }]);
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(0);
+      expect(result.eventCount).toBe(0);
+      const reason = strace.getTamperReason();
+      expect(reason).not.toBeNull();
+      expect(reason).toMatch(/unknown LineSource/);
+      expect(reason).toMatch(/pid=88/);
+    });
+
+    it("source: 'shim ' (trailing space) → fatal tamper", async () => {
+      const shimLine = JSON.stringify({
+        kind: 'env_read', name: 'NPM_TOKEN', pid: 88, ts: 1, hidden: true,
+      });
+      const strace = rawRunner([{ pid: 88, line: shimLine, source: 'shim ' }]);
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(0);
+      expect(result.eventCount).toBe(0);
+      const reason = strace.getTamperReason();
+      expect(reason).not.toBeNull();
+      expect(reason).toMatch(/unknown LineSource/);
+      // The actual offending value should appear in the reason for triage.
+      expect(reason).toMatch(/shim /);
+    });
+
+    it("source: 'unknown' → fatal tamper", async () => {
+      const strace = rawRunner([
+        { pid: 88, line: 'whatever', source: 'unknown' },
+      ]);
+      const { emitter, lines } = makeEmitter();
+
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(0);
+      expect(result.eventCount).toBe(0);
+      const reason = strace.getTamperReason();
+      expect(reason).not.toBeNull();
+      expect(reason).toMatch(/unknown LineSource/);
+      expect(reason).toMatch(/unknown/);
+    });
+  });
+
   describe('exit code propagation via StraceRunner.getExitCode()', () => {
     it('returns non-zero exitCode when StraceRunner reports failure', async () => {
       const { emitter } = makeEmitter();

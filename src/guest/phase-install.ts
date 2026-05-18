@@ -257,6 +257,14 @@ export async function runInstallPhase(
   // audit event.  By dispatching on `source` and treating shim-channel parse
   // failures as fatal tamper, we close that gap while keeping strace's
   // best-effort drop for its noisy text format.
+  //
+  // Finding 1 (audit-trust): the dispatch below is runtime-exhaustive.
+  // `LineSource` is only a TypeScript type — `source` is opaque at runtime,
+  // so an `else` branch that silently falls into the strace parser is a
+  // potential audit bypass (a typo, a renamed channel, or a wrapper that
+  // produces `undefined` would route trusted-channel bytes through the
+  // best-effort path).  We require an explicit 'shim' or 'strace' value;
+  // anything else records tamper.
   for await (const { pid, line, source } of input.strace.run(cmd, args, {
     env: input.env,
     cwd: input.cwd,
@@ -295,22 +303,46 @@ export async function runInstallPhase(
       continue;
     }
 
-    // source === 'strace' — best-effort text parse.  Failures here are
-    // expected and dropped silently: strace lines can be split across
-    // reads, the format varies across versions, and the channel emits
-    // many syscall families we don't care to extract events from.  A
-    // strict gate here would mean every install hits noise-driven
-    // tamper.  The StraceRunner owns the ts counter implicitly via file
-    // ordering; we call parseStraceLine with ts=0 and let per-file
-    // ordering serve as ts.
-    const straceEvents: RawEvent[] | null = parseStraceLine(line, pid, 0);
-    if (straceEvents === null) continue;
+    if (source === 'strace') {
+      // source === 'strace' — best-effort text parse.  Failures here are
+      // expected and dropped silently: strace lines can be split across
+      // reads, the format varies across versions, and the channel emits
+      // many syscall families we don't care to extract events from.  A
+      // strict gate here would mean every install hits noise-driven
+      // tamper.  The StraceRunner owns the ts counter implicitly via file
+      // ordering; we call parseStraceLine with ts=0 and let per-file
+      // ordering serve as ts.
+      const straceEvents: RawEvent[] | null = parseStraceLine(line, pid, 0);
+      if (straceEvents === null) continue;
 
-    for (const rawEvent of straceEvents) {
-      const result = input.attribution.attribute(rawEvent.pid);
-      if (result === null) continue;
-      emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
+      for (const rawEvent of straceEvents) {
+        const result = input.attribution.attribute(rawEvent.pid);
+        if (result === null) continue;
+        emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
+      }
+      continue;
     }
+
+    // Finding 1: terminal else — unknown `LineSource` discriminator.
+    // `source` should be impossible to reach here at the type level, but a
+    // runner that yields `undefined`, a typo'd value, or a future channel
+    // name (added without updating the dispatcher) would silently fall
+    // through to the strace parser under the previous design.  Treat it as
+    // an audit-pipeline contract breach: record tamper, drop the line, let
+    // main() fail closed.  We deliberately truncate `source` in the reason
+    // because it could carry attacker-controlled bytes if the runner ever
+    // surfaces them verbatim.
+    const sourceStr: string = typeof source === 'string'
+      ? source
+      : `<${typeof source}>`;
+    const MAX_SRC = 40;
+    const sourceForReason = sourceStr.length > MAX_SRC
+      ? `${sourceStr.slice(0, MAX_SRC)}…`
+      : sourceStr;
+    input.strace.recordTamper(
+      `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). ` +
+        'Audit-pipeline contract requires source ∈ {"shim","strace"}.',
+    );
   }
 
   // Exit code is owned by the StraceRunner (it ran the only install process).
