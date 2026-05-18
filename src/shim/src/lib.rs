@@ -607,6 +607,62 @@ unsafe fn envbuf_push(buf: &mut EnvBuf, new_entry: *mut c_char) -> bool {
     true
 }
 
+/// Remove the entry whose `NAME=` prefix matches `name` from buf.  Returns
+/// true if an entry was found and removed.  If the entry was owned (i.e.
+/// previously inserted via envbuf_set_at / envbuf_push), it is freed and
+/// removed from the owned tracker.  The ptrs[] slot is shifted down to
+/// preserve density and the new tail slot is re-NUL-terminated.
+///
+/// SECURITY: this exists so the sticky-var re-injection loop can delete a
+/// caller-supplied entry when the canonical buffer is empty.  Without it, a
+/// malicious envp_in entry (e.g. `SCRIPT_JAIL_LOG_FILE=/tmp/evil`) would
+/// survive into the child whenever the parent did not snapshot that var at
+/// shim_init time.
+///
+/// Recursion-guard contract: callers MUST hold set_in_shim(true) only for
+/// the libc::free call, which this helper wraps internally — matching the
+/// pattern used by free_entry / free_envbuf.
+unsafe fn envbuf_remove(buf: &mut EnvBuf, name: &[u8]) -> bool {
+    let idx = match envbuf_find(buf, name) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    let entry = *buf.ptrs.add(idx);
+
+    // If this entry was owned (we malloc'd it earlier in this same envbuf),
+    // free it and compact the owned tracker.  Compare by raw pointer
+    // equality — that is the same identity the owned table records.
+    if !entry.is_null() {
+        for j in 0..buf.owned_count {
+            let owned_ptr = *buf.owned.add(j) as *const c_char;
+            if owned_ptr == entry {
+                // Free the entry under the recursion guard, then shift the
+                // remaining owned entries down one slot.
+                set_in_shim(true);
+                libc::free(*buf.owned.add(j) as *mut c_void);
+                set_in_shim(false);
+                for k in j..buf.owned_count - 1 {
+                    *buf.owned.add(k) = *buf.owned.add(k + 1);
+                }
+                buf.owned_count -= 1;
+                // NULL the now-stale tail so any subsequent free_envbuf
+                // walk does not double-free.
+                *buf.owned.add(buf.owned_count) = ptr::null_mut();
+                break;
+            }
+        }
+    }
+
+    // Shift ptrs[idx+1..count] down by one slot, then re-NUL-terminate.
+    for k in idx..buf.count - 1 {
+        *buf.ptrs.add(k) = *buf.ptrs.add(k + 1);
+    }
+    buf.count -= 1;
+    *buf.ptrs.add(buf.count) = ptr::null();
+    true
+}
+
 /// Malloc a new `NAME=VALUE\0` C string.  Returns NULL on malloc failure.
 /// Wrapped in the recursion guard to protect against glibc malloc reading
 /// MALLOC_* env vars.
@@ -1515,6 +1571,14 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
     for sticky in STICKY_VARS {
         let val = canon_bytes(sticky.canon);
         if val.is_empty() {
+            // Canonical is empty (parent never set this sticky var, or it
+            // was unset at shim_init).  Any caller-supplied entry for this
+            // name must be REMOVED — leaving it in place would let an
+            // attacker poison the child's audit chain (e.g. by injecting
+            // SCRIPT_JAIL_LOG_FILE=/tmp/evil when the parent only set
+            // SCRIPT_JAIL_LOG_FD).  envbuf_remove returns false if no
+            // entry was present, which is the desired no-op.
+            envbuf_remove(&mut buf, sticky.name);
             continue;
         }
         if !overwrite_env(&mut buf, sticky.name, val) {

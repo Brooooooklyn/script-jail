@@ -469,4 +469,38 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
 
     expect(tamperEvents.length).toBe(0);
   });
+
+  // ── Test 11 (Finding A): caller-supplied sticky var is REMOVED when canon empty ─
+  //
+  // The parent runs the shim with SCRIPT_JAIL_LOG_FD only.  No
+  // SCRIPT_JAIL_LOG_FILE is set, so the canonical snapshot for that var is
+  // empty.  A Node script then spawns a child whose envp explicitly
+  // contains `SCRIPT_JAIL_LOG_FILE=/tmp/evil` — an attacker poison
+  // attempt.  The rewrite_envp loop MUST delete the caller's entry rather
+  // than skip; otherwise the child shim would honor /tmp/evil and the
+  // audit log would be redirected.
+  //
+  // We verify by inspecting the child's actual env (printed via
+  // node -e 'process.stdout.write(process.env.SCRIPT_JAIL_LOG_FILE || "ABSENT")').
+  it('caller-supplied SCRIPT_JAIL_LOG_FILE is removed when canon is empty (Finding A)', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const res = runWithShim({
+      cmd: `node -e 'const cp = require("node:child_process");
+                     const r = cp.spawnSync("node",
+                       ["-e", "process.stdout.write(process.env.SCRIPT_JAIL_LOG_FILE || \\"ABSENT\\")"],
+                       { env: { PATH: process.env.PATH || "/usr/bin:/bin",
+                                SCRIPT_JAIL_LOG_FILE: "/tmp/evil" } });
+                     process.stdout.write(r.stdout.toString());'`,
+      // Deliberately do NOT set SCRIPT_JAIL_LOG_FILE here — parent's
+      // canon will be empty for that sticky var.  SCRIPT_JAIL_LOG_FD is
+      // injected by runWithShim itself.
+    });
+
+    // The child must report ABSENT — the attacker entry was stripped.
+    // If the bug were present, the child would print "/tmp/evil".
+    expect(res.stdout).toContain('ABSENT');
+    expect(res.stdout).not.toContain('/tmp/evil');
+  });
+
 });
