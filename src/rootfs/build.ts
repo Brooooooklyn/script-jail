@@ -17,7 +17,17 @@
 //   7. Report size; warn if > 200 MB
 
 import { execSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, statSync, copyFileSync, readdirSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  statSync,
+  copyFileSync,
+  readdirSync,
+  rmSync,
+  openSync,
+  readSync,
+  closeSync,
+} from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -101,6 +111,142 @@ export function formatBytes(bytes: number): string {
 export const SIZE_WARN_THRESHOLD_BYTES = 200 * 1024 * 1024; // 200 MB
 
 // ---------------------------------------------------------------------------
+// ELF validation for libscriptjail.so
+// ---------------------------------------------------------------------------
+//
+// The rootfs Dockerfile COPYs `images/libscriptjail.so` into the VM at
+// `/lib/libscriptjail.so`; the guest agent then sets `LD_PRELOAD=/lib/libscriptjail.so`.
+// If the host devloop produced a macOS Mach-O dylib (or some other non-ELF
+// blob) and somebody renamed it to `.so`, the dynamic linker inside the VM
+// silently refuses to load it, leaving the env-read audit chain absent.
+// We therefore validate the magic bytes of the on-disk file BEFORE accepting
+// it. The check is intentionally minimal — only what's needed to distinguish
+// a Linux ELF shared object for the current rootfs target (x86-64) from the
+// shapes we know can be confused with it (Mach-O, empty file, scripts).
+//
+// Reference (ELF64 header, little-endian):
+//   bytes 0..3   = 0x7F 'E' 'L' 'F'           (ELF magic)
+//   byte  4      = EI_CLASS  (2 = ELFCLASS64)
+//   byte  5      = EI_DATA   (1 = ELFDATA2LSB, little-endian)
+//   bytes 16..17 = e_type    (3 = ET_DYN, shared object)
+//   bytes 18..19 = e_machine (62 = EM_X86_64, 183 = EM_AARCH64)
+//
+// All numeric ELF header fields above are stored little-endian per EI_DATA=1.
+
+/** ELF e_machine values we recognise.  Currently only x86-64 ships. */
+export const EM_X86_64 = 62;
+export const EM_AARCH64 = 183;
+
+/** Map a runner image to the ELF e_machine value expected for that rootfs. */
+export function expectedShimMachine(_input: Pick<BuildInput, 'runnerImage'>): number {
+  // Both supported rootfses currently target x86-64 (firecracker downloads,
+  // vmlinux, and the action's microVM are all x86_64). When an aarch64
+  // rootfs is added, switch on `runnerImage` here.
+  return EM_X86_64;
+}
+
+/** Human-readable label for an e_machine value (used in error messages). */
+export function machineLabel(machine: number): string {
+  if (machine === EM_X86_64) return 'x86-64 (EM_X86_64)';
+  if (machine === EM_AARCH64) return 'aarch64 (EM_AARCH64)';
+  return `e_machine=${machine}`;
+}
+
+/**
+ * Validate that `buf` (at least 20 bytes of the start of a file) looks like a
+ * Linux ELF64 little-endian shared object for the given machine. Returns
+ * `null` on success or a descriptive error string on any mismatch.
+ *
+ * Pure / no IO — the file-reading wrapper lives in `validateShimFile`.
+ */
+export function validateElfShimHeader(
+  buf: Uint8Array,
+  expectedMachine: number,
+): string | null {
+  if (buf.length < 20) {
+    return `header too short (${buf.length} bytes; need ≥ 20)`;
+  }
+
+  // Bytes 0..3: ELF magic 0x7F 'E' 'L' 'F'.
+  if (
+    buf[0] !== 0x7f ||
+    buf[1] !== 0x45 || // 'E'
+    buf[2] !== 0x4c || // 'L'
+    buf[3] !== 0x46    // 'F'
+  ) {
+    // Mach-O 64-bit little-endian magics are 0xCFFAEDFE / 0xCEFAEDFE
+    // (Mach-O fat is 0xCAFEBABE / 0xBEBAFECA).  Surface that when we see it
+    // so the error directs the user to rebuild on Linux rather than to
+    // hunt down a generic "bad magic" message.
+    const m =
+      (buf[0]! << 24) |
+      (buf[1]! << 16) |
+      (buf[2]! <<  8) |
+       buf[3]!;
+    const u = m >>> 0;
+    if (u === 0xcffaedfe || u === 0xcefaedfe || u === 0xfeedfacf || u === 0xfeedface) {
+      return 'file is a Mach-O binary, not a Linux ELF shared object';
+    }
+    if (u === 0xcafebabe || u === 0xbebafeca) {
+      return 'file is a Mach-O universal binary, not a Linux ELF shared object';
+    }
+    return `bad ELF magic: expected 0x7F 45 4C 46, got 0x${u.toString(16).padStart(8, '0')}`;
+  }
+
+  // Byte 4: EI_CLASS — 2 = ELFCLASS64.
+  if (buf[4] !== 2) {
+    return `unsupported EI_CLASS=${buf[4]} (expected 2 = ELFCLASS64)`;
+  }
+
+  // Byte 5: EI_DATA — 1 = little-endian (ELFDATA2LSB).
+  if (buf[5] !== 1) {
+    return `unsupported EI_DATA=${buf[5]} (expected 1 = ELFDATA2LSB, little-endian)`;
+  }
+
+  // Bytes 16..17: e_type, little-endian u16.  3 = ET_DYN (shared object / PIE).
+  const eType = buf[16]! | (buf[17]! << 8);
+  if (eType !== 3) {
+    return `unsupported e_type=${eType} (expected 3 = ET_DYN, shared object)`;
+  }
+
+  // Bytes 18..19: e_machine, little-endian u16.
+  const eMachine = buf[18]! | (buf[19]! << 8);
+  if (eMachine !== expectedMachine) {
+    return (
+      `wrong architecture: got ${machineLabel(eMachine)}, ` +
+      `expected ${machineLabel(expectedMachine)}`
+    );
+  }
+
+  return null;
+}
+
+/**
+ * Read the first 20 bytes of `path` and validate them with
+ * `validateElfShimHeader`. Returns `null` on success or a descriptive error
+ * string. Surfaces `read` / `open` errors as strings rather than throwing so
+ * the caller can fold them into a single error message.
+ */
+export function validateShimFile(path: string, expectedMachine: number): string | null {
+  let fd: number;
+  try {
+    fd = openSync(path, 'r');
+  } catch (err) {
+    return `cannot open: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  try {
+    const buf = Buffer.alloc(20);
+    const n = readSync(fd, buf, 0, 20, 0);
+    if (n < 20) {
+      return `header too short (${n} bytes; need ≥ 20)`;
+    }
+    return validateElfShimHeader(buf, expectedMachine);
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shell helpers
 // ---------------------------------------------------------------------------
 
@@ -157,15 +303,33 @@ function copyPreloads(): void {
 // Step 3 — Ensure libscriptjail.so
 // ---------------------------------------------------------------------------
 
-function ensureShim(): boolean {
+function ensureShim(input: BuildInput): boolean {
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
+  const expectedMachine = expectedShimMachine(input);
 
   if (existsSync(shimOut)) {
-    console.log(`[rootfs] libscriptjail.so already present.`);
-    return true;
-  }
-
-  if (isMacOS()) {
+    // The file is on disk, but we must NOT trust it blindly: a previous
+    // macOS-side build may have left a Mach-O dylib here (see
+    // `validateElfShimHeader` for the rationale).  If validation fails on
+    // Linux we rebuild from source; on macOS we surface a fatal error
+    // because we cannot produce a Linux .so from a Darwin toolchain.
+    const err = validateShimFile(shimOut, expectedMachine);
+    if (err === null) {
+      console.log(`[rootfs] libscriptjail.so already present (validated ELF).`);
+      return true;
+    }
+    console.warn(`[rootfs] images/libscriptjail.so failed ELF validation: ${err}`);
+    if (isMacOS()) {
+      throw new Error(
+        `[rootfs] images/libscriptjail.so is not a valid Linux ELF shared object (${err}). ` +
+        'Cannot rebuild from macOS (Darwin cargo produces a Mach-O .dylib, not a Linux .so). ' +
+        'Delete images/libscriptjail.so and run the rootfs build on a Linux host (or in CI) ' +
+        'so cargo can produce a real x86-64 ELF shared object.',
+      );
+    }
+    console.warn('[rootfs] Removing stale artifact and rebuilding via cargo …');
+    rmSync(shimOut, { force: true });
+  } else if (isMacOS()) {
     console.warn(
       '[rootfs] WARNING: Running on macOS — cannot build libscriptjail.so (requires Linux toolchain).\n' +
       '[rootfs]          Skipping shim build. The docker build step will also be skipped.\n' +
@@ -186,6 +350,17 @@ function ensureShim(): boolean {
 
   if (!existsSync(shimOut)) {
     throw new Error(`[rootfs] cargo build ran but ${shimOut} was not produced.`);
+  }
+
+  // Validate the freshly-built artifact too — a cargo misconfiguration
+  // (cross-compiling to the wrong target, building for the host arch on a
+  // mismatched runner) is exactly the kind of mistake this check catches.
+  const buildErr = validateShimFile(shimOut, expectedMachine);
+  if (buildErr !== null) {
+    throw new Error(
+      `[rootfs] cargo built ${shimOut} but it failed ELF validation: ${buildErr}. ` +
+      'Check src/shim/Cargo.toml and the active rustup target.',
+    );
   }
   return true;
 }
@@ -335,7 +510,7 @@ export async function buildRootfs(input: BuildInput): Promise<void> {
   copyPreloads();
 
   // Step 3: ensure shim
-  const shimOk = ensureShim();
+  const shimOk = ensureShim(input);
 
   if (!shimOk) {
     // On macOS without the .so we cannot build the docker image because the
