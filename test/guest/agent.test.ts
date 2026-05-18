@@ -697,6 +697,76 @@ describe('agent main()', () => {
     ).toBe(false);
   });
 
+  // ── Finding E: agent fails closed when createEventsFile throws ──────────
+  //
+  // The previous code wrapped createEventsFile() in a try/catch and fell
+  // back to SCRIPT_JAIL_LOG_FILE="".  npm spawns lifecycle children with
+  // `stdio: 'inherit'` which only propagates fds 0–2 — so the SCRIPT_JAIL_
+  // LOG_FD=3 channel does NOT survive past the first child.  Descendants
+  // (the actual node processes inside lifecycle scripts) lose their audit
+  // sink entirely: env_read / dlopen / exec / env_tamper events go into
+  // the void.  A transient /tmp blip would silently produce a clean
+  // lockfile with missing audit signals.  The fix: bail with a fatal
+  // error frame before Phase A starts; never emit a final lockfile.
+  it('aborts fatally with an error frame when createEventsFile throws', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const { strace } = trackingStrace();
+    const configPath = writeConfig(testDir);
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    // The host go signal is irrelevant — the agent must bail before
+    // Phase A. We send one anyway so a regression that lets the agent
+    // proceed doesn't deadlock the test waiting for it.
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner,
+        strace,
+        dnsLookup: offlineLookup,
+        createEventsFile: () => {
+          const err = new Error('EACCES: /tmp is read-only') as NodeJS.ErrnoException;
+          err.code = 'EACCES';
+          throw err;
+        },
+      });
+      // flushAndExit's callback fires one tick later.
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    expect(exitedWith).toBe(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Exactly one fatal error frame, naming the underlying failure.
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(true);
+    expect(String(errors[0]!['message'])).toMatch(/failed to create audit-events file/);
+    expect(String(errors[0]!['message'])).toMatch(/EACCES/);
+
+    // Critically: NO `install_done` handshake, NO `fetch_done` handshake
+    // (the bail happens before Phase A), and NO final lockfile.
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).not.toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(false);
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'fetch_done'),
+    ).toBe(false);
+  });
+
   // ── Finding D: tamper gate dispatches on contract, not class identity ───
   //
   // The previous gate was `straceRunner instanceof LinuxStraceRunner`, which

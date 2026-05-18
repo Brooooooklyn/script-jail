@@ -1176,6 +1176,16 @@ export interface AgentInput {
    * to capture breadcrumbs in-process instead of polluting test stderr.
    */
   diag?: (msg: string) => void;
+  /**
+   * Injection seam for {@link createEventsFile}.  Production uses the
+   * default (mkdtemp + open with O_EXCL|O_NOFOLLOW under `/tmp`).  Tests
+   * inject a fake to simulate the file-create failure path (e.g.
+   * EMFILE / EACCES / EEXIST race) without arranging a read-only /tmp,
+   * and to assert the agent fails closed instead of silently falling
+   * back to an empty `SCRIPT_JAIL_LOG_FILE`.  Returning a value behaves
+   * like the production helper; throwing exercises the fail-closed gate.
+   */
+  createEventsFile?: () => EventsFile;
 }
 
 /**
@@ -1298,24 +1308,40 @@ export async function main(input: AgentInput): Promise<void> {
   //     never emits a final lockfile — `findAuditBypass` cannot help if the
   //     evidence of an `envp_alloc_failed` was erased before the agent saw it.
   //
-  //     Tests inject a custom strace runner via `input.strace`; in that path
-  //     we still create the events file (and pass its path via childEnv) so
-  //     test environments using the production env-shim see a usable sink.
-  //     The injected runner is free to ignore the path entirely.
-  let eventsFile: EventsFile | null;
+  //     Failure to create the file (EACCES on a read-only /tmp, EMFILE on
+  //     fd exhaustion, EEXIST race against another tenant, etc.) is FATAL.
+  //     The previous fallback path set SCRIPT_JAIL_LOG_FILE="" and continued,
+  //     hoping the inherited fd 3 would carry audit traffic — but npm spawns
+  //     lifecycle children with `stdio: 'inherit'`, which only propagates
+  //     fds 0–2.  Any descendant Node process beyond the first child loses
+  //     the audit sink entirely: env_read / dlopen / exec / env_tamper events
+  //     would be written into the void, producing a final lockfile with
+  //     missing signals that the audit_bypass gate (fe13357) and tamper
+  //     detection (81d238e) cannot recover.  A transient /tmp blip would
+  //     silently degrade the audit — so we bail with a fatal error frame
+  //     instead.  The injection seam (`input.createEventsFile`) lets tests
+  //     exercise this branch deterministically.
+  const makeEventsFile = input.createEventsFile ?? createEventsFile;
+  let eventsFile: EventsFile;
   try {
-    eventsFile = createEventsFile();
+    eventsFile = makeEventsFile();
   } catch (err) {
-    // Creating the events file is non-fatal in test/CI environments where
-    // /tmp may be read-only or otherwise unwritable — fall back to a NULL
-    // path so the production env-shim's SCRIPT_JAIL_LOG_FILE branch is
-    // skipped and writers fall through to SCRIPT_JAIL_LOG_FD.  We
-    // deliberately do NOT bail here because the audit pipeline has other
-    // signals (strace, fd 3) and the events file is one of several inputs.
-    diag(input, `events-file create failed (non-fatal): ${String(err)}`);
-    eventsFile = null;
+    // Surface the error class/message but not the path — `/tmp/script-jail-
+    // events-<random>` is short-lived and not sensitive, yet keeping the
+    // diagnostic compact avoids leaking guest tmpdir layout to the host log.
+    const reason = err instanceof Error ? err.message : String(err);
+    emitter.emitError(
+      `script-jail agent: failed to create audit-events file — ${reason}. ` +
+        'Refusing to proceed: descendants of the install child only inherit ' +
+        'fds 0–2 (stdio: inherit), so without SCRIPT_JAIL_LOG_FILE pointing ' +
+        'at a real path the audit pipeline loses env_read / dlopen / exec / ' +
+        'env_tamper events from grandchildren.',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
   }
-  const eventsFilePath = eventsFile !== null ? eventsFile.path : '';
+  const eventsFilePath = eventsFile.path;
 
   // 5. Build child environment
   const childEnv = buildChildEnv(process.env, config, protectedEnvPath, eventsFilePath);

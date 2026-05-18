@@ -26691,14 +26691,20 @@ async function main(input) {
   diag(input, `manager resolved: ${manager}`);
   const protectedEnvPath = "/tmp/script-jail-protected.txt";
   (0, import_node_fs3.writeFileSync)(protectedEnvPath, config2.protected.env.join("\n") + "\n", "utf8");
+  const makeEventsFile = input.createEventsFile ?? createEventsFile;
   let eventsFile;
   try {
-    eventsFile = createEventsFile();
+    eventsFile = makeEventsFile();
   } catch (err) {
-    diag(input, `events-file create failed (non-fatal): ${String(err)}`);
-    eventsFile = null;
+    const reason = err instanceof Error ? err.message : String(err);
+    emitter.emitError(
+      `script-jail agent: failed to create audit-events file \u2014 ${reason}. Refusing to proceed: descendants of the install child only inherit fds 0\u20132 (stdio: inherit), so without SCRIPT_JAIL_LOG_FILE pointing at a real path the audit pipeline loses env_read / dlopen / exec / env_tamper events from grandchildren.`,
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
   }
-  const eventsFilePath = eventsFile !== null ? eventsFile.path : "";
+  const eventsFilePath = eventsFile.path;
   const childEnv = buildChildEnv(process.env, config2, protectedEnvPath, eventsFilePath);
   const spawner = input.spawner ?? new LinuxSpawner();
   const straceRunner = input.strace ?? new LinuxStraceRunner(void 0, eventsFile);
