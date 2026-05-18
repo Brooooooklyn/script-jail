@@ -26027,6 +26027,7 @@ async function runInstallPhase(input) {
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
+      if (cwdUnknownHas(pid)) return null;
       const cwd = cwdGet(pid);
       if (cwd === void 0) return null;
       return path.resolve(cwd, targetPath);
@@ -26041,6 +26042,7 @@ async function runInstallPhase(input) {
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
+      if (cwdUnknownHas(pid)) return null;
       const tracked = cwdGet(pid);
       if (tracked !== void 0) {
         return path.resolve(tracked, targetPath);
@@ -26131,7 +26133,7 @@ async function runInstallPhase(input) {
       const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
       if (cloneMatch !== null) {
         const syscallName = cloneMatch[1] ?? "";
-        const rcMatch = line.match(/=\s*(\d+)\b/);
+        const rcMatch = line.match(/\)\s*=\s*(-?\d+)\b/);
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
           if (Number.isFinite(childPid) && childPid > 0) {
@@ -26244,21 +26246,50 @@ async function runInstallPhase(input) {
           if (Number.isFinite(first) && Number.isFinite(last) && first >= 0 && last >= first) {
             if (hasUnshare) {
               const sharedRoot = rootedFd(pid);
-              const callerCurrentParent = fdParent.get(pid);
-              if (sharedRoot !== pid) {
-                const sharedPrefix = `${sharedRoot}:`;
-                const snapshot = [];
-                for (const [key, val] of dirfdTable) {
-                  if (key.startsWith(sharedPrefix)) {
-                    snapshot.push([key.slice(sharedPrefix.length), val]);
-                  }
+              const sharedPrefix = `${sharedRoot}:`;
+              const snapshot = [];
+              for (const [key, val] of dirfdTable) {
+                if (key.startsWith(sharedPrefix)) {
+                  snapshot.push([key.slice(sharedPrefix.length), val]);
                 }
-                const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+              }
+              const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+              if (sharedRoot !== pid) {
                 fdParent.delete(pid);
                 for (const [fdSuffix, val] of snapshot) {
                   dirfdTable.set(`${pid}:${fdSuffix}`, val);
                 }
                 if (sharedUnknown) dirfdStateUnknown.add(pid);
+              } else {
+                const otherMembers = [];
+                for (const memberPid of fdParent.keys()) {
+                  if (memberPid === pid) continue;
+                  if (findFdRoot(memberPid) === pid) {
+                    otherMembers.push(memberPid);
+                  }
+                }
+                if (otherMembers.length > 0) {
+                  otherMembers.sort((a, b) => a - b);
+                  const newRoot = otherMembers[0];
+                  fdParent.delete(newRoot);
+                  for (const member of otherMembers) {
+                    if (member === newRoot) continue;
+                    fdParent.set(member, newRoot);
+                  }
+                  const oldPrefix = `${pid}:`;
+                  for (const [fdSuffix, val] of snapshot) {
+                    dirfdTable.set(`${newRoot}:${fdSuffix}`, val);
+                    dirfdTable.delete(`${oldPrefix}${fdSuffix}`);
+                  }
+                  if (sharedUnknown) {
+                    dirfdStateUnknown.delete(pid);
+                    dirfdStateUnknown.add(newRoot);
+                  }
+                  for (const [fdSuffix, val] of snapshot) {
+                    dirfdTable.set(`${pid}:${fdSuffix}`, val);
+                  }
+                  if (sharedUnknown) dirfdStateUnknown.add(pid);
+                }
               }
               const groupPrefix = `${rootedFd(pid)}:`;
               for (const key of dirfdTable.keys()) {
@@ -26269,7 +26300,6 @@ async function runInstallPhase(input) {
                   dirfdTable.delete(key);
                 }
               }
-              void callerCurrentParent;
             } else {
               const groupPrefix = `${rootedFd(pid)}:`;
               for (const key of dirfdTable.keys()) {
@@ -27368,9 +27398,13 @@ var LinuxStraceRunner = class {
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
       stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
-    if (child.pid !== void 0 && this._rootPid === null) {
+    let rootPidDeterministicResolution = false;
+    if (child.pid !== void 0) {
+      rootPidDeterministicResolution = true;
       const pid = readStraceChildPid(child.pid);
-      if (pid !== null) this._rootPid = pid;
+      if (pid !== null) {
+        this._rootPid = pid;
+      }
     }
     const exitPromise = new Promise((resolve2) => {
       child.on("close", (code) => {
@@ -27406,13 +27440,21 @@ var LinuxStraceRunner = class {
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
-        // Pin the install root pid from the first per-pid strace
-        // output file we ever observe (bug-fix #1 — see field docs
-        // and StraceTailerOptions.recordRootPid).  First-writer wins:
-        // the tailer's flag ensures only the very first file's pid
-        // reaches this callback.
-        recordRootPid: (pid) => {
-          if (this._rootPid === null) this._rootPid = pid;
+        // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
+        // fallback runs ONLY when the /proc-based deterministic
+        // resolution was not attempted (i.e. child.pid was undefined,
+        // typically a test spawn stub).  When the /proc path was
+        // attempted but returned null (timeout, ambiguous,
+        // unavailable), `rootPidDeterministicResolution` is true and
+        // we deliberately DO NOT install this callback — the
+        // dispatcher gets `null` from `getRootPid()` and fails closed.
+        // First-writer-wins between the (single) /proc resolution and
+        // the file-observation fallback is therefore replaced with a
+        // mutually-exclusive decision made at spawn time.
+        ...rootPidDeterministicResolution ? {} : {
+          recordRootPid: (pid) => {
+            if (this._rootPid === null) this._rootPid = pid;
+          }
         }
       });
     } finally {

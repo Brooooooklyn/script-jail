@@ -848,6 +848,18 @@ export async function runInstallPhase(
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
+      // Codex follow-up (bug #2, high, 2026-05-19): the cwdUnknown bit
+      // DOMINATES the cwdGet lookup.  After `unionCwd` reconciles
+      // differing parent/child cwds it marks the merged group
+      // cwdUnknown (and may also leave a stale adopted value in
+      // pidCwd, depending on reconciliation order).  Pre-fix, this
+      // canonicalizer called `cwdGet(pid)` directly — bypassing the
+      // unknown signal and happily returning the adopted value, which
+      // defeated the fail-closed posture.  Strict fix: consult
+      // `cwdUnknownHas` FIRST and return null if the pid's cwd state
+      // is unknown, regardless of whether a value happens to be in
+      // pidCwd.  The unknown bit is the canonical fail-closed signal.
+      if (cwdUnknownHas(pid)) return null;
       const cwd = cwdGet(pid);
       if (cwd === undefined) return null;
       return path.resolve(cwd, targetPath);
@@ -906,6 +918,19 @@ export async function runInstallPhase(
       if (path.isAbsolute(targetPath)) {
         return path.resolve(targetPath);
       }
+      // Codex follow-up (bug #2, high, 2026-05-19): the cwdUnknown bit
+      // DOMINATES.  After `unionCwd` merges a child cwd-unknown group
+      // into a parent cwd-known group, the merged group inherits the
+      // unknown bit but may also retain the parent's old cwd value
+      // (the reconciliation rule only deletes pidCwd[merged] when
+      // both sides had values and they differed — see unionCwd).
+      // Pre-fix, this canonicalizer called `cwdGet(pid)` directly,
+      // returning the stale parent value and certifying a wrong cwd
+      // for the merged group's AT_FDCWD-relative opens.  Strict fix:
+      // consult `cwdUnknownHas` BEFORE `cwdGet`; if unknown, return
+      // null so the open is dropped + a `<UNRESOLVED_PATH>` synth
+      // surfaces in the post-loop pass.
+      if (cwdUnknownHas(pid)) return null;
       const tracked = cwdGet(pid);
       if (tracked !== undefined) {
         return path.resolve(tracked, targetPath);
@@ -1306,11 +1331,26 @@ export async function runInstallPhase(
       if (cloneMatch !== null) {
         const syscallName = cloneMatch[1] ?? '';
         // Locate the trailing "= <rc>" and gate on success (positive rc).
-        // We match the rc as a decimal integer; clone/clone3 never return
-        // hex or symbolic forms.  Negative rc (e.g. "-1 ENOMEM") fails
-        // the regex and the propagation is skipped — correct, since no
-        // child pid exists in that case.
-        const rcMatch = line.match(/=\s*(\d+)\b/);
+        //
+        // Codex follow-up (bug #4, high, 2026-05-19): the prior regex was
+        // `/=\s*(\d+)\b/` — greedy across the whole line.  A clone3 line
+        // like
+        //   clone3({flags=CLONE_VM|CLONE_FS, stack_size=0,
+        //           exit_signal=17}, 88) = 9999
+        // contains numeric struct fields (`stack_size=0`, `exit_signal=17`)
+        // BEFORE the trailing `= 9999`.  The greedy regex matched `=0`
+        // first, so `childPid` became 0, the success gate `childPid > 0`
+        // rejected the line, and propagation was silently skipped — the
+        // child inherited NO state and every AT_FDCWD-relative open from
+        // it failed closed even when the parent had a known cwd.
+        //
+        // Strict fix: anchor the return-value match on the closing `)` of
+        // the syscall.  Strace always renders syscall return as
+        // `<syscall>(<args>) = <rc>[ ERRNO]`, so `\)\s*=\s*(-?\d+)\b`
+        // picks up the rc unambiguously, regardless of how many `=N`
+        // tokens appear inside the args.  We accept negative rc too —
+        // the `childPid > 0` gate below still discards failure cases.
+        const rcMatch = line.match(/\)\s*=\s*(-?\d+)\b/);
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? '', 10);
           if (Number.isFinite(childPid) && childPid > 0) {
@@ -1543,20 +1583,27 @@ export async function runInstallPhase(
               //   4. Apply the close range to the new private group
               //      only.
               const sharedRoot = rootedFd(pid);
-              const callerCurrentParent = fdParent.get(pid);
-              if (sharedRoot !== pid) {
-                // Snapshot shared-group state under sharedRoot.
-                const sharedPrefix = `${sharedRoot}:`;
-                const snapshot: Array<[string, string]> = [];
-                for (const [key, val] of dirfdTable) {
-                  if (key.startsWith(sharedPrefix)) {
-                    snapshot.push([key.slice(sharedPrefix.length), val]);
-                  }
+              // Snapshot shared-group state under sharedRoot.  We need
+              // this in BOTH detach branches below: either to seed the
+              // caller's new private group (caller was a non-root
+              // member) OR to migrate the shared group's state to a new
+              // root pid (caller WAS the representative).
+              const sharedPrefix = `${sharedRoot}:`;
+              const snapshot: Array<[string, string]> = [];
+              for (const [key, val] of dirfdTable) {
+                if (key.startsWith(sharedPrefix)) {
+                  snapshot.push([key.slice(sharedPrefix.length), val]);
                 }
-                const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+              }
+              const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+              if (sharedRoot !== pid) {
+                // Caller is a NON-ROOT member of the shared group.
                 // Detach: pid becomes its own root.  fdParent.delete
                 // is enough — findFdRoot returns the pid itself when
-                // there's no parent pointer.
+                // there's no parent pointer.  The shared group's
+                // representative stays unchanged; remaining members
+                // (root + any other non-root members) keep resolving
+                // to sharedRoot.
                 fdParent.delete(pid);
                 // Copy snapshot into pid's NEW private group.
                 for (const [fdSuffix, val] of snapshot) {
@@ -1568,10 +1615,81 @@ export async function runInstallPhase(
                 // sibling pid that resolves via findFdRoot to
                 // sharedRoot retains full access.  This is the whole
                 // point of CLOSE_RANGE_UNSHARE.
+              } else {
+                // Codex follow-up (bug #1, high, 2026-05-19): caller IS
+                // the group representative.  Pre-fix this branch was a
+                // silent no-op (the prior code only entered the detach
+                // arm when `sharedRoot !== pid`).  That left every
+                // remaining sibling resolving to `sharedRoot === pid`
+                // and the close-range below mutated the shared group's
+                // dirfdTable entries — siblings then saw deletions they
+                // shouldn't, and if the caller reused the deleted fds
+                // via subsequent openat, sibling opens via the OLD fd
+                // would resolve through the caller's new path.
+                //
+                // Find the remaining members of the shared group (all
+                // pids `p !== pid` whose `findFdRoot(p) === pid`).
+                // Iterate `fdParent` keys — any pid present in the map
+                // resolves through its parent chain to a root; pids
+                // not in the map are their own root.  Path compression
+                // means most members point directly at `sharedRoot`,
+                // but we re-resolve via findFdRoot to be safe.
+                const otherMembers: number[] = [];
+                for (const memberPid of fdParent.keys()) {
+                  if (memberPid === pid) continue;
+                  if (findFdRoot(memberPid) === pid) {
+                    otherMembers.push(memberPid);
+                  }
+                }
+                if (otherMembers.length > 0) {
+                  // Promote the first remaining member to be the new
+                  // root.  Re-point every other member's parent to it,
+                  // migrate the shared dirfdTable / dirfdStateUnknown
+                  // entries from the OLD root (`pid`) to the new root,
+                  // then detach the caller into a private group.
+                  //
+                  // Why "first" arbitrarily: union-find groups are
+                  // unordered sets; any member is a valid root.  We
+                  // pick the smallest pid for determinism (helps any
+                  // future debugging based on transcript dumps).
+                  otherMembers.sort((a, b) => a - b);
+                  const newRoot = otherMembers[0]!;
+                  // Re-point every other member to newRoot.  Also
+                  // clear newRoot's own parent pointer (it becomes a
+                  // self-root).
+                  fdParent.delete(newRoot);
+                  for (const member of otherMembers) {
+                    if (member === newRoot) continue;
+                    fdParent.set(member, newRoot);
+                  }
+                  // Migrate dirfdTable entries: shared group keys
+                  // were `${pid}:<fd>` (because sharedRoot === pid).
+                  // Move each to `${newRoot}:<fd>`.
+                  const oldPrefix = `${pid}:`;
+                  for (const [fdSuffix, val] of snapshot) {
+                    dirfdTable.set(`${newRoot}:${fdSuffix}`, val);
+                    dirfdTable.delete(`${oldPrefix}${fdSuffix}`);
+                  }
+                  // Migrate dirfdStateUnknown membership.
+                  if (sharedUnknown) {
+                    dirfdStateUnknown.delete(pid);
+                    dirfdStateUnknown.add(newRoot);
+                  }
+                  // Now the caller (`pid`) has no fdParent entry and
+                  // no shared dirfdTable entries — it's a singleton
+                  // root.  Seed its private group from the snapshot so
+                  // the close-range below applies to a private copy.
+                  for (const [fdSuffix, val] of snapshot) {
+                    dirfdTable.set(`${pid}:${fdSuffix}`, val);
+                  }
+                  if (sharedUnknown) dirfdStateUnknown.add(pid);
+                }
+                // If there are NO other members, the "shared" group is
+                // a singleton (just the caller).  Nothing to detach
+                // against — the snapshot already lives under `pid:<fd>`
+                // in the dirfdTable, and the close-range below applies
+                // to it directly.  No action needed.
               }
-              // (If sharedRoot === pid, the caller was ALREADY its
-              // own root — nothing to detach.  Fall through and
-              // close on its own group.)
               // Now close the range against the caller's group (which
               // is either the brand-new private group or the original
               // singleton group).
@@ -1584,11 +1702,6 @@ export async function runInstallPhase(
                   dirfdTable.delete(key);
                 }
               }
-              // Suppress unused-warning for callerCurrentParent — we
-              // captured it for diagnostic clarity in the comment
-              // above; the value isn't otherwise needed because
-              // fdParent.delete handles all the union-find bookkeeping.
-              void callerCurrentParent;
             } else {
               // Pre-existing behaviour: close the range on the caller's
               // (possibly shared) group.  Siblings observe the closes.

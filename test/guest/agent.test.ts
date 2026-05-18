@@ -2199,6 +2199,110 @@ describe('LinuxStraceRunner stderr forwarding', () => {
       process.stderr.write = origWrite;
     }
   });
+
+  // Codex follow-up (bug #3, high, 2026-05-19): tri-state rootPid resolution.
+  // When `child.pid` is defined AND readStraceChildPid returns null (timeout,
+  // ambiguous, /proc unavailable), the per-pid-file fallback MUST be suppressed.
+  // Pre-fix the fallback ran unconditionally — a per-pid file's pid would have
+  // seeded `_rootPid` and re-introduced the race the deterministic /proc
+  // resolution was added to eliminate.
+  it('rootPid: /proc failure with defined child.pid leaves rootPid null and DISABLES per-pid-file fallback (bug #3)', async () => {
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    // child.pid = 0 makes readStraceChildPid throw on every readFileSync
+    // (`/proc/0/task/0/children` doesn't exist) so it returns null AFTER
+    // the deadline.  Crucially, pid IS DEFINED (typeof === 'number'),
+    // which selects the deterministic-resolution code path — once that
+    // path is taken, the per-pid-file fallback MUST be suppressed even
+    // when readStraceChildPid returns null.
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: 0,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    const runner = new LinuxStraceRunner(() => fakeChild);
+    const basePath = `${tailerDir}/strace.out`;
+    // Pre-create a per-pid file so the tailer's discovery path would
+    // otherwise fire recordRootPid(<pid>) with this synthetic pid.
+    writeFileSync(`${basePath}.4242`, 'openat(AT_FDCWD, "/x", O_RDONLY) = 3\n', 'utf8');
+
+    const runIter = runner.run('npm', ['rebuild'], {
+      env: {},
+      cwd: tailerDir,
+      basePath,
+    });
+    const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
+      const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
+      for await (const item of runIter) {
+        collected.push(item);
+      }
+      return collected;
+    })();
+    fakeStderr.push(null);
+    fakeFd3.push(null);
+    // Allow the tailer one poll cycle to drain the pre-created file
+    // BEFORE we signal exit, so the recordRootPid suppression is the
+    // ONLY reason _rootPid stays null (rather than the iterator exiting
+    // before the tailer ever discovered the file).
+    setTimeout(() => { closeListener?.(0); }, 200);
+    await itemsPromise;
+
+    // CRITICAL ASSERTION: getRootPid() is null even though a per-pid
+    // file with pid 4242 was visible the entire run.  The suppression
+    // is what bug #3's fix introduces.
+    expect(runner.getRootPid()).toBeNull();
+  });
+
+  // Bug #3 sanity — the test-fake fallback path still works.  When
+  // child.pid is UNDEFINED (catastrophic spawn or test stub), the
+  // per-pid-file fallback MUST still seed _rootPid for the convenience
+  // of older test fakes that rely on it.
+  it('rootPid: undefined child.pid keeps the per-pid-file fallback enabled (bug #3 sanity)', async () => {
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: undefined,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    const runner = new LinuxStraceRunner(() => fakeChild);
+    const basePath = `${tailerDir}/strace.out`;
+    writeFileSync(`${basePath}.5151`, 'openat(AT_FDCWD, "/x", O_RDONLY) = 3\n', 'utf8');
+
+    const runIter = runner.run('npm', ['rebuild'], {
+      env: {},
+      cwd: tailerDir,
+      basePath,
+    });
+    const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
+      const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
+      for await (const item of runIter) {
+        collected.push(item);
+      }
+      return collected;
+    })();
+    fakeStderr.push(null);
+    fakeFd3.push(null);
+    setTimeout(() => { closeListener?.(0); }, 200);
+    await itemsPromise;
+
+    // Fallback enabled → pid 5151 was observed and seeded _rootPid.
+    expect(runner.getRootPid()).toBe(5151);
+  });
 });
 
 // ---------------------------------------------------------------------------

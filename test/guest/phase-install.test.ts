@@ -5544,6 +5544,429 @@ describe('runInstallPhase', () => {
     });
   });
 
+  // =====================================================================
+  // codex follow-up #4 regression (2026-05-19):
+  //   #1 — CLOSE_RANGE_UNSHARE caller IS the group representative.
+  //        The detach must still re-root the group and seed a private
+  //        copy for the caller; pre-fix this branch was a no-op so
+  //        siblings observed deletions from the caller's close_range.
+  //   #2 — cwdUnknown dominates canonicalizers.  After unionCwd merges
+  //        a child cwd-unknown group into a parent cwd-known group, the
+  //        parent's adopted value MUST NOT certify subsequent
+  //        AT_FDCWD-relative opens — the unknown bit fails closed.
+  //   #3 — tri-state rootPid resolution (LinuxStraceRunner side).
+  //        When the /proc resolution path was attempted but produced
+  //        no pid, the per-pid-file fallback MUST be suppressed.  See
+  //        agent.test.ts for the runner-side test; we still capture
+  //        the dispatcher's null-rootPid contract here.
+  //   #4 — clone3 return-value parsing.  Struct fields like
+  //        `stack_size=0` MUST NOT shadow the trailing rc.  Pre-fix
+  //        the rc regex matched the first `=N` token in the line.
+  // =====================================================================
+  describe('codex follow-up #4 regression', () => {
+    const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
+
+    // Bug #1 (round 2) — caller IS the group representative.
+    //  parent (group root) opens fd 7→/A, parent clones with CLONE_FILES
+    //  → child joins parent's group, parent (NOT child) calls
+    //  close_range(3, INT_MAX, CLOSE_RANGE_UNSHARE).  The remaining
+    //  sibling (the child) must keep resolving fd 7→/A through whichever
+    //  representative the implementation chose.  Pre-fix the parent's
+    //  detach was a silent no-op and the close range mutated the SHARED
+    //  group's entries — the child's openat(7, "file") would have
+    //  failed closed.
+    it('CLOSE_RANGE_UNSHARE when caller IS the group root: sibling fd state preserved (bug #1)', async () => {
+      const proc = mockProcReader({
+        8001: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unshare-root-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        8002: {
+          ppid: 8001,
+          env: {
+            npm_package_name: 'unshare-root-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /A as fd 7.
+        {
+          pid: 8001,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Parent clones with CLONE_FILES → child joins parent's group.
+        // Parent is the group root (rootedFd(parent) === parent because
+        // unionFd points the CHILD's root at the parent's root).
+        {
+          pid: 8001,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES, child_tidptr=0x7f...) = 8002',
+          source: 'strace',
+        },
+        // PARENT (the group root) detaches via CLOSE_RANGE_UNSHARE.
+        {
+          pid: 8001,
+          line: 'close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0',
+          source: 'strace',
+        },
+        // Child's openat(7, "file") MUST still resolve to /A/file
+        // (the sibling state was preserved because the implementation
+        // re-rooted the group to the child before detaching the parent).
+        {
+          pid: 8002,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Parent's openat(7, "file") MUST fail closed (caller detached
+        // AND closed fd 7 in its new private group).
+        {
+          pid: 8001,
+          line: 'openat(7, "file", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 8001 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child's read resolved to /A/file — sibling fd table survived.
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 8002;
+      });
+      expect(childRead).toHaveLength(1);
+      // Parent's read MUST NOT have resolved to /A/file (its private
+      // group lost fd 7 to the close range).
+      const parentRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file' && r['pid'] === 8001;
+      });
+      expect(parentRead).toHaveLength(0);
+      // Parent's openat surfaces as <UNRESOLVED_PATH>.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 8001;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #1 sanity — caller IS the group root AND is the only member
+    // (singleton group).  Nothing to detach against; close_range applies
+    // to the caller's private state directly.  No siblings to preserve.
+    it('CLOSE_RANGE_UNSHARE on a singleton group: close applies to caller directly (bug #1 sanity)', async () => {
+      const proc = mockProcReader({
+        8101: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'singleton-unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Pid 8101 opens /A as fd 7 — singleton group.
+        {
+          pid: 8101,
+          line: 'openat(AT_FDCWD, "/A", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // CLOSE_RANGE_UNSHARE on a singleton: no other members to
+        // re-root; the close range applies to pid 8101's own entries.
+        {
+          pid: 8101,
+          line: 'close_range(3, 4294967295, CLOSE_RANGE_UNSHARE) = 0',
+          source: 'strace',
+        },
+        // Pid 8101's openat(7, "file") MUST fail closed (its fd 7 was
+        // closed in the singleton's group).
+        {
+          pid: 8101,
+          line: 'openat(7, "file", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 8101 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const certified = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/file';
+      });
+      expect(certified).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 8101;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #2 — cwdUnknown dominance.
+    //  parent has cwd=/A (seeded as install root); child has
+    //  cwdUnknown=true (a chdir to a relative path with no prior cwd
+    //  marked it unknown).  CLONE_FS clone unions them.  After the
+    //  union the merged group inherits the unknown bit AND the
+    //  parent's old /A value (unionCwd only deletes the merged-group
+    //  pidCwd entry when BOTH sides had values that DIFFERED).  ANY
+    //  AT_FDCWD-relative open from either pid MUST fail closed.
+    it('cwdUnknown dominates canonicalizer: child cwdUnknown + parent cwd=/A + CLONE_FS → opens fail closed (bug #2)', async () => {
+      const proc = mockProcReader({
+        8201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unknown-dominates-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        8202: {
+          ppid: 8201,
+          env: {
+            npm_package_name: 'unknown-dominates-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent (install root) gets seeded with /A via the explicit
+        // cwd seed below.  We do an absolute chdir to make it explicit.
+        {
+          pid: 8201,
+          line: 'chdir("/A") = 0',
+          source: 'strace',
+        },
+        // Child performs a RELATIVE chdir with NO prior cwd — this
+        // sets cwdUnknown on the child's group (per the chdirRe
+        // handler in phase-install.ts).
+        {
+          pid: 8202,
+          line: 'chdir("subdir") = 0',
+          source: 'strace',
+        },
+        // Now the parent observes a CLONE_FS clone of the child.  The
+        // union reconciles: parent has cwd=/A, child has cwdUnknown.
+        // Per unionCwd, the merged group keeps /A as the pidCwd value
+        // (no conflict because child had no value) AND inherits the
+        // unknown bit.  Pre-fix the canonicalizer called cwdGet first
+        // and returned /A — certifying every subsequent relative open.
+        // Post-fix the unknown bit dominates: returns null.
+        {
+          pid: 8201,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES, child_tidptr=0x7f...) = 8202',
+          source: 'strace',
+        },
+        // Parent's AT_FDCWD-relative openat MUST fail closed.
+        {
+          pid: 8201,
+          line: 'openat(AT_FDCWD, "secret.key", O_RDONLY) = 4',
+          source: 'strace',
+        },
+        // Child's AT_FDCWD-relative openat MUST also fail closed.
+        {
+          pid: 8202,
+          line: 'openat(AT_FDCWD, "other.key", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/A',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 8201 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No relative open should have been resolved to /A/* — the
+      // unknown bit dominates after the union.
+      const certified = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          (r['path'] === '/A/secret.key' || r['path'] === '/A/other.key')
+        );
+      });
+      expect(certified).toHaveLength(0);
+      // Both pids surface <UNRESOLVED_PATH>.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'exec' &&
+          r['unresolved_path'] === true &&
+          (r['pid'] === 8201 || r['pid'] === 8202)
+        );
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(2);
+    });
+
+    // Bug #3 (dispatcher-side contract) — null rootPid disables seeding.
+    //  When the runner returns null from getRootPid(), the dispatcher
+    //  MUST NOT seed any pid's cwd from input.cwd.  First-observed-pid
+    //  fallback (the pre-fix race) is gone.  This test exercises the
+    //  dispatcher contract; agent.test.ts covers the runner-side
+    //  /proc-failure path that produces null in the first place.
+    it('rootPid=null leaves all pids unseeded; first-observed AT_FDCWD-relative open fails closed (bug #3)', async () => {
+      const proc = mockProcReader({
+        8301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'null-rootpid-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // First-observed pid does an AT_FDCWD-relative openat without
+        // any prior chdir.  Pre-fix the "first observed pid wins"
+        // fallback would have seeded pidCwd[8301] = input.cwd → /work
+        // → certified open to /work/secret.key.  Post-fix (rootPid
+        // null) no seeding happens → fails closed.
+        {
+          pid: 8301,
+          line: 'openat(AT_FDCWD, "secret.key", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        // rootPid explicitly null — mirrors the runner-side decision
+        // that /proc resolution failed and the per-pid-file fallback
+        // was suppressed (bug #3 tri-state).
+        strace: cannedStraceRunner(records, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/secret.key' && r['pid'] === 8301;
+      });
+      expect(stale).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 8301;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Bug #4 — clone3 return-value parsing anchored on the closing `)`.
+    //  Real-shape clone3 lines contain numeric struct fields BEFORE the
+    //  trailing rc (`stack_size=0`, `exit_signal=17`).  Pre-fix the rc
+    //  regex was `/=\s*(\d+)\b/` — greedy across the line — and
+    //  matched the first `=0`, making `childPid` parse to 0 and the
+    //  propagation branch silently skip.  Post-fix the regex anchors
+    //  on `)\s*=\s*` and picks up the real rc.  We then verify
+    //  propagation happened: the child does an AT_FDCWD-relative open
+    //  and resolves against the parent's cwd (which was seeded as
+    //  input.cwd).
+    it('clone3 with numeric struct fields propagates state to child (bug #4)', async () => {
+      const proc = mockProcReader({
+        8401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'clone3-rc-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9999: {
+          ppid: 8401,
+          env: {
+            npm_package_name: 'clone3-rc-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Real-shape clone3 line with `stack_size=0` (and other `=N`
+        // tokens) BEFORE the trailing `= 9999`.  Pre-fix the rc parse
+        // matched `=0` → childPid=0 → propagation skipped.
+        {
+          pid: 8401,
+          line: 'clone3({flags=CLONE_VM|CLONE_FS, stack_size=0, child_tidptr=0x7f8c0000, exit_signal=17}, 88) = 9999',
+          source: 'strace',
+        },
+        // Child does an AT_FDCWD-relative open.  Post-fix the
+        // CLONE_FS-flagged clone3 unions the cwd group, so the child
+        // resolves through the parent's cwd (seeded from input.cwd =
+        // /work as the install root).
+        {
+          pid: 9999,
+          line: 'openat(AT_FDCWD, "package.json", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 8401 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child's open resolved to /work/package.json (propagation
+      // succeeded).  Pre-fix this open would have failed closed.
+      const hit = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/package.json' && r['pid'] === 9999;
+      });
+      expect(hit).toHaveLength(1);
+      // No <UNRESOLVED_PATH> for pid 9999.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 9999;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Bug #4 negative case — pre-fix regression sentinel.  Without the
+    // anchored regex the dispatcher would have parsed childPid=0 from
+    // the leading `stack_size=0` and skipped propagation entirely; the
+    // child's openat would then have failed closed (no cwd seed).  We
+    // assert the POSITIVE outcome to prevent re-introduction.
+    it('clone3 rc anchored on closing `)` works with `=N` struct fields preceding the rc (bug #4)', async () => {
+      // Sanity check the regex at the source level — we extract a
+      // copy via a small inline parser that mirrors phase-install's
+      // intent.  This is a behavioural assertion of the anchor.
+      const line =
+        'clone3({flags=CLONE_VM|CLONE_FS, stack_size=0, exit_signal=17}, 88) = 12345';
+      // Pre-fix regex.
+      const pre = line.match(/=\s*(\d+)\b/);
+      expect(pre?.[1]).toBe('0'); // pre-fix matched the wrong token.
+      // Post-fix anchored regex.
+      const post = line.match(/\)\s*=\s*(-?\d+)\b/);
+      expect(post?.[1]).toBe('12345');
+    });
+  });
+
   describe('parseShimLine (exported for testing)', () => {
     it('parses env_read lines', async () => {
       // Import parseShimLine directly

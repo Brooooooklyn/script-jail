@@ -1252,26 +1252,54 @@ export class LinuxStraceRunner implements StraceRunner {
     //
     // The /proc query is bounded (≤50ms / ≤10 iterations).  On the
     // production guest, strace forks its child within a single scheduler
-    // quantum, so the loop usually completes on the first iteration.  We
-    // fall back to the per-pid-file heuristic (kept intact below) when:
-    //   - child.pid is undefined (spawn failed catastrophically),
-    //   - /proc is unavailable (some test sandboxes),
-    //   - children remains empty for the full deadline,
-    //   - or multiple children appear simultaneously (ambiguous → fail
-    //     closed; the dispatcher's missing-rootPid path resolves nothing
-    //     for cwd seeding and every pid falls through to clone-propagation
-    //     or the conservative `<UNRESOLVED_PATH>` synth).
+    // quantum, so the loop usually completes on the first iteration.
     //
-    // First-writer-wins between the /proc path and the file-observation
-    // fallback: whichever sets `this._rootPid` first sticks.  Typically
-    // the /proc path wins because the children file is populated by the
-    // kernel during clone(), well before strace has had a chance to
-    // PTRACE_SYSCALL through to the install command's first userspace
-    // syscall.
-    if (child.pid !== undefined && this._rootPid === null) {
+    // Codex follow-up (bug #3, high, 2026-05-19): TRI-STATE resolution.
+    // Pre-fix, the file-observation fallback (recordRootPid below) ran
+    // unconditionally — when readStraceChildPid returned null (timeout,
+    // /proc unavailable, ambiguous multi-child), `_rootPid` was left null
+    // here and the recordRootPid callback later happily seeded it from
+    // the first per-pid strace file the tailer drained.  That is EXACTLY
+    // the nondeterministic race we tried to eliminate (a forked child's
+    // file can be drained before the install command's).
+    //
+    // Strict fix: decide ONCE at spawn time which resolution mode to use,
+    // and disable the fallback when the /proc path was attempted but
+    // didn't yield a definite pid.
+    //
+    //   A. `child.pid` exists AND readStraceChildPid returned a pid:
+    //      use it; DISABLE the per-pid-file fallback (rootPid is pinned).
+    //   B. `child.pid` exists but readStraceChildPid returned null
+    //      (deadline expired, ambiguous multi-child, /proc unavailable):
+    //      leave `_rootPid` null AND DISABLE the per-pid-file fallback.
+    //      The dispatcher gets null from getRootPid(); no pid is seeded;
+    //      every pid fails closed on AT_FDCWD-relative opens until it
+    //      performs an observable chdir.  Conservative but correct.
+    //   C. `child.pid` is undefined (spawn impl returned a stub — test
+    //      fakes or a catastrophic failure where we can't query /proc
+    //      at all): KEEP the per-pid-file fallback for test convenience.
+    //      Production strace always produces a child.pid.
+    //
+    // The `_rootPidDeterministicResolution` flag captures the A/B vs C
+    // distinction so the callback wire-up below can branch on it.  Once
+    // true, no per-pid-file observation can clobber the decision — even
+    // if a malicious or unusual event order produces a sibling's file
+    // first.
+    let rootPidDeterministicResolution = false;
+    if (child.pid !== undefined) {
+      // Production path: /proc must be consulted before we install the
+      // tailer callback so the decision is fixed before any per-pid
+      // file is drained.
+      rootPidDeterministicResolution = true;
       const pid = readStraceChildPid(child.pid);
-      if (pid !== null) this._rootPid = pid;
+      if (pid !== null) {
+        this._rootPid = pid;
+      }
+      // If pid === null we leave _rootPid as null and the dispatcher
+      // fails closed.  The recordRootPid callback below is suppressed.
     }
+    // Else: child.pid is undefined → spawn-stub / test path; allow the
+    // per-pid-file fallback to seed _rootPid below.
 
     const exitPromise = new Promise<void>((resolve) => {
       child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });
@@ -1308,14 +1336,24 @@ export class LinuxStraceRunner implements StraceRunner {
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,
-        // Pin the install root pid from the first per-pid strace
-        // output file we ever observe (bug-fix #1 — see field docs
-        // and StraceTailerOptions.recordRootPid).  First-writer wins:
-        // the tailer's flag ensures only the very first file's pid
-        // reaches this callback.
-        recordRootPid: (pid) => {
-          if (this._rootPid === null) this._rootPid = pid;
-        },
+        // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
+        // fallback runs ONLY when the /proc-based deterministic
+        // resolution was not attempted (i.e. child.pid was undefined,
+        // typically a test spawn stub).  When the /proc path was
+        // attempted but returned null (timeout, ambiguous,
+        // unavailable), `rootPidDeterministicResolution` is true and
+        // we deliberately DO NOT install this callback — the
+        // dispatcher gets `null` from `getRootPid()` and fails closed.
+        // First-writer-wins between the (single) /proc resolution and
+        // the file-observation fallback is therefore replaced with a
+        // mutually-exclusive decision made at spawn time.
+        ...(rootPidDeterministicResolution
+          ? {}
+          : {
+              recordRootPid: (pid: number): void => {
+                if (this._rootPid === null) this._rootPid = pid;
+              },
+            }),
       });
     } finally {
       if (stderrRl !== null) {
