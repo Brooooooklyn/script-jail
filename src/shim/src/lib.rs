@@ -36,6 +36,10 @@ const NAME_MAX_LEN: usize = 256;
 const JSONL_BUF: usize = 4096;
 const TRUNC_MARKER: &[u8] = b"<truncated>";
 const CANON_BUF_LEN: usize = 1024;
+/// Room for: LD_PRELOAD + NODE_OPTIONS + 6 × SCRIPT_JAIL_* injected entries.
+const MAX_ENVP_GROWTH: usize = 8;
+/// Sanity cap on input envp length — rejects hostile or corrupted envps.
+const MAX_ENVP_SANITY: usize = 8192;
 
 // ── protect-list (fixed-size, written once at constructor time) ────────────
 
@@ -71,6 +75,15 @@ static CANON_PRELOAD_PATH: CanonBuf = CanonBuf {
     bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
     len: AtomicUsize::new(0),
 };
+
+/// Returns the live byte slice of a CanonBuf (without the NUL terminator).
+/// Safe to call after INIT_DONE is observed via Acquire — by then the ctor has
+/// finished writing and `len` is stable.
+unsafe fn canon_bytes(buf: &CanonBuf) -> &[u8] {
+    let len = buf.len.load(Ordering::Acquire);
+    let bytes = &*buf.bytes.get();
+    &bytes[..len]
+}
 
 // ── log fd ─────────────────────────────────────────────────────────────────
 
@@ -320,6 +333,313 @@ unsafe fn load_protect_list(path: *const c_char) {
     let _ = libc::close(fd);
 
     PROTECTED.count.store(count, Ordering::Release);
+}
+
+// ── EnvBuf + env helpers ───────────────────────────────────────────────────
+//
+// Heap-backed mutable environment array for exec wrappers.  All allocation
+// goes through libc::malloc / libc::free; no Rust allocator is linked.
+//
+// Layout invariants:
+//   ptrs[0..count]   – the live entries (pointers into either the original
+//                       envp_in array or into strings we malloc'd).
+//   ptrs[count]      – always NULL (terminator).
+//   owned[0..owned_count] – all malloc'd entry strings we are responsible for
+//                       freeing.  These are a subset of ptrs[].
+//   cap              – total slots allocated for ptrs (>= count + 1).
+//   owned_cap        – total slots allocated for owned (>= owned_count).
+//
+// EnvBuf is stack-local, used exclusively by a single exec wrapper call on
+// one thread.  No Send/Sync impls needed.
+
+struct EnvBuf {
+    ptrs: *mut *const c_char, // libc::malloc'd; NULL-terminated.
+    cap: usize,               // capacity in slots (entries + 1 for terminator).
+    count: usize,             // currently-occupied entries (not counting NULL).
+    owned: *mut *mut c_char,  // libc::malloc'd: per-entry strdup'd C strings we created.
+    owned_cap: usize,
+    owned_count: usize,
+}
+
+/// Build an EnvBuf from an incoming `envp_in` pointer array (may be NULL).
+///
+/// Returns None if:
+///   - the input envp has more than MAX_ENVP_SANITY entries (hostile envp), or
+///   - any malloc call fails.
+/// On None the caller should forward envp_in unchanged.
+unsafe fn envbuf_from(envp_in: *const *const c_char) -> Option<EnvBuf> {
+    // Count input entries.  NULL envp means zero entries.
+    let count_in: usize = if envp_in.is_null() {
+        0
+    } else {
+        let mut n = 0usize;
+        loop {
+            if n > MAX_ENVP_SANITY {
+                return None;
+            }
+            if (*envp_in.add(n)).is_null() {
+                break;
+            }
+            n += 1;
+        }
+        n
+    };
+
+    // ptrs capacity: count_in + growth headroom + 1 NULL terminator.
+    let ptrs_cap = count_in + MAX_ENVP_GROWTH + 1;
+    let ptrs_bytes = ptrs_cap
+        .checked_mul(core::mem::size_of::<*const c_char>())
+        .unwrap_or(0);
+
+    // owned capacity: growth headroom + 1 (never more than MAX_ENVP_GROWTH entries owned).
+    let owned_cap = MAX_ENVP_GROWTH + 1;
+    let owned_bytes = owned_cap
+        .checked_mul(core::mem::size_of::<*mut c_char>())
+        .unwrap_or(0);
+
+    if ptrs_bytes == 0 || owned_bytes == 0 {
+        return None;
+    }
+
+    set_in_shim(true);
+    let ptrs_raw = libc::malloc(ptrs_bytes) as *mut *const c_char;
+    set_in_shim(false);
+    if ptrs_raw.is_null() {
+        return None;
+    }
+
+    set_in_shim(true);
+    let owned_raw = libc::malloc(owned_bytes) as *mut *mut c_char;
+    set_in_shim(false);
+    if owned_raw.is_null() {
+        set_in_shim(true);
+        libc::free(ptrs_raw as *mut c_void);
+        set_in_shim(false);
+        return None;
+    }
+
+    // Shallow-copy input entries into ptrs.
+    if count_in > 0 {
+        core::ptr::copy_nonoverlapping(
+            envp_in as *const *const c_char,
+            ptrs_raw,
+            count_in,
+        );
+    }
+    // NUL-terminate.
+    *ptrs_raw.add(count_in) = ptr::null();
+
+    Some(EnvBuf {
+        ptrs: ptrs_raw,
+        cap: ptrs_cap,
+        count: count_in,
+        owned: owned_raw,
+        owned_cap,
+        owned_count: 0,
+    })
+}
+
+/// Free all malloc'd memory in buf and zero out its fields.  Idempotent.
+unsafe fn free_envbuf(buf: &mut EnvBuf) {
+    // Free all entry strings we own.
+    for i in 0..buf.owned_count {
+        let p = *buf.owned.add(i);
+        if !p.is_null() {
+            set_in_shim(true);
+            libc::free(p as *mut c_void);
+            set_in_shim(false);
+        }
+    }
+    buf.owned_count = 0;
+
+    if !buf.owned.is_null() {
+        set_in_shim(true);
+        libc::free(buf.owned as *mut c_void);
+        set_in_shim(false);
+        buf.owned = ptr::null_mut();
+    }
+    buf.owned_cap = 0;
+
+    if !buf.ptrs.is_null() {
+        set_in_shim(true);
+        libc::free(buf.ptrs as *mut c_void);
+        set_in_shim(false);
+        buf.ptrs = ptr::null_mut();
+    }
+    buf.cap = 0;
+    buf.count = 0;
+}
+
+/// Find the slot index of an entry whose `NAME=` prefix matches `name`.
+/// `name` is the bare name without `=` (e.g. `b"LD_PRELOAD"`).
+/// Returns the index into buf.ptrs[], or None.
+unsafe fn envbuf_find(buf: &EnvBuf, name: &[u8]) -> Option<usize> {
+    let nlen = name.len();
+    for i in 0..buf.count {
+        let entry = *buf.ptrs.add(i);
+        if entry.is_null() {
+            continue;
+        }
+        // Check that entry[0..nlen] == name and entry[nlen] == b'='.
+        let mut ok = true;
+        for j in 0..nlen {
+            if *entry.add(j) as u8 != name[j] {
+                ok = false;
+                break;
+            }
+        }
+        if ok && *entry.add(nlen) as u8 == b'=' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Replace ptrs[idx] with new_entry and push new_entry onto owned[].
+/// Caller must have malloc'd new_entry already (via make_entry).
+unsafe fn envbuf_set_at(buf: &mut EnvBuf, idx: usize, new_entry: *mut c_char) {
+    *buf.ptrs.add(idx) = new_entry as *const c_char;
+    // Track it for freeing.
+    if buf.owned_count < buf.owned_cap {
+        *buf.owned.add(buf.owned_count) = new_entry;
+        buf.owned_count += 1;
+    }
+}
+
+/// Append a new entry to buf.ptrs[], bump count, re-NUL-terminate, push onto owned[].
+/// Returns false if there is no room (cap would be exceeded).
+unsafe fn envbuf_push(buf: &mut EnvBuf, new_entry: *mut c_char) -> bool {
+    // Need count + 1 entries + 1 NUL terminator <= cap.
+    if buf.count + 1 >= buf.cap {
+        return false;
+    }
+    *buf.ptrs.add(buf.count) = new_entry as *const c_char;
+    buf.count += 1;
+    *buf.ptrs.add(buf.count) = ptr::null(); // re-NUL-terminate.
+    // Track it for freeing.
+    if buf.owned_count < buf.owned_cap {
+        *buf.owned.add(buf.owned_count) = new_entry;
+        buf.owned_count += 1;
+    }
+    true
+}
+
+/// Malloc a new `NAME=VALUE\0` C string.  Returns NULL on malloc failure.
+/// Wrapped in the recursion guard to protect against glibc malloc reading
+/// MALLOC_* env vars.
+unsafe fn make_entry(name: &[u8], value: &[u8]) -> *mut c_char {
+    // name.len() + '=' + value.len() + NUL
+    let total = name.len() + 1 + value.len() + 1;
+    set_in_shim(true);
+    let buf = libc::malloc(total) as *mut u8;
+    set_in_shim(false);
+    if buf.is_null() {
+        return ptr::null_mut();
+    }
+    // Write: name '=' value '\0'
+    core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len());
+    *buf.add(name.len()) = b'=';
+    if !value.is_empty() {
+        core::ptr::copy_nonoverlapping(value.as_ptr(), buf.add(name.len() + 1), value.len());
+    }
+    *buf.add(name.len() + 1 + value.len()) = 0u8;
+    buf as *mut c_char
+}
+
+/// Ensure `name` is set in buf to a value that contains `to_append`.
+///
+/// - If `to_append` is empty, return true immediately (no-op).
+/// - If `name` is absent: add a new `name=to_append` entry.
+/// - If `name` is present but already ends with `to_append` (accounting for
+///   the separator): leave it unchanged (idempotent).
+/// - Otherwise: concatenate `existing + separator + to_append`.
+///
+/// Returns false only on malloc failure.
+unsafe fn append_path_env(
+    buf: &mut EnvBuf,
+    name: &[u8],
+    to_append: &[u8],
+    separator: u8,
+) -> bool {
+    if to_append.is_empty() {
+        return true;
+    }
+
+    match envbuf_find(buf, name) {
+        None => {
+            // Not present — add a fresh entry.
+            let entry = make_entry(name, to_append);
+            if entry.is_null() {
+                return false;
+            }
+            envbuf_push(buf, entry)
+        }
+        Some(idx) => {
+            // Present — get a slice of the existing value (after the '=').
+            let raw = *buf.ptrs.add(idx);
+            // Advance past `name=`.
+            let val_ptr = raw.add(name.len() + 1);
+            // Compute value length.
+            let mut val_len = 0usize;
+            while *val_ptr.add(val_len) != 0 {
+                val_len += 1;
+            }
+            let existing = core::slice::from_raw_parts(val_ptr as *const u8, val_len);
+
+            // Idempotency: already exactly to_append, or ends with sep+to_append.
+            if existing == to_append {
+                return true;
+            }
+            if val_len >= to_append.len() + 1 {
+                let tail = &existing[val_len - to_append.len() - 1..];
+                if tail[0] == separator && &tail[1..] == to_append {
+                    return true;
+                }
+            }
+
+            // Build new value: existing + separator + to_append.
+            // But only add separator if existing is non-empty.
+            let sep_len = if val_len > 0 { 1usize } else { 0usize };
+            let new_val_len = val_len + sep_len + to_append.len();
+            let total = name.len() + 1 + new_val_len + 1;
+            set_in_shim(true);
+            let raw_buf = libc::malloc(total) as *mut u8;
+            set_in_shim(false);
+            if raw_buf.is_null() {
+                return false;
+            }
+            let mut off = 0usize;
+            core::ptr::copy_nonoverlapping(name.as_ptr(), raw_buf, name.len());
+            off += name.len();
+            *raw_buf.add(off) = b'=';
+            off += 1;
+            if val_len > 0 {
+                core::ptr::copy_nonoverlapping(val_ptr as *const u8, raw_buf.add(off), val_len);
+                off += val_len;
+                *raw_buf.add(off) = separator;
+                off += 1;
+            }
+            core::ptr::copy_nonoverlapping(to_append.as_ptr(), raw_buf.add(off), to_append.len());
+            off += to_append.len();
+            *raw_buf.add(off) = 0u8;
+
+            envbuf_set_at(buf, idx, raw_buf as *mut c_char);
+            true
+        }
+    }
+}
+
+/// Ensure `name` is set in buf.  If already present, leave it unchanged.
+/// If absent, add `name=value`.  Returns false only on malloc failure.
+unsafe fn ensure_env(buf: &mut EnvBuf, name: &[u8], value: &[u8]) -> bool {
+    if envbuf_find(buf, name).is_some() {
+        return true; // preserve caller's value, do not overwrite.
+    }
+    let entry = make_entry(name, value);
+    if entry.is_null() {
+        return false;
+    }
+    envbuf_push(buf, entry)
 }
 
 // ── JSON escape ────────────────────────────────────────────────────────────
