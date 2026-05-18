@@ -22,7 +22,12 @@ import type { Emitter } from './emit.js';
 import type { Attribution } from './attribution.js';
 import { parseStraceLine } from './strace-parser.js';
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
-import type { AttributedEvent, RawEvent } from '../lock/schema.js';
+import {
+  ExecEvent,
+  EnvTamperEvent,
+  type AttributedEvent,
+  type RawEvent,
+} from '../lock/schema.js';
 
 /**
  * StraceRunner abstraction. Spawns strace and streams (pid, line) records.
@@ -91,12 +96,22 @@ const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[]
 };
 
 /**
- * Parse a JSONL line coming from the LD_PRELOAD env-shim or the dlopen-block
- * preload. Returns a RawEvent or null if the line is malformed/unrecognised.
+ * Parse a JSONL line coming from the LD_PRELOAD shim, the env-spy preload, or
+ * the dlopen-block preload. Returns a RawEvent or null if the line is
+ * malformed/unrecognised.
  *
  * Expected shapes:
- *   env_read:  {"kind":"env_read","name":"...","pid":N,"ts":N,"hidden":bool}
- *   dlopen:    {"kind":"dlopen","filename":"...","result":"blocked","pid":N,"ts":N}
+ *   env_read:    {"kind":"env_read","name":"...","pid":N,"ts":N,"hidden":bool}
+ *   dlopen:      {"kind":"dlopen","filename":"...","result":"blocked","pid":N,"ts":N}
+ *   exec:        {"kind":"exec","prog":"...","argv0":"...|null","envp_alloc_failed":bool,"pid":N,"ts":N}
+ *   env_tamper:  {"kind":"env_tamper","op":"setenv|unsetenv|putenv|clearenv",
+ *                 "name":"...","refused":true,"pid":N,"ts":N}
+ *
+ * exec/env_tamper validation goes through the zod schema (rather than the
+ * hand-rolled shape checks env_read/dlopen still use) because both shapes
+ * carry conditional fields (argv0 nullable; env_tamper name optional for
+ * clearenv) that are easier to express declaratively. Existing env_read /
+ * dlopen branches are left as-is to keep their tight error paths unchanged.
  */
 export function parseShimLine(line: string): RawEvent | null {
   try {
@@ -125,6 +140,12 @@ export function parseShimLine(line: string): RawEvent | null {
       ) {
         return { kind: 'dlopen', filename, result: 'blocked', pid, ts };
       }
+    } else if (obj['kind'] === 'exec') {
+      const parsed = ExecEvent.safeParse(obj);
+      if (parsed.success) return parsed.data;
+    } else if (obj['kind'] === 'env_tamper') {
+      const parsed = EnvTamperEvent.safeParse(obj);
+      if (parsed.success) return parsed.data;
     }
     return null;
   } catch {

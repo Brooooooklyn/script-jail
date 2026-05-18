@@ -317,6 +317,169 @@ describe('runInstallPhase', () => {
       expect((parsed['raw'] as Record<string, unknown>)['name']).toBe('HOME');
     });
 
+    it('processes exec shim lines (envp_alloc_failed=false)', async () => {
+      const proc = mockProcReader({
+        61: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'exec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      const shimLine = JSON.stringify({
+        kind: 'exec',
+        prog: '/usr/bin/node',
+        argv0: 'node',
+        envp_alloc_failed: false,
+        pid: 61,
+        ts: 4242,
+      });
+
+      const strace = cannedStraceRunner([{ pid: 61, line: shimLine }]);
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(1);
+      const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
+      const raw = parsed['raw'] as Record<string, unknown>;
+      expect(raw['kind']).toBe('exec');
+      expect(raw['prog']).toBe('/usr/bin/node');
+      expect(raw['argv0']).toBe('node');
+      expect(raw['envp_alloc_failed']).toBe(false);
+    });
+
+    it('processes exec shim lines (envp_alloc_failed=true) — audit-bypass signal', async () => {
+      const proc = mockProcReader({
+        62: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'audit-bypass-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      const shimLine = JSON.stringify({
+        kind: 'exec',
+        prog: 'sh',
+        argv0: null, // posix_spawnp can elide argv0
+        envp_alloc_failed: true,
+        pid: 62,
+        ts: 4243,
+      });
+
+      const strace = cannedStraceRunner([{ pid: 62, line: shimLine }]);
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['kind']).toBe('exec');
+      expect(raw['argv0']).toBeNull();
+      expect(raw['envp_alloc_failed']).toBe(true);
+    });
+
+    it('processes env_tamper shim lines with a name (unsetenv LD_PRELOAD)', async () => {
+      const proc = mockProcReader({
+        63: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'tamper-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      const shimLine = JSON.stringify({
+        kind: 'env_tamper',
+        op: 'unsetenv',
+        name: 'LD_PRELOAD',
+        refused: true,
+        pid: 63,
+        ts: 4244,
+      });
+
+      const strace = cannedStraceRunner([{ pid: 63, line: shimLine }]);
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['kind']).toBe('env_tamper');
+      expect(raw['op']).toBe('unsetenv');
+      expect(raw['name']).toBe('LD_PRELOAD');
+      expect(raw['refused']).toBe(true);
+    });
+
+    it('processes env_tamper shim lines without a name (clearenv)', async () => {
+      const proc = mockProcReader({
+        64: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'clearenv-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+
+      const shimLine = JSON.stringify({
+        kind: 'env_tamper',
+        op: 'clearenv',
+        refused: true,
+        pid: 64,
+        ts: 4245,
+      });
+
+      const strace = cannedStraceRunner([{ pid: 64, line: shimLine }]);
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['kind']).toBe('env_tamper');
+      expect(raw['op']).toBe('clearenv');
+      expect(raw['name']).toBeUndefined();
+      expect(raw['refused']).toBe(true);
+    });
+
     it('processes dlopen shim lines', async () => {
       const proc = mockProcReader({
         77: {
@@ -687,6 +850,118 @@ describe('runInstallPhase', () => {
     it('returns null for unknown kind', async () => {
       const { parseShimLine } = await import('../../src/guest/phase-install.js');
       expect(parseShimLine(JSON.stringify({ kind: 'unknown', pid: 1 }))).toBeNull();
+    });
+
+    it('parses well-formed exec lines (envp_alloc_failed=false)', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/usr/bin/node',
+        argv0: 'node',
+        envp_alloc_failed: false,
+        pid: 3,
+        ts: 1,
+      });
+      const ev = parseShimLine(line);
+      expect(ev).not.toBeNull();
+      expect(ev?.kind).toBe('exec');
+      if (ev?.kind === 'exec') {
+        expect(ev.envp_alloc_failed).toBe(false);
+        expect(ev.argv0).toBe('node');
+        expect(ev.prog).toBe('/usr/bin/node');
+      }
+    });
+
+    it('parses exec lines with envp_alloc_failed=true and argv0=null', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: 'sh',
+        argv0: null,
+        envp_alloc_failed: true,
+        pid: 4,
+        ts: 2,
+      });
+      const ev = parseShimLine(line);
+      expect(ev?.kind).toBe('exec');
+      if (ev?.kind === 'exec') {
+        expect(ev.envp_alloc_failed).toBe(true);
+        expect(ev.argv0).toBeNull();
+      }
+    });
+
+    it('rejects exec lines missing envp_alloc_failed', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/usr/bin/node',
+        argv0: 'node',
+        pid: 5,
+        ts: 3,
+      });
+      expect(parseShimLine(line)).toBeNull();
+    });
+
+    it('parses env_tamper lines with a name', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'env_tamper',
+        op: 'unsetenv',
+        name: 'LD_PRELOAD',
+        refused: true,
+        pid: 6,
+        ts: 4,
+      });
+      const ev = parseShimLine(line);
+      expect(ev?.kind).toBe('env_tamper');
+      if (ev?.kind === 'env_tamper') {
+        expect(ev.op).toBe('unsetenv');
+        expect(ev.name).toBe('LD_PRELOAD');
+        expect(ev.refused).toBe(true);
+      }
+    });
+
+    it('parses env_tamper clearenv lines without a name', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'env_tamper',
+        op: 'clearenv',
+        refused: true,
+        pid: 7,
+        ts: 5,
+      });
+      const ev = parseShimLine(line);
+      expect(ev?.kind).toBe('env_tamper');
+      if (ev?.kind === 'env_tamper') {
+        expect(ev.op).toBe('clearenv');
+        expect(ev.name).toBeUndefined();
+      }
+    });
+
+    it('rejects env_tamper lines with refused != true', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'env_tamper',
+        op: 'setenv',
+        name: 'LD_PRELOAD',
+        refused: false,
+        pid: 8,
+        ts: 6,
+      });
+      expect(parseShimLine(line)).toBeNull();
+    });
+
+    it('rejects env_tamper lines with invalid op', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'env_tamper',
+        op: 'setenv_unknown',
+        name: 'LD_PRELOAD',
+        refused: true,
+        pid: 9,
+        ts: 7,
+      });
+      expect(parseShimLine(line)).toBeNull();
     });
   });
 });
