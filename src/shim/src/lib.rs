@@ -36,8 +36,10 @@ const NAME_MAX_LEN: usize = 256;
 const JSONL_BUF: usize = 4096;
 const TRUNC_MARKER: &[u8] = b"<truncated>";
 const CANON_BUF_LEN: usize = 1024;
-/// Room for: LD_PRELOAD + NODE_OPTIONS + 6 × SCRIPT_JAIL_* injected entries.
-const MAX_ENVP_GROWTH: usize = 8;
+/// Room for: LD_PRELOAD + NODE_OPTIONS + 7 × SCRIPT_JAIL_* injected entries
+/// (must be >= 2 + STICKY_NAMES.len()).  Margin keeps small future additions
+/// safe.
+const MAX_ENVP_GROWTH: usize = 12;
 /// Sanity cap on input envp length — rejects hostile or corrupted envps.
 const MAX_ENVP_SANITY: usize = 8192;
 
@@ -94,7 +96,12 @@ static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 type GetenvFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 
 static REAL_CLEARENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_EXECV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REAL_EXECVE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_EXECVEAT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_EXECVP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_EXECVPE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static REAL_FEXECVE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REAL_GETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REAL_POSIX_SPAWN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REAL_POSIX_SPAWNP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -899,6 +906,21 @@ unsafe fn shim_init() {
     let execve_ptr = libc::dlsym(libc::RTLD_NEXT, b"execve\0".as_ptr() as *const c_char);
     REAL_EXECVE.store(execve_ptr as *mut c_void, Ordering::Release);
 
+    let execv_ptr = libc::dlsym(libc::RTLD_NEXT, b"execv\0".as_ptr() as *const c_char);
+    REAL_EXECV.store(execv_ptr as *mut c_void, Ordering::Release);
+
+    let execvp_ptr = libc::dlsym(libc::RTLD_NEXT, b"execvp\0".as_ptr() as *const c_char);
+    REAL_EXECVP.store(execvp_ptr as *mut c_void, Ordering::Release);
+
+    let execvpe_ptr = libc::dlsym(libc::RTLD_NEXT, b"execvpe\0".as_ptr() as *const c_char);
+    REAL_EXECVPE.store(execvpe_ptr as *mut c_void, Ordering::Release);
+
+    let execveat_ptr = libc::dlsym(libc::RTLD_NEXT, b"execveat\0".as_ptr() as *const c_char);
+    REAL_EXECVEAT.store(execveat_ptr as *mut c_void, Ordering::Release);
+
+    let fexecve_ptr = libc::dlsym(libc::RTLD_NEXT, b"fexecve\0".as_ptr() as *const c_char);
+    REAL_FEXECVE.store(fexecve_ptr as *mut c_void, Ordering::Release);
+
     let posix_spawn_ptr =
         libc::dlsym(libc::RTLD_NEXT, b"posix_spawn\0".as_ptr() as *const c_char);
     REAL_POSIX_SPAWN.store(posix_spawn_ptr as *mut c_void, Ordering::Release);
@@ -1044,4 +1066,736 @@ pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn __secure_getenv(name: *const c_char) -> *mut c_char {
     secure_getenv(name)
+}
+
+// ── exec wrappers ──────────────────────────────────────────────────────────
+//
+// All exec-family entry points funnel through `dispatch_exec` (which forwards
+// to real_execve) or `dispatch_spawn` (which forwards to real posix_spawn /
+// posix_spawnp).  Each wrapper is responsible for:
+//   1. The standard guard preamble (in_shim / INIT_DONE) and set_in_shim
+//      bracketing.
+//   2. Resolving the program name to an absolute path when PATH search is
+//      required (execvp / execvpe / posix_spawnp / execveat / fexecve).
+//   3. Calling the dispatch helper with the resolved prog and original argv.
+//
+// `dispatch_exec` rewrites envp via the EnvBuf helpers — re-injecting
+// LD_PRELOAD, NODE_OPTIONS, and the SCRIPT_JAIL_* sticky vars — emits an
+// "exec" JSONL audit line, then forwards to real_execve.  On real_execve
+// failure return it frees the EnvBuf and propagates the error.
+
+// ── real-symbol callers (transmute wrappers around the AtomicPtr slots) ────
+
+type ExecveFn =
+    unsafe extern "C" fn(*const c_char, *const *const c_char, *const *const c_char) -> c_int;
+type PosixSpawnFn = unsafe extern "C" fn(
+    *mut libc::pid_t,
+    *const c_char,
+    *const libc::posix_spawn_file_actions_t,
+    *const libc::posix_spawnattr_t,
+    *const *mut c_char,
+    *const *mut c_char,
+) -> c_int;
+
+unsafe fn real_execve_raw(
+    prog: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    let p = REAL_EXECVE.load(Ordering::Acquire);
+    if p.is_null() {
+        // dlsym failed — return -1 with errno=ENOSYS, the safest forwarding
+        // semantics for a missing exec implementation.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = libc::ENOSYS;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = libc::ENOSYS;
+        }
+        return -1;
+    }
+    let f: ExecveFn = transmute(p);
+    f(prog, argv, envp)
+}
+
+unsafe fn real_posix_spawn_raw(
+    slot: &AtomicPtr<c_void>,
+    pid: *mut libc::pid_t,
+    path: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+) -> c_int {
+    let p = slot.load(Ordering::Acquire);
+    if p.is_null() {
+        return libc::ENOSYS;
+    }
+    let f: PosixSpawnFn = transmute(p);
+    f(pid, path, file_actions, attrp, argv, envp)
+}
+
+// ── environ access ─────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    static environ: *const *const c_char;
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn environ_ptr() -> *const *const c_char {
+    environ
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn environ_ptr() -> *const *const c_char {
+    ptr::null()
+}
+
+// ── audit emit for exec events ─────────────────────────────────────────────
+
+unsafe fn emit_exec(
+    prog: *const c_char,
+    argv0: *const c_char,
+    envp_alloc_failed: bool,
+) {
+    let log_fd = LOG_FD.load(Ordering::Acquire);
+    if log_fd < 0 {
+        return;
+    }
+
+    let mut ts: libc::timespec = core::mem::zeroed();
+    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    let ns: i64 = (ts.tv_sec as i64) * 1_000_000_000i64 + ts.tv_nsec as i64;
+    let pid = libc::getpid();
+
+    let mut buf = [0u8; JSONL_BUF];
+    let mut pos = 0usize;
+
+    // Reserve trailing budget for the suffix: closing argv0 quote (or "null"),
+    // ","pid":<20>,"ts":<20>,"envp_alloc_failed":<5>}\n.
+    const SUFFIX_RESERVE: usize = 96;
+
+    let prefix = br#"{"kind":"exec","prog":""#;
+    if prefix.len() > buf.len() {
+        return;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+
+    // Compute a per-string escape budget so neither prog nor argv0 can starve
+    // the other.  Allow half of the remaining budget for prog.
+    let total_budget_end = JSONL_BUF.saturating_sub(SUFFIX_RESERVE);
+    let prog_budget_end = pos + (total_budget_end.saturating_sub(pos)) / 2;
+    if pos < prog_budget_end {
+        let written = json_escape(&mut buf[pos..prog_budget_end], prog);
+        pos += written;
+    }
+
+    // argv0 field: emit `"argv0":null` for a NULL pointer (no surrounding quotes),
+    // otherwise emit `"argv0":"<escaped>"`.
+    if argv0.is_null() {
+        let mid = br#"","argv0":null"#;
+        if pos + mid.len() > buf.len() {
+            return;
+        }
+        buf[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+    } else {
+        let mid = br#"","argv0":""#;
+        if pos + mid.len() > buf.len() {
+            return;
+        }
+        buf[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+        if pos < total_budget_end {
+            let written = json_escape(&mut buf[pos..total_budget_end], argv0);
+            pos += written;
+        }
+        if pos + 1 > buf.len() {
+            return;
+        }
+        buf[pos] = b'"';
+        pos += 1;
+    }
+
+    let mid1 = br#","pid":"#;
+    if pos + mid1.len() > buf.len() {
+        return;
+    }
+    buf[pos..pos + mid1.len()].copy_from_slice(mid1);
+    pos += mid1.len();
+    pos += write_i64(&mut buf[pos..], pid as i64);
+
+    let mid2 = br#","ts":"#;
+    if pos + mid2.len() > buf.len() {
+        return;
+    }
+    buf[pos..pos + mid2.len()].copy_from_slice(mid2);
+    pos += mid2.len();
+    pos += write_i64(&mut buf[pos..], ns);
+
+    let mid3 = br#","envp_alloc_failed":"#;
+    if pos + mid3.len() > buf.len() {
+        return;
+    }
+    buf[pos..pos + mid3.len()].copy_from_slice(mid3);
+    pos += mid3.len();
+    let bool_str: &[u8] = if envp_alloc_failed { b"true" } else { b"false" };
+    if pos + bool_str.len() + 2 > buf.len() {
+        return;
+    }
+    buf[pos..pos + bool_str.len()].copy_from_slice(bool_str);
+    pos += bool_str.len();
+
+    buf[pos] = b'}';
+    pos += 1;
+    buf[pos] = b'\n';
+    pos += 1;
+
+    if pos > 0 && pos <= JSONL_BUF {
+        write_all(log_fd, &buf[..pos]);
+    }
+}
+
+// ── envp rewrite (shared by exec + spawn dispatchers) ──────────────────────
+
+/// List of SCRIPT_JAIL_* sticky env-var names re-injected on every exec.
+/// Stored as NUL-terminated literals so we can pass them directly to
+/// real_getenv_raw without copying.
+const STICKY_NAMES: &[&[u8]] = &[
+    b"SCRIPT_JAIL_LOG_FILE\0",
+    b"SCRIPT_JAIL_LOG_FD\0",
+    b"SCRIPT_JAIL_PROTECTED_ENV_FILE\0",
+    b"SCRIPT_JAIL_SPOOF_PLATFORM\0",
+    b"SCRIPT_JAIL_SPOOF_ARCH\0",
+    b"SCRIPT_JAIL_PRELOAD_PATH\0",
+    b"SCRIPT_JAIL_NODE_OPTIONS\0",
+];
+
+/// Build a rewritten EnvBuf from the input envp.  `envp_in` may be NULL — that
+/// is treated semantically as "caller asked for an empty env"; we still
+/// re-inject our own LD_PRELOAD/NODE_OPTIONS/SCRIPT_JAIL_* entries because
+/// otherwise the shim chain breaks in the child.  We do NOT fold in the
+/// current process's `environ` — preserving the caller's intent.
+///
+/// Returns None on any allocation failure: caller must emit
+/// `envp_alloc_failed:true` and forward the original envp_in untouched.
+///
+/// The returned buf is the caller's responsibility to `free_envbuf` on real_*
+/// return.
+unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
+    // Read canon values BEFORE envbuf_from — those helpers do not hold the
+    // recursion guard across calls.  canon_bytes is a memory read.
+    let preload = canon_bytes(&CANON_PRELOAD_PATH);
+    let node_opts = canon_bytes(&CANON_NODE_OPTIONS);
+
+    let mut buf = envbuf_from(envp_in)?;
+
+    // Re-inject LD_PRELOAD and NODE_OPTIONS.  append_path_env is a no-op for
+    // empty `to_append`, so if a canon buf is empty this contributes nothing.
+    if !append_path_env(&mut buf, b"LD_PRELOAD", preload, b':') {
+        free_envbuf(&mut buf);
+        return None;
+    }
+    if !append_path_env(&mut buf, b"NODE_OPTIONS", node_opts, b' ') {
+        free_envbuf(&mut buf);
+        return None;
+    }
+
+    // Re-inject SCRIPT_JAIL_* sticky values from the current process env.
+    // The shim itself was loaded with these values, so the current process's
+    // env carries the canonical state.
+    for name_z in STICKY_NAMES {
+        // Strip the trailing NUL for envbuf_find / ensure_env.
+        let name = &name_z[..name_z.len() - 1];
+        set_in_shim(true);
+        let val_ptr = real_getenv_raw(name_z.as_ptr() as *const c_char);
+        set_in_shim(false);
+        if val_ptr.is_null() {
+            continue;
+        }
+        let mut vlen = 0usize;
+        while *val_ptr.add(vlen) != 0 {
+            vlen += 1;
+        }
+        let val = core::slice::from_raw_parts(val_ptr as *const u8, vlen);
+        if !ensure_env(&mut buf, name, val) {
+            free_envbuf(&mut buf);
+            return None;
+        }
+    }
+
+    Some(buf)
+}
+
+// ── dispatch_exec: shared funnel for execve-family wrappers ────────────────
+//
+// Each wrapper supplies its own `forward` closure-like callback through the
+// `RealExecForward` enum so the real libc function actually invoked matches
+// the wrapper's contract (e.g. execvp keeps glibc's PATH search; execveat
+// keeps the kernel's AT_FDCWD / AT_EMPTY_PATH / flags handling).
+//
+// On return from rewrite_envp, the recursion guard is undefined (helpers
+// clobber it).  We re-assert it before emit_exec and the real forward so
+// emit/real_* internals (clock_gettime, write, libc init paths) do not
+// reenter the audited path.
+
+enum RealExecForward {
+    Execve,    // real_execve(prog, argv, envp)
+    Execvpe,   // real_execvpe(prog, argv, envp)
+    Execveat { // real_execveat(dirfd, prog, argv, envp, flags)
+        dirfd: c_int,
+        flags: c_int,
+    },
+    Fexecve { // real_fexecve(fd, argv, envp); prog is unused
+        fd: c_int,
+    },
+}
+
+type ExecvFn = unsafe extern "C" fn(*const c_char, *const *const c_char) -> c_int;
+type ExecveatFn = unsafe extern "C" fn(
+    c_int,
+    *const c_char,
+    *const *const c_char,
+    *const *const c_char,
+    c_int,
+) -> c_int;
+type FexecveFn =
+    unsafe extern "C" fn(c_int, *const *const c_char, *const *const c_char) -> c_int;
+
+unsafe fn forward_to_real(
+    kind: &RealExecForward,
+    prog: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    match kind {
+        RealExecForward::Execve => real_execve_raw(prog, argv, envp),
+        RealExecForward::Execvpe => {
+            let p = REAL_EXECVPE.load(Ordering::Acquire);
+            if !p.is_null() {
+                let f: ExecveFn = transmute(p);
+                return f(prog, argv, envp);
+            }
+            // glibc-only ABI.  If absent, the most-correct fallback is to
+            // hand off to real_execve and skip PATH search.  Better than
+            // silently dropping the call.
+            real_execve_raw(prog, argv, envp)
+        }
+        RealExecForward::Execveat { dirfd, flags } => {
+            let p = REAL_EXECVEAT.load(Ordering::Acquire);
+            if !p.is_null() {
+                let f: ExecveatFn = transmute(p);
+                return f(*dirfd, prog, argv, envp, *flags);
+            }
+            // Older glibc: no execveat libc wrapper.  Fall back to syscall.
+            #[cfg(target_os = "linux")]
+            {
+                let rc = libc::syscall(
+                    libc::SYS_execveat,
+                    *dirfd,
+                    prog,
+                    argv,
+                    envp,
+                    *flags,
+                ) as c_int;
+                return rc;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    *libc::__error() = libc::ENOSYS;
+                }
+                -1
+            }
+        }
+        RealExecForward::Fexecve { fd } => {
+            let p = REAL_FEXECVE.load(Ordering::Acquire);
+            if !p.is_null() {
+                let f: FexecveFn = transmute(p);
+                return f(*fd, argv, envp);
+            }
+            // Fallback: use /proc/self/fd/<fd> with real_execve.  This is
+            // exactly how glibc itself implements fexecve internally.
+            let mut buf = [0u8; 64];
+            match proc_fd_only(*fd, &mut buf) {
+                Some(_) => real_execve_raw(buf.as_ptr() as *const c_char, argv, envp),
+                None => {
+                    #[cfg(target_os = "linux")]
+                    unsafe {
+                        *libc::__errno_location() = libc::ENOSYS;
+                    }
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        *libc::__error() = libc::ENOSYS;
+                    }
+                    -1
+                }
+            }
+        }
+    }
+}
+
+unsafe fn dispatch_exec(
+    kind: RealExecForward,
+    prog: *const c_char,
+    argv: *const *const c_char,
+    envp_in: *const *const c_char,
+) -> c_int {
+    let argv0 = if argv.is_null() {
+        ptr::null()
+    } else {
+        *argv
+    };
+
+    match rewrite_envp(envp_in) {
+        Some(mut buf) => {
+            // Re-assert the recursion guard: rewrite_envp's helpers cleared
+            // it on each malloc, so we are now `in_shim==false`.
+            set_in_shim(true);
+            emit_exec(prog, argv0, false);
+            let rewritten = buf.ptrs as *const *const c_char;
+            let rc = forward_to_real(&kind, prog, argv, rewritten);
+            // real_* only returns on failure.
+            free_envbuf(&mut buf);
+            set_in_shim(false);
+            rc
+        }
+        None => {
+            // Couldn't rewrite — forward the original envp untouched.
+            set_in_shim(true);
+            emit_exec(prog, argv0, true);
+            let rc = forward_to_real(&kind, prog, argv, envp_in);
+            set_in_shim(false);
+            rc
+        }
+    }
+}
+
+// ── dispatch_spawn: shared funnel for posix_spawn / posix_spawnp ───────────
+//
+// Unlike dispatch_exec, posix_spawn does NOT replace the process image; it
+// forks+execs a child and returns control to the parent regardless of
+// outcome.  The parent owns the rewritten EnvBuf and frees it on return.
+
+unsafe fn dispatch_spawn(
+    real_slot: &AtomicPtr<c_void>,
+    pid: *mut libc::pid_t,
+    path: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp_in: *const *mut c_char,
+) -> c_int {
+    let argv0 = if argv.is_null() {
+        ptr::null()
+    } else {
+        *argv as *const c_char
+    };
+
+    match rewrite_envp(envp_in as *const *const c_char) {
+        Some(mut buf) => {
+            set_in_shim(true);
+            emit_exec(path, argv0, false);
+            let rc = real_posix_spawn_raw(
+                real_slot,
+                pid,
+                path,
+                file_actions,
+                attrp,
+                argv,
+                buf.ptrs as *const *mut c_char,
+            );
+            free_envbuf(&mut buf);
+            set_in_shim(false);
+            rc
+        }
+        None => {
+            set_in_shim(true);
+            emit_exec(path, argv0, true);
+            let rc = real_posix_spawn_raw(real_slot, pid, path, file_actions, attrp, argv, envp_in);
+            set_in_shim(false);
+            rc
+        }
+    }
+}
+
+// ── execve(prog, argv, envp) ───────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn execve(
+    prog: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        return real_execve_raw(prog, argv, envp);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_execve_raw(prog, argv, envp);
+    }
+    set_in_shim(true);
+    let rc = dispatch_exec(RealExecForward::Execve, prog, argv, envp);
+    set_in_shim(false);
+    rc
+}
+
+// ── execv(prog, argv) ──────────────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn execv(
+    prog: *const c_char,
+    argv: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        // Re-entrant: forward to real execv (or real_execve with environ).
+        let p = REAL_EXECV.load(Ordering::Acquire);
+        if !p.is_null() {
+            let f: ExecvFn = transmute(p);
+            return f(prog, argv);
+        }
+        return real_execve_raw(prog, argv, environ_ptr());
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        let p = REAL_EXECV.load(Ordering::Acquire);
+        if !p.is_null() {
+            let f: ExecvFn = transmute(p);
+            return f(prog, argv);
+        }
+        return real_execve_raw(prog, argv, environ_ptr());
+    }
+    set_in_shim(true);
+    // execv inherits environ.  We rewrite the inherited env so the child sees
+    // our injected LD_PRELOAD etc., then forward to real_execve (since execv
+    // doesn't take envp, but the rewritten env must reach the child).
+    let rc = dispatch_exec(RealExecForward::Execve, prog, argv, environ_ptr());
+    set_in_shim(false);
+    rc
+}
+
+// ── execvp(file, argv) ─────────────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn execvp(
+    file: *const c_char,
+    argv: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        let p = REAL_EXECVP.load(Ordering::Acquire);
+        if !p.is_null() {
+            let f: ExecvFn = transmute(p);
+            return f(file, argv);
+        }
+        return real_execve_raw(file, argv, environ_ptr());
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        let p = REAL_EXECVP.load(Ordering::Acquire);
+        if !p.is_null() {
+            let f: ExecvFn = transmute(p);
+            return f(file, argv);
+        }
+        return real_execve_raw(file, argv, environ_ptr());
+    }
+    set_in_shim(true);
+    // execvp uses libc's PATH search via real_execvp, but real_execvp inherits
+    // the *current* environ — which already contains our shim values.  So we
+    // do not rewrite envp at the API level; we ensure environ stays canonical
+    // by definition (the shim was loaded with it).  However the rest of the
+    // shim's exec audit pipeline relies on rewriting envp.  To preserve glibc
+    // PATH-search semantics (ENOEXEC shell fallback, EACCES preservation,
+    // multi-candidate retry), we forward to real_execvp directly.
+    //
+    // The child will inherit environ from the parent; environ in the parent
+    // already has LD_PRELOAD/NODE_OPTIONS/SCRIPT_JAIL_* set (since the shim
+    // was loaded from them).  So no envp rewrite is strictly required to keep
+    // the chain alive.  We still emit an exec audit event for visibility.
+    let argv0 = if argv.is_null() { ptr::null() } else { *argv };
+    emit_exec(file, argv0, false);
+    let p = REAL_EXECVP.load(Ordering::Acquire);
+    let rc = if !p.is_null() {
+        let f: ExecvFn = transmute(p);
+        f(file, argv)
+    } else {
+        real_execve_raw(file, argv, environ_ptr())
+    };
+    set_in_shim(false);
+    rc
+}
+
+// ── execvpe(file, argv, envp) ──────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn execvpe(
+    file: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        let p = REAL_EXECVPE.load(Ordering::Acquire);
+        if !p.is_null() {
+            let f: ExecveFn = transmute(p);
+            return f(file, argv, envp);
+        }
+        return real_execve_raw(file, argv, envp);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        let p = REAL_EXECVPE.load(Ordering::Acquire);
+        if !p.is_null() {
+            let f: ExecveFn = transmute(p);
+            return f(file, argv, envp);
+        }
+        return real_execve_raw(file, argv, envp);
+    }
+    set_in_shim(true);
+    // Forward through real_execvpe so glibc's PATH-search semantics
+    // (ENOEXEC fallback, EACCES handling, multi-candidate retry) are
+    // preserved.  Rewrite envp first so the child still has our shim vars.
+    let rc = dispatch_exec(RealExecForward::Execvpe, file, argv, envp);
+    set_in_shim(false);
+    rc
+}
+
+// ── execveat(dirfd, pathname, argv, envp, flags) ───────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn execveat(
+    dirfd: c_int,
+    pathname: *const c_char,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+    flags: c_int,
+) -> c_int {
+    let argv_const = argv as *const *const c_char;
+    let envp_const = envp as *const *const c_char;
+    if in_shim() {
+        return forward_to_real(
+            &RealExecForward::Execveat { dirfd, flags },
+            pathname,
+            argv_const,
+            envp_const,
+        );
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return forward_to_real(
+            &RealExecForward::Execveat { dirfd, flags },
+            pathname,
+            argv_const,
+            envp_const,
+        );
+    }
+    set_in_shim(true);
+    let rc = dispatch_exec(
+        RealExecForward::Execveat { dirfd, flags },
+        pathname,
+        argv_const,
+        envp_const,
+    );
+    set_in_shim(false);
+    rc
+}
+
+// ── fexecve(fd, argv, envp) ────────────────────────────────────────────────
+
+unsafe fn proc_fd_only(fd: c_int, out_buf: &mut [u8; 64]) -> Option<usize> {
+    let prefix = b"/proc/self/fd/";
+    let mut pos = 0usize;
+    if pos + prefix.len() >= out_buf.len() {
+        return None;
+    }
+    out_buf[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    let n = write_i64(&mut out_buf[pos..], fd as i64);
+    pos += n;
+    if pos >= out_buf.len() {
+        return None;
+    }
+    out_buf[pos] = 0;
+    Some(pos)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fexecve(
+    fd: c_int,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        return forward_to_real(&RealExecForward::Fexecve { fd }, ptr::null(), argv, envp);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return forward_to_real(&RealExecForward::Fexecve { fd }, ptr::null(), argv, envp);
+    }
+    set_in_shim(true);
+    let rc = dispatch_exec(RealExecForward::Fexecve { fd }, ptr::null(), argv, envp);
+    set_in_shim(false);
+    rc
+}
+
+// ── posix_spawn(pid, path, file_actions, attrp, argv, envp) ────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn(
+    pid: *mut libc::pid_t,
+    path: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+) -> c_int {
+    if in_shim() {
+        return real_posix_spawn_raw(&REAL_POSIX_SPAWN, pid, path, file_actions, attrp, argv, envp);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_posix_spawn_raw(&REAL_POSIX_SPAWN, pid, path, file_actions, attrp, argv, envp);
+    }
+    set_in_shim(true);
+    let rc = dispatch_spawn(&REAL_POSIX_SPAWN, pid, path, file_actions, attrp, argv, envp);
+    set_in_shim(false);
+    rc
+}
+
+// ── posix_spawnp(pid, file, file_actions, attrp, argv, envp) ───────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawnp(
+    pid: *mut libc::pid_t,
+    file: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+) -> c_int {
+    if in_shim() {
+        return real_posix_spawn_raw(
+            &REAL_POSIX_SPAWNP,
+            pid,
+            file,
+            file_actions,
+            attrp,
+            argv,
+            envp,
+        );
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_posix_spawn_raw(
+            &REAL_POSIX_SPAWNP,
+            pid,
+            file,
+            file_actions,
+            attrp,
+            argv,
+            envp,
+        );
+    }
+    set_in_shim(true);
+    // Forward through real_posix_spawnp so glibc's PATH search runs in the
+    // child with file_actions (cwd changes etc.) already applied — anything
+    // we resolve in the parent would race with file_actions.
+    let rc = dispatch_spawn(&REAL_POSIX_SPAWNP, pid, file, file_actions, attrp, argv, envp);
+    set_in_shim(false);
+    rc
 }
