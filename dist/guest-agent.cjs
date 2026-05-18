@@ -24942,6 +24942,35 @@ var ExecEvent = external_exports.object({
   // Default false for shim-sourced events.  Only set true by the
   // synthesized cross-check pass in runInstallPhase (Finding 1).
   syscall_bypass: external_exports.boolean().default(false),
+  // Default false for shim-sourced events.  Only set true by the
+  // events-file forgery detector in runInstallPhase (Finding A,
+  // 2026-05-18): strace observed a `write`-mode openat of the per-VM
+  // SCRIPT_JAIL_LOG_FILE path from a pid that never loaded
+  // `/lib/libscriptjail.so` (i.e. a lifecycle script that bypassed
+  // LD_PRELOAD via raw-syscall exec + scrubbed envp and is now trying
+  // to forge shim events into the trusted JSONL channel).  Producing a
+  // synthetic exec event with this flag drives normalize.ts to emit
+  // `<EVENTS_FILE_FORGERY>` under `audit_bypass`, which the host-side
+  // `findAuditBypass` scan hard-fails on.
+  events_file_forgery: external_exports.boolean().default(false),
+  // Audit-trust Finding (high, 2026-05-18): the shim emits one event
+  // BEFORE calling real_execve (with result='ok' — optimistic, since
+  // successful execs never return) and a SECOND event with
+  // result='failed' AFTER real_execve returns (a return at all proves
+  // the exec failed).  posix_spawn emits a single event tagged with
+  // the actual outcome.  The phase-install cross-check counts
+  // `okEvents - failedEvents` per pid so failed-attempt libc wrappers
+  // cancel out and only true successful execs contribute to the
+  // strace/shim pairing.  Without this, an attacker could pad shim
+  // exec count with failed wrapped execves (e.g. `execve("/missing",
+  // …)`) and a paired raw-syscall bypass would produce a zero delta
+  // — silently disabling the `<SYSCALL_EXEC_BYPASS>` detector.
+  //
+  // Default 'ok' preserves backwards compatibility with pre-fix shim
+  // builds that emit the event without a `result` field (older
+  // libscriptjail.so + new agent).  CI verifies the shim and agent
+  // are built together but this gives us a safety net.
+  result: external_exports.enum(["ok", "failed"]).default("ok"),
   pid: external_exports.number(),
   ts: external_exports.number()
 });
@@ -25704,6 +25733,11 @@ async function runInstallPhase(input) {
   };
   const straceExecsByPid = /* @__PURE__ */ new Map();
   const shimExecCountByPid = /* @__PURE__ */ new Map();
+  const SHIM_LIBRARY_PATH = "/lib/libscriptjail.so";
+  const eventsFilePathRaw = input.env["SCRIPT_JAIL_LOG_FILE"];
+  const eventsFilePath = typeof eventsFilePathRaw === "string" && eventsFilePathRaw.length > 0 ? eventsFilePathRaw : null;
+  const shimLoadedPids = /* @__PURE__ */ new Set();
+  const forgerySamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
   const recordAttribution = (pid, attr) => {
     if (!attributionSnapshotByPid.has(pid)) {
@@ -25727,10 +25761,9 @@ async function runInstallPhase(input) {
       }
       const result = input.attribution.attribute(shimEvent.pid);
       if (shimEvent.kind === "exec") {
-        shimExecCountByPid.set(
-          shimEvent.pid,
-          (shimExecCountByPid.get(shimEvent.pid) ?? 0) + 1
-        );
+        const current = shimExecCountByPid.get(shimEvent.pid) ?? 0;
+        const next = shimEvent.result === "failed" ? current > 0 ? current - 1 : 0 : current + 1;
+        shimExecCountByPid.set(shimEvent.pid, next);
       }
       if (result !== null) {
         recordAttribution(shimEvent.pid, result);
@@ -25743,6 +25776,19 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         const result = input.attribution.attribute(rawEvent.pid);
+        if (rawEvent.kind === "read" && rawEvent.path === SHIM_LIBRARY_PATH) {
+          shimLoadedPids.add(rawEvent.pid);
+        }
+        if (eventsFilePath !== null && rawEvent.kind === "write" && rawEvent.path === eventsFilePath && !shimLoadedPids.has(rawEvent.pid)) {
+          const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+          forgerySamples.push({
+            pid: rawEvent.pid,
+            ts: rawEvent.ts,
+            path: rawEvent.path,
+            pkg: result?.pkg ?? snapshot?.pkg ?? "<unattributed>",
+            lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? "install"
+          });
+        }
         if (result !== null) {
           recordAttribution(rawEvent.pid, result);
         }
@@ -25777,7 +25823,8 @@ async function runInstallPhase(input) {
   }
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
-    const shimCount = shimExecCountByPid.get(pid) ?? 0;
+    const shimNet = shimExecCountByPid.get(pid) ?? 0;
+    const shimCount = shimNet < 0 ? 0 : shimNet;
     if (straceCount <= shimCount) continue;
     const bypassCount = straceCount - shimCount;
     const tail = samples.slice(straceCount - bypassCount);
@@ -25788,6 +25835,13 @@ async function runInstallPhase(input) {
         argv0: sample.argv0.length > 0 ? sample.argv0 : null,
         envp_alloc_failed: false,
         syscall_bypass: true,
+        events_file_forgery: false,
+        // The synthesised event represents a strace-observed successful
+        // execve syscall; tag it `result:'ok'` so it matches the shape
+        // of a real successful exec.  This field isn't consumed by
+        // normalize.ts for the synth path (which keys on
+        // `syscall_bypass`) but the schema requires it.
+        result: "ok",
         pid: sample.pid,
         ts: sample.ts
       };
@@ -25797,6 +25851,24 @@ async function runInstallPhase(input) {
         lifecycle: sample.lifecycle
       });
     }
+  }
+  for (const sample of forgerySamples) {
+    const synthetic = {
+      kind: "exec",
+      prog: sample.path,
+      argv0: sample.path,
+      envp_alloc_failed: false,
+      syscall_bypass: false,
+      events_file_forgery: true,
+      result: "ok",
+      pid: sample.pid,
+      ts: sample.ts
+    };
+    emit({
+      raw: synthetic,
+      pkg: sample.pkg,
+      lifecycle: sample.lifecycle
+    });
   }
   const exitCode = input.strace.getExitCode();
   return { exitCode, eventCount, tamperReason: phaseTamperReason };
@@ -25895,6 +25967,11 @@ function normalize(events, ctx) {
           const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
           const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
           block.audit_bypass.push(`<SYSCALL_EXEC_BYPASS> ${tokenized}`);
+        }
+        if (ev.raw.events_file_forgery) {
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
+          const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
+          block.audit_bypass.push(`<EVENTS_FILE_FORGERY> ${tokenized}`);
         }
         break;
       }

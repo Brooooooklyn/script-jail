@@ -81,3 +81,20 @@ jobs:
             echo "::error::dist/main.cjs is out of date. Run 'pnpm build:bundle' locally and commit the result."
             exit 1
           fi
+
+      # The guest agent bundle is the in-VM entry point copied into the
+      # rootfs by src/rootfs/build.ts.  Without a CI gate here, a source
+      # change to src/guest/** that ships without `pnpm build:guest-agent`
+      # would leave the committed dist/guest-agent.cjs stale — the rootfs
+      # build would silently embed an out-of-date agent and the action
+      # would audit installs against the old logic.  Mirror the dist/main.cjs
+      # gate (Finding B, 2026-05-18).
+      - name: Bundle guest agent
+        run: pnpm build:guest-agent
+
+      - name: Verify dist/guest-agent.cjs is up to date
+        run: |
+          if ! git diff --exit-code -- dist/guest-agent.cjs; then
+            echo "::error::dist/guest-agent.cjs is out of date. Run 'pnpm build:guest-agent' locally and commit the result."
+            exit 1
+          fi
