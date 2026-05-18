@@ -52,7 +52,34 @@
 
 'use strict';
 
-const fs = require('fs');
+const fs = require('node:fs');
+
+// Audit-trust Finding 4 (high, 2026-05-18): capture every fs / process
+// function reference we depend on AT PRELOAD MODULE LOAD TIME, before any
+// lifecycle JS can run.  All subsequent uses must reference these LOCAL
+// bindings — never `fs.writeSync` / `process.exit` directly, because those
+// are mutable property slots that lifecycle JS can monkeypatch BEFORE
+// triggering audit events.
+//
+// Concrete attack: a lifecycle script that runs `require('fs').writeSync =
+// () => {}` (or `process.exit = () => {}`) before reading
+// `process.env.NPM_TOKEN` would otherwise neutralise both the env_read
+// audit line and the fail-closed exit (`emitAuditFdLostAndExit`) — the
+// access would happen invisibly with no record.  By holding the original
+// callable references in `const` slots scoped to this module, the
+// monkeypatch only affects the public fs.writeSync slot, not our captures.
+//
+// The `process.exit` capture uses `.bind(process)` because some Node
+// internals branch on `this`; binding ensures the call site doesn't have
+// to remember to pass the receiver.
+const _writeSync = fs.writeSync;
+const _openSync = fs.openSync;
+const _closeSync = fs.closeSync;
+const _processExit = process.exit.bind(process);
+const _stderrWrite =
+  process.stderr && typeof process.stderr.write === 'function'
+    ? process.stderr.write.bind(process.stderr)
+    : null;
 
 // Idempotency: a single Node process may --require this preload multiple
 // times (NODE_OPTIONS inheritance + nested invocations).  Skip re-wrapping
@@ -103,7 +130,7 @@ let logFd = -1;
 {
   if (logFilePath) {
     try {
-      logFd = fs.openSync(logFilePath, 'a');
+      logFd = _openSync(logFilePath, 'a');
     } catch {
       logFd = -1;
     }
@@ -149,9 +176,9 @@ function emitAuditFdLostAndExit(reason) {
   // line with a non-zero exit.
   if (logFilePath) {
     try {
-      const fd = fs.openSync(logFilePath, 'a');
-      try { fs.writeSync(fd, line); } catch { /* swallowed; we exit below */ }
-      try { fs.closeSync(fd); } catch { /* swallowed; we exit below */ }
+      const fd = _openSync(logFilePath, 'a');
+      try { _writeSync(fd, line); } catch { /* swallowed; we exit below */ }
+      try { _closeSync(fd); } catch { /* swallowed; we exit below */ }
     } catch { /* swallowed; we exit below */ }
   }
   // Write a human-readable line to stderr so an interactive run also
@@ -160,12 +187,19 @@ function emitAuditFdLostAndExit(reason) {
   // command's exit code, which the agent then treats as a fatal install
   // failure.  We use 91 (an uncommon code) so accidentally-overlapping
   // exit codes from user code don't collide with this signal.
-  try {
-    process.stderr.write(
-      `script-jail/env-spy: fatal — cached events-file fd is unusable and reopen failed (${reason}); aborting to avoid silent audit loss\n`,
-    );
-  } catch { /* ignored */ }
-  process.exit(91);
+  //
+  // Finding 4: route through the captured stderr write reference and the
+  // captured process.exit reference so a lifecycle script that
+  // monkeypatched `process.stderr.write = () => {}` or `process.exit = () => {}`
+  // before triggering an audit-loss event cannot silence this final signal.
+  if (_stderrWrite !== null) {
+    try {
+      _stderrWrite(
+        `script-jail/env-spy: fatal — cached events-file fd is unusable and reopen failed (${reason}); aborting to avoid silent audit loss\n`,
+      );
+    } catch { /* ignored */ }
+  }
+  _processExit(91);
 }
 
 /**
@@ -198,7 +232,7 @@ function logEnvRead(name, hidden) {
     hidden,
   }) + '\n';
   try {
-    fs.writeSync(logFd, line);
+    _writeSync(logFd, line);
     return;
   } catch { /* fall through to recovery */ }
 
@@ -211,7 +245,7 @@ function logEnvRead(name, hidden) {
 
   let newFd;
   try {
-    newFd = fs.openSync(logFilePath, 'a');
+    newFd = _openSync(logFilePath, 'a');
   } catch (openErr) {
     emitAuditFdLostAndExit(
       `reopen of ${logFilePath} failed: ${
@@ -223,10 +257,10 @@ function logEnvRead(name, hidden) {
   // Best-effort: close the stale fd so we don't accumulate leaked fds
   // when an attacker repeatedly tampers.  closeSync on an already-invalid
   // fd will throw EBADF; swallow it.
-  try { fs.closeSync(logFd); } catch { /* ignored */ }
+  try { _closeSync(logFd); } catch { /* ignored */ }
   logFd = newFd;
   try {
-    fs.writeSync(logFd, line);
+    _writeSync(logFd, line);
   } catch (retryErr) {
     emitAuditFdLostAndExit(
       `retry write after reopen failed: ${

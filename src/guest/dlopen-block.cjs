@@ -32,7 +32,22 @@
 
 'use strict';
 
-const fs = require('fs');
+const fs = require('node:fs');
+
+// Audit-trust Finding 4 (high, 2026-05-18): capture every fs / process
+// function reference we depend on AT PRELOAD MODULE LOAD TIME, before any
+// lifecycle JS can run.  All subsequent uses must reference these LOCAL
+// bindings — never `fs.writeSync` / `process.exit` directly, because those
+// are mutable property slots that lifecycle JS can monkeypatch BEFORE
+// triggering audit events.  See env-spy.cjs for the long-form rationale.
+const _writeSync = fs.writeSync;
+const _openSync = fs.openSync;
+const _closeSync = fs.closeSync;
+const _processExit = process.exit.bind(process);
+const _stderrWrite =
+  process.stderr && typeof process.stderr.write === 'function'
+    ? process.stderr.write.bind(process.stderr)
+    : null;
 
 const BLOCKED_MSG = 'script-jail: native addons are blocked at install time';
 
@@ -63,7 +78,7 @@ function resolveLogFd() {
     cachedFilePath = filePath;
     if (cachedFileFd !== null) return cachedFileFd;
     try {
-      cachedFileFd = fs.openSync(filePath, 'a');
+      cachedFileFd = _openSync(filePath, 'a');
     } catch {
       cachedFileFd = -1;
     }
@@ -98,17 +113,23 @@ function emitAuditFdLostAndExit(reason) {
   }) + '\n';
   if (cachedFilePath) {
     try {
-      const fd = fs.openSync(cachedFilePath, 'a');
-      try { fs.writeSync(fd, line); } catch { /* ignored */ }
-      try { fs.closeSync(fd); } catch { /* ignored */ }
+      const fd = _openSync(cachedFilePath, 'a');
+      try { _writeSync(fd, line); } catch { /* ignored */ }
+      try { _closeSync(fd); } catch { /* ignored */ }
     } catch { /* ignored */ }
   }
-  try {
-    process.stderr.write(
-      `script-jail/dlopen-block: fatal — cached events-file fd is unusable and reopen failed (${reason}); aborting to avoid silent audit loss\n`,
-    );
-  } catch { /* ignored */ }
-  process.exit(91);
+  // Finding 4: route through the captured stderr write reference and
+  // captured process.exit reference so a lifecycle script that monkeypatched
+  // `process.stderr.write` or `process.exit` before triggering an
+  // audit-loss event cannot silence this final signal.
+  if (_stderrWrite !== null) {
+    try {
+      _stderrWrite(
+        `script-jail/dlopen-block: fatal — cached events-file fd is unusable and reopen failed (${reason}); aborting to avoid silent audit loss\n`,
+      );
+    } catch { /* ignored */ }
+  }
+  _processExit(91);
 }
 
 /**
@@ -139,7 +160,7 @@ function logDlopen(filename) {
 
   let firstErr;
   try {
-    fs.writeSync(fd, line);
+    _writeSync(fd, line);
     return;
   } catch (err) {
     firstErr = err;
@@ -157,7 +178,7 @@ function logDlopen(filename) {
   }
   let newFd;
   try {
-    newFd = fs.openSync(cachedFilePath, 'a');
+    newFd = _openSync(cachedFilePath, 'a');
   } catch (openErr) {
     emitAuditFdLostAndExit(
       `reopen of ${cachedFilePath} failed: ${
@@ -167,11 +188,11 @@ function logDlopen(filename) {
     return;
   }
   if (cachedFileFd !== null && cachedFileFd >= 0) {
-    try { fs.closeSync(cachedFileFd); } catch { /* ignored */ }
+    try { _closeSync(cachedFileFd); } catch { /* ignored */ }
   }
   cachedFileFd = newFd;
   try {
-    fs.writeSync(newFd, line);
+    _writeSync(newFd, line);
   } catch (retryErr) {
     emitAuditFdLostAndExit(
       `retry write after reopen failed: ${

@@ -339,42 +339,41 @@ describe('env-spy preload', () => {
 
   it('reopens the events file on EBADF and writes the env_read line via the new fd', async () => {
     const logFile = freshLogFile();
-    // The child:
-    //   1. monkey-patches fs.writeSync so the first call throws EBADF;
-    //   2. requires env-spy.cjs (which is the --require target via NODE_OPTIONS);
-    //   3. reads process.env.FOO, which goes through the Proxy → logEnvRead →
-    //      writeSync (throws EBADF) → reopen → retry → success.
-    // Because env-spy is pre-loaded via NODE_OPTIONS=--require=env-spy.cjs
-    // BEFORE the child script body runs, we need to install the writeSync
-    // stub in `--require` order.  Easiest path: inject a SECOND --require
-    // that runs BEFORE env-spy.  But --require entries run in left-to-right
-    // order, so we instead patch writeSync at the top of the child script
-    // and then trigger a delayed env-read.  The first env-spy auto-reads
-    // (process.env.SCRIPT_JAIL_LOG_FILE / SCRIPT_JAIL_PROTECTED_ENV_NAMES)
-    // happen BEFORE our patch — so we must NOT patch writeSync until after
-    // env-spy's resolveLogFd has run and logFd is cached.  Insert the
-    // patch in the user code, then make the read.
+    // Audit-trust Finding 4 (high, 2026-05-18): the preload captures fs
+    // function references at module load time, so monkeypatching
+    // `fs.writeSync` no longer reaches the preload's writes.  To exercise
+    // the EBADF recovery path we therefore have to invalidate the
+    // underlying fd directly — by closing every fd in /proc/self/fd that
+    // points at the events file.  That's the actual production threat
+    // (a lifecycle script scanning /proc/self/fd/ and calling
+    // `close(n)` on descriptors it doesn't own).
+    //
+    // Linux-only: /proc/self/fd is not present on macOS, so we skip this
+    // test on Darwin.  CI runs Linux for the guest test suite.
+    if (process.platform !== 'linux') return;
     const code = `
-      const fs = require('fs');
-      // env-spy is already preloaded by NODE_OPTIONS=--require=...;
-      // logFd is now > 0 and cached.  Install a one-shot EBADF stub on
-      // writeSync — only the FIRST call throws, so the reopen-retry path
-      // succeeds on the second attempt.
-      const realWriteSync = fs.writeSync;
-      let firstCall = true;
-      fs.writeSync = function (fd, ...rest) {
-        if (firstCall) {
-          firstCall = false;
-          const err = new Error('Stale fd');
-          err.code = 'EBADF';
-          throw err;
+      const fs = require('node:fs');
+      // Find any fd in /proc/self/fd whose readlink resolves to the
+      // events file path and close it via the host fd table.  Calling
+      // closeSync(n) on someone else's fd is the same primitive a
+      // hostile lifecycle script would use — the kernel doesn't track
+      // ownership at this layer.
+      const logFile = ${JSON.stringify(logFile)};
+      try {
+        const fds = fs.readdirSync('/proc/self/fd');
+        for (const name of fds) {
+          const fd = Number(name);
+          if (!Number.isInteger(fd)) continue;
+          let target;
+          try { target = fs.readlinkSync('/proc/self/fd/' + name); } catch { continue; }
+          if (target === logFile) {
+            try { fs.closeSync(fd); } catch { /* ignored */ }
+          }
         }
-        return realWriteSync.call(fs, fd, ...rest);
-      };
-      // Trigger one env_read through the Proxy.  Recovery path expectation:
-      // the first writeSync throws EBADF → env-spy reopens the file by
-      // path → writeSync (the new, non-stubbed fd) succeeds on the second
-      // call.  The events file must contain exactly one env_read line.
+      } catch { /* ignored */ }
+      // Trigger one env_read through the Proxy.  Recovery path:
+      // writeSync on the stale fd throws EBADF → env-spy reopens the
+      // file by path → writeSync (the new fd) succeeds.
       const v = process.env.FOO;
       process.stdout.write('FOO=' + (v || 'ABSENT'));
     `;
@@ -390,36 +389,47 @@ describe('env-spy preload', () => {
   });
 
   it('exits non-zero with audit_fd_lost when reopen also fails (unrecoverable fd-tamper)', async () => {
+    // Audit-trust Finding 4: monkeypatching fs.openSync no longer affects
+    // the preload (it captured _openSync at module load).  To force a
+    // reopen failure we make the events-file PATH itself fail to open by
+    // pointing at a directory that we then chmod 0 underneath the
+    // running child.  Linux-specific, and racy in principle — but the
+    // child closes the cached fd FIRST (driving the EBADF) and the
+    // chmod is applied before that close so the reopen sees the broken
+    // permissions deterministically.
+    if (process.platform !== 'linux') return;
     const logFile = freshLogFile();
-    // Same stub strategy, but also stub fs.openSync so the reopen retry
-    // fails too.  Expected: env-spy exits non-zero and emits an
-    // env_tamper{op:'audit_fd_lost'} JSONL line via the final fresh-open
-    // fallback (which we also break — proving the exit-non-zero is the
-    // hard fail-closed signal even when no audit line can be written).
     const code = `
-      const fs = require('fs');
-      const realWriteSync = fs.writeSync;
-      let firstWrite = true;
-      fs.writeSync = function (fd, ...rest) {
-        if (firstWrite) {
-          firstWrite = false;
-          const err = new Error('Stale fd');
-          err.code = 'EBADF';
-          throw err;
+      const fs = require('node:fs');
+      const logFile = ${JSON.stringify(logFile)};
+      // Break the path so reopen fails: rename the file, which means the
+      // path no longer resolves.  EACCES on a missing parent dir is more
+      // robust than the chmod approach.
+      const brokenDir = logFile + '.dir';
+      try {
+        // Move the file out of the way, then put a path-eating dir in
+        // its place with no read permissions.  openSync('a') will fail
+        // with EACCES.
+        fs.renameSync(logFile, logFile + '.moved');
+        fs.mkdirSync(brokenDir, { mode: 0o000 });
+        fs.renameSync(brokenDir, logFile);
+      } catch { /* ignored */ }
+      // Now close every fd that points at the moved file so the cached
+      // fd in env-spy goes stale and the next writeSync throws EBADF.
+      try {
+        const fds = fs.readdirSync('/proc/self/fd');
+        for (const name of fds) {
+          const fd = Number(name);
+          if (!Number.isInteger(fd)) continue;
+          let target;
+          try { target = fs.readlinkSync('/proc/self/fd/' + name); } catch { continue; }
+          if (target === logFile + '.moved' || target === logFile + '.moved (deleted)') {
+            try { fs.closeSync(fd); } catch { /* ignored */ }
+          }
         }
-        return realWriteSync.call(fs, fd, ...rest);
-      };
-      // Now break openSync ENTIRELY so the reopen branch fails too —
-      // including the final fallback open inside emitAuditFdLostAndExit.
-      // Both the env_read retry AND the audit_fd_lost write should fail;
-      // the process MUST still exit non-zero.
-      fs.openSync = function () {
-        const err = new Error('Stubbed openSync failure');
-        err.code = 'EACCES';
-        throw err;
-      };
-      // Trigger one env_read.  writeSync throws → reopen attempts openSync
-      // → throws → emitAuditFdLostAndExit → process.exit(91).
+      } catch { /* ignored */ }
+      // Trigger one env_read.  writeSync throws EBADF → reopen attempts
+      // openSync(logFile) → fails → emitAuditFdLostAndExit → exit(91).
       const v = process.env.FOO;
       // Must never be reached:
       process.stdout.write('UNREACHED');
@@ -433,5 +443,86 @@ describe('env-spy preload', () => {
     // Stderr should carry the diagnostic so an interactive caller can
     // correlate the failure with the audit-fd-lost cause.
     expect(result.stderr).toMatch(/script-jail\/env-spy/);
+  });
+
+  // Audit-trust Finding 4 (high, 2026-05-18) — monkeypatch resistance.
+  //
+  // Lifecycle JS that runs INSIDE the audited process can (before
+  // triggering a sensitive env read) overwrite `fs.writeSync` /
+  // `fs.openSync` / `process.exit` to neutralise the audit chain.  The
+  // preload captures these references at module load time (before any
+  // user code runs), so the monkeypatch only affects the public slots,
+  // not the captured references.  These tests pin that contract.
+  describe('Finding 4 — monkeypatch resistance', () => {
+    it('monkeypatched fs.writeSync after preload load does NOT silence env_read audit', async () => {
+      const logFile = freshLogFile();
+      const code = `
+        const fs = require('node:fs');
+        // Monkeypatch AFTER the preload has loaded (the preload runs as
+        // --require BEFORE the child body).  If the preload were
+        // reading fs.writeSync through the mutable slot on every call,
+        // this stub would suppress every env_read line.
+        fs.writeSync = function () { /* silent black hole */ };
+        // Also monkeypatch process.exit so a fail-closed exit can't
+        // accidentally hide the bug.
+        process.exit = function () { /* swallow */ };
+        const v = process.env.NPM_TOKEN;
+        process.stdout.write('TOKEN=' + (v === undefined ? 'HIDDEN' : 'LEAKED'));
+      `;
+      const result = await runWithSpy(code, {
+        SCRIPT_JAIL_LOG_FILE: logFile,
+        SCRIPT_JAIL_PROTECTED_ENV_NAMES: 'NPM_TOKEN',
+        NPM_TOKEN: 'super-secret',
+      });
+      expect(result.exitCode).toBe(0);
+      // Value must be hidden (protected list still enforced).
+      expect(result.stdout).toContain('TOKEN=HIDDEN');
+      // The audit line must exist despite the monkeypatched writeSync.
+      const lines = readEnvReadLines(logFile);
+      const tokenReads = lines.filter((l) => l.name === 'NPM_TOKEN');
+      expect(tokenReads.length).toBeGreaterThanOrEqual(1);
+      expect(tokenReads[0]!.hidden).toBe(true);
+    });
+
+    it('monkeypatched process.exit does NOT prevent fail-closed exit on unrecoverable audit-fd loss', async () => {
+      // Combine the unrecoverable-fd-tamper attack with a process.exit
+      // override.  The preload captured `_processExit` at load time, so
+      // the user's override only affects the public slot and the exit
+      // still fires.
+      if (process.platform !== 'linux') return;
+      const logFile = freshLogFile();
+      const code = `
+        const fs = require('node:fs');
+        // Monkeypatch process.exit BEFORE triggering the audit-loss
+        // event.  The captured _processExit reference must still fire.
+        process.exit = function () { /* swallow */ };
+        const logFile = ${JSON.stringify(logFile)};
+        try {
+          fs.renameSync(logFile, logFile + '.moved');
+          fs.mkdirSync(logFile, { mode: 0o000 });
+        } catch { /* ignored */ }
+        try {
+          const fds = fs.readdirSync('/proc/self/fd');
+          for (const name of fds) {
+            const fd = Number(name);
+            if (!Number.isInteger(fd)) continue;
+            let target;
+            try { target = fs.readlinkSync('/proc/self/fd/' + name); } catch { continue; }
+            if (target === logFile + '.moved' || target === logFile + '.moved (deleted)') {
+              try { fs.closeSync(fd); } catch { /* ignored */ }
+            }
+          }
+        } catch { /* ignored */ }
+        const v = process.env.FOO;
+        process.stdout.write('UNREACHED');
+      `;
+      const result = await runWithSpy(code, {
+        SCRIPT_JAIL_LOG_FILE: logFile,
+        FOO: 'bar',
+      });
+      // Must exit non-zero despite the monkeypatched process.exit.
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).not.toContain('UNREACHED');
+    });
   });
 });
