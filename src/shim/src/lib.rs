@@ -600,16 +600,16 @@ unsafe fn shim_init() {
     //    set, so exec wrappers can read them safely via Acquire on INIT_DONE.
     unsafe fn capture_canon(buf: &CanonBuf, name: *const c_char) {
         let val = real_getenv_raw(name);
-        if val.is_null() || *val == 0 {
+        if val.is_null() || *val as u8 == 0 {
             return;
         }
         // Walk to NUL, copy at most CANON_BUF_LEN-1 bytes, NUL-terminate.
         let mut n = 0usize;
-        while n < CANON_BUF_LEN - 1 && *val.add(n) != 0 {
+        while n < CANON_BUF_LEN - 1 && *val.add(n) as u8 != 0 {
             n += 1;
         }
-        let dst = &mut *buf.bytes.get();
         // SAFETY: ctor-only writer; no concurrent readers (INIT_DONE is false).
+        let dst = &mut *buf.bytes.get();
         core::ptr::copy_nonoverlapping(val as *const u8, dst.as_mut_ptr(), n);
         dst[n] = 0;
         buf.len.store(n, Ordering::Release);
