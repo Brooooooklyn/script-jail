@@ -408,12 +408,15 @@ export async function runInstallPhase(
   // openat-forgery attack.  Even when per-pid CWD tracking fails (Layer
   // 2 below — strace dropped the chdir line, fchdir resolved against an
   // unknown fd, etc.), a non-shim-loaded pid that opens ANY file whose
-  // basename matches the events file is suspicious in the controlled
-  // rootfs.  The basename `events.jsonl` is unique to this audit
-  // channel in the microVM; lifecycle scripts have no business writing
-  // to a file by that name.  If we ever need to harden this further we
-  // can rename the events file to include a per-VM random suffix so
-  // the basename itself is unique.
+  // basename matches the events file is unambiguously a forgery
+  // attempt: the basename is per-run-random (`events-<32-hex>.jsonl`,
+  // see `createEventsFile` in `agent.ts`), unguessable by a package's
+  // lifecycle script, and unique to this audit channel.  The earlier
+  // generic `events.jsonl` basename caused false positives (a package
+  // legitimately writing `./events.jsonl` to its own cwd matched the
+  // safety net); per-run randomization closes that gap while
+  // preserving the detector for actual forgery (an attacker who reads
+  // SCRIPT_JAIL_LOG_FILE then chdir's into the events directory).
   const eventsFileBasename: string | null =
     eventsFilePathCanonical !== null
       ? path.basename(eventsFilePathCanonical)
@@ -844,15 +847,24 @@ export async function runInstallPhase(
           // safety net.  Even when canonical resolution fails or
           // disagrees, an openat-write whose basename equals the
           // events file basename from a non-shim-loaded pid in the
-          // controlled rootfs is suspicious.  The basename
-          // `events.jsonl` is unique to this audit channel; lifecycle
-          // scripts have no business writing to a file by that name.
-          // This catches:
+          // controlled rootfs is unambiguously a forgery attempt.
+          // The basename is per-run-random
+          // (`events-<32-hex>.jsonl`, see `createEventsFile`),
+          // unguessable by a lifecycle script, and unique to this
+          // audit channel — there is no legitimate reason for any
+          // package to write to that exact filename.  This catches:
           //   - cwd-relative opens after `chdir(events-dir)` when
           //     strace dropped the chdir line and Layer 2 doesn't
           //     have a cwd entry for this pid.
           //   - dirfd-relative opens where the dirfd's source was
           //     missed by strace.
+          //
+          // Pre-randomization (when the basename was the generic
+          // `events.jsonl`), this layer caused medium-severity false
+          // positives: a package writing `./events.jsonl` to its own
+          // cwd matched the basename and hard-failed the install.
+          // Per-run randomization in `createEventsFile` is what makes
+          // this layer safe to enable.
           const targetBasename = path.basename(rawEvent.path);
           const isCanonicalMatch = canonicalTarget === eventsFilePathCanonical;
           const isBasenameMatch = targetBasename === eventsFileBasename;

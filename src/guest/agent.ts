@@ -31,7 +31,7 @@ import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
 import { discoverPkgDirs } from './discover-pkg-dirs.js';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   CANON_PROTECTED_ENV_NAMES_MAX_LEN,
   MAX_PROTECTED_ENV_NAMES,
@@ -1378,8 +1378,9 @@ export function buildChildEnv(
 }
 
 /**
- * Per-VM events-file handle.  The path is randomized (mkdtemp under /tmp) and
- * the directory mode is 0700; the file itself is opened with O_CREAT|O_EXCL
+ * Per-VM events-file handle.  BOTH the parent directory AND the file
+ * basename are randomized per VM run.  The directory is created via
+ * mkdtemp with mode 0700; the file itself is opened with O_CREAT|O_EXCL
  * so we know nothing pre-existed.  `baseline` captures the {inode, device}
  * pair at creation so the tailer can re-stat on every drain cycle and detect
  * unlink / replace / truncate / symlink-swap by an audited lifecycle script.
@@ -1391,6 +1392,16 @@ export function buildChildEnv(
  * Randomizing the path raises the bar against blind-target attacks, and the
  * inode/dev baseline + tailer fail-closed gate catches the case where an
  * attacker discovers the path via /proc/self/environ.
+ *
+ * Randomizing the BASENAME (not just the parent directory) is also load-
+ * bearing for the Layer-1 forgery detector in `phase-install.ts`: that
+ * detector flags any non-shim-loaded openat-write whose target basename
+ * equals the events file basename.  With a generic basename like
+ * `events.jsonl`, a legitimate package that writes `./events.jsonl`
+ * would be falsely flagged.  A per-run random basename
+ * (`events-<32-hex>.jsonl`) eliminates that collision while preserving
+ * the detector for genuine forgery attempts that scrape
+ * `SCRIPT_JAIL_LOG_FILE`.
  */
 export interface EventsFile {
   /** Absolute path of the JSONL events file inside the VM. */
@@ -1428,14 +1439,42 @@ export interface EventsFile {
  *     race the create-then-stat pair.
  */
 export function createEventsFile(parentDir: string = '/tmp'): EventsFile {
-  const dirPath = mkdtempSync(joinPath(parentDir, 'script-jail-events-'));
+  // Audit-trust Finding (medium, 2026-05-19): the events file basename
+  // must NOT be a generic name like `events.jsonl`.  The Layer-1
+  // basename safety net in `phase-install.ts` flags any non-shim-loaded
+  // openat-write whose target basename equals the events file basename.
+  // With a fixed `events.jsonl` basename, a legitimate package that
+  // happens to write `./events.jsonl` (no chdir, just a relative path
+  // in the cwd) would be falsely flagged as `<EVENTS_FILE_FORGERY>`.
+  //
+  // Generate a single cryptographic-random tag at create time and use
+  // it for BOTH the directory name (which mkdtemp already randomizes
+  // via its `XXXXXX` template, but we use our tag explicitly so the
+  // file basename can share the same tag) AND the filename:
+  //   /tmp/script-jail-events-<tag>/events-<tag>.jsonl
+  // The basename `events-<tag>.jsonl` is then a 32-hex-character string
+  // a package cannot guess in a single run, eliminating the false
+  // positive while preserving Layer 1 against a same-rootfs attacker
+  // that scrapes SCRIPT_JAIL_LOG_FILE.
+  //
+  // 16 random bytes → 32 hex chars; the birthday-collision space (~2^64)
+  // is comfortably beyond any realistic guess budget inside one install.
+  const tag = randomBytes(16).toString('hex');
+  // We still use mkdtempSync for the directory create — it gives us
+  // atomic O_EXCL semantics on the directory and is the established
+  // safe primitive.  Append our random tag to the prefix so the final
+  // directory name is `script-jail-events-<tag>XXXXXX` (mkdtemp
+  // requires a `XXXXXX`-template suffix).  The leading `<tag>` is what
+  // we use for the file basename — the trailing 6 chars from mkdtemp
+  // are extra entropy we discard from the filename derivation.
+  const dirPath = mkdtempSync(joinPath(parentDir, `script-jail-events-${tag}-`));
   // mkdtempSync is defined by POSIX to create with mode 0700 (umask is
   // not applied), but enforce it explicitly so the Finding-B parent-
   // directory guard does not rely on platform-default behaviour.  A
   // weakened mode here would let a non-root caller create decoy files at
   // a colliding path inside the watched directory.
   chmodSync(dirPath, 0o700);
-  const path = joinPath(dirPath, 'events.jsonl');
+  const path = joinPath(dirPath, `events-${tag}.jsonl`);
   // O_NOFOLLOW refuses to traverse a symlink at the final path component.
   // Defends a future code path that creates the events file in a less-
   // restricted location: if anything has dropped a symlink at our path

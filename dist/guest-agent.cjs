@@ -27110,9 +27110,10 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
   };
 }
 function createEventsFile(parentDir = "/tmp") {
-  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path2.join)(parentDir, "script-jail-events-"));
+  const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
+  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path2.join)(parentDir, `script-jail-events-${tag}-`));
   (0, import_node_fs3.chmodSync)(dirPath, 448);
-  const path2 = (0, import_node_path2.join)(dirPath, "events.jsonl");
+  const path2 = (0, import_node_path2.join)(dirPath, `events-${tag}.jsonl`);
   const fd = (0, import_node_fs3.openSync)(
     path2,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition

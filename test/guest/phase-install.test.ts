@@ -2527,6 +2527,121 @@ describe('runInstallPhase', () => {
       });
     });
 
+    // Audit-trust Finding (medium, 2026-05-19) — per-run random basename
+    // eliminates Layer-1 false positives.  The Layer-1 safety net flags
+    // any non-shim-loaded openat-write whose target basename equals the
+    // events file basename.  With the pre-fix generic basename
+    // `events.jsonl`, a legitimate package that writes `./events.jsonl`
+    // to its own cwd would falsely trip Layer 1.  After the fix, the
+    // events file basename is `events-<32-hex>.jsonl` (minted per VM run
+    // in `createEventsFile`), so:
+    //   - a package writing the generic `events.jsonl` no longer matches
+    //     and is NOT flagged (false-positive gone);
+    //   - a package that writes the actual per-run-random basename in a
+    //     wrong directory IS still flagged via Layer 1 (the basename is
+    //     unguessable, so the only way to hit it is by reading
+    //     SCRIPT_JAIL_LOG_FILE — i.e. genuine attacker behaviour).
+    describe('per-run random basename eliminates Layer-1 false positives (Finding, 2026-05-19)', () => {
+      // Per-run-random basename, as `createEventsFile` would produce
+      // (events-<32-hex>.jsonl).  The exact hex value is irrelevant —
+      // what matters is that it differs from the generic `events.jsonl`
+      // a package might legitimately write.
+      const RANDOM_TAG = 'a'.repeat(32);
+      const RANDOM_EVENTS_FILE = `/tmp/script-jail-events-${RANDOM_TAG}/events-${RANDOM_TAG}.jsonl`;
+
+      it('non-shim-loaded pid writes generic ./events.jsonl with no chdir → NOT flagged (false-positive fix)', async () => {
+        const proc = mockProcReader({
+          801: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'innocent-generic-events-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // The package writes a file literally named `events.jsonl`
+        // in its own cwd via AT_FDCWD-relative openat.  Pre-fix this
+        // matched the Layer-1 safety net (basename == 'events.jsonl')
+        // even though the canonical target is nowhere near the audit
+        // events file.  Post-fix, the events file basename is
+        // `events-<tag>.jsonl`, so the generic name no longer collides.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 801,
+            line: 'openat(AT_FDCWD, "events.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7',
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: RANDOM_EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const synths = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(synths).toHaveLength(0);
+      });
+
+      it('non-shim-loaded pid writes the actual per-run-random basename in a wrong directory → flagged via Layer 1', async () => {
+        const proc = mockProcReader({
+          802: {
+            ppid: 1,
+            env: {
+              npm_package_name: 'random-basename-forge-pkg',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            },
+          },
+        });
+        // Attacker scraped SCRIPT_JAIL_LOG_FILE from /proc/self/environ
+        // and now knows the per-run-random basename.  They open it from
+        // a *different* directory (no chdir) — canonical resolution
+        // returns a path that doesn't equal the canonical events file,
+        // but Layer 1 still catches it because the basename matches the
+        // unguessable random tag.
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          {
+            pid: 802,
+            line: `openat(AT_FDCWD, "events-${RANDOM_TAG}.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7`,
+            source: 'strace',
+          },
+        ];
+
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: RANDOM_EVENTS_FILE },
+          strace: cannedStraceRunner(records),
+          attribution: new Attribution(proc),
+          emitter,
+        });
+
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const synths = events.filter((e) => {
+          const raw = e['raw'] as Record<string, unknown>;
+          return raw['kind'] === 'exec' && raw['events_file_forgery'] === true;
+        });
+        expect(synths).toHaveLength(1);
+        const raw = synths[0]!['raw'] as Record<string, unknown>;
+        // Forensic path falls back to the canonical events file path
+        // because canonical resolution of the relative path against
+        // the agent's cwd does NOT produce the configured events file
+        // (the package is in a different directory).
+        expect(raw['prog']).toBe(RANDOM_EVENTS_FILE);
+      });
+    });
+
     // Audit-trust Finding (high, 2026-05-19) — shim-trust must NOT survive
     // exec image replacement.  A pid becomes shim-trusted when ld.so maps
     // `/lib/libscriptjail.so` into the ORIGINAL process image.  A

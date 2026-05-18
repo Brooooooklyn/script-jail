@@ -136,9 +136,12 @@ same UID as the audited process. A malicious lifecycle script with that UID can:
 2. Discover existing audit fds via `/proc/self/fd/N` and write directly to
    them, which strace's openat trace cannot detect.
 
-3. Use `openat(dirfd, basename, ...)` or path aliases (`/tmp/foo/../events-dir/./events.jsonl`)
-   to open the file via spellings the path-equality detector may miss. (The
-   strace parser now canonicalizes these; see commit 7a4a281.)
+3. Use `openat(dirfd, basename, ...)` or path aliases
+   (`/tmp/foo/../events-dir/./events-<tag>.jsonl`) to open the file via
+   spellings the path-equality detector may miss. (The strace parser now
+   canonicalizes these; see commit 7a4a281. The per-run-random basename
+   `events-<32-hex>.jsonl` minted in `createEventsFile` also feeds the
+   Layer-1 basename safety net in `phase-install.ts`.)
 
 4. Spoof the shim-trust signal by `open("/lib/libscriptjail.so", O_RDONLY)`
    without actually loading it. The forgery detector grants shim-trust to
