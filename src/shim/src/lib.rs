@@ -31,6 +31,17 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 // ── tunables ───────────────────────────────────────────────────────────────
 
+// LOAD-BEARING: `MAX_PROTECTED` and `NAME_MAX_LEN` must stay in lockstep with
+// `MAX_PROTECTED_ENV_NAMES` and `PROTECTED_NAME_MAX_LEN` in
+// `src/shim/canon-buf-len.ts`.  Those TS constants gate `buildChildEnv` so the
+// agent refuses to compose a `SCRIPT_JAIL_PROTECTED_ENV_NAMES` value that the
+// shim would silently truncate inside `load_protect_list_from_bytes` (either
+// by exceeding the entry-count cap or by exceeding the per-entry byte cap).
+// Without the matching agent-side guard, the dropped names leak through
+// env-spy / shim getenv unannotated.  Any change to either constant here MUST
+// be mirrored in canon-buf-len.ts (and vice-versa).  See also CANON_BUF_LEN
+// (Finding 2 in the same audit-trust series) and the comment next to
+// `CANON_PROTECTED_ENV_NAMES_MAX_LEN`.
 const MAX_PROTECTED: usize = 64;
 const NAME_MAX_LEN: usize = 256;
 const JSONL_BUF: usize = 4096;

@@ -26,3 +26,23 @@
 // truncation bug, so any change here MUST be mirrored in lib.rs and
 // vice-versa.
 export const CANON_PROTECTED_ENV_NAMES_MAX_LEN = 1023;
+
+// Audit-trust Finding 3 (2026-05-18): the shim's static protect-list table
+// has a fixed capacity of `MAX_PROTECTED` entries, each at most `NAME_MAX_LEN`
+// bytes (including the trailing NUL).  An over-long byte-length check by
+// itself is not enough: a config of 100 short names (`A`,`B`,`C`,…) is under
+// the 1023-byte CanonBuf cap but would silently drop everything past entry
+// 64 inside `load_protect_list_from_bytes`, so the dropped names would leak
+// through env-spy / shim getenv unannotated.
+//
+// CONTRACT: these MUST stay in lockstep with `MAX_PROTECTED` and
+// `NAME_MAX_LEN` in `src/shim/src/lib.rs`.  See the load-bearing comments
+// next to those constants for the rationale.
+//
+//   - `MAX_PROTECTED_ENV_NAMES` mirrors the shim's `MAX_PROTECTED` (entry
+//     count cap).
+//   - `PROTECTED_NAME_MAX_LEN` mirrors `NAME_MAX_LEN - 1` (per-entry payload
+//     cap, excluding the NUL terminator the shim writes at offset
+//     `NAME_MAX_LEN - 1`).
+export const MAX_PROTECTED_ENV_NAMES = 64;
+export const PROTECTED_NAME_MAX_LEN = 255;

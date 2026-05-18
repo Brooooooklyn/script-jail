@@ -918,24 +918,19 @@ describe('buildChildEnv protected-env-names length gate', () => {
 
   it('accepts a protect list that fits within the CanonBuf payload (<= 1023 bytes)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
-    const { CANON_PROTECTED_ENV_NAMES_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+    const { CANON_PROTECTED_ENV_NAMES_MAX_LEN, MAX_PROTECTED_ENV_NAMES } =
+      await import('../../src/shim/canon-buf-len.js');
 
-    // Build a list that exactly hits the cap.  Each name is 7 bytes
-    // (e.g. "NAME000"); separators are commas.  We want total bytes ===
-    // CANON_PROTECTED_ENV_NAMES_MAX_LEN (the boundary case: must accept).
+    // Build a list that approaches the byte cap from below WITHOUT
+    // exceeding the entry-count cap (Finding 3, MAX_PROTECTED_ENV_NAMES =
+    // 64).  64 × 15-byte names + 63 commas = 960 + 63 = 1023 bytes
+    // (exactly the inclusive cap).  Each name is 15 bytes ASCII.
     const names: string[] = [];
-    let bytes = 0;
-    let i = 0;
-    while (true) {
-      const name = `NAME${String(i).padStart(3, '0')}`; // 7 bytes ASCII
-      const candidateBytes = bytes + (names.length === 0 ? name.length : 1 + name.length);
-      if (candidateBytes > CANON_PROTECTED_ENV_NAMES_MAX_LEN) break;
-      names.push(name);
-      bytes = candidateBytes;
-      i += 1;
+    for (let i = 0; i < MAX_PROTECTED_ENV_NAMES; i++) {
+      names.push(`PROT_NM_${String(i).padStart(2, '0')}_X`); // 15 bytes
     }
-
     const joined = names.join(',');
+    expect(names.length).toBe(MAX_PROTECTED_ENV_NAMES);
     expect(Buffer.byteLength(joined, 'utf8')).toBeLessThanOrEqual(CANON_PROTECTED_ENV_NAMES_MAX_LEN);
 
     const env = buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl');
@@ -944,14 +939,19 @@ describe('buildChildEnv protected-env-names length gate', () => {
 
   it('rejects a protect list that would silently truncate inside the shim (> 1023 bytes)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
-    const { CANON_PROTECTED_ENV_NAMES_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+    const { CANON_PROTECTED_ENV_NAMES_MAX_LEN, MAX_PROTECTED_ENV_NAMES } =
+      await import('../../src/shim/canon-buf-len.js');
 
-    // Build a list that overshoots the cap by at least a few bytes.
-    // Each 16-byte name → easy arithmetic: 65 entries × 16 bytes + 64
-    // commas = 1040 + 64 = 1104 bytes (well over the 1023 cap).
+    // To exercise SOLELY the byte-length gate (Finding 2), keep the entry
+    // count at or below MAX_PROTECTED_ENV_NAMES (64) but make individual
+    // entries long enough that the joined byte length exceeds 1023.
+    // 64 × 17-byte entries + 63 commas = 1088 + 63 = 1151 bytes.
     const names: string[] = [];
-    for (let i = 0; i < 65; i++) names.push(`PROTECTED_NAME${String(i).padStart(2, '0')}`);
+    for (let i = 0; i < MAX_PROTECTED_ENV_NAMES; i++) {
+      names.push(`PROT_NAME_NO_${String(i).padStart(3, '0')}`); // 17 bytes ASCII
+    }
     const joined = names.join(',');
+    expect(names.length).toBe(MAX_PROTECTED_ENV_NAMES);
     expect(Buffer.byteLength(joined, 'utf8')).toBeGreaterThan(CANON_PROTECTED_ENV_NAMES_MAX_LEN);
 
     expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
@@ -964,17 +964,20 @@ describe('buildChildEnv protected-env-names length gate', () => {
 
   it('error message references the configured entry count and the canon-buf cap', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
 
-    // Construct a 1024-byte joined string (cap is 1023 inclusive — 1024
-    // is the smallest invalid size).
+    // Stay at or below MAX_PROTECTED_ENV_NAMES so the entry-count gate
+    // doesn't pre-empt the byte-length gate.  Build entries large enough
+    // that the joined string is just over 1023 bytes.
     const names: string[] = [];
     let bytes = 0;
-    while (bytes < 1024) {
-      const name = 'A'.repeat(8); // 8 bytes
-      const add = names.length === 0 ? name.length : 1 + name.length;
+    // 64 × 17-byte entries → 64 entries (cap), 1151 bytes joined (over cap)
+    for (let i = 0; i < MAX_PROTECTED_ENV_NAMES; i++) {
+      const name = `PROT_NAME_NO_${String(i).padStart(3, '0')}`; // 17 bytes
       names.push(name);
-      bytes += add;
+      bytes += name.length + (i === 0 ? 0 : 1);
     }
+    expect(bytes).toBeGreaterThanOrEqual(1024);
     expect(Buffer.byteLength(names.join(','), 'utf8')).toBeGreaterThanOrEqual(1024);
 
     let caught: Error | undefined;
@@ -986,6 +989,132 @@ describe('buildChildEnv protected-env-names length gate', () => {
     expect(caught).toBeDefined();
     expect(caught!.message).toContain(`${names.length} entries`);
     expect(caught!.message).toContain('1023 bytes');
+  });
+});
+
+describe('buildChildEnv protect-list entry-count and per-entry-length gates', () => {
+  // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list
+  // table holds `MAX_PROTECTED = 64` entries of at most `NAME_MAX_LEN - 1
+  // = 255` bytes each.  The byte-length check from Finding 2 covers the
+  // total CanonBuf size but NOT the structural caps inside
+  // `load_protect_list_from_bytes`, so a configuration of many short
+  // names (or a single very long name) could silently truncate inside
+  // the shim despite passing the byte-length gate.  These tests pin the
+  // boundary behaviour.
+
+  function makeConfig(protectedEnv: string[]): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: protectedEnv },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('accepts exactly MAX_PROTECTED_ENV_NAMES entries (boundary, must accept)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
+
+    // Each entry "A" = 1 byte, total joined = 64 + 63 = 127 bytes (well
+    // under the 1023-byte CanonBuf cap, so the entry-count check is the
+    // only gate that could fire).
+    const names = Array.from({ length: MAX_PROTECTED_ENV_NAMES }, (_, i) => `N${i}`);
+    expect(names.length).toBe(MAX_PROTECTED_ENV_NAMES);
+
+    const env = buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl');
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe(names.join(','));
+  });
+
+  it('rejects MAX_PROTECTED_ENV_NAMES + 1 entries with a precise error', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
+
+    const names = Array.from(
+      { length: MAX_PROTECTED_ENV_NAMES + 1 },
+      (_, i) => `N${i}`,
+    );
+    // Joined "N0,N1,..." comfortably under the 1023-byte byte-length cap
+    // (so the entry-count gate is the one that must fire).
+    expect(Buffer.byteLength(names.join(','), 'utf8')).toBeLessThan(1023);
+
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`SCRIPT_JAIL_PROTECTED_ENV_NAMES has ${MAX_PROTECTED_ENV_NAMES + 1} entries`),
+    );
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`at most ${MAX_PROTECTED_ENV_NAMES} entries`),
+    );
+  });
+
+  it('accepts an entry of exactly PROTECTED_NAME_MAX_LEN bytes (boundary, must accept)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { PROTECTED_NAME_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+
+    // 255 ASCII bytes — exactly the cap.
+    const name = 'A'.repeat(PROTECTED_NAME_MAX_LEN);
+    expect(Buffer.byteLength(name, 'utf8')).toBe(PROTECTED_NAME_MAX_LEN);
+
+    const env = buildChildEnv({}, makeConfig([name]), '/tmp/events.jsonl');
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe(name);
+  });
+
+  it('rejects an entry of PROTECTED_NAME_MAX_LEN + 1 bytes with a precise error', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { PROTECTED_NAME_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+
+    const tooLong = 'B'.repeat(PROTECTED_NAME_MAX_LEN + 1);
+    // Single entry, well under the joined-byte-length cap, so the per-
+    // entry gate is the one that must fire.
+    expect(Buffer.byteLength(tooLong, 'utf8')).toBeLessThan(1023);
+
+    expect(() => buildChildEnv({}, makeConfig([tooLong]), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`SCRIPT_JAIL_PROTECTED_ENV_NAMES entry \\[0\\] is ${PROTECTED_NAME_MAX_LEN + 1} bytes`),
+    );
+    expect(() => buildChildEnv({}, makeConfig([tooLong]), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`at most ${PROTECTED_NAME_MAX_LEN} bytes`),
+    );
+  });
+
+  it('per-entry check reports the offending index when the bad entry is not first', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { PROTECTED_NAME_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+
+    const names = ['OK_ONE', 'OK_TWO', 'C'.repeat(PROTECTED_NAME_MAX_LEN + 1), 'OK_THREE'];
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      /entry \[2\] is \d+ bytes/,
+    );
+  });
+
+  it('entry-count gate fires before the byte-length gate on multi-violation configs', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES, CANON_PROTECTED_ENV_NAMES_MAX_LEN } =
+      await import('../../src/shim/canon-buf-len.js');
+
+    // 80 × 16-byte entries: 80 × 16 + 79 = 1359 bytes (both > 1023 AND >
+    // 64 entries).  The entry-count error is the more actionable signal
+    // (it points at the structural cap, not the byte cap), so we assert
+    // it surfaces first.
+    const names = Array.from(
+      { length: 80 },
+      (_, i) => `PROTECTED_NAME${String(i).padStart(2, '0')}`,
+    );
+    expect(names.length).toBeGreaterThan(MAX_PROTECTED_ENV_NAMES);
+    expect(Buffer.byteLength(names.join(','), 'utf8')).toBeGreaterThan(
+      CANON_PROTECTED_ENV_NAMES_MAX_LEN,
+    );
+
+    let caught: Error | undefined;
+    try {
+      buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl');
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).toMatch(/has \d+ entries/);
+    expect(caught!.message).not.toMatch(/is \d+ bytes \(comma-joined/);
   });
 });
 

@@ -26064,6 +26064,8 @@ var import_node_crypto = require("node:crypto");
 
 // src/shim/canon-buf-len.ts
 var CANON_PROTECTED_ENV_NAMES_MAX_LEN = 1023;
+var MAX_PROTECTED_ENV_NAMES = 64;
+var PROTECTED_NAME_MAX_LEN = 255;
 
 // src/guest/agent.ts
 var AgentConfig = external_exports.object({
@@ -26693,6 +26695,19 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
   const requireFlags = preloads.map((p) => `--require=${p}`);
   const childNodeOptions = [noAddons, ...requireFlags].join(" ");
   const protectedNames = config2.protected.env.join(",");
+  if (config2.protected.env.length > MAX_PROTECTED_ENV_NAMES) {
+    throw new Error(
+      `SCRIPT_JAIL_PROTECTED_ENV_NAMES has ${config2.protected.env.length} entries; the LD_PRELOAD shim's static protect-list table can hold at most ${MAX_PROTECTED_ENV_NAMES} entries before silently dropping the suffix and leaking the dropped names unannotated.  Reduce the \`protected.env\` list in .script-jail.yml (or split secrets across multiple runs).`
+    );
+  }
+  for (const [idx, name] of config2.protected.env.entries()) {
+    const nameByteLen = Buffer.byteLength(name, "utf8");
+    if (nameByteLen > PROTECTED_NAME_MAX_LEN) {
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] is ${nameByteLen} bytes (${JSON.stringify(name)}); the LD_PRELOAD shim's per-entry buffer can hold at most ${PROTECTED_NAME_MAX_LEN} bytes before silently dropping the entry and leaking the env-var name unannotated.  Shorten or remove the entry in the \`protected.env\` list in .script-jail.yml.`
+      );
+    }
+  }
   const protectedNamesByteLen = Buffer.byteLength(protectedNames, "utf8");
   if (protectedNamesByteLen > CANON_PROTECTED_ENV_NAMES_MAX_LEN) {
     throw new Error(

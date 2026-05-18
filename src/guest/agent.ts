@@ -32,7 +32,11 @@ import { render } from '../lock/render.js';
 import { discoverPkgDirs } from './discover-pkg-dirs.js';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { CANON_PROTECTED_ENV_NAMES_MAX_LEN } from '../shim/canon-buf-len.js';
+import {
+  CANON_PROTECTED_ENV_NAMES_MAX_LEN,
+  MAX_PROTECTED_ENV_NAMES,
+  PROTECTED_NAME_MAX_LEN,
+} from '../shim/canon-buf-len.js';
 
 // ---------------------------------------------------------------------------
 // Config schema
@@ -1155,6 +1159,42 @@ export function buildChildEnv(
   // not valid POSIX env-var names anyway (POSIX permits [A-Za-z_][A-Za-z0-9_]*),
   // so the channel is unambiguous.
   const protectedNames = config.protected.env.join(',');
+
+  // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list
+  // table has a fixed capacity (`MAX_PROTECTED` entries, each at most
+  // `NAME_MAX_LEN - 1 = 255` bytes).  An overall byte-length check by
+  // itself is not enough: a config of 100 short names (`A`,`B`,`C`,…) is
+  // well under the 1023-byte CanonBuf cap but would silently drop every
+  // entry past index 64 inside `load_protect_list_from_bytes` — those
+  // names would leak through env-spy / shim getenv unannotated, exactly
+  // the silent-truncation bug Finding 2 fixed for byte-length.
+  //
+  // Two specific guards: entry count and per-entry byte length.  Both
+  // throw with a precise pointer at the offending entry so the action
+  // operator can fix the misconfiguration without grepping the shim
+  // source.  Both fire BEFORE the byte-length check below so a config
+  // that violates multiple caps surfaces the most actionable error first.
+  if (config.protected.env.length > MAX_PROTECTED_ENV_NAMES) {
+    throw new Error(
+      `SCRIPT_JAIL_PROTECTED_ENV_NAMES has ${config.protected.env.length} entries; ` +
+        `the LD_PRELOAD shim's static protect-list table can hold at most ` +
+        `${MAX_PROTECTED_ENV_NAMES} entries before silently dropping the suffix and ` +
+        `leaking the dropped names unannotated.  Reduce the \`protected.env\` ` +
+        `list in .script-jail.yml (or split secrets across multiple runs).`,
+    );
+  }
+  for (const [idx, name] of config.protected.env.entries()) {
+    const nameByteLen = Buffer.byteLength(name, 'utf8');
+    if (nameByteLen > PROTECTED_NAME_MAX_LEN) {
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] is ${nameByteLen} bytes ` +
+          `(${JSON.stringify(name)}); the LD_PRELOAD shim's per-entry buffer can ` +
+          `hold at most ${PROTECTED_NAME_MAX_LEN} bytes before silently dropping the ` +
+          `entry and leaking the env-var name unannotated.  Shorten or remove ` +
+          `the entry in the \`protected.env\` list in .script-jail.yml.`,
+      );
+    }
+  }
 
   // Audit-trust Finding 2: the shim's `capture_canon` in `src/shim/src/lib.rs`
   // copies `SCRIPT_JAIL_PROTECTED_ENV_NAMES` into a fixed-size CanonBuf
