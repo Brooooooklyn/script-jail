@@ -1810,3 +1810,318 @@ pub unsafe extern "C" fn posix_spawnp(
     set_in_shim(false);
     rc
 }
+
+// ── env mutator guards ──────────────────────────────────────────────────────
+//
+// These wrappers intercept setenv/unsetenv/putenv/clearenv to refuse in-process
+// tampering with the 9 audit-chain env-var names.  A lifecycle script calling
+// e.g. `delete process.env.LD_PRELOAD` compiles to `unsetenv("LD_PRELOAD")`
+// and would silently break the shim chain without this guard.
+//
+// On a refused call the wrapper emits a JSONL `env_tamper` event and returns 0
+// (pretend success — many callers discard the return value, and we want to
+// silently neuter the tamper rather than signal an error that might abort the
+// script).  clearenv is always refused; the other three refuse only when the
+// target name is in AUDIT_PROTECTED_NAMES.
+
+/// The 9 env-var names whose values must remain canonical for the audit chain
+/// to survive.  Stored as byte-slice literals (no NUL terminator) so we can
+/// walk them with cstr_eq_bytes / cstr_starts_with_eq_or_nul.
+static AUDIT_PROTECTED_NAMES: &[&[u8]] = &[
+    b"LD_PRELOAD",
+    b"NODE_OPTIONS",
+    b"SCRIPT_JAIL_LOG_FILE",
+    b"SCRIPT_JAIL_LOG_FD",
+    b"SCRIPT_JAIL_PROTECTED_ENV_FILE",
+    b"SCRIPT_JAIL_SPOOF_PLATFORM",
+    b"SCRIPT_JAIL_SPOOF_ARCH",
+    b"SCRIPT_JAIL_PRELOAD_PATH",
+    b"SCRIPT_JAIL_NODE_OPTIONS",
+];
+
+/// Compare a C-string against a Rust byte slice (no NUL in `bytes`).
+/// Returns true iff the C-string is exactly `bytes` (same bytes + NUL).
+unsafe fn cstr_eq_bytes(c_str: *const c_char, bytes: &[u8]) -> bool {
+    if c_str.is_null() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = *c_str.add(i) as u8;
+        if c != bytes[i] {
+            return false;
+        }
+        i += 1;
+    }
+    // Must terminate exactly at this position.
+    *c_str.add(i) == 0
+}
+
+/// Check whether a C-string name is in the audit-protected set.
+unsafe fn is_audit_protected_env_name(name: *const c_char) -> bool {
+    if name.is_null() {
+        return false;
+    }
+    for &protected in AUDIT_PROTECTED_NAMES {
+        if cstr_eq_bytes(name, protected) {
+            return true;
+        }
+    }
+    false
+}
+
+/// For `putenv("NAME=VALUE")` or `putenv("NAME")` (bare, treated as unsetenv):
+/// check whether the NAME portion (up to '=' or NUL) is in the protected set.
+///
+/// Walks the input bytes matching against each protected name's bytes.  The
+/// input must have '=' or NUL exactly at index `name_bytes.len()` to match.
+unsafe fn is_putenv_name_protected(string: *mut c_char) -> bool {
+    if string.is_null() {
+        return false;
+    }
+    for &name_bytes in AUDIT_PROTECTED_NAMES {
+        let len = name_bytes.len();
+        // Check that the first `len` bytes match.
+        let mut matched = true;
+        for i in 0..len {
+            if (*string.add(i) as u8) != name_bytes[i] {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            // The byte at index `len` must be '=' or NUL for this to be an
+            // exact name match (not a prefix of a longer name).
+            let next = *string.add(len) as u8;
+            if next == b'=' || next == 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Emit a JSONL `env_tamper` audit event.
+///
+/// `op`   — the operation name as bytes (e.g. b"setenv", b"unsetenv").
+/// `name` — Some(ptr) emits `"name":"<escaped>"`.  None omits the field.
+unsafe fn emit_tamper(op: &[u8], name: Option<*const c_char>) {
+    let log_fd = LOG_FD.load(Ordering::Acquire);
+    if log_fd < 0 {
+        return;
+    }
+
+    let mut ts: libc::timespec = core::mem::zeroed();
+    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    let ns: i64 = (ts.tv_sec as i64) * 1_000_000_000i64 + ts.tv_nsec as i64;
+    let pid = libc::getpid();
+
+    let mut buf = [0u8; JSONL_BUF];
+    let mut pos = 0usize;
+
+    // {"kind":"env_tamper","op":"
+    let prefix = br#"{"kind":"env_tamper","op":""#;
+    if prefix.len() > buf.len() {
+        return;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+
+    // op value (trusted ASCII — no escaping needed)
+    if pos + op.len() + 1 > buf.len() {
+        return;
+    }
+    buf[pos..pos + op.len()].copy_from_slice(op);
+    pos += op.len();
+    buf[pos] = b'"';
+    pos += 1;
+
+    // optional "name":"<escaped>" field
+    if let Some(name_ptr) = name {
+        // ,"name":"
+        let mid = br#","name":""#;
+        if pos + mid.len() > buf.len() {
+            return;
+        }
+        buf[pos..pos + mid.len()].copy_from_slice(mid);
+        pos += mid.len();
+
+        // Reserve space for closing quote + ,"refused":true,"pid":...,"ts":...}\n
+        const SUFFIX_RESERVE: usize = 80;
+        let budget_end = JSONL_BUF.saturating_sub(SUFFIX_RESERVE);
+        if pos < budget_end {
+            let written = json_escape(&mut buf[pos..budget_end], name_ptr);
+            pos += written;
+        }
+        if pos + 1 > buf.len() {
+            return;
+        }
+        buf[pos] = b'"';
+        pos += 1;
+    }
+
+    // ,"refused":true
+    let refused = br#","refused":true"#;
+    if pos + refused.len() > buf.len() {
+        return;
+    }
+    buf[pos..pos + refused.len()].copy_from_slice(refused);
+    pos += refused.len();
+
+    // ,"pid":<N>
+    let mid1 = br#","pid":"#;
+    if pos + mid1.len() > buf.len() {
+        return;
+    }
+    buf[pos..pos + mid1.len()].copy_from_slice(mid1);
+    pos += mid1.len();
+    pos += write_i64(&mut buf[pos..], pid as i64);
+
+    // ,"ts":<N>
+    let mid2 = br#","ts":"#;
+    if pos + mid2.len() > buf.len() {
+        return;
+    }
+    buf[pos..pos + mid2.len()].copy_from_slice(mid2);
+    pos += mid2.len();
+    pos += write_i64(&mut buf[pos..], ns);
+
+    // }\n
+    if pos + 2 > buf.len() {
+        return;
+    }
+    buf[pos] = b'}';
+    pos += 1;
+    buf[pos] = b'\n';
+    pos += 1;
+
+    write_all(log_fd, &buf[..pos]);
+}
+
+// Raw forwarders for the 4 env-mutator real symbols.
+
+type SetenvFn = unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> c_int;
+type UnsetenvFn = unsafe extern "C" fn(*const c_char) -> c_int;
+type PutenvFn = unsafe extern "C" fn(*mut c_char) -> c_int;
+type ClearenvFn = unsafe extern "C" fn() -> c_int;
+
+unsafe fn real_setenv_raw(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int {
+    let p = REAL_SETENV.load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    let f: SetenvFn = transmute(p);
+    f(name, value, overwrite)
+}
+
+unsafe fn real_unsetenv_raw(name: *const c_char) -> c_int {
+    let p = REAL_UNSETENV.load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    let f: UnsetenvFn = transmute(p);
+    f(name)
+}
+
+unsafe fn real_putenv_raw(string: *mut c_char) -> c_int {
+    let p = REAL_PUTENV.load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    let f: PutenvFn = transmute(p);
+    f(string)
+}
+
+unsafe fn real_clearenv_raw() -> c_int {
+    let p = REAL_CLEARENV.load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    let f: ClearenvFn = transmute(p);
+    f()
+}
+
+// ── setenv(name, value, overwrite) ─────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn setenv(
+    name: *const c_char,
+    value: *const c_char,
+    overwrite: c_int,
+) -> c_int {
+    if in_shim() {
+        return real_setenv_raw(name, value, overwrite);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_setenv_raw(name, value, overwrite);
+    }
+    set_in_shim(true);
+    if is_audit_protected_env_name(name) {
+        emit_tamper(b"setenv", Some(name));
+        set_in_shim(false);
+        return 0;
+    }
+    let rc = real_setenv_raw(name, value, overwrite);
+    set_in_shim(false);
+    rc
+}
+
+// ── unsetenv(name) ──────────────────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
+    if in_shim() {
+        return real_unsetenv_raw(name);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_unsetenv_raw(name);
+    }
+    set_in_shim(true);
+    if is_audit_protected_env_name(name) {
+        emit_tamper(b"unsetenv", Some(name));
+        set_in_shim(false);
+        return 0;
+    }
+    let rc = real_unsetenv_raw(name);
+    set_in_shim(false);
+    rc
+}
+
+// ── putenv("NAME=VALUE") ────────────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
+    if in_shim() {
+        return real_putenv_raw(string);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_putenv_raw(string);
+    }
+    set_in_shim(true);
+    if is_putenv_name_protected(string) {
+        emit_tamper(b"putenv", Some(string as *const c_char));
+        set_in_shim(false);
+        return 0;
+    }
+    let rc = real_putenv_raw(string);
+    set_in_shim(false);
+    rc
+}
+
+// ── clearenv() ──────────────────────────────────────────────────────────────
+
+#[no_mangle]
+pub unsafe extern "C" fn clearenv() -> c_int {
+    if in_shim() {
+        return real_clearenv_raw();
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_clearenv_raw();
+    }
+    set_in_shim(true);
+    // clearenv is always refused — there is no legitimate reason for an npm
+    // lifecycle script to wipe the entire env, and re-injection would be brittle.
+    emit_tamper(b"clearenv", None);
+    set_in_shim(false);
+    0
+}
