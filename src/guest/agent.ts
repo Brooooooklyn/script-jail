@@ -740,8 +740,10 @@ function buildChildEnv(
     SCRIPT_JAIL_LOG_FILE: EVENTS_FILE_PATH,
     SCRIPT_JAIL_LOG_FD: String(config.log_fd),
     SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedEnvFilePath,
+    SCRIPT_JAIL_PRELOAD_PATH: '/lib/libscriptjail.so',
     SCRIPT_JAIL_SPOOF_PLATFORM: config.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config.spoof.arch,
+    SCRIPT_JAIL_NODE_OPTIONS: preloads.map((p) => `--require=${p}`).join(' '),
     NODE_OPTIONS: [
       ...(baseEnv['NODE_OPTIONS'] ? [baseEnv['NODE_OPTIONS']] : []),
       ...preloads.map((p) => `--require=${p}`),
