@@ -6,6 +6,13 @@ images/firecracker
 images/vmlinux
 images/*.ext4
 images/*.so
+images/*.dylib
+images/*.d
+
+# Spurious ESM-flavoured action bundle.  action.yml uses dist/main.cjs; an
+# accidental dist/main.js (e.g. from `esbuild --outfile=dist/main.js`) would
+# be a stale duplicate that bypasses any gates added to the .cjs bundle.
+dist/main.js
 
 # Local research scratch
 .firecrawl/

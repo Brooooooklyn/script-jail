@@ -119,10 +119,16 @@ function defaultRunnerImage(): RunnerImage {
 // ---------------------------------------------------------------------------
 
 function buildActionBundle(): void {
+  // action.yml's `main:` field points at dist/main.cjs, and `pnpm build:bundle`
+  // writes there too — so this coordinator MUST also write to .cjs. A prior
+  // revision of this file wrote to dist/main.js, which left a stale bundle in
+  // the working tree that bypassed gates added to dist/main.cjs (e.g. the
+  // audit_bypass hard-fail in commit fe13357). action.yml is the source of
+  // truth: keep this aligned with it.
   console.log('[build] Building action bundle: src/main.ts → dist/main.cjs …');
   const esbuildBin = join(REPO_ROOT, 'node_modules', '.bin', 'esbuild');
   const mainSrc = join(REPO_ROOT, 'src', 'main.ts');
-  const mainOut = join(REPO_ROOT, 'dist', 'main.js');
+  const mainOut = join(REPO_ROOT, 'dist', 'main.cjs');
 
   execSync(
     `"${esbuildBin}" "${mainSrc}" ` +
@@ -204,7 +210,7 @@ async function main(): Promise<void> {
   } else {
     buildActionBundle();
   }
-  artifacts.push({ path: join(REPO_ROOT, 'dist', 'main.js') });
+  artifacts.push({ path: join(REPO_ROOT, 'dist', 'main.cjs') });
 
   // Step 2: Rust shim
   if (skipShim) {
