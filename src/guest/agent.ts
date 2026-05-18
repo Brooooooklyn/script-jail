@@ -990,8 +990,19 @@ export class LinuxStraceRunner implements StraceRunner {
     // `<SYSCALL_EXEC_BYPASS>`.  The strace parser (strace-parser.ts) is
     // updated in lockstep so an `execveat(...)` line produces the same
     // `spawn` RawEvent shape as `execve(...)`.
+    // Audit-trust Finding 4 (high, 2026-05-18): strace's default string
+    // size is 32 bytes, which truncates long paths in `openat(...)` output
+    // (e.g. `/tmp/script-jail-events-abc123def4"...`) and silently
+    // defeats the exact-string events-file forgery check.  `-s 4096`
+    // raises the limit far above any realistic Linux PATH_MAX-ish input
+    // while keeping per-line output manageable.  Truncation can still
+    // happen for extreme payloads (argv with megabytes of args), but
+    // 4096 covers every realistic events-file path AND every
+    // realistic exec argv — and forgery detection only depends on the
+    // openat path being intact.
     const straceArgs = [
       '-ff',
+      '-s', '4096',
       '-e', 'trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
       '-o', opts.basePath,
       cmd,

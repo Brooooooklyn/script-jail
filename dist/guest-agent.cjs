@@ -26775,6 +26775,8 @@ var LinuxStraceRunner = class {
   async *run(cmd, args, opts) {
     const straceArgs = [
       "-ff",
+      "-s",
+      "4096",
       "-e",
       "trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2",
       "-o",
