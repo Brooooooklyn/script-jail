@@ -8352,5 +8352,254 @@ describe('runInstallPhase', () => {
       });
       expect(unresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex follow-up (high, 2026-05-19): pending-detach cwd conflict
+    // must taint BOTH parent and child.  The real kernel order is
+    //   1. parent chdir(/A)             — parent cwd = /A
+    //   2. clone(CLONE_FS)              — child shares the fs_struct
+    //   3. child chdir(/root)           — SHARED mutation: both
+    //                                     parent AND child now see /root
+    //   4. child unshare(CLONE_NEWUSER) — kernel detaches; both retain
+    //                                     /root, but now independent.
+    // If strace surfaces steps 3+4 before step 2's clone line and we
+    // reconcile at step 2 with parent=/A vs child=/root, the post-step-3
+    // shared value (/root) is unrecoverable from the model.  Fail closed
+    // on BOTH sides: parent's stale modeled /A must not be trusted for
+    // its own AT_FDCWD-relative opens either.
+    it('pending-cwd-detach conflict taints BOTH parent and child (bug #1)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'cwd-taint-both-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'cwd-taint-both-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent chdir(/A) at the start: parent cwd = /A.
+        { pid: 1000, line: 'chdir("/A") = 0', source: 'strace' },
+        // Child chdir(/root) — at strace-wire time this was the SHARED
+        // group, so the kernel mutated BOTH.  In our model, child is
+        // still a singleton (we haven't seen the clone) so this just
+        // sets child cwd = /root.
+        { pid: 1001, line: 'chdir("/root") = 0', source: 'strace' },
+        // Child unshare — pending marker.
+        { pid: 1001, line: 'unshare(CLONE_NEWUSER) = 0', source: 'strace' },
+        // Parent clone(CLONE_FS) — reconcile: parent=/A vs child=/root
+        // disagree under a pending marker → taint both.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent AT_FDCWD openat — must fail closed (parent cwd was
+        // tainted).  Pre-fix this resolved through /A and could miss
+        // an out-of-tree protected-paths match like /root/.ssh/id_rsa.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent's openat MUST NOT resolve to /A/.ssh/id_rsa — that's
+      // the stale-modeled-cwd bug.
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/.ssh/id_rsa' && r['pid'] === 1000;
+      });
+      expect(leaked).toHaveLength(0);
+      // <UNRESOLVED_PATH> surfaced for the parent — parent's cwd was
+      // tainted by the pending-detach conflict.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1000;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (high, 2026-05-19): pending-detach fd conflict
+    // must drop BOTH parent and child fd entries.  The real kernel
+    // order is
+    //   1. parent openat → fd 7 = /safe
+    //   2. child openat → fd 99 = /root
+    //   3. child dup2(99, 7) — SHARED mutation: fd 7 now points at
+    //      /root for BOTH sides
+    //   4. child unshare(CLONE_FILES) — kernel detaches.
+    // If strace surfaces 2+3+4 before the parent's clone, reconciling
+    // sees parent fd 7 → /safe vs child fd 7 → /root.  The actual
+    // shared post-step-3 state was /root.  Without tainting parent,
+    // parent's openat(7, ...) would still resolve through /safe and
+    // miss protected-paths in /root.
+    it('pending-fd-detach conflict drops BOTH parent and child fd entries (bug #2)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fd-taint-both-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'fd-taint-both-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /safe as fd 7.
+        {
+          pid: 1000,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child opens /root as fd 99.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/root", O_RDONLY|O_DIRECTORY) = 99',
+          source: 'strace',
+        },
+        // Child dup2(99, 7) — in the kernel this mutated the shared
+        // table.  In our model child is still a singleton, so this
+        // sets child fd 7 → /root locally.
+        { pid: 1001, line: 'dup2(99, 7) = 7', source: 'strace' },
+        // Child unshare(CLONE_FILES) — pending fd-detach marker.
+        { pid: 1001, line: 'unshare(CLONE_FILES) = 0', source: 'strace' },
+        // Parent clone(CLONE_FILES) — reconcile: parent fd 7 → /safe
+        // vs child fd 7 → /root.  Conflict + pending marker → drop
+        // BOTH fd-7 entries and mark both groups fd-unknown.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Parent openat(7, ".ssh/id_rsa") — MUST fail closed (stale
+        // fd 7 entry was dropped by the conflict).
+        {
+          pid: 1000,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Parent's openat MUST NOT resolve to /safe/.ssh/id_rsa — that's
+      // the stale-fd-entry bug.
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' && r['path'] === '/safe/.ssh/id_rsa' && r['pid'] === 1000
+        );
+      });
+      expect(leaked).toHaveLength(0);
+      // <UNRESOLVED_PATH> surfaced for the parent — parent's fd 7
+      // entry was dropped by the pending-detach conflict.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1000;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex follow-up (high, 2026-05-19): regression preservation —
+    // when there's NO prior child state to conflict with, the copy
+    // branch still inherits parent's cwd into the child's private
+    // group.  Same shape as bug #1 minus the child's pre-clone chdir.
+    it('pending-cwd-detach without conflict still copies parent cwd to child (no regression)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'no-conflict-copy-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'no-conflict-copy-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent chdir(/A).
+        { pid: 1000, line: 'chdir("/A") = 0', source: 'strace' },
+        // Child unshare — pending marker.  No prior child chdir, so
+        // child has no cwd state of its own.
+        { pid: 1001, line: 'unshare(CLONE_NEWUSER) = 0', source: 'strace' },
+        // Parent clone(CLONE_FS) — copy branch installs parent's /A
+        // into child's private group (no conflict path triggered).
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(AT_FDCWD, "x") — resolves to /A/x via inherited
+        // cwd.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "x", O_RDONLY) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child's openat resolves to /A/x — inherited cwd preserved
+      // when no conflict.
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/A/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // No <UNRESOLVED_PATH> for child — copy succeeded with no
+      // conflict.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
   });
 });

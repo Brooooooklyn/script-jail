@@ -1614,10 +1614,45 @@ export async function runInstallPhase(
               } else if (parentCwd !== undefined && childCwd !== undefined) {
                 if (parentCwd !== childCwd) {
                   // Conflict: child already had its own cwd that
-                  // disagrees with the parent's pre-clone cwd.  Fail
-                  // closed.
+                  // disagrees with the parent's pre-clone cwd.
+                  //
+                  // Codex follow-up (high, 2026-05-19): in the
+                  // pending-detach case (childHadPendingCwdDetach),
+                  // the real kernel order was:
+                  //
+                  //   1. clone(CLONE_FS) — parent + child share fs_struct.
+                  //   2. one of them chdir(<...>) — mutation hits the
+                  //      shared struct, BOTH observe the new cwd.
+                  //   3. child unshare(CLONE_FS|CLONE_NEWUSER|...) —
+                  //      kernel splits the struct into two private
+                  //      copies whose initial state equals the shared
+                  //      state at unshare-time.
+                  //
+                  // When strace surfaces these lines out of order and
+                  // we end up reconciling at step (1) with parent
+                  // and child already holding DIFFERENT cwds, we
+                  // cannot recover the post-step-2 shared value from
+                  // the modeled per-side values: parent's modeled cwd
+                  // is whatever it had pre-share, child's is whatever
+                  // it had post-share (or vice versa).  The correct
+                  // semantic is that BOTH sides should now hold the
+                  // SAME value (the shared one at unshare time), but
+                  // we don't know what it was.  Taint BOTH groups to
+                  // UNKNOWN: fail closed for AT_FDCWD-relative opens
+                  // until each side re-establishes its cwd via an
+                  // absolute chdir.
+                  //
+                  // In the non-pending case (plain fork without
+                  // CLONE_FS), parent and child were never shared,
+                  // so a disagreement just means the child raced
+                  // ahead with its own chdir — only the child needs
+                  // tainting.
                   cwdDelete(childPid);
                   cwdUnknownAdd(childPid);
+                  if (childHadPendingCwdDetach) {
+                    cwdDelete(pid);
+                    cwdUnknownAdd(pid);
+                  }
                 }
                 // else: equal — leave child's value in place.
               } else if (parentCwd !== undefined) {
@@ -1655,6 +1690,12 @@ export async function runInstallPhase(
               if (parentRoot !== childRoot) {
                 const parentPrefix = `${parentRoot}:`;
                 const childPrefix = `${childRoot}:`;
+                // Collect parent-side keys to delete after iteration —
+                // the conflict-on-pending-detach branch needs to drop
+                // BOTH sides' entries (see below), but mutating the
+                // map mid-iteration risks skipping entries on some JS
+                // engines.  Defer deletes.
+                const parentDeletes: string[] = [];
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
                     const suffix = key.slice(parentPrefix.length);
@@ -1671,12 +1712,51 @@ export async function runInstallPhase(
                         });
                       }
                     } else {
-                      // Same fd, different paths — fail closed.
+                      // Same fd, different paths — fail closed on
+                      // the child side.
+                      //
+                      // Codex follow-up (high, 2026-05-19): in the
+                      // pending-detach case (childHadPendingFdDetach),
+                      // the real kernel order was:
+                      //
+                      //   1. clone(CLONE_FILES) — parent + child share
+                      //      files_struct.
+                      //   2. one side dup/close mutates the shared
+                      //      table — BOTH observe the change.
+                      //   3. child unshare(CLONE_FILES) — kernel
+                      //      copies the shared table into two
+                      //      private copies that start at the same
+                      //      shared state.
+                      //
+                      // If strace surfaces these out of order and we
+                      // reconcile at step (1) with parent fd K → /A
+                      // and child fd K → /B disagreeing, the post-
+                      // step-2 shared entry is unrecoverable from the
+                      // model.  Taint BOTH sides: drop the child key
+                      // AND the parent key so subsequent
+                      // openat(<K>, ...) on either side fails closed.
+                      //
+                      // In the non-pending case the two groups were
+                      // never shared; only the child's stale state
+                      // needs dropping.
                       dirfdTable.delete(childKey);
+                      if (childHadPendingFdDetach) {
+                        parentDeletes.push(key);
+                      }
                     }
                   }
                 }
+                for (const key of parentDeletes) {
+                  dirfdTable.delete(key);
+                }
                 if (fdUnknownHas(pid)) {
+                  fdUnknownAdd(childPid);
+                }
+                // Pending-detach conflict also taints the parent's
+                // fd-group unknown bit — any open-by-numeric-fd we
+                // can't model accurately must fail closed.
+                if (childHadPendingFdDetach && parentDeletes.length > 0) {
+                  fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
               }
