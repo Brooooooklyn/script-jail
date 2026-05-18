@@ -47,6 +47,7 @@ function execEv(prog: string, envp_alloc_failed: boolean, argv0: string | null =
       envp_alloc_failed,
       syscall_bypass: false,
       events_file_forgery: false,
+      unresolved_path: false,
       result: 'ok',
       pid: 1,
       ts: 0,

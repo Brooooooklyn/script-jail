@@ -139,6 +139,19 @@ export const ExecEvent = z.object({
   // `<EVENTS_FILE_FORGERY>` under `audit_bypass`, which the host-side
   // `findAuditBypass` scan hard-fails on.
   events_file_forgery: z.boolean().default(false),
+  // Default false for shim-sourced events.  Only set true by the
+  // dirfd/cwd-relative path canonicalizer in runInstallPhase (Finding,
+  // 2026-05-19): strace observed an openat with a numeric dirfd or an
+  // AT_FDCWD-relative path that we COULD NOT resolve (the dirfd's
+  // opening was never seen, or the pid never chdir'd from its inherited
+  // cwd).  Emitting the unresolved relative path as a normal lockfile
+  // event would let a package writing `openat(rootFd, ".ssh/id_rsa",
+  // …)` masquerade as a plain relative read and bypass the
+  // `$HOME/.ssh/**` protected-paths matcher.  Producing a synthetic
+  // exec event with this flag drives normalize.ts to emit
+  // `<UNRESOLVED_PATH>` under `audit_bypass`, which the host-side
+  // `findAuditBypass` scan hard-fails on.
+  unresolved_path: z.boolean().default(false),
   // Audit-trust Finding (high, 2026-05-18): the shim emits one event
   // BEFORE calling real_execve (with result='ok' — optimistic, since
   // successful execs never return) and a SECOND event with

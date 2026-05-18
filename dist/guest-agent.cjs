@@ -24957,6 +24957,19 @@ var ExecEvent = external_exports.object({
   // `<EVENTS_FILE_FORGERY>` under `audit_bypass`, which the host-side
   // `findAuditBypass` scan hard-fails on.
   events_file_forgery: external_exports.boolean().default(false),
+  // Default false for shim-sourced events.  Only set true by the
+  // dirfd/cwd-relative path canonicalizer in runInstallPhase (Finding,
+  // 2026-05-19): strace observed an openat with a numeric dirfd or an
+  // AT_FDCWD-relative path that we COULD NOT resolve (the dirfd's
+  // opening was never seen, or the pid never chdir'd from its inherited
+  // cwd).  Emitting the unresolved relative path as a normal lockfile
+  // event would let a package writing `openat(rootFd, ".ssh/id_rsa",
+  // …)` masquerade as a plain relative read and bypass the
+  // `$HOME/.ssh/**` protected-paths matcher.  Producing a synthetic
+  // exec event with this flag drives normalize.ts to emit
+  // `<UNRESOLVED_PATH>` under `audit_bypass`, which the host-side
+  // `findAuditBypass` scan hard-fails on.
+  unresolved_path: external_exports.boolean().default(false),
   // Audit-trust Finding (high, 2026-05-18): the shim emits one event
   // BEFORE calling real_execve (with result='ok' — optimistic, since
   // successful execs never return) and a SECOND event with
@@ -25894,6 +25907,7 @@ async function runInstallPhase(input) {
   const dirfdTable = /* @__PURE__ */ new Map();
   const fdKey = (pid, fd) => `${pid}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
+  const pidCwdUnknown = /* @__PURE__ */ new Set();
   const canonicalizeOpenTarget = (pid, targetPath, dirfd) => {
     if (dirfd === void 0) {
       if (path.isAbsolute(targetPath)) {
@@ -25907,8 +25921,25 @@ async function runInstallPhase(input) {
     if (dirPath === void 0) return null;
     return path.resolve(dirPath, targetPath);
   };
+  const canonicalizeForEmit = (pid, targetPath, dirfd) => {
+    if (dirfd === void 0) {
+      if (path.isAbsolute(targetPath)) {
+        return path.resolve(targetPath);
+      }
+      const tracked = pidCwd.get(pid);
+      if (tracked !== void 0) {
+        return path.resolve(tracked, targetPath);
+      }
+      if (pidCwdUnknown.has(pid)) return null;
+      return path.resolve(input.cwd, targetPath);
+    }
+    const dirPath = dirfdTable.get(fdKey(pid, dirfd));
+    if (dirPath === void 0) return null;
+    return path.resolve(dirPath, targetPath);
+  };
   const shimLoadedPids = /* @__PURE__ */ new Set();
   const forgerySamples = [];
+  const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
   const recordAttribution = (pid, attr) => {
     if (!attributionSnapshotByPid.has(pid)) {
@@ -25947,9 +25978,17 @@ async function runInstallPhase(input) {
       if (chdirMatch !== null) {
         const rawTarget = chdirMatch[1] ?? "";
         const decoded = unescapeStraceString(rawTarget);
-        const current = pidCwd.get(pid);
-        const resolved = current !== void 0 && !path.isAbsolute(decoded) ? path.resolve(current, decoded) : path.resolve(decoded);
-        pidCwd.set(pid, resolved);
+        if (path.isAbsolute(decoded)) {
+          pidCwd.set(pid, path.resolve(decoded));
+          pidCwdUnknown.delete(pid);
+        } else {
+          const current = pidCwd.get(pid);
+          if (current !== void 0) {
+            pidCwd.set(pid, path.resolve(current, decoded));
+          } else {
+            pidCwdUnknown.add(pid);
+          }
+        }
         continue;
       }
       const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
@@ -25959,6 +25998,10 @@ async function runInstallPhase(input) {
           const dirPath = dirfdTable.get(fdKey(pid, fd));
           if (dirPath !== void 0) {
             pidCwd.set(pid, dirPath);
+            pidCwdUnknown.delete(pid);
+          } else {
+            pidCwdUnknown.add(pid);
+            pidCwd.delete(pid);
           }
         }
         continue;
@@ -26028,6 +26071,27 @@ async function runInstallPhase(input) {
           straceExecsByPid.set(rawEvent.pid, samples);
         }
         if (result === null) continue;
+        if (rawEvent.kind === "read" || rawEvent.kind === "write") {
+          const canonical = canonicalizeForEmit(
+            rawEvent.pid,
+            rawEvent.path,
+            rawEvent.dirfd
+          );
+          if (canonical === null) {
+            unresolvedPathSamples.push({
+              pid: rawEvent.pid,
+              ts: rawEvent.ts,
+              path: rawEvent.path,
+              kind: rawEvent.kind,
+              pkg: result.pkg,
+              lifecycle: result.lifecycle
+            });
+            continue;
+          }
+          const resolved = rawEvent.kind === "read" ? { ...rawEvent, path: canonical } : { ...rawEvent, path: canonical };
+          emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });
+          continue;
+        }
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -26054,6 +26118,7 @@ async function runInstallPhase(input) {
         envp_alloc_failed: false,
         syscall_bypass: true,
         events_file_forgery: false,
+        unresolved_path: false,
         // The synthesised event represents a strace-observed successful
         // execve syscall; tag it `result:'ok'` so it matches the shape
         // of a real successful exec.  This field isn't consumed by
@@ -26078,6 +26143,27 @@ async function runInstallPhase(input) {
       envp_alloc_failed: false,
       syscall_bypass: false,
       events_file_forgery: true,
+      unresolved_path: false,
+      result: "ok",
+      pid: sample.pid,
+      ts: sample.ts
+    };
+    emit({
+      raw: synthetic,
+      pkg: sample.pkg,
+      lifecycle: sample.lifecycle
+    });
+  }
+  for (const sample of unresolvedPathSamples) {
+    const ident = `${sample.kind}:${sample.path}`;
+    const synthetic = {
+      kind: "exec",
+      prog: ident,
+      argv0: ident,
+      envp_alloc_failed: false,
+      syscall_bypass: false,
+      events_file_forgery: false,
+      unresolved_path: true,
       result: "ok",
       pid: sample.pid,
       ts: sample.ts
@@ -26190,6 +26276,11 @@ function normalize(events, ctx) {
           const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
           const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
           block.audit_bypass.push(`<EVENTS_FILE_FORGERY> ${tokenized}`);
+        }
+        if (ev.raw.unresolved_path) {
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
+          const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
+          block.audit_bypass.push(`<UNRESOLVED_PATH> ${tokenized}`);
         }
         break;
       }

@@ -1234,6 +1234,7 @@ describe('runInstallPhase', () => {
           envp_alloc_failed: false,
           syscall_bypass: true,
           events_file_forgery: false,
+          unresolved_path: false,
           result: 'ok',
           pid: 1,
           ts: 0,
@@ -3302,6 +3303,7 @@ describe('runInstallPhase', () => {
           envp_alloc_failed: false,
           syscall_bypass: false,
           events_file_forgery: true,
+          unresolved_path: false,
           result: 'ok',
           pid: 1,
           ts: 0,
@@ -3625,6 +3627,482 @@ describe('runInstallPhase', () => {
       const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
       expect(raw['hidden']).toBe(false);
       expect(raw).not.toHaveProperty('errno');
+    });
+  });
+
+  // Audit-trust Finding (high, 2026-05-19) — dirfd/cwd-relative path
+  // resolution before emit.  Pre-fix, strace-parsed openat events with
+  // a numeric dirfd or AT_FDCWD-relative path were emitted with the
+  // LITERAL relative `path` field; the protected-paths matcher and
+  // cross-package matcher then saw the relative form and bypassed
+  // their checks.
+  //
+  // The fix canonicalizes the path via the dirfd table + per-pid cwd
+  // BEFORE applyProtectedPathsPolicy and emit.  When resolution
+  // succeeds, the absolute path replaces the relative one.  When
+  // resolution fails (numeric dirfd we never observed), we fail
+  // closed: the raw event is dropped and a synthetic `<UNRESOLVED_PATH>`
+  // audit_bypass entry is surfaced so `findAuditBypass` in
+  // src/action/diff.ts hard-fails the lockfile diff.
+  //
+  // For AT_FDCWD-relative opens, the canonicalizer falls back to
+  // `input.cwd` when no explicit chdir was observed (covers the
+  // common case of the install command itself + its children that
+  // never chdir'd).
+  describe('dirfd/cwd-relative path resolved before emit (Finding, 2026-05-19)', () => {
+    const EVENTS_FILE = '/tmp/script-jail-events/events.jsonl';
+
+    // Case 1: dirfd-relative write inside the package.  The package
+    // helper opens its own directory (giving a numeric dirfd), then
+    // writes to `build.log` via openat(<pkg-dirfd>, "build.log", …).
+    // The emitted fs.write event MUST have an absolute path
+    // ($PKG/build.log) — NOT the relative form — so the
+    // cross-package matcher in normalize.ts doesn't false-positive on
+    // the package's own intra-dir write.
+    it('dirfd-relative write inside package dir → absolute path emitted (no false escaped_write)', async () => {
+      const proc = mockProcReader({
+        901: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'helper-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const PKG_DIR = '/work/node_modules/helper-pkg';
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Pkg helper opens its own dir → fd 12.
+        {
+          pid: 901,
+          line: `openat(AT_FDCWD, "${PKG_DIR}", O_RDONLY|O_DIRECTORY) = 12`,
+          source: 'strace',
+        },
+        // Pkg helper writes build.log via the dirfd.
+        {
+          pid: 901,
+          line: 'openat(12, "build.log", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 13',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // We expect two write events: the dir open (read) and the build.log write.
+      const writes = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'write';
+      });
+      expect(writes).toHaveLength(1);
+      const raw = writes[0]!['raw'] as Record<string, unknown>;
+      // Resolved to absolute path, not the literal "build.log".
+      expect(raw['path']).toBe(`${PKG_DIR}/build.log`);
+      // No <UNRESOLVED_PATH> audit_bypass entry for this legitimate write.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Case 2: AT_FDCWD-relative read of a protected file after chdir.
+    // Pre-fix, `openat(AT_FDCWD, ".ssh/id_rsa", …)` was emitted with
+    // path=".ssh/id_rsa" and the protected-paths matcher
+    // (`$HOME/.ssh/**`) couldn't match the relative form — the probe
+    // leaked past the hidden/drop logic.  With chdir tracking + cwd
+    // resolution, the event now carries `/root/.ssh/id_rsa` so the
+    // matcher fires and marks the read hidden.
+    it('AT_FDCWD-relative protected probe after chdir($HOME) → resolved, hidden=true', async () => {
+      const proc = mockProcReader({
+        902: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'probe-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 902,
+          line: 'chdir("/root") = 0',
+          source: 'strace',
+        },
+        {
+          pid: 902,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      // Path resolved to absolute via pidCwd table populated by chdir.
+      expect(raw['path']).toBe('/root/.ssh/id_rsa');
+      // Protected-paths matcher saw the absolute form and marked it hidden.
+      expect(raw['hidden']).toBe(true);
+      // No <UNRESOLVED_PATH> for this — chdir was observed, cwd is tracked.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Case 3: dirfd-relative open with an UNRESOLVABLE dirfd (we
+    // never observed it being opened — could happen if strace -ff
+    // dropped a line, or if the dirfd was inherited across an
+    // unobserved fork).  Fail closed: drop the raw event, surface a
+    // synthetic `<UNRESOLVED_PATH>` audit_bypass entry so
+    // findAuditBypass hard-fails the diff.
+    it('numeric dirfd never observed → raw event dropped, <UNRESOLVED_PATH> audit_bypass surfaced', async () => {
+      const proc = mockProcReader({
+        903: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'orphan-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // No prior openat for fd 99 on this pid → dirfdTable miss.
+        {
+          pid: 903,
+          line: 'openat(99, "secret", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The raw read event must NOT have been emitted — it would carry
+      // the literal "secret" relative path and bypass policy matchers.
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(0);
+      // The synthetic <UNRESOLVED_PATH> audit_bypass entry must be present.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(1);
+      const raw = unresolved[0]!['raw'] as Record<string, unknown>;
+      // Forensic ident carries kind:path so the auditor can see the attempt.
+      expect(raw['prog']).toBe('read:secret');
+      // End-to-end through normalize → render: the entry must surface as
+      // `<UNRESOLVED_PATH> …` under audit_bypass so findAuditBypass catches it.
+      const ev: AttributedEvent = {
+        raw: unresolved[0]!['raw'] as AttributedEvent['raw'],
+        pkg: events[0]!['pkg'] as string,
+        lifecycle: events[0]!['lifecycle'] as AttributedEvent['lifecycle'],
+      };
+      const ctx: NormalizeContext = {
+        roots: { repo: '/work', nodeModules: '/work/node_modules', home: '/root', tmp: '/tmp', cache: '/cache' },
+        pkgDirs: new Map([[ev.pkg, '/work/node_modules/orphan-pkg']]),
+      };
+      const out = normalize([ev], ctx);
+      const block = out.get(ev.pkg)!.lifecycle.postinstall!;
+      expect(block.audit_bypass.some((e) => e.startsWith('<UNRESOLVED_PATH>'))).toBe(true);
+    });
+
+    // Case 4: a numeric dirfd we never observed for a WRITE — same
+    // fail-closed behavior as case 3 but ensures the write branch is
+    // covered, not just read.
+    // Codex adversarial follow-up (high, 2026-05-19): a relative chdir
+    // from an untracked-cwd pid must NOT be resolved against the agent
+    // process's cwd.  Pre-fix, `path.resolve("subdir")` produced
+    // `<agent_cwd>/subdir`, which was then trusted by canonicalizeForEmit
+    // and emitted as a normal absolute path — bypassing protected-paths /
+    // cross-package matchers on the real target.  Post-fix, the pid is
+    // marked cwd-unknown and AT_FDCWD-relative opens from it fail closed.
+    it('relative chdir from untracked-cwd pid → AT_FDCWD-relative opens fail closed (codex follow-up)', async () => {
+      const proc = mockProcReader({
+        910: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'rel-chdir-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Relative chdir from a pid with no prior tracked cwd.
+        // Kernel cwd moves to parent_cwd/subdir — which we don't know.
+        {
+          pid: 910,
+          line: 'chdir("subdir") = 0',
+          source: 'strace',
+        },
+        // Subsequent AT_FDCWD-relative open: must fail closed.
+        {
+          pid: 910,
+          line: 'openat(AT_FDCWD, "secret", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No plain read event for "secret" must leak through.
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === 'secret';
+      });
+      expect(reads).toHaveLength(0);
+      // And no plain read event with the WRONG resolution (input.cwd
+      // joined with "secret") must appear either.
+      const wrongReads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === '/work/secret';
+      });
+      expect(wrongReads).toHaveLength(0);
+      // <UNRESOLVED_PATH> audit_bypass entry MUST be present.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(1);
+      const raw = unresolved[0]!['raw'] as Record<string, unknown>;
+      expect(raw['prog']).toBe('read:secret');
+    });
+
+    // Codex adversarial follow-up (high, 2026-05-19): fchdir to a fd
+    // that was never observed being opened (e.g. inherited across an
+    // unobserved fork, or strace -ff dropped the openat line).  The
+    // kernel cwd has moved to *somewhere* unknown; subsequent
+    // AT_FDCWD-relative opens must fail closed.  Pre-fix, the fchdir
+    // branch was a silent no-op and canonicalizeForEmit would have
+    // fallen back to input.cwd, certifying a wrong absolute path.
+    it('fchdir to unknown fd marks pid cwd-unknown → subsequent AT_FDCWD-relative opens fail closed (codex follow-up)', async () => {
+      const proc = mockProcReader({
+        911: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'fchdir-unknown-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // fd 42 was never opened on this pid — fchdir to unknown fd.
+        {
+          pid: 911,
+          line: 'fchdir(42) = 0',
+          source: 'strace',
+        },
+        // AT_FDCWD-relative open after the state mutation.
+        {
+          pid: 911,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No plain read event for the wrong absolute path (/work/.ssh/id_rsa)
+      // must leak through — that would bypass the $HOME/.ssh/** matcher.
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(0);
+      // <UNRESOLVED_PATH> audit_bypass entry MUST be present.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(1);
+      const raw = unresolved[0]!['raw'] as Record<string, unknown>;
+      expect(raw['prog']).toBe('read:.ssh/id_rsa');
+    });
+
+    // An ABSOLUTE chdir RE-ESTABLISHES confidence after a prior
+    // unresolvable mutation — the new cwd is known, so AT_FDCWD-relative
+    // opens after it resolve normally.
+    it('absolute chdir after unresolvable mutation re-establishes cwd → relative opens resolve again', async () => {
+      const proc = mockProcReader({
+        912: {
+          ppid: 1,
+          env: {
+            npm_package_name: 're-establish-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // First: an unresolvable fchdir.
+        {
+          pid: 912,
+          line: 'fchdir(99) = 0',
+          source: 'strace',
+        },
+        // Then: an absolute chdir re-establishes confidence.
+        {
+          pid: 912,
+          line: 'chdir("/tmp/known") = 0',
+          source: 'strace',
+        },
+        // Now AT_FDCWD-relative resolves against /tmp/known.
+        {
+          pid: 912,
+          line: 'openat(AT_FDCWD, "data.txt", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/tmp/known/data.txt');
+      // The earlier unresolvable fchdir is forgotten — no
+      // <UNRESOLVED_PATH> entry from THIS pid (it had no relative
+      // opens between the fchdir and the absolute chdir).
+      const unresolvedFromThisPid = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 912;
+      });
+      expect(unresolvedFromThisPid).toHaveLength(0);
+    });
+
+    it('numeric dirfd never observed (write) → raw event dropped, <UNRESOLVED_PATH> audit_bypass surfaced', async () => {
+      const proc = mockProcReader({
+        904: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'orphan-write-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // fd 77 was never opened on this pid; openat with it = dirfd miss.
+        {
+          pid: 904,
+          line: 'openat(77, "evil", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 8',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // No plain write event should leak through carrying "evil".
+      const writes = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'write';
+      });
+      expect(writes).toHaveLength(0);
+      // <UNRESOLVED_PATH> must be surfaced with the write kind in its ident.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(1);
+      const raw = unresolved[0]!['raw'] as Record<string, unknown>;
+      expect(raw['prog']).toBe('write:evil');
     });
   });
 

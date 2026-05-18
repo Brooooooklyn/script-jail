@@ -191,6 +191,32 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
             : ident;
           block.audit_bypass.push(`<EVENTS_FILE_FORGERY> ${tokenized}`);
         }
+        // Audit-trust Finding (high, 2026-05-19): a strace-observed
+        // dirfd/cwd-relative read or write could not be canonicalized
+        // (numeric dirfd whose source we never saw, or AT_FDCWD-relative
+        // path from a pid with no tracked cwd).  Emitting the unresolved
+        // relative path as a normal lockfile event would let an attacker
+        // probe protected paths (`openat(rootFd, ".ssh/id_rsa", …)`) or
+        // forge writes inside their package dir (`openat(pkgDirFd,
+        // "build.log", …)` reading as an escaped write) and bypass the
+        // protected-paths / cross-package matchers.  Surface as
+        // `<UNRESOLVED_PATH> …` under `audit_bypass`.  The forensic
+        // identifier is `prog` — the canonicalizer-fail synthesiser
+        // sets it to the literal unresolved relative path so the
+        // auditor can see what the script tried to open.
+        if (ev.raw.unresolved_path) {
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0
+            ? ev.raw.argv0
+            : ev.raw.prog;
+          // Unresolved paths are by definition relative (no leading '/'),
+          // so token substitution has nothing to bite on — render as-is.
+          // We still defensively call tokenize() for absolute idents to
+          // mirror the other audit_bypass branches.
+          const tokenized = ident.startsWith('/')
+            ? tokenize(ident, ctx.roots, pkgDir)
+            : ident;
+          block.audit_bypass.push(`<UNRESOLVED_PATH> ${tokenized}`);
+        }
         break;
       }
       case 'env_tamper': {

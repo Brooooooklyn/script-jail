@@ -452,6 +452,31 @@ export async function runInstallPhase(
   // this map is the proper resolution.
   const pidCwd = new Map<number, string>();
 
+  // Audit-trust Finding (high, 2026-05-19, codex follow-up): set of pids
+  // whose cwd state we OBSERVED a mutation event for but COULD NOT
+  // resolve.  Membership in this set is "sticky": once a pid lands
+  // here, AT_FDCWD-relative opens from it fail closed via the emit-time
+  // canonicalizer until a SUCCESSFUL absolute chdir re-establishes a
+  // known cwd.  Two cases populate it:
+  //
+  //   (a) `chdir("<relative>")` with no prior pidCwd entry.  Resolving
+  //       the relative target against the agent process's cwd (or
+  //       input.cwd) would produce a NON-NULL absolute path that is
+  //       almost certainly wrong (the traced pid's actual cwd at
+  //       fork-time is what relative chdir is anchored to).  We mark
+  //       cwd unknown and fail closed on subsequent relative opens.
+  //
+  //   (b) `fchdir(<unknown-fd>) = 0`.  Strace observed a successful
+  //       fchdir, but the fd is not in our dirfdTable — could be an
+  //       inherited fd, a fork-time dup, or a strace line we missed.
+  //       The kernel's cwd has moved to *somewhere*; we don't know
+  //       where.  Mark unknown and fail closed.
+  //
+  // A subsequent `chdir("/absolute")` removes the pid from the set and
+  // re-seeds `pidCwd` with the absolute path — confidence is
+  // re-established because absolute chdir doesn't depend on prior cwd.
+  const pidCwdUnknown = new Set<number>();
+
   /**
    * Canonicalize the target path of an openat write event for comparison
    * against `eventsFilePathCanonical`.  Returns the canonical absolute
@@ -499,6 +524,67 @@ export async function runInstallPhase(
     return path.resolve(dirPath, targetPath);
   };
 
+  // Audit-trust Finding (high, 2026-05-19): a separate canonicalizer for
+  // the *emit* path (NOT the events-file forgery detector).  Same logic
+  // as `canonicalizeOpenTarget`, with one difference: when a pid has
+  // no tracked cwd AND we have NOT observed an unresolvable state
+  // mutation for that pid, we fall back to `input.cwd` — the install
+  // command's initial working directory.  This is the natural inherited
+  // cwd for the install command's pid tree when no explicit chdir was
+  // issued.  Without this fallback, every AT_FDCWD-relative read/write
+  // from the install command itself would route through the unresolved
+  // fail-closed path and flood `audit_bypass` with `<UNRESOLVED_PATH>`
+  // entries.
+  //
+  // Codex follow-up (high, 2026-05-19): the fallback is GATED on
+  // `pidCwdUnknown` not containing the pid.  Membership means we
+  // observed a chdir/fchdir that we couldn't resolve — in that state
+  // the kernel's cwd has moved to *somewhere*, but not to `input.cwd`.
+  // Falling back to `input.cwd` would silently certify a wrong
+  // absolute path; the strict fail-closed behavior catches the:
+  //   (a) `chdir("<relative>")` from an untracked pid → kernel cwd is
+  //       parent_cwd/relative, which is NOT input.cwd unless the
+  //       parent never moved.
+  //   (b) `fchdir(<unknown-fd>)` → kernel cwd is wherever that fd's
+  //       directory was, completely opaque to us.
+  //
+  // The events-file forgery detector deliberately does NOT use this
+  // fallback: there `null` from canonicalize means "drop the
+  // canonical-equality check, fall back to Layer-1 basename match" —
+  // a conservative posture that pairs with the unguessable per-run
+  // random basename for safety.  Using `input.cwd` as a fallback in
+  // the forgery detector would risk false positives if any pid wrote
+  // to `$INPUT_CWD/<random-basename>` for legitimate reasons.
+  //
+  // dirfd opens with an unknown dirfd entry still return `null` here —
+  // that case is the actual codex attack vector (a numeric dirfd we
+  // never saw opened) and must fail closed.
+  const canonicalizeForEmit = (
+    pid: number,
+    targetPath: string,
+    dirfd: number | undefined,
+  ): string | null => {
+    if (dirfd === undefined) {
+      if (path.isAbsolute(targetPath)) {
+        return path.resolve(targetPath);
+      }
+      const tracked = pidCwd.get(pid);
+      if (tracked !== undefined) {
+        return path.resolve(tracked, targetPath);
+      }
+      // No tracked cwd.  If we observed an unresolvable state mutation
+      // for this pid, fail closed — `input.cwd` is NOT the kernel's
+      // current cwd in that case.
+      if (pidCwdUnknown.has(pid)) return null;
+      // No state mutations observed → safe to use input.cwd as the
+      // inherited-cwd fallback for the install process's pid tree.
+      return path.resolve(input.cwd, targetPath);
+    }
+    const dirPath = dirfdTable.get(fdKey(pid, dirfd));
+    if (dirPath === undefined) return null;
+    return path.resolve(dirPath, targetPath);
+  };
+
   const shimLoadedPids = new Set<number>();
   interface ForgerySample {
     pid: number;
@@ -508,6 +594,37 @@ export async function runInstallPhase(
     lifecycle: AttributedEvent['lifecycle'];
   }
   const forgerySamples: ForgerySample[] = [];
+
+  // Audit-trust Finding (high, 2026-05-19): per-event sample of an openat
+  // read/write whose dirfd/cwd-relative path we could NOT resolve.
+  // Emitting the literal relative path as a normal lockfile event would
+  // bypass:
+  //   (a) the protected-paths matcher (a `$HOME/.ssh/**` pattern can't
+  //       match `".ssh/id_rsa"` — micromatch requires the absolute /
+  //       tokenized form), and
+  //   (b) the cross-package matcher in normalize.ts (a relative
+  //       `"build.log"` doesn't start with the package dir prefix, so a
+  //       package's legitimate intra-dir write reads as an escaped
+  //       write).
+  // We collect samples here and surface one synthetic <UNRESOLVED_PATH>
+  // exec event per offending openat in the post-loop synthesis pass.
+  // Per-event (rather than phase-level setPhaseTamper) granularity
+  // mirrors the existing <EVENTS_FILE_FORGERY> and
+  // <SYSCALL_EXEC_BYPASS> patterns: it lets the auditor see WHICH
+  // package issued the unresolvable open under WHICH lifecycle stage.
+  interface UnresolvedPathSample {
+    pid: number;
+    ts: number;
+    // The literal relative path the script tried to open.  Carried
+    // forensically only — never matched against any policy pattern.
+    path: string;
+    // Kind (read|write) is preserved so the audit_bypass entry can
+    // include it for context.
+    kind: 'read' | 'write';
+    pkg: string;
+    lifecycle: AttributedEvent['lifecycle'];
+  }
+  const unresolvedPathSamples: UnresolvedPathSample[] = [];
 
   // Audit-trust Finding 3 (high, 2026-05-18): a raw `syscall(SYS_execve, …)`
   // bypass with an attacker-controlled `envp` produces a child whose
@@ -698,11 +815,36 @@ export async function runInstallPhase(
       if (chdirMatch !== null) {
         const rawTarget = chdirMatch[1] ?? '';
         const decoded = unescapeStraceString(rawTarget);
-        const current = pidCwd.get(pid);
-        const resolved = current !== undefined && !path.isAbsolute(decoded)
-          ? path.resolve(current, decoded)
-          : path.resolve(decoded);
-        pidCwd.set(pid, resolved);
+        if (path.isAbsolute(decoded)) {
+          // Absolute chdir: resolve to canonical absolute form,
+          // re-establish confidence (remove unknown-state mark).
+          pidCwd.set(pid, path.resolve(decoded));
+          pidCwdUnknown.delete(pid);
+        } else {
+          // Relative chdir.  Codex follow-up (high, 2026-05-19): pre-
+          // fix, we computed `path.resolve(current ?? '', decoded)` —
+          // when `current` was undefined, `path.resolve` falls back to
+          // the AGENT process's cwd (process.cwd()), NOT the traced
+          // pid's actual cwd.  That silently certified a wrong
+          // absolute path and let subsequent AT_FDCWD-relative opens
+          // bypass protected-paths / cross-package matchers.
+          //
+          // Strict fix: only honour relative chdir when we have a
+          // tracked prior cwd.  Otherwise mark the pid's cwd state
+          // unknown so the emit canonicalizer fails closed on later
+          // relative opens.
+          const current = pidCwd.get(pid);
+          if (current !== undefined) {
+            pidCwd.set(pid, path.resolve(current, decoded));
+            // Keep pidCwdUnknown unchanged: a relative chdir on top
+            // of a known cwd produces a known cwd.
+          } else {
+            pidCwdUnknown.add(pid);
+            // Do NOT pidCwd.set(...) here — leaving the entry absent
+            // means canonicalizeForEmit consults pidCwdUnknown and
+            // returns null.
+          }
+        }
         continue;
       }
       const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
@@ -712,6 +854,18 @@ export async function runInstallPhase(
           const dirPath = dirfdTable.get(fdKey(pid, fd));
           if (dirPath !== undefined) {
             pidCwd.set(pid, dirPath);
+            // Successful fchdir to a KNOWN fd: re-establish confidence.
+            pidCwdUnknown.delete(pid);
+          } else {
+            // Codex follow-up (high, 2026-05-19): successful fchdir to
+            // an UNKNOWN fd means the kernel's cwd has moved to
+            // *somewhere*, but we don't know where.  Pre-fix this
+            // branch was a silent no-op — leaving pidCwd as it was
+            // (or absent) and letting canonicalizeForEmit fall back
+            // to input.cwd, which is wrong.  Mark cwd unknown so
+            // subsequent AT_FDCWD-relative opens fail closed.
+            pidCwdUnknown.add(pid);
+            pidCwd.delete(pid);
           }
         }
         continue;
@@ -950,6 +1104,72 @@ export async function runInstallPhase(
         // get traced.  The bypass synthesis path above is the deliberate
         // exception: an unattributable raw execve IS the signal.
         if (result === null) continue;
+
+        // Audit-trust Finding (high, 2026-05-19): canonicalize dirfd /
+        // cwd-relative read/write paths BEFORE applyProtectedPathsPolicy
+        // and BEFORE emit.  Strace yields the syscall's path argument
+        // verbatim — relative when dirfd is non-AT_FDCWD or when the
+        // pid opened with AT_FDCWD on a cwd-relative path.  Without
+        // canonicalization here, the protected-paths matcher and the
+        // cross-package matcher would both see the literal relative
+        // path:
+        //   * `openat(rootFd, ".ssh/id_rsa", O_RDONLY)` — the
+        //     `$HOME/.ssh/**` pattern can't match `".ssh/id_rsa"`
+        //     (micromatch requires the absolute/tokenized form), so
+        //     the read leaks past the hidden/drop logic.
+        //   * `openat(pkgDirFd, "build.log", O_CREAT|O_WRONLY)` — the
+        //     cross-package matcher in normalize.ts doesn't see the
+        //     pkg dir prefix, so a package's own intra-dir write
+        //     surfaces as a false-positive escaped write.
+        //
+        // Fail-closed posture when resolution is impossible (numeric
+        // dirfd we never observed, OR AT_FDCWD-relative from a pid
+        // with no tracked cwd): we collect an UnresolvedPathSample
+        // and DROP the raw event so the unresolved relative path
+        // never reaches the lockfile.  The post-loop synthesiser
+        // then surfaces one `<UNRESOLVED_PATH>` audit_bypass entry
+        // per drop, matching the existing per-event surfacing of
+        // `<EVENTS_FILE_FORGERY>` and `<SYSCALL_EXEC_BYPASS>` (and
+        // catchable by `findAuditBypass` in src/action/diff.ts).
+        //
+        // Successful absolute-path opens (AT_FDCWD + leading '/')
+        // still pass through this branch — `canonicalizeOpenTarget`
+        // returns `path.resolve(targetPath)` for them, which is the
+        // same string with `.` / `..` segments collapsed.  Going
+        // through canonicalize for those is intentional: it
+        // normalises path-alias forms like `/foo/.././bar` to the
+        // unambiguous form before downstream matchers see them.
+        if (rawEvent.kind === 'read' || rawEvent.kind === 'write') {
+          const canonical = canonicalizeForEmit(
+            rawEvent.pid,
+            rawEvent.path,
+            rawEvent.dirfd,
+          );
+          if (canonical === null) {
+            // Fail closed: record an UnresolvedPathSample for
+            // post-loop synthesis and DROP the raw event so a
+            // relative path never reaches normalize/tokenize.
+            unresolvedPathSamples.push({
+              pid: rawEvent.pid,
+              ts: rawEvent.ts,
+              path: rawEvent.path,
+              kind: rawEvent.kind,
+              pkg: result.pkg,
+              lifecycle: result.lifecycle,
+            });
+            continue;
+          }
+          // Replace path with canonical absolute form.  Spread
+          // preserves discriminant + all transport fields; TS
+          // narrows on the literal `kind` so the spread keeps the
+          // read/write discriminated-union shape.
+          const resolved: RawEvent =
+            rawEvent.kind === 'read'
+              ? { ...rawEvent, path: canonical }
+              : { ...rawEvent, path: canonical };
+          emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });
+          continue;
+        }
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -1017,6 +1237,7 @@ export async function runInstallPhase(
         envp_alloc_failed: false,
         syscall_bypass: true,
         events_file_forgery: false,
+        unresolved_path: false,
         // The synthesised event represents a strace-observed successful
         // execve syscall; tag it `result:'ok'` so it matches the shape
         // of a real successful exec.  This field isn't consumed by
@@ -1051,6 +1272,41 @@ export async function runInstallPhase(
       envp_alloc_failed: false,
       syscall_bypass: false,
       events_file_forgery: true,
+      unresolved_path: false,
+      result: 'ok',
+      pid: sample.pid,
+      ts: sample.ts,
+    };
+    emit({
+      raw: synthetic,
+      pkg: sample.pkg,
+      lifecycle: sample.lifecycle,
+    });
+  }
+
+  // Audit-trust Finding (high, 2026-05-19): emit one synthetic exec event
+  // per dropped openat read/write whose dirfd/cwd-relative path we could
+  // not resolve.  The `unresolved_path: true` flag drives normalize.ts
+  // to surface the entry as `<UNRESOLVED_PATH> …` under `audit_bypass`,
+  // which the host-side `findAuditBypass` scan in src/action/diff.ts
+  // hard-fails on.  The forensic `prog`/`argv0` carries the literal
+  // relative path the script tried to open — never matched against any
+  // policy, only shown to the auditor.  The pkg / lifecycle come from
+  // the attribution result captured at the drop site (Layer 1: we DO
+  // require attribution success here so the drop maps to a concrete
+  // package — unattributed reads were already filtered above).
+  for (const sample of unresolvedPathSamples) {
+    // Prefix the kind so the auditor can distinguish read vs write
+    // attempts (e.g. ".ssh/id_rsa probe" vs "build.log write").
+    const ident = `${sample.kind}:${sample.path}`;
+    const synthetic: RawEvent = {
+      kind: 'exec',
+      prog: ident,
+      argv0: ident,
+      envp_alloc_failed: false,
+      syscall_bypass: false,
+      events_file_forgery: false,
+      unresolved_path: true,
       result: 'ok',
       pid: sample.pid,
       ts: sample.ts,
