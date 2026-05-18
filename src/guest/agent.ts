@@ -281,8 +281,16 @@ export interface StraceTailerOptions {
    * that unlinks / truncates / replaces the events file to erase
    * `audit_bypass` evidence before the tailer reads it.  When undefined no
    * tamper checking is performed (used by tests that supply a private path).
+   *
+   * `mtimeNs` and `ctimeNs` (both captured at file creation in
+   * `createEventsFile`) are also part of the baseline so the tailer can
+   * detect the "utimes restore" tamper: append → truncate → utimes-back-to-
+   * original-mtime.  Pure mtime checking misses this because utimes can set
+   * mtime to any value; ctime cannot — the kernel always advances ctime on
+   * any metadata or content change.  See `drainEventsFile` for the
+   * "ctime advanced without consumed bytes" gate that closes this hole.
    */
-  eventsBaseline?: { ino: bigint; dev: bigint };
+  eventsBaseline?: { ino: bigint; dev: bigint; mtimeNs: bigint; ctimeNs: bigint };
   /**
    * Absolute path of the parent directory that contains the events file
    * (Finding B).  When provided the tailer attaches a second `fs.watch` to
@@ -456,7 +464,7 @@ export async function* runStraceTailer(
   // Append-then-truncate defence (Finding A): a polling tailer with a 50ms
   // window can MISS an intermediate `append → grow → truncate-back` cycle
   // entirely, because the next poll observes `size === eventsPos` again and
-  // the new bytes are gone.  Two cross-checks plug the hole:
+  // the new bytes are gone.  Multiple cross-checks plug the hole:
   //   1. `lastMtime` — kernel updates st_mtim on EVERY write; truncate(2)
   //      counts as a write.  If poll N sees mtime > lastMtime but the file
   //      is the same size as at the previous read position, bytes were
@@ -466,6 +474,18 @@ export async function* runStraceTailer(
   //      `size >= eventsPos`) means the file was truncated.  This catches
   //      the case where a poll happens to land between an append and the
   //      truncation that follows.
+  //   3. `lastConsumedCtime` — ctime advances on every metadata or content
+  //      change AND CANNOT be reset by utimes(2) (only mtime/atime can).
+  //      A second-finding (audit-trust 2026-05-18) tamper: append a line,
+  //      truncate back to the previous size, THEN `utimes(path, atime,
+  //      oldMtime)` to restore the original mtime.  That sequence leaves
+  //      size === eventsPos AND mtime == lastMtime, so checks (1) and (2)
+  //      see nothing — but ctime is now strictly greater than the ctime we
+  //      observed at our last successful drain.  Flagging "ctime advanced
+  //      since last drain but size still at eventsPos" closes the hole.
+  //   4. mtime regression: a `utimes(path, atime, oldMtime)` that restores
+  //      a previously-pinned mtime is itself tamper — legitimate writes
+  //      only move mtime forward.  `mtime < maxObservedMtime` => tamper.
   // We also wire `fs.watch` (inotify on Linux) on the events file inode so
   // truncate(2) / open(O_TRUNC) generate `change` events the polling loop
   // would otherwise have to race to observe.
@@ -473,6 +493,22 @@ export async function* runStraceTailer(
   let eventsBuf = '';
   let lastMtime: bigint = -1n; // -1n until first successful stat
   let maxSeenSize = 0;
+  // Baseline ctime, captured at file creation in createEventsFile.  Updated
+  // to the current ctime each time we successfully read bytes from the
+  // file (the only legitimate cause of ctime advancement).  Any drain that
+  // sees `current.ctime > lastConsumedCtime` while `size === eventsPos`
+  // means something modified the file without leaving bytes for us — the
+  // utimes-restore tamper signature.  Initialized lazily on the first
+  // successful stat when no baseline was provided (tests that omit
+  // eventsBaseline get the old behaviour).
+  let lastConsumedCtime: bigint =
+    opts.eventsBaseline !== undefined ? opts.eventsBaseline.ctimeNs : -1n;
+  // Track max observed mtime across polls so a `utimes`-driven REGRESSION
+  // is flagged even if it happens to land between drains.  Initialized from
+  // the baseline mtime when known so utimes-back-to-pre-creation timestamps
+  // are caught from the first poll.
+  let maxObservedMtime: bigint =
+    opts.eventsBaseline !== undefined ? opts.eventsBaseline.mtimeNs : -1n;
   function recordTamper(reason: string): void {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -532,13 +568,52 @@ export async function* runStraceTailer(
     }
     if (sizeNum > maxSeenSize) maxSeenSize = sizeNum;
 
-    // mtime monotonicity: every write — append OR truncate — bumps st_mtim.
-    // If mtime has advanced since the previous successful stat but the size
-    // is still at `eventsPos` (i.e. no new bytes for us to consume), bytes
-    // were written and then discarded between our polls.  That's the
-    // append-then-truncate canary: the new mtime is the only durable trace
-    // of the writes the attacker tried to erase.
+    // mtime regression: utimes(2) is the only way mtime can move backwards,
+    // and no legitimate writer in this system calls utimes on the events
+    // file.  A monotonic check against the largest mtime we have ever
+    // observed (initialized from the baseline at creation) catches the
+    // utimes-restore tamper where an attacker bumps mtime forward to write
+    // a malicious line, then pins mtime back to its previous value to make
+    // the older "mtime advanced without new bytes" gate quiet.
     const mtimeBig = (stat as unknown as { mtimeNs: bigint }).mtimeNs;
+    const ctimeBig = (stat as unknown as { ctimeNs: bigint }).ctimeNs;
+    if (maxObservedMtime !== -1n && mtimeBig < maxObservedMtime) {
+      recordTamper(
+        `events file mtime regressed (mtimeNs=${mtimeBig} < maxObserved=${maxObservedMtime}, size=${sizeNum} eventsPos=${eventsPos}): ${path}`,
+      );
+      return;
+    }
+    if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
+
+    // ctime monotonicity (utimes-bypass defence): every metadata or content
+    // modification advances ctime, and utimes(2) CANNOT roll it back — only
+    // mtime/atime are settable.  If ctime has advanced since the last drain
+    // that consumed bytes, the file was modified; if `size === eventsPos`
+    // at the same time, the bytes that drove the modification are no longer
+    // visible (truncated away) — and the attacker may have additionally
+    // utimes-restored mtime to silence the legacy mtime-advanced check.
+    // Flag tamper.
+    //
+    // NOTE: ctime advances on EVERY legitimate write too (the shim appends
+    // a JSONL line → ctime + mtime + size all move together).  We only flag
+    // when ctime has advanced AND there are no new bytes to read; the
+    // `lastConsumedCtime` is updated after a successful read so subsequent
+    // legitimate writes do not re-trip this gate.
+    if (
+      lastConsumedCtime !== -1n &&
+      ctimeBig > lastConsumedCtime &&
+      sizeNum === eventsPos
+    ) {
+      recordTamper(
+        `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`,
+      );
+      return;
+    }
+
+    // Retained as defense-in-depth: a plain append-then-truncate (no utimes
+    // restore) bumps mtime AND ctime forward.  The ctime check above will
+    // also fire in that case, but the original mtime check stays in place
+    // so the pre-existing test contract continues to hold.
     if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
       recordTamper(
         `events file mtime advanced without new bytes (mtimeNs=${mtimeBig} > last=${lastMtime}, size=${sizeNum} == eventsPos): ${path}`,
@@ -546,6 +621,12 @@ export async function* runStraceTailer(
       return;
     }
     lastMtime = mtimeBig;
+    // Initialize ctime baseline lazily when the caller did not supply one
+    // (test-only path: production always passes opts.eventsBaseline).  Until
+    // initialized, the ctime gate above is dormant — first observation just
+    // seeds the watermark.
+    if (lastConsumedCtime === -1n) lastConsumedCtime = ctimeBig;
+    if (maxObservedMtime === -1n) maxObservedMtime = mtimeBig;
 
     if (sizeNum <= eventsPos) return;
 
@@ -580,6 +661,11 @@ export async function* runStraceTailer(
     closeSync(fd);
 
     eventsPos += bytesRead;
+    // ctime almost certainly advanced as a result of the same writes we
+    // just consumed.  Record it as the new "last consumed" baseline so the
+    // utimes-restore gate above doesn't fire on the next poll for these
+    // legitimate bytes.
+    lastConsumedCtime = ctimeBig;
 
     const chunk = eventsBuf + buf.slice(0, bytesRead).toString('utf8');
     const newlineIdx = chunk.lastIndexOf('\n');
@@ -1120,8 +1206,20 @@ export interface EventsFile {
   path: string;
   /** Directory containing the file (mode 0700, mkdtemp-generated). */
   dirPath: string;
-  /** Baseline inode + device pair, captured at creation via fstat. */
-  baseline: { ino: bigint; dev: bigint };
+  /**
+   * Baseline {inode, device, mtimeNs, ctimeNs} pair, captured at creation
+   * via fstat.  The tailer compares dev/ino on every drain to detect
+   * unlink+recreate / symlink swap.  `ctimeNs` and `mtimeNs` are captured
+   * additionally to detect the "utimes restore" tamper: a same-UID attacker
+   * who appends to the file, truncates back to the previous size, and then
+   * calls `utimes(path, atime, oldMtime)` can defeat a pure mtime-based
+   * check (since mtime is settable) — but ctime is set by the kernel on
+   * every metadata or content modification and CANNOT be reset by utimes,
+   * making it a stronger signal that something happened to the file after
+   * our last successful drain.  See `drainEventsFile` in `runStraceTailer`
+   * for the use sites.
+   */
+  baseline: { ino: bigint; dev: bigint; mtimeNs: bigint; ctimeNs: bigint };
 }
 
 /**
@@ -1161,10 +1259,17 @@ export function createEventsFile(parentDir: string = '/tmp'): EventsFile {
     fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
     0o600,
   );
-  let baseline: { ino: bigint; dev: bigint };
+  let baseline: { ino: bigint; dev: bigint; mtimeNs: bigint; ctimeNs: bigint };
   try {
     const s = fstatSync(fd, { bigint: true });
-    baseline = { ino: s.ino, dev: s.dev };
+    // ctimeNs (status-change time) is captured in addition to mtimeNs
+    // because ctime is the only mtime-class field that cannot be reset by
+    // utimes(2): the kernel updates it on EVERY metadata or content
+    // modification, including content writes, truncates, chmod, AND a
+    // utimes() call itself.  A utimes-restore tamper bumps ctime but leaves
+    // mtime where the attacker pinned it — so tracking ctime monotonicity
+    // post-create catches the attack that pure mtime monotonicity misses.
+    baseline = { ino: s.ino, dev: s.dev, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
   } finally {
     closeSync(fd);
   }

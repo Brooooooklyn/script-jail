@@ -1382,7 +1382,7 @@ describe('runStraceTailer', () => {
     const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const stat = fstatSyncFn(fd, { bigint: true });
     closeSyncFn(fd);
-    const baseline = { ino: stat.ino, dev: stat.dev };
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
     const tamperRef: { reason: string | null } = { reason: null };
 
     let resolveExit!: () => void;
@@ -1420,7 +1420,7 @@ describe('runStraceTailer', () => {
     const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const stat = fstatSyncFn(fd, { bigint: true });
     closeSyncFn(fd);
-    const baseline = { ino: stat.ino, dev: stat.dev };
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
     const tamperRef: { reason: string | null } = { reason: null };
 
     let resolveExit!: () => void;
@@ -1456,7 +1456,7 @@ describe('runStraceTailer', () => {
     const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const stat = fstatSyncFn(fd, { bigint: true });
     closeSyncFn(fd);
-    const baseline = { ino: stat.ino, dev: stat.dev };
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
     const tamperRef: { reason: string | null } = { reason: null };
 
     let resolveExit!: () => void;
@@ -1492,7 +1492,7 @@ describe('runStraceTailer', () => {
     const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const stat = fstatSyncFn(fd, { bigint: true });
     closeSyncFn(fd);
-    const baseline = { ino: stat.ino, dev: stat.dev };
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
     const tamperRef: { reason: string | null } = { reason: null };
 
     // Pre-populate with a line so the tailer advances eventsPos > 0.
@@ -1547,7 +1547,7 @@ describe('runStraceTailer', () => {
     const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const stat = fstatSyncFn(fd, { bigint: true });
     closeSyncFn(fd);
-    const baseline = { ino: stat.ino, dev: stat.dev };
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
     const tamperRef: { reason: string | null } = { reason: null };
 
     // Pre-populate with one line so eventsPos advances on first drain.
@@ -1616,7 +1616,7 @@ describe('runStraceTailer', () => {
     const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const stat = fstatSyncFn(fd, { bigint: true });
     closeSyncFn(fd);
-    const baseline = { ino: stat.ino, dev: stat.dev };
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
     const tamperRef: { reason: string | null } = { reason: null };
 
     let resolveExit!: () => void;
@@ -1650,6 +1650,114 @@ describe('runStraceTailer', () => {
     expect(tamperRef.reason).not.toBeNull();
     expect(tamperRef.reason).toMatch(
       /parent directory rename|events file disappeared|inode mismatch/,
+    );
+  });
+
+  // Audit-trust 2026-05-18: append-truncate-utimes_restore bypass.
+  //
+  // Same-UID attacker:
+  //   1. stat() the events file, record current mtime.
+  //   2. Append a corrupting/malicious JSONL line — mtime + ctime + size
+  //      all advance.
+  //   3. ftruncate() back to the original size — mtime + ctime advance
+  //      again, size returns to baseline.
+  //   4. utimesSync(path, atime, oldMtime) — mtime is restored to the
+  //      pre-attack value.  ctime, however, ADVANCES one more time (the
+  //      kernel updates ctime on any metadata change, including utimes
+  //      itself) and cannot be set back.
+  // After the sequence, size === eventsPos AND mtime === lastObservedMtime,
+  // so the legacy "mtime advanced without new bytes" gate stays quiet.
+  // ctime, however, is strictly greater than the ctime observed at the
+  // last successful drain (which is the baseline ctime if no drains have
+  // happened yet) — flagging tamper.
+  it('records a tamper reason on append-truncate-utimes_restore (ctime-based detection)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      truncateSync,
+      writeFileSync: writeSyncFn,
+      utimesSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'events.jsonl');
+    // Create with O_EXCL so we own the inode (matches createEventsFile in
+    // production).  Capture {ino, dev, mtimeNs, ctimeNs} at creation —
+    // ctimeNs is the load-bearing baseline for this test.
+    const fd = openSyncFn(
+      eventsPath,
+      // eslint-disable-next-line no-bitwise -- POSIX flag composition
+      fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      0o600,
+    );
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = {
+      ino: stat.ino,
+      dev: stat.dev,
+      mtimeNs: stat.mtimeNs,
+      ctimeNs: stat.ctimeNs,
+    };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 30,
+      drainMs: 80,
+    });
+
+    // Record the pre-attack mtime — we'll restore it at the end of the
+    // tamper sequence to defeat the pure mtime-advanced gate.  Use the
+    // baseline-captured mtime so we know the exact value to pin to (a
+    // re-stat here would race with any background activity).
+    const preAttackAtimeNs = stat.atimeNs;
+    const preAttackMtimeNs = stat.mtimeNs;
+
+    setTimeout(() => {
+      // Step 1: append a malicious line.  This advances mtime, ctime, size.
+      writeSyncFn(
+        eventsPath,
+        '{"kind":"audit_bypass","name":"NPM_TOKEN","pid":99,"ts":1,"hidden":false}\n',
+        { encoding: 'utf8', flag: 'a' },
+      );
+      // Step 2: truncate back to original size (0).  mtime and ctime
+      // advance again; size returns to baseline.
+      truncateSync(eventsPath, 0);
+      // Step 3: utimes — restore mtime to its pre-attack value.  ctime
+      // advances one more time (kernel rule), atime is restored too (the
+      // test pins both fields so atime monotonicity does not factor in).
+      //
+      // node:fs.utimesSync takes seconds or Date.  Convert ns → s (number)
+      // with floor; precision loss only affects atime/mtime, which is the
+      // attacker-favorable case (any precision loss makes the attack
+      // STRONGER, not weaker, so the test remains a valid lower bound).
+      const atimeSec = Number(preAttackAtimeNs) / 1e9;
+      const mtimeSec = Number(preAttackMtimeNs) / 1e9;
+      utimesSync(eventsPath, atimeSec, mtimeSec);
+      // Resolve so the tailer drains and exits.  Give a longer window so
+      // the polling loop and inotify watcher both have a chance to fire.
+      setTimeout(resolveExit, 250);
+    }, 80);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    // The ctime-based detection is the load-bearing signal: even when
+    // mtime is utimes-restored and size is back to eventsPos, ctime is
+    // strictly greater than the baseline ctime.  Accept any of the
+    // ctime-flavoured reasons; "shrank below max-seen" is also acceptable
+    // if a poll happened to land between the append and the truncate
+    // (defense-in-depth).
+    expect(tamperRef.reason).toMatch(
+      /ctime advanced without new bytes|shrank below max-seen|mtime regressed/,
     );
   });
 });

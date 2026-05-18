@@ -26207,6 +26207,8 @@ async function* runStraceTailer(opts) {
   let eventsBuf = "";
   let lastMtime = -1n;
   let maxSeenSize = 0;
+  let lastConsumedCtime = opts.eventsBaseline !== void 0 ? opts.eventsBaseline.ctimeNs : -1n;
+  let maxObservedMtime = opts.eventsBaseline !== void 0 ? opts.eventsBaseline.mtimeNs : -1n;
   function recordTamper(reason) {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -26252,6 +26254,20 @@ async function* runStraceTailer(opts) {
     }
     if (sizeNum > maxSeenSize) maxSeenSize = sizeNum;
     const mtimeBig = stat.mtimeNs;
+    const ctimeBig = stat.ctimeNs;
+    if (maxObservedMtime !== -1n && mtimeBig < maxObservedMtime) {
+      recordTamper(
+        `events file mtime regressed (mtimeNs=${mtimeBig} < maxObserved=${maxObservedMtime}, size=${sizeNum} eventsPos=${eventsPos}): ${path}`
+      );
+      return;
+    }
+    if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
+    if (lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
+      recordTamper(
+        `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`
+      );
+      return;
+    }
     if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
       recordTamper(
         `events file mtime advanced without new bytes (mtimeNs=${mtimeBig} > last=${lastMtime}, size=${sizeNum} == eventsPos): ${path}`
@@ -26259,6 +26275,8 @@ async function* runStraceTailer(opts) {
       return;
     }
     lastMtime = mtimeBig;
+    if (lastConsumedCtime === -1n) lastConsumedCtime = ctimeBig;
+    if (maxObservedMtime === -1n) maxObservedMtime = mtimeBig;
     if (sizeNum <= eventsPos) return;
     const toRead = sizeNum - eventsPos;
     const buf = Buffer.allocUnsafe(toRead);
@@ -26292,6 +26310,7 @@ async function* runStraceTailer(opts) {
     }
     (0, import_node_fs3.closeSync)(fd);
     eventsPos += bytesRead;
+    lastConsumedCtime = ctimeBig;
     const chunk = eventsBuf + buf.slice(0, bytesRead).toString("utf8");
     const newlineIdx = chunk.lastIndexOf("\n");
     if (newlineIdx === -1) {
@@ -26662,7 +26681,7 @@ function createEventsFile(parentDir = "/tmp") {
   let baseline;
   try {
     const s = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
-    baseline = { ino: s.ino, dev: s.dev };
+    baseline = { ino: s.ino, dev: s.dev, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
   } finally {
     (0, import_node_fs3.closeSync)(fd);
   }
