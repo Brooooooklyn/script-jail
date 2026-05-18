@@ -40,6 +40,11 @@ import {
   type RunnerImage,
 } from '../src/rootfs/build.js';
 import { detectRunnerImage } from '../src/action/runner-image.js';
+import {
+  decideShimRebuild as decideShimRebuildShared,
+  shimArtifactIsStale as shimArtifactIsStaleShared,
+  shimSourceInputs as shimSourceInputsShared,
+} from '../src/rootfs/shim-freshness.js';
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -143,69 +148,27 @@ function buildActionBundle(): void {
 // Step 2 — Build Rust shim
 // ---------------------------------------------------------------------------
 
-/**
- * Files whose mtime gates whether `images/libscriptjail.so` is fresh enough
- * to reuse. Touching any of these makes `buildShim` rebuild from cargo.
- *
- * Kept narrow on purpose: these are the inputs cargo actually consumes for
- * the `script-jail-shim` crate. Adding more (e.g. an entire src/shim tree
- * glob) would be more thorough but would also force a rebuild on unrelated
- * edits — `Cargo.toml` already declares the source layout.
- */
+// Freshness helpers now live in src/rootfs/shim-freshness.ts so that both
+// scripts/build.ts:buildShim() AND src/rootfs/build.ts:ensureShim() can call
+// the exact same logic.  See that module for the rationale (Finding 3).
+//
+// We re-export them at the same names with the same signatures used by the
+// existing tests in test/scripts/build-shim-freshness.test.ts; the
+// `shimSourceInputs` default-argument behaviour is preserved.
+
+/** Bound to the shared helper but keeps the `repoRoot = REPO_ROOT` default. */
 export function shimSourceInputs(repoRoot: string = REPO_ROOT): ReadonlyArray<string> {
-  return [
-    join(repoRoot, 'src', 'shim', 'Cargo.toml'),
-    join(repoRoot, 'src', 'shim', 'Cargo.lock'),
-    join(repoRoot, 'src', 'shim', 'rust-toolchain.toml'),
-    join(repoRoot, 'src', 'shim', 'src', 'lib.rs'),
-  ];
+  return shimSourceInputsShared(repoRoot);
 }
 
-/**
- * Pure decision helper for "is the cached `libscriptjail.so` stale?".
- *
- * `artifactMtimeMs` is `null` when the artifact doesn't exist (→ rebuild).
- * `sourceMtimesMs` is the list of mtimes for every shim source input that
- * exists on disk; empty when none are found (→ rebuild defensively).
- *
- * Returns `true` when ANY of:
- *   - the artifact does not exist;
- *   - no shim sources can be found (degenerate / broken checkout);
- *   - any source is newer than the artifact.
- *
- * Pure / no IO — separated from `shimArtifactIsStale` to make it
- * straightforward to unit-test the comparison rules without touching the
- * filesystem.
- */
-export function decideShimRebuild(
-  artifactMtimeMs: number | null,
-  sourceMtimesMs: ReadonlyArray<number>,
-): boolean {
-  if (artifactMtimeMs === null) return true;
-  if (sourceMtimesMs.length === 0) return true;
-  const latestSource = Math.max(...sourceMtimesMs);
-  return latestSource > artifactMtimeMs;
-}
+export const decideShimRebuild = decideShimRebuildShared;
 
-/**
- * Inspect the filesystem and decide whether `libscriptjail.so` needs to be
- * rebuilt. See `decideShimRebuild` for the rule.
- *
- * Missing source files are skipped silently — they cannot have been an input
- * to whatever produced the artifact, so treating them as "ancient" would be
- * misleading.
- */
+/** Bound to the shared helper but keeps the default sources behaviour. */
 export function shimArtifactIsStale(
   shimOut: string,
   sources: ReadonlyArray<string> = shimSourceInputs(),
 ): boolean {
-  const artifactMtime = existsSync(shimOut) ? statSync(shimOut).mtimeMs : null;
-  const sourceMtimes: number[] = [];
-  for (const path of sources) {
-    if (!existsSync(path)) continue;
-    sourceMtimes.push(statSync(path).mtimeMs);
-  }
-  return decideShimRebuild(artifactMtime, sourceMtimes);
+  return shimArtifactIsStaleShared(shimOut, sources);
 }
 
 function buildShim(): void {

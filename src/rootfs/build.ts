@@ -33,6 +33,8 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 
+import { shimArtifactIsStale, shimSourceInputs } from './shim-freshness.js';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -508,21 +510,48 @@ function ensureShim(input: BuildInput): boolean {
     // Linux we rebuild from source; on macOS we surface a fatal error
     // because we cannot produce a Linux .so from a Darwin toolchain.
     const err = validateShimFile(shimOut, expectedMachine);
-    if (err === null) {
-      console.log(`[rootfs] libscriptjail.so already present (validated ELF).`);
-      return true;
-    }
-    console.warn(`[rootfs] images/libscriptjail.so failed ELF validation: ${err}`);
-    if (isMacOS()) {
-      throw new Error(
-        `[rootfs] images/libscriptjail.so is not a valid Linux ELF shared object (${err}). ` +
-        'Cannot rebuild from macOS (Darwin cargo produces a Mach-O .dylib, not a Linux .so). ' +
-        'Delete images/libscriptjail.so and run the rootfs build on a Linux host (or in CI) ' +
-        'so cargo can produce a real x86-64 ELF shared object.',
+    if (err !== null) {
+      console.warn(`[rootfs] images/libscriptjail.so failed ELF validation: ${err}`);
+      if (isMacOS()) {
+        throw new Error(
+          `[rootfs] images/libscriptjail.so is not a valid Linux ELF shared object (${err}). ` +
+          'Cannot rebuild from macOS (Darwin cargo produces a Mach-O .dylib, not a Linux .so). ' +
+          'Delete images/libscriptjail.so and run the rootfs build on a Linux host (or in CI) ' +
+          'so cargo can produce a real x86-64 ELF shared object.',
+        );
+      }
+      console.warn('[rootfs] Removing stale artifact and rebuilding via cargo …');
+      rmSync(shimOut, { force: true });
+    } else {
+      // ELF validation passed.  Finding 3 (audit-trust): the ELF check only
+      // detects MALFORMED artifacts (wrong magic, no PT_DYNAMIC, etc.) — a
+      // structurally-valid `.so` produced from out-of-date Rust source still
+      // looks fine to the validator.  Before accepting the artifact, gate it
+      // through the same mtime-based freshness check that
+      // `scripts/build.ts:buildShim` uses, so a caller that bypasses the
+      // top-level build script (direct `oxnode src/rootfs/build.ts`, future
+      // tooling, etc.) cannot embed a stale shim into the Firecracker rootfs.
+      const sources = shimSourceInputs(REPO_ROOT);
+      if (!shimArtifactIsStale(shimOut, sources)) {
+        console.log(`[rootfs] libscriptjail.so already present (validated ELF + fresh).`);
+        return true;
+      }
+      if (isMacOS()) {
+        // Same constraint as the ELF-validation failure path: we cannot
+        // produce a Linux .so from Darwin cargo.  Fail closed with a clear
+        // message rather than silently keeping the stale artifact.
+        throw new Error(
+          `[rootfs] images/libscriptjail.so is older than the shim source inputs ` +
+          `(${sources.join(', ')}). Cannot rebuild from macOS — touch the artifact, ` +
+          'or run the rootfs build on a Linux host / CI so cargo can produce a fresh ' +
+          'x86-64 ELF shared object.',
+        );
+      }
+      console.warn(
+        '[rootfs] libscriptjail.so is older than shim sources; rebuilding via cargo …',
       );
+      rmSync(shimOut, { force: true });
     }
-    console.warn('[rootfs] Removing stale artifact and rebuilding via cargo …');
-    rmSync(shimOut, { force: true });
   } else if (isMacOS()) {
     console.warn(
       '[rootfs] WARNING: Running on macOS — cannot build libscriptjail.so (requires Linux toolchain).\n' +
@@ -557,6 +586,20 @@ function ensureShim(input: BuildInput): boolean {
     );
   }
   return true;
+}
+
+/**
+ * Test entry point for Finding 3: simulate the decision `ensureShim` makes
+ * for an artifact whose ELF validation already passed.  Returns `'reject'`
+ * (artifact is stale and must be rebuilt or fail closed) or `'accept'`
+ * (artifact is fresh).  Production code paths must continue to call
+ * `ensureShim` itself.
+ */
+export function ensureShimFreshnessDecision(
+  shimOut: string,
+  sources: ReadonlyArray<string>,
+): 'accept' | 'reject' {
+  return shimArtifactIsStale(shimOut, sources) ? 'reject' : 'accept';
 }
 
 // ---------------------------------------------------------------------------

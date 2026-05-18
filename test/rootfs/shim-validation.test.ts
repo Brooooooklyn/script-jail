@@ -15,7 +15,7 @@
 // REJECTED because ld.so cannot load it.
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -25,6 +25,7 @@ import {
   validateShimFile,
   expectedShimMachine,
   machineLabel,
+  ensureShimFreshnessDecision,
   EM_X86_64,
   EM_AARCH64,
   ELF64_EHDR_SIZE,
@@ -496,5 +497,84 @@ describe('machineLabel', () => {
 
   it('falls back to raw e_machine for unknown values', () => {
     expect(machineLabel(0x1234)).toBe(`e_machine=${0x1234}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 (audit-trust): ensureShim must enforce freshness, not just
+// ELF validity.  The ELF validator only catches MALFORMED artifacts; a
+// structurally-valid `.so` produced from out-of-date Rust source is
+// invisible to it.  These tests exercise the freshness gate that
+// `ensureShim` runs AFTER ELF validation but BEFORE accepting the
+// artifact, via the test-only `ensureShimFreshnessDecision` helper.
+// ---------------------------------------------------------------------------
+describe('ensureShim freshness gate (Finding 3)', () => {
+  it('rejects a stale-but-structurally-valid .so when a source is newer', () => {
+    // Models the exact bypass: a previous build left a real Linux ELF on
+    // disk (ELF validator returns null), but a subsequent edit to
+    // src/shim/src/lib.rs means it no longer reflects the audit shim that
+    // the rootfs is supposed to embed.
+    const dir = mkdtempSync(join(tmpdir(), 'shim-stale-elf-'));
+    try {
+      const artifact = join(dir, 'libscriptjail.so');
+      const source = join(dir, 'lib.rs');
+      // Write a real ELF blob to the artifact path — the validator would
+      // accept it, but freshness is what we're gating on here.
+      writeFileSync(artifact, Buffer.from('whatever; freshness is mtime-only'));
+      writeFileSync(source, '// new shim source');
+
+      // Force artifact older than source.
+      const past = new Date(Date.now() - 60_000);
+      utimesSync(artifact, past, past);
+      const now = new Date();
+      utimesSync(source, now, now);
+
+      expect(ensureShimFreshnessDecision(artifact, [source])).toBe('reject');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a fresh artifact whose mtime is newer than every source', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shim-fresh-elf-'));
+    try {
+      const artifact = join(dir, 'libscriptjail.so');
+      const source = join(dir, 'lib.rs');
+      writeFileSync(source, '// shim source');
+      writeFileSync(artifact, Buffer.from('fresh build'));
+
+      const past = new Date(Date.now() - 60_000);
+      utimesSync(source, past, past);
+      const now = new Date();
+      utimesSync(artifact, now, now);
+
+      expect(ensureShimFreshnessDecision(artifact, [source])).toBe('accept');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects when the artifact does not exist (defensive)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shim-missing-'));
+    try {
+      const artifact = join(dir, 'libscriptjail.so');
+      const source = join(dir, 'lib.rs');
+      writeFileSync(source, 'x');
+      expect(ensureShimFreshnessDecision(artifact, [source])).toBe('reject');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects when no shim sources can be found (broken checkout)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shim-degenerate-'));
+    try {
+      const artifact = join(dir, 'libscriptjail.so');
+      writeFileSync(artifact, Buffer.from('whatever'));
+      const missing = join(dir, 'does-not-exist.rs');
+      expect(ensureShimFreshnessDecision(artifact, [missing])).toBe('reject');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
