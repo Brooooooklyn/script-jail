@@ -133,6 +133,17 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         block.network_attempts.push(`${tag}connect ${ev.raw.host}:${ev.raw.port}`);
         break;
       }
+      case 'exec':
+      case 'env_tamper': {
+        // Libc-level audit signals emitted by the LD_PRELOAD shim. They live
+        // in the raw audit JSONL for forensic inspection but are intentionally
+        // not surfaced in the rendered lockfile yet — exec is redundant with
+        // the strace-observed execve syscall already feeding spawn_attempts,
+        // and env_tamper is informational (the operation was refused, the
+        // attacker did not change anything). Future work may add dedicated
+        // LifecycleBlock fields if these signals prove useful as policy deltas.
+        break;
+      }
     }
   }
 

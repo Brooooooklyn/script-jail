@@ -81,6 +81,37 @@ export const NetworkEvent = z.object({
 });
 export type NetworkEvent = z.infer<typeof NetworkEvent>;
 
+// Emitted by the LD_PRELOAD shim's libc exec wrappers (execve, posix_spawn,
+// execvpe, execveat, fexecve). Records the libc-level exec attempt, including
+// the original prog/argv0 BEFORE any PATH search or rewrite. Redundant with
+// strace-observed execve syscalls at the kernel level, so currently dropped
+// in normalize.ts and not surfaced in the rendered lockfile; available in
+// the raw audit JSONL for forensic inspection.
+export const ExecEvent = z.object({
+  kind: z.literal('exec'),
+  prog: z.string(),
+  argv0: z.string().nullable(),
+  envp_alloc_failed: z.boolean(),
+  pid: z.number(),
+  ts: z.number(),
+});
+export type ExecEvent = z.infer<typeof ExecEvent>;
+
+// Emitted by the LD_PRELOAD shim's env-mutator wrappers when a script tries
+// to setenv/unsetenv/putenv/clearenv a protected name (LD_PRELOAD,
+// NODE_OPTIONS, SCRIPT_JAIL_*). The call is silently refused (returns 0 to
+// the caller) and this event records the attempt.
+export const EnvTamperEvent = z.object({
+  kind: z.literal('env_tamper'),
+  op: z.enum(['setenv', 'unsetenv', 'putenv', 'clearenv']),
+  // Omitted for clearenv (whole-environ wipe — no single name).
+  name: z.string().optional(),
+  refused: z.literal(true),
+  pid: z.number(),
+  ts: z.number(),
+});
+export type EnvTamperEvent = z.infer<typeof EnvTamperEvent>;
+
 export const RawEvent = z.discriminatedUnion('kind', [
   FsReadEvent,
   FsWriteEvent,
@@ -88,6 +119,8 @@ export const RawEvent = z.discriminatedUnion('kind', [
   SpawnEvent,
   DlopenEvent,
   NetworkEvent,
+  ExecEvent,
+  EnvTamperEvent,
 ]);
 export type RawEvent = z.infer<typeof RawEvent>;
 
