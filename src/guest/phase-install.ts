@@ -692,32 +692,50 @@ export async function runInstallPhase(
     pendingFdTombstones.delete(pid);
   }
   // Codex follow-up (medium, 2026-05-19, bug #2 — stale-tombstone-on-
-  // reopen): cancel any PRE-marker fd tombstones for `pid` whose target
-  // fd matches `newFd`.  Strace ordering can surface a close/cloexec/
-  // close_range BEFORE a subsequent open/dup/F_DUPFD that reuses the
-  // same fd number — without cancellation, the delayed-clone
-  // reconciler would replay the stale tombstone AFTER unionFd merges
-  // the freshly-reopened mapping into the parent group, deleting the
+  // reopen): cancel any PENDING fd tombstones / range-close actions for
+  // `pid` whose target fd matches `newFd`.  Strace ordering can surface
+  // a close/cloexec/close_range BEFORE a subsequent open/dup/F_DUPFD
+  // that reuses the same fd number — without cancellation, the
+  // delayed-clone reconciler would replay the stale tombstone AFTER
+  // the unified group has the freshly-reopened mapping, deleting the
   // valid entry on BOTH sides.
+  //
+  // Two storage locations are visited:
+  //
+  //   1. The PRE-marker bucket (`pendingFdTombstones`) — point and
+  //      range tombstones recorded before any detach marker exists.
+  //   2. The POST-marker interleaved log on an existing fd-detach
+  //      marker (`pendingFdDetach[pid].postDetachLog`) — once a
+  //      marker is created, subsequent close/cloexec/close_range
+  //      observations queue here.  Stale entries in this log must
+  //      ALSO be excised on reopen; otherwise the marker's reconcile
+  //      replay re-drops `newFd` from the child's private copy.
   //
   // For point tombstones (`close` / `cloexec`) targeting `newFd` we
   // simply drop them.  For range tombstones (`closeRange`) covering
-  // `newFd` we surgically excise `newFd` from the range — splitting
-  // into [first, newFd-1] and [newFd+1, last] when the range had more
-  // than one entry — so other fds in the range remain tombstoned.
-  // Empty / inverted sub-ranges are pruned.
+  // `newFd` — whether stored as a `tombstone` log entry, an `action`
+  // log entry, or in the pre-marker bucket — we surgically excise
+  // `newFd` from the range, splitting into [first, newFd-1] and
+  // [newFd+1, last] when the range had more than one entry.  Empty
+  // / inverted sub-ranges are pruned.
   //
-  // Only PRE-marker tombstones (in `pendingFdTombstones`) are
-  // mutated; once a marker exists, tombstones live in the snapshot's
-  // `preDetachTombstones[]` (frozen at marker time) or the
-  // `postDetachLog[]` (private to the child's group already).
-  function cancelPendingTombstonesForFd(pid: number, newFd: number): void {
-    const bucket = pendingFdTombstones.get(pid);
-    if (bucket === undefined) return;
+  // `action: execveCloexec` log entries are left alone: they sweep
+  // only entries already marked cloexec=true.  The freshly-opened
+  // `newFd` was installed without O_CLOEXEC (and any prior cloexec
+  // tombstone on `newFd` is excised above before the sweep can
+  // observe it), so execveCloexec never touches it.
+  //
+  // The snapshot's `preDetachTombstones[]` is intentionally NOT
+  // touched: those describe mutations against the parent-shared
+  // baseline observed BEFORE the marker existed, frozen at marker
+  // time, and reflect already-propagated shared-kernel state.  The
+  // marker's `entries` baseline is similarly left alone (parent-
+  // state-at-first-detach, different semantics).
+  function cancelTombstonesInBucket(bucket: FdTombstone[], newFd: number): FdTombstone[] {
     const next: FdTombstone[] = [];
     for (const tomb of bucket) {
       if (tomb.kind === 'close' || tomb.kind === 'cloexec') {
-        if (tomb.fd === newFd) continue; // drop stale point tombstone
+        if (tomb.fd === newFd) continue;
         next.push(tomb);
       } else {
         // closeRange — split around newFd if it falls inside.
@@ -743,8 +761,74 @@ export async function runInstallPhase(
         }
       }
     }
-    if (next.length === 0) pendingFdTombstones.delete(pid);
-    else pendingFdTombstones.set(pid, next);
+    return next;
+  }
+  function cancelPendingTombstonesForFd(pid: number, newFd: number): void {
+    // 1. PRE-marker bucket.
+    const bucket = pendingFdTombstones.get(pid);
+    if (bucket !== undefined) {
+      const next = cancelTombstonesInBucket(bucket, newFd);
+      if (next.length === 0) pendingFdTombstones.delete(pid);
+      else pendingFdTombstones.set(pid, next);
+    }
+    // 2. POST-marker interleaved log on the active fd-detach marker.
+    //    Walk in observed order; rewrite each entry whose target fd
+    //    matches `newFd`.  `tombstone` entries follow the same drop /
+    //    split rules as the pre-marker bucket.  `action` entries of
+    //    kind `closeRange` undergo the same range surgery (and are
+    //    dropped if both sub-ranges are empty — the close_range had
+    //    no surviving fds to act on).  Other action kinds (`none`,
+    //    `execveCloexec`) don't reference fd numbers and are passed
+    //    through unchanged.
+    const snap = pendingFdDetach.get(pid);
+    if (snap === undefined) return;
+    const nextLog: FdLogEntry[] = [];
+    for (const entry of snap.postDetachLog) {
+      if (entry.kind === 'tombstone') {
+        const filtered = cancelTombstonesInBucket([entry.tombstone], newFd);
+        for (const tomb of filtered) {
+          nextLog.push({ kind: 'tombstone', tombstone: tomb });
+        }
+        continue;
+      }
+      // entry.kind === 'action'
+      const action = entry.action;
+      if (action.kind === 'closeRange') {
+        if (newFd < action.first || newFd > action.last) {
+          nextLog.push(entry);
+          continue;
+        }
+        if (action.first <= newFd - 1) {
+          nextLog.push({
+            kind: 'action',
+            action: {
+              kind: 'closeRange',
+              first: action.first,
+              last: newFd - 1,
+              cloexec: action.cloexec,
+            },
+          });
+        }
+        if (newFd + 1 <= action.last) {
+          nextLog.push({
+            kind: 'action',
+            action: {
+              kind: 'closeRange',
+              first: newFd + 1,
+              last: action.last,
+              cloexec: action.cloexec,
+            },
+          });
+        }
+        // If both sub-ranges collapsed (single-fd close_range == newFd
+        // only) the action is fully cancelled — drop it.
+        continue;
+      }
+      // Other actions (`none`, `execveCloexec`) don't reference fd
+      // numbers; preserve them verbatim.
+      nextLog.push(entry);
+    }
+    snap.postDetachLog = nextLog;
   }
 
   // Helper: snapshot the child's CURRENT cwd state for a pending marker.

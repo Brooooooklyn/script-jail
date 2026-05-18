@@ -25930,9 +25930,7 @@ async function runInstallPhase(input) {
     for (const tomb of bucket) snap.preDetachTombstones.push(tomb);
     pendingFdTombstones.delete(pid);
   }
-  function cancelPendingTombstonesForFd(pid, newFd) {
-    const bucket = pendingFdTombstones.get(pid);
-    if (bucket === void 0) return;
+  function cancelTombstonesInBucket(bucket, newFd) {
     const next = [];
     for (const tomb of bucket) {
       if (tomb.kind === "close" || tomb.kind === "cloexec") {
@@ -25961,8 +25959,59 @@ async function runInstallPhase(input) {
         }
       }
     }
-    if (next.length === 0) pendingFdTombstones.delete(pid);
-    else pendingFdTombstones.set(pid, next);
+    return next;
+  }
+  function cancelPendingTombstonesForFd(pid, newFd) {
+    const bucket = pendingFdTombstones.get(pid);
+    if (bucket !== void 0) {
+      const next = cancelTombstonesInBucket(bucket, newFd);
+      if (next.length === 0) pendingFdTombstones.delete(pid);
+      else pendingFdTombstones.set(pid, next);
+    }
+    const snap = pendingFdDetach.get(pid);
+    if (snap === void 0) return;
+    const nextLog = [];
+    for (const entry of snap.postDetachLog) {
+      if (entry.kind === "tombstone") {
+        const filtered = cancelTombstonesInBucket([entry.tombstone], newFd);
+        for (const tomb of filtered) {
+          nextLog.push({ kind: "tombstone", tombstone: tomb });
+        }
+        continue;
+      }
+      const action = entry.action;
+      if (action.kind === "closeRange") {
+        if (newFd < action.first || newFd > action.last) {
+          nextLog.push(entry);
+          continue;
+        }
+        if (action.first <= newFd - 1) {
+          nextLog.push({
+            kind: "action",
+            action: {
+              kind: "closeRange",
+              first: action.first,
+              last: newFd - 1,
+              cloexec: action.cloexec
+            }
+          });
+        }
+        if (newFd + 1 <= action.last) {
+          nextLog.push({
+            kind: "action",
+            action: {
+              kind: "closeRange",
+              first: newFd + 1,
+              last: action.last,
+              cloexec: action.cloexec
+            }
+          });
+        }
+        continue;
+      }
+      nextLog.push(entry);
+    }
+    snap.postDetachLog = nextLog;
   }
   function snapshotCwd(pid) {
     return { cwd: cwdGet(pid), unknown: cwdUnknownHas(pid) };

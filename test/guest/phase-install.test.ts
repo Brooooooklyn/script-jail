@@ -10664,5 +10664,348 @@ describe('runInstallPhase', () => {
       });
       expect(parentUnresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex follow-up (medium, 2026-05-19, bug #2 — postDetachLog
+    // stale-tombstone cancellation): once a child has an active
+    // pending-fd-detach marker (e.g. from CLOSE_RANGE_UNSHARE), any
+    // subsequent close/cloexec/close_range observations queue onto
+    // the marker's `postDetachLog[]` in observed order.  A later
+    // openat / dup / F_DUPFD that REUSES the same fd number must
+    // excise the stale entry from the log; otherwise the delayed-
+    // clone reconciler replays the log and the freshly-reopened fd
+    // gets dropped from the child's private copy.
+    //
+    // The three regression tests below stage post-marker scenarios
+    // that ONLY trip the postDetachLog bug being fixed.  Parent
+    // does not pre-open fd 7 — that orthogonal interaction would
+    // expose the dispatcher's copy-pass "fork conflict" path,
+    // which is a separate (pre-existing) concern from this fix.
+    // Restricting the scenarios isolates the postDetachLog stale-
+    // entry pathway: the bug visibly drops the child's freshly-
+    // reopened mapping at log replay, and the fix preserves it.
+    //
+    // Scenario 1 — close_range UNSHARE creates a closeRange action
+    // entry in postDetachLog; child reopens the just-closed fd
+    // before delayed parent clone arrives.
+    //   1. child close_range(7, 7, CLOSE_RANGE_UNSHARE) →
+    //      snapshot taken; postDetachLog seeded with the
+    //      closeRange [7,7] action
+    //   2. child openat(...) = 7 → /B → post-fix: my cancel
+    //      helper splits the closeRange action's range around
+    //      fd 7 (single-fd range collapses to empty → dropped
+    //      from postDetachLog)
+    //   3. delayed parent clone(CLONE_FILES) = child → log
+    //      replay sees an empty postDetachLog → /B mapping
+    //      survives in child's group
+    //   4. child openat(7, "x") → /B/x certified
+    //
+    // Pre-fix: log replay applied the stale closeRange [7,7],
+    // deleting fd 7 from the child's private group; child
+    // openat(7) failed closed.
+    it('close_range UNSHARE marker then reopen in range cancels postDetachLog action entry (bug #2 postDetachLog action)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'post-log-cancel-range-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'post-log-cancel-range-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child close_range(7, 7, CLOSE_RANGE_UNSHARE) at
+        // singleton time.  Creates pendingFdDetach marker with
+        // snapshot.entries=[] (child has no rooted fds yet);
+        // postDetachLog seeded with closeRange [7,7] action.
+        {
+          pid: 1001,
+          line: 'close_range(7, 7, CLOSE_RANGE_UNSHARE) = 0',
+          source: 'strace',
+        },
+        // Child openat → fd 7 = /B in child's rooted group.
+        // Post-fix: cancelPendingTombstonesForFd walks
+        // postDetachLog and excises fd 7 from the closeRange
+        // [7,7] action — the only-fd-in-range case fully
+        // cancels the action, leaving an empty postDetachLog.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  Reconciler
+        // enters the copy branch.  Parent has no fd 7 entries to
+        // copy → no copy-pass conflict.  preDetachTombstones
+        // empty; postDetachLog empty after surgery → child's /B
+        // entry survives.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST resolve to /B/x.  Pre-fix
+        // this failed closed (closeRange [7,7] replay dropped
+        // fd 7).
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 8',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child: /B/x certified.
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // No <UNRESOLVED_PATH> from the openat — the reopened /B
+      // mapping survived the reconciler.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Codex follow-up (medium, 2026-05-19, bug #2 — postDetachLog
+    // stale-tombstone, post-marker close):
+    //   1. child unshare(CLONE_FILES) → snapshot.entries=[],
+    //      postDetachLog=[{action: none}]
+    //   2. child close(7) — fd 7 is UNTRACKED in child's rooted
+    //      table → recordFdTombstone appends a {tombstone, close
+    //      fd 7} entry to postDetachLog (marker already exists)
+    //   3. child openat(...) = 7 → /C — post-fix: cancel helper
+    //      walks postDetachLog and drops the close tombstone for
+    //      fd 7
+    //   4. delayed parent clone(CLONE_FILES) = child
+    //
+    // Reconciler: copy branch.  postDetachLog after surgery is
+    // [{action: none}]; the close tombstone is gone.  Child's
+    // current fd 7 → /C survives; parent (no fd 7) untouched.
+    //
+    // Pre-fix: the close tombstone for fd 7 lived in
+    // postDetachLog through reconciliation; the replay deleted
+    // fd 7 from the child's group → child openat(7) failed
+    // closed.
+    it('post-marker close then reopen cancels postDetachLog close tombstone (bug #2 postDetachLog tombstone)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'post-log-cancel-close-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'post-log-cancel-close-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child unshare(CLONE_FILES) — singleton detach.
+        // snapshotFd captures empty entries; marker created with
+        // postDetachLog=[{action: none}].
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Child close(7) — fd 7 untracked in child's rooted
+        // table; recordFdTombstone appends a close tombstone for
+        // fd 7 onto postDetachLog (marker exists → post-marker
+        // path).
+        {
+          pid: 1001,
+          line: 'close(7) = 0',
+          source: 'strace',
+        },
+        // Child opens /C as fd 7 — Post-fix: cancel helper walks
+        // postDetachLog and drops the close tombstone for fd 7.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/C", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  Copy
+        // branch: parent has no fd 7 → no copy-pass conflict;
+        // preDetachTombstones empty; postDetachLog replay sees
+        // only the `none` action → /C survives.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST resolve to /C/x.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child: /C/x certified.
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/C/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // No <UNRESOLVED_PATH>.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Codex follow-up (medium, 2026-05-19, bug #2 — postDetachLog
+    // stale-tombstone, post-marker cloexec):
+    //   1. child unshare(CLONE_FILES) → snapshot, postDetachLog
+    //      seeded with {action: none}
+    //   2. child fcntl(7, F_SETFD, FD_CLOEXEC) — fd 7 untracked
+    //      → post-marker cloexec tombstone appended to
+    //      postDetachLog
+    //   3. child openat(...) = 7 → /B (no O_CLOEXEC) — Post-fix:
+    //      cancels the cloexec tombstone in postDetachLog
+    //   4. child execve — appends {action: execveCloexec} to
+    //      postDetachLog
+    //   5. delayed parent clone(CLONE_FILES) = child
+    //
+    // Reconciler: copy branch.  postDetachLog replay:
+    //   - none — no-op
+    //   - cloexec tombstone for fd 7 — CANCELLED at step 3 →
+    //     gone
+    //   - execveCloexec — sweeps entries with cloexec=true.  /B
+    //     was opened without O_CLOEXEC (cloexec=false) → not
+    //     swept.
+    //
+    // Result: child fd 7 → /B/x.
+    //
+    // Pre-fix: the cloexec tombstone for fd 7 lived in
+    // postDetachLog through reconciliation; the replay marked
+    // fd 7 (/B) cloexec=true; the subsequent execveCloexec sweep
+    // dropped /B.  Child openat(7) failed closed.
+    it('post-marker cloexec then reopen cancels postDetachLog cloexec tombstone before execve sweep (bug #2 postDetachLog cloexec)', async () => {
+      const proc = mockProcReader({
+        1000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'post-log-cancel-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        1001: {
+          ppid: 1000,
+          env: {
+            npm_package_name: 'post-log-cancel-cloexec-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Child unshare(CLONE_FILES) — singleton detach.  Snapshot
+        // entries empty.  Marker created.
+        {
+          pid: 1001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Child fcntl(7, F_SETFD, FD_CLOEXEC) — fd 7 untracked in
+        // child's rooted table; recorded as POST-marker cloexec
+        // tombstone for fd 7 in postDetachLog.
+        {
+          pid: 1001,
+          line: 'fcntl(7, F_SETFD, FD_CLOEXEC) = 0',
+          source: 'strace',
+        },
+        // Child opens /B as fd 7 (no O_CLOEXEC).  Post-fix:
+        // cancels the post-marker cloexec tombstone in
+        // postDetachLog.  /B installed with cloexec=false.
+        {
+          pid: 1001,
+          line: 'openat(AT_FDCWD, "/B", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child execve — post-marker execveCloexec action queued
+        // onto postDetachLog.  Sweep only affects entries marked
+        // cloexec=true.
+        {
+          pid: 1001,
+          line: 'execve("/bin/sh", ["/bin/sh"], 0x7f...) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  Copy branch:
+        // parent has no fd 7 → no copy-pass conflict.
+        // postDetachLog replay: cloexec tombstone gone;
+        // execveCloexec sees /B with cloexec=false → /B not
+        // swept.
+        {
+          pid: 1000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 1001',
+          source: 'strace',
+        },
+        // Child openat(7, "x") — MUST resolve to /B/x.
+        {
+          pid: 1001,
+          line: 'openat(7, "x", O_RDONLY) = 10',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 1000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Child: /B/x certified (cloexec cancelled before sweep).
+      const childRead = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/B/x' && r['pid'] === 1001;
+      });
+      expect(childRead).toHaveLength(1);
+      // No <UNRESOLVED_PATH>.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 1001;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
   });
 });
