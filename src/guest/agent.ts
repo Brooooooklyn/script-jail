@@ -980,9 +980,19 @@ export class LinuxStraceRunner implements StraceRunner {
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
   ): AsyncIterable<{ pid: number; line: string; source: LineSource }> {
+    // Audit-trust Finding 2 (high, 2026-05-18): strace's `-e trace=execve`
+    // does NOT cover `execveat`.  A lifecycle script that issues
+    // `syscall(SYS_execveat, AT_FDCWD, path, argv, envp, 0)` directly
+    // bypasses the libc execve wrapper (so the shim sees no exec event)
+    // AND, prior to this fix, also bypassed strace's observation entirely.
+    // Adding `execveat` to the trace set means the strace-vs-shim
+    // cross-check in phase-install can still flag the bypass as
+    // `<SYSCALL_EXEC_BYPASS>`.  The strace parser (strace-parser.ts) is
+    // updated in lockstep so an `execveat(...)` line produces the same
+    // `spawn` RawEvent shape as `execve(...)`.
     const straceArgs = [
       '-ff',
-      '-e', 'trace=openat,execve,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
+      '-e', 'trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
       '-o', opts.basePath,
       cmd,
       ...args,

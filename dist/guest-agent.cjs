@@ -25400,6 +25400,18 @@ function _parseStraceLine(line, pid, ts) {
       return parseOpenat(args, retVal, pid, ts);
     case "execve":
       return parseExecve(args, retVal, pid, ts);
+    // Audit-trust Finding 2 (high, 2026-05-18): execveat must be parsed
+    // because the agent's strace invocation now also passes -e trace=execveat.
+    // A raw `syscall(SYS_execveat, AT_FDCWD, path, argv, envp, 0)` from a
+    // lifecycle script previously bypassed both the libc shim AND strace
+    // observation; tracing execveat closes the strace-side gap.  The
+    // wire format is `execveat(dirfd, "path", [argv...], envp, flags)`,
+    // i.e. the same shape as execve with a leading `dirfd` and trailing
+    // `flags`.  We drop both and emit the same `spawn` RawEvent the
+    // execve parser produces, so downstream pipeline code (the per-pid
+    // cross-check in phase-install) treats the two identically.
+    case "execveat":
+      return parseExecveat(args, retVal, pid, ts);
     case "connect":
       return parseConnect(args, retVal, pid, ts);
     case "readlinkat":
@@ -25444,9 +25456,18 @@ function parseExecve(args, retVal, pid, ts) {
   const r = extractQuotedString(pathToken, 0);
   if (r === null) return null;
   const argvToken = args[1] ?? "";
+  return buildSpawnEvent(r[0], argvToken, retVal, pid, ts);
+}
+function parseExecveat(args, retVal, pid, ts) {
+  const pathToken = args[1] ?? "";
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const argvToken = args[2] ?? "";
+  return buildSpawnEvent(r[0], argvToken, retVal, pid, ts);
+}
+function buildSpawnEvent(path, argvToken, retVal, pid, ts) {
   const argv = parseArgvToken(argvToken);
   if (argv.length === 0) {
-    const [path] = r;
     argv.push(path);
   }
   let result;
@@ -25683,6 +25704,12 @@ async function runInstallPhase(input) {
   };
   const straceExecsByPid = /* @__PURE__ */ new Map();
   const shimExecCountByPid = /* @__PURE__ */ new Map();
+  const attributionSnapshotByPid = /* @__PURE__ */ new Map();
+  const recordAttribution = (pid, attr) => {
+    if (!attributionSnapshotByPid.has(pid)) {
+      attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
+    }
+  };
   for await (const { pid, line, source } of input.strace.run(cmd, args, {
     env: input.env,
     cwd: input.cwd,
@@ -25706,6 +25733,7 @@ async function runInstallPhase(input) {
         );
       }
       if (result !== null) {
+        recordAttribution(shimEvent.pid, result);
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -25715,21 +25743,27 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         const result = input.attribution.attribute(rawEvent.pid);
-        if (result === null) continue;
+        if (result !== null) {
+          recordAttribution(rawEvent.pid, result);
+        }
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           const argv0 = rawEvent.argv[0] ?? "";
           const prog = argv0;
+          const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+          const pkg = result?.pkg ?? snapshot?.pkg ?? "<unattributed>";
+          const lifecycle = result?.lifecycle ?? snapshot?.lifecycle ?? "install";
           const samples = straceExecsByPid.get(rawEvent.pid) ?? [];
           samples.push({
             argv0,
             prog,
             pid: rawEvent.pid,
             ts: rawEvent.ts,
-            pkg: result.pkg,
-            lifecycle: result.lifecycle
+            pkg,
+            lifecycle
           });
           straceExecsByPid.set(rawEvent.pid, samples);
         }
+        if (result === null) continue;
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -26600,7 +26634,7 @@ var LinuxStraceRunner = class {
     const straceArgs = [
       "-ff",
       "-e",
-      "trace=openat,execve,connect,readlinkat,statx,renameat2,unlinkat,faccessat2",
+      "trace=openat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2",
       "-o",
       opts.basePath,
       cmd,

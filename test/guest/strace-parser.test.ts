@@ -169,6 +169,73 @@ describe('execve', () => {
   });
 });
 
+// ── execveat ─────────────────────────────────────────────────────────────────
+//
+// Audit-trust Finding 2 (high): strace's `-e trace=execve` does NOT cover
+// execveat.  A lifecycle script that calls `syscall(SYS_execveat, ...)` runs
+// without entering the libc shim AND, prior to the fix, also escaped strace.
+// The agent now passes `-e trace=execve,execveat`; these tests pin the
+// parser side of that contract — an execveat line must produce the same
+// `spawn` RawEvent shape as execve so the per-pid bypass cross-check in
+// phase-install treats the two identically.
+
+describe('execveat', () => {
+  it('success → spawn event with result=ok and argv parsed', () => {
+    const line = 'execveat(AT_FDCWD, "/bin/sh", ["sh", "-c", "echo hi"], 0x7ffd... /* 38 vars */, 0) = 0';
+    const evs = parseStraceLine(line, 1234, 7);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({
+      kind: 'spawn',
+      argv: ['sh', '-c', 'echo hi'],
+      result: 'ok',
+      pid: 1234,
+      ts: 7,
+    });
+  });
+
+  it('ENOENT → spawn event with result=enoent', () => {
+    const line = 'execveat(AT_FDCWD, "/usr/bin/nope", ["nope"], 0x7ffd..., 0) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 99, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['nope'], result: 'enoent', pid: 99 });
+  });
+
+  it('EACCES → spawn event with result=eacces', () => {
+    const line = 'execveat(AT_FDCWD, "/tmp/x.sh", ["./x.sh"], 0x7ffd..., 0) = -1 EACCES (Permission denied)';
+    const evs = parseStraceLine(line, 12, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['./x.sh'], result: 'eacces' });
+  });
+
+  it('numeric dirfd is accepted (parser ignores dirfd token)', () => {
+    // The dirfd may be a numeric fd rather than AT_FDCWD.  We must NOT
+    // drop the line just because the dirfd isn't AT_FDCWD (unlike
+    // openat/statx/etc); the audit signal we care about is the bare
+    // fact that the process called execveat.
+    const line = 'execveat(5, "/bin/sh", ["sh"], 0x7ffd..., 0) = 0';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['sh'], result: 'ok' });
+  });
+
+  it('AT_EMPTY_PATH form (empty path string) falls back to argv[0]', () => {
+    // When AT_EMPTY_PATH is in flags, the path argument is "" and the
+    // executable is identified by the dirfd alone.  We can't usefully
+    // recover that path, so fall back to argv[0] for the prog field.
+    const line = 'execveat(3, "", ["sh"], 0x7ffd..., AT_EMPTY_PATH) = 0';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['sh'], result: 'ok' });
+  });
+
+  it('argv with /* envp */ placeholder for envp still works', () => {
+    const line = 'execveat(AT_FDCWD, "/bin/env", ["env"], [/* envp */], 0) = 0';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['env'], result: 'ok' });
+  });
+});
+
 // ── connect ──────────────────────────────────────────────────────────────────
 
 describe('connect', () => {

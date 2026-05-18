@@ -329,6 +329,17 @@ function _parseStraceLine(line: string, pid: number, ts: number): RawEvent[] | n
   switch (syscallName) {
     case 'openat':      return parseOpenat(args, retVal, pid, ts);
     case 'execve':      return parseExecve(args, retVal, pid, ts);
+    // Audit-trust Finding 2 (high, 2026-05-18): execveat must be parsed
+    // because the agent's strace invocation now also passes -e trace=execveat.
+    // A raw `syscall(SYS_execveat, AT_FDCWD, path, argv, envp, 0)` from a
+    // lifecycle script previously bypassed both the libc shim AND strace
+    // observation; tracing execveat closes the strace-side gap.  The
+    // wire format is `execveat(dirfd, "path", [argv...], envp, flags)`,
+    // i.e. the same shape as execve with a leading `dirfd` and trailing
+    // `flags`.  We drop both and emit the same `spawn` RawEvent the
+    // execve parser produces, so downstream pipeline code (the per-pid
+    // cross-check in phase-install) treats the two identically.
+    case 'execveat':    return parseExecveat(args, retVal, pid, ts);
     case 'connect':     return parseConnect(args, retVal, pid, ts);
     case 'readlinkat':  return parseReadlinkat(args, retVal, pid, ts);
     case 'statx':       return parseStatx(args, retVal, pid, ts);
@@ -392,10 +403,50 @@ function parseExecve(args: string[], retVal: RetVal, pid: number, ts: number): R
 
   // The argv is the second argument (args[1]); the third (envp) is discarded.
   const argvToken = args[1] ?? '';
+  return buildSpawnEvent(r[0], argvToken, retVal, pid, ts);
+}
+
+// Audit-trust Finding 2 (high, 2026-05-18): parse execveat in the same shape
+// as execve.  Wire format:
+//
+//   execveat(AT_FDCWD, "/bin/sh", ["sh", "-c", "..."], 0x.. /* 38 vars */, 0) = 0
+//   execveat(3, "", ["sh"], 0x.., AT_EMPTY_PATH) = 0       (rare; empty-path form)
+//
+// We treat the path argument (args[1]) as authoritative for the program
+// being executed and the argv array (args[2]) for argv, matching execve's
+// handling.  The `dirfd` (args[0]) and `flags` (args[4]) tokens are
+// discarded — they're not load-bearing for the audit signal (the
+// strace-vs-shim cross-check pairs by pid + result=ok, not by syscall
+// path).  If `args[1]` is empty (the AT_EMPTY_PATH form), fall back to
+// the argv's argv[0] so the synthesised bypass event still has a
+// human-readable prog.
+function parseExecveat(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
+  // args[0]=dirfd, args[1]=path, args[2]=argv, args[3]=envp_or_pointer, args[4]=flags
+  const pathToken = args[1] ?? '';
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+
+  const argvToken = args[2] ?? '';
+  return buildSpawnEvent(r[0], argvToken, retVal, pid, ts);
+}
+
+/**
+ * Shared spawn-event constructor used by both execve and execveat parsers.
+ * Mirrors the pre-existing execve handling exactly so the two syscalls
+ * produce identical RawEvent shapes (the downstream cross-check in
+ * src/guest/phase-install.ts pairs strace `spawn` events with shim `exec`
+ * events by pid + result; it does not distinguish the underlying syscall).
+ */
+function buildSpawnEvent(
+  path: string,
+  argvToken: string,
+  retVal: RetVal,
+  pid: number,
+  ts: number,
+): RawEvent[] {
   const argv = parseArgvToken(argvToken);
   if (argv.length === 0) {
     // Fall back to just the executable path from arg0
-    const [path] = r;
     argv.push(path);
   }
 
