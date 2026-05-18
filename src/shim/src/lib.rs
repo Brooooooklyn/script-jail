@@ -37,7 +37,7 @@ const JSONL_BUF: usize = 4096;
 const TRUNC_MARKER: &[u8] = b"<truncated>";
 const CANON_BUF_LEN: usize = 1024;
 /// Room for: LD_PRELOAD + NODE_OPTIONS + 7 × SCRIPT_JAIL_* injected entries
-/// (must be >= 2 + STICKY_NAMES.len()).  Margin keeps small future additions
+/// (must be >= 2 + STICKY_VARS.len()).  Margin keeps small future additions
 /// safe.
 const MAX_ENVP_GROWTH: usize = 12;
 /// Sanity cap on input envp length — rejects hostile or corrupted envps.
@@ -74,6 +74,38 @@ static CANON_NODE_OPTIONS: CanonBuf = CanonBuf {
 };
 
 static CANON_PRELOAD_PATH: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+// Sticky SCRIPT_JAIL_* vars are also snapshotted at shim_init from the trusted
+// parent environ.  Reading them via libc::getenv at exec-time is UNSAFE: a
+// native attacker can mutate `environ[i]` directly (bypassing setenv/putenv
+// guards) to redirect the child's audit chain (log file, protect-list path,
+// platform/arch spoof).  Capturing once during the ctor — before any user
+// code runs — gives us a tamper-proof source of truth for rewrite_envp.
+
+static CANON_LOG_FILE: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+static CANON_LOG_FD: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+static CANON_PROTECTED_ENV_FILE: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+static CANON_SPOOF_PLATFORM: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+static CANON_SPOOF_ARCH: CanonBuf = CanonBuf {
     bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
     len: AtomicUsize::new(0),
 };
@@ -1103,6 +1135,29 @@ unsafe fn shim_init() {
         &CANON_PRELOAD_PATH,
         b"SCRIPT_JAIL_PRELOAD_PATH\0".as_ptr() as *const c_char,
     );
+    // The remaining sticky SCRIPT_JAIL_* vars are also snapshotted here so
+    // exec-time rewrite_envp never has to consult the (mutable) live environ.
+    // See the CANON_LOG_FILE / CANON_LOG_FD / ... static defs for rationale.
+    capture_canon(
+        &CANON_LOG_FILE,
+        b"SCRIPT_JAIL_LOG_FILE\0".as_ptr() as *const c_char,
+    );
+    capture_canon(
+        &CANON_LOG_FD,
+        b"SCRIPT_JAIL_LOG_FD\0".as_ptr() as *const c_char,
+    );
+    capture_canon(
+        &CANON_PROTECTED_ENV_FILE,
+        b"SCRIPT_JAIL_PROTECTED_ENV_FILE\0".as_ptr() as *const c_char,
+    );
+    capture_canon(
+        &CANON_SPOOF_PLATFORM,
+        b"SCRIPT_JAIL_SPOOF_PLATFORM\0".as_ptr() as *const c_char,
+    );
+    capture_canon(
+        &CANON_SPOOF_ARCH,
+        b"SCRIPT_JAIL_SPOOF_ARCH\0".as_ptr() as *const c_char,
+    );
 
     // 7. Open for business.
     INIT_DONE.store(true, Ordering::Release);
@@ -1359,18 +1414,55 @@ unsafe fn emit_exec(
 }
 
 // ── envp rewrite (shared by exec + spawn dispatchers) ──────────────────────
+//
+// INVARIANT: all SCRIPT_JAIL_* sticky vars are snapshotted at shim_init from
+// the parent's trusted environ (see capture_canon in the ctor).  Exec-time
+// reads via real_getenv_raw / libc::getenv are FORBIDDEN here because the
+// live `environ` array is mutable — a native attacker can poke
+// `environ[i] = "SCRIPT_JAIL_LOG_FILE=/dev/null"` directly, bypassing
+// setenv/putenv/unsetenv guards, and the poisoned value would otherwise be
+// stamped into the child's env as canonical.  The CanonBuf statics are
+// written exactly once in the ctor (before INIT_DONE flips) and are read
+// here via an Acquire load — making the snapshot tamper-proof.
 
-/// List of SCRIPT_JAIL_* sticky env-var names re-injected on every exec.
-/// Stored as NUL-terminated literals so we can pass them directly to
-/// real_getenv_raw without copying.
-const STICKY_NAMES: &[&[u8]] = &[
-    b"SCRIPT_JAIL_LOG_FILE\0",
-    b"SCRIPT_JAIL_LOG_FD\0",
-    b"SCRIPT_JAIL_PROTECTED_ENV_FILE\0",
-    b"SCRIPT_JAIL_SPOOF_PLATFORM\0",
-    b"SCRIPT_JAIL_SPOOF_ARCH\0",
-    b"SCRIPT_JAIL_PRELOAD_PATH\0",
-    b"SCRIPT_JAIL_NODE_OPTIONS\0",
+/// Pairs each sticky SCRIPT_JAIL_* env-var name (without NUL) with the
+/// init-time CanonBuf that holds its canonical value.  rewrite_envp reads
+/// values exclusively through these CanonBufs; it does NOT consult the live
+/// process environ for sticky vars.
+struct StickyVar {
+    name: &'static [u8],
+    canon: &'static CanonBuf,
+}
+
+const STICKY_VARS: &[StickyVar] = &[
+    StickyVar {
+        name: b"SCRIPT_JAIL_LOG_FILE",
+        canon: &CANON_LOG_FILE,
+    },
+    StickyVar {
+        name: b"SCRIPT_JAIL_LOG_FD",
+        canon: &CANON_LOG_FD,
+    },
+    StickyVar {
+        name: b"SCRIPT_JAIL_PROTECTED_ENV_FILE",
+        canon: &CANON_PROTECTED_ENV_FILE,
+    },
+    StickyVar {
+        name: b"SCRIPT_JAIL_SPOOF_PLATFORM",
+        canon: &CANON_SPOOF_PLATFORM,
+    },
+    StickyVar {
+        name: b"SCRIPT_JAIL_SPOOF_ARCH",
+        canon: &CANON_SPOOF_ARCH,
+    },
+    StickyVar {
+        name: b"SCRIPT_JAIL_PRELOAD_PATH",
+        canon: &CANON_PRELOAD_PATH,
+    },
+    StickyVar {
+        name: b"SCRIPT_JAIL_NODE_OPTIONS",
+        canon: &CANON_NODE_OPTIONS,
+    },
 ];
 
 /// Build a rewritten EnvBuf from the input envp.  `envp_in` may be NULL — that
@@ -1407,28 +1499,25 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
         return None;
     }
 
-    // Re-inject SCRIPT_JAIL_* sticky values from the current process env.
-    // The shim itself was loaded with these values, so the current process's
-    // env carries the canonical state.
+    // Re-inject SCRIPT_JAIL_* sticky values from the init-time CanonBufs.
+    //
+    // SECURITY: do NOT read these via libc::getenv / real_getenv_raw at
+    // exec-time.  The live `environ` is freely mutable by native code
+    // (direct `environ[i] = ...` writes bypass our setenv/putenv guards),
+    // so any getenv-at-rewrite would let an attacker redirect the child's
+    // audit log, protect-list path, or platform/arch spoof.  The CanonBufs
+    // are snapshotted from the trusted parent environ inside shim_init
+    // BEFORE any user code has had a chance to mutate it.
     //
     // Use overwrite_env (not ensure_env) so a malicious caller cannot pass
-    // e.g. `SCRIPT_JAIL_LOG_FILE=/dev/null` in envp_in and redirect the
-    // child's audit log.  The shim's own value is authoritative.
-    for name_z in STICKY_NAMES {
-        // Strip the trailing NUL for envbuf_find / overwrite_env.
-        let name = &name_z[..name_z.len() - 1];
-        set_in_shim(true);
-        let val_ptr = real_getenv_raw(name_z.as_ptr() as *const c_char);
-        set_in_shim(false);
-        if val_ptr.is_null() {
+    // e.g. `SCRIPT_JAIL_LOG_FILE=/dev/null` in envp_in and shadow the
+    // canonical value.  The CanonBuf snapshot is authoritative.
+    for sticky in STICKY_VARS {
+        let val = canon_bytes(sticky.canon);
+        if val.is_empty() {
             continue;
         }
-        let mut vlen = 0usize;
-        while *val_ptr.add(vlen) != 0 {
-            vlen += 1;
-        }
-        let val = core::slice::from_raw_parts(val_ptr as *const u8, vlen);
-        if !overwrite_env(&mut buf, name, val) {
+        if !overwrite_env(&mut buf, sticky.name, val) {
             free_envbuf(&mut buf);
             return None;
         }
