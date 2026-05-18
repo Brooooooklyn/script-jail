@@ -35,6 +35,14 @@ const MAX_PROTECTED: usize = 64;
 const NAME_MAX_LEN: usize = 256;
 const JSONL_BUF: usize = 4096;
 const TRUNC_MARKER: &[u8] = b"<truncated>";
+// LOAD-BEARING: must stay in lockstep with `CANON_PROTECTED_ENV_NAMES_MAX_LEN`
+// in `src/shim/canon-buf-len.ts`.  That constant equals `CANON_BUF_LEN - 1`
+// (max payload bytes excluding the NUL terminator) and gates the agent's
+// `buildChildEnv` against composing a `SCRIPT_JAIL_PROTECTED_ENV_NAMES` value
+// that would silently truncate inside `capture_canon` below — which would
+// drop the suffix from the protect list and leak those env-var names through
+// env-spy / shim getenv unannotated.  Any change to CANON_BUF_LEN here MUST
+// be mirrored in `src/shim/canon-buf-len.ts` (and vice versa).
 const CANON_BUF_LEN: usize = 1024;
 /// Room for: LD_PRELOAD + NODE_OPTIONS + 7 × SCRIPT_JAIL_* injected entries
 /// (must be >= 2 + STICKY_VARS.len()).  Margin keeps small future additions

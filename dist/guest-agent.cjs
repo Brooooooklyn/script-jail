@@ -10351,6 +10351,7 @@ __export(agent_exports, {
   LinuxVsockConnection: () => LinuxVsockConnection,
   MemoryConnection: () => MemoryConnection,
   PassThrough: () => import_node_stream.PassThrough,
+  buildChildEnv: () => buildChildEnv,
   createEventsFile: () => createEventsFile,
   main: () => main,
   runStraceTailer: () => runStraceTailer
@@ -26006,6 +26007,11 @@ function readAndRegister(pkgPath, result) {
 // src/guest/agent.ts
 var import_node_child_process = require("node:child_process");
 var import_node_crypto = require("node:crypto");
+
+// src/shim/canon-buf-len.ts
+var CANON_PROTECTED_ENV_NAMES_MAX_LEN = 1023;
+
+// src/guest/agent.ts
 var AgentConfig = external_exports.object({
   protected: external_exports.object({
     files: external_exports.array(external_exports.string()).default([]),
@@ -26633,6 +26639,12 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
   const requireFlags = preloads.map((p) => `--require=${p}`);
   const childNodeOptions = [noAddons, ...requireFlags].join(" ");
   const protectedNames = config2.protected.env.join(",");
+  const protectedNamesByteLen = Buffer.byteLength(protectedNames, "utf8");
+  if (protectedNamesByteLen > CANON_PROTECTED_ENV_NAMES_MAX_LEN) {
+    throw new Error(
+      `SCRIPT_JAIL_PROTECTED_ENV_NAMES is ${protectedNamesByteLen} bytes (comma-joined from ${config2.protected.env.length} entries); the LD_PRELOAD shim's CanonBuf can hold at most ${CANON_PROTECTED_ENV_NAMES_MAX_LEN} bytes before silently truncating the suffix and leaking the dropped names unannotated.  Reduce the \`protected.env\` list in .script-jail.yml (or split secrets across multiple runs).`
+    );
+  }
   return {
     ...baseEnv,
     LD_PRELOAD: "/lib/libscriptjail.so",
@@ -26935,6 +26947,7 @@ if (isMain) {
   LinuxVsockConnection,
   MemoryConnection,
   PassThrough,
+  buildChildEnv,
   createEventsFile,
   main,
   runStraceTailer

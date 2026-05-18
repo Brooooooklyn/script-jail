@@ -32,6 +32,7 @@ import { render } from '../lock/render.js';
 import { discoverPkgDirs } from './discover-pkg-dirs.js';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { CANON_PROTECTED_ENV_NAMES_MAX_LEN } from '../shim/canon-buf-len.js';
 
 // ---------------------------------------------------------------------------
 // Config schema
@@ -67,7 +68,7 @@ const AgentConfig = z.object({
   manager: z.enum(['npm', 'pnpm', 'yarn']).optional(),
 });
 
-type AgentConfig = z.infer<typeof AgentConfig>;
+export type AgentConfig = z.infer<typeof AgentConfig>;
 
 // ---------------------------------------------------------------------------
 // Connection abstraction
@@ -1100,7 +1101,12 @@ async function waitForGo(readable: Readable): Promise<void> {
 // Build env dict for child processes
 // ---------------------------------------------------------------------------
 
-function buildChildEnv(
+/**
+ * @internal Exported for unit tests only — production calls this from
+ * `main()`.  The over-long-protect-list rejection (audit-trust Finding 2)
+ * is the load-bearing invariant tested via this surface.
+ */
+export function buildChildEnv(
   baseEnv: NodeJS.ProcessEnv,
   config: AgentConfig,
   eventsFilePath: string,
@@ -1149,6 +1155,32 @@ function buildChildEnv(
   // not valid POSIX env-var names anyway (POSIX permits [A-Za-z_][A-Za-z0-9_]*),
   // so the channel is unambiguous.
   const protectedNames = config.protected.env.join(',');
+
+  // Audit-trust Finding 2: the shim's `capture_canon` in `src/shim/src/lib.rs`
+  // copies `SCRIPT_JAIL_PROTECTED_ENV_NAMES` into a fixed-size CanonBuf
+  // (CANON_BUF_LEN = 1024 bytes including NUL).  If the host composes a list
+  // whose UTF-8 encoding exceeds CANON_BUF_LEN - 1 = 1023 bytes, the shim
+  // SILENTLY truncates the suffix at copy time and the dropped names are
+  // never registered in the protect list — those env-var names would then
+  // leak through env-spy / shim getenv unannotated for every audited child.
+  //
+  // Fail closed at config-construction time on the trusted host side, before
+  // any audit begins.  `Buffer.byteLength('utf8')` matches what the shim sees:
+  // libc passes the env var's raw bytes through to `capture_canon`, which
+  // copies byte-by-byte until either NUL or CANON_BUF_LEN-1 is reached.
+  // Throwing here surfaces the misconfiguration directly to the action
+  // operator rather than producing a misleadingly-clean lockfile.
+  const protectedNamesByteLen = Buffer.byteLength(protectedNames, 'utf8');
+  if (protectedNamesByteLen > CANON_PROTECTED_ENV_NAMES_MAX_LEN) {
+    throw new Error(
+      `SCRIPT_JAIL_PROTECTED_ENV_NAMES is ${protectedNamesByteLen} bytes ` +
+        `(comma-joined from ${config.protected.env.length} entries); the LD_PRELOAD ` +
+        `shim's CanonBuf can hold at most ${CANON_PROTECTED_ENV_NAMES_MAX_LEN} bytes ` +
+        `before silently truncating the suffix and leaking the dropped names ` +
+        `unannotated.  Reduce the \`protected.env\` list in .script-jail.yml ` +
+        `(or split secrets across multiple runs).`,
+    );
+  }
 
   return {
     ...baseEnv,
