@@ -561,15 +561,18 @@ export async function* runStraceTailer(
   // are caught from the first poll.
   let maxObservedMtime: bigint =
     opts.eventsBaseline !== undefined ? opts.eventsBaseline.mtimeNs : -1n;
-  // 2026-05-19: number of consecutive polls observing `ctime advanced AND
-  // size === eventsPos` before flagging tamper.  Linux 5.10 (Ubuntu 22.04
-  // rootfs) sometimes returns stat() with a newer ctime than the size-update
-  // it accompanies, producing a one-shot false positive during active
-  // writes.  Three consecutive polls (~3 × pollIntervalMs) is enough to
-  // outlast the kernel's lazy ctime settle while still catching a real
-  // utimes-restore tamper, which leaves the file quiescent after the attack.
+  // 2026-05-19: number of consecutive polls observing `ctime/mtime advanced
+  // AND size === eventsPos` before flagging tamper.  Linux 5.10 (Ubuntu 22.04
+  // rootfs) sometimes returns stat() with newer ctime/mtime than the
+  // size-update it accompanies, producing a one-shot false positive during
+  // active writes.  Three consecutive polls (~3 × pollIntervalMs) is enough
+  // to outlast the kernel's lazy settle while still catching the real
+  // tampers: a utimes-restore leaves the file quiescent after the attack,
+  // and an append-then-truncate that bumps mtime without bytes likewise
+  // settles past the kernel's lazy window.
   let ctimeAdvanceStablePolls = 0;
-  const CTIME_ADVANCE_REQUIRED_POLLS = 3;
+  let mtimeAdvanceStablePolls = 0;
+  const META_ADVANCE_REQUIRED_POLLS = 3;
   function recordTamper(reason: string): void {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -678,7 +681,7 @@ export async function* runStraceTailer(
       sizeNum === eventsPos
     ) {
       ctimeAdvanceStablePolls += 1;
-      if (ctimeAdvanceStablePolls >= CTIME_ADVANCE_REQUIRED_POLLS) {
+      if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
           `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`,
         );
@@ -691,12 +694,20 @@ export async function* runStraceTailer(
     // Retained as defense-in-depth: a plain append-then-truncate (no utimes
     // restore) bumps mtime AND ctime forward.  The ctime check above will
     // also fire in that case, but the original mtime check stays in place
-    // so the pre-existing test contract continues to hold.
+    // so the pre-existing test contract continues to hold.  Same lazy-stat
+    // race as ctime above — gate on N consecutive polls so we tolerate the
+    // kernel's brief mtime/size desync without weakening the steady-state
+    // tamper signal.
     if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
-      recordTamper(
-        `events file mtime advanced without new bytes (mtimeNs=${mtimeBig} > last=${lastMtime}, size=${sizeNum} == eventsPos): ${path}`,
-      );
-      return;
+      mtimeAdvanceStablePolls += 1;
+      if (mtimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
+        recordTamper(
+          `events file mtime advanced without new bytes (mtimeNs=${mtimeBig} > last=${lastMtime}, size=${sizeNum} == eventsPos): ${path}`,
+        );
+        return;
+      }
+    } else {
+      mtimeAdvanceStablePolls = 0;
     }
     lastMtime = mtimeBig;
     // Initialize ctime baseline lazily when the caller did not supply one
