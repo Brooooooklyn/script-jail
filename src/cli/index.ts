@@ -22,9 +22,17 @@
 //   - warnings       → stderr (via shared `warn`, rebound to stderr here so
 //                      the CLI user sees them on the diagnostic stream)
 //   - fatal errors   → stderr
+//
+// Audit pipeline:
+//   The orchestration logic (arch-flag overlay, makeOverlay, post-VM
+//   diff / write / audit-bypass gate) lives in `../shared/run-audit.ts`
+//   so the GitHub Action and the CLI run the SAME pipeline.  This file
+//   owns only the macOS-specific bits: host detection, artifact lookup,
+//   and the VZ launcher closure.
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { resolve, relative, isAbsolute, dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -34,16 +42,18 @@ import {
   UnsupportedArchError,
   type DetectedHost,
 } from './detect-host.js';
-import { buildArchFlagOverlay } from './arch-flags.js';
 import { spawnVm, type VmConfig, type VmMode } from './spawn-vm.js';
 import { parseArgs } from './parse-args.js';
 import { detectPm, BunUnsupportedError } from '../shared/detect-pm.js';
 import { warn as sharedWarn } from '../shared/log.js';
 import { resolveArtifacts } from '../shared/artifacts.js';
-import { buildEffectiveConfig } from '../action/config-override.js';
-import { makeOverlay, type OverlayResult } from '../action/firecracker/overlay.js';
+import {
+  makeOverlay,
+  type OverlayResult,
+} from '../action/firecracker/overlay.js';
 import { resolveHostNodePrefix } from '../action/host-node-prefix.js';
-import { renderDiff } from '../action/diff.js';
+import { runAudit, type LauncherResult } from '../shared/run-audit.js';
+import { buildArchFlagOverlay } from './arch-flags.js';
 
 // ---------------------------------------------------------------------------
 // Help text
@@ -114,6 +124,10 @@ export interface CliDeps {
    * assert that `hostArch` comes from the injected `detectHost` return value
    * (NOT re-derived from `process.arch`).  Production callers do not set
    * this.
+   *
+   * The overlay invocation moved into `runAudit` as part of the shared-core
+   * refactor; this seam is threaded through to runAudit's `buildArchFlagOverlay`
+   * input so existing tests keep working unchanged.
    */
   buildArchFlagOverlay?: typeof buildArchFlagOverlay;
   /**
@@ -128,6 +142,14 @@ export interface CliDeps {
    * resolver walks the host's PATH for a real Node install.
    */
   resolveHostNodePrefix?: typeof resolveHostNodePrefix;
+  /**
+   * Optional override for the shared audit pipeline.  Production callers
+   * do not set this.  Tests use it to short-circuit the entire
+   * makeOverlay → launch → diff path when they want to exercise the CLI's
+   * pre-runAudit wiring (argv parsing, host detection, artifact lookup)
+   * in isolation.
+   */
+  runAudit?: typeof runAudit;
 }
 
 export async function run(deps: CliDeps = {}): Promise<number> {
@@ -142,9 +164,13 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   const doDetectHost = deps.detectHost ?? detectHost;
   const doDetectPm = deps.detectPm ?? detectPm;
   const doSpawnVm = deps.spawnVm ?? spawnVm;
-  const doBuildArchFlagOverlay = deps.buildArchFlagOverlay ?? buildArchFlagOverlay;
   const doMakeOverlay = deps.makeOverlay ?? makeOverlay;
   const doResolveHostNodePrefix = deps.resolveHostNodePrefix ?? resolveHostNodePrefix;
+  const doRunAudit = deps.runAudit ?? runAudit;
+  // buildArchFlagOverlay is threaded through to runAudit (see below).
+  // Captured here so the production default flows through identically to
+  // pre-refactor behaviour when no override is supplied.
+  const doBuildArchFlagOverlay = deps.buildArchFlagOverlay ?? buildArchFlagOverlay;
 
   const args = parseArgs(argv);
   if (args.errors.length > 0) {
@@ -198,34 +224,6 @@ export async function run(deps: CliDeps = {}): Promise<number> {
     throw err;
   }
 
-  // --- Arch-flag overlay --------------------------------------------------
-  // detectPm returns 'yarn' for both yarn-classic and yarn-berry; the
-  // distinction is deferred to PR 3+ (where `yarn --version` runs in the
-  // VM).  For PR 2 we treat 'yarn' as berry by default — the worst case for
-  // yarn-classic users on arm64 is a missed warning, not incorrect output.
-  //
-  // hostArch comes from the injected detectHost (NOT re-derived from
-  // process.arch) so unit tests can exercise the arm64 codepath from an x64
-  // dev box without monkey-patching process.arch.
-  const archOverlay = doBuildArchFlagOverlay({ pm, hostArch: host.hostArch });
-  for (const w of archOverlay.warnings) warn(w);
-
-  // --- Build effective config (with arch overlays threaded through) ------
-  // Thread archOverlay's optional sidecars into buildEffectiveConfig().  The
-  // helper writes them next to the rewritten config YAML; we then hand the
-  // paths to makeOverlay's `extraRepoOverlayFiles` so they land on the repo
-  // disk inside the VM.
-  const effectiveConfig = buildEffectiveConfig({
-    userConfigPath: configPath,
-    overrides: { spoofPlatform: args.spoofPlatform, spoofArch: args.spoofArch },
-    ...(archOverlay.yarnrcOverlay !== undefined
-      ? { yarnrcOverlay: archOverlay.yarnrcOverlay }
-      : {}),
-    ...(archOverlay.pmFlagsJson !== undefined
-      ? { pmFlagsJson: archOverlay.pmFlagsJson }
-      : {}),
-  });
-
   // --- Resolve artifacts ---------------------------------------------------
   // Repo root for artifact discovery: prefer the script-jail package's own
   // root (so a developer running `node dist/cli.cjs` from a consumer repo
@@ -238,7 +236,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
     ubuntuMajor: DEFAULT_UBUNTU_MAJOR,
   });
 
-  // --- Build per-run overlay (rootfs + repo + host-node) -------------------
+  // --- Resolve host-node prefix --------------------------------------------
   let hostNodePrefix: string;
   try {
     hostNodePrefix = doResolveHostNodePrefix();
@@ -268,102 +266,95 @@ export async function run(deps: CliDeps = {}): Promise<number> {
     return 1;
   }
 
-  const extraRepoOverlayFiles: Array<{ relPath: string; content: string }> = [];
-  if (effectiveConfig.yarnrcPath !== undefined) {
-    extraRepoOverlayFiles.push({
-      relPath: '.yarnrc.yml',
-      content: readFileSync(effectiveConfig.yarnrcPath, 'utf8'),
-    });
-  }
-  if (effectiveConfig.pmFlagsPath !== undefined) {
-    // Lands under `<repo>/etc/script-jail/pm-flags.json` inside the VM at
-    // `/work/etc/script-jail/pm-flags.json`.  init.sh copies it into the
-    // canonical `/etc/script-jail/pm-flags.json` location where
-    // `loadPmFlags()` reads it.  This mirrors how config.yml flows.
-    extraRepoOverlayFiles.push({
-      relPath: 'etc/script-jail/pm-flags.json',
-      content: readFileSync(effectiveConfig.pmFlagsPath, 'utf8'),
-    });
-  }
+  // --- Build the VZ launcher closure --------------------------------------
+  // runAudit hands us the overlay it built; we assemble VmConfig and call
+  // spawnVm.  We do NOT clean up the overlay here — runAudit owns that
+  // lifecycle and will call `overlay.cleanup()` after this closure returns
+  // (or throws).
+  const launch = async (overlay: OverlayResult): Promise<LauncherResult> => {
+    const vmConfig: VmConfig = {
+      kernelPath: artifacts.kernelPath,
+      kernelCmdline: DEFAULT_KERNEL_CMDLINE,
+      rootfsDiskPath: overlay.rootfsCopyPath,
+      repoDiskPath: overlay.repoDiskPath,
+      hostNodeDiskPath: overlay.hostNodeDiskPath,
+      // VZ does not consume a UDS path (the listener lives in-process) but
+      // the Rust validator requires the field to be present.  Pass the
+      // workDir + sentinel filename so the file path validates and so logs
+      // distinguish it from any real UDS.
+      vsockUdsPath: resolve(overlay.workDir, 'vsock.sock'),
+      vsockPort: VSOCK_PORT,
+      vcpuCount: DEFAULT_VCPU_COUNT,
+      memoryMb: DEFAULT_MEMORY_MB,
+      enableNetwork: true,
+      mode,
+      repoDir: cwd,
+      configPath,
+      lockPath,
+    };
 
-  let overlay: OverlayResult;
-  try {
-    overlay = await doMakeOverlay({
-      baseRootfsPath: artifacts.rootfsPath,
-      repoSrcPath: cwd,
-      configPath: effectiveConfig.configPath,
-      hostNodePrefix,
-      extraRepoOverlayFiles,
-    });
-  } catch (err) {
-    if (err instanceof Error) {
-      stderr.write(`script-jail: failed to build overlay: ${err.message}\n`);
-      return 1;
-    }
-    throw err;
-  }
-
-  // --- Build VmConfig ------------------------------------------------------
-  const vmConfig: VmConfig = {
-    kernelPath: artifacts.kernelPath,
-    kernelCmdline: DEFAULT_KERNEL_CMDLINE,
-    rootfsDiskPath: overlay.rootfsCopyPath,
-    repoDiskPath: overlay.repoDiskPath,
-    hostNodeDiskPath: overlay.hostNodeDiskPath,
-    // VZ does not consume a UDS path (the listener lives in-process) but the
-    // Rust validator requires the field to be present.  Pass the workDir +
-    // sentinel filename so the file path validates and so logs distinguish
-    // it from any real UDS.
-    vsockUdsPath: resolve(overlay.workDir, 'vsock.sock'),
-    vsockPort: VSOCK_PORT,
-    vcpuCount: DEFAULT_VCPU_COUNT,
-    memoryMb: DEFAULT_MEMORY_MB,
-    enableNetwork: true,
-    mode,
-    repoDir: cwd,
-    configPath,
-    lockPath,
+    const result = await doSpawnVm(vmConfig);
+    // spawnVm surfaces non-fatal `error` frames via `result.warnings`.
+    // Pass them through verbatim so runAudit (or future callers) can wire
+    // them into a "no final frame" diagnostic — today they are unused
+    // post-launch, but keeping the contract makes the CLI parity-stable
+    // with the Action's launcher closure.
+    return {
+      finalYaml: result.finalYaml,
+      nonFatalWarnings: result.warnings,
+    };
   };
 
-  // --- Run the VM ----------------------------------------------------------
-  let finalYaml: string;
+  // --- Hand off to runAudit -----------------------------------------------
+  // runAudit owns the arch-flag overlay, effective-config, makeOverlay,
+  // diff/write, and the audit-bypass gate (which the CLI previously
+  // skipped — closing that security gap is one of the wins from this
+  // refactor).
   try {
-    const result = await doSpawnVm(vmConfig);
-    finalYaml = result.finalYaml;
+    const result = await doRunAudit({
+      repoDir: cwd,
+      configPath,
+      lockPath,
+      mode,
+      overrides: {
+        spoofPlatform: args.spoofPlatform,
+        spoofArch: args.spoofArch,
+      },
+      pm,
+      // hostArch comes from the injected detectHost (NOT re-derived from
+      // process.arch) so unit tests can exercise the arm64 codepath from
+      // an x64 dev box without monkey-patching process.arch.
+      hostArch: host.hostArch,
+      baseRootfsPath: artifacts.rootfsPath,
+      hostNodePrefix,
+      // os.tmpdir() — never `cwd` — so the rewritten config YAML and any
+      // arch-flag sidecars (.yarnrc.yml / pm-flags.json) cannot pollute
+      // the user's repo.  runAudit creates a private mkdtemp dir under
+      // this parent and removes it in `finally` even on crash.
+      workDir: tmpdir(),
+      launch,
+      io: {
+        warn,
+        stdout,
+        stderr,
+        // CLI is not a GitHub Action: no setOutput, no annotations.
+        // The audit-bypass gate STILL fires via the stderr message
+        // inside runAudit.
+      },
+      // Thread the CLI's existing dependency-injection seams through to
+      // runAudit so test stubs continue to intercept the same call sites
+      // they did pre-refactor.
+      buildArchFlagOverlay: doBuildArchFlagOverlay,
+      makeOverlay: doMakeOverlay,
+    });
+    return result.exitCode;
   } catch (err) {
     if (err instanceof Error) {
       stderr.write(`script-jail: ${err.message}\n`);
       return 1;
     }
     throw err;
-  } finally {
-    await overlay.cleanup();
   }
-
-  // --- Post-VM: write or diff ---------------------------------------------
-  if (mode === 'update') {
-    writeFileSync(lockPath, finalYaml, 'utf8');
-    stderr.write(
-      `[script-jail] wrote ${Buffer.byteLength(finalYaml, 'utf8')} bytes to ${lockPath}\n`,
-    );
-    return 0;
-  }
-
-  // mode === 'check'
-  const committed = existsSync(lockPath) ? readFileSync(lockPath, 'utf8') : '';
-  const diff = renderDiff({
-    lockPath: relativeForDisplay(lockPath, cwd),
-    committed,
-    generated: finalYaml,
-  });
-  if (diff.unified !== '') {
-    stdout.write(diff.unified);
-    if (!diff.unified.endsWith('\n')) stdout.write('\n');
-  }
-  for (const ann of diff.annotations) {
-    stdout.write(`${ann}\n`);
-  }
-  return diff.match ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,17 +415,6 @@ function resolveScriptJailRoot(cwd: string): string {
 // esbuild injects it) and the ESM dev build (where it does not exist).  We
 // declare it as a top-level binding so TS does not complain in either case.
 declare const __filename: string | undefined;
-
-/**
- * Returns `absPath` made relative to `repoDir` when it is inside the repo.
- * Falls back to the absolute path otherwise.  Used purely for cosmetic
- * annotation labels — the underlying read/write uses the absolute path.
- */
-function relativeForDisplay(absPath: string, repoDir: string): string {
-  const rel = relative(repoDir, absPath);
-  if (rel.startsWith('..') || isAbsolute(rel)) return absPath;
-  return rel;
-}
 
 // ---------------------------------------------------------------------------
 // Entry point

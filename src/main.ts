@@ -5,35 +5,32 @@
 // Flow:
 //   1. Parse inputs (./action/inputs.ts) and detect the PM (./shared/detect-pm.ts).
 //   2. Ensure Firecracker + vmlinux are downloaded (./action/firecracker/download.ts).
-//   3. Build the per-run overlay (./action/firecracker/overlay.ts).
-//   4. Launch the VM (./action/firecracker/launch.ts) and open the vsock
-//      session (./action/firecracker/vsock.ts).
-//   5. Drive the handshake → final exchange with the guest.
-//   6. Teardown (./action/firecracker/teardown.ts) ALWAYS runs in `finally`.
-//   7. Post-VM: render diff (./action/diff.ts) or write the new lockfile.
+//   3. Hand off to `runAudit` (../shared/run-audit.ts) which owns:
+//        - arch-flag overlay
+//        - effective-config + extraRepoOverlayFiles assembly
+//        - `makeOverlay(...)` + cleanup
+//        - the post-VM diff / write / audit-bypass gate
+//      ...and call the Firecracker launcher closure built here for step (4).
+//   4. The launcher closure spawns the VM (./action/firecracker/launch.ts),
+//      opens the vsock session (./action/firecracker/vsock.ts), drives the
+//      handshake → final exchange, and tears the VM down in `finally`.
+//      `runAudit` is responsible for `overlay.cleanup()` — the launcher
+//      passes `overlay: null` to teardown so it does not double-clean.
 //
 // This module is intentionally thin: each step delegates to a helper that is
-// independently unit-tested.  There is no unit test for main.ts itself —
-// orchestration involves real OS resources (sockets, KVM, mkfs.ext4) that
-// cannot be mocked cleanly without growing this file beyond what is readable.
+// independently unit-tested.
 
 import { setOutput } from '@actions/core';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative } from 'node:path';
+import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import { parseInputs } from './action/inputs.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { resolveHostNodePrefix } from './action/host-node-prefix.js';
-import {
-  renderDiff,
-  findAuditBypass,
-  formatAuditBypassError,
-} from './action/diff.js';
 import { warn } from './action/log.js';
-import { buildEffectiveConfig } from './action/config-override.js';
 import { maybeClearCache } from './action/cache.js';
 import {
   ensureBinaries,
@@ -47,6 +44,7 @@ import { launchVm, type VmHandle } from './action/firecracker/launch.js';
 import { openVsockSession, type VsockSession } from './action/firecracker/vsock.js';
 import { teardown } from './action/firecracker/teardown.js';
 import type { OverlayResult } from './action/firecracker/overlay.js';
+import { runAudit, type LauncherResult } from './shared/run-audit.js';
 
 // ---------------------------------------------------------------------------
 // Pinned versions
@@ -91,6 +89,8 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     validateManifest: doValidateManifest = validateManifest,
     preFetchArtifacts: doPreFetchArtifacts = preFetchArtifacts,
     ensureBinaries: doEnsureBinaries = ensureBinaries,
+    // makeOverlay is now owned by runAudit; the MainDeps seam threads
+    // through so existing tests / future maintainers can still stub it.
     makeOverlay: doMakeOverlay = makeOverlay,
     launchVm: doLaunchVm = launchVm,
     openVsockSession: doOpenVsockSession = openVsockSession,
@@ -173,12 +173,6 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     }
     throw err;
   }
-  // We still call detectPm() for its validation side effects (lockfile
-  // present, not bun-only) and the lockfileSha256 it computes — the actual
-  // package-manager choice now lives in the guest agent config on the repo
-  // disk, not in the rootfs filename.  Marked `void` so noUnusedLocals stays
-  // happy until a follow-up (Task #12+) wires `pm.lockfileSha256` through.
-  void pm;
 
   // --- Detect runner image -------------------------------------------------
   const runnerImage = detectRunnerImage();
@@ -269,214 +263,170 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // bin/ directory) so it finds the right Node.
   const hostNodePrefix = resolveHostNodePrefix();
 
-  // --- Apply spoof-platform / spoof-arch overrides -------------------------
-  // The user's config YAML ships `spoof.platform` and `spoof.arch`, which the
-  // guest agent reads and exports as SCRIPT_JAIL_SPOOF_PLATFORM / _ARCH for the
-  // platform-spoof preload (see src/guest/agent.ts and platform-spoof.cjs).
-  // The action also advertises `spoof-platform` / `spoof-arch` inputs and
-  // users supplying them expect them to take precedence over whatever is on
-  // disk.  We materialise an effective copy of the config to a per-run temp
-  // path, applying the overrides, and feed that path into makeOverlay() so
-  // the override lands in the VM's repo disk at /etc/script-jail/config.yml.
-  // The user's source file on the host is never modified.
-  // Pass `imagesDir` as the workDir so the rewritten config lives under the
-  // same RUNNER_TEMP-rooted tree we already use for binaries.  GitHub Actions
-  // purges RUNNER_TEMP between jobs; without this, leaving the workDir at the
-  // helper's mkdtemp default would accumulate stray dirs under os.tmpdir() on
-  // self-hosted runners.
-  const effectiveConfig = buildEffectiveConfig({
-    userConfigPath: inputs.configPath,
+  // --- Hand off to runAudit -----------------------------------------------
+  // The launcher closure below is the host-specific half: spawn Firecracker,
+  // open vsock, drive the handshake → final exchange, tear the VM down in
+  // `finally`.  runAudit owns the overlay (we pass `overlay: null` to
+  // teardown so it does not also call cleanup — single ownership).
+  //
+  // hostArch: the Action only ever runs on the Linux runner today, and
+  // the manifest / pre-fetch path is x64-only (`detectRunnerImage` resolves
+  // to one of the published linux images).  Hardcoded here; if the action
+  // ever ships an arm64 runner image, this is the single line to update.
+  const launch = async (overlay: OverlayResult): Promise<LauncherResult> => {
+    // Per-run unique socket paths so concurrent jobs on the same runner
+    // do not clash.
+    const runId = randomBytes(4).toString('hex');
+    const apiSocketPath = join(tmpdir(), `script-jail-fc-api-${runId}.sock`);
+    const vsockUdsPath = join(tmpdir(), `script-jail-vsock-${runId}`);
+
+    let vm: VmHandle | null = null;
+    let vsock: VsockSession | null = null;
+    let finalYaml: string | null = null;
+    let fatalError: Error | null = null;
+    // Non-fatal guest errors are surfaced as ::warning:: annotations as
+    // they arrive, AND retained so we can attach them to a "no final
+    // frame" diagnostic if the session ends without a `final`.
+    const nonFatalErrors: string[] = [];
+
+    try {
+      // --- Boot the VM ---------------------------------------------------
+      // Phase A networking is enabled at launch (tap0 + /network-interfaces/eth0
+      // in `launch.ts`).  Phase B's offline guarantee is enforced from
+      // inside the guest: after receiving `go` the agent runs `ip link
+      // set eth0 down` (see `src/guest/agent.ts`) and verifies with a DNS
+      // probe.  We deliberately do NOT touch Firecracker's host-side
+      // rate-limiter API here — its `size: 0` is interpreted as "rate
+      // limiter disabled" (i.e. unlimited), not "no bandwidth", so a
+      // host-side patch would be a silent no-op.  The guest is the
+      // source of truth for interface state.
+      vm = await doLaunchVm({
+        firecrackerPath,
+        vmlinuxPath,
+        rootfsPath: overlay.rootfsCopyPath,
+        repoDiskPath: overlay.repoDiskPath,
+        hostNodeDiskPath: overlay.hostNodeDiskPath,
+        vsockCid: GUEST_CID,
+        vsockUdsPath,
+        enableNetwork: true,
+        socketPath: apiSocketPath,
+      });
+
+      // --- Open vsock session -------------------------------------------
+      vsock = await doOpenVsockSession(vsockUdsPath, VSOCK_PORT);
+
+      // --- Drive the protocol -------------------------------------------
+      for await (const frame of vsock.events) {
+        if (frame.kind === 'event') {
+          // We deliberately ignore the live event stream: the guest agent
+          // does its own normalisation inside the VM and emits the YAML
+          // in the `final` frame.  Host-side normalisation is not on the
+          // v1 roadmap.
+          continue;
+        }
+        if (frame.kind === 'handshake') {
+          if (frame.phase === 'fetch_done') {
+            // Release the guest with `go`.  Network teardown happens
+            // inside the guest before Phase B starts (see
+            // `src/guest/agent.ts`, `dropEth0`) — host-side rate-limiter
+            // patching is unreliable because Firecracker treats `size: 0`
+            // as "rate limiter disabled" (unlimited), not "no bandwidth".
+            await vsock.sendGo();
+            continue;
+          }
+          // `install_done` is an FYI marker; the agent will follow with
+          // `final`.  No action needed here, but we keep the branch
+          // explicit so future handshake phases must opt in rather than
+          // fall through unnoticed.
+          continue;
+        }
+        if (frame.kind === 'error') {
+          if (frame.fatal) {
+            fatalError = new Error(`script-jail guest fatal: ${frame.message}`);
+            break;
+          }
+          // Non-fatal errors are surfaced as warnings AND retained so
+          // that, if the stream ends without a final frame, we can
+          // attach them to the diagnostic message instead of throwing a
+          // context-free error.
+          nonFatalErrors.push(frame.message);
+          warn(`script-jail guest: ${frame.message}`);
+          continue;
+        }
+        if (frame.kind === 'final') {
+          finalYaml = frame.yaml;
+          break;
+        }
+      }
+    } finally {
+      // runAudit owns the overlay; pass `overlay: null` so teardown does
+      // NOT also call cleanup.  teardown.ts handles null gracefully (it
+      // gates the safeRun on `overlay !== null`).
+      await doTeardown({
+        vm,
+        overlay: null,
+        vsock,
+        apiSocketPath,
+        vsockUdsPath,
+      });
+    }
+
+    if (fatalError !== null) throw fatalError;
+    if (finalYaml === null) {
+      const tail =
+        nonFatalErrors.length > 0
+          ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(', ')}]`
+          : '';
+      throw new Error(
+        `script-jail: vsock session ended without a final frame.${tail}`,
+      );
+    }
+
+    return { finalYaml, nonFatalWarnings: nonFatalErrors };
+  };
+
+  const result = await runAudit({
+    repoDir,
+    configPath: inputs.configPath,
+    lockPath: inputs.lockPath,
+    mode: inputs.mode,
     overrides: {
       spoofPlatform: inputs.spoofPlatform,
       spoofArch: inputs.spoofArch,
     },
-    workDir: imagesDir,
-  });
-
-  // --- Build per-run overlay ----------------------------------------------
-  const overlay: OverlayResult = await doMakeOverlay({
+    pm: pm.manager,
+    // The Action only runs on Linux/x64 runners today.  Hardcoded so the
+    // arch-flag overlay no-ops (matching pre-refactor behaviour).  If we
+    // ever ship an arm64 runner image, swap this for runtime detection.
+    hostArch: 'x64',
     baseRootfsPath,
-    repoSrcPath: repoDir,
-    configPath: effectiveConfig.configPath,
     hostNodePrefix,
+    // Pass `imagesDir` as the workDir so the rewritten config lives under
+    // the same RUNNER_TEMP-rooted tree we already use for binaries.
+    // GitHub Actions purges RUNNER_TEMP between jobs; without this,
+    // leaving the workDir at buildEffectiveConfig's mkdtemp default
+    // would accumulate stray dirs under os.tmpdir() on self-hosted runners.
+    workDir: imagesDir,
+    launch,
+    io: {
+      warn,
+      setOutput,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      emitAuditBypassAnnotation: (lockLabel, msg) => {
+        process.stdout.write(`::error file=${lockLabel},line=1::${msg}\n`);
+      },
+    },
+    makeOverlay: doMakeOverlay,
   });
 
-  // --- Generate unique per-run socket paths --------------------------------
-  const runId = randomBytes(4).toString('hex');
-  const apiSocketPath = join(tmpdir(), `script-jail-fc-api-${runId}.sock`);
-  const vsockUdsPath = join(tmpdir(), `script-jail-vsock-${runId}`);
-
-  let vm: VmHandle | null = null;
-  let vsock: VsockSession | null = null;
-  let finalYaml: string | null = null;
-  let fatalError: Error | null = null;
-  // Non-fatal guest errors are surfaced as ::warning:: annotations as they
-  // arrive, AND retained here so we can attach them to a "no final frame"
-  // diagnostic if the session ends without a `final`.
-  const nonFatalErrors: string[] = [];
-
-  try {
-    // --- Boot the VM -------------------------------------------------------
-    // Phase A networking is enabled at launch (tap0 + /network-interfaces/eth0
-    // in `launch.ts`).  Phase B's offline guarantee is enforced from inside
-    // the guest itself: after receiving `go` the agent runs `ip link set eth0
-    // down` (see `src/guest/agent.ts`) and then verifies with a DNS probe.
-    // We deliberately do NOT touch Firecracker's host-side rate-limiter API
-    // here — its `size: 0` is interpreted as "rate limiter disabled" (i.e.
-    // unlimited), not "no bandwidth", so a host-side patch would be a silent
-    // no-op.  The guest is the source of truth for interface state.
-    vm = await doLaunchVm({
-      firecrackerPath,
-      vmlinuxPath,
-      rootfsPath: overlay.rootfsCopyPath,
-      repoDiskPath: overlay.repoDiskPath,
-      hostNodeDiskPath: overlay.hostNodeDiskPath,
-      vsockCid: GUEST_CID,
-      vsockUdsPath,
-      enableNetwork: true,
-      socketPath: apiSocketPath,
-    });
-
-    // --- Open vsock session -----------------------------------------------
-    vsock = await doOpenVsockSession(vsockUdsPath, VSOCK_PORT);
-
-    // --- Drive the protocol -----------------------------------------------
-    for await (const frame of vsock.events) {
-      if (frame.kind === 'event') {
-        // We deliberately ignore the live event stream: the guest agent does
-        // its own normalisation inside the VM and emits the YAML in the
-        // `final` frame.  Host-side normalisation is not on the v1 roadmap.
-        continue;
-      }
-      if (frame.kind === 'handshake') {
-        if (frame.phase === 'fetch_done') {
-          // Release the guest with `go`.  Network teardown happens inside
-          // the guest before Phase B starts (see `src/guest/agent.ts`,
-          // `dropEth0`) — host-side rate-limiter patching is unreliable
-          // because Firecracker treats `size: 0` as "rate limiter disabled"
-          // (unlimited), not "no bandwidth".
-          await vsock.sendGo();
-          continue;
-        }
-        // `install_done` is an FYI marker; the agent will follow with `final`.
-        // No action needed here, but we keep the branch explicit so future
-        // handshake phases must opt in rather than fall through unnoticed.
-        continue;
-      }
-      if (frame.kind === 'error') {
-        if (frame.fatal) {
-          fatalError = new Error(`script-jail guest fatal: ${frame.message}`);
-          break;
-        }
-        // Non-fatal errors are surfaced as warnings AND retained so that, if
-        // the stream ends without a final frame, we can attach them to the
-        // diagnostic message instead of throwing a context-free error.
-        nonFatalErrors.push(frame.message);
-        warn(`script-jail guest: ${frame.message}`);
-        continue;
-      }
-      if (frame.kind === 'final') {
-        finalYaml = frame.yaml;
-        break;
-      }
-    }
-  } finally {
-    await doTeardown({
-      vm,
-      overlay,
-      vsock,
-      apiSocketPath,
-      vsockUdsPath,
-    });
-  }
-
-  if (fatalError !== null) throw fatalError;
-  if (finalYaml === null) {
-    const tail =
-      nonFatalErrors.length > 0
-        ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(', ')}]`
-        : '';
-    throw new Error(
-      `script-jail: vsock session ended without a final frame.${tail}`,
-    );
-  }
-
-  // --- Post-VM: diff or write ---------------------------------------------
-  if (inputs.mode === 'check') {
-    const committed = existsSync(inputs.lockPath)
-      ? readFileSync(inputs.lockPath, 'utf8')
-      : '';
-
-    const diff = renderDiff({
-      lockPath: relativeForDisplay(inputs.lockPath, repoDir),
-      committed,
-      generated: finalYaml,
-    });
-
-    if (diff.unified !== '') {
-      process.stdout.write(diff.unified);
-      // Make sure the annotations don't smash onto the diff's last line.
-      if (!diff.unified.endsWith('\n')) process.stdout.write('\n');
-    }
-    for (const ann of diff.annotations) {
-      process.stdout.write(`${ann}\n`);
-    }
-
-    // SECURITY: scan the generated lockfile for `audit_bypass` entries
-    // INDEPENDENTLY of the diff result.  An attacker could commit a
-    // lockfile that already records `<EXEC_FAIL_OPEN> …` — then every
-    // subsequent install bypasses the audit envelope but the byte-equal
-    // diff returns match=true.  Lockfile equality alone is not success.
-    // This gate fires in BOTH paths: drift + match.
-    const bypassEntries = findAuditBypass(finalYaml);
-
-    setOutput('lockfile', inputs.lockPath);
-    setOutput('diff', diff.unified);
-
-    if (bypassEntries.length > 0) {
-      const msg = formatAuditBypassError(bypassEntries);
-      const lockLabel = relativeForDisplay(inputs.lockPath, repoDir);
-      process.stderr.write(`${msg}\n`);
-      // GitHub Actions annotation so the bypass surfaces in the PR UI
-      // even if the diff path was clean.
-      process.stdout.write(
-        `::error file=${lockLabel},line=1::${msg}\n`,
-      );
-      exitProcess(1);
-    }
-
-    if (!diff.match) exitProcess(1);
-    return;
-  }
-
-  // mode === 'update'
-  writeFileSync(inputs.lockPath, finalYaml, 'utf8');
-  // Diagnostic: emit the path + byte count so the next workflow run can map
-  // an empty-on-disk lockfile back to either (a) a wrong path or (b) an
-  // empty `finalYaml`.  Cheap (one line); pays for itself the next time
-  // `test -s "$LOCK"` fails downstream.
-  process.stderr.write(
-    `[script-jail] wrote ${Buffer.byteLength(finalYaml, 'utf8')} bytes to ${inputs.lockPath}\n`,
-  );
-  setOutput('lockfile', inputs.lockPath);
-  setOutput('diff', '');
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Returns `absPath` made relative to `repoDir` when it is inside the repo.
- * Falls back to the absolute path otherwise.  Used purely for cosmetic
- * annotation labels — the underlying read/write uses the absolute path.
- */
-function relativeForDisplay(absPath: string, repoDir: string): string {
-  const rel = relative(repoDir, absPath);
-  // If `rel` starts with ".." or is absolute on Windows, the path escapes the
-  // repo — keep the absolute path to avoid a misleading label.
-  if (rel.startsWith('..') || isAbsolute(rel)) return absPath;
-  return rel;
+  // Preserve the existing semantics: in `update` mode runAudit returns
+  // exitCode 0 and main historically fell through to `return` rather than
+  // calling exitProcess.  In `check` mode the pre-refactor code called
+  // exitProcess(1) on drift/bypass and `return` on match.  We honour that
+  // distinction by exiting only on non-zero codes.  Existing tests that
+  // inject `exitProcess` to capture this behaviour stay green.
+  if (result.exitCode !== 0) exitProcess(result.exitCode);
 }
 
 // ---------------------------------------------------------------------------
