@@ -2069,23 +2069,6 @@ export async function main(input: AgentInput): Promise<void> {
 
   emitter.emitHandshake('fetch_done');
 
-  // Auto-discover installed packages from node_modules so normalize() can
-  // resolve every fs-event's pkg→dir mapping without requiring the consumer
-  // to hand-curate pkg_dirs in .script-jail.yml.
-  //
-  // This runs AFTER Phase A's fetch_done handshake (npm ci has populated
-  // node_modules) and BEFORE Phase B (install under strace), so the map
-  // is ready when collectedEvents are normalized at the end.
-  const nodeModulesDir = `${config.work_dir}/node_modules`;
-  const discoveredPkgDirs = discoverPkgDirs(nodeModulesDir);
-  diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
-
-  // Merge: user-supplied pkg_dirs override wins on conflict — preserves the
-  // escape hatch for hand-curated audits, even though consumers typically
-  // leave pkg_dirs empty.
-  const pkgDirs = new Map<string, string>(discoveredPkgDirs);
-  for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
-
   // 9. Wait for host "go" signal (exact string "go\n" required)
   try {
     await waitForGo(input.connection.readable);
@@ -2255,6 +2238,30 @@ export async function main(input: AgentInput): Promise<void> {
   }
 
   emitter.emitHandshake('install_done');
+
+  // 11c. Auto-discover installed packages from node_modules so normalize()
+  //      can resolve every fs-event's pkg→dir mapping without requiring
+  //      the consumer to hand-curate pkg_dirs in .script-jail.yml.
+  //
+  //      Why AFTER Phase B (not after Phase A as one might expect):
+  //      pnpm's Phase A is `pnpm fetch`, which populates the pnpm store
+  //      but leaves `${work_dir}/node_modules` empty.  Scanning before
+  //      Phase B would discover 0 packages and route every install event
+  //      to `<unattributed>` — silently producing an empty lockfile.
+  //      npm and yarn DO populate node_modules in Phase A, but moving
+  //      the scan after Phase B is harmless for them and gives one
+  //      uniform code path across managers.  Phase B is also the right
+  //      moment because by then any rebuild-time `node_modules` rewrites
+  //      (e.g. yarn rebuild) have settled.
+  const nodeModulesDir = `${config.work_dir}/node_modules`;
+  const discoveredPkgDirs = discoverPkgDirs(nodeModulesDir);
+  diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
+
+  // Merge: user-supplied pkg_dirs override wins on conflict — preserves
+  // the escape hatch for hand-curated audits, even though consumers
+  // typically leave pkg_dirs empty.
+  const pkgDirs = new Map<string, string>(discoveredPkgDirs);
+  for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
 
   // 12. Normalize + render
   const ctx: NormalizeContext = { roots, pkgDirs };

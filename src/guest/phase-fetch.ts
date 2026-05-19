@@ -13,7 +13,12 @@
 //         them separately in the offline phase B.
 //
 //   pnpm: `pnpm fetch`
-//     Fetches tarballs to the store without linking. Clean separation.
+//     Fetches tarballs to the store without linking — node_modules stays
+//     empty after Phase A.  Phase B's `pnpm install --frozen-lockfile
+//     --offline` then materialises node_modules and runs lifecycle scripts.
+//     Because pnpm does NOT create node_modules in Phase A, the agent's
+//     `discoverPkgDirs` call is deliberately deferred until AFTER Phase B
+//     completes (see agent.ts).
 //
 //   yarn: `yarn install --immutable --mode=skip-build`
 //     Fetches and links packages but skips lifecycle script execution.

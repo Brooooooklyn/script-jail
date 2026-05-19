@@ -28711,11 +28711,6 @@ ${fetchResult.stderr}
     return;
   }
   emitter.emitHandshake("fetch_done");
-  const nodeModulesDir = `${config2.work_dir}/node_modules`;
-  const discoveredPkgDirs = discoverPkgDirs(nodeModulesDir);
-  diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
-  const pkgDirs = new Map(discoveredPkgDirs);
-  for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
   try {
     await waitForGo(input.connection.readable);
   } catch (err) {
@@ -28814,6 +28809,11 @@ ${fetchResult.stderr}
     return;
   }
   emitter.emitHandshake("install_done");
+  const nodeModulesDir = `${config2.work_dir}/node_modules`;
+  const discoveredPkgDirs = discoverPkgDirs(nodeModulesDir);
+  diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
+  const pkgDirs = new Map(discoveredPkgDirs);
+  for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
   const ctx = { roots, pkgDirs };
   let yaml;
   try {

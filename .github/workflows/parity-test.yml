@@ -361,14 +361,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            flex bison libelf-dev libssl-dev bc
+            flex bison libelf-dev libssl-dev bc \
+            gcc-aarch64-linux-gnu
 
       - name: Install Rust target (aarch64-linux-gnu)
         run: rustup target add aarch64-unknown-linux-gnu
 
-      # Cross-compile toolchain for the arm64 shim.  cargo-zigbuild +
-      # zig replace the per-host gcc-aarch64-linux-gnu setup with a
-      # single tool that works identically on Linux and macOS hosts.
+      # Cross-compile toolchain split:
+      #   - Rust shim:  cargo-zigbuild + zig (portable across Linux/macOS hosts).
+      #   - Linux kernel: gcc-aarch64-linux-gnu (kbuild expects a real cc, not
+      #     a Rust toolchain).  Installed above with the other kernel deps.
       - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
