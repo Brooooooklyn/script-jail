@@ -1680,6 +1680,21 @@ export function buildChildEnv(
       noAddons,
       ...requireFlags,
     ].join(' '),
+
+    // Redirect pnpm's content-addressed store off the rootfs (sized
+    // ~512 MB and shared with `/lib`, `/usr`, `/root`, etc.) onto the
+    // repo overlay disk (~4 GB, see src/action/firecracker/overlay.ts:
+    // REPO_DISK_MIN_MB).  Without this, a real-world monorepo (e.g.
+    // vuejs/core's ~500 MB dep graph) overruns the rootfs partway
+    // through `pnpm fetch` — Phase A reports `ok=true` but the store
+    // is incomplete, Phase B's `pnpm install --offline` then links
+    // only what's present and emits a truncated lockfile.
+    //
+    // `npm_config_store_dir` is the documented pnpm env knob for
+    // store location (pnpm reads npm-style env vars).  npm and yarn
+    // do not recognise this key and ignore it, so setting it
+    // unconditionally is safe across managers.
+    npm_config_store_dir: `${config.work_dir}/.pnpm-store`,
   };
 }
 

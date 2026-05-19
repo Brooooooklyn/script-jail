@@ -295,17 +295,19 @@ jobs:
       # The arm64 rootfs + VZ kernel + arm64 .so are produced by the Linux
       # release pipeline; the parity workflow doesn't have a pre-published
       # release to pull from on the branch under test.  Instead, download
-      # them as workflow artifacts from a sibling `build-mac-artifacts` job
-      # below.
-      # actions/upload-artifact@v7 preserves directory structure relative
-      # to $GITHUB_WORKSPACE, so the archive contains the `images/` prefix.
-      # Download to the workspace root so the files land at their expected
-      # `images/<asset>` paths.
+      # them as workflow artifacts from a sibling `build-mac-arm64-artifacts`
+      # job below.
+      #
+      # actions/upload-artifact@v7 computes the LEAST COMMON ANCESTOR of all
+      # uploaded paths (all under `images/`) and strips that prefix from the
+      # archive — so the zip's root contains the bare filenames, NOT
+      # `images/<asset>`.  Download into `images/` so the layout the CLI
+      # expects is reconstructed.
       - name: Download arm64 VM artifacts (kernel + rootfs + .so)
         uses: actions/download-artifact@v8
         with:
           name: mac-arm64-vm-artifacts
-          path: .
+          path: images
 
       # Invoke the same `dist/cli.cjs` bundle that the npm package ships
       # so the parity test exercises the consumer artifact, not the .ts
