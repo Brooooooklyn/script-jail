@@ -154,6 +154,15 @@ jobs:
       - name: Install deps
         run: pnpm install --frozen-lockfile
 
+      # vuejs/core is a pnpm monorepo, so the agent inside the VM detects
+      # `pnpm` as the manager and tries to exec it.  pnpm/action-setup@v4
+      # installs pnpm under a runner-local path that's NOT under the Node
+      # prefix the host-node disk packs, so without this step the agent
+      # would hit `spawn pnpm ENOENT`.  Install pnpm globally into the Node
+      # prefix that `resolveHostNodePrefix` packs.
+      - name: Install pnpm into Node prefix (for host-node disk packing)
+        run: npm install -g pnpm@11.1.2
+
       # Build the action bundle + the x86_64 rootfs + the shim from THIS
       # branch.  The parity test must run against the code under review,
       # not against whatever's in dist/ or a tagged release.
@@ -254,6 +263,12 @@ jobs:
       - name: Install deps
         run: pnpm install --frozen-lockfile
 
+      # Same rationale as the linux-firecracker job: vuejs/core is a pnpm
+      # monorepo, the agent invokes `pnpm` inside the VM, and the CLI's
+      # host-node packing only picks up what lives under the Node prefix.
+      - name: Install pnpm into Node prefix (for host-node disk packing)
+        run: npm install -g pnpm@11.1.2
+
       # Build the CLI bundle and the host-mac Rust binary.  We build the
       # binary into place under `target/release/script-jail-vm` — spawn-vm.ts
       # picks it up automatically.
@@ -345,7 +360,11 @@ jobs:
           version: 0.16.0
 
       - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild@0.21.1
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Install pnpm deps
         run: pnpm install --frozen-lockfile

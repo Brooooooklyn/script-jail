@@ -229,7 +229,11 @@ jobs:
           version: 0.16.0
 
       - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild@0.21.1
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Build Rust shim (arm64 — cross-compile via cargo-zigbuild)
         run: pnpm build -- --skip-rootfs --skip-bundle --shim-arm64
