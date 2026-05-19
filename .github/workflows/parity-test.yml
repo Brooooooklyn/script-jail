@@ -284,6 +284,15 @@ jobs:
       - name: Install pnpm into Node prefix (for host-node disk packing)
         run: npm install -g pnpm@11.1.2
 
+      # The CLI builds two side ext4 disks per run (repo + host-node).  On
+      # macOS we shell out to `mkfs.ext4` from homebrew's e2fsprogs — Docker
+      # is no longer pre-installed on GitHub-hosted macOS runners, so the
+      # legacy Docker-Alpine fallback isn't viable on CI.  The formula is
+      # keg-only, so overlay.ts auto-discovers it under
+      # `$(brew --prefix e2fsprogs)/sbin/mkfs.ext4` without needing PATH edits.
+      - name: Install e2fsprogs (for mkfs.ext4 on macOS)
+        run: brew install e2fsprogs
+
       # Build the CLI bundle and the host-mac Rust binary.  We build the
       # binary into place under `target/release/script-jail-vm` — spawn-vm.ts
       # picks it up automatically.

@@ -221,7 +221,11 @@ function copyRootfs(src: string, dest: string): void {
  * Build a small ext4 image from `srcDir` content.
  *
  * On Linux: `mkfs.ext4 -d <srcDir>` (no mount required, no root).
- * On macOS: delegate to an Alpine docker container (same as rootfs/build.ts).
+ * On macOS: prefer native `mkfs.ext4` from homebrew's `e2fsprogs` (keg-only,
+ * located under `$(brew --prefix e2fsprogs)/sbin`); fall back to a Docker
+ * Alpine helper if e2fsprogs isn't installed.  Docker is no longer
+ * pre-installed on GitHub-hosted macOS runners, so CI relies on the native
+ * path.
  *
  * Size is estimated at max(REPO_DISK_MIN_MB, 2× the source dir size). The
  * floor (4 GB) gives the guest enough headroom to run `pnpm install` /
@@ -233,26 +237,69 @@ async function buildRepoDisk(srcDir: string, outPath: string): Promise<void> {
   const sizeMB = estimateDiskSizeMB(srcDir);
   const sizeSpec = `${sizeMB}M`;
 
-  if (platform === 'linux') {
-    execSync(
-      `mkfs.ext4 -d "${srcDir}" -L repo -O ^has_journal -m 0 "${outPath}" ${sizeSpec}`,
+  const mkfs = resolveMkfsExt4();
+  if (mkfs !== null) {
+    const result = spawnSync(
+      mkfs,
+      [
+        '-d', srcDir,
+        '-L', 'repo',
+        '-O', '^has_journal',
+        '-m', '0',
+        outPath,
+        sizeSpec,
+      ],
       { stdio: 'inherit' },
     );
-  } else {
-    // macOS: use Docker Alpine helper.
-    const outDir = join(outPath, '..');
-    const imageName = basename(outPath);
-    execSync(
-      `docker run --rm ` +
-      `-v "${srcDir}:/work:ro" ` +
-      `-v "${outDir}:/out" ` +
-      `alpine:latest ` +
-      `sh -c ` +
-      `"apk add --no-cache e2fsprogs && ` +
-      ` mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
-      { stdio: 'inherit' },
-    );
+    if (result.status !== 0) {
+      throw new Error(
+        `mkfs.ext4 for repo disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
+      );
+    }
+    return;
   }
+
+  // Last-resort macOS fallback: Docker Alpine.  Only reachable when e2fsprogs
+  // is not installed; on CI we install it explicitly so this branch is dead.
+  const outDir = join(outPath, '..');
+  const imageName = basename(outPath);
+  execSync(
+    `docker run --rm ` +
+    `-v "${srcDir}:/work:ro" ` +
+    `-v "${outDir}:/out" ` +
+    `alpine:latest ` +
+    `sh -c ` +
+    `"apk add --no-cache e2fsprogs && ` +
+    ` mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
+    { stdio: 'inherit' },
+  );
+}
+
+/**
+ * Locate a usable `mkfs.ext4` binary.
+ *
+ * - Linux: returns the bare command name; PATH lookup is fine and the binary
+ *   ships with the e2fsprogs package every Ubuntu/Debian/etc. ships by default.
+ * - macOS: probes the homebrew keg-only e2fsprogs install (Apple Silicon
+ *   `/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4`, Intel
+ *   `/usr/local/opt/e2fsprogs/sbin/mkfs.ext4`), then falls back to PATH so a
+ *   user who manually symlinked or PATH-exported the binary still works.
+ *   Returns `null` when nothing was found so the caller can fall back to the
+ *   docker helper.
+ */
+function resolveMkfsExt4(): string | null {
+  if (platform === 'linux') return 'mkfs.ext4';
+  if (platform !== 'darwin') return null;
+  for (const candidate of [
+    '/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4',
+    '/usr/local/opt/e2fsprogs/sbin/mkfs.ext4',
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  // Try PATH lookup via `command -v`; cheap and avoids hard-coding more paths.
+  const lookup = spawnSync('command', ['-v', 'mkfs.ext4'], { shell: '/bin/sh', encoding: 'utf8' });
+  if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
+  return null;
 }
 
 /**
@@ -317,11 +364,13 @@ async function buildHostNodeDisk(hostNodePrefix: string, outPath: string): Promi
   // Defensive: even though `hostNodePrefix` is validated by
   // resolveHostNodePrefix() before reaching here, we use argv-form spawn so
   // any path-with-spaces or stray shell metacharacters cannot break out.
-  // buildRepoDisk() uses the older string-form execSync; that path operates on
-  // a workDir we created via mkdtempSync() so the same risk does not apply.
-  if (platform === 'linux') {
+  // buildRepoDisk() uses the older string-form execSync for the docker
+  // fallback; that path operates on a workDir we created via mkdtempSync()
+  // so the same risk does not apply.
+  const mkfs = resolveMkfsExt4();
+  if (mkfs !== null) {
     const result = spawnSync(
-      'mkfs.ext4',
+      mkfs,
       [
         '-d', hostNodePrefix,
         '-L', 'host-node',
@@ -337,29 +386,30 @@ async function buildHostNodeDisk(hostNodePrefix: string, outPath: string): Promi
         `mkfs.ext4 for host-node disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
       );
     }
-  } else {
-    // macOS: use Docker Alpine helper.  Mount the prefix read-only and the
-    // out dir read-write; mkfs.ext4 runs inside the container at a fixed
-    // path so the user-controlled prefix never reaches the inner shell.
-    const outDir = join(outPath, '..');
-    const imageName = basename(outPath);
-    const result = spawnSync(
-      'docker',
-      [
-        'run', '--rm',
-        '-v', `${hostNodePrefix}:/work:ro`,
-        '-v', `${outDir}:/out`,
-        'alpine:latest',
-        'sh', '-c',
-        `apk add --no-cache e2fsprogs && mkfs.ext4 -d /work -L host-node -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}`,
-      ],
-      { stdio: 'inherit' },
+    return;
+  }
+
+  // Last-resort macOS fallback: Docker Alpine.  Mount the prefix read-only
+  // and the out dir read-write; mkfs.ext4 runs inside the container at a
+  // fixed path so the user-controlled prefix never reaches the inner shell.
+  const outDir = join(outPath, '..');
+  const imageName = basename(outPath);
+  const result = spawnSync(
+    'docker',
+    [
+      'run', '--rm',
+      '-v', `${hostNodePrefix}:/work:ro`,
+      '-v', `${outDir}:/out`,
+      'alpine:latest',
+      'sh', '-c',
+      `apk add --no-cache e2fsprogs && mkfs.ext4 -d /work -L host-node -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}`,
+    ],
+    { stdio: 'inherit' },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `docker mkfs.ext4 for host-node disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
     );
-    if (result.status !== 0) {
-      throw new Error(
-        `docker mkfs.ext4 for host-node disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
-      );
-    }
   }
 }
 

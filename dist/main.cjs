@@ -27135,19 +27135,50 @@ function copyRootfs(src, dest) {
 async function buildRepoDisk(srcDir, outPath) {
   const sizeMB = estimateDiskSizeMB(srcDir);
   const sizeSpec = `${sizeMB}M`;
-  if (import_node_process.platform === "linux") {
-    (0, import_node_child_process.execSync)(
-      `mkfs.ext4 -d "${srcDir}" -L repo -O ^has_journal -m 0 "${outPath}" ${sizeSpec}`,
+  const mkfs = resolveMkfsExt4();
+  if (mkfs !== null) {
+    const result = (0, import_node_child_process.spawnSync)(
+      mkfs,
+      [
+        "-d",
+        srcDir,
+        "-L",
+        "repo",
+        "-O",
+        "^has_journal",
+        "-m",
+        "0",
+        outPath,
+        sizeSpec
+      ],
       { stdio: "inherit" }
     );
-  } else {
-    const outDir = (0, import_node_path7.join)(outPath, "..");
-    const imageName = (0, import_node_path7.basename)(outPath);
-    (0, import_node_child_process.execSync)(
-      `docker run --rm -v "${srcDir}:/work:ro" -v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
-      { stdio: "inherit" }
-    );
+    if (result.status !== 0) {
+      throw new Error(
+        `mkfs.ext4 for repo disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
+      );
+    }
+    return;
   }
+  const outDir = (0, import_node_path7.join)(outPath, "..");
+  const imageName = (0, import_node_path7.basename)(outPath);
+  (0, import_node_child_process.execSync)(
+    `docker run --rm -v "${srcDir}:/work:ro" -v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
+    { stdio: "inherit" }
+  );
+}
+function resolveMkfsExt4() {
+  if (import_node_process.platform === "linux") return "mkfs.ext4";
+  if (import_node_process.platform !== "darwin") return null;
+  for (const candidate of [
+    "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+    "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
+  ]) {
+    if ((0, import_node_fs8.existsSync)(candidate)) return candidate;
+  }
+  const lookup = (0, import_node_child_process.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
+  if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
+  return null;
 }
 var REPO_DISK_MIN_MB = 4096;
 function estimateDiskSizeMB(dir) {
@@ -27172,9 +27203,10 @@ function estimateDiskSizeMB(dir) {
 async function buildHostNodeDisk(hostNodePrefix, outPath) {
   const sizeMB = estimateHostNodeDiskSizeMB(hostNodePrefix);
   const sizeSpec = `${sizeMB}M`;
-  if (import_node_process.platform === "linux") {
-    const result = (0, import_node_child_process.spawnSync)(
-      "mkfs.ext4",
+  const mkfs = resolveMkfsExt4();
+  if (mkfs !== null) {
+    const result2 = (0, import_node_child_process.spawnSync)(
+      mkfs,
       [
         "-d",
         hostNodePrefix,
@@ -27189,35 +27221,35 @@ async function buildHostNodeDisk(hostNodePrefix, outPath) {
       ],
       { stdio: "inherit" }
     );
-    if (result.status !== 0) {
+    if (result2.status !== 0) {
       throw new Error(
-        `mkfs.ext4 for host-node disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
+        `mkfs.ext4 for host-node disk failed (exit ${result2.status ?? "unknown"}, signal ${result2.signal ?? "none"})`
       );
     }
-  } else {
-    const outDir = (0, import_node_path7.join)(outPath, "..");
-    const imageName = (0, import_node_path7.basename)(outPath);
-    const result = (0, import_node_child_process.spawnSync)(
-      "docker",
-      [
-        "run",
-        "--rm",
-        "-v",
-        `${hostNodePrefix}:/work:ro`,
-        "-v",
-        `${outDir}:/out`,
-        "alpine:latest",
-        "sh",
-        "-c",
-        `apk add --no-cache e2fsprogs && mkfs.ext4 -d /work -L host-node -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}`
-      ],
-      { stdio: "inherit" }
+    return;
+  }
+  const outDir = (0, import_node_path7.join)(outPath, "..");
+  const imageName = (0, import_node_path7.basename)(outPath);
+  const result = (0, import_node_child_process.spawnSync)(
+    "docker",
+    [
+      "run",
+      "--rm",
+      "-v",
+      `${hostNodePrefix}:/work:ro`,
+      "-v",
+      `${outDir}:/out`,
+      "alpine:latest",
+      "sh",
+      "-c",
+      `apk add --no-cache e2fsprogs && mkfs.ext4 -d /work -L host-node -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}`
+    ],
+    { stdio: "inherit" }
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `docker mkfs.ext4 for host-node disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
     );
-    if (result.status !== 0) {
-      throw new Error(
-        `docker mkfs.ext4 for host-node disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
-      );
-    }
   }
 }
 function estimateHostNodeDiskSizeMB(dir) {
