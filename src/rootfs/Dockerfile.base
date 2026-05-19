@@ -10,23 +10,27 @@ FROM ubuntu:${UBUNTU_MAJOR}
 # locale payloads never get committed to a layer in the first place.  A
 # follow-up `RUN rm -rf …` would only mask the bytes, not shrink the image.
 #
-# Swap the default Ubuntu apt mirror over to the Azure-hosted mirror before
-# `apt-get update`.  GitHub-hosted runners (both x86_64 and arm64-via-QEMU)
-# live on Azure; the default `ports.ubuntu.com` arm64 mirror has been
-# unreachable for sustained windows (5+ minutes of connection timeouts
-# observed), while `azure.ports.ubuntu.com` is in-network and reliable.
-# We also redirect `archive.ubuntu.com` (x86_64) to its Azure mirror for
-# parity.  The retry loop below is a defense-in-depth backstop.
+# Swap the default Ubuntu apt mirrors before `apt-get update`:
+#   - x86_64 main archive  →  azure.archive.ubuntu.com (in-network on Azure-
+#     hosted GitHub runners).
+#   - arm64 ports archive  →  mirror.us.leaseweb.net/ubuntu-ports/ (Canonical's
+#     own `ports.ubuntu.com` and CNAME `azure.ports.ubuntu.com` resolve to the
+#     same overloaded 91.189.91.x bank, which has been TCP-blackholing from
+#     GitHub-hosted runners for sustained windows).  Leaseweb runs an
+#     independent US mirror with very high uptime.
 #
 # Sources files differ across releases (sources.list on 22.04, deb822
 # ubuntu.sources on 24.04), so we rewrite every matching file under
-# /etc/apt without caring which exists.
+# /etc/apt without caring which exists.  The retry loop is a backstop.
 RUN set -eu; \
     find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
       -exec sed -i \
-        -e 's|http://ports\.ubuntu\.com|http://azure.ports.ubuntu.com|g' \
+        -e 's|http://ports\.ubuntu\.com/ubuntu-ports|http://mirror.us.leaseweb.net/ubuntu-ports|g' \
         -e 's|http://archive\.ubuntu\.com|http://azure.archive.ubuntu.com|g' \
         {} +; \
+    echo 'Acquire::http::Timeout "30";' > /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::Retries "3";'       >> /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::ForceIPv4 "true";'  >> /etc/apt/apt.conf.d/99script-jail-net; \
     for attempt in 1 2 3 4 5; do \
       if apt-get update && \
          apt-get install -y --no-install-recommends \
