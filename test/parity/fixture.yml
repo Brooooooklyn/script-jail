@@ -1,0 +1,28 @@
+# script-jail — parity-test fixture
+#
+# This file pins the upstream repository that .github/workflows/parity-test.yml
+# uses to verify byte-equality of the lockfile produced under Linux/Firecracker
+# versus macOS/VZ.  The fixture is pinned by commit SHA (not just tag) so a
+# force-pushed tag in upstream cannot retroactively change what the test
+# audits.
+#
+# Bumping the pin:
+#   1. Pick a new vuejs/core tag and resolve it to a commit SHA:
+#        gh api repos/vuejs/core/git/refs/tags/<tag>
+#   2. Update `tag` and `sha` below.
+#   3. Trigger the parity workflow (`gh workflow run parity-test.yml`).
+#   4. If a divergence appears that wasn't there before, investigate before
+#      merging the pin bump — the new tag may have introduced a postinstall
+#      script that exercises a code path script-jail handles non-uniformly.
+#
+# Why vuejs/core:
+#   - pnpm monorepo with 28+ workspace packages — exercises the real fetch
+#     graph, not a trivial single-package smoke.
+#   - Heavy native postinstall surface (esbuild self-verify, rollup per-arch
+#     optional deps) — exercises the arm64 cross-arch divergence story
+#     documented in docs/divergence.md.
+
+repo: vuejs/core
+tag: v3.5.34
+sha: 57545e958ae28ed17aa9e0ed321abcd8dc99f752
+package_manager: pnpm

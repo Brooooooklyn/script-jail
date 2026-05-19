@@ -1,0 +1,426 @@
+# script-jail — .github/workflows/parity-test.yml
+#
+# Verify that the .script-jail.lock.yml produced by the Linux/Firecracker
+# action and the macOS/VZ CLI are byte-equal (modulo the documented
+# `generated_at` / `manager_lockfile_sha256` canonicalisation) for a pinned
+# upstream fixture.
+#
+# Fixture: test/parity/fixture.yml pins vuejs/core at a specific tag + commit
+# SHA — see that file for bump instructions and the rationale for the
+# fixture choice.
+#
+# Triggers:
+#   - workflow_dispatch: manual, for ad-hoc validation.
+#   - pull_request paths-filtered to the parity-relevant surface so a PR
+#     touching the CLI, the action's lockfile path, the guest agent, or
+#     the parity infrastructure itself gets the gate.  Other PRs skip it
+#     to keep the routine matrix lean (this workflow takes ~25 min wall
+#     clock).
+#
+# What this catches:
+#   - Linux-only package selected on macOS (PM-flag overlay bug).
+#   - Different event order between platforms (lock renderer bug).
+#   - Spurious event on one side (audit-policy desync).
+#
+# What this does NOT yet filter:
+#   The documented v1 divergence on Apple Silicon — see docs/divergence.md.
+#   The diff job's report surfaces the raw delta; the maintainer interprets
+#   it.  Future work in scripts/parity-diff.ts will add `--allow-arm64-
+#   enoexec` once we have concrete divergence patterns to filter.
+
+name: parity-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/cli/**'
+      - 'src/shared/**'
+      - 'src/guest/**'
+      - 'src/host-mac/**'
+      - 'src/rootfs/**'
+      - 'src/lock/**'
+      - 'src/action/diff.ts'
+      - 'src/action/config-override.ts'
+      - 'src/action/firecracker/**'
+      - 'test/parity/**'
+      - 'scripts/parity-diff.ts'
+      - 'scripts/build.ts'
+      - 'images/kernel/**'
+      - 'images/rootfs.Dockerfile'
+      - '.github/workflows/parity-test.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # resolve-fixture — single source of truth for which commit of upstream we
+  # audit.  Both platform jobs read its outputs so the fixture file is read
+  # exactly once.
+  # ---------------------------------------------------------------------------
+  resolve-fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      repo: ${{ steps.read.outputs.repo }}
+      sha: ${{ steps.read.outputs.sha }}
+      tag: ${{ steps.read.outputs.tag }}
+      pm: ${{ steps.read.outputs.pm }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Read fixture pin
+        id: read
+        run: |
+          set -euo pipefail
+          FIXTURE=test/parity/fixture.yml
+          # awk-based parse: fixture.yml is intentionally flat (no nested
+          # keys) so a single `key: value` regex per line is sufficient and
+          # avoids a yq dependency.
+          REPO=$(awk -F': ' '/^repo: / {print $2; exit}' "$FIXTURE")
+          TAG=$(awk -F': ' '/^tag: / {print $2; exit}' "$FIXTURE")
+          SHA=$(awk -F': ' '/^sha: / {print $2; exit}' "$FIXTURE")
+          PM=$(awk -F': ' '/^package_manager: / {print $2; exit}' "$FIXTURE")
+          for v in REPO TAG SHA PM; do
+            eval val=\$$v
+            if [ -z "${val}" ]; then
+              echo "::error::Missing '${v}' in ${FIXTURE}"
+              exit 1
+            fi
+          done
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"   >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"   >> "$GITHUB_OUTPUT"
+          echo "pm=${PM}"     >> "$GITHUB_OUTPUT"
+          {
+            echo "## Parity fixture"
+            echo
+            echo "- repo: \`${REPO}\`"
+            echo "- tag: \`${TAG}\`"
+            echo "- sha: \`${SHA}\`"
+            echo "- package_manager: \`${PM}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # linux-firecracker — run the action under real Firecracker against the
+  # pinned upstream checkout.  Mirrors the consumer's runtime exactly: same
+  # rootfs, same kernel, same KVM-backed VMM.
+  # ---------------------------------------------------------------------------
+  linux-firecracker:
+    needs: resolve-fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The action's pre-fetch step refuses placeholder-pinned manifests in
+      # consumer mode.  Inside the repo's own CI we are testing the action
+      # against itself; the self-test flag skips that gate so the parity job
+      # works on the very tag that publishes the artifacts.  Same convention
+      # as e2e.yml.
+      SCRIPT_JAIL_E2E_SELF_TEST: '1'
+    steps:
+      - name: Checkout script-jail
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout upstream fixture (${{ needs.resolve-fixture.outputs.repo }}@${{ needs.resolve-fixture.outputs.tag }})
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.resolve-fixture.outputs.repo }}
+          ref: ${{ needs.resolve-fixture.outputs.sha }}
+          path: fixture
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # Build the action bundle + the x86_64 rootfs + the shim from THIS
+      # branch.  The parity test must run against the code under review,
+      # not against whatever's in dist/ or a tagged release.
+      - name: Build action bundle, shim, rootfs (x86_64)
+        run: pnpm build -- --runner-image=ubuntu-24.04
+
+      # /dev/kvm needs r/w for the runner user.  Mirrors e2e.yml exactly —
+      # ubuntu-latest exposes /dev/kvm at mode 0660 root:kvm and the runner
+      # user is not in the kvm group.
+      - name: Grant runner access to /dev/kvm
+        run: |
+          if [ ! -c /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing on ubuntu-latest — Firecracker cannot boot."
+            exit 1
+          fi
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      - name: Pre-create tap0 + enable NAT for VM egress
+        run: |
+          sudo ip tuntap add tap0 mode tap user "$(whoami)"
+          sudo ip addr add 172.16.0.1/24 dev tap0
+          sudo ip link set tap0 up
+          UPLINK=$(ip -o -4 route show default | awk '{print $5; exit}')
+          sudo iptables -t nat -A POSTROUTING -o "${UPLINK}" -j MASQUERADE
+          sudo iptables -A FORWARD -i tap0 -o "${UPLINK}" -j ACCEPT
+          sudo iptables -A FORWARD -i "${UPLINK}" -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
+
+      - name: Run script-jail action against fixture
+        env:
+          SCRIPT_JAIL_REPO_DIR: ${{ github.workspace }}/fixture
+          INPUT_MODE: update
+          INPUT_LOCK: ${{ github.workspace }}/linux-lockfile.yml
+          INPUT_CONFIG: ${{ github.workspace }}/.script-jail.yml
+        run: node dist/main.cjs
+
+      - name: Upload Linux lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-lockfile
+          path: linux-lockfile.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # macos-arm64-vz — run the CLI under real Virtualization.framework against
+  # the same fixture.  This is the macOS-developer happy path: `pnpm exec
+  # script-jail update`.
+  # ---------------------------------------------------------------------------
+  macos-arm64-vz:
+    needs: [resolve-fixture, build-mac-arm64-artifacts]
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      SCRIPT_JAIL_E2E_SELF_TEST: '1'
+    steps:
+      - name: Checkout script-jail
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout upstream fixture (${{ needs.resolve-fixture.outputs.repo }}@${{ needs.resolve-fixture.outputs.tag }})
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.resolve-fixture.outputs.repo }}
+          ref: ${{ needs.resolve-fixture.outputs.sha }}
+          path: fixture
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # Build the CLI bundle and the host-mac Rust binary.  We build the
+      # binary into place under `target/release/script-jail-vm` — spawn-vm.ts
+      # picks it up automatically.
+      - name: Build CLI bundle + script-jail-vm
+        run: |
+          pnpm build:cli
+          cargo build --release -p script-jail-host-mac
+
+      # The arm64 rootfs + VZ kernel + arm64 .so are produced by the Linux
+      # release pipeline; the parity workflow doesn't have a pre-published
+      # release to pull from on the branch under test.  Instead, download
+      # them as workflow artifacts from a sibling `build-mac-artifacts` job
+      # below.
+      # actions/upload-artifact@v4 preserves directory structure relative
+      # to $GITHUB_WORKSPACE, so the archive contains the `images/` prefix.
+      # Download to the workspace root so the files land at their expected
+      # `images/<asset>` paths.
+      - name: Download arm64 VM artifacts (kernel + rootfs + .so)
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-arm64-vm-artifacts
+          path: .
+
+      # Invoke the same `dist/cli.cjs` bundle that the npm package ships
+      # so the parity test exercises the consumer artifact, not the .ts
+      # source.  `working-directory: fixture` matches what a Vue contributor
+      # would actually type (`cd vue-repo && pnpm exec script-jail update`).
+      - name: Run script-jail CLI against fixture
+        working-directory: fixture
+        env:
+          SCRIPT_JAIL_REPO_DIR: ${{ github.workspace }}/fixture
+        run: |
+          node "${{ github.workspace }}/dist/cli.cjs" update \
+            --lock "${{ github.workspace }}/macos-lockfile.yml" \
+            --config "${{ github.workspace }}/.script-jail.yml"
+
+      - name: Upload macOS lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-lockfile
+          path: macos-lockfile.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # build-mac-arm64-artifacts — the macOS job needs the arm64 rootfs ext4,
+  # the arm64 libscriptjail.so, and the arm64 VZ kernel.  We build them on a
+  # Linux runner (mkfs.ext4 + the rootfs Docker build target the linux/arm64
+  # platform; cross-compile via aarch64-unknown-linux-gnu for the shim; the
+  # kernel build script handles its own cross-compile) and hand them across
+  # to the macOS job via upload-artifact.
+  # ---------------------------------------------------------------------------
+  build-mac-arm64-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install kernel build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu flex bison libelf-dev libssl-dev bc
+
+      - name: Install Rust target (aarch64-linux-gnu)
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Install pnpm deps
+        run: pnpm install --frozen-lockfile
+
+      # Build the arm64 .so AND the arm64 rootfs in one invocation.
+      # `--shim-arm64` triggers the cross-compile; `--skip-shim` suppresses the
+      # x86_64 shim build (we don't need it on this branch of the workflow);
+      # `--skip-bundle` skips dist/main.cjs (the macOS path doesn't need it).
+      - name: Build arm64 shim + rootfs (ubuntu-24.04)
+        run: pnpm build -- --shim-arm64 --skip-bundle --skip-shim --runner-image=ubuntu-24.04
+
+      - name: Build VZ kernel (arm64)
+        run: bash images/kernel/build.sh --arch=arm64 --force
+
+      - name: Upload arm64 VM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-arm64-vm-artifacts
+          path: |
+            images/rootfs-ubuntu-24.04-arm64.ext4
+            images/libscriptjail-arm64.so
+            images/vmlinux-vz-arm64
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # diff — pull both lockfiles, canonicalise volatile fields, and compare.
+  # ---------------------------------------------------------------------------
+  diff:
+    needs: [linux-firecracker, macos-arm64-vz]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-lockfile
+          path: artifacts/linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64-lockfile
+          path: artifacts/macos-arm64
+
+      - name: Run parity diff
+        id: diff
+        # Capture the exit code without `set -e` aborting the step.  Exit 0
+        # = parity, 1 = diverged, 2 = usage error / missing input.  We treat
+        # 0 and 1 as expected outcomes and only fail the step on 2 (or any
+        # other unexpected exit).
+        run: |
+          set +e
+          pnpm exec oxnode scripts/parity-diff.ts \
+            --left  artifacts/linux/linux-lockfile.yml \
+            --right artifacts/macos-arm64/macos-lockfile.yml \
+            --left-label  linux-firecracker \
+            --right-label macos-arm64-vz \
+            --report parity-report.md
+          RC=$?
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -gt 1 ]; then
+            echo "::error::parity-diff exited $RC (usage error or missing input)"
+            exit 1
+          fi
+          if [ "$RC" -eq 1 ]; then
+            echo "::warning::Lockfiles diverged — see the parity-report artifact."
+          fi
+
+      - name: Append report to step summary
+        if: always()
+        run: |
+          if [ -f parity-report.md ]; then
+            cat parity-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-report
+          path: parity-report.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail the workflow on divergence
+        if: steps.diff.outputs.rc == '1'
+        run: |
+          echo "::error::Linux and macOS lockfiles diverge.  See parity-report artifact for details."
+          exit 1
