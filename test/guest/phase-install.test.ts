@@ -2259,6 +2259,97 @@ describe('runInstallPhase', () => {
       expect(spawns[0]!['pkg']).toBe('pkg-z@3.0.0');
       expect(spawns[0]!['lifecycle']).toBe('postinstall');
     });
+
+    // Audit-trust follow-up #5 (Codex review of def7515, 2026-05-19):
+    // when BOTH the old generation AND the recycled generation of a
+    // pid have exited by the time the delayed old-gen exit-line is
+    // processed, the liveness-only check fails: attribute(pid)
+    // returns null (no /proc), so the eviction triggers and wipes
+    // the freshly-propagated snapshot.  The recycled gen's ENOENT
+    // spawn line — also drained late — then has nothing to fall
+    // back on and is dropped.
+    //
+    // The outstanding-clones counter closes this hole: at clone-
+    // propagation time we increment, so when the delayed old-gen
+    // exit fires we see outstanding > 0 and decline to evict.
+    it('dead-recycled-pid + delayed-old-exit: snapshot survives so the recycled child spawn still emits', async () => {
+      // Reader: parent pid 600 returns pkg-w env (always alive in
+      // /proc).  Child pid 601 returns null on every read — modelling
+      // both the old generation and the recycled generation being
+      // reaped by the time any /proc read for 601 happens.
+      const reader: ProcReader = {
+        readPpid(pid: number): number | null {
+          if (pid === 600) return 1;
+          return null;
+        },
+        readEnviron(pid: number): Map<string, string> | null {
+          if (pid === 600) {
+            return new Map(
+              Object.entries({
+                npm_package_name: 'pkg-w',
+                npm_package_version: '4.0.0',
+                npm_lifecycle_event: 'postinstall',
+              }),
+            );
+          }
+          // pid 601: both old and recycled generations are gone.
+          return null;
+        },
+      };
+      const attr = new Attribution(reader);
+
+      // Tailer order (cross-file ordering — production-natural):
+      //   1. New parent 600's file drained first → clone(...) = 601
+      //      → outstandingClones[601] = 1; snapshot[601] = pkg-w.
+      //   2. Old-gen 601's file drained → +++ exited +++ (the
+      //      DELAYED exit for the dead old gen).  With outstanding
+      //      > 0 we balance to 0 and KEEP the snapshot.  Pre-fix:
+      //      liveness probe returns null (both gens dead) → evict.
+      //   3. Recycled gen-2 601's file drained → ENOENT spawn.
+      //      attribute(601) returns null (both gens dead).  Snapshot
+      //      fallback emits with pkg-w.  Pre-fix this would be
+      //      dropped.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 600,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 601',
+          source: 'strace',
+        },
+        {
+          pid: 601,
+          line: '+++ exited with 0 +++',
+          source: 'strace',
+        },
+        {
+          pid: 601,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "x.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: 600 }),
+        attribution: attr,
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 601 && raw['result'] === 'enoent';
+      });
+      expect(spawns).toHaveLength(1);
+      // Recycled child's ENOENT spawn surfaces with the parent's
+      // propagated pkg-w.  Regression signal: a dropped event
+      // (length 0) means the delayed old-gen exit evicted the
+      // propagated snapshot.
+      expect(spawns[0]!['pkg']).toBe('pkg-w@4.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+    });
   });
 
   // Audit-trust Finding (high, 2026-05-18) — shim exec events carry a
