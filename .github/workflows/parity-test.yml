@@ -235,11 +235,24 @@ jobs:
   # macos-arm64-vz — run the CLI under real Virtualization.framework against
   # the same fixture.  This is the macOS-developer happy path: `pnpm exec
   # script-jail update`.
+  #
+  # KNOWN LIMITATION: GitHub-hosted macOS runners are themselves virtualized
+  # (Anka), and Apple's Virtualization.framework does not support nested
+  # virtualization.  Attempting to start the VM fails with VZErrorDomain
+  # code 2: "Virtualization is not available on this hardware."  We keep
+  # the job in the matrix so the rest of the macOS code path
+  # (entitlement-signing, disk-building via homebrew e2fsprogs, artifact
+  # download, config wiring) still gets exercised, but mark it
+  # `continue-on-error: true` so the overall workflow can complete.  The
+  # `diff` job below is gated on `macos-arm64-vz.result == 'success'`, so
+  # it only fires when this job is run on bare-metal hardware (self-hosted
+  # Mac runner, larger paid runner with bare-metal access, or local dev).
   # ---------------------------------------------------------------------------
   macos-arm64-vz:
     needs: [resolve-fixture, build-mac-arm64-artifacts]
     runs-on: macos-latest
     timeout-minutes: 45
+    continue-on-error: true
     env:
       SCRIPT_JAIL_E2E_SELF_TEST: '1'
     steps:
@@ -447,9 +460,18 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # diff — pull both lockfiles, canonicalise volatile fields, and compare.
+  #
+  # Gated on `macos-arm64-vz.result == 'success'` because that job is
+  # `continue-on-error: true` on GitHub-hosted runners (no nested
+  # virtualization).  When the macOS job actually completes (self-hosted
+  # bare-metal Mac runner, or paid larger runner with bare-metal access),
+  # diff runs and asserts byte-equal lockfiles modulo canonical fields;
+  # otherwise diff is skipped and the workflow's overall conclusion is
+  # determined by linux-firecracker.
   # ---------------------------------------------------------------------------
   diff:
     needs: [linux-firecracker, macos-arm64-vz]
+    if: needs.macos-arm64-vz.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
