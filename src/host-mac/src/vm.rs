@@ -10,8 +10,8 @@
 // in PR 4 once kernel + rootfs images exist.
 
 use crossbeam_channel::Sender;
-use objc2::rc::Retained;
 use objc2::AnyThread;
+use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_virtualization::{
     VZLinuxBootLoader, VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,

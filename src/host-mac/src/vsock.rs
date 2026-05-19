@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crossbeam_channel::Sender;
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject};
-use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSObject, NSObjectProtocol};
 use objc2_virtualization::{
     VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketListener,

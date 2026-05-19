@@ -13,8 +13,8 @@
 
 use std::path::Path;
 
-use objc2::rc::Retained;
 use objc2::AnyThread;
+use objc2::rc::Retained;
 use objc2_foundation::{NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZStorageDeviceAttachment, VZVirtioBlockDeviceConfiguration,

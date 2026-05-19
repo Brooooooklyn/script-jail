@@ -160,6 +160,20 @@ jobs:
       - name: Build action bundle, shim, rootfs (x86_64)
         run: pnpm build -- --runner-image=ubuntu-24.04
 
+      # The action under SCRIPT_JAIL_E2E_SELF_TEST=1 skips the pre-fetch
+      # download but still looks for the rootfs + shim at
+      # ${RUNNER_TEMP}/script-jail-images/.  Mirrors e2e.yml's staging step
+      # so the action's overlay/launch path finds them at the canonical
+      # location.
+      - name: Stage local artifacts under $RUNNER_TEMP/script-jail-images
+        run: |
+          set -euo pipefail
+          IMAGES_DIR="${RUNNER_TEMP}/script-jail-images"
+          mkdir -p "${IMAGES_DIR}"
+          cp images/rootfs-ubuntu-24.04.ext4 "${IMAGES_DIR}/"
+          cp images/libscriptjail.so "${IMAGES_DIR}/"
+          ls -l "${IMAGES_DIR}"
+
       # /dev/kvm needs r/w for the runner user.  Mirrors e2e.yml exactly —
       # ubuntu-latest exposes /dev/kvm at mode 0660 root:kvm and the runner
       # user is not in the kvm group.
@@ -317,10 +331,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu flex bison libelf-dev libssl-dev bc
+            flex bison libelf-dev libssl-dev bc
 
       - name: Install Rust target (aarch64-linux-gnu)
         run: rustup target add aarch64-unknown-linux-gnu
+
+      # Cross-compile toolchain for the arm64 shim.  cargo-zigbuild +
+      # zig replace the per-host gcc-aarch64-linux-gnu setup with a
+      # single tool that works identically on Linux and macOS hosts.
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild@0.21.1
 
       - name: Install pnpm deps
         run: pnpm install --frozen-lockfile

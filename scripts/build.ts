@@ -208,28 +208,27 @@ export function shimArtifactIsStale(
  * produce a Linux ELF from this toolchain (would yield a Mach-O dylib), so
  * we surface a clear error pointing the user at CI.
  *
- * Requires `aarch64-linux-gnu-gcc` to be installed (Ubuntu:
- * `apt-get install -y gcc-aarch64-linux-gnu`) and the rustup target
- * `aarch64-unknown-linux-gnu` to be added.  PR 4 wires the build infra; PR 5
- * adds the CI step that installs the prerequisites.
+ * Cross-compile via cargo-zigbuild + zig.  zigbuild bundles the
+ * cross-libc/sysroot lookup and the linker invocation into one tool, so
+ * the same `pnpm build --shim-arm64` works on Linux AND macOS dev hosts
+ * (and on the release runners) without per-host `gcc-aarch64-linux-gnu`
+ * installs or `.cargo/config.toml` linker pinning.
+ *
+ * Prerequisites (installed by .github/workflows/{release,parity-test}.yml
+ * before invoking this; same install also works locally):
+ *   - `cargo install cargo-zigbuild`
+ *   - zig binary on PATH (`brew install zig` on macOS,
+ *     `pip install ziglang` / download tarball on Linux)
+ *   - `rustup target add aarch64-unknown-linux-gnu` (for the std rlib)
  */
 function buildShimArm64(): void {
-  if (process.platform === 'darwin') {
-    throw new Error(
-      '[build] --shim-arm64 cannot run on macOS — cargo on Darwin cannot ' +
-        'produce a Linux ELF .so from the current toolchain. Run in CI on a ' +
-        'Linux runner with `gcc-aarch64-linux-gnu` and the ' +
-        '`aarch64-unknown-linux-gnu` rustup target installed.',
-    );
-  }
-
   const target = 'aarch64-unknown-linux-gnu';
   const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail-arm64.so');
 
-  console.log(`[build] Building arm64 shim via cargo --target ${target} …`);
+  console.log(`[build] Building arm64 shim via cargo zigbuild --target ${target} …`);
   execSync(
-    `cargo build --release --manifest-path "${manifest}" --target ${target}`,
+    `cargo zigbuild --release --manifest-path "${manifest}" --target ${target}`,
     { stdio: 'inherit', cwd: REPO_ROOT },
   );
 

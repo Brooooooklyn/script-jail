@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use crossbeam_channel::Sender;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineDelegate};
 

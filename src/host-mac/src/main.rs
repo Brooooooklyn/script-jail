@@ -24,7 +24,7 @@ use std::thread;
 
 use crossbeam_channel::{select, unbounded};
 
-use script_jail_host_mac::cli::{parse_args, print_usage, SubCommand};
+use script_jail_host_mac::cli::{SubCommand, parse_args, print_usage};
 use script_jail_host_mac::config::{self, ConfigError, VmConfig};
 use script_jail_host_mac::delegate::ShutdownReason;
 use script_jail_host_mac::dispatch;
