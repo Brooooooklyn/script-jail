@@ -2225,26 +2225,53 @@ export async function runInstallPhase(
       //      and the Attribution cache invalidation MUST happen
       //      together — the snapshot map is downstream of Attribution.
       //
-      //  (2) Generation-token check: strace `-ff` per-pid files are
-      //      tailed in filesystem order, not global event order, so a
-      //      NEW parent's `clone(...) = <recycledPid>` line in fileA
+      //  (2) Liveness recheck against /proc.  Strace `-ff` per-pid files
+      //      are tailed in filesystem order, not global event order, so
+      //      a NEW parent's `clone(...) = <recycledPid>` line in fileA
       //      may be processed BEFORE the OLD generation's
       //      `+++ exited +++` line in fileB.  At the moment the
       //      delayed exit-line is processed, the snapshot may already
       //      hold a new-generation entry (clone-propagation wrote it
-      //      first).  We compare `recordedAtTs` to the exit-line's ts
-      //      and decline to evict when the snapshot is strictly newer
-      //      than the exit observation.  Note that the Attribution
-      //      invalidation in (1) ALWAYS runs — even when we keep the
-      //      snapshot — because the cache entry is keyed by pid and
-      //      the recycled generation's `attribute()` MUST re-read
-      //      /proc regardless of which snapshot we keep.
+      //      first).  A pure dispatcher-monotonic generation-token
+      //      check is insufficient because BOTH orderings produce
+      //      monotonically-increasing dispatch timestamps — by
+      //      definition the later-dispatched line wins ts comparison.
+      //
+      //      The only signal that genuinely distinguishes "current
+      //      generation exit" from "stale generation exit observed
+      //      after recycle" is live /proc state.  After invalidate(),
+      //      re-call `attribute(pid)`: if /proc still has a live
+      //      attribution chain for the pid, the exit-line is for an
+      //      older generation that has already been replaced by a
+      //      reused pid.  Keep the snapshot (and refresh it from the
+      //      live attribution — which may differ from what
+      //      clone-propagation wrote, e.g. the recycled child's
+      //      environ has its own npm vars distinct from the parent's).
+      //      If /proc returns null, the pid is genuinely reaped and
+      //      no replacement has spun up yet — eviction is correct.
+      //
+      //      Window of ambiguity: between strace observing exit and
+      //      the kernel populating /proc/<recycledPid>/environ for the
+      //      new generation, /proc reads null and we evict.  In
+      //      practice the kernel populates environ atomically during
+      //      execve, so by the time the polling tailer reads the
+      //      delayed exit-line, the new generation has either set up
+      //      /proc entirely or has not been spawned at all.  The
+      //      residual race is acceptable for the same reason
+      //      pid-recycling within a 30-second microVM install is a
+      //      theoretical concern: tens of thousands of pid allocations
+      //      would be required to wrap PID_MAX.
       if (line.startsWith('+++') && line.endsWith('+++')) {
-        const existing = attributionSnapshotByPid.get(pid);
-        if (existing === undefined || existing.recordedAtTs <= lineTs) {
-          attributionSnapshotByPid.delete(pid);
-        }
         input.attribution.invalidate(pid);
+        const liveAttrib = input.attribution.attribute(pid);
+        if (liveAttrib === null) {
+          attributionSnapshotByPid.delete(pid);
+        } else {
+          // pid is alive (recycled by a newer generation).  Refresh the
+          // snapshot from the live attribution rather than leaving the
+          // potentially-stale clone-propagated value in place.
+          recordAttribution(pid, liveAttrib, lineTs);
+        }
         continue;
       }
 

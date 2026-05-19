@@ -26455,11 +26455,13 @@ async function runInstallPhase(input) {
     }
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
-        const existing = attributionSnapshotByPid.get(pid);
-        if (existing === void 0 || existing.recordedAtTs <= lineTs) {
-          attributionSnapshotByPid.delete(pid);
-        }
         input.attribution.invalidate(pid);
+        const liveAttrib = input.attribution.attribute(pid);
+        if (liveAttrib === null) {
+          attributionSnapshotByPid.delete(pid);
+        } else {
+          recordAttribution(pid, liveAttrib, lineTs);
+        }
         continue;
       }
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);

@@ -2014,6 +2014,140 @@ describe('runInstallPhase', () => {
       expect(spawns[0]!['pkg']).toBe('pkg-y@2.0.0');
       expect(spawns[0]!['lifecycle']).toBe('postinstall');
     });
+
+    // Audit-trust follow-up #3 (Codex review of 6e708ca, 2026-05-19):
+    // a pure dispatcher-monotonic generation-token CANNOT distinguish
+    // "delayed old-gen exit arriving after a new clone" from "current
+    // exit arriving after the clone that recycled the pid", because by
+    // definition the later-dispatched line gets the higher ts.  The
+    // ONLY signal that genuinely separates the two cases is live /proc
+    // state: after invalidate(), re-call attribute(pid).  If /proc
+    // returns a live attribution chain, the pid has been recycled and
+    // the exit is for a vacated old generation — keep the snapshot
+    // (refreshing it from the live attribution).  If /proc returns
+    // null, the pid is reaped and eviction is correct.
+    //
+    // This test exercises the exact production-natural ordering Codex
+    // requested:
+    //   1. new parent clone(...) = recycledPid is yielded FIRST
+    //   2. old-gen +++ exited +++ for recycledPid arrives DELAYED
+    //   3. an unattributable recycled-pid spawn surfaces with the
+    //      NEW generation's package, not the old gen's (which would
+    //      indicate the delayed exit clobbered the new snapshot).
+    //
+    // No explicit `ts` overrides — only the dispatcher's monotonic
+    // counter assigns timestamps.
+    it('production-natural reorder: delayed exit after new clone does NOT clobber recycled-pid snapshot (liveness recheck)', async () => {
+      // Stateful reader: pid 700 is the new parent (pkg-q).  pid 701
+      // is the recycled child.  /proc returns the OLD generation's env
+      // (pkg-p) on the very first read (any pre-exit attribute()
+      // would observe this) and the NEW generation's env (pkg-q) on
+      // every subsequent read.  This mirrors a real kernel where, by
+      // the time the delayed exit-line is observed, /proc/<recycled>
+      // has been re-populated with the new generation's env.
+      let pid701EnvironReads = 0;
+      const reader: ProcReader = {
+        readPpid(pid: number): number | null {
+          if (pid === 700) return 1;
+          if (pid === 701) return 1;
+          return null;
+        },
+        readEnviron(pid: number): Map<string, string> | null {
+          if (pid === 700) {
+            return new Map(
+              Object.entries({
+                npm_package_name: 'pkg-q',
+                npm_package_version: '2.0.0',
+                npm_lifecycle_event: 'postinstall',
+              }),
+            );
+          }
+          if (pid === 701) {
+            pid701EnvironReads += 1;
+            const env =
+              pid701EnvironReads === 1
+                ? {
+                    npm_package_name: 'pkg-p',
+                    npm_package_version: '1.0.0',
+                    npm_lifecycle_event: 'install',
+                  }
+                : {
+                    npm_package_name: 'pkg-q',
+                    npm_package_version: '2.0.0',
+                    npm_lifecycle_event: 'postinstall',
+                  };
+            return new Map(Object.entries(env));
+          }
+          return null;
+        },
+      };
+      const attr = new Attribution(reader);
+
+      // Production-natural ordering: dispatcher monotonic ts assigns
+      // ts=N to the clone line and ts=N+1 to the delayed exit line.
+      // A pure ts-comparison would (incorrectly) evict the snapshot.
+      // The liveness-recheck fix keeps it because attribute(701)
+      // returns the new gen's pkg-q at exit time.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // 1. Generation-1 of pid 701 runs briefly so the snapshot is
+        //    seeded with pkg-p.
+        {
+          pid: 701,
+          line: 'execve("/usr/bin/node", ["node", "g1.js"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        // 2. New parent 700 clones — kernel reassigns pid 701 to a
+        //    new generation. clone-line is delivered BEFORE the old
+        //    generation's exit line (per-pid file cross-ordering).
+        {
+          pid: 700,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 701',
+          source: 'strace',
+        },
+        // 3. DELAYED old-gen exit line.  Pre-fix this would have
+        //    invalidate()d the snapshot for pid 701 because the
+        //    monotonic ts comparison passes (clone ts < this exit
+        //    ts).  Post-fix the dispatcher calls attribute(701)
+        //    after invalidate() — /proc returns pkg-q (the
+        //    recycled gen's identity), so liveAttrib != null and
+        //    the snapshot is REFRESHED (not evicted).
+        {
+          pid: 701,
+          line: '+++ exited with 0 +++',
+          source: 'strace',
+        },
+        // 4. Recycled-pid ENOENT spawn so we can observe the
+        //    surviving attribution.
+        {
+          pid: 701,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "x.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: 701 }),
+        attribution: attr,
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 701 && raw['result'] === 'enoent';
+      });
+      expect(spawns).toHaveLength(1);
+      // Recycled pid 701 surfaces pkg-q.  Regression signal: pkg-p
+      // would mean the delayed exit-line clobbered the new-gen
+      // snapshot via a ts comparison that doesn't actually reflect
+      // happens-before in production.
+      expect(spawns[0]!['pkg']).toBe('pkg-q@2.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+    });
   });
 
   // Audit-trust Finding (high, 2026-05-18) — shim exec events carry a
