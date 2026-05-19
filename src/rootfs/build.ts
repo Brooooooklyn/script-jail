@@ -538,8 +538,26 @@ function copyPreloads(): void {
 // ---------------------------------------------------------------------------
 
 function ensureShim(input: BuildInput): boolean {
+  // The Dockerfile COPYs `images/libscriptjail.so` unconditionally, so the
+  // arm64 rootfs build needs the arm64-arch bytes at that exact path.  The
+  // arch-suffixed sibling (`images/libscriptjail-arm64.so`) is produced
+  // upstream by `scripts/build.ts:buildShimArm64()` via cargo-zigbuild;
+  // stage it to the canonical path so the validator + Docker COPY see one
+  // file and the existing validation + freshness logic keeps working.
+  //
+  // The staging is a one-way copy: subsequent x86_64 rootfs builds in the
+  // same checkout would re-build `libscriptjail.so` via cargo (host arch =
+  // x86_64) and clobber the arm64 bytes back to x86_64.  In practice each
+  // CI job is single-arch, so the clobber happens at most once per workflow
+  // run and is the intended behaviour.
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
+  const archSuffixedShim = join(REPO_ROOT, 'images', 'libscriptjail-arm64.so');
   const expectedMachine = expectedShimMachine(input);
+
+  if (input.arch === 'arm64' && existsSync(archSuffixedShim)) {
+    console.log('[rootfs] Staging libscriptjail-arm64.so → libscriptjail.so (arm64 rootfs build).');
+    copyFileSync(archSuffixedShim, shimOut);
+  }
 
   if (existsSync(shimOut)) {
     // The file is on disk, but we must NOT trust it blindly: a previous

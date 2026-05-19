@@ -223,8 +223,11 @@ function copyRootfs(src: string, dest: string): void {
  * On Linux: `mkfs.ext4 -d <srcDir>` (no mount required, no root).
  * On macOS: delegate to an Alpine docker container (same as rootfs/build.ts).
  *
- * Size is estimated at max(32 MB, 2× the source dir size) to leave headroom
- * for filesystem overhead.
+ * Size is estimated at max(REPO_DISK_MIN_MB, 2× the source dir size). The
+ * floor (4 GB) gives the guest enough headroom to run `pnpm install` /
+ * `npm install` against real-world monorepos (e.g. vuejs/core's ~500 MB
+ * dependency graph) without ENOSPC inside the VM. The image is sparse, so
+ * the actual host disk footprint is just `metadata + content` — not 4 GB.
  */
 async function buildRepoDisk(srcDir: string, outPath: string): Promise<void> {
   const sizeMB = estimateDiskSizeMB(srcDir);
@@ -252,6 +255,17 @@ async function buildRepoDisk(srcDir: string, outPath: string): Promise<void> {
   }
 }
 
+/**
+ * Floor for the repo overlay disk. Sized so that real-world monorepos
+ * (vuejs/core, next.js, etc.) have room to materialise their full
+ * dependency graph + pnpm-store hard-link tree without ENOSPC.
+ *
+ * The image is sparse, so the on-host footprint is just `metadata + content`
+ * — bumping this number doesn't bloat the rootfs artifact or the per-VM
+ * temp dir; it only enlarges the *logical* address space the guest sees.
+ */
+const REPO_DISK_MIN_MB = 4096;
+
 /** Recursively sum the size of files under `dir` and return a size in MB. */
 function estimateDiskSizeMB(dir: string): number {
   let totalBytes = 0;
@@ -272,7 +286,7 @@ function estimateDiskSizeMB(dir: string): number {
   if (existsSync(dir)) visit(dir);
 
   const estimatedMB = Math.ceil((totalBytes * 2) / (1024 * 1024));
-  return Math.max(32, estimatedMB);
+  return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 
 /**
@@ -352,9 +366,9 @@ async function buildHostNodeDisk(hostNodePrefix: string, outPath: string): Promi
 /**
  * Size estimator for the host-node disk: max(64 MB, 1.5× source-tree size).
  *
- * Separate from estimateDiskSizeMB() because the floor (64 vs 32 MB) and
- * multiplier (1.5 vs 2) differ — Node installs are well-known in size so we
- * don't need as much slack.
+ * Separate from estimateDiskSizeMB() because the floor (64 MB vs the repo
+ * disk's 4 GB) and multiplier (1.5 vs 2) differ — Node installs are
+ * well-known in size so we don't need as much slack.
  */
 function estimateHostNodeDiskSizeMB(dir: string): number {
   let totalBytes = 0;

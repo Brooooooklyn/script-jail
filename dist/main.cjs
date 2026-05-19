@@ -42498,6 +42498,7 @@ async function buildRepoDisk(srcDir, outPath) {
     );
   }
 }
+var REPO_DISK_MIN_MB = 4096;
 function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
@@ -42515,7 +42516,7 @@ function estimateDiskSizeMB(dir) {
   };
   if ((0, import_node_fs9.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
-  return Math.max(32, estimatedMB);
+  return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 async function buildHostNodeDisk(hostNodePrefix, outPath) {
   const sizeMB = estimateHostNodeDiskSizeMB(hostNodePrefix);

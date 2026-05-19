@@ -138,6 +138,15 @@ jobs:
           path: fixture
           persist-credentials: false
 
+      # The repo overlay disk is sized at 2× the on-disk fixture size.  For
+      # vuejs/core the `.git` directory dominates that size (deep history)
+      # and is dead weight inside the VM — neither npm/pnpm nor the audit
+      # touches it.  Strip it before disk packing so the overlay has more
+      # proportional headroom for the install and so mkfs.ext4 has fewer
+      # inodes to lay out.
+      - name: Strip fixture .git before mounting into VM
+        run: rm -rf fixture/.git
+
       - uses: pnpm/action-setup@v4
         with:
           version: 11.1.2
@@ -246,6 +255,12 @@ jobs:
           ref: ${{ needs.resolve-fixture.outputs.sha }}
           path: fixture
           persist-credentials: false
+
+      # Mirror the linux-firecracker job: strip `.git` so both platforms
+      # feed an identical fixture into the audit and the repo overlay
+      # carries no dead weight.
+      - name: Strip fixture .git before mounting into VM
+        run: rm -rf fixture/.git
 
       - uses: pnpm/action-setup@v4
         with:
