@@ -1748,7 +1748,7 @@ describe('runStraceTailer', () => {
   });
 
   it('records a tamper reason when the events file is replaced with a different inode', async () => {
-    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, unlinkSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, writeFileSync: writeSyncFn, renameSync, constants: fsConstants } = await import('node:fs');
     const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
     const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const stat = fstatSyncFn(fd, { bigint: true });
@@ -1772,13 +1772,21 @@ describe('runStraceTailer', () => {
     });
 
     // Replace the file with a fresh one at the same path — new inode.
+    // On Linux, `unlink` immediately followed by `writeFile` of the same
+    // path can reuse the just-freed inode number (the kernel's inode
+    // allocator picks the lowest free slot), which leaves the baseline
+    // {ino,dev} check passing.  Force a guaranteed-different inode by
+    // writing the replacement at a sibling path first, then atomically
+    // renaming over the target: the renamed file's inode was allocated
+    // BEFORE the unlink and so cannot collide.
     // Then deterministically wait for the tailer to observe the tamper
     // (rather than racing a fixed 100ms timer that's flaky on slow CI
     // runners where the polling loop hasn't drained between the
     // unlink+rewrite and the resolveExit).
     setTimeout(() => {
-      unlinkSync(eventsPath);
-      writeSyncFn(eventsPath, '{"kind":"env_read","name":"INJECTED","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+      const tmpPath = `${eventsPath}.replacement`;
+      writeSyncFn(tmpPath, '{"kind":"env_read","name":"INJECTED","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+      renameSync(tmpPath, eventsPath);
       // Poll tamperRef.reason every 10ms (≤ pollIntervalMs of 20ms) up to
       // a generous 2s cap, then resolveExit.  The cap is large enough
       // that even a heavily-contended CI runner has many poll cycles to
