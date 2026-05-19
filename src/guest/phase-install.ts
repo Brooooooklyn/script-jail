@@ -909,21 +909,41 @@ export async function runInstallPhase(
     }
   }
   function recordFdTombstone(pid: number, tomb: FdTombstone): void {
-    // Singleton-only gate: tombstones describe the singleton pid's
-    // pre/post-detach mutations on UNTRACKED inherited fds.  A
-    // non-singleton pid's mutations already hit the shared dirfdTable
-    // directly via the standard close/close_range/fcntl handlers and
-    // need no replay path.
-    if (!isFdSingleton(pid)) return;
-    const existingSnap = pendingFdDetach.get(pid);
-    if (existingSnap !== undefined) {
-      // Marker already exists → tombstone is POST-detach (recorded
-      // after at least one detach action has been queued).  Push into
-      // the interleaved postDetachLog so the reconciler replays it in
-      // observed order relative to other actions / tombstones.
-      existingSnap.postDetachLog.push({ kind: 'tombstone', tombstone: tomb });
+    // Codex follow-up (high, 2026-05-19, pass 52 — CLONE_FILES sibling
+    // tombstones miss root-owned marker): resolve the fd-group ROOT
+    // FIRST.  After C owns a pending fd-detach marker and C `clone(
+    // CLONE_FILES) = G` is observed, G is non-singleton and
+    // `rootedFd(G) === C`.  G's pre-fix tombstones (close on an
+    // inherited fd that hasn't yet been copied into C/G because P→C
+    // reconciliation hasn't surfaced, F_SETFD CLOEXEC on the same, or
+    // a no-UNSHARE close_range covering one) must append to C's marker
+    // log so the delayed-clone reconciliation replays them against the
+    // parent-copied entries.  Pre-fix the early `isFdSingleton(pid)`
+    // gate returned before the lookup, so G's tombstones were dropped
+    // and the reconciler later resurrected stale parent entries / missed
+    // CLOEXEC sweeps via the copy pass.
+    const root = rootedFd(pid);
+    const rootSnap = pendingFdDetach.get(root);
+    if (rootSnap !== undefined) {
+      // Marker already exists on the fd-group root (which may equal
+      // pid OR be the marker-owning sibling).  Tombstone is POST-detach
+      // relative to that marker; push into the interleaved postDetachLog
+      // so the reconciler replays it in observed order regardless of
+      // whether pid is itself a singleton.  This is the critical case
+      // for CLONE_FILES sibling visibility: G's mutation under shared
+      // fd-table propagates to C's view at kernel level, and the
+      // marker replay must see the tombstone before delayed-clone
+      // parent-copy.
+      rootSnap.postDetachLog.push({ kind: 'tombstone', tombstone: tomb });
       return;
     }
+    // No root marker → fall back to pre-marker bucket behaviour, which
+    // is singleton-scoped.  Pre-marker buckets are pid-keyed and only
+    // make sense for the singleton-window: a non-singleton pid's
+    // mutations already hit the shared dirfdTable directly via the
+    // standard close/close_range/fcntl handlers, so there is no replay
+    // needed.
+    if (!isFdSingleton(pid)) return;
     // No marker yet → tombstone is PRE-detach.  Queue in the bucket;
     // `snapshotFd` will absorb the bucket into preDetachTombstones.
     let bucket = pendingFdTombstones.get(pid);
@@ -2533,7 +2553,33 @@ export async function runInstallPhase(
               // the entry cloexec=true on both sides, range close
               // drops in [first,last] on both sides.
               if (standaloneFdTombstones !== undefined && standaloneFdTombstones.length > 0) {
-                const groupPrefix = `${rootedFd(pid)}:`;
+                const mergedRoot = rootedFd(pid);
+                const groupPrefix = `${mergedRoot}:`;
+                // Codex follow-up (high, 2026-05-19, pass 52 finding 2 —
+                // pre-marker sibling tombstones not durable through later
+                // P→C reconciliation): if the merged fd-group root holds
+                // a pending fd-detach marker (e.g. the marker owner is C
+                // and we are unioning a sibling G into C), the standalone
+                // tombstones G recorded BEFORE the C clone(=G) line
+                // surfaced are kernel-real mutations that happened AFTER
+                // C's marker was seeded.  Applying them only against the
+                // current dirfdTable is insufficient because the entries
+                // they describe may not exist yet — they will be copied
+                // in later by the delayed P→C reconciliation walking C's
+                // marker.  Push the tombstones into the marker's
+                // postDetachLog so the future replay drops the parent-
+                // copied entries (close), flips cloexec, or surgically
+                // delete/cloexec range entries.  Doing this BEFORE the
+                // immediate direct application below preserves both
+                // effects: the marker captures the future-replay copy,
+                // and the direct application handles fds that already
+                // exist in the merged root pre-P→C.
+                const mergedSnap = pendingFdDetach.get(mergedRoot);
+                if (mergedSnap !== undefined) {
+                  for (const tomb of standaloneFdTombstones) {
+                    mergedSnap.postDetachLog.push({ kind: 'tombstone', tombstone: tomb });
+                  }
+                }
                 for (const tomb of standaloneFdTombstones) {
                   if (tomb.kind === 'close') {
                     dirfdTable.delete(`${groupPrefix}${tomb.fd}`);
@@ -3664,14 +3710,28 @@ export async function runInstallPhase(
               // brings into the child group.  Range form avoids
               // enumerating UINT_MAX fds for the common "close all
               // above first" idiom.
-              if (isFdSingleton(pid)) {
-                recordFdTombstone(pid, {
-                  kind: 'closeRange',
-                  first,
-                  last,
-                  cloexec: hasCloexec,
-                });
-              }
+              //
+              // Codex follow-up (high, 2026-05-19, pass 52): no outer
+              // singleton gate here — `recordFdTombstone` now resolves
+              // the fd-group root FIRST and appends to a root-owned
+              // marker's postDetachLog regardless of whether `pid` is
+              // a singleton.  This is required for the CLONE_FILES
+              // sibling scenario: P fd 7 = /safe; P clone(CLONE_FILES)
+              // = C DELAYED; C unshare(CLONE_FILES) [marker on C]; C
+              // clone(CLONE_FILES) = G; G close_range(7,7,0).  G is
+              // non-singleton (G is C's CLONE_FILES sibling), but
+              // `rootedFd(G) === C` and C owns the marker — so the
+              // tombstone belongs in C's postDetachLog so that the
+              // delayed P→C reconciliation does not resurrect the
+              // copied P:7 in C/G.  The pre-marker bucket path inside
+              // `recordFdTombstone` still preserves its singleton
+              // semantic for the no-marker case.
+              recordFdTombstone(pid, {
+                kind: 'closeRange',
+                first,
+                last,
+                cloexec: hasCloexec,
+              });
               // Codex follow-up (high, 2026-05-19, bug #5 — post-
               // marker close-of-reuse, range form, no-UNSHARE
               // branch): mirrors the UNSHARE branch above.  When

@@ -13221,5 +13221,250 @@ describe('runInstallPhase', () => {
       });
       expect(gUnresolved).toHaveLength(0);
     });
+
+    // Codex pass 52 finding 1 (high, 2026-05-19) — CLONE_FILES sibling
+    // tombstones miss the root-owned marker.
+    //
+    // Pre-fix shape:
+    //   1. P opens /safe → fd 7 (modeled `<P>:7 = /safe`).
+    //   2. (kernel) P clone(CLONE_FILES) = C — DELAYED in strace.
+    //   3. C unshare(CLONE_FILES) — marker on C (`<C>` becomes its
+    //      own fd-group root).
+    //   4. C clone(CLONE_FILES) = G observed; G unions into C, so
+    //      `rootedFd(G) === C`.  G is non-singleton.
+    //   5. G close(7) — recordFdTombstone returns early on the old
+    //      `!isFdSingleton(pid)` gate, so the tombstone is dropped.
+    //   6. Delayed `P clone(CLONE_FILES) = C` surfaces — copy branch
+    //      walks C's marker, copies P:7=/safe into <C>:7, and
+    //      replays C's preDetachTombstones / postDetachLog.  Pre-fix
+    //      neither side has any tombstone referencing fd 7, so
+    //      `<C>:7 = /safe` survives.
+    //   7. G openat(7, "x") = -1 EACCES — canonicalizes via
+    //      `<C>:7 = /safe` to /safe/x.  Pre-fix this resolves
+    //      (incorrectly); post-fix the tombstone landed in C's
+    //      postDetachLog and dropped <C>:7 during marker replay so
+    //      the resolution returns `<UNRESOLVED_PATH>`.
+    //
+    // Post-fix: `recordFdTombstone(G, {kind:'close', fd:7})` resolves
+    // `rootedFd(G) = C`, finds C's marker, and pushes the tombstone
+    // into C's postDetachLog regardless of singleton state.
+    it('sibling close at root marker records tombstone via fd-group root (pass-52 finding 1)', async () => {
+      const proc = mockProcReader({
+        9200: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pass52-finding1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9201: {
+          ppid: 9200,
+          env: {
+            npm_package_name: 'pass52-finding1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9202: {
+          ppid: 9201,
+          env: {
+            npm_package_name: 'pass52-finding1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // (1) P opens /safe → fd 7.
+        {
+          pid: 9200,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // (2) C unshare(CLONE_FILES) — marker created on C.
+        {
+          pid: 9201,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // (3) C clone(CLONE_FILES) = G observed — G unions into C.
+        {
+          pid: 9201,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9202',
+          source: 'strace',
+        },
+        // (4) G close(7) — fd 7 is NOT in dirfdTable yet under <C>:7
+        // (P→C clone delayed).  Pre-fix: recordFdTombstone early-
+        // returns on `!isFdSingleton(9202)`; tombstone dropped.
+        // Post-fix: resolves `rootedFd(9202) = 9201`, finds C's
+        // marker, appends `{kind:'close', fd:7}` to postDetachLog.
+        {
+          pid: 9202,
+          line: 'close(7) = 0',
+          source: 'strace',
+        },
+        // (5) Delayed P clone(CLONE_FILES) = C surfaces.  Copy branch
+        // walks C's marker.  Post-fix the postDetachLog tombstone
+        // drops <C>:7 during replay (and taints fd-state-unknown so
+        // a subsequent openat(7,…) fails closed).
+        {
+          pid: 9200,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9201',
+          source: 'strace',
+        },
+        // (6) G openat(7, "x") fails — but we audit the canonicalize
+        // attempt regardless of return code (failed lookups still
+        // emit the resolved path).  Post-fix this resolves to
+        // <UNRESOLVED_PATH>; pre-fix it leaked /safe/x.
+        {
+          pid: 9202,
+          line: 'openat(7, "x", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9200 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Pre-fix /safe/x leaked through stale parent fd 7 via the
+      // unioned group.  Post-fix the tombstone landed in C's marker
+      // postDetachLog and dropped <C>:7, so /safe/x never appears.
+      const leakedSafe = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/safe/x' && r['pid'] === 9202;
+      });
+      expect(leakedSafe).toHaveLength(0);
+    });
+
+    // Codex pass 52 finding 2 (high, 2026-05-19) — pre-marker sibling
+    // tombstones applied to unified group but not durable through P→C
+    // marker reconciliation.
+    //
+    // Pre-fix shape:
+    //   1. P opens /safe → fd 7 (`<P>:7 = /safe`).
+    //   2. (kernel) P clone(CLONE_FILES) = C — DELAYED.
+    //   3. C unshare(CLONE_FILES) — marker on C.
+    //   4. (kernel) C clone(CLONE_FILES) = G — DELAYED in strace.
+    //   5. G close_range(7,7,0) — G is singleton at observation
+    //      time (C-G clone not drained), so recordFdTombstone queues
+    //      the entry in pendingFdTombstones[G] as a pre-marker
+    //      bucket entry.
+    //   6. C clone(CLONE_FILES) = G surfaces — childPid = G, childFdSnap
+    //      is undefined.  Code unifies G into C and applies the
+    //      standalone tombstone to <C>:* directly.  But <C>:7 is
+    //      still absent (P→C delayed) so the close_range tombstone
+    //      has no effect on dirfdTable.  Pre-fix: bucket deleted; the
+    //      tombstone is gone.
+    //   7. Delayed P clone(CLONE_FILES) = C surfaces — marker replay
+    //      copies <P>:7 = /safe → <C>:7.  Pre-fix nothing in C's
+    //      marker references fd 7, so /safe survives.
+    //   8. G openat(7, "x") — canonicalizes via <C>:7 = /safe to
+    //      /safe/x.  Pre-fix this leaks; post-fix the tombstone now
+    //      lives in C's postDetachLog and drops <C>:7 during
+    //      reconciliation.
+    //
+    // Post-fix: at step (6) the standalone tombstones path detects
+    // C's marker on the merged root and ALSO pushes each tombstone
+    // into the marker's postDetachLog, so the delayed P→C
+    // reconciliation replays them.
+    it('pre-marker sibling tombstone preserved across P→C reconciliation (pass-52 finding 2)', async () => {
+      const proc = mockProcReader({
+        9300: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pass52-finding2-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9301: {
+          ppid: 9300,
+          env: {
+            npm_package_name: 'pass52-finding2-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9302: {
+          ppid: 9301,
+          env: {
+            npm_package_name: 'pass52-finding2-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // (1) P opens /safe → fd 7.
+        {
+          pid: 9300,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // (2) C unshare(CLONE_FILES) — marker on C.
+        {
+          pid: 9301,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // (3) G close_range(7, 7, 0) — G is singleton (C-G clone not
+        // drained).  Recorded in pendingFdTombstones[G] as pre-marker
+        // bucket entry.
+        {
+          pid: 9302,
+          line: 'close_range(7, 7, 0) = 0',
+          source: 'strace',
+        },
+        // (4) C clone(CLONE_FILES) = G surfaces.  childFdSnap on G
+        // is undefined; standaloneFdTombstones path is taken.  Pre-
+        // fix: tombstones applied directly to <C>:* (no effect on
+        // <C>:7 — still absent) and bucket deleted.  Post-fix: also
+        // pushed into C's marker postDetachLog so the future P→C
+        // replay drops the parent-copied fd 7.
+        {
+          pid: 9301,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9302',
+          source: 'strace',
+        },
+        // (5) Delayed P clone(CLONE_FILES) = C surfaces — copy branch
+        // walks C's marker.  Post-fix postDetachLog tombstone drops
+        // <C>:7 (and taints unknown so AT_FDCWD-relative resolution
+        // via fd 7 fails closed).
+        {
+          pid: 9300,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9301',
+          source: 'strace',
+        },
+        // (6) G openat(7, "x") — post-fix resolves UNRESOLVED;
+        // pre-fix it leaked /safe/x.
+        {
+          pid: 9302,
+          line: 'openat(7, "x", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9300 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const leakedSafe = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/safe/x' && r['pid'] === 9302;
+      });
+      expect(leakedSafe).toHaveLength(0);
+    });
   });
 });

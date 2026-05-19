@@ -25975,12 +25975,13 @@ async function runInstallPhase(input) {
     }
   }
   function recordFdTombstone(pid, tomb) {
-    if (!isFdSingleton(pid)) return;
-    const existingSnap = pendingFdDetach.get(pid);
-    if (existingSnap !== void 0) {
-      existingSnap.postDetachLog.push({ kind: "tombstone", tombstone: tomb });
+    const root = rootedFd(pid);
+    const rootSnap = pendingFdDetach.get(root);
+    if (rootSnap !== void 0) {
+      rootSnap.postDetachLog.push({ kind: "tombstone", tombstone: tomb });
       return;
     }
+    if (!isFdSingleton(pid)) return;
     let bucket = pendingFdTombstones.get(pid);
     if (bucket === void 0) {
       bucket = [];
@@ -26522,7 +26523,14 @@ async function runInstallPhase(input) {
             if (cloneFiles && !childHadPendingFdDetach) {
               unionFd(pid, childPid);
               if (standaloneFdTombstones !== void 0 && standaloneFdTombstones.length > 0) {
-                const groupPrefix = `${rootedFd(pid)}:`;
+                const mergedRoot = rootedFd(pid);
+                const groupPrefix = `${mergedRoot}:`;
+                const mergedSnap = pendingFdDetach.get(mergedRoot);
+                if (mergedSnap !== void 0) {
+                  for (const tomb of standaloneFdTombstones) {
+                    mergedSnap.postDetachLog.push({ kind: "tombstone", tombstone: tomb });
+                  }
+                }
                 for (const tomb of standaloneFdTombstones) {
                   if (tomb.kind === "close") {
                     dirfdTable.delete(`${groupPrefix}${tomb.fd}`);
@@ -26993,14 +27001,12 @@ async function runInstallPhase(input) {
                   }
                 }
               }
-              if (isFdSingleton(pid)) {
-                recordFdTombstone(pid, {
-                  kind: "closeRange",
-                  first,
-                  last,
-                  cloexec: hasCloexec
-                });
-              }
+              recordFdTombstone(pid, {
+                kind: "closeRange",
+                first,
+                last,
+                cloexec: hasCloexec
+              });
               if (!hasCloexec) {
                 recordPostMarkerFdRangeClose(pid, first, last);
                 clearOpaqueFdRange(pid, first, last);
