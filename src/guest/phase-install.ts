@@ -2455,6 +2455,23 @@ export async function runInstallPhase(
                       // returns EBADF.  Skip the copy; the child
                       // group key stays absent.
                       if (closedPostMarker) continue;
+                      // Codex pass 45 follow-up (high, 2026-05-19,
+                      // bug #6 — unresolved post-marker open): if the
+                      // child's post-marker activity OPENED this fd
+                      // through an unknown source (untracked dirfd or
+                      // unknown cwd), there is NO modeled child entry
+                      // but the kernel did install a fresh private fd.
+                      // Copying parent's stale shared-baseline mapping
+                      // would let a later child `openat(<fd>, ...)`
+                      // certify through the parent's path — the same
+                      // failure mode as the `existing.path !== val.path`
+                      // branch below.  Skip the copy; subsequent child
+                      // resolves via this fd will fail closed.
+                      const reusedPostMarker =
+                        Number.isFinite(fdNum) &&
+                        childPostMarkerFdTouched !== undefined &&
+                        childPostMarkerFdTouched.has(fdNum);
+                      if (reusedPostMarker) continue;
                       dirfdTable.set(childKey, val);
                     } else if (existing.path === val.path) {
                       // Same fd, same path — keep, OR cloexec bits.
@@ -3867,6 +3884,39 @@ export async function runInstallPhase(
             // unshare/exec installs a child-private fd; pre-detach
             // tombstones targeting this fd describe the pre-unshare
             // shared mutation and must NOT clobber the child copy.
+            recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
+          } else {
+            // Codex pass 45 follow-up (high, 2026-05-19, bug #6 —
+            // unresolved post-marker open).  A successful open whose
+            // canonicalization returned `null` (untracked dirfd, or
+            // AT_FDCWD with an unknown cwd) still installs a fresh
+            // private fd at `retFd` in the kernel — we just don't know
+            // its target path.  Without bookkeeping here:
+            //   1. A stale dirfdTable entry at `retFd` (e.g. from a
+            //      pre-marker open that has not yet been swept) can
+            //      survive and certify a later `openat(retFd, ...)`
+            //      through that stale path.
+            //   2. Pending pre-/post-marker tombstones targeting this
+            //      fd describe the PRIOR fd at that number; they must
+            //      be cancelled since the kernel installed a fresh fd.
+            //   3. On out-of-order delayed-clone reconciliation the
+            //      reconciler would see no child entry for `retFd` and
+            //      copy the parent's same-numbered fd into the child
+            //      group, certifying a child `openat(retFd, ...)`
+            //      through the parent's stale path.
+            // Mirror the canonicalized branch's tombstone-cancel +
+            // post-marker reuse bookkeeping so delayed reconciliation
+            // excludes this fd from the parent-copy.  We deliberately
+            // do NOT call `fdUnknownAdd(pid)` here — that would taint
+            // the WHOLE pid's fd group and break legitimate later
+            // resolutions through unrelated tracked fds (e.g. a
+            // singleton pid that did `openat(<bad-dirfd>, ...) = 8`
+            // would lose access to its other tracked fds).  The
+            // post-marker reuse marker is the precise signal the
+            // reconciler needs; the dirfdTable-delete handles the
+            // stale-mapping case directly.
+            dirfdTable.delete(fdKey(rawEvent.pid, rawEvent.retFd));
+            cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
             recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
           }
         }

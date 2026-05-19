@@ -26537,6 +26537,8 @@ async function runInstallPhase(input) {
                     const closedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdClosed !== void 0 && childPostMarkerFdClosed.has(fdNum);
                     if (existing === void 0) {
                       if (closedPostMarker) continue;
+                      const reusedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdTouched !== void 0 && childPostMarkerFdTouched.has(fdNum);
+                      if (reusedPostMarker) continue;
                       dirfdTable.set(childKey, val);
                     } else if (existing.path === val.path) {
                       if (existing.cloexec !== val.cloexec) {
@@ -27136,6 +27138,10 @@ async function runInstallPhase(input) {
               path: canonicalForFd,
               cloexec
             });
+            cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
+            recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
+          } else {
+            dirfdTable.delete(fdKey(rawEvent.pid, rawEvent.retFd));
             cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
             recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
           }

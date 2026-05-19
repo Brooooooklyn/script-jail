@@ -12258,5 +12258,123 @@ describe('runInstallPhase', () => {
       });
       expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex pass 45 follow-up (high, 2026-05-19, bug #6 — unresolved
+    // post-marker open).  Pre-fix sequence:
+    //   1. Parent opens fd 7 → /safe.
+    //   2. Child unshare(CLONE_FILES) — pendingFdDetach marker on child.
+    //   3. Child openat(99, "dir", O_DIRECTORY) = 7.  fd 99 was never
+    //      tracked, so canonicalizeOpenTarget returns null and the
+    //      pre-fix code skipped ALL fd bookkeeping for the new child
+    //      fd 7.  The kernel installed a fresh private fd; the model
+    //      had no mapping AND no post-marker reuse marker.
+    //   4. (Out-of-order) parent clone(CLONE_FILES) = child.  The copy
+    //      pass saw no child entry for fd 7 and copied parent's stale
+    //      /safe mapping into the child group.
+    //   5. Child openat(7, ".ssh/id_rsa", O_RDONLY).  Resolved against
+    //      the leaked parent path → emitted as /safe/.ssh/id_rsa.
+    //
+    // Post-fix:
+    //   - Step (3) now drops any stale dirfdTable entry at child fd 7,
+    //     marks the child fd-group state-unknown, cancels any pending
+    //     tombstones for fd 7, and records the opaque post-marker
+    //     reuse so the reconciler excludes fd 7 from the copy.
+    //   - Step (4)'s reconciliation skips copying parent's /safe →
+    //     child fd 7 (post-marker reuse + state-unknown).
+    //   - Step (5) fails closed: <UNRESOLVED_PATH> surfaces under the
+    //     child, NOT /safe/.ssh/id_rsa.
+    it('unresolved post-marker open (untracked dirfd) does not certify through parent fd on delayed clone (bug #6)', async () => {
+      const proc = mockProcReader({
+        4000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unresolved-post-marker-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        4001: {
+          ppid: 4000,
+          env: {
+            npm_package_name: 'unresolved-post-marker-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /safe → fd 7 in parent's dirfdTable.
+        {
+          pid: 4000,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child explicitly detaches via unshare(CLONE_FILES).  At this
+        // point the child is still a singleton group (delayed parent
+        // clone hasn't surfaced) — the unshare records a pending
+        // FdDetach marker so subsequent post-marker fd activity is
+        // tracked for the eventual reconciliation.
+        {
+          pid: 4001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Child openat(99, "dir", O_DIRECTORY) = 7.  fd 99 is NEVER
+        // tracked (no prior open established it).  Pre-fix this was
+        // silently dropped because canonicalize returned null.  Post-
+        // fix it triggers the opaque-open bookkeeping branch.
+        {
+          pid: 4001,
+          line: 'openat(99, "dir", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  Reconciliation
+        // sees the pending marker + post-marker fd-7 reuse → MUST
+        // skip copying parent's /safe → child fd 7.
+        {
+          pid: 4000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 4001',
+          source: 'strace',
+        },
+        // Child openat(7, ".ssh/id_rsa") — MUST fail closed.  EACCES
+        // ensures we don't return a retFd that would re-pollute the
+        // table; the protected-paths emit / unresolved synthesis path
+        // is what we want to assert on.
+        {
+          pid: 4001,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 4000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The leak: a certified read against /safe/.ssh/id_rsa for the
+      // child MUST NOT appear.
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          r['path'] === '/safe/.ssh/id_rsa' &&
+          r['pid'] === 4001
+        );
+      });
+      expect(leaked).toHaveLength(0);
+      // <UNRESOLVED_PATH> audit_bypass surfaces for the child's
+      // failing openat(7, ".ssh/id_rsa") — fd 7 is opaque and the
+      // reconciler did not copy parent's mapping.
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 4001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });
