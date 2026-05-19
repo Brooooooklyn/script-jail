@@ -305,9 +305,19 @@ export function parseShimLine(line: string): RawEvent | null {
 export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
-  const { cmd, args } = INSTALL_CMD[input.manager];
+  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
   // pm-flags.json extras are spliced into Phase A (fetch/resolve), not here —
   // dependency resolution is already done by the time Phase B runs.
+
+  // For pnpm: pin the store-dir to the repo overlay disk so Phase B
+  // reads from the same store Phase A populated.  Must be IDENTICAL to
+  // the value spliced in phase-fetch.ts — if Phase B's --store-dir
+  // differed from Phase A's, pnpm would see an empty store and either
+  // fall back to network (which is dropped at this point) or link
+  // nothing.  Keep both phases in lockstep via `input.cwd`.
+  const args = input.manager === 'pnpm'
+    ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`]
+    : baseArgs;
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`

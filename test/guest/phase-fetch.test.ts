@@ -63,11 +63,11 @@ describe('runFetchPhase', () => {
   });
 
   describe('pnpm', () => {
-    it('runs pnpm fetch', async () => {
+    it('runs pnpm fetch with --store-dir pinned to cwd', async () => {
       const { spawner, calls } = mockSpawner();
       await runFetchPhase({ manager: 'pnpm', cwd: '/work', env: BASE_ENV, spawner });
       expect(calls[0]!.cmd).toBe('pnpm');
-      expect(calls[0]!.args).toEqual(['fetch']);
+      expect(calls[0]!.args).toEqual(['fetch', '--store-dir=/work/.pnpm-store']);
     });
 
     it('returns ok=true on success', async () => {
@@ -171,6 +171,7 @@ describe('runFetchPhase', () => {
       expect(calls[0]!.cmd).toBe('pnpm');
       expect(calls[0]!.args).toEqual([
         'fetch', '--cpu=x64', '--os=linux', '--libc=glibc',
+        '--store-dir=/work/.pnpm-store',
       ]);
     });
 
@@ -216,7 +217,9 @@ describe('runFetchPhase', () => {
         spawner,
         pmFlagsPath,
       });
-      expect(calls[0]!.args).toEqual(['fetch']);
+      // pm-flags malformed → no extra_install_args spliced; --store-dir
+      // is still pinned (it's not pm-flags-derived).
+      expect(calls[0]!.args).toEqual(['fetch', '--store-dir=/work/.pnpm-store']);
     });
 
     it('argv is unchanged when pm-flags.json has the wrong schema', async () => {

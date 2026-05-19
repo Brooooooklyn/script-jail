@@ -83,6 +83,20 @@ export async function runFetchPhase(
     }
   }
 
+  // For pnpm: force the content-addressed store onto the repo overlay
+  // disk (4 GB, same filesystem as node_modules so hardlinks work).
+  // The default ~/.local/share/pnpm/store lives on the much smaller
+  // rootfs ext4 (~512 MB), which overruns silently on real monorepos
+  // (vuejs/core ≈ 500 MB).  pnpm's CLI flag wins over .npmrc / env in
+  // its config precedence chain, so this is the only fully reliable
+  // place to set it — the `npm_config_store_dir` env in agent.ts
+  // turned out to be a no-op in pnpm 11.x against fixtures that ship
+  // their own .npmrc.  `--store-dir` is a global pnpm flag and may
+  // legally appear before or after the subcommand.
+  if (input.manager === 'pnpm') {
+    args = [...args, `--store-dir=${input.cwd}/.pnpm-store`];
+  }
+
   const result = await input.spawner.spawn(cmd, args, {
     env: input.env,
     cwd: input.cwd,

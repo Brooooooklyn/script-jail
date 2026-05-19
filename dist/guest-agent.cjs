@@ -25273,6 +25273,9 @@ async function runFetchPhase(input) {
       args = [...baseArgs, ...extraInstallArgs];
     }
   }
+  if (input.manager === "pnpm") {
+    args = [...args, `--store-dir=${input.cwd}/.pnpm-store`];
+  }
   const result = await input.spawner.spawn(cmd, args, {
     env: input.env,
     cwd: input.cwd
@@ -25921,7 +25924,8 @@ function parseShimLine(line) {
   }
 }
 async function runInstallPhase(input) {
-  const { cmd, args } = INSTALL_CMD[input.manager];
+  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
+  const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
