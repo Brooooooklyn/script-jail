@@ -1528,6 +1528,201 @@ describe('runInstallPhase', () => {
       });
       expect(spawns).toHaveLength(0);
     });
+
+    // Audit-trust follow-up to the clone-propagation fix (Codex review of
+    // commit e5af2be, 2026-05-19): the propagation block reads
+    // `attributionSnapshotByPid.get(parentPid)` which is empty when the
+    // parent's FIRST observed traced line is the clone itself — pre-fix,
+    // the child was left unseeded and a short-lived ENOENT spawn from
+    // that child was still silently dropped.  Post-fix the dispatcher
+    // synchronously calls `input.attribution.attribute(parentPid)` at
+    // clone time when no snapshot exists, records the result, and uses
+    // it to seed the child.
+    it('clone-first ordering: parent has no prior event, /proc seeds at clone time', async () => {
+      // Parent pid 311 has live /proc context (Attribution succeeds).
+      // The very first traced line we emit for pid 311 is the clone —
+      // there is no prior execve, no prior shim event.  Pre-fix the
+      // snapshot map for pid 311 was empty at the clone-handler and the
+      // child was left unseeded.
+      const proc = mockProcReader({
+        311: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'parent-first-event',
+            npm_package_version: '3.0.0',
+            npm_lifecycle_event: 'preinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // No prior parent event — the clone is the FIRST observed line
+        // for pid 311.  This is the case Codex flagged.
+        {
+          pid: 311,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 312',
+          source: 'strace',
+        },
+        // Child execve's a missing binary and is reaped — /proc/<312>
+        // is gone so Attribution.attribute(312) → null.  The fallback
+        // MUST find a snapshot for 312 seeded at clone time.
+        {
+          pid: 312,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "boom.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: 311 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 312;
+      });
+      expect(spawns).toHaveLength(1);
+      expect(spawns[0]!['pkg']).toBe('parent-first-event@3.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('preinstall');
+    });
+
+    // Audit-trust follow-up #2 (Codex review of e5af2be, 2026-05-19):
+    // attributionSnapshotByPid was write-once with no eviction, so a
+    // recycled pid carried the earlier package label into the new
+    // spawn fallback — turning what used to be a dropped event into
+    // confidently wrong attribution.  Post-fix the strace exit line
+    // (`+++ exited with N +++`) is pre-parsed and evicts the snapshot
+    // for the named pid; subsequent observations on the reused pid
+    // are re-attributed from scratch.
+    //
+    // Scenario: pid 321 is attributed to pkg-A.  Pid 321 exits.  Then
+    // a fresh parent pid 411 (attributed to pkg-B) clones a child
+    // whose recycled pid happens to be 321.  The child of 411 then
+    // execve's a missing binary and is reaped — the spawn fallback
+    // must surface 322 attributed to pkg-B (the live parent), NOT to
+    // pkg-A (the dead first-generation pid 321 we cloned a child
+    // from).
+    it('pid-reuse hazard: exit line evicts stale snapshot before a recycled pid is cloned to a new child', async () => {
+      // Scenario: pid 411 first attributed to pkg-a; pid 411 exits
+      // (snapshot evicted); pid 412 first observed via clone whose
+      // child pid is the recycled 411 (a different package, pkg-b).
+      // The child's subsequent ENOENT spawn must surface pkg-b — the
+      // snapshot the clone-time propagation wrote — NOT the stale
+      // pkg-a from generation-1.
+      //
+      // We use a hand-rolled Attribution stub instead of `new
+      // Attribution(proc)` for two reasons:
+      //
+      //   1. We need attribute() to return pkg-a for pid 411 ONLY on
+      //      the first call (generation 1) and null on the final
+      //      ENOENT spawn (modelling a reaped recycled pid whose
+      //      /proc entry is gone again).  The real Attribution
+      //      memoises per-pid so subsequent calls would hit the
+      //      pkg-a cache.  The dispatcher uses the SNAPSHOT MAP
+      //      (which is what we're testing) only when attribute()
+      //      returns null on a spawn event; otherwise pkg comes
+      //      from result.pkg.
+      //
+      //   2. We want the assertion to fail specifically when the
+      //      snapshot map carries a stale pkg-a — i.e. exit-line
+      //      eviction or refresh-on-success is broken.  Using the
+      //      real Attribution would conflate the snapshot-map fix
+      //      with attribute-cache lifetime (which Codex explicitly
+      //      flagged as out of scope for this PR).
+      let attribute411Calls = 0;
+      const stubAttr = {
+        attribute(pid: number): { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null {
+          if (pid === 411) {
+            attribute411Calls += 1;
+            // First attribute(411) is for the generation-1 execve →
+            // pkg-a.  All later attribute(411) calls (the recycled
+            // generation-2 ENOENT spawn) return null — the recycled
+            // process was reaped before strace's tail reached the
+            // line, so /proc/<411>/{environ,status} ENOENT.
+            return attribute411Calls === 1
+              ? { pkg: 'pkg-a@1.0.0', lifecycle: 'install' }
+              : null;
+          }
+          if (pid === 412) {
+            return { pkg: 'pkg-b@2.0.0', lifecycle: 'postinstall' };
+          }
+          return null;
+        },
+      } as unknown as Attribution;
+
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Generation 1: pid 411 attributed to pkg-a via a successful
+        // execve observation.  recordAttribution writes pkg-a into
+        // the snapshot map.
+        {
+          pid: 411,
+          line: 'execve("/usr/bin/node", ["node", "a.js"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        // Pid 411 exits — the new exit-line pre-parser MUST evict
+        // attributionSnapshotByPid[411] here, otherwise the recycled
+        // pid 411 inherits a stale pkg-a in the clone-propagation
+        // block via `recordAttribution(childPid, parentAttrib)`
+        // overwriting the entry (refresh-on-success keeps us
+        // resilient, but the eviction is the principled mechanism).
+        {
+          pid: 411,
+          line: '+++ exited with 127 +++',
+          source: 'strace',
+        },
+        // Generation 2: a different parent pid 412 (pkg-b) is
+        // observed for the first time via its clone line.  The
+        // kernel happens to recycle pid 411 as the child pid.  Fix
+        // 1's clone-time parent-sampling records pkg-b for 412 and
+        // propagates it to the child (recycled pid 411).
+        {
+          pid: 412,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 411',
+          source: 'strace',
+        },
+        // Recycled pid 411 execve's a missing binary and is reaped
+        // — attribute(411) returns null this time (stub).  The
+        // spawn fallback consults the snapshot map, which now holds
+        // pkg-b (propagated from 412 at clone time, replacing the
+        // evicted pkg-a).
+        {
+          pid: 411,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "x.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: 411 }),
+        attribution: stubAttr,
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Pick the generation-2 ENOENT spawn (pid 411, result=enoent).
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 411 && raw['result'] === 'enoent';
+      });
+      expect(spawns).toHaveLength(1);
+      // Critical assertion: recycled pid 411 inherits pkg-b from
+      // parent 412 (via clone propagation onto an EVICTED snapshot
+      // slot), NOT the stale pkg-a from generation-1.  This is the
+      // "confidently wrong attribution under pid reuse" hazard
+      // Codex flagged.
+      expect(spawns[0]!['pkg']).toBe('pkg-b@2.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+    });
   });
 
   // Audit-trust Finding (high, 2026-05-18) — shim exec events carry a

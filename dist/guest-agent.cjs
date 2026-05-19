@@ -26381,9 +26381,7 @@ async function runInstallPhase(input) {
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
   const recordAttribution = (pid, attr) => {
-    if (!attributionSnapshotByPid.has(pid)) {
-      attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
-    }
+    attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
   };
   for await (const { pid, line, source } of input.strace.run(cmd, args, {
     env: input.env,
@@ -26420,6 +26418,10 @@ async function runInstallPhase(input) {
       continue;
     }
     if (source === "strace") {
+      if (line.startsWith("+++") && line.endsWith("+++")) {
+        attributionSnapshotByPid.delete(pid);
+        continue;
+      }
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
       if (chdirMatch !== null) {
         const rawTarget = chdirMatch[1] ?? "";
@@ -26830,7 +26832,14 @@ async function runInstallPhase(input) {
             if (shimLoadedPids.has(pid)) {
               shimLoadedPids.add(childPid);
             }
-            const parentAttrib = attributionSnapshotByPid.get(pid);
+            let parentAttrib = attributionSnapshotByPid.get(pid);
+            if (parentAttrib === void 0) {
+              const sampled = input.attribution.attribute(pid);
+              if (sampled !== null) {
+                recordAttribution(pid, sampled);
+                parentAttrib = sampled;
+              }
+            }
             if (parentAttrib !== void 0) {
               recordAttribution(childPid, parentAttrib);
             }

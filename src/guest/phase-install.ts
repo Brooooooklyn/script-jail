@@ -1947,9 +1947,16 @@ export async function runInstallPhase(
   //       the lockfile diff and the `findAuditBypass` scan in
   //       src/action/diff.ts hard-fails the PR.
   //
-  // The map is keyed by pid; entries are written once (first observation)
-  // and never overwritten, so a later attribution failure can't tamper
-  // with an earlier successful snapshot.
+  // The map is keyed by pid.  Entries are REFRESHED on every successful
+  // attribution observation: the sole caller (~line 4482) only invokes
+  // `recordAttribution` when `result !== null`, so the helper never
+  // receives a worse-quality signal than the snapshot we already have.
+  // The refresh is important for same-pid re-exec into a different
+  // package context (npm spawns a wrapper that itself execs a
+  // package-bin), and is the second half of the snapshot-lifetime fix
+  // that goes with the exit-line eviction below — together they prevent
+  // a recycled or re-exec'd pid from carrying a stale earlier label
+  // into the spawn fallback (Codex audit-trust 2026-05-19).
   const attributionSnapshotByPid: Map<
     number,
     { pkg: string; lifecycle: AttributedEvent['lifecycle'] }
@@ -1958,9 +1965,7 @@ export async function runInstallPhase(
     pid: number,
     attr: { pkg: string; lifecycle: AttributedEvent['lifecycle'] },
   ): void => {
-    if (!attributionSnapshotByPid.has(pid)) {
-      attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
-    }
+    attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
   };
 
   // StraceRunner is the SOLE owner of the install process.
@@ -2101,10 +2106,12 @@ export async function runInstallPhase(
         shimExecCountByPid.set(shimEvent.pid, next);
       }
       if (result !== null) {
-        // Finding 3 (audit-trust): snapshot attribution for this pid the
-        // first time we see it.  A later raw execve from the same pid
-        // with a scrubbed envp would otherwise lose the lifecycle
-        // context and slip past the bypass detector.
+        // Finding 3 (audit-trust): snapshot attribution for this pid on
+        // every successful observation.  A later raw execve from the
+        // same pid with a scrubbed envp would otherwise lose the
+        // lifecycle context and slip past the bypass detector.  The
+        // refresh semantics (see `recordAttribution` declaration) also
+        // keep same-pid re-execs into a new package context current.
         recordAttribution(shimEvent.pid, result);
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
@@ -2112,6 +2119,33 @@ export async function runInstallPhase(
     }
 
     if (source === 'strace') {
+      // Audit-trust Finding (medium, 2026-05-19): pre-parse process-exit
+      // lines BEFORE any other per-pid bookkeeping in this branch so
+      // that the snapshot map (and other pid-keyed state we want to be
+      // lifecycle-bounded) never serves a stale entry for a reused or
+      // re-exec'd pid.  Strace's `-ff` per-pid output renders the
+      // exit-line literally as:
+      //
+      //   +++ exited with 0 +++
+      //   +++ exited with 127 +++
+      //   +++ killed by SIGKILL +++
+      //
+      // (the per-pid file's lines are already stripped of any pid
+      // prefix; the dispatcher receives `pid` separately).  The strace
+      // parser drops these lines (see src/guest/strace-parser.ts:300-302
+      // — the same `+++ ... +++` shape is also used for kill/SIG-exit
+      // notifications) so handling them here is the only place the
+      // dispatcher gets to react.  We treat any `+++ ... +++` line as
+      // process termination for the named pid and evict its snapshot —
+      // that's the only state with a pid-reuse hazard that
+      // recordAttribution writes today; other pid-keyed maps
+      // (pidCwd / dirfdTable / shimLoadedPids / etc) are governed by
+      // exec/clone semantics and are intentionally NOT cleared here.
+      if (line.startsWith('+++') && line.endsWith('+++')) {
+        attributionSnapshotByPid.delete(pid);
+        continue;
+      }
+
       // Audit-trust Finding (high, 2026-05-19): pre-parse `chdir(...)` and
       // `fchdir(...)` lines to maintain the per-pid CWD table.  These
       // syscalls don't produce a RawEvent (they're transport-only state
@@ -3303,8 +3337,33 @@ export async function runInstallPhase(
             // pkg / lifecycle label.  Only propagate when the parent
             // actually has a snapshot — clone lines from pids without a
             // tracked attribution (e.g. unshare-detached pseudo-parents)
-            // leave the child unattributed, same as before.
-            const parentAttrib = attributionSnapshotByPid.get(pid);
+            // leave the child unattributed.
+            //
+            // Audit-trust follow-up (high, 2026-05-19): if the parent's
+            // FIRST observed traced line is the clone itself (no prior
+            // shim event, no prior raw execve), the snapshot map is
+            // empty and a naive `attributionSnapshotByPid.get(pid)`
+            // returns undefined — leaving the child unseeded.  In that
+            // window the parent process is still alive (it must be — it
+            // just executed clone successfully), so /proc/<parent>/
+            // environ and status are readable and Attribution can walk
+            // pid → ppid → env.  We synchronously sample the parent's
+            // attribution here exactly the same way the regular
+            // dispatch path samples a pid on first observation, record
+            // it (so subsequent same-pid events reuse it), and use the
+            // freshly-sampled snapshot to seed the child.  This closes
+            // the clone-first-ordering hole identified by the Codex
+            // audit-trust review of e5af2be: a short-lived ENOENT
+            // child of a freshly-observed parent now surfaces in
+            // spawn_blocked instead of being silently dropped.
+            let parentAttrib = attributionSnapshotByPid.get(pid);
+            if (parentAttrib === undefined) {
+              const sampled = input.attribution.attribute(pid);
+              if (sampled !== null) {
+                recordAttribution(pid, sampled);
+                parentAttrib = sampled;
+              }
+            }
             if (parentAttrib !== undefined) {
               recordAttribution(childPid, parentAttrib);
             }
