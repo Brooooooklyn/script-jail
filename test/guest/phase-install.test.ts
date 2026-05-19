@@ -12877,5 +12877,168 @@ describe('runInstallPhase', () => {
       // post-fix the dup2 clears the marker so this doesn't happen.
       expect(unresolved).toHaveLength(1);
     });
+
+    // Codex pass 50 follow-up (high, 2026-05-19, bug — post-marker fd
+    // reuses are missed when performed by a CLONE_FILES sibling).
+    //
+    // Pre-fix failure shape:
+    //   1. Parent P opens /safe → fd 7 (modeled as `<P>:7 = /safe`).
+    //   2. (kernel) P does `clone(CLONE_FILES) = C` — DELAYED in
+    //      strace output.  P + C share files_struct at kernel level.
+    //   3. C does `unshare(CLONE_FILES) = 0` — snapshotFd seeds the
+    //      pending-fd-detach marker on C.  C becomes its own root.
+    //   4. C does `clone(CLONE_FILES) = G` — observed IMMEDIATELY.
+    //      G has no pending marker; reconciler takes the union branch
+    //      and `unionFd(C, G)` makes `rootedFd(G) === C`.  G now
+    //      shares C's post-detach private fd table.
+    //   5. G does `openat(AT_FDCWD, "/known", O_DIRECTORY) = 7` —
+    //      installs `<C>:7 = /known` (keyed by rootedFd(G)=C).  This
+    //      is a POST-MARKER REUSE for C's marker but the mutating pid
+    //      is G.  Pre-fix `recordPostMarkerFdReuse(G, 7)` short-
+    //      circuited because `pendingFdDetach.get(G) === undefined`
+    //      (no marker on G); the lifecycle entry was never recorded.
+    //   6. Delayed `P clone(CLONE_FILES) = C` surfaces → reconciler
+    //      runs the COPY branch (childHadPendingFdDetach=true).  Pre-
+    //      fix: `postMarkerFdReuses.get(C)` returns undefined; the
+    //      copy-pass sees parent's `<P>:7 = /safe` vs child's
+    //      `<C>:7 = /known` as an ordinary conflict and DROPS the
+    //      child entry (fail-closed on disagreement).
+    //   7. G does `openat(7, "file", O_RDONLY) = -1 EACCES` —
+    //      canonicalize against rootedFd(G)=C; pre-fix the entry was
+    //      dropped → returns null → `<UNRESOLVED_PATH>`.
+    //
+    // Post-fix: `recordPostMarkerFdReuse(G, 7)` keys by `rootedFd(G)
+    // = C` and finds C's marker in `pendingFdDetach`, so the
+    // lifecycle entry is correctly recorded under `postMarkerFdReuses[C]`.
+    // The reconciler reads the lifecycle by the same root, sees fd 7
+    // is a post-marker reuse, and preserves the child entry through
+    // the conflict-resolution branch.  G's `openat(7, "file")`
+    // resolves to `/known/file` as the canonical post-marker private
+    // reopen intended.
+    it('post-marker fd reuse by CLONE_FILES sibling is preserved through delayed-clone reconciliation (pass-50 bug)', async () => {
+      const proc = mockProcReader({
+        9000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pass50-bug-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9001: {
+          ppid: 9000,
+          env: {
+            npm_package_name: 'pass50-bug-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9002: {
+          ppid: 9001,
+          env: {
+            npm_package_name: 'pass50-bug-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // (1) Parent P=9000 opens /safe → fd 7.  Modeled in P's
+        // singleton fd group as `<9000>:7 = /safe`.
+        {
+          pid: 9000,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // (2) C=9001 unshares CLONE_FILES.  snapshotFd seeds the
+        // pending marker; C becomes its own fd-group root.  Note:
+        // P's `clone(CLONE_FILES) = 9001` line has NOT yet been
+        // observed — the delayed-clone window starts here.
+        {
+          pid: 9001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // (3) C clones G=9002 with CLONE_FILES — observed
+        // immediately.  Reconciler takes the union branch and
+        // `unionFd(9001, 9002)` makes `rootedFd(9002) === 9001`.
+        // G now shares C's post-detach private fd table.
+        {
+          pid: 9001,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9002',
+          source: 'strace',
+        },
+        // (4) G opens /known → fd 7 via AT_FDCWD.  canonicalize
+        // returns "/known"; entry installed as `<9001>:7 = /known`
+        // (keyed by rootedFd(G)=9001).  POST-MARKER REUSE: pre-fix
+        // `recordPostMarkerFdReuse(9002, 7)` short-circuited (no
+        // marker on G); post-fix it keys by rootedFd(9002)=9001
+        // and updates `postMarkerFdReuses[9001][7] = 'open'`.
+        {
+          pid: 9002,
+          line: 'openat(AT_FDCWD, "/known", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // (5) Delayed `P clone(CLONE_FILES) = C` surfaces →
+        // reconciler runs the COPY branch (childHadPendingFdDetach=
+        // true).  Pre-fix: copy-pass saw `<9000>:7=/safe` vs
+        // `<9001>:7=/known` as ordinary conflict and dropped the
+        // child entry.  Post-fix: lifecycle has fd 7 → 'open' so
+        // `reusedPostMarker` is true and the child entry is
+        // preserved.
+        {
+          pid: 9000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9001',
+          source: 'strace',
+        },
+        // (6) G does `openat(7, "file", O_RDONLY)` — canonicalize
+        // against rootedFd(9002)=9001; post-fix `<9001>:7 = /known`
+        // survives reconciliation, so the resolved path is
+        // /known/file.  Pre-fix it was dropped → null →
+        // `<UNRESOLVED_PATH>`.
+        {
+          pid: 9002,
+          line: 'openat(7, "file", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The post-marker reopen via the CLONE_FILES sibling MUST
+      // survive reconciliation: G's `openat(7, "file")` canonicalizes
+      // to /known/file.  Pre-fix this surfaced as <UNRESOLVED_PATH>
+      // because reconciliation dropped the child entry on the
+      // perceived parent-vs-child path conflict.
+      const resolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/known/file' && r['pid'] === 9002;
+      });
+      expect(resolved).toHaveLength(1);
+      // No leak through parent's stale /safe: a successful resolve
+      // through `<9000>:7 = /safe` would emit /safe/file.  Post-fix
+      // the COPY branch preserves the child's /known mapping and
+      // parent's /safe stays under parent's prefix only — G resolves
+      // through child's prefix, not parent's.
+      const leakedSafe = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/safe/file' && r['pid'] === 9002;
+      });
+      expect(leakedSafe).toHaveLength(0);
+      // No <UNRESOLVED_PATH> entry for G — the post-marker reopen
+      // resolved cleanly through the preserved child mapping.
+      const gUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 9002;
+      });
+      expect(gUnresolved).toHaveLength(0);
+    });
   });
 });

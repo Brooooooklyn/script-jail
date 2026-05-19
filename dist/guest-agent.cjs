@@ -25912,12 +25912,13 @@ async function runInstallPhase(input) {
   const pendingFdTombstones = /* @__PURE__ */ new Map();
   const postMarkerFdReuses = /* @__PURE__ */ new Map();
   function recordPostMarkerFdReuse(pid, fd) {
-    const snap = pendingFdDetach.get(pid);
+    const root = rootedFd(pid);
+    const snap = pendingFdDetach.get(root);
     if (snap === void 0) return;
-    let lifecycle = postMarkerFdReuses.get(pid);
+    let lifecycle = postMarkerFdReuses.get(root);
     if (lifecycle === void 0) {
       lifecycle = /* @__PURE__ */ new Map();
-      postMarkerFdReuses.set(pid, lifecycle);
+      postMarkerFdReuses.set(root, lifecycle);
     }
     lifecycle.set(fd, "open");
     const fdSuffix = String(fd);
@@ -25928,8 +25929,9 @@ async function runInstallPhase(input) {
     }
   }
   function recordPostMarkerFdClose(pid, fd) {
-    if (pendingFdDetach.get(pid) === void 0) return;
-    const lifecycle = postMarkerFdReuses.get(pid);
+    const root = rootedFd(pid);
+    if (pendingFdDetach.get(root) === void 0) return;
+    const lifecycle = postMarkerFdReuses.get(root);
     if (lifecycle === void 0) return;
     if (lifecycle.get(fd) === "open") {
       lifecycle.set(fd, "closed");
@@ -25962,8 +25964,9 @@ async function runInstallPhase(input) {
     if (set2.size === 0) opaqueFdReuses.delete(root);
   }
   function recordPostMarkerFdRangeClose(pid, first, last) {
-    if (pendingFdDetach.get(pid) === void 0) return;
-    const lifecycle = postMarkerFdReuses.get(pid);
+    const root = rootedFd(pid);
+    if (pendingFdDetach.get(root) === void 0) return;
+    const lifecycle = postMarkerFdReuses.get(root);
     if (lifecycle === void 0) return;
     for (const [fd, state] of lifecycle) {
       if (fd >= first && fd <= last && state === "open") {
@@ -26470,8 +26473,9 @@ async function runInstallPhase(input) {
             pendingCwdDetach.delete(childPid);
             const childFdSnap = pendingFdDetach.get(childPid);
             pendingFdDetach.delete(childPid);
-            const childPostMarkerLifecycle = postMarkerFdReuses.get(childPid);
-            postMarkerFdReuses.delete(childPid);
+            const childFdRoot = rootedFd(childPid);
+            const childPostMarkerLifecycle = postMarkerFdReuses.get(childFdRoot);
+            postMarkerFdReuses.delete(childFdRoot);
             const childPostMarkerFdTouched = childPostMarkerLifecycle === void 0 ? void 0 : new Set(childPostMarkerLifecycle.keys());
             const childPostMarkerFdClosed = (() => {
               if (childPostMarkerLifecycle === void 0) return void 0;

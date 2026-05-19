@@ -738,16 +738,45 @@ export async function runInstallPhase(
   // a fd in 'open' → 'closed' for that fd (range-walks the per-pid
   // map; unknown fds in the range are handled by the existing
   // post-detach range tombstone logic).
+  //
+  // Codex pass 50 follow-up (high, 2026-05-19): keyed by FD-GROUP
+  // ROOT (via `rootedFd(pid)`), NOT by the mutating pid.  Pre-fix
+  // the map was per-pid, which silently dropped post-marker reuses
+  // performed by CLONE_FILES siblings of the marker owner.  Concrete
+  // breakage: P opens fd 7=/safe; C does unshare(CLONE_FILES) →
+  // marker created on C; C does clone(CLONE_FILES)=G → G joins C's
+  // post-detach private fd group via `unionFd(C, G)`; G does
+  // openat(AT_FDCWD, "/known", ...)=7 — this is a post-marker reuse
+  // of fd 7 in C's group, but `pendingFdDetach.get(G)` is undefined
+  // pre-fix, so the lifecycle entry was never recorded.  Then the
+  // delayed `P clone(CLONE_FILES)=C` line surfaces; reconciliation
+  // reads `postMarkerFdReuses.get(C)` and finds nothing, so the
+  // copy-pass treats G's fd 7=/known as an ordinary conflict (drops
+  // the child entry) instead of preserving the post-marker private
+  // reopen.  G's subsequent `openat(7, "file", …)` resolves to
+  // `<UNRESOLVED_PATH>`.
+  //
+  // Marker-owner invariant: a marker is created right after
+  // `detachFdGroup(pid)`, so the owner is always its own root at
+  // marker-creation time AND remains its own root for the marker's
+  // lifetime (`unionFd(other, owner)` is gated on absence of a
+  // pending marker; `unionFd(owner, child)` keeps owner as the
+  // parent's root).  Consequently `postMarkerFdReuses[root]` is
+  // exactly the lifecycle the reconciliation needs, and `root ===
+  // ownerPid` whenever an entry exists.
   const postMarkerFdReuses = new Map<number, Map<number, 'open' | 'closed'>>();
   function recordPostMarkerFdReuse(pid: number, fd: number): void {
-    // Only track when a marker is actively pending — otherwise there's
-    // no future reconciliation that needs the exclusion.
-    const snap = pendingFdDetach.get(pid);
+    // Only track when a marker is actively pending on the FD-GROUP's
+    // marker owner — otherwise there's no future reconciliation
+    // that needs the exclusion.  The marker owner is the fd-group
+    // root by invariant (see comment block above).
+    const root = rootedFd(pid);
+    const snap = pendingFdDetach.get(root);
     if (snap === undefined) return;
-    let lifecycle = postMarkerFdReuses.get(pid);
+    let lifecycle = postMarkerFdReuses.get(root);
     if (lifecycle === undefined) {
       lifecycle = new Map();
-      postMarkerFdReuses.set(pid, lifecycle);
+      postMarkerFdReuses.set(root, lifecycle);
     }
     // Transition: 'open' or absent → 'open'; 'closed' → 'open' (reopen
     // cancels the earlier post-marker close).
@@ -769,14 +798,18 @@ export async function runInstallPhase(
     }
   }
   // Codex follow-up (high, 2026-05-19, bug #5 — post-marker close of
-  // a reused fd): transition the per-pid lifecycle entry for `fd`
-  // from 'open' → 'closed'.  Only meaningful when a marker is
-  // pending AND `fd` was previously recorded as an 'open' reuse —
-  // otherwise no entry exists / the close is governed by the
-  // existing pre-marker / post-marker untracked-fd tombstone paths.
+  // a reused fd): transition the lifecycle entry for `fd` from
+  // 'open' → 'closed'.  Only meaningful when a marker is pending on
+  // the fd-group's marker owner AND `fd` was previously recorded as
+  // an 'open' reuse — otherwise no entry exists / the close is
+  // governed by the existing pre-marker / post-marker untracked-fd
+  // tombstone paths.  Keyed by fd-group root (pass 50 follow-up) so
+  // CLONE_FILES siblings of the marker owner update the SAME
+  // lifecycle map the reconciler consumes.
   function recordPostMarkerFdClose(pid: number, fd: number): void {
-    if (pendingFdDetach.get(pid) === undefined) return;
-    const lifecycle = postMarkerFdReuses.get(pid);
+    const root = rootedFd(pid);
+    if (pendingFdDetach.get(root) === undefined) return;
+    const lifecycle = postMarkerFdReuses.get(root);
     if (lifecycle === undefined) return;
     if (lifecycle.get(fd) === 'open') {
       lifecycle.set(fd, 'closed');
@@ -859,13 +892,15 @@ export async function runInstallPhase(
   }
   // Codex follow-up (high, 2026-05-19, bug #5 — post-marker
   // close_range over a range that may include reused fds): walk the
-  // per-pid lifecycle map and transition every fd in [first, last]
+  // fd-group lifecycle map and transition every fd in [first, last]
   // currently in 'open' → 'closed'.  Range covers reused fds only;
   // unknown fds in the range are still tracked by the existing
-  // post-detach range tombstone logic on `postDetachLog`.
+  // post-detach range tombstone logic on `postDetachLog`.  Keyed by
+  // fd-group root (pass 50 follow-up).
   function recordPostMarkerFdRangeClose(pid: number, first: number, last: number): void {
-    if (pendingFdDetach.get(pid) === undefined) return;
-    const lifecycle = postMarkerFdReuses.get(pid);
+    const root = rootedFd(pid);
+    if (pendingFdDetach.get(root) === undefined) return;
+    const lifecycle = postMarkerFdReuses.get(root);
     if (lifecycle === undefined) return;
     for (const [fd, state] of lifecycle) {
       if (fd >= first && fd <= last && state === 'open') {
@@ -2275,8 +2310,20 @@ export async function runInstallPhase(
             //     state.  Used by the copy-pass to skip parent
             //     entries that would resurrect a kernel-closed fd
             //     in the child copy.
-            const childPostMarkerLifecycle = postMarkerFdReuses.get(childPid);
-            postMarkerFdReuses.delete(childPid);
+            // Codex pass 50 follow-up (high, 2026-05-19): post-marker
+            // fd reuses are keyed by fd-group ROOT (not by mutating
+            // pid), so a CLONE_FILES sibling of the marker owner that
+            // reused / closed fds post-marker has its lifecycle stored
+            // under the SAME root we look up here.  The marker owner
+            // is the fd-group root by invariant (markers are created
+            // immediately after `detachFdGroup(pid)`), so at this
+            // reconciliation moment `rootedFd(childPid) === childPid`
+            // when childPid is the marker owner — but using
+            // `rootedFd(childPid)` keeps the lookup symmetric with the
+            // record/transition helpers above.
+            const childFdRoot = rootedFd(childPid);
+            const childPostMarkerLifecycle = postMarkerFdReuses.get(childFdRoot);
+            postMarkerFdReuses.delete(childFdRoot);
             const childPostMarkerFdTouched =
               childPostMarkerLifecycle === undefined
                 ? undefined
