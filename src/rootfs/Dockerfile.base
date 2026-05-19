@@ -9,9 +9,25 @@ FROM ubuntu:${UBUNTU_MAJOR}
 # The cleanup `rm -rf` lives in the SAME RUN as the install so the docs/man/
 # locale payloads never get committed to a layer in the first place.  A
 # follow-up `RUN rm -rf …` would only mask the bytes, not shrink the image.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      strace busybox dumb-init ca-certificates socat && \
+#
+# Retry the apt fetch up to 5 times with backoff: arm64 cross-builds run
+# under QEMU against `ports.ubuntu.com`, which has been intermittently
+# unreachable from GitHub-hosted runners (connection timeouts, missing
+# index files).  A single transient failure shouldn't fail the whole
+# release/parity build.
+RUN set -eu; \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get update && \
+         apt-get install -y --no-install-recommends \
+           strace busybox dumb-init ca-certificates socat; then \
+        break; \
+      fi; \
+      if [ "$attempt" = "5" ]; then \
+        echo "apt install failed after 5 attempts" >&2; exit 1; \
+      fi; \
+      echo "apt install attempt $attempt failed; sleeping before retry" >&2; \
+      sleep $((attempt * 5)); \
+    done && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /usr/share/doc /usr/share/man /usr/share/locale \
            /var/cache/apt /var/lib/dpkg/info/*.md5sums
