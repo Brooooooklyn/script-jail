@@ -230,6 +230,88 @@ describe('Attribution', () => {
     expect(reader.environCalls).toBe(environAfterFirst);
   });
 
+  // Audit-trust follow-up (Codex review of e22c79b, 2026-05-19):
+  // `invalidate(pid)` drops the per-pid cache entry so the NEXT
+  // `attribute(pid)` call re-walks /proc.  The phase-install
+  // dispatcher calls this on every observed `+++ exited +++` strace
+  // line to handle pid recycling: without it, a recycled pid's
+  // subsequent attribution returns the dead generation's cached
+  // result.
+  it('invalidate(pid) drops cache → next attribute(pid) re-reads /proc', () => {
+    // Stateful reader that returns one environ on first read of pid
+    // 500 and a different environ on the next.  The pid's ppid stays
+    // 1 in both cases so a single environ read is enough to terminate
+    // the walk.
+    let environReads = 0;
+    const readerSpec: Record<number, ProcSpec> = {
+      500: { ppid: 1, env: npmEnv('pkg-a', '1.0.0', 'install') },
+    };
+    const reader: ProcReader = {
+      readPpid(pid: number): number | null {
+        return readerSpec[pid]?.ppid ?? null;
+      },
+      readEnviron(pid: number): Map<string, string> | null {
+        environReads += 1;
+        if (pid === 500) {
+          // First read → pkg-a; subsequent reads → pkg-b (recycled pid
+          // whose new /proc/<pid>/environ has different npm vars).
+          const env =
+            environReads === 1
+              ? npmEnv('pkg-a', '1.0.0', 'install')
+              : npmEnv('pkg-b', '2.0.0', 'postinstall');
+          return new Map(Object.entries(env));
+        }
+        const entry = readerSpec[pid];
+        if (entry === undefined) return null;
+        if (entry.env === null || entry.env === undefined) return null;
+        return new Map(Object.entries(entry.env));
+      },
+    };
+
+    const attr = new Attribution(reader);
+
+    // First call → pkg-a (the cache is populated).
+    expect(attr.attribute(500)).toEqual<AttributionResult>({
+      pkg: 'pkg-a@1.0.0',
+      lifecycle: 'install',
+    });
+
+    // Without invalidate, a second call would hit the cache and
+    // return pkg-a — this is the exact bug `invalidate` exists to
+    // fix.  Sanity-check the cache works as documented before
+    // invalidating.
+    expect(attr.attribute(500)).toEqual<AttributionResult>({
+      pkg: 'pkg-a@1.0.0',
+      lifecycle: 'install',
+    });
+
+    // Invalidate and call again — the reader is consulted afresh and
+    // returns the recycled pid's NEW environ (pkg-b).
+    attr.invalidate(500);
+    expect(attr.attribute(500)).toEqual<AttributionResult>({
+      pkg: 'pkg-b@2.0.0',
+      lifecycle: 'postinstall',
+    });
+  });
+
+  // Defensive: invalidate(pid) on a pid that was never cached is a
+  // no-op (Map.delete on a missing key).  This ensures the dispatcher
+  // can call invalidate() unconditionally on every exit line without
+  // needing to gate on cache membership.
+  it('invalidate(pid) on uncached pid is a no-op', () => {
+    const reader = syntheticReader({
+      600: { ppid: 1, env: npmEnv('pkg-x', '1.0.0', 'install') },
+    });
+    const attr = new Attribution(reader);
+    // No prior attribute(600) call → cache is empty for pid 600.
+    expect(() => attr.invalidate(600)).not.toThrow();
+    // Subsequent attribute returns the expected result.
+    expect(attr.attribute(600)).toEqual<AttributionResult>({
+      pkg: 'pkg-x@1.0.0',
+      lifecycle: 'install',
+    });
+  });
+
   // 13. Two pids sharing an ancestor
   // Terminal-result caching only (v1): each starting pid is cached separately.
   // The shared ancestor (200) may be re-read for the second starting pid (400)

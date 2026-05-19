@@ -25069,8 +25069,14 @@ function buildPkg(name, version2) {
 var Attribution = class {
   reader;
   // Terminal-only cache: keyed by starting pid. Intermediate pids are not
-  // cached (v1 limitation). Pid recycling is impossible in the single-install
-  // Firecracker environment where this runs.
+  // cached (v1 limitation). Pid recycling is rare but possible — even in the
+  // single-install Firecracker environment, a short-lived child can exit and
+  // have its pid reassigned within the same install when another sibling
+  // forks. The {@link invalidate} method exists so the phase-install
+  // dispatcher can drop a dead generation's cached attribution upon observing
+  // its `+++ exited +++` line, ensuring the next `attribute(pid)` on the
+  // recycled pid re-reads /proc instead of returning the dead generation's
+  // result.
   cache = /* @__PURE__ */ new Map();
   constructor(reader) {
     this.reader = reader;
@@ -25087,7 +25093,8 @@ var Attribution = class {
    *   - No process in the chain has the required env vars.
    *
    * Results are cached per starting pid. A second call with the same pid will
-   * return the cached value without any additional /proc reads.
+   * return the cached value without any additional /proc reads — unless
+   * {@link invalidate} has been called for the pid in between.
    */
   attribute(pid) {
     if (this.cache.has(pid)) {
@@ -25096,6 +25103,23 @@ var Attribution = class {
     const result = this._walk(pid);
     this.cache.set(pid, result);
     return result;
+  }
+  /**
+   * Drop the cached attribution for `pid`. The next call to
+   * {@link attribute} for the same pid will walk /proc afresh.
+   *
+   * Used by the phase-install dispatcher when it observes a process-exit
+   * strace line (`+++ exited +++` / `+++ killed by SIG... +++`) so a
+   * recycled pid does NOT inherit the dead generation's cached
+   * attribution result. Without invalidation, the per-pid `cache` Map
+   * here would keep returning the old pkg/lifecycle pair forever (the
+   * single-install Firecracker environment runs for the whole install,
+   * so the process-level cache is long-lived), and the dispatcher's
+   * snapshot machinery would store the stale value as the recycled
+   * pid's new generation snapshot.
+   */
+  invalidate(pid) {
+    this.cache.delete(pid);
   }
   _walk(startPid) {
     let current = startPid;
@@ -26380,14 +26404,26 @@ async function runInstallPhase(input) {
   const forgerySamples = [];
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
-  const recordAttribution = (pid, attr) => {
-    attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
+  const recordAttribution = (pid, attr, ts) => {
+    const existing = attributionSnapshotByPid.get(pid);
+    if (existing === void 0 || existing.recordedAtTs <= ts) {
+      attributionSnapshotByPid.set(pid, {
+        pkg: attr.pkg,
+        lifecycle: attr.lifecycle,
+        recordedAtTs: ts
+      });
+    }
   };
-  for await (const { pid, line, source } of input.strace.run(cmd, args, {
+  let dispatchTs = 0;
+  for await (const record2 of input.strace.run(cmd, args, {
     env: input.env,
     cwd: input.cwd,
     basePath
   })) {
+    const { pid, line, source } = record2;
+    const explicitTs = record2.ts;
+    const lineTs = explicitTs !== void 0 ? explicitTs : dispatchTs;
+    dispatchTs++;
     if (!installRootSeeded) {
       const rootPid = input.strace.getRootPid();
       if (rootPid !== null && pid === rootPid) {
@@ -26412,14 +26448,18 @@ async function runInstallPhase(input) {
         shimExecCountByPid.set(shimEvent.pid, next);
       }
       if (result !== null) {
-        recordAttribution(shimEvent.pid, result);
+        recordAttribution(shimEvent.pid, result, lineTs);
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
     }
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
-        attributionSnapshotByPid.delete(pid);
+        const existing = attributionSnapshotByPid.get(pid);
+        if (existing === void 0 || existing.recordedAtTs <= lineTs) {
+          attributionSnapshotByPid.delete(pid);
+        }
+        input.attribution.invalidate(pid);
         continue;
       }
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
@@ -26836,12 +26876,12 @@ async function runInstallPhase(input) {
             if (parentAttrib === void 0) {
               const sampled = input.attribution.attribute(pid);
               if (sampled !== null) {
-                recordAttribution(pid, sampled);
+                recordAttribution(pid, sampled, lineTs);
                 parentAttrib = sampled;
               }
             }
             if (parentAttrib !== void 0) {
-              recordAttribution(childPid, parentAttrib);
+              recordAttribution(childPid, parentAttrib, lineTs);
             }
           }
         }
@@ -27164,7 +27204,7 @@ async function runInstallPhase(input) {
         }
         continue;
       }
-      const straceEvents = parseStraceLine(line, pid, 0);
+      const straceEvents = parseStraceLine(line, pid, lineTs);
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
@@ -27273,7 +27313,7 @@ async function runInstallPhase(input) {
           }
         }
         if (result !== null) {
-          recordAttribution(rawEvent.pid, result);
+          recordAttribution(rawEvent.pid, result, rawEvent.ts);
         }
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           const argv0 = rawEvent.argv[0] ?? "";

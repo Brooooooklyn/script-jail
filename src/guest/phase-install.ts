@@ -84,7 +84,24 @@ export interface StraceRunner {
     cmd: string,
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
-  ): AsyncIterable<{ pid: number; line: string; source: LineSource }>;
+  ): AsyncIterable<{
+    pid: number;
+    line: string;
+    source: LineSource;
+    /**
+     * Optional explicit generation-token override.  When omitted (the
+     * production case), the phase-install dispatcher assigns its own
+     * monotonic counter to each yielded line.  When set (test-only
+     * channel for exercising out-of-order delivery), the dispatcher
+     * uses the supplied value as the line's `ts`.  This is the seam
+     * tests use to simulate strace `-ff` cross-file reorderings —
+     * e.g. a delayed `+++ exited +++` line whose ts predates a
+     * later-but-already-processed clone-propagation snapshot.
+     * Production `LinuxStraceRunner` never sets this field; only the
+     * canned test runners do.
+     */
+    ts?: number;
+  }>;
 
   /**
    * Returns the exit code of the most recently run process.
@@ -1957,15 +1974,44 @@ export async function runInstallPhase(
   // that goes with the exit-line eviction below — together they prevent
   // a recycled or re-exec'd pid from carrying a stale earlier label
   // into the spawn fallback (Codex audit-trust 2026-05-19).
+  //
+  // Audit-trust follow-up (Codex review of e22c79b, 2026-05-19):
+  // each snapshot also carries `recordedAtTs` — the monotonic ts of the
+  // dispatcher line that wrote it.  Strace `-ff` produces one file per
+  // pid; the tailer reads them in filesystem-order, NOT global event
+  // order, so a NEW parent's `clone(...) = <recycledPid>` line in
+  // fileA can be processed BEFORE the OLD generation's
+  // `+++ exited +++` line in fileB.  Without a generation token, the
+  // delayed exit-line eviction would clobber the snapshot the new
+  // clone-propagation just wrote.  By comparing `recordedAtTs` against
+  // the exit-line's ts, the eviction can decline to delete a snapshot
+  // recorded by a later observation than the exit.
   const attributionSnapshotByPid: Map<
     number,
-    { pkg: string; lifecycle: AttributedEvent['lifecycle'] }
+    { pkg: string; lifecycle: AttributedEvent['lifecycle']; recordedAtTs: number }
   > = new Map();
   const recordAttribution = (
     pid: number,
     attr: { pkg: string; lifecycle: AttributedEvent['lifecycle'] },
+    ts: number,
   ): void => {
-    attributionSnapshotByPid.set(pid, { pkg: attr.pkg, lifecycle: attr.lifecycle });
+    // Generation-token ordering: an entry written by a LATER observation
+    // (higher ts) takes precedence.  Equal ts is treated as refresh (a
+    // single line can yield multiple observations — e.g. a successful
+    // shim event followed by recording at the same dispatcher tick).
+    // An earlier-ts write (lower ts than what we already have) is
+    // ignored: it would otherwise let an out-of-order delayed event
+    // overwrite a newer snapshot.  Production order from a global
+    // monotonic dispatcher counter never produces out-of-order writes,
+    // so this is a defensive guard rather than a hot path.
+    const existing = attributionSnapshotByPid.get(pid);
+    if (existing === undefined || existing.recordedAtTs <= ts) {
+      attributionSnapshotByPid.set(pid, {
+        pkg: attr.pkg,
+        lifecycle: attr.lifecycle,
+        recordedAtTs: ts,
+      });
+    }
   };
 
   // StraceRunner is the SOLE owner of the install process.
@@ -1990,11 +2036,36 @@ export async function runInstallPhase(
   // produces `undefined` would route trusted-channel bytes through the
   // best-effort path).  We require an explicit 'shim' or 'strace' value;
   // anything else records tamper.
-  for await (const { pid, line, source } of input.strace.run(cmd, args, {
+  // Dispatcher-level monotonic counter that serves as the generation
+  // token for attribution-snapshot bookkeeping (see
+  // `attributionSnapshotByPid` declaration).  Incremented for every
+  // line yielded by the runner regardless of source / parse outcome,
+  // so a single global ordering covers shim, strace, and the inline
+  // pre-parsers (clone / exit / chdir / dup / etc.) uniformly.  This
+  // is the SAME generation-token semantics `parseStraceStream` would
+  // assign if we used it directly (see
+  // src/guest/strace-parser.ts:286-288); we maintain the counter at
+  // the dispatcher level because the runner streams both shim and
+  // strace lines through one channel.
+  let dispatchTs = 0;
+  for await (const record of input.strace.run(cmd, args, {
     env: input.env,
     cwd: input.cwd,
     basePath,
   })) {
+    const { pid, line, source } = record;
+    // Production runners never supply `ts`; the dispatcher's monotonic
+    // counter is the canonical generation token (see
+    // `attributionSnapshotByPid` declaration).  Canned test runners
+    // MAY supply `ts` to simulate strace `-ff` cross-file reorderings
+    // — e.g. a delayed `+++ exited +++` line whose ts predates a
+    // later-but-already-processed clone-propagation snapshot.  In
+    // either case `dispatchTs` advances by one per line so subsequent
+    // dispatcher-assigned ts values continue to climb past any
+    // explicit override.
+    const explicitTs = record.ts;
+    const lineTs = explicitTs !== undefined ? explicitTs : dispatchTs;
+    dispatchTs++;
     // Codex follow-up #1 (high, 2026-05-19) + bug-fix refinement (high,
     // 2026-05-19): seed the install root pid's cwd with `input.cwd`
     // EXACTLY ONCE, for EXACTLY the pid the runner reports as the
@@ -2112,7 +2183,7 @@ export async function runInstallPhase(
         // lifecycle context and slip past the bypass detector.  The
         // refresh semantics (see `recordAttribution` declaration) also
         // keep same-pid re-execs into a new package context current.
-        recordAttribution(shimEvent.pid, result);
+        recordAttribution(shimEvent.pid, result, lineTs);
         emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
       }
       continue;
@@ -2141,8 +2212,39 @@ export async function runInstallPhase(
       // recordAttribution writes today; other pid-keyed maps
       // (pidCwd / dirfdTable / shimLoadedPids / etc) are governed by
       // exec/clone semantics and are intentionally NOT cleared here.
+      //
+      // Audit-trust follow-up (Codex review of e22c79b, 2026-05-19):
+      // two additional invariants here, both required to close the
+      // pid-reuse hazard end-to-end:
+      //
+      //  (1) Attribution's per-pid result cache is dropped via
+      //      `invalidate(pid)`.  Without this, a recycled pid's next
+      //      `attribute()` call returns the dead generation's cached
+      //      result and `recordAttribution` stores that stale value as
+      //      the new generation's snapshot.  The exit-line eviction
+      //      and the Attribution cache invalidation MUST happen
+      //      together — the snapshot map is downstream of Attribution.
+      //
+      //  (2) Generation-token check: strace `-ff` per-pid files are
+      //      tailed in filesystem order, not global event order, so a
+      //      NEW parent's `clone(...) = <recycledPid>` line in fileA
+      //      may be processed BEFORE the OLD generation's
+      //      `+++ exited +++` line in fileB.  At the moment the
+      //      delayed exit-line is processed, the snapshot may already
+      //      hold a new-generation entry (clone-propagation wrote it
+      //      first).  We compare `recordedAtTs` to the exit-line's ts
+      //      and decline to evict when the snapshot is strictly newer
+      //      than the exit observation.  Note that the Attribution
+      //      invalidation in (1) ALWAYS runs — even when we keep the
+      //      snapshot — because the cache entry is keyed by pid and
+      //      the recycled generation's `attribute()` MUST re-read
+      //      /proc regardless of which snapshot we keep.
       if (line.startsWith('+++') && line.endsWith('+++')) {
-        attributionSnapshotByPid.delete(pid);
+        const existing = attributionSnapshotByPid.get(pid);
+        if (existing === undefined || existing.recordedAtTs <= lineTs) {
+          attributionSnapshotByPid.delete(pid);
+        }
+        input.attribution.invalidate(pid);
         continue;
       }
 
@@ -3356,16 +3458,24 @@ export async function runInstallPhase(
             // audit-trust review of e5af2be: a short-lived ENOENT
             // child of a freshly-observed parent now surfaces in
             // spawn_blocked instead of being silently dropped.
-            let parentAttrib = attributionSnapshotByPid.get(pid);
+            let parentAttrib:
+              | { pkg: string; lifecycle: AttributedEvent['lifecycle'] }
+              | undefined = attributionSnapshotByPid.get(pid);
             if (parentAttrib === undefined) {
               const sampled = input.attribution.attribute(pid);
               if (sampled !== null) {
-                recordAttribution(pid, sampled);
+                recordAttribution(pid, sampled, lineTs);
                 parentAttrib = sampled;
               }
             }
             if (parentAttrib !== undefined) {
-              recordAttribution(childPid, parentAttrib);
+              // Use the clone line's ts so the child's snapshot is
+              // generation-token-stamped at the moment of observation
+              // — a delayed exit-line for the OLD generation of
+              // childPid arriving later (lower ts) will fail the
+              // eviction's `recordedAtTs <= exitTs` check and leave
+              // this new-gen snapshot intact.
+              recordAttribution(childPid, parentAttrib, lineTs);
             }
           }
         }
@@ -4142,10 +4252,11 @@ export async function runInstallPhase(
       // reads, the format varies across versions, and the channel emits
       // many syscall families we don't care to extract events from.  A
       // strict gate here would mean every install hits noise-driven
-      // tamper.  The StraceRunner owns the ts counter implicitly via file
-      // ordering; we call parseStraceLine with ts=0 and let per-file
-      // ordering serve as ts.
-      const straceEvents: RawEvent[] | null = parseStraceLine(line, pid, 0);
+      // tamper.  We pass the dispatcher's monotonic `lineTs` so emitted
+      // RawEvents carry the same generation token the exit/clone
+      // pre-parsers use (see `attributionSnapshotByPid` and the exit-
+      // line eviction above for the role of this counter).
+      const straceEvents: RawEvent[] | null = parseStraceLine(line, pid, lineTs);
       if (straceEvents === null) continue;
 
       for (const rawEvent of straceEvents) {
@@ -4539,7 +4650,7 @@ export async function runInstallPhase(
         // unsuccessful execve doesn't tell us anything about the
         // bypass invariant.
         if (result !== null) {
-          recordAttribution(rawEvent.pid, result);
+          recordAttribution(rawEvent.pid, result, rawEvent.ts);
         }
 
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {

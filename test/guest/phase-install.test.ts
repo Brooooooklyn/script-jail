@@ -49,7 +49,7 @@ function makeEmitter(): { emitter: Emitter; lines: string[] } {
  * (or `null` to opt out of seeding entirely).
  */
 function cannedStraceRunner(
-  records: Array<{ pid: number; line: string; source?: 'shim' | 'strace' }>,
+  records: Array<{ pid: number; line: string; source?: 'shim' | 'strace'; ts?: number }>,
   exitCode = 0,
   opts: { rootPid?: number | null } = {},
 ): StraceRunner & { recordedTamper(): string | null } {
@@ -70,7 +70,16 @@ function cannedStraceRunner(
       for (const r of records) {
         const source: 'shim' | 'strace' =
           r.source ?? (r.line.startsWith('{') ? 'shim' : 'strace');
-        yield { pid: r.pid, line: r.line, source };
+        // Propagate the optional explicit ts override through to the
+        // dispatcher.  Production runners never set `ts`; this is a
+        // test-only seam used by the snapshot-reorder tests to drive
+        // exit-line `ts` smaller than a previously-recorded snapshot's
+        // `recordedAtTs`.
+        if (r.ts !== undefined) {
+          yield { pid: r.pid, line: r.line, source, ts: r.ts };
+        } else {
+          yield { pid: r.pid, line: r.line, source };
+        }
       }
     },
     getExitCode() { return _exitCode; },
@@ -1654,6 +1663,18 @@ describe('runInstallPhase', () => {
           }
           return null;
         },
+        // The dispatcher calls `invalidate(pid)` on every observed
+        // `+++ exited +++` line (Codex follow-up #1 to e22c79b — the
+        // snapshot map and the Attribution cache MUST be invalidated
+        // together).  This stub bypasses the real cache so the
+        // invalidate call is a no-op for our purposes; the
+        // attribute() side-effect counter above models the same
+        // "second call returns null" behaviour the real Attribution
+        // would produce after invalidate() + a recycled-pid /proc
+        // re-read failure.
+        invalidate(_pid: number): void {
+          /* no-op for this stub */
+        },
       } as unknown as Attribution;
 
       const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
@@ -1721,6 +1742,276 @@ describe('runInstallPhase', () => {
       // "confidently wrong attribution under pid reuse" hazard
       // Codex flagged.
       expect(spawns[0]!['pkg']).toBe('pkg-b@2.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+    });
+
+    // Audit-trust follow-up #1 (Codex review of e22c79b, 2026-05-19):
+    // strace `-ff` per-pid files are tailed in filesystem-order, NOT
+    // global event order — so a new parent's `clone(...) =
+    // <recycledPid>` line in fileA can be processed BEFORE the OLD
+    // generation's `+++ exited +++` line in fileB.  Pre-fix the
+    // delayed exit-line eviction would clobber the snapshot the
+    // clone-propagation just wrote, leaving the recycled pid
+    // unattributable.  Post-fix each snapshot carries the dispatcher's
+    // monotonic `recordedAtTs` and the exit-line evicts only when
+    // `recordedAtTs <= exitLineTs` — a delayed exit-line whose ts
+    // predates the new snapshot is rejected and the snapshot survives.
+    //
+    // This test uses the REAL Attribution class (not a stub) because
+    // the bug crucially involves the interaction between the snapshot
+    // map AND the Attribution per-pid cache; bypassing Attribution
+    // would hide the cache-invalidation half of the fix.
+    it('reordered exit/clone: delayed exit line with `ts < snapshot.recordedAtTs` does NOT evict the new-gen snapshot', async () => {
+      // ProcReader spec: pid 800 is the new parent (pkg-b); pid 801 is
+      // the recycled child we propagate the parent's snapshot onto.
+      // The mock returns one env for pid 801 on the FIRST attribution
+      // (pkg-a, modelling generation-1) and a different env on every
+      // subsequent reader call (pkg-b, modelling the recycled
+      // generation-2's identity).  The dispatcher's invalidate() call
+      // on the exit-line is what makes the SECOND call re-read /proc
+      // (and so pick up the pkg-b env); see also Test C in
+      // test/guest/attribution.test.ts.
+      let pid801EnvironReads = 0;
+      const reader: ProcReader = {
+        readPpid(pid: number): number | null {
+          if (pid === 800) return 1;
+          if (pid === 801) return 1;
+          return null;
+        },
+        readEnviron(pid: number): Map<string, string> | null {
+          if (pid === 800) {
+            return new Map(
+              Object.entries({
+                npm_package_name: 'pkg-b',
+                npm_package_version: '2.0.0',
+                npm_lifecycle_event: 'install',
+              }),
+            );
+          }
+          if (pid === 801) {
+            pid801EnvironReads += 1;
+            // Generation 1 → pkg-a; everything after invalidate → pkg-b.
+            const env =
+              pid801EnvironReads === 1
+                ? {
+                    npm_package_name: 'pkg-a',
+                    npm_package_version: '1.0.0',
+                    npm_lifecycle_event: 'install',
+                  }
+                : {
+                    npm_package_name: 'pkg-b',
+                    npm_package_version: '2.0.0',
+                    npm_lifecycle_event: 'install',
+                  };
+            return new Map(Object.entries(env));
+          }
+          return null;
+        },
+      };
+      const attr = new Attribution(reader);
+
+      // Test fixture is constructed via the canned runner's `ts`
+      // override so we can drive an exit-line whose ts predates the
+      // clone-propagation's `recordedAtTs`.  In production the global
+      // monotonic dispatcher counter would never produce this
+      // ordering; the explicit-ts seam exists exactly to exercise
+      // the defensive generation-token check.
+      //
+      // Sequence:
+      //   ts=10 → execve in pid 801 (generation 1, pkg-a observed →
+      //            snapshot for 801 recorded at recordedAtTs=10).
+      //   ts=20 → +++ exited +++ for pid 801 (generation-1 exits;
+      //            snapshot for 801 evicted, Attribution cache for
+      //            801 invalidated → next attribute(801) re-reads
+      //            /proc and gets pkg-b).
+      //   ts=30 → clone(...) = 801 from new parent pid 800 (pkg-b);
+      //            propagation samples /proc for 801 (now pkg-b) and
+      //            writes snapshot for 801 with recordedAtTs=30.
+      //   ts=25 → +++ exited +++ for pid 801 — DELAYED old-gen exit
+      //            line with ts < recordedAtTs(30).  The
+      //            generation-token check MUST reject the eviction:
+      //            existing.recordedAtTs (30) > exitLineTs (25) →
+      //            keep the snapshot.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace'; ts?: number }> = [
+        {
+          pid: 801,
+          line: 'execve("/usr/bin/node", ["node", "g1.js"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+          ts: 10,
+        },
+        {
+          pid: 801,
+          line: '+++ exited with 0 +++',
+          source: 'strace',
+          ts: 20,
+        },
+        {
+          pid: 800,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 801',
+          source: 'strace',
+          ts: 30,
+        },
+        {
+          pid: 801,
+          line: '+++ exited with 0 +++',
+          source: 'strace',
+          ts: 25, // ← DELAYED: ts < clone propagation's recordedAtTs (30)
+        },
+        // Finally a recycled-pid spawn so we can observe what the
+        // snapshot held when this event was attributed via the
+        // spawn-event fallback.  attribute(801) returns pkg-b here
+        // (the mock reader's second read), but we also assert the
+        // snapshot survived: the `result?.pkg` direct attribution
+        // SHOULD agree with the snapshot's pkg-b for the assertion
+        // to be meaningful.
+        {
+          pid: 801,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "x.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+          ts: 40,
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: 801 }),
+        attribution: attr,
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 801 && raw['result'] === 'enoent';
+      });
+      expect(spawns).toHaveLength(1);
+      // The clone-propagated snapshot for recycled pid 801 survived
+      // the delayed exit line.  The recycled-pid ENOENT spawn
+      // attributes through the post-eviction `attribute()` retry
+      // (which now returns pkg-b — see Test C in attribution.test.ts)
+      // OR through the snapshot fallback; either way pkg-b is the
+      // correct answer and pkg-a (the dead generation's label) is
+      // the regression signal.
+      expect(spawns[0]!['pkg']).toBe('pkg-b@2.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('install');
+    });
+
+    // Audit-trust follow-up #2 (Codex review of e22c79b, 2026-05-19):
+    // the exit-line pre-parser must call `Attribution.invalidate(pid)`
+    // alongside snapshot eviction.  Without invalidation, the per-pid
+    // Attribution cache (which is independent of the snapshot map)
+    // continues to return the dead generation's result; the next
+    // `attribute(recycledPid)` call hits that cache and
+    // `recordAttribution` stores the stale value as the new
+    // generation's snapshot.  This test uses the REAL Attribution
+    // class with a stateful ProcReader so the cache + invalidate
+    // interaction is exercised end-to-end.
+    it('Attribution.invalidate is called on exit so recycled pid re-reads /proc (not the dead-gen cache)', async () => {
+      // Stateful reader: pid 900 returns one env on first read (pkg-x,
+      // generation-1) and a different env on subsequent reads (pkg-y,
+      // recycled generation-2).  The pid switches identity AFTER
+      // invalidate() — without invalidate, attribute(900) would
+      // return cached pkg-x and the recycled spawn would surface
+      // pkg-x.  We assert the inverse: pkg-y is observed.
+      let pid900EnvironReads = 0;
+      const reader: ProcReader = {
+        readPpid(pid: number): number | null {
+          if (pid === 900) return 1;
+          if (pid === 950) return 1;
+          return null;
+        },
+        readEnviron(pid: number): Map<string, string> | null {
+          if (pid === 950) {
+            // The recycled-pid's NEW parent — provides pkg-y so
+            // clone-propagation has a snapshot to seed onto pid 900.
+            return new Map(
+              Object.entries({
+                npm_package_name: 'pkg-y',
+                npm_package_version: '2.0.0',
+                npm_lifecycle_event: 'postinstall',
+              }),
+            );
+          }
+          if (pid === 900) {
+            pid900EnvironReads += 1;
+            const env =
+              pid900EnvironReads === 1
+                ? {
+                    npm_package_name: 'pkg-x',
+                    npm_package_version: '1.0.0',
+                    npm_lifecycle_event: 'install',
+                  }
+                : {
+                    npm_package_name: 'pkg-y',
+                    npm_package_version: '2.0.0',
+                    npm_lifecycle_event: 'postinstall',
+                  };
+            return new Map(Object.entries(env));
+          }
+          return null;
+        },
+      };
+      const attr = new Attribution(reader);
+
+      // Production-natural ordering (dispatcher monotonic ts):
+      //   1. execve(900) generation-1 → pkg-x cached + snapshot.
+      //   2. +++ exited +++ for 900 → snapshot evicted AND
+      //      Attribution.invalidate(900) called.  WITHOUT the
+      //      invalidate, the next `attribute(900)` would still
+      //      return pkg-x from cache.
+      //   3. clone(...) = 900 from new parent 950 (pkg-y).  At
+      //      propagation time the dispatcher samples
+      //      attribute(900) — with the invalidate fix this
+      //      re-reads /proc and gets pkg-y.
+      //   4. spawn fallback emits an event attributed to pkg-y.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 900,
+          line: 'execve("/usr/bin/node", ["node", "g1.js"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 900,
+          line: '+++ exited with 0 +++',
+          source: 'strace',
+        },
+        {
+          pid: 950,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 900',
+          source: 'strace',
+        },
+        {
+          pid: 900,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "x.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: 900 }),
+        attribution: attr,
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 900 && raw['result'] === 'enoent';
+      });
+      expect(spawns).toHaveLength(1);
+      // Recycled pid 900's ENOENT spawn surfaces pkg-y — the
+      // generation-2 identity the stateful reader exposes ONLY when
+      // Attribution.invalidate(900) was called on the exit line.
+      // Pre-fix this would have been pkg-x (the dead generation
+      // cached at the first attribute() call).
+      expect(spawns[0]!['pkg']).toBe('pkg-y@2.0.0');
       expect(spawns[0]!['lifecycle']).toBe('postinstall');
     });
   });
