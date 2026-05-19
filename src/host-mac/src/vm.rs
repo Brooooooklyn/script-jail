@@ -143,10 +143,15 @@ pub fn build_config(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfigura
     // nicer when these are present.  Surface failures via stderr so a
     // mismatched identifier is at least visible during triage instead of
     // silently broken.
+    //
+    // VZ caps virtio block-device identifiers at 20 bytes, so keep these
+    // short.  "script-jail-host-node" (21) would be rejected and the whole
+    // VM config would fail validation; drop the hyphen to keep it under
+    // the limit and stay parallel with the other two.
     for (device, ident) in [
         (&rootfs, "script-jail-rootfs"),
         (&repo, "script-jail-repo"),
-        (&host_node, "script-jail-host-node"),
+        (&host_node, "script-jail-hostnode"),
     ] {
         if let Err(err) = disks::set_identifier(device, ident) {
             eprintln!("script-jail-vm: warning: set_identifier({ident}) failed: {err}");

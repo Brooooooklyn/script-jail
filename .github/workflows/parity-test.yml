@@ -301,6 +301,22 @@ jobs:
           pnpm build:cli
           cargo build --release -p script-jail-host-mac
 
+      # Virtualization.framework refuses to instantiate a VM unless the
+      # calling process is code-signed with the
+      # `com.apple.security.virtualization` entitlement (the error is
+      # VZErrorDomain code 2: "the process doesn’t have the entitlement").
+      # Ad-hoc sign (`--sign -`) is sufficient on macOS 14+; the binary
+      # gets a freshly computed SHA-only signature with the entitlement
+      # blob attached.  `--force` overwrites any existing signature so
+      # this is idempotent across cache reuse.
+      - name: Codesign script-jail-vm with VZ entitlement
+        run: |
+          codesign --sign - \
+            --entitlements src/host-mac/script-jail-vm.entitlements \
+            --force \
+            target/release/script-jail-vm
+          codesign --display --entitlements - target/release/script-jail-vm
+
       # The arm64 rootfs + VZ kernel + arm64 .so are produced by the Linux
       # release pipeline; the parity workflow doesn't have a pre-published
       # release to pull from on the branch under test.  Instead, download
