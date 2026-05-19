@@ -762,6 +762,81 @@ export async function runInstallPhase(
       lifecycle.set(fd, 'closed');
     }
   }
+
+  // ===================================================================
+  // Codex adversarial pass 46 (high, 2026-05-19, bug #7 — marker-less
+  // opaque-fd reuse).  Companion to `postMarkerFdReuses` / bug #6.
+  //
+  // Failure pattern pre-fix:
+  //   1. parent P opens /safe → fd 7
+  //   2. child C is created via clone(CLONE_FILES) — DELAYED in strace
+  //      output (parent's clone line not yet observed by the dispatcher).
+  //   3. child C does openat(99, "dir", O_DIRECTORY) = 7 with fd 99
+  //      untracked, so canonicalize returns null.  C did NOT do an
+  //      unshare beforehand → `pendingFdDetach` has no marker for C →
+  //      `recordPostMarkerFdReuse` short-circuits → NO bookkeeping is
+  //      recorded for the kernel-installed fresh fd 7.
+  //   4. parent's clone(CLONE_FILES) line surfaces; reconciliation
+  //      unions C into P's group.  `unionFd` only inspects parent vs
+  //      child dirfdTable entries (and C has none for fd 7 — canonicalize
+  //      returned null), so parent's stale fd 7 → /safe survives.
+  //   5. child C does openat(7, ".ssh/id_rsa", O_RDONLY) — resolved
+  //      against the leaked /safe path.  Same trust-boundary failure
+  //      as bug #6 but the marker-less path.
+  //
+  // Why a per-fd opaque-reuse marker (not `fdUnknownAdd`):
+  // `fdUnknownAdd(pid)` taints the WHOLE pid's fd group and breaks
+  // legitimate later resolutions through unrelated tracked fds (a
+  // singleton pid that did one opaque open would lose access to every
+  // other valid fd it has).  Per-fd granularity is the precise signal
+  // the reconciler needs.
+  //
+  // Lifecycle:
+  //   - `recordOpaqueFdReuse` is unconditional (does NOT gate on a
+  //     pending marker).  It's the marker-less safety net.
+  //   - `recordPostMarkerFdReuse` (above) is the marker-aware
+  //     optimisation that ALSO records the lifecycle state for the
+  //     marker's reconciliation pass.  Both helpers are called at every
+  //     post-marker reuse site; they're complementary, not exclusive.
+  //   - Cleared on: legitimate close, close_range covering the fd,
+  //     successful canonicalized open at the same fd number (a fresh
+  //     tracked mapping supersedes the opaque marker).
+  //   - NOT auto-cleared on execve: we couldn't canonicalize the open,
+  //     so we don't know whether the fd had O_CLOEXEC.  Conservative:
+  //     keep the marker until an explicit close.
+  //
+  // Union-find migration: the map is keyed by fd-group root via
+  // `rootedFd(pid)`.  `unionFd` MUST merge the two groups' opaque sets
+  // into the parent's root and `detachFdGroup` MUST migrate the opaque
+  // set to the new root.  See the corresponding sites for the inline
+  // wiring.
+  // ===================================================================
+  const opaqueFdReuses = new Map<number, Set<number>>();
+  function recordOpaqueFdReuse(pid: number, fd: number): void {
+    const root = rootedFd(pid);
+    let set = opaqueFdReuses.get(root);
+    if (set === undefined) {
+      set = new Set();
+      opaqueFdReuses.set(root, set);
+    }
+    set.add(fd);
+  }
+  function clearOpaqueFdReuse(pid: number, fd: number): void {
+    const root = rootedFd(pid);
+    const set = opaqueFdReuses.get(root);
+    if (set === undefined) return;
+    set.delete(fd);
+    if (set.size === 0) opaqueFdReuses.delete(root);
+  }
+  function clearOpaqueFdRange(pid: number, first: number, last: number): void {
+    const root = rootedFd(pid);
+    const set = opaqueFdReuses.get(root);
+    if (set === undefined) return;
+    for (const fd of [...set]) {
+      if (fd >= first && fd <= last) set.delete(fd);
+    }
+    if (set.size === 0) opaqueFdReuses.delete(root);
+  }
   // Codex follow-up (high, 2026-05-19, bug #5 — post-marker
   // close_range over a range that may include reused fds): walk the
   // per-pid lifecycle map and transition every fd in [first, last]
@@ -1140,6 +1215,14 @@ export async function runInstallPhase(
     }
     const childFdUnknown = dirfdStateUnknown.has(cr);
     const parentFdUnknown = dirfdStateUnknown.has(pr);
+    // Codex adversarial pass 46 (high, 2026-05-19, bug #7 — marker-
+    // less opaque-fd reuse): snapshot both groups' opaque-reuse sets
+    // BEFORE re-pointing the parent pointer, then merge into the
+    // parent's root afterwards.  An opaque fd on EITHER side means
+    // the kernel-shared fd table was replaced through that fd and
+    // the parent's same-numbered modeled entry is stale — drop it.
+    const childOpaque = opaqueFdReuses.get(cr);
+    const parentOpaque = opaqueFdReuses.get(pr);
     // Re-point parent pointer after we've finished iterating the map
     // (so the iteration above sees the pre-union roots).
     fdParent.set(cr, pr);
@@ -1168,6 +1251,30 @@ export async function runInstallPhase(
         // producing a `<UNRESOLVED_PATH>` synth.
         dirfdTable.delete(mergedKey);
       }
+    }
+    // Codex adversarial pass 46 (high, 2026-05-19, bug #7): apply
+    // opaque-fd-reuse drops AFTER the merge.  For any fd in either
+    // side's opaque set, the kernel-shared fd table at that fd was
+    // replaced through an opaque (untracked) source — the parent's
+    // modeled entry at that same fd is stale (the kernel had been
+    // sharing the table under CLONE_FILES, so the kernel-real fd is
+    // whatever the opaque open installed, not what the parent's
+    // model says).  Drop the merged entry and KEEP the opaque marker
+    // so a subsequent openat(<fd>, ...) on the merged group fails
+    // closed via dirfdTable.get returning undefined.
+    if (childOpaque !== undefined || parentOpaque !== undefined) {
+      const merged = new Set<number>();
+      if (childOpaque !== undefined) for (const fd of childOpaque) merged.add(fd);
+      if (parentOpaque !== undefined) for (const fd of parentOpaque) merged.add(fd);
+      // Drop any merged dirfdTable entry at an opaque fd — the
+      // kernel-shared mapping was opaque'd.
+      for (const fd of merged) {
+        dirfdTable.delete(`${pr}:${fd}`);
+      }
+      // Stash the merged opaque set under the new root (the parent's
+      // root) and clear the child's slot.
+      if (childOpaque !== undefined) opaqueFdReuses.delete(cr);
+      opaqueFdReuses.set(pr, merged);
     }
     // dirfdStateUnknown propagation: either side's unknown bit taints
     // the merged group.
@@ -1214,6 +1321,12 @@ export async function runInstallPhase(
       }
     }
     const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+    // Codex adversarial pass 46 (high, 2026-05-19, bug #7 — marker-
+    // less opaque-fd reuse): snapshot the shared group's opaque-reuse
+    // set BEFORE we mutate fdParent so subsequent rootedFd lookups in
+    // this function still resolve to `sharedRoot`.  The opaque set
+    // follows union-find migration — see comments at the helpers.
+    const sharedOpaque = opaqueFdReuses.get(sharedRoot);
     if (sharedRoot !== pid) {
       // Non-root member detach: clear parent pointer, copy snapshot
       // into private group.  Shared group state stays intact.
@@ -1222,6 +1335,12 @@ export async function runInstallPhase(
         dirfdTable.set(`${pid}:${fdSuffix}`, val);
       }
       if (sharedUnknown) dirfdStateUnknown.add(pid);
+      // Seed caller's new singleton with a COPY of the shared opaque
+      // set; the original stays under sharedRoot for the remaining
+      // members.
+      if (sharedOpaque !== undefined) {
+        opaqueFdReuses.set(pid, new Set(sharedOpaque));
+      }
       return;
     }
     // Caller IS the representative.  Find other members.
@@ -1253,6 +1372,14 @@ export async function runInstallPhase(
     if (sharedUnknown) {
       dirfdStateUnknown.delete(pid);
       dirfdStateUnknown.add(newRoot);
+    }
+    // Migrate the opaque-reuse set: the shared group continues under
+    // `newRoot`, so move the set from `pid` → `newRoot`.  Seed
+    // caller's NEW singleton group with a copy.
+    if (sharedOpaque !== undefined) {
+      opaqueFdReuses.delete(pid);
+      opaqueFdReuses.set(newRoot, sharedOpaque);
+      opaqueFdReuses.set(pid, new Set(sharedOpaque));
     }
     // Seed caller's NEW singleton group from snapshot.
     for (const [fdSuffix, val] of snapshot) {
@@ -2433,6 +2560,14 @@ export async function runInstallPhase(
                 //     (fail closed on subsequent openat(<fd>, ...)
                 //     from the child).  Parent's entry is preserved
                 //     unless the SNAPSHOT-based taint pass fires.
+                // Codex adversarial pass 46 (high, 2026-05-19, bug
+                // #7 — marker-less opaque-fd reuse): consult the
+                // child group's opaque-reuse set BEFORE the copy
+                // pass.  Unlike `childPostMarkerFdTouched` (which is
+                // gated on a pending marker), `opaqueFdReuses` is
+                // recorded unconditionally at every opaque-open
+                // site — covering the no-marker delayed-clone case.
+                const childOpaqueSet = opaqueFdReuses.get(childRoot);
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
                     const suffix = key.slice(parentPrefix.length);
@@ -2443,6 +2578,10 @@ export async function runInstallPhase(
                       Number.isFinite(fdNum) &&
                       childPostMarkerFdClosed !== undefined &&
                       childPostMarkerFdClosed.has(fdNum);
+                    const opaqueReuse =
+                      Number.isFinite(fdNum) &&
+                      childOpaqueSet !== undefined &&
+                      childOpaqueSet.has(fdNum);
                     if (existing === undefined) {
                       // Codex follow-up (high, 2026-05-19, bug #5 —
                       // post-marker close-of-reuse): if the child
@@ -2472,6 +2611,15 @@ export async function runInstallPhase(
                         childPostMarkerFdTouched !== undefined &&
                         childPostMarkerFdTouched.has(fdNum);
                       if (reusedPostMarker) continue;
+                      // Codex adversarial pass 46 (high, 2026-05-19,
+                      // bug #7 — marker-less opaque-fd reuse): same
+                      // hazard as bug #6 but covers the no-marker
+                      // case (child did NOT unshare before its
+                      // opaque open).  An opaque-reuse marker
+                      // signals the kernel-installed fd at this
+                      // number is opaque; the parent's same-numbered
+                      // entry must not be copied.
+                      if (opaqueReuse) continue;
                       dirfdTable.set(childKey, val);
                     } else if (existing.path === val.path) {
                       // Same fd, same path — keep, OR cloexec bits.
@@ -2497,6 +2645,11 @@ export async function runInstallPhase(
                       if (reusedPostMarker) {
                         continue;
                       }
+                      // Marker-less opaque reuse: same reasoning —
+                      // child's modeled entry (if any) supersedes a
+                      // conflicting parent path because the kernel
+                      // installed a fresh private fd at this number.
+                      if (opaqueReuse) continue;
                       // Same fd, different paths — fail closed on the
                       // child side.  This handles plain fork conflicts
                       // (no pending marker — child raced ahead with
@@ -3100,6 +3253,12 @@ export async function runInstallPhase(
             // stale shared-baseline entry instead of resurrecting
             // a kernel-closed fd in the child copy.
             recordPostMarkerFdClose(pid, fd);
+            // Codex adversarial pass 46 (high, 2026-05-19, bug #7):
+            // legitimate close drops any opaque-reuse marker for
+            // this fd — the kernel slot is now empty and a future
+            // open at the same fd number will install a fresh
+            // (potentially canonicalizable) mapping.
+            clearOpaqueFdReuse(pid, fd);
           }
           // Delete unconditionally: even on EBADF, our stale entry (if
           // any) is invalidated — the kernel's reply tells us the fd
@@ -3288,6 +3447,10 @@ export async function runInstallPhase(
               // stays 'open' until then.
               if (!hasCloexec) {
                 recordPostMarkerFdRangeClose(pid, first, last);
+                // Codex adversarial pass 46 (high, 2026-05-19, bug
+                // #7): legitimate close_range drops opaque-reuse
+                // markers in the range — see the point-close site.
+                clearOpaqueFdRange(pid, first, last);
               }
             } else {
               // Pre-existing behaviour: close the range on the caller's
@@ -3353,6 +3516,10 @@ export async function runInstallPhase(
               // resurrecting them from the parent's stale entries.
               if (!hasCloexec) {
                 recordPostMarkerFdRangeClose(pid, first, last);
+                // Codex adversarial pass 46 (high, 2026-05-19, bug
+                // #7): legitimate close_range drops opaque-reuse
+                // markers in the range — see the point-close site.
+                clearOpaqueFdRange(pid, first, last);
               }
             }
           }
@@ -3885,13 +4052,21 @@ export async function runInstallPhase(
             // tombstones targeting this fd describe the pre-unshare
             // shared mutation and must NOT clobber the child copy.
             recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
+            // Codex adversarial pass 46 (high, 2026-05-19, bug #7):
+            // a canonicalized open supersedes any prior opaque marker
+            // on the same fd number — the kernel installed a fresh
+            // fd whose target we now know, so the opaque-reuse signal
+            // is no longer needed.
+            clearOpaqueFdReuse(rawEvent.pid, rawEvent.retFd);
           } else {
             // Codex pass 45 follow-up (high, 2026-05-19, bug #6 —
-            // unresolved post-marker open).  A successful open whose
-            // canonicalization returned `null` (untracked dirfd, or
-            // AT_FDCWD with an unknown cwd) still installs a fresh
-            // private fd at `retFd` in the kernel — we just don't know
-            // its target path.  Without bookkeeping here:
+            // unresolved post-marker open) + Codex pass 46 follow-up
+            // (high, 2026-05-19, bug #7 — marker-less opaque-fd
+            // reuse).  A successful open whose canonicalization
+            // returned `null` (untracked dirfd, or AT_FDCWD with an
+            // unknown cwd) still installs a fresh private fd at
+            // `retFd` in the kernel — we just don't know its target
+            // path.  Without bookkeeping here:
             //   1. A stale dirfdTable entry at `retFd` (e.g. from a
             //      pre-marker open that has not yet been swept) can
             //      survive and certify a later `openat(retFd, ...)`
@@ -3904,20 +4079,32 @@ export async function runInstallPhase(
             //      copy the parent's same-numbered fd into the child
             //      group, certifying a child `openat(retFd, ...)`
             //      through the parent's stale path.
-            // Mirror the canonicalized branch's tombstone-cancel +
-            // post-marker reuse bookkeeping so delayed reconciliation
-            // excludes this fd from the parent-copy.  We deliberately
-            // do NOT call `fdUnknownAdd(pid)` here — that would taint
-            // the WHOLE pid's fd group and break legitimate later
-            // resolutions through unrelated tracked fds (e.g. a
-            // singleton pid that did `openat(<bad-dirfd>, ...) = 8`
-            // would lose access to its other tracked fds).  The
-            // post-marker reuse marker is the precise signal the
+            //
+            // Two complementary mechanisms cover both the marker-aware
+            // and marker-less paths:
+            //
+            //   - `recordPostMarkerFdReuse` (bug #6): marker-aware
+            //     lifecycle entry consulted by the snapshot-aware
+            //     reconciler.  Short-circuits when no marker is
+            //     pending.
+            //   - `recordOpaqueFdReuse` (bug #7): marker-LESS per-fd
+            //     opaque-reuse marker, ALWAYS recorded.  Consulted by
+            //     `unionFd` (drops the merged fd entry on CLONE_FILES)
+            //     and by the non-CLONE_FILES copy branch in the clone
+            //     reconciler (skips copying parent's entry into child).
+            //
+            // We deliberately do NOT call `fdUnknownAdd(pid)` here —
+            // that would taint the WHOLE pid's fd group and break
+            // legitimate later resolutions through unrelated tracked
+            // fds (a singleton pid that did `openat(<bad-dirfd>, ...)
+            // = 8` would lose access to its other tracked fds).  The
+            // per-fd opaque marker is the precise signal the
             // reconciler needs; the dirfdTable-delete handles the
             // stale-mapping case directly.
             dirfdTable.delete(fdKey(rawEvent.pid, rawEvent.retFd));
             cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
             recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
+            recordOpaqueFdReuse(rawEvent.pid, rawEvent.retFd);
           }
         }
 

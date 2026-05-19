@@ -12376,5 +12376,199 @@ describe('runInstallPhase', () => {
       });
       expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex pass 46 follow-up (high, 2026-05-19, bug #7 — marker-less
+    // opaque-fd reuse, CLONE_FILES case).  Companion to bug #6.
+    //
+    // Distinction from bug #6: the child does NOT call unshare(2)
+    // before its opaque open.  Pre-fix, `recordPostMarkerFdReuse`
+    // short-circuited (no pending marker) and the opaque open left
+    // NO bookkeeping.  The delayed clone(CLONE_FILES) reconciliation
+    // unions the child's group with the parent's, finds no parent-vs-
+    // child fd conflict in dirfdTable (child had no modeled fd 7
+    // entry — canonicalize returned null), and the parent's stale
+    // fd 7 → /safe persists in the merged group.  A later
+    // openat(7, ".ssh/id_rsa") from the child resolves via /safe.
+    //
+    // Post-fix: `recordOpaqueFdReuse` is UNGATED on pending markers.
+    // The child's opaque open records fd 7 in `opaqueFdReuses` keyed
+    // by the child's pre-union root.  At union time, `unionFd` merges
+    // both groups' opaque sets and drops the merged fd-table entry
+    // for every opaque fd — parent's stale /safe at fd 7 is dropped.
+    // Subsequent child openat(7, ".ssh/id_rsa") fails closed.
+    it('marker-less opaque open via CLONE_FILES does not leak parent fd across delayed clone (bug #7 CLONE_FILES)', async () => {
+      const proc = mockProcReader({
+        5000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'marker-less-opaque-clone-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        5001: {
+          ppid: 5000,
+          env: {
+            npm_package_name: 'marker-less-opaque-clone-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /safe → fd 7.
+        {
+          pid: 5000,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child opens "dir" through an untracked dirfd → canonicalize
+        // returns null, dirfdTable.delete(child:7), opaque marker
+        // recorded.  NO unshare beforehand — this is the marker-less
+        // path.  Pre-fix the opaque marker would NOT have been
+        // recorded (short-circuit on missing pending marker).
+        {
+          pid: 5001,
+          line: 'openat(99, "dir", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child.  `unionFd` runs:
+        // pre-fix it merged child into parent group, parent's stale
+        // /safe at fd 7 survived because child had no modeled entry.
+        // Post-fix the union consults the merged opaque set and
+        // drops the merged fd-table entry for opaque fd 7.
+        {
+          pid: 5000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 5001',
+          source: 'strace',
+        },
+        // Child openat(7, ".ssh/id_rsa") — MUST fail closed.
+        {
+          pid: 5001,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 5000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The leak: certified read against /safe/.ssh/id_rsa from
+      // child MUST NOT appear.
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          r['path'] === '/safe/.ssh/id_rsa' &&
+          r['pid'] === 5001
+        );
+      });
+      expect(leaked).toHaveLength(0);
+      // <UNRESOLVED_PATH> audit_bypass surfaces for the child's
+      // failing openat(7, ".ssh/id_rsa") — fd 7 is opaque and the
+      // union dropped the merged entry.
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 5001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex pass 46 follow-up (high, 2026-05-19, bug #7 — marker-less
+    // opaque-fd reuse, non-CLONE_FILES case).
+    //
+    // Like the CLONE_FILES test above but the deferred clone does
+    // NOT include CLONE_FILES — parent and child have separate fd
+    // tables from the kernel's POV.  Reconciliation takes the COPY
+    // branch (line ~2480) which iterates parent's fds and copies
+    // them into the child's group.  Pre-fix, with no marker and no
+    // opaque bookkeeping, the copy branch saw `existing === undefined`
+    // at child fd 7 and copied parent's stale /safe in.
+    //
+    // Post-fix: the copy branch consults `opaqueFdReuses[childRoot]`
+    // and skips the copy when the child has an opaque marker at the
+    // fd.  Subsequent child openat(7, ".ssh/id_rsa") fails closed.
+    it('marker-less opaque open via non-CLONE_FILES does not leak parent fd across delayed clone (bug #7 non-CLONE_FILES)', async () => {
+      const proc = mockProcReader({
+        6000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'marker-less-opaque-no-clone-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        6001: {
+          ppid: 6000,
+          env: {
+            npm_package_name: 'marker-less-opaque-no-clone-files-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /safe → fd 7.
+        {
+          pid: 6000,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child opaque open through untracked dirfd → opaque marker
+        // recorded under child's singleton root.  NO unshare; NO
+        // marker.
+        {
+          pid: 6001,
+          line: 'openat(99, "dir", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Delayed parent clone WITHOUT CLONE_FILES = child.  The
+        // reconciler takes the copy branch (independent fd tables).
+        // Pre-fix the copy branch saw no child entry at fd 7 and
+        // copied parent's /safe in.  Post-fix it sees the child's
+        // opaque marker and skips the copy.
+        {
+          pid: 6000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_SIGHAND, child_tidptr=0x7f...) = 6001',
+          source: 'strace',
+        },
+        // Child openat(7, ".ssh/id_rsa") — MUST fail closed.
+        {
+          pid: 6001,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 6000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          r['path'] === '/safe/.ssh/id_rsa' &&
+          r['pid'] === 6001
+        );
+      });
+      expect(leaked).toHaveLength(0);
+      const childUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 6001;
+      });
+      expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

@@ -25935,6 +25935,32 @@ async function runInstallPhase(input) {
       lifecycle.set(fd, "closed");
     }
   }
+  const opaqueFdReuses = /* @__PURE__ */ new Map();
+  function recordOpaqueFdReuse(pid, fd) {
+    const root = rootedFd(pid);
+    let set2 = opaqueFdReuses.get(root);
+    if (set2 === void 0) {
+      set2 = /* @__PURE__ */ new Set();
+      opaqueFdReuses.set(root, set2);
+    }
+    set2.add(fd);
+  }
+  function clearOpaqueFdReuse(pid, fd) {
+    const root = rootedFd(pid);
+    const set2 = opaqueFdReuses.get(root);
+    if (set2 === void 0) return;
+    set2.delete(fd);
+    if (set2.size === 0) opaqueFdReuses.delete(root);
+  }
+  function clearOpaqueFdRange(pid, first, last) {
+    const root = rootedFd(pid);
+    const set2 = opaqueFdReuses.get(root);
+    if (set2 === void 0) return;
+    for (const fd of [...set2]) {
+      if (fd >= first && fd <= last) set2.delete(fd);
+    }
+    if (set2.size === 0) opaqueFdReuses.delete(root);
+  }
   function recordPostMarkerFdRangeClose(pid, first, last) {
     if (pendingFdDetach.get(pid) === void 0) return;
     const lifecycle = postMarkerFdReuses.get(pid);
@@ -26156,6 +26182,8 @@ async function runInstallPhase(input) {
     }
     const childFdUnknown = dirfdStateUnknown.has(cr);
     const parentFdUnknown = dirfdStateUnknown.has(pr);
+    const childOpaque = opaqueFdReuses.get(cr);
+    const parentOpaque = opaqueFdReuses.get(pr);
     fdParent.set(cr, pr);
     for (const [fdSuffix, childVal] of childFds) {
       const mergedKey = `${pr}:${fdSuffix}`;
@@ -26168,6 +26196,16 @@ async function runInstallPhase(input) {
       } else {
         dirfdTable.delete(mergedKey);
       }
+    }
+    if (childOpaque !== void 0 || parentOpaque !== void 0) {
+      const merged = /* @__PURE__ */ new Set();
+      if (childOpaque !== void 0) for (const fd of childOpaque) merged.add(fd);
+      if (parentOpaque !== void 0) for (const fd of parentOpaque) merged.add(fd);
+      for (const fd of merged) {
+        dirfdTable.delete(`${pr}:${fd}`);
+      }
+      if (childOpaque !== void 0) opaqueFdReuses.delete(cr);
+      opaqueFdReuses.set(pr, merged);
     }
     if (childFdUnknown) dirfdStateUnknown.delete(cr);
     if (childFdUnknown || parentFdUnknown) dirfdStateUnknown.add(pr);
@@ -26182,12 +26220,16 @@ async function runInstallPhase(input) {
       }
     }
     const sharedUnknown = dirfdStateUnknown.has(sharedRoot);
+    const sharedOpaque = opaqueFdReuses.get(sharedRoot);
     if (sharedRoot !== pid) {
       fdParent.delete(pid);
       for (const [fdSuffix, val] of snapshot) {
         dirfdTable.set(`${pid}:${fdSuffix}`, val);
       }
       if (sharedUnknown) dirfdStateUnknown.add(pid);
+      if (sharedOpaque !== void 0) {
+        opaqueFdReuses.set(pid, new Set(sharedOpaque));
+      }
       return;
     }
     const otherMembers = [];
@@ -26215,6 +26257,11 @@ async function runInstallPhase(input) {
     if (sharedUnknown) {
       dirfdStateUnknown.delete(pid);
       dirfdStateUnknown.add(newRoot);
+    }
+    if (sharedOpaque !== void 0) {
+      opaqueFdReuses.delete(pid);
+      opaqueFdReuses.set(newRoot, sharedOpaque);
+      opaqueFdReuses.set(pid, new Set(sharedOpaque));
     }
     for (const [fdSuffix, val] of snapshot) {
       dirfdTable.set(`${pid}:${fdSuffix}`, val);
@@ -26528,6 +26575,7 @@ async function runInstallPhase(input) {
                     }
                   }
                 }
+                const childOpaqueSet = opaqueFdReuses.get(childRoot);
                 for (const [key, val] of dirfdTable) {
                   if (key.startsWith(parentPrefix)) {
                     const suffix = key.slice(parentPrefix.length);
@@ -26535,10 +26583,12 @@ async function runInstallPhase(input) {
                     const existing = dirfdTable.get(childKey);
                     const fdNum = parseInt(suffix, 10);
                     const closedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdClosed !== void 0 && childPostMarkerFdClosed.has(fdNum);
+                    const opaqueReuse = Number.isFinite(fdNum) && childOpaqueSet !== void 0 && childOpaqueSet.has(fdNum);
                     if (existing === void 0) {
                       if (closedPostMarker) continue;
                       const reusedPostMarker = Number.isFinite(fdNum) && childPostMarkerFdTouched !== void 0 && childPostMarkerFdTouched.has(fdNum);
                       if (reusedPostMarker) continue;
+                      if (opaqueReuse) continue;
                       dirfdTable.set(childKey, val);
                     } else if (existing.path === val.path) {
                       if (existing.cloexec !== val.cloexec) {
@@ -26552,6 +26602,7 @@ async function runInstallPhase(input) {
                       if (reusedPostMarker) {
                         continue;
                       }
+                      if (opaqueReuse) continue;
                       dirfdTable.delete(childKey);
                     }
                   }
@@ -26809,6 +26860,7 @@ async function runInstallPhase(input) {
               recordFdTombstone(pid, { kind: "close", fd });
             }
             recordPostMarkerFdClose(pid, fd);
+            clearOpaqueFdReuse(pid, fd);
           }
           dirfdTable.delete(fdKey(pid, fd));
         }
@@ -26902,6 +26954,7 @@ async function runInstallPhase(input) {
               }
               if (!hasCloexec) {
                 recordPostMarkerFdRangeClose(pid, first, last);
+                clearOpaqueFdRange(pid, first, last);
               }
             } else {
               const groupPrefix = `${rootedFd(pid)}:`;
@@ -26930,6 +26983,7 @@ async function runInstallPhase(input) {
               }
               if (!hasCloexec) {
                 recordPostMarkerFdRangeClose(pid, first, last);
+                clearOpaqueFdRange(pid, first, last);
               }
             }
           }
@@ -27140,10 +27194,12 @@ async function runInstallPhase(input) {
             });
             cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
             recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
+            clearOpaqueFdReuse(rawEvent.pid, rawEvent.retFd);
           } else {
             dirfdTable.delete(fdKey(rawEvent.pid, rawEvent.retFd));
             cancelPendingTombstonesForFd(rawEvent.pid, rawEvent.retFd);
             recordPostMarkerFdReuse(rawEvent.pid, rawEvent.retFd);
+            recordOpaqueFdReuse(rawEvent.pid, rawEvent.retFd);
           }
         }
         if (rawEvent.kind === "read" && rawEvent.path === SHIM_LIBRARY_PATH) {
