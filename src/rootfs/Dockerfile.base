@@ -10,12 +10,23 @@ FROM ubuntu:${UBUNTU_MAJOR}
 # locale payloads never get committed to a layer in the first place.  A
 # follow-up `RUN rm -rf …` would only mask the bytes, not shrink the image.
 #
-# Retry the apt fetch up to 5 times with backoff: arm64 cross-builds run
-# under QEMU against `ports.ubuntu.com`, which has been intermittently
-# unreachable from GitHub-hosted runners (connection timeouts, missing
-# index files).  A single transient failure shouldn't fail the whole
-# release/parity build.
+# Swap the default Ubuntu apt mirror over to the Azure-hosted mirror before
+# `apt-get update`.  GitHub-hosted runners (both x86_64 and arm64-via-QEMU)
+# live on Azure; the default `ports.ubuntu.com` arm64 mirror has been
+# unreachable for sustained windows (5+ minutes of connection timeouts
+# observed), while `azure.ports.ubuntu.com` is in-network and reliable.
+# We also redirect `archive.ubuntu.com` (x86_64) to its Azure mirror for
+# parity.  The retry loop below is a defense-in-depth backstop.
+#
+# Sources files differ across releases (sources.list on 22.04, deb822
+# ubuntu.sources on 24.04), so we rewrite every matching file under
+# /etc/apt without caring which exists.
 RUN set -eu; \
+    find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+      -exec sed -i \
+        -e 's|http://ports\.ubuntu\.com|http://azure.ports.ubuntu.com|g' \
+        -e 's|http://archive\.ubuntu\.com|http://azure.archive.ubuntu.com|g' \
+        {} +; \
     for attempt in 1 2 3 4 5; do \
       if apt-get update && \
          apt-get install -y --no-install-recommends \
