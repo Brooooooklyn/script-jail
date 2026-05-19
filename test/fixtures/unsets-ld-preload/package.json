@@ -1,0 +1,9 @@
+{
+  "name": "unsets-ld-preload",
+  "version": "1.0.0",
+  "description": "Shape fixture: postinstall deletes process.env.LD_PRELOAD and NODE_OPTIONS, then spawns a Node child. The env-mutator wrapper should refuse the unsetenv calls (audit events with refused:true), AND the exec wrapper should re-inject as defense-in-depth, so the child still sees LD_PRELOAD.",
+  "private": true,
+  "scripts": {
+    "postinstall": "node script.js"
+  }
+}

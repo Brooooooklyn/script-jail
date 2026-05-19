@@ -27,7 +27,11 @@ import { parseInputs } from './action/inputs.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './action/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { resolveHostNodePrefix } from './action/host-node-prefix.js';
-import { renderDiff } from './action/diff.js';
+import {
+  renderDiff,
+  findAuditBypass,
+  formatAuditBypassError,
+} from './action/diff.js';
 import { warn } from './action/log.js';
 import { buildEffectiveConfig } from './action/config-override.js';
 import { maybeClearCache } from './action/cache.js';
@@ -414,8 +418,28 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       process.stdout.write(`${ann}\n`);
     }
 
+    // SECURITY: scan the generated lockfile for `audit_bypass` entries
+    // INDEPENDENTLY of the diff result.  An attacker could commit a
+    // lockfile that already records `<EXEC_FAIL_OPEN> …` — then every
+    // subsequent install bypasses the audit envelope but the byte-equal
+    // diff returns match=true.  Lockfile equality alone is not success.
+    // This gate fires in BOTH paths: drift + match.
+    const bypassEntries = findAuditBypass(finalYaml);
+
     setOutput('lockfile', inputs.lockPath);
     setOutput('diff', diff.unified);
+
+    if (bypassEntries.length > 0) {
+      const msg = formatAuditBypassError(bypassEntries);
+      const lockLabel = relativeForDisplay(inputs.lockPath, repoDir);
+      process.stderr.write(`${msg}\n`);
+      // GitHub Actions annotation so the bypass surfaces in the PR UI
+      // even if the diff path was clean.
+      process.stdout.write(
+        `::error file=${lockLabel},line=1::${msg}\n`,
+      );
+      exitProcess(1);
+    }
 
     if (!diff.match) exitProcess(1);
     return;

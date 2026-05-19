@@ -23,6 +23,9 @@
 //   reviewers see actual timestamps rather than the sentinel.
 
 import { createTwoFilesPatch, structuredPatch } from 'diff';
+import { parse as parseYaml } from 'yaml';
+
+import { Lock } from '../lock/schema.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -144,6 +147,113 @@ function canonicalizeVolatileFields(yaml: string): string {
     '$1: <canonicalized>',
   );
 }
+
+// ---------------------------------------------------------------------------
+// audit_bypass detection
+// ---------------------------------------------------------------------------
+
+/**
+ * One `<EXEC_FAIL_OPEN> <prog>` entry surfaced in the generated lockfile.
+ * Carries the package id and lifecycle stage so the action can emit a
+ * targeted annotation pointing the auditor at the bypass.
+ */
+export interface AuditBypassEntry {
+  packageId: string;
+  stage: string;
+  entry: string;
+}
+
+/**
+ * Scan a generated lockfile (YAML text) for any non-empty `audit_bypass`
+ * arrays under `packages.<pkg>.lifecycle.<stage>`.  Returns one
+ * AuditBypassEntry per offending string.
+ *
+ * SECURITY (defense in depth): the byte-equality diff path treats a
+ * committed lockfile that ALREADY contains `<EXEC_FAIL_OPEN> …` lines as
+ * "no drift" — which is exactly the silenced state a malicious PR would
+ * commit to baseline a permanent audit bypass.  This scan is the standalone
+ * gate that fires even when the diff matches, so an attacker cannot launder
+ * a permanent bypass through a single approved PR.
+ *
+ * The check parses the YAML defensively: malformed input returns an empty
+ * array (caller's diff path will surface the malformedness separately).
+ * It does NOT enforce the full Lock schema (so future schema additions do
+ * not break this gate); it walks the parsed tree by shape.
+ */
+export function findAuditBypass(generated: string): AuditBypassEntry[] {
+  let doc: unknown;
+  try {
+    doc = parseYaml(generated);
+  } catch {
+    return [];
+  }
+  if (doc === null || typeof doc !== 'object') return [];
+
+  // Prefer the strict schema parse when it succeeds — that gives us
+  // canonical key shapes — but fall back to a hand-walk on validation
+  // failure so a partially-corrupt lockfile still triggers the gate.
+  const parsed = Lock.safeParse(doc);
+  const packagesRaw = parsed.success
+    ? parsed.data.packages
+    : (doc as { packages?: unknown }).packages;
+  if (
+    packagesRaw === undefined ||
+    packagesRaw === null ||
+    typeof packagesRaw !== 'object'
+  ) {
+    return [];
+  }
+
+  const out: AuditBypassEntry[] = [];
+  for (const [packageId, pkgRaw] of Object.entries(
+    packagesRaw as Record<string, unknown>,
+  )) {
+    if (pkgRaw === null || typeof pkgRaw !== 'object') continue;
+    const lifecycleRaw = (pkgRaw as { lifecycle?: unknown }).lifecycle;
+    if (
+      lifecycleRaw === null ||
+      lifecycleRaw === undefined ||
+      typeof lifecycleRaw !== 'object'
+    ) {
+      continue;
+    }
+    for (const [stage, blockRaw] of Object.entries(
+      lifecycleRaw as Record<string, unknown>,
+    )) {
+      if (blockRaw === null || typeof blockRaw !== 'object') continue;
+      const ab = (blockRaw as { audit_bypass?: unknown }).audit_bypass;
+      if (!Array.isArray(ab)) continue;
+      for (const entry of ab) {
+        if (typeof entry === 'string' && entry.length > 0) {
+          out.push({ packageId, stage, entry });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Format a list of audit_bypass entries as a single human-readable error
+ * line, suitable for stderr / Action log surfacing.  Truncates long lists
+ * to keep the message bounded.
+ */
+export function formatAuditBypassError(entries: AuditBypassEntry[]): string {
+  const MAX = 10;
+  const head = entries.slice(0, MAX).map((e) => {
+    return `${e.packageId} (${e.stage}): ${e.entry}`;
+  });
+  const more =
+    entries.length > MAX ? ` (+${entries.length - MAX} more)` : '';
+  return (
+    'Audit envelope was bypassed — see audit_bypass entries: [' +
+    head.join('; ') +
+    ']' +
+    more
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 /**
  * Count the number of lines in `s`.  An empty string is 0 lines.  A trailing

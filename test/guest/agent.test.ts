@@ -108,6 +108,60 @@ function emptyStrace(exitCode = 0): StraceRunner {
       void cmd;
     },
     getExitCode() { return exitCode; },
+    // Finding D: tamper reporting is part of the StraceRunner contract.
+    // Test fakes that don't audit a shared events file return null.
+    getTamperReason() { return null; },
+    recordTamper(_reason: string) { /* no-op for test fakes */ },
+    getRootPid() { return null; },
+  };
+}
+
+/**
+ * A LinuxStraceRunner subclass that emits no records, succeeds with the
+ * supplied exit code, and reports a fixed tamper reason.  Historically this
+ * existed because the agent's fail-closed gate dispatched on
+ * `instanceof LinuxStraceRunner` — Finding D moved that gate onto the
+ * `StraceRunner` interface contract, so a plain object literal works too
+ * (see `tamperingPlainStrace` below).  Keep the subclass variant around
+ * to exercise the inheritance path for any future LinuxStraceRunner
+ * decorator subclasses that ride on it.
+ */
+class TamperingStraceRunner extends LinuxStraceRunner {
+  private readonly _reason: string;
+  private readonly _stubExitCode: number;
+  constructor(reason: string, exitCode = 0) {
+    super(undefined, null);
+    this._reason = reason;
+    this._stubExitCode = exitCode;
+  }
+  override async *run(_cmd: string, _args: string[]): AsyncIterable<{ pid: number; line: string; source: 'shim' | 'strace' }> {
+    void _cmd; void _args;
+  }
+  override getExitCode(): number {
+    return this._stubExitCode;
+  }
+  override getTamperReason(): string | null {
+    return this._reason;
+  }
+}
+
+/**
+ * A plain object-literal `StraceRunner` (NOT a `LinuxStraceRunner`
+ * subclass) that reports a fixed tamper reason.  Used to verify Finding D:
+ * the agent's tamper gate must dispatch on the interface contract, not on
+ * class identity, so any contract-conforming runner can force fail-closed.
+ */
+function tamperingPlainStrace(reason: string, exitCode = 0): StraceRunner {
+  let currentReason = reason;
+  return {
+    async *run() { /* yield nothing */ },
+    getExitCode() { return exitCode; },
+    getTamperReason() { return currentReason; },
+    recordTamper(r: string) {
+      // First-writer-wins parity with LinuxStraceRunner.
+      if (currentReason === '' || currentReason === null) currentReason = r;
+    },
+    getRootPid() { return null; },
   };
 }
 
@@ -123,6 +177,10 @@ function trackingStrace(exitCode = 0): { strace: StraceRunner; calls: string[] }
         calls.push(`${cmd} ${args.join(' ')}`);
       },
       getExitCode() { return exitCode; },
+      // Finding D: tamper reporting is part of the StraceRunner contract.
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op for test fakes */ },
+      getRootPid() { return null; },
     },
   };
 }
@@ -335,6 +393,19 @@ describe('agent main()', () => {
     expect(env['NODE_OPTIONS']).toContain('dlopen-block.cjs');
     expect(env['NODE_OPTIONS']).toContain('platform-spoof.cjs');
     expect(env['SCRIPT_JAIL_LOG_FD']).toBe('3');
+    // Finding C: --no-addons disables Node's native-addon loading at the
+    // V8 level so `node --expose-internals` cannot reach the internalBinding
+    // dlopen path that bypasses our JS dlopen-block preload.  Must be
+    // present in BOTH the live NODE_OPTIONS and the sticky
+    // SCRIPT_JAIL_NODE_OPTIONS the Rust shim re-injects across exec().
+    expect(env['NODE_OPTIONS']).toContain('--no-addons');
+    expect(env['SCRIPT_JAIL_NODE_OPTIONS']).toContain('--no-addons');
+    // Order: --no-addons MUST precede any --require= entry so an attacker-
+    // controlled trailing flag in NODE_OPTIONS can never neutralise it.
+    const noAddonsIdx = String(env['NODE_OPTIONS']).indexOf('--no-addons');
+    const firstRequireIdx = String(env['NODE_OPTIONS']).indexOf('--require=');
+    expect(noAddonsIdx).toBeGreaterThanOrEqual(0);
+    expect(firstRequireIdx).toBeGreaterThan(noAddonsIdx);
   });
 
   it('throws when config file does not exist', async () => {
@@ -581,6 +652,182 @@ describe('agent main()', () => {
     ).toBe(true);
   });
 
+  // ── Finding A: agent fails closed when the events file was tampered ─────
+  //
+  // The tailer records a tamper reason whenever the events file disappears,
+  // is replaced, or shrinks.  main() must convert that into a fatal error
+  // frame and refuse to emit a final lockfile — otherwise a hostile
+  // lifecycle script that `rm`s the events file (erasing audit_bypass
+  // evidence) could pair its evasion with a clean YAML diff.
+  it('aborts fatally with an error frame when the strace runner reports events-file tampering', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const configPath = writeConfig(testDir);
+
+    // LinuxStraceRunner subclass — exercises the inheritance path.  The
+    // Finding-D refactor moved the gate onto the contract so a plain
+    // object literal works too (see the test immediately below).
+    const strace = new TamperingStraceRunner('events file disappeared: /tmp/events.jsonl');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
+      // flushAndExit's callback fires one tick later.
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    expect(exitedWith).toBe(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The fatal error must name the tamper reason verbatim, so the host's
+    // log surfaces what happened.
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(true);
+    expect(String(errors[0]!['message'])).toMatch(/tampered/);
+    expect(String(errors[0]!['message'])).toMatch(/events file disappeared/);
+
+    // Critically: NO `install_done` handshake and NO `final` lockfile.
+    // Without this, the host's check mode would diff a possibly-clean
+    // YAML and pass on tampered audit data.
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).not.toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(false);
+  });
+
+  // ── Finding E: agent fails closed when createEventsFile throws ──────────
+  //
+  // The previous code wrapped createEventsFile() in a try/catch and fell
+  // back to SCRIPT_JAIL_LOG_FILE="".  npm spawns lifecycle children with
+  // `stdio: 'inherit'` which only propagates fds 0–2 — so the SCRIPT_JAIL_
+  // LOG_FD=3 channel does NOT survive past the first child.  Descendants
+  // (the actual node processes inside lifecycle scripts) lose their audit
+  // sink entirely: env_read / dlopen / exec / env_tamper events go into
+  // the void.  A transient /tmp blip would silently produce a clean
+  // lockfile with missing audit signals.  The fix: bail with a fatal
+  // error frame before Phase A starts; never emit a final lockfile.
+  it('aborts fatally with an error frame when createEventsFile throws', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const { strace } = trackingStrace();
+    const configPath = writeConfig(testDir);
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    // The host go signal is irrelevant — the agent must bail before
+    // Phase A. We send one anyway so a regression that lets the agent
+    // proceed doesn't deadlock the test waiting for it.
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner,
+        strace,
+        dnsLookup: offlineLookup,
+        createEventsFile: () => {
+          const err = new Error('EACCES: /tmp is read-only') as NodeJS.ErrnoException;
+          err.code = 'EACCES';
+          throw err;
+        },
+      });
+      // flushAndExit's callback fires one tick later.
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    expect(exitedWith).toBe(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Exactly one fatal error frame, naming the underlying failure.
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(true);
+    expect(String(errors[0]!['message'])).toMatch(/failed to create audit-events file/);
+    expect(String(errors[0]!['message'])).toMatch(/EACCES/);
+
+    // Critically: NO `install_done` handshake, NO `fetch_done` handshake
+    // (the bail happens before Phase A), and NO final lockfile.
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).not.toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(false);
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'fetch_done'),
+    ).toBe(false);
+  });
+
+  // ── Finding D: tamper gate dispatches on contract, not class identity ───
+  //
+  // The previous gate was `straceRunner instanceof LinuxStraceRunner`, which
+  // silently skipped the tamper check for ANY runner that wasn't a direct
+  // subclass — wrappers, decorators, alternative production implementations,
+  // or test fakes that carried a legitimate tamper reason were all ignored.
+  // Finding D moved tamper reporting onto the StraceRunner interface so the
+  // gate is now `straceRunner.getTamperReason()`.  A plain object literal
+  // that conforms to the contract MUST trigger fail-closed.
+  it('honors getTamperReason() from a plain-object StraceRunner (no LinuxStraceRunner subclass)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const { spawner } = mockSpawner();
+    const configPath = writeConfig(testDir);
+
+    // Plain object literal — NOT an instance of LinuxStraceRunner.  Under
+    // the old `instanceof` gate this would have been silently ignored and
+    // the agent would have emitted a clean final lockfile.
+    const strace = tamperingPlainStrace('events file inode mismatch: dev=42 ino=99');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    expect(exitedWith).toBe(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const errors = frames.filter((f) => f['kind'] === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!['fatal']).toBe(true);
+    expect(String(errors[0]!['message'])).toMatch(/tampered/);
+    expect(String(errors[0]!['message'])).toMatch(/inode mismatch/);
+
+    const kinds = frames.map((f) => f['kind']);
+    expect(kinds).not.toContain('final');
+    expect(
+      frames.some((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done'),
+    ).toBe(false);
+  });
+
   it('treats a hung DNS lookup as offline once the verify timeout fires', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const { spawner } = mockSpawner();
@@ -641,6 +888,336 @@ describe('agent main()', () => {
 
     expect(fetchIdx).toBeLessThan(installDoneIdx);
     expect(installDoneIdx).toBeLessThan(finalIdx);
+  });
+});
+
+describe('buildChildEnv protected-env-names length gate', () => {
+  // Audit-trust Finding 2 (2026-05-18): the Rust shim's `capture_canon`
+  // copies SCRIPT_JAIL_PROTECTED_ENV_NAMES into a fixed-size CanonBuf
+  // (CANON_BUF_LEN = 1024 bytes including NUL).  A long list silently
+  // truncates inside the shim — the dropped names are NOT registered as
+  // protected, and those env-var values would leak through env-spy / shim
+  // getenv unannotated for every audited child.  The fix rejects the
+  // config at buildChildEnv-time (on the trusted host side, before any
+  // audit begins) so the misconfiguration surfaces immediately rather than
+  // producing a deceptively-clean lockfile.
+  //
+  // We import buildChildEnv and CANON_PROTECTED_ENV_NAMES_MAX_LEN from
+  // their respective module paths.  buildChildEnv is exported solely for
+  // this test surface; the production caller is `main()`.
+
+  function makeConfig(protectedEnv: string[]): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: protectedEnv },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('accepts a protect list that fits within the CanonBuf payload (<= 1023 bytes)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { CANON_PROTECTED_ENV_NAMES_MAX_LEN, MAX_PROTECTED_ENV_NAMES } =
+      await import('../../src/shim/canon-buf-len.js');
+
+    // Build a list that approaches the byte cap from below WITHOUT
+    // exceeding the entry-count cap (Finding 3, MAX_PROTECTED_ENV_NAMES =
+    // 64).  64 × 15-byte names + 63 commas = 960 + 63 = 1023 bytes
+    // (exactly the inclusive cap).  Each name is 15 bytes ASCII.
+    const names: string[] = [];
+    for (let i = 0; i < MAX_PROTECTED_ENV_NAMES; i++) {
+      names.push(`PROT_NM_${String(i).padStart(2, '0')}_X`); // 15 bytes
+    }
+    const joined = names.join(',');
+    expect(names.length).toBe(MAX_PROTECTED_ENV_NAMES);
+    expect(Buffer.byteLength(joined, 'utf8')).toBeLessThanOrEqual(CANON_PROTECTED_ENV_NAMES_MAX_LEN);
+
+    const env = buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl');
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe(joined);
+  });
+
+  it('rejects a protect list that would silently truncate inside the shim (> 1023 bytes)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { CANON_PROTECTED_ENV_NAMES_MAX_LEN, MAX_PROTECTED_ENV_NAMES } =
+      await import('../../src/shim/canon-buf-len.js');
+
+    // To exercise SOLELY the byte-length gate (Finding 2), keep the entry
+    // count at or below MAX_PROTECTED_ENV_NAMES (64) but make individual
+    // entries long enough that the joined byte length exceeds 1023.
+    // 64 × 17-byte entries + 63 commas = 1088 + 63 = 1151 bytes.
+    const names: string[] = [];
+    for (let i = 0; i < MAX_PROTECTED_ENV_NAMES; i++) {
+      names.push(`PROT_NAME_NO_${String(i).padStart(3, '0')}`); // 17 bytes ASCII
+    }
+    const joined = names.join(',');
+    expect(names.length).toBe(MAX_PROTECTED_ENV_NAMES);
+    expect(Buffer.byteLength(joined, 'utf8')).toBeGreaterThan(CANON_PROTECTED_ENV_NAMES_MAX_LEN);
+
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      /SCRIPT_JAIL_PROTECTED_ENV_NAMES is \d+ bytes/,
+    );
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      /silently truncating/,
+    );
+  });
+
+  it('error message references the configured entry count and the canon-buf cap', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
+
+    // Stay at or below MAX_PROTECTED_ENV_NAMES so the entry-count gate
+    // doesn't pre-empt the byte-length gate.  Build entries large enough
+    // that the joined string is just over 1023 bytes.
+    const names: string[] = [];
+    let bytes = 0;
+    // 64 × 17-byte entries → 64 entries (cap), 1151 bytes joined (over cap)
+    for (let i = 0; i < MAX_PROTECTED_ENV_NAMES; i++) {
+      const name = `PROT_NAME_NO_${String(i).padStart(3, '0')}`; // 17 bytes
+      names.push(name);
+      bytes += name.length + (i === 0 ? 0 : 1);
+    }
+    expect(bytes).toBeGreaterThanOrEqual(1024);
+    expect(Buffer.byteLength(names.join(','), 'utf8')).toBeGreaterThanOrEqual(1024);
+
+    let caught: Error | undefined;
+    try {
+      buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl');
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).toContain(`${names.length} entries`);
+    expect(caught!.message).toContain('1023 bytes');
+  });
+});
+
+describe('buildChildEnv protect-list entry-count and per-entry-length gates', () => {
+  // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list
+  // table holds `MAX_PROTECTED = 64` entries of at most `NAME_MAX_LEN - 1
+  // = 255` bytes each.  The byte-length check from Finding 2 covers the
+  // total CanonBuf size but NOT the structural caps inside
+  // `load_protect_list_from_bytes`, so a configuration of many short
+  // names (or a single very long name) could silently truncate inside
+  // the shim despite passing the byte-length gate.  These tests pin the
+  // boundary behaviour.
+
+  function makeConfig(protectedEnv: string[]): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: protectedEnv },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('accepts exactly MAX_PROTECTED_ENV_NAMES entries (boundary, must accept)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
+
+    // Each entry "A" = 1 byte, total joined = 64 + 63 = 127 bytes (well
+    // under the 1023-byte CanonBuf cap, so the entry-count check is the
+    // only gate that could fire).
+    const names = Array.from({ length: MAX_PROTECTED_ENV_NAMES }, (_, i) => `N${i}`);
+    expect(names.length).toBe(MAX_PROTECTED_ENV_NAMES);
+
+    const env = buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl');
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe(names.join(','));
+  });
+
+  it('rejects MAX_PROTECTED_ENV_NAMES + 1 entries with a precise error', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
+
+    const names = Array.from(
+      { length: MAX_PROTECTED_ENV_NAMES + 1 },
+      (_, i) => `N${i}`,
+    );
+    // Joined "N0,N1,..." comfortably under the 1023-byte byte-length cap
+    // (so the entry-count gate is the one that must fire).
+    expect(Buffer.byteLength(names.join(','), 'utf8')).toBeLessThan(1023);
+
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`SCRIPT_JAIL_PROTECTED_ENV_NAMES has ${MAX_PROTECTED_ENV_NAMES + 1} entries`),
+    );
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`at most ${MAX_PROTECTED_ENV_NAMES} entries`),
+    );
+  });
+
+  it('accepts an entry of exactly PROTECTED_NAME_MAX_LEN bytes (boundary, must accept)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { PROTECTED_NAME_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+
+    // 255 ASCII bytes — exactly the cap.
+    const name = 'A'.repeat(PROTECTED_NAME_MAX_LEN);
+    expect(Buffer.byteLength(name, 'utf8')).toBe(PROTECTED_NAME_MAX_LEN);
+
+    const env = buildChildEnv({}, makeConfig([name]), '/tmp/events.jsonl');
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe(name);
+  });
+
+  it('rejects an entry of PROTECTED_NAME_MAX_LEN + 1 bytes with a precise error', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { PROTECTED_NAME_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+
+    const tooLong = 'B'.repeat(PROTECTED_NAME_MAX_LEN + 1);
+    // Single entry, well under the joined-byte-length cap, so the per-
+    // entry gate is the one that must fire.
+    expect(Buffer.byteLength(tooLong, 'utf8')).toBeLessThan(1023);
+
+    expect(() => buildChildEnv({}, makeConfig([tooLong]), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`SCRIPT_JAIL_PROTECTED_ENV_NAMES entry \\[0\\] is ${PROTECTED_NAME_MAX_LEN + 1} bytes`),
+    );
+    expect(() => buildChildEnv({}, makeConfig([tooLong]), '/tmp/events.jsonl')).toThrow(
+      new RegExp(`at most ${PROTECTED_NAME_MAX_LEN} bytes`),
+    );
+  });
+
+  it('per-entry check reports the offending index when the bad entry is not first', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { PROTECTED_NAME_MAX_LEN } = await import('../../src/shim/canon-buf-len.js');
+
+    const names = ['OK_ONE', 'OK_TWO', 'C'.repeat(PROTECTED_NAME_MAX_LEN + 1), 'OK_THREE'];
+    expect(() => buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl')).toThrow(
+      /entry \[2\] is \d+ bytes/,
+    );
+  });
+
+  it('entry-count gate fires before the byte-length gate on multi-violation configs', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES, CANON_PROTECTED_ENV_NAMES_MAX_LEN } =
+      await import('../../src/shim/canon-buf-len.js');
+
+    // 80 × 16-byte entries: 80 × 16 + 79 = 1359 bytes (both > 1023 AND >
+    // 64 entries).  The entry-count error is the more actionable signal
+    // (it points at the structural cap, not the byte cap), so we assert
+    // it surfaces first.
+    const names = Array.from(
+      { length: 80 },
+      (_, i) => `PROTECTED_NAME${String(i).padStart(2, '0')}`,
+    );
+    expect(names.length).toBeGreaterThan(MAX_PROTECTED_ENV_NAMES);
+    expect(Buffer.byteLength(names.join(','), 'utf8')).toBeGreaterThan(
+      CANON_PROTECTED_ENV_NAMES_MAX_LEN,
+    );
+
+    let caught: Error | undefined;
+    try {
+      buildChildEnv({}, makeConfig(names), '/tmp/events.jsonl');
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).toMatch(/has \d+ entries/);
+    expect(caught!.message).not.toMatch(/is \d+ bytes \(comma-joined/);
+  });
+});
+
+describe('buildChildEnv protect-list strict env-var name gate (Finding 5)', () => {
+  // Audit-trust Finding 5 (medium, 2026-05-18): the prior count cap
+  // validated `config.protected.env.length` (YAML array length), but the
+  // shim and env-spy parsers split the wire format on ',' and '\n' at
+  // runtime.  A single YAML entry `"FOO,BAR,...,A65"` containing 65
+  // names would pass the entry-count gate (1 entry) yet trigger
+  // silent truncation inside the shim's `load_protect_list_from_bytes`.
+  //
+  // The fix rejects any YAML entry whose value does not match the
+  // strict env-var name grammar `[A-Za-z_][A-Za-z0-9_]*`.  These tests
+  // pin the gate so the audit chain cannot be defeated by smuggling
+  // separators into individual entries.
+
+  function makeConfig(protectedEnv: string[]): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: protectedEnv },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('rejects an entry containing a comma (the wire separator)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['FOO,BAR']), '/tmp/events.jsonl')).toThrow(
+      /entry \[0\] \("FOO,BAR"\) must not contain a comma/,
+    );
+  });
+
+  it('rejects an entry containing a newline (the alternate wire separator)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['FOO\nBAR']), '/tmp/events.jsonl')).toThrow(
+      /must not contain a newline/,
+    );
+  });
+
+  it('rejects a single entry that smuggles 65 comma-joined names past the entry-count cap', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const { MAX_PROTECTED_ENV_NAMES } = await import('../../src/shim/canon-buf-len.js');
+    // A single YAML entry composed of MAX+1 valid env-var names joined
+    // by commas.  The OLD count check would see 1 entry (passes) but
+    // the shim parser would split it into 65 names at runtime, then
+    // silently truncate the 65th.  The strict gate rejects this at
+    // configuration time.
+    const smuggled = Array.from(
+      { length: MAX_PROTECTED_ENV_NAMES + 1 },
+      (_, i) => `N${i}`,
+    ).join(',');
+    expect(() => buildChildEnv({}, makeConfig([smuggled]), '/tmp/events.jsonl')).toThrow(
+      /must not contain a comma/,
+    );
+  });
+
+  it('rejects an entry with leading whitespace', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig([' FOO']), '/tmp/events.jsonl')).toThrow(
+      /must match \^\[A-Za-z_\]\[A-Za-z0-9_\]\*\$/,
+    );
+  });
+
+  it('rejects an entry starting with #', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // The shim parser skips '#'-prefixed entries entirely — accepting
+    // them in YAML would silently drop the secret the operator meant
+    // to protect.
+    expect(() => buildChildEnv({}, makeConfig(['#FOO']), '/tmp/events.jsonl')).toThrow(
+      /must match \^\[A-Za-z_\]\[A-Za-z0-9_\]\*\$/,
+    );
+  });
+
+  it('rejects an empty string entry', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['']), '/tmp/events.jsonl')).toThrow(
+      /is empty or not a string/,
+    );
+  });
+
+  it('rejects an entry starting with a digit (POSIX env-var name grammar)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    expect(() => buildChildEnv({}, makeConfig(['1FOO']), '/tmp/events.jsonl')).toThrow(
+      /must match \^\[A-Za-z_\]\[A-Za-z0-9_\]\*\$/,
+    );
+  });
+
+  it('accepts plain ASCII env-var names', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // Sanity check: the strict gate must not break legitimate configs.
+    const env = buildChildEnv(
+      {},
+      makeConfig(['NPM_TOKEN', 'GITHUB_TOKEN', '_PRIVATE']),
+      '/tmp/events.jsonl',
+    );
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe('NPM_TOKEN,GITHUB_TOKEN,_PRIVATE');
   });
 });
 
@@ -783,10 +1360,10 @@ describe('runStraceTailer', () => {
 
   /** Collect all items from an async iterable with a timeout guard. */
   async function collect(
-    iter: AsyncIterable<{ pid: number; line: string }>,
+    iter: AsyncIterable<{ pid: number; line: string; source: 'shim' | 'strace' }>,
     timeoutMs = 3000,
-  ): Promise<Array<{ pid: number; line: string }>> {
-    const results: Array<{ pid: number; line: string }> = [];
+  ): Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> {
+    const results: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
     await Promise.race([
       (async () => {
         for await (const item of iter) {
@@ -822,8 +1399,8 @@ describe('runStraceTailer', () => {
 
     const items = await collect(tailer);
     expect(items.length).toBe(2);
-    expect(items[0]).toEqual({ pid: 1234, line: 'openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3' });
-    expect(items[1]).toEqual({ pid: 1234, line: 'execve("/bin/sh", ["sh"], ...) = 0' });
+    expect(items[0]).toEqual({ pid: 1234, line: 'openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3', source: 'strace' });
+    expect(items[1]).toEqual({ pid: 1234, line: 'execve("/bin/sh", ["sh"], ...) = 0', source: 'strace' });
   });
 
   it('yields lines from multiple per-pid files with correct pids', async () => {
@@ -877,7 +1454,7 @@ describe('runStraceTailer', () => {
 
     const items = await collect(tailer);
     expect(items).toHaveLength(1);
-    expect(items[0]).toEqual({ pid: 9999, line: 'openat(AT_FDCWD, "/late", O_RDONLY) = 5' });
+    expect(items[0]).toEqual({ pid: 9999, line: 'openat(AT_FDCWD, "/late", O_RDONLY) = 5', source: 'strace' });
   });
 
   it('yields JSONL lines from fd3Stream with pid=0', async () => {
@@ -1045,10 +1622,12 @@ describe('runStraceTailer', () => {
     expect(items[0]).toEqual({
       pid: 0,
       line: '{"kind":"env_read","name":"NPM_TOKEN","pid":1001,"ts":0,"hidden":true}',
+      source: 'shim',
     });
     expect(items[1]).toEqual({
       pid: 0,
       line: '{"kind":"dlopen","filename":"/work/node_modules/x/evil.node","pid":1002,"ts":1,"result":"blocked"}',
+      source: 'shim',
     });
   });
 
@@ -1121,6 +1700,425 @@ describe('runStraceTailer', () => {
     expect(names.filter((n) => n === 'A')).toHaveLength(1);
     expect(names.filter((n) => n === 'B')).toHaveLength(1);
   });
+
+  // ── Finding A: events-file tamper detection ─────────────────────────────
+  //
+  // The tailer baseline-stats SCRIPT_JAIL_LOG_FILE at startup (passed in via
+  // eventsBaseline) and re-checks {dev, ino} on every drain cycle.  Any
+  // mismatch — unlink, replace, truncate, EACCES — must record a tamper
+  // reason into tamperRef so the agent fails closed at install-end.
+
+  it('records a tamper reason when the events file is unlinked mid-run', async () => {
+    const { statSync, openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, unlinkSync, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    // Create file with O_EXCL like the production agent does.
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Unlink the events file mid-run.  The polling loop must observe this
+    // and record a tamper reason.
+    setTimeout(() => {
+      unlinkSync(eventsPath);
+      setTimeout(resolveExit, 100);
+    }, 40);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/events file (disappeared|became unreadable|inode mismatch)/);
+    // Defensive: also reference statSync to keep the (linter-suppressed) import warm.
+    expect(typeof statSync).toBe('function');
+  });
+
+  it('records a tamper reason when the events file is replaced with a different inode', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, writeFileSync: writeSyncFn, renameSync, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Replace the file with a fresh one at the same path — new inode.
+    // On Linux, `unlink` immediately followed by `writeFile` of the same
+    // path can reuse the just-freed inode number (the kernel's inode
+    // allocator picks the lowest free slot), which leaves the baseline
+    // {ino,dev} check passing.  Force a guaranteed-different inode by
+    // writing the replacement at a sibling path first, then atomically
+    // renaming over the target: the renamed file's inode was allocated
+    // BEFORE the unlink and so cannot collide.
+    // Then deterministically wait for the tailer to observe the tamper
+    // (rather than racing a fixed 100ms timer that's flaky on slow CI
+    // runners where the polling loop hasn't drained between the
+    // unlink+rewrite and the resolveExit).
+    setTimeout(() => {
+      const tmpPath = `${eventsPath}.replacement`;
+      writeSyncFn(tmpPath, '{"kind":"env_read","name":"INJECTED","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+      renameSync(tmpPath, eventsPath);
+      // Poll tamperRef.reason every 10ms (≤ pollIntervalMs of 20ms) up to
+      // a generous 2s cap, then resolveExit.  The cap is large enough
+      // that even a heavily-contended CI runner has many poll cycles to
+      // notice the inode swap; the fall-through still triggers
+      // resolveExit so the test can fail fast if tamper genuinely never
+      // fires (rather than hanging until the 4s collect timeout).
+      const start = Date.now();
+      const waitForTamper = (): void => {
+        if (tamperRef.reason !== null || Date.now() - start > 2000) {
+          resolveExit();
+          return;
+        }
+        setTimeout(waitForTamper, 10);
+      };
+      waitForTamper();
+    }, 40);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/inode mismatch|disappeared/);
+  });
+
+  it('does NOT record tamper when the events file is untouched (happy path)', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, appendFileSync: appendSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    setTimeout(() => {
+      // Legitimate append — same inode, growing size.
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"OK","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+      setTimeout(resolveExit, 100);
+    }, 40);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
+    // The legitimate appended line must still be yielded.
+    expect(items.some((i) => i.line.includes('"name":"OK"'))).toBe(true);
+  });
+
+  it('records a tamper reason when the events file is truncated below the read position', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, truncateSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    // Pre-populate with a line so the tailer advances eventsPos > 0.
+    writeSyncFn(
+      eventsPath,
+      '{"kind":"env_read","name":"FIRST","pid":1,"ts":0,"hidden":false}\n',
+      { encoding: 'utf8', flag: 'a' },
+    );
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    // Wait for first drain to advance eventsPos, then truncate to 0.
+    setTimeout(() => {
+      truncateSync(eventsPath, 0);
+      setTimeout(resolveExit, 120);
+    }, 80);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/shrank|inode mismatch/);
+  });
+
+  // Finding A: append-then-truncate-to-same-size cycle.
+  //
+  // An attacker who knows the polling interval can race the tailer:
+  //   1. Read the file's current size (== eventsPos after the last drain).
+  //   2. Append a sensitive event line, growing the file.
+  //   3. Truncate the file back to the size from step 1, BEFORE the next
+  //      poll observes the growth.
+  // A naive size-shrink check (`size < eventsPos`) misses this because the
+  // size has been restored.  The fix uses mtime monotonicity (every write,
+  // including truncate, advances mtime) plus max-seen-size monotonicity
+  // (any poll that observes a smaller size than a prior poll is tamper)
+  // plus an inotify watch on the file inode that triggers an immediate
+  // drain on every kernel-reported modification.
+  it('records a tamper reason on an append-then-truncate-to-same-size cycle', async () => {
+    const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, truncateSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    // Pre-populate with one line so eventsPos advances on first drain.
+    const firstLine = '{"kind":"env_read","name":"FIRST","pid":1,"ts":0,"hidden":false}\n';
+    writeSyncFn(eventsPath, firstLine, { encoding: 'utf8', flag: 'a' });
+    const baselineSize = Buffer.byteLength(firstLine, 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      // Slightly longer poll interval — we want there to be a real polling
+      // window even on a slow CI runner.  The mtime + maxSeenSize checks
+      // still fire even when the polling races losing the intermediate
+      // growth observation.
+      pollIntervalMs: 30,
+      drainMs: 80,
+    });
+
+    // After eventsPos advances past the first line, append a "sensitive"
+    // line and immediately truncate back to baselineSize.  Sleep briefly
+    // between operations so the kernel definitely bumps mtime.
+    setTimeout(() => {
+      writeSyncFn(
+        eventsPath,
+        '{"kind":"audit_bypass","name":"NPM_TOKEN","pid":99,"ts":1,"hidden":false}\n',
+        { encoding: 'utf8', flag: 'a' },
+      );
+      // Tight loop, then truncate — replicates the racing-attacker scenario.
+      setTimeout(() => {
+        truncateSync(eventsPath, baselineSize);
+        setTimeout(resolveExit, 200);
+      }, 5);
+    }, 120);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    // Either signal is acceptable: a poll caught the intermediate grow (→
+    // max-seen mismatch), or it landed on the post-truncate state (→ mtime
+    // advanced without new bytes), or the inotify watch forced a drain that
+    // observed the larger size.
+    expect(tamperRef.reason).toMatch(
+      /shrank below max-seen|mtime advanced without new bytes|shrank/,
+    );
+  });
+
+  // Finding B: parent-directory rename watch.
+  //
+  // The transient-rename attack: rename the events file aside, drop a
+  // decoy at the same path, let a child open the decoy, then rename the
+  // original back.  The inode baseline is restored before the next drain
+  // so the existing dev/ino check passes — but the child's writes never
+  // reach the file the tailer reads from.  Inotify on the parent dir
+  // catches the IN_MOVED_FROM / IN_MOVED_TO / IN_CREATE events even when
+  // the polling loop misses the window.
+  it('records a tamper reason when the events file is renamed away in its parent directory', async () => {
+    const { renameSync, openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, constants: fsConstants } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      // Finding-B inputs: watch the parent directory for renames affecting
+      // the events file's basename.
+      eventsDirPath: tailerDir,
+      eventsFileBasename: 'events.jsonl',
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 30,
+      drainMs: 80,
+    });
+
+    // Rename the events file aside.  The parent-dir watcher should fire a
+    // 'rename' event with filename='events.jsonl' and record tamper, even
+    // if the polling loop happens to miss the gap before exit.
+    setTimeout(() => {
+      renameSync(eventsPath, join(tailerDir, 'events.bak'));
+      setTimeout(resolveExit, 200);
+    }, 60);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(
+      /parent directory rename|events file disappeared|inode mismatch/,
+    );
+  });
+
+  // Audit-trust 2026-05-18: append-truncate-utimes_restore bypass.
+  //
+  // Same-UID attacker:
+  //   1. stat() the events file, record current mtime.
+  //   2. Append a corrupting/malicious JSONL line — mtime + ctime + size
+  //      all advance.
+  //   3. ftruncate() back to the original size — mtime + ctime advance
+  //      again, size returns to baseline.
+  //   4. utimesSync(path, atime, oldMtime) — mtime is restored to the
+  //      pre-attack value.  ctime, however, ADVANCES one more time (the
+  //      kernel updates ctime on any metadata change, including utimes
+  //      itself) and cannot be set back.
+  // After the sequence, size === eventsPos AND mtime === lastObservedMtime,
+  // so the legacy "mtime advanced without new bytes" gate stays quiet.
+  // ctime, however, is strictly greater than the ctime observed at the
+  // last successful drain (which is the baseline ctime if no drains have
+  // happened yet) — flagging tamper.
+  it('records a tamper reason on append-truncate-utimes_restore (ctime-based detection)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      truncateSync,
+      writeFileSync: writeSyncFn,
+      utimesSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'events.jsonl');
+    // Create with O_EXCL so we own the inode (matches createEventsFile in
+    // production).  Capture {ino, dev, mtimeNs, ctimeNs} at creation —
+    // ctimeNs is the load-bearing baseline for this test.
+    const fd = openSyncFn(
+      eventsPath,
+      // eslint-disable-next-line no-bitwise -- POSIX flag composition
+      fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      0o600,
+    );
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = {
+      ino: stat.ino,
+      dev: stat.dev,
+      mtimeNs: stat.mtimeNs,
+      ctimeNs: stat.ctimeNs,
+    };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 30,
+      drainMs: 80,
+    });
+
+    // Record the pre-attack mtime — we'll restore it at the end of the
+    // tamper sequence to defeat the pure mtime-advanced gate.  Use the
+    // baseline-captured mtime so we know the exact value to pin to (a
+    // re-stat here would race with any background activity).
+    const preAttackAtimeNs = stat.atimeNs;
+    const preAttackMtimeNs = stat.mtimeNs;
+
+    setTimeout(() => {
+      // Step 1: append a malicious line.  This advances mtime, ctime, size.
+      writeSyncFn(
+        eventsPath,
+        '{"kind":"audit_bypass","name":"NPM_TOKEN","pid":99,"ts":1,"hidden":false}\n',
+        { encoding: 'utf8', flag: 'a' },
+      );
+      // Step 2: truncate back to original size (0).  mtime and ctime
+      // advance again; size returns to baseline.
+      truncateSync(eventsPath, 0);
+      // Step 3: utimes — restore mtime to its pre-attack value.  ctime
+      // advances one more time (kernel rule), atime is restored too (the
+      // test pins both fields so atime monotonicity does not factor in).
+      //
+      // node:fs.utimesSync takes seconds or Date.  Convert ns → s (number)
+      // with floor; precision loss only affects atime/mtime, which is the
+      // attacker-favorable case (any precision loss makes the attack
+      // STRONGER, not weaker, so the test remains a valid lower bound).
+      const atimeSec = Number(preAttackAtimeNs) / 1e9;
+      const mtimeSec = Number(preAttackMtimeNs) / 1e9;
+      utimesSync(eventsPath, atimeSec, mtimeSec);
+      // Resolve so the tailer drains and exits.  Give a longer window so
+      // the polling loop and inotify watcher both have a chance to fire.
+      setTimeout(resolveExit, 250);
+    }, 80);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    // The ctime-based detection is the load-bearing signal: even when
+    // mtime is utimes-restored and size is back to eventsPos, ctime is
+    // strictly greater than the baseline ctime.  Accept any of the
+    // ctime-flavoured reasons; "shrank below max-seen" is also acceptable
+    // if a poll happened to land between the append and the truncate
+    // (defense-in-depth).
+    expect(tamperRef.reason).toMatch(
+      /ctime advanced without new bytes|shrank below max-seen|mtime regressed/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1153,6 +2151,11 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     const fakeChild: SpawnResult = {
       stderr: fakeStderr,
       stdio: [null, null, fakeStderr, fakeFd3],
+      // bug #1 (2026-05-19): SpawnResult now exposes pid so the runner
+      // can read /proc/<pid>/task/<pid>/children to identify strace's
+      // direct child.  undefined here keeps the runner on the fallback
+      // path (the per-pid file observation heuristic).
+      pid: undefined,
       on(event: string, listener: unknown) {
         if (event === 'close') closeListener = listener as (code: number | null) => void;
         if (event === 'error') errorListener = listener as (err: Error) => void;
@@ -1182,8 +2185,8 @@ describe('LinuxStraceRunner stderr forwarding', () => {
       });
 
       // Collect items from the iterator in background while we push data.
-      const itemsPromise: Promise<Array<{ pid: number; line: string }>> = (async () => {
-        const collected: Array<{ pid: number; line: string }> = [];
+      const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
+        const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
         for await (const item of runIter) {
           collected.push(item);
         }
@@ -1221,6 +2224,110 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     } finally {
       process.stderr.write = origWrite;
     }
+  });
+
+  // Codex follow-up (bug #3, high, 2026-05-19): tri-state rootPid resolution.
+  // When `child.pid` is defined AND readStraceChildPid returns null (timeout,
+  // ambiguous, /proc unavailable), the per-pid-file fallback MUST be suppressed.
+  // Pre-fix the fallback ran unconditionally — a per-pid file's pid would have
+  // seeded `_rootPid` and re-introduced the race the deterministic /proc
+  // resolution was added to eliminate.
+  it('rootPid: /proc failure with defined child.pid leaves rootPid null and DISABLES per-pid-file fallback (bug #3)', async () => {
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    // child.pid = 0 makes readStraceChildPid throw on every readFileSync
+    // (`/proc/0/task/0/children` doesn't exist) so it returns null AFTER
+    // the deadline.  Crucially, pid IS DEFINED (typeof === 'number'),
+    // which selects the deterministic-resolution code path — once that
+    // path is taken, the per-pid-file fallback MUST be suppressed even
+    // when readStraceChildPid returns null.
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: 0,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    const runner = new LinuxStraceRunner(() => fakeChild);
+    const basePath = `${tailerDir}/strace.out`;
+    // Pre-create a per-pid file so the tailer's discovery path would
+    // otherwise fire recordRootPid(<pid>) with this synthetic pid.
+    writeFileSync(`${basePath}.4242`, 'openat(AT_FDCWD, "/x", O_RDONLY) = 3\n', 'utf8');
+
+    const runIter = runner.run('npm', ['rebuild'], {
+      env: {},
+      cwd: tailerDir,
+      basePath,
+    });
+    const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
+      const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
+      for await (const item of runIter) {
+        collected.push(item);
+      }
+      return collected;
+    })();
+    fakeStderr.push(null);
+    fakeFd3.push(null);
+    // Allow the tailer one poll cycle to drain the pre-created file
+    // BEFORE we signal exit, so the recordRootPid suppression is the
+    // ONLY reason _rootPid stays null (rather than the iterator exiting
+    // before the tailer ever discovered the file).
+    setTimeout(() => { closeListener?.(0); }, 200);
+    await itemsPromise;
+
+    // CRITICAL ASSERTION: getRootPid() is null even though a per-pid
+    // file with pid 4242 was visible the entire run.  The suppression
+    // is what bug #3's fix introduces.
+    expect(runner.getRootPid()).toBeNull();
+  });
+
+  // Bug #3 sanity — the test-fake fallback path still works.  When
+  // child.pid is UNDEFINED (catastrophic spawn or test stub), the
+  // per-pid-file fallback MUST still seed _rootPid for the convenience
+  // of older test fakes that rely on it.
+  it('rootPid: undefined child.pid keeps the per-pid-file fallback enabled (bug #3 sanity)', async () => {
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: undefined,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    const runner = new LinuxStraceRunner(() => fakeChild);
+    const basePath = `${tailerDir}/strace.out`;
+    writeFileSync(`${basePath}.5151`, 'openat(AT_FDCWD, "/x", O_RDONLY) = 3\n', 'utf8');
+
+    const runIter = runner.run('npm', ['rebuild'], {
+      env: {},
+      cwd: tailerDir,
+      basePath,
+    });
+    const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
+      const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
+      for await (const item of runIter) {
+        collected.push(item);
+      }
+      return collected;
+    })();
+    fakeStderr.push(null);
+    fakeFd3.push(null);
+    setTimeout(() => { closeListener?.(0); }, 200);
+    await itemsPromise;
+
+    // Fallback enabled → pid 5151 was observed and seeded _rootPid.
+    expect(runner.getRootPid()).toBe(5151);
   });
 });
 
@@ -1269,7 +2376,7 @@ describe('runStraceTailer cleanup on early break', () => {
       });
 
       // Read exactly one item then break.
-      const collected: Array<{ pid: number; line: string }> = [];
+      const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
       for await (const item of tailer) {
         collected.push(item);
         break; // triggers the try/finally in runStraceTailer
@@ -1284,5 +2391,31 @@ describe('runStraceTailer cleanup on early break', () => {
     } finally {
       (globalThis as Record<string, unknown>)['clearInterval'] = realClearInterval;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codex follow-up (bug #1, 2026-05-19): readStraceChildPid — deterministic
+// resolution of strace's direct child pid via /proc/<pid>/task/<pid>/children
+// ---------------------------------------------------------------------------
+
+describe('readStraceChildPid', () => {
+  it('returns null when /proc is unavailable for the given pid', async () => {
+    // Pid 0 is not a real process on Linux; /proc/0 does not exist, so
+    // every readFileSync attempt will throw and the loop will exit
+    // after the deadline.  Set a short deadline to keep the test fast.
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    const result = readStraceChildPid(0, 15);
+    expect(result).toBeNull();
+  });
+
+  it('returns null when the deadline expires (very short deadline)', async () => {
+    // Pass a pid that almost certainly has no children (process.pid
+    // itself is the test runner; the children file may be non-empty
+    // BUT we use a 0ms deadline so the loop exits on the first
+    // Date.now() check without reading anything).
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    const result = readStraceChildPid(process.pid, 0);
+    expect(result).toBeNull();
   });
 });

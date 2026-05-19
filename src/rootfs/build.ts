@@ -17,11 +17,23 @@
 //   7. Report size; warn if > 200 MB
 
 import { execSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, statSync, copyFileSync, readdirSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  statSync,
+  copyFileSync,
+  readdirSync,
+  rmSync,
+  openSync,
+  readSync,
+  closeSync,
+} from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
+
+import { shimArtifactIsStale, shimSourceInputs } from './shim-freshness.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -101,6 +113,336 @@ export function formatBytes(bytes: number): string {
 export const SIZE_WARN_THRESHOLD_BYTES = 200 * 1024 * 1024; // 200 MB
 
 // ---------------------------------------------------------------------------
+// ELF validation for libscriptjail.so
+// ---------------------------------------------------------------------------
+//
+// The rootfs Dockerfile COPYs `images/libscriptjail.so` into the VM at
+// `/lib/libscriptjail.so`; the guest agent then sets `LD_PRELOAD=/lib/libscriptjail.so`.
+// If the host devloop produced a macOS Mach-O dylib (or some other non-ELF
+// blob) and somebody renamed it to `.so`, the dynamic linker inside the VM
+// silently refuses to load it, leaving the env-read audit chain absent.
+// We therefore validate the on-disk file BEFORE accepting it.
+//
+// Validation depth is "loadability", not just the prefix: a 20-byte blob with
+// a valid ELF magic prefix passes a magic check but ld.so cannot load it
+// (no program headers, no PT_DYNAMIC, no symbol table). To catch that, we:
+//   1. Verify the ELF identification bytes (magic, class, endianness).
+//   2. Verify e_type / e_machine match a shared object for the rootfs target.
+//   3. Read the program header table off `e_phoff` and require it to fit in
+//      the file (e_phoff > 0, e_phoff + e_phnum * e_phentsize <= file_size).
+//   4. Walk the program headers and require at least one PT_DYNAMIC entry.
+//      A loadable shared object must have a dynamic section — that is what
+//      ld.so consults for SONAME / DT_NEEDED / symbol resolution.
+//
+// Reference (ELF64 header, little-endian):
+//   bytes 0..3     = 0x7F 'E' 'L' 'F'           (ELF magic)
+//   byte  4        = EI_CLASS  (2 = ELFCLASS64)
+//   byte  5        = EI_DATA   (1 = ELFDATA2LSB, little-endian)
+//   bytes 16..17   = e_type    (3 = ET_DYN, shared object)
+//   bytes 18..19   = e_machine (62 = EM_X86_64, 183 = EM_AARCH64)
+//   bytes 32..39   = e_phoff   (u64, file offset of program header table)
+//   bytes 54..55   = e_phentsize (u16, size of each phdr entry; 56 for ELF64)
+//   bytes 56..57   = e_phnum   (u16, number of phdr entries)
+//
+// Program header entry (ELF64, 56 bytes):
+//   bytes 0..3     = p_type    (u32; 1 = PT_LOAD, 2 = PT_DYNAMIC)
+//
+// All numeric ELF header fields above are stored little-endian per EI_DATA=1.
+
+/** Size of the ELF64 header. */
+export const ELF64_EHDR_SIZE = 64;
+/** Size of a single ELF64 program header entry. */
+export const ELF64_PHDR_SIZE = 56;
+
+/** Program header types we care about. */
+export const PT_LOAD = 1;
+export const PT_DYNAMIC = 2;
+
+/** ELF e_machine values we recognise.  Currently only x86-64 ships. */
+export const EM_X86_64 = 62;
+export const EM_AARCH64 = 183;
+
+/** Map a runner image to the ELF e_machine value expected for that rootfs. */
+export function expectedShimMachine(_input: Pick<BuildInput, 'runnerImage'>): number {
+  // Both supported rootfses currently target x86-64 (firecracker downloads,
+  // vmlinux, and the action's microVM are all x86_64). When an aarch64
+  // rootfs is added, switch on `runnerImage` here.
+  return EM_X86_64;
+}
+
+/** Human-readable label for an e_machine value (used in error messages). */
+export function machineLabel(machine: number): string {
+  if (machine === EM_X86_64) return 'x86-64 (EM_X86_64)';
+  if (machine === EM_AARCH64) return 'aarch64 (EM_AARCH64)';
+  return `e_machine=${machine}`;
+}
+
+/**
+ * Validate that `buf` (the start of a file, at least 20 bytes) looks like a
+ * Linux ELF64 little-endian shared object for the given machine. Returns
+ * `null` on success or a descriptive error string on any mismatch.
+ *
+ * This is the prefix-only check used to identify clearly-wrong file shapes
+ * (Mach-O, scripts, 32-bit ELF, big-endian ELF, wrong architecture). It does
+ * NOT verify loadability — for that, callers must additionally inspect the
+ * program header table via `validateElfProgramHeaders` (or, end-to-end, use
+ * `validateShimFile`, which reads the full header and walks the phdrs).
+ *
+ * Pure / no IO.
+ */
+export function validateElfShimHeader(
+  buf: Uint8Array,
+  expectedMachine: number,
+): string | null {
+  if (buf.length < 20) {
+    return `header too short (${buf.length} bytes; need ≥ 20)`;
+  }
+
+  // Bytes 0..3: ELF magic 0x7F 'E' 'L' 'F'.
+  if (
+    buf[0] !== 0x7f ||
+    buf[1] !== 0x45 || // 'E'
+    buf[2] !== 0x4c || // 'L'
+    buf[3] !== 0x46    // 'F'
+  ) {
+    // Mach-O 64-bit little-endian magics are 0xCFFAEDFE / 0xCEFAEDFE
+    // (Mach-O fat is 0xCAFEBABE / 0xBEBAFECA).  Surface that when we see it
+    // so the error directs the user to rebuild on Linux rather than to
+    // hunt down a generic "bad magic" message.
+    const m =
+      (buf[0]! << 24) |
+      (buf[1]! << 16) |
+      (buf[2]! <<  8) |
+       buf[3]!;
+    const u = m >>> 0;
+    if (u === 0xcffaedfe || u === 0xcefaedfe || u === 0xfeedfacf || u === 0xfeedface) {
+      return 'file is a Mach-O binary, not a Linux ELF shared object';
+    }
+    if (u === 0xcafebabe || u === 0xbebafeca) {
+      return 'file is a Mach-O universal binary, not a Linux ELF shared object';
+    }
+    return `bad ELF magic: expected 0x7F 45 4C 46, got 0x${u.toString(16).padStart(8, '0')}`;
+  }
+
+  // Byte 4: EI_CLASS — 2 = ELFCLASS64.
+  if (buf[4] !== 2) {
+    return `unsupported EI_CLASS=${buf[4]} (expected 2 = ELFCLASS64)`;
+  }
+
+  // Byte 5: EI_DATA — 1 = little-endian (ELFDATA2LSB).
+  if (buf[5] !== 1) {
+    return `unsupported EI_DATA=${buf[5]} (expected 1 = ELFDATA2LSB, little-endian)`;
+  }
+
+  // Bytes 16..17: e_type, little-endian u16.  3 = ET_DYN (shared object / PIE).
+  const eType = buf[16]! | (buf[17]! << 8);
+  if (eType !== 3) {
+    return `unsupported e_type=${eType} (expected 3 = ET_DYN, shared object)`;
+  }
+
+  // Bytes 18..19: e_machine, little-endian u16.
+  const eMachine = buf[18]! | (buf[19]! << 8);
+  if (eMachine !== expectedMachine) {
+    return (
+      `wrong architecture: got ${machineLabel(eMachine)}, ` +
+      `expected ${machineLabel(expectedMachine)}`
+    );
+  }
+
+  return null;
+}
+
+/** Read a little-endian unsigned 16-bit integer from `buf` at `off`. */
+function readU16LE(buf: Uint8Array, off: number): number {
+  return (buf[off]! | (buf[off + 1]! << 8)) >>> 0;
+}
+
+/** Read a little-endian unsigned 32-bit integer from `buf` at `off`. */
+function readU32LE(buf: Uint8Array, off: number): number {
+  return (
+    (buf[off]! |
+      (buf[off + 1]! << 8) |
+      (buf[off + 2]! << 16) |
+      (buf[off + 3]! << 24)) >>>
+    0
+  );
+}
+
+/**
+ * Read a little-endian unsigned 64-bit integer from `buf` at `off` as a
+ * JavaScript number. We use Number rather than BigInt because ELF offsets in
+ * a < 4 GiB shared object fit comfortably in a double's 53-bit mantissa, and
+ * the rest of the validation does plain arithmetic. Returns `null` when the
+ * value exceeds Number.MAX_SAFE_INTEGER (would indicate a corrupt header).
+ */
+function readU64LEAsNumber(buf: Uint8Array, off: number): number | null {
+  const lo = readU32LE(buf, off);
+  const hi = readU32LE(buf, off + 4);
+  // hi * 2^32 + lo. Reject anything that would lose precision.
+  if (hi > 0x001fffff) return null;
+  return hi * 0x100000000 + lo;
+}
+
+/**
+ * Walk the program header table and require at least one PT_DYNAMIC entry.
+ * `ehdr` is the first 64 bytes of the file (the ELF64 header). `phdrs` is the
+ * raw bytes of the program header table, exactly `phnum * phentsize` long.
+ *
+ * Returns `null` on success or a descriptive error string. Pure / no IO.
+ *
+ * The check is intentionally strict — a shared object that ld.so can load
+ * MUST have a PT_DYNAMIC segment (that is what supplies SONAME, DT_NEEDED,
+ * and the dynamic symbol table). We also require at least one PT_LOAD, which
+ * supplies the actual mapped code/data: an .so with no PT_LOAD is meaningless.
+ */
+export function validateElfProgramHeaders(
+  ehdr: Uint8Array,
+  phdrs: Uint8Array,
+  fileSize: number,
+): string | null {
+  if (ehdr.length < ELF64_EHDR_SIZE) {
+    return `ELF header too short (${ehdr.length} bytes; need ${ELF64_EHDR_SIZE})`;
+  }
+
+  const ePhoff = readU64LEAsNumber(ehdr, 32);
+  const ePhentsize = readU16LE(ehdr, 54);
+  const ePhnum = readU16LE(ehdr, 56);
+
+  if (ePhoff === null) {
+    return 'e_phoff is unreasonably large (overflow / corrupt header)';
+  }
+  if (ePhoff === 0) {
+    return 'no program header table (e_phoff=0); not a loadable shared object';
+  }
+  if (ePhnum === 0) {
+    return 'no program header entries (e_phnum=0); not a loadable shared object';
+  }
+  if (ePhentsize !== ELF64_PHDR_SIZE) {
+    return (
+      `unsupported e_phentsize=${ePhentsize} ` +
+      `(expected ${ELF64_PHDR_SIZE} for ELF64)`
+    );
+  }
+
+  const phdrEnd = ePhoff + ePhnum * ePhentsize;
+  if (phdrEnd > fileSize) {
+    return (
+      `program header table runs past end of file ` +
+      `(e_phoff=${ePhoff} + ${ePhnum}*${ePhentsize} = ${phdrEnd}, file_size=${fileSize})`
+    );
+  }
+  if (phdrs.length < ePhnum * ePhentsize) {
+    return (
+      `program header buffer truncated ` +
+      `(got ${phdrs.length} bytes; need ${ePhnum * ePhentsize})`
+    );
+  }
+
+  let sawDynamic = false;
+  let sawLoad = false;
+  for (let i = 0; i < ePhnum; i++) {
+    const off = i * ePhentsize;
+    const pType = readU32LE(phdrs, off);
+    if (pType === PT_DYNAMIC) sawDynamic = true;
+    if (pType === PT_LOAD) sawLoad = true;
+  }
+  if (!sawLoad) {
+    return 'no PT_LOAD segment; not a loadable shared object';
+  }
+  if (!sawDynamic) {
+    return (
+      'no PT_DYNAMIC segment; ld.so cannot resolve symbols ' +
+      '(stale / corrupt artifact?)'
+    );
+  }
+  return null;
+}
+
+/**
+ * Read `path` and validate that it is a Linux ELF64 little-endian shared
+ * object for `expectedMachine` AND that it is loadable (has a program header
+ * table containing at least one PT_DYNAMIC segment). Returns `null` on
+ * success or a descriptive error string. Surfaces `read` / `open` errors as
+ * strings rather than throwing so the caller can fold them into a single
+ * error message.
+ *
+ * Validates loadability, not just the prefix: a 20-byte file with the right
+ * magic was previously accepted but ld.so cannot load it; that escape is now
+ * closed.
+ */
+export function validateShimFile(path: string, expectedMachine: number): string | null {
+  let fd: number;
+  try {
+    fd = openSync(path, 'r');
+  } catch (err) {
+    return `cannot open: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  try {
+    // 1. Read the full ELF64 header (64 bytes).
+    const ehdr = Buffer.alloc(ELF64_EHDR_SIZE);
+    const n = readSync(fd, ehdr, 0, ELF64_EHDR_SIZE, 0);
+    if (n < ELF64_EHDR_SIZE) {
+      return `header too short (${n} bytes; need ≥ ${ELF64_EHDR_SIZE})`;
+    }
+
+    // 2. Prefix check (magic + class + endian + e_type + e_machine).
+    const prefixErr = validateElfShimHeader(ehdr, expectedMachine);
+    if (prefixErr !== null) return prefixErr;
+
+    // 3. Inspect the program header table for PT_DYNAMIC / PT_LOAD.
+    let fileSize: number;
+    try {
+      fileSize = statSync(path).size;
+    } catch (err) {
+      return `cannot stat: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    const ePhoff = readU64LEAsNumber(ehdr, 32);
+    const ePhentsize = readU16LE(ehdr, 54);
+    const ePhnum = readU16LE(ehdr, 56);
+
+    // Quick-fail before the second read so the error matches what
+    // validateElfProgramHeaders would report.
+    if (ePhoff === null) {
+      return 'e_phoff is unreasonably large (overflow / corrupt header)';
+    }
+    if (ePhoff === 0) {
+      return 'no program header table (e_phoff=0); not a loadable shared object';
+    }
+    if (ePhnum === 0) {
+      return 'no program header entries (e_phnum=0); not a loadable shared object';
+    }
+    if (ePhentsize !== ELF64_PHDR_SIZE) {
+      return (
+        `unsupported e_phentsize=${ePhentsize} ` +
+        `(expected ${ELF64_PHDR_SIZE} for ELF64)`
+      );
+    }
+
+    const phdrBytes = ePhnum * ePhentsize;
+    if (ePhoff + phdrBytes > fileSize) {
+      return (
+        `program header table runs past end of file ` +
+        `(e_phoff=${ePhoff} + ${ePhnum}*${ePhentsize} = ${ePhoff + phdrBytes}, file_size=${fileSize})`
+      );
+    }
+
+    const phdrs = Buffer.alloc(phdrBytes);
+    const m = readSync(fd, phdrs, 0, phdrBytes, ePhoff);
+    if (m < phdrBytes) {
+      return (
+        `short read of program header table ` +
+        `(got ${m} bytes; need ${phdrBytes} at offset ${ePhoff})`
+      );
+    }
+
+    return validateElfProgramHeaders(ehdr, phdrs, fileSize);
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shell helpers
 // ---------------------------------------------------------------------------
 
@@ -157,15 +499,60 @@ function copyPreloads(): void {
 // Step 3 — Ensure libscriptjail.so
 // ---------------------------------------------------------------------------
 
-function ensureShim(): boolean {
+function ensureShim(input: BuildInput): boolean {
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
+  const expectedMachine = expectedShimMachine(input);
 
   if (existsSync(shimOut)) {
-    console.log(`[rootfs] libscriptjail.so already present.`);
-    return true;
-  }
-
-  if (isMacOS()) {
+    // The file is on disk, but we must NOT trust it blindly: a previous
+    // macOS-side build may have left a Mach-O dylib here (see
+    // `validateElfShimHeader` for the rationale).  If validation fails on
+    // Linux we rebuild from source; on macOS we surface a fatal error
+    // because we cannot produce a Linux .so from a Darwin toolchain.
+    const err = validateShimFile(shimOut, expectedMachine);
+    if (err !== null) {
+      console.warn(`[rootfs] images/libscriptjail.so failed ELF validation: ${err}`);
+      if (isMacOS()) {
+        throw new Error(
+          `[rootfs] images/libscriptjail.so is not a valid Linux ELF shared object (${err}). ` +
+          'Cannot rebuild from macOS (Darwin cargo produces a Mach-O .dylib, not a Linux .so). ' +
+          'Delete images/libscriptjail.so and run the rootfs build on a Linux host (or in CI) ' +
+          'so cargo can produce a real x86-64 ELF shared object.',
+        );
+      }
+      console.warn('[rootfs] Removing stale artifact and rebuilding via cargo …');
+      rmSync(shimOut, { force: true });
+    } else {
+      // ELF validation passed.  Finding 3 (audit-trust): the ELF check only
+      // detects MALFORMED artifacts (wrong magic, no PT_DYNAMIC, etc.) — a
+      // structurally-valid `.so` produced from out-of-date Rust source still
+      // looks fine to the validator.  Before accepting the artifact, gate it
+      // through the same mtime-based freshness check that
+      // `scripts/build.ts:buildShim` uses, so a caller that bypasses the
+      // top-level build script (direct `oxnode src/rootfs/build.ts`, future
+      // tooling, etc.) cannot embed a stale shim into the Firecracker rootfs.
+      const sources = shimSourceInputs(REPO_ROOT);
+      if (!shimArtifactIsStale(shimOut, sources)) {
+        console.log(`[rootfs] libscriptjail.so already present (validated ELF + fresh).`);
+        return true;
+      }
+      if (isMacOS()) {
+        // Same constraint as the ELF-validation failure path: we cannot
+        // produce a Linux .so from Darwin cargo.  Fail closed with a clear
+        // message rather than silently keeping the stale artifact.
+        throw new Error(
+          `[rootfs] images/libscriptjail.so is older than the shim source inputs ` +
+          `(${sources.join(', ')}). Cannot rebuild from macOS — touch the artifact, ` +
+          'or run the rootfs build on a Linux host / CI so cargo can produce a fresh ' +
+          'x86-64 ELF shared object.',
+        );
+      }
+      console.warn(
+        '[rootfs] libscriptjail.so is older than shim sources; rebuilding via cargo …',
+      );
+      rmSync(shimOut, { force: true });
+    }
+  } else if (isMacOS()) {
     console.warn(
       '[rootfs] WARNING: Running on macOS — cannot build libscriptjail.so (requires Linux toolchain).\n' +
       '[rootfs]          Skipping shim build. The docker build step will also be skipped.\n' +
@@ -187,7 +574,32 @@ function ensureShim(): boolean {
   if (!existsSync(shimOut)) {
     throw new Error(`[rootfs] cargo build ran but ${shimOut} was not produced.`);
   }
+
+  // Validate the freshly-built artifact too — a cargo misconfiguration
+  // (cross-compiling to the wrong target, building for the host arch on a
+  // mismatched runner) is exactly the kind of mistake this check catches.
+  const buildErr = validateShimFile(shimOut, expectedMachine);
+  if (buildErr !== null) {
+    throw new Error(
+      `[rootfs] cargo built ${shimOut} but it failed ELF validation: ${buildErr}. ` +
+      'Check src/shim/Cargo.toml and the active rustup target.',
+    );
+  }
   return true;
+}
+
+/**
+ * Test entry point for Finding 3: simulate the decision `ensureShim` makes
+ * for an artifact whose ELF validation already passed.  Returns `'reject'`
+ * (artifact is stale and must be rebuilt or fail closed) or `'accept'`
+ * (artifact is fresh).  Production code paths must continue to call
+ * `ensureShim` itself.
+ */
+export function ensureShimFreshnessDecision(
+  shimOut: string,
+  sources: ReadonlyArray<string>,
+): 'accept' | 'reject' {
+  return shimArtifactIsStale(shimOut, sources) ? 'reject' : 'accept';
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +747,7 @@ export async function buildRootfs(input: BuildInput): Promise<void> {
   copyPreloads();
 
   // Step 3: ensure shim
-  const shimOk = ensureShim();
+  const shimOk = ensureShim(input);
 
   if (!shimOk) {
     // On macOS without the .so we cannot build the docker image because the

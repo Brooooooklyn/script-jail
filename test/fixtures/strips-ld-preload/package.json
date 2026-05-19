@@ -1,0 +1,9 @@
+{
+  "name": "strips-ld-preload",
+  "version": "1.0.0",
+  "description": "Shape fixture: postinstall spawns a Node child with a sanitized envp (only PATH preserved). The exec wrapper in the shim should re-inject LD_PRELOAD, NODE_OPTIONS, and the SCRIPT_JAIL_* sticky vars so the child still runs under audit.",
+  "private": true,
+  "scripts": {
+    "postinstall": "node script.js"
+  }
+}

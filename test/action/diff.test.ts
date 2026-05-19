@@ -4,7 +4,11 @@
 
 import { describe, it, expect } from 'vitest';
 
-import { renderDiff } from '../../src/action/diff.js';
+import {
+  renderDiff,
+  findAuditBypass,
+  formatAuditBypassError,
+} from '../../src/action/diff.js';
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -285,5 +289,205 @@ describe('renderDiff — volatile field canonicalization', () => {
 
     const r = renderDiff({ lockPath: 'x.yml', committed, generated });
     expect(r.match).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// audit_bypass scan (Finding B: defense-in-depth gate)
+// ---------------------------------------------------------------------------
+
+// Compose a minimal valid-shape lockfile YAML for the scan tests.  We hand-
+// build the YAML rather than calling render() to keep the test independent
+// of any future render-side reshuffling.
+function lockfileWith(opts: {
+  audit_bypass?: string[];
+  pkgId?: string;
+  stage?: string;
+}): string {
+  const pkgId = opts.pkgId ?? 'evil-pkg@1.0.0';
+  const stage = opts.stage ?? 'postinstall';
+  const bypass = opts.audit_bypass ?? [];
+  const lines: string[] = [];
+  lines.push('schema_version: 1');
+  lines.push('manager: npm');
+  lines.push('manager_lockfile_sha256: "abc"');
+  lines.push('node_version: 20.0.0');
+  lines.push('generated_at: 2026-05-17T09:00:00.000Z');
+  lines.push('packages:');
+  lines.push(`  ${pkgId}:`);
+  lines.push('    lifecycle:');
+  lines.push(`      ${stage}:`);
+  lines.push('        external_reads: []');
+  lines.push('        escaped_writes: []');
+  lines.push('        env_read: []');
+  lines.push('        spawn_attempts: []');
+  lines.push('        spawn_blocked: []');
+  lines.push('        dlopen_attempts: []');
+  lines.push('        network_attempts: []');
+  if (bypass.length > 0) {
+    lines.push('        audit_bypass:');
+    for (const e of bypass) {
+      // YAML quoting: just quote it — the `<` literal is safe in a quoted
+      // scalar and parsers round-trip it cleanly.
+      lines.push(`          - "${e}"`);
+    }
+  }
+  return lines.join('\n') + '\n';
+}
+
+describe('findAuditBypass', () => {
+  it('returns an empty list for a lockfile with no audit_bypass', () => {
+    const yaml = lockfileWith({});
+    expect(findAuditBypass(yaml)).toEqual([]);
+  });
+
+  it('returns each non-empty audit_bypass entry with pkg+stage attribution', () => {
+    const yaml = lockfileWith({
+      pkgId: 'evil@1.0.0',
+      stage: 'postinstall',
+      audit_bypass: ['<EXEC_FAIL_OPEN> /usr/bin/node'],
+    });
+    const r = findAuditBypass(yaml);
+    expect(r.length).toBe(1);
+    expect(r[0]).toEqual({
+      packageId: 'evil@1.0.0',
+      stage: 'postinstall',
+      entry: '<EXEC_FAIL_OPEN> /usr/bin/node',
+    });
+  });
+
+  it('returns multiple entries across packages and stages', () => {
+    const yaml =
+      'schema_version: 1\n' +
+      'manager: npm\n' +
+      'manager_lockfile_sha256: "abc"\n' +
+      'node_version: 20.0.0\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages:\n' +
+      '  a@1.0.0:\n' +
+      '    lifecycle:\n' +
+      '      postinstall:\n' +
+      '        external_reads: []\n' +
+      '        escaped_writes: []\n' +
+      '        env_read: []\n' +
+      '        spawn_attempts: []\n' +
+      '        spawn_blocked: []\n' +
+      '        dlopen_attempts: []\n' +
+      '        network_attempts: []\n' +
+      '        audit_bypass:\n' +
+      '          - "<EXEC_FAIL_OPEN> /usr/bin/node"\n' +
+      '  b@2.0.0:\n' +
+      '    lifecycle:\n' +
+      '      prepare:\n' +
+      '        external_reads: []\n' +
+      '        escaped_writes: []\n' +
+      '        env_read: []\n' +
+      '        spawn_attempts: []\n' +
+      '        spawn_blocked: []\n' +
+      '        dlopen_attempts: []\n' +
+      '        network_attempts: []\n' +
+      '        audit_bypass:\n' +
+      '          - "<EXEC_FAIL_OPEN> /bin/sh"\n';
+    const r = findAuditBypass(yaml);
+    expect(r.length).toBe(2);
+    // findAuditBypass walks Object.entries — order is insertion order for
+    // plain objects from YAML.parse on string keys, which is the YAML doc's
+    // order.  Don't depend on the exact ordering across runs; assert
+    // membership instead.
+    const tuples = r.map((e) => `${e.packageId}|${e.stage}|${e.entry}`).sort();
+    expect(tuples).toEqual([
+      'a@1.0.0|postinstall|<EXEC_FAIL_OPEN> /usr/bin/node',
+      'b@2.0.0|prepare|<EXEC_FAIL_OPEN> /bin/sh',
+    ]);
+  });
+
+  it('returns an empty list for malformed YAML rather than throwing', () => {
+    expect(findAuditBypass('not: [valid: yaml: at: all')).toEqual([]);
+  });
+
+  it('returns an empty list for an empty input', () => {
+    expect(findAuditBypass('')).toEqual([]);
+  });
+
+  it('ignores audit_bypass entries that are not strings or are empty', () => {
+    const yaml =
+      'schema_version: 1\n' +
+      'manager: npm\n' +
+      'manager_lockfile_sha256: "abc"\n' +
+      'node_version: 20.0.0\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages:\n' +
+      '  a@1.0.0:\n' +
+      '    lifecycle:\n' +
+      '      postinstall:\n' +
+      '        external_reads: []\n' +
+      '        escaped_writes: []\n' +
+      '        env_read: []\n' +
+      '        spawn_attempts: []\n' +
+      '        spawn_blocked: []\n' +
+      '        dlopen_attempts: []\n' +
+      '        network_attempts: []\n' +
+      '        audit_bypass:\n' +
+      '          - ""\n' +
+      '          - "<EXEC_FAIL_OPEN> /usr/bin/node"\n';
+    const r = findAuditBypass(yaml);
+    // The empty string is skipped; only the real entry surfaces.
+    expect(r.length).toBe(1);
+    expect(r[0]?.entry).toBe('<EXEC_FAIL_OPEN> /usr/bin/node');
+  });
+});
+
+describe('formatAuditBypassError', () => {
+  it('formats a single entry as a human-readable list', () => {
+    const msg = formatAuditBypassError([
+      {
+        packageId: 'evil@1.0.0',
+        stage: 'postinstall',
+        entry: '<EXEC_FAIL_OPEN> /usr/bin/node',
+      },
+    ]);
+    expect(msg).toContain('Audit envelope was bypassed');
+    expect(msg).toContain('evil@1.0.0');
+    expect(msg).toContain('postinstall');
+    expect(msg).toContain('<EXEC_FAIL_OPEN> /usr/bin/node');
+  });
+
+  it('truncates long lists with a "(+N more)" tail', () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      packageId: `pkg-${i}@1.0.0`,
+      stage: 'postinstall',
+      entry: `<EXEC_FAIL_OPEN> /bin/p${i}`,
+    }));
+    const msg = formatAuditBypassError(entries);
+    expect(msg).toContain('(+15 more)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defense-in-depth: lockfile equality is NOT success when audit_bypass is set.
+// This asserts the invariant the check-mode gate in src/main.ts enforces:
+// renderDiff() can still return match=true (because committed === generated),
+// but findAuditBypass() MUST return a non-empty list and the action must
+// hard-fail.  We exercise both functions in parallel here.
+// ---------------------------------------------------------------------------
+
+describe('audit_bypass + lockfile equality (Finding B)', () => {
+  it('renderDiff matches when committed == generated, but findAuditBypass still flags the bypass', () => {
+    const yaml = lockfileWith({
+      audit_bypass: ['<EXEC_FAIL_OPEN> /usr/bin/node'],
+    });
+    const diff = renderDiff({
+      lockPath: '.script-jail.lock.yml',
+      committed: yaml,
+      generated: yaml,
+    });
+    // The byte-equality path says "no drift" — exactly the silenced state
+    // a malicious PR would commit.
+    expect(diff.match).toBe(true);
+
+    // But the standalone gate fires regardless, surfacing the bypass.
+    const bypass = findAuditBypass(yaml);
+    expect(bypass.length).toBeGreaterThan(0);
+    expect(bypass[0]?.entry).toBe('<EXEC_FAIL_OPEN> /usr/bin/node');
   });
 });

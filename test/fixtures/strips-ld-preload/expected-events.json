@@ -1,0 +1,14 @@
+[
+  {
+    "raw": {
+      "kind": "exec",
+      "prog": "node",
+      "argv0": "node",
+      "pid": 1001,
+      "ts": 0,
+      "envp_alloc_failed": false
+    },
+    "pkg": "strips-ld-preload@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

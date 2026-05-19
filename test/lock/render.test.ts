@@ -11,6 +11,8 @@ function emptyBlock(): LifecycleBlock {
     spawn_blocked: [],
     dlopen_attempts: [],
     network_attempts: [],
+    audit_bypass: [],
+    env_tamper: [],
   };
 }
 
@@ -49,6 +51,8 @@ describe('render', () => {
             spawn_blocked: ['<ENOENT> bash -c echo hi'],
             dlopen_attempts: ['<BLOCKED> libssl.so'],
             network_attempts: ['<BLOCKED> connect 198.51.100.7:443'],
+            audit_bypass: [],
+            env_tamper: [],
           },
         })],
       ]);
@@ -130,6 +134,8 @@ describe('render', () => {
             spawn_blocked: [],
             dlopen_attempts: [],
             network_attempts: [],
+            audit_bypass: [],
+            env_tamper: [],
           },
         })],
       ]);
@@ -140,6 +146,63 @@ describe('render', () => {
       expect(out).toContain('$CACHE/esbuild/bin/<hash>');
       expect(out).toContain('ESBUILD_BINARY_PATH');
       expect(out).toContain('node $PKG/install.js');
+    });
+  });
+
+  describe('optional list fields (Finding 4)', () => {
+    it('omits audit_bypass when empty', () => {
+      const packages = new Map<string, PackageBlock>([
+        ['empty-pkg@1.0.0', makePkg({ postinstall: emptyBlock() })],
+      ]);
+      const out = render({ ...baseInput, packages });
+      // Always-rendered fields must appear, but the optional ones must not
+      // (empty arrays would churn every fixture for no signal).
+      expect(out).toContain('network_attempts:');
+      expect(out).not.toContain('audit_bypass:');
+      expect(out).not.toContain('env_tamper:');
+    });
+
+    it('emits audit_bypass when populated', () => {
+      const packages = new Map<string, PackageBlock>([
+        ['bypass-pkg@1.0.0', makePkg({
+          postinstall: { ...emptyBlock(), audit_bypass: ['<EXEC_FAIL_OPEN> /usr/bin/node'] },
+        })],
+      ]);
+      const out = render({ ...baseInput, packages });
+      expect(out).toContain('audit_bypass:');
+      expect(out).toContain('<EXEC_FAIL_OPEN> /usr/bin/node');
+    });
+
+    it('emits env_tamper when populated', () => {
+      const packages = new Map<string, PackageBlock>([
+        ['tamper-pkg@1.0.0', makePkg({
+          postinstall: { ...emptyBlock(), env_tamper: ['<REFUSED> unsetenv LD_PRELOAD'] },
+        })],
+      ]);
+      const out = render({ ...baseInput, packages });
+      expect(out).toContain('env_tamper:');
+      expect(out).toContain('<REFUSED> unsetenv LD_PRELOAD');
+    });
+
+    it('emits audit_bypass and env_tamper AFTER the always-rendered seven fields', () => {
+      const packages = new Map<string, PackageBlock>([
+        ['both@1.0.0', makePkg({
+          postinstall: {
+            ...emptyBlock(),
+            audit_bypass: ['<EXEC_FAIL_OPEN> /usr/bin/node'],
+            env_tamper: ['<REFUSED> unsetenv LD_PRELOAD'],
+          },
+        })],
+      ]);
+      const out = render({ ...baseInput, packages });
+      const networkIdx = out.indexOf('network_attempts:');
+      const bypassIdx = out.indexOf('audit_bypass:');
+      const tamperIdx = out.indexOf('env_tamper:');
+      // network_attempts is the last always-rendered field; the optional
+      // ones come after it in the order declared in render.ts.
+      expect(networkIdx).toBeGreaterThan(-1);
+      expect(bypassIdx).toBeGreaterThan(networkIdx);
+      expect(tamperIdx).toBeGreaterThan(bypassIdx);
     });
   });
 
@@ -175,6 +238,8 @@ describe('render', () => {
             spawn_blocked: [],
             dlopen_attempts: [],
             network_attempts: [],
+            audit_bypass: [],
+            env_tamper: [],
           },
         })],
       ]);

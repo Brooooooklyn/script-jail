@@ -11,6 +11,7 @@
   "scripts": {
     "build": "oxnode scripts/build.ts",
     "build:bundle": "esbuild src/main.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/main.cjs",
+    "build:guest-agent": "esbuild src/guest/agent.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/guest-agent.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:guest": "vitest run --project=guest",

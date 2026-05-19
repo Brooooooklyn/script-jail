@@ -5,9 +5,13 @@
 // module directly, but it can be unit-tested in vitest on the host.
 //
 // LIMITATIONS (v1):
-//   - Only handles `openat(AT_FDCWD, ...)` -- openat with a numeric dir-fd is
-//     dropped with null (the relative-path base is unknowable without fd table
-//     tracking).
+//   - openat with a numeric dir-fd is emitted with the literal relative
+//     `path` and the `dirfd`/`retFd` transport-only fields filled in;
+//     phase-install resolves the relative path against its per-pid fd
+//     table before the events-file forgery check.  Other consumers
+//     (protected-paths, normalize, render) ignore the unresolved
+//     relative path — they care about absolute syscall paths and have
+//     no business inspecting fd-relative names.
 //   - Unfinished/resumed pairs (<unfinished ...> / <... foo resumed>) are both
 //     dropped; we lose those syscall outcomes entirely in v1.
 //   - We expect `strace -ff` WITHOUT `-t`/`-tt`. Timestamp prefixes are
@@ -38,7 +42,15 @@ import type { RawEvent } from '../lock/schema.js';
  * (everything between the opening and closing double-quote).
  * Handles: \\ \" \n \t \r \a \b \f \v \0NN (octal) \xNN (hex).
  * Unrecognised escapes are left as-is (the backslash is kept).
+ *
+ * Exported as {@link unescapeStraceString} so call sites that do their
+ * own line-level regex matching (e.g. the `chdir(...)` pre-parser in
+ * `src/guest/phase-install.ts`) get the same escape handling as the
+ * full syscall parser below.
  */
+export function unescapeStraceString(s: string): string {
+  return unescape(s);
+}
 function unescape(s: string): string {
   return s.replace(/\\(\\|"|n|t|r|a|b|f|v|x[0-9a-fA-F]{1,2}|[0-7]{1,3})/g, (_, esc: string) => {
     switch (esc[0]) {
@@ -328,7 +340,44 @@ function _parseStraceLine(line: string, pid: number, ts: number): RawEvent[] | n
 
   switch (syscallName) {
     case 'openat':      return parseOpenat(args, retVal, pid, ts);
+    // Audit-trust Finding (high, 2026-05-19): openat2 is a Linux 5.6+
+    // variant of openat that takes a `struct open_how` instead of bare
+    // flags + mode.  Without parsing it, a raw `syscall(SYS_openat2,
+    // AT_FDCWD, path, &how, sizeof(how))` opening the events file for
+    // write produces a strace line our parser drops — the forgery
+    // detector then sees nothing and the bypass is silent.  We emit
+    // the same `read`/`write` RawEvent shape as `parseOpenat` so all
+    // downstream consumers (dirfdTable, shim-trust set, events-file
+    // forgery detector) behave identically.
+    case 'openat2':     return parseOpenat2(args, retVal, pid, ts);
+    // Audit-trust Finding (high, 2026-05-19): legacy `open` and `creat`.
+    // glibc routes most userspace calls through `openat(AT_FDCWD, ...)`,
+    // but a native attacker can still issue
+    // `syscall(SYS_open, "/tmp/.../events.jsonl", O_WRONLY|O_APPEND)`
+    // or `syscall(SYS_creat, path, mode)` directly.  Without these
+    // dispatch entries (and the matching `-e trace=open,creat` flags
+    // in `src/guest/agent.ts`) the events-file forgery detector sees
+    // nothing.  `creat(path, mode)` is semantically equivalent to
+    // `open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)` — always a write —
+    // so `parseCreat` synthesises that classification.  Both emit the
+    // same RawEvent shape as parseOpenat (with `retFd` for the
+    // dirfdTable in phase-install), so the downstream forgery
+    // detector, dirfdTable, and shim-trust set treat the legacy
+    // syscalls identically to openat.
+    case 'open':        return parseOpen(args, retVal, pid, ts);
+    case 'creat':       return parseCreat(args, retVal, pid, ts);
     case 'execve':      return parseExecve(args, retVal, pid, ts);
+    // Audit-trust Finding 2 (high, 2026-05-18): execveat must be parsed
+    // because the agent's strace invocation now also passes -e trace=execveat.
+    // A raw `syscall(SYS_execveat, AT_FDCWD, path, argv, envp, 0)` from a
+    // lifecycle script previously bypassed both the libc shim AND strace
+    // observation; tracing execveat closes the strace-side gap.  The
+    // wire format is `execveat(dirfd, "path", [argv...], envp, flags)`,
+    // i.e. the same shape as execve with a leading `dirfd` and trailing
+    // `flags`.  We drop both and emit the same `spawn` RawEvent the
+    // execve parser produces, so downstream pipeline code (the per-pid
+    // cross-check in phase-install) treats the two identically.
+    case 'execveat':    return parseExecveat(args, retVal, pid, ts);
     case 'connect':     return parseConnect(args, retVal, pid, ts);
     case 'readlinkat':  return parseReadlinkat(args, retVal, pid, ts);
     case 'statx':       return parseStatx(args, retVal, pid, ts);
@@ -345,10 +394,35 @@ function _parseStraceLine(line: string, pid: number, ts: number): RawEvent[] | n
 // -- per-syscall parsers -------------------------------------------------------
 
 function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
-  // openat(AT_FDCWD, "path", flags[, mode]) = fd
-  // v1 limitation: only AT_FDCWD is handled; numeric dir-fds are dropped.
+  // openat(dirfd, "path", flags[, mode]) = fd
+  //
+  // Audit-trust Finding 2 (high, 2026-05-18): historically we dropped any
+  // openat whose dirfd was a numeric fd (rather than AT_FDCWD), which
+  // created an audit-bypass channel: a process could
+  // `openat(AT_FDCWD, "/tmp/.../dir", O_DIRECTORY) = <fd>` and then
+  // `openat(<fd>, "events.jsonl", O_WRONLY|O_APPEND) = <fd2>` — the
+  // second call was invisible to our pipeline, so it could not be
+  // caught by the events-file forgery detector.
+  //
+  // We now emit events for both cases.  The `dirfd` transport-only field
+  // is attached when the dirfd is a numeric fd; phase-install carries a
+  // per-pid <fd → canonical dir path> table built from `retFd` and
+  // resolves the relative path before doing the equality check against
+  // SCRIPT_JAIL_LOG_FILE.  `retFd` is the openat return value on
+  // success; it's how phase-install grows its fd table for the next
+  // openat-with-numeric-dirfd on the same pid.
   const dirfdToken = args[0] ?? '';
-  if (dirfdToken !== 'AT_FDCWD') return null;
+  let dirfd: number | undefined;
+  if (dirfdToken !== 'AT_FDCWD') {
+    // Parse the numeric dirfd.  strace renders dir-fds as bare integers
+    // ("5"), occasionally with a "</path>" comment for -y mode.  We
+    // only accept a leading integer here; the rest of the token is
+    // ignored.
+    const m = dirfdToken.match(/^(-?\d+)/);
+    if (m === null) return null; // not AT_FDCWD and not parseable as an int — drop
+    dirfd = parseInt(m[1] ?? '', 10);
+    if (!Number.isFinite(dirfd)) return null;
+  }
 
   const pathToken = args[1] ?? '';
   const r = extractQuotedString(pathToken, 0);
@@ -374,14 +448,210 @@ function parseOpenat(args: string[], retVal: RetVal, pid: number, ts: number): R
     else return null; // other errors: drop
   }
 
-  if (isWrite) {
-    return [errno === undefined
-      ? { kind: 'write', path, pid, ts, hidden: false }
-      : { kind: 'write', path, pid, ts, hidden: false, errno }];
+  // Audit-trust Finding 2: `retFd` on success carries the kernel-assigned
+  // fd so phase-install can grow its <pid, fd> → directory map.  The
+  // openat return value is a small positive integer for success.  We
+  // tolerate hex form ("0x5") even though strace renders these as
+  // decimal in practice.
+  let retFd: number | undefined;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith('0x')
+      ? parseInt(retVal.raw, 16)
+      : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
   }
-  return [errno === undefined
-    ? { kind: 'read', path, pid, ts, hidden: false }
-    : { kind: 'read', path, pid, ts, hidden: false, errno }];
+
+  const base = { path, pid, ts, hidden: false } as const;
+  // Build the event with optional fields included only when present, so
+  // exactOptionalPropertyTypes doesn't treat `field: undefined` as
+  // "explicitly undefined" (downstream code reads `field === undefined`
+  // to mean absent — same convention as `errno`).
+  const optional: { errno?: 'ENOENT' | 'EACCES'; dirfd?: number; retFd?: number } = {};
+  if (errno !== undefined) optional.errno = errno;
+  if (dirfd !== undefined) optional.dirfd = dirfd;
+  if (retFd !== undefined) optional.retFd = retFd;
+
+  if (isWrite) {
+    return [{ kind: 'write', ...base, ...optional }];
+  }
+  return [{ kind: 'read', ...base, ...optional }];
+}
+
+// Audit-trust Finding (high, 2026-05-19): parser for the Linux 5.6+ openat2
+// syscall.  Strace wire format:
+//
+//   openat2(AT_FDCWD, "events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=0x0}, 16) = 7
+//   openat2(5, "events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=RESOLVE_BENEATH}, 24) = 7
+//   openat2(AT_FDCWD, "/lib/libc.so", {flags=O_RDONLY|O_CLOEXEC, mode=0, resolve=0x0}, 24) = 3
+//
+// Args:
+//   args[0] dirfd       — AT_FDCWD or a numeric fd (same as openat)
+//   args[1] pathname    — quoted string
+//   args[2] open_how    — `{flags=..., mode=..., resolve=...}` struct
+//   args[3] size        — sizeof(struct open_how), ignored
+//
+// The `flags=...` field inside the struct is the only token we need for
+// the write-bit determination; everything else is informational.  We
+// emit the same RawEvent shape as parseOpenat (read or write event,
+// errno on failure, dirfd/retFd transport-only fields when applicable)
+// so all downstream code paths in src/guest/phase-install.ts (dirfdTable
+// population, shim-trust set, events-file forgery detector) treat the
+// two syscalls identically.  Failure handling mirrors parseOpenat:
+// ENOENT/EACCES emit events stamped with errno; other errors drop.
+function parseOpenat2(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
+  const dirfdToken = args[0] ?? '';
+  let dirfd: number | undefined;
+  if (dirfdToken !== 'AT_FDCWD') {
+    const m = dirfdToken.match(/^(-?\d+)/);
+    if (m === null) return null;
+    dirfd = parseInt(m[1] ?? '', 10);
+    if (!Number.isFinite(dirfd)) return null;
+  }
+
+  const pathToken = args[1] ?? '';
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const [path] = r;
+
+  // Extract the `flags=...` field from the open_how struct.  The struct
+  // is rendered with comma-separated key=value pairs inside braces;
+  // splitArgs has already returned the entire `{...}` token as args[2].
+  // We match `flags=<token>` where the value extends to the next comma
+  // or closing brace.  Falling back to an empty flags string is safe:
+  // flagsImplyWrite returns false on an empty input, so we'd classify
+  // as read — a more conservative classification that loses the write
+  // signal for a malformed line.  In practice strace always renders
+  // the flags field; this is defence in depth.
+  const howToken = args[2] ?? '';
+  const flagsMatch = howToken.match(/flags=([^,}]+)/);
+  const flags = flagsMatch !== null ? (flagsMatch[1] ?? '').trim() : '';
+  const isWrite = flagsImplyWrite(flags);
+
+  let errno: 'ENOENT' | 'EACCES' | undefined;
+  if (retVal.isError) {
+    if (retVal.errno === 'ENOENT') errno = 'ENOENT';
+    else if (retVal.errno === 'EACCES') errno = 'EACCES';
+    else return null;
+  }
+
+  let retFd: number | undefined;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith('0x')
+      ? parseInt(retVal.raw, 16)
+      : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
+  }
+
+  const base = { path, pid, ts, hidden: false } as const;
+  const optional: { errno?: 'ENOENT' | 'EACCES'; dirfd?: number; retFd?: number } = {};
+  if (errno !== undefined) optional.errno = errno;
+  if (dirfd !== undefined) optional.dirfd = dirfd;
+  if (retFd !== undefined) optional.retFd = retFd;
+
+  if (isWrite) {
+    return [{ kind: 'write', ...base, ...optional }];
+  }
+  return [{ kind: 'read', ...base, ...optional }];
+}
+
+// Audit-trust Finding (high, 2026-05-19): parser for the legacy `open(...)`
+// syscall.  Strace wire format:
+//
+//   open("/etc/hostname", O_RDONLY) = 3
+//   open("/tmp/script-jail-events/events.jsonl", O_WRONLY|O_APPEND|O_CREAT, 0644) = 7
+//   open("/nonexistent", O_RDONLY) = -1 ENOENT (No such file or directory)
+//
+// Args:
+//   args[0] pathname    — quoted string (always absolute or cwd-relative;
+//                          no dirfd argument).
+//   args[1] flags       — bitmask like O_WRONLY|O_APPEND
+//   args[2] mode        — present iff O_CREAT (or O_TMPFILE) is in flags;
+//                          ignored for the audit decision.
+//
+// Because legacy `open` has no dirfd argument we never emit a `dirfd`
+// field — the path is implicitly resolved against the caller's CWD,
+// which `canonicalizeOpenTarget` in `src/guest/phase-install.ts`
+// already handles via the `pidCwd` map for AT_FDCWD-style relative
+// opens.  `retFd` is still emitted on success so a follow-up
+// `openat(<open-fd>, "relative", ...)` from the same pid resolves
+// correctly through the existing dirfdTable.
+function parseOpen(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
+  const pathToken = args[0] ?? '';
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const [path] = r;
+
+  const flags = args[1] ?? '';
+  const isWrite = flagsImplyWrite(flags);
+
+  let errno: 'ENOENT' | 'EACCES' | undefined;
+  if (retVal.isError) {
+    if (retVal.errno === 'ENOENT') errno = 'ENOENT';
+    else if (retVal.errno === 'EACCES') errno = 'EACCES';
+    else return null;
+  }
+
+  let retFd: number | undefined;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith('0x')
+      ? parseInt(retVal.raw, 16)
+      : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
+  }
+
+  const base = { path, pid, ts, hidden: false } as const;
+  const optional: { errno?: 'ENOENT' | 'EACCES'; retFd?: number } = {};
+  if (errno !== undefined) optional.errno = errno;
+  if (retFd !== undefined) optional.retFd = retFd;
+
+  if (isWrite) {
+    return [{ kind: 'write', ...base, ...optional }];
+  }
+  return [{ kind: 'read', ...base, ...optional }];
+}
+
+// Audit-trust Finding (high, 2026-05-19): parser for the legacy `creat(...)`
+// syscall.  Strace wire format:
+//
+//   creat("/tmp/build.log", 0644) = 5
+//   creat("/no/dir/file", 0644) = -1 ENOENT (No such file or directory)
+//
+// Args:
+//   args[0] pathname    — quoted string
+//   args[1] mode        — file mode bits; ignored for the audit decision.
+//
+// `creat(path, mode)` is semantically equivalent to
+// `open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)` — it always opens for write
+// — so we unconditionally classify the event as a write regardless of any
+// `flags` token (which doesn't exist for this syscall).  Same RawEvent
+// shape as parseOpen otherwise.
+function parseCreat(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
+  const pathToken = args[0] ?? '';
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+  const [path] = r;
+
+  let errno: 'ENOENT' | 'EACCES' | undefined;
+  if (retVal.isError) {
+    if (retVal.errno === 'ENOENT') errno = 'ENOENT';
+    else if (retVal.errno === 'EACCES') errno = 'EACCES';
+    else return null;
+  }
+
+  let retFd: number | undefined;
+  if (!retVal.isError) {
+    const rawN = retVal.raw.startsWith('0x')
+      ? parseInt(retVal.raw, 16)
+      : parseInt(retVal.raw, 10);
+    if (Number.isFinite(rawN) && rawN >= 0) retFd = rawN;
+  }
+
+  const base = { path, pid, ts, hidden: false } as const;
+  const optional: { errno?: 'ENOENT' | 'EACCES'; retFd?: number } = {};
+  if (errno !== undefined) optional.errno = errno;
+  if (retFd !== undefined) optional.retFd = retFd;
+
+  return [{ kind: 'write', ...base, ...optional }];
 }
 
 function parseExecve(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
@@ -392,10 +662,50 @@ function parseExecve(args: string[], retVal: RetVal, pid: number, ts: number): R
 
   // The argv is the second argument (args[1]); the third (envp) is discarded.
   const argvToken = args[1] ?? '';
+  return buildSpawnEvent(r[0], argvToken, retVal, pid, ts);
+}
+
+// Audit-trust Finding 2 (high, 2026-05-18): parse execveat in the same shape
+// as execve.  Wire format:
+//
+//   execveat(AT_FDCWD, "/bin/sh", ["sh", "-c", "..."], 0x.. /* 38 vars */, 0) = 0
+//   execveat(3, "", ["sh"], 0x.., AT_EMPTY_PATH) = 0       (rare; empty-path form)
+//
+// We treat the path argument (args[1]) as authoritative for the program
+// being executed and the argv array (args[2]) for argv, matching execve's
+// handling.  The `dirfd` (args[0]) and `flags` (args[4]) tokens are
+// discarded — they're not load-bearing for the audit signal (the
+// strace-vs-shim cross-check pairs by pid + result=ok, not by syscall
+// path).  If `args[1]` is empty (the AT_EMPTY_PATH form), fall back to
+// the argv's argv[0] so the synthesised bypass event still has a
+// human-readable prog.
+function parseExecveat(args: string[], retVal: RetVal, pid: number, ts: number): RawEvent[] | null {
+  // args[0]=dirfd, args[1]=path, args[2]=argv, args[3]=envp_or_pointer, args[4]=flags
+  const pathToken = args[1] ?? '';
+  const r = extractQuotedString(pathToken, 0);
+  if (r === null) return null;
+
+  const argvToken = args[2] ?? '';
+  return buildSpawnEvent(r[0], argvToken, retVal, pid, ts);
+}
+
+/**
+ * Shared spawn-event constructor used by both execve and execveat parsers.
+ * Mirrors the pre-existing execve handling exactly so the two syscalls
+ * produce identical RawEvent shapes (the downstream cross-check in
+ * src/guest/phase-install.ts pairs strace `spawn` events with shim `exec`
+ * events by pid + result; it does not distinguish the underlying syscall).
+ */
+function buildSpawnEvent(
+  path: string,
+  argvToken: string,
+  retVal: RetVal,
+  pid: number,
+  ts: number,
+): RawEvent[] {
   const argv = parseArgvToken(argvToken);
   if (argv.length === 0) {
     // Fall back to just the executable path from arg0
-    const [path] = r;
     argv.push(path);
   }
 

@@ -1,0 +1,38 @@
+[
+  {
+    "raw": {
+      "kind": "env_tamper",
+      "op": "unsetenv",
+      "name": "LD_PRELOAD",
+      "refused": true,
+      "pid": 1001,
+      "ts": 0
+    },
+    "pkg": "unsets-ld-preload@1.0.0",
+    "lifecycle": "postinstall"
+  },
+  {
+    "raw": {
+      "kind": "env_tamper",
+      "op": "unsetenv",
+      "name": "NODE_OPTIONS",
+      "refused": true,
+      "pid": 1001,
+      "ts": 0
+    },
+    "pkg": "unsets-ld-preload@1.0.0",
+    "lifecycle": "postinstall"
+  },
+  {
+    "raw": {
+      "kind": "exec",
+      "prog": "node",
+      "argv0": "node",
+      "pid": 1001,
+      "ts": 0,
+      "envp_alloc_failed": false
+    },
+    "pkg": "unsets-ld-preload@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

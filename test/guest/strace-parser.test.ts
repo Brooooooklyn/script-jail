@@ -26,25 +26,27 @@ describe('openat', () => {
   it('O_RDONLY → read event', () => {
     const line = 'openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 42, 0);
-    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 42, ts: 0, hidden: false }]);
+    // retFd carries the openat return value (3) for the phase-install
+    // fd-table; see Finding 2 in strace-parser.ts.
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 42, ts: 0, hidden: false, retFd: 3 }]);
   });
 
   it('O_WRONLY → write event', () => {
     const line = 'openat(AT_FDCWD, "/tmp/out.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 5';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'write', path: '/tmp/out.txt', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/out.txt', pid: 1, ts: 0, hidden: false, retFd: 5 }]);
   });
 
   it('O_CREAT|O_WRONLY|O_TRUNC → write event', () => {
     const line = 'openat(AT_FDCWD, "/tmp/build.log", O_CREAT|O_WRONLY|O_TRUNC, 0666) = 7';
     const evs = parseStraceLine(line, 1, 1);
-    expect(evs).toEqual([{ kind: 'write', path: '/tmp/build.log', pid: 1, ts: 1, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/build.log', pid: 1, ts: 1, hidden: false, retFd: 7 }]);
   });
 
   it('O_RDWR|O_APPEND → write event (write wins)', () => {
     const line = 'openat(AT_FDCWD, "/var/log/app.log", O_RDWR|O_APPEND) = 4';
     const evs = parseStraceLine(line, 1, 2);
-    expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false, retFd: 4 }]);
   });
 
   it('ENOENT on O_RDONLY → read event stamped with errno (policy filter decides downstream)', () => {
@@ -82,19 +84,342 @@ describe('openat', () => {
     // A file named "a)b" must not confuse the outer-paren depth counter.
     const line = 'openat(AT_FDCWD, "/work/pkg/a)b", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a)b', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a)b', pid: 1, ts: 0, hidden: false, retFd: 3 }]);
   });
 
   it('path containing literal ( is parsed correctly (quote-aware paren scan)', () => {
     // A file named "a(b" must not push the depth counter to 2.
     const line = 'openat(AT_FDCWD, "/work/pkg/a(b", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 1, 0);
-    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a(b', pid: 1, ts: 0, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a(b', pid: 1, ts: 0, hidden: false, retFd: 3 }]);
   });
 
-  it('numeric dir-fd → null (v1 limitation)', () => {
+  // Audit-trust Finding 2 (high, 2026-05-18): numeric dir-fd opens MUST be
+  // emitted so phase-install can resolve the relative path against its
+  // per-pid fd table.  Previously these were dropped, creating an
+  // events-file forgery bypass (open the dir, then openat(<dirfd>,
+  // "events.jsonl", O_WRONLY|O_APPEND) was invisible to the pipeline).
+  it('numeric dir-fd (read) → read event with dirfd + retFd carried for downstream resolve', () => {
     const line = 'openat(5, "relative.txt", O_RDONLY) = 6';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'relative.txt', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 6,
+    }]);
+  });
+
+  it('numeric dir-fd (write) → write event with dirfd + retFd', () => {
+    const line = 'openat(5, "events.jsonl", O_WRONLY|O_APPEND) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write', path: 'events.jsonl', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 7,
+    }]);
+  });
+
+  it('AT_FDCWD on success → retFd present, dirfd absent', () => {
+    const line = 'openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: '/etc/hostname', pid: 1, ts: 0, hidden: false,
+      retFd: 3,
+    }]);
+  });
+
+  it('numeric dir-fd ENOENT → emits read with errno + dirfd (no retFd on failure)', () => {
+    const line = 'openat(5, "missing.txt", O_RDONLY) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'missing.txt', pid: 1, ts: 0, hidden: false,
+      errno: 'ENOENT', dirfd: 5,
+    }]);
+  });
+
+  it('garbage dirfd token (not AT_FDCWD, not numeric) → null', () => {
+    const line = 'openat(GARBAGE, "foo", O_RDONLY) = 3';
     expect(parseStraceLine(line, 1, 0)).toBeNull();
+  });
+});
+
+// ── openat2 ─────────────────────────────────────────────────────────────────
+//
+// Audit-trust Finding (high, 2026-05-19): openat2 (Linux 5.6+) is a more
+// capable variant of openat — it takes a `struct open_how` instead of bare
+// flags + mode.  A raw `syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how))`
+// from a lifecycle script previously escaped the parser (no case in the
+// dispatch switch) AND was not in the agent's strace -e trace= set; both
+// gaps are now closed.  The parser must produce the same RawEvent shape as
+// parseOpenat so the dirfdTable, shim-trust set, and events-file forgery
+// detector all behave identically.
+
+describe('openat2', () => {
+  it('O_RDONLY in open_how struct → read event', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 42, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 42, ts: 0, hidden: false, retFd: 3 }]);
+  });
+
+  it('O_WRONLY|O_APPEND in open_how struct → write event with retFd', () => {
+    const line = 'openat2(AT_FDCWD, "/tmp/script-jail-events/events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=0x0}, 24) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write',
+      path: '/tmp/script-jail-events/events.jsonl',
+      pid: 1, ts: 0, hidden: false, retFd: 7,
+    }]);
+  });
+
+  it('O_CREAT|O_WRONLY|O_TRUNC → write event', () => {
+    const line = 'openat2(AT_FDCWD, "/tmp/build.log", {flags=O_CREAT|O_WRONLY|O_TRUNC, mode=0666, resolve=0x0}, 24) = 5';
+    const evs = parseStraceLine(line, 1, 1);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/build.log', pid: 1, ts: 1, hidden: false, retFd: 5 }]);
+  });
+
+  it('O_RDWR|O_APPEND → write event (write wins)', () => {
+    const line = 'openat2(AT_FDCWD, "/var/log/app.log", {flags=O_RDWR|O_APPEND, mode=0, resolve=0x0}, 24) = 4';
+    const evs = parseStraceLine(line, 1, 2);
+    expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false, retFd: 4 }]);
+  });
+
+  it('ENOENT on O_RDONLY → read event stamped with errno', () => {
+    const line = 'openat2(AT_FDCWD, "/nonexistent", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/nonexistent', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
+  });
+
+  it('ENOENT on O_WRONLY → write event stamped with errno', () => {
+    const line = 'openat2(AT_FDCWD, "/no/dir/file", {flags=O_WRONLY|O_CREAT, mode=0644, resolve=0x0}, 24) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/no/dir/file', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
+  });
+
+  it('EACCES on O_WRONLY → write event stamped with errno=EACCES', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/shadow", {flags=O_WRONLY|O_CREAT, mode=0644, resolve=0x0}, 24) = -1 EACCES (Permission denied)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/etc/shadow', pid: 1, ts: 0, hidden: false, errno: 'EACCES' }]);
+  });
+
+  it('successful openat2 does NOT carry an errno field (no exactOptional `undefined`)', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).not.toHaveProperty('errno');
+  });
+
+  it('numeric dir-fd (write) → write event with dirfd + retFd carried for downstream resolve', () => {
+    // The dirfd-relative form is critical: an attacker can openat2(<events-dir-fd>,
+    // "events.jsonl", {flags=O_WRONLY|O_APPEND, ...}) to bypass an absolute-path check.
+    const line = 'openat2(5, "events.jsonl", {flags=O_WRONLY|O_APPEND, mode=0, resolve=0x0}, 24) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write', path: 'events.jsonl', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 7,
+    }]);
+  });
+
+  it('numeric dir-fd (read) → read event with dirfd + retFd', () => {
+    const line = 'openat2(5, "relative.txt", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 6';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'relative.txt', pid: 1, ts: 0, hidden: false,
+      dirfd: 5, retFd: 6,
+    }]);
+  });
+
+  it('AT_FDCWD on success → retFd present, dirfd absent', () => {
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: '/etc/hostname', pid: 1, ts: 0, hidden: false,
+      retFd: 3,
+    }]);
+  });
+
+  it('numeric dir-fd ENOENT → emits read with errno + dirfd (no retFd on failure)', () => {
+    const line = 'openat2(5, "missing.txt", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'read', path: 'missing.txt', pid: 1, ts: 0, hidden: false,
+      errno: 'ENOENT', dirfd: 5,
+    }]);
+  });
+
+  it('garbage dirfd token (not AT_FDCWD, not numeric) → null', () => {
+    const line = 'openat2(GARBAGE, "foo", {flags=O_RDONLY, mode=0, resolve=0x0}, 24) = 3';
+    expect(parseStraceLine(line, 1, 0)).toBeNull();
+  });
+
+  it('open_how with RESOLVE_BENEATH (sandboxing flag) is parsed correctly', () => {
+    // RESOLVE_BENEATH constrains the path resolution; the flags field is
+    // still what we care about for the audit decision.
+    const line = 'openat2(AT_FDCWD, "/etc/hostname", {flags=O_RDONLY|O_CLOEXEC, mode=0, resolve=RESOLVE_BENEATH}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 1, ts: 0, hidden: false, retFd: 3 }]);
+  });
+
+  it('open_how with field order variation (mode before flags) — fallback when no flags= field', () => {
+    // If for any reason strace renders the struct without a `flags=` field
+    // we degrade to a read classification (the more conservative choice
+    // when we cannot prove write intent).  This is defence in depth — in
+    // practice strace always renders flags first.
+    const line = 'openat2(AT_FDCWD, "/some/path", {mode=0, resolve=0x0}, 24) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'read', path: '/some/path' });
+  });
+});
+
+// ── legacy open ──────────────────────────────────────────────────────────────
+//
+// Audit-trust Finding (high, 2026-05-19): legacy `open(...)` is a 2-or-3-arg
+// syscall (no dirfd) that glibc routes through `openat(AT_FDCWD, ...)` in
+// userspace, BUT a native attacker can still call it directly via
+// `syscall(SYS_open, path, flags[, mode])`.  Without parsing it, a raw
+// `syscall(SYS_open, "/tmp/script-jail-events-XXX/events.jsonl",
+// O_WRONLY|O_APPEND)` would slip past the parser and the events-file
+// forgery detector would see nothing.  Same RawEvent shape as openat is
+// emitted (read/write based on flags, errno on failure, retFd on success
+// for the dirfdTable in phase-install); no `dirfd` field since the legacy
+// syscall has no dirfd argument.
+
+describe('open (legacy)', () => {
+  it('O_RDONLY → read event', () => {
+    const line = 'open("/etc/hostname", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 42, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 42, ts: 0, hidden: false, retFd: 3 }]);
+  });
+
+  it('O_WRONLY|O_CREAT|O_TRUNC with mode → write event with retFd', () => {
+    const line = 'open("/tmp/out.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 5';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/out.txt', pid: 1, ts: 0, hidden: false, retFd: 5 }]);
+  });
+
+  it('O_WRONLY|O_APPEND (events-file forgery shape) → write event', () => {
+    const line = 'open("/tmp/script-jail-events/events.jsonl", O_WRONLY|O_APPEND) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write',
+      path: '/tmp/script-jail-events/events.jsonl',
+      pid: 1, ts: 0, hidden: false, retFd: 7,
+    }]);
+  });
+
+  it('O_RDWR|O_APPEND → write event (write wins)', () => {
+    const line = 'open("/var/log/app.log", O_RDWR|O_APPEND) = 4';
+    const evs = parseStraceLine(line, 1, 2);
+    expect(evs).toEqual([{ kind: 'write', path: '/var/log/app.log', pid: 1, ts: 2, hidden: false, retFd: 4 }]);
+  });
+
+  it('ENOENT on O_RDONLY → read event stamped with errno', () => {
+    const line = 'open("/nonexistent", O_RDONLY) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/nonexistent', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
+  });
+
+  it('ENOENT on O_WRONLY → write event stamped with errno', () => {
+    const line = 'open("/no/dir/file", O_WRONLY|O_CREAT, 0644) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/no/dir/file', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
+  });
+
+  it('EACCES on O_WRONLY → write event stamped with errno=EACCES', () => {
+    const line = 'open("/etc/shadow", O_WRONLY|O_CREAT, 0644) = -1 EACCES (Permission denied)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/etc/shadow', pid: 1, ts: 0, hidden: false, errno: 'EACCES' }]);
+  });
+
+  it('successful open does NOT carry an errno field (no exactOptional `undefined`)', () => {
+    const line = 'open("/etc/hostname", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).not.toHaveProperty('errno');
+  });
+
+  it('legacy open never carries a dirfd field (no dirfd argument in the syscall)', () => {
+    // canonicalizeOpenTarget routes through AT_FDCWD logic when dirfd is
+    // absent — absolute paths resolve via path.resolve; relative paths
+    // resolve against pidCwd.
+    const line = 'open("/etc/hostname", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).not.toHaveProperty('dirfd');
+  });
+
+  it('path containing literal ) is parsed correctly (quote-aware paren scan)', () => {
+    const line = 'open("/work/pkg/a)b", O_RDONLY) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'read', path: '/work/pkg/a)b', pid: 1, ts: 0, hidden: false, retFd: 3 }]);
+  });
+
+  it('relative path → emits with the literal relative path (phase-install resolves via pidCwd)', () => {
+    // A bare relative path appears in legacy open as-is; phase-install's
+    // canonicalizeOpenTarget walks pidCwd when dirfd is undefined and
+    // path is relative.
+    const line = 'open("events.jsonl", O_WRONLY|O_APPEND) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: 'events.jsonl', pid: 1, ts: 0, hidden: false, retFd: 7 }]);
+  });
+});
+
+// ── legacy creat ─────────────────────────────────────────────────────────────
+//
+// Audit-trust Finding (high, 2026-05-19): legacy `creat(path, mode)` is
+// equivalent to `open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)` — it always
+// opens for write.  Same RawEvent shape as parseOpen otherwise.
+
+describe('creat (legacy)', () => {
+  it('success → write event (creat is always a write)', () => {
+    const line = 'creat("/tmp/build.log", 0644) = 5';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/tmp/build.log', pid: 1, ts: 0, hidden: false, retFd: 5 }]);
+  });
+
+  it('events-file forgery shape → write event with retFd', () => {
+    const line = 'creat("/tmp/script-jail-events/events.jsonl", 0644) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{
+      kind: 'write',
+      path: '/tmp/script-jail-events/events.jsonl',
+      pid: 1, ts: 0, hidden: false, retFd: 7,
+    }]);
+  });
+
+  it('ENOENT → write event stamped with errno', () => {
+    const line = 'creat("/no/dir/file", 0644) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/no/dir/file', pid: 1, ts: 0, hidden: false, errno: 'ENOENT' }]);
+  });
+
+  it('EACCES → write event stamped with errno=EACCES', () => {
+    const line = 'creat("/etc/shadow", 0644) = -1 EACCES (Permission denied)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: '/etc/shadow', pid: 1, ts: 0, hidden: false, errno: 'EACCES' }]);
+  });
+
+  it('other errors are dropped (no audit story)', () => {
+    const line = 'creat("/dev/full", 0644) = -1 ENOSPC (No space left on device)';
+    expect(parseStraceLine(line, 1, 0)).toBeNull();
+  });
+
+  it('successful creat does NOT carry an errno field', () => {
+    const line = 'creat("/tmp/out", 0644) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).not.toHaveProperty('errno');
+  });
+
+  it('creat never carries a dirfd field', () => {
+    const line = 'creat("/tmp/out", 0644) = 3';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).not.toHaveProperty('dirfd');
+  });
+
+  it('relative path → emits write event with the literal relative path', () => {
+    const line = 'creat("events.jsonl", 0644) = 7';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).toEqual([{ kind: 'write', path: 'events.jsonl', pid: 1, ts: 0, hidden: false, retFd: 7 }]);
   });
 });
 
@@ -166,6 +491,73 @@ describe('execve', () => {
     const evs = parseStraceLine(line, 1, 0);
     expect(evs).not.toBeNull();
     expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['node', '-e', "require('fs').readFileSync('/etc/hostname')"] });
+  });
+});
+
+// ── execveat ─────────────────────────────────────────────────────────────────
+//
+// Audit-trust Finding 2 (high): strace's `-e trace=execve` does NOT cover
+// execveat.  A lifecycle script that calls `syscall(SYS_execveat, ...)` runs
+// without entering the libc shim AND, prior to the fix, also escaped strace.
+// The agent now passes `-e trace=execve,execveat`; these tests pin the
+// parser side of that contract — an execveat line must produce the same
+// `spawn` RawEvent shape as execve so the per-pid bypass cross-check in
+// phase-install treats the two identically.
+
+describe('execveat', () => {
+  it('success → spawn event with result=ok and argv parsed', () => {
+    const line = 'execveat(AT_FDCWD, "/bin/sh", ["sh", "-c", "echo hi"], 0x7ffd... /* 38 vars */, 0) = 0';
+    const evs = parseStraceLine(line, 1234, 7);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({
+      kind: 'spawn',
+      argv: ['sh', '-c', 'echo hi'],
+      result: 'ok',
+      pid: 1234,
+      ts: 7,
+    });
+  });
+
+  it('ENOENT → spawn event with result=enoent', () => {
+    const line = 'execveat(AT_FDCWD, "/usr/bin/nope", ["nope"], 0x7ffd..., 0) = -1 ENOENT (No such file or directory)';
+    const evs = parseStraceLine(line, 99, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['nope'], result: 'enoent', pid: 99 });
+  });
+
+  it('EACCES → spawn event with result=eacces', () => {
+    const line = 'execveat(AT_FDCWD, "/tmp/x.sh", ["./x.sh"], 0x7ffd..., 0) = -1 EACCES (Permission denied)';
+    const evs = parseStraceLine(line, 12, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['./x.sh'], result: 'eacces' });
+  });
+
+  it('numeric dirfd is accepted (parser ignores dirfd token)', () => {
+    // The dirfd may be a numeric fd rather than AT_FDCWD.  We must NOT
+    // drop the line just because the dirfd isn't AT_FDCWD (unlike
+    // openat/statx/etc); the audit signal we care about is the bare
+    // fact that the process called execveat.
+    const line = 'execveat(5, "/bin/sh", ["sh"], 0x7ffd..., 0) = 0';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['sh'], result: 'ok' });
+  });
+
+  it('AT_EMPTY_PATH form (empty path string) falls back to argv[0]', () => {
+    // When AT_EMPTY_PATH is in flags, the path argument is "" and the
+    // executable is identified by the dirfd alone.  We can't usefully
+    // recover that path, so fall back to argv[0] for the prog field.
+    const line = 'execveat(3, "", ["sh"], 0x7ffd..., AT_EMPTY_PATH) = 0';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['sh'], result: 'ok' });
+  });
+
+  it('argv with /* envp */ placeholder for envp still works', () => {
+    const line = 'execveat(AT_FDCWD, "/bin/env", ["env"], [/* envp */], 0) = 0';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'spawn', argv: ['env'], result: 'ok' });
   });
 });
 
@@ -463,7 +855,7 @@ describe('real captured strace output', () => {
   it('[real] openat /etc/hostname O_RDONLY → read event', () => {
     const line = 'openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3';
     const evs = parseStraceLine(line, 12345, 1);
-    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 12345, ts: 1, hidden: false }]);
+    expect(evs).toEqual([{ kind: 'read', path: '/etc/hostname', pid: 12345, ts: 1, hidden: false, retFd: 3 }]);
   });
 
   // Real: statx of a file that doesn't exist

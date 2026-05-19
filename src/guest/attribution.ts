@@ -67,8 +67,14 @@ function buildPkg(name: string, version: string | undefined): string {
 export class Attribution {
   private readonly reader: ProcReader;
   // Terminal-only cache: keyed by starting pid. Intermediate pids are not
-  // cached (v1 limitation). Pid recycling is impossible in the single-install
-  // Firecracker environment where this runs.
+  // cached (v1 limitation). Pid recycling is rare but possible — even in the
+  // single-install Firecracker environment, a short-lived child can exit and
+  // have its pid reassigned within the same install when another sibling
+  // forks. The {@link invalidate} method exists so the phase-install
+  // dispatcher can drop a dead generation's cached attribution upon observing
+  // its `+++ exited +++` line, ensuring the next `attribute(pid)` on the
+  // recycled pid re-reads /proc instead of returning the dead generation's
+  // result.
   private readonly cache: Map<number, AttributionResult | null> = new Map();
 
   constructor(reader: ProcReader) {
@@ -87,7 +93,8 @@ export class Attribution {
    *   - No process in the chain has the required env vars.
    *
    * Results are cached per starting pid. A second call with the same pid will
-   * return the cached value without any additional /proc reads.
+   * return the cached value without any additional /proc reads — unless
+   * {@link invalidate} has been called for the pid in between.
    */
   attribute(pid: number): AttributionResult | null {
     if (this.cache.has(pid)) {
@@ -97,6 +104,24 @@ export class Attribution {
     const result = this._walk(pid);
     this.cache.set(pid, result);
     return result;
+  }
+
+  /**
+   * Drop the cached attribution for `pid`. The next call to
+   * {@link attribute} for the same pid will walk /proc afresh.
+   *
+   * Used by the phase-install dispatcher when it observes a process-exit
+   * strace line (`+++ exited +++` / `+++ killed by SIG... +++`) so a
+   * recycled pid does NOT inherit the dead generation's cached
+   * attribution result. Without invalidation, the per-pid `cache` Map
+   * here would keep returning the old pkg/lifecycle pair forever (the
+   * single-install Firecracker environment runs for the whole install,
+   * so the process-level cache is long-lived), and the dispatcher's
+   * snapshot machinery would store the stale value as the recycled
+   * pid's new generation snapshot.
+   */
+  invalidate(pid: number): void {
+    this.cache.delete(pid);
   }
 
   private _walk(startPid: number): AttributionResult | null {

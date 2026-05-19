@@ -227,6 +227,101 @@ describe('dlopen-block preload', () => {
     expect(entry.result).toBe('blocked');
   });
 
+  // Audit-trust Finding 4 (high, 2026-05-18) — monkeypatch resistance.
+  //
+  // Lifecycle JS can overwrite `fs.writeSync` BEFORE attempting to load a
+  // native addon.  Without captured references, the preload's audit log
+  // line would route through the attacker's stub and disappear.  The
+  // preload binds the original at module load time, so the monkeypatch
+  // only affects the public slot.
+  it('monkeypatched fs.writeSync does NOT silence dlopen audit line', async () => {
+    const logFile = (() => {
+      const p = join(
+        tmpdir(),
+        `script-jail-dlopen-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+      );
+      writeFileSync(p, '');
+      return p;
+    })();
+    const code = `
+      const fs = require('node:fs');
+      // Monkeypatch AFTER the preload load.  If the preload were
+      // reading fs.writeSync on every call, this stub would suppress
+      // the dlopen audit line.
+      fs.writeSync = function () { /* silent black hole */ };
+      try {
+        process.dlopen({ exports: {} }, '/nonexistent/file.node');
+      } catch {}
+    `;
+    const result = await runWithBlock(code, { SCRIPT_JAIL_LOG_FILE: logFile });
+    expect(result.exitCode).toBe(0);
+
+    const { readFileSync: rfs } = await import('node:fs');
+    const contents = rfs(logFile, 'utf8');
+    const dlopenLines = contents
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o['kind'] === 'dlopen');
+    // The audit line must exist despite the monkeypatched writeSync.
+    expect(dlopenLines.length).toBe(1);
+    expect(dlopenLines[0]!['filename']).toBe('/nonexistent/file.node');
+  });
+
+  // Audit-trust Finding 5 (high, 2026-05-19) — env-mutation redirect.
+  //
+  // The previous resolveLogFd read process.env.SCRIPT_JAIL_LOG_FILE lazily on
+  // the first dlopen call, so a lifecycle script could
+  // `process.env.SCRIPT_JAIL_LOG_FILE = '/dev/null'` BEFORE triggering its
+  // own dlopen attempt and silently redirect the audit signal.  The preload
+  // now snapshots both SCRIPT_JAIL_LOG_FILE and SCRIPT_JAIL_LOG_FD at module
+  // load time into local const slots, so mutating process.env afterwards
+  // cannot redirect (or null out) the audit destination.
+  it('mutating process.env.SCRIPT_JAIL_LOG_FILE after preload does NOT redirect dlopen audit', async () => {
+    const realLog = join(
+      tmpdir(),
+      `script-jail-dlopen-real-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+    );
+    const decoy = join(
+      tmpdir(),
+      `script-jail-dlopen-decoy-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+    );
+    writeFileSync(realLog, '');
+    writeFileSync(decoy, '');
+
+    const code = `
+      // Lifecycle JS runs AFTER the preload (--require) has bound the
+      // events-file path into a captured const.  Redirecting (or deleting)
+      // process.env.SCRIPT_JAIL_LOG_FILE here must NOT change where the
+      // audit line lands.
+      process.env.SCRIPT_JAIL_LOG_FILE = ${JSON.stringify(decoy)};
+      delete process.env.SCRIPT_JAIL_LOG_FD;
+      try {
+        process.dlopen({ exports: {} }, '/nonexistent/file.node');
+      } catch {}
+    `;
+    const result = await runWithBlock(code, { SCRIPT_JAIL_LOG_FILE: realLog });
+    expect(result.exitCode).toBe(0);
+
+    const { readFileSync } = await import('node:fs');
+    const realDlopen = readFileSync(realLog, 'utf8')
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o['kind'] === 'dlopen');
+    const decoyDlopen = readFileSync(decoy, 'utf8')
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o['kind'] === 'dlopen');
+
+    // Audit line landed in the ORIGINAL file path captured at preload load,
+    // not the post-load redirect target.
+    expect(realDlopen.length).toBe(1);
+    expect(realDlopen[0]!['filename']).toBe('/nonexistent/file.node');
+    expect(decoyDlopen.length).toBe(0);
+  });
+
   it('falls back to SCRIPT_JAIL_LOG_FD when SCRIPT_JAIL_LOG_FILE is unset', async () => {
     // The legacy fd-3 path must continue to work for tests / non-production
     // callers that wire a pipe directly.  We can't easily wire a real pipe

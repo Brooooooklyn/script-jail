@@ -12,26 +12,31 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, constants as fsConstants, type Stats } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
 import { PassThrough, Writable, type Readable } from 'node:stream';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { dirname, basename } from 'node:path';
+import { dirname, basename, join as joinPath } from 'node:path';
 
 import { Attribution } from './attribution.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { Emitter } from './emit.js';
 import { runFetchPhase, type Spawner } from './phase-fetch.js';
-import { runInstallPhase, type StraceRunner } from './phase-install.js';
+import { runInstallPhase, type LineSource, type StraceRunner } from './phase-install.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
 import { discoverPkgDirs } from './discover-pkg-dirs.js';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  CANON_PROTECTED_ENV_NAMES_MAX_LEN,
+  MAX_PROTECTED_ENV_NAMES,
+  PROTECTED_NAME_MAX_LEN,
+} from '../shim/canon-buf-len.js';
 
 // ---------------------------------------------------------------------------
 // Config schema
@@ -67,7 +72,7 @@ const AgentConfig = z.object({
   manager: z.enum(['npm', 'pnpm', 'yarn']).optional(),
 });
 
-type AgentConfig = z.infer<typeof AgentConfig>;
+export type AgentConfig = z.infer<typeof AgentConfig>;
 
 // ---------------------------------------------------------------------------
 // Connection abstraction
@@ -264,12 +269,68 @@ export interface StraceTailerOptions {
   fd3Stream: Readable | null;
   /**
    * Absolute path of a shared JSONL events file produced by the env-shim and
-   * dlopen-block preload (production channel — see {@link EVENTS_FILE_PATH}).
+   * dlopen-block preload (production channel — see {@link createEventsFile}).
    * Tailed alongside per-pid strace files; lines arrive with pid=0 (the same
    * synthetic pid we use for fd3 lines, since attribution happens later from
    * the embedded pid field).  When undefined, no events-file polling is done.
    */
   eventsFilePath?: string;
+  /**
+   * Baseline {inode, device} captured at events-file creation time.  On every
+   * drain cycle the tailer re-stats the path and compares against this
+   * baseline; any mismatch (replacement, deletion, EACCES, size shrinkage)
+   * is recorded into `tamperRef.reason` so the agent can fail closed at
+   * post-install time.
+   *
+   * SECURITY: this is the only barrier against a malicious lifecycle script
+   * that unlinks / truncates / replaces the events file to erase
+   * `audit_bypass` evidence before the tailer reads it.  When undefined no
+   * tamper checking is performed (used by tests that supply a private path).
+   *
+   * `mtimeNs` and `ctimeNs` (both captured at file creation in
+   * `createEventsFile`) are also part of the baseline so the tailer can
+   * detect the "utimes restore" tamper: append → truncate → utimes-back-to-
+   * original-mtime.  Pure mtime checking misses this because utimes can set
+   * mtime to any value; ctime cannot — the kernel always advances ctime on
+   * any metadata or content change.  See `drainEventsFile` for the
+   * "ctime advanced without consumed bytes" gate that closes this hole.
+   */
+  eventsBaseline?: { ino: bigint; dev: bigint; mtimeNs: bigint; ctimeNs: bigint };
+  /**
+   * Absolute path of the parent directory that contains the events file
+   * (Finding B).  When provided the tailer attaches a second `fs.watch` to
+   * this directory and treats any `rename` event affecting the events-file
+   * basename as tamper.
+   *
+   * Why this exists in addition to the inode-baseline check on the events
+   * file itself: a hostile lifecycle script can `rename(events.jsonl,
+   * events.bak)` aside, create a decoy at the same path, spawn a child that
+   * `open()`s the decoy, then `rename(events.bak, events.jsonl)` back.  By
+   * the time the next drain re-stats the path, the baseline inode is back —
+   * but the child's fd is wired to the decoy and the original file's events
+   * (including any `audit_bypass`) are dropped for that child.  The
+   * directory-level inotify watch catches the transient swap because the
+   * kernel reports IN_MOVED_FROM / IN_MOVED_TO regardless of timing.
+   *
+   * Test runners that supply a fake StraceRunner and want the watcher
+   * inactive simply omit this option.
+   */
+  eventsDirPath?: string;
+  /**
+   * Basename of the events file inside `eventsDirPath`.  Used to filter the
+   * directory watcher's `rename` events; the watcher only flags tamper when
+   * a rename affects this exact basename.  Defaults to the basename of
+   * `eventsFilePath` when both are provided.
+   */
+  eventsFileBasename?: string;
+  /**
+   * Optional sink for tamper detection.  When the tailer detects events-file
+   * tampering it writes a human-readable reason here; the agent's main loop
+   * reads this after install completes and fails closed if it is non-empty.
+   * Using a ref-object so the writer (tailer) and reader (main) share state
+   * without forcing an extra parameter through the StraceRunner interface.
+   */
+  tamperRef?: { reason: string | null };
   /**
    * Promise that resolves when the traced child process has exited.
    * The tailer waits for this, then does one final drain poll, then ends.
@@ -279,12 +340,43 @@ export interface StraceTailerOptions {
   pollIntervalMs?: number;
   /** Extra drain time in ms after child exit to catch final writes (default 100). */
   drainMs?: number;
+  /**
+   * Optional callback invoked once with the pid of the FIRST per-pid
+   * strace output file discovered during tailing — i.e. the install
+   * command's pid (strace's direct child).  Used by
+   * `LinuxStraceRunner.getRootPid()` to expose the audit root to the
+   * dispatcher in {@link runInstallPhase} so it can seed cwd state
+   * for EXACTLY one pid instead of relying on a "first observed pid
+   * wins" heuristic that could mis-seed a child whose strace per-pid
+   * file is drained before the parent's.
+   *
+   * Strace's `-ff -o <basePath>` writes per-pid files in the order
+   * the kernel creates the pids; the install command's pid is the
+   * first one created (it's strace's direct child).  Polling /
+   * inotify may yield those files in a different order than they
+   * were created, but the FIRST file ever observed during the
+   * tailing loop is overwhelmingly the install command's — there's
+   * a small window during which no events have been written yet to
+   * any per-pid file.  When the first poll/watch fires, the only
+   * file present is the install command's.  We capture that pid
+   * here.
+   *
+   * If no file is ever discovered (strace failed to spawn), the
+   * callback is never invoked.
+   */
+  recordRootPid?(pid: number): void;
 }
 
 /**
  * StraceTailer merges:
- *   1. Lines from per-pid strace output files  → { pid: <pid>, line }
- *   2. JSONL lines from the fd3Stream pipe      → { pid: 0, line }
+ *   1. Lines from per-pid strace output files  → { pid: <pid>, line, source: 'strace' }
+ *   2. JSONL lines from the fd3Stream pipe      → { pid: 0, line, source: 'shim' }
+ *   3. JSONL lines from the events file path    → { pid: 0, line, source: 'shim' }
+ *
+ * The `source` discriminator lets the caller dispatch parsers safely: the
+ * trusted shim channel never falls back to the strace text parser (which
+ * would mask a partial-line poisoning attack — see {@link LineSource}),
+ * and the strace channel never gets fed to the strict JSONL parser.
  *
  * The async generator ends once the child has exited and all trailing writes
  * have been drained.
@@ -293,12 +385,12 @@ export interface StraceTailerOptions {
  */
 export async function* runStraceTailer(
   opts: StraceTailerOptions,
-): AsyncGenerator<{ pid: number; line: string }> {
+): AsyncGenerator<{ pid: number; line: string; source: LineSource }> {
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const drainMs = opts.drainMs ?? 100;
 
   // Shared queue: all sources push here; the generator drains it.
-  const queue: Array<{ pid: number; line: string }> = [];
+  const queue: Array<{ pid: number; line: string; source: LineSource }> = [];
   let done = false; // set true once the child has exited and drain is complete
 
   // Notify the generator loop that new items are available or done changed.
@@ -313,6 +405,13 @@ export async function* runStraceTailer(
   const filePos = new Map<string, number>();
   // Map from filename → partial (unterminated) line buffer.
   const fileBuf = new Map<string, string>();
+  // Tracks whether we've already invoked opts.recordRootPid.  The FIRST
+  // per-pid file ever discovered (by `pollDir` or `fs.watch`) is the
+  // install command's strace output — strace writes the install root's
+  // file before any of its descendants' files are created.  When this
+  // flag is false and a parseable pid is encountered in `drainFile`,
+  // we report the pid and flip the flag.
+  let rootPidReported = false;
 
   function parsePidFromFilename(name: string): number {
     const suffix = name.slice(opts.basePrefix.length + 1); // strip "strace.out."
@@ -323,6 +422,21 @@ export async function* runStraceTailer(
   function drainFile(name: string): void {
     const fullPath = `${opts.watchDir}/${name}`;
     const pid = parsePidFromFilename(name);
+    // Report the FIRST observed per-pid file's pid as the install root.
+    // We check `filePos.has(name)` rather than `pos === 0` because a pid
+    // observation BEFORE the file has any bytes is still a valid signal
+    // — the file existed, the kernel chose that pid, that's enough to
+    // pin the install root.  Subsequent drainFile calls for OTHER
+    // filenames are descendants and must not overwrite the root.
+    if (!rootPidReported && pid > 0 && !filePos.has(name)) {
+      rootPidReported = true;
+      try {
+        opts.recordRootPid?.(pid);
+      } catch {
+        // Recording is best-effort; a callback throw must not abort
+        // the tailer.  In practice the recorder just sets a field.
+      }
+    }
     const pos = filePos.get(name) ?? 0;
 
     let size = 0;
@@ -361,7 +475,10 @@ export async function* runStraceTailer(
 
     for (const line of complete.split('\n')) {
       if (line.length > 0) {
-        queue.push({ pid, line });
+        // Per-pid strace files carry strace's text format — tagged
+        // `'strace'` so the install-phase dispatcher never tries to
+        // JSON.parse them.
+        queue.push({ pid, line, source: 'strace' });
       }
     }
     wake();
@@ -386,34 +503,258 @@ export async function* runStraceTailer(
   // watchDir and a single absolute path (rather than a "prefix.PID" pattern)
   // is enough to identify it.  Position + partial-line buffer mirror the
   // per-pid logic in drainFile().
+  //
+  // SECURITY: every drain cycle re-stats the path and compares inode/device
+  // against `opts.eventsBaseline`.  Any mismatch (the audited script
+  // unlinked + recreated the file, replaced it with a symlink, truncated
+  // it, or made it unreadable) is recorded into `opts.tamperRef.reason`.
+  // The agent's main loop reads that after install completes and fails
+  // closed.  Without this gate, a `rm /tmp/script-jail-events.jsonl`
+  // followed by `envp_alloc_failed` would erase the `audit_bypass` signal
+  // and let the action's check mode return clean.
+  //
+  // Append-then-truncate defence (Finding A): a polling tailer with a 50ms
+  // window can MISS an intermediate `append → grow → truncate-back` cycle
+  // entirely, because the next poll observes `size === eventsPos` again and
+  // the new bytes are gone.  Multiple cross-checks plug the hole:
+  //   1. `lastMtime` — kernel updates st_mtim on EVERY write; truncate(2)
+  //      counts as a write.  If poll N sees mtime > lastMtime but the file
+  //      is the same size as at the previous read position, bytes were
+  //      written and then discarded between polls.
+  //   2. `maxSeenSize` — monotonically tracks the largest size ever observed
+  //      across polls.  A poll that observes `size < maxSeenSize` (even when
+  //      `size >= eventsPos`) means the file was truncated.  This catches
+  //      the case where a poll happens to land between an append and the
+  //      truncation that follows.
+  //   3. `lastConsumedCtime` — ctime advances on every metadata or content
+  //      change AND CANNOT be reset by utimes(2) (only mtime/atime can).
+  //      A second-finding (audit-trust 2026-05-18) tamper: append a line,
+  //      truncate back to the previous size, THEN `utimes(path, atime,
+  //      oldMtime)` to restore the original mtime.  That sequence leaves
+  //      size === eventsPos AND mtime == lastMtime, so checks (1) and (2)
+  //      see nothing — but ctime is now strictly greater than the ctime we
+  //      observed at our last successful drain.  Flagging "ctime advanced
+  //      since last drain but size still at eventsPos" closes the hole.
+  //   4. mtime regression: a `utimes(path, atime, oldMtime)` that restores
+  //      a previously-pinned mtime is itself tamper — legitimate writes
+  //      only move mtime forward.  `mtime < maxObservedMtime` => tamper.
+  // We also wire `fs.watch` (inotify on Linux) on the events file inode so
+  // truncate(2) / open(O_TRUNC) generate `change` events the polling loop
+  // would otherwise have to race to observe.
   let eventsPos = 0;
   let eventsBuf = '';
+  let lastMtime: bigint = -1n; // -1n until first successful stat
+  let maxSeenSize = 0;
+  // Baseline ctime, captured at file creation in createEventsFile.  Updated
+  // to the current ctime each time we successfully read bytes from the
+  // file (the only legitimate cause of ctime advancement).  Any drain that
+  // sees `current.ctime > lastConsumedCtime` while `size === eventsPos`
+  // means something modified the file without leaving bytes for us — the
+  // utimes-restore tamper signature.  Initialized lazily on the first
+  // successful stat when no baseline was provided (tests that omit
+  // eventsBaseline get the old behaviour).
+  let lastConsumedCtime: bigint =
+    opts.eventsBaseline !== undefined ? opts.eventsBaseline.ctimeNs : -1n;
+  // Track max observed mtime across polls so a `utimes`-driven REGRESSION
+  // is flagged even if it happens to land between drains.  Initialized from
+  // the baseline mtime when known so utimes-back-to-pre-creation timestamps
+  // are caught from the first poll.
+  let maxObservedMtime: bigint =
+    opts.eventsBaseline !== undefined ? opts.eventsBaseline.mtimeNs : -1n;
+  // 2026-05-19: number of consecutive polls observing `ctime/mtime advanced
+  // AND size === eventsPos` before flagging tamper.  Linux 5.10 (Ubuntu 22.04
+  // rootfs) sometimes returns stat() with newer ctime/mtime than the
+  // size-update it accompanies, producing a one-shot false positive during
+  // active writes.  Three consecutive polls (~3 × pollIntervalMs) is enough
+  // to outlast the kernel's lazy settle while still catching the real
+  // tampers: a utimes-restore leaves the file quiescent after the attack,
+  // and an append-then-truncate that bumps mtime without bytes likewise
+  // settles past the kernel's lazy window.
+  let ctimeAdvanceStablePolls = 0;
+  let mtimeAdvanceStablePolls = 0;
+  const META_ADVANCE_REQUIRED_POLLS = 3;
+  function recordTamper(reason: string): void {
+    if (opts.tamperRef && opts.tamperRef.reason === null) {
+      opts.tamperRef.reason = reason;
+    }
+  }
   function drainEventsFile(): void {
     const path = opts.eventsFilePath;
     if (path === undefined || path === '') return;
 
-    let size = 0;
+    let stat: Stats;
     try {
-      size = statSync(path).size;
-    } catch {
-      return; // file not yet created or unreadable
+      stat = statSync(path, { bigint: true }) as unknown as Stats;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        recordTamper(`events file disappeared: ${path}`);
+      } else if (code === 'EACCES' || code === 'EPERM') {
+        recordTamper(`events file became unreadable (${code}): ${path}`);
+      }
+      return;
     }
-    if (size <= eventsPos) return;
 
-    const toRead = size - eventsPos;
+    // Baseline identity check: any change in {dev, ino} means the file
+    // path has been rebound to a different inode (unlink + recreate,
+    // rename-over, symlink swap) — the original audit trail is unreachable.
+    const baseline = opts.eventsBaseline;
+    if (baseline !== undefined) {
+      const statIno = (stat as unknown as { ino: bigint }).ino;
+      const statDev = (stat as unknown as { dev: bigint }).dev;
+      if (statIno !== baseline.ino || statDev !== baseline.dev) {
+        recordTamper(
+          `events file inode mismatch (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${statDev} ino=${statIno}): ${path}`,
+        );
+        return;
+      }
+    }
+
+    const sizeBig = (stat as unknown as { size: bigint }).size;
+    // Detect truncation: a regular file's size MUST be monotonically
+    // non-decreasing across our reads (writers use O_APPEND).  A shrink
+    // means somebody ftruncate()/open(O_TRUNC)'d the file mid-run.
+    const sizeNum = Number(sizeBig);
+    if (sizeNum < eventsPos) {
+      recordTamper(`events file shrank (size=${sizeNum} < eventsPos=${eventsPos}): ${path}`);
+      return;
+    }
+    // Max-size monotonicity: even when `size >= eventsPos`, a regression
+    // below `maxSeenSize` means an earlier poll (or fs.watch fire) saw a
+    // larger size that has since been truncated away.  Without this gate,
+    // append-then-truncate-to-same-pos cycles would pass undetected because
+    // the polling loop can lose the intermediate growth between ticks.
+    if (sizeNum < maxSeenSize) {
+      recordTamper(
+        `events file shrank below max-seen (size=${sizeNum} < maxSeenSize=${maxSeenSize}): ${path}`,
+      );
+      return;
+    }
+    if (sizeNum > maxSeenSize) maxSeenSize = sizeNum;
+
+    // mtime regression: utimes(2) is the only way mtime can move backwards,
+    // and no legitimate writer in this system calls utimes on the events
+    // file.  A monotonic check against the largest mtime we have ever
+    // observed (initialized from the baseline at creation) catches the
+    // utimes-restore tamper where an attacker bumps mtime forward to write
+    // a malicious line, then pins mtime back to its previous value to make
+    // the older "mtime advanced without new bytes" gate quiet.
+    const mtimeBig = (stat as unknown as { mtimeNs: bigint }).mtimeNs;
+    const ctimeBig = (stat as unknown as { ctimeNs: bigint }).ctimeNs;
+    if (maxObservedMtime !== -1n && mtimeBig < maxObservedMtime) {
+      recordTamper(
+        `events file mtime regressed (mtimeNs=${mtimeBig} < maxObserved=${maxObservedMtime}, size=${sizeNum} eventsPos=${eventsPos}): ${path}`,
+      );
+      return;
+    }
+    if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
+
+    // ctime monotonicity (utimes-bypass defence): every metadata or content
+    // modification advances ctime, and utimes(2) CANNOT roll it back — only
+    // mtime/atime are settable.  If ctime has advanced since the last drain
+    // that consumed bytes, the file was modified; if `size === eventsPos`
+    // at the same time, the bytes that drove the modification are no longer
+    // visible (truncated away) — and the attacker may have additionally
+    // utimes-restored mtime to silence the legacy mtime-advanced check.
+    // Flag tamper.
+    //
+    // NOTE: ctime advances on EVERY legitimate write too (the shim appends
+    // a JSONL line → ctime + mtime + size all move together).  We only flag
+    // when ctime has advanced AND there are no new bytes to read; the
+    // `lastConsumedCtime` is updated after a successful read so subsequent
+    // legitimate writes do not re-trip this gate.
+    //
+    // 2026-05-19 follow-up: on Linux 5.10 (Ubuntu 22.04 microVM rootfs) we
+    // see spurious one-shot ctime advances of a few ms with size unchanged
+    // — the kernel updates ctime slightly after the size-bumping write
+    // returns, and a stat() that lands in the gap reports the new ctime
+    // against an unchanged size.  A real utimes-restore attack persists
+    // across many polls (the attacker stops touching the file once the
+    // attack completes), so requiring N consecutive observations of the
+    // suspicious state collapses the false positive without weakening the
+    // defence.  The mtime-regression check above remains the primary
+    // signal; this gate stays defence-in-depth for the narrow case where
+    // the attacker restores mtime to a value still ≥ maxObservedMtime.
+    if (
+      lastConsumedCtime !== -1n &&
+      ctimeBig > lastConsumedCtime &&
+      sizeNum === eventsPos
+    ) {
+      ctimeAdvanceStablePolls += 1;
+      if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
+        recordTamper(
+          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`,
+        );
+        return;
+      }
+    } else {
+      ctimeAdvanceStablePolls = 0;
+    }
+
+    // Retained as defense-in-depth: a plain append-then-truncate (no utimes
+    // restore) bumps mtime AND ctime forward.  The ctime check above will
+    // also fire in that case, but the original mtime check stays in place
+    // so the pre-existing test contract continues to hold.  Same lazy-stat
+    // race as ctime above — gate on N consecutive polls so we tolerate the
+    // kernel's brief mtime/size desync without weakening the steady-state
+    // tamper signal.
+    if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
+      mtimeAdvanceStablePolls += 1;
+      if (mtimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
+        recordTamper(
+          `events file mtime advanced without new bytes (mtimeNs=${mtimeBig} > last=${lastMtime}, size=${sizeNum} == eventsPos): ${path}`,
+        );
+        return;
+      }
+    } else {
+      mtimeAdvanceStablePolls = 0;
+    }
+    lastMtime = mtimeBig;
+    // Initialize ctime baseline lazily when the caller did not supply one
+    // (test-only path: production always passes opts.eventsBaseline).  Until
+    // initialized, the ctime gate above is dormant — first observation just
+    // seeds the watermark.
+    if (lastConsumedCtime === -1n) lastConsumedCtime = ctimeBig;
+    if (maxObservedMtime === -1n) maxObservedMtime = mtimeBig;
+
+    if (sizeNum <= eventsPos) return;
+
+    const toRead = sizeNum - eventsPos;
     const buf = Buffer.allocUnsafe(toRead);
     let fd = -1;
     let bytesRead = 0;
     try {
       fd = openSync(path, 'r');
+      // Verify the just-opened fd is still the SAME inode the stat above
+      // resolved — guards against a race where the file is unlinked between
+      // the stat and the open and a new file with the same path now exists.
+      if (baseline !== undefined) {
+        const fdStat = fstatSync(fd, { bigint: true });
+        if (fdStat.ino !== baseline.ino || fdStat.dev !== baseline.dev) {
+          closeSync(fd);
+          recordTamper(
+            `events file fd-stat mismatch on open (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${fdStat.dev} ino=${fdStat.ino}): ${path}`,
+          );
+          return;
+        }
+      }
       bytesRead = readSync(fd, buf, 0, toRead, eventsPos);
-    } catch {
+    } catch (err) {
       if (fd >= 0) { try { closeSync(fd); } catch { /* ignore */ } }
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'EACCES' || code === 'EPERM') {
+        recordTamper(`events file became unreadable on open (${code}): ${path}`);
+      }
       return;
     }
     closeSync(fd);
 
     eventsPos += bytesRead;
+    // ctime almost certainly advanced as a result of the same writes we
+    // just consumed.  Record it as the new "last consumed" baseline so the
+    // utimes-restore gate above doesn't fire on the next poll for these
+    // legitimate bytes.
+    lastConsumedCtime = ctimeBig;
 
     const chunk = eventsBuf + buf.slice(0, bytesRead).toString('utf8');
     const newlineIdx = chunk.lastIndexOf('\n');
@@ -429,7 +770,10 @@ export async function* runStraceTailer(
       if (line.length > 0) {
         // pid=0 matches the fd3Stream convention: attribution will read the
         // pid field embedded in the JSONL payload, not this synthetic one.
-        queue.push({ pid: 0, line });
+        // Tagged `'shim'` because the events file is written by trusted
+        // shim/preload code under SCRIPT_JAIL_LOG_FILE; the dispatcher
+        // treats parse failures here as fatal tamper.
+        queue.push({ pid: 0, line, source: 'shim' });
       }
     }
     wake();
@@ -443,7 +787,8 @@ export async function* runStraceTailer(
     const rl = createInterface({ input: opts.fd3Stream, crlfDelay: Infinity });
     rl.on('line', (line: string) => {
       if (line.length > 0) {
-        queue.push({ pid: 0, line });
+        // fd-3 is the preload-owned pipe — tagged `'shim'`.
+        queue.push({ pid: 0, line, source: 'shim' });
         wake();
       }
     });
@@ -467,6 +812,91 @@ export async function* runStraceTailer(
     // fs.watch not available on this fs — polling only
   }
 
+  // Inotify-backed watch on the events file inode itself (Finding A).  On
+  // Linux `fs.watch` translates to inotify, which fires on EVERY write
+  // including truncate(2) and open(O_TRUNC).  Triggering an immediate drain
+  // on each fire collapses the polling-window race during which an
+  // append-then-truncate cycle could otherwise erase evidence between two
+  // 50ms ticks — the post-drain `mtime` and `maxSeenSize` checks then
+  // observe the now-discarded growth and flag tamper.
+  let eventsWatcher: ReturnType<typeof fsWatch> | null = null;
+  if (opts.eventsFilePath !== undefined && opts.eventsFilePath !== '') {
+    try {
+      eventsWatcher = fsWatch(opts.eventsFilePath, { persistent: false }, () => {
+        drainEventsFile();
+        wake();
+      });
+      // Inotify reports IN_DELETE_SELF / IN_MOVE_SELF as a watcher 'rename'
+      // event followed by EPERM on subsequent reads on some kernels.  The
+      // drainEventsFile() polling fallback (above) will catch those via
+      // stat() returning ENOENT or the inode-mismatch check, so a watcher
+      // error here is non-fatal — just drop the watch.
+      eventsWatcher.on('error', () => { /* polling is the fallback */ });
+    } catch {
+      // fs.watch unavailable on this fs (e.g. tmpfs in some test setups) —
+      // mtime + max-size monotonicity in drainEventsFile() remains active.
+    }
+  }
+
+  // Inotify-backed watch on the events file's PARENT DIRECTORY (Finding B).
+  // The directory mode is 0700 (mkdtemp + explicit chmod in createEventsFile),
+  // so under normal operation no non-root caller can rename/create/unlink
+  // anything inside.  This watcher is the defense-in-depth signal for the
+  // corner case where the directory perms are weakened — or for a future
+  // change to a shared parent — and catches the transient-rename trick:
+  //
+  //   mv events.jsonl events.bak                # rename away
+  //   <create decoy at events.jsonl>            # IN_CREATE on basename
+  //   <child opens events.jsonl via path>       # child fd → decoy
+  //   mv events.bak events.jsonl                # rename back, baseline OK
+  //
+  // The inode-baseline check on the events file alone misses this because
+  // by the next drain cycle the original inode is back at the path.  The
+  // kernel's IN_MOVED_FROM / IN_MOVED_TO / IN_CREATE fire regardless of
+  // when the polling loop ticks, so the directory watcher captures the
+  // transient swap.  Any `rename`-flavoured event whose filename matches
+  // the events-file basename (or is null on some kernels — be conservative
+  // and treat the event as tamper rather than ignore) records tamper.
+  let eventsDirWatcher: ReturnType<typeof fsWatch> | null = null;
+  if (
+    opts.eventsDirPath !== undefined &&
+    opts.eventsDirPath !== '' &&
+    opts.eventsFilePath !== undefined &&
+    opts.eventsFilePath !== ''
+  ) {
+    const expectedBasename =
+      opts.eventsFileBasename ?? opts.eventsFilePath.slice(opts.eventsFilePath.lastIndexOf('/') + 1);
+    try {
+      eventsDirWatcher = fsWatch(
+        opts.eventsDirPath,
+        { persistent: false },
+        (event, filename) => {
+          // Inotify maps `IN_MOVED_FROM`, `IN_MOVED_TO`, `IN_CREATE`,
+          // `IN_DELETE` to Node's "rename" event.  Any rename on our
+          // expected basename — or a null filename which Linux emits when
+          // the kernel cannot supply the name — is treated as tamper.
+          // `change` events on a sibling file (none should exist in the
+          // 0700 mkdtemp dir, but be defensive) are ignored.
+          if (event !== 'rename') return;
+          if (filename !== null && filename !== expectedBasename) return;
+          recordTamper(
+            `events file parent directory rename detected (filename=${filename ?? '<null>'}): ${opts.eventsDirPath}`,
+          );
+          // Also trigger an immediate drain — if the swap was a brief
+          // rename-aside/back, the file content visible to the tailer may
+          // have shifted, and the post-drain inode/mtime checks will pick
+          // up any additional mismatch.
+          drainEventsFile();
+          wake();
+        },
+      );
+      eventsDirWatcher.on('error', () => { /* polling is the fallback */ });
+    } catch {
+      // fs.watch unavailable on this fs — directory-level guard is best-
+      // effort; inode/mtime/size checks remain the primary line of defense.
+    }
+  }
+
   // Poll on a fixed interval as fallback / complement to fs.watch.
   let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
     pollDir();
@@ -486,7 +916,7 @@ export async function* runStraceTailer(
       for (const [name, partial] of fileBuf) {
         if (partial.length > 0) {
           const pid = parsePidFromFilename(name);
-          queue.push({ pid, line: partial });
+          queue.push({ pid, line: partial, source: 'strace' });
           fileBuf.set(name, '');
         }
       }
@@ -494,13 +924,22 @@ export async function* runStraceTailer(
       // emit \n-terminated lines, but POSIX doesn't require atomic writes
       // across newlines so a partial chunk is technically possible).
       if (eventsBuf.length > 0) {
-        queue.push({ pid: 0, line: eventsBuf });
+        // A trailing partial chunk on the shim channel is unusual but not
+        // necessarily malicious (writer crashed mid-line, kernel buffer
+        // boundary, etc.).  Still tag it `'shim'` so the install-phase
+        // dispatcher routes it to the shim parser; a parse failure there
+        // will record tamper, which is the right outcome — we cannot
+        // distinguish a benign torn write from a deliberate prefix
+        // injection at this layer.
+        queue.push({ pid: 0, line: eventsBuf, source: 'shim' });
         eventsBuf = '';
       }
       // Stop the poll timer.
       if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
       // Stop fs.watch.
       if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+      if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
+      if (eventsDirWatcher !== null) { try { eventsDirWatcher.close(); } catch { /* ignore */ } eventsDirWatcher = null; }
       done = true;
       wake();
     }, drainMs);
@@ -528,11 +967,13 @@ export async function* runStraceTailer(
     // Cleanup on early consumer break (try/finally).
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
     if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+    if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
+    if (eventsDirWatcher !== null) { try { eventsDirWatcher.close(); } catch { /* ignore */ } eventsDirWatcher = null; }
     // Drain any remaining partial lines (best-effort).
     for (const [name, partial] of fileBuf) {
       if (partial.length > 0) {
         const pid = parsePidFromFilename(name);
-        queue.push({ pid, line: partial });
+        queue.push({ pid, line: partial, source: 'strace' });
         fileBuf.set(name, '');
       }
     }
@@ -558,6 +999,16 @@ export interface SpawnResult {
   stderr: NodeJS.ReadableStream | null;
   /** stdio[3] is the fd-3 pipe (LD_PRELOAD JSONL). */
   stdio: Array<NodeJS.ReadableStream | null | undefined>;
+  /**
+   * The strace process pid.  Used by the runner (bug #1 fix,
+   * 2026-05-19) to query `/proc/<pid>/task/<pid>/children` and
+   * deterministically resolve the install command's pid (strace's
+   * direct child) without depending on per-pid strace file discovery
+   * order.  `undefined` when spawn failed catastrophically (e.g.
+   * ENOENT on the strace binary) — the runner falls back to the
+   * tailer's "first per-pid file observed" heuristic in that case.
+   */
+  pid: number | undefined;
   on(event: 'close', listener: (code: number | null) => void): this;
   on(event: 'error', listener: (err: Error) => void): this;
 }
@@ -569,37 +1020,248 @@ export type SpawnImpl = (
   opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: Array<string> },
 ) => SpawnResult;
 
+/**
+ * Codex follow-up (bug #1, high, 2026-05-19): deterministically resolve the
+ * pid of strace's direct child by polling
+ * `/proc/<stracePid>/task/<stracePid>/children` for ≤ `deadlineMs` (default
+ * 50ms, ≤10 iterations).  Strace's direct child IS the install command —
+ * `execve(install_cmd, ...)` happens under `PTRACE_TRACEME` immediately
+ * after fork() — so as soon as the children file contains exactly one pid
+ * we have the install root.
+ *
+ * Returns:
+ *   - the child pid on success,
+ *   - `null` when the deadline expires without a single pid appearing,
+ *   - `null` when MORE THAN ONE pid appears (ambiguous, e.g. strace itself
+ *     spawned a helper thread; the dispatcher's null path is the safe
+ *     conservative behaviour),
+ *   - `null` when `/proc` is unavailable (some test sandboxes, non-Linux
+ *     reads).
+ *
+ * Blocking is intentional: this runs ONCE per install, at agent startup
+ * before any user-visible work, in a sub-100ms window.  The event loop
+ * isn't carrying meaningful traffic at this point — the strace child has
+ * just been fork()'d and hasn't yet emitted any per-pid file output for
+ * the tailer to drain.
+ *
+ * Exported only so unit tests can exercise the parser without spawning
+ * a real strace.
+ */
+export function readStraceChildPid(
+  stracePid: number,
+  deadlineMs = 50,
+): number | null {
+  const start = Date.now();
+  // Cap iterations defensively in case `Date.now()` is somehow non-
+  // monotonic in the runtime (a virtualisation quirk we don't see today
+  // but is cheap to guard against).
+  for (let iter = 0; iter < 10; iter++) {
+    if (Date.now() - start >= deadlineMs) break;
+    let raw: string;
+    try {
+      raw = readFileSync(
+        `/proc/${stracePid}/task/${stracePid}/children`,
+        'utf8',
+      ).trim();
+    } catch {
+      // strace hasn't yet fork'd its child, or /proc is unavailable.
+      // Brief synchronous backoff via a tight busy-wait keyed on
+      // Date.now(); the deadline check above bounds total time.
+      const sleepStart = Date.now();
+      while (Date.now() - sleepStart < 5) { /* spin */ }
+      continue;
+    }
+    if (raw.length === 0) {
+      // No child observed yet — wait briefly and re-poll.  Same backoff
+      // strategy as the catch branch above.
+      const sleepStart = Date.now();
+      while (Date.now() - sleepStart < 5) { /* spin */ }
+      continue;
+    }
+    const pids = raw
+      .split(/\s+/)
+      .filter((s) => s.length > 0)
+      .map((s) => parseInt(s, 10))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (pids.length === 1) return pids[0] ?? null;
+    // Ambiguous (multiple children) — fail closed.
+    if (pids.length > 1) return null;
+    const sleepStart = Date.now();
+    while (Date.now() - sleepStart < 5) { /* spin */ }
+  }
+  return null;
+}
+
 export class LinuxStraceRunner implements StraceRunner {
   private _exitCode = 0;
   private readonly _spawnImpl: SpawnImpl;
+  private readonly _eventsFile: EventsFile | null;
+  private readonly _tamperRef: { reason: string | null } = { reason: null };
+  // Codex follow-up (bug #1, high, 2026-05-19): pid of the install
+  // command (strace's direct child) — captured the first time a
+  // per-pid strace output file is observed in `runStraceTailer`.
+  // Exposed via `getRootPid()` so the install-phase dispatcher can
+  // seed `pidCwd` for EXACTLY this pid instead of relying on a "first
+  // event yielded" heuristic that could mis-seed a child whose
+  // per-pid file happens to be drained before the parent's.  Null
+  // until the first per-pid file is observed (and remains null if
+  // strace failed to spawn).
+  private _rootPid: number | null = null;
 
-  constructor(spawnImpl?: SpawnImpl) {
+  /**
+   * @param spawnImpl  Injection seam for tests.  Production passes through
+   *                   to `node:child_process.spawn`.
+   * @param eventsFile Per-VM events-file handle (path + baseline inode/dev)
+   *                   created by the agent before strace launches.  When
+   *                   `null`, the runner does not point any writer at a
+   *                   shared events file — used by tests that supply a
+   *                   pre-set environment via the `opts.env` passed to
+   *                   `run()`.
+   */
+  constructor(spawnImpl?: SpawnImpl, eventsFile?: EventsFile | null) {
     this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
+    this._eventsFile = eventsFile ?? null;
   }
 
   getExitCode(): number {
     return this._exitCode;
   }
 
+  /**
+   * Returns the human-readable tamper reason recorded by the tailer's
+   * events-file watcher, or null if no tampering was observed.  Only
+   * meaningful after `run()` has been fully consumed.  Surface this in
+   * `main()` to force-fail check mode when an audited process unlinked or
+   * replaced the events file mid-install (Finding A).
+   */
+  getTamperReason(): string | null {
+    return this._tamperRef.reason;
+  }
+
+  /**
+   * Plumb a tamper reason from {@link runInstallPhase} (specifically: shim-
+   * channel JSONL parse failures) into the same `_tamperRef` slot that the
+   * events-file watcher uses.  First-writer-wins — once `_tamperRef.reason`
+   * is non-null, subsequent calls are dropped so the earliest signal (which
+   * is most likely the root cause) is preserved.
+   */
+  recordTamper(reason: string): void {
+    if (this._tamperRef.reason === null) {
+      this._tamperRef.reason = reason;
+    }
+  }
+
+  getRootPid(): number | null {
+    return this._rootPid;
+  }
+
   async *run(
     cmd: string,
     args: string[],
     opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
-  ): AsyncIterable<{ pid: number; line: string }> {
-    // Ensure the events file is created empty before any writer can open it.
-    // The shim and dlopen-block preload open with O_APPEND|O_CREAT, so a
-    // pre-existing file from a previous Phase B run would otherwise leak.
-    try {
-      writeFileSync(EVENTS_FILE_PATH, '', 'utf8');
-    } catch {
-      // Non-fatal: if /tmp isn't writable, the writers will just hit EACCES
-      // and the events file path is silently inert.  Phase B continues —
-      // strace events still flow through the per-pid files.
-    }
-
+  ): AsyncIterable<{ pid: number; line: string; source: LineSource }> {
+    // Audit-trust Finding 2 (high, 2026-05-18): strace's `-e trace=execve`
+    // does NOT cover `execveat`.  A lifecycle script that issues
+    // `syscall(SYS_execveat, AT_FDCWD, path, argv, envp, 0)` directly
+    // bypasses the libc execve wrapper (so the shim sees no exec event)
+    // AND, prior to this fix, also bypassed strace's observation entirely.
+    // Adding `execveat` to the trace set means the strace-vs-shim
+    // cross-check in phase-install can still flag the bypass as
+    // `<SYSCALL_EXEC_BYPASS>`.  The strace parser (strace-parser.ts) is
+    // updated in lockstep so an `execveat(...)` line produces the same
+    // `spawn` RawEvent shape as `execve(...)`.
+    // Audit-trust Finding 4 (high, 2026-05-18): strace's default string
+    // size is 32 bytes, which truncates long paths in `openat(...)` output
+    // (e.g. `/tmp/script-jail-events-abc123def4"...`) and silently
+    // defeats the exact-string events-file forgery check.  `-s 4096`
+    // raises the limit far above any realistic Linux PATH_MAX-ish input
+    // while keeping per-line output manageable.  Truncation can still
+    // happen for extreme payloads (argv with megabytes of args), but
+    // 4096 covers every realistic events-file path AND every
+    // realistic exec argv — and forgery detection only depends on the
+    // openat path being intact.
+    // Audit-trust Finding (high, 2026-05-19): include `chdir` and `fchdir`
+    // in the trace set so phase-install can maintain a per-pid CWD table.
+    // Without per-pid CWD tracking, a non-shim-loaded attacker pid could
+    // `chdir("/tmp/script-jail-events-XXX")` and then issue
+    // `openat(AT_FDCWD, "events.jsonl", O_APPEND|O_WRONLY)`; the
+    // canonicalizer would resolve the relative target against the AGENT's
+    // cwd (not the attacker's) and miss the equality check against the
+    // canonical events file path — silently dropping the
+    // `<EVENTS_FILE_FORGERY>` signal.  With `chdir`/`fchdir` traced, the
+    // dispatcher in `runInstallPhase` updates a `pidCwd` map and resolves
+    // AT_FDCWD-relative openat targets against the attacker's actual cwd.
+    // Audit-trust Finding (high, 2026-05-19): include `openat2` in the
+    // trace set.  Linux 5.6+ added openat2 as a more capable variant of
+    // openat (it takes a `struct open_how` instead of bare flags + mode
+    // and supports the RESOLVE_* sandboxing flags).  A raw-syscall
+    // child can `syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how))`
+    // to open the events file for write; without tracing openat2 the
+    // events-file forgery detector sees no openat line and the
+    // forgery slips past.  The strace parser learned `parseOpenat2` in
+    // lockstep so the wire-format struct argument is decoded for the
+    // flags field (write-bit detection) and the same RawEvent shape as
+    // openat is emitted.
+    // Audit-trust Finding (high, 2026-05-19): include legacy `open` and
+    // `creat` in the trace set.  glibc routes every userspace `open(...)`
+    // and `creat(...)` call through `openat(AT_FDCWD, ...)` on Linux, so
+    // most lifecycle scripts never invoke the legacy syscalls directly.
+    // BUT a native attacker can still issue raw `syscall(SYS_open,
+    // "/tmp/script-jail-events-XXX/events.jsonl", O_WRONLY|O_APPEND)`
+    // or `syscall(SYS_creat, path, mode)` to bypass the libc wrappers.
+    // Without tracing these syscalls strace sees nothing, the parser
+    // never emits a write RawEvent, and the events-file forgery
+    // detector is silently defeated.  The strace parser gained
+    // `parseOpen` and `parseCreat` in lockstep so each line produces
+    // the same `read`/`write` RawEvent shape as openat (creat is
+    // always a write — equivalent to `open(path, O_WRONLY|O_CREAT|
+    // O_TRUNC, mode)`); the dirfdTable in phase-install consumes
+    // `retFd` exactly like openat so a follow-up
+    // `openat(<creat-fd>, ...)` resolves correctly.
+    //
+    // Audit-trust Finding (high, 2026-05-19, codex follow-up): include
+    // `clone`, `clone3`, `vfork`, and `fork` so phase-install can
+    // propagate per-pid cwd and dirfd-table state to forked children at
+    // the moment the kernel creates them.  Without these, a child pid
+    // that inherits a parent's `chdir("/root")` produces an
+    // AT_FDCWD-relative openat that the dispatcher resolves with NO
+    // tracked cwd — pre-fix that fell back to `input.cwd`, silently
+    // dropping a `.ssh/id_rsa` probe.  Strace renders the syscalls as
+    //   `clone(child_stack=..., flags=...) = <child_pid>`,
+    //   `clone3({flags=..., ...}, <size>) = <child_pid>`,
+    //   `vfork() = <child_pid>`, `fork() = <child_pid>`.
+    // On the host's modern glibc, every fork goes through `clone` or
+    // `clone3`, but tracing all four costs nothing and immunises us
+    // against alpine/musl rootfs variants that still expose `fork(2)`.
+    //
+    // Audit-trust Finding (high, 2026-05-19, codex follow-up): include
+    // `dup`, `dup2`, `dup3`, `close`, and `close_range` so the dirfdTable
+    // can be invalidated when a pid mutates its fd table.  A process
+    // can `openat(AT_FDCWD, "/pkg", O_DIRECTORY) = 7`, then
+    // `openat(AT_FDCWD, "/root", O_DIRECTORY) = 8`, then untraced
+    // `dup2(8, 7)`, then `openat(7, ".ssh/id_rsa", O_RDONLY)`.  Without
+    // tracing the fd mutations the dirfdTable still maps `7 -> /pkg`,
+    // so the openat resolves to `/pkg/.ssh/id_rsa` and bypasses the
+    // protected-paths matcher.  After tracing them, phase-install
+    // propagates / invalidates the dirfdTable entry at the dup/close,
+    // and the openat either resolves correctly or fails closed via
+    // the `<UNRESOLVED_PATH>` audit_bypass entry.
+    //
+    // Audit-trust Finding (high, 2026-05-19, codex follow-up):
+    // include `fcntl` (and the 32-bit-arch variant `fcntl64`).  Pre-fix
+    // we deliberately omitted these because the cmd subcommand variety
+    // is large; phase-install now models the subcommands we care about
+    // (F_DUPFD / F_DUPFD_CLOEXEC / F_SETFD / F_GETFD) and falls back to
+    // `dirfdStateUnknown` for anything it doesn't recognise.  This
+    // closes the post-exec-CLOEXEC bypass: a script that opens a dirfd
+    // with O_CLOEXEC and then execs sees the kernel close the fd, but
+    // our dirfdTable would have kept the stale entry indefinitely
+    // without tracking the CLOEXEC bit + sweeping on exec.  Also catches
+    // F_SETFD FD_CLOEXEC mutations on previously-non-CLOEXEC fds.
     const straceArgs = [
       '-ff',
-      '-e', 'trace=openat,execve,connect,readlinkat,statx,renameat2,unlinkat,faccessat2',
+      '-s', '4096',
+      '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64,unshare',
       '-o', opts.basePath,
       cmd,
       ...args,
@@ -614,6 +1276,74 @@ export class LinuxStraceRunner implements StraceRunner {
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
       stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
     });
+
+    // Codex follow-up (bug #1, high, 2026-05-19): deterministically capture
+    // the install command's pid by reading `/proc/<strace_pid>/task/<strace_
+    // pid>/children` immediately after spawn.  strace's direct child IS the
+    // install command (strace exec'd it under PTRACE_TRACEME), so as soon as
+    // exactly one pid appears in the children file we have the install root.
+    //
+    // Why this beats the prior "first per-pid file observed" heuristic:
+    // strace writes one file per traced pid via `-ff -o <basePath>`.  The
+    // tailer polls the directory with readdirSync() + fs.watch(); readdir
+    // order is filesystem-dependent and fs.watch events are coalesced by
+    // the kernel.  Under load — or simply on tmpfs where dirents come back
+    // in inode order — a forked child's per-pid file can be discovered
+    // BEFORE the strace-root's.  Pre-fix we'd seed pidCwd[<child>] =
+    // input.cwd, certifying a wrong cwd for the child (whose actual cwd
+    // was inherited from a chdir'd parent) and slipping AT_FDCWD-relative
+    // probes past protected-paths.
+    //
+    // The /proc query is bounded (≤50ms / ≤10 iterations).  On the
+    // production guest, strace forks its child within a single scheduler
+    // quantum, so the loop usually completes on the first iteration.
+    //
+    // Codex follow-up (bug #3, high, 2026-05-19): TRI-STATE resolution.
+    // Pre-fix, the file-observation fallback (recordRootPid below) ran
+    // unconditionally — when readStraceChildPid returned null (timeout,
+    // /proc unavailable, ambiguous multi-child), `_rootPid` was left null
+    // here and the recordRootPid callback later happily seeded it from
+    // the first per-pid strace file the tailer drained.  That is EXACTLY
+    // the nondeterministic race we tried to eliminate (a forked child's
+    // file can be drained before the install command's).
+    //
+    // Strict fix: decide ONCE at spawn time which resolution mode to use,
+    // and disable the fallback when the /proc path was attempted but
+    // didn't yield a definite pid.
+    //
+    //   A. `child.pid` exists AND readStraceChildPid returned a pid:
+    //      use it; DISABLE the per-pid-file fallback (rootPid is pinned).
+    //   B. `child.pid` exists but readStraceChildPid returned null
+    //      (deadline expired, ambiguous multi-child, /proc unavailable):
+    //      leave `_rootPid` null AND DISABLE the per-pid-file fallback.
+    //      The dispatcher gets null from getRootPid(); no pid is seeded;
+    //      every pid fails closed on AT_FDCWD-relative opens until it
+    //      performs an observable chdir.  Conservative but correct.
+    //   C. `child.pid` is undefined (spawn impl returned a stub — test
+    //      fakes or a catastrophic failure where we can't query /proc
+    //      at all): KEEP the per-pid-file fallback for test convenience.
+    //      Production strace always produces a child.pid.
+    //
+    // The `_rootPidDeterministicResolution` flag captures the A/B vs C
+    // distinction so the callback wire-up below can branch on it.  Once
+    // true, no per-pid-file observation can clobber the decision — even
+    // if a malicious or unusual event order produces a sibling's file
+    // first.
+    let rootPidDeterministicResolution = false;
+    if (child.pid !== undefined) {
+      // Production path: /proc must be consulted before we install the
+      // tailer callback so the decision is fixed before any per-pid
+      // file is drained.
+      rootPidDeterministicResolution = true;
+      const pid = readStraceChildPid(child.pid);
+      if (pid !== null) {
+        this._rootPid = pid;
+      }
+      // If pid === null we leave _rootPid as null and the dispatcher
+      // fails closed.  The recordRootPid callback below is suppressed.
+    }
+    // Else: child.pid is undefined → spawn-stub / test path; allow the
+    // per-pid-file fallback to seed _rootPid below.
 
     const exitPromise = new Promise<void>((resolve) => {
       child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });
@@ -642,8 +1372,32 @@ export class LinuxStraceRunner implements StraceRunner {
         watchDir,
         basePrefix,
         fd3Stream,
-        eventsFilePath: EVENTS_FILE_PATH,
+        ...(this._eventsFile !== null ? {
+          eventsFilePath: this._eventsFile.path,
+          eventsBaseline: this._eventsFile.baseline,
+          eventsDirPath: this._eventsFile.dirPath,
+          eventsFileBasename: basename(this._eventsFile.path),
+          tamperRef: this._tamperRef,
+        } : {}),
         exitPromise,
+        // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
+        // fallback runs ONLY when the /proc-based deterministic
+        // resolution was not attempted (i.e. child.pid was undefined,
+        // typically a test spawn stub).  When the /proc path was
+        // attempted but returned null (timeout, ambiguous,
+        // unavailable), `rootPidDeterministicResolution` is true and
+        // we deliberately DO NOT install this callback — the
+        // dispatcher gets `null` from `getRootPid()` and fails closed.
+        // First-writer-wins between the (single) /proc resolution and
+        // the file-observation fallback is therefore replaced with a
+        // mutually-exclusive decision made at spawn time.
+        ...(rootPidDeterministicResolution
+          ? {}
+          : {
+              recordRootPid: (pid: number): void => {
+                if (this._rootPid === null) this._rootPid = pid;
+              },
+            }),
       });
     } finally {
       if (stderrRl !== null) {
@@ -716,16 +1470,182 @@ async function waitForGo(readable: Readable): Promise<void> {
 // Build env dict for child processes
 // ---------------------------------------------------------------------------
 
-function buildChildEnv(
+/**
+ * @internal Exported for unit tests only — production calls this from
+ * `main()`.  The over-long-protect-list rejection (audit-trust Finding 2)
+ * is the load-bearing invariant tested via this surface.
+ */
+export function buildChildEnv(
   baseEnv: NodeJS.ProcessEnv,
   config: AgentConfig,
-  protectedEnvFilePath: string,
+  eventsFilePath: string,
 ): NodeJS.ProcessEnv {
   const preloads = [
     '/usr/local/lib/script-jail/dlopen-block.cjs',
     '/usr/local/lib/script-jail/platform-spoof.cjs',
     '/usr/local/lib/script-jail/env-spy.cjs',
   ];
+
+  // `--no-addons` (Finding C) disables native-addon loading at the V8 level:
+  // process.dlopen throws and `internalBinding('process_methods').dlopen`
+  // refuses to load any `.node` file.  Without this flag a lifecycle script
+  // run as `node --expose-internals ...` could reach the internalBinding
+  // dlopen path directly, bypassing the JS `dlopen-block.cjs` preload (which
+  // only patches process.dlopen / process.binding).  The Rust shim never
+  // sees the syscall because Node-loaded .node files come through dlopen()
+  // already-resolved through the runtime, but the audit chain only catches
+  // the JS-surface call.  Setting --no-addons closes the bypass at the
+  // engine level.
+  //
+  // Order matters: we PREPEND --no-addons so it can never be neutralised by
+  // an attacker-controlled flag that comes earlier in NODE_OPTIONS.  The
+  // existing --require entries follow it.
+  const noAddons = '--no-addons';
+  const requireFlags = preloads.map((p) => `--require=${p}`);
+  const childNodeOptions = [noAddons, ...requireFlags].join(' ');
+
+  // Finding 4 (audit-trust): the protected-env list used to be written to
+  // `/tmp/script-jail-protected.txt` and the path leaked through the child
+  // env via `SCRIPT_JAIL_PROTECTED_ENV_FILE`.  A lifecycle script running
+  // as the same UID could truncate or overwrite the file before spawning a
+  // child; the child's shim would then load the attacker's weakened list at
+  // `shim_init` time and stop hiding NPM_TOKEN / GH_TOKEN / etc.
+  //
+  // The replacement encodes the list directly as a comma-separated env var
+  // (`SCRIPT_JAIL_PROTECTED_ENV_NAMES`).  The shim captures it into a
+  // CanonBuf at `shim_init` (before any audited code runs) and the existing
+  // exec-rewrite (`STICKY_VARS` in src/shim/src/lib.rs) re-injects the
+  // canonical value on every exec — so attackers cannot strip the entry from
+  // a descendant's envp either.  The name itself is also added to
+  // `AUDIT_PROTECTED_NAMES`, so setenv/unsetenv/putenv attempts to mutate it
+  // are refused and audited.
+  //
+  // Comma is the separator: per shim-side parsing, names containing ',' are
+  // not valid POSIX env-var names anyway (POSIX permits [A-Za-z_][A-Za-z0-9_]*),
+  // so the channel is unambiguous.
+  //
+  // Audit-trust Finding 5 (medium, 2026-05-18): validate each entry as a
+  // strict env-var name BEFORE applying the entry-count and byte-length
+  // caps.  Previously the count check counted YAML array entries, but the
+  // shim and env-spy parsers split on ',' and '\n' at runtime — a single
+  // YAML string `"FOO,BAR,...,A65"` containing 65 names would pass the
+  // entry-count gate (1 entry) but the shim's
+  // `load_protect_list_from_bytes` would silently truncate after entry 64
+  // and the dropped names would leak unannotated.
+  //
+  // The chosen alternative is the stricter form: refuse any entry that
+  // does not match the POSIX env-var name grammar
+  // `[A-Za-z_][A-Za-z0-9_]*`.  This rejects:
+  //   * entries containing ',' (the wire separator).
+  //   * entries containing '\n' (the alternate wire separator).
+  //   * entries containing whitespace, '#', or any other byte that the
+  //     shim parser would strip / interpret specially.
+  // It also rejects leading-digit names — those would parse via the wire
+  // format but cannot be set via the shell anyway (POSIX shells refuse
+  // `1FOO=bar` assignment), so accepting them would be misleading.
+  //
+  // We fire this check FIRST so the error message points at the offending
+  // YAML entry rather than at a downstream symptom (count cap, byte cap).
+  // An empty entry is also rejected — those would be silently skipped by
+  // the shim parser and the operator would not learn that the secret
+  // they meant to protect never made it into the list.
+  const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  for (const [idx, name] of config.protected.env.entries()) {
+    if (typeof name !== 'string' || name.length === 0) {
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] is empty or not a string; ` +
+          `each \`protected.env\` entry must be a non-empty env-var name matching ` +
+          `${ENV_NAME_RE.source}.`,
+      );
+    }
+    if (!ENV_NAME_RE.test(name)) {
+      // Surface a specific diagnostic for the two highest-signal cases
+      // (comma / newline) since those produce the silent-truncation
+      // bypass Finding 5 fixes.
+      let detail: string;
+      if (name.includes(',')) {
+        detail =
+          'must not contain a comma — the shim parser splits the wire format on `,` ' +
+          'and would treat the entry as multiple names, defeating the entry-count cap.';
+      } else if (name.includes('\n')) {
+        detail =
+          'must not contain a newline — the shim parser splits the wire format on `\\n` ' +
+          'and would treat the entry as multiple names, defeating the entry-count cap.';
+      } else {
+        detail =
+          `must match ${ENV_NAME_RE.source} (POSIX env-var name grammar).  ` +
+          'Whitespace, comments, and non-ASCII bytes are rejected to avoid silent ' +
+          'splitting / stripping inside the shim parser.';
+      }
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] (${JSON.stringify(name)}) ${detail}`,
+      );
+    }
+  }
+
+  const protectedNames = config.protected.env.join(',');
+
+  // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list
+  // table has a fixed capacity (`MAX_PROTECTED` entries, each at most
+  // `NAME_MAX_LEN - 1 = 255` bytes).  An overall byte-length check by
+  // itself is not enough: a config of 100 short names (`A`,`B`,`C`,…) is
+  // well under the 1023-byte CanonBuf cap but would silently drop every
+  // entry past index 64 inside `load_protect_list_from_bytes` — those
+  // names would leak through env-spy / shim getenv unannotated, exactly
+  // the silent-truncation bug Finding 2 fixed for byte-length.
+  //
+  // Two specific guards: entry count and per-entry byte length.  Both
+  // throw with a precise pointer at the offending entry so the action
+  // operator can fix the misconfiguration without grepping the shim
+  // source.  Both fire BEFORE the byte-length check below so a config
+  // that violates multiple caps surfaces the most actionable error first.
+  if (config.protected.env.length > MAX_PROTECTED_ENV_NAMES) {
+    throw new Error(
+      `SCRIPT_JAIL_PROTECTED_ENV_NAMES has ${config.protected.env.length} entries; ` +
+        `the LD_PRELOAD shim's static protect-list table can hold at most ` +
+        `${MAX_PROTECTED_ENV_NAMES} entries before silently dropping the suffix and ` +
+        `leaking the dropped names unannotated.  Reduce the \`protected.env\` ` +
+        `list in .script-jail.yml (or split secrets across multiple runs).`,
+    );
+  }
+  for (const [idx, name] of config.protected.env.entries()) {
+    const nameByteLen = Buffer.byteLength(name, 'utf8');
+    if (nameByteLen > PROTECTED_NAME_MAX_LEN) {
+      throw new Error(
+        `SCRIPT_JAIL_PROTECTED_ENV_NAMES entry [${idx}] is ${nameByteLen} bytes ` +
+          `(${JSON.stringify(name)}); the LD_PRELOAD shim's per-entry buffer can ` +
+          `hold at most ${PROTECTED_NAME_MAX_LEN} bytes before silently dropping the ` +
+          `entry and leaking the env-var name unannotated.  Shorten or remove ` +
+          `the entry in the \`protected.env\` list in .script-jail.yml.`,
+      );
+    }
+  }
+
+  // Audit-trust Finding 2: the shim's `capture_canon` in `src/shim/src/lib.rs`
+  // copies `SCRIPT_JAIL_PROTECTED_ENV_NAMES` into a fixed-size CanonBuf
+  // (CANON_BUF_LEN = 1024 bytes including NUL).  If the host composes a list
+  // whose UTF-8 encoding exceeds CANON_BUF_LEN - 1 = 1023 bytes, the shim
+  // SILENTLY truncates the suffix at copy time and the dropped names are
+  // never registered in the protect list — those env-var names would then
+  // leak through env-spy / shim getenv unannotated for every audited child.
+  //
+  // Fail closed at config-construction time on the trusted host side, before
+  // any audit begins.  `Buffer.byteLength('utf8')` matches what the shim sees:
+  // libc passes the env var's raw bytes through to `capture_canon`, which
+  // copies byte-by-byte until either NUL or CANON_BUF_LEN-1 is reached.
+  // Throwing here surfaces the misconfiguration directly to the action
+  // operator rather than producing a misleadingly-clean lockfile.
+  const protectedNamesByteLen = Buffer.byteLength(protectedNames, 'utf8');
+  if (protectedNamesByteLen > CANON_PROTECTED_ENV_NAMES_MAX_LEN) {
+    throw new Error(
+      `SCRIPT_JAIL_PROTECTED_ENV_NAMES is ${protectedNamesByteLen} bytes ` +
+        `(comma-joined from ${config.protected.env.length} entries); the LD_PRELOAD ` +
+        `shim's CanonBuf can hold at most ${CANON_PROTECTED_ENV_NAMES_MAX_LEN} bytes ` +
+        `before silently truncating the suffix and leaking the dropped names ` +
+        `unannotated.  Reduce the \`protected.env\` list in .script-jail.yml ` +
+        `(or split secrets across multiple runs).`,
+    );
+  }
 
   return {
     ...baseEnv,
@@ -737,24 +1657,160 @@ function buildChildEnv(
     // the spawn — a known file path.  Both writers use O_WRONLY|O_APPEND
     // so concurrent writes don't race on file offset; POSIX makes writes
     // smaller than PIPE_BUF atomic on regular files.
-    SCRIPT_JAIL_LOG_FILE: EVENTS_FILE_PATH,
+    //
+    // The path is generated per-VM via `createEventsFile` (mkdtemp + 0700
+    // dir + O_EXCL file) so its name is unguessable; the agent also
+    // captures the file's inode/device at creation and the tailer re-stats
+    // on every drain cycle to detect unlink/replace/truncate attempts by
+    // a malicious lifecycle script.  See {@link createEventsFile}.
+    SCRIPT_JAIL_LOG_FILE: eventsFilePath,
     SCRIPT_JAIL_LOG_FD: String(config.log_fd),
-    SCRIPT_JAIL_PROTECTED_ENV_FILE: protectedEnvFilePath,
+    SCRIPT_JAIL_PROTECTED_ENV_NAMES: protectedNames,
+    SCRIPT_JAIL_PRELOAD_PATH: '/lib/libscriptjail.so',
     SCRIPT_JAIL_SPOOF_PLATFORM: config.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config.spoof.arch,
+    // Canonical sticky value the Rust shim's `shim_init` captures into
+    // CANON_NODE_OPTIONS via real_getenv_raw() and re-injects on every exec
+    // (see src/shim/src/lib.rs).  --no-addons is included so descendants
+    // inherit the bypass-block at every fork+exec boundary, even when the
+    // immediate caller scrubs NODE_OPTIONS.
+    SCRIPT_JAIL_NODE_OPTIONS: childNodeOptions,
     NODE_OPTIONS: [
       ...(baseEnv['NODE_OPTIONS'] ? [baseEnv['NODE_OPTIONS']] : []),
-      ...preloads.map((p) => `--require=${p}`),
+      noAddons,
+      ...requireFlags,
     ].join(' '),
   };
 }
 
 /**
- * Absolute path of the shared JSONL events file.  The shim and the dlopen-block
- * preload append events here; the agent tails this file alongside the per-pid
- * strace output files.  Lives under /tmp (rootfs tmpfs) so it's reset per VM.
+ * Per-VM events-file handle.  BOTH the parent directory AND the file
+ * basename are randomized per VM run.  The directory is created via
+ * mkdtemp with mode 0700; the file itself is opened with O_CREAT|O_EXCL
+ * so we know nothing pre-existed.  `baseline` captures the {inode, device}
+ * pair at creation so the tailer can re-stat on every drain cycle and detect
+ * unlink / replace / truncate / symlink-swap by an audited lifecycle script.
+ *
+ * SECURITY: the static `/tmp/script-jail-events.jsonl` path that preceded
+ * this was a trivial target — `rm /tmp/script-jail-events.jsonl` from a
+ * postinstall script erased the audit trail before the agent could read it,
+ * and the file's only consumer (the tailer) treated ENOENT as a silent no-op.
+ * Randomizing the path raises the bar against blind-target attacks, and the
+ * inode/dev baseline + tailer fail-closed gate catches the case where an
+ * attacker discovers the path via /proc/self/environ.
+ *
+ * Randomizing the BASENAME (not just the parent directory) is also load-
+ * bearing for the Layer-1 forgery detector in `phase-install.ts`: that
+ * detector flags any non-shim-loaded openat-write whose target basename
+ * equals the events file basename.  With a generic basename like
+ * `events.jsonl`, a legitimate package that writes `./events.jsonl`
+ * would be falsely flagged.  A per-run random basename
+ * (`events-<32-hex>.jsonl`) eliminates that collision while preserving
+ * the detector for genuine forgery attempts that scrape
+ * `SCRIPT_JAIL_LOG_FILE`.
  */
-export const EVENTS_FILE_PATH = '/tmp/script-jail-events.jsonl';
+export interface EventsFile {
+  /** Absolute path of the JSONL events file inside the VM. */
+  path: string;
+  /** Directory containing the file (mode 0700, mkdtemp-generated). */
+  dirPath: string;
+  /**
+   * Baseline {inode, device, mtimeNs, ctimeNs} pair, captured at creation
+   * via fstat.  The tailer compares dev/ino on every drain to detect
+   * unlink+recreate / symlink swap.  `ctimeNs` and `mtimeNs` are captured
+   * additionally to detect the "utimes restore" tamper: a same-UID attacker
+   * who appends to the file, truncates back to the previous size, and then
+   * calls `utimes(path, atime, oldMtime)` can defeat a pure mtime-based
+   * check (since mtime is settable) — but ctime is set by the kernel on
+   * every metadata or content modification and CANNOT be reset by utimes,
+   * making it a stronger signal that something happened to the file after
+   * our last successful drain.  See `drainEventsFile` in `runStraceTailer`
+   * for the use sites.
+   */
+  baseline: { ino: bigint; dev: bigint; mtimeNs: bigint; ctimeNs: bigint };
+}
+
+/**
+ * Create the per-VM events file under a fresh 0700 tmpdir and return its
+ * handle.  Called by `main()` BEFORE strace launches so the path is set in
+ * `SCRIPT_JAIL_LOG_FILE` (via `buildChildEnv`) and the baseline can be
+ * compared on every drain cycle.
+ *
+ * Implementation notes:
+ *   - `mkdtempSync` returns a path with mode 0700 by default.
+ *   - The file is opened with O_RDWR|O_CREAT|O_EXCL so we know we hold the
+ *     fresh inode; if the path somehow already exists (it shouldn't, mkdtemp
+ *     is unique), we fail rather than rebind to a foreign file.
+ *   - fstat-on-fd captures dev+ino atomically with the create; nothing can
+ *     race the create-then-stat pair.
+ */
+export function createEventsFile(parentDir: string = '/tmp'): EventsFile {
+  // Audit-trust Finding (medium, 2026-05-19): the events file basename
+  // must NOT be a generic name like `events.jsonl`.  The Layer-1
+  // basename safety net in `phase-install.ts` flags any non-shim-loaded
+  // openat-write whose target basename equals the events file basename.
+  // With a fixed `events.jsonl` basename, a legitimate package that
+  // happens to write `./events.jsonl` (no chdir, just a relative path
+  // in the cwd) would be falsely flagged as `<EVENTS_FILE_FORGERY>`.
+  //
+  // Generate a single cryptographic-random tag at create time and use
+  // it for BOTH the directory name (which mkdtemp already randomizes
+  // via its `XXXXXX` template, but we use our tag explicitly so the
+  // file basename can share the same tag) AND the filename:
+  //   /tmp/script-jail-events-<tag>/events-<tag>.jsonl
+  // The basename `events-<tag>.jsonl` is then a 32-hex-character string
+  // a package cannot guess in a single run, eliminating the false
+  // positive while preserving Layer 1 against a same-rootfs attacker
+  // that scrapes SCRIPT_JAIL_LOG_FILE.
+  //
+  // 16 random bytes → 32 hex chars; the birthday-collision space (~2^64)
+  // is comfortably beyond any realistic guess budget inside one install.
+  const tag = randomBytes(16).toString('hex');
+  // We still use mkdtempSync for the directory create — it gives us
+  // atomic O_EXCL semantics on the directory and is the established
+  // safe primitive.  Append our random tag to the prefix so the final
+  // directory name is `script-jail-events-<tag>XXXXXX` (mkdtemp
+  // requires a `XXXXXX`-template suffix).  The leading `<tag>` is what
+  // we use for the file basename — the trailing 6 chars from mkdtemp
+  // are extra entropy we discard from the filename derivation.
+  const dirPath = mkdtempSync(joinPath(parentDir, `script-jail-events-${tag}-`));
+  // mkdtempSync is defined by POSIX to create with mode 0700 (umask is
+  // not applied), but enforce it explicitly so the Finding-B parent-
+  // directory guard does not rely on platform-default behaviour.  A
+  // weakened mode here would let a non-root caller create decoy files at
+  // a colliding path inside the watched directory.
+  chmodSync(dirPath, 0o700);
+  const path = joinPath(dirPath, `events-${tag}.jsonl`);
+  // O_NOFOLLOW refuses to traverse a symlink at the final path component.
+  // Defends a future code path that creates the events file in a less-
+  // restricted location: if anything has dropped a symlink at our path
+  // before we open(), open() fails with ELOOP rather than rebinding our
+  // writers to an attacker-chosen target.  O_EXCL already protects this
+  // specific create call (mkdtemp + unique name), but O_NOFOLLOW costs
+  // nothing and closes the door to a class of TOCTOU-via-symlink swaps
+  // on any future variant that reuses this helper.
+  const fd = openSync(
+    path,
+    // eslint-disable-next-line no-bitwise -- POSIX open flag composition
+    fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  let baseline: { ino: bigint; dev: bigint; mtimeNs: bigint; ctimeNs: bigint };
+  try {
+    const s = fstatSync(fd, { bigint: true });
+    // ctimeNs (status-change time) is captured in addition to mtimeNs
+    // because ctime is the only mtime-class field that cannot be reset by
+    // utimes(2): the kernel updates it on EVERY metadata or content
+    // modification, including content writes, truncates, chmod, AND a
+    // utimes() call itself.  A utimes-restore tamper bumps ctime but leaves
+    // mtime where the attacker pinned it — so tracking ctime monotonicity
+    // post-create catches the attack that pure mtime monotonicity misses.
+    baseline = { ino: s.ino, dev: s.dev, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
+  } finally {
+    closeSync(fd);
+  }
+  return { path, dirPath, baseline };
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -814,6 +1870,16 @@ export interface AgentInput {
    * to capture breadcrumbs in-process instead of polluting test stderr.
    */
   diag?: (msg: string) => void;
+  /**
+   * Injection seam for {@link createEventsFile}.  Production uses the
+   * default (mkdtemp + open with O_EXCL|O_NOFOLLOW under `/tmp`).  Tests
+   * inject a fake to simulate the file-create failure path (e.g.
+   * EMFILE / EACCES / EEXIST race) without arranging a read-only /tmp,
+   * and to assert the agent fails closed instead of silently falling
+   * back to an empty `SCRIPT_JAIL_LOG_FILE`.  Returning a value behaves
+   * like the production helper; throwing exercises the fail-closed gate.
+   */
+  createEventsFile?: () => EventsFile;
 }
 
 /**
@@ -924,16 +1990,55 @@ export async function main(input: AgentInput): Promise<void> {
   const manager = config.manager ?? detectManager(config.work_dir);
   diag(input, `manager resolved: ${manager}`);
 
-  // 4. Write protected-env file to a temp location
-  const protectedEnvPath = '/tmp/script-jail-protected.txt';
-  writeFileSync(protectedEnvPath, config.protected.env.join('\n') + '\n', 'utf8');
+  // 4. Create the audit-events file under a per-VM 0700 tmpdir BEFORE the
+  //     child env is built so SCRIPT_JAIL_LOG_FILE points at this fresh path.
+  //     The file's {inode, device} baseline is recorded and re-checked by the
+  //     tailer on every drain cycle (Finding A).  If anything inside the VM
+  //     unlinks / replaces / truncates the file, the agent fails closed and
+  //     never emits a final lockfile — `findAuditBypass` cannot help if the
+  //     evidence of an `envp_alloc_failed` was erased before the agent saw it.
+  //
+  //     Failure to create the file (EACCES on a read-only /tmp, EMFILE on
+  //     fd exhaustion, EEXIST race against another tenant, etc.) is FATAL.
+  //     The previous fallback path set SCRIPT_JAIL_LOG_FILE="" and continued,
+  //     hoping the inherited fd 3 would carry audit traffic — but npm spawns
+  //     lifecycle children with `stdio: 'inherit'`, which only propagates
+  //     fds 0–2.  Any descendant Node process beyond the first child loses
+  //     the audit sink entirely: env_read / dlopen / exec / env_tamper events
+  //     would be written into the void, producing a final lockfile with
+  //     missing signals that the audit_bypass gate (fe13357) and tamper
+  //     detection (81d238e) cannot recover.  A transient /tmp blip would
+  //     silently degrade the audit — so we bail with a fatal error frame
+  //     instead.  The injection seam (`input.createEventsFile`) lets tests
+  //     exercise this branch deterministically.
+  const makeEventsFile = input.createEventsFile ?? createEventsFile;
+  let eventsFile: EventsFile;
+  try {
+    eventsFile = makeEventsFile();
+  } catch (err) {
+    // Surface the error class/message but not the path — `/tmp/script-jail-
+    // events-<random>` is short-lived and not sensitive, yet keeping the
+    // diagnostic compact avoids leaking guest tmpdir layout to the host log.
+    const reason = err instanceof Error ? err.message : String(err);
+    emitter.emitError(
+      `script-jail agent: failed to create audit-events file — ${reason}. ` +
+        'Refusing to proceed: descendants of the install child only inherit ' +
+        'fds 0–2 (stdio: inherit), so without SCRIPT_JAIL_LOG_FILE pointing ' +
+        'at a real path the audit pipeline loses env_read / dlopen / exec / ' +
+        'env_tamper events from grandchildren.',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+  const eventsFilePath = eventsFile.path;
 
   // 5. Build child environment
-  const childEnv = buildChildEnv(process.env, config, protectedEnvPath);
+  const childEnv = buildChildEnv(process.env, config, eventsFilePath);
 
   // 6. Set up spawner (Phase A) and strace runner (Phase B)
   const spawner: Spawner = input.spawner ?? new LinuxSpawner();
-  const straceRunner: StraceRunner = input.strace ?? new LinuxStraceRunner();
+  const straceRunner: StraceRunner = input.strace ?? new LinuxStraceRunner(undefined, eventsFile);
 
   // 7. Attribution (reads /proc; real ProcReader in production)
   const attribution = new Attribution(new LinuxProcReader());
@@ -1107,6 +2212,45 @@ export async function main(input: AgentInput): Promise<void> {
     );
     input.connection.close();
     process.exitCode = installResult.exitCode;
+    return;
+  }
+
+  // 11b. Events-file tamper check (Findings A + B): the tailer baseline-
+  //      stats the SCRIPT_JAIL_LOG_FILE path on every drain cycle and records
+  //      any anomaly (unlink, inode mismatch, truncate, EACCES, parent-dir
+  //      rename, mtime regression, max-seen-size shrink).  An audit bypass
+  //      that erased its own `audit_bypass` entry would still leave this
+  //      tamper signal because the inode/dev pair is captured BEFORE any
+  //      audited code runs.  Fail closed — the host sees this as "vsock
+  //      session ended without a final frame" plus the error frame.
+  //
+  //      Finding D: the gate dispatches on the `StraceRunner` interface
+  //      contract (`getTamperReason()`), NOT on `instanceof
+  //      LinuxStraceRunner`.  Any runner implementation — wrapper,
+  //      decorator, alternative production runner — that observes tamper
+  //      can report it and force a fail-closed path through `main()`
+  //      without subclassing the canonical Linux runner.  Tests that don't
+  //      audit a shared events file simply return `null` and the gate is
+  //      a no-op for them.
+  //
+  //      Finding 2 (audit-trust): we ALSO consult
+  //      `installResult.tamperReason`, owned directly by `runInstallPhase`.
+  //      The StraceRunner.recordTamper() contract allows no-op
+  //      implementations, so the install-phase dispatcher cannot rely on
+  //      the runner to surface shim-channel parse failures or unknown
+  //      LineSource discriminator values via getTamperReason().  Treat
+  //      either signal as fatal — defence in depth.  First-non-null wins
+  //      so the earliest, most specific reason makes it into the error
+  //      frame.
+  const tamperReason =
+    installResult.tamperReason ?? straceRunner.getTamperReason();
+  if (tamperReason !== null) {
+    emitter.emitError(
+      `audit pipeline tampered with: ${tamperReason}. ` +
+        'Refusing to emit a final lockfile — a clean diff would be untrustworthy.',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
     return;
   }
 

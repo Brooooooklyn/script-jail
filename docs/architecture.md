@@ -39,16 +39,30 @@ Key files:
 
 - `src/guest/strace-parser.ts` — parses `openat`, `connect`, `execve` strace lines.
 - `src/guest/protected-paths.ts` — replaces values for protected paths/env-vars with `<HIDDEN>`; drops `ENOENT` probes for unprotected paths so the audit reflects intent, not noise.
-- `src/guest/attribution.ts` + `proc-reader.ts` — map a pid to the owning package using `/proc/<pid>/cwd` and the discovered `node_modules` tree.
+- `src/guest/attribution.ts` + `proc-reader.ts` — walk `/proc/<pid>/status` PPid chain looking for an ancestor whose `environ` carries `npm_package_name` + a canonical `npm_lifecycle_event`. Results are cached per starting pid; `invalidate(pid)` drops the cache so a recycled pid re-walks `/proc`.
 - `src/lock/normalize.ts` — drops reads inside the owning package's own directory; marks cross-package writes; coalesces duplicates.
 - `src/lock/tokenize.ts` — substitutes `$PKG`, `$NODE_MODULES`, `$HOME`, `$REPO`, `$CACHE`, `$TMP` for absolute paths.
 - `src/lock/render.ts` — emits canonical YAML.
+
+### Attribution and snapshot lifecycle
+
+`Attribution.attribute(pid)` returns a `{ pkg, lifecycle }` pair by walking the pid's `/proc/<pid>/status` PPid chain and reading each ancestor's `environ`. The walk terminates at pid 0/1 or when `readPpid` returns null. Results are cached per starting pid.
+
+The phase-install dispatcher layers a per-pid **attribution snapshot** on top of the cache so fallback paths can attribute events even when `/proc` is no longer authoritative (child reaped, envp scrubbed by a raw `execve`, etc.). Each snapshot carries `{ pkg, lifecycle, recordedAtTs, stale }`:
+
+- **`recordedAtTs`** is the monotonic dispatcher ts of the line that wrote the snapshot. `recordAttribution` only overwrites an entry when the incoming ts is `>=` the stored ts. This protects against strace `-ff` cross-file ordering: per-pid trace files are drained in filesystem order, not happens-before, so a new generation's `clone(...) = <recycledPid>` line can be processed before an older generation's delayed `+++ exited +++` line. The ts gate ensures the older event can't clobber the fresh snapshot.
+
+- **`stale`** is set to `true` on the exit line when `/proc` also returns null for the pid (the recycled generation hasn't set up `/proc` yet, or there is no recycled generation). Snapshots are never evicted on exit — the never-evict policy is required because no available signal (dispatcher ts, `/proc` liveness, outstanding-clones counter) can distinguish "normal clone-then-exit" from "delayed old-exit observed after a recycled clone" from observation order alone. Instead, fallback paths treat stale snapshots as missing: forgery attribution and bypass synthesis skip them, the spawn fallback still emits the event but routes it to `<unattributed>`, and the clone-parent-lookup re-attributes via `/proc`. When a delayed clone eventually arrives, `recordAttribution` writes a fresh entry (`stale: false`) and the package label resumes.
+
+- The dispatcher calls `Attribution.invalidate(pid)` twice on every exit line — once before the post-invalidate liveness probe (so the probe doesn't read a dead-generation cached pkg), and once after (so a later recycle triggers a fresh walk rather than reading a cached null).
+
+This model evolved through several rounds of Codex adversarial review (commits `e5af2be` → `f6a8d34` on `feat/exec-shim-env-reinject`); the final design is documented in-line at the exit-line handler in `src/guest/phase-install.ts`.
 
 ## Preload stack
 
 | Layer | File | Catches |
 | --- | --- | --- |
-| Rust `LD_PRELOAD` shim | `src/shim/src/lib.rs` → `libscriptjail.so` | libc `getenv` / `secure_getenv` / `__secure_getenv` (covers libuv, native addons, child binaries inheriting env). |
+| Rust `LD_PRELOAD` shim | `src/shim/src/lib.rs` → `libscriptjail.so` | libc `getenv` / `secure_getenv` / `__secure_getenv` (covers libuv, native addons, child binaries inheriting env); `execve` / `execv` / `execvp` / `execvpe` / `execveat` / `fexecve` / `posix_spawn` / `posix_spawnp` (re-injects audit env vars on every exec); `setenv` / `unsetenv` / `putenv` / `clearenv` (refuses tampering of protected names). |
 | Node `--require` JS | `src/guest/env-spy.cjs` | JS `process.env.X` reads (Node copies env into a JS object early; `getenv` won't see these). |
 | Node `--require` JS | `src/guest/dlopen-block.cjs` | `process.dlopen` calls — blocks native addons before they map. |
 | Node `--require` JS | `src/guest/platform-spoof.cjs` | spoofs `process.platform` / `process.arch` to flush out OS-conditioned attack branches. |
@@ -76,11 +90,29 @@ Env-var reads need both the libc shim and the JS preload because they sit on opp
 
 **Critical detail — the Proxy receiver.** In the `get` / `set` traps, forward via `Reflect.get(target, prop, target)` (and the equivalent for `set`), passing `target` — not the Proxy — as the receiver. `process.env` is a host-side `EnvironmentVariableNamespace` object whose accessors use `this` to find the underlying environment store. When the receiver is the Proxy, Node can't locate the store and reads silently return wrong values, which breaks `child_process.spawn` with no diagnostic. The equivalent member-access form (`target[prop]`) also works.
 
-**Unified event shape.** Both layers emit the same JSONL line — `{"kind":"env_read","name":...,"pid":...,"ts":...,"hidden":...}` — to `SCRIPT_JAIL_LOG_FILE` (preferred) or `SCRIPT_JAIL_LOG_FD` (tests). Writes are kept ≤ `PIPE_BUF` so they are atomic. Downstream, normalize dedupes, attribution maps `pid` → owning package + lifecycle stage, and the renderer emits one `env_read:` block per package.
+**Unified event shape.** Both layers emit JSONL to `SCRIPT_JAIL_LOG_FILE` (preferred) or `SCRIPT_JAIL_LOG_FD` (tests), one of three `kind`s:
+
+- `env_read` — `{"kind":"env_read","name":...,"pid":...,"ts":...,"hidden":...}` emitted by every libc `getenv` / JS `process.env.X` read of a name on the protected list.
+- `exec` — `{"kind":"exec","prog":...,"argv0":...,"pid":...,"ts":...,"envp_alloc_failed"?:...}` emitted by the shim's exec wrappers (`execve` / `execv*` / `execveat` / `fexecve` / `posix_spawn[p]`) before forwarding to the real symbol. The optional `envp_alloc_failed` flag fires when env re-injection couldn't allocate and the caller's `envp` was forwarded unmodified (the exec still proceeds; the audit trail records the degraded state).
+- `env_tamper` — `{"kind":"env_tamper","op":"setenv|unsetenv|putenv|clearenv","name":...,"pid":...,"ts":...,"refused":true}` emitted by the in-process env-mutator wrappers when the target is one of the protected names. The call is refused (returns 0 to the caller) and the audit event records the attempt.
+
+Writes are kept ≤ `PIPE_BUF` so they are atomic. Downstream, normalize dedupes, attribution maps `pid` → owning package + lifecycle stage, and the renderer emits one block per (package, event-kind) pair.
 
 **Protected-list policy.** Both layers read the same list, sourced from `.script-jail.yml` and serialized to `SCRIPT_JAIL_PROTECTED_ENV_FILE` (one name per line; `#` for comments). Adding a new protected name only requires editing the config — both layers pick it up at process start.
 
-**Known gap.** Direct iteration of `char **environ` bypasses both layers; a process that reconstructs `envp` manually for an `execve` it builds itself is not caught at the libc layer and is outside Node's `process.env` view. Mitigation is ELF interposition on the `environ` array pointer; not implemented yet. v1 also relies on the host keeping `SCRIPT_JAIL_PROTECTED_ENV_FILE` immutable — a guest that unsets it before exec would still be audited (the protect-list is loaded at preload init) but a fresh child process spawned without the preload would not.
+### Cross-exec preservation
+
+The shim wraps all eight exec entry points (`execve`, `execv`, `execvp`, `execvpe`, `execveat`, `fexecve`, `posix_spawn`, `posix_spawnp`) via the same `dispatch_exec` / `dispatch_spawn` funnels in `src/shim/src/lib.rs`. Before forwarding to the real symbol, every wrapper rewrites the caller-supplied `envp`:
+
+- `LD_PRELOAD` — the shim's own path is colon-appended, ensuring the child process loads `libscriptjail.so` even if the parent tried to remove it.
+- `NODE_OPTIONS` — the `--require=…` block is space-appended so the three JS preloads are loaded in every Node child.
+- Seven `SCRIPT_JAIL_*` sticky vars (`SCRIPT_JAIL_LOG_FILE`, `SCRIPT_JAIL_LOG_FD`, `SCRIPT_JAIL_PROTECTED_ENV_FILE`, `SCRIPT_JAIL_SPOOF_PLATFORM`, `SCRIPT_JAIL_SPOOF_ARCH`, `SCRIPT_JAIL_PRELOAD_PATH`, `SCRIPT_JAIL_NODE_OPTIONS`) — each is added to the rewritten `envp` only when absent (`ensure_env` semantics), preserving any value the caller deliberately reassigned for a side channel.
+
+The canonical values for `LD_PRELOAD` and `NODE_OPTIONS` reinjection come from two env vars read at `shim_init` time: `SCRIPT_JAIL_PRELOAD_PATH` (set to `/lib/libscriptjail.so` by `buildChildEnv` in `src/guest/agent.ts`) and `SCRIPT_JAIL_NODE_OPTIONS` (set to the space-separated `--require=…` block for the three `/usr/local/lib/script-jail/*.cjs` preloads). This means every child process — however the parent constructs its `envp` — inherits a canonical audit environment.
+
+The `setenv` / `unsetenv` / `putenv` / `clearenv` wrappers close the in-process mutation window. Any call that targets one of the nine protected names (`LD_PRELOAD`, `NODE_OPTIONS`, or any `SCRIPT_JAIL_*` sticky var) is silently refused: the wrapper returns 0 so the caller sees no error (Node's `delete process.env.X` path does not raise), but the underlying env entry is not modified. Refused calls are recorded in the audit log.
+
+**Known gap.** `execle` is the one exec variant the shim does not wrap: its `char *const envp[]` is passed as a C variadic argument, and intercepting variadics in stable `#![no_std]` Rust requires inline asm or a nightly toolchain bump; deferred to v2. In glibc, `execl` and `execlp` build their argument vector and then call `execve` with the process's own `__environ`, so the setenv/unsetenv guards in this version close the practical-attack window for those two. Direct `char **environ` array manipulation (bypassing all libc env functions) remains uncovered; this is rare in npm lifecycle scripts.
 
 ## vsock protocol
 
@@ -107,3 +139,55 @@ The pinned kernel (Linux 5.10.223 from AWS Firecracker CI) lives outside the roo
 - `mode=update` — generated lockfile is written in place. Used to regenerate after a legitimate dependency change.
 
 `generated_at` and `manager_lockfile_sha256` change every run by design; the diff path canonicalizes them so they don't cause false positives. See `src/action/diff.ts`.
+
+## Threat model and known gaps
+
+### Same-UID audit-channel limitation
+
+The audit events file (`SCRIPT_JAIL_LOG_FILE`) is owned and writable by the
+same UID as the audited process. A malicious lifecycle script with that UID can:
+
+1. Open the events file directly (bypassing the shim emit path) and append
+   forged JSONL records. The `<EVENTS_FILE_FORGERY>` audit_bypass detector
+   catches the canonical attack via strace openat cross-check, but a process
+   already trusted by the detector (one that has libscriptjail.so mapped)
+   can still write to the file from inside its address space.
+
+2. Discover existing audit fds via `/proc/self/fd/N` and write directly to
+   them, which strace's openat trace cannot detect.
+
+3. Use `openat(dirfd, basename, ...)` or path aliases
+   (`/tmp/foo/../events-dir/./events-<tag>.jsonl`) to open the file via
+   spellings the path-equality detector may miss. (The strace parser now
+   canonicalizes these; see commit 7a4a281. The per-run-random basename
+   `events-<32-hex>.jsonl` minted in `createEventsFile` also feeds the
+   Layer-1 basename safety net in `phase-install.ts`.)
+
+4. Spoof the shim-trust signal by `open("/lib/libscriptjail.so", O_RDONLY)`
+   without actually loading it. The forgery detector grants shim-trust to
+   any pid that reads the .so file because we have no cheap kernel-side
+   signal that ld.so actually mapped the segment. The truly unforgeable
+   signal would be the kernel-side mmap of the .so as executable
+   (`PROT_EXEC`), but tracing every `mmap` syscall is prohibitively
+   expensive for an interactive install. A shim-emitted runtime event
+   after init would be same-UID forgeable (see gap 1). The only
+   complete fix is UID separation (see below).
+
+These gaps are accepted in v1 because:
+- The microVM is single-use and discarded after install.
+- Network is off during install (Phase B), so exfiltration is bounded.
+- Strace observes process spawns and syscalls regardless of forged events.
+- The audit_bypass gate is defense-in-depth, not the primary security guarantee.
+
+A future v2 may add UID separation: run the audited process as a different
+UID than the agent, so the events file is read-only to the audited process
+and write-only to the shim's process group. This requires:
+- A separate init step to create a sandboxed UID with no write access to
+  agent-owned paths.
+- The events file owned by the agent UID, group-owned by the shim's UID,
+  mode 0640.
+- The shim runs with setegid into the shim's UID for events-file writes.
+
+Until then, the audit_bypass gate is best-effort detection of canonical
+attacks (envp scrubbing, raw syscall exec, file unlink/truncate/rename,
+mtime/ctime tamper). It is not a cryptographic integrity check.

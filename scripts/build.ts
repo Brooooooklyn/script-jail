@@ -28,7 +28,7 @@
 
 import { execSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -40,6 +40,11 @@ import {
   type RunnerImage,
 } from '../src/rootfs/build.js';
 import { detectRunnerImage } from '../src/action/runner-image.js';
+import {
+  decideShimRebuild as decideShimRebuildShared,
+  shimArtifactIsStale as shimArtifactIsStaleShared,
+  shimSourceInputs as shimSourceInputsShared,
+} from '../src/rootfs/shim-freshness.js';
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -119,10 +124,16 @@ function defaultRunnerImage(): RunnerImage {
 // ---------------------------------------------------------------------------
 
 function buildActionBundle(): void {
+  // action.yml's `main:` field points at dist/main.cjs, and `pnpm build:bundle`
+  // writes there too — so this coordinator MUST also write to .cjs. A prior
+  // revision of this file wrote to dist/main.js, which left a stale bundle in
+  // the working tree that bypassed gates added to dist/main.cjs (e.g. the
+  // audit_bypass hard-fail in commit fe13357). action.yml is the source of
+  // truth: keep this aligned with it.
   console.log('[build] Building action bundle: src/main.ts → dist/main.cjs …');
   const esbuildBin = join(REPO_ROOT, 'node_modules', '.bin', 'esbuild');
   const mainSrc = join(REPO_ROOT, 'src', 'main.ts');
-  const mainOut = join(REPO_ROOT, 'dist', 'main.js');
+  const mainOut = join(REPO_ROOT, 'dist', 'main.cjs');
 
   execSync(
     `"${esbuildBin}" "${mainSrc}" ` +
@@ -137,6 +148,29 @@ function buildActionBundle(): void {
 // Step 2 — Build Rust shim
 // ---------------------------------------------------------------------------
 
+// Freshness helpers now live in src/rootfs/shim-freshness.ts so that both
+// scripts/build.ts:buildShim() AND src/rootfs/build.ts:ensureShim() can call
+// the exact same logic.  See that module for the rationale (Finding 3).
+//
+// We re-export them at the same names with the same signatures used by the
+// existing tests in test/scripts/build-shim-freshness.test.ts; the
+// `shimSourceInputs` default-argument behaviour is preserved.
+
+/** Bound to the shared helper but keeps the `repoRoot = REPO_ROOT` default. */
+export function shimSourceInputs(repoRoot: string = REPO_ROOT): ReadonlyArray<string> {
+  return shimSourceInputsShared(repoRoot);
+}
+
+export const decideShimRebuild = decideShimRebuildShared;
+
+/** Bound to the shared helper but keeps the default sources behaviour. */
+export function shimArtifactIsStale(
+  shimOut: string,
+  sources: ReadonlyArray<string> = shimSourceInputs(),
+): boolean {
+  return shimArtifactIsStaleShared(shimOut, sources);
+}
+
 function buildShim(): void {
   if (process.platform === 'darwin') {
     console.warn(
@@ -147,12 +181,31 @@ function buildShim(): void {
   }
 
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
-  if (existsSync(shimOut)) {
-    console.log('[build] images/libscriptjail.so already present, skipping shim build.');
+
+  // Freshness check: only reuse `images/libscriptjail.so` when every shim
+  // input (Cargo.toml/Cargo.lock/rust-toolchain.toml/src/lib.rs) is older
+  // than the artifact. Any source edit forces a rebuild.
+  //
+  // Defence in depth: the rootfs build also runs `validateShimFile` to catch
+  // *malformed* artifacts (wrong arch, truncated header, no PT_DYNAMIC). This
+  // mtime check protects against the *silently-stale* case that validation
+  // cannot detect — a structurally-valid .so produced from out-of-date source.
+  if (!shimArtifactIsStale(shimOut)) {
+    console.log(
+      '[build] images/libscriptjail.so is up-to-date relative to shim sources; ' +
+      'skipping shim build.',
+    );
     return;
   }
 
-  console.log('[build] Building Rust shim via cargo …');
+  if (existsSync(shimOut)) {
+    console.log(
+      '[build] images/libscriptjail.so is older than shim sources; rebuilding via cargo …',
+    );
+  } else {
+    console.log('[build] Building Rust shim via cargo …');
+  }
+
   const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
   execSync(
     `cargo build --release --manifest-path "${manifest}"`,
@@ -204,7 +257,7 @@ async function main(): Promise<void> {
   } else {
     buildActionBundle();
   }
-  artifacts.push({ path: join(REPO_ROOT, 'dist', 'main.js') });
+  artifacts.push({ path: join(REPO_ROOT, 'dist', 'main.cjs') });
 
   // Step 2: Rust shim
   if (skipShim) {
@@ -237,7 +290,16 @@ async function main(): Promise<void> {
   collectSummary(artifacts);
 }
 
-main().catch((err: unknown) => {
-  console.error(String(err instanceof Error ? err.stack ?? err.message : err));
-  process.exit(1);
-});
+// Only run main() when this file is the CLI entry point. Tests import the
+// exported `decideShimRebuild` / `shimArtifactIsStale` helpers; they must NOT
+// trigger a full build at import time.
+const isMain =
+  typeof process.argv[1] === 'string' &&
+  resolve(process.argv[1]) === __filename;
+
+if (isMain) {
+  main().catch((err: unknown) => {
+    console.error(String(err instanceof Error ? err.stack ?? err.message : err));
+    process.exit(1);
+  });
+}

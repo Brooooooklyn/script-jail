@@ -133,6 +133,119 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         block.network_attempts.push(`${tag}connect ${ev.raw.host}:${ev.raw.port}`);
         break;
       }
+      case 'exec': {
+        // Most exec events ARE redundant with the strace-observed execve
+        // syscall already feeding spawn_attempts. Two signals are worth
+        // surfacing — both as `audit_bypass` entries:
+        //
+        //   1. `envp_alloc_failed=true`: the shim's re-injection of
+        //      LD_PRELOAD / NODE_OPTIONS / SCRIPT_JAIL_* into the child's
+        //      envp could not allocate, so the child ran OUTSIDE the audit
+        //      envelope.  strace still sees the syscall but the shim is no
+        //      longer loaded in that pid — anything getenv/dlopen-shaped
+        //      inside the child is therefore invisible.
+        //
+        //   2. `syscall_bypass=true` (audit-trust Finding 1, 2026-05-18):
+        //      synthesized by runInstallPhase when a strace execve has no
+        //      matching shim exec event.  That gap is only possible when
+        //      the lifecycle script issued `syscall(SYS_execve, …)`
+        //      directly, bypassing every libc-level wrapper.  The child
+        //      ran without our env envelope for the same reason: the
+        //      kernel syscall does NOT go through our rewrite_envp.
+        //
+        // Silently dropping either signal makes the lockfile diff stay
+        // clean even when audit was bypassed, which is the worst possible
+        // outcome for an auditor.
+        if (ev.raw.envp_alloc_failed) {
+          const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
+          block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
+        }
+        if (ev.raw.syscall_bypass) {
+          // Prefer argv0 (the syscall's first argv entry, which is the
+          // most attacker-visible identifier of the spawned program); fall
+          // back to the strace-observed `prog` (the syscall path arg) when
+          // argv0 is null/empty.
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0
+            ? ev.raw.argv0
+            : ev.raw.prog;
+          const tokenized = ident.startsWith('/')
+            ? tokenize(ident, ctx.roots, pkgDir)
+            : ident;
+          block.audit_bypass.push(`<SYSCALL_EXEC_BYPASS> ${tokenized}`);
+        }
+        // Audit-trust Finding A (high, 2026-05-18): a non-shim-loaded pid
+        // opened SCRIPT_JAIL_LOG_FILE in write mode — i.e. a lifecycle
+        // script bypassed LD_PRELOAD via raw-syscall exec + scrubbed envp
+        // and is now writing forged events into the trusted JSONL
+        // channel.  Surface as `<EVENTS_FILE_FORGERY> …` under
+        // `audit_bypass` so the host-side `findAuditBypass` scan in
+        // src/action/diff.ts hard-fails the lockfile diff.  Tokenisation
+        // follows the same rules as `<SYSCALL_EXEC_BYPASS>` (prefer
+        // argv0 for forensic context).
+        if (ev.raw.events_file_forgery) {
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0
+            ? ev.raw.argv0
+            : ev.raw.prog;
+          const tokenized = ident.startsWith('/')
+            ? tokenize(ident, ctx.roots, pkgDir)
+            : ident;
+          block.audit_bypass.push(`<EVENTS_FILE_FORGERY> ${tokenized}`);
+        }
+        // Audit-trust Finding (high, 2026-05-19): a strace-observed
+        // dirfd/cwd-relative read or write could not be canonicalized
+        // (numeric dirfd whose source we never saw, or AT_FDCWD-relative
+        // path from a pid with no tracked cwd).  Emitting the unresolved
+        // relative path as a normal lockfile event would let an attacker
+        // probe protected paths (`openat(rootFd, ".ssh/id_rsa", …)`) or
+        // forge writes inside their package dir (`openat(pkgDirFd,
+        // "build.log", …)` reading as an escaped write) and bypass the
+        // protected-paths / cross-package matchers.  Surface as
+        // `<UNRESOLVED_PATH> …` under `audit_bypass`.  The forensic
+        // identifier is `prog` — the canonicalizer-fail synthesiser
+        // sets it to the literal unresolved relative path so the
+        // auditor can see what the script tried to open.
+        if (ev.raw.unresolved_path) {
+          const ident = ev.raw.argv0 && ev.raw.argv0.length > 0
+            ? ev.raw.argv0
+            : ev.raw.prog;
+          // Unresolved paths are by definition relative (no leading '/'),
+          // so token substitution has nothing to bite on — render as-is.
+          // We still defensively call tokenize() for absolute idents to
+          // mirror the other audit_bypass branches.
+          const tokenized = ident.startsWith('/')
+            ? tokenize(ident, ctx.roots, pkgDir)
+            : ident;
+          block.audit_bypass.push(`<UNRESOLVED_PATH> ${tokenized}`);
+        }
+        break;
+      }
+      case 'env_tamper': {
+        // The shim REFUSED the call (refused:true is the only legal value
+        // today), so prod env state is untouched. The audit value is the
+        // attempt itself: a script tried to wipe LD_PRELOAD, NODE_OPTIONS,
+        // or any SCRIPT_JAIL_* sticky var. clearenv has no `name` (whole-env
+        // wipe) — render that as `<REFUSED> clearenv` with no name tail.
+        //
+        // Audit-trust Finding 4 (2026-05-18): `audit_fd_lost` is a different
+        // beast — it signals the JS preload's cached events-file fd was
+        // closed (almost certainly by a hostile lifecycle script scanning
+        // /proc/self/fd/) and the reopen-by-path retry also failed.  At
+        // that point we cannot trust any subsequent events from this pid;
+        // surface it as `<AUDIT_FD_LOST>` under `audit_bypass` so the
+        // host-side `findAuditBypass` scan in src/action/diff.ts catches
+        // it and hard-fails the lockfile diff.  Same severity classification
+        // as `<EXEC_FAIL_OPEN>`.
+        if (ev.raw.op === 'audit_fd_lost') {
+          block.audit_bypass.push('<AUDIT_FD_LOST>');
+          break;
+        }
+        const name = ev.raw.name;
+        const entry = name !== undefined
+          ? `<REFUSED> ${ev.raw.op} ${name}`
+          : `<REFUSED> ${ev.raw.op}`;
+        block.env_tamper.push(entry);
+        break;
+      }
     }
   }
 
@@ -166,6 +279,8 @@ function getLifecycleBlock(
       spawn_blocked: [],
       dlopen_attempts: [],
       network_attempts: [],
+      audit_bypass: [],
+      env_tamper: [],
     };
     pkgBlock.lifecycle[lifecycle] = newLifecycleBlock;
     block = newLifecycleBlock;
@@ -182,6 +297,8 @@ function sortAndDedupe(block: LifecycleBlock): void {
     'spawn_blocked',
     'dlopen_attempts',
     'network_attempts',
+    'audit_bypass',
+    'env_tamper',
   ];
   for (const f of fields) {
     // Use codepoint order rather than localeCompare: localeCompare is ICU-
