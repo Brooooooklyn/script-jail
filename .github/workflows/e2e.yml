@@ -352,6 +352,41 @@ jobs:
 
           echo "All 15 marker assertions passed."
 
+          # ------------------------------------------------------------------
+          # False-positive assertions for the 'normal' deps (express, axios,
+          # dotenv, yaml, zod).  None of these packages declares any
+          # lifecycle script, so:
+          #   1. The audit pipeline records nothing for them — their
+          #      `<name>@<version>:` entry must NOT appear as a top-level
+          #      key under `packages:` in the lockfile.  Their PRESENCE in
+          #      the lock would mean a phantom event was attributed to a
+          #      package with no scripts to attribute from.
+          #   2. The lockfile-global `audit_bypass:` field is rendered ONLY
+          #      when non-empty (see src/lock/render.ts OPTIONAL_LIST_FIELDS).
+          #      No legitimate path through the audit pipeline produces an
+          #      audit_bypass entry — its appearance is the load-bearing
+          #      tamper signal.  Installing benign packages must not
+          #      synthesize one.
+          # If either assertion fires, we have a false positive worth
+          # investigating before merging.
+          echo "--- false-positive assertions for normal deps ---"
+          for pkg in 'express@' 'axios@' 'dotenv@' 'yaml@' 'zod@'; do
+            if grep -qE "^  ${pkg}" "$LOCK"; then
+              echo "::error::false positive — '$pkg' appears as a package entry in the lockfile but has no lifecycle scripts"
+              grep -nE "^  ${pkg}" "$LOCK"
+              exit 1
+            else
+              echo "  ✓ no entry for ${pkg} (expected — no lifecycle scripts)"
+            fi
+          done
+          if grep -qE '^\s*audit_bypass:' "$LOCK"; then
+            echo "::error::false positive — audit_bypass entries appeared in the lockfile"
+            grep -nE -A2 '^\s*audit_bypass:' "$LOCK"
+            exit 1
+          else
+            echo "  ✓ no audit_bypass entries (expected — clean install + caught attacks)"
+          fi
+
       # ----------------------------------------------------------------------
       # Tamper path: remove a marker line and assert mode=check fails exit-1.
       # ----------------------------------------------------------------------

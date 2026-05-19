@@ -2,7 +2,7 @@
   "name": "script-jail-e2e-consumer",
   "version": "0.0.0",
   "private": true,
-  "description": "Layer 2 e2e consumer (happy path). Depends on every fixture under test/fixtures/ via relative file: specifiers so `npm install` runs each fixture's lifecycle script inside the script-jail VM. The Layer 2 workflow runs `mode=update`, asserts the produced .script-jail.lock.yml contains every expected attack-shape marker, then runs `mode=check` against that just-produced file and asserts exit 0. No committed golden — src/action/diff.ts is byte-exact and the lockfile's generated_at field varies per run, so a static golden cannot stay in sync.",
+  "description": "Layer 2 e2e consumer (happy path). Depends on every fixture under test/fixtures/ via relative file: specifiers so `npm install` runs each fixture's lifecycle script inside the script-jail VM. The Layer 2 workflow runs `mode=update`, asserts the produced .script-jail.lock.yml contains every expected attack-shape marker, then runs `mode=check` against that just-produced file and asserts exit 0. No committed golden — src/action/diff.ts is byte-exact and the lockfile's generated_at field varies per run, so a static golden cannot stay in sync. The 'normal' dependencies below (express, axios, dotenv, yaml, zod) are pulled from the public registry by Phase A; none have lifecycle scripts, so they exercise the false-positive surface: a clean install must not produce audit_bypass entries or attribute spurious markers to these packages.",
   "dependencies": {
     "reads-home-ssh": "file:../../fixtures/reads-home-ssh",
     "reads-secret-env": "file:../../fixtures/reads-secret-env",
@@ -11,6 +11,11 @@
     "tries-network-egress": "file:../../fixtures/tries-network-egress",
     "writes-into-repo": "file:../../fixtures/writes-into-repo",
     "cross-package-tampering": "file:../../fixtures/cross-package-tampering",
-    "victim-package": "file:../../fixtures/victim-package"
+    "victim-package": "file:../../fixtures/victim-package",
+    "express": "5.2.1",
+    "axios": "1.16.1",
+    "dotenv": "17.4.2",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
   }
 }
