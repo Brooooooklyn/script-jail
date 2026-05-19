@@ -238,6 +238,17 @@ jobs:
       - name: Build Rust shim (arm64 — cross-compile via cargo-zigbuild)
         run: pnpm build -- --skip-rootfs --skip-bundle --shim-arm64
 
+      # The arm64 rootfs builds below run `docker buildx --platform=linux/arm64`
+      # on an x86_64 runner.  Without QEMU binfmt registration the runner
+      # kernel can't execute the arm64 `/bin/sh` (etc.) the buildx steps
+      # invoke, surfacing as `exec /bin/sh: exec format error`.  Registered
+      # once here so both arm64 rootfs build steps (ubuntu-22.04, ubuntu-24.04)
+      # see it.  No-op for the x64 rootfs builds.
+      - name: Register QEMU binfmt handlers (for linux/arm64 build)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       # Build BOTH x64 rootfs ext4 images, reusing the bundle + shim built above.
       # `--skip-bundle` and `--skip-shim` avoid the redundant work the build
       # script would otherwise repeat per --runner-image invocation.

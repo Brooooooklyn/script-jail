@@ -384,6 +384,17 @@ jobs:
       - name: Install pnpm deps
         run: pnpm install --frozen-lockfile
 
+      # The arm64 rootfs is built via `docker buildx --platform=linux/arm64`
+      # on an x86_64 runner.  Without QEMU binfmt registration the runner
+      # kernel can't execute the arm64 `/bin/sh` (etc.) the buildx steps
+      # invoke, surfacing as `exec /bin/sh: exec format error`.
+      # `docker/setup-qemu-action@v3` registers the binfmt handlers via
+      # `tonistiigi/binfmt` so cross-arch RUN steps work transparently.
+      - name: Register QEMU binfmt handlers (for linux/arm64 build)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       # Build the arm64 .so AND the arm64 rootfs in one invocation.
       # `--shim-arm64` triggers the cross-compile; `--skip-shim` suppresses the
       # x86_64 shim build (we don't need it on this branch of the workflow);
