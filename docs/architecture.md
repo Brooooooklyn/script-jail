@@ -39,10 +39,24 @@ Key files:
 
 - `src/guest/strace-parser.ts` — parses `openat`, `connect`, `execve` strace lines.
 - `src/guest/protected-paths.ts` — replaces values for protected paths/env-vars with `<HIDDEN>`; drops `ENOENT` probes for unprotected paths so the audit reflects intent, not noise.
-- `src/guest/attribution.ts` + `proc-reader.ts` — map a pid to the owning package using `/proc/<pid>/cwd` and the discovered `node_modules` tree.
+- `src/guest/attribution.ts` + `proc-reader.ts` — walk `/proc/<pid>/status` PPid chain looking for an ancestor whose `environ` carries `npm_package_name` + a canonical `npm_lifecycle_event`. Results are cached per starting pid; `invalidate(pid)` drops the cache so a recycled pid re-walks `/proc`.
 - `src/lock/normalize.ts` — drops reads inside the owning package's own directory; marks cross-package writes; coalesces duplicates.
 - `src/lock/tokenize.ts` — substitutes `$PKG`, `$NODE_MODULES`, `$HOME`, `$REPO`, `$CACHE`, `$TMP` for absolute paths.
 - `src/lock/render.ts` — emits canonical YAML.
+
+### Attribution and snapshot lifecycle
+
+`Attribution.attribute(pid)` returns a `{ pkg, lifecycle }` pair by walking the pid's `/proc/<pid>/status` PPid chain and reading each ancestor's `environ`. The walk terminates at pid 0/1 or when `readPpid` returns null. Results are cached per starting pid.
+
+The phase-install dispatcher layers a per-pid **attribution snapshot** on top of the cache so fallback paths can attribute events even when `/proc` is no longer authoritative (child reaped, envp scrubbed by a raw `execve`, etc.). Each snapshot carries `{ pkg, lifecycle, recordedAtTs, stale }`:
+
+- **`recordedAtTs`** is the monotonic dispatcher ts of the line that wrote the snapshot. `recordAttribution` only overwrites an entry when the incoming ts is `>=` the stored ts. This protects against strace `-ff` cross-file ordering: per-pid trace files are drained in filesystem order, not happens-before, so a new generation's `clone(...) = <recycledPid>` line can be processed before an older generation's delayed `+++ exited +++` line. The ts gate ensures the older event can't clobber the fresh snapshot.
+
+- **`stale`** is set to `true` on the exit line when `/proc` also returns null for the pid (the recycled generation hasn't set up `/proc` yet, or there is no recycled generation). Snapshots are never evicted on exit — the never-evict policy is required because no available signal (dispatcher ts, `/proc` liveness, outstanding-clones counter) can distinguish "normal clone-then-exit" from "delayed old-exit observed after a recycled clone" from observation order alone. Instead, fallback paths treat stale snapshots as missing: forgery attribution and bypass synthesis skip them, the spawn fallback still emits the event but routes it to `<unattributed>`, and the clone-parent-lookup re-attributes via `/proc`. When a delayed clone eventually arrives, `recordAttribution` writes a fresh entry (`stale: false`) and the package label resumes.
+
+- The dispatcher calls `Attribution.invalidate(pid)` twice on every exit line — once before the post-invalidate liveness probe (so the probe doesn't read a dead-generation cached pkg), and once after (so a later recycle triggers a fresh walk rather than reading a cached null).
+
+This model evolved through several rounds of Codex adversarial review (commits `e5af2be` → `f6a8d34` on `feat/exec-shim-env-reinject`); the final design is documented in-line at the exit-line handler in `src/guest/phase-install.ts`.
 
 ## Preload stack
 
@@ -76,7 +90,13 @@ Env-var reads need both the libc shim and the JS preload because they sit on opp
 
 **Critical detail — the Proxy receiver.** In the `get` / `set` traps, forward via `Reflect.get(target, prop, target)` (and the equivalent for `set`), passing `target` — not the Proxy — as the receiver. `process.env` is a host-side `EnvironmentVariableNamespace` object whose accessors use `this` to find the underlying environment store. When the receiver is the Proxy, Node can't locate the store and reads silently return wrong values, which breaks `child_process.spawn` with no diagnostic. The equivalent member-access form (`target[prop]`) also works.
 
-**Unified event shape.** Both layers emit the same JSONL line — `{"kind":"env_read","name":...,"pid":...,"ts":...,"hidden":...}` — to `SCRIPT_JAIL_LOG_FILE` (preferred) or `SCRIPT_JAIL_LOG_FD` (tests). Writes are kept ≤ `PIPE_BUF` so they are atomic. Downstream, normalize dedupes, attribution maps `pid` → owning package + lifecycle stage, and the renderer emits one `env_read:` block per package.
+**Unified event shape.** Both layers emit JSONL to `SCRIPT_JAIL_LOG_FILE` (preferred) or `SCRIPT_JAIL_LOG_FD` (tests), one of three `kind`s:
+
+- `env_read` — `{"kind":"env_read","name":...,"pid":...,"ts":...,"hidden":...}` emitted by every libc `getenv` / JS `process.env.X` read of a name on the protected list.
+- `exec` — `{"kind":"exec","prog":...,"argv0":...,"pid":...,"ts":...,"envp_alloc_failed"?:...}` emitted by the shim's exec wrappers (`execve` / `execv*` / `execveat` / `fexecve` / `posix_spawn[p]`) before forwarding to the real symbol. The optional `envp_alloc_failed` flag fires when env re-injection couldn't allocate and the caller's `envp` was forwarded unmodified (the exec still proceeds; the audit trail records the degraded state).
+- `env_tamper` — `{"kind":"env_tamper","op":"setenv|unsetenv|putenv|clearenv","name":...,"pid":...,"ts":...,"refused":true}` emitted by the in-process env-mutator wrappers when the target is one of the protected names. The call is refused (returns 0 to the caller) and the audit event records the attempt.
+
+Writes are kept ≤ `PIPE_BUF` so they are atomic. Downstream, normalize dedupes, attribution maps `pid` → owning package + lifecycle stage, and the renderer emits one block per (package, event-kind) pair.
 
 **Protected-list policy.** Both layers read the same list, sourced from `.script-jail.yml` and serialized to `SCRIPT_JAIL_PROTECTED_ENV_FILE` (one name per line; `#` for comments). Adding a new protected name only requires editing the config — both layers pick it up at process start.
 

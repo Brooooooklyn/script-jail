@@ -1936,76 +1936,36 @@ export async function runInstallPhase(
   }
   const unresolvedPathSamples: UnresolvedPathSample[] = [];
 
-  // Audit-trust Finding 3 (high, 2026-05-18): a raw `syscall(SYS_execve, …)`
-  // bypass with an attacker-controlled `envp` produces a child whose
-  // `/proc/<pid>/environ` is missing the npm_package_name /
-  // npm_lifecycle_event vars Attribution depends on.  The pre-fix flow
-  // gated bypass counting on attribution succeeding, so the most damaging
-  // case (raw exec + scrubbed envp) silently skipped the bypass detector
-  // and produced a clean lockfile.
+  // Per-pid attribution snapshots, populated on the first successful
+  // attribution and consulted by fallback paths when /proc no longer
+  // serves the lifecycle vars (child reaped, env scrubbed, etc.).
   //
-  // The fix has two halves:
+  // Why this exists (Audit-trust Finding 3, 2026-05-18): a raw
+  // `syscall(SYS_execve, …)` with an attacker-controlled `envp`
+  // produces a child whose `/proc/<pid>/environ` is missing the
+  // npm vars Attribution depends on. Without a cached snapshot, the
+  // bypass detector silently skips the event. With the snapshot
+  // captured on the first attributable observation (typically the
+  // shim's pre-exec line), the audit_bypass entry still surfaces
+  // even when the post-exec environ is empty.
   //
-  //   (a) Snapshot lifecycle attribution per-pid the FIRST time we see
-  //       attribution succeed for that pid (or any event with a known
-  //       attribution result).  Strace observes pids in spawn-order, so
-  //       the very first event we see for a pid is normally from BEFORE
-  //       the child has had a chance to overwrite its own environ.  We
-  //       cache that snapshot here and prefer it over re-reading
-  //       /proc/<pid>/environ at bypass-count time.
-  //
-  //   (b) Decouple bypass counting (and synthetic-event emission) from
-  //       attribution success.  The strace observation of an execve is
-  //       proof-of-bypass when no matching shim event exists, regardless
-  //       of whether we can still attribute the pid to a package.  When
-  //       the snapshot is empty (attribution NEVER succeeded for this
-  //       pid — strange but possible) we fall back to a "<unknown>"
-  //       pkg + lifecycle so the audit_bypass entry still surfaces in
-  //       the lockfile diff and the `findAuditBypass` scan in
-  //       src/action/diff.ts hard-fails the PR.
-  //
-  // The map is keyed by pid.  Entries are REFRESHED on every successful
-  // attribution observation: the sole caller (~line 4482) only invokes
-  // `recordAttribution` when `result !== null`, so the helper never
-  // receives a worse-quality signal than the snapshot we already have.
-  // The refresh is important for same-pid re-exec into a different
-  // package context (npm spawns a wrapper that itself execs a
-  // package-bin), and is the second half of the snapshot-lifetime fix
-  // that goes with the exit-line eviction below — together they prevent
-  // a recycled or re-exec'd pid from carrying a stale earlier label
-  // into the spawn fallback (Codex audit-trust 2026-05-19).
-  //
-  // Audit-trust follow-up (Codex review of e22c79b, 2026-05-19):
-  // each snapshot also carries `recordedAtTs` — the monotonic ts of the
-  // dispatcher line that wrote it.  Strace `-ff` produces one file per
-  // pid; the tailer reads them in filesystem-order, NOT global event
-  // order, so a NEW parent's `clone(...) = <recycledPid>` line in
-  // fileA can be processed BEFORE the OLD generation's
-  // `+++ exited +++` line in fileB.  Without a generation token, the
-  // delayed exit-line eviction would clobber the snapshot the new
-  // clone-propagation just wrote.  By comparing `recordedAtTs` against
-  // the exit-line's ts, the eviction can decline to delete a snapshot
-  // recorded by a later observation than the exit.
-  // Audit-trust follow-up (Codex review of 15f8faf, 2026-05-19):
-  // snapshots carry a `stale` flag flipped to `true` when the pid's
-  // exit-line is observed.  The never-evict-on-exit policy keeps the
-  // snapshot in the map so a delayed clone-propagation can overwrite
-  // it with a fresh value — but until that overwrite arrives, any
-  // null-attribution fallback that would otherwise emit under the
-  // stale package label MUST instead emit as `<unattributed>`.
-  // The risk path Codex identified: pid N attributed to pkg-A, pid
-  // N exits, pkg-B clones a child reusing pid N; cross-file ordering
-  // drains the recycled child's per-pid file BEFORE the parent's
-  // delayed `clone(...) = N` line.  The child's ENOENT spawn lands
-  // with attribute(N) returning null (child reaped), so the spawn
-  // fallback historically read snapshot[N] = pkg-A and rendered the
-  // event under pkg-A — confidently wrong.  Marking stale and
-  // routing stale fallbacks to `<unattributed>` makes the audit
-  // signal ambiguous-but-correct rather than wrong.
-  //
-  // recordAttribution clears the stale flag (any successful
-  // observation freshens the snapshot) AND uses recordedAtTs
-  // monotonicity for out-of-order ts protection.
+  // Field roles:
+  //   - pkg / lifecycle       — last observed attribution.
+  //   - recordedAtTs          — monotonic ts of the dispatcher line
+  //                              that wrote this entry. Gates writes
+  //                              in recordAttribution so a delayed
+  //                              older event can't clobber a fresher
+  //                              one (strace `-ff` cross-file order
+  //                              is filesystem-order, not happens-
+  //                              before).
+  //   - stale                 — set on exit when /proc is also empty
+  //                              for this pid. Stale entries do NOT
+  //                              attribute fallbacks under their
+  //                              package — they route to
+  //                              `<unattributed>` until a delayed
+  //                              clone overwrites them. See the
+  //                              exit-line handler below for the
+  //                              full lifecycle model.
   const attributionSnapshotByPid: Map<
     number,
     {
