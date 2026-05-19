@@ -26086,11 +26086,14 @@ async function runInstallPhase(input) {
         entries.push([key.slice(prefix.length), val]);
       }
     }
+    const liveOpaque = opaqueFdReuses.get(root);
+    const preDetachOpaque = liveOpaque === void 0 ? /* @__PURE__ */ new Set() : new Set(liveOpaque);
     const snap = {
       entries,
       unknown: dirfdStateUnknown.has(root),
       postDetachLog: [{ kind: "action", action }],
-      preDetachTombstones: []
+      preDetachTombstones: [],
+      preDetachOpaque
     };
     absorbPendingTombstones(pid, snap);
     return snap;
@@ -26618,6 +26621,11 @@ async function runInstallPhase(input) {
                   fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
+                if (fdPendingDetachShared && childFdSnap !== void 0 && childFdSnap.preDetachOpaque.size > 0) {
+                  for (const fd of childFdSnap.preDetachOpaque) {
+                    dirfdTable.delete(`${parentPrefix}${fd}`);
+                  }
+                }
                 if (fdUnknownHas(pid)) {
                   fdUnknownAdd(childPid);
                 }
@@ -26841,9 +26849,13 @@ async function runInstallPhase(input) {
               dirfdTable.set(newKey, { path: oldVal.path, cloexec: newCloexec });
               cancelPendingTombstonesForFd(pid, newFd);
               recordPostMarkerFdReuse(pid, newFd);
+              clearOpaqueFdReuse(pid, newFd);
             } else {
               dirfdTable.delete(newKey);
               fdUnknownAdd(pid);
+              cancelPendingTombstonesForFd(pid, newFd);
+              recordPostMarkerFdReuse(pid, newFd);
+              recordOpaqueFdReuse(pid, newFd);
             }
           }
         }
@@ -27070,9 +27082,13 @@ async function runInstallPhase(input) {
               });
               cancelPendingTombstonesForFd(pid, rc);
               recordPostMarkerFdReuse(pid, rc);
+              clearOpaqueFdReuse(pid, rc);
             } else {
               dirfdTable.delete(newKey);
               fdUnknownAdd(pid);
+              cancelPendingTombstonesForFd(pid, rc);
+              recordPostMarkerFdReuse(pid, rc);
+              recordOpaqueFdReuse(pid, rc);
             }
           } else if (cmd2 === "F_SETFD") {
             const cur = dirfdTable.get(oldKey);

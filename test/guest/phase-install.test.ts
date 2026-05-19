@@ -12570,5 +12570,237 @@ describe('runInstallPhase', () => {
       });
       expect(childUnresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex pass 47 follow-up (high, 2026-05-19, bug #1 — pre-detach
+    // opaque reuse not replayed against the parent on delayed
+    // clone(CLONE_FILES)).
+    //
+    // Pre-fix failure shape (the gap pass-46 left uncovered):
+    //   1. Parent P opens /safe → fd 7 (modeled, parent-private group).
+    //   2. (kernel) clone(CLONE_FILES) = C — DELAYED in strace output.
+    //      Parent + child share files_struct at kernel level.
+    //   3. Child C does opaque `openat(99, "dir", O_DIRECTORY) = 7` —
+    //      untracked dirfd → canonicalize returns null.  The kernel
+    //      rewrote the SHARED fd 7 to point at <opaque target>.  Our
+    //      model records `opaqueFdReuses[child]` += {7}.
+    //   4. Child C does `unshare(CLONE_FILES) = 0` → snapshotFd is
+    //      called and freezes the live opaque set into
+    //      `snap.preDetachOpaque`.  The kernel-private fd 7 in the
+    //      parent's NOW-private group still points at the opaque
+    //      target — parent's modeled `/safe` is stale.
+    //   5. Delayed parent's clone(CLONE_FILES) = C line surfaces →
+    //      reconciliation runs the COPY branch (because
+    //      childHadPendingFdDetach=true).
+    //
+    // Pre-fix gap: pass-46's `unionFd` opaque-set merge runs in the
+    // CLONE_FILES-without-marker branch — but `childHadPendingFdDetach`
+    // makes the reconciler take the COPY branch instead.  The
+    // copy branch only consulted `opaqueFdReuses[childRoot]` for
+    // "should I copy parent → child?" decisions; parent's own stale
+    // fd 7 entry was NEVER dropped.  A later parent
+    // `openat(7, ".ssh/id_rsa")` then resolves through `/safe`.
+    //
+    // Post-fix: `snap.preDetachOpaque` is propagated to the parent's
+    // fd-group under shared CLONE_FILES — parent's `parentPrefix:7`
+    // is deleted, subsequent parent openat(7, …) fails closed.
+    it('pre-detach opaque reuse propagates to parent on delayed clone(CLONE_FILES) (pass-47 bug #1)', async () => {
+      const proc = mockProcReader({
+        7000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pass47-bug1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        7001: {
+          ppid: 7000,
+          env: {
+            npm_package_name: 'pass47-bug1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent opens /safe → fd 7.  Modeled in parent's pre-clone
+        // (singleton) group as `<parent>:7 = /safe`.
+        {
+          pid: 7000,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child does an opaque open through an untracked dirfd → fd 7.
+        // canonicalize returns null; `recordOpaqueFdReuse` records
+        // fd 7 in `opaqueFdReuses[child]`.  No unshare yet → no
+        // snapshot yet.
+        {
+          pid: 7001,
+          line: 'openat(99, "dir", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // Child unshares CLONE_FILES → `snapshotFd` runs and absorbs
+        // the live opaque set into `snap.preDetachOpaque = {7}`.
+        // The pending-fd-detach marker is now active.
+        {
+          pid: 7001,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // Delayed parent clone(CLONE_FILES) = child surfaces →
+        // reconciliation runs the COPY branch (childHadPendingFdDetach
+        // is true).  Pre-fix: parent's fd 7 → /safe survived.
+        // Post-fix: `preDetachOpaque` drops parent's `parentPrefix:7`.
+        {
+          pid: 7000,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 7001',
+          source: 'strace',
+        },
+        // Parent openat(7, ".ssh/id_rsa") — MUST fail closed.  The
+        // parent's modeled fd 7 was certifying /safe pre-fix; post-
+        // fix the entry was dropped at reconciliation.
+        {
+          pid: 7000,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The leak: parent's modeled fd 7 → /safe must NOT certify
+      // /safe/.ssh/id_rsa.
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return (
+          r['kind'] === 'read' &&
+          r['path'] === '/safe/.ssh/id_rsa' &&
+          r['pid'] === 7000
+        );
+      });
+      expect(leaked).toHaveLength(0);
+      // Parent's failing openat(7, …) surfaces as an <UNRESOLVED_PATH>
+      // audit_bypass entry — fd 7 entry was dropped, no canonical
+      // resolution possible.
+      const parentUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7000;
+      });
+      expect(parentUnresolved.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // Codex pass 47 follow-up (medium, 2026-05-19, bug #2 — known dup
+    // reopens leave stale opaque markers).
+    //
+    // Pre-fix failure shape:
+    //   1. Singleton pid opens /known → fd 5 (canonicalized; opaque
+    //      marker, if any, cleared by the canonicalized-open path).
+    //   2. Same pid does opaque `openat(99, "x", O_DIRECTORY) = 7`
+    //      (untracked dirfd → canonicalize null → opaque marker at
+    //      fd 7).
+    //   3. Same pid does `dup2(5, 7) = 7` — known-source dup
+    //      installs a valid mapping at fd 7 (`<pid>:7 = /known`).
+    //      Pre-fix the opaque marker for fd 7 was NOT cleared.
+    //   4. Same pid does `openat(7, "file", O_RDONLY)` — canonical
+    //      resolution succeeds against `/known/file` (the live
+    //      dirfdTable mapping wins).
+    //
+    // The latent hazard pre-fix: a subsequent delayed-clone
+    // reconciliation under shared CLONE_FILES would consult the
+    // stale opaque marker at fd 7 and DELETE the legitimate
+    // /known mapping (via `unionFd`'s opaque-set merge) — fail-
+    // closed regression that masks a perfectly trustworthy
+    // resolution.
+    //
+    // Post-fix: the known-source dup site clears the opaque marker
+    // at fd 7 after installing the valid mapping.  The fd 7
+    // resolution against /known/file proceeds as expected.
+    it('known dup2 over an opaque fd clears the marker; subsequent openat resolves cleanly (pass-47 bug #2)', async () => {
+      const proc = mockProcReader({
+        8000: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pass47-bug2-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // (1) Open /known → fd 5.  Modeled as `<pid>:5 = /known`.
+        {
+          pid: 8000,
+          line: 'openat(AT_FDCWD, "/known", O_RDONLY|O_DIRECTORY) = 5',
+          source: 'strace',
+        },
+        // (2) Opaque open via untracked dirfd → fd 7.  No tracked
+        // entry installed; `recordOpaqueFdReuse` records fd 7 in
+        // `opaqueFdReuses[pid]`.
+        {
+          pid: 8000,
+          line: 'openat(99, "x", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // (3) Known-source `dup2(5, 7) = 7` — installs valid mapping
+        // at fd 7 (`<pid>:7 = /known`).  Post-fix the opaque marker
+        // at fd 7 is cleared.  Pre-fix the marker survived.
+        {
+          pid: 8000,
+          line: 'dup2(5, 7) = 7',
+          source: 'strace',
+        },
+        // (4) openat(7, "file", O_RDONLY) — successfully canonicalizes
+        // through fd 7 → /known to emit /known/file.
+        {
+          pid: 8000,
+          line: 'openat(7, "file", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 8000 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The fd 7 read MUST resolve to /known/file.  Pre-fix the
+      // surviving opaque marker would have either (a) caused
+      // `unionFd` to drop the legitimate /known mapping on a
+      // subsequent delayed-clone reconciliation, or (b) caused a
+      // conservative reconciler wiring to skip the parent-side copy
+      // and surface the openat as <UNRESOLVED_PATH>.  Post-fix the
+      // marker is gone immediately at the dup2 site and the
+      // canonical resolution succeeds for openat(7, "file", …).
+      const resolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/known/file' && r['pid'] === 8000;
+      });
+      expect(resolved).toHaveLength(1);
+      // The post-dup2 fd 7 openat must NOT have produced an
+      // <UNRESOLVED_PATH> entry — only the prior opaque-source
+      // openat (line 2) is expected to be unresolved.  Concretely:
+      // exactly one <UNRESOLVED_PATH> in the entire trace, and it
+      // is NOT for the file `"file"` (which post-fix is resolved).
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 8000;
+      });
+      // Exactly one unresolved (the opaque untracked-dirfd open).
+      // Pre-fix, the surviving marker plus a conservative reconciler
+      // wiring would also have unresolved the openat(7, "file") —
+      // post-fix the dup2 clears the marker so this doesn't happen.
+      expect(unresolved).toHaveLength(1);
+    });
   });
 });

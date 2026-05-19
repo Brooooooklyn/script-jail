@@ -665,6 +665,26 @@ export async function runInstallPhase(
     // seeds the first action; appendFdAction pushes subsequent ones).
     postDetachLog: FdLogEntry[];
     preDetachTombstones: FdTombstone[];
+    // Codex pass 47 follow-up (high, 2026-05-19, bug #1 — pre-detach
+    // opaque reuse not replayed against the parent).  The set of fd
+    // NUMBERS for which the child's PRE-marker activity recorded an
+    // opaque-reuse marker on the SHARED fd group.  Frozen at marker
+    // creation by `snapshotFd` from `opaqueFdReuses[<currentRoot>]`,
+    // then absorbed at delayed-clone reconciliation: under shared
+    // CLONE_FILES the kernel-shared files_struct was opaque'd at
+    // those fds BEFORE the marker, so the parent's same-numbered
+    // entries must be DROPPED (their model state is stale; the
+    // kernel slot was rewritten by an opaque source).
+    //
+    // Distinction vs `opaqueFdReuses` post-marker:
+    //   - preDetachOpaque (this set): pre-marker opaque reuses.
+    //     Kernel-shared state was opaque at marker time → drop
+    //     parent's fd-N entry at reconciliation.
+    //   - opaqueFdReuses[currentRoot] (post-marker): only the
+    //     CHILD's private fd was opaque'd.  Reconciliation just
+    //     skips parent→child copy (already handled today by the
+    //     copy branch + unionFd opaque-set merge).
+    preDetachOpaque: Set<number>;
   }
   const pendingCwdDetach = new Map<number, CwdSnapshot>();
   const pendingFdDetach = new Map<number, FdSnapshot>();
@@ -1053,11 +1073,26 @@ export async function runInstallPhase(
         entries.push([key.slice(prefix.length), val]);
       }
     }
+    // Codex pass 47 follow-up (high, 2026-05-19, bug #1 — pre-detach
+    // opaque reuse not replayed against the parent): freeze the
+    // CURRENT opaque-reuse set into the snapshot.  Anything recorded
+    // BEFORE the marker reflects mutations on the (then) kernel-
+    // shared fd table, so the parent's same-numbered entries must
+    // be dropped at delayed-clone reconciliation under shared
+    // CLONE_FILES.  Cloned (not shared) so the live
+    // `opaqueFdReuses[root]` set is unaffected by future
+    // post-marker mutations; reconciliation uses the snapshot for
+    // pre-detach semantics and the live set for post-marker
+    // semantics.
+    const liveOpaque = opaqueFdReuses.get(root);
+    const preDetachOpaque =
+      liveOpaque === undefined ? new Set<number>() : new Set<number>(liveOpaque);
     const snap: FdSnapshot = {
       entries,
       unknown: dirfdStateUnknown.has(root),
       postDetachLog: [{ kind: 'action', action }],
       preDetachTombstones: [],
+      preDetachOpaque,
     };
     absorbPendingTombstones(pid, snap);
     return snap;
@@ -2674,6 +2709,33 @@ export async function runInstallPhase(
                   fdUnknownAdd(pid);
                   fdUnknownAdd(childPid);
                 }
+                // Codex pass 47 follow-up (high, 2026-05-19, bug #1 —
+                // pre-detach opaque reuse not replayed against the
+                // parent): under shared CLONE_FILES the child's
+                // PRE-marker opaque opens mutated the SHARED files_
+                // struct, so the parent's same-numbered entries are
+                // stale.  Drop them.  This is the symmetric pass to
+                // the snapshot-entries conflict drop above — that one
+                // handles "child opened a known path that conflicts
+                // with parent's", this one handles "child opened an
+                // opaque path that we couldn't model but the kernel
+                // installed at fd N".
+                //
+                // Skip when the child has a fresh POST-marker mapping
+                // at the same fd: the post-marker open is in the
+                // child's private group (already private at that
+                // point) and tells us nothing about the parent's
+                // pre-detach state.  The pre-detach opaque marker is
+                // what matters for the parent's view.
+                if (
+                  fdPendingDetachShared &&
+                  childFdSnap !== undefined &&
+                  childFdSnap.preDetachOpaque.size > 0
+                ) {
+                  for (const fd of childFdSnap.preDetachOpaque) {
+                    dirfdTable.delete(`${parentPrefix}${fd}`);
+                  }
+                }
                 if (fdUnknownHas(pid)) {
                   fdUnknownAdd(childPid);
                 }
@@ -3194,6 +3256,16 @@ export async function runInstallPhase(
               // pre-unshare shared mutation; the child's reconciled
               // copy must EXCLUDE `newFd` from those tombstones.
               recordPostMarkerFdReuse(pid, newFd);
+              // Codex pass 47 follow-up (high, 2026-05-19, bug #2 —
+              // known dup reopens leave stale opaque markers): a
+              // known-source dup installs a valid mapping at `newFd`
+              // and supersedes any prior opaque-reuse marker (the
+              // fd's directory target is now known again).  Mirrors
+              // the canonicalized-open path which clears the marker
+              // after installing a known mapping — without this,
+              // `unionFd` would later DROP the just-installed entry
+              // because the stale marker survived.
+              clearOpaqueFdReuse(pid, newFd);
             } else {
               // oldfd has no tracked dir mapping → newfd must NOT
               // retain its previous mapping either (it now aliases
@@ -3218,6 +3290,18 @@ export async function runInstallPhase(
               // path consumes it to taint the parent's fd group too,
               // so parent's subsequent openat(7, ...) fails closed.
               fdUnknownAdd(pid);
+              // Codex pass 47 follow-up (high, 2026-05-19, bug #2 —
+              // untracked-source dup symmetry): mirror the
+              // unresolved-open path.  The kernel installed a fresh
+              // private fd at `newFd` whose directory target is
+              // opaque — record the per-fd opaque marker so the
+              // marker-less reconciler drops the parent's same-
+              // numbered entry instead of trusting it.  Cancel any
+              // pending tombstones targeting this fd for the same
+              // reason as the known-source branch.
+              cancelPendingTombstonesForFd(pid, newFd);
+              recordPostMarkerFdReuse(pid, newFd);
+              recordOpaqueFdReuse(pid, newFd);
             }
           }
         }
@@ -3715,6 +3799,12 @@ export async function runInstallPhase(
               // Codex follow-up (high, 2026-05-19, bug #3 — post-marker
               // fd reuse exclusion): mirrors the dup-family fix.
               recordPostMarkerFdReuse(pid, rc);
+              // Codex pass 47 follow-up (high, 2026-05-19, bug #2 —
+              // known dup reopens leave stale opaque markers): the
+              // valid mapping just installed at fd `rc` supersedes
+              // any prior opaque-reuse marker; mirrors the canonical-
+              // ized-open and dup-family fixes above.
+              clearOpaqueFdReuse(pid, rc);
             } else {
               // Unknown source fd → invalidate any prior mapping at the
               // new fd (mirrors the dup-family behaviour).
@@ -3729,6 +3819,15 @@ export async function runInstallPhase(
               // to the parent's group at any pending-detach
               // reconciliation under shared CLONE_FILES.
               fdUnknownAdd(pid);
+              // Codex pass 47 follow-up (high, 2026-05-19, bug #2 —
+              // untracked-source F_DUPFD symmetry): mirror the
+              // unresolved-open path.  The kernel installed a fresh
+              // private fd at `rc` whose directory target is opaque;
+              // record the per-fd opaque marker so the marker-less
+              // reconciler drops the parent's same-numbered entry.
+              cancelPendingTombstonesForFd(pid, rc);
+              recordPostMarkerFdReuse(pid, rc);
+              recordOpaqueFdReuse(pid, rc);
             }
           } else if (cmd === 'F_SETFD') {
             // Mutate fd's FD_CLOEXEC bit per the arg.  Strace renders
