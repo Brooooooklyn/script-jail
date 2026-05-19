@@ -1276,7 +1276,7 @@ unsafe fn real_posix_spawn_raw(
 // ── environ access ─────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-extern "C" {
+unsafe extern "C" {
     static environ: *const *const c_char;
 }
 
