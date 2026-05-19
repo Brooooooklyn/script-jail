@@ -26459,6 +26459,7 @@ async function runInstallPhase(input) {
         const liveAttrib = input.attribution.attribute(pid);
         if (liveAttrib === null) {
           attributionSnapshotByPid.delete(pid);
+          input.attribution.invalidate(pid);
         } else {
           recordAttribution(pid, liveAttrib, lineTs);
         }

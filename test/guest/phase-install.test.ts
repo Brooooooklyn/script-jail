@@ -2148,6 +2148,117 @@ describe('runInstallPhase', () => {
       expect(spawns[0]!['pkg']).toBe('pkg-q@2.0.0');
       expect(spawns[0]!['lifecycle']).toBe('postinstall');
     });
+
+    // Audit-trust follow-up #4 (Codex review of 3a88b30, 2026-05-19):
+    // when the exit-line liveness recheck observes `attribute(pid)`
+    // returns null (pid is genuinely reaped at exit time), the
+    // Attribution cache keeps the null entry.  Without a second
+    // invalidate, the next recycled generation's `attribute(pid)`
+    // — whether as a propagation parent OR a direct attribution —
+    // would hit that cached null and never re-read the now-populated
+    // /proc entry.  This test exercises the exit-before-recycle
+    // ordering: pid dies, exit is observed, /proc returns null at
+    // exit-time probe, THEN the kernel recycles the pid for a new
+    // generation, and the recycled pid acts as a clone parent.
+    it('exit-before-recycle: cached null from exit-time probe does not poison a later recycled-pid attribution', async () => {
+      // Stateful reader: pid 850 returns null while "dead", then
+      // returns pkg-z's env once the recycled generation comes up.
+      // The reader needs an external flip signal because the test
+      // controls when the recycle happens.  We model this as a
+      // counter: reads 1..2 → null (pre-recycle); reads 3+ → pkg-z.
+      let pid850EnvironReads = 0;
+      const reader: ProcReader = {
+        readPpid(pid: number): number | null {
+          if (pid === 850) return 1;
+          if (pid === 851) return 850;
+          return null;
+        },
+        readEnviron(pid: number): Map<string, string> | null {
+          if (pid === 850) {
+            pid850EnvironReads += 1;
+            // Reads 1..2 model the dead-pid window between exit-time
+            // observation and kernel recycle.  Read 3+ models the
+            // recycled generation having populated /proc.
+            if (pid850EnvironReads <= 2) return null;
+            return new Map(
+              Object.entries({
+                npm_package_name: 'pkg-z',
+                npm_package_version: '3.0.0',
+                npm_lifecycle_event: 'postinstall',
+              }),
+            );
+          }
+          return null;
+        },
+      };
+      const attr = new Attribution(reader);
+
+      // Sequence:
+      //   1. exec in pid 850 — gen-1 reads /proc, gets null. Cache
+      //      stores null for 850.  Read count = 1.
+      //   2. +++ exited +++ — invalidate(850) drops cache; probe
+      //      attribute(850) → null (read count = 2). Snapshot
+      //      delete + WITHOUT the follow-up invalidate the cached
+      //      null would persist.  WITH it the next attribute()
+      //      re-reads /proc.
+      //   3. clone(...) = 851 with parent=850 — recycled gen-2 is
+      //      now alive.  Clone propagation samples attribute(850).
+      //      Pre-fix: cached null → child unattributed → spawn
+      //      dropped.  Post-fix: cache was invalidated after the
+      //      null probe → re-reads /proc → returns pkg-z (read
+      //      count = 3) → recordAttribution(850, pkg-z) → propagate
+      //      pkg-z to child 851.
+      //   4. ENOENT spawn from child 851 with /proc returning null
+      //      for 851 — falls through to snapshot fallback which now
+      //      holds pkg-z.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 850,
+          line: 'execve("/usr/bin/node", ["node", "g1.js"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        {
+          pid: 850,
+          line: '+++ exited with 0 +++',
+          source: 'strace',
+        },
+        {
+          pid: 850,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 851',
+          source: 'strace',
+        },
+        {
+          pid: 851,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "x.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: 850 }),
+        attribution: attr,
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 851 && raw['result'] === 'enoent';
+      });
+      expect(spawns).toHaveLength(1);
+      // The recycled parent 850 was attributed at clone-propagation
+      // time — proving the exit-time null probe didn't poison the
+      // cache.  Regression signal: a missing spawn (the
+      // exit-cached null would have made attribute(850) return null
+      // at clone-propagation time → no snapshot to propagate → spawn
+      // dropped).
+      expect(spawns[0]!['pkg']).toBe('pkg-z@3.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+    });
   });
 
   // Audit-trust Finding (high, 2026-05-18) — shim exec events carry a

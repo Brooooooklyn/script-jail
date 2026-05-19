@@ -2266,6 +2266,17 @@ export async function runInstallPhase(
         const liveAttrib = input.attribution.attribute(pid);
         if (liveAttrib === null) {
           attributionSnapshotByPid.delete(pid);
+          // Audit-trust follow-up (Codex review of 3a88b30, 2026-05-19):
+          // `attribute()` caches its result — including the null we just
+          // observed for a reaped pid.  If the pid is later recycled by
+          // a new generation, the next `attribute(pid)` call (e.g. from
+          // clone propagation sampling a recycled parent, or from a
+          // recycled-pid event's direct attribution) would hit that
+          // cached null and never re-read the now-populated /proc
+          // entry, breaking the new generation's attribution.  Drop
+          // the cached null so the recycled generation triggers a
+          // fresh /proc walk.
+          input.attribution.invalidate(pid);
         } else {
           // pid is alive (recycled by a newer generation).  Refresh the
           // snapshot from the live attribution rather than leaving the
