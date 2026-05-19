@@ -351,6 +351,14 @@ describe('env-spy preload', () => {
     // Linux-only: /proc/self/fd is not present on macOS, so we skip this
     // test on Darwin.  CI runs Linux for the guest test suite.
     if (process.platform !== 'linux') return;
+    // Codex pass 52 finding 3 (high, 2026-05-19) — the test previously
+    // occupied the freed fd slot with a `/dev/null` RDONLY decoy so the
+    // recovery openSync landed on a different fd number, masking the
+    // real production fd-slot-reuse failure (recovery would
+    // closeSync(oldLogFd) and close the JUST-OPENED fd).  Production
+    // has been fixed to skip the cleanup close when newFd === oldLogFd,
+    // so the decoy is no longer needed — the direct close attack now
+    // recovers cleanly without help.
     const code = `
       const fs = require('node:fs');
       // Find any fd in /proc/self/fd whose readlink resolves to the
@@ -359,25 +367,11 @@ describe('env-spy preload', () => {
       // hostile lifecycle script would use — the kernel doesn't track
       // ownership at this layer.
       //
-      // IMPORTANT (fd-slot reuse race): on Linux, close(fd) frees the
-      // fd-table slot, and the kernel's next open(2) returns the LOWEST
-      // free fd — which is exactly the slot we just freed.  env-spy's
-      // recovery path then races itself: it opens a new fd (gets the
-      // recycled slot N), then close()s the "stale" cached logFd (still
-      // numerically N) — which closes the JUST-OPENED new fd.  The
-      // immediately-following writeSync(N) then fails with EBADF a
-      // SECOND time, env-spy hits emitAuditFdLostAndExit, and the
-      // process exits 91.
-      //
-      // To exercise the recovery path WITHOUT triggering that production
-      // race, occupy the freed slot ourselves with a read-only /dev/null
-      // descriptor right after the close.  Two effects:
-      //   1. writeSync on the cached logFd still EBADFs (the new
-      //      occupant is RDONLY → write fails the same way).
-      //   2. env-spy's recovery openSync allocates the NEXT-lowest free
-      //      slot (a different fd number), so its subsequent
-      //      closeSync(<old logFd>) closes our /dev/null placeholder
-      //      instead of the freshly-opened logFile fd.
+      // After close(fd), the kernel's next open(2) returns the LOWEST
+      // free fd — exactly the slot we just freed.  env-spy's recovery
+      // path detects this slot reuse (newFd === oldLogFd) and SKIPS
+      // the cleanup close so the fresh fd is preserved; the retry
+      // writeSync then succeeds against the live fd.
       const logFile = ${JSON.stringify(logFile)};
       try {
         const fds = fs.readdirSync('/proc/self/fd');
@@ -388,17 +382,13 @@ describe('env-spy preload', () => {
           try { target = fs.readlinkSync('/proc/self/fd/' + name); } catch { continue; }
           if (target === logFile) {
             try { fs.closeSync(fd); } catch { /* ignored */ }
-            // Re-occupy the freed slot with a RDONLY decoy so env-spy's
-            // recovery openSync lands on a different fd number.  The
-            // RDONLY mode preserves the EBADF behaviour on writeSync —
-            // a write to a read-only fd fails with EBADF on Linux.
-            try { fs.openSync('/dev/null', 'r'); } catch { /* ignored */ }
           }
         }
       } catch { /* ignored */ }
       // Trigger one env_read through the Proxy.  Recovery path:
       // writeSync on the stale fd throws EBADF → env-spy reopens the
-      // file by path → writeSync (the new fd) succeeds.
+      // file by path → fd-slot-reuse detection preserves newFd →
+      // writeSync (the new fd) succeeds.
       const v = process.env.FOO;
       process.stdout.write('FOO=' + (v || 'ABSENT'));
     `;

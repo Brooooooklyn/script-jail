@@ -243,6 +243,7 @@ function logEnvRead(name, hidden) {
   // silently dropped, matching the pre-Finding-4 behaviour.
   if (logFilePath === null) return;
 
+  const oldLogFd = logFd;
   let newFd;
   try {
     newFd = _openSync(logFilePath, 'a');
@@ -254,10 +255,25 @@ function logEnvRead(name, hidden) {
     );
     return;
   }
-  // Best-effort: close the stale fd so we don't accumulate leaked fds
-  // when an attacker repeatedly tampers.  closeSync on an already-invalid
-  // fd will throw EBADF; swallow it.
-  try { _closeSync(logFd); } catch { /* ignored */ }
+  // Codex pass 52 finding 3 (high, 2026-05-19) — fd-slot reuse on
+  // EBADF recovery.  When a hostile lifecycle script closes our cached
+  // log fd via /proc/self/fd/<N>, the kernel frees fd slot N.  Our
+  // immediate writeSync EBADFs; recovery calls openSync(logFilePath,
+  // 'a') and the kernel's "lowest free fd" allocator returns slot N
+  // (the slot we just lost).  If we then closeSync(oldLogFd) — i.e.
+  // closeSync(N) — we close the JUST-OPENED fresh fd, and the retry
+  // write fails again with EBADF.  Production hits emitAuditFdLost
+  // AndExit and exits 91 even though the recovery succeeded.
+  //
+  // Fix: detect the slot-reuse case BEFORE the cleanup close.  When
+  // `newFd === oldLogFd`, the kernel has already replaced the slot
+  // contents with our newly-opened file — no cleanup needed, the slot
+  // is live and valid.  In every other case we still close the stale
+  // numeric fd defensively (best-effort) to avoid leaking fds when an
+  // attacker repeatedly tampers.
+  if (newFd !== oldLogFd) {
+    try { _closeSync(oldLogFd); } catch { /* ignored */ }
+  }
   logFd = newFd;
   try {
     _writeSync(logFd, line);
