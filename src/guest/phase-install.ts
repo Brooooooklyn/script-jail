@@ -1990,29 +1990,6 @@ export async function runInstallPhase(
     number,
     { pkg: string; lifecycle: AttributedEvent['lifecycle']; recordedAtTs: number }
   > = new Map();
-  // Audit-trust follow-up (Codex review of def7515, 2026-05-19):
-  // count outstanding clones per pid — a clone(...) = pid line
-  // increments, an exit line decrements.  When an exit fires AND
-  // outstanding > 0, we have at least one observed clone whose exit
-  // has not yet been seen, so the matching pid generation is still
-  // alive.  The exit could belong to an OLDER generation whose
-  // exit-line was delayed by strace `-ff` cross-file ordering — in
-  // that case the snapshot recorded for the still-alive newer
-  // generation MUST survive.  We decrement the counter (balance one
-  // generation) but keep the snapshot.  Only when outstanding <= 0
-  // is the exit unambiguously for the LAST observed generation; the
-  // snapshot can be evicted.  This closes the "dead recycled-pid +
-  // delayed old exit" hole the liveness-only check couldn't:
-  // /proc returns null when both generations are reaped, so a pure
-  // null probe would evict regardless.
-  //
-  // Initialization: pids that strace observes alive at trace start
-  // (e.g. the install root) have no observed clone.  They're
-  // initialized lazily — first exit decrements 0 → -1 (clamped at
-  // -∞ in the Map but treated as <=0), so the exit evicts as it
-  // historically did.  Subsequent recycles increment from 0 again
-  // via clone propagation.
-  const outstandingClonesByPid: Map<number, number> = new Map();
   const recordAttribution = (
     pid: number,
     attr: { pkg: string; lifecycle: AttributedEvent['lifecycle'] },
@@ -2285,40 +2262,58 @@ export async function runInstallPhase(
       //      theoretical concern: tens of thousands of pid allocations
       //      would be required to wrap PID_MAX.
       if (line.startsWith('+++') && line.endsWith('+++')) {
+        // Audit-trust final model (Codex review of 2496405,
+        // 2026-05-19): the snapshot is NEVER evicted on exit.
+        //
+        // Why: the per-pid file ordering of strace `-ff` makes it
+        // impossible to distinguish "current generation's exit" from
+        // "delayed older generation's exit observed after the new
+        // generation's clone was already processed" from observation
+        // order alone.  All available signals — dispatcher-monotonic
+        // ts (delivery order, not happens-before), /proc liveness
+        // (null when BOTH gens are dead), and outstanding-clones
+        // counting (clone-then-exit looks identical to delayed-exit-
+        // after-clone) — fail to distinguish these cases without
+        // out-of-band kernel data we don't have.
+        //
+        // The simplification: clone propagation already overwrites
+        // stale snapshots via recordAttribution's `recordedAtTs`
+        // monotonicity (a clone for a recycled pid always has a
+        // higher ts than the dead generation's recordedAtTs).  So
+        // the only failure mode evicting protects against —
+        // misattribution when the pid is silently reused without our
+        // observing a clone — requires strace `-ff` to miss a clone
+        // event, which is a strace-level gap, not an attribution
+        // hazard.
+        //
+        // Memory cost: snapshots accumulate for the lifetime of the
+        // install (~30 s, ~hundreds of pids).  Bounded and acceptable.
+        //
+        // We still call invalidate() twice on the Attribution cache:
+        // (1) Drop any cached generation-1 result.  Without this, a
+        //     subsequent attribute(pid) for the same pid (e.g. the
+        //     recycled gen's event) would hit the dead gen's cached
+        //     pkg and `recordAttribution` would write it as the new
+        //     snapshot before clone propagation arrived.
+        // (2) After the post-invalidate attribute() probe caches its
+        //     fresh result (potentially null if all gens are reaped),
+        //     drop it AGAIN so a later recycle triggers a fresh walk.
         input.attribution.invalidate(pid);
-        // Audit-trust follow-up (Codex review of def7515, 2026-05-19):
-        // outstanding-clones bookkeeping is the only signal that
-        // distinguishes "delayed old-gen exit observed AFTER the
-        // new clone for a recycled pid" from "current exit observed
-        // for the only-ever generation of pid".  Liveness via
-        // /proc fails when both old AND new generations are reaped
-        // by the time the delayed exit-line is read.
-        const outstanding = outstandingClonesByPid.get(pid) ?? 0;
-        if (outstanding > 0) {
-          // At least one clone observed for `pid` whose exit hasn't
-          // landed yet.  Balance this exit against the OLDEST clone
-          // by decrementing — the matching generation is now
-          // accounted for — but DO NOT evict the snapshot, which
-          // belongs to the most-recently-observed (and still
-          // unmatched) clone.  Future events for this pid will use
-          // the surviving snapshot as the fallback.  We also do NOT
-          // re-invalidate Attribution's cache: the next attribute()
-          // call after this invalidate() will re-walk /proc, and
-          // either the still-alive newer generation answers
-          // (returns a fresh result, cached) or all-dead answers
-          // (caches null) — both are correct for what comes next.
-          outstandingClonesByPid.set(pid, outstanding - 1);
-        } else {
-          // No outstanding clones; the exit balances either the
-          // install-root pid or a previously-balanced generation
-          // whose clone we never observed.  Evict the snapshot and
-          // drop Attribution's cached null so a future recycle of
-          // this pid triggers a fresh /proc walk (without the
-          // second invalidate the cached null from the call above
-          // would poison the recycled gen's attribution).
-          attributionSnapshotByPid.delete(pid);
-          input.attribution.invalidate(pid);
+        const liveAttrib = input.attribution.attribute(pid);
+        if (liveAttrib !== null) {
+          // pid is still alive — recycled generation has /proc set up
+          // OR a thread of the same pid is still alive.  Refresh the
+          // snapshot from live attribution so a same-pid re-exec into
+          // a different package context (npm_lifecycle_event changes)
+          // is reflected immediately.  This is the only signal that
+          // refreshes a stale snapshot mid-install.
+          recordAttribution(pid, liveAttrib, lineTs);
         }
+        // Drop the freshly-cached result (live OR null) so the next
+        // attribute(pid) call walks /proc again — protects against the
+        // cached-null poisoning hole identified by Codex review of
+        // 3a88b30 / def7515.
+        input.attribution.invalidate(pid);
         continue;
       }
 
@@ -3544,25 +3539,14 @@ export async function runInstallPhase(
             }
             if (parentAttrib !== undefined) {
               // Use the clone line's ts so the child's snapshot is
-              // generation-token-stamped at the moment of observation
-              // — a delayed exit-line for the OLD generation of
-              // childPid arriving later (lower ts) will fail the
-              // eviction's `recordedAtTs <= exitTs` check and leave
-              // this new-gen snapshot intact.
+              // recorded with a recordedAtTs that strictly exceeds
+              // any prior snapshot for childPid (e.g. a dead old
+              // generation's snapshot that the never-evict-on-exit
+              // policy leaves in place).  recordAttribution's
+              // monotonicity gate overwrites the dead-gen snapshot
+              // with the new gen's pkg — the canonical recycle path.
               recordAttribution(childPid, parentAttrib, lineTs);
             }
-            // Audit-trust follow-up (Codex review of def7515,
-            // 2026-05-19): increment the outstanding-clones counter
-            // so a later exit-line for `childPid` knows there's an
-            // un-balanced clone observation pending.  Without this,
-            // the dead-recycled-pid + delayed-old-exit race would
-            // delete the freshly-propagated snapshot.  See the
-            // declaration of `outstandingClonesByPid` for the full
-            // rationale.
-            outstandingClonesByPid.set(
-              childPid,
-              (outstandingClonesByPid.get(childPid) ?? 0) + 1,
-            );
           }
         }
         continue;

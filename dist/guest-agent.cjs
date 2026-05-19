@@ -26404,7 +26404,6 @@ async function runInstallPhase(input) {
   const forgerySamples = [];
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
-  const outstandingClonesByPid = /* @__PURE__ */ new Map();
   const recordAttribution = (pid, attr, ts) => {
     const existing = attributionSnapshotByPid.get(pid);
     if (existing === void 0 || existing.recordedAtTs <= ts) {
@@ -26457,13 +26456,11 @@ async function runInstallPhase(input) {
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
         input.attribution.invalidate(pid);
-        const outstanding = outstandingClonesByPid.get(pid) ?? 0;
-        if (outstanding > 0) {
-          outstandingClonesByPid.set(pid, outstanding - 1);
-        } else {
-          attributionSnapshotByPid.delete(pid);
-          input.attribution.invalidate(pid);
+        const liveAttrib = input.attribution.attribute(pid);
+        if (liveAttrib !== null) {
+          recordAttribution(pid, liveAttrib, lineTs);
         }
+        input.attribution.invalidate(pid);
         continue;
       }
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
@@ -26887,10 +26884,6 @@ async function runInstallPhase(input) {
             if (parentAttrib !== void 0) {
               recordAttribution(childPid, parentAttrib, lineTs);
             }
-            outstandingClonesByPid.set(
-              childPid,
-              (outstandingClonesByPid.get(childPid) ?? 0) + 1
-            );
           }
         }
         continue;
