@@ -26410,7 +26410,8 @@ async function runInstallPhase(input) {
       attributionSnapshotByPid.set(pid, {
         pkg: attr.pkg,
         lifecycle: attr.lifecycle,
-        recordedAtTs: ts
+        recordedAtTs: ts,
+        stale: false
       });
     }
   };
@@ -26459,6 +26460,11 @@ async function runInstallPhase(input) {
         const liveAttrib = input.attribution.attribute(pid);
         if (liveAttrib !== null) {
           recordAttribution(pid, liveAttrib, lineTs);
+        } else {
+          const existing = attributionSnapshotByPid.get(pid);
+          if (existing !== void 0) {
+            attributionSnapshotByPid.set(pid, { ...existing, stale: true });
+          }
         }
         input.attribution.invalidate(pid);
         continue;
@@ -26873,7 +26879,8 @@ async function runInstallPhase(input) {
             if (shimLoadedPids.has(pid)) {
               shimLoadedPids.add(childPid);
             }
-            let parentAttrib = attributionSnapshotByPid.get(pid);
+            const parentSnapshot = attributionSnapshotByPid.get(pid);
+            let parentAttrib = parentSnapshot !== void 0 && !parentSnapshot.stale ? { pkg: parentSnapshot.pkg, lifecycle: parentSnapshot.lifecycle } : void 0;
             if (parentAttrib === void 0) {
               const sampled = input.attribution.attribute(pid);
               if (sampled !== null) {
@@ -27300,6 +27307,7 @@ async function runInstallPhase(input) {
           const isBasenameMatch = targetBasename === eventsFileBasename;
           if (isCanonicalMatch || isBasenameMatch) {
             const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+            const usableSnapshot = snapshot !== void 0 && !snapshot.stale ? snapshot : void 0;
             const forensicPath = canonicalTarget ?? eventsFilePathCanonical;
             forgerySamples.push({
               pid: rawEvent.pid,
@@ -27308,8 +27316,8 @@ async function runInstallPhase(input) {
               // synthesised audit_bypass entry shows the resolved
               // target, not a relative basename or aliased form.
               path: forensicPath,
-              pkg: result?.pkg ?? snapshot?.pkg ?? "<unattributed>",
-              lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? "install"
+              pkg: result?.pkg ?? usableSnapshot?.pkg ?? "<unattributed>",
+              lifecycle: result?.lifecycle ?? usableSnapshot?.lifecycle ?? "install"
             });
           }
         }
@@ -27320,8 +27328,9 @@ async function runInstallPhase(input) {
           const argv0 = rawEvent.argv[0] ?? "";
           const prog = argv0;
           const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
-          const pkg = result?.pkg ?? snapshot?.pkg ?? "<unattributed>";
-          const lifecycle = result?.lifecycle ?? snapshot?.lifecycle ?? "install";
+          const usableSnapshot = snapshot !== void 0 && !snapshot.stale ? snapshot : void 0;
+          const pkg = result?.pkg ?? usableSnapshot?.pkg ?? "<unattributed>";
+          const lifecycle = result?.lifecycle ?? usableSnapshot?.lifecycle ?? "install";
           const samples = straceExecsByPid.get(rawEvent.pid) ?? [];
           samples.push({
             argv0,
@@ -27337,10 +27346,11 @@ async function runInstallPhase(input) {
           if (rawEvent.kind === "spawn") {
             const spawnSnapshot = attributionSnapshotByPid.get(rawEvent.pid);
             if (spawnSnapshot !== void 0) {
+              const isStale = spawnSnapshot.stale;
               emit({
                 raw: rawEvent,
-                pkg: spawnSnapshot.pkg,
-                lifecycle: spawnSnapshot.lifecycle
+                pkg: isStale ? "<unattributed>" : spawnSnapshot.pkg,
+                lifecycle: isStale ? "install" : spawnSnapshot.lifecycle
               });
             }
           }

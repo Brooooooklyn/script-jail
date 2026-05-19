@@ -1986,9 +1986,34 @@ export async function runInstallPhase(
   // clone-propagation just wrote.  By comparing `recordedAtTs` against
   // the exit-line's ts, the eviction can decline to delete a snapshot
   // recorded by a later observation than the exit.
+  // Audit-trust follow-up (Codex review of 15f8faf, 2026-05-19):
+  // snapshots carry a `stale` flag flipped to `true` when the pid's
+  // exit-line is observed.  The never-evict-on-exit policy keeps the
+  // snapshot in the map so a delayed clone-propagation can overwrite
+  // it with a fresh value — but until that overwrite arrives, any
+  // null-attribution fallback that would otherwise emit under the
+  // stale package label MUST instead emit as `<unattributed>`.
+  // The risk path Codex identified: pid N attributed to pkg-A, pid
+  // N exits, pkg-B clones a child reusing pid N; cross-file ordering
+  // drains the recycled child's per-pid file BEFORE the parent's
+  // delayed `clone(...) = N` line.  The child's ENOENT spawn lands
+  // with attribute(N) returning null (child reaped), so the spawn
+  // fallback historically read snapshot[N] = pkg-A and rendered the
+  // event under pkg-A — confidently wrong.  Marking stale and
+  // routing stale fallbacks to `<unattributed>` makes the audit
+  // signal ambiguous-but-correct rather than wrong.
+  //
+  // recordAttribution clears the stale flag (any successful
+  // observation freshens the snapshot) AND uses recordedAtTs
+  // monotonicity for out-of-order ts protection.
   const attributionSnapshotByPid: Map<
     number,
-    { pkg: string; lifecycle: AttributedEvent['lifecycle']; recordedAtTs: number }
+    {
+      pkg: string;
+      lifecycle: AttributedEvent['lifecycle'];
+      recordedAtTs: number;
+      stale: boolean;
+    }
   > = new Map();
   const recordAttribution = (
     pid: number,
@@ -2004,12 +2029,15 @@ export async function runInstallPhase(
     // overwrite a newer snapshot.  Production order from a global
     // monotonic dispatcher counter never produces out-of-order writes,
     // so this is a defensive guard rather than a hot path.
+    //
+    // Successful attribution is always fresh: clears the `stale` flag.
     const existing = attributionSnapshotByPid.get(pid);
     if (existing === undefined || existing.recordedAtTs <= ts) {
       attributionSnapshotByPid.set(pid, {
         pkg: attr.pkg,
         lifecycle: attr.lifecycle,
         recordedAtTs: ts,
+        stale: false,
       });
     }
   };
@@ -2305,9 +2333,24 @@ export async function runInstallPhase(
           // OR a thread of the same pid is still alive.  Refresh the
           // snapshot from live attribution so a same-pid re-exec into
           // a different package context (npm_lifecycle_event changes)
-          // is reflected immediately.  This is the only signal that
-          // refreshes a stale snapshot mid-install.
+          // is reflected immediately.  recordAttribution clears the
+          // stale flag (success ⇒ fresh).
           recordAttribution(pid, liveAttrib, lineTs);
+        } else {
+          // Audit-trust follow-up (Codex review of 15f8faf,
+          // 2026-05-19): pid is reaped at exit-line time AND no
+          // recycled generation has /proc set up yet.  Mark the
+          // existing snapshot stale so any null-attribution fallback
+          // emitted BEFORE clone propagation overwrites it routes to
+          // `<unattributed>` instead of confidently mis-attributing
+          // under the dead generation's package.  When the delayed
+          // clone-line eventually arrives, recordAttribution writes
+          // a fresh entry (stale: false) and subsequent fallbacks
+          // use the correct package.
+          const existing = attributionSnapshotByPid.get(pid);
+          if (existing !== undefined) {
+            attributionSnapshotByPid.set(pid, { ...existing, stale: true });
+          }
         }
         // Drop the freshly-cached result (live OR null) so the next
         // attribute(pid) call walks /proc again — protects against the
@@ -3527,10 +3570,19 @@ export async function runInstallPhase(
             // audit-trust review of e5af2be: a short-lived ENOENT
             // child of a freshly-observed parent now surfaces in
             // spawn_blocked instead of being silently dropped.
+            const parentSnapshot = attributionSnapshotByPid.get(pid);
             let parentAttrib:
               | { pkg: string; lifecycle: AttributedEvent['lifecycle'] }
-              | undefined = attributionSnapshotByPid.get(pid);
+              | undefined =
+              parentSnapshot !== undefined && !parentSnapshot.stale
+                ? { pkg: parentSnapshot.pkg, lifecycle: parentSnapshot.lifecycle }
+                : undefined;
             if (parentAttrib === undefined) {
+              // No usable cached snapshot (either none, or stale from
+              // a prior exit observation).  Force a fresh /proc walk —
+              // if the parent is alive, this returns the current
+              // generation's attribution and recordAttribution clears
+              // the stale flag.
               const sampled = input.attribution.attribute(pid);
               if (sampled !== null) {
                 recordAttribution(pid, sampled, lineTs);
@@ -4679,6 +4731,13 @@ export async function runInstallPhase(
 
           if (isCanonicalMatch || isBasenameMatch) {
             const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+            // Stale snapshots (set true on exit-line when pid is reaped
+            // and no recycled gen has /proc populated yet) must NOT
+            // contribute attribution — would mis-render under the dead
+            // generation's package.  See `attributionSnapshotByPid`
+            // declaration for the full rationale.
+            const usableSnapshot =
+              snapshot !== undefined && !snapshot.stale ? snapshot : undefined;
             // Forensic path: prefer the canonically-resolved target
             // when we have one (most informative); otherwise fall
             // back to the canonical events file path (the basename
@@ -4691,8 +4750,8 @@ export async function runInstallPhase(
               // synthesised audit_bypass entry shows the resolved
               // target, not a relative basename or aliased form.
               path: forensicPath,
-              pkg: result?.pkg ?? snapshot?.pkg ?? '<unattributed>',
-              lifecycle: result?.lifecycle ?? snapshot?.lifecycle ?? 'install',
+              pkg: result?.pkg ?? usableSnapshot?.pkg ?? '<unattributed>',
+              lifecycle: result?.lifecycle ?? usableSnapshot?.lifecycle ?? 'install',
             });
           }
         }
@@ -4736,10 +4795,15 @@ export async function runInstallPhase(
           // drop the sample on attribution failure — the bypass
           // counter MUST run regardless (Finding 3).
           const snapshot = attributionSnapshotByPid.get(rawEvent.pid);
+          // Stale snapshots from exited generations are NOT a valid
+          // fallback for bypass-synthesis attribution — would render
+          // the bypass entry under the dead generation's package.
+          const usableSnapshot =
+            snapshot !== undefined && !snapshot.stale ? snapshot : undefined;
           const pkg =
-            result?.pkg ?? snapshot?.pkg ?? '<unattributed>';
+            result?.pkg ?? usableSnapshot?.pkg ?? '<unattributed>';
           const lifecycle =
-            result?.lifecycle ?? snapshot?.lifecycle ?? 'install';
+            result?.lifecycle ?? usableSnapshot?.lifecycle ?? 'install';
           const samples = straceExecsByPid.get(rawEvent.pid) ?? [];
           samples.push({
             argv0,
@@ -4780,10 +4844,22 @@ export async function runInstallPhase(
           if (rawEvent.kind === 'spawn') {
             const spawnSnapshot = attributionSnapshotByPid.get(rawEvent.pid);
             if (spawnSnapshot !== undefined) {
+              // Stale snapshots from exited generations cannot be
+              // trusted to attribute the current observation — the
+              // observation order doesn't distinguish "fresh snapshot
+              // from a new clone" from "old gen's snapshot + delayed
+              // clone-line still pending".  Emit under `<unattributed>`
+              // so the audit signal is preserved (the spawn DID
+              // happen, the diff gate still surfaces it) but routed
+              // through the ambiguous-attribution path rather than
+              // confidently mis-rendered under a dead package.  See
+              // Codex review of 15f8faf for the production-realistic
+              // ordering that motivated this.
+              const isStale = spawnSnapshot.stale;
               emit({
                 raw: rawEvent,
-                pkg: spawnSnapshot.pkg,
-                lifecycle: spawnSnapshot.lifecycle,
+                pkg: isStale ? '<unattributed>' : spawnSnapshot.pkg,
+                lifecycle: isStale ? 'install' : spawnSnapshot.lifecycle,
               });
             }
           }

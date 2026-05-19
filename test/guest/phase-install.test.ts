@@ -2343,12 +2343,18 @@ describe('runInstallPhase', () => {
         return raw['kind'] === 'spawn' && raw['pid'] === 601 && raw['result'] === 'enoent';
       });
       expect(spawns).toHaveLength(1);
-      // Recycled child's ENOENT spawn surfaces with the parent's
-      // propagated pkg-w.  Regression signal: a dropped event
-      // (length 0) means the delayed old-gen exit evicted the
-      // propagated snapshot.
-      expect(spawns[0]!['pkg']).toBe('pkg-w@4.0.0');
-      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+      // Recycled child's ENOENT spawn surfaces under `<unattributed>`,
+      // NOT the parent-propagated pkg-w.  Rationale (Codex review of
+      // 15f8faf, 2026-05-19): observation order can't distinguish
+      // "fresh snapshot from new clone" from "stale old-gen snapshot
+      // + delayed clone still pending", so the safer path is to
+      // route the event through the ambiguous-attribution sentinel
+      // rather than risk confidently mis-rendering under a dead
+      // package.  Regression signal: a dropped event (length 0)
+      // means the stale-flag check went too far; a `pkg-w` attribution
+      // means the stale-flag was bypassed.
+      expect(spawns[0]!['pkg']).toBe('<unattributed>');
+      expect(spawns[0]!['lifecycle']).toBe('install');
     });
   });
 
