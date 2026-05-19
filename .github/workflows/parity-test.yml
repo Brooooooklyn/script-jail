@@ -253,6 +253,14 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     continue-on-error: true
+    outputs:
+      # Set to 'true' only when the lockfile-upload step actually ran AND
+      # succeeded.  `needs.<job>.result` is unreliable here because a job
+      # with `continue-on-error: true` is reported as `success` to
+      # downstream `needs` references regardless of the actual outcome, so
+      # gating `diff` on `result == 'success'` lets it run when the VM
+      # never booted.  A step `outcome` reflects the literal step state.
+      lockfile_uploaded: ${{ steps.upload_macos_lockfile.outcome == 'success' }}
     env:
       SCRIPT_JAIL_E2E_SELF_TEST: '1'
     steps:
@@ -361,6 +369,7 @@ jobs:
             --config "${{ github.workspace }}/.script-jail.yml"
 
       - name: Upload macOS lockfile
+        id: upload_macos_lockfile
         uses: actions/upload-artifact@v7
         with:
           name: macos-arm64-lockfile
@@ -461,17 +470,19 @@ jobs:
   # ---------------------------------------------------------------------------
   # diff — pull both lockfiles, canonicalise volatile fields, and compare.
   #
-  # Gated on `macos-arm64-vz.result == 'success'` because that job is
-  # `continue-on-error: true` on GitHub-hosted runners (no nested
-  # virtualization).  When the macOS job actually completes (self-hosted
-  # bare-metal Mac runner, or paid larger runner with bare-metal access),
-  # diff runs and asserts byte-equal lockfiles modulo canonical fields;
-  # otherwise diff is skipped and the workflow's overall conclusion is
-  # determined by linux-firecracker.
+  # Gated on the macOS job's `lockfile_uploaded` output (set only when the
+  # upload step's outcome was `success`) rather than `needs.<job>.result`,
+  # because `continue-on-error: true` causes `result` to be reported as
+  # `success` to downstream needs regardless of the actual outcome — which
+  # otherwise lets diff run when the VM never booted.  On GitHub-hosted
+  # runners VZ doesn't work (no nested virt), so the upload step is never
+  # reached and diff is skipped; on bare-metal hardware (self-hosted Mac
+  # runner, or paid larger runner with bare-metal access), diff fires and
+  # asserts byte-equal lockfiles modulo canonical fields.
   # ---------------------------------------------------------------------------
   diff:
     needs: [linux-firecracker, macos-arm64-vz]
-    if: needs.macos-arm64-vz.result == 'success'
+    if: needs.macos-arm64-vz.outputs.lockfile_uploaded == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
