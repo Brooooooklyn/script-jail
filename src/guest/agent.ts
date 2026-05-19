@@ -561,6 +561,15 @@ export async function* runStraceTailer(
   // are caught from the first poll.
   let maxObservedMtime: bigint =
     opts.eventsBaseline !== undefined ? opts.eventsBaseline.mtimeNs : -1n;
+  // 2026-05-19: number of consecutive polls observing `ctime advanced AND
+  // size === eventsPos` before flagging tamper.  Linux 5.10 (Ubuntu 22.04
+  // rootfs) sometimes returns stat() with a newer ctime than the size-update
+  // it accompanies, producing a one-shot false positive during active
+  // writes.  Three consecutive polls (~3 × pollIntervalMs) is enough to
+  // outlast the kernel's lazy ctime settle while still catching a real
+  // utimes-restore tamper, which leaves the file quiescent after the attack.
+  let ctimeAdvanceStablePolls = 0;
+  const CTIME_ADVANCE_REQUIRED_POLLS = 3;
   function recordTamper(reason: string): void {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -651,15 +660,32 @@ export async function* runStraceTailer(
     // when ctime has advanced AND there are no new bytes to read; the
     // `lastConsumedCtime` is updated after a successful read so subsequent
     // legitimate writes do not re-trip this gate.
+    //
+    // 2026-05-19 follow-up: on Linux 5.10 (Ubuntu 22.04 microVM rootfs) we
+    // see spurious one-shot ctime advances of a few ms with size unchanged
+    // — the kernel updates ctime slightly after the size-bumping write
+    // returns, and a stat() that lands in the gap reports the new ctime
+    // against an unchanged size.  A real utimes-restore attack persists
+    // across many polls (the attacker stops touching the file once the
+    // attack completes), so requiring N consecutive observations of the
+    // suspicious state collapses the false positive without weakening the
+    // defence.  The mtime-regression check above remains the primary
+    // signal; this gate stays defence-in-depth for the narrow case where
+    // the attacker restores mtime to a value still ≥ maxObservedMtime.
     if (
       lastConsumedCtime !== -1n &&
       ctimeBig > lastConsumedCtime &&
       sizeNum === eventsPos
     ) {
-      recordTamper(
-        `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`,
-      );
-      return;
+      ctimeAdvanceStablePolls += 1;
+      if (ctimeAdvanceStablePolls >= CTIME_ADVANCE_REQUIRED_POLLS) {
+        recordTamper(
+          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`,
+        );
+        return;
+      }
+    } else {
+      ctimeAdvanceStablePolls = 0;
     }
 
     // Retained as defense-in-depth: a plain append-then-truncate (no utimes

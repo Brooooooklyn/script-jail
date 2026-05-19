@@ -27916,6 +27916,8 @@ async function* runStraceTailer(opts) {
   let maxSeenSize = 0;
   let lastConsumedCtime = opts.eventsBaseline !== void 0 ? opts.eventsBaseline.ctimeNs : -1n;
   let maxObservedMtime = opts.eventsBaseline !== void 0 ? opts.eventsBaseline.mtimeNs : -1n;
+  let ctimeAdvanceStablePolls = 0;
+  const CTIME_ADVANCE_REQUIRED_POLLS = 3;
   function recordTamper(reason) {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -27970,10 +27972,15 @@ async function* runStraceTailer(opts) {
     }
     if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
     if (lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
-      recordTamper(
-        `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path2}`
-      );
-      return;
+      ctimeAdvanceStablePolls += 1;
+      if (ctimeAdvanceStablePolls >= CTIME_ADVANCE_REQUIRED_POLLS) {
+        recordTamper(
+          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path2}`
+        );
+        return;
+      }
+    } else {
+      ctimeAdvanceStablePolls = 0;
     }
     if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
       recordTamper(
