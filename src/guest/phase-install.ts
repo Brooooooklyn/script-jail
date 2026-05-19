@@ -955,12 +955,22 @@ export async function runInstallPhase(
   //
   //   1. The PRE-marker bucket (`pendingFdTombstones`) — point and
   //      range tombstones recorded before any detach marker exists.
+  //      Keyed by RAW pid: pre-marker buckets are pid-scoped before
+  //      any sharing / detach occurs.
   //   2. The POST-marker interleaved log on an existing fd-detach
-  //      marker (`pendingFdDetach[pid].postDetachLog`) — once a
-  //      marker is created, subsequent close/cloexec/close_range
-  //      observations queue here.  Stale entries in this log must
-  //      ALSO be excised on reopen; otherwise the marker's reconcile
-  //      replay re-drops `newFd` from the child's private copy.
+  //      marker (`pendingFdDetach[rootedFd(pid)].postDetachLog`) —
+  //      once a marker is created, subsequent close/cloexec/
+  //      close_range observations queue here.  Stale entries in
+  //      this log must ALSO be excised on reopen; otherwise the
+  //      marker's reconcile replay re-drops `newFd` from the
+  //      child's private copy.  Keyed by FD-GROUP ROOT (pass 51
+  //      follow-up): after the pass 50 rekeying, the marker is
+  //      stored at the marker owner == fd-group root.  When a
+  //      CLONE_FILES sibling G of the marker owner C reopens an
+  //      fd, `rootedFd(G) === C`, so the lookup must resolve via
+  //      the root to find C's marker — keying by the raw sibling
+  //      pid would miss the cancellation and the reconciler would
+  //      later replay a stale closeRange that drops G's fresh fd.
   //
   // For point tombstones (`close` / `cloexec`) targeting `newFd` we
   // simply drop them.  For range tombstones (`closeRange`) covering
@@ -1015,7 +1025,8 @@ export async function runInstallPhase(
     return next;
   }
   function cancelPendingTombstonesForFd(pid: number, newFd: number): void {
-    // 1. PRE-marker bucket.
+    // 1. PRE-marker bucket — keyed by raw pid (pre-marker buckets
+    //    are pid-scoped before any detach / fd-group sharing).
     const bucket = pendingFdTombstones.get(pid);
     if (bucket !== undefined) {
       const next = cancelTombstonesInBucket(bucket, newFd);
@@ -1031,7 +1042,18 @@ export async function runInstallPhase(
     //    no surviving fds to act on).  Other action kinds (`none`,
     //    `execveCloexec`) don't reference fd numbers and are passed
     //    through unchanged.
-    const snap = pendingFdDetach.get(pid);
+    //
+    //    Codex pass 51 follow-up (high, 2026-05-19): resolve via the
+    //    fd-group root.  After pass 50 the marker is stored at the
+    //    marker owner == rootedFd(owner), and CLONE_FILES siblings
+    //    of the owner satisfy `rootedFd(sibling) === owner`.  Keying
+    //    this lookup by the raw `pid` would miss the marker for a
+    //    sibling reopen, leaving any stale closeRange action / range
+    //    tombstone unsplit; the delayed-clone reconciler would then
+    //    replay the closeRange against the child copy and drop the
+    //    sibling's fresh post-marker fd.
+    const root = rootedFd(pid);
+    const snap = pendingFdDetach.get(root);
     if (snap === undefined) return;
     const nextLog: FdLogEntry[] = [];
     for (const entry of snap.postDetachLog) {

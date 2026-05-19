@@ -26032,7 +26032,8 @@ async function runInstallPhase(input) {
       if (next.length === 0) pendingFdTombstones.delete(pid);
       else pendingFdTombstones.set(pid, next);
     }
-    const snap = pendingFdDetach.get(pid);
+    const root = rootedFd(pid);
+    const snap = pendingFdDetach.get(root);
     if (snap === void 0) return;
     const nextLog = [];
     for (const entry of snap.postDetachLog) {

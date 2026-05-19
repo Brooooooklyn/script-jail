@@ -13040,5 +13040,186 @@ describe('runInstallPhase', () => {
       });
       expect(gUnresolved).toHaveLength(0);
     });
+
+    // Codex pass 51 follow-up (high, 2026-05-19, bug — sibling reopens
+    // miss root-owned marker-log cancellation).
+    //
+    // Pre-fix failure shape:
+    //   1. Parent P opens /safe → fd 7 (modeled as `<P>:7 = /safe`).
+    //   2. (kernel) P does `clone(CLONE_FILES) = C` — DELAYED in
+    //      strace output.  P + C share files_struct at kernel level.
+    //   3. C does `unshare(CLONE_FILES) = 0` — snapshotFd seeds the
+    //      pending-fd-detach marker on C with a `{ kind: 'none' }`
+    //      action.  C becomes its own fd-group root.
+    //   4. C does `close_range(5, 10, CLOSE_RANGE_UNSHARE) = 0` —
+    //      singleton + marker present → `appendFdAction` queues a
+    //      `{ kind: 'closeRange', first: 5, last: 10 }` ACTION in
+    //      C's postDetachLog.
+    //   5. C does `clone(CLONE_FILES) = G` — observed immediately.
+    //      Reconciler unions G into C's group; `rootedFd(G) === C`.
+    //   6. G does `openat(AT_FDCWD, "/known", O_DIRECTORY) = 7` —
+    //      canonicalize returns "/known"; entry installed as
+    //      `<C>:7 = /known` (keyed by rootedFd(G)=C).  Pre-fix the
+    //      reopen handler called `cancelPendingTombstonesForFd(G, 7)`
+    //      which looked up `pendingFdDetach.get(G)` (undefined — the
+    //      marker lives at C, the fd-group root), so the closeRange
+    //      action over [5..10] was NOT split around fd 7.
+    //      `recordPostMarkerFdReuse(G, 7)` already resolves via
+    //      `rootedFd(G) = C` (pass-50 fix), so the lifecycle is
+    //      recorded correctly — but the closeRange ACTION replay
+    //      (unlike tombstone replay) does NOT honour the post-marker
+    //      reuse exclude set, so the lifecycle entry alone cannot
+    //      protect G's fresh fd from the unsplit action.
+    //   7. Delayed `P clone(CLONE_FILES) = C` surfaces → reconciler
+    //      walks C's postDetachLog.  Pre-fix: the unsplit closeRange
+    //      action deletes every fd in [5..10] from C's child copy,
+    //      including the freshly-installed `<C>:7 = /known`.
+    //   8. G does `openat(7, "file", O_RDONLY)` — canonicalize via
+    //      `rootedFd(G) = C` finds no `<C>:7` entry → null →
+    //      `<UNRESOLVED_PATH>`.
+    //
+    // Post-fix: `cancelPendingTombstonesForFd(G, 7)` resolves via
+    // `rootedFd(G) = C`, finds C's marker, and splits the closeRange
+    // action `{first:5, last:10}` into `{first:5, last:6}` and
+    // `{first:8, last:10}` — fd 7 is surgically excised.  The
+    // reconciler's replay leaves `<C>:7 = /known` intact and G's
+    // `openat(7, "file")` resolves cleanly to /known/file.
+    it('sibling reopen via CLONE_FILES splits root-owned closeRange action in marker log (pass-51 bug)', async () => {
+      const proc = mockProcReader({
+        9100: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'pass51-bug-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9101: {
+          ppid: 9100,
+          env: {
+            npm_package_name: 'pass51-bug-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        9102: {
+          ppid: 9101,
+          env: {
+            npm_package_name: 'pass51-bug-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // (1) Parent P=9100 opens /safe → fd 7.  Modeled in P's
+        // singleton fd group as `<9100>:7 = /safe`.
+        {
+          pid: 9100,
+          line: 'openat(AT_FDCWD, "/safe", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // (2) C=9101 unshares CLONE_FILES.  snapshotFd seeds the
+        // pending marker on C with `{ kind: 'none' }`; C becomes
+        // its own fd-group root.  P's `clone(CLONE_FILES) = 9101`
+        // line has NOT yet been observed (delayed-clone window).
+        {
+          pid: 9101,
+          line: 'unshare(CLONE_FILES) = 0',
+          source: 'strace',
+        },
+        // (3) C does CLOSE_RANGE_UNSHARE over [5..10].  Singleton +
+        // marker present → `appendFdAction` queues a
+        // `{ kind: 'closeRange', first: 5, last: 10 }` ACTION in
+        // C's postDetachLog.  Marker log now reads
+        // [{ none }, { closeRange 5..10 }].
+        {
+          pid: 9101,
+          line: 'close_range(5, 10, CLOSE_RANGE_UNSHARE) = 0',
+          source: 'strace',
+        },
+        // (4) C clones G=9102 with CLONE_FILES — observed
+        // immediately.  Reconciler unions G into C's group;
+        // `rootedFd(9102) === 9101`.  G now shares C's post-detach
+        // private fd table.
+        {
+          pid: 9101,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9102',
+          source: 'strace',
+        },
+        // (5) G opens /known → fd 7 via AT_FDCWD.  canonicalize
+        // returns "/known"; entry installed as `<9101>:7 = /known`
+        // (keyed by rootedFd(G)=9101).  Pre-fix the reopen handler's
+        // `cancelPendingTombstonesForFd(9102, 7)` looked up
+        // `pendingFdDetach.get(9102) === undefined` and returned
+        // without splitting the closeRange action — fd 7 stayed
+        // inside the [5..10] range that the reconciler will replay.
+        // Post-fix the lookup resolves via `rootedFd(9102) = 9101`,
+        // finds C's marker, and splits the action around fd 7.
+        {
+          pid: 9102,
+          line: 'openat(AT_FDCWD, "/known", O_RDONLY|O_DIRECTORY) = 7',
+          source: 'strace',
+        },
+        // (6) Delayed `P clone(CLONE_FILES) = C` surfaces →
+        // reconciler runs the COPY branch (childHadPendingFdDetach=
+        // true) and walks C's postDetachLog.  Pre-fix: closeRange
+        // action deletes every fd in [5..10] from the child copy,
+        // including `<9101>:7 = /known` (the ACTION replay does
+        // NOT consult `childPostMarkerFdTouched`, so the pass-50
+        // lifecycle exclude does not save fd 7).  Post-fix: the
+        // action was split into [5..6] + [8..10] at the reopen
+        // site, so the replay leaves `<9101>:7 = /known` intact.
+        {
+          pid: 9100,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND, child_tidptr=0x7f...) = 9101',
+          source: 'strace',
+        },
+        // (7) G does `openat(7, "file", O_RDONLY)` — canonicalize
+        // against rootedFd(9102)=9101.  Post-fix `<9101>:7 = /known`
+        // survives reconciliation, so the resolved path is
+        // /known/file.  Pre-fix it was dropped → null →
+        // `<UNRESOLVED_PATH>`.
+        {
+          pid: 9102,
+          line: 'openat(7, "file", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 9100 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // G's `openat(7, "file")` MUST canonicalize to /known/file
+      // after reconciliation — fd 7 was excised from the stale
+      // closeRange in C's marker log via the rootedFd-keyed
+      // cancellation.
+      const resolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/known/file' && r['pid'] === 9102;
+      });
+      expect(resolved).toHaveLength(1);
+      // Sanity: parent's stale /safe must NOT leak through G's fd
+      // resolution.  Parent's `<9100>:7 = /safe` stays under
+      // parent's prefix; G resolves through `<9101>:7 = /known`.
+      const leakedSafe = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/safe/file' && r['pid'] === 9102;
+      });
+      expect(leakedSafe).toHaveLength(0);
+      // No `<UNRESOLVED_PATH>` for G — the surgical split kept the
+      // fresh fd alive through delayed-clone reconciliation.
+      const gUnresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 9102;
+      });
+      expect(gUnresolved).toHaveLength(0);
+    });
   });
 });
