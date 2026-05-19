@@ -71,7 +71,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           # The action invokes itself via `uses: ./` further down.  We don't
           # need git credentials persisted on disk for that — and dropping
@@ -80,13 +80,13 @@ jobs:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           # Pinned to the same version as `packageManager` in package.json.
           version: 11.1.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: '24'
           cache: 'pnpm'

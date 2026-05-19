@@ -35,17 +35,17 @@ jobs:
         node-version: ['22', '24', '26']
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           # Pinned to the same version as `packageManager` in package.json so
           # CI and local installs resolve identical dependency graphs.
           version: 11.1.2
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'pnpm'

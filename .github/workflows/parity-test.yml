@@ -72,7 +72,7 @@ jobs:
       tag: ${{ steps.read.outputs.tag }}
       pm: ${{ steps.read.outputs.pm }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -126,12 +126,12 @@ jobs:
       SCRIPT_JAIL_E2E_SELF_TEST: '1'
     steps:
       - name: Checkout script-jail
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Checkout upstream fixture (${{ needs.resolve-fixture.outputs.repo }}@${{ needs.resolve-fixture.outputs.tag }})
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: ${{ needs.resolve-fixture.outputs.repo }}
           ref: ${{ needs.resolve-fixture.outputs.sha }}
@@ -147,11 +147,11 @@ jobs:
       - name: Strip fixture .git before mounting into VM
         run: rm -rf fixture/.git
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.1.2
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -164,7 +164,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # vuejs/core is a pnpm monorepo, so the agent inside the VM detects
-      # `pnpm` as the manager and tries to exec it.  pnpm/action-setup@v4
+      # `pnpm` as the manager and tries to exec it.  pnpm/action-setup@v6
       # installs pnpm under a runner-local path that's NOT under the Node
       # prefix the host-node disk packs, so without this step the agent
       # would hit `spawn pnpm ENOENT`.  Install pnpm globally into the Node
@@ -224,7 +224,7 @@ jobs:
         run: node dist/main.cjs
 
       - name: Upload Linux lockfile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-lockfile
           path: linux-lockfile.yml
@@ -244,12 +244,12 @@ jobs:
       SCRIPT_JAIL_E2E_SELF_TEST: '1'
     steps:
       - name: Checkout script-jail
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Checkout upstream fixture (${{ needs.resolve-fixture.outputs.repo }}@${{ needs.resolve-fixture.outputs.tag }})
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: ${{ needs.resolve-fixture.outputs.repo }}
           ref: ${{ needs.resolve-fixture.outputs.sha }}
@@ -262,11 +262,11 @@ jobs:
       - name: Strip fixture .git before mounting into VM
         run: rm -rf fixture/.git
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.1.2
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -297,12 +297,12 @@ jobs:
       # release to pull from on the branch under test.  Instead, download
       # them as workflow artifacts from a sibling `build-mac-artifacts` job
       # below.
-      # actions/upload-artifact@v4 preserves directory structure relative
+      # actions/upload-artifact@v7 preserves directory structure relative
       # to $GITHUB_WORKSPACE, so the archive contains the `images/` prefix.
       # Download to the workspace root so the files land at their expected
       # `images/<asset>` paths.
       - name: Download arm64 VM artifacts (kernel + rootfs + .so)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mac-arm64-vm-artifacts
           path: .
@@ -321,7 +321,7 @@ jobs:
             --config "${{ github.workspace }}/.script-jail.yml"
 
       - name: Upload macOS lockfile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-arm64-lockfile
           path: macos-lockfile.yml
@@ -340,15 +340,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.1.2
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -391,7 +391,7 @@ jobs:
       # `docker/setup-qemu-action@v3` registers the binfmt handlers via
       # `tonistiigi/binfmt` so cross-arch RUN steps work transparently.
       - name: Register QEMU binfmt handlers (for linux/arm64 build)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
@@ -406,7 +406,7 @@ jobs:
         run: bash images/kernel/build.sh --arch=arm64 --force
 
       - name: Upload arm64 VM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mac-arm64-vm-artifacts
           path: |
@@ -424,27 +424,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.1.2
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '24'
           cache: 'pnpm'
 
       - run: pnpm install --frozen-lockfile
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-lockfile
           path: artifacts/linux
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: macos-arm64-lockfile
           path: artifacts/macos-arm64
@@ -482,7 +482,7 @@ jobs:
 
       - name: Upload parity report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: parity-report
           path: parity-report.md

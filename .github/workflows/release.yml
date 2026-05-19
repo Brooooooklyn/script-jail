@@ -27,7 +27,7 @@
 #       dependency lifecycle script cannot write to the repo or its
 #       releases via the runner's git credentials.
 #     - `publish` is a minimal job that only downloads the build artifacts
-#       and uploads them via softprops/action-gh-release@v2.  Only this
+#       and uploads them via softprops/action-gh-release@v3.  Only this
 #       job carries contents:write.
 
 name: release
@@ -63,7 +63,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -88,7 +88,7 @@ jobs:
              artifacts/mac-bin/script-jail-vm-arm64-darwin
 
       - name: Upload Mach-O artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: script-jail-vm-arm64-darwin
           path: artifacts/mac-bin/script-jail-vm-arm64-darwin
@@ -116,7 +116,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           # Don't leave the GITHUB_TOKEN persisted as a git credential after
           # checkout.  install/test/build phases run npm/pnpm lifecycle
@@ -125,12 +125,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 11.1.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -245,7 +245,7 @@ jobs:
       # once here so both arm64 rootfs build steps (ubuntu-22.04, ubuntu-24.04)
       # see it.  No-op for the x64 rootfs builds.
       - name: Register QEMU binfmt handlers (for linux/arm64 build)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
@@ -283,7 +283,7 @@ jobs:
       # the `build-mac-bin` job below; we re-fetch it here via a workflow
       # artifact so the SHA summary can include it in the paste-block.
       - name: Download script-jail-vm Mach-O artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: script-jail-vm-arm64-darwin
           path: artifacts/mac-bin
@@ -347,7 +347,7 @@ jobs:
       # than a job output or cache) keeps the build job side-effect-free
       # outside its own filesystem.
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets
           path: |
@@ -385,12 +385,12 @@ jobs:
       # credentials; the release upload below receives the write-scoped
       # token via the workflow env, not via git.
       - name: Checkout (verification source)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets
           # download-artifact@v4 preserves the directory structure under the
@@ -405,7 +405,7 @@ jobs:
       # `check-publish-artifacts.sh` finds it at
       # `artifacts/script-jail-vm-arm64-darwin`.
       - name: Download Mach-O artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: script-jail-vm-arm64-darwin
           path: artifacts
@@ -422,12 +422,12 @@ jobs:
             --dist-source dist/main.cjs \
             --dist-cli-source dist/cli.cjs
 
-      # softprops/action-gh-release@v2 auto-creates the release for the tag
+      # softprops/action-gh-release@v3 auto-creates the release for the tag
       # (or appends to an existing one) and uploads each listed file.  We pin
       # to the major tag — the maintainer's standard practice in this repo
       # for actions that publish frequent patch releases.
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/images/rootfs-ubuntu-22.04.ext4
