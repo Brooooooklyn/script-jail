@@ -67,6 +67,14 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
   // producing a visible SKIP in the test report rather than a vacuous pass.
   let shimAvailable = false;
 
+  // CI runners install `node` outside /usr/bin (e.g. /opt/hostedtoolcache/node/...).
+  // The C-source helpers below execve `/usr/bin/env` with `env node -e ...`,
+  // so the child's PATH MUST include the actual node binary directory, not
+  // the hard-coded `/usr/bin:/bin`.  Forward the test runner's PATH verbatim
+  // (which is guaranteed to contain node, since vitest spawned us via it)
+  // and quote-escape it for safe embedding inside a C string literal.
+  const runtimePath = (process.env['PATH'] ?? '/usr/bin:/bin').replace(/"/g, '\\"');
+
   // ── beforeAll: compile .so if stale ─────────────────────────────────────
   //
   // On Linux we treat a build failure as a hard error so that CI cannot go
@@ -224,10 +232,18 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     // Assert at least one valid JSONL line was emitted.
     expect(res.logLines.length).toBeGreaterThan(0);
 
-    const first = res.logLines[0];
-    expect(first).toBeDefined();
-    if (first !== undefined) {
-      const parsed = JSON.parse(first) as Record<string, unknown>;
+    // The exec-wrapper now emits an `exec` event for every wrapped exec
+    // (e.g. for the `node` invocation itself), which races ahead of the
+    // first `env_read` line.  Don't assert by index — filter the JSONL
+    // stream for an env_read entry and validate its shape.
+    const envReadLine = res.logLines.find((l: string) => {
+      try {
+        return (JSON.parse(l) as Record<string, unknown>)['kind'] === 'env_read';
+      } catch { return false; }
+    });
+    expect(envReadLine).toBeDefined();
+    if (envReadLine !== undefined) {
+      const parsed = JSON.parse(envReadLine) as Record<string, unknown>;
       expect(parsed['kind']).toBe('env_read');
       expect(typeof parsed['name']).toBe('string');
       expect(typeof parsed['pid']).toBe('number');
@@ -625,7 +641,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           "SCRIPT_JAIL_LOG_FILE=/tmp/evil-one",
           "SCRIPT_JAIL_LOG_FILE=/tmp/evil-two",
           "LD_PRELOAD=${shimSo}",
@@ -693,7 +709,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           "SCRIPT_JAIL_LOG_FILE=/tmp/evil-one",
           "SCRIPT_JAIL_LOG_FILE=/tmp/evil-two",
           "LD_PRELOAD=${shimSo}",
@@ -769,7 +785,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           /* FIRST entry: already canonical — exactly the SCRIPT_JAIL_PRELOAD_PATH
              value the parent will set below.  The idempotency check will fire. */
           "LD_PRELOAD=${shimSo}",
@@ -838,7 +854,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           "LD_PRELOAD=${shimSo}",
           /* FIRST: already canonical (matches SCRIPT_JAIL_NODE_OPTIONS). */
           "NODE_OPTIONS=${canonNodeOpts}",
@@ -913,7 +929,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           /* Pure attacker payload — not a duplicate, not canonical. */
           "LD_PRELOAD=/tmp/evil.so",
           "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
@@ -982,7 +998,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           "LD_PRELOAD=${shimSo}",
           /* Pure attacker payload: --require points at a non-existent
              file (so if it survived, Node would fail to start with a
@@ -1063,7 +1079,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           "LD_PRELOAD=/tmp/evil.so",
           "NODE_OPTIONS=--require=/tmp/evil.js",
           "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
@@ -1142,7 +1158,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           /* Pure attacker payload — NO shim path. */
           "LD_PRELOAD=/tmp/evil.so",
           0,
@@ -1208,7 +1224,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           /* Canonical shim path PLUS an attacker suffix.  ld.so loads
              both .so files; the attacker's ELF ctor runs.  Must be
              stripped down to just the canonical entry. */
@@ -1277,7 +1293,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           /* Keep shim in the chain so the child can still emit audit. */
           "LD_PRELOAD=${shimSo}",
           /* Pure attacker NODE_OPTIONS — parent never set one and never
@@ -1347,7 +1363,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           /* Caller passes LD_PRELOAD=shimSo so the child stays under
              audit.  No SCRIPT_JAIL_PRELOAD_PATH on the parent so canon
              is empty.  Rewrite must leave this entry alone. */
@@ -1418,7 +1434,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           "LD_PRELOAD=${shimSo}",
           "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
           /* Attacker-controlled audit DSO. */
@@ -1477,7 +1493,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
           0,
         };
         char *envp[] = {
-          "PATH=/usr/bin:/bin",
+          "PATH=${runtimePath}",
           "LD_PRELOAD=${shimSo}",
           "SCRIPT_JAIL_PRELOAD_PATH=${shimSo}",
           /* Attacker-controlled library search path. */

@@ -358,6 +358,26 @@ describe('env-spy preload', () => {
       // closeSync(n) on someone else's fd is the same primitive a
       // hostile lifecycle script would use — the kernel doesn't track
       // ownership at this layer.
+      //
+      // IMPORTANT (fd-slot reuse race): on Linux, close(fd) frees the
+      // fd-table slot, and the kernel's next open(2) returns the LOWEST
+      // free fd — which is exactly the slot we just freed.  env-spy's
+      // recovery path then races itself: it opens a new fd (gets the
+      // recycled slot N), then close()s the "stale" cached logFd (still
+      // numerically N) — which closes the JUST-OPENED new fd.  The
+      // immediately-following writeSync(N) then fails with EBADF a
+      // SECOND time, env-spy hits emitAuditFdLostAndExit, and the
+      // process exits 91.
+      //
+      // To exercise the recovery path WITHOUT triggering that production
+      // race, occupy the freed slot ourselves with a read-only /dev/null
+      // descriptor right after the close.  Two effects:
+      //   1. writeSync on the cached logFd still EBADFs (the new
+      //      occupant is RDONLY → write fails the same way).
+      //   2. env-spy's recovery openSync allocates the NEXT-lowest free
+      //      slot (a different fd number), so its subsequent
+      //      closeSync(<old logFd>) closes our /dev/null placeholder
+      //      instead of the freshly-opened logFile fd.
       const logFile = ${JSON.stringify(logFile)};
       try {
         const fds = fs.readdirSync('/proc/self/fd');
@@ -368,6 +388,11 @@ describe('env-spy preload', () => {
           try { target = fs.readlinkSync('/proc/self/fd/' + name); } catch { continue; }
           if (target === logFile) {
             try { fs.closeSync(fd); } catch { /* ignored */ }
+            // Re-occupy the freed slot with a RDONLY decoy so env-spy's
+            // recovery openSync lands on a different fd number.  The
+            // RDONLY mode preserves the EBADF behaviour on writeSync —
+            // a write to a read-only fd fails with EBADF on Linux.
+            try { fs.openSync('/dev/null', 'r'); } catch { /* ignored */ }
           }
         }
       } catch { /* ignored */ }

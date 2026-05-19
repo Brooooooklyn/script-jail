@@ -1772,10 +1772,28 @@ describe('runStraceTailer', () => {
     });
 
     // Replace the file with a fresh one at the same path — new inode.
+    // Then deterministically wait for the tailer to observe the tamper
+    // (rather than racing a fixed 100ms timer that's flaky on slow CI
+    // runners where the polling loop hasn't drained between the
+    // unlink+rewrite and the resolveExit).
     setTimeout(() => {
       unlinkSync(eventsPath);
       writeSyncFn(eventsPath, '{"kind":"env_read","name":"INJECTED","pid":1,"ts":0,"hidden":false}\n', 'utf8');
-      setTimeout(resolveExit, 100);
+      // Poll tamperRef.reason every 10ms (≤ pollIntervalMs of 20ms) up to
+      // a generous 2s cap, then resolveExit.  The cap is large enough
+      // that even a heavily-contended CI runner has many poll cycles to
+      // notice the inode swap; the fall-through still triggers
+      // resolveExit so the test can fail fast if tamper genuinely never
+      // fires (rather than hanging until the 4s collect timeout).
+      const start = Date.now();
+      const waitForTamper = (): void => {
+        if (tamperRef.reason !== null || Date.now() - start > 2000) {
+          resolveExit();
+          return;
+        }
+        setTimeout(waitForTamper, 10);
+      };
+      waitForTamper();
     }, 40);
 
     await collect(tailer, 4000);
