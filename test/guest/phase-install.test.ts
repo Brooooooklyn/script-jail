@@ -1407,6 +1407,127 @@ describe('runInstallPhase', () => {
       expect(synths[0]!['pkg']).toBe('snapshot-pkg@2.0.0');
       expect(synths[0]!['lifecycle']).toBe('install');
     });
+
+    // Regression test for the spawns-gcc@1.0.0 e2e bug (2026-05-19):
+    // a short-lived posix_spawnp child execve()s a missing rootfs binary
+    // (gcc), libc returns -1 ENOENT, the child exits 127 within
+    // microseconds.  By the time strace tails the ENOENT line, the
+    // child pid is fully reaped — /proc/<childpid>/{environ,status}
+    // both ENOENT and Attribution.attribute(childPid) returns null.
+    // Pre-fix the spawn event was dropped at the
+    // `if (result === null) continue` gate in the regular dispatch
+    // path, so spawn_blocked for the parent stayed `[]` and the
+    // <ENOENT> marker never landed in the e2e lockfile.  Post-fix the
+    // parent's attribution snapshot is propagated to the child at
+    // clone time and the regular spawn-event dispatch reuses the
+    // snapshot exactly the way the bypass-synthesis branch already
+    // did.
+    it('clone-propagated snapshot lets short-lived ENOENT child surface in spawn_blocked', async () => {
+      // Parent pid 301 has intact env (attribution succeeds and the
+      // snapshot is recorded).  Child pid 302 has NO ProcReader entry
+      // — Attribution.attribute returns null for it, mirroring the
+      // reaped-before-tail race.
+      const proc = mockProcReader({
+        301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'spawns-gcc',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent emits a real exec first so the install-phase
+        // dispatcher records an attribution snapshot for pid 301.
+        {
+          pid: 301,
+          line: 'execve("/usr/bin/node", ["node", "script.js"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+        // Parent clones — child pid 302 inherits the snapshot.  Plain
+        // fork (no CLONE_FS / CLONE_FILES) so the copy branches run.
+        {
+          pid: 301,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 302',
+          source: 'strace',
+        },
+        // Child execve's a missing rootfs binary — libc returns
+        // ENOENT, the child exits 127 immediately.  Attribution from
+        // /proc/<child>/environ returns null (no entry in the
+        // ProcReader spec above).
+        {
+          pid: 302,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "evil.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The child's ENOENT spawn event must surface — attributed to
+      // the parent's snapshot.
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 302;
+      });
+      expect(spawns).toHaveLength(1);
+      expect(spawns[0]!['pkg']).toBe('spawns-gcc@1.0.0');
+      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+      const raw = spawns[0]!['raw'] as Record<string, unknown>;
+      expect(raw['result']).toBe('enoent');
+      expect(raw['argv']).toEqual(['gcc', '-c', 'evil.c']);
+    });
+
+    // Negative control for the above: without the parent's prior
+    // attribution success, the snapshot map is empty and the child's
+    // spawn event has nothing to fall back to.  The event MUST still
+    // be dropped — broadening the fallback past the snapshot would
+    // flood the lockfile with system-pid noise.
+    it('clone child with no parent snapshot → spawn ENOENT remains dropped (no flood)', async () => {
+      const proc = mockProcReader({});
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Clone without a prior parent attribution success.  Pid 401
+        // never gets a snapshot recorded because Attribution returns
+        // null for it too.
+        {
+          pid: 401,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 402',
+          source: 'strace',
+        },
+        {
+          pid: 402,
+          line: 'execve("/usr/bin/gcc", ["gcc", "-c", "x.c"], 0x2 /* 0 vars */) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn';
+      });
+      expect(spawns).toHaveLength(0);
+    });
   });
 
   // Audit-trust Finding (high, 2026-05-18) — shim exec events carry a

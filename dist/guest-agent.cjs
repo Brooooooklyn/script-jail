@@ -26830,6 +26830,10 @@ async function runInstallPhase(input) {
             if (shimLoadedPids.has(pid)) {
               shimLoadedPids.add(childPid);
             }
+            const parentAttrib = attributionSnapshotByPid.get(pid);
+            if (parentAttrib !== void 0) {
+              recordAttribution(childPid, parentAttrib);
+            }
           }
         }
         continue;
@@ -27279,7 +27283,19 @@ async function runInstallPhase(input) {
           });
           straceExecsByPid.set(rawEvent.pid, samples);
         }
-        if (result === null) continue;
+        if (result === null) {
+          if (rawEvent.kind === "spawn") {
+            const spawnSnapshot = attributionSnapshotByPid.get(rawEvent.pid);
+            if (spawnSnapshot !== void 0) {
+              emit({
+                raw: rawEvent,
+                pkg: spawnSnapshot.pkg,
+                lifecycle: spawnSnapshot.lifecycle
+              });
+            }
+          }
+          continue;
+        }
         if (rawEvent.kind === "read" || rawEvent.kind === "write") {
           const canonical = canonicalizeForEmit(
             rawEvent.pid,

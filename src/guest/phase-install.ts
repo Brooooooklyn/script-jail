@@ -3283,6 +3283,31 @@ export async function runInstallPhase(
             if (shimLoadedPids.has(pid)) {
               shimLoadedPids.add(childPid);
             }
+
+            // Audit-trust Finding (high, 2026-05-19): propagate the parent's
+            // attribution snapshot to the child at clone time.  A short-
+            // lived posix_spawnp child that execve()s a missing binary
+            // (e.g. `gcc` not present in the rootfs) exits 127 within
+            // microseconds — by the time the strace tailer processes the
+            // `execve(...) = -2 ENOENT` line, the child pid is fully
+            // reaped, so /proc/<childpid>/environ and
+            // /proc/<childpid>/status both ENOENT and
+            // `Attribution.attribute(childPid)` returns null.  Pre-fix the
+            // spawn event was dropped at the `if (result === null) continue`
+            // gate further down and `spawn_blocked` stayed empty for the
+            // parent's package (cf. the spawns-gcc@1.0.0 e2e failure).  By
+            // seeding the child's snapshot from the parent at clone time
+            // (using the same write-once `recordAttribution` helper as
+            // every other attribution-success site) the spawn-event
+            // dispatcher's snapshot fallback can recover the parent's
+            // pkg / lifecycle label.  Only propagate when the parent
+            // actually has a snapshot — clone lines from pids without a
+            // tracked attribution (e.g. unshare-detached pseudo-parents)
+            // leave the child unattributed, same as before.
+            const parentAttrib = attributionSnapshotByPid.get(pid);
+            if (parentAttrib !== undefined) {
+              recordAttribution(childPid, parentAttrib);
+            }
           }
         }
         continue;
@@ -4492,7 +4517,38 @@ export async function runInstallPhase(
         // the lockfile with noise from system processes that happen to
         // get traced.  The bypass synthesis path above is the deliberate
         // exception: an unattributable raw execve IS the signal.
-        if (result === null) continue;
+        //
+        // Audit-trust Finding (high, 2026-05-19): one further exception
+        // — a `spawn` event whose pid is unattributable via /proc but
+        // for whom we DO have a parent-propagated attribution snapshot
+        // (recorded at clone time) must still emit.  The motivating
+        // case: a posix_spawnp child execve()s a missing rootfs binary
+        // (`gcc` in spawns-gcc@1.0.0), exits 127 within microseconds,
+        // and is reaped before strace tails the ENOENT line.
+        // /proc/<childpid>/{environ,status} both ENOENT, so
+        // Attribution.attribute(childPid) → null.  Pre-fix the event
+        // was dropped here and `spawn_blocked` stayed `[]`, removing
+        // the audit signal from the lockfile.  The bypass-synthesis
+        // branch above already uses this same snapshot fallback; we
+        // mirror its semantics for the regular spawn-event dispatch.
+        //
+        // Scope is narrow on purpose: only `kind === 'spawn'`.  An
+        // unattributable read/write/dlopen/connect from a system pid
+        // would flood the lockfile if we broadened the fallback —
+        // that's the floor the existing gate enforces.
+        if (result === null) {
+          if (rawEvent.kind === 'spawn') {
+            const spawnSnapshot = attributionSnapshotByPid.get(rawEvent.pid);
+            if (spawnSnapshot !== undefined) {
+              emit({
+                raw: rawEvent,
+                pkg: spawnSnapshot.pkg,
+                lifecycle: spawnSnapshot.lifecycle,
+              });
+            }
+          }
+          continue;
+        }
 
         // Audit-trust Finding (high, 2026-05-19): canonicalize dirfd /
         // cwd-relative read/write paths BEFORE applyProtectedPathsPolicy
