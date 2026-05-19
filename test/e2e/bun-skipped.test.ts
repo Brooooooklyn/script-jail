@@ -35,7 +35,7 @@ describe.sequential('e2e: bun consumer skipped with warning', () => {
     expect(result.exit?.code).toBe(0);
 
     // The `warn` helper writes `::warning::<msg>\n` to stdout.  The exact
-    // message comes from BunUnsupportedError in src/action/detect-pm.ts.
+    // message comes from BunUnsupportedError in src/shared/detect-pm.ts.
     expect(result.stdout).toContain('::warning::');
     expect(result.stdout).toContain('script-jail v1 does not support bun');
   });

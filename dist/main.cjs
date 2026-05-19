@@ -26427,10 +26427,10 @@ function setOutput(name, value) {
 }
 
 // src/main.ts
-var import_node_fs11 = require("node:fs");
+var import_node_fs12 = require("node:fs");
 var import_node_os5 = require("node:os");
 var import_node_path9 = require("node:path");
-var import_node_crypto4 = require("node:crypto");
+var import_node_crypto5 = require("node:crypto");
 
 // src/action/inputs.ts
 var import_node_path = require("node:path");
@@ -26501,12 +26501,12 @@ function defaultGetInput(name) {
   return process.env[key];
 }
 
-// src/action/detect-pm.ts
+// src/shared/detect-pm.ts
 var import_node_crypto = require("node:crypto");
 var import_node_fs = require("node:fs");
 var import_node_path2 = require("node:path");
 
-// src/action/log.ts
+// src/shared/log.ts
 function warn(msg, write = (s) => {
   process.stdout.write(s);
 }) {
@@ -26514,7 +26514,7 @@ function warn(msg, write = (s) => {
 `);
 }
 
-// src/action/detect-pm.ts
+// src/shared/detect-pm.ts
 var BunUnsupportedError = class extends Error {
   constructor() {
     super("script-jail v1 does not support bun. Use npm/pnpm/yarn, or wait for v2.");
@@ -42069,9 +42069,21 @@ function buildEffectiveConfig(input) {
     arch: input.overrides.spoofArch
   };
   const outDir = input.workDir ?? (0, import_node_fs4.mkdtempSync)((0, import_node_path4.join)((0, import_node_os2.tmpdir)(), "script-jail-config-"));
-  const outPath = (0, import_node_path4.join)(outDir, "config.yml");
-  (0, import_node_fs4.writeFileSync)(outPath, (0, import_yaml2.stringify)(config2), "utf8");
-  return outPath;
+  const configPath = (0, import_node_path4.join)(outDir, "config.yml");
+  (0, import_node_fs4.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  const result = { configPath };
+  if (input.yarnrcOverlay !== void 0) {
+    const yarnrcPath = (0, import_node_path4.join)(outDir, ".yarnrc.yml");
+    (0, import_node_fs4.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    result.yarnrcPath = yarnrcPath;
+  }
+  if (input.pmFlagsJson !== void 0) {
+    const pmFlagsPath = (0, import_node_path4.join)(outDir, "etc", "script-jail", "pm-flags.json");
+    (0, import_node_fs4.mkdirSync)((0, import_node_path4.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs4.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    result.pmFlagsPath = pmFlagsPath;
+  }
+  return result;
 }
 
 // src/action/cache.ts
@@ -42095,14 +42107,73 @@ function maybeClearCache(input) {
 }
 
 // src/action/firecracker/download.ts
+var import_node_fs7 = require("node:fs");
+var import_promises2 = require("node:fs/promises");
+var import_node_path6 = require("node:path");
+var import_node_os3 = require("node:os");
+var import_node_crypto3 = require("node:crypto");
+var import_node_zlib = require("node:zlib");
+
+// src/shared/http-download.ts
 var import_node_crypto2 = require("node:crypto");
 var import_node_fs6 = require("node:fs");
 var import_promises = require("node:fs/promises");
 var import_node_https = require("node:https");
 var import_node_http = require("node:http");
-var import_node_path6 = require("node:path");
-var import_node_os3 = require("node:os");
-var import_node_zlib = require("node:zlib");
+async function sha256File(filePath) {
+  return new Promise((resolve2, reject) => {
+    const hash2 = (0, import_node_crypto2.createHash)("sha256");
+    const stream = (0, import_node_fs6.createReadStream)(filePath);
+    stream.on("data", (chunk) => hash2.update(chunk));
+    stream.on("end", () => resolve2(hash2.digest("hex")));
+    stream.on("error", reject);
+  });
+}
+var NodeHttpClient = class {
+  async download(url2, destPath, expectedSha256) {
+    const tmpPath = `${destPath}.tmp.${(0, import_node_crypto2.randomBytes)(4).toString("hex")}`;
+    try {
+      await downloadToFile(url2, tmpPath, 0);
+      const actual = await sha256File(tmpPath);
+      if (actual !== expectedSha256) {
+        throw new Error(
+          `SHA-256 mismatch for ${url2}: expected ${expectedSha256}, got ${actual}`
+        );
+      }
+      await (0, import_promises.rename)(tmpPath, destPath);
+    } catch (err) {
+      try {
+        await (0, import_promises.unlink)(tmpPath);
+      } catch {
+      }
+      throw err;
+    }
+  }
+};
+async function downloadToFile(url2, destPath, redirects) {
+  if (redirects > 5) throw new Error(`Too many redirects fetching ${url2}`);
+  const getter = url2.startsWith("https://") ? import_node_https.get : import_node_http.get;
+  await new Promise((resolve2, reject) => {
+    getter(url2, (res) => {
+      if (res.statusCode !== void 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve2).catch(reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode ?? "?"} fetching ${url2}`));
+        return;
+      }
+      const out = (0, import_node_fs6.createWriteStream)(destPath);
+      res.pipe(out);
+      out.on("finish", () => resolve2());
+      out.on("error", reject);
+      res.on("error", reject);
+    }).on("error", reject);
+  });
+}
+
+// src/action/firecracker/download.ts
 var KNOWN_VERSIONS = {
   "1.8.0": "bc899bdaef8d0aa7b0fafbf49a2bf647e0298558f4faee44970d87a1c6d1ae2d",
   "1.9.0": "95c13740c7ca1a6dfb40e0f51cd0a9eefee1f223cd2c3538755d03c3a9ba5237"
@@ -42115,7 +42186,7 @@ async function ensureBinaries(input) {
       `script-jail: unknown Firecracker version "${firecrackerVersion}". Add it (with a pinned SHA-256) to KNOWN_VERSIONS in src/action/firecracker/download.ts.`
     );
   }
-  (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs7.mkdirSync)(imagesDir, { recursive: true });
   const tarUrl = `https://github.com/firecracker-microvm/firecracker/releases/download/v${firecrackerVersion}/firecracker-v${firecrackerVersion}-x86_64.tgz`;
   const tarPath = (0, import_node_path6.join)(imagesDir, `firecracker-v${firecrackerVersion}-x86_64.tgz`);
   const fcBinPath = (0, import_node_path6.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
@@ -42124,24 +42195,15 @@ async function ensureBinaries(input) {
     ensureFile(http, tarUrl, tarPath, expectedTarSha),
     ensureFile(http, kernelUrl, vmlinuxPath, kernelSha256)
   ]);
-  if ((0, import_node_fs6.existsSync)(fcBinPath)) {
-    await (0, import_promises.unlink)(fcBinPath);
+  if ((0, import_node_fs7.existsSync)(fcBinPath)) {
+    await (0, import_promises2.unlink)(fcBinPath);
   }
   void tarFresh;
   await extractFirecrackerBinary(tarPath, fcBinPath, firecrackerVersion);
   return { firecrackerPath: fcBinPath, vmlinuxPath };
 }
-async function sha256File(filePath) {
-  return new Promise((resolve2, reject) => {
-    const hash2 = (0, import_node_crypto2.createHash)("sha256");
-    const stream = (0, import_node_fs6.createReadStream)(filePath);
-    stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve2(hash2.digest("hex")));
-    stream.on("error", reject);
-  });
-}
 async function ensureFile(http, url2, destPath, expectedSha256) {
-  if ((0, import_node_fs6.existsSync)(destPath)) {
+  if ((0, import_node_fs7.existsSync)(destPath)) {
     const actual = await sha256File(destPath);
     if (actual === expectedSha256) return false;
     console.warn(
@@ -42154,12 +42216,12 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
 async function extractFirecrackerBinary(tarPath, destPath, version2) {
   const tmpOut = (0, import_node_path6.join)(
     (0, import_node_os3.tmpdir)(),
-    `script-jail-fc-${(0, import_node_crypto2.randomBytes)(4).toString("hex")}`
+    `script-jail-fc-${(0, import_node_crypto3.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version2}-x86_64`;
   await new Promise((resolve2, reject) => {
     const gunzip = (0, import_node_zlib.createGunzip)();
-    const input = (0, import_node_fs6.createReadStream)(tarPath);
+    const input = (0, import_node_fs7.createReadStream)(tarPath);
     const BLOCK = 512;
     let buf = Buffer.alloc(0);
     let state = "header";
@@ -42206,7 +42268,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2) {
           if (name === targetEntry && declaredSize > 0) {
             capturing = true;
             foundEntry = true;
-            outStream = (0, import_node_fs6.createWriteStream)(tmpOut);
+            outStream = (0, import_node_fs7.createWriteStream)(tmpOut);
           } else {
             capturing = false;
           }
@@ -42233,56 +42295,13 @@ async function extractFirecrackerBinary(tarPath, destPath, version2) {
     };
     input.pipe(gunzip);
   });
-  await (0, import_promises.rename)(tmpOut, destPath);
-  await (0, import_promises.chmod)(destPath, 493);
-}
-var NodeHttpClient = class {
-  async download(url2, destPath, expectedSha256) {
-    const tmpPath = `${destPath}.tmp.${(0, import_node_crypto2.randomBytes)(4).toString("hex")}`;
-    try {
-      await downloadToFile(url2, tmpPath, 0);
-      const actual = await sha256File(tmpPath);
-      if (actual !== expectedSha256) {
-        throw new Error(
-          `SHA-256 mismatch for ${url2}: expected ${expectedSha256}, got ${actual}`
-        );
-      }
-      await (0, import_promises.rename)(tmpPath, destPath);
-    } catch (err) {
-      try {
-        await (0, import_promises.unlink)(tmpPath);
-      } catch {
-      }
-      throw err;
-    }
-  }
-};
-async function downloadToFile(url2, destPath, redirects) {
-  if (redirects > 5) throw new Error(`Too many redirects fetching ${url2}`);
-  const getter = url2.startsWith("https://") ? import_node_https.get : import_node_http.get;
-  await new Promise((resolve2, reject) => {
-    getter(url2, (res) => {
-      if (res.statusCode !== void 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve2).catch(reject);
-        return;
-      }
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode ?? "?"} fetching ${url2}`));
-        return;
-      }
-      const out = (0, import_node_fs6.createWriteStream)(destPath);
-      res.pipe(out);
-      out.on("finish", () => resolve2());
-      out.on("error", reject);
-      res.on("error", reject);
-    }).on("error", reject);
-  });
+  await (0, import_promises2.rename)(tmpOut, destPath);
+  await (0, import_promises2.chmod)(destPath, 493);
 }
 
 // src/action/pre-fetch-artifacts.ts
-var import_node_crypto3 = require("node:crypto");
-var import_node_fs7 = require("node:fs");
+var import_node_crypto4 = require("node:crypto");
+var import_node_fs8 = require("node:fs");
 var import_node_path7 = require("node:path");
 function rootfsAssetName(runnerImage) {
   return `rootfs-${runnerImage}.ext4`;
@@ -42290,11 +42309,18 @@ function rootfsAssetName(runnerImage) {
 var LIBSCRIPTJAIL_ASSET = "libscriptjail.so";
 async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
-  (0, import_node_fs7.mkdirSync)(imagesDir, { recursive: true });
+  const platform4 = input.platform ?? "linux";
+  (0, import_node_fs8.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName(runnerImage);
   const assets = [
-    { name: wantedRootfs, expected: requireExpected(manifest, wantedRootfs) },
-    { name: LIBSCRIPTJAIL_ASSET, expected: requireExpected(manifest, LIBSCRIPTJAIL_ASSET) }
+    {
+      name: wantedRootfs,
+      expected: requireExpected(manifest, platform4, wantedRootfs)
+    },
+    {
+      name: LIBSCRIPTJAIL_ASSET,
+      expected: requireExpected(manifest, platform4, LIBSCRIPTJAIL_ASSET)
+    }
   ];
   await Promise.all(
     assets.map(
@@ -42310,8 +42336,14 @@ async function preFetchArtifacts(input) {
 function assetUrl(manifest, asset) {
   return `https://github.com/${manifest.repo}/releases/download/${manifest.tag}/${asset}`;
 }
-function requireExpected(manifest, asset) {
-  const sha = manifest.expected[asset];
+function requireExpected(manifest, platform4, asset) {
+  const section = manifest.expected[platform4];
+  if (section === void 0) {
+    throw new Error(
+      `script-jail: artifact manifest is missing the "${platform4}" platform section.  Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`
+    );
+  }
+  const sha = section[asset];
   if (sha === void 0) {
     throw new Error(
       `script-jail: artifact manifest is missing an expected SHA-256 for "${asset}". Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`
@@ -42321,7 +42353,7 @@ function requireExpected(manifest, asset) {
 }
 async function ensureAsset(args) {
   const { http, url: url2, destPath, expectedSha256 } = args;
-  if ((0, import_node_fs7.existsSync)(destPath)) {
+  if ((0, import_node_fs8.existsSync)(destPath)) {
     const actual = await sha256File2(destPath);
     if (actual === expectedSha256) return;
     console.warn(
@@ -42332,8 +42364,8 @@ async function ensureAsset(args) {
 }
 async function sha256File2(filePath) {
   return new Promise((resolve2, reject) => {
-    const hash2 = (0, import_node_crypto3.createHash)("sha256");
-    const stream = (0, import_node_fs7.createReadStream)(filePath);
+    const hash2 = (0, import_node_crypto4.createHash)("sha256");
+    const stream = (0, import_node_fs8.createReadStream)(filePath);
     stream.on("data", (chunk) => hash2.update(chunk));
     stream.on("end", () => resolve2(hash2.digest("hex")));
     stream.on("error", reject);
@@ -42346,20 +42378,42 @@ var PINNED_MANIFEST = {
   // update when forked
   tag: "v0.1.0",
   expected: {
-    "rootfs-ubuntu-22.04.ext4": "PLACEHOLDER_SHA256_ROOTFS_UBUNTU_22_04",
-    "rootfs-ubuntu-24.04.ext4": "PLACEHOLDER_SHA256_ROOTFS_UBUNTU_24_04",
-    "libscriptjail.so": "PLACEHOLDER_SHA256_LIBSCRIPTJAIL_SO"
+    linux: {
+      "rootfs-ubuntu-22.04.ext4": "PLACEHOLDER_SHA256_LINUX_ROOTFS_UBUNTU_22_04",
+      "rootfs-ubuntu-24.04.ext4": "PLACEHOLDER_SHA256_LINUX_ROOTFS_UBUNTU_24_04",
+      "libscriptjail.so": "PLACEHOLDER_SHA256_LINUX_LIBSCRIPTJAIL_SO"
+    },
+    darwin: {
+      "rootfs-ubuntu-22.04-arm64.ext4": "PLACEHOLDER_SHA256_DARWIN_ROOTFS_UBUNTU_22_04_ARM64",
+      "rootfs-ubuntu-24.04-arm64.ext4": "PLACEHOLDER_SHA256_DARWIN_ROOTFS_UBUNTU_24_04_ARM64",
+      "libscriptjail-arm64.so": "PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_SO",
+      "vmlinux-vz-x86_64": "PLACEHOLDER_SHA256_VMLINUX_VZ_X86_64",
+      "vmlinux-vz-arm64": "PLACEHOLDER_SHA256_VMLINUX_VZ_ARM64",
+      // No `script-jail-vm-x86_64-darwin` — see the file header for the
+      // Intel-macOS-runner deprecation note.
+      "script-jail-vm-arm64-darwin": "PLACEHOLDER_SHA256_SCRIPT_JAIL_VM_ARM64_DARWIN"
+    }
   }
 };
 
 // src/action/validate-manifest.ts
 var MANIFEST_PATH = "src/action/artifact-manifest.ts";
 var SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+var PLATFORMS = ["linux", "darwin"];
 function validateManifest(manifest) {
+  const expected = manifest.expected;
+  if (expected === void 0 || typeof expected !== "object" || expected.linux === void 0 || expected.darwin === void 0 || typeof expected.linux !== "object" || typeof expected.darwin !== "object") {
+    throw new Error(
+      `script-jail: action artifact manifest at ${MANIFEST_PATH} is not platform-keyed.  Expected \`expected: { linux: {...}, darwin: {...} }\`. Open a GitHub issue against the action repository (${manifest.repo}).`
+    );
+  }
   const offenders = [];
-  for (const [name, value] of Object.entries(manifest.expected)) {
-    if (!SHA256_HEX_RE.test(value)) {
-      offenders.push(name);
+  for (const platform4 of PLATFORMS) {
+    const section = manifest.expected[platform4];
+    for (const [name, value] of Object.entries(section)) {
+      if (!SHA256_HEX_RE.test(value)) {
+        offenders.push(`${platform4}/${name}`);
+      }
     }
   }
   if (offenders.length === 0) return;
@@ -42369,8 +42423,8 @@ function validateManifest(manifest) {
 }
 
 // src/action/firecracker/overlay.ts
-var import_node_fs8 = require("node:fs");
-var import_promises2 = require("node:fs/promises");
+var import_node_fs9 = require("node:fs");
+var import_promises3 = require("node:fs/promises");
 var import_node_path8 = require("node:path");
 var import_node_os4 = require("node:os");
 var import_node_child_process = require("node:child_process");
@@ -42381,25 +42435,39 @@ async function makeOverlay(input) {
     repoSrcPath,
     configPath,
     hostNodePrefix,
-    workDir: maybeWorkDir
+    workDir: maybeWorkDir,
+    extraRepoOverlayFiles
   } = input;
-  const workDir = maybeWorkDir ?? (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
-  (0, import_node_fs8.mkdirSync)(workDir, { recursive: true });
+  const workDir = maybeWorkDir ?? (0, import_node_fs9.mkdtempSync)((0, import_node_path8.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
+  (0, import_node_fs9.mkdirSync)(workDir, { recursive: true });
   const rootfsCopyPath = (0, import_node_path8.join)(workDir, "rootfs.ext4");
   copyRootfs(baseRootfsPath, rootfsCopyPath);
   const repoStageDir = (0, import_node_path8.join)(workDir, "repo-stage");
-  (0, import_node_fs8.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs8.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  (0, import_node_fs9.mkdirSync)(repoStageDir, { recursive: true });
+  (0, import_node_fs9.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
   const configDestDir = (0, import_node_path8.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs8.mkdirSync)(configDestDir, { recursive: true });
-  (0, import_node_fs8.copyFileSync)(configPath, (0, import_node_path8.join)(configDestDir, "config.yml"));
+  (0, import_node_fs9.mkdirSync)(configDestDir, { recursive: true });
+  (0, import_node_fs9.copyFileSync)(configPath, (0, import_node_path8.join)(configDestDir, "config.yml"));
+  if (extraRepoOverlayFiles !== void 0) {
+    for (const entry of extraRepoOverlayFiles) {
+      const dest = (0, import_node_path8.join)(repoStageDir, entry.relPath);
+      const destNormalized = (0, import_node_path8.join)(dest);
+      if (!destNormalized.startsWith(repoStageDir + "/") && destNormalized !== repoStageDir) {
+        throw new Error(
+          `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`
+        );
+      }
+      (0, import_node_fs9.mkdirSync)((0, import_node_path8.dirname)(destNormalized), { recursive: true });
+      (0, import_node_fs9.writeFileSync)(destNormalized, entry.content, "utf8");
+    }
+  }
   const repoDiskPath = (0, import_node_path8.join)(workDir, "repo.ext4");
   await buildRepoDisk(repoStageDir, repoDiskPath);
   const hostNodeDiskPath = (0, import_node_path8.join)(workDir, "host-node.ext4");
   await buildHostNodeDisk(hostNodePrefix, hostNodeDiskPath);
   const cleanup = async () => {
     try {
-      await (0, import_promises2.rm)(workDir, { recursive: true, force: true });
+      await (0, import_promises3.rm)(workDir, { recursive: true, force: true });
     } catch (err) {
       console.warn(`[overlay] cleanup warning: ${String(err)}`);
     }
@@ -42411,7 +42479,7 @@ function copyRootfs(src, dest) {
     const result = (0, import_node_child_process.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
     if (result.status === 0) return;
   }
-  (0, import_node_fs8.cpSync)(src, dest);
+  (0, import_node_fs9.cpSync)(src, dest);
 }
 async function buildRepoDisk(srcDir, outPath) {
   const sizeMB = estimateDiskSizeMB(srcDir);
@@ -42434,9 +42502,9 @@ function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat2 = (0, import_node_fs8.statSync)(p, { bigint: false });
+      const stat2 = (0, import_node_fs9.statSync)(p, { bigint: false });
       if (stat2.isDirectory()) {
-        for (const child of (0, import_node_fs8.readdirSync)(p)) {
+        for (const child of (0, import_node_fs9.readdirSync)(p)) {
           visit((0, import_node_path8.join)(p, child));
         }
       } else if (stat2.isFile() || stat2.isSymbolicLink()) {
@@ -42445,7 +42513,7 @@ function estimateDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs8.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs9.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(32, estimatedMB);
 }
@@ -42504,9 +42572,9 @@ function estimateHostNodeDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat2 = (0, import_node_fs8.statSync)(p, { bigint: false });
+      const stat2 = (0, import_node_fs9.statSync)(p, { bigint: false });
       if (stat2.isDirectory()) {
-        for (const child of (0, import_node_fs8.readdirSync)(p)) {
+        for (const child of (0, import_node_fs9.readdirSync)(p)) {
           visit((0, import_node_path8.join)(p, child));
         }
       } else if (stat2.isFile() || stat2.isSymbolicLink()) {
@@ -42515,15 +42583,15 @@ function estimateHostNodeDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs8.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs9.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 1.5 / (1024 * 1024));
   return Math.max(64, estimatedMB);
 }
 
 // src/action/firecracker/launch.ts
 var import_node_http2 = require("node:http");
-var import_node_fs9 = require("node:fs");
-var import_promises3 = require("node:fs/promises");
+var import_node_fs10 = require("node:fs");
+var import_promises4 = require("node:fs/promises");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process2 = require("node:process");
 var DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off ro rootfstype=ext4 init=/sbin/init";
@@ -42548,7 +42616,7 @@ async function launchVm(input) {
         `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
-    if (!(0, import_node_fs9.existsSync)("/dev/kvm")) {
+    if (!(0, import_node_fs10.existsSync)("/dev/kvm")) {
       throw new Error(
         "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
@@ -42614,7 +42682,7 @@ async function launchVm(input) {
   } catch (err) {
     handle.kill("SIGKILL");
     try {
-      await (0, import_promises3.unlink)(socketPath);
+      await (0, import_promises4.unlink)(socketPath);
     } catch {
     }
     throw err;
@@ -42708,7 +42776,7 @@ var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((0, import_node_fs9.existsSync)(socketPath)) return;
+      if ((0, import_node_fs10.existsSync)(socketPath)) return;
       await sleep(50);
     }
     throw new Error(`Timeout waiting for socket: ${socketPath}`);
@@ -42768,50 +42836,9 @@ var UnixSocketApiClient = class {
 
 // src/action/firecracker/vsock.ts
 var import_node_net = require("node:net");
+
+// src/shared/vsock-protocol.ts
 var import_node_readline = require("node:readline");
-async function openVsockSession(udsPath, port, options) {
-  let duplex;
-  if (options?.duplex !== void 0) {
-    duplex = options.duplex;
-    duplex.write(`CONNECT ${port}
-`);
-  } else {
-    const sock = await dialVsockWithRetry(
-      udsPath,
-      port,
-      options?.connectTimeoutMs ?? 3e4
-    );
-    duplex = socketToDuplex(sock);
-  }
-  const events = parseFrames(duplex.readable);
-  const session = {
-    events,
-    sendGo: () => {
-      return new Promise((resolve2, reject) => {
-        void reject;
-        const ok = duplex.write("go\n");
-        if (!ok) {
-          const writeable = duplex;
-          if (typeof writeable.once === "function") {
-            writeable.once("drain", () => {
-              resolve2();
-            });
-          } else {
-            setImmediate(() => {
-              resolve2();
-            });
-          }
-        } else {
-          resolve2();
-        }
-      });
-    },
-    close: async () => {
-      duplex.destroy();
-    }
-  };
-  return session;
-}
 async function* parseFrames(readable) {
   const rl = (0, import_node_readline.createInterface)({ input: readable, crlfDelay: Infinity });
   for await (const line of rl) {
@@ -42884,6 +42911,51 @@ function classifyFrame(obj) {
       };
     }
   }
+}
+
+// src/action/firecracker/vsock.ts
+async function openVsockSession(udsPath, port, options) {
+  let duplex;
+  if (options?.duplex !== void 0) {
+    duplex = options.duplex;
+    duplex.write(`CONNECT ${port}
+`);
+  } else {
+    const sock = await dialVsockWithRetry(
+      udsPath,
+      port,
+      options?.connectTimeoutMs ?? 3e4
+    );
+    duplex = socketToDuplex(sock);
+  }
+  const events = parseFrames(duplex.readable);
+  const session = {
+    events,
+    sendGo: () => {
+      return new Promise((resolve2, reject) => {
+        void reject;
+        const ok = duplex.write("go\n");
+        if (!ok) {
+          const writeable = duplex;
+          if (typeof writeable.once === "function") {
+            writeable.once("drain", () => {
+              resolve2();
+            });
+          } else {
+            setImmediate(() => {
+              resolve2();
+            });
+          }
+        } else {
+          resolve2();
+        }
+      });
+    },
+    close: async () => {
+      duplex.destroy();
+    }
+  };
+  return session;
 }
 function connectUnixSocket(sockPath, timeoutMs) {
   return new Promise((resolve2, reject) => {
@@ -42986,8 +43058,8 @@ function socketToDuplex(sock) {
 }
 
 // src/action/firecracker/teardown.ts
-var import_promises4 = require("node:fs/promises");
-var import_node_fs10 = require("node:fs");
+var import_promises5 = require("node:fs/promises");
+var import_node_fs11 = require("node:fs");
 async function teardown(handles) {
   if (handles.vsock !== null) {
     await safeRun("close vsock session", () => handles.vsock.close());
@@ -43028,11 +43100,11 @@ async function safeRun(label, fn) {
   }
 }
 async function removeIfExists(filePath) {
-  if (!(0, import_node_fs10.existsSync)(filePath)) return;
+  if (!(0, import_node_fs11.existsSync)(filePath)) return;
   try {
-    await (0, import_promises4.unlink)(filePath);
+    await (0, import_promises5.unlink)(filePath);
   } catch (err) {
-    await (0, import_promises4.rm)(filePath, { recursive: true, force: true });
+    await (0, import_promises5.rm)(filePath, { recursive: true, force: true });
   }
 }
 function timeout(ms) {
@@ -43075,7 +43147,7 @@ async function main(deps = {}) {
   void pm;
   const runnerImage = detectRunnerImage();
   const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path9.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
-  (0, import_node_fs11.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs12.mkdirSync)(imagesDir, { recursive: true });
   maybeClearCache({
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
@@ -43091,7 +43163,11 @@ async function main(deps = {}) {
       imagesDir,
       runnerImage,
       manifest: PINNED_MANIFEST,
-      http
+      http,
+      // PR 5: manifest is platform-keyed.  The Action only ever runs on the
+      // Linux runner, so always consult the linux section.  The macOS CLI
+      // (src/cli/index.ts) does NOT call preFetchArtifacts at all.
+      platform: "linux"
     });
   }
   const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
@@ -43102,7 +43178,7 @@ async function main(deps = {}) {
     http
   });
   const hostNodePrefix = resolveHostNodePrefix();
-  const effectiveConfigPath = buildEffectiveConfig({
+  const effectiveConfig = buildEffectiveConfig({
     userConfigPath: inputs.configPath,
     overrides: {
       spoofPlatform: inputs.spoofPlatform,
@@ -43113,10 +43189,10 @@ async function main(deps = {}) {
   const overlay = await doMakeOverlay({
     baseRootfsPath,
     repoSrcPath: repoDir,
-    configPath: effectiveConfigPath,
+    configPath: effectiveConfig.configPath,
     hostNodePrefix
   });
-  const runId = (0, import_node_crypto4.randomBytes)(4).toString("hex");
+  const runId = (0, import_node_crypto5.randomBytes)(4).toString("hex");
   const apiSocketPath = (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
   const vsockUdsPath = (0, import_node_path9.join)((0, import_node_os5.tmpdir)(), `script-jail-vsock-${runId}`);
   let vm = null;
@@ -43179,7 +43255,7 @@ async function main(deps = {}) {
     );
   }
   if (inputs.mode === "check") {
-    const committed = (0, import_node_fs11.existsSync)(inputs.lockPath) ? (0, import_node_fs11.readFileSync)(inputs.lockPath, "utf8") : "";
+    const committed = (0, import_node_fs12.existsSync)(inputs.lockPath) ? (0, import_node_fs12.readFileSync)(inputs.lockPath, "utf8") : "";
     const diff = renderDiff({
       lockPath: relativeForDisplay(inputs.lockPath, repoDir),
       committed,
@@ -43210,7 +43286,7 @@ async function main(deps = {}) {
     if (!diff.match) exitProcess(1);
     return;
   }
-  (0, import_node_fs11.writeFileSync)(inputs.lockPath, finalYaml, "utf8");
+  (0, import_node_fs12.writeFileSync)(inputs.lockPath, finalYaml, "utf8");
   process.stderr.write(
     `[script-jail] wrote ${Buffer.byteLength(finalYaml, "utf8")} bytes to ${inputs.lockPath}
 `

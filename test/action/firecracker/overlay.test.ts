@@ -161,6 +161,40 @@ describe('makeOverlay — staging (no ext4 build)', () => {
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
+  it('extraRepoOverlayFiles land on the staged repo dir before mkfs.ext4', async () => {
+    // We assert via a custom workDir whose repo-stage subdir we can inspect
+    // AFTER makeOverlay returns.  (makeOverlay leaves the staging dir
+    // present until cleanup().)
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+    const myWorkDir = join(testDir, 'overlay-work');
+    mkdirSync(myWorkDir, { recursive: true });
+
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+      hostNodePrefix: hostNodePrefixDir,
+      workDir: myWorkDir,
+      extraRepoOverlayFiles: [
+        { relPath: '.yarnrc.yml', content: 'supportedArchitectures:\n  os:\n    - linux\n' },
+        { relPath: 'etc/script-jail/pm-flags.json', content: '{"extra_install_args":["--cpu=x64"]}' },
+      ],
+    });
+
+    try {
+      const stageDir = join(myWorkDir, 'repo-stage');
+      expect(existsSync(join(stageDir, '.yarnrc.yml'))).toBe(true);
+      expect(readFileSync(join(stageDir, '.yarnrc.yml'), 'utf8'))
+        .toContain('supportedArchitectures');
+      expect(existsSync(join(stageDir, 'etc', 'script-jail', 'pm-flags.json'))).toBe(true);
+      expect(readFileSync(join(stageDir, 'etc', 'script-jail', 'pm-flags.json'), 'utf8'))
+        .toContain('--cpu=x64');
+    } finally {
+      await result.cleanup();
+    }
+  });
+
   it('returns correct paths for rootfsCopyPath and repoDiskPath', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);
     const configPath = fakeConfig(testDir);

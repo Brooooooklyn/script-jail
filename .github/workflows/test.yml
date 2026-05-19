@@ -32,7 +32,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        node-version: ['22', '24']
+        node-version: ['22', '24', '26']
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -53,7 +53,7 @@ jobs:
       # The Rust shim (`src/shim/`) is compiled by the guest test suite via
       # `cargo build`.  The matrix only contains Linux runners today, so this
       # toolchain install runs on every leg.  The version here matches the
-      # pin in `src/shim/rust-toolchain.toml` (belt-and-braces).
+      # pin in `rust-toolchain.toml` (belt-and-braces).
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -96,5 +96,21 @@ jobs:
         run: |
           if ! git diff --exit-code -- dist/guest-agent.cjs; then
             echo "::error::dist/guest-agent.cjs is out of date. Run 'pnpm build:guest-agent' locally and commit the result."
+            exit 1
+          fi
+
+      # The CLI bundle is the macOS-host entry point (`pnpm exec script-jail
+      # init`) the npm package ships under `bin/`.  Without a CI gate here, a
+      # source change to src/cli/** or src/shared/** that ships without
+      # `pnpm build:cli` would leave the committed dist/cli.cjs stale — the
+      # published package would invoke an out-of-date CLI even though every
+      # source-level test passed.  Mirror the dist/main.cjs gate.
+      - name: Bundle CLI
+        run: pnpm build:cli
+
+      - name: Verify dist/cli.cjs is up to date
+        run: |
+          if ! git diff --exit-code -- dist/cli.cjs; then
+            echo "::error::dist/cli.cjs is out of date. Run 'pnpm build:cli' locally and commit the result."
             exit 1
           fi

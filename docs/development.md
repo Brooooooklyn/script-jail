@@ -7,7 +7,7 @@
 1. Bundles `src/main.ts` to `dist/main.cjs` with esbuild (cjs target, node20).
 2. Bundles the guest agent (`src/guest/agent.ts` + entry) to `dist/guest-agent.cjs`.
 3. Copies/compiles the preloads to `dist/preloads/*.cjs`.
-4. Builds the Rust shim (`cargo build --release --manifest-path src/shim/Cargo.toml`) and copies `target/release/libscriptjail.so` → `images/libscriptjail.so` (skipped on macOS dev hosts; CI provides the Rust toolchain via `dtolnay/rust-toolchain@stable` pinned to match `src/shim/rust-toolchain.toml`).
+4. Builds the Rust shim (`cargo build --release --manifest-path src/shim/Cargo.toml`) and copies `target/release/libscriptjail.so` → `images/libscriptjail.so` (skipped on macOS dev hosts; CI provides the Rust toolchain via `dtolnay/rust-toolchain@stable` pinned to match `rust-toolchain.toml`).
 5. Optionally builds the per-runner-image rootfs when `--runner-image=ubuntu-22.04|ubuntu-24.04` is passed.
 
 For day-to-day host-side edits, `pnpm build:bundle` is enough (rebuilds only `dist/main.cjs`).
@@ -39,7 +39,7 @@ Always include the rebuilt `dist/` files in the same commit as the source change
 Tagged releases (`release.yml`) bundle:
 
 - `dist/` JS artifacts.
-- `libscriptjail.so` (Rust shim binary; built with the toolchain pinned in `src/shim/rust-toolchain.toml`).
+- `libscriptjail.so` (Rust shim binary; built with the toolchain pinned in `rust-toolchain.toml`).
 - The per-runner-image rootfs (ext4).
 - A manifest pinning Firecracker, kernel, and rootfs SHAs.
 

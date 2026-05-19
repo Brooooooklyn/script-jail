@@ -42,10 +42,27 @@ import { shimArtifactIsStale, shimSourceInputs } from './shim-freshness.js';
 /** Supported runner images.  Must stay in sync with `src/action/runner-image.ts`. */
 export type RunnerImage = 'ubuntu-22.04' | 'ubuntu-24.04';
 
+/**
+ * Target architecture for the rootfs ext4.
+ *
+ *   - 'x64'    → x86_64 image, native on Linux CI, docker-buildx-linux/amd64 on macOS.
+ *   - 'arm64'  → aarch64 image, native on arm64 Linux, docker-buildx-linux/arm64
+ *                (qemu emulation on x86_64 hosts).  PR 4 wires the codepath;
+ *                PR 5 hooks it into CI.  Local arm64 builds work today but
+ *                are slow (qemu).
+ */
+export type BuildArch = 'x64' | 'arm64';
+
 export interface BuildInput {
   runnerImage: RunnerImage;
   /** Directory where images/*.ext4 are written. Defaults to <repo root>/images */
   outputDir: string;
+  /**
+   * Target arch for the rootfs.  Defaults to 'x64' to preserve the existing
+   * Firecracker pipeline.  PR 4 introduced this parameter; production callers
+   * (release.yml, scripts/build.ts) must pass the desired value.
+   */
+  arch?: BuildArch;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +79,14 @@ const REPO_ROOT = join(__dirname, '..', '..');
 // ---------------------------------------------------------------------------
 
 /** Compute the output ext4 image filename. */
-export function imageFilename(input: Pick<BuildInput, 'runnerImage'>): string {
+export function imageFilename(input: Pick<BuildInput, 'runnerImage' | 'arch'>): string {
+  // x64 keeps the existing flat name for backwards-compat with the release
+  // pipeline + PINNED_MANIFEST.  arm64 gets an explicit suffix so both
+  // images can coexist under `images/`.
+  const arch = input.arch ?? 'x64';
+  if (arch === 'arm64') {
+    return `rootfs-${input.runnerImage}-arm64.ext4`;
+  }
   return `rootfs-${input.runnerImage}.ext4`;
 }
 
@@ -72,8 +96,22 @@ export function imageOutputPath(input: BuildInput): string {
 }
 
 /** Docker image tag for this runner image. */
-export function dockerTag(input: Pick<BuildInput, 'runnerImage'>): string {
+export function dockerTag(input: Pick<BuildInput, 'runnerImage' | 'arch'>): string {
+  // arm64 gets an arch suffix so x64 and arm64 tags can coexist in a local
+  // docker engine.  The x64 tag stays unsuffixed for backwards-compat with
+  // the existing release pipeline.
+  const arch = input.arch ?? 'x64';
+  if (arch === 'arm64') return `script-jail-rootfs:${input.runnerImage}-arm64`;
   return `script-jail-rootfs:${input.runnerImage}`;
+}
+
+/**
+ * Map a target arch to the `docker buildx --platform` value.  Used by the
+ * arm64 path so a macOS / x86_64 builder can produce a Linux/arm64 image
+ * via qemu emulation; PR 4 wires this in, PR 5 enables it from CI.
+ */
+export function dockerPlatform(arch: BuildArch): string {
+  return arch === 'arm64' ? 'linux/arm64' : 'linux/amd64';
 }
 
 /** Map a runner image to its `ubuntu:<version>` base tag. */
@@ -163,11 +201,11 @@ export const EM_X86_64 = 62;
 export const EM_AARCH64 = 183;
 
 /** Map a runner image to the ELF e_machine value expected for that rootfs. */
-export function expectedShimMachine(_input: Pick<BuildInput, 'runnerImage'>): number {
-  // Both supported rootfses currently target x86-64 (firecracker downloads,
-  // vmlinux, and the action's microVM are all x86_64). When an aarch64
-  // rootfs is added, switch on `runnerImage` here.
-  return EM_X86_64;
+export function expectedShimMachine(input: Pick<BuildInput, 'runnerImage' | 'arch'>): number {
+  // x64 is the default arch (preserves existing Firecracker pipeline); PR 4
+  // adds the arm64 fork so the macOS arm64 CLI can validate `libscriptjail-arm64.so`.
+  const arch = input.arch ?? 'x64';
+  return arch === 'arm64' ? EM_AARCH64 : EM_X86_64;
 }
 
 /** Human-readable label for an e_machine value (used in error messages). */
@@ -567,7 +605,7 @@ function ensureShim(input: BuildInput): boolean {
 
   mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
   copyFileSync(
-    join(REPO_ROOT, 'src', 'shim', 'target', 'release', 'libscriptjail.so'),
+    join(REPO_ROOT, 'target', 'release', 'libscriptjail.so'),
     shimOut,
   );
 
@@ -609,14 +647,32 @@ export function ensureShimFreshnessDecision(
 function dockerBuild(input: BuildInput): void {
   const tag = dockerTag(input);
   const dockerfile = join(REPO_ROOT, 'src', 'rootfs', 'Dockerfile.base');
-  run(
-    `docker build ` +
-    `--build-arg UBUNTU_MAJOR=${ubuntuMajor(input)} ` +
-    `-f "${dockerfile}" ` +
-    `-t "${tag}" ` +
-    `.`,
-  );
-  console.log(`[rootfs] Built docker image: ${tag}`);
+  const arch = input.arch ?? 'x64';
+
+  // arm64 uses `docker buildx build --platform=linux/arm64` (qemu on x86_64
+  // hosts; native on arm64).  x64 keeps the plain `docker build` path so the
+  // existing CI runners (which may not have buildx pre-configured) keep
+  // working unchanged.
+  if (arch === 'arm64') {
+    run(
+      `docker buildx build ` +
+      `--platform=${dockerPlatform(arch)} ` +
+      `--load ` +
+      `--build-arg UBUNTU_MAJOR=${ubuntuMajor(input)} ` +
+      `-f "${dockerfile}" ` +
+      `-t "${tag}" ` +
+      `.`,
+    );
+  } else {
+    run(
+      `docker build ` +
+      `--build-arg UBUNTU_MAJOR=${ubuntuMajor(input)} ` +
+      `-f "${dockerfile}" ` +
+      `-t "${tag}" ` +
+      `.`,
+    );
+  }
+  console.log(`[rootfs] Built docker image: ${tag} (arch=${arch})`);
 }
 
 // ---------------------------------------------------------------------------
@@ -785,11 +841,14 @@ const isMain =
   resolve(process.argv[1]) === __filename;
 
 if (isMain) {
-  // CLI: `oxnode src/rootfs/build.ts [--runner-image=ubuntu-22.04|ubuntu-24.04]`
-  const runnerImage = parseRunnerImageArg(process.argv.slice(2)) ?? 'ubuntu-24.04';
+  // CLI: `oxnode src/rootfs/build.ts [--runner-image=ubuntu-22.04|ubuntu-24.04] [--arch=x64|arm64]`
+  const cliArgs = process.argv.slice(2);
+  const runnerImage = parseRunnerImageArg(cliArgs) ?? 'ubuntu-24.04';
+  const arch = parseArchArg(cliArgs) ?? 'x64';
   const defaultInput: BuildInput = {
     runnerImage,
     outputDir: join(REPO_ROOT, 'images'),
+    arch,
   };
 
   buildRootfs(defaultInput).catch((err: unknown) => {
@@ -813,6 +872,33 @@ export function parseRunnerImageArg(args: ReadonlyArray<string>): RunnerImage | 
     throw new Error(
       `[rootfs] Unknown --runner-image value: ${String(value)}. ` +
       `Expected one of: ubuntu-22.04, ubuntu-24.04.`,
+    );
+  }
+  return undefined;
+}
+
+/**
+ * Parse `--arch=x64|arm64` (or `--arch x64`) from argv.  Returns `undefined`
+ * when the flag is absent so callers can apply their own default.  Throws
+ * on an unknown value.  Used by both `scripts/build.ts` and the direct CLI
+ * entrypoint below so the same syntax works in both places.
+ */
+export function parseArchArg(args: ReadonlyArray<string>): BuildArch | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? '';
+    const m = /^--arch=(.+)$/.exec(arg);
+    let value: string | undefined;
+    if (m !== null) {
+      value = m[1];
+    } else if (arg === '--arch') {
+      value = args[i + 1];
+    } else {
+      continue;
+    }
+    if (value === 'x64' || value === 'arm64') return value;
+    throw new Error(
+      `[rootfs] Unknown --arch value: ${String(value)}. ` +
+      `Expected one of: x64, arm64.`,
     );
   }
   return undefined;

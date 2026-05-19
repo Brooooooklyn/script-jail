@@ -32,6 +32,14 @@ import {
   type RawEvent,
 } from '../lock/schema.js';
 
+// Re-export `loadPmFlags` so any pre-existing importers
+// (`import { loadPmFlags } from './phase-install.js'`) keep working.  The
+// canonical home is `./load-pm-flags.ts`; phase-install no longer invokes it
+// directly — `extra_install_args` are spliced into Phase A (fetch/resolve),
+// not Phase B (rebuild/relink), because npm/pnpm resolve their dependency
+// graph in Phase A.  See `phase-fetch.ts` for the runtime call site.
+export { loadPmFlags } from './load-pm-flags.js';
+
 /**
  * StraceRunner abstraction. Spawns strace and streams (pid, line) records.
  * It is the sole owner of the audited child process — no separate Spawner is
@@ -227,6 +235,15 @@ const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[]
   yarn: { cmd: 'yarn', args: ['install', '--immutable', '--offline'] },
 };
 
+// pm-flags.json (extra_install_args for --cpu/--os/--libc) is consumed in
+// Phase A (`src/guest/phase-fetch.ts`), NOT here.  Phase B (`npm rebuild` /
+// `pnpm install --offline` / `yarn install --immutable`) runs against an
+// already-resolved tree; appending arch flags here would be too late and
+// would not affect which platform-specific subpackages get downloaded.
+// `loadPmFlags` is re-exported from this module (see top of file) for
+// backward compat with pre-existing test imports; the canonical home is
+// `./load-pm-flags.ts`.
+
 /**
  * Parse a JSONL line coming from the LD_PRELOAD shim, the env-spy preload, or
  * the dlopen-block preload. Returns a RawEvent or null if the line is
@@ -289,6 +306,8 @@ export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
   const { cmd, args } = INSTALL_CMD[input.manager];
+  // pm-flags.json extras are spliced into Phase A (fetch/resolve), not here —
+  // dependency resolution is already done by the time Phase B runs.
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`

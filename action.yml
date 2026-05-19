@@ -38,5 +38,5 @@ outputs:
     description: Unified diff between the generated and committed lockfile; empty on match.
 
 runs:
-  using: node20
+  using: node24
   main: dist/main.cjs

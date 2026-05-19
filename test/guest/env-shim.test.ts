@@ -109,7 +109,7 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     // the canonical path.
     mkdirSync(join(repoRoot, 'images'), { recursive: true });
     copyFileSync(
-      join(repoRoot, 'src/shim/target/release/libscriptjail.so'),
+      join(repoRoot, 'target/release/libscriptjail.so'),
       shimSo,
     );
 

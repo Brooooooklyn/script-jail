@@ -33,8 +33,8 @@ import { join } from 'node:path';
 export function shimSourceInputs(repoRoot: string): ReadonlyArray<string> {
   return [
     join(repoRoot, 'src', 'shim', 'Cargo.toml'),
-    join(repoRoot, 'src', 'shim', 'Cargo.lock'),
-    join(repoRoot, 'src', 'shim', 'rust-toolchain.toml'),
+    join(repoRoot, 'Cargo.lock'),
+    join(repoRoot, 'rust-toolchain.toml'),
     join(repoRoot, 'src', 'shim', 'src', 'lib.rs'),
   ];
 }

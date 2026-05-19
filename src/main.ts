@@ -3,7 +3,7 @@
 // GitHub Action entry point.  Wired in action.yml as `runs.main: dist/main.cjs`.
 //
 // Flow:
-//   1. Parse inputs (./action/inputs.ts) and detect the PM (./action/detect-pm.ts).
+//   1. Parse inputs (./action/inputs.ts) and detect the PM (./shared/detect-pm.ts).
 //   2. Ensure Firecracker + vmlinux are downloaded (./action/firecracker/download.ts).
 //   3. Build the per-run overlay (./action/firecracker/overlay.ts).
 //   4. Launch the VM (./action/firecracker/launch.ts) and open the vsock
@@ -24,7 +24,7 @@ import { isAbsolute, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import { parseInputs } from './action/inputs.js';
-import { detectPm, BunUnsupportedError, type DetectedPm } from './action/detect-pm.js';
+import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { resolveHostNodePrefix } from './action/host-node-prefix.js';
 import {
@@ -240,6 +240,10 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       runnerImage,
       manifest: PINNED_MANIFEST,
       http,
+      // PR 5: manifest is platform-keyed.  The Action only ever runs on the
+      // Linux runner, so always consult the linux section.  The macOS CLI
+      // (src/cli/index.ts) does NOT call preFetchArtifacts at all.
+      platform: 'linux',
     });
   }
 
@@ -280,7 +284,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // purges RUNNER_TEMP between jobs; without this, leaving the workDir at the
   // helper's mkdtemp default would accumulate stray dirs under os.tmpdir() on
   // self-hosted runners.
-  const effectiveConfigPath = buildEffectiveConfig({
+  const effectiveConfig = buildEffectiveConfig({
     userConfigPath: inputs.configPath,
     overrides: {
       spoofPlatform: inputs.spoofPlatform,
@@ -293,7 +297,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   const overlay: OverlayResult = await doMakeOverlay({
     baseRootfsPath,
     repoSrcPath: repoDir,
-    configPath: effectiveConfigPath,
+    configPath: effectiveConfig.configPath,
     hostNodePrefix,
   });
 

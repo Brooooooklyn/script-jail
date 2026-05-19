@@ -1,4 +1,4 @@
-// script-jail — src/action/detect-pm.ts
+// script-jail — src/shared/detect-pm.ts
 //
 // Detects the package manager from lockfile presence in the repository root.
 //
@@ -13,12 +13,13 @@
 //
 // When multiple supported lockfiles are present we log a warning (via the
 // shared `warn` helper from ./log.ts so it shows up as a GitHub Actions
-// `::warning::` annotation) and pick the highest priority.  This mirrors
-// the behaviour of `corepack` and most CI install actions.
+// `::warning::` annotation by default) and pick the highest priority.
+// This mirrors the behaviour of `corepack` and most CI install actions.
 //
 // The `fs` and `warn` fields on `DetectInput` are injection seams so tests
-// can avoid touching the real filesystem or stdout.  Production code uses
-// node:fs and the default warn helper.
+// can avoid touching the real filesystem or stdout.  Default writes a
+// GitHub Actions ::warning:: annotation; callers (host-mac CLI in PR 2+)
+// can override to log via their own sink.
 //
 // This function is synchronous: the lockfile read is small and one-shot, so
 // async IO buys nothing.  We return `DetectedPm` directly (not a Promise).

@@ -6908,14 +6908,14 @@ var require_parser = __commonJS({
             case "scalar":
             case "single-quoted-scalar":
             case "double-quoted-scalar": {
-              const fs2 = this.flowScalar(this.type);
+              const fs3 = this.flowScalar(this.type);
               if (atNextItem || it.value) {
-                map2.items.push({ start, key: fs2, sep: [] });
+                map2.items.push({ start, key: fs3, sep: [] });
                 this.onKeyLine = true;
               } else if (it.sep) {
-                this.stack.push(fs2);
+                this.stack.push(fs3);
               } else {
-                Object.assign(it, { key: fs2, sep: [] });
+                Object.assign(it, { key: fs3, sep: [] });
                 this.onKeyLine = true;
               }
               return;
@@ -7043,13 +7043,13 @@ var require_parser = __commonJS({
             case "scalar":
             case "single-quoted-scalar":
             case "double-quoted-scalar": {
-              const fs2 = this.flowScalar(this.type);
+              const fs3 = this.flowScalar(this.type);
               if (!it || it.value)
-                fc.items.push({ start: [], key: fs2, sep: [] });
+                fc.items.push({ start: [], key: fs3, sep: [] });
               else if (it.sep)
-                this.stack.push(fs2);
+                this.stack.push(fs3);
               else
-                Object.assign(it, { key: fs2, sep: [] });
+                Object.assign(it, { key: fs3, sep: [] });
               return;
             }
             case "flow-map-end":
@@ -25241,6 +25241,23 @@ var Emitter = class {
   }
 };
 
+// src/guest/load-pm-flags.ts
+var fs = __toESM(require("node:fs"), 1);
+var PmFlagsSchema = external_exports.object({
+  extra_install_args: external_exports.array(external_exports.string())
+});
+var PM_FLAGS_PATH = "/etc/script-jail/pm-flags.json";
+function loadPmFlags(filePath = PM_FLAGS_PATH) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = PmFlagsSchema.safeParse(JSON.parse(raw));
+    if (!parsed.success) return { extraInstallArgs: [] };
+    return { extraInstallArgs: parsed.data.extra_install_args };
+  } catch {
+    return { extraInstallArgs: [] };
+  }
+}
+
 // src/guest/phase-fetch.ts
 var FETCH_CMD = {
   npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
@@ -25248,7 +25265,14 @@ var FETCH_CMD = {
   yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
 };
 async function runFetchPhase(input) {
-  const { cmd, args } = FETCH_CMD[input.manager];
+  const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
+  let args = baseArgs;
+  if (input.manager === "npm" || input.manager === "pnpm") {
+    const { extraInstallArgs } = loadPmFlags(input.pmFlagsPath);
+    if (extraInstallArgs.length > 0) {
+      args = [...baseArgs, ...extraInstallArgs];
+    }
+  }
   const result = await input.spawner.spawn(cmd, args, {
     env: input.env,
     cwd: input.cwd
@@ -25260,7 +25284,7 @@ async function runFetchPhase(input) {
 }
 
 // src/guest/phase-install.ts
-var fs = __toESM(require("node:fs"), 1);
+var fs2 = __toESM(require("node:fs"), 1);
 var path = __toESM(require("node:path"), 1);
 
 // src/guest/strace-parser.ts
@@ -25923,7 +25947,7 @@ async function runInstallPhase(input) {
   const eventsFilePathCanonical = (() => {
     if (eventsFilePath === null) return null;
     try {
-      return fs.realpathSync(eventsFilePath);
+      return fs2.realpathSync(eventsFilePath);
     } catch {
       return path.resolve(eventsFilePath);
     }

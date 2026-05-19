@@ -152,8 +152,8 @@ describe('shimSourceInputs', () => {
   it('includes Cargo.toml, Cargo.lock, rust-toolchain.toml, and src/lib.rs', () => {
     const inputs = shimSourceInputs('/repo');
     expect(inputs).toContain('/repo/src/shim/Cargo.toml');
-    expect(inputs).toContain('/repo/src/shim/Cargo.lock');
-    expect(inputs).toContain('/repo/src/shim/rust-toolchain.toml');
+    expect(inputs).toContain('/repo/Cargo.lock');
+    expect(inputs).toContain('/repo/rust-toolchain.toml');
     expect(inputs).toContain('/repo/src/shim/src/lib.rs');
   });
 });

@@ -114,6 +114,15 @@ if [ ! -f /work/etc/script-jail/config.yml ]; then
 fi
 cp /work/etc/script-jail/config.yml /etc/script-jail/config.yml
 
+# pm-flags.json is OPTIONAL: only the macOS CLI (src/cli/) stages it, and
+# only when forcing a Linux/x64 install resolution from an arm64 host.  The
+# action's overlay (src/action/firecracker/overlay.ts) never writes it, so
+# absence is normal — degrade silently and let `loadPmFlags()` in the guest
+# default to "no extra args".
+if [ -f /work/etc/script-jail/pm-flags.json ]; then
+  cp /work/etc/script-jail/pm-flags.json /etc/script-jail/pm-flags.json
+fi
+
 # --- Host-Node disk (filesystem label `host-node`) ----------------------------
 # Mount the runner's packed Node install read-only at /opt/host-node, then
 # prepend its bin/ to PATH.  This makes `node`, `npm`, `corepack`, `pnpm`, and

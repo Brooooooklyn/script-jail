@@ -20,26 +20,46 @@
 #   of the downloaded artifacts, and refuses to proceed on mismatch.
 #
 # Bootstrap path:
-#   On the very first tag of a fresh fork, `PINNED_MANIFEST.expected` is
-#   entirely placeholders — there are no real SHAs to verify against yet.  In
-#   that documented case we emit a warning and proceed so the maintainer can
-#   copy the published SHAs into the manifest and cut the next tag.  Mixed
-#   manifests (some real, some placeholder) are treated as bugs and rejected.
+#   On the very first tag of a fresh fork, every entry in
+#   `PINNED_MANIFEST.expected.{linux,darwin}` is a placeholder — there are no
+#   real SHAs to verify against yet.  In that documented case we emit a
+#   warning and proceed so the maintainer can copy the published SHAs into
+#   the manifest and cut the next tag.  Mixed manifests (some real, some
+#   placeholder) are treated as bugs and rejected.
+#
+# Manifest shape (PR 5):
+#   `PINNED_MANIFEST.expected` is platform-keyed:
+#     expected: {
+#       linux:  { 'rootfs-…': '<sha>', 'libscriptjail.so': '<sha>', … },
+#       darwin: { 'vmlinux-vz-x86_64': '<sha>', 'libscriptjail-arm64.so': …, … },
+#     }
+#   The parser walks each `<platform>: { ... }` sub-block and extracts the
+#   keys it cares about.  The `<platform>` prefix in offender messages
+#   disambiguates the two sections (`linux/libscriptjail.so` vs.
+#   `darwin/libscriptjail-arm64.so`).
 #
 # Flags:
-#   --manifest <path>      Path to src/action/artifact-manifest.ts (required).
-#   --dir <path>           Directory containing the downloaded artifacts
-#                          (expects images/ and dist/ subdirs).
-#   --dist-source <path>   Optional path to the tagged dist/main.cjs to compare
-#                          the artifact's dist/main.cjs against.  When omitted,
-#                          dist/main.cjs verification is skipped (useful for
-#                          tests that only exercise the manifest path).
+#   --manifest <path>          Path to src/action/artifact-manifest.ts (required).
+#   --dir <path>               Directory containing the downloaded artifacts
+#                              (expects images/ and dist/ subdirs).
+#   --dist-source <path>       Optional path to the tagged dist/main.cjs to compare
+#                              the artifact's dist/main.cjs against.  When omitted,
+#                              dist/main.cjs verification is skipped (useful for
+#                              tests that only exercise the manifest path).
+#   --dist-cli-source <path>   Optional path to the tagged dist/cli.cjs to compare
+#                              the artifact's dist/cli.cjs against.  Same threat
+#                              class as --dist-source: the publish job downloads
+#                              dist/cli.cjs from the build job and uploads it to
+#                              the release; a tampered cli.cjs would ship to npm
+#                              consumers.  When omitted, dist/cli.cjs verification
+#                              is silently skipped.
 
 set -euo pipefail
 
 MANIFEST=""
 DIR=""
 DIST_SOURCE=""
+DIST_CLI_SOURCE=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -53,6 +73,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --dist-source)
       DIST_SOURCE="${2:-}"
+      shift 2
+      ;;
+    --dist-cli-source)
+      DIST_CLI_SOURCE="${2:-}"
       shift 2
       ;;
     *)
@@ -76,50 +100,91 @@ fi
 #
 # We do NOT run `pnpm install` in the publish job (that would re-introduce
 # the third-party-code threat we're defending against), so we cannot import
-# the TypeScript module.  Instead we grep the three known keys directly.
+# the TypeScript module.  Instead we grep the known keys directly per
+# platform section.
 #
-# Each entry in PINNED_MANIFEST.expected matches the form (whitespace-tolerant):
+# Each entry in the nested expected block matches (whitespace-tolerant):
 #     '<name>': '<value>',
 # where <value> is either a 64-char lowercase hex SHA or a
 # PLACEHOLDER_SHA256_<NAME> bootstrap string.
 #
+# Two-pass extraction:
+#   1. Pull out the `expected: { ... }` block of PINNED_MANIFEST.
+#   2. Within that block, split into one sub-block per platform key
+#      (`linux: { ... }`, `darwin: { ... }`) and scope each value lookup to
+#      that sub-block.
+#
 # The parser is intentionally strict to defeat a few specific poisoning
 # vectors a malicious or sloppy change to the source file could introduce:
 #
-#   1. Scope: we extract the `expected: { ... }` block from PINNED_MANIFEST
-#      and ONLY search inside that block.  A stray example line in a comment
-#      or another exported map elsewhere in the file cannot satisfy the
-#      regex.
+#   1. Scope: we extract `expected: { ... }` from PINNED_MANIFEST and then
+#      EACH `<platform>: { ... }` sub-block before searching for asset
+#      values.  A stray example line in a comment or another exported map
+#      elsewhere in the file cannot satisfy the regex.
 #   2. Metacharacter safety: artifact names contain `.` which is a regex
 #      wildcard.  We escape the key before interpolating it into the regex
 #      so `rootfs-ubuntu-22x04xext4` does not silently substitute for
 #      `rootfs-ubuntu-22.04.ext4`.
-#   3. Single-match: we require exactly ONE line per key.  A duplicate
-#      definition (whether deliberate or the result of a bad merge) fails
-#      the parser instead of silently picking one.
+#   3. Single-match: we require exactly ONE line per key per platform.  A
+#      duplicate definition (whether deliberate or the result of a bad
+#      merge) fails the parser instead of silently picking one.
 #
 # The extraction prints the value to stdout; success/failure is signalled by
 # exit code, and ALL diagnostics go to stderr so they're never confused with
 # the value itself.
 
-# Extract the `expected: { ... }` block of PINNED_MANIFEST into a temp file
-# so subsequent greps cannot match against unrelated parts of the source.
+# Extract the `expected: { ... }` block of PINNED_MANIFEST into a variable.
+# Strategy: awk state machine that counts `{` / `}` characters so the
+# extraction survives nested sub-blocks (PR 5 introduces
+# `linux: { ... }` and `darwin: { ... }` inside expected).  We start the
+# depth counter at 1 immediately after seeing `expected: {`, then echo
+# every line until depth returns to 0.
 #
-# Strategy: awk state machine — once we see `export const PINNED_MANIFEST`
-# we wait for the literal `expected: {` opener, then echo every line until
-# the matching `}` at the same indentation.  This is intentionally
-# brittle-by-design: any reformatting of the manifest source must keep the
-# `expected: {` / `},` pattern this script depends on.
+# The depth counter is intentionally character-based (gsub returns the
+# count) rather than line-based: a stray `}` in a string value would be
+# rare in this file (asset names contain only `[A-Za-z0-9._-]`), but
+# counting characters is robust to "two braces on one line" and matches
+# how a JS parser would walk the file.
 EXPECTED_BLOCK="$(awk '
-  BEGIN { in_manifest = 0; in_expected = 0 }
+  BEGIN { in_manifest = 0; in_expected = 0; depth = 0 }
   /export[[:space:]]+const[[:space:]]+PINNED_MANIFEST/ { in_manifest = 1; next }
-  in_manifest && /^[[:space:]]*expected:[[:space:]]*\{/ { in_expected = 1; next }
-  in_expected && /^[[:space:]]*\},?[[:space:]]*$/ { in_expected = 0; in_manifest = 0; exit }
-  in_expected { print }
+  in_manifest && /^[[:space:]]*expected:[[:space:]]*\{/ { in_expected = 1; depth = 1; next }
+  in_expected {
+    opens  = gsub(/\{/, "{", $0)
+    closes = gsub(/\}/, "}", $0)
+    depth += opens - closes
+    if (depth <= 0) { in_expected = 0; in_manifest = 0; exit }
+    print
+  }
 ' "$MANIFEST")"
 
 if [ -z "$EXPECTED_BLOCK" ]; then
   echo "check-publish-artifacts: could not locate PINNED_MANIFEST.expected { ... } block in $MANIFEST" >&2
+  exit 1
+fi
+
+# Carve a platform sub-block out of EXPECTED_BLOCK.  We rely on the same
+# `<key>: { ... }` opener/closer pattern as the outer extraction.  Platform
+# keys MUST appear at the start of their line (`linux:` or `darwin:`).
+extract_platform_block() {
+  local platform="$1"
+  printf '%s\n' "$EXPECTED_BLOCK" | awk -v plat="$platform" '
+    BEGIN { in_section = 0 }
+    !in_section && $0 ~ ("^[[:space:]]*" plat ":[[:space:]]*\\{") { in_section = 1; next }
+    in_section && /^[[:space:]]*\},?[[:space:]]*$/ { in_section = 0; exit }
+    in_section { print }
+  '
+}
+
+LINUX_BLOCK="$(extract_platform_block 'linux')"
+DARWIN_BLOCK="$(extract_platform_block 'darwin')"
+
+if [ -z "$LINUX_BLOCK" ]; then
+  echo "check-publish-artifacts: could not locate linux: { ... } sub-block inside PINNED_MANIFEST.expected" >&2
+  exit 1
+fi
+if [ -z "$DARWIN_BLOCK" ]; then
+  echo "check-publish-artifacts: could not locate darwin: { ... } sub-block inside PINNED_MANIFEST.expected" >&2
   exit 1
 fi
 
@@ -131,40 +196,68 @@ escape_regex() {
   printf '%s' "$1" | sed -E 's/[][\\.^$*+?(){}|/-]/\\&/g'
 }
 
-# Extract the value for a manifest key from the captured expected block.
-# Requires EXACTLY one match (zero or multiple is an error).  Echoes the
-# value on success; on failure echoes a diagnostic to stderr and returns 1.
-extract_expected() {
-  local name="$1"
+# Extract the value for a manifest key from a given block.  Requires EXACTLY
+# one match (zero or multiple is an error).  Echoes the value on success; on
+# failure echoes a diagnostic to stderr and returns 1.  The `platform`
+# argument is used purely for diagnostic prefixes (`linux/...`, `darwin/...`).
+extract_from_block() {
+  local platform="$1"
+  local block="$2"
+  local name="$3"
   local escaped
   escaped="$(escape_regex "$name")"
   local matches
-  matches="$(printf '%s\n' "$EXPECTED_BLOCK" | grep -cE "^[[:space:]]*'${escaped}'[[:space:]]*:[[:space:]]*'[^']*'[[:space:]]*,?[[:space:]]*\$" || true)"
+  matches="$(printf '%s\n' "$block" | grep -cE "^[[:space:]]*'${escaped}'[[:space:]]*:[[:space:]]*'[^']*'[[:space:]]*,?[[:space:]]*\$" || true)"
   if [ "$matches" -eq 0 ]; then
-    echo "check-publish-artifacts: manifest key not found: '${name}'" >&2
+    echo "check-publish-artifacts: manifest key not found: '${platform}/${name}'" >&2
     return 1
   fi
   if [ "$matches" -gt 1 ]; then
-    echo "check-publish-artifacts: manifest key '${name}' appears $matches times — must appear exactly once." >&2
+    echo "check-publish-artifacts: manifest key '${platform}/${name}' appears $matches times — must appear exactly once." >&2
     return 1
   fi
-  printf '%s\n' "$EXPECTED_BLOCK" \
+  printf '%s\n' "$block" \
     | grep -E "^[[:space:]]*'${escaped}'[[:space:]]*:[[:space:]]*'[^']*'[[:space:]]*,?[[:space:]]*\$" \
     | sed -E "s/^[[:space:]]*'${escaped}'[[:space:]]*:[[:space:]]*'([^']*)'.*/\1/"
 }
 
-# `set -e` would normally swallow extract_expected's non-zero exit inside
+# `set -e` would normally swallow extract_from_block's non-zero exit inside
 # command substitution.  We catch failures explicitly so the error message
 # the helper printed to stderr surfaces with a non-zero exit.
-if ! EXPECTED_ROOTFS_22="$(extract_expected 'rootfs-ubuntu-22.04.ext4')"; then
+
+# --- Linux platform keys ------------------------------------------------------
+if ! EXPECTED_LINUX_ROOTFS_22="$(extract_from_block 'linux' "$LINUX_BLOCK" 'rootfs-ubuntu-22.04.ext4')"; then
   exit 1
 fi
-if ! EXPECTED_ROOTFS_24="$(extract_expected 'rootfs-ubuntu-24.04.ext4')"; then
+if ! EXPECTED_LINUX_ROOTFS_24="$(extract_from_block 'linux' "$LINUX_BLOCK" 'rootfs-ubuntu-24.04.ext4')"; then
   exit 1
 fi
-if ! EXPECTED_LIBSO="$(extract_expected 'libscriptjail.so')"; then
+if ! EXPECTED_LINUX_LIBSO="$(extract_from_block 'linux' "$LINUX_BLOCK" 'libscriptjail.so')"; then
   exit 1
 fi
+
+# --- Darwin platform keys -----------------------------------------------------
+if ! EXPECTED_DARWIN_ROOTFS_22_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'rootfs-ubuntu-22.04-arm64.ext4')"; then
+  exit 1
+fi
+if ! EXPECTED_DARWIN_ROOTFS_24_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'rootfs-ubuntu-24.04-arm64.ext4')"; then
+  exit 1
+fi
+if ! EXPECTED_DARWIN_LIBSO_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'libscriptjail-arm64.so')"; then
+  exit 1
+fi
+if ! EXPECTED_VMLINUX_VZ_X86_64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'vmlinux-vz-x86_64')"; then
+  exit 1
+fi
+if ! EXPECTED_VMLINUX_VZ_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'vmlinux-vz-arm64')"; then
+  exit 1
+fi
+if ! EXPECTED_SJ_VM_ARM64_DARWIN="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'script-jail-vm-arm64-darwin')"; then
+  exit 1
+fi
+# Intentionally NO key for `script-jail-vm-x86_64-darwin` — Intel macOS
+# runners are deprecated and v1 does not ship that binary.  Adding the key
+# here would force a stub artifact in the build job.
 
 # --- Classify placeholders ----------------------------------------------------
 
@@ -179,7 +272,13 @@ is_placeholder() {
 
 PLACEHOLDER_COUNT=0
 REAL_COUNT=0
-for v in "$EXPECTED_ROOTFS_22" "$EXPECTED_ROOTFS_24" "$EXPECTED_LIBSO"; do
+for v in \
+  "$EXPECTED_LINUX_ROOTFS_22" "$EXPECTED_LINUX_ROOTFS_24" "$EXPECTED_LINUX_LIBSO" \
+  "$EXPECTED_DARWIN_ROOTFS_22_ARM64" "$EXPECTED_DARWIN_ROOTFS_24_ARM64" \
+  "$EXPECTED_DARWIN_LIBSO_ARM64" \
+  "$EXPECTED_VMLINUX_VZ_X86_64" "$EXPECTED_VMLINUX_VZ_ARM64" \
+  "$EXPECTED_SJ_VM_ARM64_DARWIN"
+do
   if is_placeholder "$v"; then
     PLACEHOLDER_COUNT=$((PLACEHOLDER_COUNT + 1))
   else
@@ -194,15 +293,51 @@ fi
 
 # --- Locate artifacts ---------------------------------------------------------
 
-ART_ROOTFS_22="$DIR/images/rootfs-ubuntu-22.04.ext4"
-ART_ROOTFS_24="$DIR/images/rootfs-ubuntu-24.04.ext4"
-ART_LIBSO="$DIR/images/libscriptjail.so"
+# Linux platform artifacts (always required — the build job produces these).
+ART_LINUX_ROOTFS_22="$DIR/images/rootfs-ubuntu-22.04.ext4"
+ART_LINUX_ROOTFS_24="$DIR/images/rootfs-ubuntu-24.04.ext4"
+ART_LINUX_LIBSO="$DIR/images/libscriptjail.so"
 ART_DIST="$DIR/dist/main.cjs"
+ART_DIST_CLI="$DIR/dist/cli.cjs"
+
+# Darwin platform artifacts (PR 5 — built in the same release pipeline,
+# uploaded as separate workflow artifacts and aggregated here).
+ART_DARWIN_ROOTFS_22_ARM64="$DIR/images/rootfs-ubuntu-22.04-arm64.ext4"
+ART_DARWIN_ROOTFS_24_ARM64="$DIR/images/rootfs-ubuntu-24.04-arm64.ext4"
+ART_DARWIN_LIBSO_ARM64="$DIR/images/libscriptjail-arm64.so"
+ART_VMLINUX_VZ_X86_64="$DIR/images/vmlinux-vz-x86_64"
+ART_VMLINUX_VZ_ARM64="$DIR/images/vmlinux-vz-arm64"
+ART_SJ_VM_ARM64_DARWIN="$DIR/script-jail-vm-arm64-darwin"
 
 # Artifacts must exist in BOTH modes — a missing file means the build job's
-# upload-artifact step is broken, not a bootstrap nuance.
+# upload-artifact step is broken, not a bootstrap nuance.  Tests that only
+# exercise the linux/dist path do not produce the darwin artifacts; the
+# release workflow's full run does.  Whether to require the darwin set is
+# controlled by SCRIPT_JAIL_CHECK_DARWIN_ARTIFACTS=1 — defaulted ON, but tests
+# can override.
+CHECK_DARWIN_ARTIFACTS="${SCRIPT_JAIL_CHECK_DARWIN_ARTIFACTS:-1}"
+
+required_files=("$ART_LINUX_ROOTFS_22" "$ART_LINUX_ROOTFS_24" "$ART_LINUX_LIBSO" "$ART_DIST")
+# dist/cli.cjs is only required when the caller supplies a source to compare
+# against.  The "source" path is the tagged fresh-checkout copy; without it,
+# we have nothing to compare against and skipping is the only safe answer.
+# Back-compat: tests that don't exercise cli.cjs simply omit the flag.
+if [ -n "$DIST_CLI_SOURCE" ]; then
+  required_files+=("$ART_DIST_CLI")
+fi
+if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
+  required_files+=(
+    "$ART_DARWIN_ROOTFS_22_ARM64"
+    "$ART_DARWIN_ROOTFS_24_ARM64"
+    "$ART_DARWIN_LIBSO_ARM64"
+    "$ART_VMLINUX_VZ_X86_64"
+    "$ART_VMLINUX_VZ_ARM64"
+    "$ART_SJ_VM_ARM64_DARWIN"
+  )
+fi
+
 missing=()
-for f in "$ART_ROOTFS_22" "$ART_ROOTFS_24" "$ART_LIBSO" "$ART_DIST"; do
+for f in "${required_files[@]}"; do
   if [ ! -f "$f" ]; then
     missing+=("$f")
   fi
@@ -221,10 +356,22 @@ sha_of() {
   sha256sum "$1" | cut -d' ' -f1
 }
 
-COMPUTED_ROOTFS_22="$(sha_of "$ART_ROOTFS_22")"
-COMPUTED_ROOTFS_24="$(sha_of "$ART_ROOTFS_24")"
-COMPUTED_LIBSO="$(sha_of "$ART_LIBSO")"
+COMPUTED_LINUX_ROOTFS_22="$(sha_of "$ART_LINUX_ROOTFS_22")"
+COMPUTED_LINUX_ROOTFS_24="$(sha_of "$ART_LINUX_ROOTFS_24")"
+COMPUTED_LINUX_LIBSO="$(sha_of "$ART_LINUX_LIBSO")"
 COMPUTED_DIST="$(sha_of "$ART_DIST")"
+if [ -n "$DIST_CLI_SOURCE" ]; then
+  COMPUTED_DIST_CLI="$(sha_of "$ART_DIST_CLI")"
+fi
+
+if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
+  COMPUTED_DARWIN_ROOTFS_22_ARM64="$(sha_of "$ART_DARWIN_ROOTFS_22_ARM64")"
+  COMPUTED_DARWIN_ROOTFS_24_ARM64="$(sha_of "$ART_DARWIN_ROOTFS_24_ARM64")"
+  COMPUTED_DARWIN_LIBSO_ARM64="$(sha_of "$ART_DARWIN_LIBSO_ARM64")"
+  COMPUTED_VMLINUX_VZ_X86_64="$(sha_of "$ART_VMLINUX_VZ_X86_64")"
+  COMPUTED_VMLINUX_VZ_ARM64="$(sha_of "$ART_VMLINUX_VZ_ARM64")"
+  COMPUTED_SJ_VM_ARM64_DARWIN="$(sha_of "$ART_SJ_VM_ARM64_DARWIN")"
+fi
 
 # --- Mixed-manifest is a packaging bug (checked BEFORE bootstrap) -------------
 
@@ -264,21 +411,51 @@ if [ -n "$DIST_SOURCE" ]; then
   check "dist/main.cjs" "$EXPECTED_DIST" "$COMPUTED_DIST"
 fi
 
+# dist/cli.cjs is in the same threat class as dist/main.cjs: the publish job
+# downloads the artifact from the build job and uploads it directly to the
+# release.  The fresh-checkout copy of dist/cli.cjs is the independent source
+# of truth.  Like the main.cjs check above, this comparison runs in BOTH
+# normal and bootstrap modes — skipping it in bootstrap would leave the npm
+# CLI bundle outside the gate exactly when consumers most need it intact.
+if [ -n "$DIST_CLI_SOURCE" ]; then
+  if [ ! -f "$DIST_CLI_SOURCE" ]; then
+    echo "check-publish-artifacts: --dist-cli-source given but file not found: $DIST_CLI_SOURCE" >&2
+    exit 1
+  fi
+  EXPECTED_DIST_CLI="$(sha_of "$DIST_CLI_SOURCE")"
+  check "dist/cli.cjs" "$EXPECTED_DIST_CLI" "$COMPUTED_DIST_CLI"
+fi
+
 # --- Bootstrap path -----------------------------------------------------------
 #
-# All-placeholder manifest: the rootfs/libso SHAs have no trustworthy
+# All-placeholder manifest: the rootfs/libso/kernel SHAs have no trustworthy
 # reference yet (this IS the run that produces them), so we skip those
-# three comparisons and print the computed values for the maintainer to
-# paste into the manifest.  The dist/main.cjs comparison above still ran.
+# comparisons and print the computed values for the maintainer to paste into
+# the manifest.  The dist/main.cjs and dist/cli.cjs comparisons above still ran.
 
 if [ "$ALL_PLACEHOLDERS" -eq 1 ]; then
   echo "::warning::check-publish-artifacts: PINNED_MANIFEST.expected is entirely placeholders; skipping SHA comparison (bootstrap path). Copy the SHAs below into src/action/artifact-manifest.ts and cut the next tag."
   echo "check-publish-artifacts: bootstrap mode — manifest entries are placeholders." >&2
-  echo "  rootfs-ubuntu-22.04.ext4: $COMPUTED_ROOTFS_22" >&2
-  echo "  rootfs-ubuntu-24.04.ext4: $COMPUTED_ROOTFS_24" >&2
-  echo "  libscriptjail.so:             $COMPUTED_LIBSO" >&2
-  echo "  dist/main.cjs:             $COMPUTED_DIST" >&2
+  echo "  linux/rootfs-ubuntu-22.04.ext4:        $COMPUTED_LINUX_ROOTFS_22" >&2
+  echo "  linux/rootfs-ubuntu-24.04.ext4:        $COMPUTED_LINUX_ROOTFS_24" >&2
+  echo "  linux/libscriptjail.so:                $COMPUTED_LINUX_LIBSO" >&2
+  if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
+    echo "  darwin/rootfs-ubuntu-22.04-arm64.ext4: $COMPUTED_DARWIN_ROOTFS_22_ARM64" >&2
+    echo "  darwin/rootfs-ubuntu-24.04-arm64.ext4: $COMPUTED_DARWIN_ROOTFS_24_ARM64" >&2
+    echo "  darwin/libscriptjail-arm64.so:         $COMPUTED_DARWIN_LIBSO_ARM64" >&2
+    echo "  darwin/vmlinux-vz-x86_64:              $COMPUTED_VMLINUX_VZ_X86_64" >&2
+    echo "  darwin/vmlinux-vz-arm64:               $COMPUTED_VMLINUX_VZ_ARM64" >&2
+    echo "  darwin/script-jail-vm-arm64-darwin:    $COMPUTED_SJ_VM_ARM64_DARWIN" >&2
+  fi
+  echo "  dist/main.cjs:                         $COMPUTED_DIST" >&2
+  if [ -n "$DIST_CLI_SOURCE" ]; then
+    echo "  dist/cli.cjs:                          $COMPUTED_DIST_CLI" >&2
+  fi
   if [ "${#errors[@]}" -gt 0 ]; then
+    # `errors[]` accumulates dist/main.cjs and (when --dist-cli-source is
+    # supplied) dist/cli.cjs mismatches; per-error lines below name the
+    # exact offending bundle.  The summary line keeps the historical
+    # "dist/main.cjs mismatch" prefix for log-grep compatibility.
     echo "check-publish-artifacts: dist/main.cjs mismatch in bootstrap mode — refusing to publish." >&2
     for e in "${errors[@]}"; do
       echo "  $e" >&2
@@ -290,9 +467,17 @@ fi
 
 # --- Compare manifest-pinned artifacts ----------------------------------------
 
-check "rootfs-ubuntu-22.04.ext4" "$EXPECTED_ROOTFS_22" "$COMPUTED_ROOTFS_22"
-check "rootfs-ubuntu-24.04.ext4" "$EXPECTED_ROOTFS_24" "$COMPUTED_ROOTFS_24"
-check "libscriptjail.so"             "$EXPECTED_LIBSO"     "$COMPUTED_LIBSO"
+check "linux/rootfs-ubuntu-22.04.ext4" "$EXPECTED_LINUX_ROOTFS_22" "$COMPUTED_LINUX_ROOTFS_22"
+check "linux/rootfs-ubuntu-24.04.ext4" "$EXPECTED_LINUX_ROOTFS_24" "$COMPUTED_LINUX_ROOTFS_24"
+check "linux/libscriptjail.so"         "$EXPECTED_LINUX_LIBSO"     "$COMPUTED_LINUX_LIBSO"
+if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
+  check "darwin/rootfs-ubuntu-22.04-arm64.ext4" "$EXPECTED_DARWIN_ROOTFS_22_ARM64" "$COMPUTED_DARWIN_ROOTFS_22_ARM64"
+  check "darwin/rootfs-ubuntu-24.04-arm64.ext4" "$EXPECTED_DARWIN_ROOTFS_24_ARM64" "$COMPUTED_DARWIN_ROOTFS_24_ARM64"
+  check "darwin/libscriptjail-arm64.so"         "$EXPECTED_DARWIN_LIBSO_ARM64"     "$COMPUTED_DARWIN_LIBSO_ARM64"
+  check "darwin/vmlinux-vz-x86_64"              "$EXPECTED_VMLINUX_VZ_X86_64"      "$COMPUTED_VMLINUX_VZ_X86_64"
+  check "darwin/vmlinux-vz-arm64"               "$EXPECTED_VMLINUX_VZ_ARM64"       "$COMPUTED_VMLINUX_VZ_ARM64"
+  check "darwin/script-jail-vm-arm64-darwin"    "$EXPECTED_SJ_VM_ARM64_DARWIN"     "$COMPUTED_SJ_VM_ARM64_DARWIN"
+fi
 
 if [ "${#errors[@]}" -gt 0 ]; then
   echo "check-publish-artifacts: SHA mismatch — refusing to publish." >&2

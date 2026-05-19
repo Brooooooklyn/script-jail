@@ -52,9 +52,10 @@ import {
   copyFileSync,
   statSync,
   existsSync,
+  writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
-import { join, basename } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execSync, spawnSync } from 'node:child_process';
 import { platform } from 'node:process';
@@ -85,6 +86,17 @@ export interface OverlayInput {
    * under os.tmpdir() automatically.
    */
   workDir?: string | undefined;
+  /**
+   * Optional additional files to land on the repo disk inside the VM.
+   * Each entry's `relPath` is relative to the repo root inside the VM
+   * (e.g. `.yarnrc.yml`, `etc/script-jail/pm-flags.json`).  Files are
+   * staged into the repo-staging dir BEFORE `mkfs.ext4 -d` runs so they
+   * become part of the immutable repo disk.
+   *
+   * Used by the macOS CLI (PR 2+) to layer per-PM install-arg overlays;
+   * the existing action surface leaves this undefined.
+   */
+  extraRepoOverlayFiles?: ReadonlyArray<{ relPath: string; content: string }>;
 }
 
 export interface OverlayResult {
@@ -111,6 +123,7 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
     configPath,
     hostNodePrefix,
     workDir: maybeWorkDir,
+    extraRepoOverlayFiles,
   } = input;
 
   // 1. Create per-run work dir if not supplied.
@@ -141,6 +154,26 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
   const configDestDir = join(repoStageDir, 'etc', 'script-jail');
   mkdirSync(configDestDir, { recursive: true });
   copyFileSync(configPath, join(configDestDir, 'config.yml'));
+
+  // 3b. Layer any caller-supplied extra files onto the repo stage dir.
+  //     Written before mkfs.ext4 -d so they end up on the immutable repo
+  //     disk.  Used by the macOS CLI (PR 2+) to inject .yarnrc.yml and
+  //     etc/script-jail/pm-flags.json.  Defence in depth: reject any
+  //     relPath that resolves outside the stage dir so a malicious caller
+  //     can't traverse via `..` into the host filesystem.
+  if (extraRepoOverlayFiles !== undefined) {
+    for (const entry of extraRepoOverlayFiles) {
+      const dest = join(repoStageDir, entry.relPath);
+      const destNormalized = join(dest); // collapses .. segments
+      if (!destNormalized.startsWith(repoStageDir + '/') && destNormalized !== repoStageDir) {
+        throw new Error(
+          `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`,
+        );
+      }
+      mkdirSync(dirname(destNormalized), { recursive: true });
+      writeFileSync(destNormalized, entry.content, 'utf8');
+    }
+  }
 
   // 4. Build the repo disk ext4.
   const repoDiskPath = join(workDir, 'repo.ext4');

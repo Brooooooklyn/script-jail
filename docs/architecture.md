@@ -9,6 +9,37 @@ The Action splits into two halves connected over a vsock socket:
 
 The kernel boundary is load-bearing. A pure-JS sandbox can't catch libuv-backed env reads, `dlopen` for native addons, or `execve` of arbitrary binaries — those reach the kernel before any JS hook fires. Hence the microVM.
 
+## Cross-host parity (macOS VZ)
+
+The same audit runs in two places:
+
+- **Linux CI** — the GitHub Action invocation. Boots Firecracker; the host
+  half lives in `src/main.ts` + `src/action/firecracker/`.
+
+- **macOS developer host** — the local CLI invocation
+  (`pnpm exec script-jail …`). Boots Apple's Virtualization.framework via
+  `objc2-virtualization`; the host half lives in `src/host-mac/` (Rust)
+  driven by `src/cli/` (TypeScript). Requires macOS 14+.
+
+Both halves share the same guest agent (`src/guest/`), the same vsock
+protocol (`src/shared/vsock-protocol.ts`), and the same lockfile renderer
+(`src/lock/`). The split is intentionally thin — only the VMM startup,
+disk attachment, and console wiring differ.
+
+The release pipeline (`release.yml`) ships per-platform artifacts under
+one tag: the Linux runner consumes `rootfs-ubuntu-<major>.ext4` +
+`libscriptjail.so` + the pinned upstream `vmlinux` from Firecracker CI;
+the macOS CLI consumes `rootfs-ubuntu-<major>-arm64.ext4` +
+`libscriptjail-arm64.so` + the hand-built `vmlinux-vz-{x86_64,arm64}` +
+the `script-jail-vm-arm64-darwin` Mach-O binary. The manifest in
+`src/action/artifact-manifest.ts` is platform-keyed
+(`expected: { linux: {...}, darwin: {...} }`) so each consumer pins only
+the SHAs it cares about.
+
+A handful of cases produce byte-different lockfiles across the two
+runners — see [docs/divergence.md](./divergence.md) for the catalogue and
+the v2 mitigation path.
+
 ## Two-phase install
 
 1. **Phase A — fetch.** Network on, no strace. Lets the package manager resolve the registry and populate its cache. Output of this phase is not audited.
@@ -78,7 +109,7 @@ Adding a new audit category means picking the right layer: kernel-only behavior 
 - `Cargo.lock` is committed so transitive dep drift can't change the bytes between two tagged builds (the artifact SHA is recorded in `src/action/artifact-manifest.ts`).
 - `src/lib.rs` is the entire implementation: `#[panic_handler]` aborts; recursion is guarded by a `pthread_key_create`-backed thread-local set up at the very top of the `#[ctor::ctor]` constructor; real symbols are resolved via `libc::dlsym(libc::RTLD_NEXT, …)`; if the pthread key fails to create, init returns early without setting `INIT_DONE` so the wrappers stay on transparent passthrough; all buffers are fixed-size stack allocations, no allocator is linked.
 
-Build path: `pnpm build` → `scripts/build.ts:buildShim` → `cargo build --release --manifest-path src/shim/Cargo.toml` → copy `src/shim/target/release/libscriptjail.so` → `images/libscriptjail.so` → rootfs Dockerfile copies into `/lib/libscriptjail.so`. On macOS dev hosts `buildShim` short-circuits with a warning.
+Build path: `pnpm build` → `scripts/build.ts:buildShim` → `cargo build --release --manifest-path src/shim/Cargo.toml` → copy `target/release/libscriptjail.so` → `images/libscriptjail.so` → rootfs Dockerfile copies into `/lib/libscriptjail.so`. On macOS dev hosts `buildShim` short-circuits with a warning.
 
 ### Env-read detection in detail
 

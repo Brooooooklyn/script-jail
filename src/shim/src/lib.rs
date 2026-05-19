@@ -16,6 +16,14 @@
 //   - All buffers are fixed-size stack allocations; no allocator is linked.
 
 #![no_std]
+// Rust 2024 promoted `unsafe_op_in_unsafe_fn` from allow to warn.  This crate
+// is a libc-shim cdylib whose `unsafe extern "C" fn` exports contain dozens of
+// FFI/raw-pointer operations; wrapping each one in an additional `unsafe { }`
+// block adds noise without changing the trust boundary, since the crate has
+// no `extern "Rust"` callers and every export is, by design, the trusted
+// landing point for an LD_PRELOAD interception.  Suppress at crate root so
+// the existing 2021 semantics carry over verbatim.
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::mem::transmute;
@@ -1150,7 +1158,7 @@ unsafe fn shim_init() {
 //     getenv (e.g., emit's clock_gettime / write), and clear it before
 //     returning so the next call audits.
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     if in_shim() {
         return real_getenv_raw(name);
@@ -1170,7 +1178,7 @@ pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     val
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
     if in_shim() {
         return real_secure_getenv_raw(name);
@@ -1191,7 +1199,7 @@ pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
 }
 
 // __secure_getenv is a deprecated glibc alias for secure_getenv.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __secure_getenv(name: *const c_char) -> *mut c_char {
     secure_getenv(name)
 }
@@ -1886,7 +1894,7 @@ unsafe fn dispatch_spawn(
 
 // ── execve(prog, argv, envp) ───────────────────────────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn execve(
     prog: *const c_char,
     argv: *const *const c_char,
@@ -1917,7 +1925,7 @@ pub unsafe extern "C" fn execve(
 // one the child sees; execv historically just calls execve with environ
 // under the hood, so this preserves API semantics.
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn execv(
     prog: *const c_char,
     argv: *const *const c_char,
@@ -1953,7 +1961,7 @@ pub unsafe extern "C" fn execv(
 // apply.  Skipping rewrite_envp here would let a native script bypass the
 // audit chain by mutating environ directly and then calling execvp.
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn execvp(
     file: *const c_char,
     argv: *const *const c_char,
@@ -1982,7 +1990,7 @@ pub unsafe extern "C" fn execvp(
 
 // ── execvpe(file, argv, envp) ──────────────────────────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn execvpe(
     file: *const c_char,
     argv: *const *const c_char,
@@ -2015,7 +2023,7 @@ pub unsafe extern "C" fn execvpe(
 
 // ── execveat(dirfd, pathname, argv, envp, flags) ───────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn execveat(
     dirfd: c_int,
     pathname: *const c_char,
@@ -2071,7 +2079,7 @@ unsafe fn proc_fd_only(fd: c_int, out_buf: &mut [u8; 64]) -> Option<usize> {
     Some(pos)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn fexecve(
     fd: c_int,
     argv: *const *const c_char,
@@ -2091,7 +2099,7 @@ pub unsafe extern "C" fn fexecve(
 
 // ── posix_spawn(pid, path, file_actions, attrp, argv, envp) ────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn posix_spawn(
     pid: *mut libc::pid_t,
     path: *const c_char,
@@ -2114,7 +2122,7 @@ pub unsafe extern "C" fn posix_spawn(
 
 // ── posix_spawnp(pid, file, file_actions, attrp, argv, envp) ───────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn posix_spawnp(
     pid: *mut libc::pid_t,
     file: *const c_char,
@@ -2439,7 +2447,7 @@ unsafe fn real_clearenv_raw() -> c_int {
 
 // ── setenv(name, value, overwrite) ─────────────────────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn setenv(
     name: *const c_char,
     value: *const c_char,
@@ -2464,7 +2472,7 @@ pub unsafe extern "C" fn setenv(
 
 // ── unsetenv(name) ──────────────────────────────────────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
     if in_shim() {
         return real_unsetenv_raw(name);
@@ -2485,7 +2493,7 @@ pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
 
 // ── putenv("NAME=VALUE") ────────────────────────────────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
     if in_shim() {
         return real_putenv_raw(string);
@@ -2522,7 +2530,7 @@ pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
 
 // ── clearenv() ──────────────────────────────────────────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn clearenv() -> c_int {
     if in_shim() {
         return real_clearenv_raw();
