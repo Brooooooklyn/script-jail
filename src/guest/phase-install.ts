@@ -3210,6 +3210,19 @@ export async function runInstallPhase(
           const oldFd = parseInt(dupMatch[2] ?? '', 10);
           const newFd = op === 'dup' ? rc : parseInt(dupMatch[3] ?? '', 10);
           if (Number.isFinite(oldFd) && Number.isFinite(newFd)) {
+            // Codex pass 48 follow-up (high, 2026-05-19, bug #8 — dup2 no-op):
+            // Linux dup2(fd, fd) is a no-op: the descriptor stays put with all
+            // its flags (including FD_CLOEXEC) preserved.  Treating it as a
+            // fresh install would clobber the cloexec bit (the strace line has
+            // no flags arg for dup2) and run reuse bookkeeping inappropriately.
+            // dup3(fd, fd, ...) returns EINVAL on Linux so the success path
+            // cannot hit this case; the failed-syscall branch already handles
+            // it correctly.  Special-case op === 'dup2' && oldFd === newFd here
+            // so dirfdTable/tombstones/postMarkerFdReuses/opaqueFdReuses are
+            // left untouched.
+            if (op === 'dup2' && oldFd === newFd) {
+              continue;
+            }
             const oldKey = fdKey(pid, oldFd);
             const newKey = fdKey(pid, newFd);
             const oldVal = dirfdTable.get(oldKey);

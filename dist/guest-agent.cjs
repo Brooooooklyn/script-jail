@@ -26831,6 +26831,9 @@ async function runInstallPhase(input) {
           const oldFd = parseInt(dupMatch[2] ?? "", 10);
           const newFd = op === "dup" ? rc : parseInt(dupMatch[3] ?? "", 10);
           if (Number.isFinite(oldFd) && Number.isFinite(newFd)) {
+            if (op === "dup2" && oldFd === newFd) {
+              continue;
+            }
             const oldKey = fdKey(pid, oldFd);
             const newKey = fdKey(pid, newFd);
             const oldVal = dirfdTable.get(oldKey);

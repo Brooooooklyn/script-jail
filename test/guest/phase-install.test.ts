@@ -6471,6 +6471,81 @@ describe('runInstallPhase', () => {
       });
       expect(unresolved.length).toBeGreaterThanOrEqual(1);
     });
+
+    // Codex pass 48 regression (high, 2026-05-19, bug #8 — dup2 no-op):
+    // Linux dup2(fd, fd) is a kernel no-op: the descriptor stays put with
+    // all flags preserved (including FD_CLOEXEC).  The pass-47 dup-parity
+    // fix accidentally treated every successful dup2 as a fresh install,
+    // which clobbered cloexec=true → false on the same-fd target (the
+    // strace line carries no flags arg for dup2).  After a subsequent
+    // execve the model would keep the fd alive even though the kernel
+    // closed it on exec, and later openat(<that-fd>, "rel") would
+    // certify a stale path.  Pin the fix: dup2(fd, fd) leaves dirfdTable
+    // / tombstones / postMarkerFdReuses / opaqueFdReuses untouched, so
+    // the exec cloexec sweep still drops fd 7 and the post-exec relative
+    // open MUST fail closed.
+    it('dup2(fd, fd) is a no-op → cloexec preserved → exec sweeps fd → post-exec openat fails closed (bug #8)', async () => {
+      const proc = mockProcReader({
+        7701: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'dup2-noop-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Open /sensitive with O_CLOEXEC → fd 7 (cloexec=true).
+        {
+          pid: 7701,
+          line: 'openat(AT_FDCWD, "/sensitive", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 7',
+          source: 'strace',
+        },
+        // dup2(7, 7): Linux no-op — fd 7 stays put with cloexec=true.
+        {
+          pid: 7701,
+          line: 'dup2(7, 7) = 7',
+          source: 'strace',
+        },
+        // Exec — kernel sweeps fd 7 (CLOEXEC).
+        {
+          pid: 7701,
+          line: 'execve("/usr/bin/sh", ["sh", "-c", "x"], 0x7ffd...) = 0',
+          source: 'strace',
+        },
+        // Post-exec openat(7, ".ssh/id_rsa") — kernel returns EACCES /
+        // EBADF; our model MUST fail closed (no certification through
+        // /sensitive).
+        {
+          pid: 7701,
+          line: 'openat(7, ".ssh/id_rsa", O_RDONLY) = -1 EACCES (Permission denied)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 7701 }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The stale resolution `/sensitive/.ssh/id_rsa` MUST NOT appear.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/sensitive/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // The post-exec openat must surface as unresolved.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 7701;
+      });
+      expect(unresolved.length).toBeGreaterThanOrEqual(1);
+    });
   });
 
   describe('parseShimLine (exported for testing)', () => {
