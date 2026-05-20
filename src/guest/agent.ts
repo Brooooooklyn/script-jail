@@ -1680,6 +1680,21 @@ export function buildChildEnv(
       noAddons,
       ...requireFlags,
     ].join(' '),
+
+    // Redirect pnpm's content-addressed store off the rootfs (sized
+    // ~512 MB and shared with `/lib`, `/usr`, `/root`, etc.) onto the
+    // repo overlay disk (~4 GB, see src/action/firecracker/overlay.ts:
+    // REPO_DISK_MIN_MB).  Without this, a real-world monorepo (e.g.
+    // vuejs/core's ~500 MB dep graph) overruns the rootfs partway
+    // through `pnpm fetch` — Phase A reports `ok=true` but the store
+    // is incomplete, Phase B's `pnpm install --offline` then links
+    // only what's present and emits a truncated lockfile.
+    //
+    // `npm_config_store_dir` is the documented pnpm env knob for
+    // store location (pnpm reads npm-style env vars).  npm and yarn
+    // do not recognise this key and ignore it, so setting it
+    // unconditionally is safe across managers.
+    npm_config_store_dir: `${config.work_dir}/.pnpm-store`,
   };
 }
 
@@ -2069,23 +2084,6 @@ export async function main(input: AgentInput): Promise<void> {
 
   emitter.emitHandshake('fetch_done');
 
-  // Auto-discover installed packages from node_modules so normalize() can
-  // resolve every fs-event's pkg→dir mapping without requiring the consumer
-  // to hand-curate pkg_dirs in .script-jail.yml.
-  //
-  // This runs AFTER Phase A's fetch_done handshake (npm ci has populated
-  // node_modules) and BEFORE Phase B (install under strace), so the map
-  // is ready when collectedEvents are normalized at the end.
-  const nodeModulesDir = `${config.work_dir}/node_modules`;
-  const discoveredPkgDirs = discoverPkgDirs(nodeModulesDir);
-  diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
-
-  // Merge: user-supplied pkg_dirs override wins on conflict — preserves the
-  // escape hatch for hand-curated audits, even though consumers typically
-  // leave pkg_dirs empty.
-  const pkgDirs = new Map<string, string>(discoveredPkgDirs);
-  for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
-
   // 9. Wait for host "go" signal (exact string "go\n" required)
   try {
     await waitForGo(input.connection.readable);
@@ -2203,16 +2201,41 @@ export async function main(input: AgentInput): Promise<void> {
     protectedPaths,
   });
 
-  // 11. If install failed, emit error and abort — do NOT emit a final lockfile
-  //     for a failed install, which would give the host a partial/untrusted artifact.
+  // 11. Phase B exit-code handling.  A non-zero exit is the COMMON case for a
+  //     real repo: Phase B runs dependency lifecycle scripts offline under
+  //     strace, and scripts that reach for the network (puppeteer fetching
+  //     Chrome, esbuild fetching a platform binary) fail — `pnpm rebuild` /
+  //     `npm rebuild` then propagate the first failure's exit code.  That
+  //     failure IS audit data: the collected events already describe what
+  //     the script attempted.  So a non-zero exit is NON-fatal **as long as
+  //     the audit actually observed something**.
+  //
+  //     But a non-zero exit with ZERO collected events means the install
+  //     machinery itself failed before any lifecycle script ran under audit
+  //     (pnpm could not start, strace could not attach, the offline install
+  //     aborted during resolution).  Emitting a lockfile then would publish
+  //     a deceptively CLEAN artifact — empty not because the scripts were
+  //     benign but because nothing was audited.  In `update` mode that empty
+  //     lockfile gets committed and every future `check` passes silently.
+  //     Fail closed in that case.  (A *zero* exit with zero events is fine —
+  //     that is a genuinely clean repo with no escaping behaviour.)
   if (installResult.exitCode !== 0) {
+    if (installResult.eventCount === 0) {
+      emitter.emitError(
+        `Phase B (install) failed with exit code ${installResult.exitCode} ` +
+          'and produced no audit events — the install never ran a lifecycle ' +
+          'script under audit. Refusing to emit a lockfile that observed nothing.',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
     emitter.emitError(
-      `Phase B (install) failed with exit code ${installResult.exitCode}`,
-      true,
+      `Phase B (install) exited non-zero (code ${installResult.exitCode}) — ` +
+        'one or more dependency lifecycle scripts failed under audit. This is ' +
+        'recorded in the lockfile, not treated as a fatal error.',
+      false,
     );
-    input.connection.close();
-    process.exitCode = installResult.exitCode;
-    return;
   }
 
   // 11b. Events-file tamper check (Findings A + B): the tailer baseline-
@@ -2256,6 +2279,30 @@ export async function main(input: AgentInput): Promise<void> {
 
   emitter.emitHandshake('install_done');
 
+  // 11c. Auto-discover installed packages from node_modules so normalize()
+  //      can resolve every fs-event's pkg→dir mapping without requiring
+  //      the consumer to hand-curate pkg_dirs in .script-jail.yml.
+  //
+  //      Why AFTER Phase B (not after Phase A as one might expect):
+  //      pnpm's Phase A is `pnpm fetch`, which populates the pnpm store
+  //      but leaves `${work_dir}/node_modules` empty.  Scanning before
+  //      Phase B would discover 0 packages and route every install event
+  //      to `<unattributed>` — silently producing an empty lockfile.
+  //      npm and yarn DO populate node_modules in Phase A, but moving
+  //      the scan after Phase B is harmless for them and gives one
+  //      uniform code path across managers.  Phase B is also the right
+  //      moment because by then any rebuild-time `node_modules` rewrites
+  //      (e.g. yarn rebuild) have settled.
+  const nodeModulesDir = `${config.work_dir}/node_modules`;
+  const discoveredPkgDirs = discoverPkgDirs(nodeModulesDir);
+  diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
+
+  // Merge: user-supplied pkg_dirs override wins on conflict — preserves
+  // the escape hatch for hand-curated audits, even though consumers
+  // typically leave pkg_dirs empty.
+  const pkgDirs = new Map<string, string>(discoveredPkgDirs);
+  for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
+
   // 12. Normalize + render
   const ctx: NormalizeContext = { roots, pkgDirs };
 
@@ -2274,13 +2321,14 @@ export async function main(input: AgentInput): Promise<void> {
       }
     }
 
-    // Task #12: the lockfile's `node_version` reflects the Node binary the
-    // audit *actually ran against* — i.e. the runner's Node, packed onto the
-    // host-node disk and mounted at /opt/host-node.  We source it from the
-    // running process (process.version, e.g. "v20.11.0") and strip the
-    // leading "v" for canonical YAML output.  `config.node_version` is
-    // retained in the schema for backwards compatibility but no longer
-    // authoritative.
+    // The lockfile's `node_version` reflects the Node binary the audit
+    // *actually ran against* — i.e. the Linux Node toolchain that `vp env
+    // install` downloaded at guest boot (installed under
+    // /opt/vp/js_runtime/node/<ver>/bin and placed on PATH by init.sh).  We
+    // source it from the running process (process.version, e.g. "v20.11.0")
+    // and strip the leading "v" for canonical YAML output.
+    // `config.node_version` is retained in the schema for backwards
+    // compatibility but no longer authoritative.
     const rawNodeVersion = input.nodeVersion ?? process.version;
     const nodeVersion = rawNodeVersion.replace(/^v/, '');
 
@@ -2332,8 +2380,8 @@ if (isMain) {
 
   // Production: `nodeVersion` is intentionally omitted from main()'s input so
   // the renderer captures `process.version` of the running interpreter — which
-  // is the host-mounted Node at /opt/host-node, picked up via PATH by init.sh.
-  // That's the entire point of the host-Node mount (Task #12).
+  // is the Linux Node toolchain `vp env install` downloaded at guest boot
+  // (under /opt/vp/js_runtime/node/<ver>/bin, placed on PATH by init.sh).
   //
   // The TCP port here (10243) is the guest-side endpoint of the socat
   // AF_VSOCK<->TCP bridge configured in src/rootfs/init.sh.  The host still

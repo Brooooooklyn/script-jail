@@ -223,3 +223,74 @@ describe('discoverPkgDirs()', () => {
     expect(result.get('@scope/valid@1.0.0')).toBe(join(nm, '@scope', 'valid'));
   });
 });
+
+describe('discoverPkgDirs() — pnpm .pnpm virtual store', () => {
+  it('discovers transitive deps that live only under .pnpm', () => {
+    const nm = join(testDir, 'node_modules');
+    // A transitive dep is present ONLY under .pnpm, never at top-level.
+    writePkg(
+      join(nm, '.pnpm', 'transitive@2.3.4', 'node_modules', 'transitive'),
+      'transitive',
+      '2.3.4',
+    );
+
+    const result = discoverPkgDirs(nm);
+
+    expect(result.get('transitive@2.3.4')).toBe(
+      join(nm, '.pnpm', 'transitive@2.3.4', 'node_modules', 'transitive'),
+    );
+  });
+
+  it('registers the real package dir, not a sibling dependency symlink', () => {
+    const nm = join(testDir, 'node_modules');
+    // `host` lives at its own .pnpm entry (real dir).
+    writePkg(join(nm, '.pnpm', 'host@1.0.0', 'node_modules', 'host'), 'host', '1.0.0');
+    // `dep` lives at its own .pnpm entry, and is present beside `host` as a
+    // SYMLINK (pnpm wires a package's deps in as links).
+    writePkg(join(nm, '.pnpm', 'dep@2.0.0', 'node_modules', 'dep'), 'dep', '2.0.0');
+    symlinkSync(
+      join(nm, '.pnpm', 'dep@2.0.0', 'node_modules', 'dep'),
+      join(nm, '.pnpm', 'host@1.0.0', 'node_modules', 'dep'),
+      'dir',
+    );
+
+    const result = discoverPkgDirs(nm);
+
+    // `dep` is registered at its OWN canonical real path — never the symlink
+    // path under host's node_modules.
+    expect(result.get('dep@2.0.0')).toBe(
+      join(nm, '.pnpm', 'dep@2.0.0', 'node_modules', 'dep'),
+    );
+    expect(result.get('host@1.0.0')).toBe(
+      join(nm, '.pnpm', 'host@1.0.0', 'node_modules', 'host'),
+    );
+  });
+
+  it('discovers scoped packages inside the .pnpm store', () => {
+    const nm = join(testDir, 'node_modules');
+    writePkg(
+      join(nm, '.pnpm', '@scope+tool@1.2.3', 'node_modules', '@scope', 'tool'),
+      '@scope/tool',
+      '1.2.3',
+    );
+
+    const result = discoverPkgDirs(nm);
+
+    expect(result.get('@scope/tool@1.2.3')).toBe(
+      join(nm, '.pnpm', '@scope+tool@1.2.3', 'node_modules', '@scope', 'tool'),
+    );
+  });
+
+  it('the .pnpm real directory overrides a top-level symlink for a direct dep', () => {
+    const nm = join(testDir, 'node_modules');
+    const realDir = join(nm, '.pnpm', 'pkg@1.0.0', 'node_modules', 'pkg');
+    writePkg(realDir, 'pkg', '1.0.0');
+    // Direct dep: top-level node_modules/pkg is a symlink into .pnpm.
+    symlinkSync(realDir, join(nm, 'pkg'), 'dir');
+
+    const result = discoverPkgDirs(nm);
+
+    // The canonical real .pnpm path wins over the top-level symlink path.
+    expect(result.get('pkg@1.0.0')).toBe(realDir);
+  });
+});

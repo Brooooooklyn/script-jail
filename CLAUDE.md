@@ -10,7 +10,7 @@ For the user-facing description and motivation, see [README.md](./README.md).
 - pnpm (pinned via `packageManager` field) — always use `pnpm`, never `npm` or `yarn`.
 - Vitest with four projects (unit / guest / integration / e2e).
 - Build runner: `oxnode` (do not use `tsx` or `ts-node`).
-- Rust `LD_PRELOAD` shim (`#![no_std]` cdylib in `src/shim/`, pinned via `src/shim/rust-toolchain.toml`); built with `cargo build --release` and copied to `images/libscriptjail.so`.
+- Rust `LD_PRELOAD` shim (`#![no_std]` cdylib in `src/shim/`, pinned via the root `rust-toolchain.toml`); built with `cargo build --release` and copied to `images/libscriptjail.so`.
 
 ## Repo layout
 

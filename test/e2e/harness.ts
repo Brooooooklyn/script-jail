@@ -20,12 +20,9 @@
 // a glob that excludes this file (e.g. include `test/e2e/**/*.test.ts` only).
 
 import {
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   writeFileSync,
-  chmodSync,
-  realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -334,7 +331,6 @@ function makeFakeOverlay(workDir: string): OverlayResult {
   return {
     rootfsCopyPath: join(workDir, 'rootfs.ext4'),
     repoDiskPath: join(workDir, 'repo.ext4'),
-    hostNodeDiskPath: join(workDir, 'host-node.ext4'),
     workDir,
     cleanup: async () => {},
   };
@@ -448,8 +444,6 @@ const TRACKED_ENV_KEYS: ReadonlyArray<string> = [
   'INPUT_SPOOF-ARCH',
   'INPUT_CACHE-FIRECRACKER',
   'ImageOS',
-  'PATH',
-  'RUNNER_TOOL_CACHE',
   'RUNNER_TEMP',
 ];
 
@@ -466,36 +460,6 @@ function restoreEnv(snapshot: Map<string, string | undefined>): void {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
-}
-
-// ---- Fake host-Node prefix --------------------------------------------------
-//
-// `resolveHostNodePrefix` in src/main.ts walks PATH for `node` and validates
-// the derived install prefix.  In tests we have no setup-node-style toolcache,
-// so the harness materialises a minimal prefix under os.tmpdir() containing an
-// executable `bin/node` shim.  os.tmpdir() (e.g. /var/folders/... on macOS,
-// /tmp on Linux) is on the helper's accept list, so the prefix passes
-// validation without marker files.  Cached for the lifetime of the process to
-// avoid creating dozens of tmpdirs across runMain() calls.
-
-let cachedFakeNodePrefix: string | null = null;
-
-function ensureFakeNodePrefix(): string {
-  if (cachedFakeNodePrefix !== null) return cachedFakeNodePrefix;
-  const prefix = mkdtempSync(join(tmpdir(), 'script-jail-fake-node-'));
-  const binDir = join(prefix, 'bin');
-  mkdirSync(binDir, { recursive: true });
-  const nodePath = join(binDir, 'node');
-  // Minimal POSIX shell shim with the executable bit set.  It is never
-  // executed — only stat'd + access(X_OK)'d by `resolveHostNodeExecPath`.
-  writeFileSync(nodePath, '#!/bin/sh\nexit 0\n', 'utf8');
-  chmodSync(nodePath, 0o755);
-  // resolveHostNodeExecPath calls realpathSync on the resolved node binary.
-  // On macOS, os.tmpdir() returns /var/folders/... while realpath resolves to
-  // /private/var/folders/... .  Cache the realpath so RUNNER_TOOL_CACHE can
-  // be set to a value that actually contains the resolved exec path.
-  cachedFakeNodePrefix = realpathSync(prefix);
-  return cachedFakeNodePrefix;
 }
 
 // ---- Module import (deferred + guarded) -------------------------------------
@@ -644,16 +608,6 @@ export async function runMain(input: RunMainInput): Promise<RunMainResult> {
   // macOS dev hosts the latter is absent; set ImageOS to ubuntu24 so the
   // harness works on any platform.
   process.env['ImageOS'] = 'ubuntu24';
-
-  // resolveHostNodePrefix walks PATH for `node`.  Prepend a tmp-rooted
-  // fake-prefix so it resolves to an accepted (os.tmpdir-rooted) install
-  // without depending on the user's real Node toolchain.
-  const fakePrefix = ensureFakeNodePrefix();
-  const fakeBin = join(fakePrefix, 'bin');
-  const origPath = process.env['PATH'] ?? '';
-  process.env['PATH'] = `${fakeBin}${origPath !== '' ? `:${origPath}` : ''}`;
-  // Belt-and-braces: RUNNER_TOOL_CACHE accepts the fake prefix too.
-  process.env['RUNNER_TOOL_CACHE'] = fakePrefix;
 
   // RUNNER_TEMP keeps maybeClearCache + the images-dir build inside a known
   // tmp tree rather than the test runner's RUNNER_TEMP (which may not exist

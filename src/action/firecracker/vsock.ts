@@ -1,6 +1,14 @@
 // script-jail — src/action/firecracker/vsock.ts
 //
-// Host-side vsock connection handler.
+// Firecracker-specific host-side vsock handler.
+//
+// The generic JSONL protocol (frame types, `parseFrames`,
+// `VsockSession` / `VsockDuplex`) lives in ../../shared/vsock-protocol.ts —
+// re-exported below so existing internal importers from this module keep
+// working unchanged.  This file owns only the Firecracker-specific UDS
+// lifecycle: opening the host-initiated control socket, performing the
+// `CONNECT <port>\n` handshake, and the retry/backoff logic that copes with
+// guest-AF_VSOCK-listener boot latency.
 //
 // Protocol (Firecracker vsock-over-UDS pattern, host-initiated mode):
 //   - When PUT /vsock is processed, Firecracker creates a Unix-domain
@@ -37,43 +45,19 @@
 //   src/rootfs/orchestrate.sh, and src/guest/agent.ts.
 
 import { createConnection, type Socket } from 'node:net';
-import { createInterface } from 'node:readline';
-import type { AttributedEvent } from '../../lock/schema.js';
 
-// ---------------------------------------------------------------------------
-// Frame types
-// ---------------------------------------------------------------------------
+import {
+  parseFrames,
+  type GuestFrame,
+  type VsockDuplex,
+  type VsockSession,
+} from '../../shared/vsock-protocol.js';
 
-export type GuestFrame =
-  | { kind: 'event'; event: AttributedEvent }
-  | { kind: 'handshake'; phase: 'fetch_done' | 'install_done' }
-  | { kind: 'error'; message: string; fatal: boolean }
-  | { kind: 'final'; yaml: string };
-
-// ---------------------------------------------------------------------------
-// VsockSession
-// ---------------------------------------------------------------------------
-
-export interface VsockSession {
-  /** Async iterable of parsed frames from the guest. */
-  events: AsyncIterable<GuestFrame>;
-  /** Writes "go\n" to the guest connection. */
-  sendGo(): Promise<void>;
-  /** Closes the underlying connection. */
-  close(): Promise<void>;
-}
-
-// ---------------------------------------------------------------------------
-// Duplex abstraction for test injection
-// ---------------------------------------------------------------------------
-
-/** Minimal duplex interface used by VsockSession internals. */
-export interface VsockDuplex {
-  write(data: string): boolean;
-  destroy(): void;
-  /** The readable side for line-by-line parsing. */
-  readable: NodeJS.ReadableStream;
-}
+// Re-export the generic protocol surface so internal Firecracker callers
+// (teardown.ts, vsock.test.ts, etc.) can keep importing from './vsock.js'
+// unchanged.  New code targeting the generic protocol should import from
+// `src/shared/vsock-protocol.js` directly.
+export type { GuestFrame, VsockDuplex, VsockSession };
 
 // ---------------------------------------------------------------------------
 // openVsockSession
@@ -83,8 +67,10 @@ export interface VsockDuplex {
  * Opens a vsock session to the guest.
  *
  * Production:
- *   Connects to `${udsPath}_${port}` (the Firecracker UDS naming convention),
- *   sends the "CONNECT <port>\n" handshake, then parses JSONL frames.
+ *   Connects to the BASE Firecracker UDS at `${udsPath}` (host-initiated
+ *   mode — see the protocol comment at the top of this file), then sends
+ *   the "CONNECT <port>\n" handshake over that connection and parses
+ *   JSONL frames once the guest replies with "OK <port>\n".
  *
  * Tests:
  *   Pass `options.duplex` to inject a fake duplex.  The CONNECT handshake
@@ -125,7 +111,7 @@ export async function openVsockSession(
     // CONNECT + OK handshake already completed inside dialVsockWithRetry.
   }
 
-  // Build the async iterable over JSONL frames.
+  // Build the async iterable over JSONL frames (generic; in shared/).
   const events = parseFrames(duplex.readable);
 
   const session: VsockSession = {
@@ -158,105 +144,6 @@ export async function openVsockSession(
   };
 
   return session;
-}
-
-// ---------------------------------------------------------------------------
-// JSONL frame parser
-// ---------------------------------------------------------------------------
-
-/**
- * Reads JSONL lines from `readable` and yields typed GuestFrame objects.
- *
- * Malformed JSON lines do NOT crash the stream — they are yielded as an
- * error frame with `fatal: false` so the caller can log them and continue.
- */
-async function* parseFrames(
-  readable: NodeJS.ReadableStream,
-): AsyncIterable<GuestFrame> {
-  const rl = createInterface({ input: readable, crlfDelay: Infinity });
-
-  for await (const line of rl) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    let raw: unknown;
-    try {
-      raw = JSON.parse(trimmed);
-    } catch {
-      yield {
-        kind: 'error',
-        message: `script-jail vsock: malformed JSON frame: ${trimmed.slice(0, 200)}`,
-        fatal: false,
-      };
-      continue;
-    }
-
-    if (typeof raw !== 'object' || raw === null) {
-      yield {
-        kind: 'error',
-        message: `script-jail vsock: expected JSON object, got: ${trimmed.slice(0, 200)}`,
-        fatal: false,
-      };
-      continue;
-    }
-
-    yield classifyFrame(raw as Record<string, unknown>);
-  }
-}
-
-/** Classify a parsed JSON object into a typed GuestFrame. */
-function classifyFrame(obj: Record<string, unknown>): GuestFrame {
-  const kind = obj['kind'];
-
-  switch (kind) {
-    case 'event': {
-      // We trust the guest to send well-formed events; the host normalizer
-      // validates them more strictly.  Here we just pass them through.
-      return {
-        kind: 'event',
-        event: obj as unknown as AttributedEvent,
-      };
-    }
-
-    case 'handshake': {
-      const phase = obj['phase'];
-      if (phase === 'fetch_done' || phase === 'install_done') {
-        return { kind: 'handshake', phase };
-      }
-      return {
-        kind: 'error',
-        message: `script-jail vsock: unknown handshake phase: ${String(phase)}`,
-        fatal: false,
-      };
-    }
-
-    case 'error': {
-      return {
-        kind: 'error',
-        message: typeof obj['message'] === 'string' ? obj['message'] : String(obj['message']),
-        fatal: obj['fatal'] === true,
-      };
-    }
-
-    case 'final': {
-      if (typeof obj['yaml'] !== 'string') {
-        return {
-          kind: 'error',
-          message: `script-jail vsock: "final" frame missing "yaml" string field`,
-          fatal: false,
-        };
-      }
-      return { kind: 'final', yaml: obj['yaml'] };
-    }
-
-    default: {
-      return {
-        kind: 'error',
-        message: `script-jail vsock: unknown frame kind: ${String(kind)}`,
-        fatal: false,
-      };
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------

@@ -8,10 +8,15 @@
   "engines": {
     "node": ">=20.0.0"
   },
+  "bin": {
+    "script-jail": "dist/cli.cjs"
+  },
   "scripts": {
     "build": "oxnode scripts/build.ts",
     "build:bundle": "esbuild src/main.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/main.cjs",
     "build:guest-agent": "esbuild src/guest/agent.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/guest-agent.cjs",
+    "build:cli": "esbuild src/cli/index.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/cli.cjs --banner:js=\"#!/usr/bin/env node\"",
+    "build:bundle:all": "pnpm build:bundle && pnpm build:guest-agent && pnpm build:cli",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:guest": "vitest run --project=guest",

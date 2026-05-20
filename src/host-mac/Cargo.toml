@@ -1,0 +1,26 @@
+[package]
+name             = "script-jail-host-mac"
+version          = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description      = "macOS host runner for script-jail: boots a Linux guest under Virtualization.framework via objc2-virtualization."
+
+[[bin]]
+name = "script-jail-vm"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+objc2                 = "0.6"
+objc2-foundation      = "0.3"
+objc2-virtualization  = "0.3.2"
+block2                = "0.6"
+dispatch2             = "0.3"
+serde                 = { version = "1", features = ["derive"] }
+serde_json            = "1"
+crossbeam-channel     = "0.5"
+
+# NOTE: `[profile.release]` for this crate lives in the workspace root
+# Cargo.toml.  Cargo ignores profile blocks in workspace members.

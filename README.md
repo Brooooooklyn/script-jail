@@ -13,3 +13,13 @@ Pre-alpha. Project skeleton only. See [the design plan](./docs/design.md) (TODO)
 ## Why a microVM
 
 A pure-JS install sandbox can't close every gap: bun ignores `NODE_OPTIONS=--require`, `dlopen`/`execve` reach the kernel before any JS hook, and libuv-backed env reads sidestep a `process.env` Proxy. The kernel is the only honest boundary.
+
+## Generating the lockfile locally on macOS
+
+A macOS Apple Silicon developer can run the same audit locally via Apple's Virtualization.framework instead of waiting for CI:
+
+```bash
+pnpm exec script-jail init
+```
+
+Requires macOS 14 or newer; the CLI exits with a clear message on older releases. See [`docs/divergence.md`](./docs/divergence.md) for the known cross-host parity limits.

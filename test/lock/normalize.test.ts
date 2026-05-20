@@ -180,6 +180,12 @@ describe('normalize', () => {
       '/proc/self/maps',
       '/sys/fs/cgroup/memory',
       '/dev/urandom',
+      // vite-plus toolchain (VP_HOME=/opt/vp).  The bare `/opt` and `/opt/vp`
+      // directory stat()s must drop alongside the subtree — the noise prefix
+      // intentionally omits the trailing slash so they do.
+      '/opt',
+      '/opt/vp',
+      '/opt/vp/js_runtime/node/24.15.0/bin/node',
     ];
 
     for (const p of noisePaths) {

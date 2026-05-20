@@ -36,13 +36,32 @@ import type { RunnerImage } from './runner-image.js';
 // Public types
 // ---------------------------------------------------------------------------
 
+/**
+ * Platform key for the nested `expected` map.  PR 5 split the manifest by
+ * platform so the action (which only runs on Linux) and the macOS CLI (PR 4)
+ * can pin distinct asset sets without two manifest files.
+ */
+export type ManifestPlatform = 'linux' | 'darwin';
+
+/**
+ * Per-asset SHA-256 map for one platform section.  Asset filename → 64-char
+ * lowercase hex digest (or a `PLACEHOLDER_SHA256_*` bootstrap string until
+ * the first release is cut).
+ */
+export type ManifestSection = Readonly<Record<string, string>>;
+
 export interface ArtifactManifest {
   /** GitHub repo "owner/name" for the release.  E.g. "brooklyn/script-jail". */
   repo: string;
   /** Release tag, e.g. "v1.0.0". */
   tag: string;
-  /** Map of asset filename → expected SHA-256 hex digest. */
-  expected: Readonly<Record<string, string>>;
+  /**
+   * Platform-keyed map of asset SHAs.  The Linux runner consumes
+   * `expected.linux`; the macOS CLI consumes `expected.darwin`.  The two
+   * sections never share asset filenames — the .so/rootfs/binary names are
+   * arch-suffixed so a copy-paste between sections is immediately obvious.
+   */
+  expected: Readonly<Record<ManifestPlatform, ManifestSection>>;
 }
 
 export interface PreFetchInput {
@@ -50,6 +69,14 @@ export interface PreFetchInput {
   runnerImage: RunnerImage;
   manifest: ArtifactManifest;
   http: HttpClient;
+  /**
+   * Which platform section of the manifest to consult.  Defaults to `'linux'`
+   * because this helper is invoked from the GitHub Action's `main.ts`, which
+   * only runs on Linux.  The macOS CLI (PR 4) does not call preFetchArtifacts
+   * at all — it resolves artifacts from the local `images/` dir via
+   * `src/shared/artifacts.ts`.
+   */
+  platform?: ManifestPlatform;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +108,7 @@ const LIBSCRIPTJAIL_ASSET = 'libscriptjail.so';
  */
 export async function preFetchArtifacts(input: PreFetchInput): Promise<void> {
   const { imagesDir, runnerImage, manifest, http } = input;
+  const platform: ManifestPlatform = input.platform ?? 'linux';
 
   mkdirSync(imagesDir, { recursive: true });
 
@@ -88,8 +116,14 @@ export async function preFetchArtifacts(input: PreFetchInput): Promise<void> {
 
   // Build the list of (asset, destPath, expectedSha) tuples we actually need.
   const assets: ReadonlyArray<{ name: string; expected: string }> = [
-    { name: wantedRootfs, expected: requireExpected(manifest, wantedRootfs) },
-    { name: LIBSCRIPTJAIL_ASSET, expected: requireExpected(manifest, LIBSCRIPTJAIL_ASSET) },
+    {
+      name: wantedRootfs,
+      expected: requireExpected(manifest, platform, wantedRootfs),
+    },
+    {
+      name: LIBSCRIPTJAIL_ASSET,
+      expected: requireExpected(manifest, platform, LIBSCRIPTJAIL_ASSET),
+    },
   ];
 
   // Download all assets in parallel; each call is independently idempotent.
@@ -116,8 +150,19 @@ function assetUrl(manifest: ArtifactManifest, asset: string): string {
   );
 }
 
-function requireExpected(manifest: ArtifactManifest, asset: string): string {
-  const sha = manifest.expected[asset];
+function requireExpected(
+  manifest: ArtifactManifest,
+  platform: ManifestPlatform,
+  asset: string,
+): string {
+  const section = manifest.expected[platform];
+  if (section === undefined) {
+    throw new Error(
+      `script-jail: artifact manifest is missing the "${platform}" platform ` +
+        `section.  Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`,
+    );
+  }
+  const sha = section[asset];
   if (sha === undefined) {
     throw new Error(
       `script-jail: artifact manifest is missing an expected SHA-256 for "${asset}". ` +

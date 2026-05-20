@@ -1,0 +1,11 @@
+{
+  "kernel_path": "test/fixtures/host-mac/missing-kernel",
+  "kernel_cmdline": "console=ttyS0 reboot=k panic=1 ro rootfstype=ext4 init=/sbin/init",
+  "rootfs_disk_path": "test/fixtures/host-mac/missing-rootfs.img",
+  "repo_disk_path": "test/fixtures/host-mac/missing-repo.img",
+  "vsock_uds_path": "/tmp/script-jail-vsock-smoke",
+  "vsock_port": 10242,
+  "vcpu_count": 2,
+  "memory_mb": 2048,
+  "enable_network": true
+}

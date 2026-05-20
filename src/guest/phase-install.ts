@@ -5,9 +5,22 @@
 //   npm:  `npm rebuild --foreground-scripts`
 //     Runs lifecycle scripts against the already-fetched node_modules.
 //     --foreground-scripts keeps stdout/stderr visible for debugging.
-//   pnpm: `pnpm install --frozen-lockfile --offline --config.side-effects-cache=false`
-//     Installs from cache without network and without side-effect cache
-//     to ensure we always run lifecycle scripts fresh.
+//   pnpm: `pnpm rebuild --pending --config.side-effects-cache=false`
+//     Phase A already materialised node_modules with `--ignore-scripts`;
+//     `pnpm rebuild` is the only pnpm command that re-runs dependency build
+//     scripts against an existing node_modules tree.  A plain `pnpm install
+//     --offline` would NOT — once `pnpm install --ignore-scripts` has built
+//     the virtual store, a second install just links the top-level tree and
+//     never re-executes dependency scripts.
+//     `--pending` scopes the rebuild to exactly the packages whose build was
+//     deferred by Phase A's `--ignore-scripts` (pnpm records them in
+//     node_modules/.modules.yaml `pendingBuilds`) — precisely the audit
+//     target, and the pnpm-documented mode for "run the builds skipped by
+//     --ignore-scripts".  `--config.side-effects-cache=false` stops pnpm
+//     reusing cached build artifacts, so every script runs fresh under
+//     strace.  Like `npm rebuild`, this rebuilds DEPENDENCIES only and
+//     respects pnpm 10's `onlyBuiltDependencies`/`allowBuilds` allowlist —
+//     i.e. it audits exactly the scripts a real `pnpm install` would run.
 //   yarn: `yarn install --immutable --offline`
 //     Re-links packages and runs scripts without touching the registry.
 //
@@ -31,6 +44,14 @@ import {
   type AttributedEvent,
   type RawEvent,
 } from '../lock/schema.js';
+
+// Re-export `loadPmFlags` so any pre-existing importers
+// (`import { loadPmFlags } from './phase-install.js'`) keep working.  The
+// canonical home is `./load-pm-flags.ts`; phase-install no longer invokes it
+// directly — `extra_install_args` are spliced into Phase A (fetch/resolve),
+// not Phase B (rebuild/relink), because npm/pnpm resolve their dependency
+// graph in Phase A.  See `phase-fetch.ts` for the runtime call site.
+export { loadPmFlags } from './load-pm-flags.js';
 
 /**
  * StraceRunner abstraction. Spawns strace and streams (pid, line) records.
@@ -223,9 +244,18 @@ export interface PhaseInstallResult {
 
 const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
   npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['install', '--frozen-lockfile', '--offline', '--config.side-effects-cache=false'] },
+  pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
   yarn: { cmd: 'yarn', args: ['install', '--immutable', '--offline'] },
 };
+
+// pm-flags.json (extra_install_args for --cpu/--os/--libc) is consumed in
+// Phase A (`src/guest/phase-fetch.ts`), NOT here.  Phase B (`npm rebuild` /
+// `pnpm rebuild` / `yarn install --immutable`) runs against an
+// already-resolved tree; appending arch flags here would be too late and
+// would not affect which platform-specific subpackages get downloaded.
+// `loadPmFlags` is re-exported from this module (see top of file) for
+// backward compat with pre-existing test imports; the canonical home is
+// `./load-pm-flags.ts`.
 
 /**
  * Parse a JSONL line coming from the LD_PRELOAD shim, the env-spy preload, or
@@ -288,7 +318,19 @@ export function parseShimLine(line: string): RawEvent | null {
 export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
-  const { cmd, args } = INSTALL_CMD[input.manager];
+  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
+  // pm-flags.json extras are spliced into Phase A (fetch/resolve), not here —
+  // dependency resolution is already done by the time Phase B runs.
+
+  // For pnpm: pin the store-dir to the repo overlay disk — IDENTICAL to
+  // the value spliced in phase-fetch.ts.  `pnpm rebuild` operates on the
+  // node_modules tree Phase A materialised, but still resolves store
+  // config; a mismatched --store-dir would point pnpm at an empty store
+  // on the cramped rootfs ext4.  Keep both phases in lockstep via
+  // `input.cwd`.
+  const args = input.manager === 'pnpm'
+    ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`]
+    : baseArgs;
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`

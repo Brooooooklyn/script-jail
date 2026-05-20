@@ -1,9 +1,14 @@
 node_modules/
 .pnpm-store/
 
+# Cargo workspace build output (workspace root since PR 1)
+target/
+
 # Built rootfs / firecracker / kernel — produced by scripts/build.ts, fetched/cached in CI
 images/firecracker
 images/vmlinux
+images/vmlinux-vz-*
+images/script-jail-vm-*
 images/*.ext4
 images/*.so
 images/*.dylib

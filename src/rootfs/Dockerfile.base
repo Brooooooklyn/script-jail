@@ -1,25 +1,97 @@
 # syntax=docker/dockerfile:1
 ARG UBUNTU_MAJOR=24.04
 
+# vite-plus toolchain provisioning args.  Defaults are PLACEHOLDERS — the real
+# values come from `src/rootfs/vite-plus.ts` via `--build-arg` (see
+# `dockerBuild()` in src/rootfs/build.ts).  Building this Dockerfile by hand
+# without the build args will fail the SHA-256 check below.
+ARG VP_VERSION=0.0.0
+ARG VP_ARCH=x64
+ARG VP_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+ARG NODE_VERSION=0.0.0
+
 FROM ubuntu:${UBUNTU_MAJOR}
 
-# Install only audit/init tooling. NO node, npm, pnpm, yarn — those come via
-# the host-node drive at runtime (mounted at /opt/host-node by init.sh).
+ARG VP_VERSION
+ARG VP_ARCH
+ARG VP_SHA256
+ARG NODE_VERSION
+
+# Install only audit/init tooling. NO node, npm, pnpm, yarn — those are
+# provisioned at runtime: `vp` (baked below) downloads a real Linux Node
+# toolchain into VP_HOME during Phase A (see src/rootfs/init.sh).
 #
 # The cleanup `rm -rf` lives in the SAME RUN as the install so the docs/man/
 # locale payloads never get committed to a layer in the first place.  A
 # follow-up `RUN rm -rf …` would only mask the bytes, not shrink the image.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      strace busybox dumb-init ca-certificates socat && \
+#
+# Swap the default Ubuntu apt mirrors before `apt-get update`:
+#   - x86_64 main archive  →  azure.archive.ubuntu.com (in-network on Azure-
+#     hosted GitHub runners).
+#   - arm64 ports archive  →  mirror.us.leaseweb.net/ubuntu-ports/ (Canonical's
+#     own `ports.ubuntu.com` and CNAME `azure.ports.ubuntu.com` resolve to the
+#     same overloaded 91.189.91.x bank, which has been TCP-blackholing from
+#     GitHub-hosted runners for sustained windows).  Leaseweb runs an
+#     independent US mirror with very high uptime.
+#
+# Sources files differ across releases (sources.list on 22.04, deb822
+# ubuntu.sources on 24.04), so we rewrite every matching file under
+# /etc/apt without caring which exists.  The retry loop is a backstop.
+#
+# `curl` is added to the package set: it downloads the `vp` tarball below.
+RUN set -eu; \
+    find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+      -exec sed -i \
+        -e 's|http://ports\.ubuntu\.com/ubuntu-ports|http://mirror.us.leaseweb.net/ubuntu-ports|g' \
+        -e 's|http://archive\.ubuntu\.com|http://azure.archive.ubuntu.com|g' \
+        {} +; \
+    echo 'Acquire::http::Timeout "30";' > /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::Retries "3";'       >> /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::ForceIPv4 "true";'  >> /etc/apt/apt.conf.d/99script-jail-net; \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get update && \
+         apt-get install -y --no-install-recommends \
+           strace busybox dumb-init ca-certificates socat curl; then \
+        break; \
+      fi; \
+      if [ "$attempt" = "5" ]; then \
+        echo "apt install failed after 5 attempts" >&2; exit 1; \
+      fi; \
+      echo "apt install attempt $attempt failed; sleeping before retry" >&2; \
+      sleep $((attempt * 5)); \
+    done && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /usr/share/doc /usr/share/man /usr/share/locale \
            /var/cache/apt /var/lib/dpkg/info/*.md5sums
 
-# Build dirs the agent + init script expect.  /opt/host-node is pre-created so
-# the runtime mount has a mountpoint without init.sh having to mkdir it under
-# a read-only rootfs (rootfs is mounted rw, but pre-creating is cheaper).
-RUN mkdir -p /work /etc/script-jail /usr/local/lib/script-jail /usr/local/bin /opt/host-node
+# Build dirs the agent + init script expect.  /opt/vp is the runtime VP_HOME
+# (pre-created so init.sh can write into it under the rw rootfs without an
+# extra mkdir).  The `vp env install` Node download (~200 MB) lands here, so
+# the rootfs ext4 is sized with headroom (see src/rootfs/build.ts).
+RUN mkdir -p /work /etc/script-jail /usr/local/lib/script-jail /usr/local/bin /opt/vp
+
+# Bake the standalone `vp` (vite-plus) binary.  The npm tarball is per-arch
+# (the package name embeds x64 / arm64) and extracts to `package/vp`.  The
+# SHA-256 is pinned in src/rootfs/vite-plus.ts and passed via --build-arg;
+# `vp` itself downloads the Node toolchain at runtime, not here.
+#
+# NODE_VERSION is recorded at /etc/script-jail/node-version so init.sh can
+# run `vp env install "$(cat …)"` with an EXACT version — reproducibility is
+# load-bearing for the byte-stable lockfile (a bare major would drift).
+RUN set -eu; \
+    url="https://registry.npmjs.org/@voidzero-dev/vite-plus-cli-linux-${VP_ARCH}-gnu/-/vite-plus-cli-linux-${VP_ARCH}-gnu-${VP_VERSION}.tgz"; \
+    for attempt in 1 2 3 4 5; do \
+      if curl -fsSL --retry 3 -o /tmp/vp.tgz "$url"; then break; fi; \
+      if [ "$attempt" = "5" ]; then \
+        echo "vp download failed after 5 attempts: $url" >&2; exit 1; \
+      fi; \
+      echo "vp download attempt $attempt failed; retrying" >&2; sleep $((attempt * 5)); \
+    done; \
+    echo "${VP_SHA256}  /tmp/vp.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/vp.tgz -C /tmp; \
+    install -m 0755 /tmp/package/vp /usr/local/bin/vp; \
+    rm -rf /tmp/vp.tgz /tmp/package; \
+    printf '%s\n' "${NODE_VERSION}" > /etc/script-jail/node-version
 
 # Init + agent + JS preloads (copied at build time from the host build context)
 COPY src/rootfs/init.sh /sbin/init

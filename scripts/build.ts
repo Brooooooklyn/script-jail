@@ -21,6 +21,13 @@
 //                                                rootfs against
 //   --all                                        build BOTH runner-image rootfses
 //                                                (overrides --runner-image)
+//   --arch=x64|arm64                             target rootfs architecture (PR 4).
+//                                                Defaults to 'x64' unless
+//                                                --shim-arm64 is also set.
+//   --shim-arm64                                 cross-compile libscriptjail.so for
+//                                                aarch64-unknown-linux-gnu (PR 4).
+//                                                Linux-only; macOS surfaces a
+//                                                clear error pointing at CI.
 //
 // Default: build a single rootfs for whichever runner image we detect (via
 // `detectRunnerImage()`); falls back to `ubuntu-24.04` when detection fails
@@ -35,7 +42,9 @@ import {
   buildRootfs,
   formatBytes,
   imageOutputPath,
+  parseArchArg,
   parseRunnerImageArg,
+  type BuildArch,
   type BuildInput,
   type RunnerImage,
 } from '../src/rootfs/build.js';
@@ -68,6 +77,21 @@ interface ParsedArgs {
   all: boolean;
   /** Explicit `--runner-image=…` choice; ignored when `--all`. */
   runnerImage: RunnerImage | undefined;
+  /**
+   * Explicit `--arch=x64|arm64`.  Drives the rootfs build (BuildInput.arch)
+   * AND, when 'arm64', triggers the aarch64-unknown-linux-gnu cross-compile
+   * for libscriptjail.so.  Defaults to undefined → host arch fallback.
+   */
+  arch: BuildArch | undefined;
+  /**
+   * PR 4 flag: `--shim-arm64` requests the cross-compiled
+   * `target/aarch64-unknown-linux-gnu/release/libscriptjail.so` → copied to
+   * `images/libscriptjail-arm64.so`.  Implies --arch=arm64 for the rootfs
+   * step unless --arch is supplied separately.  Gated on Linux: on macOS we
+   * surface a clear error pointing at CI (cargo on Darwin cannot build a
+   * Linux .so from this toolchain).
+   */
+  shimArm64: boolean;
 }
 
 function parseArgs(): ParsedArgs {
@@ -77,21 +101,28 @@ function parseArgs(): ParsedArgs {
   const skipBundle = args.includes('--skip-bundle');
   const skipShim = args.includes('--skip-shim');
   const all = args.includes('--all');
+  const shimArm64 = args.includes('--shim-arm64');
   const runnerImage = parseRunnerImageArg(args);
+  const arch = parseArchArg(args);
 
   // Warn about unknown flags so typos don't silently no-op.
-  for (const arg of args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? '';
     if (
       arg === '--skip-rootfs' ||
       arg === '--skip-bundle' ||
       arg === '--skip-shim' ||
       arg === '--all' ||
-      /^--runner-image=/.test(arg)
+      arg === '--shim-arm64' ||
+      /^--runner-image=/.test(arg) ||
+      /^--arch=/.test(arg)
     ) continue;
+    // --arch <value> two-token form: skip both this token and the value.
+    if (arg === '--arch') { i++; continue; }
     console.warn(`[build] Unknown flag: ${arg}`);
   }
 
-  return { skipRootfs, skipBundle, skipShim, all, runnerImage };
+  return { skipRootfs, skipBundle, skipShim, all, runnerImage, arch, shimArm64 };
 }
 
 /**
@@ -171,6 +202,44 @@ export function shimArtifactIsStale(
   return shimArtifactIsStaleShared(shimOut, sources);
 }
 
+/**
+ * Cross-compile `libscriptjail.so` for aarch64-unknown-linux-gnu and copy it
+ * to `images/libscriptjail-arm64.so`.  Gated on Linux: macOS cargo cannot
+ * produce a Linux ELF from this toolchain (would yield a Mach-O dylib), so
+ * we surface a clear error pointing the user at CI.
+ *
+ * Cross-compile via cargo-zigbuild + zig.  zigbuild bundles the
+ * cross-libc/sysroot lookup and the linker invocation into one tool, so
+ * the same `pnpm build --shim-arm64` works on Linux AND macOS dev hosts
+ * (and on the release runners) without per-host `gcc-aarch64-linux-gnu`
+ * installs or `.cargo/config.toml` linker pinning.
+ *
+ * Prerequisites (installed by .github/workflows/{release,parity-test}.yml
+ * before invoking this; same install also works locally):
+ *   - `cargo install cargo-zigbuild`
+ *   - zig binary on PATH (`brew install zig` on macOS,
+ *     `pip install ziglang` / download tarball on Linux)
+ *   - `rustup target add aarch64-unknown-linux-gnu` (for the std rlib)
+ */
+function buildShimArm64(): void {
+  const target = 'aarch64-unknown-linux-gnu';
+  const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
+  const shimOut = join(REPO_ROOT, 'images', 'libscriptjail-arm64.so');
+
+  console.log(`[build] Building arm64 shim via cargo zigbuild --target ${target} …`);
+  execSync(
+    `cargo zigbuild --release --manifest-path "${manifest}" --target ${target}`,
+    { stdio: 'inherit', cwd: REPO_ROOT },
+  );
+
+  mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
+  copyFileSync(
+    join(REPO_ROOT, 'target', target, 'release', 'libscriptjail.so'),
+    shimOut,
+  );
+  console.log(`[build] images/libscriptjail-arm64.so built.`);
+}
+
 function buildShim(): void {
   if (process.platform === 'darwin') {
     console.warn(
@@ -214,7 +283,7 @@ function buildShim(): void {
 
   mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
   copyFileSync(
-    join(REPO_ROOT, 'src', 'shim', 'target', 'release', 'libscriptjail.so'),
+    join(REPO_ROOT, 'target', 'release', 'libscriptjail.so'),
     shimOut,
   );
   console.log('[build] images/libscriptjail.so built.');
@@ -247,7 +316,8 @@ function collectSummary(artifacts: ArtifactSummary[]): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const { skipRootfs, skipBundle, skipShim, all, runnerImage } = parseArgs();
+  const { skipRootfs, skipBundle, skipShim, all, runnerImage, arch, shimArm64 } =
+    parseArgs();
 
   const artifacts: ArtifactSummary[] = [];
 
@@ -259,13 +329,23 @@ async function main(): Promise<void> {
   }
   artifacts.push({ path: join(REPO_ROOT, 'dist', 'main.cjs') });
 
-  // Step 2: Rust shim
+  // Step 2: Rust shim(s)
   if (skipShim) {
     console.log('[build] --skip-shim passed; skipping Rust-shim build.');
   } else {
     buildShim();
   }
   artifacts.push({ path: join(REPO_ROOT, 'images', 'libscriptjail.so') });
+
+  // Step 2b: optional arm64 shim cross-compile.  Surfaces a clear error on
+  // macOS (where cargo cannot produce a Linux .so) so dev hosts know the
+  // build path is CI-only.
+  if (shimArm64) {
+    buildShimArm64();
+    artifacts.push({
+      path: join(REPO_ROOT, 'images', 'libscriptjail-arm64.so'),
+    });
+  }
 
   // Step 3: rootfs
   if (skipRootfs) {
@@ -275,10 +355,16 @@ async function main(): Promise<void> {
       ? ['ubuntu-22.04', 'ubuntu-24.04']
       : [runnerImage ?? defaultRunnerImage()];
 
+    // When --shim-arm64 is set without an explicit --arch, default the rootfs
+    // arch to arm64 too — building the arm64 .so without an arm64 rootfs to
+    // pair it with is almost never what the user wants.
+    const rootfsArch: BuildArch = arch ?? (shimArm64 ? 'arm64' : 'x64');
+
     for (const target of targets) {
       const rootfsInput: BuildInput = {
         runnerImage: target,
         outputDir: join(REPO_ROOT, 'images'),
+        arch: rootfsArch,
       };
 
       await buildRootfs(rootfsInput);

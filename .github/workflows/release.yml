@@ -27,7 +27,7 @@
 #       dependency lifecycle script cannot write to the repo or its
 #       releases via the runner's git credentials.
 #     - `publish` is a minimal job that only downloads the build artifacts
-#       and uploads them via softprops/action-gh-release@v2.  Only this
+#       and uploads them via softprops/action-gh-release@v3.  Only this
 #       job carries contents:write.
 
 name: release
@@ -44,22 +44,79 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # build — install/test/build with NO write capabilities and no persisted
-  # checkout credentials.  Hands the final artifacts off to `publish` via the
-  # standard actions/upload-artifact mechanism.
+  # build-mac-bin — produce the Mach-O `script-jail-vm-arm64-darwin` binary.
+  # Runs on a macos-latest Apple-Silicon runner; emits the binary as a workflow
+  # artifact that the main `build` job downloads to compute its SHA and that
+  # `publish` uploads to the release.
+  #
+  # We keep this job tightly scoped — no `pnpm install`, no Docker, no
+  # access to the consumer-tree of the action — so the macOS runner only
+  # ever runs `cargo build` against the in-repo Rust workspace.  Splitting
+  # this off (vs. running it inside `build`) also lets the (much cheaper)
+  # rootfs build proceed in parallel on the Linux runner.
   # ---------------------------------------------------------------------------
-  build:
-    runs-on: ubuntu-24.04
-    # The rootfs build invokes Docker + mkfs.ext4 twice (once per runner
-    # image); 30 minutes is comfortable headroom over the typical ~10-min
-    # combined runtime.
-    timeout-minutes: 30
+  build-mac-bin:
+    runs-on: macos-latest
+    timeout-minutes: 15
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: . -> target
+
+      - name: cargo build (release)
+        run: cargo build --release -p script-jail-host-mac
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/mac-bin
+          cp target/release/script-jail-vm \
+             artifacts/mac-bin/script-jail-vm-arm64-darwin
+
+      - name: Upload Mach-O artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: script-jail-vm-arm64-darwin
+          path: artifacts/mac-bin/script-jail-vm-arm64-darwin
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # build — install/test/build with NO write capabilities and no persisted
+  # checkout credentials.  Hands the final artifacts off to `publish` via the
+  # standard actions/upload-artifact mechanism.
+  # ---------------------------------------------------------------------------
+  build:
+    # Requires `build-mac-bin` because the SHA paste-block + manifest
+    # bootstrap path need to include the Mach-O binary's hash.  The runner
+    # downloads that artifact mid-job to feed it into `Compute SHAs`.
+    needs: build-mac-bin
+    runs-on: ubuntu-24.04
+    # The rootfs build invokes Docker + mkfs.ext4 twice (once per runner
+    # image); 30 minutes is comfortable headroom over the typical ~10-min
+    # combined runtime.  PR 5 also runs the VZ kernel build (~5-10 min)
+    # twice, so the total budget needs a slight bump.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           # Don't leave the GITHUB_TOKEN persisted as a git credential after
           # checkout.  install/test/build phases run npm/pnpm lifecycle
@@ -68,19 +125,19 @@ jobs:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 11.1.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'pnpm'
 
       # The shim is a Rust cdylib (`src/shim/`); cargo is required before
       # `pnpm build` or the explicit shim-build step further down.  The
-      # version pin matches `src/shim/rust-toolchain.toml`.
+      # version pin matches `rust-toolchain.toml`.
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -136,33 +193,129 @@ jobs:
       - name: Build action bundle
         run: pnpm build:bundle
 
-      - name: Build Rust shim
+      - name: Build CLI bundle
+        # The macOS CLI ships as `dist/cli.cjs` and is consumed by `npm install`
+        # users on Darwin.  We bundle it in the same release flow so the npm
+        # tarball that pairs with this tag carries an up-to-date CLI.
+        run: pnpm build:cli
+
+      - name: Build Rust shim (x86_64)
         run: |
           cargo build --release --manifest-path src/shim/Cargo.toml
-          cp src/shim/target/release/libscriptjail.so images/libscriptjail.so
+          cp target/release/libscriptjail.so images/libscriptjail.so
 
-      # Build BOTH rootfs ext4 images, reusing the bundle + shim built above.
+      # PR 5: arm64 shim build infra.  The cross-toolchain is required so
+      # cargo-zigbuild + zig produce the aarch64-unknown-linux-gnu ELF
+      # .so from the amd64 release runner.  Same tool also works from
+      # macOS, so a future move to a different runner doesn't require
+      # touching the build script.  rustup-target-add is invoked first
+      # because dtolnay/rust-toolchain's `stable` does not pre-install it.
+      - name: Install arm64 cross-toolchain (kernel deps only)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            flex \
+            bison \
+            libelf-dev \
+            libssl-dev \
+            bc \
+            xz-utils \
+            gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build Rust shim (arm64 — cross-compile via cargo-zigbuild)
+        run: pnpm build -- --skip-rootfs --skip-bundle --shim-arm64
+
+      # The arm64 rootfs builds below run `docker buildx --platform=linux/arm64`
+      # on an x86_64 runner.  Without QEMU binfmt registration the runner
+      # kernel can't execute the arm64 `/bin/sh` (etc.) the buildx steps
+      # invoke, surfacing as `exec /bin/sh: exec format error`.  Registered
+      # once here so both arm64 rootfs build steps (ubuntu-22.04, ubuntu-24.04)
+      # see it.  No-op for the x64 rootfs builds.
+      - name: Register QEMU binfmt handlers (for linux/arm64 build)
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      # Build BOTH x64 rootfs ext4 images, reusing the bundle + shim built above.
       # `--skip-bundle` and `--skip-shim` avoid the redundant work the build
       # script would otherwise repeat per --runner-image invocation.
-      - name: Build rootfs (ubuntu-22.04)
+      - name: Build rootfs (ubuntu-22.04, x64)
         run: pnpm build -- --runner-image=ubuntu-22.04 --skip-bundle --skip-shim
 
-      - name: Build rootfs (ubuntu-24.04)
+      - name: Build rootfs (ubuntu-24.04, x64)
         run: pnpm build -- --runner-image=ubuntu-24.04 --skip-bundle --skip-shim
 
-      # Compute SHA-256 of each released artifact and surface them in the
+      # PR 5: build the two arm64 rootfs ext4 images for the macOS CLI.
+      # `--arch=arm64` selects the arm64 base image AND skips the redundant
+      # x64 shim build (the arm64 .so above already produced
+      # `images/libscriptjail-arm64.so`).
+      - name: Build rootfs (ubuntu-22.04, arm64)
+        run: pnpm build -- --runner-image=ubuntu-22.04 --arch=arm64 --skip-bundle --skip-shim
+
+      - name: Build rootfs (ubuntu-24.04, arm64)
+        run: pnpm build -- --runner-image=ubuntu-24.04 --arch=arm64 --skip-bundle --skip-shim
+
+      # PR 5: build the two VZ kernels.  Pinned upstream version + per-arch
+      # config; see images/kernel/build.sh for the full pipeline.
+      - name: Build vmlinux-vz (x86_64)
+        run: bash images/kernel/build.sh --arch=x86_64 --force
+
+      - name: Build vmlinux-vz (arm64)
+        run: bash images/kernel/build.sh --arch=arm64 --force
+
+      # Compute SHA-256 of every released artifact and surface them in the
       # job summary so the maintainer can copy the digests into
       # src/action/artifact-manifest.ts before cutting the next release.
+      # The Mach-O binary (`script-jail-vm-arm64-darwin`) is produced by
+      # the `build-mac-bin` job below; we re-fetch it here via a workflow
+      # artifact so the SHA summary can include it in the paste-block.
+      - name: Download script-jail-vm Mach-O artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: script-jail-vm-arm64-darwin
+          path: artifacts/mac-bin
+
       - name: Compute SHAs
         id: shas
         run: |
           set -euo pipefail
-          ROOTFS_22="$(sha256sum images/rootfs-ubuntu-22.04.ext4 | cut -d' ' -f1)"
-          ROOTFS_24="$(sha256sum images/rootfs-ubuntu-24.04.ext4 | cut -d' ' -f1)"
-          LIBSO="$(sha256sum images/libscriptjail.so | cut -d' ' -f1)"
-          echo "rootfs_22=${ROOTFS_22}" >> "$GITHUB_OUTPUT"
-          echo "rootfs_24=${ROOTFS_24}" >> "$GITHUB_OUTPUT"
-          echo "libso=${LIBSO}" >> "$GITHUB_OUTPUT"
+          # --- Linux platform artifacts ---
+          LINUX_ROOTFS_22="$(sha256sum images/rootfs-ubuntu-22.04.ext4 | cut -d' ' -f1)"
+          LINUX_ROOTFS_24="$(sha256sum images/rootfs-ubuntu-24.04.ext4 | cut -d' ' -f1)"
+          LINUX_LIBSO="$(sha256sum images/libscriptjail.so | cut -d' ' -f1)"
+          # --- Darwin platform artifacts ---
+          DARWIN_ROOTFS_22_ARM64="$(sha256sum images/rootfs-ubuntu-22.04-arm64.ext4 | cut -d' ' -f1)"
+          DARWIN_ROOTFS_24_ARM64="$(sha256sum images/rootfs-ubuntu-24.04-arm64.ext4 | cut -d' ' -f1)"
+          DARWIN_LIBSO_ARM64="$(sha256sum images/libscriptjail-arm64.so | cut -d' ' -f1)"
+          VMLINUX_VZ_X86_64="$(sha256sum images/vmlinux-vz-x86_64 | cut -d' ' -f1)"
+          VMLINUX_VZ_ARM64="$(sha256sum images/vmlinux-vz-arm64 | cut -d' ' -f1)"
+          SJ_VM_ARM64_DARWIN="$(sha256sum artifacts/mac-bin/script-jail-vm-arm64-darwin | cut -d' ' -f1)"
+          # --- Surface as job outputs (also useful for downstream steps) ---
+          {
+            echo "linux_rootfs_22=${LINUX_ROOTFS_22}"
+            echo "linux_rootfs_24=${LINUX_ROOTFS_24}"
+            echo "linux_libso=${LINUX_LIBSO}"
+            echo "darwin_rootfs_22_arm64=${DARWIN_ROOTFS_22_ARM64}"
+            echo "darwin_rootfs_24_arm64=${DARWIN_ROOTFS_24_ARM64}"
+            echo "darwin_libso_arm64=${DARWIN_LIBSO_ARM64}"
+            echo "vmlinux_vz_x86_64=${VMLINUX_VZ_X86_64}"
+            echo "vmlinux_vz_arm64=${VMLINUX_VZ_ARM64}"
+            echo "sj_vm_arm64_darwin=${SJ_VM_ARM64_DARWIN}"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "## Artifact SHAs"
             echo
@@ -173,9 +326,19 @@ jobs:
             echo "  repo: '${{ github.repository }}',"
             echo "  tag: '${{ github.ref_name }}',"
             echo "  expected: {"
-            echo "    'rootfs-ubuntu-22.04.ext4': '${ROOTFS_22}',"
-            echo "    'rootfs-ubuntu-24.04.ext4': '${ROOTFS_24}',"
-            echo "    'libscriptjail.so':              '${LIBSO}',"
+            echo "    linux: {"
+            echo "      'rootfs-ubuntu-22.04.ext4': '${LINUX_ROOTFS_22}',"
+            echo "      'rootfs-ubuntu-24.04.ext4': '${LINUX_ROOTFS_24}',"
+            echo "      'libscriptjail.so':         '${LINUX_LIBSO}',"
+            echo "    },"
+            echo "    darwin: {"
+            echo "      'rootfs-ubuntu-22.04-arm64.ext4': '${DARWIN_ROOTFS_22_ARM64}',"
+            echo "      'rootfs-ubuntu-24.04-arm64.ext4': '${DARWIN_ROOTFS_24_ARM64}',"
+            echo "      'libscriptjail-arm64.so':         '${DARWIN_LIBSO_ARM64}',"
+            echo "      'vmlinux-vz-x86_64':              '${VMLINUX_VZ_X86_64}',"
+            echo "      'vmlinux-vz-arm64':               '${VMLINUX_VZ_ARM64}',"
+            echo "      'script-jail-vm-arm64-darwin':    '${SJ_VM_ARM64_DARWIN}',"
+            echo "    },"
             echo "  },"
             echo "};"
             echo '```'
@@ -185,14 +348,20 @@ jobs:
       # than a job output or cache) keeps the build job side-effect-free
       # outside its own filesystem.
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets
           path: |
             images/rootfs-ubuntu-22.04.ext4
             images/rootfs-ubuntu-24.04.ext4
+            images/rootfs-ubuntu-22.04-arm64.ext4
+            images/rootfs-ubuntu-24.04-arm64.ext4
             images/libscriptjail.so
+            images/libscriptjail-arm64.so
+            images/vmlinux-vz-x86_64
+            images/vmlinux-vz-arm64
             dist/main.cjs
+            dist/cli.cjs
           if-no-files-found: error
           retention-days: 1
 
@@ -217,18 +386,29 @@ jobs:
       # credentials; the release upload below receives the write-scoped
       # token via the workflow env, not via git.
       - name: Checkout (verification source)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets
           # download-artifact@v4 preserves the directory structure under the
           # given path.  We isolate the downloaded artifacts under ./artifacts
           # so they cannot overwrite the freshly-checked-out source tree
           # (in particular dist/main.cjs, which we compare against below).
+          path: artifacts
+
+      # PR 5: the macOS Mach-O binary is uploaded as a separate workflow
+      # artifact by the `build-mac-bin` job (it can't be cross-built on
+      # the Linux runner).  Land it under `artifacts/` so
+      # `check-publish-artifacts.sh` finds it at
+      # `artifacts/script-jail-vm-arm64-darwin`.
+      - name: Download Mach-O artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: script-jail-vm-arm64-darwin
           path: artifacts
 
       # Independently verify the downloaded artifacts against the SHAs the
@@ -240,17 +420,25 @@ jobs:
           bash scripts/check-publish-artifacts.sh \
             --manifest src/action/artifact-manifest.ts \
             --dir artifacts \
-            --dist-source dist/main.cjs
+            --dist-source dist/main.cjs \
+            --dist-cli-source dist/cli.cjs
 
-      # softprops/action-gh-release@v2 auto-creates the release for the tag
+      # softprops/action-gh-release@v3 auto-creates the release for the tag
       # (or appends to an existing one) and uploads each listed file.  We pin
       # to the major tag — the maintainer's standard practice in this repo
       # for actions that publish frequent patch releases.
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/images/rootfs-ubuntu-22.04.ext4
             artifacts/images/rootfs-ubuntu-24.04.ext4
+            artifacts/images/rootfs-ubuntu-22.04-arm64.ext4
+            artifacts/images/rootfs-ubuntu-24.04-arm64.ext4
             artifacts/images/libscriptjail.so
+            artifacts/images/libscriptjail-arm64.so
+            artifacts/images/vmlinux-vz-x86_64
+            artifacts/images/vmlinux-vz-arm64
+            artifacts/script-jail-vm-arm64-darwin
             artifacts/dist/main.cjs
+            artifacts/dist/cli.cjs

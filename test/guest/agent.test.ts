@@ -117,6 +117,33 @@ function emptyStrace(exitCode = 0): StraceRunner {
 }
 
 /**
+ * A StraceRunner that yields ONE event-producing strace line — so
+ * `runInstallPhase` reports `eventCount > 0` — and exits with the supplied
+ * code.  Used to exercise the "Phase B failed but the audit DID observe a
+ * lifecycle script" path, which must stay non-fatal (unlike a zero-event
+ * failure, which fails closed).
+ */
+function eventEmittingStrace(exitCode: number): StraceRunner {
+  return {
+    async *run() {
+      // A strace execve with no paired shim exec is recorded as an exec
+      // event (audit_bypass) — exec events emit even when attribution
+      // cannot resolve a package, so this reliably yields eventCount > 0
+      // without needing a /proc-backed Attribution.
+      yield {
+        pid: 5555,
+        line: 'execve("/usr/bin/node", ["node", "install.js"], 0x7ffd /* 12 vars */) = 0',
+        source: 'strace' as const,
+      };
+    },
+    getExitCode() { return exitCode; },
+    getTamperReason() { return null; },
+    recordTamper(_reason: string) { /* no-op for test fakes */ },
+    getRootPid() { return 5555; },
+  };
+}
+
+/**
  * A LinuxStraceRunner subclass that emits no records, succeeds with the
  * supplied exit code, and reports a fixed tamper reason.  Historically this
  * existed because the agent's fail-closed gate dispatched on
@@ -425,8 +452,8 @@ describe('agent main()', () => {
 
     await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
 
-    expect(fetchCalls[0]).toContain('pnpm fetch');
-    expect(installCalls[0]).toContain('pnpm install');
+    expect(fetchCalls[0]).toContain('pnpm install --frozen-lockfile --ignore-scripts');
+    expect(installCalls[0]).toContain('pnpm rebuild');
   });
 
   it('handles yarn manager config', async () => {
@@ -443,7 +470,11 @@ describe('agent main()', () => {
     expect(installCalls[0]).toContain('yarn install --immutable --offline');
   });
 
-  it('does NOT emit install_done or final lockfile when install fails', async () => {
+  it('fails closed when Phase B exits non-zero with no audit events', async () => {
+    // A non-zero Phase B exit with ZERO collected events means the install
+    // machinery itself failed before any lifecycle script ran under audit.
+    // Emitting a lockfile then would publish a deceptively-clean artifact —
+    // fail closed: no install_done, no final, a fatal error frame instead.
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir);
 
@@ -458,7 +489,7 @@ describe('agent main()', () => {
         configPath,
         connection: conn,
         spawner: mockSpawner().spawner,
-        strace: emptyStrace(1), // Phase B fails
+        strace: emptyStrace(1), // Phase B non-zero, zero events
         dnsLookup: offlineLookup,
       });
     } finally {
@@ -470,17 +501,56 @@ describe('agent main()', () => {
     const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
     const kinds = frames.map((f) => f['kind']);
 
-    // install_done should NOT be emitted on failure
     const installDoneFrames = frames.filter((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done');
     expect(installDoneFrames).toHaveLength(0);
-
-    // final should NOT be emitted on failure
     expect(kinds).not.toContain('final');
 
-    // An error frame should be emitted instead
-    expect(kinds).toContain('error');
     const errFrame = frames.find((f) => f['kind'] === 'error');
     expect(errFrame?.['fatal']).toBe(true);
+  });
+
+  it('still emits install_done and the final lockfile when Phase B exits non-zero but audited scripts', async () => {
+    // A non-zero Phase B exit WITH collected events means a dependency
+    // lifecycle script ran and failed under audit (e.g. an offline
+    // postinstall).  That is audit data, not a fatal error — the lockfile
+    // must still be emitted, accompanied by a NON-fatal error frame.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir);
+
+    const origExit = process.exit.bind(process);
+    // @ts-expect-error — patching process.exit for test
+    process.exit = () => { /* no-op */ };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: eventEmittingStrace(1), // Phase B non-zero, but events observed
+        dnsLookup: offlineLookup,
+      });
+    } finally {
+      process.exit = origExit;
+    }
+
+    const output = getOutput();
+    const lines = output.split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const kinds = frames.map((f) => f['kind']);
+
+    // install_done IS emitted — the audit observed scripts, so non-zero is non-fatal.
+    const installDoneFrames = frames.filter((f) => f['kind'] === 'handshake' && f['phase'] === 'install_done');
+    expect(installDoneFrames).toHaveLength(1);
+
+    // The final lockfile IS emitted.
+    expect(kinds).toContain('final');
+
+    // A NON-fatal error frame surfaces the non-zero exit for host visibility.
+    const errFrame = frames.find((f) => f['kind'] === 'error');
+    expect(errFrame).toBeDefined();
+    expect(errFrame?.['fatal']).toBe(false);
   });
 
   it('proceeds to Phase B when verifyOffline reports the lookup failed (offline)', async () => {

@@ -2,8 +2,11 @@
 // Injects mock StraceRunner (which owns the install process); no real processes spawned.
 
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { runInstallPhase, type StraceRunner } from '../../src/guest/phase-install.js';
+import { runInstallPhase, loadPmFlags, type StraceRunner } from '../../src/guest/phase-install.js';
 import { Emitter } from '../../src/guest/emit.js';
 import { Attribution } from '../../src/guest/attribution.js';
 import type { ProcReader } from '../../src/guest/attribution.js';
@@ -150,7 +153,7 @@ describe('runInstallPhase', () => {
       expect(calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
     });
 
-    it('pnpm → pnpm install --frozen-lockfile --offline --config.side-effects-cache=false', async () => {
+    it('pnpm → pnpm rebuild --pending --config.side-effects-cache=false --store-dir=<cwd>/.pnpm-store', async () => {
       const calls: Array<{ cmd: string; args: string[] }> = [];
       const strace: StraceRunner = {
         async *run(cmd, args) { calls.push({ cmd, args }); },
@@ -170,7 +173,8 @@ describe('runInstallPhase', () => {
       });
       expect(calls[0]!.cmd).toBe('pnpm');
       expect(calls[0]!.args).toEqual([
-        'install', '--frozen-lockfile', '--offline', '--config.side-effects-cache=false',
+        'rebuild', '--pending', '--config.side-effects-cache=false',
+        '--store-dir=/work/.pnpm-store',
       ]);
     });
 
@@ -14415,5 +14419,62 @@ describe('runInstallPhase', () => {
       });
       expect(leakedSafe).toHaveLength(0);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadPmFlags — pm-flags.json loader (PR 2)
+// ---------------------------------------------------------------------------
+
+describe('loadPmFlags', () => {
+  let testDir: string;
+  let pmFlagsPath: string;
+
+  function setup(): void {
+    testDir = mkdtempSync(join(tmpdir(), 'script-jail-pm-flags-'));
+    pmFlagsPath = join(testDir, 'pm-flags.json');
+  }
+  function teardown(): void {
+    try { rmSync(testDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  it('returns empty array when the file does not exist', () => {
+    setup();
+    try {
+      // Read a path that doesn't exist.
+      expect(loadPmFlags(join(testDir, 'absent.json'))).toEqual({ extraInstallArgs: [] });
+    } finally { teardown(); }
+  });
+
+  it('returns the parsed extra_install_args when the file is well-formed', () => {
+    setup();
+    try {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['--cpu=x64', '--os=linux'] }));
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--cpu=x64', '--os=linux'] });
+    } finally { teardown(); }
+  });
+
+  it('returns empty array on malformed JSON', () => {
+    setup();
+    try {
+      writeFileSync(pmFlagsPath, 'not json');
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+    } finally { teardown(); }
+  });
+
+  it('returns empty array when the schema does not match', () => {
+    setup();
+    try {
+      writeFileSync(pmFlagsPath, JSON.stringify({ other_field: 'oops' }));
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+    } finally { teardown(); }
+  });
+
+  it('returns empty array when extra_install_args has non-string entries', () => {
+    setup();
+    try {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['ok', 42] }));
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+    } finally { teardown(); }
   });
 });

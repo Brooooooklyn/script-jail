@@ -69,16 +69,6 @@ export interface LaunchInput {
   rootfsPath: string;
   /** Optional second disk (repo). If provided, added as drive id "repo". */
   repoDiskPath?: string | undefined;
-  /**
-   * Optional third disk: the runner's Node install packed as ext4.
-   * Attached as drive id "host_node" — the underscore form is required
-   * because Firecracker's API server runs checked_id (^[A-Za-z0-9_]+$)
-   * on the URL path and rejects hyphens with HTTP 400 InvalidID. The
-   * guest still identifies the drive by its ext4 LABEL "host-node"
-   * (set in overlay.ts), so the mount point /opt/host-node and the
-   * `blkid -L host-node` lookup stay unchanged.
-   */
-  hostNodeDiskPath?: string | undefined;
   vcpu?: number | undefined;       // default 2
   memMB?: number | undefined;      // default 2048
   /** Guest CID for vsock (must be > 2; host CID is 2). */
@@ -142,7 +132,6 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     vmlinuxPath,
     rootfsPath,
     repoDiskPath,
-    hostNodeDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -229,27 +218,6 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
         path_on_host: repoDiskPath,
         is_root_device: false,
         is_read_only: false,
-      });
-    }
-
-    // 4c. Optional host-node disk (runner's Node install).  Registered
-    //     after the repo drive so when both drives are present the guest
-    //     sees ordering rootfs → repo → host-node (e.g. /dev/vda, /dev/vdb,
-    //     /dev/vdc — useful when reading kernel logs).  The guest's init.sh
-    //     resolves the drive by filesystem label via `blkid -L host-node`,
-    //     not by device path, so the actual /dev/vd* letter does not affect
-    //     correctness — only debugging readability.
-    if (hostNodeDiskPath !== undefined) {
-      // drive_id MUST be alphanumeric/underscore: Firecracker's checked_id
-      // (src/firecracker/src/api_server/parsed_request.rs) runs on the URL
-      // path component before the body is parsed; a hyphen yields HTTP 400.
-      // The guest still finds this disk via `blkid -L host-node` (the ext4
-      // LABEL, set in overlay.ts), so user-visible names stay hyphenated.
-      await apiClient.put('/drives/host_node', {
-        drive_id: 'host_node',
-        path_on_host: hostNodeDiskPath,
-        is_root_device: false,
-        is_read_only: true,
       });
     }
 

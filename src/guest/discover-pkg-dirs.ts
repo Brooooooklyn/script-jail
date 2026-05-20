@@ -21,8 +21,13 @@ import { join } from 'node:path';
  *   - The parsed `name` from package.json is used as the key (NOT the filesystem
  *     dirname) to handle `file:` deps and other cases where the dir name differs.
  *
- * pnpm: the `.pnpm/` virtual store is skipped (starts with `.`); pnpm hoists
- * the canonical name-keyed layout into `node_modules/<name>` anyway.
+ * pnpm: with the default isolated layout, only DIRECT dependencies appear in
+ * the top-level node_modules; every transitive dependency lives ONLY under
+ * `node_modules/.pnpm/<name>@<version>(_<peerhash>)/node_modules/<name>`.
+ * The top-level pass above therefore finds only direct deps for a pnpm
+ * install.  After it we walk `.pnpm/` (see {@link scanPnpmVirtualStore}) so
+ * every package that can run a lifecycle script is registered — otherwise
+ * `normalize()` throws on the first transitive-dependency event.
  *
  * Returns an empty Map if `nodeModulesDir` does not exist or cannot be read.
  */
@@ -68,7 +73,75 @@ export function discoverPkgDirs(nodeModulesDir: string): Map<string, string> {
     }
   }
 
+  // pnpm isolated layout: register every package in the `.pnpm/` virtual
+  // store.  Runs AFTER the top-level pass so a package's real `.pnpm`
+  // directory — where pnpm actually executes its lifecycle scripts, and the
+  // path strace records — overrides the top-level symlink path that the pass
+  // above registered for direct dependencies.
+  scanPnpmVirtualStore(join(nodeModulesDir, '.pnpm'), result);
+
   return result;
+}
+
+/**
+ * Walk pnpm's `.pnpm` virtual store and register every package's canonical
+ * real directory.  pnpm lays each resolved package out at
+ *   .pnpm/<name>@<version>(_<peerhash>)/node_modules/<name>
+ * with that package's own dependencies present alongside it as SYMLINKS.
+ * We register only the real directories (the packages themselves) and skip
+ * the symlinks (each linked dependency is registered via its own `.pnpm`
+ * entry), so every package maps to the directory pnpm runs its scripts in.
+ *
+ * No-op when `.pnpm` does not exist (npm / yarn, or pnpm with
+ * `node-linker=hoisted`).
+ */
+function scanPnpmVirtualStore(pnpmDir: string, result: Map<string, string>): void {
+  let flatEntries: import('node:fs').Dirent<string>[];
+  try {
+    flatEntries = readdirSync(pnpmDir, { withFileTypes: true, encoding: 'utf8' });
+  } catch {
+    return; // no .pnpm dir — not a default-layout pnpm install
+  }
+
+  for (const flat of flatEntries) {
+    // Each `<name>@<version>(_<peerhash>)` entry is a directory; skip
+    // `lock.yaml` and any other non-directory bookkeeping files.
+    if (!flat.isDirectory()) continue;
+
+    const innerNm = join(pnpmDir, flat.name, 'node_modules');
+    let innerEntries: import('node:fs').Dirent<string>[];
+    try {
+      innerEntries = readdirSync(innerNm, { withFileTypes: true, encoding: 'utf8' });
+    } catch {
+      continue; // no node_modules inside this entry — skip
+    }
+
+    for (const inner of innerEntries) {
+      if (inner.name.startsWith('.')) continue;
+      // Symlinks are this package's dependency links — registered via their
+      // own `.pnpm` entry.  Only real directories are packages that
+      // physically live here.
+      if (inner.isSymbolicLink() || !inner.isDirectory()) continue;
+
+      if (inner.name.startsWith('@')) {
+        // Scope grouping directory — recurse one level.
+        const scopeDir = join(innerNm, inner.name);
+        let scopeEntries: import('node:fs').Dirent<string>[];
+        try {
+          scopeEntries = readdirSync(scopeDir, { withFileTypes: true, encoding: 'utf8' });
+        } catch {
+          continue;
+        }
+        for (const se of scopeEntries) {
+          if (se.name.startsWith('.')) continue;
+          if (se.isSymbolicLink() || !se.isDirectory()) continue;
+          readAndRegister(join(scopeDir, se.name), result);
+        }
+      } else {
+        readAndRegister(join(innerNm, inner.name), result);
+      }
+    }
+  }
 }
 
 function readAndRegister(pkgPath: string, result: Map<string, string>): void {

@@ -71,7 +71,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           # The action invokes itself via `uses: ./` further down.  We don't
           # need git credentials persisted on disk for that — and dropping
@@ -80,20 +80,20 @@ jobs:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           # Pinned to the same version as `packageManager` in package.json.
           version: 11.1.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'pnpm'
 
       # `pnpm build` below invokes `cargo build --release` to produce the
       # Rust LD_PRELOAD shim (`images/libscriptjail.so`).  The version pin
-      # mirrors `src/shim/rust-toolchain.toml` so both code paths resolve
+      # mirrors `rust-toolchain.toml` so both code paths resolve
       # to the same toolchain.
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -281,10 +281,9 @@ jobs:
           # documented escape hatch in src/main.ts:140; it takes precedence
           # over both GITHUB_WORKSPACE and process.cwd() and is documented
           # inline at the read site.  Without this override the action
-          # would copy the script-jail repo root into /work (where its
-          # pnpm-lock.yaml triggers `manager=pnpm` detection — and `pnpm`
-          # isn't on the host-node disk, producing `spawn pnpm ENOENT`
-          # inside the VM).
+          # would copy the script-jail repo root into /work, where its own
+          # pnpm-lock.yaml would (incorrectly) make the VM audit script-jail
+          # itself instead of the consumer fixture.
           SCRIPT_JAIL_REPO_DIR: ${{ runner.temp }}/consumer
         with:
           mode: update

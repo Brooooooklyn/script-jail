@@ -91,9 +91,23 @@ function manifest(): ArtifactManifest {
     repo: REPO,
     tag: TAG,
     expected: {
-      'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
-      'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
-      'libscriptjail.so': sha(LIB_CONTENT),
+      linux: {
+        'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
+        'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
+        'libscriptjail.so': sha(LIB_CONTENT),
+      },
+      darwin: {
+        // PR 5: darwin keys are not consumed by preFetchArtifacts (which only
+        // runs on the Linux runner) but must be present so the manifest is
+        // structurally valid.  Real SHAs here let the platform='darwin'
+        // tests below use the same manifest builder.
+        'rootfs-ubuntu-22.04-arm64.ext4': sha('fake-darwin-rootfs-22-arm64'),
+        'rootfs-ubuntu-24.04-arm64.ext4': sha('fake-darwin-rootfs-24-arm64'),
+        'libscriptjail-arm64.so': sha('fake-darwin-libscriptjail-arm64'),
+        'vmlinux-vz-x86_64': sha('fake-vmlinux-vz-x86_64'),
+        'vmlinux-vz-arm64': sha('fake-vmlinux-vz-arm64'),
+        'script-jail-vm-arm64-darwin': sha('fake-script-jail-vm-arm64-darwin'),
+      },
     },
   };
 }
@@ -223,9 +237,12 @@ describe('preFetchArtifacts', () => {
       repo: REPO,
       tag: TAG,
       expected: {
-        // libscriptjail.so missing on purpose.
-        'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
-        'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
+        linux: {
+          // libscriptjail.so missing on purpose.
+          'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
+          'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
+        },
+        darwin: {},
       },
     };
 
@@ -239,6 +256,57 @@ describe('preFetchArtifacts', () => {
         http: client,
       }),
     ).rejects.toThrow(/missing an expected SHA-256 for "libscriptjail\.so"/);
+  });
+
+  it('platform="linux" (default) consults the linux section and ignores darwin entries', async () => {
+    // TDD requirement: a manifest with BOTH platform sections must only
+    // fetch the linux assets when called with platform='linux' (or the
+    // default).  Darwin entries (vmlinux-vz, arm64 rootfs, script-jail-vm)
+    // must be completely ignored by preFetchArtifacts.
+    const { client, calls } = mockHttpClient(defaultPayloads());
+
+    await preFetchArtifacts({
+      imagesDir: testDir,
+      runnerImage: 'ubuntu-24.04',
+      manifest: manifest(),
+      http: client,
+      // platform defaults to 'linux'; assert by NOT setting it.
+    });
+
+    const urls = calls.map((c) => c.url).sort();
+    expect(urls).toEqual([
+      urlFor('libscriptjail.so'),
+      urlFor('rootfs-ubuntu-24.04.ext4'),
+    ]);
+    // None of the darwin-only assets should appear in the URL list.
+    for (const darwinAsset of [
+      'rootfs-ubuntu-24.04-arm64.ext4',
+      'rootfs-ubuntu-22.04-arm64.ext4',
+      'libscriptjail-arm64.so',
+      'vmlinux-vz-x86_64',
+      'vmlinux-vz-arm64',
+      'script-jail-vm-arm64-darwin',
+    ]) {
+      expect(urls).not.toContain(urlFor(darwinAsset));
+    }
+  });
+
+  it('manifest with both linux and darwin sections + platform="linux" → only linux assets', async () => {
+    const { client, calls } = mockHttpClient(defaultPayloads());
+
+    await preFetchArtifacts({
+      imagesDir: testDir,
+      runnerImage: 'ubuntu-22.04',
+      manifest: manifest(),
+      http: client,
+      platform: 'linux',
+    });
+
+    const urls = calls.map((c) => c.url).sort();
+    expect(urls).toEqual([
+      urlFor('libscriptjail.so'),
+      urlFor('rootfs-ubuntu-22.04.ext4'),
+    ]);
   });
 
   it('creates imagesDir if it does not exist', async () => {
@@ -261,9 +329,12 @@ describe('preFetchArtifacts', () => {
       repo: 'someone/elsewhere',
       tag: 'v9.9.9',
       expected: {
-        'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
-        'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
-        'libscriptjail.so': sha(LIB_CONTENT),
+        linux: {
+          'rootfs-ubuntu-22.04.ext4': sha(ROOTFS_22_CONTENT),
+          'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
+          'libscriptjail.so': sha(LIB_CONTENT),
+        },
+        darwin: {},
       },
     };
     const altPayloads: Record<string, string> = {

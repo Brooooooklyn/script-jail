@@ -24,6 +24,7 @@
 
 import { PINNED_MANIFEST } from '../src/action/artifact-manifest.js';
 import { validateManifest } from '../src/action/validate-manifest.js';
+import type { ManifestPlatform } from '../src/action/pre-fetch-artifacts.js';
 
 /**
  * Canonical SHA-256 hex digest.  Mirrors `SHA256_HEX_RE` in
@@ -44,11 +45,23 @@ const PLACEHOLDER_PREFIX = 'PLACEHOLDER_SHA256_';
 const args = process.argv.slice(2);
 const warnOnlyPlaceholders = args.includes('--warn-only-placeholders');
 
+const PLATFORMS: ReadonlyArray<ManifestPlatform> = ['linux', 'darwin'];
+
+function totalEntries(): number {
+  let n = 0;
+  for (const p of PLATFORMS) {
+    const section = PINNED_MANIFEST.expected[p];
+    if (section !== undefined) n += Object.keys(section).length;
+  }
+  return n;
+}
+
 try {
   validateManifest(PINNED_MANIFEST);
   console.log(
-    `validate-manifest: OK — all ${Object.keys(PINNED_MANIFEST.expected).length} ` +
-      `entries in PINNED_MANIFEST.expected are canonical 64-char lowercase hex.`,
+    `validate-manifest: OK — all ${totalEntries()} entries in ` +
+      `PINNED_MANIFEST.expected.{linux,darwin} are canonical 64-char ` +
+      `lowercase hex.`,
   );
 } catch (err) {
   const message = err instanceof Error ? err.message : String(err);
@@ -57,14 +70,21 @@ try {
     // Re-classify offenders: are they ALL recognised bootstrap placeholders,
     // or did something else slip in (uppercase, wrong length, typo)?  Only
     // the all-placeholder case is the documented bootstrap loop — anything
-    // else is a real bug and must still hard-fail the release.
+    // else is a real bug and must still hard-fail the release.  Offender
+    // names are prefixed with `<platform>/` so the maintainer sees which
+    // section to fix.
     const offenders: Array<{ name: string; value: string }> = [];
     const nonPlaceholder: string[] = [];
-    for (const [name, value] of Object.entries(PINNED_MANIFEST.expected)) {
-      if (!SHA256_HEX_RE.test(value)) {
-        offenders.push({ name, value });
-        if (!value.startsWith(PLACEHOLDER_PREFIX)) {
-          nonPlaceholder.push(name);
+    for (const platform of PLATFORMS) {
+      const section = PINNED_MANIFEST.expected[platform];
+      if (section === undefined) continue;
+      for (const [name, value] of Object.entries(section)) {
+        if (!SHA256_HEX_RE.test(value)) {
+          const labelled = `${platform}/${name}`;
+          offenders.push({ name: labelled, value });
+          if (!value.startsWith(PLACEHOLDER_PREFIX)) {
+            nonPlaceholder.push(labelled);
+          }
         }
       }
     }

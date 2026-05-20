@@ -1,9 +1,9 @@
 [package]
-name        = "script-jail-shim"
-version     = "0.0.0"
-edition     = "2021"
-publish     = false
-description = "LD_PRELOAD shim that audits getenv / secure_getenv / __secure_getenv calls and hides protected names."
+name             = "script-jail-shim"
+version          = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description      = "LD_PRELOAD shim that audits getenv / secure_getenv / __secure_getenv calls and hides protected names."
 
 [lib]
 name        = "scriptjail"
@@ -13,9 +13,6 @@ crate-type  = ["cdylib"]
 libc = { version = "0.2", default-features = false }
 ctor = { version = "1.0", default-features = false, features = ["proc_macro"] }
 
-[profile.release]
-opt-level     = "z"
-lto           = true
-codegen-units = 1
-panic         = "abort"
-strip         = true
+# NOTE: `[profile.release]` for this crate lives in the workspace root
+# Cargo.toml (one level up).  Cargo ignores profile blocks in workspace
+# members and emits a warning if duplicated here.

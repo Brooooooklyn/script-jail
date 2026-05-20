@@ -1,0 +1,254 @@
+// script-jail — scripts/parity-diff.ts
+//
+// Compare two .script-jail.lock.yml files for byte-equality after the same
+// canonicalization that `src/action/diff.ts` applies for the action's
+// check-mode diff.  Volatile fields the renderer intentionally lets drift
+// across runs (`generated_at`, `manager_lockfile_sha256`) are normalised to
+// a fixed placeholder before comparison.
+//
+// Invoked from `.github/workflows/parity-test.yml` as:
+//
+//   pnpm exec oxnode scripts/parity-diff.ts \
+//     --left  artifacts/linux/linux-lockfile.yml      --left-label  linux-firecracker \
+//     --right artifacts/macos-arm64/macos-lockfile.yml --right-label macos-arm64-vz \
+//     --report parity-report.md
+//
+// Exit codes:
+//   0 — lockfiles are byte-equal after canonicalization (parity holds).
+//   1 — lockfiles diverge.
+//   2 — usage error or input file missing.
+//
+// Output:
+//   stdout — the unified diff (empty when parity holds).
+//   --report <path> — Markdown report (verdict + counts + embedded diff).
+//                     Suitable for $GITHUB_STEP_SUMMARY.
+//
+// What this DOES catch:
+//   - PM-flag overlay bug (linux-only package selected on macOS).
+//   - Lock renderer ordering bug (different event order between platforms).
+//   - Audit-policy desync (spurious event on one side).
+//
+// What this does NOT yet filter:
+//   The documented v1 divergence on Apple Silicon — `spawn`/`exec`/`dlopen`
+//   events whose x64 binary cannot be executed on an arm64 guest — currently
+//   surfaces as a diff hunk.  See docs/parity-testing.md for the v2 plan:
+//   once we observe what real divergence looks like against a non-trivial
+//   fixture, the filter rules will be added here behind a `--allow-arm64-
+//   enoexec` flag.  For now, the maintainer reads the report and decides.
+
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parseArgs } from 'node:util';
+
+interface ParityOptions {
+  left: string;
+  right: string;
+  leftLabel: string;
+  rightLabel: string;
+  reportPath: string | null;
+}
+
+class ParityArgError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ParityArgError';
+  }
+}
+
+// Mirror `src/action/diff.ts` canonicalization: replace the two volatile
+// field values with a fixed placeholder.  We do NOT YAML-parse-and-reserialize
+// — that would normalise away legitimate whitespace and key-order
+// differences which ARE meaningful divergences.  Line-level substitution
+// keeps the diff faithful.
+function canonicalize(content: string): string {
+  return content
+    .split('\n')
+    .map((line) => {
+      if (/^generated_at:\s/.test(line)) return 'generated_at: <canonical>';
+      if (/^manager_lockfile_sha256:\s/.test(line)) {
+        return 'manager_lockfile_sha256: <canonical>';
+      }
+      return line;
+    })
+    .join('\n');
+}
+
+function parseArguments(argv: ReadonlyArray<string>): ParityOptions {
+  const { values } = parseArgs({
+    args: [...argv],
+    options: {
+      left: { type: 'string' },
+      right: { type: 'string' },
+      'left-label': { type: 'string', default: 'left' },
+      'right-label': { type: 'string', default: 'right' },
+      report: { type: 'string' },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+
+  if (typeof values.left !== 'string' || values.left.length === 0) {
+    throw new ParityArgError('--left <path> is required');
+  }
+  if (typeof values.right !== 'string' || values.right.length === 0) {
+    throw new ParityArgError('--right <path> is required');
+  }
+
+  return {
+    left: values.left,
+    right: values.right,
+    leftLabel: values['left-label'] ?? 'left',
+    rightLabel: values['right-label'] ?? 'right',
+    reportPath: typeof values.report === 'string' ? values.report : null,
+  };
+}
+
+// Use the system `diff -u` rather than implementing LCS in TypeScript: the
+// output format is stable across coreutils versions and every CI runner has
+// it, the comparison is already line-canonicalised before we get here, and
+// any future enhancement (filters, statistics) can read the unified-diff
+// stream rather than its own algorithm.
+function unifiedDiff(opts: {
+  leftPath: string;
+  rightPath: string;
+  leftLabel: string;
+  rightLabel: string;
+}): string {
+  try {
+    execFileSync('diff', [
+      '-u',
+      '--label', opts.leftLabel,
+      '--label', opts.rightLabel,
+      opts.leftPath,
+      opts.rightPath,
+    ], { stdio: 'pipe' });
+    return '';
+  } catch (err) {
+    const e = err as { status?: number; stdout?: Buffer; stderr?: Buffer };
+    // diff exit 1 = differences found (expected); exit 2 = trouble.
+    if (e.status === 1 && e.stdout) return e.stdout.toString('utf8');
+    const stderr = e.stderr ? e.stderr.toString('utf8') : '';
+    throw new Error(`diff failed (exit=${String(e.status ?? '?')}): ${stderr}`);
+  }
+}
+
+function summariseDiff(diff: string): { insertions: number; deletions: number; hunks: number } {
+  let insertions = 0;
+  let deletions = 0;
+  let hunks = 0;
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+') && !line.startsWith('+++')) insertions++;
+    else if (line.startsWith('-') && !line.startsWith('---')) deletions++;
+    else if (line.startsWith('@@')) hunks++;
+  }
+  return { insertions, deletions, hunks };
+}
+
+function renderMarkdownReport(args: {
+  opts: ParityOptions;
+  match: boolean;
+  diff: string;
+}): string {
+  const { opts, match, diff } = args;
+  if (match) {
+    return [
+      '# Parity report',
+      '',
+      `**Verdict:** parity holds — lockfiles are byte-equal after canonicalization.`,
+      '',
+      '| side | path | label |',
+      '|---|---|---|',
+      `| left | \`${opts.left}\` | ${opts.leftLabel} |`,
+      `| right | \`${opts.right}\` | ${opts.rightLabel} |`,
+      '',
+      'Volatile fields (`generated_at`, `manager_lockfile_sha256`) were canonicalised before comparison.',
+      '',
+    ].join('\n');
+  }
+
+  const { insertions, deletions, hunks } = summariseDiff(diff);
+  return [
+    '# Parity report',
+    '',
+    `**Verdict:** diverged — lockfiles are NOT byte-equal after canonicalization.`,
+    '',
+    '| side | path | label |',
+    '|---|---|---|',
+    `| left | \`${opts.left}\` | ${opts.leftLabel} |`,
+    `| right | \`${opts.right}\` | ${opts.rightLabel} |`,
+    '',
+    `**Summary:** ${hunks} hunk(s), ${insertions} insertion(s), ${deletions} deletion(s).`,
+    '',
+    'See `docs/parity-testing.md` for how to interpret arm64-on-Apple-Silicon divergence vs. real audit drift.',
+    '',
+    '<details>',
+    '<summary>Unified diff</summary>',
+    '',
+    '```diff',
+    diff.trimEnd(),
+    '```',
+    '',
+    '</details>',
+    '',
+  ].join('\n');
+}
+
+function main(argv: ReadonlyArray<string>): number {
+  let opts: ParityOptions;
+  try {
+    opts = parseArguments(argv);
+  } catch (err) {
+    if (err instanceof ParityArgError) {
+      process.stderr.write(`parity-diff: ${err.message}\n`);
+      process.stderr.write('usage: parity-diff.ts --left <path> --right <path>\n');
+      process.stderr.write('                      [--left-label <name>] [--right-label <name>] [--report <path>]\n');
+      return 2;
+    }
+    throw err;
+  }
+
+  let leftRaw: string;
+  let rightRaw: string;
+  try {
+    leftRaw = readFileSync(opts.left, 'utf8');
+  } catch {
+    process.stderr.write(`parity-diff: cannot read --left at ${opts.left}\n`);
+    return 2;
+  }
+  try {
+    rightRaw = readFileSync(opts.right, 'utf8');
+  } catch {
+    process.stderr.write(`parity-diff: cannot read --right at ${opts.right}\n`);
+    return 2;
+  }
+
+  const leftCanon = canonicalize(leftRaw);
+  const rightCanon = canonicalize(rightRaw);
+  const match = leftCanon === rightCanon;
+
+  let diff = '';
+  if (!match) {
+    const stage = mkdtempSync(join(tmpdir(), 'parity-diff-'));
+    const leftPath = join(stage, 'left.yml');
+    const rightPath = join(stage, 'right.yml');
+    writeFileSync(leftPath, leftCanon);
+    writeFileSync(rightPath, rightCanon);
+    diff = unifiedDiff({
+      leftPath,
+      rightPath,
+      leftLabel: opts.leftLabel,
+      rightLabel: opts.rightLabel,
+    });
+    process.stdout.write(diff);
+  }
+
+  if (opts.reportPath !== null) {
+    writeFileSync(opts.reportPath, renderMarkdownReport({ opts, match, diff }));
+  }
+
+  return match ? 0 : 1;
+}
+
+process.exit(main(process.argv.slice(2)));

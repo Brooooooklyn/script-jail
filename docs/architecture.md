@@ -9,6 +9,37 @@ The Action splits into two halves connected over a vsock socket:
 
 The kernel boundary is load-bearing. A pure-JS sandbox can't catch libuv-backed env reads, `dlopen` for native addons, or `execve` of arbitrary binaries — those reach the kernel before any JS hook fires. Hence the microVM.
 
+## Cross-host parity (macOS VZ)
+
+The same audit runs in two places:
+
+- **Linux CI** — the GitHub Action invocation. Boots Firecracker; the host
+  half lives in `src/main.ts` + `src/action/firecracker/`.
+
+- **macOS developer host** — the local CLI invocation
+  (`pnpm exec script-jail …`). Boots Apple's Virtualization.framework via
+  `objc2-virtualization`; the host half lives in `src/host-mac/` (Rust)
+  driven by `src/cli/` (TypeScript). Requires macOS 14+.
+
+Both halves share the same guest agent (`src/guest/`), the same vsock
+protocol (`src/shared/vsock-protocol.ts`), and the same lockfile renderer
+(`src/lock/`). The split is intentionally thin — only the VMM startup,
+disk attachment, and console wiring differ.
+
+The release pipeline (`release.yml`) ships per-platform artifacts under
+one tag: the Linux runner consumes `rootfs-ubuntu-<major>.ext4` +
+`libscriptjail.so` + the pinned upstream `vmlinux` from Firecracker CI;
+the macOS CLI consumes `rootfs-ubuntu-<major>-arm64.ext4` +
+`libscriptjail-arm64.so` + the hand-built `vmlinux-vz-{x86_64,arm64}` +
+the `script-jail-vm-arm64-darwin` Mach-O binary. The manifest in
+`src/action/artifact-manifest.ts` is platform-keyed
+(`expected: { linux: {...}, darwin: {...} }`) so each consumer pins only
+the SHAs it cares about.
+
+A handful of cases produce byte-different lockfiles across the two
+runners — see [docs/divergence.md](./divergence.md) for the catalogue and
+the v2 mitigation path.
+
 ## Two-phase install
 
 1. **Phase A — fetch.** Network on, no strace. Lets the package manager resolve the registry and populate its cache. Output of this phase is not audited.
@@ -78,7 +109,7 @@ Adding a new audit category means picking the right layer: kernel-only behavior 
 - `Cargo.lock` is committed so transitive dep drift can't change the bytes between two tagged builds (the artifact SHA is recorded in `src/action/artifact-manifest.ts`).
 - `src/lib.rs` is the entire implementation: `#[panic_handler]` aborts; recursion is guarded by a `pthread_key_create`-backed thread-local set up at the very top of the `#[ctor::ctor]` constructor; real symbols are resolved via `libc::dlsym(libc::RTLD_NEXT, …)`; if the pthread key fails to create, init returns early without setting `INIT_DONE` so the wrappers stay on transparent passthrough; all buffers are fixed-size stack allocations, no allocator is linked.
 
-Build path: `pnpm build` → `scripts/build.ts:buildShim` → `cargo build --release --manifest-path src/shim/Cargo.toml` → copy `src/shim/target/release/libscriptjail.so` → `images/libscriptjail.so` → rootfs Dockerfile copies into `/lib/libscriptjail.so`. On macOS dev hosts `buildShim` short-circuits with a warning.
+Build path: `pnpm build` → `scripts/build.ts:buildShim` → `cargo build --release --manifest-path src/shim/Cargo.toml` → copy `target/release/libscriptjail.so` → `images/libscriptjail.so` → rootfs Dockerfile copies into `/lib/libscriptjail.so`. On macOS dev hosts `buildShim` short-circuits with a warning.
 
 ### Env-read detection in detail
 
@@ -125,11 +156,12 @@ No shared filesystem, no container runtime, no Docker-in-Docker.
 
 ## Rootfs
 
-Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. Three virtio drives mount at boot:
+Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Two virtio drives mount at boot:
 
-1. The rootfs itself (read-only).
+1. The rootfs itself.
 2. An ext4 overlay holding the consumer repo + caches at `/work`.
-3. The host's Node install at `/opt/host-node` — so the same Node binary the runner uses also runs inside the VM, without baking a Node version into the rootfs.
+
+There is no host-Node drive: the toolchain is provisioned at runtime, so a macOS host (whose own `node` is a Mach-O binary) can still produce a Linux-guest lockfile. The exact Node version is pinned in `src/rootfs/vite-plus.ts` for byte-stable cross-host parity.
 
 The pinned kernel (Linux 5.10.223 from AWS Firecracker CI) lives outside the rootfs and is downloaded by the host via the artifact manifest.
 

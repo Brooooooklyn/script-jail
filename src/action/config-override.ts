@@ -1,7 +1,17 @@
 // script-jail — src/action/config-override.ts
 //
-// Builds a per-run effective copy of the user's script-jail config YAML with the
-// action's `spoof-platform` and `spoof-arch` inputs applied as overrides.
+// Builds a per-run effective copy of the user's script-jail config YAML with
+// the action's `spoof-platform` and `spoof-arch` inputs applied as overrides,
+// plus (PR 2+) optional sidecar files needed by the macOS CLI to force a
+// Linux/x64 install resolution from an arm64 host:
+//
+//   - .yarnrc.yml          (yarnrcOverlay)     — Yarn Berry supportedArchitectures
+//   - etc/script-jail/pm-flags.json (pmFlagsJson)     — npm extra install args
+//   - etc/script-jail/pnpm-arch.json (pnpmArchOverlay) — pnpm supportedArchitectures
+//
+// The sidecar files live in the same `workDir` as the rewritten config so the
+// caller can hand the whole bag to `makeOverlay({ extraRepoOverlayFiles: … })`
+// and have them land on the repo disk inside the VM.
 //
 // Why this exists:
 //   The guest agent reads `spoof.platform` / `spoof.arch` from
@@ -9,22 +19,26 @@
 //   SCRIPT_JAIL_SPOOF_ARCH for the platform-spoof preload (see
 //   src/guest/agent.ts buildChildEnv + src/guest/platform-spoof.cjs).
 //   The action also advertises `spoof-platform` / `spoof-arch` inputs and
-//   users supplying them expect the input to win over whatever is on disk.
+//   users supplying them expect them to win over whatever is on disk.
+//
+//   For arm64 macOS developers running the CLI locally, the same install
+//   needs to resolve Linux/x64 subpackages (the audit VM is x64).  We
+//   materialise the per-PM payload here so it travels with the config.
 //
 // Approach:
 //   Parse the user's YAML, mutate `spoof.platform` / `spoof.arch`, serialize
-//   the result, write it to a per-run temp file, and return the temp path.
-//   The caller (main.ts) passes the returned path into makeOverlay() so the
-//   override lands inside the VM's repo disk.  The user's source file on the
-//   host is never modified.
+//   the result, write it to a per-run temp file, and (optionally) write the
+//   yarnrc / pm-flags sidecars under the same workDir.  Return all three
+//   paths so the caller can pass them into `makeOverlay`.  The user's source
+//   file on the host is never modified.
 //
 // We intentionally preserve every other key verbatim — `protected.files`,
 // `protected.env`, `node_version`, etc.  The `yaml` library round-trips
 // scalars/maps/sequences cleanly; the only field we touch is `spoof`.
 
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import type { SpoofArch, SpoofPlatform } from './inputs.js';
@@ -48,18 +62,55 @@ export interface BuildEffectiveConfigInput {
    * created under os.tmpdir().  Tests inject a deterministic dir.
    */
   workDir?: string;
+  /**
+   * Optional `.yarnrc.yml` content to materialize alongside the config.
+   * Provided by the macOS CLI (`src/cli/arch-flags.ts`) when forcing a
+   * Linux/x64 install resolution from an arm64 yarn-berry host.  Written
+   * verbatim to `<workDir>/.yarnrc.yml`.
+   */
+  yarnrcOverlay?: string;
+  /**
+   * Optional `etc/script-jail/pm-flags.json` payload.  Read by the guest
+   * (`src/guest/phase-fetch.ts`) which appends `extra_install_args` to npm's
+   * `ci` invocation.  npm only — pnpm does not accept these CLI flags.
+   * Written verbatim (after JSON.stringify) to
+   * `<workDir>/etc/script-jail/pm-flags.json`.
+   */
+  pmFlagsJson?: { extra_install_args: string[] };
+  /**
+   * Optional `etc/script-jail/pnpm-arch.json` content.  Provided by the
+   * macOS CLI (`src/cli/arch-flags.ts`) when forcing a Linux/x64 install
+   * resolution from an arm64 pnpm host.  Holds a `supportedArchitectures`
+   * object; the guest (`src/guest/apply-pnpm-arch.ts`) merges it into the
+   * repo's root `package.json` under the `pnpm` key before Phase A.
+   * Written verbatim to `<workDir>/etc/script-jail/pnpm-arch.json`.
+   */
+  pnpmArchOverlay?: string;
+}
+
+export interface BuildEffectiveConfigResult {
+  /** Absolute path to the rewritten config YAML.  Always present. */
+  configPath: string;
+  /** Absolute path to the .yarnrc.yml sidecar, if `yarnrcOverlay` was supplied. */
+  yarnrcPath?: string;
+  /** Absolute path to the pm-flags.json sidecar, if `pmFlagsJson` was supplied. */
+  pmFlagsPath?: string;
+  /** Absolute path to the pnpm-arch.json sidecar, if `pnpmArchOverlay` was supplied. */
+  pnpmArchPath?: string;
 }
 
 /**
  * Read the user's config YAML, apply spoof overrides from action inputs,
  * write a per-run config file to `workDir` (or a fresh tmpdir), and return
- * its absolute path.
+ * its absolute path along with any sidecar paths.
  *
- * The user's source file is never modified.  The returned path is intended
- * for `makeOverlay({ configPath })` so the override lands in the VM's
- * config disk at /etc/script-jail/config.yml.
+ * The user's source file is never modified.  The returned paths are intended
+ * for `makeOverlay({ configPath, extraRepoOverlayFiles })` so the overrides
+ * land on the VM's repo disk.
  */
-export function buildEffectiveConfig(input: BuildEffectiveConfigInput): string {
+export function buildEffectiveConfig(
+  input: BuildEffectiveConfigInput,
+): BuildEffectiveConfigResult {
   const text = readFileSync(input.userConfigPath, 'utf8');
 
   // parseYaml returns `unknown` (could be null for an empty file, a scalar,
@@ -89,10 +140,37 @@ export function buildEffectiveConfig(input: BuildEffectiveConfigInput): string {
 
   const outDir =
     input.workDir ?? mkdtempSync(join(tmpdir(), 'script-jail-config-'));
-  const outPath = join(outDir, 'config.yml');
+  const configPath = join(outDir, 'config.yml');
 
   // stringifyYaml emits a trailing newline; the agent's parseYaml handles
   // either form, so we don't need to massage the output.
-  writeFileSync(outPath, stringifyYaml(config), 'utf8');
-  return outPath;
+  writeFileSync(configPath, stringifyYaml(config), 'utf8');
+
+  const result: BuildEffectiveConfigResult = { configPath };
+
+  if (input.yarnrcOverlay !== undefined) {
+    const yarnrcPath = join(outDir, '.yarnrc.yml');
+    writeFileSync(yarnrcPath, input.yarnrcOverlay, 'utf8');
+    result.yarnrcPath = yarnrcPath;
+  }
+
+  if (input.pmFlagsJson !== undefined) {
+    const pmFlagsPath = join(outDir, 'etc', 'script-jail', 'pm-flags.json');
+    mkdirSync(dirname(pmFlagsPath), { recursive: true });
+    // Pretty-print so the file is reviewable on disk; the guest's parser
+    // doesn't care either way (JSON.parse handles whitespace).
+    writeFileSync(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + '\n', 'utf8');
+    result.pmFlagsPath = pmFlagsPath;
+  }
+
+  if (input.pnpmArchOverlay !== undefined) {
+    const pnpmArchPath = join(outDir, 'etc', 'script-jail', 'pnpm-arch.json');
+    mkdirSync(dirname(pnpmArchPath), { recursive: true });
+    // Written verbatim — the content is already hand-formatted deterministic
+    // JSON in src/cli/arch-flags.ts.
+    writeFileSync(pnpmArchPath, input.pnpmArchOverlay, 'utf8');
+    result.pnpmArchPath = pnpmArchPath;
+  }
+
+  return result;
 }

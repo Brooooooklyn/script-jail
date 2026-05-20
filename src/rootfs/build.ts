@@ -1,11 +1,11 @@
 // script-jail — src/rootfs/build.ts
 // Orchestrates building the Firecracker rootfs ext4 image.
 //
-// In v2 the rootfs is keyed by Ubuntu major (`ubuntu-22.04`, `ubuntu-24.04`)
-// rather than by `(node-major, package-manager)`: Node ships into the VM at
-// runtime via a third virtio drive packed by the action (see
-// `src/action/firecracker/overlay.ts`).  The rootfs therefore only needs to
-// be ABI-compatible with whatever the host runner provides.
+// The rootfs is keyed by Ubuntu major (`ubuntu-22.04`, `ubuntu-24.04`) and
+// arch.  It bakes the standalone `vp` (vite-plus) binary; the guest's
+// init.sh runs `vp env install <pinned NODE_VERSION>` during Phase A to
+// download a real Linux Node toolchain (see src/rootfs/Dockerfile.base and
+// src/rootfs/vite-plus.ts).  There is no host-node virtio drive.
 //
 // Steps:
 //   1. Bundle src/guest/agent.ts → dist/guest-agent.cjs via esbuild
@@ -34,6 +34,11 @@ import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 
 import { shimArtifactIsStale, shimSourceInputs } from './shim-freshness.js';
+import {
+  NODE_VERSION,
+  VITE_PLUS_SHA256,
+  VITE_PLUS_VERSION,
+} from './vite-plus.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,10 +47,27 @@ import { shimArtifactIsStale, shimSourceInputs } from './shim-freshness.js';
 /** Supported runner images.  Must stay in sync with `src/action/runner-image.ts`. */
 export type RunnerImage = 'ubuntu-22.04' | 'ubuntu-24.04';
 
+/**
+ * Target architecture for the rootfs ext4.
+ *
+ *   - 'x64'    → x86_64 image, native on Linux CI, docker-buildx-linux/amd64 on macOS.
+ *   - 'arm64'  → aarch64 image, native on arm64 Linux, docker-buildx-linux/arm64
+ *                (qemu emulation on x86_64 hosts).  PR 4 wires the codepath;
+ *                PR 5 hooks it into CI.  Local arm64 builds work today but
+ *                are slow (qemu).
+ */
+export type BuildArch = 'x64' | 'arm64';
+
 export interface BuildInput {
   runnerImage: RunnerImage;
   /** Directory where images/*.ext4 are written. Defaults to <repo root>/images */
   outputDir: string;
+  /**
+   * Target arch for the rootfs.  Defaults to 'x64' to preserve the existing
+   * Firecracker pipeline.  PR 4 introduced this parameter; production callers
+   * (release.yml, scripts/build.ts) must pass the desired value.
+   */
+  arch?: BuildArch;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +84,14 @@ const REPO_ROOT = join(__dirname, '..', '..');
 // ---------------------------------------------------------------------------
 
 /** Compute the output ext4 image filename. */
-export function imageFilename(input: Pick<BuildInput, 'runnerImage'>): string {
+export function imageFilename(input: Pick<BuildInput, 'runnerImage' | 'arch'>): string {
+  // x64 keeps the existing flat name for backwards-compat with the release
+  // pipeline + PINNED_MANIFEST.  arm64 gets an explicit suffix so both
+  // images can coexist under `images/`.
+  const arch = input.arch ?? 'x64';
+  if (arch === 'arm64') {
+    return `rootfs-${input.runnerImage}-arm64.ext4`;
+  }
   return `rootfs-${input.runnerImage}.ext4`;
 }
 
@@ -72,8 +101,22 @@ export function imageOutputPath(input: BuildInput): string {
 }
 
 /** Docker image tag for this runner image. */
-export function dockerTag(input: Pick<BuildInput, 'runnerImage'>): string {
+export function dockerTag(input: Pick<BuildInput, 'runnerImage' | 'arch'>): string {
+  // arm64 gets an arch suffix so x64 and arm64 tags can coexist in a local
+  // docker engine.  The x64 tag stays unsuffixed for backwards-compat with
+  // the existing release pipeline.
+  const arch = input.arch ?? 'x64';
+  if (arch === 'arm64') return `script-jail-rootfs:${input.runnerImage}-arm64`;
   return `script-jail-rootfs:${input.runnerImage}`;
+}
+
+/**
+ * Map a target arch to the `docker buildx --platform` value.  Used by the
+ * arm64 path so a macOS / x86_64 builder can produce a Linux/arm64 image
+ * via qemu emulation; PR 4 wires this in, PR 5 enables it from CI.
+ */
+export function dockerPlatform(arch: BuildArch): string {
+  return arch === 'arm64' ? 'linux/arm64' : 'linux/amd64';
 }
 
 /** Map a runner image to its `ubuntu:<version>` base tag. */
@@ -163,11 +206,11 @@ export const EM_X86_64 = 62;
 export const EM_AARCH64 = 183;
 
 /** Map a runner image to the ELF e_machine value expected for that rootfs. */
-export function expectedShimMachine(_input: Pick<BuildInput, 'runnerImage'>): number {
-  // Both supported rootfses currently target x86-64 (firecracker downloads,
-  // vmlinux, and the action's microVM are all x86_64). When an aarch64
-  // rootfs is added, switch on `runnerImage` here.
-  return EM_X86_64;
+export function expectedShimMachine(input: Pick<BuildInput, 'runnerImage' | 'arch'>): number {
+  // x64 is the default arch (preserves existing Firecracker pipeline); PR 4
+  // adds the arm64 fork so the macOS arm64 CLI can validate `libscriptjail-arm64.so`.
+  const arch = input.arch ?? 'x64';
+  return arch === 'arm64' ? EM_AARCH64 : EM_X86_64;
 }
 
 /** Human-readable label for an e_machine value (used in error messages). */
@@ -500,8 +543,26 @@ function copyPreloads(): void {
 // ---------------------------------------------------------------------------
 
 function ensureShim(input: BuildInput): boolean {
+  // The Dockerfile COPYs `images/libscriptjail.so` unconditionally, so the
+  // arm64 rootfs build needs the arm64-arch bytes at that exact path.  The
+  // arch-suffixed sibling (`images/libscriptjail-arm64.so`) is produced
+  // upstream by `scripts/build.ts:buildShimArm64()` via cargo-zigbuild;
+  // stage it to the canonical path so the validator + Docker COPY see one
+  // file and the existing validation + freshness logic keeps working.
+  //
+  // The staging is a one-way copy: subsequent x86_64 rootfs builds in the
+  // same checkout would re-build `libscriptjail.so` via cargo (host arch =
+  // x86_64) and clobber the arm64 bytes back to x86_64.  In practice each
+  // CI job is single-arch, so the clobber happens at most once per workflow
+  // run and is the intended behaviour.
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail.so');
+  const archSuffixedShim = join(REPO_ROOT, 'images', 'libscriptjail-arm64.so');
   const expectedMachine = expectedShimMachine(input);
+
+  if (input.arch === 'arm64' && existsSync(archSuffixedShim)) {
+    console.log('[rootfs] Staging libscriptjail-arm64.so → libscriptjail.so (arm64 rootfs build).');
+    copyFileSync(archSuffixedShim, shimOut);
+  }
 
   if (existsSync(shimOut)) {
     // The file is on disk, but we must NOT trust it blindly: a previous
@@ -567,7 +628,7 @@ function ensureShim(input: BuildInput): boolean {
 
   mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
   copyFileSync(
-    join(REPO_ROOT, 'src', 'shim', 'target', 'release', 'libscriptjail.so'),
+    join(REPO_ROOT, 'target', 'release', 'libscriptjail.so'),
     shimOut,
   );
 
@@ -609,50 +670,94 @@ export function ensureShimFreshnessDecision(
 function dockerBuild(input: BuildInput): void {
   const tag = dockerTag(input);
   const dockerfile = join(REPO_ROOT, 'src', 'rootfs', 'Dockerfile.base');
-  run(
-    `docker build ` +
+  const arch = input.arch ?? 'x64';
+
+  // vite-plus toolchain build args.  `VP_ARCH` matches our BuildArch values
+  // (`x64` / `arm64`) one-to-one — the vp npm package name embeds the same
+  // tokens.  The SHA-256 is pinned per-arch so the Dockerfile can verify the
+  // download.  See src/rootfs/vite-plus.ts.
+  const buildArgs =
     `--build-arg UBUNTU_MAJOR=${ubuntuMajor(input)} ` +
-    `-f "${dockerfile}" ` +
-    `-t "${tag}" ` +
-    `.`,
-  );
-  console.log(`[rootfs] Built docker image: ${tag}`);
+    `--build-arg VP_VERSION=${VITE_PLUS_VERSION} ` +
+    `--build-arg VP_ARCH=${arch} ` +
+    `--build-arg VP_SHA256=${VITE_PLUS_SHA256[arch]} ` +
+    `--build-arg NODE_VERSION=${NODE_VERSION} `;
+
+  // arm64 uses `docker buildx build --platform=linux/arm64` (qemu on x86_64
+  // hosts; native on arm64).  x64 keeps the plain `docker build` path so the
+  // existing CI runners (which may not have buildx pre-configured) keep
+  // working unchanged.
+  if (arch === 'arm64') {
+    run(
+      `docker buildx build ` +
+      `--platform=${dockerPlatform(arch)} ` +
+      `--load ` +
+      buildArgs +
+      `-f "${dockerfile}" ` +
+      `-t "${tag}" ` +
+      `.`,
+    );
+  } else {
+    run(
+      `docker build ` +
+      buildArgs +
+      `-f "${dockerfile}" ` +
+      `-t "${tag}" ` +
+      `.`,
+    );
+  }
+  console.log(`[rootfs] Built docker image: ${tag} (arch=${arch})`);
 }
 
 // ---------------------------------------------------------------------------
 // Step 5+6 — Export container → ext4
 // ---------------------------------------------------------------------------
 
+/**
+ * ext4 size for the rootfs image.  The guest writes the `vp env install`
+ * Node toolchain (~200 MB under /opt/vp) plus corepack's package-manager
+ * cache at runtime, so the filesystem needs real headroom beyond the
+ * baked image content.  The repo's node_modules / pnpm store live on the
+ * separate 4 GB repo disk, not here.
+ */
+export const ROOTFS_SIZE_MB = 1024;
+
 /** On Linux, use native mkfs.ext4 (from e2fsprogs). */
 function makeExt4Native(exportDir: string, outImage: string): void {
-  // We size at 512 MB to give headroom; the Firecracker VM never writes much.
   run(
     `mkfs.ext4 -d "${exportDir}" ` +
     `-L rootfs -O ^has_journal ` +
     `-m 0 ` +
     `"${outImage}" ` +
-    `512M`,
+    `${ROOTFS_SIZE_MB}M`,
   );
 }
 
-/** On macOS (no native mkfs.ext4), use an Alpine container to create the image. */
-function makeExt4ViaDocker(exportDir: string, outImage: string): void {
+/**
+ * On macOS (no native mkfs.ext4), build the ext4 inside an Alpine container.
+ *
+ * The `docker export` tar is piped STRAIGHT into the Alpine container, which
+ * extracts it and runs `mkfs.ext4` entirely on the Linux side.  An earlier
+ * version extracted to a macOS temp dir and bind-mounted it `:ro`, but
+ * `mkfs.ext4 -d` calls `llistxattr` on every symlink and OrbStack's virtiofs
+ * returns ENOENT for that on symlinks — aborting the populate with
+ * `set_inode_xattr: No such file or directory`.  Keeping the source tree on
+ * the container's own overlayfs avoids virtiofs entirely; only `/out` (the
+ * destination image) stays a macOS bind mount, and it is write-only.
+ */
+function makeExt4ViaDocker(containerId: string, outImage: string): void {
   const outDir = dirname(outImage);
   const imageName = 'rootfs.ext4';
-  // Mount exportDir as /work (source) and outDir as /out (destination).
   run(
-    `docker run --rm ` +
-    `-v "${exportDir}:/work:ro" ` +
-    `-v "${outDir}:/out" ` +
-    `alpine:latest ` +
-    `sh -c ` +
-    `"apk add --no-cache e2fsprogs && ` +
-    ` mkfs.ext4 -d /work -L rootfs -O ^has_journal -m 0 /out/${imageName} 512M"`,
+    `docker export "${containerId}" | ` +
+    `docker run --rm -i -v "${outDir}:/out" alpine:latest sh -c ` +
+    `"apk add --no-cache e2fsprogs tar && ` +
+    ` mkdir /rootfs && tar -x -C /rootfs && ` +
+    ` mkfs.ext4 -d /rootfs -L rootfs -O ^has_journal -m 0 /out/${imageName} ${ROOTFS_SIZE_MB}M"`,
   );
   // The container writes rootfs.ext4 into outDir; rename to the expected filename.
   const tmpOut = join(outDir, imageName);
   if (tmpOut !== outImage) {
-    // Rename the file to the expected target path.
     execSync(`mv "${tmpOut}" "${outImage}"`);
   }
 }
@@ -662,42 +767,37 @@ function exportAndConvert(input: BuildInput): void {
   const outImage = imageOutputPath(input);
   mkdirSync(dirname(outImage), { recursive: true });
 
-  // Create a temp directory to hold the exported filesystem tree.
-  const tmpBase = tmpdir();
-  const tmpDir = join(tmpBase, `script-jail-rootfs-${randomBytes(6).toString('hex')}`);
-  mkdirSync(tmpDir, { recursive: true });
+  // Create a container (not running) so we can export its filesystem.
+  const containerId = runCapture(`docker create "${tag}"`);
+  console.log(`[rootfs] Created container ${containerId.slice(0, 12)} for export`);
 
   try {
-    // Create a container (not running) so we can export its filesystem.
-    const containerId = runCapture(`docker create "${tag}"`);
-    console.log(`[rootfs] Created container ${containerId.slice(0, 12)} for export`);
-
-    try {
-      // Export container filesystem as a tar stream and extract it.
-      run(`docker export "${containerId}" | tar -x -C "${tmpDir}"`);
-      console.log(`[rootfs] Exported filesystem to ${tmpDir}`);
-    } finally {
-      // Always remove the temporary container.
-      try { execSync(`docker rm "${containerId}"`, { stdio: 'ignore' }); } catch { /* ignore */ }
-    }
-
-    // Verify we got something.
-    const exported = readdirSync(tmpDir);
-    if (exported.length === 0) {
-      throw new Error(`[rootfs] docker export produced an empty directory: ${tmpDir}`);
-    }
-
-    // Convert to ext4.
     if (isLinux()) {
-      console.log(`[rootfs] Creating ext4 image (native mkfs.ext4) …`);
-      makeExt4Native(tmpDir, outImage);
+      // Native path: extract the export tar to a temp dir, then mkfs.ext4 -d.
+      const tmpDir = join(
+        tmpdir(),
+        `script-jail-rootfs-${randomBytes(6).toString('hex')}`,
+      );
+      mkdirSync(tmpDir, { recursive: true });
+      try {
+        run(`docker export "${containerId}" | tar -x -C "${tmpDir}"`);
+        const exported = readdirSync(tmpDir);
+        if (exported.length === 0) {
+          throw new Error(`[rootfs] docker export produced an empty directory: ${tmpDir}`);
+        }
+        console.log(`[rootfs] Creating ext4 image (native mkfs.ext4) …`);
+        makeExt4Native(tmpDir, outImage);
+      } finally {
+        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
     } else {
+      // macOS path: pipe the export tar straight into the Alpine helper.
       console.log(`[rootfs] Creating ext4 image (via Alpine docker helper) …`);
-      makeExt4ViaDocker(tmpDir, outImage);
+      makeExt4ViaDocker(containerId, outImage);
     }
   } finally {
-    // Clean up the temp directory.
-    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    // Always remove the temporary container.
+    try { execSync(`docker rm "${containerId}"`, { stdio: 'ignore' }); } catch { /* ignore */ }
   }
 
   console.log(`[rootfs] Wrote: ${outImage}`);
@@ -785,11 +885,14 @@ const isMain =
   resolve(process.argv[1]) === __filename;
 
 if (isMain) {
-  // CLI: `oxnode src/rootfs/build.ts [--runner-image=ubuntu-22.04|ubuntu-24.04]`
-  const runnerImage = parseRunnerImageArg(process.argv.slice(2)) ?? 'ubuntu-24.04';
+  // CLI: `oxnode src/rootfs/build.ts [--runner-image=ubuntu-22.04|ubuntu-24.04] [--arch=x64|arm64]`
+  const cliArgs = process.argv.slice(2);
+  const runnerImage = parseRunnerImageArg(cliArgs) ?? 'ubuntu-24.04';
+  const arch = parseArchArg(cliArgs) ?? 'x64';
   const defaultInput: BuildInput = {
     runnerImage,
     outputDir: join(REPO_ROOT, 'images'),
+    arch,
   };
 
   buildRootfs(defaultInput).catch((err: unknown) => {
@@ -813,6 +916,33 @@ export function parseRunnerImageArg(args: ReadonlyArray<string>): RunnerImage | 
     throw new Error(
       `[rootfs] Unknown --runner-image value: ${String(value)}. ` +
       `Expected one of: ubuntu-22.04, ubuntu-24.04.`,
+    );
+  }
+  return undefined;
+}
+
+/**
+ * Parse `--arch=x64|arm64` (or `--arch x64`) from argv.  Returns `undefined`
+ * when the flag is absent so callers can apply their own default.  Throws
+ * on an unknown value.  Used by both `scripts/build.ts` and the direct CLI
+ * entrypoint below so the same syntax works in both places.
+ */
+export function parseArchArg(args: ReadonlyArray<string>): BuildArch | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? '';
+    const m = /^--arch=(.+)$/.exec(arg);
+    let value: string | undefined;
+    if (m !== null) {
+      value = m[1];
+    } else if (arg === '--arch') {
+      value = args[i + 1];
+    } else {
+      continue;
+    }
+    if (value === 'x64' || value === 'arm64') return value;
+    throw new Error(
+      `[rootfs] Unknown --arch value: ${String(value)}. ` +
+      `Expected one of: x64, arm64.`,
     );
   }
   return undefined;

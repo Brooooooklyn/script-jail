@@ -1,0 +1,344 @@
+# script-jail — .github/workflows/parity-test.yml
+#
+# Compare the .script-jail.lock.yml produced by the Linux/Firecracker action
+# against the committed macOS/VZ lockfile for a pinned upstream fixture, and
+# surface the delta as an advisory report.
+#
+# ADVISORY, NOT A HARD GATE (v1):
+#   The Linux side runs x86_64 under Firecracker inside GitHub Actions; the
+#   macOS side is an arm64 VZ guest generated locally on Apple hardware.
+#   Those environments differ in CPU architecture (OpenSSL reads
+#   `OPENSSL_ia32cap` vs `OPENSSL_armcap`, x64-only native addons cannot
+#   load/exec on arm64) and in ambient environment (CI-detection env vars
+#   set in Actions but not on a local Mac), so byte-equality is not
+#   achievable in v1.  The diff job reports divergence as a `::warning::`
+#   plus an uploaded report for a maintainer to interpret; it does NOT fail
+#   the workflow.  A future hard gate depends on either an arm64 CI runner
+#   or `scripts/parity-diff.ts` learning to filter the documented
+#   arch/environment divergence.
+#
+# WHY THE macOS SIDE IS COMMITTED, NOT GENERATED IN CI:
+#   GitHub-hosted macOS runners are themselves virtualized (Anka) and
+#   Apple's Virtualization.framework does not support nested virtualization,
+#   so the VZ-backed CLI cannot boot a VM in CI.  Instead, a maintainer
+#   generates the macOS lockfile locally on bare-metal Apple hardware and
+#   commits it to `test/parity/macos-arm64-lockfile.yml`.  CI generates the
+#   Linux lockfile fresh on every run and diffs it against that committed
+#   file.  When the fixture pin bumps, the committed lockfile must be
+#   regenerated — see test/parity/macos-arm64-lockfile.yml's header for the
+#   exact local command.
+#
+# Fixture: test/parity/fixture.yml pins vuejs/core at a specific tag + commit
+# SHA — see that file for bump instructions and the rationale for the
+# fixture choice.
+#
+# Triggers:
+#   - workflow_dispatch: manual, for ad-hoc validation.
+#   - pull_request paths-filtered to the parity-relevant surface so a PR
+#     touching the CLI, the action's lockfile path, the guest agent, or
+#     the parity infrastructure itself gets the advisory check.  Other PRs
+#     skip it to keep the routine matrix lean.
+#
+# What the report surfaces:
+#   - Linux-only package selected on macOS (PM-flag overlay bug).
+#   - Different event order between platforms (lock renderer bug).
+#   - Spurious event on one side (audit-policy desync).
+#   - A stale committed macOS lockfile after the Linux audit logic changed.
+#   - The documented v1 arch/environment divergence on Apple Silicon
+#     (see docs/divergence.md) — expected, not actionable in v1.
+#
+# Since the report mixes real desync with expected divergence, a maintainer
+# interprets it; the job does not fail on divergence.  Future work in
+# scripts/parity-diff.ts will add `--allow-arm64-enoexec` once we have
+# concrete divergence patterns to filter, at which point this can become a
+# hard gate again.
+
+name: parity-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/cli/**'
+      - 'src/shared/**'
+      - 'src/guest/**'
+      - 'src/host-mac/**'
+      - 'src/rootfs/**'
+      - 'src/lock/**'
+      - 'src/action/diff.ts'
+      - 'src/action/config-override.ts'
+      - 'src/action/firecracker/**'
+      - 'test/parity/**'
+      - 'scripts/parity-diff.ts'
+      - 'scripts/build.ts'
+      - 'images/kernel/**'
+      - 'images/rootfs.Dockerfile'
+      - '.github/workflows/parity-test.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # resolve-fixture — single source of truth for which commit of upstream we
+  # audit.  The linux-firecracker job reads its outputs so the fixture file
+  # is read exactly once.
+  # ---------------------------------------------------------------------------
+  resolve-fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      repo: ${{ steps.read.outputs.repo }}
+      sha: ${{ steps.read.outputs.sha }}
+      tag: ${{ steps.read.outputs.tag }}
+      pm: ${{ steps.read.outputs.pm }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read fixture pin
+        id: read
+        run: |
+          set -euo pipefail
+          FIXTURE=test/parity/fixture.yml
+          # awk-based parse: fixture.yml is intentionally flat (no nested
+          # keys) so a single `key: value` regex per line is sufficient and
+          # avoids a yq dependency.
+          REPO=$(awk -F': ' '/^repo: / {print $2; exit}' "$FIXTURE")
+          TAG=$(awk -F': ' '/^tag: / {print $2; exit}' "$FIXTURE")
+          SHA=$(awk -F': ' '/^sha: / {print $2; exit}' "$FIXTURE")
+          PM=$(awk -F': ' '/^package_manager: / {print $2; exit}' "$FIXTURE")
+          for v in REPO TAG SHA PM; do
+            eval val=\$$v
+            if [ -z "${val}" ]; then
+              echo "::error::Missing '${v}' in ${FIXTURE}"
+              exit 1
+            fi
+          done
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"   >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"   >> "$GITHUB_OUTPUT"
+          echo "pm=${PM}"     >> "$GITHUB_OUTPUT"
+          {
+            echo "## Parity fixture"
+            echo
+            echo "- repo: \`${REPO}\`"
+            echo "- tag: \`${TAG}\`"
+            echo "- sha: \`${SHA}\`"
+            echo "- package_manager: \`${PM}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # linux-firecracker — run the action under real Firecracker against the
+  # pinned upstream checkout.  Mirrors the consumer's runtime exactly: same
+  # rootfs, same kernel, same KVM-backed VMM.
+  # ---------------------------------------------------------------------------
+  linux-firecracker:
+    needs: resolve-fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The action's pre-fetch step refuses placeholder-pinned manifests in
+      # consumer mode.  Inside the repo's own CI we are testing the action
+      # against itself; the self-test flag skips that gate so the parity job
+      # works on the very tag that publishes the artifacts.  Same convention
+      # as e2e.yml.
+      SCRIPT_JAIL_E2E_SELF_TEST: '1'
+    steps:
+      - name: Checkout script-jail
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Checkout upstream fixture (${{ needs.resolve-fixture.outputs.repo }}@${{ needs.resolve-fixture.outputs.tag }})
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.resolve-fixture.outputs.repo }}
+          ref: ${{ needs.resolve-fixture.outputs.sha }}
+          path: fixture
+          persist-credentials: false
+
+      # The repo overlay disk is sized at 2× the on-disk fixture size.  For
+      # vuejs/core the `.git` directory dominates that size (deep history)
+      # and is dead weight inside the VM — neither npm/pnpm nor the audit
+      # touches it.  Strip it before disk packing so the overlay has more
+      # proportional headroom for the install and so mkfs.ext4 has fewer
+      # inodes to lay out.
+      - name: Strip fixture .git before mounting into VM
+        run: rm -rf fixture/.git
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # Build the action bundle + the x86_64 rootfs + the shim from THIS
+      # branch.  The parity test must run against the code under review,
+      # not against whatever's in dist/ or a tagged release.
+      - name: Build action bundle, shim, rootfs (x86_64)
+        run: pnpm build -- --runner-image=ubuntu-24.04
+
+      # The action under SCRIPT_JAIL_E2E_SELF_TEST=1 skips the pre-fetch
+      # download but still looks for the rootfs + shim at
+      # ${RUNNER_TEMP}/script-jail-images/.  Mirrors e2e.yml's staging step
+      # so the action's overlay/launch path finds them at the canonical
+      # location.
+      - name: Stage local artifacts under $RUNNER_TEMP/script-jail-images
+        run: |
+          set -euo pipefail
+          IMAGES_DIR="${RUNNER_TEMP}/script-jail-images"
+          mkdir -p "${IMAGES_DIR}"
+          cp images/rootfs-ubuntu-24.04.ext4 "${IMAGES_DIR}/"
+          cp images/libscriptjail.so "${IMAGES_DIR}/"
+          ls -l "${IMAGES_DIR}"
+
+      # /dev/kvm needs r/w for the runner user.  Mirrors e2e.yml exactly —
+      # ubuntu-latest exposes /dev/kvm at mode 0660 root:kvm and the runner
+      # user is not in the kvm group.
+      - name: Grant runner access to /dev/kvm
+        run: |
+          if [ ! -c /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing on ubuntu-latest — Firecracker cannot boot."
+            exit 1
+          fi
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      - name: Pre-create tap0 + enable NAT for VM egress
+        run: |
+          sudo ip tuntap add tap0 mode tap user "$(whoami)"
+          sudo ip addr add 172.16.0.1/24 dev tap0
+          sudo ip link set tap0 up
+          UPLINK=$(ip -o -4 route show default | awk '{print $5; exit}')
+          sudo iptables -t nat -A POSTROUTING -o "${UPLINK}" -j MASQUERADE
+          sudo iptables -A FORWARD -i tap0 -o "${UPLINK}" -j ACCEPT
+          sudo iptables -A FORWARD -i "${UPLINK}" -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+          echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
+
+      - name: Run script-jail action against fixture
+        env:
+          SCRIPT_JAIL_REPO_DIR: ${{ github.workspace }}/fixture
+          INPUT_MODE: update
+          INPUT_LOCK: ${{ github.workspace }}/linux-lockfile.yml
+          INPUT_CONFIG: ${{ github.workspace }}/.script-jail.yml
+        run: node dist/main.cjs
+
+      - name: Upload Linux lockfile
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-lockfile
+          path: linux-lockfile.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # diff — compare the freshly generated Linux lockfile against the committed
+  # macOS lockfile (test/parity/macos-arm64-lockfile.yml).
+  #
+  # The macOS side is NOT generated in CI — GitHub-hosted macOS runners
+  # cannot boot a nested VM (see the file header).  A maintainer regenerates
+  # the committed lockfile locally whenever the fixture pin or the audit
+  # logic changes; this job surfaces the delta as an advisory report so a
+  # maintainer can spot a stale commit or a real audit desync.  It does NOT
+  # fail the workflow on divergence — see the ADVISORY note in the header.
+  # ---------------------------------------------------------------------------
+  diff:
+    needs: linux-firecracker
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-lockfile
+          path: artifacts/linux
+
+      # The macOS side is the committed file from the repo checkout.  Fail
+      # loudly if it's missing rather than letting parity-diff report a
+      # confusing "missing input" usage error.
+      - name: Assert committed macOS lockfile exists
+        run: |
+          if [ ! -f test/parity/macos-arm64-lockfile.yml ]; then
+            echo "::error::test/parity/macos-arm64-lockfile.yml is missing — regenerate it locally (see its header)."
+            exit 1
+          fi
+
+      - name: Run parity diff
+        id: diff
+        # Capture the exit code without `set -e` aborting the step.  Exit 0
+        # = parity, 1 = diverged, 2 = usage error / missing input.  We treat
+        # 0 and 1 as expected outcomes and only fail the step on 2 (or any
+        # other unexpected exit).
+        run: |
+          set +e
+          pnpm exec oxnode scripts/parity-diff.ts \
+            --left  artifacts/linux/linux-lockfile.yml \
+            --right test/parity/macos-arm64-lockfile.yml \
+            --left-label  linux-firecracker \
+            --right-label macos-arm64-vz-committed \
+            --report parity-report.md
+          RC=$?
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -gt 1 ]; then
+            echo "::error::parity-diff exited $RC (usage error or missing input)"
+            exit 1
+          fi
+          if [ "$RC" -eq 1 ]; then
+            echo "::warning::Lockfiles diverged — see the parity-report artifact."
+          fi
+
+      - name: Append report to step summary
+        if: always()
+        run: |
+          if [ -f parity-report.md ]; then
+            cat parity-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: parity-report
+          path: parity-report.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Advisory only — divergence is reported, not gated.  The Linux (x64 CI)
+      # and macOS (arm64 local) lockfiles cannot be byte-equal in v1; see the
+      # ADVISORY note in the file header.  The `::warning::` from the diff
+      # step plus the uploaded parity-report artifact are the signal a
+      # maintainer interprets.  This step only re-states the verdict.
+      - name: Report divergence (advisory)
+        if: steps.diff.outputs.rc == '1'
+        run: |
+          echo "::warning::Linux and committed macOS lockfiles diverge — advisory only. See the parity-report artifact and docs/divergence.md."

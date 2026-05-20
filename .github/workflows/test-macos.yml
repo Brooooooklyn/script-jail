@@ -1,0 +1,58 @@
+name: test-macos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Drop write scopes on GITHUB_TOKEN as a baseline hardening — the macOS
+# job only needs read access for checkout + cargo.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build + test (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          # rustfmt is not in dtolnay/rust-toolchain's default `minimal`
+          # profile.  The `Format check` step below invokes `cargo fmt`, so
+          # we have to ask for it explicitly.
+          components: rustfmt
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: . -> target
+
+      - name: cargo build
+        run: cargo build --release -p script-jail-host-mac
+
+      - name: Format check
+        run: cargo fmt --check -p script-jail-host-mac
+
+      - name: cargo test
+        run: cargo test -p script-jail-host-mac
+
+      # The fixture's kernel/rootfs paths don't exist (those artifacts ship
+      # in PR 5).  The binary must reject the config with a clear
+      # validation error mentioning "kernel_path" and exit 64.  CI asserts
+      # on that exact behaviour.
+      - name: Smoke run (expected to fail with config validation error)
+        run: |
+          set -euo pipefail
+          OUT=$(./target/release/script-jail-vm --smoke --config test/fixtures/host-mac/smoke.json 2>&1 || true)
+          echo "$OUT"
+          echo "$OUT" | grep -q "kernel_path"

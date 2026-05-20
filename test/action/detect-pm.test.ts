@@ -14,7 +14,7 @@ import {
   detectPm,
   BunUnsupportedError,
   type DetectInput,
-} from '../../src/action/detect-pm.js';
+} from '../../src/shared/detect-pm.js';
 
 // ---------------------------------------------------------------------------
 // Fake fs / warn helpers
