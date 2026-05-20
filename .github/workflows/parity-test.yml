@@ -1,9 +1,21 @@
 # script-jail — .github/workflows/parity-test.yml
 #
-# Verify that the .script-jail.lock.yml produced by the Linux/Firecracker
-# action is byte-equal (modulo the documented `generated_at` /
-# `manager_lockfile_sha256` canonicalisation) to the macOS/VZ lockfile for
-# a pinned upstream fixture.
+# Compare the .script-jail.lock.yml produced by the Linux/Firecracker action
+# against the committed macOS/VZ lockfile for a pinned upstream fixture, and
+# surface the delta as an advisory report.
+#
+# ADVISORY, NOT A HARD GATE (v1):
+#   The Linux side runs x86_64 under Firecracker inside GitHub Actions; the
+#   macOS side is an arm64 VZ guest generated locally on Apple hardware.
+#   Those environments differ in CPU architecture (OpenSSL reads
+#   `OPENSSL_ia32cap` vs `OPENSSL_armcap`, x64-only native addons cannot
+#   load/exec on arm64) and in ambient environment (CI-detection env vars
+#   set in Actions but not on a local Mac), so byte-equality is not
+#   achievable in v1.  The diff job reports divergence as a `::warning::`
+#   plus an uploaded report for a maintainer to interpret; it does NOT fail
+#   the workflow.  A future hard gate depends on either an arm64 CI runner
+#   or `scripts/parity-diff.ts` learning to filter the documented
+#   arch/environment divergence.
 #
 # WHY THE macOS SIDE IS COMMITTED, NOT GENERATED IN CI:
 #   GitHub-hosted macOS runners are themselves virtualized (Anka) and
@@ -24,20 +36,22 @@
 #   - workflow_dispatch: manual, for ad-hoc validation.
 #   - pull_request paths-filtered to the parity-relevant surface so a PR
 #     touching the CLI, the action's lockfile path, the guest agent, or
-#     the parity infrastructure itself gets the gate.  Other PRs skip it
-#     to keep the routine matrix lean.
+#     the parity infrastructure itself gets the advisory check.  Other PRs
+#     skip it to keep the routine matrix lean.
 #
-# What this catches:
+# What the report surfaces:
 #   - Linux-only package selected on macOS (PM-flag overlay bug).
 #   - Different event order between platforms (lock renderer bug).
 #   - Spurious event on one side (audit-policy desync).
 #   - A stale committed macOS lockfile after the Linux audit logic changed.
+#   - The documented v1 arch/environment divergence on Apple Silicon
+#     (see docs/divergence.md) — expected, not actionable in v1.
 #
-# What this does NOT yet filter:
-#   The documented v1 divergence on Apple Silicon — see docs/divergence.md.
-#   The diff job's report surfaces the raw delta; the maintainer interprets
-#   it.  Future work in scripts/parity-diff.ts will add `--allow-arm64-
-#   enoexec` once we have concrete divergence patterns to filter.
+# Since the report mixes real desync with expected divergence, a maintainer
+# interprets it; the job does not fail on divergence.  Future work in
+# scripts/parity-diff.ts will add `--allow-arm64-enoexec` once we have
+# concrete divergence patterns to filter, at which point this can become a
+# hard gate again.
 
 name: parity-test
 
@@ -240,7 +254,9 @@ jobs:
   # The macOS side is NOT generated in CI — GitHub-hosted macOS runners
   # cannot boot a nested VM (see the file header).  A maintainer regenerates
   # the committed lockfile locally whenever the fixture pin or the audit
-  # logic changes; this job is the gate that flags a stale commit.
+  # logic changes; this job surfaces the delta as an advisory report so a
+  # maintainer can spot a stale commit or a real audit desync.  It does NOT
+  # fail the workflow on divergence — see the ADVISORY note in the header.
   # ---------------------------------------------------------------------------
   diff:
     needs: linux-firecracker
@@ -317,8 +333,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Fail the workflow on divergence
+      # Advisory only — divergence is reported, not gated.  The Linux (x64 CI)
+      # and macOS (arm64 local) lockfiles cannot be byte-equal in v1; see the
+      # ADVISORY note in the file header.  The `::warning::` from the diff
+      # step plus the uploaded parity-report artifact are the signal a
+      # maintainer interprets.  This step only re-states the verdict.
+      - name: Report divergence (advisory)
         if: steps.diff.outputs.rc == '1'
         run: |
-          echo "::error::Linux and committed macOS lockfiles diverge.  See parity-report artifact for details."
-          exit 1
+          echo "::warning::Linux and committed macOS lockfiles diverge — advisory only. See the parity-report artifact and docs/divergence.md."

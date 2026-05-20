@@ -27566,11 +27566,15 @@ var SYSTEM_NOISE_PREFIXES = [
   "/sys/",
   "/dev/",
   // VP_HOME — the vite-plus-provisioned Node toolchain (node/npm/corepack/
-  // pnpm/yarn) and corepack's package-manager cache.  A lifecycle script that
-  // `require()`s a stdlib module makes Node read its own install tree here;
-  // that is toolchain infrastructure, not a package escape.  See
-  // src/rootfs/init.sh (VP_HOME=/opt/vp).
-  "/opt/vp/"
+  // pnpm/yarn) and corepack's package-manager cache, all under /opt/vp.  A
+  // lifecycle script that `require()`s a stdlib module makes Node read its
+  // own install tree here; that is toolchain infrastructure, not a package
+  // escape.  The prefix has no trailing slash on purpose: Node's module and
+  // executable resolution stat()s the parent directories too, so a trailing
+  // slash would let the bare `/opt` and `/opt/vp` entries leak into
+  // external_reads.  In this microVM rootfs /opt holds nothing but the vp
+  // toolchain.  See src/rootfs/init.sh (VP_HOME=/opt/vp).
+  "/opt"
 ];
 function normalize(events, ctx) {
   const out = /* @__PURE__ */ new Map();

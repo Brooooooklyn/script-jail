@@ -63,6 +63,19 @@ if [ -n "${SJ_EPOCH}" ]; then
   echo "[init] wall clock set from host epoch ${SJ_EPOCH}: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 fi
 
+# --- Scrub host->guest cmdline markers from the environment ------------------
+# The Linux kernel hands any `key=value` boot-cmdline token it does not itself
+# recognise to PID 1 as an environment variable (init/main.c collects them
+# into envp_init[]).  Our three VZ markers — sj_epoch, sj_net, sj_vsock — are
+# therefore present in this script's environment and would otherwise be
+# inherited all the way down to the audited lifecycle scripts, where npm/pnpm
+# enumerate `process.env` and the env-spy preload records every visible var as
+# an `env_read`.  Firecracker's cmdline carries no such markers, so leaving
+# them set desyncs the macOS lockfile from the CI one.  init.sh and
+# orchestrate.sh read these markers from /proc/cmdline, never from the
+# environment, so dropping the env copies is safe.
+unset sj_epoch sj_net sj_vsock
+
 # Bring up the loopback interface. The kernel creates `lo` in DOWN state;
 # without an explicit `up` here the agent's listener on 127.0.0.1:10243
 # binds successfully but no traffic actually flows. socat's TCP forwarder
