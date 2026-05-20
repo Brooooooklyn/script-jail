@@ -3,10 +3,9 @@
 // Pure builders for VZVirtioBlockDeviceConfiguration.  Each call wires a
 // VZDiskImageStorageDeviceAttachment to a fresh Virtio block device.
 //
-// Three of these are attached to the VM in src/host-mac/src/vm.rs:
+// Two of these are attached to the VM in src/host-mac/src/vm.rs:
 //   - rootfs  (rw)  — ubuntu ext4 image, mounted as `/` in the guest.
-//   - repo    (rw)  — host repo bind-mounted at `/work/repo` in the guest.
-//   - host-node (ro) — Node toolchain ext4 image, mounted at `/work/node`.
+//   - repo    (rw)  — host repo bind-mounted at `/work` in the guest.
 //
 // PR 3 only builds these; the test in vm.rs verifies the assembly compiles
 // and the API contracts hold.  Real boot is PR 4-5.

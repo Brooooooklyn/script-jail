@@ -27,8 +27,8 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-# 1. Start the agent.  `node` resolves through PATH to /opt/host-node/bin/node,
-#    which init.sh prepended.
+# 1. Start the agent.  `node` resolves through PATH to the vite-plus-
+#    provisioned toolchain under /opt/vp, which init.sh prepended.
 node /usr/local/lib/script-jail/guest-agent.cjs &
 AGENT_PID=$!
 
@@ -57,15 +57,29 @@ if [ "${i}" -ge 200 ]; then
   exit 1
 fi
 
-# 3. Start the AF_VSOCK <-> TCP bridge.  `fork` allows multiple connections
-#    (the host opens one, but fork is the safe default); `reuseaddr` avoids
-#    TIME_WAIT refusal across quick relaunches within the same VM lifetime.
-socat VSOCK-LISTEN:10242,fork,reuseaddr TCP:127.0.0.1:10243 &
+# 3. Start the AF_VSOCK <-> TCP bridge.
+#
+# The two host VMMs drive vsock in OPPOSITE directions:
+#   Firecracker — the host VMM connects IN to a guest listener, so socat must
+#     LISTEN on AF_VSOCK port 10242.  `fork` allows repeated host connects;
+#     `reuseaddr` avoids TIME_WAIT refusal across relaunches in one VM life.
+#   Apple VZ   — the host registers a VZVirtioSocketListener and waits for the
+#     guest to connect OUT (see src/host-mac/src/vsock.rs), so socat must
+#     CONNECT to the host's well-known CID 2 on port 10242.  If socat LISTENs
+#     under VZ, both ends listen and the single control session never opens.
+# The host bakes `sj_vsock=connect` into the kernel cmdline for the VZ path
+# (src/cli/index.ts); its absence means Firecracker.
+if grep -q 'sj_vsock=connect' /proc/cmdline 2>/dev/null; then
+  socat VSOCK-CONNECT:2:10242 TCP:127.0.0.1:10243 &
+else
+  socat VSOCK-LISTEN:10242,fork,reuseaddr TCP:127.0.0.1:10243 &
+fi
 SOCAT_PID=$!
 
-# Verify socat actually started — bad syntax, missing binary, or kernel
-# AF_VSOCK refusal would have it exit immediately.  socat binds synchronously
-# in its main thread before forking, so a 50ms liveness check is sufficient.
+# Verify socat actually started — bad syntax, missing binary, kernel AF_VSOCK
+# refusal, or (VZ connect path) a host listener that is not up would have it
+# exit immediately.  socat binds/connects synchronously in its main thread
+# before forking, so a 50ms liveness check is sufficient.
 sleep 0.05
 if ! kill -0 "${SOCAT_PID}" 2>/dev/null; then
   wait "${SOCAT_PID}" 2>/dev/null || true

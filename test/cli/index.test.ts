@@ -55,7 +55,6 @@ function fakeOverlay(workDir: string) {
   return {
     rootfsCopyPath: join(workDir, 'rootfs.ext4'),
     repoDiskPath: join(workDir, 'repo.ext4'),
-    hostNodeDiskPath: join(workDir, 'host-node.ext4'),
     workDir,
     cleanup: async () => { /* no-op */ },
   };
@@ -63,12 +62,11 @@ function fakeOverlay(workDir: string) {
 
 function macOsDeps(over: Partial<CliDeps>): CliDeps {
   // A "happy path" host detector: pretend we're on macOS 14 arm64.  All the
-  // post-PR-4 dependencies (overlay, host-node prefix) are stubbed so the
-  // CLI can exercise its orchestration logic without real fs / VZ access.
+  // post-PR-4 dependencies (overlay) are stubbed so the CLI can exercise its
+  // orchestration logic without real fs / VZ access.
   return {
     detectHost: () => ({ macosMajor: 14, hostArch: 'arm64' }),
     makeOverlay: async () => fakeOverlay(testDir),
-    resolveHostNodePrefix: () => '/tmp/fake-host-node-prefix',
     ...over,
   };
 }
@@ -167,7 +165,6 @@ describe('CLI — VM-launch stub', () => {
         return { warnings: [], pmFlagsJson: { extra_install_args: ['--cpu=x64', '--os=linux', '--libc=glibc'] } };
       },
       makeOverlay: async () => fakeOverlay(testDir),
-      resolveHostNodePrefix: () => '/tmp/fake-host-node-prefix',
       spawnVm: async () => { throw new MacOSVmNotImplementedError(); },
     });
     expect(code).toBe(1);
@@ -191,7 +188,6 @@ describe('CLI — VM-launch stub', () => {
         return { warnings: [] };
       },
       makeOverlay: async () => fakeOverlay(testDir),
-      resolveHostNodePrefix: () => '/tmp/fake-host-node-prefix',
       spawnVm: async () => { throw new MacOSVmNotImplementedError(); },
     });
     expect(capturedHostArch).toBe('x64');

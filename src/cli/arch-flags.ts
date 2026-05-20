@@ -13,8 +13,20 @@
 //
 //   To keep the local lockfile byte-stable against the one CI would produce,
 //   we feed each package manager the "I am a Linux/x64 glibc machine" hint
-//   at install time:
-//     - npm / pnpm:  `--cpu=x64 --os=linux --libc=glibc` install flags.
+//   at install time.  Each manager has a DIFFERENT mechanism — there is no
+//   single flag form that works everywhere:
+//     - npm:  `--cpu=x64 --os=linux --libc=glibc` install flags (npm 10+).
+//             These are CLI flags `npm ci` honours during resolution.
+//     - pnpm: a `pnpm.supportedArchitectures` block in the repo's root
+//             `package.json`.  pnpm does NOT accept `--cpu/--os/--libc` on
+//             the CLI (`pnpm fetch --cpu=x64` errors with "Unknown options:
+//             'cpu', 'os', 'libc'").  Empirically verified on pnpm 9.15.0:
+//             `pnpm fetch` reads the `pnpm` config block out of package.json
+//             even though it ignores the dependency manifest, so the hint
+//             must live there.  `.npmrc` and `pnpm-workspace.yaml` are NOT
+//             honoured for `supportedArchitectures` on pnpm 9.x.  Adding the
+//             block does not invalidate `--frozen-lockfile` (it is a
+//             resolution preference, not part of the lockfile manifest).
 //     - yarn 4+ (Berry):  a `supportedArchitectures` block in `.yarnrc.yml`.
 //     - yarn classic (v1):  unsupported — emit a warning, no overlay.
 //
@@ -42,10 +54,17 @@ export interface ArchFlagInput {
  * Payload to layer onto the VM's repo disk before the install runs.
  *
  *   `pmFlagsJson`     — JSON file landed at /etc/script-jail/pm-flags.json,
- *                       read by phase-install.ts to splice extra args into
- *                       the package manager's `install` invocation.
+ *                       read by phase-fetch.ts to splice extra args into
+ *                       npm's `ci` invocation.  npm ONLY — pnpm does not
+ *                       accept `--cpu/--os/--libc` on the CLI.
  *   `yarnrcOverlay`   — YAML content to write at <repo-root>/.yarnrc.yml.
  *                       Yarn Berry merges this with any committed .yarnrc.yml.
+ *   `pnpmArchOverlay` — JSON content landed at /etc/script-jail/pnpm-arch.json.
+ *                       Holds the `supportedArchitectures` object; the guest
+ *                       (`src/guest/apply-pnpm-arch.ts`) merges it into the
+ *                       repo's root `package.json` under the `pnpm` key
+ *                       before Phase A runs `pnpm fetch`.  pnpm reads the
+ *                       block from package.json — there is no CLI form.
  *   `warnings`        — Non-fatal messages the CLI should print so the user
  *                       knows we punted on a case (currently: yarn classic
  *                       on arm64).
@@ -53,6 +72,7 @@ export interface ArchFlagInput {
 export interface ArchFlagOverlay {
   pmFlagsJson?: { extra_install_args: string[] };
   yarnrcOverlay?: string;
+  pnpmArchOverlay?: string;
   warnings: string[];
 }
 
@@ -74,14 +94,36 @@ export function buildArchFlagOverlay(input: ArchFlagInput): ArchFlagOverlay {
   // arm64 host paths.
   switch (input.pm) {
     case 'npm':
-    case 'pnpm':
-      // npm honors --cpu / --os / --libc since v10; pnpm accepts the same
-      // flags (with --libc accepted from pnpm v9+).  Phase B passes them
-      // verbatim to `<pm> install` via /etc/script-jail/pm-flags.json.
+      // npm honours --cpu / --os / --libc as `npm ci` flags since v10.  They
+      // affect dependency resolution, which npm does in Phase A — so Phase A
+      // (`phase-fetch.ts`) splices them into `npm ci` via
+      // /etc/script-jail/pm-flags.json.
       return {
         pmFlagsJson: {
           extra_install_args: ['--cpu=x64', '--os=linux', '--libc=glibc'],
         },
+        warnings: [],
+      };
+
+    case 'pnpm':
+      // pnpm does NOT accept --cpu / --os / --libc on the CLI; passing them
+      // makes `pnpm fetch` fail with "Unknown options: 'cpu', 'os', 'libc'".
+      // The real mechanism is a `supportedArchitectures` block under the
+      // `pnpm` key of the repo's root package.json.  We hand-write the JSON
+      // (rather than JSON.stringify'ing an object) so the exact bytes are
+      // part of the public contract — snapshotted in tests — and the merge
+      // the guest performs into package.json is fully deterministic.  The
+      // guest (`apply-pnpm-arch.ts`) reads this from
+      // /etc/script-jail/pnpm-arch.json and merges it before Phase A.
+      return {
+        pnpmArchOverlay:
+          '{\n' +
+          '  "supportedArchitectures": {\n' +
+          '    "os": ["linux"],\n' +
+          '    "cpu": ["x64"],\n' +
+          '    "libc": ["glibc"]\n' +
+          '  }\n' +
+          '}\n',
         warnings: [],
       };
 

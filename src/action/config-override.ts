@@ -6,7 +6,8 @@
 // Linux/x64 install resolution from an arm64 host:
 //
 //   - .yarnrc.yml          (yarnrcOverlay)     — Yarn Berry supportedArchitectures
-//   - etc/script-jail/pm-flags.json (pmFlagsJson) — npm/pnpm extra install args
+//   - etc/script-jail/pm-flags.json (pmFlagsJson)     — npm extra install args
+//   - etc/script-jail/pnpm-arch.json (pnpmArchOverlay) — pnpm supportedArchitectures
 //
 // The sidecar files live in the same `workDir` as the rewritten config so the
 // caller can hand the whole bag to `makeOverlay({ extraRepoOverlayFiles: … })`
@@ -70,11 +71,21 @@ export interface BuildEffectiveConfigInput {
   yarnrcOverlay?: string;
   /**
    * Optional `etc/script-jail/pm-flags.json` payload.  Read by the guest
-   * (`src/guest/phase-install.ts`) which appends `extra_install_args` to the
-   * package manager's install invocation.  Written verbatim (after
-   * JSON.stringify) to `<workDir>/etc/script-jail/pm-flags.json`.
+   * (`src/guest/phase-fetch.ts`) which appends `extra_install_args` to npm's
+   * `ci` invocation.  npm only — pnpm does not accept these CLI flags.
+   * Written verbatim (after JSON.stringify) to
+   * `<workDir>/etc/script-jail/pm-flags.json`.
    */
   pmFlagsJson?: { extra_install_args: string[] };
+  /**
+   * Optional `etc/script-jail/pnpm-arch.json` content.  Provided by the
+   * macOS CLI (`src/cli/arch-flags.ts`) when forcing a Linux/x64 install
+   * resolution from an arm64 pnpm host.  Holds a `supportedArchitectures`
+   * object; the guest (`src/guest/apply-pnpm-arch.ts`) merges it into the
+   * repo's root `package.json` under the `pnpm` key before Phase A.
+   * Written verbatim to `<workDir>/etc/script-jail/pnpm-arch.json`.
+   */
+  pnpmArchOverlay?: string;
 }
 
 export interface BuildEffectiveConfigResult {
@@ -84,6 +95,8 @@ export interface BuildEffectiveConfigResult {
   yarnrcPath?: string;
   /** Absolute path to the pm-flags.json sidecar, if `pmFlagsJson` was supplied. */
   pmFlagsPath?: string;
+  /** Absolute path to the pnpm-arch.json sidecar, if `pnpmArchOverlay` was supplied. */
+  pnpmArchPath?: string;
 }
 
 /**
@@ -148,6 +161,15 @@ export function buildEffectiveConfig(
     // doesn't care either way (JSON.parse handles whitespace).
     writeFileSync(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + '\n', 'utf8');
     result.pmFlagsPath = pmFlagsPath;
+  }
+
+  if (input.pnpmArchOverlay !== undefined) {
+    const pnpmArchPath = join(outDir, 'etc', 'script-jail', 'pnpm-arch.json');
+    mkdirSync(dirname(pnpmArchPath), { recursive: true });
+    // Written verbatim — the content is already hand-formatted deterministic
+    // JSON in src/cli/arch-flags.ts.
+    writeFileSync(pnpmArchPath, input.pnpmArchOverlay, 'utf8');
+    result.pnpmArchPath = pnpmArchPath;
   }
 
   return result;

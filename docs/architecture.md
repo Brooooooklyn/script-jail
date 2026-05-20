@@ -156,11 +156,12 @@ No shared filesystem, no container runtime, no Docker-in-Docker.
 
 ## Rootfs
 
-Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. Three virtio drives mount at boot:
+Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Two virtio drives mount at boot:
 
-1. The rootfs itself (read-only).
+1. The rootfs itself.
 2. An ext4 overlay holding the consumer repo + caches at `/work`.
-3. The host's Node install at `/opt/host-node` — so the same Node binary the runner uses also runs inside the VM, without baking a Node version into the rootfs.
+
+There is no host-Node drive: the toolchain is provisioned at runtime, so a macOS host (whose own `node` is a Mach-O binary) can still produce a Linux-guest lockfile. The exact Node version is pinned in `src/rootfs/vite-plus.ts` for byte-stable cross-host parity.
 
 The pinned kernel (Linux 5.10.223 from AWS Firecracker CI) lives outside the rootfs and is downloaded by the host via the artifact manifest.
 

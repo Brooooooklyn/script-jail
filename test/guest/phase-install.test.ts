@@ -153,7 +153,7 @@ describe('runInstallPhase', () => {
       expect(calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
     });
 
-    it('pnpm → pnpm install --frozen-lockfile --offline --config.side-effects-cache=false --store-dir=<cwd>/.pnpm-store', async () => {
+    it('pnpm → pnpm rebuild --pending --config.side-effects-cache=false --store-dir=<cwd>/.pnpm-store', async () => {
       const calls: Array<{ cmd: string; args: string[] }> = [];
       const strace: StraceRunner = {
         async *run(cmd, args) { calls.push({ cmd, args }); },
@@ -173,7 +173,7 @@ describe('runInstallPhase', () => {
       });
       expect(calls[0]!.cmd).toBe('pnpm');
       expect(calls[0]!.args).toEqual([
-        'install', '--frozen-lockfile', '--offline', '--config.side-effects-cache=false',
+        'rebuild', '--pending', '--config.side-effects-cache=false',
         '--store-dir=/work/.pnpm-store',
       ]);
     });

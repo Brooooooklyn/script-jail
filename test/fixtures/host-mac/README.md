@@ -9,4 +9,3 @@ Files added in PR 5:
 - `missing-kernel` -> real arm64 vmlinuz
 - `missing-rootfs.img` -> ubuntu rootfs ext4 image
 - `missing-repo.img` -> empty repo overlay
-- `missing-host-node.img` -> Node toolchain ext4 image

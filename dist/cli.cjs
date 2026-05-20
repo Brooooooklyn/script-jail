@@ -7364,9 +7364,9 @@ __export(index_exports, {
   run: () => run
 });
 module.exports = __toCommonJS(index_exports);
-var import_node_fs7 = require("node:fs");
-var import_node_os6 = require("node:os");
-var import_node_path8 = require("node:path");
+var import_node_fs6 = require("node:fs");
+var import_node_os5 = require("node:os");
+var import_node_path7 = require("node:path");
 var import_node_url2 = require("node:url");
 
 // src/cli/detect-host.ts
@@ -7620,7 +7620,6 @@ function toJsonPayload(cfg) {
     kernel_cmdline: cfg.kernelCmdline,
     rootfs_disk_path: cfg.rootfsDiskPath,
     repo_disk_path: cfg.repoDiskPath,
-    host_node_disk_path: cfg.hostNodeDiskPath,
     vsock_uds_path: cfg.vsockUdsPath,
     vsock_port: cfg.vsockPort,
     vcpu_count: cfg.vcpuCount,
@@ -7900,8 +7899,7 @@ function resolveArtifacts(input) {
     imagesDir,
     hostArch === "x64" ? "libscriptjail.so" : "libscriptjail-arm64.so"
   );
-  const hostNodePath = (0, import_node_path3.join)(imagesDir, "host-node.ext4");
-  return { kernelPath, rootfsPath, hostNodePath, libscriptjailSoPath };
+  return { kernelPath, rootfsPath, libscriptjailSoPath };
 }
 
 // src/action/firecracker/overlay.ts
@@ -7916,7 +7914,6 @@ async function makeOverlay(input) {
     baseRootfsPath,
     repoSrcPath,
     configPath,
-    hostNodePrefix,
     workDir: maybeWorkDir,
     extraRepoOverlayFiles
   } = input;
@@ -7945,8 +7942,6 @@ async function makeOverlay(input) {
   }
   const repoDiskPath = (0, import_node_path4.join)(workDir, "repo.ext4");
   await buildRepoDisk(repoStageDir, repoDiskPath);
-  const hostNodeDiskPath = (0, import_node_path4.join)(workDir, "host-node.ext4");
-  await buildHostNodeDisk(hostNodePrefix, hostNodeDiskPath);
   const cleanup = async () => {
     try {
       await (0, import_promises.rm)(workDir, { recursive: true, force: true });
@@ -7954,7 +7949,7 @@ async function makeOverlay(input) {
       console.warn(`[overlay] cleanup warning: ${String(err)}`);
     }
   };
-  return { rootfsCopyPath, repoDiskPath, hostNodeDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, workDir, cleanup };
 }
 function copyRootfs(src, dest) {
   if (import_node_process.platform === "linux") {
@@ -8031,186 +8026,11 @@ function estimateDiskSizeMB(dir) {
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
-async function buildHostNodeDisk(hostNodePrefix, outPath) {
-  const sizeMB = estimateHostNodeDiskSizeMB(hostNodePrefix);
-  const sizeSpec = `${sizeMB}M`;
-  const mkfs = resolveMkfsExt4();
-  if (mkfs !== null) {
-    const result2 = (0, import_node_child_process2.spawnSync)(
-      mkfs,
-      [
-        "-d",
-        hostNodePrefix,
-        "-L",
-        "host-node",
-        "-O",
-        "^has_journal",
-        "-m",
-        "0",
-        outPath,
-        sizeSpec
-      ],
-      { stdio: "inherit" }
-    );
-    if (result2.status !== 0) {
-      throw new Error(
-        `mkfs.ext4 for host-node disk failed (exit ${result2.status ?? "unknown"}, signal ${result2.signal ?? "none"})`
-      );
-    }
-    return;
-  }
-  const outDir = (0, import_node_path4.join)(outPath, "..");
-  const imageName = (0, import_node_path4.basename)(outPath);
-  const result = (0, import_node_child_process2.spawnSync)(
-    "docker",
-    [
-      "run",
-      "--rm",
-      "-v",
-      `${hostNodePrefix}:/work:ro`,
-      "-v",
-      `${outDir}:/out`,
-      "alpine:latest",
-      "sh",
-      "-c",
-      `apk add --no-cache e2fsprogs && mkfs.ext4 -d /work -L host-node -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}`
-    ],
-    { stdio: "inherit" }
-  );
-  if (result.status !== 0) {
-    throw new Error(
-      `docker mkfs.ext4 for host-node disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
-    );
-  }
-}
-function estimateHostNodeDiskSizeMB(dir) {
-  let totalBytes = 0;
-  const visit = (p) => {
-    try {
-      const stat = (0, import_node_fs3.statSync)(p, { bigint: false });
-      if (stat.isDirectory()) {
-        for (const child of (0, import_node_fs3.readdirSync)(p)) {
-          visit((0, import_node_path4.join)(p, child));
-        }
-      } else if (stat.isFile() || stat.isSymbolicLink()) {
-        totalBytes += stat.size;
-      }
-    } catch {
-    }
-  };
-  if ((0, import_node_fs3.existsSync)(dir)) visit(dir);
-  const estimatedMB = Math.ceil(totalBytes * 1.5 / (1024 * 1024));
-  return Math.max(64, estimatedMB);
-}
-
-// src/action/host-node-prefix.ts
-var import_node_fs4 = require("node:fs");
-var import_node_os4 = require("node:os");
-var import_node_path5 = require("node:path");
-var HOSTED_TOOLCACHE_PREFIX = "/opt/hostedtoolcache/node/";
-var RUNNER_BUNDLED_NODE_RE = /\/runner\/runners\/[^/]+\/externals\/node[^/]*\/bin\/node$/;
-var SYSTEM_BLOCKLIST = [
-  "/usr/local",
-  "/usr",
-  "/opt/homebrew",
-  "/opt/local",
-  "/"
-];
-function resolveHostNodeExecPath(opts) {
-  const rawPath = opts !== void 0 && "path" in opts ? opts.path : process.env["PATH"];
-  const path = rawPath ?? "";
-  const segments = path.split(import_node_path5.delimiter).filter((s) => s !== "");
-  const which = opts?.which ?? makeDefaultWhich(opts?.fs ?? { existsSync: import_node_fs4.existsSync });
-  const resolved = which("node", segments);
-  if (resolved === null) {
-    throw new Error(
-      "script-jail: no `node` was found on PATH. Add `actions/setup-node` before this action so the chosen Node version is on PATH."
-    );
-  }
-  return resolved;
-}
-function makeDefaultWhich(fs) {
-  return (cmd, segments) => {
-    for (const seg of segments) {
-      const candidate = (0, import_node_path5.join)(seg, cmd);
-      if (!fs.existsSync(candidate)) continue;
-      let st;
-      try {
-        st = (0, import_node_fs4.statSync)(candidate);
-      } catch {
-        continue;
-      }
-      if (!st.isFile()) continue;
-      try {
-        (0, import_node_fs4.accessSync)(candidate, import_node_fs4.constants.X_OK);
-      } catch {
-        continue;
-      }
-      try {
-        return (0, import_node_fs4.realpathSync)(candidate);
-      } catch {
-        return candidate;
-      }
-    }
-    return null;
-  };
-}
-function resolveHostNodePrefix(opts) {
-  const fs = opts?.fs ?? { existsSync: import_node_fs4.existsSync };
-  const execPath = resolveHostNodeExecPath({
-    ...opts !== void 0 && "path" in opts ? { path: opts.path } : {},
-    ...opts?.which !== void 0 ? { which: opts.which } : {},
-    fs
-  });
-  if (RUNNER_BUNDLED_NODE_RE.test(execPath)) {
-    throw new Error(
-      "script-jail: refusing to mount the GitHub Actions runner's bundled Node. Add `actions/setup-node` before this action so the chosen Node version is used."
-    );
-  }
-  const prefix = (0, import_node_path5.dirname)((0, import_node_path5.dirname)(execPath));
-  const runnerToolCache = opts !== void 0 && "runnerToolCache" in opts ? opts.runnerToolCache : process.env["RUNNER_TOOL_CACHE"];
-  const blockedRoot = findBlockedRoot(prefix);
-  if (blockedRoot !== null) {
-    throw new Error(
-      `script-jail: refusing to pack ${blockedRoot} \u2014 looks like a system-wide install. Use actions/setup-node so Node lives in an isolated toolcache directory.`
-    );
-  }
-  if (execPath.startsWith(HOSTED_TOOLCACHE_PREFIX)) return prefix;
-  if (isUnder(execPath, "/tmp/")) return prefix;
-  const tmp = (0, import_node_os4.tmpdir)();
-  if (tmp !== "" && tmp !== "/" && isUnder(execPath, withTrailingSlash(tmp))) {
-    return prefix;
-  }
-  if (runnerToolCache !== void 0 && runnerToolCache !== "" && runnerToolCache !== "/" && findBlockedRoot(runnerToolCache) === null && isUnder(execPath, withTrailingSlash(runnerToolCache))) {
-    return prefix;
-  }
-  const hasHeader = fs.existsSync((0, import_node_path5.join)(prefix, "include", "node", "node.h"));
-  const hasDocs = fs.existsSync((0, import_node_path5.join)(prefix, "share", "doc", "node"));
-  if (hasHeader && hasDocs) return prefix;
-  throw new Error(
-    `script-jail: ${execPath} does not appear to be a self-contained Node install (missing include/node/node.h and/or share/doc/node). Use actions/setup-node before calling this action.`
-  );
-}
-function withTrailingSlash(p) {
-  return p.endsWith("/") ? p : `${p}/`;
-}
-function isUnder(path, prefixWithSlash) {
-  return path.startsWith(prefixWithSlash);
-}
-function findBlockedRoot(path) {
-  if (path === "/") return "/";
-  for (const blocked of SYSTEM_BLOCKLIST) {
-    if (blocked === "/") continue;
-    if (path === blocked) return blocked;
-    if (isUnder(path, withTrailingSlash(blocked))) return blocked;
-  }
-  return null;
-}
 
 // src/shared/run-audit.ts
-var import_node_fs6 = require("node:fs");
+var import_node_fs5 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
-var import_node_path7 = require("node:path");
+var import_node_path6 = require("node:path");
 
 // src/cli/arch-flags.ts
 function buildArchFlagOverlay(input) {
@@ -8219,11 +8039,15 @@ function buildArchFlagOverlay(input) {
   }
   switch (input.pm) {
     case "npm":
-    case "pnpm":
       return {
         pmFlagsJson: {
           extra_install_args: ["--cpu=x64", "--os=linux", "--libc=glibc"]
         },
+        warnings: []
+      };
+    case "pnpm":
+      return {
+        pnpmArchOverlay: '{\n  "supportedArchitectures": {\n    "os": ["linux"],\n    "cpu": ["x64"],\n    "libc": ["glibc"]\n  }\n}\n',
         warnings: []
       };
     case "yarn":
@@ -10370,8 +10194,8 @@ function emoji() {
 }
 var ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
 var ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
-var mac = (delimiter2) => {
-  const escapedDelim = escapeRegex(delimiter2 ?? ":");
+var mac = (delimiter) => {
+  const escapedDelim = escapeRegex(delimiter ?? ":");
   return new RegExp(`^(?:[0-9A-F]{2}${escapedDelim}){5}[0-9A-F]{2}$|^(?:[0-9a-f]{2}${escapedDelim}){5}[0-9a-f]{2}$`);
 };
 var cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
@@ -23561,12 +23385,12 @@ function countLines(s) {
 }
 
 // src/action/config-override.ts
-var import_node_fs5 = require("node:fs");
-var import_node_os5 = require("node:os");
-var import_node_path6 = require("node:path");
+var import_node_fs4 = require("node:fs");
+var import_node_os4 = require("node:os");
+var import_node_path5 = require("node:path");
 var import_yaml2 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
-  const text = (0, import_node_fs5.readFileSync)(input.userConfigPath, "utf8");
+  const text = (0, import_node_fs4.readFileSync)(input.userConfigPath, "utf8");
   const parsed = (0, import_yaml2.parse)(text);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   const existingSpoof = config2["spoof"] !== null && typeof config2["spoof"] === "object" && !Array.isArray(config2["spoof"]) ? config2["spoof"] : {};
@@ -23575,20 +23399,26 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
-  const outDir = input.workDir ?? (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)((0, import_node_os5.tmpdir)(), "script-jail-config-"));
-  const configPath = (0, import_node_path6.join)(outDir, "config.yml");
-  (0, import_node_fs5.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  const outDir = input.workDir ?? (0, import_node_fs4.mkdtempSync)((0, import_node_path5.join)((0, import_node_os4.tmpdir)(), "script-jail-config-"));
+  const configPath = (0, import_node_path5.join)(outDir, "config.yml");
+  (0, import_node_fs4.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
   const result = { configPath };
   if (input.yarnrcOverlay !== void 0) {
-    const yarnrcPath = (0, import_node_path6.join)(outDir, ".yarnrc.yml");
-    (0, import_node_fs5.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    const yarnrcPath = (0, import_node_path5.join)(outDir, ".yarnrc.yml");
+    (0, import_node_fs4.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
     result.yarnrcPath = yarnrcPath;
   }
   if (input.pmFlagsJson !== void 0) {
-    const pmFlagsPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pm-flags.json");
-    (0, import_node_fs5.mkdirSync)((0, import_node_path6.dirname)(pmFlagsPath), { recursive: true });
-    (0, import_node_fs5.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    const pmFlagsPath = (0, import_node_path5.join)(outDir, "etc", "script-jail", "pm-flags.json");
+    (0, import_node_fs4.mkdirSync)((0, import_node_path5.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs4.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
     result.pmFlagsPath = pmFlagsPath;
+  }
+  if (input.pnpmArchOverlay !== void 0) {
+    const pnpmArchPath = (0, import_node_path5.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
+    (0, import_node_fs4.mkdirSync)((0, import_node_path5.dirname)(pnpmArchPath), { recursive: true });
+    (0, import_node_fs4.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
+    result.pnpmArchPath = pnpmArchPath;
   }
   return result;
 }
@@ -23602,7 +23432,7 @@ async function runAudit(input) {
     hostArch: input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
-  const scratchDir = (0, import_node_fs6.mkdtempSync)((0, import_node_path7.join)(input.workDir, "script-jail-config-"));
+  const scratchDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(input.workDir, "script-jail-config-"));
   let result;
   let overlay = null;
   try {
@@ -23617,26 +23447,32 @@ async function runAudit(input) {
       },
       workDir: scratchDir,
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
-      ...archOverlay.pmFlagsJson !== void 0 ? { pmFlagsJson: archOverlay.pmFlagsJson } : {}
+      ...archOverlay.pmFlagsJson !== void 0 ? { pmFlagsJson: archOverlay.pmFlagsJson } : {},
+      ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}
     });
     const extraRepoOverlayFiles = [];
     if (effectiveConfig.yarnrcPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: ".yarnrc.yml",
-        content: (0, import_node_fs6.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
+        content: (0, import_node_fs5.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
       });
     }
     if (effectiveConfig.pmFlagsPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pm-flags.json",
-        content: (0, import_node_fs6.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+        content: (0, import_node_fs5.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+      });
+    }
+    if (effectiveConfig.pnpmArchPath !== void 0) {
+      extraRepoOverlayFiles.push({
+        relPath: "etc/script-jail/pnpm-arch.json",
+        content: (0, import_node_fs5.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
     overlay = await doMakeOverlay({
       baseRootfsPath: input.baseRootfsPath,
       repoSrcPath: input.repoDir,
       configPath: effectiveConfig.configPath,
-      hostNodePrefix: input.hostNodePrefix,
       extraRepoOverlayFiles
     });
     result = await input.launch(overlay);
@@ -23653,7 +23489,7 @@ async function runAudit(input) {
     }
   }
   if (input.mode === "update") {
-    (0, import_node_fs6.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
+    (0, import_node_fs5.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
     input.io.stderr.write(
       `[script-jail] wrote ${Buffer.byteLength(result.finalYaml, "utf8")} bytes to ${input.lockPath}
 `
@@ -23662,7 +23498,7 @@ async function runAudit(input) {
     input.io.setOutput?.("diff", "");
     return { exitCode: 0 };
   }
-  const committed = (0, import_node_fs6.existsSync)(input.lockPath) ? (0, import_node_fs6.readFileSync)(input.lockPath, "utf8") : "";
+  const committed = (0, import_node_fs5.existsSync)(input.lockPath) ? (0, import_node_fs5.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
   const diff = renderDiff({
     lockPath: lockLabel,
@@ -23690,8 +23526,8 @@ async function runAudit(input) {
   return { exitCode: diff.match ? 0 : 1 };
 }
 function relativeForDisplay(absPath, repoDir) {
-  const rel = (0, import_node_path7.relative)(repoDir, absPath);
-  if (rel.startsWith("..") || (0, import_node_path7.isAbsolute)(rel)) return absPath;
+  const rel = (0, import_node_path6.relative)(repoDir, absPath);
+  if (rel.startsWith("..") || (0, import_node_path6.isAbsolute)(rel)) return absPath;
   return rel;
 }
 
@@ -23722,7 +23558,7 @@ var VSOCK_PORT = 10242;
 var DEFAULT_VCPU_COUNT = 2;
 var DEFAULT_MEMORY_MB = 2048;
 var DEFAULT_UBUNTU_MAJOR = "24.04";
-var DEFAULT_KERNEL_CMDLINE = "reboot=k panic=1 pci=off init=/sbin/init.sh quiet";
+var DEFAULT_KERNEL_CMDLINE = "console=hvc0 root=/dev/vda rw rootfstype=ext4 reboot=k panic=1 init=/sbin/init sj_net=dhcp sj_vsock=connect";
 async function run(deps = {}) {
   const argv = deps.argv ?? process.argv.slice(2);
   const cwd = (deps.cwd ?? (() => process.cwd()))();
@@ -23735,7 +23571,6 @@ async function run(deps = {}) {
   const doDetectPm = deps.detectPm ?? detectPm;
   const doSpawnVm = deps.spawnVm ?? spawnVm;
   const doMakeOverlay = deps.makeOverlay ?? makeOverlay;
-  const doResolveHostNodePrefix = deps.resolveHostNodePrefix ?? resolveHostNodePrefix;
   const doRunAudit = deps.runAudit ?? runAudit;
   const doBuildArchFlagOverlay = deps.buildArchFlagOverlay ?? buildArchFlagOverlay;
   const args = parseArgs(argv);
@@ -23765,9 +23600,9 @@ async function run(deps = {}) {
     }
     throw err;
   }
-  const configPath = (0, import_node_path8.resolve)(cwd, args.configPath);
-  const lockPath = (0, import_node_path8.resolve)(cwd, args.lockPath);
-  const subcommand = args.subcommand ?? ((0, import_node_fs7.existsSync)(lockPath) ? "check" : "init");
+  const configPath = (0, import_node_path7.resolve)(cwd, args.configPath);
+  const lockPath = (0, import_node_path7.resolve)(cwd, args.lockPath);
+  const subcommand = args.subcommand ?? ((0, import_node_fs6.existsSync)(lockPath) ? "check" : "init");
   const mode = subcommand === "check" ? "check" : "update";
   let pm;
   try {
@@ -23791,18 +23626,7 @@ async function run(deps = {}) {
     hostArch: host.hostArch,
     ubuntuMajor: DEFAULT_UBUNTU_MAJOR
   });
-  let hostNodePrefix;
-  try {
-    hostNodePrefix = doResolveHostNodePrefix();
-  } catch (err) {
-    if (err instanceof Error) {
-      stderr.write(`script-jail: ${err.message}
-`);
-      return 1;
-    }
-    throw err;
-  }
-  if (deps.makeOverlay === void 0 && !(0, import_node_fs7.existsSync)(artifacts.rootfsPath)) {
+  if (deps.makeOverlay === void 0 && !(0, import_node_fs6.existsSync)(artifacts.rootfsPath)) {
     const buildHint = host.hostArch === "arm64" ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64` : `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR}`;
     stderr.write(
       `script-jail: rootfs not found at ${artifacts.rootfsPath}. Run \`${buildHint}\` (or fetch the release artifact) to produce it.
@@ -23813,15 +23637,18 @@ async function run(deps = {}) {
   const launch = async (overlay) => {
     const vmConfig = {
       kernelPath: artifacts.kernelPath,
-      kernelCmdline: DEFAULT_KERNEL_CMDLINE,
+      // Append the host wall clock as `sj_epoch=<unix-seconds>`.  A fresh VZ
+      // microVM boots at 1970-01-01; a 1970 clock fails TLS certificate
+      // validation and breaks Phase A's `vp env install` / `pnpm fetch`
+      // HTTPS downloads.  init.sh reads the marker and runs `date -s`.
+      kernelCmdline: `${DEFAULT_KERNEL_CMDLINE} sj_epoch=${Math.floor(Date.now() / 1e3)}`,
       rootfsDiskPath: overlay.rootfsCopyPath,
       repoDiskPath: overlay.repoDiskPath,
-      hostNodeDiskPath: overlay.hostNodeDiskPath,
       // VZ does not consume a UDS path (the listener lives in-process) but
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs
       // distinguish it from any real UDS.
-      vsockUdsPath: (0, import_node_path8.resolve)(overlay.workDir, "vsock.sock"),
+      vsockUdsPath: (0, import_node_path7.resolve)(overlay.workDir, "vsock.sock"),
       vsockPort: VSOCK_PORT,
       vcpuCount: DEFAULT_VCPU_COUNT,
       memoryMb: DEFAULT_MEMORY_MB,
@@ -23853,12 +23680,11 @@ async function run(deps = {}) {
       // an x64 dev box without monkey-patching process.arch.
       hostArch: host.hostArch,
       baseRootfsPath: artifacts.rootfsPath,
-      hostNodePrefix,
       // os.tmpdir() — never `cwd` — so the rewritten config YAML and any
       // arch-flag sidecars (.yarnrc.yml / pm-flags.json) cannot pollute
       // the user's repo.  runAudit creates a private mkdtemp dir under
       // this parent and removes it in `finally` even on crash.
-      workDir: (0, import_node_os6.tmpdir)(),
+      workDir: (0, import_node_os5.tmpdir)(),
       launch,
       io: {
         warn: warn2,
@@ -23899,11 +23725,11 @@ function resolveScriptJailRoot(cwd) {
   }
   if (here === "") return cwd;
   const candidates = [
-    (0, import_node_path8.resolve)((0, import_node_path8.dirname)((0, import_node_path8.dirname)(here))),
-    (0, import_node_path8.resolve)((0, import_node_path8.dirname)((0, import_node_path8.dirname)((0, import_node_path8.dirname)(here))))
+    (0, import_node_path7.resolve)((0, import_node_path7.dirname)((0, import_node_path7.dirname)(here))),
+    (0, import_node_path7.resolve)((0, import_node_path7.dirname)((0, import_node_path7.dirname)((0, import_node_path7.dirname)(here))))
   ];
   for (const c of candidates) {
-    if ((0, import_node_fs7.existsSync)((0, import_node_path8.join)(c, "package.json"))) return c;
+    if ((0, import_node_fs6.existsSync)((0, import_node_path7.join)(c, "package.json"))) return c;
   }
   return cwd;
 }

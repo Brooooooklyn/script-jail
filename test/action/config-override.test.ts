@@ -76,6 +76,7 @@ describe('buildEffectiveConfig', () => {
     expect(result.configPath.startsWith(workDir)).toBe(true);
     expect(result.yarnrcPath).toBeUndefined();
     expect(result.pmFlagsPath).toBeUndefined();
+    expect(result.pnpmArchPath).toBeUndefined();
 
     const parsed = parseYaml(readFileSync(result.configPath, 'utf8')) as Record<string, unknown>;
     expect(parsed['spoof']).toEqual({ platform: 'darwin', arch: 'arm64' });
@@ -217,5 +218,30 @@ describe('buildEffectiveConfig', () => {
     expect((result.pmFlagsPath as string)).toMatch(/etc\/script-jail\/pm-flags\.json$/);
     const parsed = JSON.parse(readFileSync(result.pmFlagsPath as string, 'utf8')) as Record<string, unknown>;
     expect(parsed).toEqual(flags);
+  });
+
+  it('writes pnpm-arch.json under etc/script-jail/ when pnpmArchOverlay is provided', () => {
+    writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
+
+    const overlay =
+      '{\n' +
+      '  "supportedArchitectures": {\n' +
+      '    "os": ["linux"],\n' +
+      '    "cpu": ["x64"],\n' +
+      '    "libc": ["glibc"]\n' +
+      '  }\n' +
+      '}\n';
+    const result = buildEffectiveConfig({
+      userConfigPath,
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      workDir,
+      pnpmArchOverlay: overlay,
+    });
+
+    expect(result.pnpmArchPath).toBeDefined();
+    expect((result.pnpmArchPath as string).startsWith(workDir)).toBe(true);
+    expect((result.pnpmArchPath as string)).toMatch(/etc\/script-jail\/pnpm-arch\.json$/);
+    // Written verbatim — byte-stable hand-formatted JSON.
+    expect(readFileSync(result.pnpmArchPath as string, 'utf8')).toBe(overlay);
   });
 });

@@ -12,29 +12,55 @@
 //       - --ignore-scripts suppresses scripts in phase A so we can audit
 //         them separately in the offline phase B.
 //
-//   pnpm: `pnpm fetch`
-//     Fetches tarballs to the store without linking — node_modules stays
-//     empty after Phase A.  Phase B's `pnpm install --frozen-lockfile
-//     --offline` then materialises node_modules and runs lifecycle scripts.
-//     Because pnpm does NOT create node_modules in Phase A, the agent's
-//     `discoverPkgDirs` call is deliberately deferred until AFTER Phase B
-//     completes (see agent.ts).
+//   pnpm: `pnpm install --frozen-lockfile --ignore-scripts`
+//     Materialises node_modules from the lockfile with network ON.
+//     `--ignore-scripts` is REQUIRED: it suppresses every lifecycle script
+//     in Phase A so they can all be re-run under strace in Phase B.
+//
+//     We deliberately do NOT use `pnpm fetch` here.  `pnpm fetch` only
+//     populates the content-addressed store and builds the *virtual* store;
+//     a subsequent `pnpm install --offline` then just links the top-level
+//     node_modules and runs the REPO's own scripts — it never re-runs
+//     DEPENDENCY build scripts, because the virtual store is already built.
+//     That produced an audit which observed ZERO dependency lifecycle
+//     scripts (an empty lockfile for any real monorepo).  Mirroring npm
+//     (`npm ci --ignore-scripts` → `npm rebuild`), Phase A now does a full
+//     scriptless install and Phase B runs `pnpm rebuild` so every dependency
+//     build script executes under strace.  `--config.side-effects-cache=false`
+//     keeps pnpm from caching built artifacts so Phase B always re-runs the
+//     scripts fresh.
 //
 //   yarn: `yarn install --immutable --mode=skip-build`
 //     Fetches and links packages but skips lifecycle script execution.
 //     Phase B runs `yarn install --immutable --offline` which re-links and
 //     triggers scripts (or yarn rebuild if needed).
 //
-// pm-flags.json (arch-resolution hints):
-//   The macOS CLI may land /etc/script-jail/pm-flags.json containing
-//   { "extra_install_args": ["--cpu=x64", "--os=linux", "--libc=glibc"] }.
-//   These flags affect *dependency resolution*, which npm and pnpm do during
-//   Phase A — so they MUST be appended here (not in Phase B, where the tree
-//   is already resolved).  yarn does not accept these CLI flags; the
-//   equivalent overlay is a `.yarnrc.yml` `supportedArchitectures` block
-//   materialised by the CLI on the repo disk before the VM boots — so we
-//   skip yarn here.
+// Arch-resolution hints (forcing Linux/x64 resolution from an arm64 host):
+//   Each package manager has a DIFFERENT mechanism and they are applied at
+//   different layers — there is no single CLI form that works everywhere:
+//
+//   * npm  — /etc/script-jail/pm-flags.json holds
+//            { "extra_install_args": ["--cpu=x64","--os=linux","--libc=glibc"] }.
+//            npm honours these as `npm ci` flags and resolves the dependency
+//            graph during Phase A, so they MUST be appended here (Phase B is
+//            too late — the tree is already resolved).
+//
+//   * pnpm — pnpm does NOT accept --cpu/--os/--libc on the CLI (`pnpm
+//            install --cpu=x64` fails with "Unknown options: 'cpu', 'os',
+//            'libc'").  Its mechanism is a `pnpm.supportedArchitectures`
+//            block in the repo's root package.json.  `pnpm install` reads
+//            that block and picks the platform variants to resolve and
+//            download — so the guest merges it into package.json HERE,
+//            before `pnpm install` runs.  See `apply-pnpm-arch.ts`.
+//
+//   * yarn — Berry reads `supportedArchitectures` from a `.yarnrc.yml` the
+//            CLI lands on the repo disk before the VM boots; nothing to do
+//            here.
+//
+//   All three overlay files are OPTIONAL: only the macOS CLI stages them and
+//   only on an arm64 host.  Absence is the normal action path.
 
+import { applyPnpmArchOverlay } from './apply-pnpm-arch.js';
 import { loadPmFlags } from './load-pm-flags.js';
 
 export interface Spawner {
@@ -51,16 +77,22 @@ export interface PhaseFetchInput {
   env: NodeJS.ProcessEnv;
   spawner: Spawner;
   /**
-   * Optional override for the pm-flags.json path.  Defaults to
+   * Optional override for the pm-flags.json path (npm only).  Defaults to
    * `/etc/script-jail/pm-flags.json` via `loadPmFlags()`.  Exposed so unit
    * tests can stub the file location without mocking the filesystem.
    */
   pmFlagsPath?: string;
+  /**
+   * Optional override for the pnpm-arch.json path (pnpm only).  Defaults to
+   * `/etc/script-jail/pnpm-arch.json` via `applyPnpmArchOverlay()`.  Exposed
+   * so unit tests can stub the file location.
+   */
+  pnpmArchPath?: string;
 }
 
 const FETCH_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
   npm:  { cmd: 'npm',  args: ['ci', '--ignore-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['fetch'] },
+  pnpm: { cmd: 'pnpm', args: ['install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false'] },
   yarn: { cmd: 'yarn', args: ['install', '--immutable', '--mode=skip-build'] },
 };
 
@@ -69,18 +101,24 @@ export async function runFetchPhase(
 ): Promise<{ ok: boolean; stderr: string }> {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
 
-  // Append pm-flags.json extras for npm / pnpm (yarn uses .yarnrc.yml overlay
-  // landed by the CLI; no equivalent CLI form exists).  Order: <pm> <subcmd>
-  // <baseArgs> <extra_install_args>.  Extras go last so they appear after the
-  // fixed flags — package-manager argv parsers all treat trailing repeated
-  // flags as overriding earlier ones, but here we never conflict with
-  // baseArgs anyway (none of `ci` / `fetch` / `install` accept --cpu/--os).
+  // npm: append pm-flags.json extras (`--cpu/--os/--libc`) to `npm ci`.
+  // Order: npm ci <baseArgs> <extra_install_args>.  Extras go last so they
+  // appear after the fixed flags — they never conflict with `ci`'s flags.
   let args = baseArgs;
-  if (input.manager === 'npm' || input.manager === 'pnpm') {
+  if (input.manager === 'npm') {
     const { extraInstallArgs } = loadPmFlags(input.pmFlagsPath);
     if (extraInstallArgs.length > 0) {
       args = [...baseArgs, ...extraInstallArgs];
     }
+  }
+
+  // pnpm: pnpm rejects --cpu/--os/--libc on the CLI, so the arch hint is a
+  // `pnpm.supportedArchitectures` block merged into the repo's package.json
+  // BEFORE `pnpm install` runs (install reads that block to pick which
+  // platform variants to resolve and download).  No-op when the overlay file
+  // is absent (the normal action path) — see apply-pnpm-arch.ts.
+  if (input.manager === 'pnpm') {
+    applyPnpmArchOverlay({ cwd: input.cwd, ...(input.pnpmArchPath !== undefined ? { overlayPath: input.pnpmArchPath } : {}) });
   }
 
   // For pnpm: force the content-addressed store onto the repo overlay

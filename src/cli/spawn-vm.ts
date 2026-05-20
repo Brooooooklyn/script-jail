@@ -54,8 +54,6 @@ export interface VmConfig {
   rootfsDiskPath: string;
   /** Per-run repo ext4 (output of `makeOverlay()`). */
   repoDiskPath: string;
-  /** Per-run host-node ext4 (output of `makeOverlay()`). */
-  hostNodeDiskPath: string;
   /**
    * vsock UDS path.  Kept in the payload for parity with the Linux runner
    * (where the listener IS a UDS); on macOS the helper's listener lives
@@ -290,7 +288,6 @@ interface VmConfigJson {
   kernel_cmdline: string;
   rootfs_disk_path: string;
   repo_disk_path: string;
-  host_node_disk_path: string;
   vsock_uds_path: string;
   vsock_port: number;
   vcpu_count: number;
@@ -305,7 +302,6 @@ export function toJsonPayload(cfg: VmConfig): VmConfigJson {
     kernel_cmdline: cfg.kernelCmdline,
     rootfs_disk_path: cfg.rootfsDiskPath,
     repo_disk_path: cfg.repoDiskPath,
-    host_node_disk_path: cfg.hostNodeDiskPath,
     vsock_uds_path: cfg.vsockUdsPath,
     vsock_port: cfg.vsockPort,
     vcpu_count: cfg.vcpuCount,

@@ -29,7 +29,6 @@ import { randomBytes } from 'node:crypto';
 import { parseInputs } from './action/inputs.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
-import { resolveHostNodePrefix } from './action/host-node-prefix.js';
 import { warn } from './action/log.js';
 import { maybeClearCache } from './action/cache.js';
 import {
@@ -208,9 +207,9 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   });
 
   // The rootfs image is keyed by runner image (e.g. rootfs-ubuntu-24.04.ext4)
-  // rather than by (node-major, package-manager): Node is bind-mounted from
-  // the host (Task #12), so the rootfs only needs to match the host's
-  // glibc / shared-library set.
+  // rather than by (node-major, package-manager): the Node toolchain is
+  // downloaded inside the guest at boot via `vp env install`, so the rootfs
+  // only needs to match a stable glibc / shared-library set.
   const baseRootfsPath = join(
     imagesDir,
     `rootfs-${runnerImage}.ext4`,
@@ -249,19 +248,6 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     kernelSha256: PINNED_VMLINUX_SHA256,
     http,
   });
-
-  // --- Resolve host-node prefix --------------------------------------------
-  // The rootfs ships no Node binary; we pack the runner's Node install into a
-  // third ext4 disk and mount it at /opt/host-node inside the VM.  Whichever
-  // Node the user's workflow set up (typically via actions/setup-node) is the
-  // Node the audit runs against.
-  //
-  // We deliberately do NOT use `process.execPath` here.  This action is wired
-  // as `runs.using: node20`, so `process.execPath` is the GitHub Actions
-  // runner's bundled Node, not the user-selected Node.  `resolveHostNodePrefix`
-  // walks PATH instead (where `actions/setup-node` has prepended its toolcache
-  // bin/ directory) so it finds the right Node.
-  const hostNodePrefix = resolveHostNodePrefix();
 
   // --- Hand off to runAudit -----------------------------------------------
   // The launcher closure below is the host-specific half: spawn Firecracker,
@@ -305,7 +291,6 @@ export async function main(deps: MainDeps = {}): Promise<void> {
         vmlinuxPath,
         rootfsPath: overlay.rootfsCopyPath,
         repoDiskPath: overlay.repoDiskPath,
-        hostNodeDiskPath: overlay.hostNodeDiskPath,
         vsockCid: GUEST_CID,
         vsockUdsPath,
         enableNetwork: true,
@@ -400,7 +385,6 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     // ever ship an arm64 runner image, swap this for runtime detection.
     hostArch: 'x64',
     baseRootfsPath,
-    hostNodePrefix,
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,

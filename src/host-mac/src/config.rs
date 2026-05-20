@@ -25,7 +25,6 @@ pub struct VmConfig {
     pub kernel_cmdline: String,
     pub rootfs_disk_path: PathBuf,
     pub repo_disk_path: PathBuf,
-    pub host_node_disk_path: PathBuf,
     /// Reserved for parity with the Linux runner (src/action/firecracker/vsock.ts).
     /// VZ does not consume a host UDS path — the listener lives in-process —
     /// but the field travels with the config so consumers don't have to
@@ -145,7 +144,6 @@ mod tests {
               "kernel_cmdline": "console=hvc0",
               "rootfs_disk_path": "/tmp/rootfs.img",
               "repo_disk_path": "/tmp/repo.img",
-              "host_node_disk_path": "/tmp/host-node.img",
               "vsock_uds_path": "/tmp/vsock",
               "vsock_port": 10242,
               "vcpu_count": 2,

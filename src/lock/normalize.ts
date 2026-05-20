@@ -45,6 +45,12 @@ const SYSTEM_NOISE_PREFIXES = [
   '/proc/',
   '/sys/',
   '/dev/',
+  // VP_HOME — the vite-plus-provisioned Node toolchain (node/npm/corepack/
+  // pnpm/yarn) and corepack's package-manager cache.  A lifecycle script that
+  // `require()`s a stdlib module makes Node read its own install tree here;
+  // that is toolchain infrastructure, not a package escape.  See
+  // src/rootfs/init.sh (VP_HOME=/opt/vp).
+  '/opt/vp/',
 ];
 
 export interface NormalizeContext {

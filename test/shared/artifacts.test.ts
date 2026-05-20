@@ -37,9 +37,6 @@ describe('resolveArtifacts — arm64', () => {
     );
   });
 
-  it('host-node staging path lives under images/', () => {
-    expect(arm.hostNodePath).toBe('/Users/test/repo/images/host-node.ext4');
-  });
 });
 
 describe('resolveArtifacts — x64', () => {

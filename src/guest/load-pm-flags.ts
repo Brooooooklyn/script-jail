@@ -2,18 +2,21 @@
 //
 // Loader for /etc/script-jail/pm-flags.json.
 //
-// The macOS CLI (`src/cli/`) lands a `/etc/script-jail/pm-flags.json` file
-// alongside the config when forcing a Linux/x64 install resolution from an
-// arm64 host (npm/pnpm `--cpu=x64 --os=linux --libc=glibc`).  Phase A
-// (`phase-fetch.ts`) reads it here and appends `extra_install_args` to the
-// package manager's fetch/resolve invocation — npm/pnpm resolve their
-// dependency graph during Phase A, so the arch hints must take effect there,
-// NOT during Phase B (`phase-install.ts`) which runs `npm rebuild` /
-// `pnpm install --offline` against the already-resolved tree.
+// NPM ONLY.  The macOS CLI (`src/cli/`) lands `/etc/script-jail/pm-flags.json`
+// when forcing a Linux/x64 install resolution from an arm64 host running
+// **npm**.  npm accepts `--cpu=x64 --os=linux --libc=glibc` as `npm ci`
+// flags; Phase A (`phase-fetch.ts`) reads them here and appends them to the
+// `npm ci` invocation — npm resolves its dependency graph during Phase A, so
+// the arch hints must take effect there, NOT during Phase B
+// (`phase-install.ts`) which runs `npm rebuild` against the already-resolved
+// tree.
 //
-// Yarn does not accept these flags on the CLI; the equivalent overlay is
-// written by the CLI as a `.yarnrc.yml` (`supportedArchitectures`) and is
-// not consulted through this loader.
+// pnpm and yarn do NOT accept `--cpu/--os/--libc` on the CLI and are NOT
+// served by this loader:
+//   * pnpm uses a `pnpm.supportedArchitectures` block merged into the repo's
+//     package.json before Phase A (see `apply-pnpm-arch.ts`).
+//   * yarn Berry uses a `.yarnrc.yml` `supportedArchitectures` overlay landed
+//     by the CLI on the repo disk before the VM boots.
 //
 // Defensive read: the file is optional (the action does not write it, only
 // the macOS CLI does).  Missing-file / parse-failure / schema-mismatch all

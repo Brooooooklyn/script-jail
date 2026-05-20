@@ -22,8 +22,9 @@
 //        it unconditionally in both entries so the second the action ever
 //        targets arm64 it does the right thing — no parity-test escape.
 //
-//     3. `extraRepoOverlayFiles` (.yarnrc.yml + etc/script-jail/pm-flags.json)
-//        threading through makeOverlay.  Action did not thread these.
+//     3. `extraRepoOverlayFiles` (.yarnrc.yml + etc/script-jail/pm-flags.json
+//        + etc/script-jail/pnpm-arch.json) threading through makeOverlay.
+//        Action did not thread these.
 //        Same reasoning: keeping the wiring identical means we cannot ship
 //        an arm64-targeting Action that silently drops the overlay.
 //
@@ -123,8 +124,6 @@ export interface RunAuditInput {
   hostArch: 'x64' | 'arm64';
   /** Absolute path to the base rootfs ext4. */
   baseRootfsPath: string;
-  /** Absolute path to the runner's Node install prefix. */
-  hostNodePrefix: string;
   /**
    * PARENT directory under which runAudit creates its private per-run
    * scratch dir (via `mkdtempSync`).  The scratch dir holds the rewritten
@@ -212,6 +211,9 @@ export async function runAudit(
       ...(archOverlay.pmFlagsJson !== undefined
         ? { pmFlagsJson: archOverlay.pmFlagsJson }
         : {}),
+      ...(archOverlay.pnpmArchOverlay !== undefined
+        ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay }
+        : {}),
     });
 
     // 4. Assemble extraRepoOverlayFiles.  Mirrors src/cli/index.ts pre-
@@ -232,13 +234,18 @@ export async function runAudit(
         content: readFileSync(effectiveConfig.pmFlagsPath, 'utf8'),
       });
     }
+    if (effectiveConfig.pnpmArchPath !== undefined) {
+      extraRepoOverlayFiles.push({
+        relPath: 'etc/script-jail/pnpm-arch.json',
+        content: readFileSync(effectiveConfig.pnpmArchPath, 'utf8'),
+      });
+    }
 
-    // 5. Build per-run overlay (rootfs + repo + host-node ext4 disks).
+    // 5. Build per-run overlay (rootfs + repo ext4 disks).
     overlay = await doMakeOverlay({
       baseRootfsPath: input.baseRootfsPath,
       repoSrcPath: input.repoDir,
       configPath: effectiveConfig.configPath,
-      hostNodePrefix: input.hostNodePrefix,
       extraRepoOverlayFiles,
     });
 

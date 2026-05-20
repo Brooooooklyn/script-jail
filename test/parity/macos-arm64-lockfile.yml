@@ -1,0 +1,466 @@
+schema_version: 1
+manager: pnpm
+manager_lockfile_sha256: ""
+node_version: 24.15.0
+generated_at: 2026-05-20T12:36:45.321Z
+packages:
+  "@swc/core@1.15.33":
+    lifecycle:
+      postinstall:
+        external_reads:
+          - $NODE_MODULES
+          - $NODE_MODULES/.pnpm
+          - $NODE_MODULES/.pnpm/@swc+core-linux-x64-gnu@1.15.33
+          - $NODE_MODULES/.pnpm/@swc+core-linux-x64-gnu@1.15.33/node_modules
+          - $NODE_MODULES/.pnpm/@swc+core-linux-x64-gnu@1.15.33/node_modules/@swc
+          - $NODE_MODULES/.pnpm/@swc+core-linux-x64-gnu@1.15.33/node_modules/@swc/core-linux-x64-gnu
+          - $NODE_MODULES/.pnpm/@swc+core-linux-x64-gnu@1.15.33/node_modules/@swc/core-linux-x64-gnu/swc.linux-x64-gnu.node
+          - $NODE_MODULES/.pnpm/@swc+core@1.15.33
+          - $NODE_MODULES/.pnpm/@swc+core@1.15.33/node_modules
+          - $NODE_MODULES/.pnpm/@swc+core@1.15.33/node_modules/@swc
+          - $NODE_MODULES/.pnpm/@swc+core@1.15.33/node_modules/@swc/core-linux-x64-gnu
+          - $NODE_MODULES/.pnpm/@swc+core@1.15.33/node_modules/@swc/core-linux-x64-gnu/package.json
+          - $NODE_MODULES/.pnpm/@swc+core@1.15.33/node_modules/@swc/core-linux-x64-gnu/swc.linux-x64-gnu.node
+          - $NODE_MODULES/.pnpm/node_modules
+          - $REPO
+          - $REPO/package.json
+          - /etc/ssl/openssl.cnf
+          - /usr
+          - /usr/bin/ldd
+          - /usr/local
+          - /usr/local/lib
+        escaped_writes:
+          - $TMPDIR/<hash>/<hash>.jsonl
+        env_read:
+          - COREPACK_ENABLE_DOWNLOAD_PROMPT
+          - COREPACK_HOME
+          - COREPACK_ROOT
+          - FORCE_COLOR
+          - HOME
+          - ICU_TIMEZONE_FILES_DIR
+          - INIT_CWD
+          - LANG
+          - LC_ALL
+          - LC_MESSAGES
+          - LD_PRELOAD
+          - NAPI_RS_FORCE_WASI
+          - NODE
+          - NODE_CHANNEL_FD
+          - NODE_COMPILE_CACHE
+          - NODE_DEBUG
+          - NODE_DEBUG_NATIVE
+          - NODE_EXTRA_CA_CERTS
+          - NODE_ICU_DATA
+          - NODE_NO_WARNINGS
+          - NODE_OPTIONS
+          - NODE_PATH
+          - NODE_PENDING_DEPRECATION
+          - NODE_PRESERVE_SYMLINKS
+          - NODE_PRESERVE_SYMLINKS_MAIN
+          - NODE_REDIRECT_WARNINGS
+          - NODE_UNIQUE_ID
+          - NODE_USE_ENV_PROXY
+          - NODE_USE_SYSTEM_CA
+          - NODE_V8_COVERAGE
+          - OPENSSL_CONF
+          - OPENSSL_armcap
+          - PATH
+          - PNPM_SCRIPT_SRC_DIR
+          - PWD
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_LOG_FILE
+          - SCRIPT_JAIL_NODE_OPTIONS
+          - SCRIPT_JAIL_PRELOAD_PATH
+          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
+          - SCRIPT_JAIL_SPOOF_ARCH
+          - SCRIPT_JAIL_SPOOF_PLATFORM
+          - SWC_BINARY_PATH
+          - TERM
+          - TMPDIR
+          - VP_HOME
+          - WATCH_REPORT_DEPENDENCIES
+          - npm_command
+          - npm_config__jsr_registry
+          - npm_config_catalog
+          - npm_config_dedupe_peers
+          - npm_config_frozen_lockfile
+          - npm_config_globalconfig
+          - npm_config_node_gyp
+          - npm_config_npm_globalconfig
+          - npm_config_peer_dependency_rules
+          - npm_config_pending
+          - npm_config_registry
+          - npm_config_side_effects_cache
+          - npm_config_store_dir
+          - npm_config_user_agent
+          - npm_config_verify_deps_before_run
+          - npm_execpath
+          - npm_lifecycle_event
+          - npm_lifecycle_script
+          - npm_node_execpath
+          - npm_package_engines_node
+          - npm_package_json
+          - npm_package_name
+          - npm_package_version
+          - pnpm_config_verify_deps_before_run
+          - sj_epoch
+          - sj_net
+          - sj_vsock
+        spawn_attempts:
+          - node postinstall.js
+          - sh -c node postinstall.js
+          - sh -c npm install --no-save --loglevel=error --prefer-offline --no-audit --progress=false @swc/wasm@1.15.33
+        spawn_blocked:
+          - <ENOENT> sh -c node postinstall.js
+        dlopen_attempts:
+          - <BLOCKED> $NODE_MODULES/.pnpm/@swc+core-linux-x64-gnu@1.15.33/node_modules/@swc/core-linux-x64-gnu/swc.linux-x64-gnu.node
+        network_attempts: []
+  esbuild@0.28.0:
+    lifecycle:
+      postinstall:
+        external_reads:
+          - $NODE_MODULES
+          - $NODE_MODULES/.pnpm
+          - $NODE_MODULES/.pnpm/@esbuild+linux-x64@0.28.0
+          - $NODE_MODULES/.pnpm/@esbuild+linux-x64@0.28.0/node_modules
+          - $NODE_MODULES/.pnpm/@esbuild+linux-x64@0.28.0/node_modules/@esbuild
+          - $NODE_MODULES/.pnpm/@esbuild+linux-x64@0.28.0/node_modules/@esbuild/linux-x64
+          - $NODE_MODULES/.pnpm/@esbuild+linux-x64@0.28.0/node_modules/@esbuild/linux-x64/bin
+          - $NODE_MODULES/.pnpm/@esbuild+linux-x64@0.28.0/node_modules/@esbuild/linux-x64/bin/esbuild
+          - $NODE_MODULES/.pnpm/esbuild@0.28.0
+          - $NODE_MODULES/.pnpm/esbuild@0.28.0/node_modules
+          - $NODE_MODULES/.pnpm/esbuild@0.28.0/node_modules/@esbuild
+          - $NODE_MODULES/.pnpm/esbuild@0.28.0/node_modules/@esbuild/linux-x64
+          - $NODE_MODULES/.pnpm/esbuild@0.28.0/node_modules/@esbuild/linux-x64/bin/esbuild
+          - $NODE_MODULES/.pnpm/esbuild@0.28.0/node_modules/@esbuild/linux-x64/package.json
+          - $REPO
+          - /etc/ssl/openssl.cnf
+          - /usr
+          - /usr/local
+          - /usr/local/lib
+        escaped_writes:
+          - $TMPDIR/<hash>/<hash>.jsonl
+        env_read:
+          - COREPACK_ENABLE_DOWNLOAD_PROMPT
+          - COREPACK_HOME
+          - COREPACK_ROOT
+          - ESBUILD_BINARY_PATH
+          - FORCE_COLOR
+          - HOME
+          - ICU_TIMEZONE_FILES_DIR
+          - INIT_CWD
+          - LANG
+          - LC_ALL
+          - LC_MESSAGES
+          - LD_PRELOAD
+          - NODE
+          - NODE_CHANNEL_FD
+          - NODE_COMPILE_CACHE
+          - NODE_DEBUG
+          - NODE_DEBUG_NATIVE
+          - NODE_EXTRA_CA_CERTS
+          - NODE_ICU_DATA
+          - NODE_NO_WARNINGS
+          - NODE_OPTIONS
+          - NODE_PATH
+          - NODE_PENDING_DEPRECATION
+          - NODE_PRESERVE_SYMLINKS
+          - NODE_PRESERVE_SYMLINKS_MAIN
+          - NODE_REDIRECT_WARNINGS
+          - NODE_UNIQUE_ID
+          - NODE_USE_ENV_PROXY
+          - NODE_USE_SYSTEM_CA
+          - NODE_V8_COVERAGE
+          - OPENSSL_CONF
+          - OPENSSL_armcap
+          - PATH
+          - PNPM_SCRIPT_SRC_DIR
+          - PWD
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_LOG_FILE
+          - SCRIPT_JAIL_NODE_OPTIONS
+          - SCRIPT_JAIL_PRELOAD_PATH
+          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
+          - SCRIPT_JAIL_SPOOF_ARCH
+          - SCRIPT_JAIL_SPOOF_PLATFORM
+          - TERM
+          - TMPDIR
+          - VP_HOME
+          - WATCH_REPORT_DEPENDENCIES
+          - npm_command
+          - npm_config__jsr_registry
+          - npm_config_catalog
+          - npm_config_dedupe_peers
+          - npm_config_frozen_lockfile
+          - npm_config_globalconfig
+          - npm_config_node_gyp
+          - npm_config_npm_globalconfig
+          - npm_config_peer_dependency_rules
+          - npm_config_pending
+          - npm_config_registry
+          - npm_config_side_effects_cache
+          - npm_config_store_dir
+          - npm_config_user_agent
+          - npm_config_verify_deps_before_run
+          - npm_execpath
+          - npm_lifecycle_event
+          - npm_lifecycle_script
+          - npm_node_execpath
+          - npm_package_bin_esbuild
+          - npm_package_engines_node
+          - npm_package_json
+          - npm_package_name
+          - npm_package_version
+          - pnpm_config_verify_deps_before_run
+          - sj_epoch
+          - sj_net
+          - sj_vsock
+        spawn_attempts:
+          - node install.js
+          - sh $PKG/bin/esbuild --version
+        spawn_blocked:
+          - <EACCES> $PKG/bin/esbuild --version
+        dlopen_attempts: []
+        network_attempts: []
+  puppeteer@24.42.0:
+    lifecycle:
+      postinstall:
+        external_reads:
+          - $NODE_MODULES
+          - $NODE_MODULES/.pnpm
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/browser-data.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/chrome-headless-shell.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/chrome.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/types.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/httpUtil.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/launch.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/main.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/package.json
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/semver
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/semver/index.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/semver/package.json
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer/browsers
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer/browsers/lib/esm/main.js
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer/browsers/package.json
+          - $NODE_MODULES/.pnpm/semver@7.7.4
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/index.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/package.json
+          - $REPO
+          - /etc/ssl/openssl.cnf
+          - /usr
+          - /usr/local
+          - /usr/local/lib
+        escaped_writes:
+          - $TMPDIR/<hash>/<hash>.jsonl
+        env_read:
+          - FORCE_COLOR
+          - HOME
+          - ICU_TIMEZONE_FILES_DIR
+          - LANG
+          - LC_ALL
+          - LC_MESSAGES
+          - NODE_CHANNEL_FD
+          - NODE_COMPILE_CACHE
+          - NODE_DEBUG
+          - NODE_DEBUG_NATIVE
+          - NODE_EXTRA_CA_CERTS
+          - NODE_ICU_DATA
+          - NODE_NO_WARNINGS
+          - NODE_OPTIONS
+          - NODE_PATH
+          - NODE_PENDING_DEPRECATION
+          - NODE_PRESERVE_SYMLINKS
+          - NODE_PRESERVE_SYMLINKS_MAIN
+          - NODE_REDIRECT_WARNINGS
+          - NODE_UNIQUE_ID
+          - NODE_USE_ENV_PROXY
+          - NODE_USE_SYSTEM_CA
+          - NODE_V8_COVERAGE
+          - OPENSSL_CONF
+          - OPENSSL_armcap
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_LOG_FILE
+          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
+          - SCRIPT_JAIL_SPOOF_ARCH
+          - SCRIPT_JAIL_SPOOF_PLATFORM
+          - WATCH_REPORT_DEPENDENCIES
+        spawn_attempts:
+          - node install.mjs
+        spawn_blocked: []
+        dlopen_attempts: []
+        network_attempts: []
+  simple-git-hooks@2.13.1:
+    lifecycle:
+      postinstall:
+        external_reads:
+          - $NODE_MODULES
+          - $NODE_MODULES/.pnpm
+          - $NODE_MODULES/.pnpm/simple-git-hooks@2.13.1
+          - $NODE_MODULES/.pnpm/simple-git-hooks@2.13.1/node_modules
+          - $REPO
+          - $REPO/package.json
+          - /etc/ssl/openssl.cnf
+          - /usr
+          - /usr/local
+          - /usr/local/lib
+        escaped_writes:
+          - $TMPDIR/<hash>/<hash>.jsonl
+        env_read:
+          - COREPACK_ENABLE_DOWNLOAD_PROMPT
+          - COREPACK_HOME
+          - COREPACK_ROOT
+          - HOME
+          - ICU_TIMEZONE_FILES_DIR
+          - INIT_CWD
+          - LANG
+          - LC_ALL
+          - LC_MESSAGES
+          - LD_PRELOAD
+          - NODE
+          - NODE_CHANNEL_FD
+          - NODE_COMPILE_CACHE
+          - NODE_DEBUG
+          - NODE_DEBUG_NATIVE
+          - NODE_EXTRA_CA_CERTS
+          - NODE_ICU_DATA
+          - NODE_NO_WARNINGS
+          - NODE_OPTIONS
+          - NODE_PATH
+          - NODE_PENDING_DEPRECATION
+          - NODE_PRESERVE_SYMLINKS
+          - NODE_PRESERVE_SYMLINKS_MAIN
+          - NODE_REDIRECT_WARNINGS
+          - NODE_UNIQUE_ID
+          - NODE_USE_ENV_PROXY
+          - NODE_USE_SYSTEM_CA
+          - NODE_V8_COVERAGE
+          - OPENSSL_CONF
+          - OPENSSL_armcap
+          - PATH
+          - PNPM_SCRIPT_SRC_DIR
+          - PWD
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_LOG_FILE
+          - SCRIPT_JAIL_NODE_OPTIONS
+          - SCRIPT_JAIL_PRELOAD_PATH
+          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
+          - SCRIPT_JAIL_SPOOF_ARCH
+          - SCRIPT_JAIL_SPOOF_PLATFORM
+          - SKIP_INSTALL_SIMPLE_GIT_HOOKS
+          - TERM
+          - TMPDIR
+          - VP_HOME
+          - WATCH_REPORT_DEPENDENCIES
+          - npm_command
+          - npm_config__jsr_registry
+          - npm_config_catalog
+          - npm_config_dedupe_peers
+          - npm_config_frozen_lockfile
+          - npm_config_globalconfig
+          - npm_config_node_gyp
+          - npm_config_npm_globalconfig
+          - npm_config_peer_dependency_rules
+          - npm_config_pending
+          - npm_config_registry
+          - npm_config_side_effects_cache
+          - npm_config_store_dir
+          - npm_config_user_agent
+          - npm_config_verify_deps_before_run
+          - npm_execpath
+          - npm_lifecycle_event
+          - npm_lifecycle_script
+          - npm_node_execpath
+          - npm_package_bin_simple_git_hooks
+          - npm_package_json
+          - npm_package_name
+          - npm_package_version
+          - pnpm_config_verify_deps_before_run
+          - sj_epoch
+          - sj_net
+          - sj_vsock
+        spawn_attempts:
+          - node ./postinstall.js
+          - sh -c git config --local core.hooksPath
+        spawn_blocked: []
+        dlopen_attempts: []
+        network_attempts: []
+  unrs-resolver@1.11.1:
+    lifecycle:
+      postinstall:
+        external_reads:
+          - $NODE_MODULES
+          - $NODE_MODULES/.pnpm
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/cli.js
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/package.json
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules/napi-postinstall
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules/napi-postinstall/lib/cli.js
+          - $REPO
+          - /etc/ssl/openssl.cnf
+          - /usr
+          - /usr/local
+          - /usr/local/lib
+        escaped_writes:
+          - $TMPDIR/<hash>/<hash>.jsonl
+        env_read:
+          - COLS
+          - HOME
+          - ICU_TIMEZONE_FILES_DIR
+          - LANG
+          - LC_ALL
+          - LC_MESSAGES
+          - NODE_CHANNEL_FD
+          - NODE_COMPILE_CACHE
+          - NODE_DEBUG
+          - NODE_DEBUG_NATIVE
+          - NODE_EXTRA_CA_CERTS
+          - NODE_ICU_DATA
+          - NODE_NO_WARNINGS
+          - NODE_OPTIONS
+          - NODE_PATH
+          - NODE_PENDING_DEPRECATION
+          - NODE_PRESERVE_SYMLINKS
+          - NODE_PRESERVE_SYMLINKS_MAIN
+          - NODE_REDIRECT_WARNINGS
+          - NODE_UNIQUE_ID
+          - NODE_USE_ENV_PROXY
+          - NODE_USE_SYSTEM_CA
+          - NODE_V8_COVERAGE
+          - OPENSSL_CONF
+          - OPENSSL_armcap
+          - POSIXLY_CORRECT
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_LOG_FILE
+          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
+          - SCRIPT_JAIL_SPOOF_ARCH
+          - SCRIPT_JAIL_SPOOF_PLATFORM
+          - WATCH_REPORT_DEPENDENCIES
+        spawn_attempts:
+          - dirname $PKG/node_modules/.bin/napi-postinstall
+          - napi-postinstall unrs-resolver 1.11.1 check
+          - node $PKG/node_modules/.bin/../../../napi-postinstall/lib/cli.js unrs-resolver 1.11.1 check
+          - sed -e s,\\,/,g
+          - sh -c napi-postinstall unrs-resolver 1.11.1 check
+          - uname
+        spawn_blocked:
+          - <ENOENT> node $PKG/node_modules/.bin/../../../napi-postinstall/lib/cli.js unrs-resolver 1.11.1 check
+          - <ENOENT> sh -c napi-postinstall unrs-resolver 1.11.1 check
+        dlopen_attempts: []
+        network_attempts: []

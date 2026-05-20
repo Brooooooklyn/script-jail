@@ -1,13 +1,10 @@
 // script-jail — src/shared/artifacts.ts
 //
-// Pure-helper that maps `(hostArch, ubuntuMajor)` to the four file paths the
+// Pure-helper that maps `(hostArch, ubuntuMajor)` to the file paths the
 // macOS CLI needs in order to boot the audit VM:
 //
 //   - kernelPath           — VZ-compatible kernel image (PR 5 ships this).
 //   - rootfsPath           — Linux ext4 image keyed by Ubuntu major + arch.
-//   - hostNodePath         — REPLACED at run-time by overlay.ts (built per
-//                            invocation from the host runner's Node install).
-//                            Returned here as a hint for documentation only.
 //   - libscriptjailSoPath  — LD_PRELOAD shim, ELF for the guest arch.
 //
 // Path resolution is intentionally PURE: this function never touches the
@@ -31,12 +28,6 @@
 // the kernel/cmdline differ but the disk image is the same OS install.  So
 // we reuse the existing rootfs naming.  PR 5 may revisit if the kernel ABI
 // forces a divergent rootfs.
-//
-// `host-node` is not an artifact — it is built per-run from the user's PATH
-// via `resolveHostNodePrefix()` and packed by `makeOverlay()`.  We still
-// surface the conventional location (`<workDir>/host-node.ext4`) here for
-// callers that want to assemble the VmConfig without re-introducing this
-// path string in two places.
 
 import { join } from 'node:path';
 
@@ -68,21 +59,13 @@ export interface ResolvedArtifacts {
   kernelPath: string;
   /** Absolute path to the rootfs ext4 image for `(hostArch, ubuntuMajor)`. */
   rootfsPath: string;
-  /**
-   * Suggested staging path for the per-run host-node disk.  NOT an artifact:
-   * `makeOverlay()` builds this from the host's PATH on every invocation and
-   * returns the actual path on disk.  Surfaced here so callers that build a
-   * VmConfig in one place can refer to it without hard-coding the filename.
-   */
-  hostNodePath: string;
   /** Absolute path to the libscriptjail.so ELF for `hostArch`. */
   libscriptjailSoPath: string;
 }
 
 /**
  * Which kind of artifact a `manifestKey()` lookup is asking about.  Mirrors
- * the four `ResolvedArtifacts` fields except `hostNodePath` (which is
- * per-run-built and never released).
+ * the `ResolvedArtifacts` fields.
  */
 export type ArtifactKind = 'kernel' | 'rootfs' | 'libscriptjail';
 
@@ -127,10 +110,7 @@ export function resolveArtifacts(input: ArtifactInput): ResolvedArtifacts {
     hostArch === 'x64' ? 'libscriptjail.so' : 'libscriptjail-arm64.so',
   );
 
-  // Not an artifact — see file-level docs.  Returned for documentation.
-  const hostNodePath = join(imagesDir, 'host-node.ext4');
-
-  return { kernelPath, rootfsPath, hostNodePath, libscriptjailSoPath };
+  return { kernelPath, rootfsPath, libscriptjailSoPath };
 }
 
 // ---------------------------------------------------------------------------

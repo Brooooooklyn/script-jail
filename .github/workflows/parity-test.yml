@@ -1,9 +1,20 @@
 # script-jail — .github/workflows/parity-test.yml
 #
 # Verify that the .script-jail.lock.yml produced by the Linux/Firecracker
-# action and the macOS/VZ CLI are byte-equal (modulo the documented
-# `generated_at` / `manager_lockfile_sha256` canonicalisation) for a pinned
-# upstream fixture.
+# action is byte-equal (modulo the documented `generated_at` /
+# `manager_lockfile_sha256` canonicalisation) to the macOS/VZ lockfile for
+# a pinned upstream fixture.
+#
+# WHY THE macOS SIDE IS COMMITTED, NOT GENERATED IN CI:
+#   GitHub-hosted macOS runners are themselves virtualized (Anka) and
+#   Apple's Virtualization.framework does not support nested virtualization,
+#   so the VZ-backed CLI cannot boot a VM in CI.  Instead, a maintainer
+#   generates the macOS lockfile locally on bare-metal Apple hardware and
+#   commits it to `test/parity/macos-arm64-lockfile.yml`.  CI generates the
+#   Linux lockfile fresh on every run and diffs it against that committed
+#   file.  When the fixture pin bumps, the committed lockfile must be
+#   regenerated — see test/parity/macos-arm64-lockfile.yml's header for the
+#   exact local command.
 #
 # Fixture: test/parity/fixture.yml pins vuejs/core at a specific tag + commit
 # SHA — see that file for bump instructions and the rationale for the
@@ -14,13 +25,13 @@
 #   - pull_request paths-filtered to the parity-relevant surface so a PR
 #     touching the CLI, the action's lockfile path, the guest agent, or
 #     the parity infrastructure itself gets the gate.  Other PRs skip it
-#     to keep the routine matrix lean (this workflow takes ~25 min wall
-#     clock).
+#     to keep the routine matrix lean.
 #
 # What this catches:
 #   - Linux-only package selected on macOS (PM-flag overlay bug).
 #   - Different event order between platforms (lock renderer bug).
 #   - Spurious event on one side (audit-policy desync).
+#   - A stale committed macOS lockfile after the Linux audit logic changed.
 #
 # What this does NOT yet filter:
 #   The documented v1 divergence on Apple Silicon — see docs/divergence.md.
@@ -60,8 +71,8 @@ concurrency:
 jobs:
   # ---------------------------------------------------------------------------
   # resolve-fixture — single source of truth for which commit of upstream we
-  # audit.  Both platform jobs read its outputs so the fixture file is read
-  # exactly once.
+  # audit.  The linux-firecracker job reads its outputs so the fixture file
+  # is read exactly once.
   # ---------------------------------------------------------------------------
   resolve-fixture:
     runs-on: ubuntu-latest
@@ -163,15 +174,6 @@ jobs:
       - name: Install deps
         run: pnpm install --frozen-lockfile
 
-      # vuejs/core is a pnpm monorepo, so the agent inside the VM detects
-      # `pnpm` as the manager and tries to exec it.  pnpm/action-setup@v6
-      # installs pnpm under a runner-local path that's NOT under the Node
-      # prefix the host-node disk packs, so without this step the agent
-      # would hit `spawn pnpm ENOENT`.  Install pnpm globally into the Node
-      # prefix that `resolveHostNodePrefix` packs.
-      - name: Install pnpm into Node prefix (for host-node disk packing)
-        run: npm install -g pnpm@11.1.2
-
       # Build the action bundle + the x86_64 rootfs + the shim from THIS
       # branch.  The parity test must run against the code under review,
       # not against whatever's in dist/ or a tagged release.
@@ -232,257 +234,16 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # macos-arm64-vz — run the CLI under real Virtualization.framework against
-  # the same fixture.  This is the macOS-developer happy path: `pnpm exec
-  # script-jail update`.
+  # diff — compare the freshly generated Linux lockfile against the committed
+  # macOS lockfile (test/parity/macos-arm64-lockfile.yml).
   #
-  # KNOWN LIMITATION: GitHub-hosted macOS runners are themselves virtualized
-  # (Anka), and Apple's Virtualization.framework does not support nested
-  # virtualization.  Attempting to start the VM fails with VZErrorDomain
-  # code 2: "Virtualization is not available on this hardware."  We keep
-  # the job in the matrix so the rest of the macOS code path
-  # (entitlement-signing, disk-building via homebrew e2fsprogs, artifact
-  # download, config wiring) still gets exercised, but mark it
-  # `continue-on-error: true` so the overall workflow can complete.  The
-  # `diff` job below is gated on `macos-arm64-vz.result == 'success'`, so
-  # it only fires when this job is run on bare-metal hardware (self-hosted
-  # Mac runner, larger paid runner with bare-metal access, or local dev).
-  # ---------------------------------------------------------------------------
-  macos-arm64-vz:
-    needs: [resolve-fixture, build-mac-arm64-artifacts]
-    runs-on: macos-latest
-    timeout-minutes: 45
-    continue-on-error: true
-    outputs:
-      # Set to 'true' only when the lockfile-upload step actually ran AND
-      # succeeded.  `needs.<job>.result` is unreliable here because a job
-      # with `continue-on-error: true` is reported as `success` to
-      # downstream `needs` references regardless of the actual outcome, so
-      # gating `diff` on `result == 'success'` lets it run when the VM
-      # never booted.  A step `outcome` reflects the literal step state.
-      lockfile_uploaded: ${{ steps.upload_macos_lockfile.outcome == 'success' }}
-    env:
-      SCRIPT_JAIL_E2E_SELF_TEST: '1'
-    steps:
-      - name: Checkout script-jail
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Checkout upstream fixture (${{ needs.resolve-fixture.outputs.repo }}@${{ needs.resolve-fixture.outputs.tag }})
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ needs.resolve-fixture.outputs.repo }}
-          ref: ${{ needs.resolve-fixture.outputs.sha }}
-          path: fixture
-          persist-credentials: false
-
-      # Mirror the linux-firecracker job: strip `.git` so both platforms
-      # feed an identical fixture into the audit and the repo overlay
-      # carries no dead weight.
-      - name: Strip fixture .git before mounting into VM
-        run: rm -rf fixture/.git
-
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11.1.2
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          cache: 'pnpm'
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-
-      - name: Install deps
-        run: pnpm install --frozen-lockfile
-
-      # Same rationale as the linux-firecracker job: vuejs/core is a pnpm
-      # monorepo, the agent invokes `pnpm` inside the VM, and the CLI's
-      # host-node packing only picks up what lives under the Node prefix.
-      - name: Install pnpm into Node prefix (for host-node disk packing)
-        run: npm install -g pnpm@11.1.2
-
-      # The CLI builds two side ext4 disks per run (repo + host-node).  On
-      # macOS we shell out to `mkfs.ext4` from homebrew's e2fsprogs — Docker
-      # is no longer pre-installed on GitHub-hosted macOS runners, so the
-      # legacy Docker-Alpine fallback isn't viable on CI.  The formula is
-      # keg-only, so overlay.ts auto-discovers it under
-      # `$(brew --prefix e2fsprogs)/sbin/mkfs.ext4` without needing PATH edits.
-      - name: Install e2fsprogs (for mkfs.ext4 on macOS)
-        run: brew install e2fsprogs
-
-      # Build the CLI bundle and the host-mac Rust binary.  We build the
-      # binary into place under `target/release/script-jail-vm` — spawn-vm.ts
-      # picks it up automatically.
-      - name: Build CLI bundle + script-jail-vm
-        run: |
-          pnpm build:cli
-          cargo build --release -p script-jail-host-mac
-
-      # Virtualization.framework refuses to instantiate a VM unless the
-      # calling process is code-signed with the
-      # `com.apple.security.virtualization` entitlement (the error is
-      # VZErrorDomain code 2: "the process doesn’t have the entitlement").
-      # Ad-hoc sign (`--sign -`) is sufficient on macOS 14+; the binary
-      # gets a freshly computed SHA-only signature with the entitlement
-      # blob attached.  `--force` overwrites any existing signature so
-      # this is idempotent across cache reuse.
-      - name: Codesign script-jail-vm with VZ entitlement
-        run: |
-          codesign --sign - \
-            --entitlements src/host-mac/script-jail-vm.entitlements \
-            --force \
-            target/release/script-jail-vm
-          codesign --display --entitlements - target/release/script-jail-vm
-
-      # The arm64 rootfs + VZ kernel + arm64 .so are produced by the Linux
-      # release pipeline; the parity workflow doesn't have a pre-published
-      # release to pull from on the branch under test.  Instead, download
-      # them as workflow artifacts from a sibling `build-mac-arm64-artifacts`
-      # job below.
-      #
-      # actions/upload-artifact@v7 computes the LEAST COMMON ANCESTOR of all
-      # uploaded paths (all under `images/`) and strips that prefix from the
-      # archive — so the zip's root contains the bare filenames, NOT
-      # `images/<asset>`.  Download into `images/` so the layout the CLI
-      # expects is reconstructed.
-      - name: Download arm64 VM artifacts (kernel + rootfs + .so)
-        uses: actions/download-artifact@v8
-        with:
-          name: mac-arm64-vm-artifacts
-          path: images
-
-      # Invoke the same `dist/cli.cjs` bundle that the npm package ships
-      # so the parity test exercises the consumer artifact, not the .ts
-      # source.  `working-directory: fixture` matches what a Vue contributor
-      # would actually type (`cd vue-repo && pnpm exec script-jail update`).
-      - name: Run script-jail CLI against fixture
-        working-directory: fixture
-        env:
-          SCRIPT_JAIL_REPO_DIR: ${{ github.workspace }}/fixture
-        run: |
-          node "${{ github.workspace }}/dist/cli.cjs" update \
-            --lock "${{ github.workspace }}/macos-lockfile.yml" \
-            --config "${{ github.workspace }}/.script-jail.yml"
-
-      - name: Upload macOS lockfile
-        id: upload_macos_lockfile
-        uses: actions/upload-artifact@v7
-        with:
-          name: macos-arm64-lockfile
-          path: macos-lockfile.yml
-          if-no-files-found: error
-          retention-days: 7
-
-  # ---------------------------------------------------------------------------
-  # build-mac-arm64-artifacts — the macOS job needs the arm64 rootfs ext4,
-  # the arm64 libscriptjail.so, and the arm64 VZ kernel.  We build them on a
-  # Linux runner (mkfs.ext4 + the rootfs Docker build target the linux/arm64
-  # platform; cross-compile via aarch64-unknown-linux-gnu for the shim; the
-  # kernel build script handles its own cross-compile) and hand them across
-  # to the macOS job via upload-artifact.
-  # ---------------------------------------------------------------------------
-  build-mac-arm64-artifacts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11.1.2
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          cache: 'pnpm'
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-
-      - name: Install kernel build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            flex bison libelf-dev libssl-dev bc \
-            gcc-aarch64-linux-gnu
-
-      - name: Install Rust target (aarch64-linux-gnu)
-        run: rustup target add aarch64-unknown-linux-gnu
-
-      # Cross-compile toolchain split:
-      #   - Rust shim:  cargo-zigbuild + zig (portable across Linux/macOS hosts).
-      #   - Linux kernel: gcc-aarch64-linux-gnu (kbuild expects a real cc, not
-      #     a Rust toolchain).  Installed above with the other kernel deps.
-      - name: Install zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Install pnpm deps
-        run: pnpm install --frozen-lockfile
-
-      # The arm64 rootfs is built via `docker buildx --platform=linux/arm64`
-      # on an x86_64 runner.  Without QEMU binfmt registration the runner
-      # kernel can't execute the arm64 `/bin/sh` (etc.) the buildx steps
-      # invoke, surfacing as `exec /bin/sh: exec format error`.
-      # `docker/setup-qemu-action@v3` registers the binfmt handlers via
-      # `tonistiigi/binfmt` so cross-arch RUN steps work transparently.
-      - name: Register QEMU binfmt handlers (for linux/arm64 build)
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
-
-      # Build the arm64 .so AND the arm64 rootfs in one invocation.
-      # `--shim-arm64` triggers the cross-compile; `--skip-shim` suppresses the
-      # x86_64 shim build (we don't need it on this branch of the workflow);
-      # `--skip-bundle` skips dist/main.cjs (the macOS path doesn't need it).
-      - name: Build arm64 shim + rootfs (ubuntu-24.04)
-        run: pnpm build -- --shim-arm64 --skip-bundle --skip-shim --runner-image=ubuntu-24.04
-
-      - name: Build VZ kernel (arm64)
-        run: bash images/kernel/build.sh --arch=arm64 --force
-
-      - name: Upload arm64 VM artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: mac-arm64-vm-artifacts
-          path: |
-            images/rootfs-ubuntu-24.04-arm64.ext4
-            images/libscriptjail-arm64.so
-            images/vmlinux-vz-arm64
-          if-no-files-found: error
-          retention-days: 1
-
-  # ---------------------------------------------------------------------------
-  # diff — pull both lockfiles, canonicalise volatile fields, and compare.
-  #
-  # Gated on the macOS job's `lockfile_uploaded` output (set only when the
-  # upload step's outcome was `success`) rather than `needs.<job>.result`,
-  # because `continue-on-error: true` causes `result` to be reported as
-  # `success` to downstream needs regardless of the actual outcome — which
-  # otherwise lets diff run when the VM never booted.  On GitHub-hosted
-  # runners VZ doesn't work (no nested virt), so the upload step is never
-  # reached and diff is skipped; on bare-metal hardware (self-hosted Mac
-  # runner, or paid larger runner with bare-metal access), diff fires and
-  # asserts byte-equal lockfiles modulo canonical fields.
+  # The macOS side is NOT generated in CI — GitHub-hosted macOS runners
+  # cannot boot a nested VM (see the file header).  A maintainer regenerates
+  # the committed lockfile locally whenever the fixture pin or the audit
+  # logic changes; this job is the gate that flags a stale commit.
   # ---------------------------------------------------------------------------
   diff:
-    needs: [linux-firecracker, macos-arm64-vz]
-    if: needs.macos-arm64-vz.outputs.lockfile_uploaded == 'true'
+    needs: linux-firecracker
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -506,10 +267,15 @@ jobs:
           name: linux-lockfile
           path: artifacts/linux
 
-      - uses: actions/download-artifact@v8
-        with:
-          name: macos-arm64-lockfile
-          path: artifacts/macos-arm64
+      # The macOS side is the committed file from the repo checkout.  Fail
+      # loudly if it's missing rather than letting parity-diff report a
+      # confusing "missing input" usage error.
+      - name: Assert committed macOS lockfile exists
+        run: |
+          if [ ! -f test/parity/macos-arm64-lockfile.yml ]; then
+            echo "::error::test/parity/macos-arm64-lockfile.yml is missing — regenerate it locally (see its header)."
+            exit 1
+          fi
 
       - name: Run parity diff
         id: diff
@@ -521,9 +287,9 @@ jobs:
           set +e
           pnpm exec oxnode scripts/parity-diff.ts \
             --left  artifacts/linux/linux-lockfile.yml \
-            --right artifacts/macos-arm64/macos-lockfile.yml \
+            --right test/parity/macos-arm64-lockfile.yml \
             --left-label  linux-firecracker \
-            --right-label macos-arm64-vz \
+            --right-label macos-arm64-vz-committed \
             --report parity-report.md
           RC=$?
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
@@ -554,5 +320,5 @@ jobs:
       - name: Fail the workflow on divergence
         if: steps.diff.outputs.rc == '1'
         run: |
-          echo "::error::Linux and macOS lockfiles diverge.  See parity-report artifact for details."
+          echo "::error::Linux and committed macOS lockfiles diverge.  See parity-report artifact for details."
           exit 1

@@ -33,7 +33,6 @@ const isLinux = platform === 'linux';
 
 let testDir: string;
 let repoDir: string;
-let hostNodePrefixDir: string;
 
 beforeEach(() => {
   testDir = mkdtempSync(join(tmpdir(), 'script-jail-overlay-test-'));
@@ -43,11 +42,6 @@ beforeEach(() => {
   // Create a minimal repo structure.
   writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'test' }));
   writeFileSync(join(repoDir, 'index.js'), 'console.log("hello")');
-
-  // Create a minimal host-node prefix structure with a bin/node placeholder.
-  hostNodePrefixDir = join(testDir, 'host-node');
-  mkdirSync(join(hostNodePrefixDir, 'bin'), { recursive: true });
-  writeFileSync(join(hostNodePrefixDir, 'bin', 'node'), '#!/bin/sh\nexit 0\n');
 });
 
 afterEach(() => {
@@ -174,7 +168,6 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       baseRootfsPath,
       repoSrcPath: repoDir,
       configPath,
-      hostNodePrefix: hostNodePrefixDir,
       workDir: myWorkDir,
       extraRepoOverlayFiles: [
         { relPath: '.yarnrc.yml', content: 'supportedArchitectures:\n  os:\n    - linux\n' },
@@ -203,7 +196,6 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       baseRootfsPath,
       repoSrcPath: repoDir,
       configPath,
-      hostNodePrefix: hostNodePrefixDir,
     });
 
     try {
@@ -225,7 +217,6 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       baseRootfsPath,
       repoSrcPath: repoDir,
       configPath,
-      hostNodePrefix: hostNodePrefixDir,
     });
 
     const { workDir } = result;
@@ -243,33 +234,12 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       baseRootfsPath,
       repoSrcPath: repoDir,
       configPath,
-      hostNodePrefix: hostNodePrefixDir,
       workDir: customWorkDir,
     });
 
     try {
       expect(result.workDir).toBe(customWorkDir);
       expect(result.rootfsCopyPath).toContain(customWorkDir);
-    } finally {
-      await result.cleanup();
-    }
-  });
-
-  it('returns a hostNodeDiskPath when hostNodePrefix is provided', async () => {
-    const baseRootfsPath = fakeBaseRootfs(testDir);
-    const configPath = fakeConfig(testDir);
-
-    const result = await makeOverlay({
-      baseRootfsPath,
-      repoSrcPath: repoDir,
-      configPath,
-      hostNodePrefix: hostNodePrefixDir,
-    });
-
-    try {
-      expect(result.hostNodeDiskPath).toBeTruthy();
-      expect(result.hostNodeDiskPath).toContain('host-node.ext4');
-      expect(existsSync(result.hostNodeDiskPath)).toBe(true);
     } finally {
       await result.cleanup();
     }
@@ -283,7 +253,6 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       baseRootfsPath,
       repoSrcPath: repoDir,
       configPath,
-      hostNodePrefix: hostNodePrefixDir,
     });
 
     try {

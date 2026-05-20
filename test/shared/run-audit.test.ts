@@ -60,7 +60,6 @@ function stubOverlay(workDir: string, capture?: {
     return {
       rootfsCopyPath: join(workDir, 'rootfs.ext4'),
       repoDiskPath: join(workDir, 'repo.ext4'),
-      hostNodeDiskPath: join(workDir, 'host-node.ext4'),
       workDir,
       cleanup: async () => {
         if (capture !== undefined) capture.cleanups++;
@@ -100,7 +99,6 @@ function baseInput(launch: RunAuditInput['launch'], over: Partial<RunAuditInput>
     pm: 'pnpm',
     hostArch: 'x64',
     baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-    hostNodePrefix: join(testDir, 'host-node-prefix'),
     workDir,
     launch,
     io,
@@ -167,7 +165,6 @@ describe('runAudit — check mode', () => {
       overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
       pm: 'pnpm', hostArch: 'x64',
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-      hostNodePrefix: join(testDir, 'host-node-prefix'),
       launch: async () => ({ finalYaml: yaml, nonFatalWarnings: [] }),
       io: makeIo().io,
       makeOverlay: stubOverlay(workDir),
@@ -187,7 +184,6 @@ describe('runAudit — check mode', () => {
       overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
       pm: 'pnpm', hostArch: 'x64',
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-      hostNodePrefix: join(testDir, 'host-node-prefix'),
       launch: async () => ({ finalYaml: generated, nonFatalWarnings: [] }),
       io,
       makeOverlay: stubOverlay(workDir),
@@ -230,7 +226,6 @@ describe('runAudit — check mode', () => {
       overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
       pm: 'pnpm', hostArch: 'x64',
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-      hostNodePrefix: join(testDir, 'host-node-prefix'),
       launch: async () => ({ finalYaml: yaml, nonFatalWarnings: [] }),
       io,
       makeOverlay: stubOverlay(workDir),
@@ -262,7 +257,6 @@ describe('runAudit — check mode', () => {
       overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
       pm: 'pnpm', hostArch: 'x64',
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-      hostNodePrefix: join(testDir, 'host-node-prefix'),
       launch: async () => ({ finalYaml: yaml, nonFatalWarnings: [] }),
       io,
       makeOverlay: stubOverlay(workDir),
@@ -314,7 +308,6 @@ describe('runAudit — arch-flag overlay fan-out', () => {
       overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
       pm: 'pnpm', hostArch: 'arm64',
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-      hostNodePrefix: join(testDir, 'host-node-prefix'),
       launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
       io: makeIo().io,
       makeOverlay: stubOverlay(workDir, capture),
@@ -327,6 +320,36 @@ describe('runAudit — arch-flag overlay fan-out', () => {
     const extras = capture.calls[0]!.extraRepoOverlayFiles;
     expect(extras).toBeDefined();
     expect(extras!.some((e) => e.relPath === 'etc/script-jail/pm-flags.json')).toBe(true);
+  });
+
+  it('threads pnpmArchOverlay into extraRepoOverlayFiles as etc/script-jail/pnpm-arch.json', async () => {
+    const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
+    const capture = { calls, cleanups: 0 };
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    const archJson =
+      '{\n  "supportedArchitectures": {\n    "os": ["linux"],\n' +
+      '    "cpu": ["x64"],\n    "libc": ["glibc"]\n  }\n}\n';
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'pnpm', hostArch: 'arm64',
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir, capture),
+      buildArchFlagOverlay: () => ({ warnings: [], pnpmArchOverlay: archJson }),
+    });
+    expect(capture.calls).toHaveLength(1);
+    const extras = capture.calls[0]!.extraRepoOverlayFiles;
+    expect(extras).toBeDefined();
+    const archEntry = extras!.find(
+      (e) => e.relPath === 'etc/script-jail/pnpm-arch.json',
+    );
+    expect(archEntry).toBeDefined();
+    // pnpm-style pmFlagsJson must NOT also appear.
+    expect(extras!.some((e) => e.relPath === 'etc/script-jail/pm-flags.json')).toBe(false);
+    expect(archEntry!.content).toBe(archJson);
   });
 });
 
@@ -343,7 +366,6 @@ describe('runAudit — overlay cleanup', () => {
       overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
       pm: 'pnpm', hostArch: 'x64',
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-      hostNodePrefix: join(testDir, 'host-node-prefix'),
       launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
       io: makeIo().io,
       makeOverlay: stubOverlay(workDir, capture),
@@ -363,7 +385,6 @@ describe('runAudit — overlay cleanup', () => {
       overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
       pm: 'pnpm', hostArch: 'x64',
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
-      hostNodePrefix: join(testDir, 'host-node-prefix'),
       launch: async () => { throw new Error('launch boom'); },
       io: makeIo().io,
       makeOverlay: stubOverlay(workDir, capture),

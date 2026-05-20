@@ -51,7 +51,6 @@ import {
   makeOverlay,
   type OverlayResult,
 } from '../action/firecracker/overlay.js';
-import { resolveHostNodePrefix } from '../action/host-node-prefix.js';
 import { runAudit, type LauncherResult } from '../shared/run-audit.js';
 import { buildArchFlagOverlay } from './arch-flags.js';
 
@@ -99,11 +98,30 @@ const DEFAULT_MEMORY_MB = 2048;
  */
 const DEFAULT_UBUNTU_MAJOR = '24.04' as const;
 /**
- * Kernel cmdline mirrors the Firecracker path verbatim; PR 5 may tighten
- * this once the VZ kernel's quirks are characterised.
+ * Kernel cmdline for the VZ runner.  Unlike Firecracker, VZ does not
+ * auto-inject `root=` and its virtio transport rides on PCI — so `pci=off`
+ * would disable the disk/vsock devices.  The rootfs ext4 image is the
+ * first VZ block device (`/dev/vda`) and must be `rw` because the guest
+ * writes to it at runtime; `console=hvc0` routes kernel logs to the
+ * helper's stderr via the virtio console.
+ *
+ * `sj_net=dhcp` tells the guest `init.sh` to DHCP eth0 instead of taking the
+ * Firecracker static 172.16.0.2: VZ's NAT device runs its own DHCP server on
+ * a subnet it picks itself, so static addressing cannot reach Phase A's
+ * network.
+ *
+ * `sj_vsock=connect` tells the guest `orchestrate.sh` to have socat CONNECT
+ * out to the host (well-known CID 2, port 10242) instead of LISTEN: the VZ
+ * host registers a VZVirtioSocketListener and waits for the guest to dial in
+ * (src/host-mac/src/vsock.rs), whereas Firecracker's host VMM connects in to
+ * a guest listener.  Without it both ends listen and the session never opens.
+ *
+ * `sj_epoch=<unix-seconds>` is deliberately NOT part of this constant — its
+ * value changes every run, so it is appended per launch in the launcher
+ * closure below.
  */
 const DEFAULT_KERNEL_CMDLINE =
-  'reboot=k panic=1 pci=off init=/sbin/init.sh quiet';
+  'console=hvc0 root=/dev/vda rw rootfstype=ext4 reboot=k panic=1 init=/sbin/init sj_net=dhcp sj_vsock=connect';
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -137,12 +155,6 @@ export interface CliDeps {
    */
   makeOverlay?: typeof makeOverlay;
   /**
-   * Optional override for the host-node prefix resolution.  Defaults to the
-   * real `resolveHostNodePrefix()`.  Tests inject a fake path because the
-   * resolver walks the host's PATH for a real Node install.
-   */
-  resolveHostNodePrefix?: typeof resolveHostNodePrefix;
-  /**
    * Optional override for the shared audit pipeline.  Production callers
    * do not set this.  Tests use it to short-circuit the entire
    * makeOverlay → launch → diff path when they want to exercise the CLI's
@@ -165,7 +177,6 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   const doDetectPm = deps.detectPm ?? detectPm;
   const doSpawnVm = deps.spawnVm ?? spawnVm;
   const doMakeOverlay = deps.makeOverlay ?? makeOverlay;
-  const doResolveHostNodePrefix = deps.resolveHostNodePrefix ?? resolveHostNodePrefix;
   const doRunAudit = deps.runAudit ?? runAudit;
   // buildArchFlagOverlay is threaded through to runAudit (see below).
   // Captured here so the production default flows through identically to
@@ -236,18 +247,6 @@ export async function run(deps: CliDeps = {}): Promise<number> {
     ubuntuMajor: DEFAULT_UBUNTU_MAJOR,
   });
 
-  // --- Resolve host-node prefix --------------------------------------------
-  let hostNodePrefix: string;
-  try {
-    hostNodePrefix = doResolveHostNodePrefix();
-  } catch (err) {
-    if (err instanceof Error) {
-      stderr.write(`script-jail: ${err.message}\n`);
-      return 1;
-    }
-    throw err;
-  }
-
   // Pre-flight rootfs existence check: surfacing "rootfs not found" before
   // makeOverlay (which would error inside its `cpSync`) gives the user an
   // actionable path.  spawnVm runs the same check via `checkArtifacts` but
@@ -274,10 +273,13 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   const launch = async (overlay: OverlayResult): Promise<LauncherResult> => {
     const vmConfig: VmConfig = {
       kernelPath: artifacts.kernelPath,
-      kernelCmdline: DEFAULT_KERNEL_CMDLINE,
+      // Append the host wall clock as `sj_epoch=<unix-seconds>`.  A fresh VZ
+      // microVM boots at 1970-01-01; a 1970 clock fails TLS certificate
+      // validation and breaks Phase A's `vp env install` / `pnpm fetch`
+      // HTTPS downloads.  init.sh reads the marker and runs `date -s`.
+      kernelCmdline: `${DEFAULT_KERNEL_CMDLINE} sj_epoch=${Math.floor(Date.now() / 1000)}`,
       rootfsDiskPath: overlay.rootfsCopyPath,
       repoDiskPath: overlay.repoDiskPath,
-      hostNodeDiskPath: overlay.hostNodeDiskPath,
       // VZ does not consume a UDS path (the listener lives in-process) but
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs
@@ -326,7 +328,6 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       // an x64 dev box without monkey-patching process.arch.
       hostArch: host.hostArch,
       baseRootfsPath: artifacts.rootfsPath,
-      hostNodePrefix,
       // os.tmpdir() — never `cwd` — so the rewritten config YAML and any
       // arch-flag sidecars (.yarnrc.yml / pm-flags.json) cannot pollute
       // the user's repo.  runAudit creates a private mkdtemp dir under
