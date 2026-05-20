@@ -257,10 +257,7 @@ pub fn build_config(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfigura
     //
     // VZ caps virtio block-device identifiers at 20 bytes, so keep these
     // short.
-    for (device, ident) in [
-        (&rootfs, "script-jail-rootfs"),
-        (&repo, "script-jail-repo"),
-    ] {
+    for (device, ident) in [(&rootfs, "script-jail-rootfs"), (&repo, "script-jail-repo")] {
         if let Err(err) = disks::set_identifier(device, ident) {
             eprintln!("script-jail-vm: warning: set_identifier({ident}) failed: {err}");
         }
@@ -497,7 +494,9 @@ pub fn boot(
             return Err(VmError::Boot("start timed out".into()));
         }
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-            return Err(VmError::Boot("start completion channel disconnected".into()));
+            return Err(VmError::Boot(
+                "start completion channel disconnected".into(),
+            ));
         }
     }
 

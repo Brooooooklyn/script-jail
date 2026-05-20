@@ -162,9 +162,7 @@ fn run() -> u8 {
                                         if attempt == 0 {
                                             continue;
                                         }
-                                        thread::sleep(
-                                            std::time::Duration::from_millis(50),
-                                        );
+                                        thread::sleep(std::time::Duration::from_millis(50));
                                     }
                                     Err(e) => {
                                         eprintln!(
