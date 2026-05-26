@@ -1,23 +1,18 @@
-// Shape fixture: postinstall attempts to load a precompiled native addon
-// via process.dlopen. The guest JS preload (dlopen-block.cjs) logs the
-// `filename` argument verbatim and then throws before the syscall, so the
-// attempt is recorded but no .node code ever executes. The catch keeps the
-// install alive.
+// Shape fixture: postinstall attempts to load a native addon via
+// process.dlopen. The default sandbox intentionally leaves native addons
+// enabled, so script-jail should not inject its legacy dlopen-block preload
+// or turn this into a policy-denied lockfile entry. The file is not a real
+// addon, so Node throws and the catch keeps the install alive.
 //
 // We construct the absolute path through process.env.INIT_CWD (npm sets this
 // to the consumer root, /work in our case) rather than __dirname. Reason:
 // for npm 7+ `file:` deps installed as symlinks under node_modules, Node
 // resolves __dirname through the symlink to the realpath (the source dir
-// outside node_modules — e.g. /work/fixtures/tries-dlopen). The preload
-// logs whatever filename string we pass; tokenize() then renders the path
-// relative to the package's installed location ($PKG = node_modules/<name>)
-// only if the path actually starts with that prefix. The realpath shape
-// would tokenize to $REPO/fixtures/... instead of $PKG/..., changing the
-// rendered marker.
+// outside node_modules — e.g. /work/fixtures/tries-dlopen). Keeping the
+// attempted filename under node_modules mirrors real native-addon loaders
+// (`bindings`, `node-gyp-build`, etc.) and avoids exercising unrelated
+// realpath behavior.
 //
-// A real native-addon loader (`bindings`, `node-gyp-build`, etc.) also
-// resolves through node_modules, so this shape mirrors real-world attacks
-// more faithfully than __dirname/realpath would.
 const path = require('node:path');
 const root = process.env['INIT_CWD'] || process.cwd();
 const pkgName = process.env['npm_package_name'] || 'tries-dlopen';

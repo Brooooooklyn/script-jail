@@ -2,9 +2,10 @@
 //
 // Compare two .script-jail.lock.yml files for byte-equality after the same
 // canonicalization that `src/action/diff.ts` applies for the action's
-// check-mode diff.  Volatile fields the renderer intentionally lets drift
-// across runs (`generated_at`, `manager_lockfile_sha256`) are normalised to
-// a fixed placeholder before comparison.
+// check-mode diff, plus parity-only filtering for known host/VMM noise.
+// Volatile fields the renderer intentionally lets drift across runs
+// (`generated_at`, `manager_lockfile_sha256`) are normalised to a fixed
+// placeholder before comparison.
 //
 // Invoked from `.github/workflows/parity-test.yml` as:
 //
@@ -28,13 +29,13 @@
 //   - Lock renderer ordering bug (different event order between platforms).
 //   - Audit-policy desync (spurious event on one side).
 //
-// What this does NOT yet filter:
-//   The documented v1 divergence on Apple Silicon — `spawn`/`exec`/`dlopen`
-//   events whose x64 binary cannot be executed on an arm64 guest — currently
+// What this does NOT filter:
+//   The documented v1 divergence on Apple Silicon — `spawn`/`exec` events
+//   whose x64 binary cannot be executed on an arm64 guest — currently
 //   surfaces as a diff hunk.  See docs/parity-testing.md for the v2 plan:
-//   once we observe what real divergence looks like against a non-trivial
-//   fixture, the filter rules will be added here behind a `--allow-arm64-
-//   enoexec` flag.  For now, the maintainer reads the report and decides.
+//   once we observe enough concrete divergence, those rules can be added
+//   behind an explicit `--allow-arm64-native-exec` flag.  For now, the
+//   maintainer reads the report and decides.
 
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -50,6 +51,32 @@ interface ParityOptions {
   reportPath: string | null;
 }
 
+const PARITY_ONLY_ENV_READS = new Set([
+  // CI/git transport environment present on the GitHub runner but not on the
+  // committed local macOS fixture.
+  'GIT_ASKPASS',
+  'GIT_SSH_COMMAND',
+  // Resolver configuration inherited from the host/VMM.
+  'LOCALDOMAIN',
+  'NOPROXY',
+  'RES_OPTIONS',
+  // Test-knob probes from dependency helper libraries. Presence depends on
+  // the ambient process env, not on the dependency install behavior.
+  'COLS',
+  'TESTING_TAR_FAKE_PLATFORM',
+  '__FAKE_FS_O_FILENAME__',
+  '__FAKE_PLATFORM__',
+]);
+
+const PARITY_ONLY_NETWORK_ATTEMPTS = new Set([
+  // Apple Virtualization.framework NAT resolver observed in local arm64 VZ
+  // lockfiles. Linux Firecracker sees public resolvers instead.
+  '<BLOCKED> connect 192.168.64.1:53',
+]);
+
+const NPM_DEBUG_LOG_BASENAME =
+  /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(\d+)\.log$/;
+
 class ParityArgError extends Error {
   constructor(message: string) {
     super(message);
@@ -63,16 +90,79 @@ class ParityArgError extends Error {
 // differences which ARE meaningful divergences.  Line-level substitution
 // keeps the diff faithful.
 function canonicalize(content: string): string {
-  return content
+  const volatileCanonicalized = content
     .split('\n')
     .map((line) => {
       if (/^generated_at:\s/.test(line)) return 'generated_at: <canonical>';
       if (/^manager_lockfile_sha256:\s/.test(line)) {
         return 'manager_lockfile_sha256: <canonical>';
       }
-      return line;
+      return canonicalizeNpmDebugLog(line);
     })
     .join('\n');
+  return filterParityOnlyNoise(volatileCanonicalized);
+}
+
+function filterParityOnlyNoise(content: string): string {
+  const out: string[] = [];
+  let activeList: { field: 'env_read' | 'network_attempts'; indent: number } | null = null;
+
+  for (const line of content.split('\n')) {
+    const fieldMatch = /^(\s*)(env_read|network_attempts):(?:\s.*)?$/.exec(line);
+    if (fieldMatch) {
+      activeList = {
+        field: fieldMatch[2] as 'env_read' | 'network_attempts',
+        indent: fieldMatch[1]!.length,
+      };
+      out.push(line);
+      continue;
+    }
+
+    if (activeList !== null) {
+      const indent = leadingSpaces(line);
+      if (line.trim() !== '' && indent <= activeList.indent) {
+        activeList = null;
+      }
+    }
+
+    if (activeList !== null) {
+      const itemMatch = /^(\s*)-\s+(.*)$/.exec(line);
+      if (itemMatch && itemMatch[1]!.length > activeList.indent) {
+        const item = itemMatch[2]!;
+        if (isParityOnlyListItem(activeList.field, item)) continue;
+      }
+    }
+
+    out.push(line);
+  }
+
+  return out.join('\n');
+}
+
+function canonicalizeNpmDebugLog(line: string): string {
+  const match = NPM_DEBUG_LOG_BASENAME.exec(line);
+  if (!match) return line;
+
+  const prefix = line.slice(0, match.index);
+  if (
+    !prefix.endsWith('/.npm/_logs/') &&
+    !prefix.endsWith('$HOME/.npm/_logs/') &&
+    !prefix.endsWith('$CACHE/_logs/')
+  ) {
+    return line;
+  }
+
+  return `${prefix}<timestamp>-debug-${match[1]}.log`;
+}
+
+function leadingSpaces(line: string): number {
+  const match = /^ */.exec(line);
+  return match ? match[0].length : 0;
+}
+
+function isParityOnlyListItem(field: 'env_read' | 'network_attempts', item: string): boolean {
+  if (field === 'env_read') return PARITY_ONLY_ENV_READS.has(item);
+  return PARITY_ONLY_NETWORK_ATTEMPTS.has(item);
 }
 
 function parseArguments(argv: ReadonlyArray<string>): ParityOptions {
@@ -163,7 +253,7 @@ function renderMarkdownReport(args: {
       `| left | \`${opts.left}\` | ${opts.leftLabel} |`,
       `| right | \`${opts.right}\` | ${opts.rightLabel} |`,
       '',
-      'Volatile fields (`generated_at`, `manager_lockfile_sha256`) were canonicalised before comparison.',
+      'Volatile fields (`generated_at`, `manager_lockfile_sha256`) and known parity-only host/VMM noise were canonicalised before comparison.',
       '',
     ].join('\n');
   }
@@ -181,7 +271,7 @@ function renderMarkdownReport(args: {
     '',
     `**Summary:** ${hunks} hunk(s), ${insertions} insertion(s), ${deletions} deletion(s).`,
     '',
-    'See `docs/parity-testing.md` for how to interpret arm64-on-Apple-Silicon divergence vs. real audit drift.',
+    'See `docs/parity-testing.md` for how to interpret arm64-on-Apple-Silicon divergence vs. real audit drift. Known parity-only host/VMM noise is filtered before this diff.',
     '',
     '<details>',
     '<summary>Unified diff</summary>',

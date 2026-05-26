@@ -1,7 +1,7 @@
 {
   "name": "tries-dlopen",
   "version": "1.0.0",
-  "description": "Shape fixture: postinstall calls process.dlopen on a precompiled .node addon, which the JS preload blocks before the syscall.",
+  "description": "Shape fixture: postinstall calls process.dlopen and should not be blocked by the default sandbox.",
   "private": true,
   "scripts": {
     "postinstall": "node script.js"

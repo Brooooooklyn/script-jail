@@ -24925,7 +24925,8 @@ var SpawnEvent = external_exports.object({
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
   filename: external_exports.string(),
-  // Always 'blocked' in v1 — the JS preload throws before the syscall.
+  // Legacy quarantine-preload event. The default runtime no longer injects
+  // dlopen-block.cjs, so normal native-addon loads are not represented here.
   result: external_exports.literal("blocked"),
   pid: external_exports.number(),
   ts: external_exports.number()
@@ -27637,6 +27638,7 @@ var SYSTEM_NOISE_PREFIXES = [
   // toolchain.  See src/rootfs/init.sh (VP_HOME=/opt/vp).
   "/opt"
 ];
+var NPM_DEBUG_LOG_BASENAME = /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(\d+)\.log$/;
 function normalize(events, ctx) {
   const out = /* @__PURE__ */ new Map();
   for (const ev of events) {
@@ -27650,14 +27652,14 @@ function normalize(events, ctx) {
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
     switch (ev.raw.kind) {
       case "read": {
-        const tokenized = tokenize(ev.raw.path, ctx.roots, pkgDir);
+        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
         const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
         block.external_reads.push(tagged);
         break;
       }
       case "write": {
-        const tokenized = tokenize(ev.raw.path, ctx.roots, pkgDir);
+        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
         const hiddenPrefix = ev.raw.hidden ? "<HIDDEN> " : "";
         const crossPrefix = isCrossPackage(tokenized) ? "<CROSS_PACKAGE> " : "";
@@ -27730,7 +27732,10 @@ function normalize(events, ctx) {
   }
   for (const pkgBlock of out.values()) {
     for (const stage of Object.values(pkgBlock.lifecycle)) {
-      if (stage) sortAndDedupe(stage);
+      if (stage) {
+        dropRedundantShellWrappers(stage);
+        sortAndDedupe(stage);
+      }
     }
   }
   return out;
@@ -27775,6 +27780,44 @@ function sortAndDedupe(block) {
   for (const f of fields) {
     block[f] = [...new Set(block[f])].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   }
+}
+function normalizeVolatilePath(path3) {
+  const match = NPM_DEBUG_LOG_BASENAME.exec(path3);
+  if (!match) return path3;
+  const prefix = path3.slice(0, match.index);
+  if (!isNpmDebugLogDir(prefix)) return path3;
+  return `${prefix}<timestamp>-debug-${match[1]}.log`;
+}
+function isNpmDebugLogDir(prefix) {
+  return prefix.endsWith("/.npm/_logs/") || prefix.endsWith("$HOME/.npm/_logs/") || prefix.endsWith("$CACHE/_logs/");
+}
+function dropRedundantShellWrappers(block) {
+  const directCommands = new Set(block.spawn_attempts);
+  for (const entry of block.spawn_blocked) {
+    const parsed = parseBlockedSpawn(entry);
+    if (parsed) directCommands.add(parsed.command);
+  }
+  block.spawn_attempts = block.spawn_attempts.filter((entry) => {
+    const direct = unwrapShC(entry);
+    return direct === null || !directCommands.has(direct);
+  });
+  block.spawn_blocked = block.spawn_blocked.filter((entry) => {
+    const parsed = parseBlockedSpawn(entry);
+    if (!parsed) return true;
+    const direct = unwrapShC(parsed.command);
+    return direct === null || !directCommands.has(direct);
+  });
+}
+function unwrapShC(command) {
+  const prefix = "sh -c ";
+  if (!command.startsWith(prefix)) return null;
+  const direct = command.slice(prefix.length);
+  return direct.length > 0 ? direct : null;
+}
+function parseBlockedSpawn(entry) {
+  const match = /^<[A-Z]+> (.+)$/.exec(entry);
+  if (!match) return null;
+  return { command: match[1] };
 }
 function isSystemNoise(ev) {
   if (ev.raw.kind !== "read" && ev.raw.kind !== "write") return false;
@@ -28677,13 +28720,11 @@ async function waitForGo(readable) {
 }
 function buildChildEnv(baseEnv, config2, eventsFilePath) {
   const preloads = [
-    "/usr/local/lib/script-jail/dlopen-block.cjs",
     "/usr/local/lib/script-jail/platform-spoof.cjs",
     "/usr/local/lib/script-jail/env-spy.cjs"
   ];
-  const noAddons = "--no-addons";
   const requireFlags = preloads.map((p) => `--require=${p}`);
-  const childNodeOptions = [noAddons, ...requireFlags].join(" ");
+  const childNodeOptions = requireFlags.join(" ");
   const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
   for (const [idx, name] of config2.protected.env.entries()) {
     if (typeof name !== "string" || name.length === 0) {
@@ -28731,8 +28772,8 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
     // fd 3 (SCRIPT_JAIL_LOG_FD) is closed in the lifecycle child, so the
-    // env-shim and dlopen-block preload need a destination that survives
-    // the spawn — a known file path.  Both writers use O_WRONLY|O_APPEND
+    // env-shim and env-spy preload need a destination that survives the
+    // spawn — a known file path.  Both writers use O_WRONLY|O_APPEND
     // so concurrent writes don't race on file offset; POSIX makes writes
     // smaller than PIPE_BUF atomic on regular files.
     //
@@ -28749,13 +28790,11 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
     SCRIPT_JAIL_SPOOF_ARCH: config2.spoof.arch,
     // Canonical sticky value the Rust shim's `shim_init` captures into
     // CANON_NODE_OPTIONS via real_getenv_raw() and re-injects on every exec
-    // (see src/shim/src/lib.rs).  --no-addons is included so descendants
-    // inherit the bypass-block at every fork+exec boundary, even when the
-    // immediate caller scrubs NODE_OPTIONS.
+    // (see src/shim/src/lib.rs), even when the immediate caller scrubs
+    // NODE_OPTIONS.
     SCRIPT_JAIL_NODE_OPTIONS: childNodeOptions,
     NODE_OPTIONS: [
       ...baseEnv["NODE_OPTIONS"] ? [baseEnv["NODE_OPTIONS"]] : [],
-      noAddons,
       ...requireFlags
     ].join(" "),
     // Redirect pnpm's content-addressed store off the rootfs (sized

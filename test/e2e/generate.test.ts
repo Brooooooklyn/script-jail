@@ -116,7 +116,8 @@ describe.sequential('e2e: generate (mode=update)', () => {
     expect(written).toContain('<HIDDEN> $HOME/.ssh/id_rsa');
     expect(written).toContain('<HIDDEN> NPM_TOKEN');
     expect(written).toContain('<ENOENT> gcc');
-    expect(written).toContain('<BLOCKED> $PKG/evil.node');
+    expect(written).toContain('node script.js');
+    expect(written).not.toContain('<BLOCKED> $PKG/evil.node');
     // Network: any host:port — assert on the "<BLOCKED> connect " prefix.
     expect(written).toContain('<BLOCKED> connect ');
     expect(written).toContain('$REPO/.bashrc');

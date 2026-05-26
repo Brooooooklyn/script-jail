@@ -1,7 +1,8 @@
 // @ts-check
 // script-jail — dlopen-block.cjs
-// NODE_OPTIONS=--require preload: replaces process.dlopen with a function that
-// throws before any native addon can load, and emits a JSONL audit line.
+// Optional legacy NODE_OPTIONS=--require preload: replaces process.dlopen with
+// a function that throws before any native addon can load, and emits a JSONL
+// audit line. The default guest runtime does not inject this preload.
 //
 // Env vars (checked in order, first match wins):
 //   SCRIPT_JAIL_LOG_FILE — absolute path to a JSONL events file. Each call
@@ -17,14 +18,9 @@
 //
 // SECURITY NOTES:
 //   - This preload blocks the documented process.dlopen and process.binding APIs.
-//     It does NOT — and need not — block internalBinding('process_methods').dlopen
-//     because the agent prepends `--no-addons` to NODE_OPTIONS (and to the sticky
-//     SCRIPT_JAIL_NODE_OPTIONS the Rust shim re-injects across exec).  --no-addons
-//     disables native-addon loading at the V8 level, so even
-//     `node --expose-internals` cannot reach a working dlopen via internalBinding.
-//     This preload remains as defense-in-depth and as the channel that emits the
-//     blocked-attempt events for `process.dlopen` callers that don't trip on the
-//     engine flag (e.g. attempts caught before V8 boots the addon loader).
+//     It is a quarantine/test tool, not the default install policy. Without
+//     `--no-addons`, a Node process with `--expose-internals` may still have
+//     internal native-loading paths that this JS-only preload does not cover.
 //   - Properties are defined as non-configurable, non-writable to prevent
 //     user code from restoring the originals via Object.defineProperty or delete.
 //
@@ -61,9 +57,9 @@ const _stderrWrite =
 // `const` slots scoped to this module.
 //
 // NOTE: we read through the original `process.env` here.  At preload module
-// load time, no other preload has installed a Proxy yet (the agent orders
-// --require so dlopen-block runs before env-spy), so this read is a normal
-// host-side environment access and cannot be redirected through user JS.
+// load time, this optional preload is expected to run before env-spy if used,
+// so this read is a normal host-side environment access and cannot be
+// redirected through user JS.
 const _logFilePath = process.env['SCRIPT_JAIL_LOG_FILE'] || '';
 const _logFdRaw = process.env['SCRIPT_JAIL_LOG_FD'] || '';
 
@@ -242,8 +238,8 @@ if (dlopenDesc && dlopenDesc.configurable === false) return;
 // Define as non-configurable and non-writable to resist override by user code.
 // This prevents `delete process.dlopen` or `process.dlopen = origDlopen` from
 // restoring the original. Note: Object.defineProperty itself can still be called
-// by code running in the same realm — VM-level enforcement via --no-addons is
-// the reliable barrier (see TODO above).
+// by code running in the same realm; this preload is not a complete VM-level
+// native-addon barrier.
 Object.defineProperty(process, 'dlopen', {
   value: blockedDlopen,
   writable: false,

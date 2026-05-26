@@ -57,6 +57,9 @@ const SYSTEM_NOISE_PREFIXES = [
   '/opt',
 ];
 
+const NPM_DEBUG_LOG_BASENAME =
+  /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(\d+)\.log$/;
+
 export interface NormalizeContext {
   roots: TokenizeRoots;
   // pkg@version → installed path inside the VM (e.g. /work/node_modules/esbuild)
@@ -84,14 +87,14 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
 
     switch (ev.raw.kind) {
       case 'read': {
-        const tokenized = tokenize(ev.raw.path, ctx.roots, pkgDir);
+        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package read
         const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
         block.external_reads.push(tagged);
         break;
       }
       case 'write': {
-        const tokenized = tokenize(ev.raw.path, ctx.roots, pkgDir);
+        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package write
         // Both prefixes are independent: <HIDDEN> answers "was this a protected
         // path?"; <CROSS_PACKAGE> answers "did this write escape into another
@@ -262,7 +265,10 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
   // Dedupe + sort every list.
   for (const pkgBlock of out.values()) {
     for (const stage of Object.values(pkgBlock.lifecycle)) {
-      if (stage) sortAndDedupe(stage);
+      if (stage) {
+        dropRedundantShellWrappers(stage);
+        sortAndDedupe(stage);
+      }
     }
   }
   return out;
@@ -316,6 +322,55 @@ function sortAndDedupe(block: LifecycleBlock): void {
     // locale), so lockfiles committed from macOS would differ from CI output.
     block[f] = [...new Set(block[f])].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   }
+}
+
+function normalizeVolatilePath(path: string): string {
+  const match = NPM_DEBUG_LOG_BASENAME.exec(path);
+  if (!match) return path;
+
+  const prefix = path.slice(0, match.index);
+  if (!isNpmDebugLogDir(prefix)) return path;
+  return `${prefix}<timestamp>-debug-${match[1]}.log`;
+}
+
+function isNpmDebugLogDir(prefix: string): boolean {
+  return (
+    prefix.endsWith('/.npm/_logs/') ||
+    prefix.endsWith('$HOME/.npm/_logs/') ||
+    prefix.endsWith('$CACHE/_logs/')
+  );
+}
+
+function dropRedundantShellWrappers(block: LifecycleBlock): void {
+  const directCommands = new Set<string>(block.spawn_attempts);
+  for (const entry of block.spawn_blocked) {
+    const parsed = parseBlockedSpawn(entry);
+    if (parsed) directCommands.add(parsed.command);
+  }
+
+  block.spawn_attempts = block.spawn_attempts.filter((entry) => {
+    const direct = unwrapShC(entry);
+    return direct === null || !directCommands.has(direct);
+  });
+  block.spawn_blocked = block.spawn_blocked.filter((entry) => {
+    const parsed = parseBlockedSpawn(entry);
+    if (!parsed) return true;
+    const direct = unwrapShC(parsed.command);
+    return direct === null || !directCommands.has(direct);
+  });
+}
+
+function unwrapShC(command: string): string | null {
+  const prefix = 'sh -c ';
+  if (!command.startsWith(prefix)) return null;
+  const direct = command.slice(prefix.length);
+  return direct.length > 0 ? direct : null;
+}
+
+function parseBlockedSpawn(entry: string): { command: string } | null {
+  const match = /^<[A-Z]+> (.+)$/.exec(entry);
+  if (!match) return null;
+  return { command: match[1]! };
 }
 
 function isSystemNoise(ev: AttributedEvent): boolean {

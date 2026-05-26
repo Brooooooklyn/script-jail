@@ -42721,7 +42721,8 @@ var SpawnEvent = external_exports.object({
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
   filename: external_exports.string(),
-  // Always 'blocked' in v1 — the JS preload throws before the syscall.
+  // Legacy quarantine-preload event. The default runtime no longer injects
+  // dlopen-block.cjs, so normal native-addon loads are not represented here.
   result: external_exports.literal("blocked"),
   pid: external_exports.number(),
   ts: external_exports.number()

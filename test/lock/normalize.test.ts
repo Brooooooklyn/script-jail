@@ -121,6 +121,27 @@ describe('normalize', () => {
       const block = getBlock(result);
       expect(block?.external_reads).toContain('$HOME/.npmrc');
     });
+
+    it('canonicalizes npm debug log timestamps in escaped paths', () => {
+      const events = [
+        writeEv('/.npm/_logs/2026-05-26T14_20_22_069Z-debug-0.log'),
+        writeEv('/root/.npm/_logs/2026-05-20T14_27_46_935Z-debug-1.log'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.escaped_writes).toEqual([
+        '$HOME/.npm/_logs/<timestamp>-debug-1.log',
+        '/.npm/_logs/<timestamp>-debug-0.log',
+      ]);
+    });
+
+    it('does not canonicalize npm-shaped timestamps outside npm debug logs', () => {
+      const path = '/work/logs/2026-05-26T14_20_22_069Z-debug-0.log';
+      const events = [writeEv(path)];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.escaped_writes).toEqual(['$REPO/logs/2026-05-26T14_20_22_069Z-debug-0.log']);
+    });
   });
 
   describe('cross-package writes (<CROSS_PACKAGE> prefix)', () => {
@@ -229,6 +250,29 @@ describe('normalize', () => {
       const block = getBlock(result);
       // The second arg is an absolute path so gets tokenized
       expect(block?.spawn_attempts[0]).toContain('$PKG');
+    });
+
+    it('drops redundant sh -c wrappers when the direct command is already recorded', () => {
+      const events = [
+        spawnEv(['node', 'postinstall.js'], 'ok'),
+        spawnEv(['sh', '-c', 'node postinstall.js'], 'ok'),
+        spawnEv(['sh', '-c', 'node postinstall.js'], 'enoent'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.spawn_attempts).toEqual(['node postinstall.js']);
+      expect(block?.spawn_blocked).toEqual([]);
+    });
+
+    it('keeps sh -c wrappers when no equivalent direct command exists', () => {
+      const events = [
+        spawnEv(['sh', '-c', 'node postinstall.js'], 'ok'),
+        spawnEv(['sh', '-c', 'node postinstall.js'], 'enoent'),
+      ];
+      const result = normalize(events, ctx);
+      const block = getBlock(result);
+      expect(block?.spawn_attempts).toEqual(['sh -c node postinstall.js']);
+      expect(block?.spawn_blocked).toEqual(['<ENOENT> sh -c node postinstall.js']);
     });
   });
 

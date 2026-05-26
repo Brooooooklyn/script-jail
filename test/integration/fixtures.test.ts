@@ -87,12 +87,12 @@ describe('fixture: reads-home-ssh', () => {
 });
 
 describe('fixture: tries-dlopen', () => {
-  it('renders a <BLOCKED> entry under dlopen_attempts', () => {
+  it('renders the lifecycle spawn without a script-jail native-addon block', () => {
     const yaml = renderFixtureYaml('tries-dlopen');
     expect(yaml).toContain('tries-dlopen@1.0.0:');
-    expect(yaml).toContain('dlopen_attempts:');
-    // The filename was inside the package's own $PKG so it tokenizes to $PKG/evil.node.
-    expect(yaml).toContain('<BLOCKED> $PKG/evil.node');
+    expect(yaml).toContain('spawn_attempts:');
+    expect(yaml).toContain('node script.js');
+    expect(yaml).not.toContain('<BLOCKED> $PKG/evil.node');
   });
 });
 

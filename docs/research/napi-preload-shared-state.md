@@ -62,12 +62,18 @@ should still ensure Node loads the same DSO path/inode that was preloaded.
 
 ## Script-jail Caveats
 
-The current sandbox cannot directly use this as a production startup signal.
-`buildChildEnv()` injects `--no-addons` into both live `NODE_OPTIONS` and sticky
-`SCRIPT_JAIL_NODE_OPTIONS`, and `dlopen-block.cjs` documents that this is the
-engine-level native-addon barrier. Any design that asks Node to `require()` the
-preloaded `libscriptjail.so` as an addon would need a deliberate exception to
-that policy.
+The default sandbox now leaves native addons enabled: `buildChildEnv()` injects
+the active `platform-spoof.cjs` and `env-spy.cjs` preloads, but does not add
+`--no-addons` and does not load `dlopen-block.cjs`. That makes a production
+startup signal through a trusted N-API view of `libscriptjail.so` viable, as
+long as Node loads the same shared-object path/inode that the dynamic linker
+preloaded.
+
+This does not by itself make arbitrary native code safe. The shim hides
+protected names from libc `getenv` / `secure_getenv`, but native addon code can
+still inspect or mutate the live `environ` array directly unless a future design
+scrubs protected entries out of the process environment or moves the audit
+channel behind a stronger isolation boundary.
 
 The current startup filter is narrower than "skip all env reads." The shim only
 suppresses unprotected libc env-read noise while Node is starting. Protected env
@@ -77,6 +83,7 @@ Current control flow:
 
 1. `buildChildEnv()` injects `LD_PRELOAD=/lib/libscriptjail.so`,
    `SCRIPT_JAIL_NODE_OPTIONS`, and `NODE_OPTIONS` with
+   `--require=/usr/local/lib/script-jail/platform-spoof.cjs` and
    `--require=/usr/local/lib/script-jail/env-spy.cjs`.
 2. The shim constructor detects a Node executable whose
    `SCRIPT_JAIL_NODE_OPTIONS` contains `env-spy.cjs` and enables
@@ -92,6 +99,7 @@ Current control flow:
 
 A N-API callback from the same `.so` would be a stronger in-process startup
 barrier than an env-marker side channel, because it would flip the flag from
-inside the preloaded library's own static state. It is viable only if we decide
-how to preserve the native-addon blocking guarantee while allowing this one
-trusted addon load.
+inside the preloaded library's own static state. With native addons enabled by
+default, the remaining production questions are how to guarantee the addon path
+matches the preloaded `.so`, and whether protected env entries should be scrubbed
+from `environ` before untrusted native lifecycle code runs.

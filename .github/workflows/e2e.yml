@@ -340,7 +340,11 @@ jobs:
           # for names in the protected list — closing this gap end-to-end.
           assert_marker '<HIDDEN> NPM_TOKEN'
           assert_marker '<ENOENT> gcc'
-          assert_marker '<BLOCKED> $PKG/evil.node'
+          assert_marker 'node script.js'
+          if grep -qF '<BLOCKED> $PKG/evil.node' "$LOCK"; then
+            echo "::error::native addon load was blocked by script-jail"
+            exit 1
+          fi
           # Network egress: src/lock/normalize.ts renders
           #   `<BLOCKED> connect <host>:<port>`
           # We match the stable prefix only — the fixture uses
