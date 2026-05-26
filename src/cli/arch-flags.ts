@@ -1,15 +1,18 @@
 // script-jail — src/cli/arch-flags.ts
 //
 // Per-package-manager payload builder that forces a Linux/x64 dependency
-// resolution from an arm64 macOS host.
+// resolution whenever the package manager would otherwise see a non-canonical
+// platform/arch signal.
 //
 // Why this exists:
-//   The script-jail audit ALWAYS runs inside a Linux/x64 VM (Phase B install
-//   under strace).  A developer running `script-jail init` from an arm64
-//   macOS laptop would, by default, see their package manager resolve
-//   arm64-darwin platform-specific subpackages (e.g. `@swc/core-darwin-arm64`).
-//   Those subpackages don't exist on the Linux/x64 VM, so the install would
-//   fail or — worse — silently audit a different dependency tree than CI.
+//   The script-jail audit's canonical dependency tree is Linux/x64.  A
+//   developer running `script-jail init` from an arm64 macOS laptop, or any
+//   run whose platform-spoof preload makes the package manager see
+//   process.arch/process.platform as something other than linux/x64, would by
+//   default resolve different platform-specific subpackages (e.g.
+//   `@swc/core-darwin-arm64`).  Those subpackages don't exist on the canonical
+//   Linux/x64 run, so the install would fail or — worse — silently audit a
+//   different dependency tree than CI.
 //
 //   To keep the local lockfile byte-stable against the one CI would produce,
 //   we feed each package manager the "I am a Linux/x64 glibc machine" hint
@@ -30,8 +33,8 @@
 //     - yarn 4+ (Berry):  a `supportedArchitectures` block in `.yarnrc.yml`.
 //     - yarn classic (v1):  unsupported — emit a warning, no overlay.
 //
-// On x64 hosts no overlay is needed; npm/pnpm/yarn already resolve x64-linux
-// subpackages by default, and the audit VM's arch matches.
+// On x64 hosts with default linux/x64 spoofing no overlay is needed;
+// npm/pnpm/yarn already resolve x64-linux subpackages by default.
 //
 // This module is pure: it returns the payloads as strings/objects.  The CLI
 // is responsible for materialising them onto disk (via the existing
@@ -44,10 +47,21 @@
 
 export type ArchFlagPm = 'npm' | 'pnpm' | 'yarn' | 'yarn-classic';
 export type ArchFlagHostArch = 'x64' | 'arm64';
+export type ArchFlagSpoofPlatform = 'linux' | 'darwin' | 'win32';
 
 export interface ArchFlagInput {
   pm: ArchFlagPm;
   hostArch: ArchFlagHostArch;
+  /**
+   * Effective process.platform exposed to Node children by platform-spoof.
+   * Defaults to the action/CLI default, linux.
+   */
+  spoofPlatform?: ArchFlagSpoofPlatform;
+  /**
+   * Effective process.arch exposed to Node children by platform-spoof.
+   * Defaults to the action/CLI default, x64.
+   */
+  spoofArch?: ArchFlagHostArch;
 }
 
 /**
@@ -85,13 +99,22 @@ export interface ArchFlagOverlay {
  * caller decides how to materialize the result.
  */
 export function buildArchFlagOverlay(input: ArchFlagInput): ArchFlagOverlay {
-  // x64 hosts: nothing to do.  The VM is x64/linux too; package managers
-  // resolve the right subpackages out of the box.
-  if (input.hostArch === 'x64') {
+  // Canonical path: the host and the package-manager process both see
+  // linux/x64, so package managers resolve the right subpackages out of the
+  // box.  If the host is arm64 OR platform-spoof makes the package manager see
+  // a non-linux/x64 target, force the dependency tree back to linux/x64.
+  const spoofPlatform = input.spoofPlatform ?? 'linux';
+  const spoofArch = input.spoofArch ?? 'x64';
+  const needsLinuxX64Overlay =
+    input.hostArch === 'arm64' ||
+    spoofPlatform !== 'linux' ||
+    spoofArch !== 'x64';
+
+  if (!needsLinuxX64Overlay) {
     return { warnings: [] };
   }
 
-  // arm64 host paths.
+  // Non-canonical package-manager platform/arch paths.
   switch (input.pm) {
     case 'npm':
       // npm honours --cpu / --os / --libc as `npm ci` flags since v10.  They
@@ -154,8 +177,9 @@ export function buildArchFlagOverlay(input: ArchFlagInput): ArchFlagOverlay {
       return {
         warnings: [
           'yarn classic (v1) does not support per-install architecture filters; ' +
-          'lockfile audit on arm64 hosts will reflect arm64 subpackages and may ' +
-          'diverge from CI. Consider upgrading to yarn 4+.',
+          'lockfile audit on arm64 hosts or spoofed non-linux/x64 targets may ' +
+          'reflect non-canonical subpackages and diverge from CI. Consider ' +
+          'upgrading to yarn 4+.',
         ],
       };
 
