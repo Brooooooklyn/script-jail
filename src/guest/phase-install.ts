@@ -248,6 +248,11 @@ const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[]
   yarn: { cmd: 'yarn', args: ['install', '--immutable', '--offline'] },
 };
 
+// LOAD-BEARING: env-spy.cjs opens this exact path after installing the
+// process.env Proxy. The open is expected to fail with ENOENT; its only job is
+// to place a same-pid, strace-ordered marker after Node bootstrap file reads.
+export const NODE_STARTUP_DONE_STRACE_PATH = '/tmp/script-jail-node-startup-done';
+
 // pm-flags.json (extra_install_args for --cpu/--os/--libc) is consumed in
 // Phase A (`src/guest/phase-fetch.ts`), NOT here.  Phase B (`npm rebuild` /
 // `pnpm rebuild` / `yarn install --immutable`) runs against an
@@ -313,6 +318,32 @@ export function parseShimLine(line: string): RawEvent | null {
   } catch {
     return null;
   }
+}
+
+function pathBasename(pathLike: string): string {
+  const nul = pathLike.indexOf('\0');
+  const value = nul === -1 ? pathLike : pathLike.slice(0, nul);
+  const slash = value.lastIndexOf('/');
+  return slash === -1 ? value : value.slice(slash + 1);
+}
+
+function isNodeBasename(pathLike: string | undefined): boolean {
+  if (pathLike === undefined || pathLike.length === 0) return false;
+  const base = pathBasename(pathLike);
+  return base === 'node' || base === 'nodejs';
+}
+
+function firstExecPathFromStraceLine(line: string): string | null {
+  let match = line.match(/^execve\("((?:\\.|[^"\\])*)"/);
+  if (match?.[1] !== undefined) return match[1];
+  match = line.match(/^execveat\([^,]+,\s*"((?:\\.|[^"\\])*)"/);
+  return match?.[1] ?? null;
+}
+
+function isNodeSpawn(rawEvent: RawEvent, line: string): boolean {
+  if (rawEvent.kind !== 'spawn' || rawEvent.result !== 'ok') return false;
+  if (isNodeBasename(rawEvent.argv[0])) return true;
+  return isNodeBasename(firstExecPathFromStraceLine(line) ?? undefined);
 }
 
 export async function runInstallPhase(
@@ -2044,6 +2075,35 @@ export async function runInstallPhase(
     }
   };
 
+  const nodeBootstrapPendingPids = new Set<number>();
+  const nodeBootstrapChildrenByPid = new Map<number, Set<number>>();
+
+  const clearNodeBootstrap = (rootPid: number): void => {
+    const stack = [rootPid];
+    for (let i = 0; i < stack.length; i++) {
+      const current = stack[i]!;
+      nodeBootstrapPendingPids.delete(current);
+      const children = nodeBootstrapChildrenByPid.get(current);
+      nodeBootstrapChildrenByPid.delete(current);
+      if (children !== undefined) {
+        stack.push(...children);
+      }
+    }
+  };
+
+  const beginNodeBootstrap = (pid: number): void => {
+    clearNodeBootstrap(pid);
+    nodeBootstrapPendingPids.add(pid);
+  };
+
+  const propagateNodeBootstrap = (parentPid: number, childPid: number): void => {
+    if (!nodeBootstrapPendingPids.has(parentPid)) return;
+    nodeBootstrapPendingPids.add(childPid);
+    const children = nodeBootstrapChildrenByPid.get(parentPid) ?? new Set<number>();
+    children.add(childPid);
+    nodeBootstrapChildrenByPid.set(parentPid, children);
+  };
+
   // StraceRunner is the SOLE owner of the install process.
   // We do NOT call a separate spawner here — that would run install twice.
   //
@@ -2527,6 +2587,8 @@ export async function runInstallPhase(
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? '', 10);
           if (Number.isFinite(childPid) && childPid > 0) {
+            propagateNodeBootstrap(pid, childPid);
+
             // Extract the clone-flag identifier list.  For `clone(...)`
             // strace renders `flags=CLONE_VM|CLONE_FS|...`; for
             // `clone3({...})` it renders the same `flags=...|...` but
@@ -4411,6 +4473,11 @@ export async function runInstallPhase(
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
           shimLoadedPids.delete(rawEvent.pid);
+          if (isNodeSpawn(rawEvent, line)) {
+            beginNodeBootstrap(rawEvent.pid);
+          } else {
+            clearNodeBootstrap(rawEvent.pid);
+          }
           // Codex follow-up (high, 2026-05-19): execve detaches the
           // caller from any shared CLONE_FILES fd group BEFORE the
           // kernel sweeps CLOEXEC.  The kernel's `do_execve` path calls
@@ -4507,6 +4574,14 @@ export async function runInstallPhase(
           if (execFdSnap !== null) {
             pendingFdDetach.set(rawEvent.pid, execFdSnap);
           }
+        }
+
+        if (
+          rawEvent.kind === 'read' &&
+          rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH
+        ) {
+          clearNodeBootstrap(rawEvent.pid);
+          continue;
         }
 
         const result = input.attribution.attribute(rawEvent.pid);
@@ -4930,6 +5005,13 @@ export async function runInstallPhase(
             rawEvent.kind === 'read'
               ? { ...rawEvent, path: canonical }
               : { ...rawEvent, path: canonical };
+          if (
+            resolved.kind === 'read' &&
+            nodeBootstrapPendingPids.has(resolved.pid) &&
+            !matcher.isProtected(resolved.path)
+          ) {
+            continue;
+          }
           emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });
           continue;
         }

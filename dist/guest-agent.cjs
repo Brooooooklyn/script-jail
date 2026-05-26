@@ -25941,6 +25941,7 @@ var INSTALL_CMD = {
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
   yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
 };
+var NODE_STARTUP_DONE_STRACE_PATH = "/tmp/script-jail-node-startup-done";
 function parseShimLine(line) {
   try {
     const obj = JSON.parse(line);
@@ -25970,6 +25971,28 @@ function parseShimLine(line) {
   } catch {
     return null;
   }
+}
+function pathBasename(pathLike) {
+  const nul = pathLike.indexOf("\0");
+  const value = nul === -1 ? pathLike : pathLike.slice(0, nul);
+  const slash = value.lastIndexOf("/");
+  return slash === -1 ? value : value.slice(slash + 1);
+}
+function isNodeBasename(pathLike) {
+  if (pathLike === void 0 || pathLike.length === 0) return false;
+  const base = pathBasename(pathLike);
+  return base === "node" || base === "nodejs";
+}
+function firstExecPathFromStraceLine(line) {
+  let match = line.match(/^execve\("((?:\\.|[^"\\])*)"/);
+  if (match?.[1] !== void 0) return match[1];
+  match = line.match(/^execveat\([^,]+,\s*"((?:\\.|[^"\\])*)"/);
+  return match?.[1] ?? null;
+}
+function isNodeSpawn(rawEvent, line) {
+  if (rawEvent.kind !== "spawn" || rawEvent.result !== "ok") return false;
+  if (isNodeBasename(rawEvent.argv[0])) return true;
+  return isNodeBasename(firstExecPathFromStraceLine(line) ?? void 0);
 }
 async function runInstallPhase(input) {
   const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
@@ -26491,6 +26514,31 @@ async function runInstallPhase(input) {
       });
     }
   };
+  const nodeBootstrapPendingPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapChildrenByPid = /* @__PURE__ */ new Map();
+  const clearNodeBootstrap = (rootPid) => {
+    const stack = [rootPid];
+    for (let i = 0; i < stack.length; i++) {
+      const current = stack[i];
+      nodeBootstrapPendingPids.delete(current);
+      const children = nodeBootstrapChildrenByPid.get(current);
+      nodeBootstrapChildrenByPid.delete(current);
+      if (children !== void 0) {
+        stack.push(...children);
+      }
+    }
+  };
+  const beginNodeBootstrap = (pid) => {
+    clearNodeBootstrap(pid);
+    nodeBootstrapPendingPids.add(pid);
+  };
+  const propagateNodeBootstrap = (parentPid, childPid) => {
+    if (!nodeBootstrapPendingPids.has(parentPid)) return;
+    nodeBootstrapPendingPids.add(childPid);
+    const children = nodeBootstrapChildrenByPid.get(parentPid) ?? /* @__PURE__ */ new Set();
+    children.add(childPid);
+    nodeBootstrapChildrenByPid.set(parentPid, children);
+  };
   let dispatchTs = 0;
   for await (const record2 of input.strace.run(cmd, args, {
     env: input.env,
@@ -26584,6 +26632,7 @@ async function runInstallPhase(input) {
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
           if (Number.isFinite(childPid) && childPid > 0) {
+            propagateNodeBootstrap(pid, childPid);
             let cloneFs = false;
             let cloneFiles = false;
             if (syscallName === "clone" || syscallName === "clone3") {
@@ -27293,6 +27342,11 @@ async function runInstallPhase(input) {
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           shimLoadedPids.delete(rawEvent.pid);
+          if (isNodeSpawn(rawEvent, line)) {
+            beginNodeBootstrap(rawEvent.pid);
+          } else {
+            clearNodeBootstrap(rawEvent.pid);
+          }
           const execFdSingleton = isFdSingleton(rawEvent.pid);
           let execFdSnap = null;
           if (execFdSingleton) {
@@ -27323,6 +27377,10 @@ async function runInstallPhase(input) {
           if (execFdSnap !== null) {
             pendingFdDetach.set(rawEvent.pid, execFdSnap);
           }
+        }
+        if (rawEvent.kind === "read" && rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH) {
+          clearNodeBootstrap(rawEvent.pid);
+          continue;
         }
         const result = input.attribution.attribute(rawEvent.pid);
         if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.errno === void 0 && rawEvent.retFd !== void 0) {
@@ -27450,6 +27508,9 @@ async function runInstallPhase(input) {
             continue;
           }
           const resolved = rawEvent.kind === "read" ? { ...rawEvent, path: canonical } : { ...rawEvent, path: canonical };
+          if (resolved.kind === "read" && nodeBootstrapPendingPids.has(resolved.pid) && !matcher.isProtected(resolved.path)) {
+            continue;
+          }
           emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });
           continue;
         }
