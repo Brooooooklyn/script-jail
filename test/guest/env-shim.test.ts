@@ -18,6 +18,7 @@ const repoRoot = new URL('../../', import.meta.url).pathname.replace(/\/$/, '');
 const shimSo        = join(repoRoot, 'images/libscriptjail.so');
 const cargoManifest = join(repoRoot, 'src/shim/Cargo.toml');
 const libRs         = join(repoRoot, 'src/shim/src/lib.rs');
+const envSpyPreload = join(repoRoot, 'src/guest/env-spy.cjs');
 
 // Temp files created during tests; cleaned up in afterEach.
 const tempFiles: string[] = [];
@@ -218,6 +219,18 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     };
   }
 
+  function parseLogObjects(logLines: string[]): Array<Record<string, unknown>> {
+    const out: Array<Record<string, unknown>> = [];
+    for (const line of logLines) {
+      try {
+        out.push(JSON.parse(line) as Record<string, unknown>);
+      } catch {
+        // ignore non-JSON diagnostics in assertions that only care about audit JSONL
+      }
+    }
+    return out;
+  }
+
   // ── Test 1: getenv calls are logged to FD 3 ──────────────────────────────
 
   it('getenv calls are logged as env_read JSONL lines', (ctx) => {
@@ -271,6 +284,28 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     // Also verify the hidden field is false for PATH (not protected).
     const parsed = JSON.parse(pathLines[0]!) as Record<string, unknown>;
     expect(parsed['hidden']).toBe(false);
+  });
+
+  it('suppresses unprotected Node startup env reads until env-spy is installed', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const nodeOptions = `--require=${envSpyPreload}`;
+    const res = runWithShim({
+      cmd: `node -e 'void process.env.SCRIPT_JAIL_AFTER_STARTUP'`,
+      env: {
+        NODE_OPTIONS: nodeOptions,
+        SCRIPT_JAIL_NODE_OPTIONS: nodeOptions,
+        OPENSSL_CONF: '/dev/null',
+        SCRIPT_JAIL_AFTER_STARTUP: 'visible',
+      },
+    });
+
+    expect(res.exitCode).toBe(0);
+    const events = parseLogObjects(res.logLines);
+    const envReads = events.filter((e) => e['kind'] === 'env_read');
+    expect(envReads.some((e) => e['name'] === 'SCRIPT_JAIL_AFTER_STARTUP')).toBe(true);
+    expect(envReads.some((e) => e['name'] === 'OPENSSL_CONF')).toBe(false);
+    expect(envReads.some((e) => typeof e['name'] === 'string' && e['name'].startsWith('OPENSSL_'))).toBe(false);
   });
 
   // ── Test 2: protected names return NULL ──────────────────────────────────

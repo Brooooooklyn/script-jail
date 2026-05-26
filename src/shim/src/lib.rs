@@ -205,6 +205,7 @@ unsafe fn real_secure_getenv_raw(name: *const c_char) -> *mut c_char {
 
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 static KEY_READY: AtomicBool = AtomicBool::new(false);
+static NODE_STARTUP_FILTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 // pthread_key_t is c_uint on Linux. Store as usize for atomic access.
 static IN_SHIM_KEY: AtomicUsize = AtomicUsize::new(0);
 
@@ -225,6 +226,73 @@ fn set_in_shim(v: bool) {
     unsafe {
         let _ = libc::pthread_setspecific(key, val);
     }
+}
+
+const NODE_STARTUP_DONE_ENV: &[u8] = b"SCRIPT_JAIL_NODE_STARTUP_DONE";
+
+unsafe fn current_exe_basename_is_node() -> bool {
+    let mut buf = [0u8; 4096];
+    let n = libc::readlink(
+        b"/proc/self/exe\0".as_ptr() as *const c_char,
+        buf.as_mut_ptr() as *mut c_char,
+        buf.len(),
+    );
+    if n <= 0 {
+        return false;
+    }
+    let len = n as usize;
+    let mut start = len;
+    while start > 0 {
+        if buf[start - 1] == b'/' {
+            break;
+        }
+        start -= 1;
+    }
+    let basename = &buf[start..len];
+    basename == b"node" || basename == b"nodejs"
+}
+
+unsafe fn cstr_contains_bytes(c_str: *const c_char, needle: &[u8]) -> bool {
+    if c_str.is_null() || needle.is_empty() {
+        return false;
+    }
+
+    let mut len = 0usize;
+    while *c_str.add(len) != 0 {
+        len += 1;
+    }
+    if len < needle.len() {
+        return false;
+    }
+
+    let haystack = core::slice::from_raw_parts(c_str as *const u8, len);
+    let last_start = len - needle.len();
+    let mut i = 0usize;
+    while i <= last_start {
+        let mut j = 0usize;
+        while j < needle.len() && haystack[i + j] == needle[j] {
+            j += 1;
+        }
+        if j == needle.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+unsafe fn putenv_name_eq_bytes(string: *mut c_char, name_bytes: &[u8]) -> bool {
+    if string.is_null() {
+        return false;
+    }
+    let len = name_bytes.len();
+    for i in 0..len {
+        if (*string.add(i) as u8) != name_bytes[i] {
+            return false;
+        }
+    }
+    let next = *string.add(len) as u8;
+    next == b'=' || next == 0
 }
 
 // ── errno (cfg-gated for cross-platform `cargo check`) ─────────────────────
@@ -1024,6 +1092,20 @@ unsafe fn shim_init() {
         return;
     }
 
+    // Node itself probes a large set of env vars during runtime startup
+    // (OpenSSL CPU caps, NODE_* toggles, etc.) before lifecycle JS can run.
+    // When the script-jail Node preloads are present, suppress those
+    // unprotected startup reads until env-spy reports that its Proxy is
+    // installed. Non-Node binaries never take this path, and protected reads
+    // are still hidden and reported by the wrappers below.
+    let script_jail_node_options =
+        real_getenv_raw(b"SCRIPT_JAIL_NODE_OPTIONS\0".as_ptr() as *const c_char);
+    if current_exe_basename_is_node()
+        && cstr_contains_bytes(script_jail_node_options, b"env-spy.cjs")
+    {
+        NODE_STARTUP_FILTER_ACTIVE.store(true, Ordering::Release);
+    }
+
     // 4. Resolve the log destination via the now-resolved real_getenv.
     //    Prefer SCRIPT_JAIL_LOG_FILE (file path, the production case);
     //    fall back to SCRIPT_JAIL_LOG_FD (legacy fd from tests).
@@ -1168,7 +1250,11 @@ pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     }
     set_in_shim(true);
     let hidden = is_protected(name);
-    emit(name, hidden);
+    let skip_startup_noise =
+        !hidden && NODE_STARTUP_FILTER_ACTIVE.load(Ordering::Acquire);
+    if !skip_startup_noise {
+        emit(name, hidden);
+    }
     let val = if hidden {
         ptr::null_mut()
     } else {
@@ -1188,7 +1274,11 @@ pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
     }
     set_in_shim(true);
     let hidden = is_protected(name);
-    emit(name, hidden);
+    let skip_startup_noise =
+        !hidden && NODE_STARTUP_FILTER_ACTIVE.load(Ordering::Acquire);
+    if !skip_startup_noise {
+        emit(name, hidden);
+    }
     let val = if hidden {
         ptr::null_mut()
     } else {
@@ -2460,6 +2550,11 @@ pub unsafe extern "C" fn setenv(
         return real_setenv_raw(name, value, overwrite);
     }
     set_in_shim(true);
+    if cstr_eq_bytes(name, NODE_STARTUP_DONE_ENV) {
+        NODE_STARTUP_FILTER_ACTIVE.store(false, Ordering::Release);
+        set_in_shim(false);
+        return 0;
+    }
     if is_audit_protected_env_name(name) {
         emit_tamper(b"setenv", Some(name));
         set_in_shim(false);
@@ -2502,6 +2597,11 @@ pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
         return real_putenv_raw(string);
     }
     set_in_shim(true);
+    if putenv_name_eq_bytes(string, NODE_STARTUP_DONE_ENV) {
+        NODE_STARTUP_FILTER_ACTIVE.store(false, Ordering::Release);
+        set_in_shim(false);
+        return 0;
+    }
     if is_putenv_name_protected(string) {
         // Copy the bare name into a stack buffer so emit_tamper only ever
         // sees `NAME` — never `NAME=<attacker-controlled value>`.  All

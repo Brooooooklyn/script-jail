@@ -80,6 +80,7 @@ const _stderrWrite =
   process.stderr && typeof process.stderr.write === 'function'
     ? process.stderr.write.bind(process.stderr)
     : null;
+const NODE_STARTUP_DONE_ENV = 'SCRIPT_JAIL_NODE_STARTUP_DONE';
 
 // Idempotency: a single Node process may --require this preload multiple
 // times (NODE_OPTIONS inheritance + nested invocations).  Skip re-wrapping
@@ -203,7 +204,7 @@ function emitAuditFdLostAndExit(reason) {
 }
 
 /**
- * Emit one JSONL env_read line for a single property access.
+ * Write one JSONL audit line to the cached sink.
  *
  * Audit-trust Finding 4 (2026-05-18): on EBADF (or any other write
  * failure that comes from a closed/invalid fd) we re-open the events file
@@ -218,19 +219,10 @@ function emitAuditFdLostAndExit(reason) {
  * path and we exit hard.  This avoids any infinite-retry loop a hostile
  * script could induce by repeatedly re-closing the fd.
  *
- * @param {string} name
- * @param {boolean} hidden
+ * @param {string} line
  */
-function logEnvRead(name, hidden) {
+function writeAuditLine(line) {
   if (logFd < 0) return;
-  const ts = Number(process.hrtime.bigint() / 1_000_000n);
-  const line = JSON.stringify({
-    kind: 'env_read',
-    name,
-    pid: process.pid,
-    ts,
-    hidden,
-  }) + '\n';
   try {
     _writeSync(logFd, line);
     return;
@@ -283,6 +275,37 @@ function logEnvRead(name, hidden) {
         (retryErr && retryErr.code) || 'unknown'
       }`,
     );
+  }
+}
+
+/**
+ * Emit one JSONL env_read line for a single property access.
+ *
+ * @param {string} name
+ * @param {boolean} hidden
+ */
+function logEnvRead(name, hidden) {
+  const ts = Number(process.hrtime.bigint() / 1_000_000n);
+  writeAuditLine(JSON.stringify({
+    kind: 'env_read',
+    name,
+    pid: process.pid,
+    ts,
+    hidden,
+  }) + '\n');
+}
+
+function signalNodeStartupDone() {
+  try {
+    // The Rust shim's setenv/putenv wrappers consume this assignment as a
+    // process-local signal and do not need the marker to remain visible in
+    // the lifecycle environment.
+    origEnv[NODE_STARTUP_DONE_ENV] = '1';
+    delete origEnv[NODE_STARTUP_DONE_ENV];
+  } catch {
+    // If the marker cannot be set, the shim keeps the startup filter active.
+    // That is fail-quiet for unprotected runtime noise; protected reads are
+    // still hidden and reported by the Rust shim.
   }
 }
 
@@ -341,3 +364,5 @@ try {
   // catches getenv calls from C code, and the absence of the JS Proxy just
   // means a known gap rather than an audit failure.
 }
+
+signalNodeStartupDone();
