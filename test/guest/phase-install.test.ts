@@ -6,7 +6,12 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { runInstallPhase, loadPmFlags, type StraceRunner } from '../../src/guest/phase-install.js';
+import {
+  NODE_STARTUP_DONE_STRACE_PATH,
+  runInstallPhase,
+  loadPmFlags,
+  type StraceRunner,
+} from '../../src/guest/phase-install.js';
 import { Emitter } from '../../src/guest/emit.js';
 import { Attribution } from '../../src/guest/attribution.js';
 import type { ProcReader } from '../../src/guest/attribution.js';
@@ -4641,6 +4646,63 @@ describe('runInstallPhase', () => {
       const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
       expect(raw['hidden']).toBe(false);
       expect(raw).not.toHaveProperty('errno');
+    });
+
+    it('filters unprotected Node bootstrap reads until env-spy startup marker', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'execve("/usr/local/bin/node", ["node", "postinstall.js"], 0x7ffd) = 0' },
+        { pid: 42, line: 'openat(AT_FDCWD, "/etc/ssl/openssl.cnf", O_RDONLY) = 3' },
+        { pid: 42, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)` },
+        { pid: 42, line: 'openat(AT_FDCWD, "/work/runtime-read.js", O_RDONLY) = 4' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      expect(raws.some((raw) => raw['kind'] === 'read' && raw['path'] === '/etc/ssl/openssl.cnf')).toBe(false);
+      expect(raws.some((raw) => raw['kind'] === 'read' && raw['path'] === NODE_STARTUP_DONE_STRACE_PATH)).toBe(false);
+      expect(raws.some((raw) => raw['kind'] === 'read' && raw['path'] === '/work/runtime-read.js')).toBe(true);
+    });
+
+    it('does not filter protected Node bootstrap reads', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'execve("/usr/local/bin/node", ["node", "postinstall.js"], 0x7ffd) = 0' },
+        { pid: 42, line: 'openat(AT_FDCWD, "/root/.ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)' },
+        { pid: 42, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)` },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      const protectedRead = raws.find((raw) => raw['kind'] === 'read');
+      expect(protectedRead?.['path']).toBe('/root/.ssh/id_rsa');
+      expect(protectedRead?.['hidden']).toBe(true);
     });
   });
 

@@ -81,6 +81,11 @@ const _stderrWrite =
     ? process.stderr.write.bind(process.stderr)
     : null;
 const NODE_STARTUP_DONE_ENV = 'SCRIPT_JAIL_NODE_STARTUP_DONE';
+// LOAD-BEARING: phase-install.ts watches this exact absolute path in the
+// per-pid strace stream. The open is intentionally expected to fail with
+// ENOENT; the syscall is only a same-pid ordering marker for file-read
+// filtering.
+const NODE_STARTUP_DONE_STRACE_PATH = '/tmp/script-jail-node-startup-done';
 
 // Idempotency: a single Node process may --require this preload multiple
 // times (NODE_OPTIONS inheritance + nested invocations).  Skip re-wrapping
@@ -306,6 +311,16 @@ function signalNodeStartupDone() {
     // If the marker cannot be set, the shim keeps the startup filter active.
     // That is fail-quiet for unprotected runtime noise; protected reads are
     // still hidden and reported by the Rust shim.
+  }
+
+  try {
+    // Make the same boundary visible in the strace channel.  The dispatcher
+    // filters same-pid file reads before this marker as Node bootstrap noise.
+    const markerFd = _openSync(NODE_STARTUP_DONE_STRACE_PATH, 'r');
+    try { _closeSync(markerFd); } catch { /* ignored */ }
+  } catch {
+    // Expected path: the marker file does not exist.  The failed openat is the
+    // signal we need because strace records it in-order with this pid's reads.
   }
 }
 

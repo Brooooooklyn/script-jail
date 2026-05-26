@@ -131,6 +131,23 @@ Writes are kept ≤ `PIPE_BUF` so they are atomic. Downstream, normalize dedupes
 
 **Protected-list policy.** Both layers read the same list, sourced from `.script-jail.yml` and serialized to `SCRIPT_JAIL_PROTECTED_ENV_FILE` (one name per line; `#` for comments). Adding a new protected name only requires editing the config — both layers pick it up at process start.
 
+### Node bootstrap file-read filtering
+
+The install phase still traces Node bootstrap file reads with strace, but
+filters unprotected reads out of the rendered lockfile until script-jail's JS
+preloads are installed. This removes runtime file-read noise such as
+`/etc/ssl/openssl.cnf` from package lifecycle blocks; the Rust shim applies the
+same bootstrap boundary to unprotected OpenSSL env probes such as
+`OPENSSL_ia32cap` / `OPENSSL_armcap`.
+
+The boundary is deliberately strace-visible rather than a shim JSONL-only event:
+`env-spy.cjs` opens `/tmp/script-jail-node-startup-done` after installing the
+`process.env` Proxy. The file is expected not to exist; the failed `openat`
+appears in the same per-pid strace stream as bootstrap file reads, so
+`phase-install.ts` can drop only same-pid reads before that marker. Protected
+path reads, writes, unresolved relative paths, spawn/connect/dlopen events, and
+synthetic audit-bypass events are not filtered.
+
 ### Cross-exec preservation
 
 The shim wraps all eight exec entry points (`execve`, `execv`, `execvp`, `execvpe`, `execveat`, `fexecve`, `posix_spawn`, `posix_spawnp`) via the same `dispatch_exec` / `dispatch_spawn` funnels in `src/shim/src/lib.rs`. Before forwarding to the real symbol, every wrapper rewrites the caller-supplied `envp`:
