@@ -269,7 +269,7 @@ export interface StraceTailerOptions {
   fd3Stream: Readable | null;
   /**
    * Absolute path of a shared JSONL events file produced by the env-shim and
-   * dlopen-block preload (production channel — see {@link createEventsFile}).
+   * env-spy preload (production channel — see {@link createEventsFile}).
    * Tailed alongside per-pid strace files; lines arrive with pid=0 (the same
    * synthetic pid we use for fd3 lines, since attribution happens later from
    * the embedded pid field).  When undefined, no events-file polling is done.
@@ -1481,28 +1481,15 @@ export function buildChildEnv(
   eventsFilePath: string,
 ): NodeJS.ProcessEnv {
   const preloads = [
-    '/usr/local/lib/script-jail/dlopen-block.cjs',
     '/usr/local/lib/script-jail/platform-spoof.cjs',
     '/usr/local/lib/script-jail/env-spy.cjs',
   ];
 
-  // `--no-addons` (Finding C) disables native-addon loading at the V8 level:
-  // process.dlopen throws and `internalBinding('process_methods').dlopen`
-  // refuses to load any `.node` file.  Without this flag a lifecycle script
-  // run as `node --expose-internals ...` could reach the internalBinding
-  // dlopen path directly, bypassing the JS `dlopen-block.cjs` preload (which
-  // only patches process.dlopen / process.binding).  The Rust shim never
-  // sees the syscall because Node-loaded .node files come through dlopen()
-  // already-resolved through the runtime, but the audit chain only catches
-  // the JS-surface call.  Setting --no-addons closes the bypass at the
-  // engine level.
-  //
-  // Order matters: we PREPEND --no-addons so it can never be neutralised by
-  // an attacker-controlled flag that comes earlier in NODE_OPTIONS.  The
-  // existing --require entries follow it.
-  const noAddons = '--no-addons';
+  // Native addons and child_process internals are intentionally allowed. The
+  // microVM plus strace/LD_PRELOAD layer records their file, env, network, and
+  // exec activity without breaking real dependency install scripts.
   const requireFlags = preloads.map((p) => `--require=${p}`);
-  const childNodeOptions = [noAddons, ...requireFlags].join(' ');
+  const childNodeOptions = requireFlags.join(' ');
 
   // Finding 4 (audit-trust): the protected-env list used to be written to
   // `/tmp/script-jail-protected.txt` and the path leaked through the child
@@ -1653,8 +1640,8 @@ export function buildChildEnv(
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
     // fd 3 (SCRIPT_JAIL_LOG_FD) is closed in the lifecycle child, so the
-    // env-shim and dlopen-block preload need a destination that survives
-    // the spawn — a known file path.  Both writers use O_WRONLY|O_APPEND
+    // env-shim and env-spy preload need a destination that survives the
+    // spawn — a known file path.  Both writers use O_WRONLY|O_APPEND
     // so concurrent writes don't race on file offset; POSIX makes writes
     // smaller than PIPE_BUF atomic on regular files.
     //
@@ -1671,13 +1658,11 @@ export function buildChildEnv(
     SCRIPT_JAIL_SPOOF_ARCH: config.spoof.arch,
     // Canonical sticky value the Rust shim's `shim_init` captures into
     // CANON_NODE_OPTIONS via real_getenv_raw() and re-injects on every exec
-    // (see src/shim/src/lib.rs).  --no-addons is included so descendants
-    // inherit the bypass-block at every fork+exec boundary, even when the
-    // immediate caller scrubs NODE_OPTIONS.
+    // (see src/shim/src/lib.rs), even when the immediate caller scrubs
+    // NODE_OPTIONS.
     SCRIPT_JAIL_NODE_OPTIONS: childNodeOptions,
     NODE_OPTIONS: [
       ...(baseEnv['NODE_OPTIONS'] ? [baseEnv['NODE_OPTIONS']] : []),
-      noAddons,
       ...requireFlags,
     ].join(' '),
 

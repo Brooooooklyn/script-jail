@@ -417,22 +417,16 @@ describe('agent main()', () => {
     expect(env['LD_PRELOAD']).toBe('/lib/libscriptjail.so');
     expect(env['SCRIPT_JAIL_SPOOF_PLATFORM']).toBe('darwin');
     expect(env['SCRIPT_JAIL_SPOOF_ARCH']).toBe('arm64');
-    expect(env['NODE_OPTIONS']).toContain('dlopen-block.cjs');
+    expect(env['NODE_OPTIONS']).not.toContain('dlopen-block.cjs');
     expect(env['NODE_OPTIONS']).toContain('platform-spoof.cjs');
+    expect(env['NODE_OPTIONS']).toContain('env-spy.cjs');
     expect(env['SCRIPT_JAIL_LOG_FD']).toBe('3');
-    // Finding C: --no-addons disables Node's native-addon loading at the
-    // V8 level so `node --expose-internals` cannot reach the internalBinding
-    // dlopen path that bypasses our JS dlopen-block preload.  Must be
-    // present in BOTH the live NODE_OPTIONS and the sticky
-    // SCRIPT_JAIL_NODE_OPTIONS the Rust shim re-injects across exec().
-    expect(env['NODE_OPTIONS']).toContain('--no-addons');
-    expect(env['SCRIPT_JAIL_NODE_OPTIONS']).toContain('--no-addons');
-    // Order: --no-addons MUST precede any --require= entry so an attacker-
-    // controlled trailing flag in NODE_OPTIONS can never neutralise it.
-    const noAddonsIdx = String(env['NODE_OPTIONS']).indexOf('--no-addons');
-    const firstRequireIdx = String(env['NODE_OPTIONS']).indexOf('--require=');
-    expect(noAddonsIdx).toBeGreaterThanOrEqual(0);
-    expect(firstRequireIdx).toBeGreaterThan(noAddonsIdx);
+    // Native addons and child_process internals stay enabled; the audit
+    // envelope observes their syscalls instead of disabling the Node runtime.
+    expect(env['NODE_OPTIONS']).not.toContain('--no-addons');
+    expect(env['SCRIPT_JAIL_NODE_OPTIONS']).not.toContain('--no-addons');
+    expect(env['SCRIPT_JAIL_NODE_OPTIONS']).toContain('platform-spoof.cjs');
+    expect(env['SCRIPT_JAIL_NODE_OPTIONS']).toContain('env-spy.cjs');
   });
 
   it('throws when config file does not exist', async () => {
@@ -1658,7 +1652,7 @@ describe('runStraceTailer', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Events-file tail tests (the production channel for shim + dlopen-block)
+  // Events-file tail tests (the production channel for shim + JS preloads)
   // -------------------------------------------------------------------------
 
   it('yields JSONL lines from a pre-written events file as pid=0', async () => {

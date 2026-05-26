@@ -1,11 +1,11 @@
 [
   {
     "raw": {
-      "kind": "dlopen",
-      "filename": "/work/node_modules/tries-dlopen/evil.node",
+      "kind": "spawn",
+      "argv": ["node", "script.js"],
       "pid": 1002,
       "ts": 0,
-      "result": "blocked"
+      "result": "ok"
     },
     "pkg": "tries-dlopen@1.0.0",
     "lifecycle": "postinstall"

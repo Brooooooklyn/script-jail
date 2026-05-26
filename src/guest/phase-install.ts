@@ -67,7 +67,7 @@ export { loadPmFlags } from './load-pm-flags.js';
  * Source channel of a yielded line.
  *
  *   `'shim'`   — line came from a trusted JSONL writer: the fd-3 pipe (env-spy
- *                / dlopen-block preloads writing directly into the
+ *                / JS preloads writing directly into the
  *                LinuxStraceRunner-owned pipe) OR the per-VM events file
  *                (SCRIPT_JAIL_LOG_FILE) the Rust LD_PRELOAD shim writes into
  *                with `O_APPEND`.  Only `parseShimLine` is consulted for these
@@ -264,7 +264,7 @@ export const NODE_STARTUP_DONE_STRACE_PATH = '/tmp/script-jail-node-startup-done
 
 /**
  * Parse a JSONL line coming from the LD_PRELOAD shim, the env-spy preload, or
- * the dlopen-block preload. Returns a RawEvent or null if the line is
+ * a JS preload. Returns a RawEvent or null if the line is
  * malformed/unrecognised.
  *
  * Expected shapes:

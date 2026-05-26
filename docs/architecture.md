@@ -43,7 +43,7 @@ the v2 mitigation path.
 ## Two-phase install
 
 1. **Phase A — fetch.** Network on, no strace. Lets the package manager resolve the registry and populate its cache. Output of this phase is not audited.
-2. **Phase B — install.** Network off (default route nulled, no DNS), strace attached. Every syscall the lifecycle scripts make is captured. `dlopen` and `execve` of disallowed binaries are blocked by the preloads/policy.
+2. **Phase B — install.** Network off (default route nulled, no DNS), strace attached. Every syscall the lifecycle scripts make is captured. Native addons and `child_process` spawns are allowed to run inside the microVM; failed or unavailable child binaries are recorded in the lockfile.
 
 Phase B is the only phase whose events end up in the lockfile.
 
@@ -95,8 +95,14 @@ This model evolved through several rounds of Codex adversarial review (commits `
 | --- | --- | --- |
 | Rust `LD_PRELOAD` shim | `src/shim/src/lib.rs` → `libscriptjail.so` | libc `getenv` / `secure_getenv` / `__secure_getenv` (covers libuv, native addons, child binaries inheriting env); `execve` / `execv` / `execvp` / `execvpe` / `execveat` / `fexecve` / `posix_spawn` / `posix_spawnp` (re-injects audit env vars on every exec); `setenv` / `unsetenv` / `putenv` / `clearenv` (refuses tampering of protected names). |
 | Node `--require` JS | `src/guest/env-spy.cjs` | JS `process.env.X` reads (Node copies env into a JS object early; `getenv` won't see these). |
-| Node `--require` JS | `src/guest/dlopen-block.cjs` | `process.dlopen` calls — blocks native addons before they map. |
 | Node `--require` JS | `src/guest/platform-spoof.cjs` | spoofs `process.platform` / `process.arch` to flush out OS-conditioned attack branches. |
+
+`src/guest/dlopen-block.cjs` remains in-tree as a legacy quarantine preload and
+has its own tests, but it is not part of the default `buildChildEnv()` preload
+set. Default installs do not pass `--no-addons`, so N-API/native dependency
+postinstalls and `child_process.spawn` use the normal Node runtime path while
+the microVM, strace, and LD_PRELOAD shim observe their file/env/network/exec
+activity.
 
 Adding a new audit category means picking the right layer: kernel-only behavior → strace; libc-level → Rust shim; JS-API-only → preload.
 
@@ -121,15 +127,16 @@ Env-var reads need both the libc shim and the JS preload because they sit on opp
 
 **Critical detail — the Proxy receiver.** In the `get` / `set` traps, forward via `Reflect.get(target, prop, target)` (and the equivalent for `set`), passing `target` — not the Proxy — as the receiver. `process.env` is a host-side `EnvironmentVariableNamespace` object whose accessors use `this` to find the underlying environment store. When the receiver is the Proxy, Node can't locate the store and reads silently return wrong values, which breaks `child_process.spawn` with no diagnostic. The equivalent member-access form (`target[prop]`) also works.
 
-**Unified event shape.** Both layers emit JSONL to `SCRIPT_JAIL_LOG_FILE` (preferred) or `SCRIPT_JAIL_LOG_FD` (tests), one of three `kind`s:
+**Unified event shape.** Both layers emit JSONL to `SCRIPT_JAIL_LOG_FILE` (preferred) or `SCRIPT_JAIL_LOG_FD` (tests), one of these `kind`s:
 
 - `env_read` — `{"kind":"env_read","name":...,"pid":...,"ts":...,"hidden":...}` emitted by every libc `getenv` / JS `process.env.X` read of a name on the protected list.
 - `exec` — `{"kind":"exec","prog":...,"argv0":...,"pid":...,"ts":...,"envp_alloc_failed"?:...}` emitted by the shim's exec wrappers (`execve` / `execv*` / `execveat` / `fexecve` / `posix_spawn[p]`) before forwarding to the real symbol. The optional `envp_alloc_failed` flag fires when env re-injection couldn't allocate and the caller's `envp` was forwarded unmodified (the exec still proceeds; the audit trail records the degraded state).
 - `env_tamper` — `{"kind":"env_tamper","op":"setenv|unsetenv|putenv|clearenv","name":...,"pid":...,"ts":...,"refused":true}` emitted by the in-process env-mutator wrappers when the target is one of the protected names. The call is refused (returns 0 to the caller) and the audit event records the attempt.
+- `dlopen` — `{"kind":"dlopen","filename":...,"result":"blocked","pid":...,"ts":...}` emitted only by the optional legacy `dlopen-block.cjs` preload, not by the default runtime path.
 
 Writes are kept ≤ `PIPE_BUF` so they are atomic. Downstream, normalize dedupes, attribution maps `pid` → owning package + lifecycle stage, and the renderer emits one block per (package, event-kind) pair.
 
-**Protected-list policy.** Both layers read the same list, sourced from `.script-jail.yml` and serialized to `SCRIPT_JAIL_PROTECTED_ENV_FILE` (one name per line; `#` for comments). Adding a new protected name only requires editing the config — both layers pick it up at process start.
+**Protected-list policy.** Both layers read the same list, sourced from `.script-jail.yml` and serialized into `SCRIPT_JAIL_PROTECTED_ENV_NAMES` (comma-separated strict POSIX env-var names). Adding a new protected name only requires editing the config — both layers pick it up at process start.
 
 ### Node bootstrap file-read filtering
 
@@ -153,12 +160,12 @@ synthetic audit-bypass events are not filtered.
 The shim wraps all eight exec entry points (`execve`, `execv`, `execvp`, `execvpe`, `execveat`, `fexecve`, `posix_spawn`, `posix_spawnp`) via the same `dispatch_exec` / `dispatch_spawn` funnels in `src/shim/src/lib.rs`. Before forwarding to the real symbol, every wrapper rewrites the caller-supplied `envp`:
 
 - `LD_PRELOAD` — the shim's own path is colon-appended, ensuring the child process loads `libscriptjail.so` even if the parent tried to remove it.
-- `NODE_OPTIONS` — the `--require=…` block is space-appended so the three JS preloads are loaded in every Node child.
-- Seven `SCRIPT_JAIL_*` sticky vars (`SCRIPT_JAIL_LOG_FILE`, `SCRIPT_JAIL_LOG_FD`, `SCRIPT_JAIL_PROTECTED_ENV_FILE`, `SCRIPT_JAIL_SPOOF_PLATFORM`, `SCRIPT_JAIL_SPOOF_ARCH`, `SCRIPT_JAIL_PRELOAD_PATH`, `SCRIPT_JAIL_NODE_OPTIONS`) — each is added to the rewritten `envp` only when absent (`ensure_env` semantics), preserving any value the caller deliberately reassigned for a side channel.
+- `NODE_OPTIONS` — the `--require=…` block is space-appended so the active JS preloads are loaded in every Node child.
+- Seven `SCRIPT_JAIL_*` sticky vars (`SCRIPT_JAIL_LOG_FILE`, `SCRIPT_JAIL_LOG_FD`, `SCRIPT_JAIL_PROTECTED_ENV_NAMES`, `SCRIPT_JAIL_SPOOF_PLATFORM`, `SCRIPT_JAIL_SPOOF_ARCH`, `SCRIPT_JAIL_PRELOAD_PATH`, `SCRIPT_JAIL_NODE_OPTIONS`) — each is added to the rewritten `envp` only when absent (`ensure_env` semantics), preserving any value the caller deliberately reassigned for a side channel.
 
-The canonical values for `LD_PRELOAD` and `NODE_OPTIONS` reinjection come from two env vars read at `shim_init` time: `SCRIPT_JAIL_PRELOAD_PATH` (set to `/lib/libscriptjail.so` by `buildChildEnv` in `src/guest/agent.ts`) and `SCRIPT_JAIL_NODE_OPTIONS` (set to the space-separated `--require=…` block for the three `/usr/local/lib/script-jail/*.cjs` preloads). This means every child process — however the parent constructs its `envp` — inherits a canonical audit environment.
+The canonical values for `LD_PRELOAD` and `NODE_OPTIONS` reinjection come from two env vars read at `shim_init` time: `SCRIPT_JAIL_PRELOAD_PATH` (set to `/lib/libscriptjail.so` by `buildChildEnv` in `src/guest/agent.ts`) and `SCRIPT_JAIL_NODE_OPTIONS` (set to the space-separated `--require=…` block for the active `/usr/local/lib/script-jail/*.cjs` preloads). This means every child process — however the parent constructs its `envp` — inherits a canonical audit environment.
 
-The `setenv` / `unsetenv` / `putenv` / `clearenv` wrappers close the in-process mutation window. Any call that targets one of the nine protected names (`LD_PRELOAD`, `NODE_OPTIONS`, or any `SCRIPT_JAIL_*` sticky var) is silently refused: the wrapper returns 0 so the caller sees no error (Node's `delete process.env.X` path does not raise), but the underlying env entry is not modified. Refused calls are recorded in the audit log.
+The `setenv` / `unsetenv` / `putenv` / `clearenv` wrappers close the in-process mutation window. Any call that targets one of the audit-chain protected names (`LD_PRELOAD`, `NODE_OPTIONS`, `LD_AUDIT`, `LD_LIBRARY_PATH`, or any `SCRIPT_JAIL_*` sticky var) is silently refused: the wrapper returns 0 so the caller sees no error (Node's `delete process.env.X` path does not raise), but the underlying env entry is not modified. Refused calls are recorded in the audit log.
 
 **Known gap.** `execle` is the one exec variant the shim does not wrap: its `char *const envp[]` is passed as a C variadic argument, and intercepting variadics in stable `#![no_std]` Rust requires inline asm or a nightly toolchain bump; deferred to v2. In glibc, `execl` and `execlp` build their argument vector and then call `execve` with the process's own `__environ`, so the setenv/unsetenv guards in this version close the practical-attack window for those two. Direct `char **environ` array manipulation (bypassing all libc env functions) remains uncovered; this is rare in npm lifecycle scripts.
 

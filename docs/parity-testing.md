@@ -85,7 +85,10 @@ canonicalises the two volatile fields, and compares.
 
 ## Interpreting the parity report
 
-`scripts/parity-diff.ts` emits a markdown report. Three cases:
+`scripts/parity-diff.ts` emits a markdown report. Before comparing, it
+canonicalizes the volatile header fields and filters known parity-only
+host/VMM noise such as ambient CI env probes and the local VZ DNS resolver.
+It does not hide native executable divergence. Three cases:
 
 ### ✅ Parity holds
 
@@ -99,11 +102,10 @@ different lockfile on Apple Silicon than on Linux CI:
 - A package whose postinstall `execve`s a downloaded x86_64 binary will
   emit a `spawn` event with `result: enoent`/`eacces` on the arm64 guest
   and `result: ok` on the Linux x86_64 guest.
-- A package whose preload dlopens an x86_64 native addon will emit a
-  `dlopen` event with `result: blocked` (the JS preload catches it) on
-  both sides — that case stays consistent — but if the postinstall script
-  itself tries to `execve` a helper that links against the same .so, the
-  helper fails to spawn on arm64.
+- A package that loads or execs an x86_64 native artifact may produce
+  different file-read or spawn shapes on an arm64 guest. Native addon loading
+  is not blocked by default; the parity question is whether the resulting
+  platform-specific file/exec surface is expected for that package.
 
 These cases are real divergence; they are flagged in the parity report and
 the maintainer reads the diff to confirm every divergent event is in this

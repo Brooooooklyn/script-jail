@@ -18,7 +18,7 @@ and break determinism across hosts:
 - **Host architecture.** A package shipping a native binding for `linux-x64`
   and `linux-arm64` will resolve a different `.node` file under an Apple
   Silicon host than under a GitHub `ubuntu-24.04` runner. The lifecycle
-  script runs the same way, but the recorded `execve`/`dlopen` payloads
+  script runs the same way, but the recorded file reads and `execve` payloads
   reference different ELF interpreters and library paths.
 
 - **Package-manager arch flags.** npm, pnpm, and yarn each consult
@@ -35,15 +35,15 @@ and break determinism across hosts:
 
 The cases below are the residual divergence after PR 4's arch-flag overlay.
 
-## Native execve / dlopen of x86_64 binaries on arm64 hosts
+## Native execve / addon loads of x86_64 binaries on arm64 hosts
 
 **Symptom.** A package that ships only a `linux-x64` prebuilt (no `linux-arm64`
 variant) lands in `node_modules` on a Linux-amd64 runner with the prebuilt
-in place. The lifecycle script then `execve`s or `dlopen`s the x86_64 binary
-during install. On an Apple Silicon (`darwin-arm64`) host the VM is also
-arm64, so the same lifecycle script either:
+in place. During install, the lifecycle script then `execve`s the x86_64
+binary or asks Node to load the x86_64 native addon. On an Apple Silicon
+(`darwin-arm64`) host the VM is also arm64, so the same lifecycle script either:
 
-1. Re-fetches the arm64 prebuilt — different `<EXEC>`/`<DLOPEN>` payload —
+1. Re-fetches the arm64 prebuilt — different file-read / `<EXEC>` payload —
    or
 2. Falls back to source build, executing `cc`/`make` instead — completely
    different event shape — or

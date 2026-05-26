@@ -85,7 +85,8 @@ export type SpawnEvent = z.infer<typeof SpawnEvent>;
 export const DlopenEvent = z.object({
   kind: z.literal('dlopen'),
   filename: z.string(),
-  // Always 'blocked' in v1 — the JS preload throws before the syscall.
+  // Legacy quarantine-preload event. The default runtime no longer injects
+  // dlopen-block.cjs, so normal native-addon loads are not represented here.
   result: z.literal('blocked'),
   pid: z.number(),
   ts: z.number(),
@@ -181,7 +182,7 @@ export type ExecEvent = z.infer<typeof ExecEvent>;
 // the caller) and this event records the attempt.
 //
 // Audit-trust Finding 4 (2026-05-18): `audit_fd_lost` is emitted by the JS
-// preloads (env-spy.cjs / dlopen-block.cjs) when a lifecycle script closes
+// preloads (env-spy.cjs / legacy dlopen-block.cjs) when a lifecycle script closes
 // the cached events-file fd via /proc/self/fd/<N> and the preload's
 // reopen-by-path retry also fails.  The preload then exits the Node process
 // non-zero so the install command itself fails — but the JSONL line also
