@@ -302,15 +302,16 @@ function logEnvRead(name, hidden) {
 
 function signalNodeStartupDone() {
   try {
-    // The Rust shim's setenv/putenv wrappers consume this assignment as a
-    // process-local signal and do not need the marker to remain visible in
-    // the lifecycle environment.
+    // The Rust shim's setenv/putenv wrappers consume this assignment and emit
+    // a shim-channel marker. phase-install uses that same-stream marker to
+    // stop recording Node bootstrap env reads without exposing the marker to
+    // lifecycle code.
     origEnv[NODE_STARTUP_DONE_ENV] = '1';
     delete origEnv[NODE_STARTUP_DONE_ENV];
   } catch {
-    // If the marker cannot be set, the shim keeps the startup filter active.
-    // That is fail-quiet for unprotected runtime noise; protected reads are
-    // still hidden and reported by the Rust shim.
+    // If the marker cannot be set, phase-install keeps recording unprotected
+    // env reads in this process as bootstrap noise. Protected reads are still
+    // hidden and reported by the Rust shim/env proxy.
   }
 
   try {

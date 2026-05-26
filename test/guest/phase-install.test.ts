@@ -4677,6 +4677,69 @@ describe('runInstallPhase', () => {
       expect(raws.some((raw) => raw['kind'] === 'read' && raw['path'] === '/work/runtime-read.js')).toBe(true);
     });
 
+    it('records Node bootstrap env reads and filters later repeats from package output', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'execve("/usr/local/bin/node", ["node", "postinstall.js"], 0x7ffd) = 0' },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: 42, ts: 1, hidden: false }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'NPM_TOKEN', pid: 42, ts: 2, hidden: true }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 42, ts: 3 }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: 42, ts: 4, hidden: false }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PACKAGE_ENV', pid: 42, ts: 5, hidden: false }) },
+        { pid: 42, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)` },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'OPENSSL_CONF')).toBe(false);
+      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PACKAGE_ENV')).toBe(true);
+      const protectedRead = raws.find((raw) => raw['kind'] === 'env_read' && raw['name'] === 'NPM_TOKEN');
+      expect(protectedRead?.['hidden']).toBe(true);
+    });
+
+    it('records Node bootstrap file reads and filters later repeats from package output', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'execve("/usr/local/bin/node", ["node", "postinstall.js"], 0x7ffd) = 0' },
+        { pid: 42, line: 'openat(AT_FDCWD, "/etc/ssl/openssl.cnf", O_RDONLY) = 3' },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 42, ts: 1 }) },
+        { pid: 42, line: 'openat(AT_FDCWD, "/etc/ssl/openssl.cnf", O_RDONLY) = 4' },
+        { pid: 42, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)` },
+        { pid: 42, line: 'openat(AT_FDCWD, "/work/runtime-read.js", O_RDONLY) = 5' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      expect(raws.some((raw) => raw['kind'] === 'read' && raw['path'] === '/etc/ssl/openssl.cnf')).toBe(false);
+      expect(raws.some((raw) => raw['kind'] === 'read' && raw['path'] === '/work/runtime-read.js')).toBe(true);
+    });
+
     it('does not filter protected Node bootstrap reads', async () => {
       const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
       const straceLines = [
@@ -7579,6 +7642,13 @@ describe('runInstallPhase', () => {
       const ev = parseShimLine(line);
       expect(ev).not.toBeNull();
       expect(ev?.kind).toBe('dlopen');
+    });
+
+    it('parses node_startup_done lines', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({ kind: 'node_startup_done', pid: 2, ts: 101 });
+      const ev = parseShimLine(line);
+      expect(ev).toEqual({ kind: 'node_startup_done', pid: 2, ts: 101 });
     });
 
     it('returns null for invalid JSON', async () => {

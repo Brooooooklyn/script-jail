@@ -205,7 +205,6 @@ unsafe fn real_secure_getenv_raw(name: *const c_char) -> *mut c_char {
 
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 static KEY_READY: AtomicBool = AtomicBool::new(false);
-static NODE_STARTUP_FILTER_ACTIVE: AtomicBool = AtomicBool::new(false);
 // pthread_key_t is c_uint on Linux. Store as usize for atomic access.
 static IN_SHIM_KEY: AtomicUsize = AtomicUsize::new(0);
 
@@ -229,57 +228,6 @@ fn set_in_shim(v: bool) {
 }
 
 const NODE_STARTUP_DONE_ENV: &[u8] = b"SCRIPT_JAIL_NODE_STARTUP_DONE";
-
-unsafe fn current_exe_basename_is_node() -> bool {
-    let mut buf = [0u8; 4096];
-    let n = libc::readlink(
-        b"/proc/self/exe\0".as_ptr() as *const c_char,
-        buf.as_mut_ptr() as *mut c_char,
-        buf.len(),
-    );
-    if n <= 0 {
-        return false;
-    }
-    let len = n as usize;
-    let mut start = len;
-    while start > 0 {
-        if buf[start - 1] == b'/' {
-            break;
-        }
-        start -= 1;
-    }
-    let basename = &buf[start..len];
-    basename == b"node" || basename == b"nodejs"
-}
-
-unsafe fn cstr_contains_bytes(c_str: *const c_char, needle: &[u8]) -> bool {
-    if c_str.is_null() || needle.is_empty() {
-        return false;
-    }
-
-    let mut len = 0usize;
-    while *c_str.add(len) != 0 {
-        len += 1;
-    }
-    if len < needle.len() {
-        return false;
-    }
-
-    let haystack = core::slice::from_raw_parts(c_str as *const u8, len);
-    let last_start = len - needle.len();
-    let mut i = 0usize;
-    while i <= last_start {
-        let mut j = 0usize;
-        while j < needle.len() && haystack[i + j] == needle[j] {
-            j += 1;
-        }
-        if j == needle.len() {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
 
 unsafe fn putenv_name_eq_bytes(string: *mut c_char, name_bytes: &[u8]) -> bool {
     if string.is_null() {
@@ -1012,6 +960,36 @@ unsafe fn emit(name: *const c_char, hidden: bool) {
     }
 }
 
+unsafe fn emit_node_startup_done() {
+    let log_fd = LOG_FD.load(Ordering::Acquire);
+    if log_fd < 0 {
+        return;
+    }
+
+    let mut ts: libc::timespec = core::mem::zeroed();
+    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    let ns: i64 = (ts.tv_sec as i64) * 1_000_000_000i64 + ts.tv_nsec as i64;
+    let pid = libc::getpid();
+
+    let mut buf = [0u8; 128];
+    let mut pos = 0usize;
+    let prefix = br#"{"kind":"node_startup_done","pid":"#;
+    buf[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    pos += write_i64(&mut buf[pos..], pid as i64);
+
+    let mid = br#","ts":"#;
+    buf[pos..pos + mid.len()].copy_from_slice(mid);
+    pos += mid.len();
+    pos += write_i64(&mut buf[pos..], ns);
+
+    let suffix = b"}\n";
+    buf[pos..pos + suffix.len()].copy_from_slice(suffix);
+    pos += suffix.len();
+
+    write_all(log_fd, &buf[..pos]);
+}
+
 // ── constructor ────────────────────────────────────────────────────────────
 
 #[ctor::ctor]
@@ -1090,20 +1068,6 @@ unsafe fn shim_init() {
     // false so all wrapper calls forward to the resolved real symbol.
     if !key_created {
         return;
-    }
-
-    // Node itself probes a large set of env vars during runtime startup
-    // (OpenSSL CPU caps, NODE_* toggles, etc.) before lifecycle JS can run.
-    // When the script-jail Node preloads are present, suppress those
-    // unprotected startup reads until env-spy reports that its Proxy is
-    // installed. Non-Node binaries never take this path, and protected reads
-    // are still hidden and reported by the wrappers below.
-    let script_jail_node_options =
-        real_getenv_raw(b"SCRIPT_JAIL_NODE_OPTIONS\0".as_ptr() as *const c_char);
-    if current_exe_basename_is_node()
-        && cstr_contains_bytes(script_jail_node_options, b"env-spy.cjs")
-    {
-        NODE_STARTUP_FILTER_ACTIVE.store(true, Ordering::Release);
     }
 
     // 4. Resolve the log destination via the now-resolved real_getenv.
@@ -1250,11 +1214,7 @@ pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     }
     set_in_shim(true);
     let hidden = is_protected(name);
-    let skip_startup_noise =
-        !hidden && NODE_STARTUP_FILTER_ACTIVE.load(Ordering::Acquire);
-    if !skip_startup_noise {
-        emit(name, hidden);
-    }
+    emit(name, hidden);
     let val = if hidden {
         ptr::null_mut()
     } else {
@@ -1274,11 +1234,7 @@ pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
     }
     set_in_shim(true);
     let hidden = is_protected(name);
-    let skip_startup_noise =
-        !hidden && NODE_STARTUP_FILTER_ACTIVE.load(Ordering::Acquire);
-    if !skip_startup_noise {
-        emit(name, hidden);
-    }
+    emit(name, hidden);
     let val = if hidden {
         ptr::null_mut()
     } else {
@@ -2551,7 +2507,7 @@ pub unsafe extern "C" fn setenv(
     }
     set_in_shim(true);
     if cstr_eq_bytes(name, NODE_STARTUP_DONE_ENV) {
-        NODE_STARTUP_FILTER_ACTIVE.store(false, Ordering::Release);
+        emit_node_startup_done();
         set_in_shim(false);
         return 0;
     }
@@ -2598,7 +2554,7 @@ pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
     }
     set_in_shim(true);
     if putenv_name_eq_bytes(string, NODE_STARTUP_DONE_ENV) {
-        NODE_STARTUP_FILTER_ACTIVE.store(false, Ordering::Release);
+        emit_node_startup_done();
         set_in_shim(false);
         return 0;
     }

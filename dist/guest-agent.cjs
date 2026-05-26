@@ -25967,6 +25967,12 @@ function parseShimLine(line) {
     } else if (obj["kind"] === "env_tamper") {
       const parsed = EnvTamperEvent.safeParse(obj);
       if (parsed.success) return parsed.data;
+    } else if (obj["kind"] === "node_startup_done") {
+      const pid = obj["pid"];
+      const ts = obj["ts"];
+      if (typeof pid === "number" && typeof ts === "number") {
+        return { kind: "node_startup_done", pid, ts };
+      }
     }
     return null;
   } catch {
@@ -26515,30 +26521,79 @@ async function runInstallPhase(input) {
       });
     }
   };
-  const nodeBootstrapPendingPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapEnvPendingPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapFilePendingPids = /* @__PURE__ */ new Set();
   const nodeBootstrapChildrenByPid = /* @__PURE__ */ new Map();
-  const clearNodeBootstrap = (rootPid) => {
+  const nodeBootstrapEnvReads = /* @__PURE__ */ new Set();
+  const nodeBootstrapFileReads = /* @__PURE__ */ new Set();
+  const nodeBootstrapSubtree = (rootPid) => {
     const stack = [rootPid];
     for (let i = 0; i < stack.length; i++) {
       const current = stack[i];
-      nodeBootstrapPendingPids.delete(current);
       const children = nodeBootstrapChildrenByPid.get(current);
-      nodeBootstrapChildrenByPid.delete(current);
       if (children !== void 0) {
         stack.push(...children);
+      }
+    }
+    return stack;
+  };
+  const clearNodeBootstrap = (rootPid) => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapEnvPendingPids.delete(current);
+      nodeBootstrapFilePendingPids.delete(current);
+      nodeBootstrapChildrenByPid.delete(current);
+    }
+  };
+  const clearNodeBootstrapEnv = (rootPid) => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapEnvPendingPids.delete(current);
+    }
+  };
+  const clearNodeBootstrapFile = (rootPid) => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapFilePendingPids.delete(current);
+      if (!nodeBootstrapEnvPendingPids.has(current)) {
+        nodeBootstrapChildrenByPid.delete(current);
       }
     }
   };
   const beginNodeBootstrap = (pid) => {
     clearNodeBootstrap(pid);
-    nodeBootstrapPendingPids.add(pid);
+    nodeBootstrapEnvPendingPids.add(pid);
+    nodeBootstrapFilePendingPids.add(pid);
   };
   const propagateNodeBootstrap = (parentPid, childPid) => {
-    if (!nodeBootstrapPendingPids.has(parentPid)) return;
-    nodeBootstrapPendingPids.add(childPid);
+    let inherited = false;
+    if (nodeBootstrapEnvPendingPids.has(parentPid)) {
+      nodeBootstrapEnvPendingPids.add(childPid);
+      inherited = true;
+    }
+    if (nodeBootstrapFilePendingPids.has(parentPid)) {
+      nodeBootstrapFilePendingPids.add(childPid);
+      inherited = true;
+    }
+    if (!inherited) return;
     const children = nodeBootstrapChildrenByPid.get(parentPid) ?? /* @__PURE__ */ new Set();
     children.add(childPid);
     nodeBootstrapChildrenByPid.set(parentPid, children);
+  };
+  const shouldFilterNodeBootstrapEnvRead = (raw) => {
+    if (raw.kind !== "env_read" || raw.hidden) return false;
+    if (nodeBootstrapEnvPendingPids.has(raw.pid)) {
+      nodeBootstrapEnvReads.add(raw.name);
+      return true;
+    }
+    return nodeBootstrapEnvReads.has(raw.name);
+  };
+  const shouldFilterNodeBootstrapFileRead = (raw) => {
+    if (raw.kind !== "read" || raw.hidden || matcher.isProtected(raw.path)) {
+      return false;
+    }
+    if (nodeBootstrapFilePendingPids.has(raw.pid)) {
+      nodeBootstrapFileReads.add(raw.path);
+      return true;
+    }
+    return nodeBootstrapFileReads.has(raw.path);
   };
   let dispatchTs = 0;
   for await (const record2 of input.strace.run(cmd, args, {
@@ -26567,11 +26622,18 @@ async function runInstallPhase(input) {
         );
         continue;
       }
+      if (shimEvent.kind === "node_startup_done") {
+        clearNodeBootstrapEnv(shimEvent.pid);
+        continue;
+      }
       const result = input.attribution.attribute(shimEvent.pid);
       if (shimEvent.kind === "exec") {
         const current = shimExecCountByPid.get(shimEvent.pid) ?? 0;
         const next = shimEvent.result === "failed" ? current > 0 ? current - 1 : 0 : current + 1;
         shimExecCountByPid.set(shimEvent.pid, next);
+      }
+      if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
+        continue;
       }
       if (result !== null) {
         recordAttribution(shimEvent.pid, result, lineTs);
@@ -27380,7 +27442,7 @@ async function runInstallPhase(input) {
           }
         }
         if (rawEvent.kind === "read" && rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH) {
-          clearNodeBootstrap(rawEvent.pid);
+          clearNodeBootstrapFile(rawEvent.pid);
           continue;
         }
         const result = input.attribution.attribute(rawEvent.pid);
@@ -27509,7 +27571,7 @@ async function runInstallPhase(input) {
             continue;
           }
           const resolved = rawEvent.kind === "read" ? { ...rawEvent, path: canonical } : { ...rawEvent, path: canonical };
-          if (resolved.kind === "read" && nodeBootstrapPendingPids.has(resolved.pid) && !matcher.isProtected(resolved.path)) {
+          if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
           emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });
