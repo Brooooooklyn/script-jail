@@ -15,12 +15,11 @@
 //        sails through the diff gate while bypassing the audit envelope.
 //        Action ran it; CLI did not.
 //
-//     2. `buildArchFlagOverlay({pm, hostArch})` + warning fan-out — needed
-//        on arm64 macOS hosts to coerce the package manager into resolving
-//        Linux/x64 subpackages (the audit VM is x64).  Today the Linux
-//        action runs on an x64 runner so this is a no-op there, but we run
-//        it unconditionally in both entries so the second the action ever
-//        targets arm64 it does the right thing — no parity-test escape.
+//     2. `buildArchFlagOverlay({pm, hostArch, spoofPlatform, spoofArch})` +
+//        warning fan-out — needed on arm64 macOS hosts and on runs whose
+//        platform-spoof config would make the package manager see a
+//        non-linux/x64 target.  The dependency tree must stay Linux/x64 even
+//        when lifecycle scripts are being spoofed to exercise other branches.
 //
 //     3. `extraRepoOverlayFiles` (.yarnrc.yml + etc/script-jail/pm-flags.json
 //        + etc/script-jail/pnpm-arch.json) threading through makeOverlay.
@@ -170,13 +169,15 @@ export async function runAudit(
     input.buildArchFlagOverlay ?? buildArchFlagOverlay;
   const doMakeOverlay = input.makeOverlay ?? makeOverlay;
 
-  // 1. Arch-flag overlay (+ warning fan-out).  No-op for x64 hosts on
-  //    npm/pnpm; yarn-classic on arm64 emits a warning here.  We treat
-  //    'yarn' as yarn-berry by default — the worst case for yarn-classic
-  //    users on arm64 is a missed warning, not incorrect output.
+  // 1. Arch-flag overlay (+ warning fan-out).  No-op only when both the host
+  //    and the platform-spoof target are canonical linux/x64.  We treat 'yarn'
+  //    as yarn-berry by default — the worst case for yarn-classic users on
+  //    non-canonical targets is a missed warning, not incorrect output.
   const archOverlay = doBuildArchFlagOverlay({
     pm: input.pm,
     hostArch: input.hostArch,
+    spoofPlatform: input.overrides.spoofPlatform ?? 'linux',
+    spoofArch: input.overrides.spoofArch ?? 'x64',
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
 

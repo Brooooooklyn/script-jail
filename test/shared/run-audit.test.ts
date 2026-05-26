@@ -298,6 +298,31 @@ describe('runAudit — arch-flag overlay fan-out', () => {
     expect(captured).toEqual({ pm: 'pnpm', hostArch: 'arm64' });
   });
 
+  it('passes effective spoof platform/arch to buildArchFlagOverlay so spoofed PM resolution is corrected', async () => {
+    let captured: {
+      pm: string;
+      hostArch: string;
+      spoofPlatform: string | undefined;
+      spoofArch: string | undefined;
+    } | null = null;
+    const input = baseInput(async () => ({ finalYaml: '', nonFatalWarnings: [] }), {
+      pm: 'pnpm',
+      hostArch: 'x64',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'arm64' },
+      buildArchFlagOverlay: ({ pm, hostArch, spoofPlatform, spoofArch }) => {
+        captured = { pm, hostArch, spoofPlatform, spoofArch };
+        return { warnings: [] };
+      },
+    });
+    await runAudit(input);
+    expect(captured).toEqual({
+      pm: 'pnpm',
+      hostArch: 'x64',
+      spoofPlatform: 'linux',
+      spoofArch: 'arm64',
+    });
+  });
+
   it('threads yarnrcOverlay / pmFlagsJson into extraRepoOverlayFiles when buildArchFlagOverlay returns them', async () => {
     const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
     const capture = { calls, cleanups: 0 };

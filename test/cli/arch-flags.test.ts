@@ -15,6 +15,38 @@ describe('buildArchFlagOverlay — x64 host', () => {
       expect(overlay).toEqual({ warnings: [] });
     },
   );
+
+  it('npm: applies linux/x64 flags when spoof-arch would make the package manager see arm64', () => {
+    const overlay = buildArchFlagOverlay({
+      pm: 'npm',
+      hostArch: 'x64',
+      spoofPlatform: 'linux',
+      spoofArch: 'arm64',
+    });
+    expect(overlay.pmFlagsJson).toEqual({
+      extra_install_args: ['--cpu=x64', '--os=linux', '--libc=glibc'],
+    });
+    expect(overlay.warnings).toEqual([]);
+  });
+
+  it('pnpm: applies supportedArchitectures when spoof-platform would make the package manager see darwin', () => {
+    const overlay = buildArchFlagOverlay({
+      pm: 'pnpm',
+      hostArch: 'x64',
+      spoofPlatform: 'darwin',
+      spoofArch: 'x64',
+    });
+    const parsed = JSON.parse(overlay.pnpmArchOverlay ?? '') as Record<string, unknown>;
+    expect(parsed).toEqual({
+      supportedArchitectures: {
+        os: ['linux'],
+        cpu: ['x64'],
+        libc: ['glibc'],
+      },
+    });
+    expect(overlay.pmFlagsJson).toBeUndefined();
+    expect(overlay.warnings).toEqual([]);
+  });
 });
 
 describe('buildArchFlagOverlay — arm64 host', () => {
