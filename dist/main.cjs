@@ -27615,7 +27615,10 @@ var import_node_path8 = require("node:path");
 
 // src/cli/arch-flags.ts
 function buildArchFlagOverlay(input) {
-  if (input.hostArch === "x64") {
+  const spoofPlatform = input.spoofPlatform ?? "linux";
+  const spoofArch = input.spoofArch ?? "x64";
+  const needsLinuxX64Overlay = input.hostArch === "arm64" || spoofPlatform !== "linux" || spoofArch !== "x64";
+  if (!needsLinuxX64Overlay) {
     return { warnings: [] };
   }
   switch (input.pm) {
@@ -27639,7 +27642,7 @@ function buildArchFlagOverlay(input) {
     case "yarn-classic":
       return {
         warnings: [
-          "yarn classic (v1) does not support per-install architecture filters; lockfile audit on arm64 hosts will reflect arm64 subpackages and may diverge from CI. Consider upgrading to yarn 4+."
+          "yarn classic (v1) does not support per-install architecture filters; lockfile audit on arm64 hosts or spoofed non-linux/x64 targets may reflect non-canonical subpackages and diverge from CI. Consider upgrading to yarn 4+."
         ]
       };
     default: {
@@ -43010,7 +43013,9 @@ async function runAudit(input) {
   const doMakeOverlay = input.makeOverlay ?? makeOverlay;
   const archOverlay = doBuildArchFlagOverlay({
     pm: input.pm,
-    hostArch: input.hostArch
+    hostArch: input.hostArch,
+    spoofPlatform: input.overrides.spoofPlatform ?? "linux",
+    spoofArch: input.overrides.spoofArch ?? "x64"
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
   const scratchDir = (0, import_node_fs11.mkdtempSync)((0, import_node_path8.join)(input.workDir, "script-jail-config-"));
