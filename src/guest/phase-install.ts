@@ -273,6 +273,8 @@ export const NODE_STARTUP_DONE_STRACE_PATH = '/tmp/script-jail-node-startup-done
  *   exec:        {"kind":"exec","prog":"...","argv0":"...|null","envp_alloc_failed":bool,"pid":N,"ts":N}
  *   env_tamper:  {"kind":"env_tamper","op":"setenv|unsetenv|putenv|clearenv",
  *                 "name":"...","refused":true,"pid":N,"ts":N}
+ *   node_startup_done:
+ *                {"kind":"node_startup_done","pid":N,"ts":N}
  *
  * exec/env_tamper validation goes through the zod schema (rather than the
  * hand-rolled shape checks env_read/dlopen still use) because both shapes
@@ -280,7 +282,15 @@ export const NODE_STARTUP_DONE_STRACE_PATH = '/tmp/script-jail-node-startup-done
  * clearenv) that are easier to express declaratively. Existing env_read /
  * dlopen branches are left as-is to keep their tight error paths unchanged.
  */
-export function parseShimLine(line: string): RawEvent | null {
+interface NodeStartupDoneEvent {
+  kind: 'node_startup_done';
+  pid: number;
+  ts: number;
+}
+
+type ShimLineEvent = RawEvent | NodeStartupDoneEvent;
+
+export function parseShimLine(line: string): ShimLineEvent | null {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
     if (obj['kind'] === 'env_read') {
@@ -313,6 +323,12 @@ export function parseShimLine(line: string): RawEvent | null {
     } else if (obj['kind'] === 'env_tamper') {
       const parsed = EnvTamperEvent.safeParse(obj);
       if (parsed.success) return parsed.data;
+    } else if (obj['kind'] === 'node_startup_done') {
+      const pid = obj['pid'];
+      const ts = obj['ts'];
+      if (typeof pid === 'number' && typeof ts === 'number') {
+        return { kind: 'node_startup_done', pid, ts };
+      }
     }
     return null;
   } catch {
@@ -2075,33 +2091,87 @@ export async function runInstallPhase(
     }
   };
 
-  const nodeBootstrapPendingPids = new Set<number>();
+  const nodeBootstrapEnvPendingPids = new Set<number>();
+  const nodeBootstrapFilePendingPids = new Set<number>();
   const nodeBootstrapChildrenByPid = new Map<number, Set<number>>();
+  const nodeBootstrapEnvReads = new Set<string>();
+  const nodeBootstrapFileReads = new Set<string>();
 
-  const clearNodeBootstrap = (rootPid: number): void => {
+  const nodeBootstrapSubtree = (rootPid: number): number[] => {
     const stack = [rootPid];
     for (let i = 0; i < stack.length; i++) {
       const current = stack[i]!;
-      nodeBootstrapPendingPids.delete(current);
       const children = nodeBootstrapChildrenByPid.get(current);
-      nodeBootstrapChildrenByPid.delete(current);
       if (children !== undefined) {
         stack.push(...children);
+      }
+    }
+    return stack;
+  };
+
+  const clearNodeBootstrap = (rootPid: number): void => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapEnvPendingPids.delete(current);
+      nodeBootstrapFilePendingPids.delete(current);
+      nodeBootstrapChildrenByPid.delete(current);
+    }
+  };
+
+  const clearNodeBootstrapEnv = (rootPid: number): void => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapEnvPendingPids.delete(current);
+    }
+  };
+
+  const clearNodeBootstrapFile = (rootPid: number): void => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapFilePendingPids.delete(current);
+      if (!nodeBootstrapEnvPendingPids.has(current)) {
+        nodeBootstrapChildrenByPid.delete(current);
       }
     }
   };
 
   const beginNodeBootstrap = (pid: number): void => {
     clearNodeBootstrap(pid);
-    nodeBootstrapPendingPids.add(pid);
+    nodeBootstrapEnvPendingPids.add(pid);
+    nodeBootstrapFilePendingPids.add(pid);
   };
 
   const propagateNodeBootstrap = (parentPid: number, childPid: number): void => {
-    if (!nodeBootstrapPendingPids.has(parentPid)) return;
-    nodeBootstrapPendingPids.add(childPid);
+    let inherited = false;
+    if (nodeBootstrapEnvPendingPids.has(parentPid)) {
+      nodeBootstrapEnvPendingPids.add(childPid);
+      inherited = true;
+    }
+    if (nodeBootstrapFilePendingPids.has(parentPid)) {
+      nodeBootstrapFilePendingPids.add(childPid);
+      inherited = true;
+    }
+    if (!inherited) return;
     const children = nodeBootstrapChildrenByPid.get(parentPid) ?? new Set<number>();
     children.add(childPid);
     nodeBootstrapChildrenByPid.set(parentPid, children);
+  };
+
+  const shouldFilterNodeBootstrapEnvRead = (raw: RawEvent): boolean => {
+    if (raw.kind !== 'env_read' || raw.hidden) return false;
+    if (nodeBootstrapEnvPendingPids.has(raw.pid)) {
+      nodeBootstrapEnvReads.add(raw.name);
+      return true;
+    }
+    return nodeBootstrapEnvReads.has(raw.name);
+  };
+
+  const shouldFilterNodeBootstrapFileRead = (raw: RawEvent): boolean => {
+    if (raw.kind !== 'read' || raw.hidden || matcher.isProtected(raw.path)) {
+      return false;
+    }
+    if (nodeBootstrapFilePendingPids.has(raw.pid)) {
+      nodeBootstrapFileReads.add(raw.path);
+      return true;
+    }
+    return nodeBootstrapFileReads.has(raw.path);
   };
 
   // StraceRunner is the SOLE owner of the install process.
@@ -2208,6 +2278,10 @@ export async function runInstallPhase(
         );
         continue;
       }
+      if (shimEvent.kind === 'node_startup_done') {
+        clearNodeBootstrapEnv(shimEvent.pid);
+        continue;
+      }
       const result = input.attribution.attribute(shimEvent.pid);
       // Audit-trust Finding 1: track the shim's exec events per pid so
       // the post-loop cross-check can pair each strace execve with a
@@ -2265,6 +2339,9 @@ export async function runInstallPhase(
               : 0
             : current + 1;
         shimExecCountByPid.set(shimEvent.pid, next);
+      }
+      if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
+        continue;
       }
       if (result !== null) {
         // Finding 3 (audit-trust): snapshot attribution for this pid on
@@ -4580,7 +4657,7 @@ export async function runInstallPhase(
           rawEvent.kind === 'read' &&
           rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH
         ) {
-          clearNodeBootstrap(rawEvent.pid);
+          clearNodeBootstrapFile(rawEvent.pid);
           continue;
         }
 
@@ -5005,11 +5082,7 @@ export async function runInstallPhase(
             rawEvent.kind === 'read'
               ? { ...rawEvent, path: canonical }
               : { ...rawEvent, path: canonical };
-          if (
-            resolved.kind === 'read' &&
-            nodeBootstrapPendingPids.has(resolved.pid) &&
-            !matcher.isProtected(resolved.path)
-          ) {
+          if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
           emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });

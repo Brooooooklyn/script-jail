@@ -2,7 +2,7 @@ schema_version: 1
 manager: pnpm
 manager_lockfile_sha256: ""
 node_version: 24.15.0
-generated_at: 2026-05-20T14:27:47.323Z
+generated_at: 2026-05-26T15:42:42.075Z
 packages:
   "@swc/core@1.15.33":
     lifecycle:
@@ -28,7 +28,7 @@ packages:
           - /usr/bin/ldd
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
-          - /.npm/_logs/2026-05-20T14_27_46_935Z-debug-0.log
+          - /.npm/_logs/<timestamp>-debug-0.log
         env_read:
           - AC_APPCIRCLE
           - AGOLA_GIT_REF
@@ -75,13 +75,10 @@ packages:
           - GO_PIPELINE_LABEL
           - GRACEFUL_FS_PLATFORM
           - HARNESS_BUILD_ID
-          - HOME
           - HUDSON_URL
           - INIT_CWD
           - JENKINS_URL
-          - LANG
           - LAYERCI
-          - LC_ALL
           - LC_CTYPE
           - LD_PRELOAD
           - MAGNUM
@@ -89,13 +86,9 @@ packages:
           - NETLIFY
           - NEVERCODE
           - NODE
-          - NODE_COMPILE_CACHE
           - NODE_COMPILE_CACHE_PORTABLE
-          - NODE_DEBUG
           - NODE_DISABLE_COMPILE_CACHE
           - NODE_ENV
-          - NODE_OPTIONS
-          - NODE_V8_COVERAGE
           - NOPT_DEBUG
           - NOW_BUILDER
           - NO_COLOR
@@ -111,12 +104,8 @@ packages:
           - SAILCI
           - SCREWDRIVER
           - SCRIPT_JAIL_LOG_FD
-          - SCRIPT_JAIL_LOG_FILE
           - SCRIPT_JAIL_NODE_OPTIONS
           - SCRIPT_JAIL_PRELOAD_PATH
-          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
-          - SCRIPT_JAIL_SPOOF_ARCH
-          - SCRIPT_JAIL_SPOOF_PLATFORM
           - SEMAPHORE
           - SHELL
           - STRIDER
@@ -135,7 +124,6 @@ packages:
           - VERCEL
           - VISUAL
           - VP_HOME
-          - WATCH_REPORT_DEPENDENCIES
           - WORKERS_CI
           - XCS
           - _ISEXE_TEST_PLATFORM_
@@ -181,11 +169,9 @@ packages:
           - node /opt/vp/js_runtime/node/24.15.0/bin/npm install --no-save --loglevel=error --prefer-offline --no-audit --progress=false @swc/wasm@1.15.33
           - node postinstall.js
           - npm install --no-save --loglevel=error --prefer-offline --no-audit --progress=false @swc/wasm@1.15.33
-          - sh -c npm install --no-save --loglevel=error --prefer-offline --no-audit --progress=false @swc/wasm@1.15.33
         spawn_blocked:
           - <ENOENT> node /opt/vp/js_runtime/node/24.15.0/bin/npm install --no-save --loglevel=error --prefer-offline --no-audit --progress=false @swc/wasm@1.15.33
-        dlopen_attempts:
-          - <BLOCKED> $NODE_MODULES/.pnpm/@swc+core-linux-x64-gnu@1.15.33/node_modules/@swc/core-linux-x64-gnu/swc.linux-x64-gnu.node
+        dlopen_attempts: []
         network_attempts: []
   esbuild@0.28.0:
     lifecycle:
@@ -213,22 +199,16 @@ packages:
           - COREPACK_HOME
           - COREPACK_ROOT
           - ESBUILD_BINARY_PATH
-          - HOME
+          - FORCE_COLOR
           - INIT_CWD
           - LD_PRELOAD
           - NODE
-          - NODE_OPTIONS
-          - NODE_V8_COVERAGE
           - PATH
           - PNPM_SCRIPT_SRC_DIR
           - PWD
           - SCRIPT_JAIL_LOG_FD
-          - SCRIPT_JAIL_LOG_FILE
           - SCRIPT_JAIL_NODE_OPTIONS
           - SCRIPT_JAIL_PRELOAD_PATH
-          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
-          - SCRIPT_JAIL_SPOOF_ARCH
-          - SCRIPT_JAIL_SPOOF_PLATFORM
           - TERM
           - TMPDIR
           - VP_HOME
@@ -559,75 +539,28 @@ packages:
           - $NODE_MODULES/.pnpm/supports-color@7.2.0/node_modules/supports-color/index.js
           - $NODE_MODULES/.pnpm/supports-color@7.2.0/node_modules/supports-color/package.json
           - $REPO
-          - $REPO/package.json
-          - /
-          - /.cache/puppeteer
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
         env_read:
-          - ALL_PROXY
           - CI
           - COREPACK_ENABLE_DOWNLOAD_PROMPT
           - COREPACK_HOME
           - COREPACK_ROOT
           - DEBUG
           - FORCE_COLOR
-          - HOME
-          - HTTPS_PROXY
           - INIT_CWD
           - LD_PRELOAD
-          - LOCALDOMAIN
           - NODE
-          - NODE_DEBUG
-          - NODE_OPTIONS
-          - NODE_TLS_REJECT_UNAUTHORIZED
-          - NODE_V8_COVERAGE
           - NO_COLOR
-          - NO_PROXY
-          - NPM_CONFIG_HTTPS_PROXY
-          - NPM_CONFIG_NO_PROXY
-          - NPM_CONFIG_PROXY
           - PATH
           - PNPM_SCRIPT_SRC_DIR
-          - PUPPETEER_BROWSER
-          - PUPPETEER_CACHE_DIR
-          - PUPPETEER_CHROME_DOWNLOAD_BASE_URL
-          - PUPPETEER_CHROME_HEADLESS_SHELL_DOWNLOAD_BASE_URL
-          - PUPPETEER_CHROME_HEADLESS_SHELL_SKIP_DOWNLOAD
-          - PUPPETEER_CHROME_HEADLESS_SHELL_VERSION
-          - PUPPETEER_CHROME_SKIP_DOWNLOAD
-          - PUPPETEER_CHROME_VERSION
-          - PUPPETEER_EXECUTABLE_PATH
-          - PUPPETEER_FIREFOX_DOWNLOAD_BASE_URL
-          - PUPPETEER_FIREFOX_SKIP_DOWNLOAD
-          - PUPPETEER_FIREFOX_VERSION
-          - PUPPETEER_LOGLEVEL
-          - PUPPETEER_SKIP_CHROME_DOWNLOAD
-          - PUPPETEER_SKIP_CHROME_HEADLESS_SHELL_DOWNLOAD
-          - PUPPETEER_SKIP_DOWNLOAD
-          - PUPPETEER_SKIP_FIREFOX_DOWNLOAD
-          - PUPPETEER_TMP_DIR
           - PWD
-          - RES_OPTIONS
           - SCRIPT_JAIL_LOG_FD
-          - SCRIPT_JAIL_LOG_FILE
           - SCRIPT_JAIL_NODE_OPTIONS
           - SCRIPT_JAIL_PRELOAD_PATH
-          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
-          - SCRIPT_JAIL_SPOOF_ARCH
-          - SCRIPT_JAIL_SPOOF_PLATFORM
           - TERM
           - TMPDIR
-          - UV_THREADPOOL_SIZE
           - VP_HOME
-          - WATCH_REPORT_DEPENDENCIES
-          - XDG_CACHE_HOME
-          - XDG_CONFIG_HOME
-          - XDG_DATA_HOME
-          - XDG_STATE_HOME
-          - all_proxy
-          - https_proxy
-          - no_proxy
           - npm_command
           - npm_config__jsr_registry
           - npm_config_catalog
@@ -636,7 +569,6 @@ packages:
           - npm_config_globalconfig
           - npm_config_http_proxy
           - npm_config_https_proxy
-          - npm_config_loglevel
           - npm_config_no_proxy
           - npm_config_node_gyp
           - npm_config_npm_globalconfig
@@ -660,14 +592,9 @@ packages:
           - pnpm_config_verify_deps_before_run
         spawn_attempts:
           - node install.mjs
-          - sh -c node install.mjs
-        spawn_blocked:
-          - <ENOENT> sh -c node install.mjs
+        spawn_blocked: []
         dlopen_attempts: []
-        network_attempts:
-          - <BLOCKED> connect 1.1.1.1:53
-          - <BLOCKED> connect 192.168.64.1:53
-          - <BLOCKED> connect 8.8.8.8:53
+        network_attempts: []
   simple-git-hooks@2.13.1:
     lifecycle:
       postinstall:
@@ -684,27 +611,19 @@ packages:
           - COREPACK_ENABLE_DOWNLOAD_PROMPT
           - COREPACK_HOME
           - COREPACK_ROOT
-          - HOME
           - INIT_CWD
           - LD_PRELOAD
           - NODE
-          - NODE_OPTIONS
-          - NODE_V8_COVERAGE
           - PATH
           - PNPM_SCRIPT_SRC_DIR
           - PWD
           - SCRIPT_JAIL_LOG_FD
-          - SCRIPT_JAIL_LOG_FILE
           - SCRIPT_JAIL_NODE_OPTIONS
           - SCRIPT_JAIL_PRELOAD_PATH
-          - SCRIPT_JAIL_PROTECTED_ENV_NAMES
-          - SCRIPT_JAIL_SPOOF_ARCH
-          - SCRIPT_JAIL_SPOOF_PLATFORM
           - SKIP_INSTALL_SIMPLE_GIT_HOOKS
           - TERM
           - TMPDIR
           - VP_HOME
-          - WATCH_REPORT_DEPENDENCIES
           - npm_command
           - npm_config__jsr_registry
           - npm_config_catalog
@@ -769,9 +688,7 @@ packages:
           - /usr/bin/ldd
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
-        env_read:
-          - COLS
-          - NODE_V8_COVERAGE
+        env_read: []
         spawn_attempts:
           - dirname $PKG/node_modules/.bin/napi-postinstall
           - napi-postinstall unrs-resolver 1.11.1 check
