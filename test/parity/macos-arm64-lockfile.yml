@@ -2,7 +2,7 @@ schema_version: 1
 manager: pnpm
 manager_lockfile_sha256: ""
 node_version: 24.15.0
-generated_at: 2026-05-27T09:20:18.637Z
+generated_at: 2026-05-27T10:38:26.825Z
 packages:
   "@swc/core@1.15.33":
     lifecycle:
@@ -30,139 +30,38 @@ packages:
           - $TMPDIR/<hash>/<hash>.jsonl
           - /.npm/_logs/<timestamp>-debug-0.log
         env_read:
-          - AC_APPCIRCLE
-          - AGOLA_GIT_REF
-          - ALPIC_HOST
-          - APPCENTER_BUILD_ID
-          - APPVEYOR
-          - BITBUCKET_COMMIT
-          - BITRISE_IO
-          - BUDDY_WORKSPACE_ID
-          - BUILDER_OUTPUT
-          - BUILDKITE
-          - BUILD_ID
-          - BUILD_NUMBER
-          - CF_BUILD_ID
-          - CF_PAGES
-          - CI
-          - CIRCLECI
-          - CIRRUS_CI
-          - CI_APP_ID
-          - CI_BUILD_ID
-          - CI_BUILD_NUMBER
-          - CI_NAME
-          - CI_XCODE_PROJECT
-          - CM_BUILD_ID
-          - CODEBUILD_BUILD_ARN
-          - COLOR
-          - COLORTERM
-          - CONTINUOUS_INTEGRATION
           - COREPACK_ENABLE_DOWNLOAD_PROMPT
           - COREPACK_HOME
           - COREPACK_ROOT
-          - DEBUG_NOPT
-          - DESTDIR
-          - DRONE
-          - DSARI
-          - EARTHLY_CI
-          - EAS_BUILD
-          - EDITOR
           - FORCE_COLOR
-          - GERRIT_PROJECT
-          - GITEA_ACTIONS
-          - GITHUB_ACTIONS
-          - GITLAB_CI
-          - GIT_ASKPASS
-          - GIT_SSH_COMMAND
-          - GO_PIPELINE_LABEL
-          - GRACEFUL_FS_PLATFORM
-          - HARNESS_BUILD_ID
-          - HUDSON_URL
           - INIT_CWD
-          - JENKINS_URL
-          - LAYERCI
-          - LC_CTYPE
           - LD_PRELOAD
-          - LOCALDOMAIN
-          - MAGNUM
           - NAPI_RS_FORCE_WASI
-          - NETLIFY
-          - NEVERCODE
           - NODE
-          - NODE_COMPILE_CACHE_PORTABLE
-          - NODE_DISABLE_COMPILE_CACHE
-          - NODE_ENV
-          - NOPROXY
-          - NOPT_DEBUG
-          - NOW_BUILDER
-          - NO_COLOR
           - PATH
-          - PATHEXT
           - PNPM_SCRIPT_SRC_DIR
-          - PREFIX
-          - PROW_JOB_ID
           - PWD
-          - RELEASE_BUILD_ID
-          - RENDER
-          - RES_OPTIONS
-          - RUN_ID
-          - SAILCI
-          - SCREWDRIVER
           - SCRIPT_JAIL_LOG_FD
           - SCRIPT_JAIL_NODE_OPTIONS
           - SCRIPT_JAIL_PRELOAD_PATH
-          - SEMAPHORE
-          - SHELL
-          - STRIDER
           - SWC_BINARY_PATH
-          - TASK_ID
-          - TEAMCITY_VERSION
           - TERM
-          - TERM_PROGRAM
-          - TESTING_TAR_FAKE_PLATFORM
-          - TEST_GRACEFUL_FS_GLOBAL_PATCH
-          - TF_BUILD
           - TMPDIR
-          - TRAVIS
-          - TZ
-          - UV_THREADPOOL_SIZE
-          - VELA
-          - VERCEL
-          - VISUAL
           - VP_HOME
-          - WORKERS_CI
-          - XCS
-          - _ISEXE_TEST_PLATFORM_
-          - __FAKE_FS_O_FILENAME__
-          - __FAKE_PLATFORM__
-          - __MINIMATCH_TESTING_PLATFORM__
-          - bamboo_planKey
           - npm_command
           - npm_config__jsr_registry
-          - npm_config_audit
-          - npm_config_cache
           - npm_config_catalog
           - npm_config_dedupe_peers
           - npm_config_frozen_lockfile
-          - npm_config_global_prefix
           - npm_config_globalconfig
-          - npm_config_init_module
-          - npm_config_local_prefix
-          - npm_config_loglevel
           - npm_config_node_gyp
-          - npm_config_noproxy
           - npm_config_npm_globalconfig
-          - npm_config_npm_version
           - npm_config_peer_dependency_rules
           - npm_config_pending
-          - npm_config_prefer_offline
-          - npm_config_prefix
           - npm_config_registry
-          - npm_config_save
           - npm_config_side_effects_cache
           - npm_config_store_dir
           - npm_config_user_agent
-          - npm_config_userconfig
           - npm_config_verify_deps_before_run
           - npm_execpath
           - npm_lifecycle_event
@@ -207,12 +106,21 @@ packages:
           - COREPACK_HOME
           - COREPACK_ROOT
           - ESBUILD_BINARY_PATH
+          - FORCE_COLOR
+          - INIT_CWD
+          - LD_PRELOAD
           - NODE
           - PATH
+          - PNPM_SCRIPT_SRC_DIR
           - PWD
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_NODE_OPTIONS
+          - SCRIPT_JAIL_PRELOAD_PATH
           - TERM
           - TMPDIR
           - VP_HOME
+          - npm_command
+          - npm_config__jsr_registry
           - npm_config_catalog
           - npm_config_dedupe_peers
           - npm_config_frozen_lockfile
@@ -226,6 +134,7 @@ packages:
           - npm_config_store_dir
           - npm_config_user_agent
           - npm_config_verify_deps_before_run
+          - npm_execpath
           - npm_lifecycle_event
           - npm_lifecycle_script
           - npm_node_execpath
@@ -254,38 +163,124 @@ packages:
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/CLI.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/Cache.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/DefaultProvider.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/browser-data.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/chrome-headless-shell.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/chrome.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/chromedriver.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/chromium.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/firefox.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/browser-data/types.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/debug.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/detectPlatform.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/fileUtil.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/httpUtil.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/install.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/launch.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/main.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/package.json
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/@puppeteer/browsers/lib/esm/provider.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/debug
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/debug/package.json
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/debug/src/index.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/progress
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/progress/index.js
+          - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/progress/package.json
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/proxy-agent
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/proxy-agent/dist/index.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/proxy-agent/package.json
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/semver
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/semver/index.js
           - $NODE_MODULES/.pnpm/@puppeteer+browsers@2.13.0/node_modules/semver/package.json
+          - $NODE_MODULES/.pnpm/cosmiconfig@9.0.0_typescript@5.6.3
+          - $NODE_MODULES/.pnpm/cosmiconfig@9.0.0_typescript@5.6.3/node_modules
+          - $NODE_MODULES/.pnpm/cosmiconfig@9.0.0_typescript@5.6.3/node_modules/cosmiconfig
+          - $NODE_MODULES/.pnpm/cosmiconfig@9.0.0_typescript@5.6.3/node_modules/cosmiconfig/dist
+          - $NODE_MODULES/.pnpm/cosmiconfig@9.0.0_typescript@5.6.3/node_modules/cosmiconfig/dist/index.js
+          - $NODE_MODULES/.pnpm/cosmiconfig@9.0.0_typescript@5.6.3/node_modules/cosmiconfig/package.json
+          - $NODE_MODULES/.pnpm/debug@4.4.3
+          - $NODE_MODULES/.pnpm/debug@4.4.3/node_modules
+          - $NODE_MODULES/.pnpm/debug@4.4.3/node_modules/debug
+          - $NODE_MODULES/.pnpm/debug@4.4.3/node_modules/debug/package.json
+          - $NODE_MODULES/.pnpm/debug@4.4.3/node_modules/debug/src
+          - $NODE_MODULES/.pnpm/debug@4.4.3/node_modules/debug/src/common.js
+          - $NODE_MODULES/.pnpm/debug@4.4.3/node_modules/debug/src/index.js
+          - $NODE_MODULES/.pnpm/debug@4.4.3/node_modules/debug/src/node.js
+          - $NODE_MODULES/.pnpm/progress@2.0.3
+          - $NODE_MODULES/.pnpm/progress@2.0.3/node_modules
+          - $NODE_MODULES/.pnpm/progress@2.0.3/node_modules/progress
+          - $NODE_MODULES/.pnpm/progress@2.0.3/node_modules/progress/index.js
+          - $NODE_MODULES/.pnpm/progress@2.0.3/node_modules/progress/lib
+          - $NODE_MODULES/.pnpm/progress@2.0.3/node_modules/progress/lib/node-progress.js
+          - $NODE_MODULES/.pnpm/progress@2.0.3/node_modules/progress/package.json
           - $NODE_MODULES/.pnpm/proxy-agent@6.5.0
           - $NODE_MODULES/.pnpm/proxy-agent@6.5.0/node_modules
           - $NODE_MODULES/.pnpm/proxy-agent@6.5.0/node_modules/proxy-agent
           - $NODE_MODULES/.pnpm/proxy-agent@6.5.0/node_modules/proxy-agent/dist
           - $NODE_MODULES/.pnpm/proxy-agent@6.5.0/node_modules/proxy-agent/dist/index.js
           - $NODE_MODULES/.pnpm/proxy-agent@6.5.0/node_modules/proxy-agent/package.json
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0/node_modules
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0/node_modules/puppeteer-core
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0/node_modules/puppeteer-core/lib
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0/node_modules/puppeteer-core/lib/esm
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0/node_modules/puppeteer-core/lib/esm/package.json
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0/node_modules/puppeteer-core/lib/esm/puppeteer
+          - $NODE_MODULES/.pnpm/puppeteer-core@24.42.0/node_modules/puppeteer-core/lib/esm/puppeteer/revisions.js
           - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3
           - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules
           - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer
           - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer/browsers
           - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer/browsers/lib/esm/main.js
           - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/@puppeteer/browsers/package.json
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/cosmiconfig
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/cosmiconfig/dist/index.js
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/cosmiconfig/package.json
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/puppeteer-core
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/puppeteer-core/lib/esm/puppeteer/revisions.js
+          - $NODE_MODULES/.pnpm/puppeteer@24.42.0_typescript@5.6.3/node_modules/puppeteer-core/package.json
           - $NODE_MODULES/.pnpm/semver@7.7.4
           - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules
           - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/classes
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/classes/comparator.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/classes/range.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/classes/semver.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/clean.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/cmp.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/coerce.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/compare-build.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/compare-loose.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/compare.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/diff.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/eq.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/gt.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/gte.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/inc.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/lt.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/lte.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/major.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/minor.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/neq.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/parse.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/patch.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/prerelease.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/rcompare.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/rsort.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/sort.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/functions/valid.js
           - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/index.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/internal
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/internal/constants.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/internal/debug.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/internal/identifiers.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/internal/lrucache.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/internal/parse-options.js
+          - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/internal/re.js
           - $NODE_MODULES/.pnpm/semver@7.7.4/node_modules/semver/package.json
           - $REPO
         escaped_writes:
@@ -362,11 +357,6 @@ packages:
         external_reads:
           - $NODE_MODULES
           - $NODE_MODULES/.pnpm
-          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-x64-gnu@1.11.1
-          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-x64-gnu@1.11.1/node_modules
-          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-x64-gnu@1.11.1/node_modules/@unrs
-          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-x64-gnu@1.11.1/node_modules/@unrs/resolver-binding-linux-x64-gnu
-          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-x64-gnu@1.11.1/node_modules/@unrs/resolver-binding-linux-x64-gnu/resolver.linux-x64-gnu.node
           - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4
           - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules
           - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall
@@ -377,17 +367,11 @@ packages:
           - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/index.js
           - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/target.js
           - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/package.json
-          - $NODE_MODULES/.pnpm/node_modules
-          - $NODE_MODULES/.pnpm/node_modules/@unrs
-          - $NODE_MODULES/.pnpm/node_modules/@unrs/resolver-binding-linux-x64-gnu
-          - $NODE_MODULES/.pnpm/node_modules/@unrs/resolver-binding-linux-x64-gnu/package.json
-          - $NODE_MODULES/.pnpm/node_modules/@unrs/resolver-binding-linux-x64-gnu/resolver.linux-x64-gnu.node
           - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1
           - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules
           - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules/napi-postinstall
           - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules/napi-postinstall/lib/cli.js
           - $REPO
-          - /usr/bin/ldd
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
         env_read:

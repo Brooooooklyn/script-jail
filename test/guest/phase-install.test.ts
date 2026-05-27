@@ -4805,7 +4805,7 @@ describe('runInstallPhase', () => {
         manager: 'npm',
         cwd: '/work',
         env: BASE_ENV,
-        strace: cannedStraceRunner(straceLines),
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
         attribution: new Attribution(proc),
         emitter,
         protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
@@ -4817,6 +4817,168 @@ describe('runInstallPhase', () => {
       });
       expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'OPENSSL_CONF')).toBe(false);
       expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PACKAGE_ENV')).toBe(true);
+      const protectedRead = raws.find((raw) => raw['kind'] === 'env_read' && raw['name'] === 'NPM_TOKEN');
+      expect(protectedRead?.['hidden']).toBe(true);
+    });
+
+    it('filters bootstrap env reads for shebang-launched Node after shim confirmation', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'execve("/work/bin/node-tool", ["node-tool"], 0x7ffd) = 0' },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: 42, ts: 1, hidden: false }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'NPM_TOKEN', pid: 42, ts: 2, hidden: true }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 42, ts: 3 }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: 42, ts: 4, hidden: false }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PACKAGE_ENV', pid: 42, ts: 5, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'OPENSSL_CONF')).toBe(false);
+      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PACKAGE_ENV')).toBe(true);
+      const protectedRead = raws.find((raw) => raw['kind'] === 'env_read' && raw['name'] === 'NPM_TOKEN');
+      expect(protectedRead?.['hidden']).toBe(true);
+    });
+
+    it('flushes unconfirmed non-Node candidate env reads when the trace drains', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'execve("/bin/env", ["env"], 0x7ffd) = 0' },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'HOME', pid: 42, ts: 1, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'HOME')).toBe(true);
+    });
+
+    it('filters unprotected env reads from npm, yarn, and pnpm client pids only', async () => {
+      const clients = [
+        {
+          name: 'npm',
+          execLine: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/npm", ["npm", "install"], 0x7ffd) = 0',
+        },
+        {
+          name: 'yarn',
+          execLine: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/yarn", ["yarn", "install"], 0x7ffd) = 0',
+        },
+        {
+          name: 'pnpm',
+          execLine: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/node", ["node", "/opt/vp/js_runtime/node/24.15.0/bin/pnpm", "install"], 0x7ffd) = 0',
+        },
+      ];
+
+      for (const client of clients) {
+        const proc = mockProcReader({
+          42: { ppid: 1, env: npmEnv },
+          43: { ppid: 42, env: npmEnv },
+        });
+        const straceLines = [
+          { pid: 42, line: client.execLine },
+          { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PM_CLIENT_BOOTSTRAP_ENV', pid: 42, ts: 1, hidden: false }) },
+          { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 42, ts: 1 }) },
+          { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'npm_config_registry', pid: 42, ts: 2, hidden: false }) },
+          { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PACKAGE_ENV', pid: 42, ts: 3, hidden: false }) },
+          { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'NPM_TOKEN', pid: 42, ts: 4, hidden: true }) },
+          { pid: 43, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PACKAGE_ENV', pid: 43, ts: 5, hidden: false }) },
+          { pid: 43, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PM_CLIENT_BOOTSTRAP_ENV', pid: 43, ts: 6, hidden: false }) },
+        ];
+        const { emitter, lines } = makeEmitter();
+
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: BASE_ENV,
+          strace: cannedStraceRunner(straceLines),
+          attribution: new Attribution(proc),
+          emitter,
+          protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+        });
+
+        const raws = lines.map((line) => {
+          const parsed = JSON.parse(line) as Record<string, unknown>;
+          return parsed['raw'] as Record<string, unknown>;
+        });
+        expect(
+          raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'npm_config_registry'),
+          client.name,
+        ).toBe(false);
+        expect(
+          raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PACKAGE_ENV' && raw['pid'] === 42),
+          client.name,
+        ).toBe(false);
+        expect(
+          raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PACKAGE_ENV' && raw['pid'] === 43),
+          client.name,
+        ).toBe(true);
+        expect(
+          raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PM_CLIENT_BOOTSTRAP_ENV' && raw['pid'] === 42),
+          client.name,
+        ).toBe(false);
+        expect(
+          raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'PM_CLIENT_BOOTSTRAP_ENV' && raw['pid'] === 43),
+          client.name,
+        ).toBe(true);
+        const protectedRead = raws.find((raw) => raw['kind'] === 'env_read' && raw['name'] === 'NPM_TOKEN');
+        expect(protectedRead?.['hidden'], client.name).toBe(true);
+      }
+    });
+
+    it('filters unprotected env reads from the root package-manager client pid', async () => {
+      const proc = mockProcReader({
+        42: { ppid: 1, env: npmEnv },
+        43: { ppid: 42, env: npmEnv },
+      });
+      const straceLines = [
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 42, ts: 1 }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'npm_config_registry', pid: 42, ts: 2, hidden: false }) },
+        { pid: 42, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'NPM_TOKEN', pid: 42, ts: 3, hidden: true }) },
+        { pid: 43, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'npm_config_registry', pid: 43, ts: 4, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'pnpm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: 42 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'npm_config_registry' && raw['pid'] === 42)).toBe(false);
+      expect(raws.some((raw) => raw['kind'] === 'env_read' && raw['name'] === 'npm_config_registry' && raw['pid'] === 43)).toBe(true);
       const protectedRead = raws.find((raw) => raw['kind'] === 'env_read' && raw['name'] === 'NPM_TOKEN');
       expect(protectedRead?.['hidden']).toBe(true);
     });

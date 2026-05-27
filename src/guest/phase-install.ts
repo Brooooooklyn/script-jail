@@ -349,6 +349,22 @@ function isNodeBasename(pathLike: string | undefined): boolean {
   return base === 'node' || base === 'nodejs';
 }
 
+function isPackageManagerClientBasename(pathLike: string | undefined): boolean {
+  if (pathLike === undefined || pathLike.length === 0) return false;
+  const base = pathBasename(pathLike);
+  return (
+    base === 'npm' ||
+    base === 'npx' ||
+    base === 'npm-cli.js' ||
+    base === 'pnpm' ||
+    base === 'pnpm.cjs' ||
+    base === 'yarn' ||
+    base === 'yarnpkg' ||
+    base === 'yarn.js' ||
+    base === 'corepack'
+  );
+}
+
 function firstExecPathFromStraceLine(line: string): string | null {
   let match = line.match(/^execve\("((?:\\.|[^"\\])*)"/);
   if (match?.[1] !== undefined) return match[1];
@@ -360,6 +376,18 @@ function isNodeSpawn(rawEvent: RawEvent, line: string): boolean {
   if (rawEvent.kind !== 'spawn' || rawEvent.result !== 'ok') return false;
   if (isNodeBasename(rawEvent.argv[0])) return true;
   return isNodeBasename(firstExecPathFromStraceLine(line) ?? undefined);
+}
+
+function isPackageManagerClientSpawn(rawEvent: RawEvent, line: string): boolean {
+  if (rawEvent.kind !== 'spawn' || rawEvent.result !== 'ok') return false;
+  if (isPackageManagerClientBasename(rawEvent.argv[0])) return true;
+  if (isPackageManagerClientBasename(firstExecPathFromStraceLine(line) ?? undefined)) {
+    return true;
+  }
+  if (isNodeBasename(rawEvent.argv[0])) {
+    return isPackageManagerClientBasename(rawEvent.argv[1]);
+  }
+  return false;
 }
 
 export async function runInstallPhase(
@@ -1838,6 +1866,7 @@ export async function runInstallPhase(
   // happens.  This is the safe default — every pid then falls through
   // to clone-propagation or the fail-closed path.
   let installRootSeeded = false;
+  let installRootPid: number | null = null;
 
   /**
    * Canonicalize the target path of an openat write event for comparison
@@ -2097,13 +2126,15 @@ export async function runInstallPhase(
   const nodeBootstrapChildrenByPid = new Map<number, Set<number>>();
   // Shebang entrypoints such as npm/pnpm do not exec as basename `node`, but
   // become Node processes after the kernel resolves the interpreter. Buffer
-  // pre-marker file reads until env-spy confirms Node and the same-pid strace
-  // marker defines the file-read boundary.
-  const nodeBootstrapCandidateFileReadsByPid = new Map<number, AttributedEvent[]>();
+  // pre-marker events until env-spy confirms Node. Env reads use the shim
+  // startup marker as their boundary; file reads also require the same-pid
+  // strace marker because they arrive on a separate stream.
+  const nodeBootstrapCandidateEventsByPid = new Map<number, AttributedEvent[]>();
   const nodeBootstrapCandidateConfirmedPids = new Set<number>();
   const nodeBootstrapCandidateFileMarkerPids = new Set<number>();
   const nodeBootstrapEnvReads = new Set<string>();
   const nodeBootstrapFileReads = new Set<string>();
+  const packageManagerClientPids = new Set<number>();
 
   const nodeBootstrapSubtree = (rootPid: number): number[] => {
     const stack = [rootPid];
@@ -2148,25 +2179,45 @@ export async function runInstallPhase(
   };
 
   const flushNodeBootstrapCandidate = (pid: number): void => {
-    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
     if (buffered === undefined) return;
-    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateEventsByPid.delete(pid);
     nodeBootstrapCandidateConfirmedPids.delete(pid);
     nodeBootstrapCandidateFileMarkerPids.delete(pid);
     for (const ev of buffered) emit(ev);
   };
 
   const dropNodeBootstrapCandidateAsNode = (pid: number): void => {
-    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
     if (buffered === undefined) return;
-    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateEventsByPid.delete(pid);
     nodeBootstrapCandidateConfirmedPids.delete(pid);
     nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    const recordEnvBaseline = !packageManagerClientPids.has(pid);
     for (const ev of buffered) {
       if (ev.raw.kind === 'read') {
         nodeBootstrapFileReads.add(ev.raw.path);
+      } else if (ev.raw.kind === 'env_read' && recordEnvBaseline) {
+        nodeBootstrapEnvReads.add(ev.raw.name);
       }
     }
+  };
+
+  const dropNodeBootstrapCandidateEnvReadsAsNode = (pid: number): void => {
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
+    if (buffered === undefined) return;
+    const recordEnvBaseline = !packageManagerClientPids.has(pid);
+    const keep: AttributedEvent[] = [];
+    for (const ev of buffered) {
+      if (ev.raw.kind === 'env_read') {
+        if (recordEnvBaseline) {
+          nodeBootstrapEnvReads.add(ev.raw.name);
+        }
+      } else {
+        keep.push(ev);
+      }
+    }
+    nodeBootstrapCandidateEventsByPid.set(pid, keep);
   };
 
   const beginNodeBootstrapCandidate = (pid: number): void => {
@@ -2174,18 +2225,19 @@ export async function runInstallPhase(
     nodeBootstrapFileCompletedPids.delete(pid);
     nodeBootstrapCandidateConfirmedPids.delete(pid);
     nodeBootstrapCandidateFileMarkerPids.delete(pid);
-    nodeBootstrapCandidateFileReadsByPid.set(pid, []);
+    nodeBootstrapCandidateEventsByPid.set(pid, []);
   };
 
   const flushAllNodeBootstrapCandidates = (): void => {
-    for (const pid of [...nodeBootstrapCandidateFileReadsByPid.keys()]) {
+    for (const pid of [...nodeBootstrapCandidateEventsByPid.keys()]) {
       flushNodeBootstrapCandidate(pid);
     }
   };
 
   const confirmNodeBootstrapCandidate = (pid: number): boolean => {
-    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    if (!nodeBootstrapCandidateEventsByPid.has(pid)) return false;
     nodeBootstrapCandidateConfirmedPids.add(pid);
+    dropNodeBootstrapCandidateEnvReadsAsNode(pid);
     if (nodeBootstrapCandidateFileMarkerPids.has(pid)) {
       dropNodeBootstrapCandidateAsNode(pid);
     }
@@ -2193,7 +2245,7 @@ export async function runInstallPhase(
   };
 
   const completeNodeBootstrapCandidateFileMarker = (pid: number): boolean => {
-    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    if (!nodeBootstrapCandidateEventsByPid.has(pid)) return false;
     nodeBootstrapCandidateFileMarkerPids.add(pid);
     if (nodeBootstrapCandidateConfirmedPids.has(pid)) {
       dropNodeBootstrapCandidateAsNode(pid);
@@ -2220,10 +2272,17 @@ export async function runInstallPhase(
   const shouldFilterNodeBootstrapEnvRead = (raw: RawEvent): boolean => {
     if (raw.kind !== 'env_read' || raw.hidden) return false;
     if (nodeBootstrapEnvPendingPids.has(raw.pid)) {
-      nodeBootstrapEnvReads.add(raw.name);
+      if (!packageManagerClientPids.has(raw.pid)) {
+        nodeBootstrapEnvReads.add(raw.name);
+      }
       return true;
     }
     return nodeBootstrapEnvReads.has(raw.name);
+  };
+
+  const shouldFilterPackageManagerClientEnvRead = (raw: RawEvent): boolean => {
+    if (raw.kind !== 'env_read' || raw.hidden) return false;
+    return packageManagerClientPids.has(raw.pid);
   };
 
   const shouldFilterNodeBootstrapFileRead = (raw: RawEvent): boolean => {
@@ -2241,9 +2300,18 @@ export async function runInstallPhase(
     if (ev.raw.kind !== 'read' || ev.raw.hidden || matcher.isProtected(ev.raw.path)) {
       return false;
     }
-    const buffered = nodeBootstrapCandidateFileReadsByPid.get(ev.raw.pid);
+    const buffered = nodeBootstrapCandidateEventsByPid.get(ev.raw.pid);
     if (buffered === undefined) return false;
     if (nodeBootstrapCandidateFileMarkerPids.has(ev.raw.pid)) return false;
+    buffered.push(ev);
+    return true;
+  };
+
+  const shouldBufferNodeBootstrapCandidateEnvRead = (ev: AttributedEvent): boolean => {
+    if (ev.raw.kind !== 'env_read' || ev.raw.hidden) return false;
+    const buffered = nodeBootstrapCandidateEventsByPid.get(ev.raw.pid);
+    if (buffered === undefined) return false;
+    if (nodeBootstrapCandidateConfirmedPids.has(ev.raw.pid)) return false;
     buffered.push(ev);
     return true;
   };
@@ -2322,6 +2390,7 @@ export async function runInstallPhase(
       const rootPid = input.strace.getRootPid();
       if (rootPid !== null && pid === rootPid) {
         installRootSeeded = true;
+        installRootPid = pid;
         cwdSet(pid, path.resolve(input.cwd));
       }
     }
@@ -2353,6 +2422,9 @@ export async function runInstallPhase(
         continue;
       }
       if (shimEvent.kind === 'node_startup_done') {
+        if (shimEvent.pid === installRootPid) {
+          packageManagerClientPids.add(shimEvent.pid);
+        }
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
         if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
           nodeBootstrapFilePendingPids.add(shimEvent.pid);
@@ -2429,7 +2501,18 @@ export async function runInstallPhase(
         // refresh semantics (see `recordAttribution` declaration) also
         // keep same-pid re-execs into a new package context current.
         recordAttribution(shimEvent.pid, result, lineTs);
-        emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
+        const attributed: AttributedEvent = {
+          raw: shimEvent,
+          pkg: result.pkg,
+          lifecycle: result.lifecycle,
+        };
+        if (shouldBufferNodeBootstrapCandidateEnvRead(attributed)) {
+          continue;
+        }
+        if (shouldFilterPackageManagerClientEnvRead(shimEvent)) {
+          continue;
+        }
+        emit(attributed);
       }
       continue;
     }
@@ -2508,6 +2591,7 @@ export async function runInstallPhase(
       //      would be required to wrap PID_MAX.
       if (line.startsWith('+++') && line.endsWith('+++')) {
         flushNodeBootstrapCandidate(pid);
+        packageManagerClientPids.delete(pid);
         // Audit-trust final model (Codex review of 2496405,
         // 2026-05-19): the snapshot is NEVER evicted on exit.
         //
@@ -4628,13 +4712,18 @@ export async function runInstallPhase(
         // survives execve (per execve(2)), so the attacker's
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
+          const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
+          packageManagerClientPids.delete(rawEvent.pid);
           shimLoadedPids.delete(rawEvent.pid);
           if (isNodeSpawn(rawEvent, line)) {
             beginNodeBootstrap(rawEvent.pid);
           } else {
             clearNodeBootstrap(rawEvent.pid);
             beginNodeBootstrapCandidate(rawEvent.pid);
+          }
+          if (isPackageManagerClient) {
+            packageManagerClientPids.add(rawEvent.pid);
           }
           // Codex follow-up (high, 2026-05-19): execve detaches the
           // caller from any shared CLONE_FILES fd group BEFORE the
