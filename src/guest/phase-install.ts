@@ -2093,7 +2093,15 @@ export async function runInstallPhase(
 
   const nodeBootstrapEnvPendingPids = new Set<number>();
   const nodeBootstrapFilePendingPids = new Set<number>();
+  const nodeBootstrapFileCompletedPids = new Set<number>();
   const nodeBootstrapChildrenByPid = new Map<number, Set<number>>();
+  // Shebang entrypoints such as npm/pnpm do not exec as basename `node`, but
+  // become Node processes after the kernel resolves the interpreter. Buffer
+  // pre-marker file reads until env-spy confirms Node and the same-pid strace
+  // marker defines the file-read boundary.
+  const nodeBootstrapCandidateFileReadsByPid = new Map<number, AttributedEvent[]>();
+  const nodeBootstrapCandidateConfirmedPids = new Set<number>();
+  const nodeBootstrapCandidateFileMarkerPids = new Set<number>();
   const nodeBootstrapEnvReads = new Set<string>();
   const nodeBootstrapFileReads = new Set<string>();
 
@@ -2113,6 +2121,7 @@ export async function runInstallPhase(
     for (const current of nodeBootstrapSubtree(rootPid)) {
       nodeBootstrapEnvPendingPids.delete(current);
       nodeBootstrapFilePendingPids.delete(current);
+      nodeBootstrapFileCompletedPids.delete(current);
       nodeBootstrapChildrenByPid.delete(current);
     }
   };
@@ -2136,6 +2145,60 @@ export async function runInstallPhase(
     clearNodeBootstrap(pid);
     nodeBootstrapEnvPendingPids.add(pid);
     nodeBootstrapFilePendingPids.add(pid);
+  };
+
+  const flushNodeBootstrapCandidate = (pid: number): void => {
+    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    if (buffered === undefined) return;
+    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    for (const ev of buffered) emit(ev);
+  };
+
+  const dropNodeBootstrapCandidateAsNode = (pid: number): void => {
+    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    if (buffered === undefined) return;
+    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    for (const ev of buffered) {
+      if (ev.raw.kind === 'read') {
+        nodeBootstrapFileReads.add(ev.raw.path);
+      }
+    }
+  };
+
+  const beginNodeBootstrapCandidate = (pid: number): void => {
+    flushNodeBootstrapCandidate(pid);
+    nodeBootstrapFileCompletedPids.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    nodeBootstrapCandidateFileReadsByPid.set(pid, []);
+  };
+
+  const flushAllNodeBootstrapCandidates = (): void => {
+    for (const pid of [...nodeBootstrapCandidateFileReadsByPid.keys()]) {
+      flushNodeBootstrapCandidate(pid);
+    }
+  };
+
+  const confirmNodeBootstrapCandidate = (pid: number): boolean => {
+    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    nodeBootstrapCandidateConfirmedPids.add(pid);
+    if (nodeBootstrapCandidateFileMarkerPids.has(pid)) {
+      dropNodeBootstrapCandidateAsNode(pid);
+    }
+    return true;
+  };
+
+  const completeNodeBootstrapCandidateFileMarker = (pid: number): boolean => {
+    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    nodeBootstrapCandidateFileMarkerPids.add(pid);
+    if (nodeBootstrapCandidateConfirmedPids.has(pid)) {
+      dropNodeBootstrapCandidateAsNode(pid);
+    }
+    return true;
   };
 
   const propagateNodeBootstrap = (parentPid: number, childPid: number): void => {
@@ -2172,6 +2235,17 @@ export async function runInstallPhase(
       return true;
     }
     return nodeBootstrapFileReads.has(raw.path);
+  };
+
+  const shouldBufferNodeBootstrapCandidateFileRead = (ev: AttributedEvent): boolean => {
+    if (ev.raw.kind !== 'read' || ev.raw.hidden || matcher.isProtected(ev.raw.path)) {
+      return false;
+    }
+    const buffered = nodeBootstrapCandidateFileReadsByPid.get(ev.raw.pid);
+    if (buffered === undefined) return false;
+    if (nodeBootstrapCandidateFileMarkerPids.has(ev.raw.pid)) return false;
+    buffered.push(ev);
+    return true;
   };
 
   // StraceRunner is the SOLE owner of the install process.
@@ -2279,6 +2353,10 @@ export async function runInstallPhase(
         continue;
       }
       if (shimEvent.kind === 'node_startup_done') {
+        const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
+        if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
+          nodeBootstrapFilePendingPids.add(shimEvent.pid);
+        }
         clearNodeBootstrapEnv(shimEvent.pid);
         continue;
       }
@@ -2429,6 +2507,7 @@ export async function runInstallPhase(
       //      theoretical concern: tens of thousands of pid allocations
       //      would be required to wrap PID_MAX.
       if (line.startsWith('+++') && line.endsWith('+++')) {
+        flushNodeBootstrapCandidate(pid);
         // Audit-trust final model (Codex review of 2496405,
         // 2026-05-19): the snapshot is NEVER evicted on exit.
         //
@@ -4549,11 +4628,13 @@ export async function runInstallPhase(
         // survives execve (per execve(2)), so the attacker's
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
+          flushNodeBootstrapCandidate(rawEvent.pid);
           shimLoadedPids.delete(rawEvent.pid);
           if (isNodeSpawn(rawEvent, line)) {
             beginNodeBootstrap(rawEvent.pid);
           } else {
             clearNodeBootstrap(rawEvent.pid);
+            beginNodeBootstrapCandidate(rawEvent.pid);
           }
           // Codex follow-up (high, 2026-05-19): execve detaches the
           // caller from any shared CLONE_FILES fd group BEFORE the
@@ -4657,6 +4738,8 @@ export async function runInstallPhase(
           rawEvent.kind === 'read' &&
           rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH
         ) {
+          completeNodeBootstrapCandidateFileMarker(rawEvent.pid);
+          nodeBootstrapFileCompletedPids.add(rawEvent.pid);
           clearNodeBootstrapFile(rawEvent.pid);
           continue;
         }
@@ -5085,7 +5168,15 @@ export async function runInstallPhase(
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
-          emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });
+          const attributed: AttributedEvent = {
+            raw: resolved,
+            pkg: result.pkg,
+            lifecycle: result.lifecycle,
+          };
+          if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+            continue;
+          }
+          emit(attributed);
           continue;
         }
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
@@ -5114,6 +5205,8 @@ export async function runInstallPhase(
         'Audit-pipeline contract requires source ∈ {"shim","strace"}.',
     );
   }
+
+  flushAllNodeBootstrapCandidates();
 
   // Audit-trust Finding 1 (2026-05-18): post-loop cross-check.  For each
   // pid we count successful strace execve syscalls vs shim libc exec

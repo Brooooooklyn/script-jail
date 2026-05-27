@@ -26523,7 +26523,11 @@ async function runInstallPhase(input) {
   };
   const nodeBootstrapEnvPendingPids = /* @__PURE__ */ new Set();
   const nodeBootstrapFilePendingPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapFileCompletedPids = /* @__PURE__ */ new Set();
   const nodeBootstrapChildrenByPid = /* @__PURE__ */ new Map();
+  const nodeBootstrapCandidateFileReadsByPid = /* @__PURE__ */ new Map();
+  const nodeBootstrapCandidateConfirmedPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapCandidateFileMarkerPids = /* @__PURE__ */ new Set();
   const nodeBootstrapEnvReads = /* @__PURE__ */ new Set();
   const nodeBootstrapFileReads = /* @__PURE__ */ new Set();
   const nodeBootstrapSubtree = (rootPid) => {
@@ -26541,6 +26545,7 @@ async function runInstallPhase(input) {
     for (const current of nodeBootstrapSubtree(rootPid)) {
       nodeBootstrapEnvPendingPids.delete(current);
       nodeBootstrapFilePendingPids.delete(current);
+      nodeBootstrapFileCompletedPids.delete(current);
       nodeBootstrapChildrenByPid.delete(current);
     }
   };
@@ -26561,6 +26566,54 @@ async function runInstallPhase(input) {
     clearNodeBootstrap(pid);
     nodeBootstrapEnvPendingPids.add(pid);
     nodeBootstrapFilePendingPids.add(pid);
+  };
+  const flushNodeBootstrapCandidate = (pid) => {
+    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    if (buffered === void 0) return;
+    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    for (const ev of buffered) emit(ev);
+  };
+  const dropNodeBootstrapCandidateAsNode = (pid) => {
+    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    if (buffered === void 0) return;
+    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    for (const ev of buffered) {
+      if (ev.raw.kind === "read") {
+        nodeBootstrapFileReads.add(ev.raw.path);
+      }
+    }
+  };
+  const beginNodeBootstrapCandidate = (pid) => {
+    flushNodeBootstrapCandidate(pid);
+    nodeBootstrapFileCompletedPids.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    nodeBootstrapCandidateFileReadsByPid.set(pid, []);
+  };
+  const flushAllNodeBootstrapCandidates = () => {
+    for (const pid of [...nodeBootstrapCandidateFileReadsByPid.keys()]) {
+      flushNodeBootstrapCandidate(pid);
+    }
+  };
+  const confirmNodeBootstrapCandidate = (pid) => {
+    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    nodeBootstrapCandidateConfirmedPids.add(pid);
+    if (nodeBootstrapCandidateFileMarkerPids.has(pid)) {
+      dropNodeBootstrapCandidateAsNode(pid);
+    }
+    return true;
+  };
+  const completeNodeBootstrapCandidateFileMarker = (pid) => {
+    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    nodeBootstrapCandidateFileMarkerPids.add(pid);
+    if (nodeBootstrapCandidateConfirmedPids.has(pid)) {
+      dropNodeBootstrapCandidateAsNode(pid);
+    }
+    return true;
   };
   const propagateNodeBootstrap = (parentPid, childPid) => {
     let inherited = false;
@@ -26595,6 +26648,16 @@ async function runInstallPhase(input) {
     }
     return nodeBootstrapFileReads.has(raw.path);
   };
+  const shouldBufferNodeBootstrapCandidateFileRead = (ev) => {
+    if (ev.raw.kind !== "read" || ev.raw.hidden || matcher.isProtected(ev.raw.path)) {
+      return false;
+    }
+    const buffered = nodeBootstrapCandidateFileReadsByPid.get(ev.raw.pid);
+    if (buffered === void 0) return false;
+    if (nodeBootstrapCandidateFileMarkerPids.has(ev.raw.pid)) return false;
+    buffered.push(ev);
+    return true;
+  };
   let dispatchTs = 0;
   for await (const record2 of input.strace.run(cmd, args, {
     env: input.env,
@@ -26623,6 +26686,10 @@ async function runInstallPhase(input) {
         continue;
       }
       if (shimEvent.kind === "node_startup_done") {
+        const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
+        if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
+          nodeBootstrapFilePendingPids.add(shimEvent.pid);
+        }
         clearNodeBootstrapEnv(shimEvent.pid);
         continue;
       }
@@ -26643,6 +26710,7 @@ async function runInstallPhase(input) {
     }
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
+        flushNodeBootstrapCandidate(pid);
         input.attribution.invalidate(pid);
         const liveAttrib = input.attribution.attribute(pid);
         if (liveAttrib !== null) {
@@ -27404,11 +27472,13 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          flushNodeBootstrapCandidate(rawEvent.pid);
           shimLoadedPids.delete(rawEvent.pid);
           if (isNodeSpawn(rawEvent, line)) {
             beginNodeBootstrap(rawEvent.pid);
           } else {
             clearNodeBootstrap(rawEvent.pid);
+            beginNodeBootstrapCandidate(rawEvent.pid);
           }
           const execFdSingleton = isFdSingleton(rawEvent.pid);
           let execFdSnap = null;
@@ -27442,6 +27512,8 @@ async function runInstallPhase(input) {
           }
         }
         if (rawEvent.kind === "read" && rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH) {
+          completeNodeBootstrapCandidateFileMarker(rawEvent.pid);
+          nodeBootstrapFileCompletedPids.add(rawEvent.pid);
           clearNodeBootstrapFile(rawEvent.pid);
           continue;
         }
@@ -27574,7 +27646,15 @@ async function runInstallPhase(input) {
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
-          emit({ raw: resolved, pkg: result.pkg, lifecycle: result.lifecycle });
+          const attributed = {
+            raw: resolved,
+            pkg: result.pkg,
+            lifecycle: result.lifecycle
+          };
+          if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+            continue;
+          }
+          emit(attributed);
           continue;
         }
         emit({ raw: rawEvent, pkg: result.pkg, lifecycle: result.lifecycle });
@@ -27588,6 +27668,7 @@ async function runInstallPhase(input) {
       `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). Audit-pipeline contract requires source \u2208 {"shim","strace"}.`
     );
   }
+  flushAllNodeBootstrapCandidates();
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
     const shimNet = shimExecCountByPid.get(pid) ?? 0;
