@@ -12,6 +12,7 @@ import { createGzip } from 'node:zlib';
 
 import {
   ensureBinaries,
+  KNOWN_TARBALL_SHA256,
   KNOWN_VERSIONS,
   type HttpClient,
   type DownloadInput,
@@ -280,6 +281,42 @@ describe('ensureBinaries', () => {
   it('KNOWN_VERSIONS includes 1.8.0 and 1.9.0', () => {
     expect(Object.keys(KNOWN_VERSIONS)).toContain('1.8.0');
     expect(Object.keys(KNOWN_VERSIONS)).toContain('1.9.0');
+    expect(Object.keys(KNOWN_TARBALL_SHA256.arm64)).toContain('1.8.0');
+    expect(Object.keys(KNOWN_TARBALL_SHA256.arm64)).toContain('1.9.0');
+  });
+
+  it('uses the aarch64 Firecracker tarball and entry when arch=arm64', async () => {
+    const binaryContent = randomBytes(32);
+    const tarGzBuffer = await buildTarGz(
+      `release-v${FAKE_VERSION}-aarch64/firecracker-v${FAKE_VERSION}-aarch64`,
+      binaryContent,
+    );
+    const calls: Array<{ url: string; dest: string }> = [];
+    const client: HttpClient = {
+      async download(url, destPath) {
+        calls.push({ url, dest: destPath });
+        if (url.includes('firecracker')) {
+          writeFileSync(destPath, tarGzBuffer);
+        } else {
+          writeFileSync(destPath, FAKE_KERNEL_CONTENT);
+        }
+      },
+    };
+
+    const result = await ensureBinaries({
+      imagesDir: testDir,
+      arch: 'arm64',
+      firecrackerVersion: FAKE_VERSION,
+      kernelUrl: 'https://example.com/vmlinux',
+      kernelSha256: FAKE_KERNEL_SHA,
+      http: client,
+    });
+
+    const tarCall = calls.find((c) => c.url.includes('firecracker'));
+    expect(tarCall?.url).toContain(`firecracker-v${FAKE_VERSION}-aarch64.tgz`);
+    expect(tarCall?.dest).toContain(`firecracker-v${FAKE_VERSION}-aarch64.tgz`);
+    const { readFileSync } = await import('node:fs');
+    expect(readFileSync(result.firecrackerPath)).toEqual(binaryContent);
   });
 
   it('rejects with a descriptive error when the tar entry is missing from the tarball', async () => {

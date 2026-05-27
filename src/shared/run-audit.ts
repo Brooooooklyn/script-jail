@@ -16,16 +16,15 @@
 //        Action ran it; CLI did not.
 //
 //     2. `buildArchFlagOverlay({pm, hostArch, spoofPlatform, spoofArch})` +
-//        warning fan-out — needed on arm64 macOS hosts and on runs whose
-//        platform-spoof config would make the package manager see a
-//        non-linux/x64 target.  The dependency tree must stay Linux/x64 even
-//        when lifecycle scripts are being spoofed to exercise other branches.
+//        warning fan-out — now a no-op by default after the project switched
+//        to same-arch parity, but the seam stays shared so tests and future
+//        explicit overrides flow through both entrypoints identically.
 //
 //     3. `extraRepoOverlayFiles` (.yarnrc.yml + etc/script-jail/pm-flags.json
 //        + etc/script-jail/pnpm-arch.json) threading through makeOverlay.
 //        Action did not thread these.
-//        Same reasoning: keeping the wiring identical means we cannot ship
-//        an arm64-targeting Action that silently drops the overlay.
+//        Same reasoning: keeping the wiring identical means a future explicit
+//        package-manager overlay cannot be silently dropped by one entrypoint.
 //
 // Each entry stays a thin wrapper that owns only what it CANNOT share:
 //   * input parsing (env vars vs argv);
@@ -169,15 +168,14 @@ export async function runAudit(
     input.buildArchFlagOverlay ?? buildArchFlagOverlay;
   const doMakeOverlay = input.makeOverlay ?? makeOverlay;
 
-  // 1. Arch-flag overlay (+ warning fan-out).  No-op only when both the host
-  //    and the platform-spoof target are canonical linux/x64.  We treat 'yarn'
-  //    as yarn-berry by default — the worst case for yarn-classic users on
-  //    non-canonical targets is a missed warning, not incorrect output.
+  // 1. Arch-flag overlay (+ warning fan-out).  The default implementation is
+  //    intentionally no-op under same-arch parity; injected test/future
+  //    implementations still get the effective host + spoof target.
   const archOverlay = doBuildArchFlagOverlay({
     pm: input.pm,
     hostArch: input.hostArch,
     spoofPlatform: input.overrides.spoofPlatform ?? 'linux',
-    spoofArch: input.overrides.spoofArch ?? 'x64',
+    spoofArch: input.overrides.spoofArch ?? input.hostArch,
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
 
@@ -200,10 +198,10 @@ export async function runAudit(
       userConfigPath: input.configPath,
       overrides: {
         // buildEffectiveConfig expects required SpoofPlatform / SpoofArch —
-        // both entries' input shapes already default these, so we coerce
-        // here rather than threading the defaults through runAudit.
+        // both entries' input shapes already default these.  Direct runAudit
+        // callers without an explicit spoof arch inherit the host arch.
         spoofPlatform: input.overrides.spoofPlatform ?? 'linux',
-        spoofArch: input.overrides.spoofArch ?? 'x64',
+        spoofArch: input.overrides.spoofArch ?? input.hostArch,
       },
       workDir: scratchDir,
       ...(archOverlay.yarnrcOverlay !== undefined

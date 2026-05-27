@@ -27,6 +27,8 @@ import { join } from 'node:path';
 export interface MaybeClearCacheInput {
   imagesDir: string;
   cacheFirecracker: boolean;
+  /** Host/guest architecture for the Firecracker tarball. Defaults to x64. */
+  arch?: 'x64' | 'arm64';
   /**
    * Firecracker release version used to derive the tarball + binary
    * filenames inside `imagesDir`.  Must match the value passed to
@@ -56,9 +58,10 @@ export function maybeClearCache(input: MaybeClearCacheInput): void {
   if (input.cacheFirecracker) return;
 
   const fs = input.fs ?? { rmSync };
+  const releaseArch = input.arch === 'arm64' ? 'aarch64' : 'x86_64';
   const tarPath = join(
     input.imagesDir,
-    `firecracker-v${input.firecrackerVersion}-x86_64.tgz`,
+    `firecracker-v${input.firecrackerVersion}-${releaseArch}.tgz`,
   );
   const fcBinPath = join(
     input.imagesDir,

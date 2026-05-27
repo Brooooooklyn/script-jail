@@ -46,6 +46,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     configPath: '.script-jail.yml',
     lockPath: '.script-jail.lock.yml',
     spoofPlatform: 'linux',
+    // `src/cli/index.ts` replaces this with the detected host arch when the
+    // user did not pass --spoof-arch.  Keeping a concrete parser default
+    // preserves the stable ParsedArgs shape.
     spoofArch: 'x64',
     help: false,
     version: false,

@@ -12,6 +12,7 @@ import { maybeClearCache } from '../../src/action/cache.js';
 const imagesDir = '/tmp/script-jail-images';
 const firecrackerVersion = '1.8.0';
 const tarPath = join(imagesDir, `firecracker-v${firecrackerVersion}-x86_64.tgz`);
+const armTarPath = join(imagesDir, `firecracker-v${firecrackerVersion}-aarch64.tgz`);
 const fcBinPath = join(imagesDir, `firecracker-v${firecrackerVersion}`);
 const vmlinuxPath = join(imagesDir, 'vmlinux');
 
@@ -66,5 +67,20 @@ describe('maybeClearCache', () => {
     for (const t of targets) {
       expect(t).not.toMatch(/rootfs-.*\.ext4$/);
     }
+  });
+
+  it('removes the aarch64 tarball when arch=arm64', () => {
+    const rmSync = vi.fn();
+
+    maybeClearCache({
+      imagesDir,
+      firecrackerVersion,
+      cacheFirecracker: false,
+      arch: 'arm64',
+      fs: { rmSync },
+    });
+
+    expect(rmSync).toHaveBeenCalledWith(armTarPath, { force: true });
+    expect(rmSync).not.toHaveBeenCalledWith(tarPath, { force: true });
   });
 });

@@ -35,30 +35,31 @@
 //     Phase B runs `yarn install --immutable --offline` which re-links and
 //     triggers scripts (or yarn rebuild if needed).
 //
-// Arch-resolution hints (forcing Linux/x64 resolution from an arm64 host):
-//   Each package manager has a DIFFERENT mechanism and they are applied at
-//   different layers — there is no single CLI form that works everywhere:
+// Optional package-manager resolution hints:
+//   The normal same-arch parity path does not stage these files.  If a future
+//   explicit override mode supplies them, each package manager has a DIFFERENT
+//   mechanism and they are applied at different layers — there is no single
+//   CLI form that works everywhere:
 //
 //   * npm  — /etc/script-jail/pm-flags.json holds
-//            { "extra_install_args": ["--cpu=x64","--os=linux","--libc=glibc"] }.
-//            npm honours these as `npm ci` flags and resolves the dependency
-//            graph during Phase A, so they MUST be appended here (Phase B is
-//            too late — the tree is already resolved).
+//            { "extra_install_args": [...] }. npm honours these as `npm ci`
+//            flags and resolves the dependency graph during Phase A, so they
+//            MUST be appended here (Phase B is too late — the tree is already
+//            resolved).
 //
-//   * pnpm — pnpm does NOT accept --cpu/--os/--libc on the CLI (`pnpm
-//            install --cpu=x64` fails with "Unknown options: 'cpu', 'os',
-//            'libc'").  Its mechanism is a `pnpm.supportedArchitectures`
-//            block in the repo's root package.json.  `pnpm install` reads
-//            that block and picks the platform variants to resolve and
-//            download — so the guest merges it into package.json HERE,
-//            before `pnpm install` runs.  See `apply-pnpm-arch.ts`.
+//   * pnpm — pnpm does NOT accept --cpu/--os/--libc on the CLI. Its override
+//            mechanism is a `pnpm.supportedArchitectures` block in the repo's
+//            root package.json. `pnpm install` reads that block and picks the
+//            platform variants to resolve and download — so the guest merges
+//            it into package.json HERE, before `pnpm install` runs. See
+//            `apply-pnpm-arch.ts`.
 //
 //   * yarn — Berry reads `supportedArchitectures` from a `.yarnrc.yml` the
 //            CLI lands on the repo disk before the VM boots; nothing to do
 //            here.
 //
-//   All three overlay files are OPTIONAL: only the macOS CLI stages them and
-//   only on an arm64 host.  Absence is the normal action path.
+//   All three overlay files are OPTIONAL. Absence is the normal action and
+//   CLI path after the switch to arm64 CI parity.
 
 import { applyPnpmArchOverlay } from './apply-pnpm-arch.js';
 import { loadPmFlags } from './load-pm-flags.js';

@@ -2,12 +2,10 @@
 //
 // Loader for /etc/script-jail/pm-flags.json.
 //
-// NPM ONLY.  The macOS CLI (`src/cli/`) lands `/etc/script-jail/pm-flags.json`
-// when forcing a Linux/x64 install resolution from an arm64 host running
-// **npm**.  npm accepts `--cpu=x64 --os=linux --libc=glibc` as `npm ci`
-// flags; Phase A (`phase-fetch.ts`) reads them here and appends them to the
-// `npm ci` invocation — npm resolves its dependency graph during Phase A, so
-// the arch hints must take effect there, NOT during Phase B
+// NPM ONLY.  If a caller lands `/etc/script-jail/pm-flags.json`, Phase A
+// (`phase-fetch.ts`) reads it here and appends `extra_install_args` to the
+// `npm ci` invocation. npm resolves its dependency graph during Phase A, so
+// any explicit package-manager hints must take effect there, NOT during Phase B
 // (`phase-install.ts`) which runs `npm rebuild` against the already-resolved
 // tree.
 //
@@ -18,11 +16,10 @@
 //   * yarn Berry uses a `.yarnrc.yml` `supportedArchitectures` overlay landed
 //     by the CLI on the repo disk before the VM boots.
 //
-// Defensive read: the file is optional (the action does not write it, only
-// the macOS CLI does).  Missing-file / parse-failure / schema-mismatch all
+// Defensive read: the file is optional, and the normal same-arch parity path
+// does not write it. Missing-file / parse-failure / schema-mismatch all
 // degrade silently to "no extra args" — we do NOT fail the install for a
-// malformed override; the worst case is that the audit proceeds without the
-// arch hint, which is exactly the pre-PR 2 behaviour.
+// malformed override.
 
 import * as fs from 'node:fs';
 

@@ -25963,6 +25963,7 @@ var require_dist = __commonJS({
 // src/main.ts
 var main_exports = {};
 __export(main_exports, {
+  detectActionHostArch: () => detectActionHostArch,
   main: () => main
 });
 module.exports = __toCommonJS(main_exports);
@@ -26457,7 +26458,7 @@ function parseInputs(input) {
       `script-jail: invalid value for input "spoof-platform": "${platformStr}". Expected one of: linux, darwin, win32.`
     );
   }
-  const archStr = rawArch.trim() === "" ? "x64" : rawArch.trim();
+  const archStr = rawArch.trim() === "" ? input.defaultSpoofArch ?? "x64" : rawArch.trim();
   if (!isSpoofArch(archStr)) {
     throw new Error(
       `script-jail: invalid value for input "spoof-arch": "${archStr}". Expected one of: x64, arm64.`
@@ -26639,9 +26640,10 @@ var import_node_path3 = require("node:path");
 function maybeClearCache(input) {
   if (input.cacheFirecracker) return;
   const fs3 = input.fs ?? { rmSync: import_node_fs3.rmSync };
+  const releaseArch = input.arch === "arm64" ? "aarch64" : "x86_64";
   const tarPath = (0, import_node_path3.join)(
     input.imagesDir,
-    `firecracker-v${input.firecrackerVersion}-x86_64.tgz`
+    `firecracker-v${input.firecrackerVersion}-${releaseArch}.tgz`
   );
   const fcBinPath = (0, import_node_path3.join)(
     input.imagesDir,
@@ -26721,21 +26723,31 @@ async function downloadToFile(url2, destPath, redirects) {
 }
 
 // src/action/firecracker/download.ts
-var KNOWN_VERSIONS = {
+var KNOWN_X64_VERSIONS = {
   "1.8.0": "bc899bdaef8d0aa7b0fafbf49a2bf647e0298558f4faee44970d87a1c6d1ae2d",
   "1.9.0": "95c13740c7ca1a6dfb40e0f51cd0a9eefee1f223cd2c3538755d03c3a9ba5237"
 };
+var KNOWN_ARM64_VERSIONS = {
+  "1.8.0": "64b49ceb53167d7616bf4fd2c73def696a320259ea6e07cf1447c9091c5f9271",
+  "1.9.0": "c5564e76dec2b8e8092c52f0f8a4c5f45cf31791e95a9302f4360a771df78f69"
+};
+var KNOWN_TARBALL_SHA256 = {
+  x64: KNOWN_X64_VERSIONS,
+  arm64: KNOWN_ARM64_VERSIONS
+};
 async function ensureBinaries(input) {
   const { imagesDir, firecrackerVersion, kernelUrl, kernelSha256, http } = input;
-  const expectedTarSha = KNOWN_VERSIONS[firecrackerVersion];
+  const arch2 = input.arch ?? "x64";
+  const releaseArch = firecrackerReleaseArch(arch2);
+  const expectedTarSha = KNOWN_TARBALL_SHA256[arch2][firecrackerVersion];
   if (expectedTarSha === void 0) {
     throw new Error(
-      `script-jail: unknown Firecracker version "${firecrackerVersion}". Add it (with a pinned SHA-256) to KNOWN_VERSIONS in src/action/firecracker/download.ts.`
+      `script-jail: unknown Firecracker version "${firecrackerVersion}" for ${arch2}. Add it (with a pinned SHA-256) to KNOWN_TARBALL_SHA256 in src/action/firecracker/download.ts.`
     );
   }
   (0, import_node_fs5.mkdirSync)(imagesDir, { recursive: true });
-  const tarUrl = `https://github.com/firecracker-microvm/firecracker/releases/download/v${firecrackerVersion}/firecracker-v${firecrackerVersion}-x86_64.tgz`;
-  const tarPath = (0, import_node_path4.join)(imagesDir, `firecracker-v${firecrackerVersion}-x86_64.tgz`);
+  const tarUrl = `https://github.com/firecracker-microvm/firecracker/releases/download/v${firecrackerVersion}/firecracker-v${firecrackerVersion}-${releaseArch}.tgz`;
+  const tarPath = (0, import_node_path4.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
   const fcBinPath = (0, import_node_path4.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
   const vmlinuxPath = (0, import_node_path4.join)(imagesDir, "vmlinux");
   const [tarFresh] = await Promise.all([
@@ -26746,7 +26758,7 @@ async function ensureBinaries(input) {
     await (0, import_promises2.unlink)(fcBinPath);
   }
   void tarFresh;
-  await extractFirecrackerBinary(tarPath, fcBinPath, firecrackerVersion);
+  await extractFirecrackerBinary(tarPath, fcBinPath, firecrackerVersion, releaseArch);
   return { firecrackerPath: fcBinPath, vmlinuxPath };
 }
 async function ensureFile(http, url2, destPath, expectedSha256) {
@@ -26760,12 +26772,12 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
   await http.download(url2, destPath, expectedSha256);
   return true;
 }
-async function extractFirecrackerBinary(tarPath, destPath, version2) {
+async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch) {
   const tmpOut = (0, import_node_path4.join)(
     (0, import_node_os.tmpdir)(),
     `script-jail-fc-${(0, import_node_crypto3.randomBytes)(4).toString("hex")}`
   );
-  const targetEntry = `firecracker-v${version2}-x86_64`;
+  const targetEntry = `firecracker-v${version2}-${releaseArch}`;
   await new Promise((resolve2, reject) => {
     const gunzip = (0, import_node_zlib.createGunzip)();
     const input = (0, import_node_fs5.createReadStream)(tarPath);
@@ -26845,28 +26857,35 @@ async function extractFirecrackerBinary(tarPath, destPath, version2) {
   await (0, import_promises2.rename)(tmpOut, destPath);
   await (0, import_promises2.chmod)(destPath, 493);
 }
+function firecrackerReleaseArch(arch2) {
+  return arch2 === "arm64" ? "aarch64" : "x86_64";
+}
 
 // src/action/pre-fetch-artifacts.ts
 var import_node_crypto4 = require("node:crypto");
 var import_node_fs6 = require("node:fs");
 var import_node_path5 = require("node:path");
-function rootfsAssetName(runnerImage) {
-  return `rootfs-${runnerImage}.ext4`;
+function rootfsAssetName(runnerImage, arch2) {
+  return arch2 === "arm64" ? `rootfs-${runnerImage}-arm64.ext4` : `rootfs-${runnerImage}.ext4`;
 }
-var LIBSCRIPTJAIL_ASSET = "libscriptjail.so";
+function libscriptjailAssetName(arch2) {
+  return arch2 === "arm64" ? "libscriptjail-arm64.so" : "libscriptjail.so";
+}
 async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
   const platform4 = input.platform ?? "linux";
+  const arch2 = input.arch ?? "x64";
   (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
-  const wantedRootfs = rootfsAssetName(runnerImage);
+  const wantedRootfs = rootfsAssetName(runnerImage, arch2);
+  const wantedLibscriptjail = libscriptjailAssetName(arch2);
   const assets = [
     {
       name: wantedRootfs,
       expected: requireExpected(manifest, platform4, wantedRootfs)
     },
     {
-      name: LIBSCRIPTJAIL_ASSET,
-      expected: requireExpected(manifest, platform4, LIBSCRIPTJAIL_ASSET)
+      name: wantedLibscriptjail,
+      expected: requireExpected(manifest, platform4, wantedLibscriptjail)
     }
   ];
   await Promise.all(
@@ -27614,42 +27633,8 @@ var import_promises6 = require("node:fs/promises");
 var import_node_path8 = require("node:path");
 
 // src/cli/arch-flags.ts
-function buildArchFlagOverlay(input) {
-  const spoofPlatform = input.spoofPlatform ?? "linux";
-  const spoofArch = input.spoofArch ?? "x64";
-  const needsLinuxX64Overlay = input.hostArch === "arm64" || spoofPlatform !== "linux" || spoofArch !== "x64";
-  if (!needsLinuxX64Overlay) {
-    return { warnings: [] };
-  }
-  switch (input.pm) {
-    case "npm":
-      return {
-        pmFlagsJson: {
-          extra_install_args: ["--cpu=x64", "--os=linux", "--libc=glibc"]
-        },
-        warnings: []
-      };
-    case "pnpm":
-      return {
-        pnpmArchOverlay: '{\n  "supportedArchitectures": {\n    "os": ["linux"],\n    "cpu": ["x64"],\n    "libc": ["glibc"]\n  }\n}\n',
-        warnings: []
-      };
-    case "yarn":
-      return {
-        yarnrcOverlay: "supportedArchitectures:\n  os:\n    - linux\n  cpu:\n    - x64\n  libc:\n    - glibc\n",
-        warnings: []
-      };
-    case "yarn-classic":
-      return {
-        warnings: [
-          "yarn classic (v1) does not support per-install architecture filters; lockfile audit on arm64 hosts or spoofed non-linux/x64 targets may reflect non-canonical subpackages and diverge from CI. Consider upgrading to yarn 4+."
-        ]
-      };
-    default: {
-      const exhaustive = input.pm;
-      throw new Error(`buildArchFlagOverlay: unsupported pm '${String(exhaustive)}'`);
-    }
-  }
+function buildArchFlagOverlay(_input) {
+  return { warnings: [] };
 }
 
 // node_modules/.pnpm/diff@9.0.0/node_modules/diff/libesm/diff/base.js
@@ -43016,7 +43001,7 @@ async function runAudit(input) {
     pm: input.pm,
     hostArch: input.hostArch,
     spoofPlatform: input.overrides.spoofPlatform ?? "linux",
-    spoofArch: input.overrides.spoofArch ?? "x64"
+    spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
   const scratchDir = (0, import_node_fs11.mkdtempSync)((0, import_node_path8.join)(input.workDir, "script-jail-config-"));
@@ -43027,10 +43012,10 @@ async function runAudit(input) {
       userConfigPath: input.configPath,
       overrides: {
         // buildEffectiveConfig expects required SpoofPlatform / SpoofArch —
-        // both entries' input shapes already default these, so we coerce
-        // here rather than threading the defaults through runAudit.
+        // both entries' input shapes already default these.  Direct runAudit
+        // callers without an explicit spoof arch inherit the host arch.
         spoofPlatform: input.overrides.spoofPlatform ?? "linux",
-        spoofArch: input.overrides.spoofArch ?? "x64"
+        spoofArch: input.overrides.spoofArch ?? input.hostArch
       },
       workDir: scratchDir,
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
@@ -43120,8 +43105,16 @@ function relativeForDisplay(absPath, repoDir) {
 
 // src/main.ts
 var FIRECRACKER_VERSION = "1.8.0";
-var PINNED_VMLINUX_URL = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223";
-var PINNED_VMLINUX_SHA256 = "22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65";
+var PINNED_KERNELS = {
+  x64: {
+    url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223",
+    sha256: "22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65"
+  },
+  arm64: {
+    url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223",
+    sha256: "eb5d95ac8a67f7a86acf0cb35625633713ad5170b56de8617808d0e18bb832ec"
+  }
+};
 var VSOCK_PORT = 10242;
 var GUEST_CID = 3;
 async function main(deps = {}) {
@@ -43142,7 +43135,8 @@ async function main(deps = {}) {
     doValidateManifest(PINNED_MANIFEST);
   }
   const repoDir = process.env["SCRIPT_JAIL_REPO_DIR"] ?? process.cwd() ?? process.env["GITHUB_WORKSPACE"] ?? "";
-  const inputs = parseInputs({ repoDir });
+  const actionHostArch = detectActionHostArch();
+  const inputs = parseInputs({ repoDir, defaultSpoofArch: actionHostArch });
   let pm;
   try {
     pm = detectPm({ repoDir });
@@ -43159,11 +43153,12 @@ async function main(deps = {}) {
   maybeClearCache({
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
-    cacheFirecracker: inputs.cacheFirecracker
+    cacheFirecracker: inputs.cacheFirecracker,
+    arch: actionHostArch
   });
   const baseRootfsPath = (0, import_node_path9.join)(
     imagesDir,
-    `rootfs-${runnerImage}.ext4`
+    rootfsImageName(runnerImage, actionHostArch)
   );
   const http = new NodeHttpClient();
   if (!selfTest) {
@@ -43172,17 +43167,20 @@ async function main(deps = {}) {
       runnerImage,
       manifest: PINNED_MANIFEST,
       http,
-      // PR 5: manifest is platform-keyed.  The Action only ever runs on the
-      // Linux runner, so always consult the linux section.  The macOS CLI
-      // (src/cli/index.ts) does NOT call preFetchArtifacts at all.
-      platform: "linux"
+      arch: actionHostArch,
+      // The released manifest currently stores the arm64 guest artifacts in
+      // the darwin section because the macOS VZ path was the first arm64
+      // consumer.  Linux/arm64 Firecracker uses the same arm64 rootfs + shim.
+      platform: actionHostArch === "arm64" ? "darwin" : "linux"
     });
   }
+  const pinnedKernel = PINNED_KERNELS[actionHostArch];
   const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
     imagesDir,
+    arch: actionHostArch,
     firecrackerVersion: FIRECRACKER_VERSION,
-    kernelUrl: PINNED_VMLINUX_URL,
-    kernelSha256: PINNED_VMLINUX_SHA256,
+    kernelUrl: pinnedKernel.url,
+    kernelSha256: pinnedKernel.sha256,
     http
   });
   const launch = async (overlay) => {
@@ -43259,10 +43257,7 @@ async function main(deps = {}) {
       spoofArch: inputs.spoofArch
     },
     pm: pm.manager,
-    // The Action only runs on Linux/x64 runners today.  Hardcoded so the
-    // arch-flag overlay no-ops (matching pre-refactor behaviour).  If we
-    // ever ship an arm64 runner image, swap this for runtime detection.
-    hostArch: "x64",
+    hostArch: actionHostArch,
     baseRootfsPath,
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
@@ -43285,6 +43280,15 @@ async function main(deps = {}) {
   });
   if (result.exitCode !== 0) exitProcess(result.exitCode);
 }
+function detectActionHostArch(arch2 = process.arch) {
+  if (arch2 === "x64" || arch2 === "arm64") return arch2;
+  throw new Error(
+    `script-jail action requires an x64 or arm64 Linux runner (detected '${arch2}').`
+  );
+}
+function rootfsImageName(runnerImage, arch2) {
+  return arch2 === "arm64" ? `rootfs-${runnerImage}-arm64.ext4` : `rootfs-${runnerImage}.ext4`;
+}
 main().catch((err) => {
   process.stderr.write(
     `${err instanceof Error ? err.stack ?? err.message : String(err)}
@@ -43294,6 +43298,7 @@ main().catch((err) => {
 });
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  detectActionHostArch,
   main
 });
 /*! Bundled license information:

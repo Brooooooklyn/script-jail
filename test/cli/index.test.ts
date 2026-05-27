@@ -193,6 +193,42 @@ describe('CLI — VM-launch stub', () => {
     expect(capturedHostArch).toBe('x64');
   });
 
+  it('defaults spoofArch to the detected host arch when --spoof-arch is omitted', async () => {
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    let capturedSpoofArch: string | null = null;
+
+    const code = await run(macOsDeps({
+      argv: ['init'],
+      cwd: () => repoDir,
+      detectHost: () => ({ macosMajor: 15, hostArch: 'arm64' }),
+      runAudit: async (input) => {
+        capturedSpoofArch = input.overrides.spoofArch ?? null;
+        return { exitCode: 0 };
+      },
+    }));
+
+    expect(code).toBe(0);
+    expect(capturedSpoofArch).toBe('arm64');
+  });
+
+  it('honours an explicit --spoof-arch over the detected host arch', async () => {
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    let capturedSpoofArch: string | null = null;
+
+    const code = await run(macOsDeps({
+      argv: ['init', '--spoof-arch', 'x64'],
+      cwd: () => repoDir,
+      detectHost: () => ({ macosMajor: 15, hostArch: 'arm64' }),
+      runAudit: async (input) => {
+        capturedSpoofArch = input.overrides.spoofArch ?? null;
+        return { exitCode: 0 };
+      },
+    }));
+
+    expect(code).toBe(0);
+    expect(capturedSpoofArch).toBe('x64');
+  });
+
   it('defaults to init when no lockfile yet exists and check otherwise', async () => {
     // No subcommand + no .script-jail.lock.yml → init (mode=update).
     // We verify by inspecting the VmConfig handed to spawnVm.

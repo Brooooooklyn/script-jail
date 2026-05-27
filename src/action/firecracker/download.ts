@@ -40,6 +40,8 @@ export type { HttpClient };
 export interface DownloadInput {
   /** Directory where cached binaries are stored (e.g. `<repo>/images`). */
   imagesDir: string;
+  /** Host/guest architecture for the Firecracker binary. Defaults to x64. */
+  arch?: FirecrackerArch;
   /** Firecracker semver without the leading "v" (e.g. `"1.8.0"`). */
   firecrackerVersion: string;
   /** Full URL for the precompiled vmlinux kernel image. */
@@ -56,16 +58,20 @@ export interface DownloadResult {
   vmlinuxPath: string;
 }
 
+export type FirecrackerArch = 'x64' | 'arm64';
+
+type FirecrackerReleaseArch = 'x86_64' | 'aarch64';
+
 // ---------------------------------------------------------------------------
 // Pinned hashes
 // ---------------------------------------------------------------------------
 
 /**
- * KNOWN_VERSIONS maps Firecracker release versions to the SHA-256 of their
- * x86_64 release tarball (firecracker-v<ver>-x86_64.tgz).
+ * KNOWN_TARBALL_SHA256 maps Firecracker release versions to the SHA-256 of
+ * their per-arch release tarball.
  *
  * These are pinned values fetched from the official GitHub release tarballs at:
- *   https://github.com/firecracker-microvm/firecracker/releases/download/v<ver>/firecracker-v<ver>-x86_64.tgz
+ *   https://github.com/firecracker-microvm/firecracker/releases/download/v<ver>/firecracker-v<ver>-<arch>.tgz
  *
  * To re-verify or pin a new release, run:
  *
@@ -73,10 +79,23 @@ export interface DownloadResult {
  *
  * and add the resulting 64-char lowercase hex digest as a new entry.
  */
-export const KNOWN_VERSIONS: Readonly<Record<string, string>> = {
+const KNOWN_X64_VERSIONS: Readonly<Record<string, string>> = {
   '1.8.0': 'bc899bdaef8d0aa7b0fafbf49a2bf647e0298558f4faee44970d87a1c6d1ae2d',
   '1.9.0': '95c13740c7ca1a6dfb40e0f51cd0a9eefee1f223cd2c3538755d03c3a9ba5237',
 };
+
+const KNOWN_ARM64_VERSIONS: Readonly<Record<string, string>> = {
+  '1.8.0': '64b49ceb53167d7616bf4fd2c73def696a320259ea6e07cf1447c9091c5f9271',
+  '1.9.0': 'c5564e76dec2b8e8092c52f0f8a4c5f45cf31791e95a9302f4360a771df78f69',
+};
+
+export const KNOWN_TARBALL_SHA256: Readonly<Record<FirecrackerArch, Readonly<Record<string, string>>>> = {
+  x64: KNOWN_X64_VERSIONS,
+  arm64: KNOWN_ARM64_VERSIONS,
+};
+
+/** Back-compat alias for tests/callers that historically meant x86_64. */
+export const KNOWN_VERSIONS = KNOWN_X64_VERSIONS;
 
 // ---------------------------------------------------------------------------
 // ensureBinaries — main export
@@ -93,12 +112,14 @@ export const KNOWN_VERSIONS: Readonly<Record<string, string>> = {
  */
 export async function ensureBinaries(input: DownloadInput): Promise<DownloadResult> {
   const { imagesDir, firecrackerVersion, kernelUrl, kernelSha256, http } = input;
+  const arch: FirecrackerArch = input.arch ?? 'x64';
+  const releaseArch = firecrackerReleaseArch(arch);
 
-  const expectedTarSha = KNOWN_VERSIONS[firecrackerVersion];
+  const expectedTarSha = KNOWN_TARBALL_SHA256[arch][firecrackerVersion];
   if (expectedTarSha === undefined) {
     throw new Error(
-      `script-jail: unknown Firecracker version "${firecrackerVersion}". ` +
-      `Add it (with a pinned SHA-256) to KNOWN_VERSIONS in src/action/firecracker/download.ts.`,
+      `script-jail: unknown Firecracker version "${firecrackerVersion}" for ${arch}. ` +
+      `Add it (with a pinned SHA-256) to KNOWN_TARBALL_SHA256 in src/action/firecracker/download.ts.`,
     );
   }
 
@@ -111,9 +132,9 @@ export async function ensureBinaries(input: DownloadInput): Promise<DownloadResu
 
   const tarUrl =
     `https://github.com/firecracker-microvm/firecracker/releases/download/` +
-    `v${firecrackerVersion}/firecracker-v${firecrackerVersion}-x86_64.tgz`;
+    `v${firecrackerVersion}/firecracker-v${firecrackerVersion}-${releaseArch}.tgz`;
 
-  const tarPath = join(imagesDir, `firecracker-v${firecrackerVersion}-x86_64.tgz`);
+  const tarPath = join(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
   const fcBinPath = join(imagesDir, `firecracker-v${firecrackerVersion}`);
   const vmlinuxPath = join(imagesDir, 'vmlinux');
 
@@ -138,7 +159,7 @@ export async function ensureBinaries(input: DownloadInput): Promise<DownloadResu
     await unlink(fcBinPath);
   }
   void tarFresh; // always re-extract (see comment above)
-  await extractFirecrackerBinary(tarPath, fcBinPath, firecrackerVersion);
+  await extractFirecrackerBinary(tarPath, fcBinPath, firecrackerVersion, releaseArch);
 
   return { firecrackerPath: fcBinPath, vmlinuxPath };
 }
@@ -178,7 +199,7 @@ async function ensureFile(
  * Extracts the `firecracker` binary from a `.tgz` tarball.
  *
  * The official Firecracker release tarball contains a single directory
- * `release-v<ver>-x86_64/` with the binary named `firecracker-v<ver>-x86_64`.
+ * `release-v<ver>-<arch>/` with the binary named `firecracker-v<ver>-<arch>`.
  * We extract that binary to `destPath`.
  *
  * NOTE: This helper is intentionally NOT exported — extraction is an internal
@@ -188,6 +209,7 @@ async function extractFirecrackerBinary(
   tarPath: string,
   destPath: string,
   version: string,
+  releaseArch: FirecrackerReleaseArch,
 ): Promise<void> {
   const tmpOut = join(
     tmpdir(),
@@ -195,7 +217,7 @@ async function extractFirecrackerBinary(
   );
 
   // Target entry inside the tarball (strip the leading directory component).
-  const targetEntry = `firecracker-v${version}-x86_64`;
+  const targetEntry = `firecracker-v${version}-${releaseArch}`;
 
   await new Promise<void>((resolve, reject) => {
     // We manually parse the tar stream to avoid depending on the `tar` package.
@@ -305,4 +327,8 @@ async function extractFirecrackerBinary(
 
   // Make executable.
   await chmod(destPath, 0o755);
+}
+
+function firecrackerReleaseArch(arch: FirecrackerArch): FirecrackerReleaseArch {
+  return arch === 'arm64' ? 'aarch64' : 'x86_64';
 }

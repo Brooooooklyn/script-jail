@@ -84,7 +84,9 @@ function urlFor(asset: string): string {
 // Realistic payloads + matching SHAs.
 const ROOTFS_22_CONTENT = 'fake-rootfs-ubuntu-22.04-bytes';
 const ROOTFS_24_CONTENT = 'fake-rootfs-ubuntu-24.04-bytes';
+const ROOTFS_24_ARM64_CONTENT = 'fake-darwin-rootfs-24-arm64';
 const LIB_CONTENT = 'fake-libscriptjail-so-bytes';
+const LIB_ARM64_CONTENT = 'fake-darwin-libscriptjail-arm64';
 
 function manifest(): ArtifactManifest {
   return {
@@ -102,8 +104,8 @@ function manifest(): ArtifactManifest {
         // structurally valid.  Real SHAs here let the platform='darwin'
         // tests below use the same manifest builder.
         'rootfs-ubuntu-22.04-arm64.ext4': sha('fake-darwin-rootfs-22-arm64'),
-        'rootfs-ubuntu-24.04-arm64.ext4': sha('fake-darwin-rootfs-24-arm64'),
-        'libscriptjail-arm64.so': sha('fake-darwin-libscriptjail-arm64'),
+        'rootfs-ubuntu-24.04-arm64.ext4': sha(ROOTFS_24_ARM64_CONTENT),
+        'libscriptjail-arm64.so': sha(LIB_ARM64_CONTENT),
         'vmlinux-vz-x86_64': sha('fake-vmlinux-vz-x86_64'),
         'vmlinux-vz-arm64': sha('fake-vmlinux-vz-arm64'),
         'script-jail-vm-arm64-darwin': sha('fake-script-jail-vm-arm64-darwin'),
@@ -117,6 +119,13 @@ function defaultPayloads(): Record<string, string> {
     [urlFor('rootfs-ubuntu-22.04.ext4')]: ROOTFS_22_CONTENT,
     [urlFor('rootfs-ubuntu-24.04.ext4')]: ROOTFS_24_CONTENT,
     [urlFor('libscriptjail.so')]: LIB_CONTENT,
+  };
+}
+
+function arm64Payloads(): Record<string, string> {
+  return {
+    [urlFor('rootfs-ubuntu-24.04-arm64.ext4')]: ROOTFS_24_ARM64_CONTENT,
+    [urlFor('libscriptjail-arm64.so')]: LIB_ARM64_CONTENT,
   };
 }
 
@@ -306,6 +315,27 @@ describe('preFetchArtifacts', () => {
     expect(urls).toEqual([
       urlFor('libscriptjail.so'),
       urlFor('rootfs-ubuntu-22.04.ext4'),
+    ]);
+  });
+
+  it('downloads arm64 rootfs and shim when arch=arm64', async () => {
+    const { client, calls } = mockHttpClient(arm64Payloads());
+
+    await preFetchArtifacts({
+      imagesDir: testDir,
+      runnerImage: 'ubuntu-24.04',
+      arch: 'arm64',
+      manifest: manifest(),
+      http: client,
+      platform: 'darwin',
+    });
+
+    expect(existsSync(join(testDir, 'rootfs-ubuntu-24.04-arm64.ext4'))).toBe(true);
+    expect(existsSync(join(testDir, 'libscriptjail-arm64.so'))).toBe(true);
+    const urls = calls.map((c) => c.url).sort();
+    expect(urls).toEqual([
+      urlFor('libscriptjail-arm64.so'),
+      urlFor('rootfs-ubuntu-24.04-arm64.ext4'),
     ]);
   });
 

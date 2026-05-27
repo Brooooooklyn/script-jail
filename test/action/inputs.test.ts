@@ -60,6 +60,17 @@ describe('parseInputs — defaults', () => {
     expect(isAbsolute(result.configPath)).toBe(true);
     expect(isAbsolute(result.lockPath)).toBe(true);
   });
+
+  it('uses the injected default spoof arch when spoof-arch is omitted', () => {
+    const result = parseInputs({
+      repoDir,
+      defaultSpoofArch: 'arm64',
+      getInput: makeGetInput({}),
+      fs: makeFs(repoDir, []),
+    });
+
+    expect(result.spoofArch).toBe('arm64');
+  });
 });
 
 describe('parseInputs — mode', () => {

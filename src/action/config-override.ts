@@ -2,8 +2,9 @@
 //
 // Builds a per-run effective copy of the user's script-jail config YAML with
 // the action's `spoof-platform` and `spoof-arch` inputs applied as overrides,
-// plus (PR 2+) optional sidecar files needed by the macOS CLI to force a
-// Linux/x64 install resolution from an arm64 host:
+// plus optional package-manager sidecar files.  The default same-arch parity
+// path does not create these sidecars, but the plumbing stays here for tests
+// and future explicit override modes:
 //
 //   - .yarnrc.yml          (yarnrcOverlay)     — Yarn Berry supportedArchitectures
 //   - etc/script-jail/pm-flags.json (pmFlagsJson)     — npm extra install args
@@ -21,9 +22,8 @@
 //   The action also advertises `spoof-platform` / `spoof-arch` inputs and
 //   users supplying them expect them to win over whatever is on disk.
 //
-//   For arm64 macOS developers running the CLI locally, the same install
-//   needs to resolve Linux/x64 subpackages (the audit VM is x64).  We
-//   materialise the per-PM payload here so it travels with the config.
+//   If a caller supplies per-PM sidecar payloads, we materialise them here so
+//   they travel with the effective config into the VM overlay.
 //
 // Approach:
 //   Parse the user's YAML, mutate `spoof.platform` / `spoof.arch`, serialize
@@ -64,9 +64,8 @@ export interface BuildEffectiveConfigInput {
   workDir?: string;
   /**
    * Optional `.yarnrc.yml` content to materialize alongside the config.
-   * Provided by the macOS CLI (`src/cli/arch-flags.ts`) when forcing a
-   * Linux/x64 install resolution from an arm64 yarn-berry host.  Written
-   * verbatim to `<workDir>/.yarnrc.yml`.
+   * Optional Yarn Berry `supportedArchitectures` override.  Written verbatim
+   * to `<workDir>/.yarnrc.yml`.
    */
   yarnrcOverlay?: string;
   /**
@@ -79,10 +78,9 @@ export interface BuildEffectiveConfigInput {
   pmFlagsJson?: { extra_install_args: string[] };
   /**
    * Optional `etc/script-jail/pnpm-arch.json` content.  Provided by the
-   * macOS CLI (`src/cli/arch-flags.ts`) when forcing a Linux/x64 install
-   * resolution from an arm64 pnpm host.  Holds a `supportedArchitectures`
-   * object; the guest (`src/guest/apply-pnpm-arch.ts`) merges it into the
-   * repo's root `package.json` under the `pnpm` key before Phase A.
+   * Optional pnpm `supportedArchitectures` override.  The guest
+   * (`src/guest/apply-pnpm-arch.ts`) merges it into the repo's root
+   * `package.json` under the `pnpm` key before Phase A.
    * Written verbatim to `<workDir>/etc/script-jail/pnpm-arch.json`.
    */
   pnpmArchOverlay?: string;

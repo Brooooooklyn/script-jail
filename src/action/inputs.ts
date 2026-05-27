@@ -42,6 +42,12 @@ export interface ParseInput {
   /** Absolute repository root used for relative-path resolution. */
   repoDir: string;
   /**
+   * Default spoofed architecture when the action input is omitted.  `main.ts`
+   * passes the actual runner arch so arm64 runners do not silently resolve
+   * x64 packages.
+   */
+  defaultSpoofArch?: SpoofArch;
+  /**
    * Optional injection seam.  Returns the raw string for a given Action input
    * name.  The default implementation reads `process.env.INPUT_<UPPER_SNAKE>`,
    * matching `@actions/core`'s convention.
@@ -99,7 +105,7 @@ export function parseInputs(input: ParseInput): ActionInputs {
   }
 
   // ---- spoof-arch -----------------------------------------------------------
-  const archStr = rawArch.trim() === '' ? 'x64' : rawArch.trim();
+  const archStr = rawArch.trim() === '' ? (input.defaultSpoofArch ?? 'x64') : rawArch.trim();
   if (!isSpoofArch(archStr)) {
     throw new Error(
       `script-jail: invalid value for input "spoof-arch": "${archStr}". ` +

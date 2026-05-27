@@ -14,7 +14,7 @@
 //   --config <path>          (default: ./.script-jail.yml)
 //   --lock <path>            (default: ./.script-jail.lock.yml)
 //   --spoof-platform <p>     linux|darwin|win32 (default: linux)
-//   --spoof-arch <a>         x64|arm64          (default: x64)
+//   --spoof-arch <a>         x64|arm64          (default: host arch)
 //   --help / --version
 //
 // Output streams:
@@ -76,7 +76,7 @@ Options:
   --config <path>        Path to .script-jail.yml (default: ./.script-jail.yml)
   --lock <path>          Path to .script-jail.lock.yml (default: ./.script-jail.lock.yml)
   --spoof-platform <p>   linux | darwin | win32 (default: linux)
-  --spoof-arch <a>       x64 | arm64 (default: x64)
+  --spoof-arch <a>       x64 | arm64 (default: host arch)
   --help                 Print this help and exit.
   --version              Print version and exit.
 `;
@@ -211,6 +211,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   // --- Resolve paths + subcommand defaulting -------------------------------
   const configPath = resolve(cwd, args.configPath);
   const lockPath = resolve(cwd, args.lockPath);
+  const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : host.hostArch;
   // init when no lockfile exists, check otherwise.  update is an alias for
   // init (both overwrite).
   const subcommand = args.subcommand ?? (existsSync(lockPath) ? 'check' : 'init');
@@ -320,7 +321,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       mode,
       overrides: {
         spoofPlatform: args.spoofPlatform,
-        spoofArch: args.spoofArch,
+        spoofArch: effectiveSpoofArch,
       },
       pm,
       // hostArch comes from the injected detectHost (NOT re-derived from
@@ -410,6 +411,10 @@ function resolveScriptJailRoot(cwd: string): string {
     if (existsSync(join(c, 'package.json'))) return c;
   }
   return cwd;
+}
+
+function hasSpoofArchArg(argv: readonly string[]): boolean {
+  return argv.includes('--spoof-arch');
 }
 
 // Allow the `__filename` reference above to type-check in both bundle (where

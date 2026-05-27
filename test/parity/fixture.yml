@@ -19,8 +19,8 @@
 #   - pnpm monorepo with 28+ workspace packages — exercises the real fetch
 #     graph, not a trivial single-package smoke.
 #   - Heavy native postinstall surface (esbuild self-verify, rollup per-arch
-#     optional deps) — exercises the arm64 cross-arch divergence story
-#     documented in docs/divergence.md.
+#     optional deps) — exercises the native package paths that must now match
+#     between Linux/arm64 Firecracker and macOS/arm64 VZ.
 
 repo: vuejs/core
 tag: v3.5.34
