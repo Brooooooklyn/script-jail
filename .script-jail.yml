@@ -23,6 +23,6 @@ protected:
 
 spoof:
   platform: linux
-  arch: x64
+  arch: arm64
 
 node_version: 20

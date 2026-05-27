@@ -42,6 +42,7 @@ import type { RunnerImage } from './runner-image.js';
  * can pin distinct asset sets without two manifest files.
  */
 export type ManifestPlatform = 'linux' | 'darwin';
+export type ArtifactArch = 'x64' | 'arm64';
 
 /**
  * Per-asset SHA-256 map for one platform section.  Asset filename → 64-char
@@ -67,6 +68,11 @@ export interface ArtifactManifest {
 export interface PreFetchInput {
   imagesDir: string;
   runnerImage: RunnerImage;
+  /**
+   * Host/guest architecture for the rootfs and shim assets. Defaults to x64
+   * for backwards compatibility with the original Linux action runner.
+   */
+  arch?: ArtifactArch;
   manifest: ArtifactManifest;
   http: HttpClient;
   /**
@@ -84,11 +90,15 @@ export interface PreFetchInput {
 // ---------------------------------------------------------------------------
 
 /** Asset filename for the per-runner rootfs. */
-function rootfsAssetName(runnerImage: RunnerImage): string {
-  return `rootfs-${runnerImage}.ext4`;
+function rootfsAssetName(runnerImage: RunnerImage, arch: ArtifactArch): string {
+  return arch === 'arm64'
+    ? `rootfs-${runnerImage}-arm64.ext4`
+    : `rootfs-${runnerImage}.ext4`;
 }
 
-const LIBSCRIPTJAIL_ASSET = 'libscriptjail.so';
+function libscriptjailAssetName(arch: ArtifactArch): string {
+  return arch === 'arm64' ? 'libscriptjail-arm64.so' : 'libscriptjail.so';
+}
 
 // ---------------------------------------------------------------------------
 // preFetchArtifacts — main export
@@ -109,10 +119,12 @@ const LIBSCRIPTJAIL_ASSET = 'libscriptjail.so';
 export async function preFetchArtifacts(input: PreFetchInput): Promise<void> {
   const { imagesDir, runnerImage, manifest, http } = input;
   const platform: ManifestPlatform = input.platform ?? 'linux';
+  const arch: ArtifactArch = input.arch ?? 'x64';
 
   mkdirSync(imagesDir, { recursive: true });
 
-  const wantedRootfs = rootfsAssetName(runnerImage);
+  const wantedRootfs = rootfsAssetName(runnerImage, arch);
+  const wantedLibscriptjail = libscriptjailAssetName(arch);
 
   // Build the list of (asset, destPath, expectedSha) tuples we actually need.
   const assets: ReadonlyArray<{ name: string; expected: string }> = [
@@ -121,8 +133,8 @@ export async function preFetchArtifacts(input: PreFetchInput): Promise<void> {
       expected: requireExpected(manifest, platform, wantedRootfs),
     },
     {
-      name: LIBSCRIPTJAIL_ASSET,
-      expected: requireExpected(manifest, platform, LIBSCRIPTJAIL_ASSET),
+      name: wantedLibscriptjail,
+      expected: requireExpected(manifest, platform, wantedLibscriptjail),
     },
   ];
 

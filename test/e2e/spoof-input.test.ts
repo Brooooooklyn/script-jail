@@ -70,9 +70,9 @@ describe.sequential('e2e: spoof-platform input wiring', () => {
       // test stays decoupled from key ordering.
       expect(capturedConfigContents).not.toBeNull();
       expect(capturedConfigContents!).toContain('platform: darwin');
-      // The action default for arch is `x64`; absence of an override means it
-      // still lands in the effective file as the runtime default.
-      expect(capturedConfigContents!).toContain('arch: x64');
+      // Absence of an override means the action uses the runtime host arch.
+      const expectedArch = process.arch === 'arm64' ? 'arm64' : 'x64';
+      expect(capturedConfigContents!).toContain(`arch: ${expectedArch}`);
     } finally {
       if (priorRunnerTemp === undefined) {
         delete process.env['RUNNER_TEMP'];

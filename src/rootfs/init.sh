@@ -197,20 +197,16 @@ if [ ! -f /work/etc/script-jail/config.yml ]; then
 fi
 cp /work/etc/script-jail/config.yml /etc/script-jail/config.yml
 
-# pm-flags.json is OPTIONAL: only the macOS CLI (src/cli/) stages it, and
-# only when forcing a Linux/x64 install resolution from an arm64 npm host.
-# The action's overlay (src/action/firecracker/overlay.ts) never writes it,
-# so absence is normal — degrade silently and let `loadPmFlags()` in the
+# pm-flags.json is OPTIONAL. The normal same-arch parity path does not stage
+# it, so absence is normal — degrade silently and let `loadPmFlags()` in the
 # guest default to "no extra args".
 if [ -f /work/etc/script-jail/pm-flags.json ]; then
   cp /work/etc/script-jail/pm-flags.json /etc/script-jail/pm-flags.json
 fi
 
-# pnpm-arch.json is OPTIONAL: only the macOS CLI stages it, and only when
-# forcing a Linux/x64 install resolution from an arm64 pnpm host.  The guest
-# (src/guest/apply-pnpm-arch.ts) merges its `supportedArchitectures` block
-# into the repo's root package.json before Phase A.  Absence is normal —
-# degrade silently to "no merge".
+# pnpm-arch.json is OPTIONAL. The guest (src/guest/apply-pnpm-arch.ts) merges
+# its `supportedArchitectures` block into the repo's root package.json before
+# Phase A when present. Absence is normal — degrade silently to "no merge".
 if [ -f /work/etc/script-jail/pnpm-arch.json ]; then
   cp /work/etc/script-jail/pnpm-arch.json /etc/script-jail/pnpm-arch.json
 fi

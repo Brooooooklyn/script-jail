@@ -23,9 +23,8 @@ inputs:
     required: false
     default: linux
   spoof-arch:
-    description: "Spoofed value for process.arch inside the VM. One of: x64 | arm64."
+    description: "Spoofed value for process.arch inside the VM. One of: x64 | arm64. Defaults to the runner CPU architecture."
     required: false
-    default: x64
   cache-firecracker:
     description: Cache the firecracker binary + kernel + rootfs across runs.
     required: false

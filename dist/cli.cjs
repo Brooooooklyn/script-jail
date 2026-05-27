@@ -7746,6 +7746,9 @@ function parseArgs(argv) {
     configPath: ".script-jail.yml",
     lockPath: ".script-jail.lock.yml",
     spoofPlatform: "linux",
+    // `src/cli/index.ts` replaces this with the detected host arch when the
+    // user did not pass --spoof-arch.  Keeping a concrete parser default
+    // preserves the stable ParsedArgs shape.
     spoofArch: "x64",
     help: false,
     version: false,
@@ -8033,42 +8036,8 @@ var import_promises2 = require("node:fs/promises");
 var import_node_path6 = require("node:path");
 
 // src/cli/arch-flags.ts
-function buildArchFlagOverlay(input) {
-  const spoofPlatform = input.spoofPlatform ?? "linux";
-  const spoofArch = input.spoofArch ?? "x64";
-  const needsLinuxX64Overlay = input.hostArch === "arm64" || spoofPlatform !== "linux" || spoofArch !== "x64";
-  if (!needsLinuxX64Overlay) {
-    return { warnings: [] };
-  }
-  switch (input.pm) {
-    case "npm":
-      return {
-        pmFlagsJson: {
-          extra_install_args: ["--cpu=x64", "--os=linux", "--libc=glibc"]
-        },
-        warnings: []
-      };
-    case "pnpm":
-      return {
-        pnpmArchOverlay: '{\n  "supportedArchitectures": {\n    "os": ["linux"],\n    "cpu": ["x64"],\n    "libc": ["glibc"]\n  }\n}\n',
-        warnings: []
-      };
-    case "yarn":
-      return {
-        yarnrcOverlay: "supportedArchitectures:\n  os:\n    - linux\n  cpu:\n    - x64\n  libc:\n    - glibc\n",
-        warnings: []
-      };
-    case "yarn-classic":
-      return {
-        warnings: [
-          "yarn classic (v1) does not support per-install architecture filters; lockfile audit on arm64 hosts or spoofed non-linux/x64 targets may reflect non-canonical subpackages and diverge from CI. Consider upgrading to yarn 4+."
-        ]
-      };
-    default: {
-      const exhaustive = input.pm;
-      throw new Error(`buildArchFlagOverlay: unsupported pm '${String(exhaustive)}'`);
-    }
-  }
+function buildArchFlagOverlay(_input) {
+  return { warnings: [] };
 }
 
 // node_modules/.pnpm/diff@9.0.0/node_modules/diff/libesm/diff/base.js
@@ -23435,7 +23404,7 @@ async function runAudit(input) {
     pm: input.pm,
     hostArch: input.hostArch,
     spoofPlatform: input.overrides.spoofPlatform ?? "linux",
-    spoofArch: input.overrides.spoofArch ?? "x64"
+    spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
   const scratchDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(input.workDir, "script-jail-config-"));
@@ -23446,10 +23415,10 @@ async function runAudit(input) {
       userConfigPath: input.configPath,
       overrides: {
         // buildEffectiveConfig expects required SpoofPlatform / SpoofArch —
-        // both entries' input shapes already default these, so we coerce
-        // here rather than threading the defaults through runAudit.
+        // both entries' input shapes already default these.  Direct runAudit
+        // callers without an explicit spoof arch inherit the host arch.
         spoofPlatform: input.overrides.spoofPlatform ?? "linux",
-        spoofArch: input.overrides.spoofArch ?? "x64"
+        spoofArch: input.overrides.spoofArch ?? input.hostArch
       },
       workDir: scratchDir,
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
@@ -23556,7 +23525,7 @@ Options:
   --config <path>        Path to .script-jail.yml (default: ./.script-jail.yml)
   --lock <path>          Path to .script-jail.lock.yml (default: ./.script-jail.lock.yml)
   --spoof-platform <p>   linux | darwin | win32 (default: linux)
-  --spoof-arch <a>       x64 | arm64 (default: x64)
+  --spoof-arch <a>       x64 | arm64 (default: host arch)
   --help                 Print this help and exit.
   --version              Print version and exit.
 `;
@@ -23608,6 +23577,7 @@ async function run(deps = {}) {
   }
   const configPath = (0, import_node_path7.resolve)(cwd, args.configPath);
   const lockPath = (0, import_node_path7.resolve)(cwd, args.lockPath);
+  const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : host.hostArch;
   const subcommand = args.subcommand ?? ((0, import_node_fs6.existsSync)(lockPath) ? "check" : "init");
   const mode = subcommand === "check" ? "check" : "update";
   let pm;
@@ -23678,7 +23648,7 @@ async function run(deps = {}) {
       mode,
       overrides: {
         spoofPlatform: args.spoofPlatform,
-        spoofArch: args.spoofArch
+        spoofArch: effectiveSpoofArch
       },
       pm,
       // hostArch comes from the injected detectHost (NOT re-derived from
@@ -23738,6 +23708,9 @@ function resolveScriptJailRoot(cwd) {
     if ((0, import_node_fs6.existsSync)((0, import_node_path7.join)(c, "package.json"))) return c;
   }
   return cwd;
+}
+function hasSpoofArchArg(argv) {
+  return argv.includes("--spoof-arch");
 }
 var isMainCjs = (() => {
   try {

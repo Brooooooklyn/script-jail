@@ -1,17 +1,13 @@
 // script-jail — src/guest/apply-pnpm-arch.ts
 //
-// Merges a `supportedArchitectures` block into the repo's root package.json
-// so pnpm resolves Linux/x64 subpackages even when the audit was kicked off
-// from an arm64 macOS host.
+// Merges an optional `supportedArchitectures` block into the repo's root
+// package.json before pnpm resolves dependencies.
 //
 // Why this exists:
-//   The macOS CLI (`src/cli/arch-flags.ts`) wants an arm64 host's `pnpm
-//   fetch` + `pnpm install --offline` to materialise the SAME platform-
-//   specific optional packages an x64-Linux CI run would.  Unlike npm, pnpm
-//   does NOT accept `--cpu/--os/--libc` on the CLI — `pnpm fetch --cpu=x64`
-//   fails with "Unknown options: 'cpu', 'os', 'libc'".  pnpm's real
-//   mechanism is a `pnpm.supportedArchitectures` block in the repo's root
-//   `package.json`.
+//   pnpm does NOT accept `--cpu/--os/--libc` on the CLI — `pnpm install
+//   --cpu=x64` fails with "Unknown options: 'cpu', 'os', 'libc'".  pnpm's
+//   real override mechanism is a `pnpm.supportedArchitectures` block in the
+//   repo's root `package.json`.
 //
 //   Empirically verified on pnpm 9.15.0:
 //     * `pnpm fetch` reads the `pnpm` config block out of package.json even
@@ -30,10 +26,8 @@
 // is an audit INPUT, not the byte-stable lockfile OUTPUT.
 //
 // Defensive: every step degrades silently.  A missing overlay file (the
-// normal case — the action never stages it, only the macOS CLI does), a
-// missing/unreadable/malformed package.json, or a malformed overlay all
-// fall through to "no merge".  The worst case is the audit proceeds without
-// the arch hint, i.e. the pre-fix behaviour.
+// normal case under same-arch parity), a missing/unreadable/malformed
+// package.json, or a malformed overlay all fall through to "no merge".
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -77,7 +71,7 @@ export interface ApplyPnpmArchResult {
  *
  * The merge preserves every other key in package.json and every sibling key
  * inside an existing `pnpm` block; it only sets `pnpm.supportedArchitectures`
- * (overwriting any committed value — the audit always forces Linux/x64).
+ * when an explicit overlay file is present.
  */
 export function applyPnpmArchOverlay(
   input: ApplyPnpmArchInput,

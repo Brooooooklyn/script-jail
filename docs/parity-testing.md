@@ -3,7 +3,8 @@
 The parity workflow (`.github/workflows/parity-test.yml`) verifies that the
 `.script-jail.lock.yml` produced by:
 
-- **Linux** running the action under real Firecracker (x86_64 guest), and
+- **Linux** running the action under real Firecracker on `ubuntu-24.04-arm`
+  (arm64 guest), and
 - **macOS** running the CLI under real Virtualization.framework (arm64 guest)
 
 are byte-equal — modulo the canonicalised volatile fields (`generated_at`,
@@ -38,10 +39,10 @@ The fixture choice deliberately stresses the pieces most likely to diverge:
   graph and the per-workspace install ordering, not a trivial one-package
   smoke.
 - **Heavy native postinstall** — `esbuild` self-verify, `rollup` per-arch
-  optional deps, the Vite toolchain. These are the exact code paths where
-  cross-arch divergence is expected on Apple Silicon (the postinstall tries
-  to `execve` an x86_64 binary downloaded by the `--cpu=x64` PM overlay, and
-  ENOEXEC on the arm64 guest).
+  optional deps, the Vite toolchain. These are the exact code paths that
+  previously diverged under Linux/x64 CI vs local arm64; the workflow now
+  runs Linux CI on arm64 so native package selection should match the local
+  VZ guest.
 - **Stable upstream**. Vue's release cadence is slow enough that a pinned
   tag stays meaningful across script-jail releases; the parity baseline
   doesn't churn weekly.
@@ -56,32 +57,30 @@ The fixture choice deliberately stresses the pieces most likely to diverge:
                      │   repo + sha + tag + pm
         ┌────────────┼──────────────────────┐
         ▼            ▼                      ▼
-  linux-firecracker  macos-arm64-vz   build-mac-arm64-artifacts
-  (real action +     (real CLI +       (arm64 rootfs, .so,
-   Firecracker)       VZ on macos-      vmlinux-vz-arm64)
-                      latest, depends
-                      on the artifact
-                      job)
-        │            │
-        └────────┬───┘
+  linux-firecracker        committed macos-arm64-vz lockfile
+  (real action +           (generated locally on bare-metal
+   arm64 Firecracker        Apple Silicon; nested VZ cannot
+   on ubuntu-24.04-arm)     run on GitHub-hosted macOS)
+        │                          │
+        └────────────┬─────────────┘
                  ▼
               diff
    (parity-diff.ts → parity-report.md)
-   (fails workflow when streams differ)
+   (advisory report when streams differ)
 ```
 
 Each platform job runs the same code path a real consumer would:
 
-- **Linux** sets up Firecracker the same way `e2e.yml` does (chmod
-  `/dev/kvm`, create `tap0`, enable NAT) and invokes the action by setting
-  `INPUT_*` env vars and running `node dist/main.cjs`.
-- **macOS** builds the CLI (`pnpm build:cli`) and the host-mac Rust binary
-  (`cargo build --release -p script-jail-host-mac`), downloads the arm64
-  rootfs / shim / VZ kernel from `build-mac-arm64-artifacts`, then runs
-  the CLI's `update` subcommand against the Vue checkout.
+- **Linux** runs on `ubuntu-24.04-arm`, sets up Firecracker the same way
+  `e2e.yml` does (chmod `/dev/kvm`, create `tap0`, enable NAT), builds the
+  arm64 rootfs, and invokes the action by setting `INPUT_*` env vars and
+  running `node dist/main.cjs`.
+- **macOS** is committed rather than generated in CI. A maintainer runs the
+  CLI's `update` subcommand locally on bare-metal Apple Silicon and commits
+  `test/parity/macos-arm64-lockfile.yml`.
 
-Both produce a `.script-jail.lock.yml`. The `diff` job downloads both,
-canonicalises the two volatile fields, and compares.
+Both produce a `.script-jail.lock.yml`. The `diff` job downloads the fresh
+Linux lockfile, canonicalises the volatile fields on both sides, and compares.
 
 ## Interpreting the parity report
 
@@ -94,25 +93,12 @@ It does not hide native executable divergence. Three cases:
 
 The lockfiles are byte-equal after canonicalisation. Ship it.
 
-### ❌ Diverged — explainable (v1 known-divergence)
+### ❌ Diverged — explainable
 
-`docs/divergence.md` enumerates the cases where v1 deliberately produces a
-different lockfile on Apple Silicon than on Linux CI:
-
-- A package whose postinstall `execve`s a downloaded x86_64 binary will
-  emit a `spawn` event with `result: enoent`/`eacces` on the arm64 guest
-  and `result: ok` on the Linux x86_64 guest.
-- A package that loads or execs an x86_64 native artifact may produce
-  different file-read or spawn shapes on an arm64 guest. Native addon loading
-  is not blocked by default; the parity question is whether the resulting
-  platform-specific file/exec surface is expected for that package.
-
-These cases are real divergence; they are flagged in the parity report and
-the maintainer reads the diff to confirm every divergent event is in this
-expected category. **Today this judgment is manual.** Future work in
-`scripts/parity-diff.ts` will add a `--allow-arm64-enoexec` filter that
-strips events matching the documented pattern from the arm64 side before
-comparison, turning the maintainer's judgment into a workflow gate.
+`docs/divergence.md` enumerates remaining parity-only differences. After the
+move to arm64 CI, native package-selection mismatches should no longer be the
+default explanation; first suspect ambient environment reads, VMM-specific
+device/procfs differences, or a stale committed macOS lockfile.
 
 ### ❌ Diverged — unexpected
 
@@ -125,11 +111,10 @@ Anything else is a bug. Common shapes:
 - **Event ordering differs** → renderer non-determinism. The lock renderer
   in `src/lock/render.ts` sorts by codepoint order; check that both jobs
   produce the same input stream to `renderLock`.
-- **A package shows up on one side but not the other** → PM-flag overlay
-  bug. The arm64 side should select identical packages to the x86_64 side
-  thanks to `--cpu=x64 --os=linux --libc=glibc`. If a package is missing
-  from the arm64 lockfile, `src/cli/arch-flags.ts` or
-  `src/guest/load-pm-flags.ts` is dropping the flag somewhere.
+- **A package shows up on one side but not the other** → package-manager
+  resolution desync. The Linux and macOS sides should both resolve arm64
+  Linux optional packages now; check whether an input override, stale
+  committed lockfile, or package-manager environment read changed the target.
 
 ## Triggering the workflow
 
@@ -174,10 +159,10 @@ gh api repos/vuejs/core/git/refs/tags/<tag> | jq -r '.object.sha'
   this workflow. Intel parity would catch a different bug class
   (Rosetta-equivalent native exec) that the arm64 path filters out via
   package-selection.
-- **The cross-arch divergence filter is not yet automated** — see the
-  "Diverged — explainable" subsection above. The first few real parity-
-  test runs are expected to produce divergent diffs; reading them is how
-  we learn the filter rules to encode in v2 of `parity-diff.ts`.
+- **The workflow depends on KVM on the arm runner** — `ubuntu-24.04-arm`
+  gives the right CPU architecture, but Firecracker still requires `/dev/kvm`.
+  The workflow probes it explicitly and fails with a clear error if the runner
+  image changes.
 - **No caching** — every run builds rootfs, kernel, and shim from scratch
   (~15 min upfront). Once the fixture pin and the build inputs stabilise,
   `actions/cache@v4` keys derived from `git rev-parse HEAD:images/` and

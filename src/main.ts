@@ -29,6 +29,7 @@ import { randomBytes } from 'node:crypto';
 import { parseInputs } from './action/inputs.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
+import type { RunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
 import { maybeClearCache } from './action/cache.js';
 import {
@@ -49,18 +50,26 @@ import { runAudit, type LauncherResult } from './shared/run-audit.js';
 // Pinned versions
 // ---------------------------------------------------------------------------
 
-/** Firecracker release version (must match a key in KNOWN_VERSIONS). */
+/** Firecracker release version (must match a key in KNOWN_TARBALL_SHA256). */
 const FIRECRACKER_VERSION = '1.8.0';
+
+export type ActionHostArch = 'x64' | 'arm64';
 
 // Pinned from Firecracker CI artifacts (v1.10, kernel 5.10.223).
 // See src/rootfs/vmlinux.md for provenance and a "build your own" recipe;
 // production deployments may prefer a stricter kernel config — refer to the
 // tag-pinned policy doc at:
 //   https://github.com/firecracker-microvm/firecracker/blob/v1.8.0/docs/kernel-policy.md
-const PINNED_VMLINUX_URL =
-  'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223';
-const PINNED_VMLINUX_SHA256 =
-  '22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65';
+const PINNED_KERNELS: Readonly<Record<ActionHostArch, { url: string; sha256: string }>> = {
+  x64: {
+    url: 'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223',
+    sha256: '22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65',
+  },
+  arm64: {
+    url: 'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223',
+    sha256: 'eb5d95ac8a67f7a86acf0cb35625633713ad5170b56de8617808d0e18bb832ec',
+  },
+};
 
 /** vsock port the guest agent listens on. */
 const VSOCK_PORT = 10242;
@@ -157,7 +166,8 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     process.env['GITHUB_WORKSPACE'] ??
     '';
 
-  const inputs = parseInputs({ repoDir });
+  const actionHostArch = detectActionHostArch();
+  const inputs = parseInputs({ repoDir, defaultSpoofArch: actionHostArch });
 
   // --- PM detection --------------------------------------------------------
   // BunUnsupportedError is non-fatal: emit a ::warning and exit cleanly so
@@ -204,15 +214,17 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     imagesDir,
     firecrackerVersion: FIRECRACKER_VERSION,
     cacheFirecracker: inputs.cacheFirecracker,
+    arch: actionHostArch,
   });
 
-  // The rootfs image is keyed by runner image (e.g. rootfs-ubuntu-24.04.ext4)
-  // rather than by (node-major, package-manager): the Node toolchain is
-  // downloaded inside the guest at boot via `vp env install`, so the rootfs
-  // only needs to match a stable glibc / shared-library set.
+  // The rootfs image is keyed by runner image and guest arch
+  // (e.g. rootfs-ubuntu-24.04-arm64.ext4) rather than by (node-major,
+  // package-manager): the Node toolchain is downloaded inside the guest at
+  // boot via `vp env install`, so the rootfs only needs to match a stable
+  // glibc / shared-library set.
   const baseRootfsPath = join(
     imagesDir,
-    `rootfs-${runnerImage}.ext4`,
+    rootfsImageName(runnerImage, actionHostArch),
   );
 
   // --- Pre-fetch release artifacts (rootfs + .so) --------------------------
@@ -233,19 +245,22 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       runnerImage,
       manifest: PINNED_MANIFEST,
       http,
-      // PR 5: manifest is platform-keyed.  The Action only ever runs on the
-      // Linux runner, so always consult the linux section.  The macOS CLI
-      // (src/cli/index.ts) does NOT call preFetchArtifacts at all.
-      platform: 'linux',
+      arch: actionHostArch,
+      // The released manifest currently stores the arm64 guest artifacts in
+      // the darwin section because the macOS VZ path was the first arm64
+      // consumer.  Linux/arm64 Firecracker uses the same arm64 rootfs + shim.
+      platform: actionHostArch === 'arm64' ? 'darwin' : 'linux',
     });
   }
 
   // --- Ensure Firecracker + kernel are present -----------------------------
+  const pinnedKernel = PINNED_KERNELS[actionHostArch];
   const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
     imagesDir,
+    arch: actionHostArch,
     firecrackerVersion: FIRECRACKER_VERSION,
-    kernelUrl: PINNED_VMLINUX_URL,
-    kernelSha256: PINNED_VMLINUX_SHA256,
+    kernelUrl: pinnedKernel.url,
+    kernelSha256: pinnedKernel.sha256,
     http,
   });
 
@@ -255,10 +270,6 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // `finally`.  runAudit owns the overlay (we pass `overlay: null` to
   // teardown so it does not also call cleanup — single ownership).
   //
-  // hostArch: the Action only ever runs on the Linux runner today, and
-  // the manifest / pre-fetch path is x64-only (`detectRunnerImage` resolves
-  // to one of the published linux images).  Hardcoded here; if the action
-  // ever ships an arm64 runner image, this is the single line to update.
   const launch = async (overlay: OverlayResult): Promise<LauncherResult> => {
     // Per-run unique socket paths so concurrent jobs on the same runner
     // do not clash.
@@ -380,10 +391,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       spoofArch: inputs.spoofArch,
     },
     pm: pm.manager,
-    // The Action only runs on Linux/x64 runners today.  Hardcoded so the
-    // arch-flag overlay no-ops (matching pre-refactor behaviour).  If we
-    // ever ship an arm64 runner image, swap this for runtime detection.
-    hostArch: 'x64',
+    hostArch: actionHostArch,
     baseRootfsPath,
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
@@ -411,6 +419,19 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // distinction by exiting only on non-zero codes.  Existing tests that
   // inject `exitProcess` to capture this behaviour stay green.
   if (result.exitCode !== 0) exitProcess(result.exitCode);
+}
+
+export function detectActionHostArch(arch: string = process.arch): ActionHostArch {
+  if (arch === 'x64' || arch === 'arm64') return arch;
+  throw new Error(
+    `script-jail action requires an x64 or arm64 Linux runner (detected '${arch}').`,
+  );
+}
+
+function rootfsImageName(runnerImage: RunnerImage, arch: ActionHostArch): string {
+  return arch === 'arm64'
+    ? `rootfs-${runnerImage}-arm64.ext4`
+    : `rootfs-${runnerImage}.ext4`;
 }
 
 // ---------------------------------------------------------------------------
