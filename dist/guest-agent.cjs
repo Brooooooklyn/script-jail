@@ -25990,6 +25990,11 @@ function isNodeBasename(pathLike) {
   const base = pathBasename(pathLike);
   return base === "node" || base === "nodejs";
 }
+function isPackageManagerClientBasename(pathLike) {
+  if (pathLike === void 0 || pathLike.length === 0) return false;
+  const base = pathBasename(pathLike);
+  return base === "npm" || base === "npx" || base === "npm-cli.js" || base === "pnpm" || base === "pnpm.cjs" || base === "yarn" || base === "yarnpkg" || base === "yarn.js" || base === "corepack";
+}
 function firstExecPathFromStraceLine(line) {
   let match = line.match(/^execve\("((?:\\.|[^"\\])*)"/);
   if (match?.[1] !== void 0) return match[1];
@@ -26000,6 +26005,17 @@ function isNodeSpawn(rawEvent, line) {
   if (rawEvent.kind !== "spawn" || rawEvent.result !== "ok") return false;
   if (isNodeBasename(rawEvent.argv[0])) return true;
   return isNodeBasename(firstExecPathFromStraceLine(line) ?? void 0);
+}
+function isPackageManagerClientSpawn(rawEvent, line) {
+  if (rawEvent.kind !== "spawn" || rawEvent.result !== "ok") return false;
+  if (isPackageManagerClientBasename(rawEvent.argv[0])) return true;
+  if (isPackageManagerClientBasename(firstExecPathFromStraceLine(line) ?? void 0)) {
+    return true;
+  }
+  if (isNodeBasename(rawEvent.argv[0])) {
+    return isPackageManagerClientBasename(rawEvent.argv[1]);
+  }
+  return false;
 }
 async function runInstallPhase(input) {
   const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
@@ -26474,6 +26490,7 @@ async function runInstallPhase(input) {
     dirfdStateUnknown.add(rootedFd(pid));
   }
   let installRootSeeded = false;
+  let installRootPid = null;
   const canonicalizeOpenTarget = (pid, targetPath, dirfd) => {
     if (dirfd === void 0) {
       if (path2.isAbsolute(targetPath)) {
@@ -26525,11 +26542,12 @@ async function runInstallPhase(input) {
   const nodeBootstrapFilePendingPids = /* @__PURE__ */ new Set();
   const nodeBootstrapFileCompletedPids = /* @__PURE__ */ new Set();
   const nodeBootstrapChildrenByPid = /* @__PURE__ */ new Map();
-  const nodeBootstrapCandidateFileReadsByPid = /* @__PURE__ */ new Map();
+  const nodeBootstrapCandidateEventsByPid = /* @__PURE__ */ new Map();
   const nodeBootstrapCandidateConfirmedPids = /* @__PURE__ */ new Set();
   const nodeBootstrapCandidateFileMarkerPids = /* @__PURE__ */ new Set();
   const nodeBootstrapEnvReads = /* @__PURE__ */ new Set();
   const nodeBootstrapFileReads = /* @__PURE__ */ new Set();
+  const packageManagerClientPids = /* @__PURE__ */ new Set();
   const nodeBootstrapSubtree = (rootPid) => {
     const stack = [rootPid];
     for (let i = 0; i < stack.length; i++) {
@@ -26568,47 +26586,67 @@ async function runInstallPhase(input) {
     nodeBootstrapFilePendingPids.add(pid);
   };
   const flushNodeBootstrapCandidate = (pid) => {
-    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
     if (buffered === void 0) return;
-    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateEventsByPid.delete(pid);
     nodeBootstrapCandidateConfirmedPids.delete(pid);
     nodeBootstrapCandidateFileMarkerPids.delete(pid);
     for (const ev of buffered) emit(ev);
   };
   const dropNodeBootstrapCandidateAsNode = (pid) => {
-    const buffered = nodeBootstrapCandidateFileReadsByPid.get(pid);
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
     if (buffered === void 0) return;
-    nodeBootstrapCandidateFileReadsByPid.delete(pid);
+    nodeBootstrapCandidateEventsByPid.delete(pid);
     nodeBootstrapCandidateConfirmedPids.delete(pid);
     nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    const recordEnvBaseline = !packageManagerClientPids.has(pid);
     for (const ev of buffered) {
       if (ev.raw.kind === "read") {
         nodeBootstrapFileReads.add(ev.raw.path);
+      } else if (ev.raw.kind === "env_read" && recordEnvBaseline) {
+        nodeBootstrapEnvReads.add(ev.raw.name);
       }
     }
+  };
+  const dropNodeBootstrapCandidateEnvReadsAsNode = (pid) => {
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
+    if (buffered === void 0) return;
+    const recordEnvBaseline = !packageManagerClientPids.has(pid);
+    const keep = [];
+    for (const ev of buffered) {
+      if (ev.raw.kind === "env_read") {
+        if (recordEnvBaseline) {
+          nodeBootstrapEnvReads.add(ev.raw.name);
+        }
+      } else {
+        keep.push(ev);
+      }
+    }
+    nodeBootstrapCandidateEventsByPid.set(pid, keep);
   };
   const beginNodeBootstrapCandidate = (pid) => {
     flushNodeBootstrapCandidate(pid);
     nodeBootstrapFileCompletedPids.delete(pid);
     nodeBootstrapCandidateConfirmedPids.delete(pid);
     nodeBootstrapCandidateFileMarkerPids.delete(pid);
-    nodeBootstrapCandidateFileReadsByPid.set(pid, []);
+    nodeBootstrapCandidateEventsByPid.set(pid, []);
   };
   const flushAllNodeBootstrapCandidates = () => {
-    for (const pid of [...nodeBootstrapCandidateFileReadsByPid.keys()]) {
+    for (const pid of [...nodeBootstrapCandidateEventsByPid.keys()]) {
       flushNodeBootstrapCandidate(pid);
     }
   };
   const confirmNodeBootstrapCandidate = (pid) => {
-    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    if (!nodeBootstrapCandidateEventsByPid.has(pid)) return false;
     nodeBootstrapCandidateConfirmedPids.add(pid);
+    dropNodeBootstrapCandidateEnvReadsAsNode(pid);
     if (nodeBootstrapCandidateFileMarkerPids.has(pid)) {
       dropNodeBootstrapCandidateAsNode(pid);
     }
     return true;
   };
   const completeNodeBootstrapCandidateFileMarker = (pid) => {
-    if (!nodeBootstrapCandidateFileReadsByPid.has(pid)) return false;
+    if (!nodeBootstrapCandidateEventsByPid.has(pid)) return false;
     nodeBootstrapCandidateFileMarkerPids.add(pid);
     if (nodeBootstrapCandidateConfirmedPids.has(pid)) {
       dropNodeBootstrapCandidateAsNode(pid);
@@ -26633,10 +26671,16 @@ async function runInstallPhase(input) {
   const shouldFilterNodeBootstrapEnvRead = (raw) => {
     if (raw.kind !== "env_read" || raw.hidden) return false;
     if (nodeBootstrapEnvPendingPids.has(raw.pid)) {
-      nodeBootstrapEnvReads.add(raw.name);
+      if (!packageManagerClientPids.has(raw.pid)) {
+        nodeBootstrapEnvReads.add(raw.name);
+      }
       return true;
     }
     return nodeBootstrapEnvReads.has(raw.name);
+  };
+  const shouldFilterPackageManagerClientEnvRead = (raw) => {
+    if (raw.kind !== "env_read" || raw.hidden) return false;
+    return packageManagerClientPids.has(raw.pid);
   };
   const shouldFilterNodeBootstrapFileRead = (raw) => {
     if (raw.kind !== "read" || raw.hidden || matcher.isProtected(raw.path)) {
@@ -26652,9 +26696,17 @@ async function runInstallPhase(input) {
     if (ev.raw.kind !== "read" || ev.raw.hidden || matcher.isProtected(ev.raw.path)) {
       return false;
     }
-    const buffered = nodeBootstrapCandidateFileReadsByPid.get(ev.raw.pid);
+    const buffered = nodeBootstrapCandidateEventsByPid.get(ev.raw.pid);
     if (buffered === void 0) return false;
     if (nodeBootstrapCandidateFileMarkerPids.has(ev.raw.pid)) return false;
+    buffered.push(ev);
+    return true;
+  };
+  const shouldBufferNodeBootstrapCandidateEnvRead = (ev) => {
+    if (ev.raw.kind !== "env_read" || ev.raw.hidden) return false;
+    const buffered = nodeBootstrapCandidateEventsByPid.get(ev.raw.pid);
+    if (buffered === void 0) return false;
+    if (nodeBootstrapCandidateConfirmedPids.has(ev.raw.pid)) return false;
     buffered.push(ev);
     return true;
   };
@@ -26672,6 +26724,7 @@ async function runInstallPhase(input) {
       const rootPid = input.strace.getRootPid();
       if (rootPid !== null && pid === rootPid) {
         installRootSeeded = true;
+        installRootPid = pid;
         cwdSet(pid, path2.resolve(input.cwd));
       }
     }
@@ -26686,6 +26739,9 @@ async function runInstallPhase(input) {
         continue;
       }
       if (shimEvent.kind === "node_startup_done") {
+        if (shimEvent.pid === installRootPid) {
+          packageManagerClientPids.add(shimEvent.pid);
+        }
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
         if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
           nodeBootstrapFilePendingPids.add(shimEvent.pid);
@@ -26704,13 +26760,25 @@ async function runInstallPhase(input) {
       }
       if (result !== null) {
         recordAttribution(shimEvent.pid, result, lineTs);
-        emit({ raw: shimEvent, pkg: result.pkg, lifecycle: result.lifecycle });
+        const attributed = {
+          raw: shimEvent,
+          pkg: result.pkg,
+          lifecycle: result.lifecycle
+        };
+        if (shouldBufferNodeBootstrapCandidateEnvRead(attributed)) {
+          continue;
+        }
+        if (shouldFilterPackageManagerClientEnvRead(shimEvent)) {
+          continue;
+        }
+        emit(attributed);
       }
       continue;
     }
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
         flushNodeBootstrapCandidate(pid);
+        packageManagerClientPids.delete(pid);
         input.attribution.invalidate(pid);
         const liveAttrib = input.attribution.attribute(pid);
         if (liveAttrib !== null) {
@@ -27472,13 +27540,18 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
+          packageManagerClientPids.delete(rawEvent.pid);
           shimLoadedPids.delete(rawEvent.pid);
           if (isNodeSpawn(rawEvent, line)) {
             beginNodeBootstrap(rawEvent.pid);
           } else {
             clearNodeBootstrap(rawEvent.pid);
             beginNodeBootstrapCandidate(rawEvent.pid);
+          }
+          if (isPackageManagerClient) {
+            packageManagerClientPids.add(rawEvent.pid);
           }
           const execFdSingleton = isFdSingleton(rawEvent.pid);
           let execFdSnap = null;
