@@ -4983,6 +4983,126 @@ describe('runInstallPhase', () => {
       expect(protectedRead?.['hidden']).toBe(true);
     });
 
+    it('attributes fast-exit Node env reads from the pid snapshot after /proc is gone', async () => {
+      let live = true;
+      const env = {
+        npm_package_name: 'esbuild',
+        npm_package_version: '0.28.0',
+        npm_lifecycle_event: 'postinstall',
+      };
+      const proc: ProcReader = {
+        readPpid(pid) {
+          return live && pid === 42 ? 1 : null;
+        },
+        readEnviron(pid) {
+          return live && pid === 42 ? new Map(Object.entries(env)) : null;
+        },
+      };
+      const strace: StraceRunner = {
+        async *run() {
+          yield {
+            pid: 42,
+            source: 'strace' as const,
+            line: 'execve("/usr/local/bin/node", ["node", "install.js"], 0x7ffd) = 0',
+          };
+          yield {
+            pid: 42,
+            source: 'shim' as const,
+            line: JSON.stringify({ kind: 'node_startup_done', pid: 42, ts: 1 }),
+          };
+          live = false;
+          yield { pid: 42, source: 'strace' as const, line: '+++ exited with 0 +++' };
+          yield {
+            pid: 42,
+            source: 'shim' as const,
+            line: JSON.stringify({ kind: 'env_read', name: 'ESBUILD_BINARY_PATH', pid: 42, ts: 2, hidden: false }),
+          };
+        },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'pnpm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const events = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+      const envRead = events.find((ev) => {
+        const raw = ev['raw'] as Record<string, unknown> | undefined;
+        return raw?.['kind'] === 'env_read' && raw['name'] === 'ESBUILD_BINARY_PATH';
+      });
+      expect(envRead?.['pkg']).toBe('esbuild@0.28.0');
+      expect((envRead?.['raw'] as Record<string, unknown>)['pid']).toBe(42);
+    });
+
+    it('keeps fast-exit package-manager client env reads filtered after /proc is gone', async () => {
+      let live = true;
+      const env = {
+        npm_package_name: 'fixture-root',
+        npm_package_version: '1.0.0',
+        npm_lifecycle_event: 'install',
+      };
+      const proc: ProcReader = {
+        readPpid(pid) {
+          return live && pid === 42 ? 1 : null;
+        },
+        readEnviron(pid) {
+          return live && pid === 42 ? new Map(Object.entries(env)) : null;
+        },
+      };
+      const strace: StraceRunner = {
+        async *run() {
+          yield {
+            pid: 42,
+            source: 'shim' as const,
+            line: JSON.stringify({ kind: 'node_startup_done', pid: 42, ts: 1 }),
+          };
+          yield {
+            pid: 42,
+            source: 'shim' as const,
+            line: JSON.stringify({ kind: 'env_read', name: 'npm_config_registry', pid: 42, ts: 2, hidden: false }),
+          };
+          live = false;
+          yield { pid: 42, source: 'strace' as const, line: '+++ exited with 0 +++' };
+          yield {
+            pid: 42,
+            source: 'shim' as const,
+            line: JSON.stringify({ kind: 'env_read', name: 'npm_config_user_agent', pid: 42, ts: 3, hidden: false }),
+          };
+        },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return 42; },
+      };
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'pnpm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      const raws = lines.map((line) => {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return parsed['raw'] as Record<string, unknown>;
+      });
+      expect(raws.some((raw) => raw['kind'] === 'env_read')).toBe(false);
+    });
+
     it('records Node bootstrap file reads and filters later repeats from package output', async () => {
       const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
       const straceLines = [
