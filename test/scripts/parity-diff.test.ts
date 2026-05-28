@@ -65,14 +65,17 @@ packages:
 `;
 
 describe('scripts/parity-diff.ts', () => {
-  it('filters known backend env/network noise and the exact esbuild native self-verify spawn', () => {
+  it('filters known backend read/env/network noise and exact benign spawns', () => {
     const dir = makeWorkspace();
     const left = join(dir, 'linux.yml');
     const right = join(dir, 'macos.yml');
 
     writeFileSync(
       left,
-      `${COMMON_LOCK_PREFIX}        env_read:
+      `${COMMON_LOCK_PREFIX.replace(
+        'external_reads: []',
+        'external_reads:\n          - $HOME/.cache/puppeteer',
+      )}        env_read:
           - HOSTNAME
           - PATH
           - SCRIPT_JAIL_CONFIG_PATH
@@ -145,6 +148,46 @@ describe('scripts/parity-diff.ts', () => {
 
     expect(result.status).toBe(1);
     expect(result.stdout).toContain('$PKG/bin/other --version');
+    expect(result.stderr).toBe('');
+  });
+
+  it('keeps writes to read-filtered paths visible', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+
+    writeFileSync(
+      left,
+      `${COMMON_LOCK_PREFIX.replace(
+        'escaped_writes: []',
+        'escaped_writes:\n          - $HOME/.cache/puppeteer',
+      )}        env_read:
+          - PATH
+        spawn_attempts:
+          - node install.js
+        spawn_blocked: []
+        dlopen_attempts: []
+        network_attempts: []
+`,
+      'utf8',
+    );
+    writeFileSync(
+      right,
+      `${COMMON_LOCK_PREFIX}        env_read:
+          - PATH
+        spawn_attempts:
+          - node install.js
+        spawn_blocked: []
+        dlopen_attempts: []
+        network_attempts: []
+`,
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('$HOME/.cache/puppeteer');
     expect(result.stderr).toBe('');
   });
 
