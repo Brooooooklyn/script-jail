@@ -29,7 +29,7 @@ const SCRIPT = join(repoRoot, 'images/kernel/build.sh');
 beforeAll(() => {
   if (!existsSync(SCRIPT)) {
     throw new Error(
-      `Expected build script at ${SCRIPT}; PR 5 ships this file.`,
+      `Expected build script at ${SCRIPT}.`,
     );
   }
 });

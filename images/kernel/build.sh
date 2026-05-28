@@ -55,11 +55,12 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 
-# Linux 6.6.x is the latest LTS line at the time of PR 5; 6.6.50 was the
-# tip at the moment of authoring.  objc2-virtualization 0.3.x boots this
-# kernel without complaint (the framework's only kernel requirement is
-# "virtio-pci + a serial console").  Bumping this is a release-level
-# concern: re-run the full build, refresh the manifest SHAs, cut a tag.
+# Linux 6.6.x was the current LTS line when the VZ kernel path was added;
+# 6.6.50 was the pinned tip at the moment of authoring. objc2-virtualization
+# 0.3.x boots this kernel without complaint (the framework's only kernel
+# requirement is "virtio-pci + a serial console"). Bumping this is a
+# release-level concern: re-run the full build, refresh the manifest SHAs,
+# cut a tag.
 DEFAULT_LINUX_VERSION="6.6.50"
 
 # Pinned upstream tarball SHA-256 digests.  When you bump

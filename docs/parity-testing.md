@@ -168,7 +168,9 @@ gh api repos/vuejs/core/git/refs/tags/<tag> | jq -r '.object.sha'
 - **The workflow no longer depends on KVM on the arm runner** —
   `ubuntu-24.04-arm` gives the right CPU architecture, and the backend selector
   falls through to Docker when `/dev/kvm` is absent.
-- **No caching** — every run builds rootfs, kernel, and shim from scratch
-  (~15 min upfront). Once the fixture pin and the build inputs stabilise,
-  `actions/cache@v4` keys derived from `git rev-parse HEAD:images/` and
-  the kernel build script's SHA would shave ~10 min per run.
+- **No rootfs/shim/Docker image cache** — every arm parity run builds the
+  arm64 action bundle, shim, rootfs, and Docker image from source. Hosted arm
+  runners normally use the Docker backend rather than booting Firecracker, so
+  the job no longer depends on a freshly built Firecracker kernel, but the
+  guest artifacts still dominate runtime. `setup-node` caches pnpm packages;
+  artifact-level caching is still deferred.

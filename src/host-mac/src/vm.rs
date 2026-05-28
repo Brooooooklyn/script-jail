@@ -566,6 +566,6 @@ mod tests {
     }
 
     // NOTE: a "happy-path" build_config test would require Virtualization.framework
-    // to be reachable AND a real entitlement.  We exercise this in PR 4 inside
-    // the e2e harness; for PR 3 the file-not-found branch is the realistic test.
+    // to be reachable AND a real entitlement. The file-not-found branch is the
+    // reliable CI smoke path; real boot coverage is artifact-gated.
 }

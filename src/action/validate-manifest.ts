@@ -43,13 +43,13 @@ const PLATFORMS: ReadonlyArray<ManifestPlatform> = ['linux', 'darwin'];
  * descriptive error listing every offending entry (prefixed with
  * `<platform>/`) so the user fixes them all in one round-trip.
  *
- * Also enforces the PR 5 manifest shape: `expected` MUST be platform-keyed
+ * Also enforces the current manifest shape: `expected` MUST be platform-keyed
  * (`{ linux: {...}, darwin: {...} }`).  A flat manifest is rejected outright
  * — a maintainer who pastes the pre-PR-5 layout would otherwise silently
  * produce a zero-offender pass.
  */
 export function validateManifest(manifest: ArtifactManifest): void {
-  // Shape gate: the platform-keyed layout is the only legal shape since PR 5.
+  // Shape gate: the platform-keyed layout is the only legal shape.
   // We check for the two known section keys explicitly rather than rejecting
   // "anything that doesn't match the union", which would mis-fire on a
   // manifest that ships extra (future) platform sections.

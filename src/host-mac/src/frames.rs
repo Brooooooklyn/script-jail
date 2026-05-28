@@ -2,9 +2,8 @@
 //
 // JSONL frame types spoken between the guest agent and the host helper.
 // Mirrors the TS `GuestFrame` discriminated union in
-// src/shared/vsock-protocol.ts — keep them in sync.  PR 3 only needs the
-// host to *read* frames; the only outbound message is the literal "go\n"
-// handshake byte, which has no envelope.
+// src/shared/vsock-protocol.ts — keep them in sync. The host reads frames and
+// sends the literal "go\n" handshake byte, which has no envelope.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +42,8 @@ pub struct FinalFrame {
 }
 
 /// Pass-through container.  The host helper does not interpret guest
-/// events in PR 3 — it forwards them to the Node CLI which already has
-/// the normalizer (src/lock/normalize.ts).  Using `serde_json::Value`
+/// events — it forwards them to the Node CLI which already has the normalizer
+/// (src/lock/normalize.ts). Using `serde_json::Value`
 /// here avoids duplicating the AttributedEvent schema on the Rust side.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EventFrame {

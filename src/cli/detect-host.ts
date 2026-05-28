@@ -4,7 +4,7 @@
 //
 // script-jail v1 runs the audited install inside a microVM.  On Linux CI the
 // hypervisor is Firecracker + KVM; on a developer's laptop we use Apple's
-// Virtualization.framework (VZ) via a native binary that PR 3-5 will plug in.
+// Virtualization.framework (VZ) via the native `script-jail-vm` helper.
 // VZ has a hard floor at macOS 14 (Sonoma) because that is the first release
 // to expose the `LinuxBootLoader` + vsock APIs we need without extra
 // entitlements.  This module is the single gatekeeper that decides whether
@@ -65,7 +65,7 @@ export class NotMacOSError extends Error {
   constructor(actualPlatform: string) {
     super(
       `script-jail CLI requires macOS (detected '${actualPlatform}'). ` +
-      `On Linux CI, use the GitHub Action (uses: Brooooooklyn/npm-jar@v1) instead.`,
+      `On Linux CI, use the GitHub Action (uses: Brooooooklyn/scriptjail@<pinned-tag>) instead.`,
     );
     this.name = 'NotMacOSError';
   }

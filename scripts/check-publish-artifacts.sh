@@ -27,7 +27,7 @@
 #   the manifest and cut the next tag.  Mixed manifests (some real, some
 #   placeholder) are treated as bugs and rejected.
 #
-# Manifest shape (PR 5):
+# Manifest shape:
 #   `PINNED_MANIFEST.expected` is platform-keyed:
 #     expected: {
 #       linux:  { 'rootfs-…': '<sha>', 'libscriptjail.so': '<sha>', … },
@@ -135,8 +135,8 @@ fi
 
 # Extract the `expected: { ... }` block of PINNED_MANIFEST into a variable.
 # Strategy: awk state machine that counts `{` / `}` characters so the
-# extraction survives nested sub-blocks (PR 5 introduces
-# `linux: { ... }` and `darwin: { ... }` inside expected).  We start the
+# extraction survives nested sub-blocks (`linux: { ... }` and
+# `darwin: { ... }` inside expected). We start the
 # depth counter at 1 immediately after seeing `expected: {`, then echo
 # every line until depth returns to 0.
 #
@@ -300,8 +300,8 @@ ART_LINUX_LIBSO="$DIR/images/libscriptjail.so"
 ART_DIST="$DIR/dist/main.cjs"
 ART_DIST_CLI="$DIR/dist/cli.cjs"
 
-# Darwin platform artifacts (PR 5 — built in the same release pipeline,
-# uploaded as separate workflow artifacts and aggregated here).
+# Darwin platform artifacts (built in the same release pipeline, uploaded as
+# separate workflow artifacts, and aggregated here).
 ART_DARWIN_ROOTFS_22_ARM64="$DIR/images/rootfs-ubuntu-22.04-arm64.ext4"
 ART_DARWIN_ROOTFS_24_ARM64="$DIR/images/rootfs-ubuntu-24.04-arm64.ext4"
 ART_DARWIN_LIBSO_ARM64="$DIR/images/libscriptjail-arm64.so"

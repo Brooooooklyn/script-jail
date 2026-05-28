@@ -18,8 +18,8 @@
 //
 // The `fs` and `warn` fields on `DetectInput` are injection seams so tests
 // can avoid touching the real filesystem or stdout.  Default writes a
-// GitHub Actions ::warning:: annotation; callers (host-mac CLI in PR 2+)
-// can override to log via their own sink.
+// GitHub Actions ::warning:: annotation; callers such as the host-mac CLI can
+// override to log via their own sink.
 //
 // This function is synchronous: the lockfile read is small and one-shot, so
 // async IO buys nothing.  We return `DetectedPm` directly (not a Promise).

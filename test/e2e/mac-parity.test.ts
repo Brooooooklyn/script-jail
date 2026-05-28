@@ -4,10 +4,10 @@
 // compares the produced `.script-jail.lock.yml` to the Linux-CI golden the
 // existing e2e workflow generates.
 //
-// PR 4 wires the test skeleton.  The actual fixture invocations require
-// PR 5's VZ kernel artifact (`images/vmlinux-vz-<arch>`) — without it,
-// `spawnVm`'s pre-flight `checkArtifacts` exits with a clear "kernel not
-// found (PR 5)" error and the test cannot run.  We therefore:
+// The actual fixture invocations require the VZ kernel artifact
+// (`images/vmlinux-vz-<arch>`) and a matching rootfs — without them,
+// `spawnVm`'s pre-flight `checkArtifacts` exits with a clear missing-artifact
+// error and the test cannot run. We therefore:
 //
 //   1. Run the suite only on darwin hosts (`process.platform === 'darwin'`).
 //   2. Skip the suite entirely when the kernel artifact is absent.
@@ -15,9 +15,8 @@
 //      rootfs ships from CI today, but a dev host without `pnpm build
 //      --arch=arm64` will not have the arm64 rootfs).
 //
-// When PR 5 lands, the kernel artifact appears in `images/vmlinux-vz-<arch>`
-// and these tests automatically start executing.  Each `it.todo` is the slot
-// for one fixture's verification body.
+// Once the artifacts are present on the host, this suite starts executing.
+// Each `it.todo` is the slot for one fixture's verification body.
 //
 // We intentionally use `describe.runIf` rather than guarding every `it` —
 // vitest reports the whole describe as "skipped" with the parent name, which
@@ -54,7 +53,7 @@ if (!canRun) {
       (!isMac
         ? `host is ${process.platform}, not darwin`
         : !kernelPresent
-          ? `kernel artifact missing at ${artifacts.kernelPath} (PR 5 ships this)`
+          ? `kernel artifact missing at ${artifacts.kernelPath}`
           : `rootfs artifact missing at ${artifacts.rootfsPath} (run \`pnpm build --runner-image=ubuntu-24.04${hostArch === 'arm64' ? ' --arch=arm64' : ''}\` to produce it)`),
   );
 }
@@ -62,8 +61,8 @@ if (!canRun) {
 describe.runIf(canRun)('macOS host runner parity', () => {
   // Each fixture below has a Linux-CI golden in test/fixtures/<name>/
   // expected-events.json; the parity test confirms the macOS CLI produces
-  // the same lockfile.  Filled in once PR 5's kernel artifact is available
-  // and the integration harness can actually exec script-jail-vm.
+  // the same lockfile. Filled in once the integration harness can execute
+  // script-jail-vm against committed fixtures.
 
   it.todo(
     'reads-secret-env fixture: produces lockfile byte-equal to Linux-CI golden',
@@ -79,6 +78,6 @@ describe.runIf(canRun)('macOS host runner parity', () => {
   );
 });
 
-// Keep `join` referenced so the import isn't pruned — used as part of the
-// "PR 5 will fill this in" scaffolding below.
+// Keep `join` referenced so the import isn't pruned while the fixture bodies
+// are still placeholders.
 void join;

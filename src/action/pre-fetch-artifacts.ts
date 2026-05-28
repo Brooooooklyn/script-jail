@@ -37,9 +37,8 @@ import type { RunnerImage } from './runner-image.js';
 // ---------------------------------------------------------------------------
 
 /**
- * Platform key for the nested `expected` map.  PR 5 split the manifest by
- * platform so the action (which only runs on Linux) and the macOS CLI (PR 4)
- * can pin distinct asset sets without two manifest files.
+ * Platform key for the nested `expected` map. The action and macOS CLI pin
+ * distinct asset sets without two manifest files.
  */
 export type ManifestPlatform = 'linux' | 'darwin';
 export type ArtifactArch = 'x64' | 'arm64';
@@ -85,8 +84,8 @@ export interface PreFetchInput {
   /**
    * Which platform section of the manifest to consult.  Defaults to `'linux'`
    * because this helper is invoked from the GitHub Action's `main.ts`, which
-   * only runs on Linux.  The macOS CLI (PR 4) does not call preFetchArtifacts
-   * at all — it resolves artifacts from the local `images/` dir via
+   * only runs on Linux. The macOS CLI does not call preFetchArtifacts at all
+   * — it resolves artifacts from the local `images/` dir via
    * `src/shared/artifacts.ts`.
    */
   platform?: ManifestPlatform;

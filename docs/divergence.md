@@ -4,12 +4,12 @@ The macOS Virtualization.framework runner produces audit lockfiles that aim
 for byte-for-byte parity with the Linux Action backend. The parity workflow
 now runs Linux CI on `ubuntu-24.04-arm`; on hosted runners `backend: auto`
 falls through to Docker because KVM is unavailable. Both sides still use a
-Linux/arm64 audit environment. A handful of host/backend/environment cases can
-produce lockfile diffs that the maintainer must recognise as "expected
-divergence" rather than chase as bugs.
+Linux/arm64 audit environment.
 
-The TL;DR: if your `.script-jail.lock.yml` diff fails on macOS but passes on
-Linux CI (or vice versa), check the cases below before opening an issue.
+Known host/backend noise is either removed before rendering or filtered by
+`scripts/parity-diff.ts`. A remaining diff is a CI failure. The TL;DR: if your
+`.script-jail.lock.yml` differs between macOS and Linux CI, check the cases
+below before treating it as a product bug.
 
 ## Why divergence is possible
 
@@ -20,7 +20,8 @@ determinism across hosts:
 - **Ambient environment.** GitHub Actions sets CI variables and runner
   metadata that a local macOS generation does not have. The guest filters
   known Node/bootstrap reads, npm/yarn/pnpm client reads, and selected CI
-  noise, but a new package-manager version can still introduce a new probe.
+  noise, but a new package-manager version can still introduce a new probe
+  that needs a narrow filter or a regenerated baseline.
 
 - **Backend/device surface.** Firecracker, Docker, bare Linux, and
   Virtualization.framework expose different device and procfs/sysfs shapes.
@@ -51,18 +52,14 @@ Two separate contracts back the "byte-equal lockfile" claim, and they are
 exercised by two separate test suites. Conflating the two is a recurring
 documentation mistake — the suites cover unrelated invariants.
 
-### macOS-side parity check
+### macOS-side smoke and parity checks
 
-`test/e2e/mac-parity.test.ts` (gated on `darwin` + Apple Silicon) is the
-local smoke test for the macOS CLI/VZ path. It runs only on Darwin hosts and
-skips itself entirely when the VZ kernel artifact
-(`images/vmlinux-vz-<arch>`) or the per-arch rootfs is absent.
-
-PR 4 status: the suite is scaffolded with four `it.todo` slots, one per
-fixture (`reads-secret-env`, `tries-dlopen`, `reads-home-ssh`,
-`tries-network-egress`). The bodies are filled in once PR 5's kernel
-artifact is published — at that point each `it.todo` becomes a real
-parity assertion.
+`test/e2e/mac-parity.test.ts` is the artifact-gated local test scaffold for
+the macOS CLI/VZ path. It runs only on Darwin hosts and skips itself entirely
+when the VZ kernel artifact (`images/vmlinux-vz-<arch>`) or the per-arch rootfs
+is absent. The committed scaffold still contains placeholder fixture cases;
+real per-fixture assertions become useful once the release artifacts are
+available on the developer host or in a suitable self-hosted macOS environment.
 
 On Linux CI, `parity-test.yml` now exercises the Action backend on
 `ubuntu-24.04-arm` and diffs it against the committed local macOS/VZ lockfile.

@@ -1,5 +1,5 @@
 // script-jail — src/rootfs/build.ts
-// Orchestrates building the Firecracker rootfs ext4 image.
+// Orchestrates building the Linux guest rootfs ext4 image.
 //
 // The rootfs is keyed by Ubuntu major (`ubuntu-22.04`, `ubuntu-24.04`) and
 // arch.  It bakes the standalone `vp` (vite-plus) binary; the guest's
@@ -50,11 +50,9 @@ export type RunnerImage = 'ubuntu-22.04' | 'ubuntu-24.04';
 /**
  * Target architecture for the rootfs ext4.
  *
- *   - 'x64'    → x86_64 image, native on Linux CI, docker-buildx-linux/amd64 on macOS.
+ *   - 'x64'    → x86_64 image, native on Linux x64, docker-buildx-linux/amd64 on macOS.
  *   - 'arm64'  → aarch64 image, native on arm64 Linux, docker-buildx-linux/arm64
- *                (qemu emulation on x86_64 hosts).  PR 4 wires the codepath;
- *                PR 5 hooks it into CI.  Local arm64 builds work today but
- *                are slow (qemu).
+ *                with qemu emulation on x86_64 hosts.
  */
 export type BuildArch = 'x64' | 'arm64';
 
@@ -63,9 +61,8 @@ export interface BuildInput {
   /** Directory where images/*.ext4 are written. Defaults to <repo root>/images */
   outputDir: string;
   /**
-   * Target arch for the rootfs.  Defaults to 'x64' to preserve the existing
-   * Firecracker pipeline.  PR 4 introduced this parameter; production callers
-   * (release.yml, scripts/build.ts) must pass the desired value.
+   * Target arch for the rootfs. Defaults to 'x64' for compatibility;
+   * release and parity callers pass the desired value explicitly.
    */
   arch?: BuildArch;
 }
@@ -113,7 +110,7 @@ export function dockerTag(input: Pick<BuildInput, 'runnerImage' | 'arch'>): stri
 /**
  * Map a target arch to the `docker buildx --platform` value.  Used by the
  * arm64 path so a macOS / x86_64 builder can produce a Linux/arm64 image
- * via qemu emulation; PR 4 wires this in, PR 5 enables it from CI.
+ * via qemu emulation.
  */
 export function dockerPlatform(arch: BuildArch): string {
   return arch === 'arm64' ? 'linux/arm64' : 'linux/amd64';
@@ -201,14 +198,14 @@ export const ELF64_PHDR_SIZE = 56;
 export const PT_LOAD = 1;
 export const PT_DYNAMIC = 2;
 
-/** ELF e_machine values we recognise.  Currently only x86-64 ships. */
+/** ELF e_machine values we recognise. */
 export const EM_X86_64 = 62;
 export const EM_AARCH64 = 183;
 
 /** Map a runner image to the ELF e_machine value expected for that rootfs. */
 export function expectedShimMachine(input: Pick<BuildInput, 'runnerImage' | 'arch'>): number {
-  // x64 is the default arch (preserves existing Firecracker pipeline); PR 4
-  // adds the arm64 fork so the macOS arm64 CLI can validate `libscriptjail-arm64.so`.
+  // x64 is the default arch for compatibility; arm64 validates
+  // `libscriptjail-arm64.so`.
   const arch = input.arch ?? 'x64';
   return arch === 'arm64' ? EM_AARCH64 : EM_X86_64;
 }

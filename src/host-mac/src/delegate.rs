@@ -110,8 +110,8 @@ impl VmDelegate {
     /// Idempotent in the sense that we drop subsequent calls (OnceCell);
     /// callers should treat that as a programming error.
     pub fn attach_tx(&self, tx: Sender<DelegateEvent>) {
-        // ignore an already-set channel — the helper should call this once
-        // and the second-call case is benign in PR 3 (no live VM).
+        // Ignore an already-set channel — the helper should call this once,
+        // and a second call is benign in tests.
         let _ = self.ivars().tx.set(tx);
     }
 

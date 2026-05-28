@@ -35,9 +35,8 @@ function fakeRepo(lockfile: string = 'pnpm-lock.yaml'): string {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'demo' }));
   writeFileSync(join(dir, lockfile), '');
-  // PR 4 wired buildEffectiveConfig into the CLI orchestration path, so the
-  // fake repo needs a minimal .script-jail.yml for the config-overlay step
-  // to succeed.  The contents are intentionally trivial — every test that
+  // The fake repo needs a minimal .script-jail.yml for the config-overlay
+  // step to succeed. The contents are intentionally trivial — every test that
   // depends on this stubs out makeOverlay below, so the rewritten config is
   // never actually read by anything downstream.
   writeFileSync(
@@ -48,8 +47,8 @@ function fakeRepo(lockfile: string = 'pnpm-lock.yaml'): string {
 }
 
 function fakeOverlay(workDir: string) {
-  // PR 4 calls makeOverlay before spawnVm; tests stub it to return a fake
-  // OverlayResult whose paths look reasonable but never exist on disk.
+  // Tests stub makeOverlay to return a fake OverlayResult whose paths look
+  // reasonable but never exist on disk.
   // spawnVm is itself stubbed in these tests so the missing files never
   // matter.
   return {
@@ -125,9 +124,9 @@ describe('CLI — host gating', () => {
 
 describe('CLI — VM-launch stub', () => {
   it('surfaces injected spawnVm errors via stderr and exits 1', async () => {
-    // PR 4 wires `spawnVm` for real, but the dependency-injection seam stays
-    // intact: tests can still stub `spawnVm` to throw, and the CLI must
-    // surface the message verbatim to stderr.  We keep
+    // The dependency-injection seam stays intact: tests can still stub
+    // `spawnVm` to throw, and the CLI must surface the message verbatim to
+    // stderr. We keep
     // `MacOSVmNotImplementedError` exported for backwards compat with this
     // test, which exercises the generic "spawnVm threw" code path.
     const repoDir = fakeRepo('pnpm-lock.yaml');

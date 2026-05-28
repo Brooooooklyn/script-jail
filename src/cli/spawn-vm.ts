@@ -15,7 +15,7 @@
 //   1. `SCRIPT_JAIL_VM_BIN`           env override; used in tests.
 //   2. `<repoRoot>/target/release/script-jail-vm`  for local `cargo build`.
 //   3. `<packageRoot>/bin/darwin-<arch>/script-jail-vm` for the published
-//      npm package (PR 5 populates `bin/` from release assets).
+//      npm package.
 //
 // All three paths are checked before raising — the error message lists every
 // one we tried so a dev who forgot to `cargo build` knows where the binary
@@ -45,10 +45,7 @@ export type VmMode = 'check' | 'update';
 export interface VmConfig {
   /** Absolute path to the VZ-compatible kernel. */
   kernelPath: string;
-  /**
-   * Kernel cmdline.  We currently use the same string the Firecracker
-   * pipeline uses; PR 5 may tighten this when the VZ kernel lands.
-   */
+  /** Kernel cmdline for the VZ guest. */
   kernelCmdline: string;
   /** Per-run rootfs ext4 (output of `makeOverlay()`). */
   rootfsDiskPath: string;
@@ -91,9 +88,9 @@ export interface VmRunResult {
 
 /**
  * Compatibility shim: kept exported so existing CLI tests that match on
- * `MacOSVmNotImplementedError` continue to compile.  PR 4 wires `spawnVm`
- * for real, so production callers never see this; tests that want the
- * "unimplemented" code path inject a stub via `CliDeps.spawnVm`.
+ * `MacOSVmNotImplementedError` continue to compile. Production callers never
+ * see this; tests that want the "unimplemented" code path inject a stub via
+ * `CliDeps.spawnVm`.
  */
 export class MacOSVmNotImplementedError extends Error {
   constructor(detail?: string) {
@@ -123,9 +120,7 @@ export class MacOSVmArtifactNotFoundError extends Error {
   constructor(public readonly artifact: string, public readonly path: string) {
     super(
       `${artifact} not found at ${path}. ` +
-        (artifact === 'kernel'
-          ? 'The VZ-compatible kernel artifact lands in PR 5; until then, run the audit on Linux CI via the GitHub Action.'
-          : `Run \`pnpm build\` (or fetch the release artifact) to produce it.`),
+        'Run `pnpm build` for local artifacts or fetch the matching release artifact.',
     );
     this.name = 'MacOSVmArtifactNotFoundError';
   }
@@ -247,9 +242,8 @@ export function resolveScriptJailVmBinary(opts?: {
 
 /**
  * Verify that each required artifact exists on disk.  Throws
- * `MacOSVmArtifactNotFoundError` for the first missing file; the order
- * matches the user-facing "which artifact is PR 5 vs. PR 4" classification
- * (kernel first because that's the one that won't exist until PR 5).
+ * `MacOSVmArtifactNotFoundError` for the first missing file. Kernel is checked
+ * first because VZ cannot build a useful VM config without it.
  *
  * Note: `libscriptjailSoPath` is NOT checked here — that ELF is baked into
  * the released rootfs (see scripts/build.ts) and the rootfs ext4 check above
@@ -362,8 +356,7 @@ export async function spawnVm(
   const stderrSink = options.stderr ?? process.stderr;
 
   // Pre-flight: every host-side artifact the helper will need.  Surfaces a
-  // friendly "kernel not found" error before we ever touch the Rust binary,
-  // which is the typical dev-host failure mode until PR 5 ships the kernel.
+  // friendly "kernel not found" error before we ever touch the Rust binary.
   checkArtifacts({
     kernelPath: vmConfig.kernelPath,
     rootfsDiskPath: vmConfig.rootfsDiskPath,
@@ -480,4 +473,3 @@ export async function spawnVm(
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
-

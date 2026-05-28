@@ -2,9 +2,9 @@
 //
 // VmConfig: the JSON document the Node CLI hands to the Rust helper.  The
 // shape mirrors src/cli/spawn-vm.ts's VmConfig plus the extra fields the VZ
-// runner needs (kernel path, vsock port, vCPU/memory).  Keeping the schema
-// in Rust separate from the TS one is intentional: PR 4 will adapt the TS
-// payload to match.
+// runner needs (kernel path, vsock port, vCPU/memory). Keeping the schema
+// in Rust separate from the TS one is intentional: it keeps the helper's
+// validation boundary independent of the Node-side type.
 //
 // Validation runs at parse time: bad files fail fast with a clear message
 // before we touch Virtualization.framework.  The `Validation` variant carries

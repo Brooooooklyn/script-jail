@@ -22,8 +22,8 @@ jobs:
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node-version }})
     runs-on: ${{ matrix.os }}
-    # 10 minutes is a hard ceiling — the full unit + guest + integration
-    # suite finishes in under a minute today, so anything beyond this is a
+    # 10 minutes is a hard ceiling — the full Vitest suite finishes in under
+    # a minute today, so anything beyond this is a
     # hang rather than slowness.
     timeout-minutes: 10
     strategy:
@@ -64,7 +64,7 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Test (unit + guest + integration)
+      - name: Test (unit + guest + integration + fake e2e)
         run: pnpm test
 
       # Rebuild the action entry from source and verify it matches the copy

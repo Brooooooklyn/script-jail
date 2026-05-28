@@ -1,6 +1,6 @@
 # script-jail
 
-Firecracker-sandboxed audit of npm/pnpm/yarn lifecycle scripts, packaged as a GitHub Action. Lockfile changes trigger an install inside a minimal microVM; every read/write/env-read/dlopen/execve/connect that escapes a package's own directory is recorded into a deterministic, byte-stable `.script-jail.lock.yml`. The Action diffs the generated lock against the committed copy and fails the PR on mismatch.
+Backend-isolated audit of npm/pnpm/yarn lifecycle scripts, packaged as a GitHub Action plus a macOS CLI. Lockfile changes trigger an install inside the selected Linux audit backend (Firecracker, Docker, or bare Linux; macOS uses Virtualization.framework locally). Reads/writes/env reads/spawns/connects/audit-bypass signals that escape normal package boundaries are recorded into a deterministic, byte-stable `.script-jail.lock.yml`. The Action diffs the generated lock against the committed copy and fails the PR on mismatch.
 
 For the user-facing description and motivation, see [README.md](./README.md).
 
@@ -16,8 +16,8 @@ For the user-facing description and motivation, see [README.md](./README.md).
 
 | Path | Role |
 | --- | --- |
-| `src/main.ts`, `src/action/` | Host-side: action entry, Firecracker lifecycle, lockfile diff, caching. |
-| `src/guest/` | Guest-side agent that runs inside the VM (orchestrator, strace parser, preloads, emit, attribution). |
+| `src/main.ts`, `src/action/` | Host-side: action entry, backend selection, Firecracker/Docker/bare launchers, lockfile diff, caching. |
+| `src/guest/` | Guest-side agent that runs inside the selected backend (orchestrator, strace parser, preloads, emit, attribution). |
 | `src/shim/` | Rust `LD_PRELOAD` shim (`#![no_std]` cdylib) that intercepts libc `getenv` / `secure_getenv` / `__secure_getenv`. |
 | `src/lock/` | Event schema (zod), normalize, render, tokenize. |
 | `src/rootfs/` | ext4 rootfs builder, per Ubuntu major (22.04 / 24.04). |
@@ -32,26 +32,27 @@ For the user-facing description and motivation, see [README.md](./README.md).
 pnpm build            # full build (bundles + rootfs when --runner-image given)
 pnpm build:bundle    # esbuild dist/main.cjs only (fastest)
 pnpm typecheck       # tsc --noEmit
-pnpm test            # unit + guest + integration (no VM)
+pnpm test            # all Vitest projects, including fake e2e (no real VM)
 pnpm test:guest      # guest-side modules only
 pnpm test:integration
-pnpm test:e2e        # boots a real Firecracker VM — needs /dev/kvm
+pnpm test:e2e        # fake VM/vsock e2e harness; real Firecracker e2e is the workflow
 pnpm cli             # oxnode src/cli/index.ts
 ```
 
-`pnpm test` is the default loop. `pnpm test:e2e` requires Linux + `/dev/kvm` + tap networking and is intended for the `e2e.yml` workflow, not local dev.
+`pnpm test` is the default loop. `pnpm test:e2e` uses the fake VM/vsock harness; privileged real Firecracker coverage is handled by `.github/workflows/e2e.yml`.
 
 ## Important conventions
 
 - **`dist/` is committed.** `test.yml` re-bundles and diffs; an out-of-date bundle fails CI. After meaningful `src/` edits run `pnpm build:bundle` (and `pnpm build` if guest/preloads changed).
 - **Lockfile output is byte-stable.** `src/lock/render.ts` sorts keys by codepoint order and uses fixed indentation. Don't add fields or formatting that aren't reproducible across runs. `generated_at` and `manager_lockfile_sha256` are the only intentionally-volatile fields and are canonicalized in the diff path (see `src/action/diff.ts`).
 - **Two-phase install.** Phase A fetches with network on and no strace; Phase B installs with network off and strace on. Treat them as separate concerns in `src/guest/`.
-- **Three preloads compose, do not overlap.** `env-spy.cjs` audits JS `process.env` reads via a Proxy; `dlopen-block.cjs` blocks `process.dlopen` before native addons load; `platform-spoof.cjs` spoofs `process.platform` / `process.arch`. The Rust shim (`src/shim/src/lib.rs`) catches libc `getenv` calls that bypass Node. Adding new audit categories means picking the right layer.
+- **Default preloads compose, do not quarantine native addons.** `env-spy.cjs` audits JS `process.env` reads via a Proxy; `platform-spoof.cjs` spoofs `process.platform` / `process.arch`; the Rust shim (`src/shim/src/lib.rs`) catches libc env reads, exec-family calls, and env tamper. `dlopen-block.cjs` is legacy optional quarantine coverage, not injected by default.
 - **Fixtures encode attack patterns.** Each `test/fixtures/<scenario>/` has a `package.json`, a lifecycle script, and `expected-events.json`. Regenerate goldens with `scripts/build-e2e-golden.ts`; do not hand-edit goldens.
-- **Artifact manifest is pinned.** `src/action/artifact-manifest.ts` pins Firecracker, kernel, and rootfs SHAs. Bumping any artifact means updating the manifest and regenerating release artifacts via `release.yml`.
+- **Artifact manifest is pinned.** `src/action/artifact-manifest.ts` pins release rootfs ext4s, shim binaries, VZ helper artifacts, and Docker image refs. Bumping any artifact means updating the manifest and regenerating release artifacts via `release.yml`.
 
 ## Further reading
 
 - [docs/architecture.md](./docs/architecture.md) — host/guest split, event pipeline, vsock protocol, two-phase install.
+- [docs/design.md](./docs/design.md) — rationale, threat model, and tradeoffs.
 - [docs/testing.md](./docs/testing.md) — vitest projects, fixtures, e2e setup, goldens.
 - [docs/development.md](./docs/development.md) — build pipeline, `dist/` invariant, common gotchas, release flow.

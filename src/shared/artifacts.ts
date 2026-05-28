@@ -3,31 +3,32 @@
 // Pure-helper that maps `(hostArch, ubuntuMajor)` to the file paths the
 // macOS CLI needs in order to boot the audit VM:
 //
-//   - kernelPath           — VZ-compatible kernel image (PR 5 ships this).
+//   - kernelPath           — VZ-compatible kernel image.
 //   - rootfsPath           — Linux ext4 image keyed by Ubuntu major + arch.
 //   - libscriptjailSoPath  — LD_PRELOAD shim, ELF for the guest arch.
 //
 // Path resolution is intentionally PURE: this function never touches the
 // filesystem, throws no errors, and does not validate that the files exist.
 // The caller (`src/cli/spawn-vm.ts`) is responsible for `existsSync` checks
-// and friendly "missing artifact (PR 5)" diagnostics.  Keeping the helper
+// and friendly missing-artifact diagnostics. Keeping the helper
 // pure lets tests assert on the expected paths without needing the actual
 // artifacts on disk.
 //
 // File-naming convention (kept in sync with `src/rootfs/build.ts:imageFilename()`):
 //   images/
-//     vmlinux-vz-x86_64                            (PR 5)
-//     vmlinux-vz-arm64                             (PR 5)
+//     vmlinux-vz-x86_64
+//     vmlinux-vz-arm64
 //     rootfs-ubuntu-<major>.ext4                   (x64; existing Firecracker
 //                                                   pipeline; also used by VZ on x64)
-//     rootfs-ubuntu-<major>-arm64.ext4             (PR 4: arm64 rootfs build)
+//     rootfs-ubuntu-<major>-arm64.ext4             (arm64 rootfs build)
 //     libscriptjail.so                             (existing x86_64 ELF)
-//     libscriptjail-arm64.so                       (PR 4: cross-compiled in CI)
+//     libscriptjail-arm64.so                       (cross-compiled in CI)
 //
 // VZ does not require a fundamentally different rootfs from Firecracker —
 // the kernel/cmdline differ but the disk image is the same OS install.  So
-// we reuse the existing rootfs naming.  PR 5 may revisit if the kernel ABI
-// forces a divergent rootfs.
+// we reuse the existing rootfs naming. If a future kernel ABI forces a
+// divergent rootfs, add an explicit artifact key rather than overloading
+// the existing names.
 
 import { join } from 'node:path';
 
@@ -47,9 +48,8 @@ export interface ArtifactInput {
   /** Host architecture (matches the in-VM guest arch). */
   hostArch: ArtifactArch;
   /**
-   * Ubuntu major version for the rootfs.  PR 4 defaults to 24.04 in the CLI
-   * (the only flavor that has a VZ kernel coming in PR 5); accepting both
-   * keeps the helper forward-compatible.
+   * Ubuntu major version for the rootfs. The CLI defaults to 24.04, but
+   * accepting both supported majors keeps the helper forward-compatible.
    */
   ubuntuMajor: ArtifactUbuntuMajor;
 }
@@ -93,7 +93,7 @@ export function resolveArtifacts(input: ArtifactInput): ResolvedArtifacts {
 
   // Rootfs naming matches `src/rootfs/build.ts:imageFilename()`:
   //   x64   -> rootfs-ubuntu-<major>.ext4         (existing Firecracker name)
-  //   arm64 -> rootfs-ubuntu-<major>-arm64.ext4   (new PR 4 arm64 variant)
+  //   arm64 -> rootfs-ubuntu-<major>-arm64.ext4   (arm64 variant)
   // VZ reuses the same disk image as Firecracker - the divergence is in the
   // kernel + cmdline, not the rootfs ext4.
   const rootfsName =

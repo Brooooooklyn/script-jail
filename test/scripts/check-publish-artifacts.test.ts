@@ -10,8 +10,8 @@
 // scripts/check-publish-artifacts.sh.  These tests drive the script via
 // child_process so we exercise the same code path the workflow does.
 //
-// PR 5: `PINNED_MANIFEST.expected` is platform-keyed, so the fixture
-// builders below produce the nested layout.  The tests cover both the
+// `PINNED_MANIFEST.expected` is platform-keyed, so the fixture builders below
+// produce the nested layout. The tests cover both the
 // "linux/dist-only" subset (driven by SCRIPT_JAIL_CHECK_DARWIN_ARTIFACTS=0)
 // and the full platform set (default).
 
@@ -821,8 +821,8 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
 
   it('bootstrap mode prints linux + darwin SHAs in the maintainer paste-block', () => {
     // The bootstrap branch is also the place we surface the computed SHAs
-    // for the maintainer to copy back into the manifest.  After PR 5 the
-    // print-block must include every key in both platform sections.
+    // for the maintainer to copy back into the manifest. The print-block must
+    // include every key in both platform sections.
     const ws = makeWorkspace();
     const manifestPath = writeManifest(ws, allPlaceholders());
     const linux: LinuxArtifactBytes = {
@@ -850,10 +850,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
   });
 
   it('rejects a hybrid manifest with real linux SHAs and placeholder darwin SHAs', () => {
-    // PR 5 specifically calls this out as the most-likely real-world
-    // packaging mistake: a maintainer pastes the linux SHAs from the
-    // bootstrap run's step-summary but forgets to fill in the darwin
-    // section.  The script's existing mixed-rejection logic
+    // This is the most likely real-world packaging mistake: a maintainer
+    // pastes the linux SHAs from the bootstrap run's step-summary but forgets
+    // to fill in the darwin section. The script's mixed-rejection logic
     // (`scripts/check-publish-artifacts.sh` near the `"mixed with"` line)
     // handles it today; this regression test prevents silent breakage.
     const ws = makeWorkspace();

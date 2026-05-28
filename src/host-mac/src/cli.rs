@@ -7,7 +7,7 @@
 //
 // The grammar is intentionally tiny — we don't depend on `clap` here
 // because the helper is invoked exclusively by the Node CLI; the surface
-// only has to be predictable enough that PR 4/5's spawn-vm.ts can construct
+// only has to be predictable enough that `src/cli/spawn-vm.ts` can construct
 // argv without surprises.
 
 use std::path::PathBuf;

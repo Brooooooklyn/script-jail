@@ -42,9 +42,9 @@ The manifest in `src/action/artifact-manifest.ts` keeps release-asset SHAs in
 `expected: { linux: {...}, darwin: {...} }` and Docker image pins in
 `dockerImages`.
 
-A handful of cases produce byte-different lockfiles across the two
-runners — see [docs/divergence.md](./divergence.md) for the catalogue and
-the v2 mitigation path.
+A small set of host/backend noise is either filtered before the lockfile is
+rendered or filtered by the parity diff. Any remaining byte difference is a
+parity failure; see [docs/divergence.md](./divergence.md) for the catalogue.
 
 ## Two-phase install
 
@@ -56,29 +56,28 @@ Phase B is the only phase whose events end up in the lockfile.
 ## Event pipeline
 
 ```
-strace -ff output ──► strace-parser ──► raw events (JSONL)
-                                            │
-                          protected-paths filter ◄─── .script-jail.yml
-                                            │
-                                       attribution
-                            (pid → pkg@version + lifecycle stage)
-                                            │
-                                       normalize
-                  (tokenize paths, drop intra-package noise, dedupe)
-                                            │
-                                         render
-                              (canonical YAML, byte-stable)
-                                            │
-                                  .script-jail.lock.yml
+strace -ff output ──► strace-parser ─┐
+                                     ├──► attributed raw events
+shim/env-spy JSONL ─► shim parser ───┘          │
+                                                │
+                      protected-paths + bootstrap/client filters ◄── .script-jail.yml
+                                                │
+                                           normalize
+                         (tokenize paths, drop intra-package noise, dedupe)
+                                                │
+                                             render
+                                  (canonical YAML, byte-stable)
+                                                │
+                                      .script-jail.lock.yml
 ```
 
 Key files:
 
-- `src/guest/strace-parser.ts` — parses `openat`, `connect`, `execve` strace lines.
+- `src/guest/strace-parser.ts` — parses filesystem, process, fd-state, and network strace lines.
 - `src/guest/protected-paths.ts` — replaces values for protected paths/env-vars with `<HIDDEN>`; drops `ENOENT` probes for unprotected paths so the audit reflects intent, not noise.
 - `src/guest/attribution.ts` + `proc-reader.ts` — walk `/proc/<pid>/status` PPid chain looking for an ancestor whose `environ` carries `npm_package_name` + a canonical `npm_lifecycle_event`. Results are cached per starting pid; `invalidate(pid)` drops the cache so a recycled pid re-walks `/proc`.
 - `src/lock/normalize.ts` — drops reads inside the owning package's own directory; marks cross-package writes; coalesces duplicates.
-- `src/lock/tokenize.ts` — substitutes `$PKG`, `$NODE_MODULES`, `$HOME`, `$REPO`, `$CACHE`, `$TMP` for absolute paths.
+- `src/lock/tokenize.ts` — substitutes `$PKG`, `$NODE_MODULES`, `$HOME`, `$REPO`, `$CACHE`, `$TMPDIR` for absolute paths.
 - `src/lock/render.ts` — emits canonical YAML.
 
 ### Attribution and snapshot lifecycle
@@ -127,15 +126,15 @@ Build path: `pnpm build` → `scripts/build.ts:buildShim` → `cargo build --rel
 
 Env-var reads need both the libc shim and the JS preload because they sit on opposite sides of a one-shot copy.
 
-**libc layer — `src/shim/src/lib.rs`.** A `#![no_std]` Rust cdylib that wraps `getenv`, `secure_getenv`, and the deprecated `__secure_getenv` alias via `LD_PRELOAD`. Real symbols are resolved with `libc::dlsym(libc::RTLD_NEXT, …)` inside a `#[ctor::ctor]` constructor. A `pthread_key_create`-backed thread-local recursion guard suppresses re-entry when `dlsym` / `open` / `clock_gettime` internally call `getenv` — the key is created before any other syscall so the bypass path is available from the very first instruction of init. When the name is on the protected list the wrapper returns `NULL` to the caller; otherwise it forwards to the real implementation. A musl fallback substitutes `getenv` for absent `secure_getenv` (script-jail guests are never setuid, so the semantics match). If `pthread_key_create` itself fails (PTHREAD_KEYS_MAX exhausted, exceedingly rare), the constructor returns early with `INIT_DONE = false`, leaving every wrapper on a transparent passthrough path so the host process is never broken. Catches libuv, native addons, and any child process that inherits the preload. For Node processes launched with the script-jail preloads, unprotected runtime-startup probes are suppressed until `env-spy.cjs` finishes installing the `process.env` Proxy; protected names are still hidden and reported.
+**libc layer — `src/shim/src/lib.rs`.** A `#![no_std]` Rust cdylib that wraps `getenv`, `secure_getenv`, and the deprecated `__secure_getenv` alias via `LD_PRELOAD`. Real symbols are resolved with `libc::dlsym(libc::RTLD_NEXT, …)` inside a `#[ctor::ctor]` constructor. A `pthread_key_create`-backed thread-local recursion guard suppresses re-entry when `dlsym` / `open` / `clock_gettime` internally call `getenv` — the key is created before any other syscall so the bypass path is available from the very first instruction of init. When the name is on the protected list the wrapper returns `NULL` to the caller; otherwise it forwards to the real implementation. A musl fallback substitutes `getenv` for absent `secure_getenv` (script-jail guests are never setuid, so the semantics match). If `pthread_key_create` itself fails (PTHREAD_KEYS_MAX exhausted, exceedingly rare), the constructor returns early with `INIT_DONE = false`, leaving every wrapper on a transparent passthrough path so the host process is never broken. Catches libuv, native addons, and any child process that inherits the preload. For Node processes launched with the script-jail preloads, unprotected runtime-startup probes are emitted as raw events and then filtered by the Node bootstrap baseline; protected names are still hidden and reported.
 
-**JS layer — `src/guest/env-spy.cjs`.** Node parses `environ[]` once at startup into an in-memory map and serves every `process.env.X` read from there without re-entering libc, so the most common attacker pattern (`process.env.NPM_TOKEN`) is invisible to the libc shim. This preload (loaded via `NODE_OPTIONS=--require`) replaces `process.env` with a Proxy whose `get` / `has` / `ownKeys` / `getOwnPropertyDescriptor` traps emit the audit event and apply hiding. The Proxy is installed with `Object.defineProperty(process, 'env', { writable: false, configurable: false })` to prevent `delete process.env` from restoring the original. A `Symbol.for('script-jail.env-spy.installed')` sentinel makes the preload idempotent across nested invocations; `logFd` and the protected-name set are pre-resolved against the **original** `process.env` before the Proxy is installed so the audit path itself cannot recurse through it.
+**JS layer — `src/guest/env-spy.cjs`.** Node parses `environ[]` once at startup into an in-memory map and serves every `process.env.X` read from there without re-entering libc, so the most common attacker pattern (`process.env.NPM_TOKEN`) is invisible to the libc shim. This preload (loaded via `NODE_OPTIONS=--require`) replaces `process.env` with a Proxy whose `get` trap emits the audit event and applies hiding. Its `has`, `ownKeys`, and `getOwnPropertyDescriptor` traps hide protected names from enumeration without producing extra read events. The Proxy is installed with `Object.defineProperty(process, 'env', { writable: false, configurable: false })` to prevent `delete process.env` from restoring the original. A `Symbol.for('script-jail.env-spy.installed')` sentinel makes the preload idempotent across nested invocations; `logFd` and the protected-name set are pre-resolved against the **original** `process.env` before the Proxy is installed so the audit path itself cannot recurse through it.
 
 **Critical detail — the Proxy receiver.** In the `get` / `set` traps, forward via `Reflect.get(target, prop, target)` (and the equivalent for `set`), passing `target` — not the Proxy — as the receiver. `process.env` is a host-side `EnvironmentVariableNamespace` object whose accessors use `this` to find the underlying environment store. When the receiver is the Proxy, Node can't locate the store and reads silently return wrong values, which breaks `child_process.spawn` with no diagnostic. The equivalent member-access form (`target[prop]`) also works.
 
 **Unified event shape.** Both layers emit JSONL to `SCRIPT_JAIL_LOG_FILE` (preferred) or `SCRIPT_JAIL_LOG_FD` (tests), one of these `kind`s:
 
-- `env_read` — `{"kind":"env_read","name":...,"pid":...,"ts":...,"hidden":...}` emitted by every libc `getenv` / JS `process.env.X` read of a name on the protected list.
+- `env_read` — `{"kind":"env_read","name":...,"pid":...,"ts":...,"hidden":...}` emitted by libc `getenv` / JS `process.env.X` reads. Protected names are hidden from the caller and rendered with `<HIDDEN>`; unprotected runtime and package-manager noise is filtered before rendering when it matches the bootstrap/client rules below.
 - `exec` — `{"kind":"exec","prog":...,"argv0":...,"pid":...,"ts":...,"envp_alloc_failed"?:...}` emitted by the shim's exec wrappers (`execve` / `execv*` / `execveat` / `fexecve` / `posix_spawn[p]`) before forwarding to the real symbol. The optional `envp_alloc_failed` flag fires when env re-injection couldn't allocate and the caller's `envp` was forwarded unmodified (the exec still proceeds; the audit trail records the degraded state).
 - `env_tamper` — `{"kind":"env_tamper","op":"setenv|unsetenv|putenv|clearenv","name":...,"pid":...,"ts":...,"refused":true}` emitted by the in-process env-mutator wrappers when the target is one of the protected names. The call is refused (returns 0 to the caller) and the audit event records the attempt.
 - `dlopen` — `{"kind":"dlopen","filename":...,"result":"blocked","pid":...,"ts":...}` emitted only by the optional legacy `dlopen-block.cjs` preload, not by the default runtime path.
@@ -144,30 +143,50 @@ Writes are kept ≤ `PIPE_BUF` so they are atomic. Downstream, normalize dedupes
 
 **Protected-list policy.** Both layers read the same list, sourced from `.script-jail.yml` and serialized into `SCRIPT_JAIL_PROTECTED_ENV_NAMES` (comma-separated strict POSIX env-var names). Adding a new protected name only requires editing the config — both layers pick it up at process start.
 
-### Node bootstrap file-read filtering
+### Bootstrap and package-manager noise filtering
 
-The install phase still traces Node bootstrap file reads with strace, but
-filters unprotected reads out of the rendered lockfile until script-jail's JS
-preloads are installed. This removes runtime file-read noise such as
-`/etc/ssl/openssl.cnf` from package lifecycle blocks; the Rust shim applies the
-same bootstrap boundary to unprotected OpenSSL env probes such as
-`OPENSSL_ia32cap` / `OPENSSL_armcap`.
+The install phase traces Node, npm, pnpm, and Yarn internals, but the rendered
+lockfile should focus on dependency lifecycle behavior. `phase-install.ts`
+therefore maintains two narrow filters:
 
-The boundary is deliberately strace-visible rather than a shim JSONL-only event:
-`env-spy.cjs` opens `/tmp/script-jail-node-startup-done` after installing the
-`process.env` Proxy. The file is expected not to exist; the failed `openat`
-appears in the same per-pid strace stream as bootstrap file reads, so
-`phase-install.ts` can drop only same-pid reads before that marker. Protected
-path reads, writes, unresolved relative paths, spawn/connect/dlopen events, and
-synthetic audit-bypass events are not filtered.
+- **Node bootstrap baseline.** For confirmed Node pids, unprotected env reads
+  and file reads observed during startup are recorded as a baseline. Later
+  unprotected repeats of those names/paths are filtered from package output.
+  This removes runtime noise such as OpenSSL probes without using a static
+  denylist that would hide a real package-specific secret read.
+- **Package-manager client pids.** Unprotected env reads from the root npm,
+  pnpm, or Yarn client process are filtered. Child lifecycle processes are not
+  blanket-filtered; their own non-baseline env reads remain visible.
+
+Protected env and file reads are never filtered by these rules. Writes,
+unresolved relative paths, spawn/connect/dlopen events, and synthetic
+audit-bypass events are also not filtered.
+
+The startup boundary is visible in both channels. `env-spy.cjs` sets
+`SCRIPT_JAIL_NODE_STARTUP_DONE`; the Rust shim consumes that assignment and
+emits a trusted `node_startup_done` JSONL marker. `env-spy.cjs` also opens
+`/tmp/script-jail-node-startup-done`; the file is expected not to exist, and
+the failed `openat` provides a same-pid strace marker for file-read ordering.
 
 ### Cross-exec preservation
 
-The shim wraps all eight exec entry points (`execve`, `execv`, `execvp`, `execvpe`, `execveat`, `fexecve`, `posix_spawn`, `posix_spawnp`) via the same `dispatch_exec` / `dispatch_spawn` funnels in `src/shim/src/lib.rs`. Before forwarding to the real symbol, every wrapper rewrites the caller-supplied `envp`:
+The shim wraps all eight exec entry points (`execve`, `execv`, `execvp`,
+`execvpe`, `execveat`, `fexecve`, `posix_spawn`, `posix_spawnp`) via the same
+`dispatch_exec` / `dispatch_spawn` funnels in `src/shim/src/lib.rs`. Before
+forwarding to the real symbol, every wrapper rewrites the caller-supplied
+`envp`:
 
-- `LD_PRELOAD` — the shim's own path is colon-appended, ensuring the child process loads `libscriptjail.so` even if the parent tried to remove it.
-- `NODE_OPTIONS` — the `--require=…` block is space-appended so the active JS preloads are loaded in every Node child.
-- Seven `SCRIPT_JAIL_*` sticky vars (`SCRIPT_JAIL_LOG_FILE`, `SCRIPT_JAIL_LOG_FD`, `SCRIPT_JAIL_PROTECTED_ENV_NAMES`, `SCRIPT_JAIL_SPOOF_PLATFORM`, `SCRIPT_JAIL_SPOOF_ARCH`, `SCRIPT_JAIL_PRELOAD_PATH`, `SCRIPT_JAIL_NODE_OPTIONS`) — each is added to the rewritten `envp` only when absent (`ensure_env` semantics), preserving any value the caller deliberately reassigned for a side channel.
+- `LD_PRELOAD` is overwritten with the canonical shim path captured at
+  `shim_init` time.
+- `NODE_OPTIONS` is overwritten with the canonical `--require=...` block for
+  the active JS preloads.
+- `LD_AUDIT` and `LD_LIBRARY_PATH` are stripped completely.
+- Seven `SCRIPT_JAIL_*` sticky vars (`SCRIPT_JAIL_LOG_FILE`,
+  `SCRIPT_JAIL_LOG_FD`, `SCRIPT_JAIL_PROTECTED_ENV_NAMES`,
+  `SCRIPT_JAIL_SPOOF_PLATFORM`, `SCRIPT_JAIL_SPOOF_ARCH`,
+  `SCRIPT_JAIL_PRELOAD_PATH`, `SCRIPT_JAIL_NODE_OPTIONS`) are overwritten with
+  their init-time canonical values. If a canonical value is empty, any
+  caller-supplied entry for that sticky var is removed.
 
 The canonical values for `LD_PRELOAD` and `NODE_OPTIONS` reinjection come from two env vars read at `shim_init` time: `SCRIPT_JAIL_PRELOAD_PATH` (set to `/lib/libscriptjail.so` by `buildChildEnv` in `src/guest/agent.ts`) and `SCRIPT_JAIL_NODE_OPTIONS` (set to the space-separated `--require=…` block for the active `/usr/local/lib/script-jail/*.cjs` preloads). This means every child process — however the parent constructs its `envp` — inherits a canonical audit environment.
 

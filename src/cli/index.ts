@@ -91,11 +91,7 @@ const VSOCK_PORT = 10242;
 const DEFAULT_VCPU_COUNT = 2;
 /** Default RAM for the macOS audit VM. */
 const DEFAULT_MEMORY_MB = 2048;
-/**
- * PR 4 default: Ubuntu 24.04 is the only flavor that will get a VZ kernel
- * shipped in PR 5.  Documented here rather than in artifact-manifest.ts
- * because the manifest restructure is also PR 5 scope.
- */
+/** Default Ubuntu major for the macOS VZ rootfs. */
 const DEFAULT_UBUNTU_MAJOR = '24.04' as const;
 /**
  * Kernel cmdline for the VZ runner.  Unlike Firecracker, VZ does not
