@@ -1,11 +1,12 @@
 # Known divergence
 
 The macOS Virtualization.framework runner produces audit lockfiles that aim
-for byte-for-byte parity with the Firecracker / Linux-CI runner. The parity
-workflow now runs Linux CI on `ubuntu-24.04-arm`, so both sides use a
-Linux/arm64 guest. A handful of host/VMM/environment cases can still produce
-lockfile diffs that the maintainer must recognise as "expected divergence"
-rather than chase as bugs.
+for byte-for-byte parity with the Linux Action backend. The parity workflow
+now runs Linux CI on `ubuntu-24.04-arm`; on hosted runners `backend: auto`
+falls through to Docker because KVM is unavailable. Both sides still use a
+Linux/arm64 audit environment. A handful of host/backend/environment cases can
+produce lockfile diffs that the maintainer must recognise as "expected
+divergence" rather than chase as bugs.
 
 The TL;DR: if your `.script-jail.lock.yml` diff fails on macOS but passes on
 Linux CI (or vice versa), check the cases below before opening an issue.
@@ -21,9 +22,9 @@ determinism across hosts:
   known Node/bootstrap reads, npm/yarn/pnpm client reads, and selected CI
   noise, but a new package-manager version can still introduce a new probe.
 
-- **VMM/device surface.** Firecracker and Virtualization.framework expose
-  different virtual devices and procfs/sysfs shapes. Most package installs do
-  not inspect these, but a native postinstall can.
+- **Backend/device surface.** Firecracker, Docker, bare Linux, and
+  Virtualization.framework expose different device and procfs/sysfs shapes.
+  Most package installs do not inspect these, but a native postinstall can.
 
 - **Native binaries the lifecycle script execs directly.** Some scripts
   shell out to a host-provided binary (`python`, `cc`, `make`). Whether the
@@ -63,7 +64,7 @@ fixture (`reads-secret-env`, `tries-dlopen`, `reads-home-ssh`,
 artifact is published — at that point each `it.todo` becomes a real
 parity assertion.
 
-On Linux CI, `parity-test.yml` now exercises the Firecracker half on
+On Linux CI, `parity-test.yml` now exercises the Action backend on
 `ubuntu-24.04-arm` and diffs it against the committed local macOS/VZ lockfile.
 
 ### Release-artifact packaging check

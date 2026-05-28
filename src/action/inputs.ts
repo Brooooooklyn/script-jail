@@ -11,10 +11,9 @@
 // All path inputs are resolved against `repoDir` (a relative path becomes an
 // absolute path).
 //
-// Note on Node version: as of v2, there is no `node-version` input.  The
-// user's `actions/setup-node` step controls which Node is on the host PATH,
-// and we bind-mount that Node into the VM (see ./runner-image.ts and
-// Task #12).  The rootfs is keyed by runner image, not by Node major.
+// Note on Node version: there is no `node-version` input. The rootfs bakes
+// vite-plus and provisions the pinned Node version during Phase A, so the
+// rootfs is keyed by runner image/arch, not by the host Node major.
 
 import { isAbsolute, join, resolve } from 'node:path';
 
@@ -25,6 +24,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 export type Mode = 'check' | 'update';
 export type SpoofPlatform = 'linux' | 'darwin' | 'win32';
 export type SpoofArch = 'x64' | 'arm64';
+export type Backend = 'auto' | 'firecracker' | 'docker' | 'bare';
 
 export interface ActionInputs {
   /** Absolute path to the script-jail config YAML. */
@@ -34,6 +34,8 @@ export interface ActionInputs {
   mode: Mode;
   spoofPlatform: SpoofPlatform;
   spoofArch: SpoofArch;
+  /** Linux Action executor backend. */
+  backend: Backend;
   /** Whether to enable runner caching of the Firecracker bits. */
   cacheFirecracker: boolean;
 }
@@ -67,6 +69,7 @@ export interface ParseInput {
 const VALID_PLATFORMS: ReadonlySet<SpoofPlatform> = new Set<SpoofPlatform>(['linux', 'darwin', 'win32']);
 const VALID_ARCHES: ReadonlySet<SpoofArch> = new Set<SpoofArch>(['x64', 'arm64']);
 const VALID_MODES: ReadonlySet<Mode> = new Set<Mode>(['check', 'update']);
+const VALID_BACKENDS: ReadonlySet<Backend> = new Set<Backend>(['auto', 'firecracker', 'docker', 'bare']);
 
 // ---------------------------------------------------------------------------
 // parseInputs
@@ -85,6 +88,7 @@ export function parseInputs(input: ParseInput): ActionInputs {
   const rawMode = getInput('mode') ?? '';
   const rawPlatform = getInput('spoof-platform') ?? '';
   const rawArch = getInput('spoof-arch') ?? '';
+  const rawBackend = getInput('backend') ?? '';
   const rawCache = getInput('cache-firecracker') ?? '';
 
   // ---- mode -----------------------------------------------------------------
@@ -113,6 +117,15 @@ export function parseInputs(input: ParseInput): ActionInputs {
     );
   }
 
+  // ---- backend ---------------------------------------------------------------
+  const backendStr = rawBackend.trim() === '' ? 'auto' : rawBackend.trim();
+  if (!isBackend(backendStr)) {
+    throw new Error(
+      `script-jail: invalid value for input "backend": "${backendStr}". ` +
+      `Expected one of: auto, firecracker, docker, bare.`,
+    );
+  }
+
   // ---- cache-firecracker ----------------------------------------------------
   const cacheStr = rawCache.trim();
   let cacheFirecracker: boolean;
@@ -135,6 +148,7 @@ export function parseInputs(input: ParseInput): ActionInputs {
     mode: modeStr,
     spoofPlatform: platformStr,
     spoofArch: archStr,
+    backend: backendStr,
     cacheFirecracker,
   };
 }
@@ -153,6 +167,10 @@ function isSpoofPlatform(s: string): s is SpoofPlatform {
 
 function isSpoofArch(s: string): s is SpoofArch {
   return VALID_ARCHES.has(s as SpoofArch);
+}
+
+function isBackend(s: string): s is Backend {
+  return VALID_BACKENDS.has(s as Backend);
 }
 
 function resolveAgainstRepo(p: string, repoDir: string): string {

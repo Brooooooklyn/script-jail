@@ -7931,16 +7931,15 @@ async function makeOverlay(input) {
   (0, import_node_fs3.mkdirSync)(configDestDir, { recursive: true });
   (0, import_node_fs3.copyFileSync)(configPath, (0, import_node_path4.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
+    const stageRoot = (0, import_node_path4.resolve)(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
-      const dest = (0, import_node_path4.join)(repoStageDir, entry.relPath);
-      const destNormalized = (0, import_node_path4.join)(dest);
-      if (!destNormalized.startsWith(repoStageDir + "/") && destNormalized !== repoStageDir) {
+      const dest = (0, import_node_path4.resolve)(stageRoot, entry.relPath);
+      if (dest !== stageRoot && !dest.startsWith(stageRoot + "/")) {
         throw new Error(
           `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`
         );
       }
-      (0, import_node_fs3.mkdirSync)((0, import_node_path4.dirname)(destNormalized), { recursive: true });
-      (0, import_node_fs3.writeFileSync)(destNormalized, entry.content, "utf8");
+      writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
   const repoDiskPath = (0, import_node_path4.join)(workDir, "repo.ext4");
@@ -7953,6 +7952,32 @@ async function makeOverlay(input) {
     }
   };
   return { rootfsCopyPath, repoDiskPath, workDir, cleanup };
+}
+function writeOverlayFile(root, relPath, content) {
+  const parts = relPath.split("/").filter((part) => part.length > 0);
+  if (parts.length === 0 || parts.some((part) => part === "..")) {
+    throw new Error(
+      `[overlay] extraRepoOverlayFiles entry '${relPath}' is not a safe relative path`
+    );
+  }
+  let dir = root;
+  for (const part of parts.slice(0, -1)) {
+    dir = (0, import_node_path4.join)(dir, part);
+    ensureRealDirectory(dir);
+  }
+  const dest = (0, import_node_path4.join)(dir, parts[parts.length - 1]);
+  (0, import_node_fs3.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs3.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+}
+function ensureRealDirectory(path) {
+  if (!(0, import_node_fs3.existsSync)(path)) {
+    (0, import_node_fs3.mkdirSync)(path, { recursive: true });
+    return;
+  }
+  const stat = (0, import_node_fs3.lstatSync)(path);
+  if (stat.isDirectory() && !stat.isSymbolicLink()) return;
+  (0, import_node_fs3.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs3.mkdirSync)(path, { recursive: true });
 }
 function copyRootfs(src, dest) {
   if (import_node_process.platform === "linux") {
@@ -23444,13 +23469,31 @@ async function runAudit(input) {
         content: (0, import_node_fs5.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
-    overlay = await doMakeOverlay({
-      baseRootfsPath: input.baseRootfsPath,
-      repoSrcPath: input.repoDir,
-      configPath: effectiveConfig.configPath,
-      extraRepoOverlayFiles
-    });
-    result = await input.launch(overlay);
+    if (input.execute !== void 0) {
+      result = await input.execute({
+        repoDir: input.repoDir,
+        configPath: effectiveConfig.configPath,
+        extraRepoOverlayFiles,
+        scratchDir,
+        pm: input.pm,
+        hostArch: input.hostArch,
+        mode: input.mode
+      });
+    } else {
+      if (input.launch === void 0) {
+        throw new Error("script-jail: runAudit requires either execute or launch.");
+      }
+      if (input.baseRootfsPath === void 0) {
+        throw new Error("script-jail: runAudit legacy launch path requires baseRootfsPath.");
+      }
+      overlay = await doMakeOverlay({
+        baseRootfsPath: input.baseRootfsPath,
+        repoSrcPath: input.repoDir,
+        configPath: effectiveConfig.configPath,
+        extraRepoOverlayFiles
+      });
+      result = await input.launch(overlay);
+    }
   } finally {
     if (overlay !== null) {
       try {

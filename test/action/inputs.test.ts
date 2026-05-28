@@ -53,6 +53,7 @@ describe('parseInputs — defaults', () => {
     expect(result.mode).toBe('check');
     expect(result.spoofPlatform).toBe('linux');
     expect(result.spoofArch).toBe('x64');
+    expect(result.backend).toBe('auto');
     expect(result.cacheFirecracker).toBe(true);
     // Default config/lock paths are resolved relative to repoDir.
     expect(result.configPath).toBe(join(repoDir, '.script-jail.yml'));
@@ -182,6 +183,29 @@ describe('parseInputs — cache-firecracker', () => {
   });
 });
 
+describe('parseInputs — backend', () => {
+  const repoDir = '/fake/repo';
+
+  it.each(['auto', 'firecracker', 'docker', 'bare'] as const)('accepts %s', (backend) => {
+    const r = parseInputs({
+      repoDir,
+      getInput: makeGetInput({ backend }),
+      fs: makeFs(repoDir, []),
+    });
+    expect(r.backend).toBe(backend);
+  });
+
+  it('throws on unknown value', () => {
+    expect(() =>
+      parseInputs({
+        repoDir,
+        getInput: makeGetInput({ backend: 'qemu' }),
+        fs: makeFs(repoDir, []),
+      }),
+    ).toThrow(/backend/);
+  });
+});
+
 describe('parseInputs — path resolution', () => {
   const repoDir = '/fake/repo';
 
@@ -282,6 +306,21 @@ describe('parseInputs — default getInput from process.env', () => {
     } finally {
       if (prev === undefined) delete process.env['INPUT_CACHE-FIRECRACKER'];
       else process.env['INPUT_CACHE-FIRECRACKER'] = prev;
+    }
+  });
+
+  it('reads backend via INPUT_BACKEND', () => {
+    const prev = process.env['INPUT_BACKEND'];
+    try {
+      process.env['INPUT_BACKEND'] = 'docker';
+      const r = parseInputs({
+        repoDir,
+        fs: makeFs(repoDir, []),
+      });
+      expect(r.backend).toBe('docker');
+    } finally {
+      if (prev === undefined) delete process.env['INPUT_BACKEND'];
+      else process.env['INPUT_BACKEND'] = prev;
     }
   });
 

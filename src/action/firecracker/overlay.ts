@@ -45,10 +45,12 @@ import {
   copyFileSync,
   statSync,
   existsSync,
+  lstatSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
-import { join, basename, dirname } from 'node:path';
+import { join, basename, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execSync, spawnSync } from 'node:child_process';
 import { platform } from 'node:process';
@@ -142,16 +144,15 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
   //     relPath that resolves outside the stage dir so a malicious caller
   //     can't traverse via `..` into the host filesystem.
   if (extraRepoOverlayFiles !== undefined) {
+    const stageRoot = resolve(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
-      const dest = join(repoStageDir, entry.relPath);
-      const destNormalized = join(dest); // collapses .. segments
-      if (!destNormalized.startsWith(repoStageDir + '/') && destNormalized !== repoStageDir) {
+      const dest = resolve(stageRoot, entry.relPath);
+      if (dest !== stageRoot && !dest.startsWith(stageRoot + '/')) {
         throw new Error(
           `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`,
         );
       }
-      mkdirSync(dirname(destNormalized), { recursive: true });
-      writeFileSync(destNormalized, entry.content, 'utf8');
+      writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
 
@@ -173,6 +174,36 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+function writeOverlayFile(root: string, relPath: string, content: string): void {
+  const parts = relPath.split('/').filter((part) => part.length > 0);
+  if (parts.length === 0 || parts.some((part) => part === '..')) {
+    throw new Error(
+      `[overlay] extraRepoOverlayFiles entry '${relPath}' is not a safe relative path`,
+    );
+  }
+
+  let dir = root;
+  for (const part of parts.slice(0, -1)) {
+    dir = join(dir, part);
+    ensureRealDirectory(dir);
+  }
+
+  const dest = join(dir, parts[parts.length - 1]!);
+  rmSync(dest, { recursive: true, force: true });
+  writeFileSync(dest, content, { encoding: 'utf8', flag: 'wx' });
+}
+
+function ensureRealDirectory(path: string): void {
+  if (!existsSync(path)) {
+    mkdirSync(path, { recursive: true });
+    return;
+  }
+  const stat = lstatSync(path);
+  if (stat.isDirectory() && !stat.isSymbolicLink()) return;
+  rmSync(path, { recursive: true, force: true });
+  mkdirSync(path, { recursive: true });
+}
 
 /**
  * Copy the base rootfs image to `destPath`.

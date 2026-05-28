@@ -1,7 +1,7 @@
 // script-jail — src/shared/run-audit.ts
 //
 // Shared audit-pipeline core called by BOTH the GitHub Action entry
-// (src/main.ts, Firecracker on Linux) and the macOS CLI entry
+// (src/main.ts, backend-selected Linux) and the macOS CLI entry
 // (src/cli/index.ts, Apple Virtualization.framework).
 //
 // Why this exists:
@@ -29,7 +29,7 @@
 // Each entry stays a thin wrapper that owns only what it CANNOT share:
 //   * input parsing (env vars vs argv);
 //   * host detection / artifact resolution;
-//   * constructing the launcher closure (Firecracker / VZ);
+//   * constructing the backend executor / launcher closure;
 //   * the output adapter (action emits GH `::warning::` + setOutput; CLI
 //     writes plain stderr).
 //
@@ -37,10 +37,8 @@
 //   * arch-flag overlay invocation + warnings;
 //   * effective-config materialisation;
 //   * extraRepoOverlayFiles assembly;
-//   * `makeOverlay(...)`;
-//   * `launch(overlay)` (the caller-supplied closure);
-//   * overlay cleanup in `finally` (single ownership — the caller's
-//     launcher MUST NOT call cleanup itself);
+//   * backend execution (or legacy makeOverlay + launch for the macOS CLI);
+//   * overlay cleanup in `finally` for the legacy launcher path;
 //   * `update` write or `check` diff + audit-bypass gate.
 
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -103,6 +101,23 @@ export interface LauncherResult {
   nonFatalWarnings: string[];
 }
 
+export interface AuditExecutionInput {
+  /** Absolute path to the user's repository root on the host. */
+  repoDir: string;
+  /** Absolute path to the rewritten config YAML for this run. */
+  configPath: string;
+  /** Additional files that must appear at repo-relative paths in the executor. */
+  extraRepoOverlayFiles: ReadonlyArray<{ relPath: string; content: string }>;
+  /** The private per-run scratch dir owned by runAudit for config sidecars. */
+  scratchDir: string;
+  /** Detected package manager for the user's repo. */
+  pm: 'npm' | 'pnpm' | 'yarn';
+  /** Host architecture of the runner / dev box. */
+  hostArch: 'x64' | 'arm64';
+  /** `update` -> write the generated lockfile; `check` -> diff + bypass gate. */
+  mode: 'update' | 'check';
+}
+
 export interface RunAuditInput {
   /** Absolute path to the user's repository root on the host. */
   repoDir: string;
@@ -120,8 +135,11 @@ export interface RunAuditInput {
   pm: 'npm' | 'pnpm' | 'yarn';
   /** Host architecture of the runner / dev box. */
   hostArch: 'x64' | 'arm64';
-  /** Absolute path to the base rootfs ext4. */
-  baseRootfsPath: string;
+  /**
+   * Absolute path to the base rootfs ext4. Required by the legacy
+   * makeOverlay+launch path; unused when `execute` is supplied.
+   */
+  baseRootfsPath?: string | undefined;
   /**
    * PARENT directory under which runAudit creates its private per-run
    * scratch dir (via `mkdtempSync`).  The scratch dir holds the rewritten
@@ -140,7 +158,16 @@ export interface RunAuditInput {
    * AFTER `launch()` returns OR throws — the launcher MUST NOT clean up
    * the overlay itself (single ownership).
    */
-  launch: (overlay: OverlayResult) => Promise<LauncherResult>;
+  /**
+   * Legacy VM launcher. The macOS CLI still uses this path. Action backends use
+   * `execute` instead.
+   */
+  launch?: ((overlay: OverlayResult) => Promise<LauncherResult>) | undefined;
+  /**
+   * Backend executor. When supplied, runAudit stops after common config/sidecar
+   * preparation and lets the backend decide how to run the audit.
+   */
+  execute?: ((input: AuditExecutionInput) => Promise<LauncherResult>) | undefined;
   io: RunAuditIo;
   /**
    * Optional test seam — overrides the arch-flag overlay builder.  The CLI
@@ -240,18 +267,37 @@ export async function runAudit(
       });
     }
 
-    // 5. Build per-run overlay (rootfs + repo ext4 disks).
-    overlay = await doMakeOverlay({
-      baseRootfsPath: input.baseRootfsPath,
-      repoSrcPath: input.repoDir,
-      configPath: effectiveConfig.configPath,
-      extraRepoOverlayFiles,
-    });
+    if (input.execute !== undefined) {
+      result = await input.execute({
+        repoDir: input.repoDir,
+        configPath: effectiveConfig.configPath,
+        extraRepoOverlayFiles,
+        scratchDir,
+        pm: input.pm,
+        hostArch: input.hostArch,
+        mode: input.mode,
+      });
+    } else {
+      if (input.launch === undefined) {
+        throw new Error('script-jail: runAudit requires either execute or launch.');
+      }
+      if (input.baseRootfsPath === undefined) {
+        throw new Error('script-jail: runAudit legacy launch path requires baseRootfsPath.');
+      }
 
-    // 6. Launch the VM via the caller-supplied closure.  We own the
-    //    cleanup so the launcher can stay tight on the host-specific
-    //    lifecycle (Firecracker socket teardown, VZ child reap, etc.).
-    result = await input.launch(overlay);
+      // 5. Build per-run overlay (rootfs + repo ext4 disks).
+      overlay = await doMakeOverlay({
+        baseRootfsPath: input.baseRootfsPath,
+        repoSrcPath: input.repoDir,
+        configPath: effectiveConfig.configPath,
+        extraRepoOverlayFiles,
+      });
+
+      // 6. Launch the VM via the caller-supplied closure.  We own the
+      //    cleanup so the launcher can stay tight on the host-specific
+      //    lifecycle (Firecracker socket teardown, VZ child reap, etc.).
+      result = await input.launch(overlay);
+    }
   } finally {
     if (overlay !== null) {
       try { await overlay.cleanup(); } catch { /* swallow — diagnostic only */ }

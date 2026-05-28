@@ -2,39 +2,45 @@
 
 ## Host vs guest
 
-The Action splits into two halves connected over a vsock socket:
+The Action splits into a host controller and a Linux audit agent. Firecracker
+connects them over vsock; Docker and bare mode use the same frame protocol over
+stdio.
 
-- **Host** (`src/main.ts`, `src/action/`) — runs on the GitHub Actions runner. Detects the package manager, downloads/caches Firecracker + kernel + rootfs, builds an ext4 overlay containing the repo, boots the VM, brokers the vsock session, then diffs/renders the result.
-- **Guest** (`src/guest/`) — runs inside the microVM. Reads `.script-jail.yml`, runs the install in two phases under `strace`, applies the protected-path policy, attributes events to packages and lifecycle stages, normalizes/renders the lockfile, and emits everything back over vsock.
+- **Host** (`src/main.ts`, `src/action/`) — runs on the GitHub Actions runner. Detects the package manager and runner image, selects a backend, prepares the effective config/repo overlay, drives the agent protocol, then diffs/renders the result.
+- **Agent** (`src/guest/`) — runs inside the selected Linux backend. Reads `.script-jail.yml`, runs the install in two phases under `strace`, applies the protected-path policy, attributes events to packages and lifecycle stages, normalizes/renders the lockfile, and emits everything back to the host.
 
-The kernel boundary is load-bearing. A pure-JS sandbox can't catch libuv-backed env reads, `dlopen` for native addons, or `execve` of arbitrary binaries — those reach the kernel before any JS hook fires. Hence the microVM.
+The kernel-level observation is load-bearing. A pure-JS sandbox can't catch libuv-backed env reads, `dlopen` for native addons, or `execve` of arbitrary binaries — those reach the kernel before any JS hook fires. Firecracker is the strongest isolation boundary, but Docker and bare mode still keep the syscall/preload audit path available when KVM is missing.
 
 ## Cross-host parity (macOS VZ)
 
 The same audit runs in two places:
 
-- **Linux CI** — the GitHub Action invocation. Boots Firecracker; the host
-  half lives in `src/main.ts` + `src/action/firecracker/`.
+- **Linux CI** — the GitHub Action invocation. The host half lives in
+  `src/main.ts` + `src/action/`. `backend: auto` tries
+  Firecracker, then Docker, then bare Linux. Firecracker-specific code lives in
+  `src/action/backend/firecracker.ts` and `src/action/firecracker/`; Docker and
+  bare mode live in `src/action/backend/`.
 
 - **macOS developer host** — the local CLI invocation
   (`pnpm exec script-jail …`). Boots Apple's Virtualization.framework via
   `objc2-virtualization`; the host half lives in `src/host-mac/` (Rust)
   driven by `src/cli/` (TypeScript). Requires macOS 14+.
 
-Both halves share the same guest agent (`src/guest/`), the same vsock
-protocol (`src/shared/vsock-protocol.ts`), and the same lockfile renderer
-(`src/lock/`). The split is intentionally thin — only the VMM startup,
-disk attachment, and console wiring differ.
+Both halves share the same guest agent (`src/guest/`), frame protocol
+(`src/shared/vsock-protocol.ts`), and lockfile renderer (`src/lock/`). The split
+is intentionally thin: backend startup, filesystem staging, and transport
+wiring differ; the audit pipeline does not.
 
-The release pipeline (`release.yml`) ships per-platform artifacts under
-one tag: the Linux runner consumes `rootfs-ubuntu-<major>.ext4` +
-`libscriptjail.so` + the pinned upstream `vmlinux` from Firecracker CI;
-the macOS CLI consumes `rootfs-ubuntu-<major>-arm64.ext4` +
-`libscriptjail-arm64.so` + the hand-built `vmlinux-vz-{x86_64,arm64}` +
-the `script-jail-vm-arm64-darwin` Mach-O binary. The manifest in
-`src/action/artifact-manifest.ts` is platform-keyed
-(`expected: { linux: {...}, darwin: {...} }`) so each consumer pins only
-the SHAs it cares about.
+The release pipeline (`release.yml`) ships per-platform artifacts under one
+tag and publishes Docker rootfs images to GHCR. Firecracker/bare Linux consume
+`rootfs-ubuntu-<major>.ext4` + `libscriptjail.so` + the pinned upstream
+`vmlinux` from Firecracker CI; Docker consumes digest-pinned
+`script-jail-rootfs` image refs; the macOS CLI consumes
+`rootfs-ubuntu-<major>-arm64.ext4` + `libscriptjail-arm64.so` + the hand-built
+`vmlinux-vz-{x86_64,arm64}` + the `script-jail-vm-arm64-darwin` Mach-O binary.
+The manifest in `src/action/artifact-manifest.ts` keeps release-asset SHAs in
+`expected: { linux: {...}, darwin: {...} }` and Docker image pins in
+`dockerImages`.
 
 A handful of cases produce byte-different lockfiles across the two
 runners — see [docs/divergence.md](./divergence.md) for the catalogue and
@@ -43,7 +49,7 @@ the v2 mitigation path.
 ## Two-phase install
 
 1. **Phase A — fetch.** Network on, no strace. Lets the package manager resolve the registry and populate its cache. Output of this phase is not audited.
-2. **Phase B — install.** Network off (default route nulled, no DNS), strace attached. Every syscall the lifecycle scripts make is captured. Native addons and `child_process` spawns are allowed to run inside the microVM; failed or unavailable child binaries are recorded in the lockfile.
+2. **Phase B — install.** Network off (Firecracker removes guest routing; Docker disconnects the container; bare mode runs the traced command under `unshare -n`), strace attached. Every syscall the lifecycle scripts make is captured. Native addons and `child_process` spawns are allowed to run inside the backend; failed or unavailable child binaries are recorded in the lockfile.
 
 Phase B is the only phase whose events end up in the lockfile.
 
@@ -101,7 +107,7 @@ This model evolved through several rounds of Codex adversarial review (commits `
 has its own tests, but it is not part of the default `buildChildEnv()` preload
 set. Default installs do not pass `--no-addons`, so N-API/native dependency
 postinstalls and `child_process.spawn` use the normal Node runtime path while
-the microVM, strace, and LD_PRELOAD shim observe their file/env/network/exec
+the backend, strace, and LD_PRELOAD shim observe their file/env/network/exec
 activity.
 
 Adding a new audit category means picking the right layer: kernel-only behavior → strace; libc-level → Rust shim; JS-API-only → preload.
@@ -169,25 +175,30 @@ The `setenv` / `unsetenv` / `putenv` / `clearenv` wrappers close the in-process 
 
 **Known gap.** `execle` is the one exec variant the shim does not wrap: its `char *const envp[]` is passed as a C variadic argument, and intercepting variadics in stable `#![no_std]` Rust requires inline asm or a nightly toolchain bump; deferred to v2. In glibc, `execl` and `execlp` build their argument vector and then call `execve` with the process's own `__environ`, so the setenv/unsetenv guards in this version close the practical-attack window for those two. Direct `char **environ` array manipulation (bypassing all libc env functions) remains uncovered; this is rare in npm lifecycle scripts.
 
-## vsock protocol
+## Agent protocol
 
-The guest agent opens a vsock CID/port pair; the host listens. Stream is newline-delimited JSON. Two event categories share the channel:
+The guest agent emits newline-delimited JSON frames. Firecracker carries those
+frames over vsock; Docker and bare mode carry them over stdio. Two event
+categories share the channel:
 
 - `raw` events emitted incrementally during Phase B (one per audited syscall after the protected-paths filter).
 - A single terminal `lockfile` frame with the rendered YAML, attribution summary, and exit status.
 
-No shared filesystem, no container runtime, no Docker-in-Docker.
+Firecracker keeps the strongest separation: no shared filesystem, no container
+runtime, no Docker-in-Docker. Docker and bare mode trade isolation strength for
+runner availability while keeping the same agent protocol and lockfile
+pipeline.
 
 ## Rootfs
 
-Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Two virtio drives mount at boot:
+Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` (Firecracker) or Docker backend bootstrap runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Firecracker mounts two virtio drives at boot:
 
 1. The rootfs itself.
 2. An ext4 overlay holding the consumer repo + caches at `/work`.
 
 There is no host-Node drive: the toolchain is provisioned at runtime, so a macOS host (whose own `node` is a Mach-O binary) can still produce a Linux-guest lockfile. The exact Node version is pinned in `src/rootfs/vite-plus.ts` for byte-stable cross-host parity.
 
-The pinned kernel (Linux 5.10.223 from AWS Firecracker CI) lives outside the rootfs and is downloaded by the host via the artifact manifest.
+The pinned kernel (Linux 5.10.223 from AWS Firecracker CI) lives outside the rootfs and is downloaded by the host when the Firecracker backend is selected.
 
 ## Diff and modes
 
@@ -230,7 +241,7 @@ same UID as the audited process. A malicious lifecycle script with that UID can:
    complete fix is UID separation (see below).
 
 These gaps are accepted in v1 because:
-- The microVM is single-use and discarded after install.
+- Firecracker microVMs and Docker containers are single-use and discarded after install; bare mode uses a staged copy of the repo and deletes it after the run.
 - Network is off during install (Phase B), so exfiltration is bounded.
 - Strace observes process spawns and syscalls regardless of forged events.
 - The audit_bypass gate is defense-in-depth, not the primary security guarantee.

@@ -52,7 +52,7 @@ export type ArtifactArch = 'x64' | 'arm64';
 export type ManifestSection = Readonly<Record<string, string>>;
 
 export interface ArtifactManifest {
-  /** GitHub repo "owner/name" for the release.  E.g. "brooklyn/script-jail". */
+  /** GitHub repo "owner/name" for the release. E.g. "Brooooooklyn/scriptjail". */
   repo: string;
   /** Release tag, e.g. "v1.0.0". */
   tag: string;
@@ -63,6 +63,13 @@ export interface ArtifactManifest {
    * arch-suffixed so a copy-paste between sections is immediately obvious.
    */
   expected: Readonly<Record<ManifestPlatform, ManifestSection>>;
+  /**
+   * Runnable Docker rootfs image references keyed by arch and runner image.
+   * References must be digest-pinned (`name@sha256:<64 lowercase hex>`).
+   */
+  dockerImages?: Readonly<
+    Record<ArtifactArch, Readonly<Partial<Record<RunnerImage, string>>>>
+  >;
 }
 
 export interface PreFetchInput {

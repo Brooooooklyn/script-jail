@@ -4,18 +4,14 @@
 //
 // Flow:
 //   1. Parse inputs (./action/inputs.ts) and detect the PM (./shared/detect-pm.ts).
-//   2. Ensure Firecracker + vmlinux are downloaded (./action/firecracker/download.ts).
+//   2. Select an audit backend (Firecracker, Docker, or bare Linux).
 //   3. Hand off to `runAudit` (../shared/run-audit.ts) which owns:
 //        - arch-flag overlay
 //        - effective-config + extraRepoOverlayFiles assembly
-//        - `makeOverlay(...)` + cleanup
 //        - the post-VM diff / write / audit-bypass gate
-//      ...and call the Firecracker launcher closure built here for step (4).
-//   4. The launcher closure spawns the VM (./action/firecracker/launch.ts),
-//      opens the vsock session (./action/firecracker/vsock.ts), drives the
-//      handshake → final exchange, and tears the VM down in `finally`.
-//      `runAudit` is responsible for `overlay.cleanup()` — the launcher
-//      passes `overlay: null` to teardown so it does not double-clean.
+//      ...and call the selected backend for step (4).
+//   4. The backend starts its isolated execution surface, drives the
+//      handshake → final exchange, and tears down in `finally`.
 //
 // This module is intentionally thin: each step delegates to a helper that is
 // independently unit-tested.
@@ -24,14 +20,11 @@ import { setOutput } from '@actions/core';
 import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
 
 import { parseInputs } from './action/inputs.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
-import type { RunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
-import { maybeClearCache } from './action/cache.js';
 import {
   ensureBinaries,
   NodeHttpClient,
@@ -40,42 +33,21 @@ import { preFetchArtifacts } from './action/pre-fetch-artifacts.js';
 import { PINNED_MANIFEST } from './action/artifact-manifest.js';
 import { validateManifest } from './action/validate-manifest.js';
 import { makeOverlay } from './action/firecracker/overlay.js';
-import { launchVm, type VmHandle } from './action/firecracker/launch.js';
-import { openVsockSession, type VsockSession } from './action/firecracker/vsock.js';
+import { launchVm } from './action/firecracker/launch.js';
+import { openVsockSession } from './action/firecracker/vsock.js';
 import { teardown } from './action/firecracker/teardown.js';
-import type { OverlayResult } from './action/firecracker/overlay.js';
-import { runAudit, type LauncherResult } from './shared/run-audit.js';
+import { runAudit } from './shared/run-audit.js';
+import { createFirecrackerBackend } from './action/backend/firecracker.js';
+import { createDockerBackend } from './action/backend/docker.js';
+import { createBareBackend } from './action/backend/bare.js';
+import { runSelectedBackend } from './action/backend/select.js';
+import type { BackendMap } from './action/backend/select.js';
 
 // ---------------------------------------------------------------------------
 // Pinned versions
 // ---------------------------------------------------------------------------
 
-/** Firecracker release version (must match a key in KNOWN_TARBALL_SHA256). */
-const FIRECRACKER_VERSION = '1.8.0';
-
 export type ActionHostArch = 'x64' | 'arm64';
-
-// Pinned from Firecracker CI artifacts (v1.10, kernel 5.10.223).
-// See src/rootfs/vmlinux.md for provenance and a "build your own" recipe;
-// production deployments may prefer a stricter kernel config — refer to the
-// tag-pinned policy doc at:
-//   https://github.com/firecracker-microvm/firecracker/blob/v1.8.0/docs/kernel-policy.md
-const PINNED_KERNELS: Readonly<Record<ActionHostArch, { url: string; sha256: string }>> = {
-  x64: {
-    url: 'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223',
-    sha256: '22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65',
-  },
-  arm64: {
-    url: 'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223',
-    sha256: 'eb5d95ac8a67f7a86acf0cb35625633713ad5170b56de8617808d0e18bb832ec',
-  },
-};
-
-/** vsock port the guest agent listens on. */
-const VSOCK_PORT = 10242;
-
-/** Guest CID for the vsock socket (host CID is fixed at 2). */
-const GUEST_CID = 3;
 
 // ---------------------------------------------------------------------------
 // main
@@ -202,183 +174,28 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     : join(tmpdir(), 'script-jail-images');
   mkdirSync(imagesDir, { recursive: true });
 
-  // --- Honour `cache-firecracker: false` -----------------------------------
-  // With caching disabled we remove the cacheable artifacts (Firecracker
-  // tarball + binary + vmlinux) so ensureBinaries below takes the fresh-
-  // download path.  Useful for forcing a re-pull after rotating the pinned
-  // SHAs in this file, or to validate the download path on demand.  We do
-  // NOT wipe the whole imagesDir — the rootfs ext4 lives there too and is
-  // provisioned by a separate step (see `baseRootfsPath` below); deleting
-  // it would break the very next call to `makeOverlay()`.
-  maybeClearCache({
-    imagesDir,
-    firecrackerVersion: FIRECRACKER_VERSION,
-    cacheFirecracker: inputs.cacheFirecracker,
-    arch: actionHostArch,
-  });
-
-  // The rootfs image is keyed by runner image and guest arch
-  // (e.g. rootfs-ubuntu-24.04-arm64.ext4) rather than by (node-major,
-  // package-manager): the Node toolchain is downloaded inside the guest at
-  // boot via `vp env install`, so the rootfs only needs to match a stable
-  // glibc / shared-library set.
-  const baseRootfsPath = join(
-    imagesDir,
-    rootfsImageName(runnerImage, actionHostArch),
-  );
-
-  // --- Pre-fetch release artifacts (rootfs + .so) --------------------------
-  // GitHub JavaScript actions don't support `runs.pre`, so the pre-fetch
-  // happens here, inside main(), before any other VM-side work.  See
-  // `./action/pre-fetch-artifacts.ts` for the asymmetry note on libscriptjail.so
-  // (baked into the released rootfs, so the .so download is informational
-  // for the v1 production path).
+  // Backends own their own artifact needs. Firecracker downloads/caches the
+  // kernel/rootfs path, Docker pulls a pinned image, and bare fetches the shim.
   const http = new NodeHttpClient();
-  if (!selfTest) {
-    // See the `SCRIPT_JAIL_E2E_SELF_TEST` block at the top of this function for
-    // why this is skipped under self-test.  In short: the workflow has
-    // already placed real rootfs + libscriptjail.so files under `imagesDir`
-    // via `pnpm build`, but they will fail the manifest SHA check because
-    // the manifest still holds placeholders until the first real release.
-    await doPreFetchArtifacts({
-      imagesDir,
-      runnerImage,
-      manifest: PINNED_MANIFEST,
-      http,
-      arch: actionHostArch,
-      // The released manifest currently stores the arm64 guest artifacts in
-      // the darwin section because the macOS VZ path was the first arm64
-      // consumer.  Linux/arm64 Firecracker uses the same arm64 rootfs + shim.
-      platform: actionHostArch === 'arm64' ? 'darwin' : 'linux',
-    });
-  }
-
-  // --- Ensure Firecracker + kernel are present -----------------------------
-  const pinnedKernel = PINNED_KERNELS[actionHostArch];
-  const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
-    imagesDir,
-    arch: actionHostArch,
-    firecrackerVersion: FIRECRACKER_VERSION,
-    kernelUrl: pinnedKernel.url,
-    kernelSha256: pinnedKernel.sha256,
-    http,
-  });
-
-  // --- Hand off to runAudit -----------------------------------------------
-  // The launcher closure below is the host-specific half: spawn Firecracker,
-  // open vsock, drive the handshake → final exchange, tear the VM down in
-  // `finally`.  runAudit owns the overlay (we pass `overlay: null` to
-  // teardown so it does not also call cleanup — single ownership).
-  //
-  const launch = async (overlay: OverlayResult): Promise<LauncherResult> => {
-    // Per-run unique socket paths so concurrent jobs on the same runner
-    // do not clash.
-    const runId = randomBytes(4).toString('hex');
-    const apiSocketPath = join(tmpdir(), `script-jail-fc-api-${runId}.sock`);
-    const vsockUdsPath = join(tmpdir(), `script-jail-vsock-${runId}`);
-
-    let vm: VmHandle | null = null;
-    let vsock: VsockSession | null = null;
-    let finalYaml: string | null = null;
-    let fatalError: Error | null = null;
-    // Non-fatal guest errors are surfaced as ::warning:: annotations as
-    // they arrive, AND retained so we can attach them to a "no final
-    // frame" diagnostic if the session ends without a `final`.
-    const nonFatalErrors: string[] = [];
-
-    try {
-      // --- Boot the VM ---------------------------------------------------
-      // Phase A networking is enabled at launch (tap0 + /network-interfaces/eth0
-      // in `launch.ts`).  Phase B's offline guarantee is enforced from
-      // inside the guest: after receiving `go` the agent runs `ip link
-      // set eth0 down` (see `src/guest/agent.ts`) and verifies with a DNS
-      // probe.  We deliberately do NOT touch Firecracker's host-side
-      // rate-limiter API here — its `size: 0` is interpreted as "rate
-      // limiter disabled" (i.e. unlimited), not "no bandwidth", so a
-      // host-side patch would be a silent no-op.  The guest is the
-      // source of truth for interface state.
-      vm = await doLaunchVm({
-        firecrackerPath,
-        vmlinuxPath,
-        rootfsPath: overlay.rootfsCopyPath,
-        repoDiskPath: overlay.repoDiskPath,
-        vsockCid: GUEST_CID,
-        vsockUdsPath,
-        enableNetwork: true,
-        socketPath: apiSocketPath,
-      });
-
-      // --- Open vsock session -------------------------------------------
-      vsock = await doOpenVsockSession(vsockUdsPath, VSOCK_PORT);
-
-      // --- Drive the protocol -------------------------------------------
-      for await (const frame of vsock.events) {
-        if (frame.kind === 'event') {
-          // We deliberately ignore the live event stream: the guest agent
-          // does its own normalisation inside the VM and emits the YAML
-          // in the `final` frame.  Host-side normalisation is not on the
-          // v1 roadmap.
-          continue;
-        }
-        if (frame.kind === 'handshake') {
-          if (frame.phase === 'fetch_done') {
-            // Release the guest with `go`.  Network teardown happens
-            // inside the guest before Phase B starts (see
-            // `src/guest/agent.ts`, `dropEth0`) — host-side rate-limiter
-            // patching is unreliable because Firecracker treats `size: 0`
-            // as "rate limiter disabled" (unlimited), not "no bandwidth".
-            await vsock.sendGo();
-            continue;
-          }
-          // `install_done` is an FYI marker; the agent will follow with
-          // `final`.  No action needed here, but we keep the branch
-          // explicit so future handshake phases must opt in rather than
-          // fall through unnoticed.
-          continue;
-        }
-        if (frame.kind === 'error') {
-          if (frame.fatal) {
-            fatalError = new Error(`script-jail guest fatal: ${frame.message}`);
-            break;
-          }
-          // Non-fatal errors are surfaced as warnings AND retained so
-          // that, if the stream ends without a final frame, we can
-          // attach them to the diagnostic message instead of throwing a
-          // context-free error.
-          nonFatalErrors.push(frame.message);
-          warn(`script-jail guest: ${frame.message}`);
-          continue;
-        }
-        if (frame.kind === 'final') {
-          finalYaml = frame.yaml;
-          break;
-        }
-      }
-    } finally {
-      // runAudit owns the overlay; pass `overlay: null` so teardown does
-      // NOT also call cleanup.  teardown.ts handles null gracefully (it
-      // gates the safeRun on `overlay !== null`).
-      await doTeardown({
-        vm,
-        overlay: null,
-        vsock,
-        apiSocketPath,
-        vsockUdsPath,
-      });
-    }
-
-    if (fatalError !== null) throw fatalError;
-    if (finalYaml === null) {
-      const tail =
-        nonFatalErrors.length > 0
-          ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(', ')}]`
-          : '';
-      throw new Error(
-        `script-jail: vsock session ended without a final frame.${tail}`,
-      );
-    }
-
-    return { finalYaml, nonFatalWarnings: nonFatalErrors };
+  const backends: BackendMap = {
+    firecracker: createFirecrackerBackend({
+      preFetchArtifacts: doPreFetchArtifacts,
+      ensureBinaries: doEnsureBinaries,
+      makeOverlay: doMakeOverlay,
+      launchVm: doLaunchVm,
+      openVsockSession: doOpenVsockSession,
+      teardown: doTeardown,
+      cacheFirecracker: inputs.cacheFirecracker,
+      warn,
+      // Existing e2e tests inject the whole Firecracker stack and run on macOS
+      // too; keep those fakes from tripping the real /dev/kvm availability gate.
+      skipAvailabilityCheck: deps.launchVm !== undefined,
+    }),
+    docker: createDockerBackend({ stderr: process.stderr }),
+    bare: createBareBackend({
+      preFetchArtifacts: doPreFetchArtifacts,
+      stderr: process.stderr,
+    }),
   };
 
   const result = await runAudit({
@@ -392,14 +209,26 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     },
     pm: pm.manager,
     hostArch: actionHostArch,
-    baseRootfsPath,
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,
     // leaving the workDir at buildEffectiveConfig's mkdtemp default
     // would accumulate stray dirs under os.tmpdir() on self-hosted runners.
     workDir: imagesDir,
-    launch,
+    execute: (auditInput) => runSelectedBackend({
+      requested: inputs.backend,
+      backends,
+      warn,
+      ctx: {
+        ...auditInput,
+        imagesDir,
+        runnerImage,
+        arch: actionHostArch,
+        manifest: PINNED_MANIFEST,
+        http,
+        selfTest,
+      },
+    }),
     io: {
       warn,
       setOutput,
@@ -409,7 +238,6 @@ export async function main(deps: MainDeps = {}): Promise<void> {
         process.stdout.write(`::error file=${lockLabel},line=1::${msg}\n`);
       },
     },
-    makeOverlay: doMakeOverlay,
   });
 
   // Preserve the existing semantics: in `update` mode runAudit returns
@@ -426,12 +254,6 @@ export function detectActionHostArch(arch: string = process.arch): ActionHostArc
   throw new Error(
     `script-jail action requires an x64 or arm64 Linux runner (detected '${arch}').`,
   );
-}
-
-function rootfsImageName(runnerImage: RunnerImage, arch: ActionHostArch): string {
-  return arch === 'arm64'
-    ? `rootfs-${runnerImage}-arm64.ext4`
-    : `rootfs-${runnerImage}.ext4`;
 }
 
 // ---------------------------------------------------------------------------
