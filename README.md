@@ -95,6 +95,40 @@ spoof:
 The Action inputs `spoof-platform` and `spoof-arch` override the config for
 that run without modifying the file on disk.
 
+## Lockfile Example
+
+The generated `.script-jail.lock.yml` is grouped by package identity and
+lifecycle stage. Empty lists are intentional: they keep the schema stable and
+make newly observed behavior obvious in diffs.
+
+```yaml
+schema_version: 1
+manager: pnpm
+manager_lockfile_sha256: "..."
+node_version: 24.15.0
+generated_at: 2026-05-28T08:00:00.000Z
+packages:
+  suspicious-install@1.2.3:
+    lifecycle:
+      postinstall:
+        external_reads:
+          - <HIDDEN> $HOME/.npmrc
+          - $REPO/package.json
+        escaped_writes:
+          - <CROSS_PACKAGE> $NODE_MODULES/victim-package/package.json
+          - $TMPDIR/<hash>/build.log
+        env_read:
+          - <HIDDEN> NPM_TOKEN
+          - PATH
+        spawn_attempts:
+          - node postinstall.js
+        spawn_blocked:
+          - <ENOENT> gcc -c native.c
+        dlopen_attempts: []
+        network_attempts:
+          - <BLOCKED> connect 198.51.100.7:443
+```
+
 ## macOS CLI
 
 On macOS 14 or newer, the CLI runs the same Linux guest agent through Apple's
