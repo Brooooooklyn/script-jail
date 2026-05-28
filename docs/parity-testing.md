@@ -66,7 +66,7 @@ The fixture choice deliberately stresses the pieces most likely to diverge:
                  ▼
               diff
    (parity-diff.ts → parity-report.md)
-   (advisory report when streams differ)
+   (fails when streams differ)
 ```
 
 Each platform job runs the same code path a real consumer would:
@@ -81,7 +81,8 @@ Each platform job runs the same code path a real consumer would:
   `test/parity/macos-arm64-lockfile.yml`.
 
 Both produce a `.script-jail.lock.yml`. The `diff` job downloads the fresh
-Linux lockfile, canonicalises the volatile fields on both sides, and compares.
+Linux lockfile, canonicalises the volatile fields on both sides, compares, and
+fails the workflow if any diff remains after the parity-only filters.
 
 ## Interpreting the parity report
 
@@ -100,6 +101,10 @@ The lockfiles are byte-equal after canonicalisation. Ship it.
 move to arm64 CI, native package-selection mismatches should no longer be the
 default explanation; first suspect ambient environment reads, VMM-specific
 device/procfs differences, or a stale committed macOS lockfile.
+
+Explainable divergence is still a CI failure. Add or update the narrow filter
+in `scripts/parity-diff.ts`, or regenerate the committed macOS baseline when the
+lockfile change is intentional.
 
 ### ❌ Diverged — unexpected
 
