@@ -54,7 +54,13 @@ interface ParityOptions {
   reportPath: string | null;
 }
 
-type ParityListField = 'env_read' | 'network_attempts' | 'spawn_attempts';
+type ParityListField = 'external_reads' | 'env_read' | 'network_attempts' | 'spawn_attempts';
+
+const PARITY_ONLY_EXTERNAL_READS = new Set([
+  // Puppeteer probes its default browser cache root. Whether that directory
+  // exists is host/backend state; writes to it still surface via escaped_writes.
+  '$HOME/.cache/puppeteer',
+]);
 
 const PARITY_ONLY_ENV_READS = new Set([
   // CI/git transport environment present on the GitHub runner but not on the
@@ -140,7 +146,7 @@ function filterParityOnlyNoise(content: string): string {
   let activeList: { field: ParityListField; indent: number } | null = null;
 
   for (const line of content.split('\n')) {
-    const fieldMatch = /^(\s*)(env_read|network_attempts|spawn_attempts):(?:\s.*)?$/.exec(line);
+    const fieldMatch = /^(\s*)(external_reads|env_read|network_attempts|spawn_attempts):(?:\s.*)?$/.exec(line);
     if (fieldMatch) {
       activeList = {
         field: fieldMatch[2] as ParityListField,
@@ -177,7 +183,7 @@ function collapseEmptyFilteredLists(content: string): string {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    const match = /^(\s*)(env_read|network_attempts|spawn_attempts):\s*$/.exec(line);
+    const match = /^(\s*)(external_reads|env_read|network_attempts|spawn_attempts):\s*$/.exec(line);
     if (!match) {
       out.push(line);
       continue;
@@ -222,6 +228,7 @@ function leadingSpaces(line: string): number {
 }
 
 function isParityOnlyListItem(field: ParityListField, item: string): boolean {
+  if (field === 'external_reads') return PARITY_ONLY_EXTERNAL_READS.has(item);
   if (field === 'env_read') return PARITY_ONLY_ENV_READS.has(item);
   if (field === 'network_attempts') return PARITY_ONLY_NETWORK_ATTEMPTS.has(item);
   return PARITY_ONLY_SPAWN_ATTEMPTS.has(item);
