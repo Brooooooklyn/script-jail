@@ -100,6 +100,10 @@ const PARITY_ONLY_SPAWN_ATTEMPTS = new Set([
   // validation, so one side can record this direct native spawn in addition to
   // the common `node install.js` lifecycle entry.
   '$PKG/bin/esbuild --version',
+  // simple-git-hooks probes the local checkout hook path when the audited
+  // workspace has a usable .git directory. Container backends can run from a
+  // copied workspace without that git metadata, so this is host shape noise.
+  'sh -c git config --local core.hooksPath',
 ]);
 
 const NPM_DEBUG_LOG_BASENAME =
