@@ -1285,6 +1285,72 @@ describe('buildChildEnv protect-list strict env-var name gate (Finding 5)', () =
   });
 });
 
+describe('buildChildEnv lifecycle env sanitization', () => {
+  function makeConfig(protectedEnv: string[]): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: protectedEnv },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('drops agent-control and host-noise env before lifecycle scripts inherit it', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+
+    const env = buildChildEnv(
+      {
+        PATH: '/usr/bin',
+        NODE_OPTIONS: '--max-old-space-size=64',
+        HOSTNAME: 'docker-container',
+        TERM: 'linux',
+        COLS: '80',
+        LINES: '24',
+        POSIXLY_CORRECT: '1',
+        SCRIPT_JAIL_CONNECTION: 'stdio',
+        SCRIPT_JAIL_CONFIG_PATH: '/etc/script-jail/config.yml',
+        SCRIPT_JAIL_NATIVE_PRELOAD_PATH: '/tmp/native.so',
+        SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: '/tmp/platform.cjs',
+        SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: '/tmp/env-spy.cjs',
+        SCRIPT_JAIL_PHASE_B_UNSHARE_NET: '1',
+        SCRIPT_JAIL_E2E_SELF_TEST: '1',
+        SCRIPT_JAIL_REPO_DIR: '/work',
+        SCRIPT_JAIL_LOG_FILE: '/stale/events.jsonl',
+      },
+      makeConfig(['NPM_TOKEN']),
+      '/tmp/events.jsonl',
+    );
+
+    expect(env['PATH']).toBe('/usr/bin');
+    expect(env['NODE_OPTIONS']).toContain('--max-old-space-size=64');
+    expect(env['SCRIPT_JAIL_LOG_FILE']).toBe('/tmp/events.jsonl');
+    expect(env['SCRIPT_JAIL_LOG_FD']).toBe('3');
+    expect(env['SCRIPT_JAIL_PROTECTED_ENV_NAMES']).toBe('NPM_TOKEN');
+
+    for (const name of [
+      'HOSTNAME',
+      'TERM',
+      'COLS',
+      'LINES',
+      'POSIXLY_CORRECT',
+      'SCRIPT_JAIL_CONNECTION',
+      'SCRIPT_JAIL_CONFIG_PATH',
+      'SCRIPT_JAIL_NATIVE_PRELOAD_PATH',
+      'SCRIPT_JAIL_PLATFORM_PRELOAD_PATH',
+      'SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH',
+      'SCRIPT_JAIL_PHASE_B_UNSHARE_NET',
+      'SCRIPT_JAIL_E2E_SELF_TEST',
+      'SCRIPT_JAIL_REPO_DIR',
+    ]) {
+      expect(env).not.toHaveProperty(name);
+    }
+  });
+});
+
 describe('MemoryConnection', () => {
   it('readable and writable are the passed streams', () => {
     const r = new PassThrough();

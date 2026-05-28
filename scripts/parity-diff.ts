@@ -29,13 +29,16 @@
 //   - Lock renderer ordering bug (different event order between platforms).
 //   - Audit-policy desync (spurious event on one side).
 //
+// What this DOES filter:
+//   - Ambient CI/VMM env names that are not dependency-controlled.
+//   - Apple Virtualization.framework NAT resolver noise.
+//   - One exact esbuild native self-verify spawn that depends on backend
+//     filesystem optimisation details; both sides still record `node install.js`.
+//
 // What this does NOT filter:
-//   The documented v1 divergence on Apple Silicon — `spawn`/`exec` events
-//   whose x64 binary cannot be executed on an arm64 guest — currently
-//   surfaces as a diff hunk.  See docs/parity-testing.md for the v2 plan:
-//   once we observe enough concrete divergence, those rules can be added
-//   behind an explicit `--allow-arm64-native-exec` flag.  For now, the
-//   maintainer reads the report and decides.
+//   Arbitrary spawn/exec divergence still surfaces as a diff hunk.  Keep
+//   spawn filters exact and evidence-backed; the maintainer should read the
+//   report and decide before adding new rules.
 
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -51,15 +54,29 @@ interface ParityOptions {
   reportPath: string | null;
 }
 
+type ParityListField = 'env_read' | 'network_attempts' | 'spawn_attempts';
+
 const PARITY_ONLY_ENV_READS = new Set([
   // CI/git transport environment present on the GitHub runner but not on the
   // committed local macOS fixture.
   'GIT_ASKPASS',
   'GIT_SSH_COMMAND',
+  'HOSTNAME',
   // Resolver configuration inherited from the host/VMM.
   'LOCALDOMAIN',
   'NOPROXY',
   'RES_OPTIONS',
+  // Agent/backend control and terminal env that lifecycle children should not
+  // rely on; older generated baselines may still contain them.
+  'LINES',
+  'POSIXLY_CORRECT',
+  'SCRIPT_JAIL_CONFIG_PATH',
+  'SCRIPT_JAIL_CONNECTION',
+  'SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH',
+  'SCRIPT_JAIL_NATIVE_PRELOAD_PATH',
+  'SCRIPT_JAIL_PHASE_B_UNSHARE_NET',
+  'SCRIPT_JAIL_PLATFORM_PRELOAD_PATH',
+  'TERM',
   // Test-knob probes from dependency helper libraries. Presence depends on
   // the ambient process env, not on the dependency install behavior.
   'COLS',
@@ -72,6 +89,14 @@ const PARITY_ONLY_NETWORK_ATTEMPTS = new Set([
   // Apple Virtualization.framework NAT resolver observed in local arm64 VZ
   // lockfiles. Linux action backends see public resolvers instead.
   '<BLOCKED> connect 192.168.64.1:53',
+]);
+
+const PARITY_ONLY_SPAWN_ATTEMPTS = new Set([
+  // esbuild's postinstall verifies the selected native binary. Depending on
+  // backend filesystem semantics, its JS shim may be hardlinked/replaced before
+  // validation, so one side can record this direct native spawn in addition to
+  // the common `node install.js` lifecycle entry.
+  '$PKG/bin/esbuild --version',
 ]);
 
 const NPM_DEBUG_LOG_BASENAME =
@@ -105,13 +130,13 @@ function canonicalize(content: string): string {
 
 function filterParityOnlyNoise(content: string): string {
   const out: string[] = [];
-  let activeList: { field: 'env_read' | 'network_attempts'; indent: number } | null = null;
+  let activeList: { field: ParityListField; indent: number } | null = null;
 
   for (const line of content.split('\n')) {
-    const fieldMatch = /^(\s*)(env_read|network_attempts):(?:\s.*)?$/.exec(line);
+    const fieldMatch = /^(\s*)(env_read|network_attempts|spawn_attempts):(?:\s.*)?$/.exec(line);
     if (fieldMatch) {
       activeList = {
-        field: fieldMatch[2] as 'env_read' | 'network_attempts',
+        field: fieldMatch[2] as ParityListField,
         indent: fieldMatch[1]!.length,
       };
       out.push(line);
@@ -131,6 +156,35 @@ function filterParityOnlyNoise(content: string): string {
         const item = itemMatch[2]!;
         if (isParityOnlyListItem(activeList.field, item)) continue;
       }
+    }
+
+    out.push(line);
+  }
+
+  return collapseEmptyFilteredLists(out.join('\n'));
+}
+
+function collapseEmptyFilteredLists(content: string): string {
+  const lines = content.split('\n');
+  const out: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const match = /^(\s*)(env_read|network_attempts|spawn_attempts):\s*$/.exec(line);
+    if (!match) {
+      out.push(line);
+      continue;
+    }
+
+    const indent = match[1]!.length;
+    let next = i + 1;
+    while (next < lines.length && lines[next]!.trim() === '') {
+      next++;
+    }
+
+    if (next >= lines.length || leadingSpaces(lines[next]!) <= indent) {
+      out.push(`${match[1]}${match[2]}: []`);
+      continue;
     }
 
     out.push(line);
@@ -160,9 +214,10 @@ function leadingSpaces(line: string): number {
   return match ? match[0].length : 0;
 }
 
-function isParityOnlyListItem(field: 'env_read' | 'network_attempts', item: string): boolean {
+function isParityOnlyListItem(field: ParityListField, item: string): boolean {
   if (field === 'env_read') return PARITY_ONLY_ENV_READS.has(item);
-  return PARITY_ONLY_NETWORK_ATTEMPTS.has(item);
+  if (field === 'network_attempts') return PARITY_ONLY_NETWORK_ATTEMPTS.has(item);
+  return PARITY_ONLY_SPAWN_ATTEMPTS.has(item);
 }
 
 function parseArguments(argv: ReadonlyArray<string>): ParityOptions {

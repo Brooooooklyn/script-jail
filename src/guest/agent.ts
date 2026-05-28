@@ -1486,6 +1486,39 @@ async function waitForGo(readable: Readable): Promise<void> {
 // Build env dict for child processes
 // ---------------------------------------------------------------------------
 
+const LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = new Set([
+  'SCRIPT_JAIL_LOG_FILE',
+  'SCRIPT_JAIL_LOG_FD',
+  'SCRIPT_JAIL_NODE_OPTIONS',
+  'SCRIPT_JAIL_PRELOAD_PATH',
+  'SCRIPT_JAIL_PROTECTED_ENV_NAMES',
+  'SCRIPT_JAIL_SPOOF_ARCH',
+  'SCRIPT_JAIL_SPOOF_PLATFORM',
+]);
+
+const LIFECYCLE_HOST_NOISE_ENV_NAMES = new Set([
+  'COLS',
+  'HOSTNAME',
+  'LINES',
+  'POSIXLY_CORRECT',
+  'TERM',
+]);
+
+function sanitizeLifecycleBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {};
+
+  for (const [name, value] of Object.entries(baseEnv)) {
+    if (value === undefined) continue;
+    if (LIFECYCLE_HOST_NOISE_ENV_NAMES.has(name)) continue;
+    if (name.startsWith('SCRIPT_JAIL_') && !LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES.has(name)) {
+      continue;
+    }
+    sanitized[name] = value;
+  }
+
+  return sanitized;
+}
+
 /**
  * @internal Exported for unit tests only — production calls this from
  * `main()`.  The over-long-protect-list rejection (audit-trust Finding 2)
@@ -1589,6 +1622,7 @@ export function buildChildEnv(
   }
 
   const protectedNames = config.protected.env.join(',');
+  const inheritedEnv = sanitizeLifecycleBaseEnv(baseEnv);
 
   // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list
   // table has a fixed capacity (`MAX_PROTECTED` entries, each at most
@@ -1653,7 +1687,7 @@ export function buildChildEnv(
   }
 
   return {
-    ...baseEnv,
+    ...inheritedEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -1680,7 +1714,7 @@ export function buildChildEnv(
     // NODE_OPTIONS.
     SCRIPT_JAIL_NODE_OPTIONS: childNodeOptions,
     NODE_OPTIONS: [
-      ...(baseEnv['NODE_OPTIONS'] ? [baseEnv['NODE_OPTIONS']] : []),
+      ...(inheritedEnv['NODE_OPTIONS'] ? [inheritedEnv['NODE_OPTIONS']] : []),
       ...requireFlags,
     ].join(' '),
 

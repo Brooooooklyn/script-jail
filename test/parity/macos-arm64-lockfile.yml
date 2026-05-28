@@ -2,7 +2,7 @@ schema_version: 1
 manager: pnpm
 manager_lockfile_sha256: ""
 node_version: 24.15.0
-generated_at: 2026-05-27T15:21:43.163Z
+generated_at: 2026-05-28T07:59:27.761Z
 packages:
   "@swc/core@1.15.33":
     lifecycle:
@@ -26,7 +26,11 @@ packages:
           - /usr/bin/ldd
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
-        env_read: []
+        env_read:
+          - FORCE_COLOR
+          - INIT_CWD
+          - NAPI_RS_FORCE_WASI
+          - SWC_DEBUG
         spawn_attempts:
           - node postinstall.js
         spawn_blocked: []
@@ -400,7 +404,91 @@ packages:
           - /
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
-        env_read: []
+        env_read:
+          - ALL_PROXY
+          - CI
+          - COREPACK_ENABLE_DOWNLOAD_PROMPT
+          - COREPACK_HOME
+          - COREPACK_ROOT
+          - DEBUG
+          - FORCE_COLOR
+          - HTTPS_PROXY
+          - INIT_CWD
+          - LD_PRELOAD
+          - LOCALDOMAIN
+          - NODE
+          - NODE_TLS_REJECT_UNAUTHORIZED
+          - NO_COLOR
+          - NO_PROXY
+          - NPM_CONFIG_HTTPS_PROXY
+          - NPM_CONFIG_NO_PROXY
+          - NPM_CONFIG_PROXY
+          - PATH
+          - PNPM_SCRIPT_SRC_DIR
+          - PUPPETEER_BROWSER
+          - PUPPETEER_CACHE_DIR
+          - PUPPETEER_CHROME_DOWNLOAD_BASE_URL
+          - PUPPETEER_CHROME_HEADLESS_SHELL_DOWNLOAD_BASE_URL
+          - PUPPETEER_CHROME_HEADLESS_SHELL_SKIP_DOWNLOAD
+          - PUPPETEER_CHROME_HEADLESS_SHELL_VERSION
+          - PUPPETEER_CHROME_SKIP_DOWNLOAD
+          - PUPPETEER_CHROME_VERSION
+          - PUPPETEER_EXECUTABLE_PATH
+          - PUPPETEER_FIREFOX_DOWNLOAD_BASE_URL
+          - PUPPETEER_FIREFOX_SKIP_DOWNLOAD
+          - PUPPETEER_FIREFOX_VERSION
+          - PUPPETEER_LOGLEVEL
+          - PUPPETEER_SKIP_CHROME_DOWNLOAD
+          - PUPPETEER_SKIP_CHROME_HEADLESS_SHELL_DOWNLOAD
+          - PUPPETEER_SKIP_DOWNLOAD
+          - PUPPETEER_SKIP_FIREFOX_DOWNLOAD
+          - PUPPETEER_TMP_DIR
+          - PWD
+          - RES_OPTIONS
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_NODE_OPTIONS
+          - SCRIPT_JAIL_PRELOAD_PATH
+          - TERM
+          - TMPDIR
+          - UV_THREADPOOL_SIZE
+          - VP_HOME
+          - XDG_CACHE_HOME
+          - XDG_CONFIG_HOME
+          - XDG_DATA_HOME
+          - XDG_STATE_HOME
+          - all_proxy
+          - https_proxy
+          - no_proxy
+          - npm_command
+          - npm_config__jsr_registry
+          - npm_config_catalog
+          - npm_config_dedupe_peers
+          - npm_config_frozen_lockfile
+          - npm_config_globalconfig
+          - npm_config_http_proxy
+          - npm_config_https_proxy
+          - npm_config_loglevel
+          - npm_config_no_proxy
+          - npm_config_node_gyp
+          - npm_config_npm_globalconfig
+          - npm_config_peer_dependency_rules
+          - npm_config_pending
+          - npm_config_proxy
+          - npm_config_registry
+          - npm_config_side_effects_cache
+          - npm_config_store_dir
+          - npm_config_user_agent
+          - npm_config_verify_deps_before_run
+          - npm_execpath
+          - npm_lifecycle_event
+          - npm_lifecycle_script
+          - npm_node_execpath
+          - npm_package_bin_puppeteer
+          - npm_package_engines_node
+          - npm_package_json
+          - npm_package_name
+          - npm_package_version
+          - pnpm_config_verify_deps_before_run
         spawn_attempts:
           - node install.mjs
         spawn_blocked: []
@@ -418,7 +506,47 @@ packages:
           - $REPO/package.json
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
-        env_read: []
+        env_read:
+          - COREPACK_ENABLE_DOWNLOAD_PROMPT
+          - COREPACK_HOME
+          - COREPACK_ROOT
+          - INIT_CWD
+          - LD_PRELOAD
+          - NODE
+          - PATH
+          - PNPM_SCRIPT_SRC_DIR
+          - PWD
+          - SCRIPT_JAIL_LOG_FD
+          - SCRIPT_JAIL_NODE_OPTIONS
+          - SCRIPT_JAIL_PRELOAD_PATH
+          - SKIP_INSTALL_SIMPLE_GIT_HOOKS
+          - TERM
+          - TMPDIR
+          - VP_HOME
+          - npm_command
+          - npm_config__jsr_registry
+          - npm_config_catalog
+          - npm_config_dedupe_peers
+          - npm_config_frozen_lockfile
+          - npm_config_globalconfig
+          - npm_config_node_gyp
+          - npm_config_npm_globalconfig
+          - npm_config_peer_dependency_rules
+          - npm_config_pending
+          - npm_config_registry
+          - npm_config_side_effects_cache
+          - npm_config_store_dir
+          - npm_config_user_agent
+          - npm_config_verify_deps_before_run
+          - npm_execpath
+          - npm_lifecycle_event
+          - npm_lifecycle_script
+          - npm_node_execpath
+          - npm_package_bin_simple_git_hooks
+          - npm_package_json
+          - npm_package_name
+          - npm_package_version
+          - pnpm_config_verify_deps_before_run
         spawn_attempts:
           - node ./postinstall.js
           - sh -c git config --local core.hooksPath
@@ -428,10 +556,40 @@ packages:
   unrs-resolver@1.11.1:
     lifecycle:
       postinstall:
-        external_reads: []
+        external_reads:
+          - $NODE_MODULES
+          - $NODE_MODULES/.pnpm
+          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-arm64-gnu@1.11.1
+          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-arm64-gnu@1.11.1/node_modules
+          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-arm64-gnu@1.11.1/node_modules/@unrs
+          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-arm64-gnu@1.11.1/node_modules/@unrs/resolver-binding-linux-arm64-gnu
+          - $NODE_MODULES/.pnpm/@unrs+resolver-binding-linux-arm64-gnu@1.11.1/node_modules/@unrs/resolver-binding-linux-arm64-gnu/resolver.linux-arm64-gnu.node
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/cli.js
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/constants.js
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/helpers.js
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/index.js
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/lib/target.js
+          - $NODE_MODULES/.pnpm/napi-postinstall@0.3.4/node_modules/napi-postinstall/package.json
+          - $NODE_MODULES/.pnpm/node_modules
+          - $NODE_MODULES/.pnpm/node_modules/@unrs
+          - $NODE_MODULES/.pnpm/node_modules/@unrs/resolver-binding-linux-arm64-gnu
+          - $NODE_MODULES/.pnpm/node_modules/@unrs/resolver-binding-linux-arm64-gnu/package.json
+          - $NODE_MODULES/.pnpm/node_modules/@unrs/resolver-binding-linux-arm64-gnu/resolver.linux-arm64-gnu.node
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules/napi-postinstall
+          - $NODE_MODULES/.pnpm/unrs-resolver@1.11.1/node_modules/napi-postinstall/lib/cli.js
+          - $REPO
+          - /usr/bin/ldd
         escaped_writes:
           - $TMPDIR/<hash>/<hash>.jsonl
-        env_read: []
+        env_read:
+          - COLS
+          - POSIXLY_CORRECT
         spawn_attempts:
           - dirname $PKG/node_modules/.bin/napi-postinstall
           - napi-postinstall unrs-resolver 1.11.1 check
