@@ -28946,6 +28946,34 @@ async function waitForGo(readable) {
     });
   });
 }
+var LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = /* @__PURE__ */ new Set([
+  "SCRIPT_JAIL_LOG_FILE",
+  "SCRIPT_JAIL_LOG_FD",
+  "SCRIPT_JAIL_NODE_OPTIONS",
+  "SCRIPT_JAIL_PRELOAD_PATH",
+  "SCRIPT_JAIL_PROTECTED_ENV_NAMES",
+  "SCRIPT_JAIL_SPOOF_ARCH",
+  "SCRIPT_JAIL_SPOOF_PLATFORM"
+]);
+var LIFECYCLE_HOST_NOISE_ENV_NAMES = /* @__PURE__ */ new Set([
+  "COLS",
+  "HOSTNAME",
+  "LINES",
+  "POSIXLY_CORRECT",
+  "TERM"
+]);
+function sanitizeLifecycleBaseEnv(baseEnv) {
+  const sanitized = {};
+  for (const [name, value] of Object.entries(baseEnv)) {
+    if (value === void 0) continue;
+    if (LIFECYCLE_HOST_NOISE_ENV_NAMES.has(name)) continue;
+    if (name.startsWith("SCRIPT_JAIL_") && !LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES.has(name)) {
+      continue;
+    }
+    sanitized[name] = value;
+  }
+  return sanitized;
+}
 function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
   const preloads = [
     preloadPaths?.platformSpoof ?? "/usr/local/lib/script-jail/platform-spoof.cjs",
@@ -28976,6 +29004,7 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     }
   }
   const protectedNames = config2.protected.env.join(",");
+  const inheritedEnv = sanitizeLifecycleBaseEnv(baseEnv);
   if (config2.protected.env.length > MAX_PROTECTED_ENV_NAMES) {
     throw new Error(
       `SCRIPT_JAIL_PROTECTED_ENV_NAMES has ${config2.protected.env.length} entries; the LD_PRELOAD shim's static protect-list table can hold at most ${MAX_PROTECTED_ENV_NAMES} entries before silently dropping the suffix and leaking the dropped names unannotated.  Reduce the \`protected.env\` list in .script-jail.yml (or split secrets across multiple runs).`
@@ -28996,7 +29025,7 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     );
   }
   return {
-    ...baseEnv,
+    ...inheritedEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -29023,7 +29052,7 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     // NODE_OPTIONS.
     SCRIPT_JAIL_NODE_OPTIONS: childNodeOptions,
     NODE_OPTIONS: [
-      ...baseEnv["NODE_OPTIONS"] ? [baseEnv["NODE_OPTIONS"]] : [],
+      ...inheritedEnv["NODE_OPTIONS"] ? [inheritedEnv["NODE_OPTIONS"]] : [],
       ...requireFlags
     ].join(" "),
     // Redirect pnpm's content-addressed store off the rootfs (sized
