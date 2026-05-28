@@ -1,20 +1,21 @@
 // script-jail — src/action/artifact-manifest.ts
 //
-// Pinned manifest of release artifacts the action AND the macOS CLI download
-// at runtime.  See `./pre-fetch-artifacts.ts` for the Linux-action download
-// logic and `.github/workflows/release.yml` for the workflow that builds and
-// publishes the matching release assets.  PR 5 split `expected` by platform
-// so the action (Linux-only) and the macOS CLI can pin distinct asset sets
-// from one source of truth.
+// Pinned manifest of release artifacts the action AND the macOS CLI consume
+// at runtime.  See `./pre-fetch-artifacts.ts` for release-asset downloads,
+// `./backend/docker.ts` for digest-pinned GHCR image pulls, and
+// `.github/workflows/release.yml` for the workflow that builds and publishes
+// both forms.  PR 5 split `expected` by platform so the action (Linux-only)
+// and the macOS CLI can pin distinct asset sets from one source of truth.
 //
 // Manifest-update workflow:
 //
 //   1. Cut a new tag (e.g. `v0.2.0`).  The release workflow runs, builds the
-//      rootfs ext4 (per runner image + arm64 variants), libscriptjail.so /
-//      libscriptjail-arm64.so, the VZ vmlinux kernels, and the
-//      script-jail-vm-arm64-darwin Mach-O binary, uploads them to the
-//      release, and prints a SHA summary in the job's GITHUB_STEP_SUMMARY.
-//   2. Copy the SHAs from the job summary into the per-platform maps below.
+//      rootfs ext4 (per runner image + arm64 variants), Docker rootfs images,
+//      libscriptjail.so / libscriptjail-arm64.so, the VZ vmlinux kernels, and
+//      the script-jail-vm-arm64-darwin Mach-O binary, uploads/pushes them,
+//      and prints SHA/image-ref summaries in the job's GITHUB_STEP_SUMMARY.
+//   2. Copy the SHAs and Docker image refs from the job summary into the maps
+//      below.
 //   3. Bump `tag` to match the new release.
 //   4. Commit, then cut the NEXT release.
 //
@@ -41,7 +42,7 @@ import type { ArtifactManifest } from './pre-fetch-artifacts.js';
  * new release.  See the file header for the full update workflow.
  */
 export const PINNED_MANIFEST: ArtifactManifest = {
-  repo: 'brooklyn/script-jail', // update when forked
+  repo: 'Brooooooklyn/scriptjail', // update when forked
   tag: 'v0.1.0',
   expected: {
     linux: {
@@ -58,6 +59,16 @@ export const PINNED_MANIFEST: ArtifactManifest = {
       // No `script-jail-vm-x86_64-darwin` — see the file header for the
       // Intel-macOS-runner deprecation note.
       'script-jail-vm-arm64-darwin':    'PLACEHOLDER_SHA256_SCRIPT_JAIL_VM_ARM64_DARWIN',
+    },
+  },
+  dockerImages: {
+    x64: {
+      'ubuntu-22.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_22_04_X64',
+      'ubuntu-24.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_24_04_X64',
+    },
+    arm64: {
+      'ubuntu-22.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_22_04_ARM64',
+      'ubuntu-24.04': 'ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_24_04_ARM64',
     },
   },
 };

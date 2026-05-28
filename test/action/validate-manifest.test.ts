@@ -47,6 +47,16 @@ function goodManifest(): ArtifactManifest {
         'script-jail-vm-arm64-darwin': REAL_SHA_A,
       },
     },
+    dockerImages: {
+      x64: {
+        'ubuntu-22.04': `ghcr.io/brooklyn/script-jail-rootfs:ubuntu-22.04@sha256:${REAL_SHA_A}`,
+        'ubuntu-24.04': `ghcr.io/brooklyn/script-jail-rootfs:ubuntu-24.04@sha256:${REAL_SHA_B}`,
+      },
+      arm64: {
+        'ubuntu-22.04': `ghcr.io/brooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:${REAL_SHA_D}`,
+        'ubuntu-24.04': `ghcr.io/brooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:${REAL_SHA_E}`,
+      },
+    },
   };
 }
 
@@ -96,6 +106,24 @@ describe('validateManifest', () => {
       /linux\/libscriptjail\.so/,
     );
     expect(() => validateManifest(m)).toThrowError(/darwin\/vmlinux-vz-arm64/);
+  });
+
+  it('requires Docker image refs to be digest-pinned', () => {
+    const m = goodManifest();
+    (m.dockerImages!.x64 as Record<string, string>)['ubuntu-24.04'] =
+      'ghcr.io/brooklyn/script-jail-rootfs:ubuntu-24.04';
+    expect(() => validateManifest(m)).toThrowError(
+      /docker\/x64\/ubuntu-24\.04/,
+    );
+  });
+
+  it('rejects Docker placeholder digests until release publishing records real digests', () => {
+    const m = goodManifest();
+    (m.dockerImages!.arm64 as Record<string, string>)['ubuntu-22.04'] =
+      'ghcr.io/brooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_22_04_ARM64';
+    expect(() => validateManifest(m)).toThrowError(
+      /docker\/arm64\/ubuntu-22\.04/,
+    );
   });
 
   it('throws when a value is hex but the wrong length (e.g. 63 chars)', () => {

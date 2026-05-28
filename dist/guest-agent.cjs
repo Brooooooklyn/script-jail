@@ -10351,6 +10351,7 @@ __export(agent_exports, {
   LinuxVsockConnection: () => LinuxVsockConnection,
   MemoryConnection: () => MemoryConnection,
   PassThrough: () => import_node_stream.PassThrough,
+  StdioConnection: () => StdioConnection,
   buildChildEnv: () => buildChildEnv,
   createEventsFile: () => createEventsFile,
   main: () => main,
@@ -28323,6 +28324,17 @@ var MemoryConnection = class {
   close() {
   }
 };
+var StdioConnection = class {
+  readable;
+  writable;
+  constructor() {
+    this.readable = process.stdin;
+    this.writable = process.stdout;
+  }
+  close() {
+    process.stdout.end();
+  }
+};
 var LinuxSpawner = class {
   async spawn(cmd, args, opts) {
     return new Promise((resolve2, reject) => {
@@ -28812,6 +28824,7 @@ var LinuxStraceRunner = class {
     return this._rootPid;
   }
   async *run(cmd, args, opts) {
+    const commandArgs = process.env["SCRIPT_JAIL_PHASE_B_UNSHARE_NET"] === "1" ? ["unshare", "-n", "--", cmd, ...args] : [cmd, ...args];
     const straceArgs = [
       "-ff",
       "-s",
@@ -28820,8 +28833,7 @@ var LinuxStraceRunner = class {
       "trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64,unshare",
       "-o",
       opts.basePath,
-      cmd,
-      ...args
+      ...commandArgs
     ];
     const child = this._spawnImpl("strace", straceArgs, {
       cwd: opts.cwd,
@@ -28934,11 +28946,12 @@ async function waitForGo(readable) {
     });
   });
 }
-function buildChildEnv(baseEnv, config2, eventsFilePath) {
+function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
   const preloads = [
-    "/usr/local/lib/script-jail/platform-spoof.cjs",
-    "/usr/local/lib/script-jail/env-spy.cjs"
+    preloadPaths?.platformSpoof ?? "/usr/local/lib/script-jail/platform-spoof.cjs",
+    preloadPaths?.envSpy ?? "/usr/local/lib/script-jail/env-spy.cjs"
   ];
+  const nativePreload = preloadPaths?.native ?? "/lib/libscriptjail.so";
   const requireFlags = preloads.map((p) => `--require=${p}`);
   const childNodeOptions = requireFlags.join(" ");
   const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -28984,7 +28997,7 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
   }
   return {
     ...baseEnv,
-    LD_PRELOAD: "/lib/libscriptjail.so",
+    LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
     // fd 3 (SCRIPT_JAIL_LOG_FD) is closed in the lifecycle child, so the
@@ -29001,7 +29014,7 @@ function buildChildEnv(baseEnv, config2, eventsFilePath) {
     SCRIPT_JAIL_LOG_FILE: eventsFilePath,
     SCRIPT_JAIL_LOG_FD: String(config2.log_fd),
     SCRIPT_JAIL_PROTECTED_ENV_NAMES: protectedNames,
-    SCRIPT_JAIL_PRELOAD_PATH: "/lib/libscriptjail.so",
+    SCRIPT_JAIL_PRELOAD_PATH: nativePreload,
     SCRIPT_JAIL_SPOOF_PLATFORM: config2.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config2.spoof.arch,
     // Canonical sticky value the Rust shim's `shim_init` captures into
@@ -29119,7 +29132,7 @@ async function main(input) {
     return;
   }
   const eventsFilePath = eventsFile.path;
-  const childEnv = buildChildEnv(process.env, config2, eventsFilePath);
+  const childEnv = buildChildEnv(process.env, config2, eventsFilePath, input.preloadPaths);
   const spawner = input.spawner ?? new LinuxSpawner();
   const straceRunner = input.strace ?? new LinuxStraceRunner(void 0, eventsFile);
   const attribution = new Attribution(new LinuxProcReader());
@@ -29149,30 +29162,35 @@ ${fetchResult.stderr}
     flushAndExit(input.connection.writable, 1);
     return;
   }
-  try {
-    if (input.dropEth0) {
-      await input.dropEth0();
-    } else {
-      await defaultDropEth0(spawner, childEnv);
+  const phaseBUsesUnshareNet = process.env["SCRIPT_JAIL_PHASE_B_UNSHARE_NET"] === "1";
+  if (!phaseBUsesUnshareNet) {
+    try {
+      if (input.dropEth0) {
+        await input.dropEth0();
+      } else {
+        await defaultDropEth0(spawner, childEnv);
+      }
+    } catch (err) {
+      emitter.emitError(
+        `script-jail agent: failed to drop eth0 from inside the guest: ${String(err)}`,
+        false
+      );
     }
-  } catch (err) {
-    emitter.emitError(
-      `script-jail agent: failed to drop eth0 from inside the guest: ${String(err)}`,
-      false
-    );
   }
-  const lookupFn = input.dnsLookup ?? import_node_dns.lookup;
-  const offline = await verifyOfflineWithTimeout(
-    lookupFn,
-    input.verifyOfflineTimeoutMs
-  );
-  if (!offline) {
-    emitter.emitError(
-      "Phase B aborted: DNS still resolves after dropping eth0 \u2014 network was not disabled, audit results would be unreliable.",
-      true
+  if (!phaseBUsesUnshareNet) {
+    const lookupFn = input.dnsLookup ?? import_node_dns.lookup;
+    const offline = await verifyOfflineWithTimeout(
+      lookupFn,
+      input.verifyOfflineTimeoutMs
     );
-    flushAndExit(input.connection.writable, 1);
-    return;
+    if (!offline) {
+      emitter.emitError(
+        "Phase B aborted: DNS still resolves after dropping eth0 \u2014 network was not disabled, audit results would be unreliable.",
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
   }
   const collectedEvents = [];
   const collectingEmitter = new Emitter(
@@ -29284,16 +29302,37 @@ ${fetchResult.stderr}
 var isMain = typeof process.argv[1] === "string" && (process.argv[1].endsWith("agent.js") || process.argv[1].endsWith("agent.cjs") || process.argv[1].endsWith("agent.ts"));
 if (isMain) {
   process.stderr.write("[agent] start: pid=" + process.pid + " node=" + process.version + " argv1=" + String(process.argv[1]) + "\n");
-  LinuxVsockConnection.listen(10243).then((conn) => {
-    process.stderr.write("[agent] vsock peer connected, entering main()\n");
-    return main({ connection: conn });
-  }).then(() => {
-    process.stderr.write("[agent] main() resolved cleanly\n");
-  }).catch((err) => {
-    const msg = err instanceof Error ? err.stack ?? err.message : String(err);
-    process.stderr.write("[agent] FATAL: " + msg + "\n");
-    process.exit(1);
+  const runMain = (conn) => main({
+    connection: conn,
+    ...process.env["SCRIPT_JAIL_CONFIG_PATH"] !== void 0 ? { configPath: process.env["SCRIPT_JAIL_CONFIG_PATH"] } : {},
+    ...process.env["SCRIPT_JAIL_NATIVE_PRELOAD_PATH"] !== void 0 || process.env["SCRIPT_JAIL_PLATFORM_PRELOAD_PATH"] !== void 0 || process.env["SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH"] !== void 0 ? {
+      preloadPaths: {
+        native: process.env["SCRIPT_JAIL_NATIVE_PRELOAD_PATH"] ?? "/lib/libscriptjail.so",
+        platformSpoof: process.env["SCRIPT_JAIL_PLATFORM_PRELOAD_PATH"] ?? "/usr/local/lib/script-jail/platform-spoof.cjs",
+        envSpy: process.env["SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH"] ?? "/usr/local/lib/script-jail/env-spy.cjs"
+      }
+    } : {}
   });
+  if (process.env["SCRIPT_JAIL_CONNECTION"] === "stdio") {
+    runMain(new StdioConnection()).then(() => {
+      process.stderr.write("[agent] main() resolved cleanly\n");
+    }).catch((err) => {
+      const msg = err instanceof Error ? err.stack ?? err.message : String(err);
+      process.stderr.write("[agent] FATAL: " + msg + "\n");
+      process.exit(1);
+    });
+  } else {
+    LinuxVsockConnection.listen(10243).then((conn) => {
+      process.stderr.write("[agent] vsock peer connected, entering main()\n");
+      return runMain(conn);
+    }).then(() => {
+      process.stderr.write("[agent] main() resolved cleanly\n");
+    }).catch((err) => {
+      const msg = err instanceof Error ? err.stack ?? err.message : String(err);
+      process.stderr.write("[agent] FATAL: " + msg + "\n");
+      process.exit(1);
+    });
+  }
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
@@ -29302,6 +29341,7 @@ if (isMain) {
   LinuxVsockConnection,
   MemoryConnection,
   PassThrough,
+  StdioConnection,
   buildChildEnv,
   createEventsFile,
   main,

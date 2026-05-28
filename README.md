@@ -1,18 +1,18 @@
 # script-jail
 
-Firecracker-sandboxed audit of package-manager lifecycle scripts. Designed to make the kind of supply-chain attacks that hit `chalk`/`debug` (Sep 2025) and Shai-Hulud (Nov 2025) visible at PR-review time.
+Backend-isolated audit of package-manager lifecycle scripts. Designed to make the kind of supply-chain attacks that hit `chalk`/`debug` (Sep 2025) and Shai-Hulud (Nov 2025) visible at PR-review time.
 
 ## What it does
 
-When `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock` changes, the GitHub Action re-runs the install inside a Firecracker microVM with a minimal rootfs (no `gcc`, no `python`, no `$HOME`, no credentials). Inside the VM, `strace` + a tiny `LD_PRELOAD` shim record every file read/write that escapes a package's own directory, every env-var the install reads, every `execve` attempt, every `dlopen` attempt, and every network connection. The result is a deterministic, human-readable `.script-jail.lock.yml` that's diffed against the committed copy — when the audit changes, the PR fails with a unified diff.
+When `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock` changes, the GitHub Action re-runs the install through an isolated Linux backend. `backend: auto` tries Firecracker first, then Docker, then a bare Linux executor. Each path uses the same guest agent, `strace`, and `LD_PRELOAD` shim to record file reads/writes outside a package's own directory, protected env-var reads, `execve`, `dlopen`, and network attempts. The result is a deterministic, human-readable `.script-jail.lock.yml` that's diffed against the committed copy — when the audit changes, the PR fails with a unified diff.
 
 ## Status
 
 Pre-alpha. Project skeleton only. See [the design plan](./docs/design.md) (TODO) for details.
 
-## Why a microVM
+## Why an isolated backend
 
-A pure-JS install sandbox can't close every gap: bun ignores `NODE_OPTIONS=--require`, `dlopen`/`execve` reach the kernel before any JS hook, and libuv-backed env reads sidestep a `process.env` Proxy. The kernel is the only honest boundary.
+A pure-JS install sandbox can't close every gap: bun ignores `NODE_OPTIONS=--require`, `dlopen`/`execve` reach the kernel before any JS hook, and libuv-backed env reads sidestep a `process.env` Proxy. The audit has to observe below JavaScript. Firecracker remains the strongest Linux backend, while Docker and bare mode keep the same syscall/preload audit usable on runners without KVM.
 
 ## Generating the lockfile locally on macOS
 

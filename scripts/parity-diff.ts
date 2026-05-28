@@ -70,7 +70,7 @@ const PARITY_ONLY_ENV_READS = new Set([
 
 const PARITY_ONLY_NETWORK_ATTEMPTS = new Set([
   // Apple Virtualization.framework NAT resolver observed in local arm64 VZ
-  // lockfiles. Linux Firecracker sees public resolvers instead.
+  // lockfiles. Linux action backends see public resolvers instead.
   '<BLOCKED> connect 192.168.64.1:53',
 ]);
 

@@ -1,34 +1,34 @@
 # script-jail — .github/workflows/release.yml
 #
 # Release pipeline: on every `v*.*.*` tag push, build the per-runner rootfs
-# ext4 images, the libscriptjail.so Rust shim, and the action bundle, then
-# attach them as release assets.
+# ext4 images, the Docker rootfs images, the libscriptjail.so Rust shim, and
+# the action bundle, then publish the artifacts.
 #
 # Why this exists:
-#   The action consumes the rootfs + .so at runtime via
+#   Firecracker/bare backends consume the rootfs + .so via
 #   `src/action/pre-fetch-artifacts.ts`, which downloads from
 #   https://github.com/<repo>/releases/download/<tag>/<asset> and verifies
 #   each file against a pinned SHA-256 in src/action/artifact-manifest.ts.
-#   This workflow produces those assets.
+#   The Docker backend consumes digest-pinned GHCR images from the same
+#   manifest. This workflow produces both forms.
 #
 # Bootstrap caveat:
 #   The first release tagged on a fresh fork will produce real SHAs that do
 #   NOT match the placeholders in src/action/artifact-manifest.ts.  The
-#   workflow prints the real SHAs in its step summary; copy them into the
-#   manifest and cut the NEXT tag.  From the second release onward, the
-#   manifest matches each tag's assets and the action's pre-fetch step
-#   succeeds.
+#   workflow prints the real SHAs and Docker image refs in its step summary;
+#   copy them into the manifest and cut the NEXT tag.  From the second release
+#   onward, the manifest matches each tag's assets and image refs.
 #
 # Supply-chain hardening:
-#   We split into two jobs so the GITHUB_TOKEN with contents:write only
-#   exists during the final upload step:
+#   We split into two jobs so the GITHUB_TOKEN with write scopes only exists
+#   during the final publish step:
 #     - `build` runs install / typecheck / test / build with the
 #       default-read token AND `persist-credentials: false`, so a malicious
 #       dependency lifecycle script cannot write to the repo or its
 #       releases via the runner's git credentials.
-#     - `publish` is a minimal job that only downloads the build artifacts
-#       and uploads them via softprops/action-gh-release@v3.  Only this
-#       job carries contents:write.
+#     - `publish` is a minimal job that only downloads verified build
+#       artifacts, pushes GHCR images, and uploads release assets. Only this
+#       job carries contents:write/packages:write.
 
 name: release
 
@@ -269,6 +269,13 @@ jobs:
       - name: Build rootfs (ubuntu-24.04, arm64)
         run: pnpm build -- --runner-image=ubuntu-24.04 --arch=arm64 --skip-bundle --skip-shim
 
+      # The arm64 rootfs build stages libscriptjail-arm64.so to the canonical
+      # images/libscriptjail.so path because Dockerfile.base has one COPY
+      # target. Restore the x64 shim before computing/uploading the Linux
+      # action artifact.
+      - name: Restore x64 shim artifact
+        run: cp target/release/libscriptjail.so images/libscriptjail.so
+
       # PR 5: build the two VZ kernels.  Pinned upstream version + per-arch
       # config; see images/kernel/build.sh for the full pipeline.
       - name: Build vmlinux-vz (x86_64)
@@ -361,21 +368,25 @@ jobs:
             images/vmlinux-vz-x86_64
             images/vmlinux-vz-arm64
             dist/main.cjs
+            dist/guest-agent.cjs
             dist/cli.cjs
+            dist/preloads/*.cjs
           if-no-files-found: error
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # publish — minimal job that ONLY has contents:write, downloads the assets
-  # the build job produced, and uploads them to the release.  No install,
-  # no test runs — nothing that executes third-party code.
+  # publish — minimal job that has release/package write scopes, downloads the
+  # build job artifacts, verifies them, publishes Docker rootfs images, and
+  # uploads the release assets. No install, no test runs — nothing that
+  # executes third-party dependency code.
   # ---------------------------------------------------------------------------
   publish:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
     permissions:
       contents: write
+      packages: write
 
     steps:
       # Re-checkout the tagged source on a separate runner whose filesystem
@@ -422,6 +433,116 @@ jobs:
             --dir artifacts \
             --dist-source dist/main.cjs \
             --dist-cli-source dist/cli.cjs
+
+      - name: Verify Docker runtime JS artifacts
+        run: |
+          set -euo pipefail
+          cmp -s artifacts/dist/guest-agent.cjs dist/guest-agent.cjs
+          cmp -s artifacts/dist/preloads/platform-spoof.cjs dist/preloads/platform-spoof.cjs
+          cmp -s artifacts/dist/preloads/env-spy.cjs dist/preloads/env-spy.cjs
+          cmp -s artifacts/dist/preloads/dlopen-block.cjs dist/preloads/dlopen-block.cjs
+
+      - name: Register QEMU binfmt handlers (for linux/arm64 Docker publish)
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish Docker rootfs images
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/preloads images
+          cp artifacts/dist/guest-agent.cjs dist/guest-agent.cjs
+          cp artifacts/dist/preloads/*.cjs dist/preloads/
+
+          vp_version="$(sed -nE "s/^export const VITE_PLUS_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          node_version="$(sed -nE "s/^export const NODE_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          vp_sha_x64="$(sed -nE "s/^[[:space:]]*x64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          vp_sha_arm64="$(sed -nE "s/^[[:space:]]*arm64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner_lc}/script-jail-rootfs"
+          : > docker-image-refs.txt
+
+          if [ -z "${vp_version}" ] || [ -z "${node_version}" ] || [ -z "${vp_sha_x64}" ] || [ -z "${vp_sha_arm64}" ]; then
+            echo "failed to parse src/rootfs/vite-plus.ts" >&2
+            exit 1
+          fi
+
+          build_one() {
+            local runner_image="$1"
+            local ubuntu_major="$2"
+            local arch="$3"
+            local platform="$4"
+            local vp_sha="$5"
+            local tag="$6"
+            local metadata
+            local digest
+            metadata="$(mktemp)"
+
+            docker buildx build \
+              --platform="${platform}" \
+              --push \
+              --metadata-file="${metadata}" \
+              --build-arg "UBUNTU_MAJOR=${ubuntu_major}" \
+              --build-arg "VP_VERSION=${vp_version}" \
+              --build-arg "VP_ARCH=${arch}" \
+              --build-arg "VP_SHA256=${vp_sha}" \
+              --build-arg "NODE_VERSION=${node_version}" \
+              -f src/rootfs/Dockerfile.base \
+              -t "${image}:${tag}" \
+              -t "${image}:${tag}-${{ github.ref_name }}" \
+              .
+
+            digest="$(jq -r '."containerimage.digest"' "${metadata}")"
+            if [ -z "${digest}" ] || [ "${digest}" = "null" ]; then
+              echo "docker buildx did not report a digest for ${tag}" >&2
+              exit 1
+            fi
+            printf '%s=%s@%s\n' "${runner_image}_${arch}" "${image}:${tag}" "${digest}" >> docker-image-refs.txt
+          }
+
+          cp artifacts/images/libscriptjail.so images/libscriptjail.so
+          build_one ubuntu-22.04 22.04 x64 linux/amd64 "${vp_sha_x64}" ubuntu-22.04
+          build_one ubuntu-24.04 24.04 x64 linux/amd64 "${vp_sha_x64}" ubuntu-24.04
+
+          cp artifacts/images/libscriptjail-arm64.so images/libscriptjail.so
+          build_one ubuntu-22.04 22.04 arm64 linux/arm64 "${vp_sha_arm64}" ubuntu-22.04-arm64
+          build_one ubuntu-24.04 24.04 arm64 linux/arm64 "${vp_sha_arm64}" ubuntu-24.04-arm64
+
+          linux_22="$(sed -n 's/^ubuntu-22.04_x64=//p' docker-image-refs.txt)"
+          linux_24="$(sed -n 's/^ubuntu-24.04_x64=//p' docker-image-refs.txt)"
+          arm64_22="$(sed -n 's/^ubuntu-22.04_arm64=//p' docker-image-refs.txt)"
+          arm64_24="$(sed -n 's/^ubuntu-24.04_arm64=//p' docker-image-refs.txt)"
+
+          {
+            echo
+            echo "## Docker image refs"
+            echo
+            echo "Update \`src/action/artifact-manifest.ts\` \`dockerImages\` with:"
+            echo
+            echo '```ts'
+            echo "  dockerImages: {"
+            echo "    x64: {"
+            echo "      'ubuntu-22.04': '${linux_22}',"
+            echo "      'ubuntu-24.04': '${linux_24}',"
+            echo "    },"
+            echo "    arm64: {"
+            echo "      'ubuntu-22.04': '${arm64_22}',"
+            echo "      'ubuntu-24.04': '${arm64_24}',"
+            echo "    },"
+            echo "  },"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # softprops/action-gh-release@v3 auto-creates the release for the tag
       # (or appends to an existing one) and uploads each listed file.  We pin

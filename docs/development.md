@@ -41,12 +41,13 @@ Tagged releases (`release.yml`) bundle:
 - `dist/` JS artifacts.
 - `libscriptjail.so` (Rust shim binary; built with the toolchain pinned in `rust-toolchain.toml`).
 - The per-runner-image rootfs (ext4).
-- A manifest pinning Firecracker, kernel, and rootfs SHAs.
+- Digest-pinned Docker rootfs images in GHCR.
+- A manifest pinning Firecracker, kernel, rootfs SHAs, and Docker image refs.
 
 When bumping any pinned artifact:
 
 1. Update the URL/SHA in `src/action/artifact-manifest.ts`.
-2. Run `scripts/validate-manifest.ts` to confirm hashes match.
+2. Run `scripts/validate-manifest.ts` to confirm hashes/image refs match.
 3. Rebuild affected artifacts and let `release.yml` publish them.
 4. Bump the version tag.
 

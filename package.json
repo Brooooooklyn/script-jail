@@ -1,7 +1,7 @@
 {
   "name": "script-jail",
   "version": "0.0.0",
-  "description": "Firecracker-sandboxed install auditor for npm/pnpm/yarn lifecycle scripts.",
+  "description": "Backend-isolated install auditor for npm/pnpm/yarn lifecycle scripts.",
   "type": "module",
   "license": "MIT",
   "packageManager": "pnpm@11.1.2",

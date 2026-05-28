@@ -212,6 +212,20 @@ export class MemoryConnection implements Connection {
   }
 }
 
+export class StdioConnection implements Connection {
+  readonly readable: Readable;
+  readonly writable: Writable;
+
+  constructor() {
+    this.readable = process.stdin;
+    this.writable = process.stdout;
+  }
+
+  close(): void {
+    process.stdout.end();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Production Spawner (Phase A only)
 // ---------------------------------------------------------------------------
@@ -1258,13 +1272,15 @@ export class LinuxStraceRunner implements StraceRunner {
     // our dirfdTable would have kept the stale entry indefinitely
     // without tracking the CLOEXEC bit + sweeping on exec.  Also catches
     // F_SETFD FD_CLOEXEC mutations on previously-non-CLOEXEC fds.
+    const commandArgs = process.env['SCRIPT_JAIL_PHASE_B_UNSHARE_NET'] === '1'
+      ? ['unshare', '-n', '--', cmd, ...args]
+      : [cmd, ...args];
     const straceArgs = [
       '-ff',
       '-s', '4096',
       '-e', 'trace=open,openat,openat2,creat,execve,execveat,connect,readlinkat,statx,renameat2,unlinkat,faccessat2,chdir,fchdir,clone,clone3,vfork,fork,dup,dup2,dup3,close,close_range,fcntl,fcntl64,unshare',
       '-o', opts.basePath,
-      cmd,
-      ...args,
+      ...commandArgs,
     ];
 
     const child = this._spawnImpl('strace', straceArgs, {
@@ -1479,11 +1495,13 @@ export function buildChildEnv(
   baseEnv: NodeJS.ProcessEnv,
   config: AgentConfig,
   eventsFilePath: string,
+  preloadPaths?: AgentInput['preloadPaths'],
 ): NodeJS.ProcessEnv {
   const preloads = [
-    '/usr/local/lib/script-jail/platform-spoof.cjs',
-    '/usr/local/lib/script-jail/env-spy.cjs',
+    preloadPaths?.platformSpoof ?? '/usr/local/lib/script-jail/platform-spoof.cjs',
+    preloadPaths?.envSpy ?? '/usr/local/lib/script-jail/env-spy.cjs',
   ];
+  const nativePreload = preloadPaths?.native ?? '/lib/libscriptjail.so';
 
   // Native addons and child_process internals are intentionally allowed. The
   // microVM plus strace/LD_PRELOAD layer records their file, env, network, and
@@ -1636,7 +1654,7 @@ export function buildChildEnv(
 
   return {
     ...baseEnv,
-    LD_PRELOAD: '/lib/libscriptjail.so',
+    LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
     // fd 3 (SCRIPT_JAIL_LOG_FD) is closed in the lifecycle child, so the
@@ -1653,7 +1671,7 @@ export function buildChildEnv(
     SCRIPT_JAIL_LOG_FILE: eventsFilePath,
     SCRIPT_JAIL_LOG_FD: String(config.log_fd),
     SCRIPT_JAIL_PROTECTED_ENV_NAMES: protectedNames,
-    SCRIPT_JAIL_PRELOAD_PATH: '/lib/libscriptjail.so',
+    SCRIPT_JAIL_PRELOAD_PATH: nativePreload,
     SCRIPT_JAIL_SPOOF_PLATFORM: config.spoof.platform,
     SCRIPT_JAIL_SPOOF_ARCH: config.spoof.arch,
     // Canonical sticky value the Rust shim's `shim_init` captures into
@@ -1830,6 +1848,11 @@ export type DnsLookupFn = (
 export interface AgentInput {
   configPath?: string;
   connection: Connection;
+  preloadPaths?: {
+    native: string;
+    platformSpoof: string;
+    envSpy: string;
+  };
   /** Used for Phase A (fetch) only. Defaults to LinuxSpawner. */
   spawner?: Spawner;
   /** Used for Phase B (install under strace). Defaults to LinuxStraceRunner. */
@@ -2034,7 +2057,7 @@ export async function main(input: AgentInput): Promise<void> {
   const eventsFilePath = eventsFile.path;
 
   // 5. Build child environment
-  const childEnv = buildChildEnv(process.env, config, eventsFilePath);
+  const childEnv = buildChildEnv(process.env, config, eventsFilePath, input.preloadPaths);
 
   // 6. Set up spawner (Phase A) and strace runner (Phase B)
   const spawner: Spawner = input.spawner ?? new LinuxSpawner();
@@ -2078,6 +2101,8 @@ export async function main(input: AgentInput): Promise<void> {
     return;
   }
 
+  const phaseBUsesUnshareNet = process.env['SCRIPT_JAIL_PHASE_B_UNSHARE_NET'] === '1';
+
   // 9b. Before verifying offline, drop the eth0 interface from inside the
   //     guest.  We use guest-side control because Firecracker's host-side
   //     rate-limiter API treats `size: 0` as "rate limiter disabled" (i.e.
@@ -2088,17 +2113,19 @@ export async function main(input: AgentInput): Promise<void> {
   //     Failure here (e.g. no eth0 interface on a Phase B-only test rig) is
   //     surfaced as a non-fatal error frame but we continue: the DNS probe
   //     immediately below is the real gate.
-  try {
-    if (input.dropEth0) {
-      await input.dropEth0();
-    } else {
-      await defaultDropEth0(spawner, childEnv);
+  if (!phaseBUsesUnshareNet) {
+    try {
+      if (input.dropEth0) {
+        await input.dropEth0();
+      } else {
+        await defaultDropEth0(spawner, childEnv);
+      }
+    } catch (err) {
+      emitter.emitError(
+        `script-jail agent: failed to drop eth0 from inside the guest: ${String(err)}`,
+        false,
+      );
     }
-  } catch (err) {
-    emitter.emitError(
-      `script-jail agent: failed to drop eth0 from inside the guest: ${String(err)}`,
-      false,
-    );
   }
 
   // 9c. Sanity check: confirm the interface drop actually killed network
@@ -2111,19 +2138,21 @@ export async function main(input: AgentInput): Promise<void> {
   //     We `return` after `process.exit(1)` so tests that stub out
   //     `process.exit` don't fall through to Phase B; in production
   //     `process.exit` terminates the process and the return is unreached.
-  const lookupFn: DnsLookupFn = input.dnsLookup ?? dnsLookup;
-  const offline = await verifyOfflineWithTimeout(
-    lookupFn,
-    input.verifyOfflineTimeoutMs,
-  );
-  if (!offline) {
-    emitter.emitError(
-      'Phase B aborted: DNS still resolves after dropping eth0 — ' +
-        'network was not disabled, audit results would be unreliable.',
-      true,
+  if (!phaseBUsesUnshareNet) {
+    const lookupFn: DnsLookupFn = input.dnsLookup ?? dnsLookup;
+    const offline = await verifyOfflineWithTimeout(
+      lookupFn,
+      input.verifyOfflineTimeoutMs,
     );
-    flushAndExit(input.connection.writable, 1);
-    return;
+    if (!offline) {
+      emitter.emitError(
+        'Phase B aborted: DNS still resolves after dropping eth0 — ' +
+          'network was not disabled, audit results would be unreliable.',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
   }
 
   // 10. Phase B: install (network off, under strace, StraceRunner owns the process)
@@ -2363,6 +2392,37 @@ if (isMain) {
   // loop to time out with the same generic FATAL.
   process.stderr.write('[agent] start: pid=' + process.pid + ' node=' + process.version + ' argv1=' + String(process.argv[1]) + '\n');
 
+  const runMain = (conn: Connection): Promise<void> =>
+    main({
+      connection: conn,
+      ...(process.env['SCRIPT_JAIL_CONFIG_PATH'] !== undefined
+        ? { configPath: process.env['SCRIPT_JAIL_CONFIG_PATH'] }
+        : {}),
+      ...(process.env['SCRIPT_JAIL_NATIVE_PRELOAD_PATH'] !== undefined ||
+        process.env['SCRIPT_JAIL_PLATFORM_PRELOAD_PATH'] !== undefined ||
+        process.env['SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH'] !== undefined
+        ? {
+            preloadPaths: {
+              native: process.env['SCRIPT_JAIL_NATIVE_PRELOAD_PATH'] ?? '/lib/libscriptjail.so',
+              platformSpoof: process.env['SCRIPT_JAIL_PLATFORM_PRELOAD_PATH'] ?? '/usr/local/lib/script-jail/platform-spoof.cjs',
+              envSpy: process.env['SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH'] ?? '/usr/local/lib/script-jail/env-spy.cjs',
+            },
+          }
+        : {}),
+    });
+
+  if (process.env['SCRIPT_JAIL_CONNECTION'] === 'stdio') {
+    runMain(new StdioConnection())
+      .then(() => {
+        process.stderr.write('[agent] main() resolved cleanly\n');
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+        process.stderr.write('[agent] FATAL: ' + msg + '\n');
+        process.exit(1);
+      });
+  } else {
+
   // Production: `nodeVersion` is intentionally omitted from main()'s input so
   // the renderer captures `process.version` of the running interpreter — which
   // is the Linux Node toolchain `vp env install` downloaded at guest boot
@@ -2375,7 +2435,7 @@ if (isMain) {
   LinuxVsockConnection.listen(10243)
     .then((conn) => {
       process.stderr.write('[agent] vsock peer connected, entering main()\n');
-      return main({ connection: conn });
+      return runMain(conn);
     })
     .then(() => {
       process.stderr.write('[agent] main() resolved cleanly\n');
@@ -2389,6 +2449,7 @@ if (isMain) {
       process.stderr.write('[agent] FATAL: ' + msg + '\n');
       process.exit(1);
     });
+  }
 }
 
 // Re-export PassThrough for use in tests if needed.

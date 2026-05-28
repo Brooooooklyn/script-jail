@@ -3,8 +3,8 @@
 The parity workflow (`.github/workflows/parity-test.yml`) verifies that the
 `.script-jail.lock.yml` produced by:
 
-- **Linux** running the action under real Firecracker on `ubuntu-24.04-arm`
-  (arm64 guest), and
+- **Linux** running the action backend on `ubuntu-24.04-arm`
+  (`backend: auto`, normally Docker on hosted runners), and
 - **macOS** running the CLI under real Virtualization.framework (arm64 guest)
 
 are byte-equal — modulo the canonicalised volatile fields (`generated_at`,
@@ -57,10 +57,10 @@ The fixture choice deliberately stresses the pieces most likely to diverge:
                      │   repo + sha + tag + pm
         ┌────────────┼──────────────────────┐
         ▼            ▼                      ▼
-  linux-firecracker        committed macos-arm64-vz lockfile
+  linux-backend            committed macos-arm64-vz lockfile
   (real action +           (generated locally on bare-metal
-   arm64 Firecracker        Apple Silicon; nested VZ cannot
-   on ubuntu-24.04-arm)     run on GitHub-hosted macOS)
+   auto backend on          Apple Silicon; nested VZ cannot
+   ubuntu-24.04-arm)        run on GitHub-hosted macOS)
         │                          │
         └────────────┬─────────────┘
                  ▼
@@ -71,10 +71,11 @@ The fixture choice deliberately stresses the pieces most likely to diverge:
 
 Each platform job runs the same code path a real consumer would:
 
-- **Linux** runs on `ubuntu-24.04-arm`, sets up Firecracker the same way
-  `e2e.yml` does (chmod `/dev/kvm`, create `tap0`, enable NAT), builds the
-  arm64 rootfs, and invokes the action by setting `INPUT_*` env vars and
-  running `node dist/main.cjs`.
+- **Linux** runs on `ubuntu-24.04-arm`, builds the action bundle plus arm64
+  rootfs/Docker image, and invokes the action by setting `INPUT_*` env vars
+  and running `node dist/main.cjs`. Hosted arm64 runners do not expose KVM, so
+  `backend: auto` normally selects Docker after the Firecracker availability
+  check fails.
 - **macOS** is committed rather than generated in CI. A maintainer runs the
   CLI's `update` subcommand locally on bare-metal Apple Silicon and commits
   `test/parity/macos-arm64-lockfile.yml`.
@@ -159,10 +160,9 @@ gh api repos/vuejs/core/git/refs/tags/<tag> | jq -r '.object.sha'
   this workflow. Intel parity would catch a different bug class
   (Rosetta-equivalent native exec) that the arm64 path filters out via
   package-selection.
-- **The workflow depends on KVM on the arm runner** — `ubuntu-24.04-arm`
-  gives the right CPU architecture, but Firecracker still requires `/dev/kvm`.
-  The workflow probes it explicitly and fails with a clear error if the runner
-  image changes.
+- **The workflow no longer depends on KVM on the arm runner** —
+  `ubuntu-24.04-arm` gives the right CPU architecture, and the backend selector
+  falls through to Docker when `/dev/kvm` is absent.
 - **No caching** — every run builds rootfs, kernel, and shim from scratch
   (~15 min upfront). Once the fixture pin and the build inputs stabilise,
   `actions/cache@v4` keys derived from `git rev-parse HEAD:images/` and

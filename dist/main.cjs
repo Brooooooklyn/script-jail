@@ -2083,9 +2083,9 @@ var require_dispatcher_base = __commonJS({
       }
       close(callback) {
         if (callback === void 0) {
-          return new Promise((resolve2, reject) => {
+          return new Promise((resolve4, reject) => {
             this.close((err, data) => {
-              return err ? reject(err) : resolve2(data);
+              return err ? reject(err) : resolve4(data);
             });
           });
         }
@@ -2123,12 +2123,12 @@ var require_dispatcher_base = __commonJS({
           err = null;
         }
         if (callback === void 0) {
-          return new Promise((resolve2, reject) => {
+          return new Promise((resolve4, reject) => {
             this.destroy(err, (err2, data) => {
               return err2 ? (
                 /* istanbul ignore next: should never error */
                 reject(err2)
-              ) : resolve2(data);
+              ) : resolve4(data);
             });
           });
         }
@@ -4395,8 +4395,8 @@ var require_util2 = __commonJS({
     function createDeferredPromise() {
       let res;
       let rej;
-      const promise2 = new Promise((resolve2, reject) => {
-        res = resolve2;
+      const promise2 = new Promise((resolve4, reject) => {
+        res = resolve4;
         rej = reject;
       });
       return { promise: promise2, resolve: res, reject: rej };
@@ -6537,12 +6537,12 @@ upgrade: ${upgrade}\r
           cb();
         }
       }
-      const waitForDrain = () => new Promise((resolve2, reject) => {
+      const waitForDrain = () => new Promise((resolve4, reject) => {
         assert2(callback === null);
         if (socket[kError]) {
           reject(socket[kError]);
         } else {
-          callback = resolve2;
+          callback = resolve4;
         }
       });
       socket.on("close", onDrain).on("drain", onDrain);
@@ -7179,12 +7179,12 @@ var require_client_h2 = __commonJS({
           cb();
         }
       }
-      const waitForDrain = () => new Promise((resolve2, reject) => {
+      const waitForDrain = () => new Promise((resolve4, reject) => {
         assert2(callback === null);
         if (socket[kError]) {
           reject(socket[kError]);
         } else {
-          callback = resolve2;
+          callback = resolve4;
         }
       });
       h2stream.on("close", onDrain).on("drain", onDrain);
@@ -7662,16 +7662,16 @@ var require_client = __commonJS({
         return this[kNeedDrain] < 2;
       }
       async [kClose]() {
-        return new Promise((resolve2) => {
+        return new Promise((resolve4) => {
           if (this[kSize]) {
-            this[kClosedResolve] = resolve2;
+            this[kClosedResolve] = resolve4;
           } else {
-            resolve2(null);
+            resolve4(null);
           }
         });
       }
       async [kDestroy](err) {
-        return new Promise((resolve2) => {
+        return new Promise((resolve4) => {
           const requests = this[kQueue].splice(this[kPendingIdx]);
           for (let i = 0; i < requests.length; i++) {
             const request = requests[i];
@@ -7682,7 +7682,7 @@ var require_client = __commonJS({
               this[kClosedResolve]();
               this[kClosedResolve] = null;
             }
-            resolve2(null);
+            resolve4(null);
           };
           if (this[kHTTPContext]) {
             this[kHTTPContext].destroy(err, callback);
@@ -7733,7 +7733,7 @@ var require_client = __commonJS({
         });
       }
       try {
-        const socket = await new Promise((resolve2, reject) => {
+        const socket = await new Promise((resolve4, reject) => {
           client[kConnector]({
             host,
             hostname: hostname3,
@@ -7745,7 +7745,7 @@ var require_client = __commonJS({
             if (err) {
               reject(err);
             } else {
-              resolve2(socket2);
+              resolve4(socket2);
             }
           });
         });
@@ -8081,8 +8081,8 @@ var require_pool_base = __commonJS({
         if (this[kQueue].isEmpty()) {
           await Promise.all(this[kClients].map((c) => c.close()));
         } else {
-          await new Promise((resolve2) => {
-            this[kClosedResolve] = resolve2;
+          await new Promise((resolve4) => {
+            this[kClosedResolve] = resolve4;
           });
         }
       }
@@ -9297,7 +9297,7 @@ var require_readable = __commonJS({
         if (this._readableState.closeEmitted) {
           return null;
         }
-        return await new Promise((resolve2, reject) => {
+        return await new Promise((resolve4, reject) => {
           if (this[kContentLength] > limit) {
             this.destroy(new AbortError());
           }
@@ -9310,7 +9310,7 @@ var require_readable = __commonJS({
             if (signal?.aborted) {
               reject(signal.reason ?? new AbortError());
             } else {
-              resolve2(null);
+              resolve4(null);
             }
           }).on("error", noop).on("data", function(chunk) {
             limit -= chunk.length;
@@ -9329,7 +9329,7 @@ var require_readable = __commonJS({
     }
     async function consume(stream, type) {
       assert2(!stream[kConsume]);
-      return new Promise((resolve2, reject) => {
+      return new Promise((resolve4, reject) => {
         if (isUnusable(stream)) {
           const rState = stream._readableState;
           if (rState.destroyed && rState.closeEmitted === false) {
@@ -9346,7 +9346,7 @@ var require_readable = __commonJS({
             stream[kConsume] = {
               type,
               stream,
-              resolve: resolve2,
+              resolve: resolve4,
               reject,
               length: 0,
               body: []
@@ -9416,18 +9416,18 @@ var require_readable = __commonJS({
       return buffer;
     }
     function consumeEnd(consume2) {
-      const { type, body, resolve: resolve2, stream, length } = consume2;
+      const { type, body, resolve: resolve4, stream, length } = consume2;
       try {
         if (type === "text") {
-          resolve2(chunksDecode(body, length));
+          resolve4(chunksDecode(body, length));
         } else if (type === "json") {
-          resolve2(JSON.parse(chunksDecode(body, length)));
+          resolve4(JSON.parse(chunksDecode(body, length)));
         } else if (type === "arrayBuffer") {
-          resolve2(chunksConcat(body, length).buffer);
+          resolve4(chunksConcat(body, length).buffer);
         } else if (type === "blob") {
-          resolve2(new Blob(body, { type: stream[kContentType] }));
+          resolve4(new Blob(body, { type: stream[kContentType] }));
         } else if (type === "bytes") {
-          resolve2(chunksConcat(body, length));
+          resolve4(chunksConcat(body, length));
         }
         consumeFinish(consume2);
       } catch (err) {
@@ -9684,9 +9684,9 @@ var require_api_request = __commonJS({
     };
     function request(opts, callback) {
       if (callback === void 0) {
-        return new Promise((resolve2, reject) => {
+        return new Promise((resolve4, reject) => {
           request.call(this, opts, (err, data) => {
-            return err ? reject(err) : resolve2(data);
+            return err ? reject(err) : resolve4(data);
           });
         });
       }
@@ -9909,9 +9909,9 @@ var require_api_stream = __commonJS({
     };
     function stream(opts, factory, callback) {
       if (callback === void 0) {
-        return new Promise((resolve2, reject) => {
+        return new Promise((resolve4, reject) => {
           stream.call(this, opts, factory, (err, data) => {
-            return err ? reject(err) : resolve2(data);
+            return err ? reject(err) : resolve4(data);
           });
         });
       }
@@ -10196,9 +10196,9 @@ var require_api_upgrade = __commonJS({
     };
     function upgrade(opts, callback) {
       if (callback === void 0) {
-        return new Promise((resolve2, reject) => {
+        return new Promise((resolve4, reject) => {
           upgrade.call(this, opts, (err, data) => {
-            return err ? reject(err) : resolve2(data);
+            return err ? reject(err) : resolve4(data);
           });
         });
       }
@@ -10290,9 +10290,9 @@ var require_api_connect = __commonJS({
     };
     function connect(opts, callback) {
       if (callback === void 0) {
-        return new Promise((resolve2, reject) => {
+        return new Promise((resolve4, reject) => {
           connect.call(this, opts, (err, data) => {
-            return err ? reject(err) : resolve2(data);
+            return err ? reject(err) : resolve4(data);
           });
         });
       }
@@ -14154,7 +14154,7 @@ var require_fetch = __commonJS({
       function dispatch({ body }) {
         const url2 = requestCurrentURL(request);
         const agent = fetchParams.controller.dispatcher;
-        return new Promise((resolve2, reject) => agent.dispatch(
+        return new Promise((resolve4, reject) => agent.dispatch(
           {
             path: url2.pathname + url2.search,
             origin: url2.origin,
@@ -14230,7 +14230,7 @@ var require_fetch = __commonJS({
                 }
               }
               const onError = this.onError.bind(this);
-              resolve2({
+              resolve4({
                 status,
                 statusText,
                 headersList,
@@ -14276,7 +14276,7 @@ var require_fetch = __commonJS({
               for (let i = 0; i < rawHeaders.length; i += 2) {
                 headersList.append(bufferToLowerCasedHeaderName(rawHeaders[i]), rawHeaders[i + 1].toString("latin1"), true);
               }
-              resolve2({
+              resolve4({
                 status,
                 statusText: STATUS_CODES[status],
                 headersList,
@@ -17952,8 +17952,8 @@ var require_util8 = __commonJS({
       return true;
     }
     function delay(ms) {
-      return new Promise((resolve2) => {
-        setTimeout(resolve2, ms).unref();
+      return new Promise((resolve4) => {
+        setTimeout(resolve4, ms).unref();
       });
     }
     module2.exports = {
@@ -26117,11 +26117,11 @@ var import_os = require("os");
 var import_fs = require("fs");
 var __awaiter = function(thisArg, _arguments, P, generator) {
   function adopt(value) {
-    return value instanceof P ? value : new P(function(resolve2) {
-      resolve2(value);
+    return value instanceof P ? value : new P(function(resolve4) {
+      resolve4(value);
     });
   }
-  return new (P || (P = Promise))(function(resolve2, reject) {
+  return new (P || (P = Promise))(function(resolve4, reject) {
     function fulfilled(value) {
       try {
         step(generator.next(value));
@@ -26137,7 +26137,7 @@ var __awaiter = function(thisArg, _arguments, P, generator) {
       }
     }
     function step(result) {
-      result.done ? resolve2(result.value) : adopt(result.value).then(fulfilled, rejected);
+      result.done ? resolve4(result.value) : adopt(result.value).then(fulfilled, rejected);
     }
     step((generator = generator.apply(thisArg, _arguments || [])).next());
   });
@@ -26428,16 +26428,16 @@ function setOutput(name, value) {
 }
 
 // src/main.ts
-var import_node_fs12 = require("node:fs");
-var import_node_os4 = require("node:os");
-var import_node_path9 = require("node:path");
-var import_node_crypto5 = require("node:crypto");
+var import_node_fs15 = require("node:fs");
+var import_node_os5 = require("node:os");
+var import_node_path12 = require("node:path");
 
 // src/action/inputs.ts
 var import_node_path = require("node:path");
 var VALID_PLATFORMS = /* @__PURE__ */ new Set(["linux", "darwin", "win32"]);
 var VALID_ARCHES = /* @__PURE__ */ new Set(["x64", "arm64"]);
 var VALID_MODES = /* @__PURE__ */ new Set(["check", "update"]);
+var VALID_BACKENDS = /* @__PURE__ */ new Set(["auto", "firecracker", "docker", "bare"]);
 function parseInputs(input) {
   const getInput = input.getInput ?? defaultGetInput;
   const rawConfig = getInput("config") ?? "";
@@ -26445,6 +26445,7 @@ function parseInputs(input) {
   const rawMode = getInput("mode") ?? "";
   const rawPlatform = getInput("spoof-platform") ?? "";
   const rawArch = getInput("spoof-arch") ?? "";
+  const rawBackend = getInput("backend") ?? "";
   const rawCache = getInput("cache-firecracker") ?? "";
   const modeStr = rawMode.trim() === "" ? "check" : rawMode.trim();
   if (!isMode(modeStr)) {
@@ -26464,6 +26465,12 @@ function parseInputs(input) {
       `script-jail: invalid value for input "spoof-arch": "${archStr}". Expected one of: x64, arm64.`
     );
   }
+  const backendStr = rawBackend.trim() === "" ? "auto" : rawBackend.trim();
+  if (!isBackend(backendStr)) {
+    throw new Error(
+      `script-jail: invalid value for input "backend": "${backendStr}". Expected one of: auto, firecracker, docker, bare.`
+    );
+  }
   const cacheStr = rawCache.trim();
   let cacheFirecracker;
   if (cacheStr === "" || cacheStr === "true") cacheFirecracker = true;
@@ -26481,6 +26488,7 @@ function parseInputs(input) {
     mode: modeStr,
     spoofPlatform: platformStr,
     spoofArch: archStr,
+    backend: backendStr,
     cacheFirecracker
   };
 }
@@ -26492,6 +26500,9 @@ function isSpoofPlatform(s) {
 }
 function isSpoofArch(s) {
   return VALID_ARCHES.has(s);
+}
+function isBackend(s) {
+  return VALID_BACKENDS.has(s);
 }
 function resolveAgainstRepo(p, repoDir) {
   if ((0, import_node_path.isAbsolute)(p)) return p;
@@ -26634,47 +26645,26 @@ function parseOsRelease(raw) {
   return out;
 }
 
-// src/action/cache.ts
-var import_node_fs3 = require("node:fs");
-var import_node_path3 = require("node:path");
-function maybeClearCache(input) {
-  if (input.cacheFirecracker) return;
-  const fs3 = input.fs ?? { rmSync: import_node_fs3.rmSync };
-  const releaseArch = input.arch === "arm64" ? "aarch64" : "x86_64";
-  const tarPath = (0, import_node_path3.join)(
-    input.imagesDir,
-    `firecracker-v${input.firecrackerVersion}-${releaseArch}.tgz`
-  );
-  const fcBinPath = (0, import_node_path3.join)(
-    input.imagesDir,
-    `firecracker-v${input.firecrackerVersion}`
-  );
-  const vmlinuxPath = (0, import_node_path3.join)(input.imagesDir, "vmlinux");
-  fs3.rmSync(tarPath, { force: true });
-  fs3.rmSync(fcBinPath, { force: true });
-  fs3.rmSync(vmlinuxPath, { force: true });
-}
-
 // src/action/firecracker/download.ts
-var import_node_fs5 = require("node:fs");
+var import_node_fs4 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
-var import_node_path4 = require("node:path");
+var import_node_path3 = require("node:path");
 var import_node_os = require("node:os");
 var import_node_crypto3 = require("node:crypto");
 var import_node_zlib = require("node:zlib");
 
 // src/shared/http-download.ts
 var import_node_crypto2 = require("node:crypto");
-var import_node_fs4 = require("node:fs");
+var import_node_fs3 = require("node:fs");
 var import_promises = require("node:fs/promises");
 var import_node_https = require("node:https");
 var import_node_http = require("node:http");
 async function sha256File(filePath) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve4, reject) => {
     const hash2 = (0, import_node_crypto2.createHash)("sha256");
-    const stream = (0, import_node_fs4.createReadStream)(filePath);
+    const stream = (0, import_node_fs3.createReadStream)(filePath);
     stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve2(hash2.digest("hex")));
+    stream.on("end", () => resolve4(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
@@ -26702,20 +26692,20 @@ var NodeHttpClient = class {
 async function downloadToFile(url2, destPath, redirects) {
   if (redirects > 5) throw new Error(`Too many redirects fetching ${url2}`);
   const getter = url2.startsWith("https://") ? import_node_https.get : import_node_http.get;
-  await new Promise((resolve2, reject) => {
+  await new Promise((resolve4, reject) => {
     getter(url2, (res) => {
       if (res.statusCode !== void 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve2).catch(reject);
+        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve4).catch(reject);
         return;
       }
       if (res.statusCode !== 200) {
         reject(new Error(`HTTP ${res.statusCode ?? "?"} fetching ${url2}`));
         return;
       }
-      const out = (0, import_node_fs4.createWriteStream)(destPath);
+      const out = (0, import_node_fs3.createWriteStream)(destPath);
       res.pipe(out);
-      out.on("finish", () => resolve2());
+      out.on("finish", () => resolve4());
       out.on("error", reject);
       res.on("error", reject);
     }).on("error", reject);
@@ -26745,16 +26735,16 @@ async function ensureBinaries(input) {
       `script-jail: unknown Firecracker version "${firecrackerVersion}" for ${arch2}. Add it (with a pinned SHA-256) to KNOWN_TARBALL_SHA256 in src/action/firecracker/download.ts.`
     );
   }
-  (0, import_node_fs5.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs4.mkdirSync)(imagesDir, { recursive: true });
   const tarUrl = `https://github.com/firecracker-microvm/firecracker/releases/download/v${firecrackerVersion}/firecracker-v${firecrackerVersion}-${releaseArch}.tgz`;
-  const tarPath = (0, import_node_path4.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
-  const fcBinPath = (0, import_node_path4.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
-  const vmlinuxPath = (0, import_node_path4.join)(imagesDir, "vmlinux");
+  const tarPath = (0, import_node_path3.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
+  const fcBinPath = (0, import_node_path3.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
+  const vmlinuxPath = (0, import_node_path3.join)(imagesDir, "vmlinux");
   const [tarFresh] = await Promise.all([
     ensureFile(http, tarUrl, tarPath, expectedTarSha),
     ensureFile(http, kernelUrl, vmlinuxPath, kernelSha256)
   ]);
-  if ((0, import_node_fs5.existsSync)(fcBinPath)) {
+  if ((0, import_node_fs4.existsSync)(fcBinPath)) {
     await (0, import_promises2.unlink)(fcBinPath);
   }
   void tarFresh;
@@ -26762,7 +26752,7 @@ async function ensureBinaries(input) {
   return { firecrackerPath: fcBinPath, vmlinuxPath };
 }
 async function ensureFile(http, url2, destPath, expectedSha256) {
-  if ((0, import_node_fs5.existsSync)(destPath)) {
+  if ((0, import_node_fs4.existsSync)(destPath)) {
     const actual = await sha256File(destPath);
     if (actual === expectedSha256) return false;
     console.warn(
@@ -26773,14 +26763,14 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
   return true;
 }
 async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch) {
-  const tmpOut = (0, import_node_path4.join)(
+  const tmpOut = (0, import_node_path3.join)(
     (0, import_node_os.tmpdir)(),
     `script-jail-fc-${(0, import_node_crypto3.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version2}-${releaseArch}`;
-  await new Promise((resolve2, reject) => {
+  await new Promise((resolve4, reject) => {
     const gunzip = (0, import_node_zlib.createGunzip)();
-    const input = (0, import_node_fs5.createReadStream)(tarPath);
+    const input = (0, import_node_fs4.createReadStream)(tarPath);
     const BLOCK = 512;
     let buf = Buffer.alloc(0);
     let state = "header";
@@ -26793,7 +26783,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
       outStream?.close();
       outStream = null;
       if (err) reject(err);
-      else resolve2();
+      else resolve4();
     };
     gunzip.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -26807,7 +26797,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
         ));
         return;
       }
-      resolve2();
+      resolve4();
     });
     gunzip.on("error", cleanup);
     input.on("error", cleanup);
@@ -26827,7 +26817,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
           if (name === targetEntry && declaredSize > 0) {
             capturing = true;
             foundEntry = true;
-            outStream = (0, import_node_fs5.createWriteStream)(tmpOut);
+            outStream = (0, import_node_fs4.createWriteStream)(tmpOut);
           } else {
             capturing = false;
           }
@@ -26863,8 +26853,8 @@ function firecrackerReleaseArch(arch2) {
 
 // src/action/pre-fetch-artifacts.ts
 var import_node_crypto4 = require("node:crypto");
-var import_node_fs6 = require("node:fs");
-var import_node_path5 = require("node:path");
+var import_node_fs5 = require("node:fs");
+var import_node_path4 = require("node:path");
 function rootfsAssetName(runnerImage, arch2) {
   return arch2 === "arm64" ? `rootfs-${runnerImage}-arm64.ext4` : `rootfs-${runnerImage}.ext4`;
 }
@@ -26873,19 +26863,19 @@ function libscriptjailAssetName(arch2) {
 }
 async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
-  const platform4 = input.platform ?? "linux";
+  const platform6 = input.platform ?? "linux";
   const arch2 = input.arch ?? "x64";
-  (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs5.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName(runnerImage, arch2);
   const wantedLibscriptjail = libscriptjailAssetName(arch2);
   const assets = [
     {
       name: wantedRootfs,
-      expected: requireExpected(manifest, platform4, wantedRootfs)
+      expected: requireExpected(manifest, platform6, wantedRootfs)
     },
     {
       name: wantedLibscriptjail,
-      expected: requireExpected(manifest, platform4, wantedLibscriptjail)
+      expected: requireExpected(manifest, platform6, wantedLibscriptjail)
     }
   ];
   await Promise.all(
@@ -26893,7 +26883,7 @@ async function preFetchArtifacts(input) {
       ({ name, expected }) => ensureAsset({
         http,
         url: assetUrl(manifest, name),
-        destPath: (0, import_node_path5.join)(imagesDir, name),
+        destPath: (0, import_node_path4.join)(imagesDir, name),
         expectedSha256: expected
       })
     )
@@ -26902,11 +26892,11 @@ async function preFetchArtifacts(input) {
 function assetUrl(manifest, asset) {
   return `https://github.com/${manifest.repo}/releases/download/${manifest.tag}/${asset}`;
 }
-function requireExpected(manifest, platform4, asset) {
-  const section = manifest.expected[platform4];
+function requireExpected(manifest, platform6, asset) {
+  const section = manifest.expected[platform6];
   if (section === void 0) {
     throw new Error(
-      `script-jail: artifact manifest is missing the "${platform4}" platform section.  Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`
+      `script-jail: artifact manifest is missing the "${platform6}" platform section.  Update src/action/artifact-manifest.ts for tag ${manifest.tag}.`
     );
   }
   const sha = section[asset];
@@ -26919,7 +26909,7 @@ function requireExpected(manifest, platform4, asset) {
 }
 async function ensureAsset(args) {
   const { http, url: url2, destPath, expectedSha256 } = args;
-  if ((0, import_node_fs6.existsSync)(destPath)) {
+  if ((0, import_node_fs5.existsSync)(destPath)) {
     const actual = await sha256File2(destPath);
     if (actual === expectedSha256) return;
     console.warn(
@@ -26929,18 +26919,18 @@ async function ensureAsset(args) {
   await http.download(url2, destPath, expectedSha256);
 }
 async function sha256File2(filePath) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve4, reject) => {
     const hash2 = (0, import_node_crypto4.createHash)("sha256");
-    const stream = (0, import_node_fs6.createReadStream)(filePath);
+    const stream = (0, import_node_fs5.createReadStream)(filePath);
     stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve2(hash2.digest("hex")));
+    stream.on("end", () => resolve4(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
 
 // src/action/artifact-manifest.ts
 var PINNED_MANIFEST = {
-  repo: "brooklyn/script-jail",
+  repo: "Brooooooklyn/scriptjail",
   // update when forked
   tag: "v0.1.0",
   expected: {
@@ -26959,12 +26949,23 @@ var PINNED_MANIFEST = {
       // Intel-macOS-runner deprecation note.
       "script-jail-vm-arm64-darwin": "PLACEHOLDER_SHA256_SCRIPT_JAIL_VM_ARM64_DARWIN"
     }
+  },
+  dockerImages: {
+    x64: {
+      "ubuntu-22.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_22_04_X64",
+      "ubuntu-24.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_24_04_X64"
+    },
+    arm64: {
+      "ubuntu-22.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_22_04_ARM64",
+      "ubuntu-24.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_24_04_ARM64"
+    }
   }
 };
 
 // src/action/validate-manifest.ts
 var MANIFEST_PATH = "src/action/artifact-manifest.ts";
 var SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+var DOCKER_DIGEST_RE = /@sha256:([0-9a-f]{64})$/;
 var PLATFORMS = ["linux", "darwin"];
 function validateManifest(manifest) {
   const expected = manifest.expected;
@@ -26974,24 +26975,33 @@ function validateManifest(manifest) {
     );
   }
   const offenders = [];
-  for (const platform4 of PLATFORMS) {
-    const section = manifest.expected[platform4];
+  for (const platform6 of PLATFORMS) {
+    const section = manifest.expected[platform6];
     for (const [name, value] of Object.entries(section)) {
       if (!SHA256_HEX_RE.test(value)) {
-        offenders.push(`${platform4}/${name}`);
+        offenders.push(`${platform6}/${name}`);
+      }
+    }
+  }
+  if (manifest.dockerImages !== void 0) {
+    for (const [arch2, images] of Object.entries(manifest.dockerImages)) {
+      for (const [runnerImage, ref] of Object.entries(images)) {
+        if (!DOCKER_DIGEST_RE.test(ref)) {
+          offenders.push(`docker/${arch2}/${runnerImage}`);
+        }
       }
     }
   }
   if (offenders.length === 0) return;
   throw new Error(
-    `script-jail: action artifact manifest at ${MANIFEST_PATH} has unpinned entries: [${offenders.join(", ")}]. This indicates the action was published without real release-asset hashes. Open a GitHub issue against the action repository (${manifest.repo}).`
+    `script-jail: action artifact manifest at ${MANIFEST_PATH} has unpinned entries: [${offenders.join(", ")}]. This indicates the action was published without real release-asset hashes or Docker image refs. Open a GitHub issue against the action repository (${manifest.repo}).`
   );
 }
 
 // src/action/firecracker/overlay.ts
-var import_node_fs7 = require("node:fs");
+var import_node_fs6 = require("node:fs");
 var import_promises3 = require("node:fs/promises");
-var import_node_path6 = require("node:path");
+var import_node_path5 = require("node:path");
 var import_node_os2 = require("node:os");
 var import_node_child_process = require("node:child_process");
 var import_node_process = require("node:process");
@@ -27003,30 +27013,29 @@ async function makeOverlay(input) {
     workDir: maybeWorkDir,
     extraRepoOverlayFiles
   } = input;
-  const workDir = maybeWorkDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path6.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
-  (0, import_node_fs7.mkdirSync)(workDir, { recursive: true });
-  const rootfsCopyPath = (0, import_node_path6.join)(workDir, "rootfs.ext4");
+  const workDir = maybeWorkDir ?? (0, import_node_fs6.mkdtempSync)((0, import_node_path5.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
+  (0, import_node_fs6.mkdirSync)(workDir, { recursive: true });
+  const rootfsCopyPath = (0, import_node_path5.join)(workDir, "rootfs.ext4");
   copyRootfs(baseRootfsPath, rootfsCopyPath);
-  const repoStageDir = (0, import_node_path6.join)(workDir, "repo-stage");
-  (0, import_node_fs7.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
-  const configDestDir = (0, import_node_path6.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs7.mkdirSync)(configDestDir, { recursive: true });
-  (0, import_node_fs7.copyFileSync)(configPath, (0, import_node_path6.join)(configDestDir, "config.yml"));
+  const repoStageDir = (0, import_node_path5.join)(workDir, "repo-stage");
+  (0, import_node_fs6.mkdirSync)(repoStageDir, { recursive: true });
+  (0, import_node_fs6.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  const configDestDir = (0, import_node_path5.join)(repoStageDir, "etc", "script-jail");
+  (0, import_node_fs6.mkdirSync)(configDestDir, { recursive: true });
+  (0, import_node_fs6.copyFileSync)(configPath, (0, import_node_path5.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
+    const stageRoot = (0, import_node_path5.resolve)(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
-      const dest = (0, import_node_path6.join)(repoStageDir, entry.relPath);
-      const destNormalized = (0, import_node_path6.join)(dest);
-      if (!destNormalized.startsWith(repoStageDir + "/") && destNormalized !== repoStageDir) {
+      const dest = (0, import_node_path5.resolve)(stageRoot, entry.relPath);
+      if (dest !== stageRoot && !dest.startsWith(stageRoot + "/")) {
         throw new Error(
           `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`
         );
       }
-      (0, import_node_fs7.mkdirSync)((0, import_node_path6.dirname)(destNormalized), { recursive: true });
-      (0, import_node_fs7.writeFileSync)(destNormalized, entry.content, "utf8");
+      writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
-  const repoDiskPath = (0, import_node_path6.join)(workDir, "repo.ext4");
+  const repoDiskPath = (0, import_node_path5.join)(workDir, "repo.ext4");
   await buildRepoDisk(repoStageDir, repoDiskPath);
   const cleanup = async () => {
     try {
@@ -27037,12 +27046,38 @@ async function makeOverlay(input) {
   };
   return { rootfsCopyPath, repoDiskPath, workDir, cleanup };
 }
+function writeOverlayFile(root, relPath, content) {
+  const parts = relPath.split("/").filter((part) => part.length > 0);
+  if (parts.length === 0 || parts.some((part) => part === "..")) {
+    throw new Error(
+      `[overlay] extraRepoOverlayFiles entry '${relPath}' is not a safe relative path`
+    );
+  }
+  let dir = root;
+  for (const part of parts.slice(0, -1)) {
+    dir = (0, import_node_path5.join)(dir, part);
+    ensureRealDirectory(dir);
+  }
+  const dest = (0, import_node_path5.join)(dir, parts[parts.length - 1]);
+  (0, import_node_fs6.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs6.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+}
+function ensureRealDirectory(path) {
+  if (!(0, import_node_fs6.existsSync)(path)) {
+    (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+    return;
+  }
+  const stat2 = (0, import_node_fs6.lstatSync)(path);
+  if (stat2.isDirectory() && !stat2.isSymbolicLink()) return;
+  (0, import_node_fs6.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+}
 function copyRootfs(src, dest) {
   if (import_node_process.platform === "linux") {
     const result = (0, import_node_child_process.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
     if (result.status === 0) return;
   }
-  (0, import_node_fs7.cpSync)(src, dest);
+  (0, import_node_fs6.cpSync)(src, dest);
 }
 async function buildRepoDisk(srcDir, outPath) {
   const sizeMB = estimateDiskSizeMB(srcDir);
@@ -27072,8 +27107,8 @@ async function buildRepoDisk(srcDir, outPath) {
     }
     return;
   }
-  const outDir = (0, import_node_path6.join)(outPath, "..");
-  const imageName = (0, import_node_path6.basename)(outPath);
+  const outDir = (0, import_node_path5.join)(outPath, "..");
+  const imageName = (0, import_node_path5.basename)(outPath);
   (0, import_node_child_process.execSync)(
     `docker run --rm -v "${srcDir}:/work:ro" -v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
     { stdio: "inherit" }
@@ -27086,7 +27121,7 @@ function resolveMkfsExt4() {
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
     "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
   ]) {
-    if ((0, import_node_fs7.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs6.existsSync)(candidate)) return candidate;
   }
   const lookup = (0, import_node_child_process.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
@@ -27097,10 +27132,10 @@ function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat2 = (0, import_node_fs7.statSync)(p, { bigint: false });
+      const stat2 = (0, import_node_fs6.statSync)(p, { bigint: false });
       if (stat2.isDirectory()) {
-        for (const child of (0, import_node_fs7.readdirSync)(p)) {
-          visit((0, import_node_path6.join)(p, child));
+        for (const child of (0, import_node_fs6.readdirSync)(p)) {
+          visit((0, import_node_path5.join)(p, child));
         }
       } else if (stat2.isFile() || stat2.isSymbolicLink()) {
         totalBytes += stat2.size;
@@ -27108,14 +27143,14 @@ function estimateDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs7.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs6.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 
 // src/action/firecracker/launch.ts
 var import_node_http2 = require("node:http");
-var import_node_fs8 = require("node:fs");
+var import_node_fs7 = require("node:fs");
 var import_promises4 = require("node:fs/promises");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process2 = require("node:process");
@@ -27140,7 +27175,7 @@ async function launchVm(input) {
         `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
-    if (!(0, import_node_fs8.existsSync)("/dev/kvm")) {
+    if (!(0, import_node_fs7.existsSync)("/dev/kvm")) {
       throw new Error(
         "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
@@ -27249,14 +27284,14 @@ var NodeSpawner = class {
       forwardStream(child.stderr, "[fc:err] ");
     }
     let exitCode;
-    const exitPromise = new Promise((resolve2) => {
+    const exitPromise = new Promise((resolve4) => {
       child.on("close", (code) => {
         exitCode = code ?? 1;
-        resolve2(exitCode);
+        resolve4(exitCode);
       });
       child.on("error", () => {
         exitCode = 1;
-        resolve2(1);
+        resolve4(1);
       });
     });
     return {
@@ -27292,14 +27327,14 @@ var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((0, import_node_fs8.existsSync)(socketPath)) return;
+      if ((0, import_node_fs7.existsSync)(socketPath)) return;
       await sleep(50);
     }
     throw new Error(`Timeout waiting for socket: ${socketPath}`);
   }
 };
 function sleep(ms) {
-  return new Promise((resolve2) => setTimeout(resolve2, ms));
+  return new Promise((resolve4) => setTimeout(resolve4, ms));
 }
 var UnixSocketApiClient = class {
   constructor(socketPath) {
@@ -27313,7 +27348,7 @@ var UnixSocketApiClient = class {
     return this._request("PATCH", path, body);
   }
   _request(method, path, body) {
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve4, reject) => {
       const payload = JSON.stringify(body);
       const req = (0, import_node_http2.request)(
         {
@@ -27338,7 +27373,7 @@ var UnixSocketApiClient = class {
                 )
               );
             } else {
-              resolve2();
+              resolve4();
             }
           });
         }
@@ -27448,22 +27483,22 @@ async function openVsockSession(udsPath, port, options) {
   const session = {
     events,
     sendGo: () => {
-      return new Promise((resolve2, reject) => {
+      return new Promise((resolve4, reject) => {
         void reject;
         const ok = duplex.write("go\n");
         if (!ok) {
           const writeable = duplex;
           if (typeof writeable.once === "function") {
             writeable.once("drain", () => {
-              resolve2();
+              resolve4();
             });
           } else {
             setImmediate(() => {
-              resolve2();
+              resolve4();
             });
           }
         } else {
-          resolve2();
+          resolve4();
         }
       });
     },
@@ -27474,7 +27509,7 @@ async function openVsockSession(udsPath, port, options) {
   return session;
 }
 function connectUnixSocket(sockPath, timeoutMs) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve4, reject) => {
     const sock = (0, import_node_net.createConnection)(sockPath);
     const timer = setTimeout(() => {
       sock.destroy();
@@ -27482,7 +27517,7 @@ function connectUnixSocket(sockPath, timeoutMs) {
     }, timeoutMs);
     sock.once("connect", () => {
       clearTimeout(timer);
-      resolve2(sock);
+      resolve4(sock);
     });
     sock.once("error", (err) => {
       clearTimeout(timer);
@@ -27521,7 +27556,7 @@ async function dialVsockWithRetry(udsPath, port, totalTimeoutMs) {
   );
 }
 function waitForOkLine(sock, timeoutMs) {
-  return new Promise((resolve2) => {
+  return new Promise((resolve4) => {
     const chunks = [];
     let settled = false;
     const finish = (result) => {
@@ -27531,7 +27566,7 @@ function waitForOkLine(sock, timeoutMs) {
       sock.off("data", onData);
       sock.off("close", onClose);
       sock.off("error", onError);
-      resolve2(result);
+      resolve4(result);
     };
     const onData = (chunk) => {
       chunks.push(chunk);
@@ -27561,7 +27596,7 @@ function waitForOkLine(sock, timeoutMs) {
   });
 }
 function sleep2(ms) {
-  return new Promise((resolve2) => setTimeout(resolve2, ms));
+  return new Promise((resolve4) => setTimeout(resolve4, ms));
 }
 function socketToDuplex(sock) {
   return {
@@ -27575,7 +27610,7 @@ function socketToDuplex(sock) {
 
 // src/action/firecracker/teardown.ts
 var import_promises5 = require("node:fs/promises");
-var import_node_fs9 = require("node:fs");
+var import_node_fs8 = require("node:fs");
 async function teardown(handles) {
   if (handles.vsock !== null) {
     await safeRun("close vsock session", () => handles.vsock.close());
@@ -27616,7 +27651,7 @@ async function safeRun(label, fn) {
   }
 }
 async function removeIfExists(filePath) {
-  if (!(0, import_node_fs9.existsSync)(filePath)) return;
+  if (!(0, import_node_fs8.existsSync)(filePath)) return;
   try {
     await (0, import_promises5.unlink)(filePath);
   } catch (err) {
@@ -27624,13 +27659,13 @@ async function removeIfExists(filePath) {
   }
 }
 function timeout(ms) {
-  return new Promise((resolve2) => setTimeout(resolve2, ms));
+  return new Promise((resolve4) => setTimeout(resolve4, ms));
 }
 
 // src/shared/run-audit.ts
-var import_node_fs11 = require("node:fs");
+var import_node_fs10 = require("node:fs");
 var import_promises6 = require("node:fs/promises");
-var import_node_path8 = require("node:path");
+var import_node_path7 = require("node:path");
 
 // src/cli/arch-flags.ts
 function buildArchFlagOverlay(_input) {
@@ -42955,12 +42990,12 @@ function countLines(s) {
 }
 
 // src/action/config-override.ts
-var import_node_fs10 = require("node:fs");
+var import_node_fs9 = require("node:fs");
 var import_node_os3 = require("node:os");
-var import_node_path7 = require("node:path");
+var import_node_path6 = require("node:path");
 var import_yaml2 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
-  const text = (0, import_node_fs10.readFileSync)(input.userConfigPath, "utf8");
+  const text = (0, import_node_fs9.readFileSync)(input.userConfigPath, "utf8");
   const parsed = (0, import_yaml2.parse)(text);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   const existingSpoof = config2["spoof"] !== null && typeof config2["spoof"] === "object" && !Array.isArray(config2["spoof"]) ? config2["spoof"] : {};
@@ -42969,25 +43004,25 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
-  const outDir = input.workDir ?? (0, import_node_fs10.mkdtempSync)((0, import_node_path7.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
-  const configPath = (0, import_node_path7.join)(outDir, "config.yml");
-  (0, import_node_fs10.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  const outDir = input.workDir ?? (0, import_node_fs9.mkdtempSync)((0, import_node_path6.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
+  const configPath = (0, import_node_path6.join)(outDir, "config.yml");
+  (0, import_node_fs9.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
   const result = { configPath };
   if (input.yarnrcOverlay !== void 0) {
-    const yarnrcPath = (0, import_node_path7.join)(outDir, ".yarnrc.yml");
-    (0, import_node_fs10.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    const yarnrcPath = (0, import_node_path6.join)(outDir, ".yarnrc.yml");
+    (0, import_node_fs9.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
     result.yarnrcPath = yarnrcPath;
   }
   if (input.pmFlagsJson !== void 0) {
-    const pmFlagsPath = (0, import_node_path7.join)(outDir, "etc", "script-jail", "pm-flags.json");
-    (0, import_node_fs10.mkdirSync)((0, import_node_path7.dirname)(pmFlagsPath), { recursive: true });
-    (0, import_node_fs10.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    const pmFlagsPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pm-flags.json");
+    (0, import_node_fs9.mkdirSync)((0, import_node_path6.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs9.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
     result.pmFlagsPath = pmFlagsPath;
   }
   if (input.pnpmArchOverlay !== void 0) {
-    const pnpmArchPath = (0, import_node_path7.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
-    (0, import_node_fs10.mkdirSync)((0, import_node_path7.dirname)(pnpmArchPath), { recursive: true });
-    (0, import_node_fs10.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
+    const pnpmArchPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
+    (0, import_node_fs9.mkdirSync)((0, import_node_path6.dirname)(pnpmArchPath), { recursive: true });
+    (0, import_node_fs9.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
     result.pnpmArchPath = pnpmArchPath;
   }
   return result;
@@ -43004,7 +43039,7 @@ async function runAudit(input) {
     spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
-  const scratchDir = (0, import_node_fs11.mkdtempSync)((0, import_node_path8.join)(input.workDir, "script-jail-config-"));
+  const scratchDir = (0, import_node_fs10.mkdtempSync)((0, import_node_path7.join)(input.workDir, "script-jail-config-"));
   let result;
   let overlay = null;
   try {
@@ -43026,28 +43061,46 @@ async function runAudit(input) {
     if (effectiveConfig.yarnrcPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: ".yarnrc.yml",
-        content: (0, import_node_fs11.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
+        content: (0, import_node_fs10.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
       });
     }
     if (effectiveConfig.pmFlagsPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pm-flags.json",
-        content: (0, import_node_fs11.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+        content: (0, import_node_fs10.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
       });
     }
     if (effectiveConfig.pnpmArchPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pnpm-arch.json",
-        content: (0, import_node_fs11.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
+        content: (0, import_node_fs10.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
-    overlay = await doMakeOverlay({
-      baseRootfsPath: input.baseRootfsPath,
-      repoSrcPath: input.repoDir,
-      configPath: effectiveConfig.configPath,
-      extraRepoOverlayFiles
-    });
-    result = await input.launch(overlay);
+    if (input.execute !== void 0) {
+      result = await input.execute({
+        repoDir: input.repoDir,
+        configPath: effectiveConfig.configPath,
+        extraRepoOverlayFiles,
+        scratchDir,
+        pm: input.pm,
+        hostArch: input.hostArch,
+        mode: input.mode
+      });
+    } else {
+      if (input.launch === void 0) {
+        throw new Error("script-jail: runAudit requires either execute or launch.");
+      }
+      if (input.baseRootfsPath === void 0) {
+        throw new Error("script-jail: runAudit legacy launch path requires baseRootfsPath.");
+      }
+      overlay = await doMakeOverlay({
+        baseRootfsPath: input.baseRootfsPath,
+        repoSrcPath: input.repoDir,
+        configPath: effectiveConfig.configPath,
+        extraRepoOverlayFiles
+      });
+      result = await input.launch(overlay);
+    }
   } finally {
     if (overlay !== null) {
       try {
@@ -43061,7 +43114,7 @@ async function runAudit(input) {
     }
   }
   if (input.mode === "update") {
-    (0, import_node_fs11.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
+    (0, import_node_fs10.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
     input.io.stderr.write(
       `[script-jail] wrote ${Buffer.byteLength(result.finalYaml, "utf8")} bytes to ${input.lockPath}
 `
@@ -43070,7 +43123,7 @@ async function runAudit(input) {
     input.io.setOutput?.("diff", "");
     return { exitCode: 0 };
   }
-  const committed = (0, import_node_fs11.existsSync)(input.lockPath) ? (0, import_node_fs11.readFileSync)(input.lockPath, "utf8") : "";
+  const committed = (0, import_node_fs10.existsSync)(input.lockPath) ? (0, import_node_fs10.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
   const diff = renderDiff({
     lockPath: lockLabel,
@@ -43098,13 +43151,130 @@ async function runAudit(input) {
   return { exitCode: diff.match ? 0 : 1 };
 }
 function relativeForDisplay(absPath, repoDir) {
-  const rel = (0, import_node_path8.relative)(repoDir, absPath);
-  if (rel.startsWith("..") || (0, import_node_path8.isAbsolute)(rel)) return absPath;
+  const rel = (0, import_node_path7.relative)(repoDir, absPath);
+  if (rel.startsWith("..") || (0, import_node_path7.isAbsolute)(rel)) return absPath;
   return rel;
 }
 
-// src/main.ts
+// src/action/backend/firecracker.ts
+var import_node_crypto5 = require("node:crypto");
+var import_node_fs12 = require("node:fs");
+var import_node_os4 = require("node:os");
+var import_node_path9 = require("node:path");
+var import_node_process3 = require("node:process");
+
+// src/action/cache.ts
+var import_node_fs11 = require("node:fs");
+var import_node_path8 = require("node:path");
+function maybeClearCache(input) {
+  if (input.cacheFirecracker) return;
+  const fs3 = input.fs ?? { rmSync: import_node_fs11.rmSync };
+  const releaseArch = input.arch === "arm64" ? "aarch64" : "x86_64";
+  const tarPath = (0, import_node_path8.join)(
+    input.imagesDir,
+    `firecracker-v${input.firecrackerVersion}-${releaseArch}.tgz`
+  );
+  const fcBinPath = (0, import_node_path8.join)(
+    input.imagesDir,
+    `firecracker-v${input.firecrackerVersion}`
+  );
+  const vmlinuxPath = (0, import_node_path8.join)(input.imagesDir, "vmlinux");
+  fs3.rmSync(tarPath, { force: true });
+  fs3.rmSync(fcBinPath, { force: true });
+  fs3.rmSync(vmlinuxPath, { force: true });
+}
+
+// src/action/backend/types.ts
+var BackendUnavailableError = class extends Error {
+  backend;
+  constructor(backend, message) {
+    super(message);
+    this.name = "BackendUnavailableError";
+    this.backend = backend;
+  }
+};
+
+// src/action/backend/process.ts
+var import_node_child_process3 = require("node:child_process");
+function commandSucceeds(cmd, args, opts = {}) {
+  const result = (0, import_node_child_process3.spawnSync)(cmd, args, {
+    stdio: "ignore",
+    env: opts.env
+  });
+  return result.status === 0;
+}
+function runCommand(cmd, args, opts = {}) {
+  const result = (0, import_node_child_process3.spawnSync)(cmd, args, {
+    stdio: "pipe",
+    encoding: "utf8",
+    env: opts.env
+  });
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || "").trim();
+    throw new Error(
+      `${cmd} ${args.join(" ")} failed with exit ${result.status ?? "unknown"}` + (detail ? `: ${detail}` : "")
+    );
+  }
+}
+async function runAgentProcess(input) {
+  const child = (0, import_node_child_process3.spawn)(input.cmd, input.args, {
+    cwd: input.cwd,
+    env: input.env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const stderr = input.stderr ?? process.stderr;
+  child.stderr.on("data", (chunk) => {
+    stderr.write(`[${input.label}:err] ${chunk.toString()}`);
+  });
+  const nonFatalWarnings = [];
+  let finalYaml = null;
+  let fatalError = null;
+  const exitPromise = new Promise((resolve4) => {
+    child.on("close", (code) => resolve4(code ?? 1));
+    child.on("error", () => resolve4(1));
+  });
+  try {
+    for await (const frame of parseFrames(child.stdout)) {
+      if (frame.kind === "event") continue;
+      if (frame.kind === "handshake") {
+        if (frame.phase === "fetch_done") {
+          if (input.onFetchDone !== void 0) await input.onFetchDone();
+          child.stdin.write("go\n");
+        }
+        continue;
+      }
+      if (frame.kind === "error") {
+        if (frame.fatal) {
+          fatalError = new Error(`script-jail ${input.label} fatal: ${frame.message}`);
+          child.kill("SIGTERM");
+          break;
+        }
+        nonFatalWarnings.push(frame.message);
+        continue;
+      }
+      if (frame.kind === "final") {
+        finalYaml = frame.yaml;
+        break;
+      }
+    }
+  } finally {
+    child.stdin.end();
+  }
+  const exitCode = await exitPromise;
+  if (fatalError !== null) throw fatalError;
+  if (finalYaml === null) {
+    const tail = nonFatalWarnings.length > 0 ? ` Prior warnings: [${nonFatalWarnings.map((m) => JSON.stringify(m)).join(", ")}]` : "";
+    throw new Error(
+      `script-jail: ${input.label} session ended without a final frame (exit ${exitCode}).${tail}`
+    );
+  }
+  return { finalYaml, nonFatalWarnings };
+}
+
+// src/action/backend/firecracker.ts
 var FIRECRACKER_VERSION = "1.8.0";
+var VSOCK_PORT = 10242;
+var GUEST_CID = 3;
 var PINNED_KERNELS = {
   x64: {
     url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223",
@@ -43115,8 +43285,432 @@ var PINNED_KERNELS = {
     sha256: "eb5d95ac8a67f7a86acf0cb35625633713ad5170b56de8617808d0e18bb832ec"
   }
 };
-var VSOCK_PORT = 10242;
-var GUEST_CID = 3;
+function createFirecrackerBackend(deps) {
+  const doPreFetchArtifacts = deps.preFetchArtifacts ?? preFetchArtifacts;
+  const doEnsureBinaries = deps.ensureBinaries ?? ensureBinaries;
+  const doMakeOverlay = deps.makeOverlay ?? makeOverlay;
+  const doLaunchVm = deps.launchVm ?? launchVm;
+  const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
+  const doTeardown = deps.teardown ?? teardown;
+  const checkExists = deps.existsSync ?? import_node_fs12.existsSync;
+  const hostPlatform = deps.platform ?? import_node_process3.platform;
+  return {
+    name: "firecracker",
+    async run(ctx) {
+      if (deps.skipAvailabilityCheck !== true) {
+        if (hostPlatform !== "linux") {
+          throw new BackendUnavailableError("firecracker", `requires Linux (detected ${hostPlatform})`);
+        }
+        if (!checkExists("/dev/kvm")) {
+          throw new BackendUnavailableError("firecracker", "/dev/kvm is missing");
+        }
+        if (!commandSucceeds("ip", ["link", "show", "tap0"])) {
+          throw new BackendUnavailableError("firecracker", "tap0 is not configured");
+        }
+      }
+      maybeClearCache({
+        imagesDir: ctx.imagesDir,
+        firecrackerVersion: FIRECRACKER_VERSION,
+        cacheFirecracker: deps.cacheFirecracker,
+        arch: ctx.arch
+      });
+      if (!ctx.selfTest) {
+        await doPreFetchArtifacts({
+          imagesDir: ctx.imagesDir,
+          runnerImage: ctx.runnerImage,
+          manifest: ctx.manifest,
+          http: ctx.http,
+          arch: ctx.arch,
+          platform: ctx.arch === "arm64" ? "darwin" : "linux"
+        });
+      }
+      const pinnedKernel = PINNED_KERNELS[ctx.arch];
+      const binaries = await doEnsureBinaries({
+        imagesDir: ctx.imagesDir,
+        arch: ctx.arch,
+        firecrackerVersion: FIRECRACKER_VERSION,
+        kernelUrl: pinnedKernel.url,
+        kernelSha256: pinnedKernel.sha256,
+        http: ctx.http
+      });
+      const overlay = await doMakeOverlay({
+        baseRootfsPath: (0, import_node_path9.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
+        repoSrcPath: ctx.repoDir,
+        configPath: ctx.configPath,
+        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+      });
+      try {
+        return await launchFirecracker({
+          overlay,
+          binaries,
+          launchVm: doLaunchVm,
+          openVsockSession: doOpenVsockSession,
+          teardown: doTeardown,
+          warn: deps.warn
+        });
+      } finally {
+        await overlay.cleanup();
+      }
+    }
+  };
+}
+function rootfsImageName(runnerImage, arch2) {
+  return arch2 === "arm64" ? `rootfs-${runnerImage}-arm64.ext4` : `rootfs-${runnerImage}.ext4`;
+}
+async function launchFirecracker(input) {
+  const runId = (0, import_node_crypto5.randomBytes)(4).toString("hex");
+  const apiSocketPath = (0, import_node_path9.join)((0, import_node_os4.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
+  const vsockUdsPath = (0, import_node_path9.join)((0, import_node_os4.tmpdir)(), `script-jail-vsock-${runId}`);
+  let vm = null;
+  let vsock = null;
+  let finalYaml = null;
+  let fatalError = null;
+  const nonFatalErrors = [];
+  try {
+    vm = await input.launchVm({
+      firecrackerPath: input.binaries.firecrackerPath,
+      vmlinuxPath: input.binaries.vmlinuxPath,
+      rootfsPath: input.overlay.rootfsCopyPath,
+      repoDiskPath: input.overlay.repoDiskPath,
+      vsockCid: GUEST_CID,
+      vsockUdsPath,
+      enableNetwork: true,
+      socketPath: apiSocketPath
+    });
+    vsock = await input.openVsockSession(vsockUdsPath, VSOCK_PORT);
+    for await (const frame of vsock.events) {
+      if (frame.kind === "event") continue;
+      if (frame.kind === "handshake") {
+        if (frame.phase === "fetch_done") await vsock.sendGo();
+        continue;
+      }
+      if (frame.kind === "error") {
+        if (frame.fatal) {
+          fatalError = new Error(`script-jail guest fatal: ${frame.message}`);
+          break;
+        }
+        nonFatalErrors.push(frame.message);
+        input.warn(`script-jail guest: ${frame.message}`);
+        continue;
+      }
+      if (frame.kind === "final") {
+        finalYaml = frame.yaml;
+        break;
+      }
+    }
+  } finally {
+    await input.teardown({
+      vm,
+      overlay: null,
+      vsock,
+      apiSocketPath,
+      vsockUdsPath
+    });
+  }
+  if (fatalError !== null) throw fatalError;
+  if (finalYaml === null) {
+    const tail = nonFatalErrors.length > 0 ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(", ")}]` : "";
+    throw new Error(`script-jail: vsock session ended without a final frame.${tail}`);
+  }
+  return { finalYaml, nonFatalWarnings: nonFatalErrors };
+}
+
+// src/action/backend/docker.ts
+var import_node_crypto6 = require("node:crypto");
+
+// src/action/backend/stage.ts
+var import_node_fs13 = require("node:fs");
+var import_node_path10 = require("node:path");
+var import_yaml3 = __toESM(require_dist(), 1);
+function stageRepoDirectory(input) {
+  const stageRoot = (0, import_node_fs13.mkdtempSync)((0, import_node_path10.join)(input.parentDir, "repo-stage-"));
+  const repoStage = (0, import_node_path10.join)(stageRoot, "work");
+  (0, import_node_fs13.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
+  materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
+  return {
+    path: repoStage,
+    cleanup: () => {
+      (0, import_node_fs13.rmSync)(stageRoot, { recursive: true, force: true });
+    }
+  };
+}
+function materializeExtraFiles(rootDir, files) {
+  const root = (0, import_node_path10.resolve)(rootDir);
+  for (const entry of files) {
+    const dest = (0, import_node_path10.resolve)(root, entry.relPath);
+    if (dest !== root && !dest.startsWith(root + "/")) {
+      throw new Error(
+        `[backend] extraRepoOverlayFiles entry '${entry.relPath}' escapes the staged repo`
+      );
+    }
+    writeOverlayFile2(root, entry.relPath, entry.content);
+  }
+}
+function writeOverlayFile2(root, relPath, content) {
+  const parts = relPath.split("/").filter((part) => part.length > 0);
+  if (parts.length === 0 || parts.some((part) => part === "..")) {
+    throw new Error(
+      `[backend] extraRepoOverlayFiles entry '${relPath}' is not a safe relative path`
+    );
+  }
+  let dir = root;
+  for (const part of parts.slice(0, -1)) {
+    dir = (0, import_node_path10.join)(dir, part);
+    ensureRealDirectory2(dir);
+  }
+  const dest = (0, import_node_path10.join)(dir, parts[parts.length - 1]);
+  (0, import_node_fs13.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs13.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+}
+function ensureRealDirectory2(path) {
+  if (!(0, import_node_fs13.existsSync)(path)) {
+    (0, import_node_fs13.mkdirSync)(path, { recursive: true });
+    return;
+  }
+  const stat2 = (0, import_node_fs13.lstatSync)(path);
+  if (stat2.isDirectory() && !stat2.isSymbolicLink()) return;
+  (0, import_node_fs13.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs13.mkdirSync)(path, { recursive: true });
+}
+function rewriteConfigWorkDir(input) {
+  const raw = (0, import_node_fs13.readFileSync)(input.configPath, "utf8");
+  const parsed = (0, import_yaml3.parse)(raw);
+  const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
+  config2["work_dir"] = input.workDir;
+  const outPath = (0, import_node_path10.join)(input.outDir, "config.backend.yml");
+  (0, import_node_fs13.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
+  return outPath;
+}
+
+// src/action/backend/docker.ts
+function createDockerBackend(deps = {}) {
+  const env = deps.env ?? process.env;
+  return {
+    name: "docker",
+    async run(ctx) {
+      if (!commandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env })) {
+        throw new BackendUnavailableError("docker", "docker is not installed or the daemon is unavailable");
+      }
+      const imageRef = resolveDockerImage(ctx);
+      if (ctx.selfTest) {
+        if (!commandSucceeds("docker", ["image", "inspect", imageRef], { env })) {
+          throw new BackendUnavailableError("docker", `local image ${imageRef} is missing`);
+        }
+      } else {
+        try {
+          runCommand("docker", ["pull", imageRef], { env });
+        } catch (err) {
+          throw new BackendUnavailableError(
+            "docker",
+            err instanceof Error ? err.message : String(err)
+          );
+        }
+      }
+      const staged = stageRepoDirectory({
+        repoDir: ctx.repoDir,
+        parentDir: ctx.scratchDir,
+        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+      });
+      const containerName = `script-jail-${(0, import_node_crypto6.randomBytes)(4).toString("hex")}`;
+      try {
+        const script = [
+          "set -eu",
+          'NODE_VERSION="$(cat /etc/script-jail/node-version)"',
+          'vp env install "${NODE_VERSION}"',
+          'NODE_BIN="$(find /opt/vp/js_runtime -maxdepth 4 -type d -name bin 2>/dev/null | head -n1)"',
+          'test -n "${NODE_BIN}"',
+          'export PATH="${NODE_BIN}:${PATH:-/usr/local/bin:/usr/bin:/bin}"',
+          "corepack enable",
+          "mkdir -p /tmp/script-jail-strace",
+          "export SCRIPT_JAIL_CONNECTION=stdio",
+          "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
+          "exec node /usr/local/lib/script-jail/guest-agent.cjs"
+        ].join("; ");
+        return await runAgentProcess({
+          cmd: "docker",
+          args: [
+            "run",
+            "--rm",
+            "-i",
+            "--name",
+            containerName,
+            "--cap-add=SYS_PTRACE",
+            "--security-opt",
+            "seccomp=unconfined",
+            "-v",
+            `${staged.path}:/work`,
+            "-v",
+            `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
+            imageRef,
+            "/bin/sh",
+            "-lc",
+            script
+          ],
+          env,
+          label: "docker",
+          ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {},
+          onFetchDone: async () => {
+            runCommand("docker", ["network", "disconnect", "bridge", containerName], { env });
+          }
+        });
+      } finally {
+        try {
+          runCommand("docker", ["rm", "-f", containerName], { env });
+        } catch {
+        }
+        staged.cleanup();
+      }
+    }
+  };
+}
+function resolveDockerImage(ctx) {
+  if (ctx.selfTest) {
+    return ctx.arch === "arm64" ? `script-jail-rootfs:${ctx.runnerImage}-arm64` : `script-jail-rootfs:${ctx.runnerImage}`;
+  }
+  const ref = ctx.manifest.dockerImages?.[ctx.arch]?.[ctx.runnerImage];
+  if (ref === void 0 || ref.trim() === "") {
+    throw new BackendUnavailableError(
+      "docker",
+      `manifest has no Docker image for ${ctx.runnerImage}/${ctx.arch}`
+    );
+  }
+  return ref;
+}
+
+// src/action/backend/bare.ts
+var import_node_fs14 = require("node:fs");
+var import_node_path11 = require("node:path");
+var import_node_process4 = require("node:process");
+function createBareBackend(deps = {}) {
+  const hostPlatform = deps.platform ?? import_node_process4.platform;
+  const env = deps.env ?? process.env;
+  const doPreFetchArtifacts = deps.preFetchArtifacts ?? preFetchArtifacts;
+  return {
+    name: "bare",
+    async run(ctx) {
+      if (hostPlatform !== "linux") {
+        throw new BackendUnavailableError("bare", `requires Linux (detected ${hostPlatform})`);
+      }
+      if (!commandSucceeds("strace", ["-V"], { env })) {
+        throw new BackendUnavailableError("bare", "strace is not available");
+      }
+      if (!commandSucceeds("unshare", ["-n", "--", "true"], { env })) {
+        throw new BackendUnavailableError("bare", "unshare -n is not available");
+      }
+      if (!ctx.selfTest) {
+        await doPreFetchArtifacts({
+          imagesDir: ctx.imagesDir,
+          runnerImage: ctx.runnerImage,
+          manifest: ctx.manifest,
+          http: ctx.http,
+          arch: ctx.arch,
+          platform: ctx.arch === "arm64" ? "darwin" : "linux"
+        });
+      }
+      const runtime = resolveRuntimePaths(ctx);
+      const staged = stageRepoDirectory({
+        repoDir: ctx.repoDir,
+        parentDir: ctx.scratchDir,
+        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+      });
+      const backendConfigPath = rewriteConfigWorkDir({
+        configPath: ctx.configPath,
+        outDir: ctx.scratchDir,
+        workDir: staged.path
+      });
+      try {
+        return await runAgentProcess({
+          cmd: process.execPath,
+          args: [runtime.agentPath],
+          env: {
+            ...env,
+            SCRIPT_JAIL_CONNECTION: "stdio",
+            SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+            SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
+            SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
+            SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
+            SCRIPT_JAIL_PHASE_B_UNSHARE_NET: "1"
+          },
+          label: "bare",
+          ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}
+        });
+      } finally {
+        staged.cleanup();
+      }
+    }
+  };
+}
+function resolveRuntimePaths(ctx) {
+  const moduleDir = currentModuleDir();
+  const roots = [
+    process.env["SCRIPT_JAIL_ACTION_ROOT"],
+    process.env["GITHUB_ACTION_PATH"],
+    moduleDir,
+    (0, import_node_path11.join)(moduleDir, ".."),
+    (0, import_node_path11.join)(moduleDir, "..", ".."),
+    process.cwd()
+  ].filter((p) => typeof p === "string" && p.length > 0);
+  const agentPath = findFirst([
+    ...roots.map((root) => (0, import_node_path11.join)(root, "guest-agent.cjs")),
+    ...roots.map((root) => (0, import_node_path11.join)(root, "dist", "guest-agent.cjs"))
+  ], "guest-agent.cjs");
+  const platformPreloadPath = findFirst([
+    ...roots.map((root) => (0, import_node_path11.join)(root, "preloads", "platform-spoof.cjs")),
+    ...roots.map((root) => (0, import_node_path11.join)(root, "dist", "preloads", "platform-spoof.cjs"))
+  ], "platform-spoof.cjs");
+  const envSpyPreloadPath = findFirst([
+    ...roots.map((root) => (0, import_node_path11.join)(root, "preloads", "env-spy.cjs")),
+    ...roots.map((root) => (0, import_node_path11.join)(root, "dist", "preloads", "env-spy.cjs"))
+  ], "env-spy.cjs");
+  const libName = ctx.arch === "arm64" ? "libscriptjail-arm64.so" : "libscriptjail.so";
+  const nativePreloadPath = findFirst([
+    (0, import_node_path11.join)(ctx.imagesDir, libName),
+    (0, import_node_path11.join)(ctx.imagesDir, "libscriptjail.so"),
+    ...roots.map((root) => (0, import_node_path11.join)(root, "images", libName)),
+    ...roots.map((root) => (0, import_node_path11.join)(root, "images", "libscriptjail.so"))
+  ], libName);
+  return {
+    agentPath,
+    nativePreloadPath,
+    platformPreloadPath,
+    envSpyPreloadPath
+  };
+}
+function currentModuleDir() {
+  if (typeof __dirname === "string") return __dirname;
+  return process.cwd();
+}
+function findFirst(candidates, label) {
+  for (const candidate of candidates) {
+    if ((0, import_node_fs14.existsSync)(candidate)) return candidate;
+  }
+  throw new BackendUnavailableError("bare", `${label} was not found`);
+}
+
+// src/action/backend/select.ts
+var AUTO_ORDER = ["firecracker", "docker", "bare"];
+async function runSelectedBackend(input) {
+  const order = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const unavailable = [];
+  for (const name of order) {
+    try {
+      return await input.backends[name].run(input.ctx);
+    } catch (err) {
+      if (err instanceof BackendUnavailableError) {
+        if (input.requested !== "auto") throw err;
+        unavailable.push(`${name}: ${err.message}`);
+        input.warn(`script-jail backend "${name}" unavailable: ${err.message}`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(
+    `script-jail: no audit backend available. Tried ${order.join(", ")}. ` + unavailable.join("; ")
+  );
+}
+
+// src/main.ts
 async function main(deps = {}) {
   const {
     validateManifest: doValidateManifest = validateManifest,
@@ -43148,104 +43742,28 @@ async function main(deps = {}) {
     throw err;
   }
   const runnerImage = detectRunnerImage();
-  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path9.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path9.join)((0, import_node_os4.tmpdir)(), "script-jail-images");
-  (0, import_node_fs12.mkdirSync)(imagesDir, { recursive: true });
-  maybeClearCache({
-    imagesDir,
-    firecrackerVersion: FIRECRACKER_VERSION,
-    cacheFirecracker: inputs.cacheFirecracker,
-    arch: actionHostArch
-  });
-  const baseRootfsPath = (0, import_node_path9.join)(
-    imagesDir,
-    rootfsImageName(runnerImage, actionHostArch)
-  );
+  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path12.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
+  (0, import_node_fs15.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
-  if (!selfTest) {
-    await doPreFetchArtifacts({
-      imagesDir,
-      runnerImage,
-      manifest: PINNED_MANIFEST,
-      http,
-      arch: actionHostArch,
-      // The released manifest currently stores the arm64 guest artifacts in
-      // the darwin section because the macOS VZ path was the first arm64
-      // consumer.  Linux/arm64 Firecracker uses the same arm64 rootfs + shim.
-      platform: actionHostArch === "arm64" ? "darwin" : "linux"
-    });
-  }
-  const pinnedKernel = PINNED_KERNELS[actionHostArch];
-  const { firecrackerPath, vmlinuxPath } = await doEnsureBinaries({
-    imagesDir,
-    arch: actionHostArch,
-    firecrackerVersion: FIRECRACKER_VERSION,
-    kernelUrl: pinnedKernel.url,
-    kernelSha256: pinnedKernel.sha256,
-    http
-  });
-  const launch = async (overlay) => {
-    const runId = (0, import_node_crypto5.randomBytes)(4).toString("hex");
-    const apiSocketPath = (0, import_node_path9.join)((0, import_node_os4.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
-    const vsockUdsPath = (0, import_node_path9.join)((0, import_node_os4.tmpdir)(), `script-jail-vsock-${runId}`);
-    let vm = null;
-    let vsock = null;
-    let finalYaml = null;
-    let fatalError = null;
-    const nonFatalErrors = [];
-    try {
-      vm = await doLaunchVm({
-        firecrackerPath,
-        vmlinuxPath,
-        rootfsPath: overlay.rootfsCopyPath,
-        repoDiskPath: overlay.repoDiskPath,
-        vsockCid: GUEST_CID,
-        vsockUdsPath,
-        enableNetwork: true,
-        socketPath: apiSocketPath
-      });
-      vsock = await doOpenVsockSession(vsockUdsPath, VSOCK_PORT);
-      for await (const frame of vsock.events) {
-        if (frame.kind === "event") {
-          continue;
-        }
-        if (frame.kind === "handshake") {
-          if (frame.phase === "fetch_done") {
-            await vsock.sendGo();
-            continue;
-          }
-          continue;
-        }
-        if (frame.kind === "error") {
-          if (frame.fatal) {
-            fatalError = new Error(`script-jail guest fatal: ${frame.message}`);
-            break;
-          }
-          nonFatalErrors.push(frame.message);
-          warn(`script-jail guest: ${frame.message}`);
-          continue;
-        }
-        if (frame.kind === "final") {
-          finalYaml = frame.yaml;
-          break;
-        }
-      }
-    } finally {
-      await doTeardown({
-        vm,
-        overlay: null,
-        vsock,
-        apiSocketPath,
-        vsockUdsPath
-      });
-    }
-    if (fatalError !== null) throw fatalError;
-    if (finalYaml === null) {
-      const tail = nonFatalErrors.length > 0 ? ` Prior warnings: [${nonFatalErrors.map((m) => JSON.stringify(m)).join(", ")}]` : "";
-      throw new Error(
-        `script-jail: vsock session ended without a final frame.${tail}`
-      );
-    }
-    return { finalYaml, nonFatalWarnings: nonFatalErrors };
+  const backends = {
+    firecracker: createFirecrackerBackend({
+      preFetchArtifacts: doPreFetchArtifacts,
+      ensureBinaries: doEnsureBinaries,
+      makeOverlay: doMakeOverlay,
+      launchVm: doLaunchVm,
+      openVsockSession: doOpenVsockSession,
+      teardown: doTeardown,
+      cacheFirecracker: inputs.cacheFirecracker,
+      warn,
+      // Existing e2e tests inject the whole Firecracker stack and run on macOS
+      // too; keep those fakes from tripping the real /dev/kvm availability gate.
+      skipAvailabilityCheck: deps.launchVm !== void 0
+    }),
+    docker: createDockerBackend({ stderr: process.stderr }),
+    bare: createBareBackend({
+      preFetchArtifacts: doPreFetchArtifacts,
+      stderr: process.stderr
+    })
   };
   const result = await runAudit({
     repoDir,
@@ -43258,14 +43776,26 @@ async function main(deps = {}) {
     },
     pm: pm.manager,
     hostArch: actionHostArch,
-    baseRootfsPath,
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,
     // leaving the workDir at buildEffectiveConfig's mkdtemp default
     // would accumulate stray dirs under os.tmpdir() on self-hosted runners.
     workDir: imagesDir,
-    launch,
+    execute: (auditInput) => runSelectedBackend({
+      requested: inputs.backend,
+      backends,
+      warn,
+      ctx: {
+        ...auditInput,
+        imagesDir,
+        runnerImage,
+        arch: actionHostArch,
+        manifest: PINNED_MANIFEST,
+        http,
+        selfTest
+      }
+    }),
     io: {
       warn,
       setOutput,
@@ -43275,8 +43805,7 @@ async function main(deps = {}) {
         process.stdout.write(`::error file=${lockLabel},line=1::${msg}
 `);
       }
-    },
-    makeOverlay: doMakeOverlay
+    }
   });
   if (result.exitCode !== 0) exitProcess(result.exitCode);
 }
@@ -43285,9 +43814,6 @@ function detectActionHostArch(arch2 = process.arch) {
   throw new Error(
     `script-jail action requires an x64 or arm64 Linux runner (detected '${arch2}').`
   );
-}
-function rootfsImageName(runnerImage, arch2) {
-  return arch2 === "arm64" ? `rootfs-${runnerImage}-arm64.ext4` : `rootfs-${runnerImage}.ext4`;
 }
 main().catch((err) => {
   process.stderr.write(
