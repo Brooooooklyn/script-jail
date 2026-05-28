@@ -4,11 +4,23 @@ import type { AuditBackend, BackendContext } from './types.js';
 import { BackendUnavailableError } from './types.js';
 import { commandSucceeds, runAgentProcess, runCommand } from './process.js';
 import { stageRepoDirectory } from './stage.js';
+import type { StagedRepo } from './stage.js';
 
 export interface DockerBackendDeps {
   stderr?: { write(s: string): unknown };
   env?: NodeJS.ProcessEnv;
 }
+
+interface HostOwner {
+  uid: number;
+  gid: number;
+}
+
+type RunCommand = (
+  cmd: string,
+  args: string[],
+  opts?: { env?: NodeJS.ProcessEnv },
+) => void;
 
 export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend {
   const env = deps.env ?? process.env;
@@ -89,10 +101,89 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
         } catch {
           // The --rm container is normally already gone.
         }
-        staged.cleanup();
+        cleanupStagedDockerRepo({
+          staged,
+          imageRef,
+          env,
+          ...(deps.stderr !== undefined ? { stderr: deps.stderr } : {}),
+        });
       }
     },
   };
+}
+
+export function cleanupStagedDockerRepo(input: {
+  staged: StagedRepo;
+  imageRef: string;
+  env?: NodeJS.ProcessEnv;
+  stderr?: { write(s: string): unknown };
+  hostOwner?: HostOwner | null;
+  run?: RunCommand;
+}): void {
+  const run = input.run ?? runCommand;
+  const hostOwner = Object.prototype.hasOwnProperty.call(input, 'hostOwner')
+    ? (input.hostOwner ?? null)
+    : getHostOwner();
+  try {
+    restoreStagedRepoOwnership({
+      imageRef: input.imageRef,
+      stagedPath: input.staged.path,
+      hostOwner,
+      run,
+      ...(input.env !== undefined ? { env: input.env } : {}),
+    });
+  } catch (err) {
+    writeDockerWarning(
+      input.stderr,
+      `failed to restore staged repo ownership: ${formatError(err)}`,
+    );
+  }
+
+  try {
+    input.staged.cleanup();
+  } catch (err) {
+    writeDockerWarning(
+      input.stderr,
+      `failed to remove staged repo: ${formatError(err)}`,
+    );
+  }
+}
+
+function restoreStagedRepoOwnership(input: {
+  imageRef: string;
+  stagedPath: string;
+  env?: NodeJS.ProcessEnv;
+  hostOwner: HostOwner | null;
+  run: RunCommand;
+}): void {
+  if (input.hostOwner === null) return;
+  input.run('docker', [
+    'run',
+    '--rm',
+    '-v', `${input.stagedPath}:/work`,
+    input.imageRef,
+    '/bin/sh',
+    '-lc',
+    `find /work -xdev -exec chown -h ${input.hostOwner.uid}:${input.hostOwner.gid} {} +`,
+  ], input.env !== undefined ? { env: input.env } : {});
+}
+
+function getHostOwner(): HostOwner | null {
+  if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function') {
+    return null;
+  }
+  return { uid: process.getuid(), gid: process.getgid() };
+}
+
+function writeDockerWarning(
+  stderr: { write(s: string): unknown } | undefined,
+  message: string,
+): void {
+  (stderr ?? process.stderr).write(`[docker:warn] ${message}\n`);
+}
+
+function formatError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function resolveDockerImage(ctx: BackendContext): string {

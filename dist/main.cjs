@@ -43562,10 +43562,67 @@ function createDockerBackend(deps = {}) {
           runCommand("docker", ["rm", "-f", containerName], { env });
         } catch {
         }
-        staged.cleanup();
+        cleanupStagedDockerRepo({
+          staged,
+          imageRef,
+          env,
+          ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}
+        });
       }
     }
   };
+}
+function cleanupStagedDockerRepo(input) {
+  const run = input.run ?? runCommand;
+  const hostOwner = Object.prototype.hasOwnProperty.call(input, "hostOwner") ? input.hostOwner ?? null : getHostOwner();
+  try {
+    restoreStagedRepoOwnership({
+      imageRef: input.imageRef,
+      stagedPath: input.staged.path,
+      hostOwner,
+      run,
+      ...input.env !== void 0 ? { env: input.env } : {}
+    });
+  } catch (err) {
+    writeDockerWarning(
+      input.stderr,
+      `failed to restore staged repo ownership: ${formatError2(err)}`
+    );
+  }
+  try {
+    input.staged.cleanup();
+  } catch (err) {
+    writeDockerWarning(
+      input.stderr,
+      `failed to remove staged repo: ${formatError2(err)}`
+    );
+  }
+}
+function restoreStagedRepoOwnership(input) {
+  if (input.hostOwner === null) return;
+  input.run("docker", [
+    "run",
+    "--rm",
+    "-v",
+    `${input.stagedPath}:/work`,
+    input.imageRef,
+    "/bin/sh",
+    "-lc",
+    `find /work -xdev -exec chown -h ${input.hostOwner.uid}:${input.hostOwner.gid} {} +`
+  ], input.env !== void 0 ? { env: input.env } : {});
+}
+function getHostOwner() {
+  if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
+    return null;
+  }
+  return { uid: process.getuid(), gid: process.getgid() };
+}
+function writeDockerWarning(stderr, message) {
+  (stderr ?? process.stderr).write(`[docker:warn] ${message}
+`);
+}
+function formatError2(err) {
+  return err instanceof Error ? err.message : String(err);
 }
 function resolveDockerImage(ctx) {
   if (ctx.selfTest) {
