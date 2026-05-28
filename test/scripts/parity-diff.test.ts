@@ -95,6 +95,7 @@ describe('scripts/parity-diff.ts', () => {
         spawn_attempts:
           - $PKG/bin/esbuild --version
           - node install.js
+          - sh -c git config --local core.hooksPath
         spawn_blocked: []
         dlopen_attempts: []
         network_attempts: []
