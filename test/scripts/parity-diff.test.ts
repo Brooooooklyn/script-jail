@@ -65,7 +65,7 @@ packages:
 `;
 
 describe('scripts/parity-diff.ts', () => {
-  it('filters known backend env noise and the exact esbuild native self-verify spawn', () => {
+  it('filters known backend env/network noise and the exact esbuild native self-verify spawn', () => {
     const dir = makeWorkspace();
     const left = join(dir, 'linux.yml');
     const right = join(dir, 'macos.yml');
@@ -81,7 +81,8 @@ describe('scripts/parity-diff.ts', () => {
           - node install.js
         spawn_blocked: []
         dlopen_attempts: []
-        network_attempts: []
+        network_attempts:
+          - <BLOCKED> connect 168.63.129.16:53
 `,
       'utf8',
     );

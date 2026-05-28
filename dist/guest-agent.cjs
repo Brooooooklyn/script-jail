@@ -26528,6 +26528,14 @@ async function runInstallPhase(input) {
   const forgerySamples = [];
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
+  const snapshotAttribution = (pid) => {
+    const snapshot = attributionSnapshotByPid.get(pid);
+    if (snapshot === void 0) return null;
+    return {
+      pkg: snapshot.pkg,
+      lifecycle: snapshot.lifecycle
+    };
+  };
   const recordAttribution = (pid, attr, ts) => {
     const existing = attributionSnapshotByPid.get(pid);
     if (existing === void 0 || existing.recordedAtTs <= ts) {
@@ -26549,6 +26557,7 @@ async function runInstallPhase(input) {
   const nodeBootstrapEnvReads = /* @__PURE__ */ new Set();
   const nodeBootstrapFileReads = /* @__PURE__ */ new Set();
   const packageManagerClientPids = /* @__PURE__ */ new Set();
+  const completedPackageManagerClientPids = /* @__PURE__ */ new Set();
   const nodeBootstrapSubtree = (rootPid) => {
     const stack = [rootPid];
     for (let i = 0; i < stack.length; i++) {
@@ -26681,7 +26690,7 @@ async function runInstallPhase(input) {
   };
   const shouldFilterPackageManagerClientEnvRead = (raw) => {
     if (raw.kind !== "env_read" || raw.hidden) return false;
-    return packageManagerClientPids.has(raw.pid);
+    return packageManagerClientPids.has(raw.pid) || completedPackageManagerClientPids.has(raw.pid);
   };
   const shouldFilterNodeBootstrapFileRead = (raw) => {
     if (raw.kind !== "read" || raw.hidden || matcher.isProtected(raw.path)) {
@@ -26741,6 +26750,7 @@ async function runInstallPhase(input) {
       }
       if (shimEvent.kind === "node_startup_done") {
         if (shimEvent.pid === installRootPid) {
+          completedPackageManagerClientPids.delete(shimEvent.pid);
           packageManagerClientPids.add(shimEvent.pid);
         }
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
@@ -26759,12 +26769,15 @@ async function runInstallPhase(input) {
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
         continue;
       }
-      if (result !== null) {
-        recordAttribution(shimEvent.pid, result, lineTs);
+      const attribution = result ?? snapshotAttribution(shimEvent.pid);
+      if (attribution !== null) {
+        if (result !== null) {
+          recordAttribution(shimEvent.pid, result, lineTs);
+        }
         const attributed = {
           raw: shimEvent,
-          pkg: result.pkg,
-          lifecycle: result.lifecycle
+          pkg: attribution.pkg,
+          lifecycle: attribution.lifecycle
         };
         if (shouldBufferNodeBootstrapCandidateEnvRead(attributed)) {
           continue;
@@ -26779,7 +26792,9 @@ async function runInstallPhase(input) {
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
         flushNodeBootstrapCandidate(pid);
-        packageManagerClientPids.delete(pid);
+        if (packageManagerClientPids.delete(pid)) {
+          completedPackageManagerClientPids.add(pid);
+        }
         input.attribution.invalidate(pid);
         const liveAttrib = input.attribution.attribute(pid);
         if (liveAttrib !== null) {
@@ -27544,6 +27559,7 @@ async function runInstallPhase(input) {
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
           packageManagerClientPids.delete(rawEvent.pid);
+          completedPackageManagerClientPids.delete(rawEvent.pid);
           shimLoadedPids.delete(rawEvent.pid);
           if (isNodeSpawn(rawEvent, line)) {
             beginNodeBootstrap(rawEvent.pid);

@@ -89,6 +89,9 @@ const PARITY_ONLY_NETWORK_ATTEMPTS = new Set([
   // Apple Virtualization.framework NAT resolver observed in local arm64 VZ
   // lockfiles. Linux action backends see public resolvers instead.
   '<BLOCKED> connect 192.168.64.1:53',
+  // Azure-hosted runner DNS endpoint observed from the Docker backend on
+  // ubuntu-24.04-arm. It is host resolver plumbing, not dependency behavior.
+  '<BLOCKED> connect 168.63.129.16:53',
 ]);
 
 const PARITY_ONLY_SPAWN_ATTEMPTS = new Set([

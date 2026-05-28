@@ -2077,13 +2077,16 @@ export async function runInstallPhase(
   //                              is filesystem-order, not happens-
   //                              before).
   //   - stale                 — set on exit when /proc is also empty
-  //                              for this pid. Stale entries do NOT
-  //                              attribute fallbacks under their
+  //                              for this pid. Most fallbacks do NOT
+  //                              attribute stale entries under their
   //                              package — they route to
   //                              `<unattributed>` until a delayed
-  //                              clone overwrites them. See the
-  //                              exit-line handler below for the
-  //                              full lifecycle model.
+  //                              clone overwrites them. Shim JSONL
+  //                              lines are the exception: they may be
+  //                              written before exit and drained after
+  //                              /proc is gone. See the exit-line
+  //                              handler below for the full lifecycle
+  //                              model.
   const attributionSnapshotByPid: Map<
     number,
     {
@@ -2093,6 +2096,18 @@ export async function runInstallPhase(
       stale: boolean;
     }
   > = new Map();
+  const snapshotAttribution = (
+    pid: number,
+  ): { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null => {
+    const snapshot = attributionSnapshotByPid.get(pid);
+    if (snapshot === undefined) return null;
+    // Shim JSONL can be written before process exit but drained after /proc is
+    // gone, so this fallback intentionally accepts stale snapshots.
+    return {
+      pkg: snapshot.pkg,
+      lifecycle: snapshot.lifecycle,
+    };
+  };
   const recordAttribution = (
     pid: number,
     attr: { pkg: string; lifecycle: AttributedEvent['lifecycle'] },
@@ -2135,6 +2150,7 @@ export async function runInstallPhase(
   const nodeBootstrapEnvReads = new Set<string>();
   const nodeBootstrapFileReads = new Set<string>();
   const packageManagerClientPids = new Set<number>();
+  const completedPackageManagerClientPids = new Set<number>();
 
   const nodeBootstrapSubtree = (rootPid: number): number[] => {
     const stack = [rootPid];
@@ -2282,7 +2298,7 @@ export async function runInstallPhase(
 
   const shouldFilterPackageManagerClientEnvRead = (raw: RawEvent): boolean => {
     if (raw.kind !== 'env_read' || raw.hidden) return false;
-    return packageManagerClientPids.has(raw.pid);
+    return packageManagerClientPids.has(raw.pid) || completedPackageManagerClientPids.has(raw.pid);
   };
 
   const shouldFilterNodeBootstrapFileRead = (raw: RawEvent): boolean => {
@@ -2423,6 +2439,7 @@ export async function runInstallPhase(
       }
       if (shimEvent.kind === 'node_startup_done') {
         if (shimEvent.pid === installRootPid) {
+          completedPackageManagerClientPids.delete(shimEvent.pid);
           packageManagerClientPids.add(shimEvent.pid);
         }
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
@@ -2493,18 +2510,21 @@ export async function runInstallPhase(
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
         continue;
       }
-      if (result !== null) {
+      const attribution = result ?? snapshotAttribution(shimEvent.pid);
+      if (attribution !== null) {
         // Finding 3 (audit-trust): snapshot attribution for this pid on
         // every successful observation.  A later raw execve from the
         // same pid with a scrubbed envp would otherwise lose the
         // lifecycle context and slip past the bypass detector.  The
         // refresh semantics (see `recordAttribution` declaration) also
         // keep same-pid re-execs into a new package context current.
-        recordAttribution(shimEvent.pid, result, lineTs);
+        if (result !== null) {
+          recordAttribution(shimEvent.pid, result, lineTs);
+        }
         const attributed: AttributedEvent = {
           raw: shimEvent,
-          pkg: result.pkg,
-          lifecycle: result.lifecycle,
+          pkg: attribution.pkg,
+          lifecycle: attribution.lifecycle,
         };
         if (shouldBufferNodeBootstrapCandidateEnvRead(attributed)) {
           continue;
@@ -2591,7 +2611,9 @@ export async function runInstallPhase(
       //      would be required to wrap PID_MAX.
       if (line.startsWith('+++') && line.endsWith('+++')) {
         flushNodeBootstrapCandidate(pid);
-        packageManagerClientPids.delete(pid);
+        if (packageManagerClientPids.delete(pid)) {
+          completedPackageManagerClientPids.add(pid);
+        }
         // Audit-trust final model (Codex review of 2496405,
         // 2026-05-19): the snapshot is NEVER evicted on exit.
         //
@@ -4715,6 +4737,7 @@ export async function runInstallPhase(
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
           packageManagerClientPids.delete(rawEvent.pid);
+          completedPackageManagerClientPids.delete(rawEvent.pid);
           shimLoadedPids.delete(rawEvent.pid);
           if (isNodeSpawn(rawEvent, line)) {
             beginNodeBootstrap(rawEvent.pid);
