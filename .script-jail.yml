@@ -1,6 +1,6 @@
-# script-jail config. Hides these files/env vars from the lifecycle scripts running
-# inside the Firecracker VM. Note: $HOME is an empty tmpfs in the VM regardless;
-# entries here are still useful for repo-local paths and for documenting intent.
+# script-jail config. Hides these files/env vars from lifecycle scripts running
+# inside the selected audit backend. Entries here cover repo-local paths,
+# package-manager auth files, and documented secret-boundary intent.
 
 protected:
   files:

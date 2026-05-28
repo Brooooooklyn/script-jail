@@ -14948,7 +14948,7 @@ describe('runInstallPhase', () => {
 });
 
 // ---------------------------------------------------------------------------
-// loadPmFlags — pm-flags.json loader (PR 2)
+// loadPmFlags — pm-flags.json loader
 // ---------------------------------------------------------------------------
 
 describe('loadPmFlags', () => {

@@ -78,8 +78,8 @@ export interface OverlayInput {
    * staged into the repo-staging dir BEFORE `mkfs.ext4 -d` runs so they
    * become part of the immutable repo disk.
    *
-   * Used by the macOS CLI (PR 2+) to layer per-PM install-arg overlays;
-   * the existing action surface leaves this undefined.
+   * Used by the macOS CLI to layer per-PM install-arg overlays; the existing
+   * action surface leaves this undefined.
    */
   extraRepoOverlayFiles?: ReadonlyArray<{ relPath: string; content: string }>;
 }
@@ -139,8 +139,8 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
 
   // 3b. Layer any caller-supplied extra files onto the repo stage dir.
   //     Written before mkfs.ext4 -d so they end up on the immutable repo
-  //     disk.  Used by the macOS CLI (PR 2+) to inject .yarnrc.yml and
-  //     etc/script-jail/pm-flags.json.  Defence in depth: reject any
+  //     disk. Used by the macOS CLI to inject .yarnrc.yml and
+  //     etc/script-jail/pm-flags.json. Defence in depth: reject any
   //     relPath that resolves outside the stage dir so a malicious caller
   //     can't traverse via `..` into the host filesystem.
   if (extraRepoOverlayFiles !== undefined) {

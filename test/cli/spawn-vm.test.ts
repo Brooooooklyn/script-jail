@@ -125,7 +125,7 @@ describe('checkArtifacts', () => {
     ).toThrow(/rootfs not found/);
   });
 
-  it('mentions PR 5 in the kernel-missing error so the user knows where the artifact comes from', () => {
+  it('points the kernel-missing error at local build or release artifacts', () => {
     try {
       checkArtifacts({
         kernelPath: join(scratch, 'no-kernel'),
@@ -134,9 +134,9 @@ describe('checkArtifacts', () => {
       throw new Error('should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(MacOSVmArtifactNotFoundError);
-      // PR 4 surfaces the "kernel is a PR 5 artifact" hint.  Document the
-      // expected message verbatim so the user-facing text doesn't drift.
-      expect((err as Error).message).toContain('PR 5');
+      const msg = (err as Error).message;
+      expect(msg).toContain('pnpm build');
+      expect(msg).toContain('release artifact');
     }
   });
 

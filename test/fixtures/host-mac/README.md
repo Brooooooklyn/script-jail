@@ -1,11 +1,9 @@
-This directory hosts macOS-host smoke fixtures. PR 3 ships only the config-validation
-fixture; PR 5 adds real kernel + rootfs artifacts at the paths referenced in this file.
+This directory hosts macOS-host smoke fixtures.
 
 The current fixture (`smoke.json`) intentionally points at non-existent files. The
 `script-jail-vm` binary must reject it with a "kernel_path" validation error and exit
 64. The macOS CI workflow at `.github/workflows/test-macos.yml` asserts on that.
 
-Files added in PR 5:
-- `missing-kernel` -> real arm64 vmlinuz
-- `missing-rootfs.img` -> ubuntu rootfs ext4 image
-- `missing-repo.img` -> empty repo overlay
+The missing paths are part of the test contract; do not replace them with real
+artifacts. Real macOS VZ runs resolve release artifacts through the CLI and
+manifest instead of this fixture directory.

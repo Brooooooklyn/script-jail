@@ -46,10 +46,9 @@ jobs:
       - name: cargo test
         run: cargo test -p script-jail-host-mac
 
-      # The fixture's kernel/rootfs paths don't exist (those artifacts ship
-      # in PR 5).  The binary must reject the config with a clear
-      # validation error mentioning "kernel_path" and exit 64.  CI asserts
-      # on that exact behaviour.
+      # The fixture's kernel/rootfs paths intentionally do not exist. The
+      # binary must reject the config with a clear validation error mentioning
+      # "kernel_path" and exit 64. CI asserts on that exact behaviour.
       - name: Smoke run (expected to fail with config validation error)
         run: |
           set -euo pipefail

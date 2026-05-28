@@ -7374,7 +7374,7 @@ var import_node_os = require("node:os");
 var NotMacOSError = class extends Error {
   constructor(actualPlatform) {
     super(
-      `script-jail CLI requires macOS (detected '${actualPlatform}'). On Linux CI, use the GitHub Action (uses: Brooooooklyn/npm-jar@v1) instead.`
+      `script-jail CLI requires macOS (detected '${actualPlatform}'). On Linux CI, use the GitHub Action (uses: Brooooooklyn/scriptjail@<pinned-tag>) instead.`
     );
     this.name = "NotMacOSError";
   }
@@ -7521,7 +7521,7 @@ Run \`cargo build --release -p script-jail-host-mac\` to build it, or set SCRIPT
 var MacOSVmArtifactNotFoundError = class extends Error {
   constructor(artifact, path) {
     super(
-      `${artifact} not found at ${path}. ` + (artifact === "kernel" ? "The VZ-compatible kernel artifact lands in PR 5; until then, run the audit on Linux CI via the GitHub Action." : `Run \`pnpm build\` (or fetch the release artifact) to produce it.`)
+      `${artifact} not found at ${path}. Run \`pnpm build\` for local artifacts or fetch the matching release artifact.`
     );
     this.artifact = artifact;
     this.path = path;

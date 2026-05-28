@@ -106,10 +106,9 @@ jobs:
     # downloads that artifact mid-job to feed it into `Compute SHAs`.
     needs: build-mac-bin
     runs-on: ubuntu-24.04
-    # The rootfs build invokes Docker + mkfs.ext4 twice (once per runner
-    # image); 30 minutes is comfortable headroom over the typical ~10-min
-    # combined runtime.  PR 5 also runs the VZ kernel build (~5-10 min)
-    # twice, so the total budget needs a slight bump.
+    # The rootfs build invokes Docker + mkfs.ext4 for each runner image and
+    # architecture. The VZ kernel build adds another pair of long native
+    # builds, so the total budget needs a wider ceiling than the test matrix.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -204,10 +203,10 @@ jobs:
           cargo build --release --manifest-path src/shim/Cargo.toml
           cp target/release/libscriptjail.so images/libscriptjail.so
 
-      # PR 5: arm64 shim build infra.  The cross-toolchain is required so
-      # cargo-zigbuild + zig produce the aarch64-unknown-linux-gnu ELF
-      # .so from the amd64 release runner.  Same tool also works from
-      # macOS, so a future move to a different runner doesn't require
+      # The cross-toolchain is required so cargo-zigbuild + zig produce the
+      # aarch64-unknown-linux-gnu ELF .so from the amd64 release runner.
+      # The same tool also works from macOS, so a future move to a different
+      # runner doesn't require
       # touching the build script.  rustup-target-add is invoked first
       # because dtolnay/rust-toolchain's `stable` does not pre-install it.
       - name: Install arm64 cross-toolchain (kernel deps only)
@@ -259,7 +258,7 @@ jobs:
       - name: Build rootfs (ubuntu-24.04, x64)
         run: pnpm build -- --runner-image=ubuntu-24.04 --skip-bundle --skip-shim
 
-      # PR 5: build the two arm64 rootfs ext4 images for the macOS CLI.
+      # Build the two arm64 rootfs ext4 images for the macOS CLI.
       # `--arch=arm64` selects the arm64 base image AND skips the redundant
       # x64 shim build (the arm64 .so above already produced
       # `images/libscriptjail-arm64.so`).
@@ -276,8 +275,8 @@ jobs:
       - name: Restore x64 shim artifact
         run: cp target/release/libscriptjail.so images/libscriptjail.so
 
-      # PR 5: build the two VZ kernels.  Pinned upstream version + per-arch
-      # config; see images/kernel/build.sh for the full pipeline.
+      # Build the two VZ kernels. Pinned upstream version + per-arch config;
+      # see images/kernel/build.sh for the full pipeline.
       - name: Build vmlinux-vz (x86_64)
         run: bash images/kernel/build.sh --arch=x86_64 --force
 
@@ -411,9 +410,9 @@ jobs:
           # (in particular dist/main.cjs, which we compare against below).
           path: artifacts
 
-      # PR 5: the macOS Mach-O binary is uploaded as a separate workflow
-      # artifact by the `build-mac-bin` job (it can't be cross-built on
-      # the Linux runner).  Land it under `artifacts/` so
+      # The macOS Mach-O binary is uploaded as a separate workflow artifact by
+      # the `build-mac-bin` job (it can't be cross-built on the Linux runner).
+      # Land it under `artifacts/` so
       # `check-publish-artifacts.sh` finds it at
       # `artifacts/script-jail-vm-arm64-darwin`.
       - name: Download Mach-O artifact

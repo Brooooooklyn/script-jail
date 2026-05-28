@@ -145,7 +145,7 @@ describe('validateManifest', () => {
   });
 
   it('rejects a flat (non-platform-keyed) manifest at runtime', () => {
-    // The platform-keyed layout (5.2) is the only legal shape after PR 5.
+    // The platform-keyed layout is the only legal shape.
     // A maintainer who copy-pastes the old flat structure must see a
     // clear error, not a silent zero-offender pass.
     const flat = {

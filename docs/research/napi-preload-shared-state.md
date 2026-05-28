@@ -75,31 +75,37 @@ still inspect or mutate the live `environ` array directly unless a future design
 scrubs protected entries out of the process environment or moves the audit
 channel behind a stronger isolation boundary.
 
-The current startup filter is narrower than "skip all env reads." The shim only
-suppresses unprotected libc env-read noise while Node is starting. Protected env
-names are still hidden and audited.
+The current production filter does not skip all startup reads in the shim.
+Instead, it records Node's own bootstrap reads and package-manager client reads
+as baselines, then drops matching unprotected noise from the rendered lockfile.
+Protected env names are still hidden and audited.
 
-Current control flow:
+Current production control flow:
 
 1. `buildChildEnv()` injects `LD_PRELOAD=/lib/libscriptjail.so`,
    `SCRIPT_JAIL_NODE_OPTIONS`, and `NODE_OPTIONS` with
    `--require=/usr/local/lib/script-jail/platform-spoof.cjs` and
-   `--require=/usr/local/lib/script-jail/env-spy.cjs`.
-2. The shim constructor detects a Node executable whose
-   `SCRIPT_JAIL_NODE_OPTIONS` contains `env-spy.cjs` and enables
-   `NODE_STARTUP_FILTER_ACTIVE`.
-3. `getenv` / `secure_getenv` suppress unprotected startup reads while that flag
-   is active, but still emit and hide protected names.
-4. `env-spy.cjs` installs the `process.env` Proxy, then sets and deletes
-   `SCRIPT_JAIL_NODE_STARTUP_DONE`.
-5. The shim's `setenv` / `putenv` wrappers consume that marker and clear
-   `NODE_STARTUP_FILTER_ACTIVE` without leaving the marker in the child env.
+   `--require=/usr/local/lib/script-jail/env-spy.cjs`. It does not inject
+   `--no-addons` or `dlopen-block.cjs`.
+2. `env-spy.cjs` installs the `process.env` Proxy, emits JS-level env-read
+   audit events for unprotected reads, and sets/deletes
+   `SCRIPT_JAIL_NODE_STARTUP_DONE` after the preload has finished installing.
+3. The shim's `setenv` / `putenv` wrappers consume that marker and emit a
+   `node_startup_done` JSONL event without leaving the marker in the child env.
+4. The install phase combines the marker with strace file-read markers to learn
+   Node bootstrap file/env reads for each spawned Node process.
+5. The renderer filters matching unprotected Node bootstrap reads and
+   npm/yarn/pnpm client reads before writing the lockfile. Protected reads are
+   still rendered, and native lifecycle executable divergence is not hidden.
 
 ## Design Implication
 
 A N-API callback from the same `.so` would be a stronger in-process startup
-barrier than an env-marker side channel, because it would flip the flag from
-inside the preloaded library's own static state. With native addons enabled by
-default, the remaining production questions are how to guarantee the addon path
-matches the preloaded `.so`, and whether protected env entries should be scrubbed
-from `environ` before untrusted native lifecycle code runs.
+barrier than an env-marker side channel, because it would flip state from inside
+the preloaded library's own static storage. The current implementation does not
+need that stronger barrier because bootstrap reads are learned and filtered
+later, but the N-API approach remains viable if we need a more precise
+"Node preload installed" signal. With native addons enabled by default, the
+remaining production questions are how to guarantee the addon path matches the
+preloaded `.so`, and whether protected env entries should be scrubbed from
+`environ` before untrusted native lifecycle code runs.

@@ -1,10 +1,8 @@
 // script-jail — src/host-mac/src/main.rs
 //
 // `script-jail-vm`: the macOS-side helper binary spawned by the Node CLI.
-// PR 3 ships the full entrypoint, but the actual VM boot is gated on
-// artifacts that don't exist until PR 4-5.  The `--smoke` mode exists to
-// give CI a regression target: it must reject the fixture config with a
-// clear "kernel_path not found" error and exit 64.
+// The `--smoke` mode gives CI a regression target: it must reject the fixture
+// config with a clear "kernel_path not found" error and exit 64.
 //
 // Wire conventions:
 //   - stdin :  expects a "go\n" line at handshake time, forwarded verbatim
@@ -87,9 +85,8 @@ fn run() -> u8 {
     let (frame_tx, frame_rx) = unbounded::<Frame>();
     let dispatch_handle = dispatch::Handle::new();
 
-    // Assemble the VZ configuration.  This is the most likely place for
-    // PR 3's smoke test to bail out, because the disk paths in the
-    // fixture don't exist.
+    // Assemble the VZ configuration. This is the most likely place for the
+    // smoke fixture to bail out, because the disk paths do not exist.
     let vm_config = match vm::build_config(&cfg) {
         Ok(c) => c,
         Err(VmError::FileNotFound(msg)) => {

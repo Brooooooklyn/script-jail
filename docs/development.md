@@ -5,12 +5,11 @@
 `pnpm build` runs `scripts/build.ts` (via `oxnode`) which:
 
 1. Bundles `src/main.ts` to `dist/main.cjs` with esbuild (cjs target, node20).
-2. Bundles the guest agent (`src/guest/agent.ts` + entry) to `dist/guest-agent.cjs`.
-3. Copies/compiles the preloads to `dist/preloads/*.cjs`.
-4. Builds the Rust shim (`cargo build --release --manifest-path src/shim/Cargo.toml`) and copies `target/release/libscriptjail.so` → `images/libscriptjail.so` (skipped on macOS dev hosts; CI provides the Rust toolchain via `dtolnay/rust-toolchain@stable` pinned to match `rust-toolchain.toml`).
-5. Optionally builds the per-runner-image rootfs when `--runner-image=ubuntu-22.04|ubuntu-24.04` is passed.
+2. Builds the Rust shim (`cargo build --release --manifest-path src/shim/Cargo.toml`) and copies `target/release/libscriptjail.so` → `images/libscriptjail.so` (skipped on macOS dev hosts; CI provides the Rust toolchain via `dtolnay/rust-toolchain@stable` pinned to match `rust-toolchain.toml`).
+3. Optionally cross-compiles `images/libscriptjail-arm64.so` when `--shim-arm64` is passed.
+4. Builds the per-runner-image rootfs when rootfs building is not skipped. The rootfs builder bundles `src/guest/agent.ts` to `dist/guest-agent.cjs` and copies `src/guest/*.cjs` preloads to `dist/preloads/` before building the Docker image and ext4.
 
-For day-to-day host-side edits, `pnpm build:bundle` is enough (rebuilds only `dist/main.cjs`).
+For day-to-day host-side edits, `pnpm build:bundle` is enough (rebuilds only `dist/main.cjs`). CLI edits require `pnpm build:cli`; guest/preload edits require `pnpm build:guest-agent` or a rootfs build.
 
 ## The `dist/` invariant
 
@@ -18,6 +17,7 @@ For day-to-day host-side edits, `pnpm build:bundle` is enough (rebuilds only `di
 
 - Host changes → `pnpm build:bundle` (rebuilds `dist/main.cjs`).
 - Guest or preload changes → `pnpm build` (rebuilds `dist/guest-agent.cjs` and `dist/preloads/`).
+- CLI changes → `pnpm build:cli` (rebuilds `dist/cli.cjs`).
 - Rootfs changes → `pnpm build --runner-image=ubuntu-XX.YY` per supported image; rootfs SHAs need updating in the artifact manifest (see release flow).
 - Shim changes (`src/shim/src/lib.rs` or `src/shim/Cargo.toml`) → rebuild via `cargo build --release` (or `pnpm build`, which wraps it); the resulting `libscriptjail.so` is released alongside the rootfs.
 
@@ -38,25 +38,29 @@ Always include the rebuilt `dist/` files in the same commit as the source change
 
 Tagged releases (`release.yml`) bundle:
 
-- `dist/` JS artifacts.
-- `libscriptjail.so` (Rust shim binary; built with the toolchain pinned in `rust-toolchain.toml`).
-- The per-runner-image rootfs (ext4).
-- Digest-pinned Docker rootfs images in GHCR.
-- A manifest pinning Firecracker, kernel, rootfs SHAs, and Docker image refs.
+- `dist/main.cjs`, `dist/guest-agent.cjs`, `dist/cli.cjs`, and `dist/preloads/*.cjs`.
+- `libscriptjail.so` and `libscriptjail-arm64.so` (Rust shim binaries; built with the toolchain pinned in `rust-toolchain.toml`).
+- The per-runner-image Linux rootfs ext4 images for x64 and arm64.
+- Firecracker/VZ kernel artifacts, including the VZ-specific kernel names consumed by the macOS helper.
+- The Darwin arm64 `script-jail-vm` helper used by the macOS CLI backend.
+- Digest-pinned Docker rootfs images in GHCR for each supported runner image and architecture.
+- A manifest pinning Firecracker binaries, kernels, rootfs SHAs, Docker image refs, shim SHAs, and macOS helper artifacts.
 
 When bumping any pinned artifact:
 
-1. Update the URL/SHA in `src/action/artifact-manifest.ts`.
-2. Run `scripts/validate-manifest.ts` to confirm hashes/image refs match.
-3. Rebuild affected artifacts and let `release.yml` publish them.
-4. Bump the version tag.
+1. Rebuild the affected artifacts and let `release.yml` publish them.
+2. Copy the release summary's URLs, SHAs, and Docker image refs into `src/action/artifact-manifest.ts`.
+3. Run `scripts/validate-manifest.ts` to confirm hashes/image refs match.
+4. Bump the version tag only after the manifest validates against the published assets.
 
 The repo's own CI sets `SCRIPT_JAIL_E2E_SELF_TEST=1` to skip manifest validation (so the action under test isn't gated on the very artifacts it's building).
 
 ## CI overview
 
-- `test.yml` — typecheck + unit/guest/integration on matrix of Ubuntu 22.04/24.04 × Node 22/24; verifies `dist/main.cjs` is current.
-- `e2e.yml` — boots real Firecracker VMs against the fixtures; asserts attack markers and check/update mode correctness.
+- `test.yml` — typecheck + unit/guest/integration/fake-e2e Vitest projects on matrix of Ubuntu 22.04/24.04 × Node 22/24/26; verifies `dist/main.cjs`, `dist/guest-agent.cjs`, and `dist/cli.cjs` are current.
+- `e2e.yml` — boots real Firecracker VMs on Ubuntu 22.04/24.04; creates `tap0`, requires `/dev/kvm`, asserts attack markers, then verifies `mode=check` fails on tampered lockfiles.
+- `parity-test.yml` — on parity-relevant PRs, runs the Action backend on `ubuntu-24.04-arm` (`backend: auto`, normally Docker on hosted arm runners) and hard-fails if the generated lockfile differs from the committed macOS/VZ arm64 baseline after parity-only filtering.
+- `test-macos.yml` — builds/tests the macOS host helper and validates the config-error smoke fixture.
 - `release.yml` — produces tagged artifacts per the manifest.
 
 Failing CI almost always means one of: out-of-date `dist/`, a golden that needs regenerating, a missed canonicalization in the renderer, or a real audit-policy change that legitimately shifts a fixture's expected events.

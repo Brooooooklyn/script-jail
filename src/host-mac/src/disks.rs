@@ -7,8 +7,8 @@
 //   - rootfs  (rw)  — ubuntu ext4 image, mounted as `/` in the guest.
 //   - repo    (rw)  — host repo bind-mounted at `/work` in the guest.
 //
-// PR 3 only builds these; the test in vm.rs verifies the assembly compiles
-// and the API contracts hold.  Real boot is PR 4-5.
+// The test in vm.rs verifies that the assembly compiles and the API contracts
+// hold; real boot coverage is artifact-gated.
 
 use std::path::Path;
 

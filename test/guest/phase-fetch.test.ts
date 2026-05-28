@@ -119,12 +119,11 @@ describe('runFetchPhase', () => {
   });
 
   // -------------------------------------------------------------------------
-  // pm-flags.json integration (PR 2 — C1 fix)
+  // pm-flags.json integration
   // -------------------------------------------------------------------------
   //
-  // The macOS CLI lands /etc/script-jail/pm-flags.json with
-  // `{ extra_install_args: [...] }` to force a Linux/x64 dependency
-  // resolution from an arm64 host (`--cpu=x64 --os=linux --libc=glibc`).
+  // The macOS CLI can land /etc/script-jail/pm-flags.json with
+  // `{ extra_install_args: [...] }` when it needs a package-manager overlay.
   // Those flags MUST be spliced into Phase A (fetch/resolve) for npm + pnpm.
   // Phase B is too late — the tree is already resolved by then.
   describe('pm-flags.json integration', () => {

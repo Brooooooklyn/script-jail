@@ -4,8 +4,8 @@
 // at runtime.  See `./pre-fetch-artifacts.ts` for release-asset downloads,
 // `./backend/docker.ts` for digest-pinned GHCR image pulls, and
 // `.github/workflows/release.yml` for the workflow that builds and publishes
-// both forms.  PR 5 split `expected` by platform so the action (Linux-only)
-// and the macOS CLI can pin distinct asset sets from one source of truth.
+// both forms. `expected` is split by platform so the action (Linux-only) and
+// the macOS CLI can pin distinct asset sets from one source of truth.
 //
 // Manifest-update workflow:
 //

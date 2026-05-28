@@ -148,8 +148,8 @@ describe('resolveArtifacts — ubuntu major versions', () => {
       hostArch: 'arm64',
       ubuntuMajor: '24.04',
     });
-    // Rootfs differs by Ubuntu major (matches imageFilename()).  Kernel does
-    // NOT differ — PR 5 ships one VZ kernel per arch, regardless of which
+    // Rootfs differs by Ubuntu major (matches imageFilename()). Kernel does
+    // NOT differ — there is one VZ kernel per arch, regardless of which
     // userland the rootfs targets.
     expect(a.rootfsPath).toBe('/Users/test/repo/images/rootfs-ubuntu-22.04-arm64.ext4');
     expect(b.rootfsPath).toBe('/Users/test/repo/images/rootfs-ubuntu-24.04-arm64.ext4');

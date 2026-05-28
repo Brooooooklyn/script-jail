@@ -10,8 +10,8 @@ publish = false
 # emits `warning: profiles for the non root package will be ignored` when a
 # profile block lives in a workspace member.  The values below are verbatim
 # the ones that previously lived in the shim manifest — kept here so they
-# actually apply.  When `src/host-mac` is added in PR 3 it will inherit the
-# same release tuning (acceptable: both are size/perf-sensitive native code).
+# actually apply. `src/host-mac` shares the same release tuning because both
+# workspace crates are size/perf-sensitive native code.
 [profile.release]
 opt-level     = "z"
 lto           = true

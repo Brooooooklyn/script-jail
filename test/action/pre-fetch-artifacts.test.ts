@@ -99,8 +99,8 @@ function manifest(): ArtifactManifest {
         'libscriptjail.so': sha(LIB_CONTENT),
       },
       darwin: {
-        // PR 5: darwin keys are not consumed by preFetchArtifacts (which only
-        // runs on the Linux runner) but must be present so the manifest is
+        // Darwin keys are not consumed by preFetchArtifacts (which only runs
+        // on the Linux runner) but must be present so the manifest is
         // structurally valid.  Real SHAs here let the platform='darwin'
         // tests below use the same manifest builder.
         'rootfs-ubuntu-22.04-arm64.ext4': sha('fake-darwin-rootfs-22-arm64'),

@@ -21,11 +21,11 @@
 //                                                rootfs against
 //   --all                                        build BOTH runner-image rootfses
 //                                                (overrides --runner-image)
-//   --arch=x64|arm64                             target rootfs architecture (PR 4).
+//   --arch=x64|arm64                             target rootfs architecture.
 //                                                Defaults to 'x64' unless
 //                                                --shim-arm64 is also set.
 //   --shim-arm64                                 cross-compile libscriptjail.so for
-//                                                aarch64-unknown-linux-gnu (PR 4).
+//                                                aarch64-unknown-linux-gnu.
 //                                                Linux-only; macOS surfaces a
 //                                                clear error pointing at CI.
 //
@@ -84,10 +84,10 @@ interface ParsedArgs {
    */
   arch: BuildArch | undefined;
   /**
-   * PR 4 flag: `--shim-arm64` requests the cross-compiled
+   * `--shim-arm64` requests the cross-compiled
    * `target/aarch64-unknown-linux-gnu/release/libscriptjail.so` → copied to
-   * `images/libscriptjail-arm64.so`.  Implies --arch=arm64 for the rootfs
-   * step unless --arch is supplied separately.  Gated on Linux: on macOS we
+   * `images/libscriptjail-arm64.so`. Implies --arch=arm64 for the rootfs
+   * step unless --arch is supplied separately. Gated on Linux: on macOS we
    * surface a clear error pointing at CI (cargo on Darwin cannot build a
    * Linux .so from this toolchain).
    */
