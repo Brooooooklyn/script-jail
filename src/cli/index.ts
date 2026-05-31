@@ -30,7 +30,7 @@
 //   owns only the macOS-specific bits: host detection, artifact lookup,
 //   and the VZ launcher closure.
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -47,6 +47,7 @@ import { parseArgs } from './parse-args.js';
 import { detectPm, BunUnsupportedError } from '../shared/detect-pm.js';
 import { warn as sharedWarn } from '../shared/log.js';
 import { resolveArtifacts } from '../shared/artifacts.js';
+import { ensureRootfs } from './rootfs-cache.js';
 import {
   makeOverlay,
   type OverlayResult,
@@ -57,8 +58,6 @@ import { buildArchFlagOverlay } from './arch-flags.js';
 // ---------------------------------------------------------------------------
 // Help text
 // ---------------------------------------------------------------------------
-
-const VERSION = '0.0.0'; // synced with package.json at release time
 
 const USAGE = `script-jail — Firecracker/VZ-sandboxed npm/pnpm/yarn lifecycle auditor.
 
@@ -186,7 +185,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
     return 1;
   }
   if (args.help) { stdout.write(USAGE); return 0; }
-  if (args.version) { stdout.write(`${VERSION}\n`); return 0; }
+  if (args.version) { stdout.write(`${readPackageVersion(cwd)}\n`); return 0; }
 
   // --- Host check ---------------------------------------------------------
   let host: DetectedHost;
@@ -243,6 +242,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
     hostArch: host.hostArch,
     ubuntuMajor: DEFAULT_UBUNTU_MAJOR,
   });
+  let baseRootfsPath = artifacts.rootfsPath;
 
   // Pre-flight rootfs existence check: surfacing "rootfs not found" before
   // makeOverlay (which would error inside its `cpSync`) gives the user an
@@ -250,7 +250,13 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   // only AFTER makeOverlay has already started copying.  We skip this when
   // makeOverlay is stubbed (deps.makeOverlay !== undefined) because tests do
   // not have the real images/ dir.
-  if (deps.makeOverlay === undefined && !existsSync(artifacts.rootfsPath)) {
+  if (deps.makeOverlay === undefined) {
+    baseRootfsPath = await ensureRootfs({
+      rootfsPath: artifacts.rootfsPath,
+      compressedRootfsPath: artifacts.compressedRootfsPath,
+    });
+  }
+  if (deps.makeOverlay === undefined && !existsSync(baseRootfsPath)) {
     const buildHint =
       host.hostArch === 'arm64'
         ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64`
@@ -324,7 +330,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       // process.arch) so unit tests can exercise the arm64 codepath from
       // an x64 dev box without monkey-patching process.arch.
       hostArch: host.hostArch,
-      baseRootfsPath: artifacts.rootfsPath,
+      baseRootfsPath,
       // os.tmpdir() — never `cwd` — so the rewritten config YAML and any
       // arch-flag sidecars (.yarnrc.yml / pm-flags.json) cannot pollute
       // the user's repo.  runAudit creates a private mkdtemp dir under
@@ -407,6 +413,17 @@ function resolveScriptJailRoot(cwd: string): string {
     if (existsSync(join(c, 'package.json'))) return c;
   }
   return cwd;
+}
+
+function readPackageVersion(cwd: string): string {
+  const packageJsonPath = join(resolveScriptJailRoot(cwd), 'package.json');
+  try {
+    const pkg = JSON.parse(String(readFileSync(packageJsonPath, 'utf8'))) as Record<string, unknown>;
+    if (typeof pkg['version'] === 'string') return pkg['version'];
+  } catch {
+    /* fall through */
+  }
+  return '0.0.0';
 }
 
 function hasSpoofArchArg(argv: readonly string[]): boolean {

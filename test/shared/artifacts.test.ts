@@ -29,6 +29,9 @@ describe('resolveArtifacts — arm64', () => {
     expect(arm.rootfsPath).toBe(
       '/Users/test/repo/images/rootfs-ubuntu-24.04-arm64.ext4',
     );
+    expect(arm.compressedRootfsPath).toBe(
+      '/Users/test/repo/images/rootfs-ubuntu-24.04-arm64.ext4.gz',
+    );
   });
 
   it('libscriptjail.so carries the arch suffix on arm64', () => {
@@ -56,6 +59,9 @@ describe('resolveArtifacts — x64', () => {
     // artifact, no manifest churn.
     expect(x64.rootfsPath).toBe(
       '/Users/test/repo/images/rootfs-ubuntu-24.04.ext4',
+    );
+    expect(x64.compressedRootfsPath).toBe(
+      '/Users/test/repo/images/rootfs-ubuntu-24.04.ext4.gz',
     );
   });
 
@@ -153,6 +159,8 @@ describe('resolveArtifacts — ubuntu major versions', () => {
     // userland the rootfs targets.
     expect(a.rootfsPath).toBe('/Users/test/repo/images/rootfs-ubuntu-22.04-arm64.ext4');
     expect(b.rootfsPath).toBe('/Users/test/repo/images/rootfs-ubuntu-24.04-arm64.ext4');
+    expect(a.compressedRootfsPath).toBe(`${a.rootfsPath}.gz`);
+    expect(b.compressedRootfsPath).toBe(`${b.rootfsPath}.gz`);
     expect(a.kernelPath).toBe(b.kernelPath);
   });
 });

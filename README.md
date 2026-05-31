@@ -146,6 +146,12 @@ VZ kernel, per-arch rootfs, and `libscriptjail` release artifacts; in this repo
 checkout those are produced by the release/build workflows and resolved from
 `images/`.
 
+The npm package currently ships the Apple Silicon runtime artifacts needed by
+the CLI: `script-jail-vm`, the VZ kernel, `libscriptjail-arm64.so`, and a
+compressed Ubuntu 24.04 arm64 rootfs. On first run, the CLI expands the
+compressed rootfs into a sparse cache under `~/Library/Caches/script-jail` (or
+`SCRIPT_JAIL_CACHE_DIR` when set).
+
 ## How It Works
 
 Install auditing is split into two phases. Phase A runs the package-manager

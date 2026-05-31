@@ -386,6 +386,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
 
     steps:
       # Re-checkout the tagged source on a separate runner whose filesystem
@@ -420,6 +421,12 @@ jobs:
         with:
           name: script-jail-vm-arm64-darwin
           path: artifacts
+
+      - name: Setup Node.js for npm publish
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
 
       # Independently verify the downloaded artifacts against the SHAs the
       # tagged source committed.  See scripts/check-publish-artifacts.sh for
@@ -543,6 +550,26 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Stage npm macOS package assets
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "${package_version}" != "${version}" ]; then
+            echo "::error::package.json version (${package_version}) must match tag ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+          mkdir -p bin/darwin-arm64 images dist
+          cp artifacts/dist/cli.cjs dist/cli.cjs
+          cp artifacts/script-jail-vm-arm64-darwin bin/darwin-arm64/script-jail-vm
+          chmod 755 bin/darwin-arm64/script-jail-vm
+          cp artifacts/images/vmlinux-vz-arm64 images/vmlinux-vz-arm64
+          cp artifacts/images/libscriptjail-arm64.so images/libscriptjail-arm64.so
+          gzip -n -c artifacts/images/rootfs-ubuntu-24.04-arm64.ext4 > images/rootfs-ubuntu-24.04-arm64.ext4.gz
+
+          node scripts/assert-npm-packlist.mjs
+
       # softprops/action-gh-release@v3 auto-creates the release for the tag
       # (or appends to an existing one) and uploads each listed file.  We pin
       # to the major tag — the maintainer's standard practice in this repo
@@ -562,3 +589,8 @@ jobs:
             artifacts/script-jail-vm-arm64-darwin
             artifacts/dist/main.cjs
             artifacts/dist/cli.cjs
+
+      - name: Publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

@@ -1,9 +1,20 @@
 {
   "name": "script-jail",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Backend-isolated install auditor for npm/pnpm/yarn lifecycle scripts.",
   "type": "module",
   "license": "MIT",
+  "files": [
+    "dist/cli.cjs",
+    "bin/darwin-arm64/script-jail-vm",
+    "images/rootfs-ubuntu-24.04-arm64.ext4.gz",
+    "images/vmlinux-vz-arm64",
+    "images/libscriptjail-arm64.so",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "packageManager": "pnpm@11.1.2",
   "engines": {
     "node": ">=20.0.0"
