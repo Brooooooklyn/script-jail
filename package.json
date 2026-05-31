@@ -6,12 +6,15 @@
   "license": "MIT",
   "files": [
     "dist/cli.cjs",
-    "bin/darwin-arm64/script-jail-vm",
-    "images/rootfs-ubuntu-24.04-arm64.ext4.gz",
-    "images/vmlinux-vz-arm64",
-    "images/libscriptjail-arm64.so",
+    "dist/guest-agent.cjs",
+    "dist/preloads/*.cjs",
     "README.md"
   ],
+  "optionalDependencies": {
+    "@script-jail/darwin-arm64": "0.1.0",
+    "@script-jail/linux-x64": "0.1.0",
+    "@script-jail/linux-arm64": "0.1.0"
+  },
   "publishConfig": {
     "access": "public"
   },

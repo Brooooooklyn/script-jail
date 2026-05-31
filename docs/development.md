@@ -45,7 +45,10 @@ Tagged releases (`release.yml`) bundle:
 - The Darwin arm64 `script-jail-vm` helper used by the macOS CLI backend.
 - Digest-pinned Docker rootfs images in GHCR for each supported runner image and architecture.
 - A manifest pinning Firecracker binaries, kernels, rootfs SHAs, Docker image refs, shim SHAs, and macOS helper artifacts.
-- An npm package containing `dist/cli.cjs` plus the macOS arm64 runtime artifacts (`bin/darwin-arm64/script-jail-vm`, `images/vmlinux-vz-arm64`, `images/libscriptjail-arm64.so`, and `images/rootfs-ubuntu-24.04-arm64.ext4.gz`).
+- Four npm packages, assembled from the build artifacts by `scripts/assemble-npm-packages.mjs` and gated per package by `scripts/assert-npm-packlist.mjs`:
+  - the JS-only main `script-jail` package (`dist/cli.cjs`, `dist/guest-agent.cjs`, `dist/preloads/*.cjs`, README). The guest agent and preloads live here once and are reused by the Linux bare-mode backend.
+  - three per-platform optional dependency packages carrying the runtime artifacts: `@script-jail/darwin-arm64` (`script-jail-vm`, `vmlinux-vz-arm64`, `libscriptjail-arm64.so`, gzipped arm64 rootfs), `@script-jail/linux-x64` (`libscriptjail.so`, gzipped x64 rootfs), and `@script-jail/linux-arm64` (`libscriptjail-arm64.so`, gzipped arm64 rootfs).
+  - `scripts/npm-packages.mjs` is the single source of truth for these package names, `files` lists, and artifact maps; the assembler, packlist gate, and release publish loop all derive from it.
 
 When bumping any pinned artifact:
 
@@ -54,12 +57,15 @@ When bumping any pinned artifact:
 3. Run `scripts/validate-manifest.ts` to confirm hashes/image refs match.
 4. Bump the version tag only after the manifest validates against the published assets.
 
-The npm publish step requires `package.json`'s `version` to match the pushed
-tag without the leading `v`, and it uses `NPM_TOKEN` plus GitHub OIDC
-provenance. Before uploading GitHub release assets or publishing to npm, the
-release job runs `scripts/assert-npm-packlist.mjs`; that gate fails if npm
-would omit a required macOS asset, if the helper loses executable mode, or if
-the packed tarball exceeds the size ceiling.
+The npm publish step requires each package's `version` to match the pushed tag
+without the leading `v`, and it uses `NPM_TOKEN` plus GitHub OIDC provenance.
+Before uploading GitHub release assets or publishing to npm, the release job
+runs `scripts/assert-npm-packlist.mjs` against **each** staged package; that
+gate fails if npm would omit a required file from any package, if the VZ helper
+(`script-jail-vm`, darwin-arm64 only) loses its executable mode, or if a packed
+tarball exceeds its per-package size ceiling. The three platform packages are
+published **before** the main `script-jail` package so that the
+`optionalDependencies` resolve when consumers install.
 
 The repo's own CI sets `SCRIPT_JAIL_E2E_SELF_TEST=1` to skip manifest validation (so the action under test isn't gated on the very artifacts it's building).
 
