@@ -12,6 +12,8 @@ import { join } from 'node:path';
 import { run, type CliDeps } from '../../src/cli/index.js';
 import { NotMacOSError } from '../../src/cli/detect-host.js';
 import { MacOSVmNotImplementedError } from '../../src/cli/spawn-vm.js';
+import { PINNED_MANIFEST } from '../../src/action/artifact-manifest.js';
+import { PlatformPackageMissingError } from '../../src/shared/artifacts.js';
 
 class Sink {
   chunks: string[] = [];
@@ -259,5 +261,137 @@ describe('CLI — VM-launch stub', () => {
       },
     }));
     expect(capturedMode).toBe('check');
+  });
+});
+
+describe('CLI — Linux backend wiring', () => {
+  // Linux deps factory: pretend we're on a Linux x64 host. The platform
+  // package is resolved via an injected seam to the dev images/ fallback, and
+  // backend execution is short-circuited via the `runSelectedBackend` seam so
+  // these smoke tests never `.run()` a real backend or probe /dev/kvm/docker.
+  function linuxDeps(over: Partial<CliDeps>): CliDeps {
+    return {
+      detectPlatform: () => ({ os: 'linux', arch: 'x64' }),
+      // Resolve to a real-looking dir so resolvePlatformPackageDir's default
+      // is never reached; tests that want the missing-package path override it.
+      resolvePlatformPackageDir: () => ({ imagesDir: join(testDir, 'pkg'), source: 'dev' }),
+      // Default: never actually run a backend.
+      runSelectedBackend: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+      ...over,
+    };
+  }
+
+  it('LINUX smoke: hands runAudit an execute closure (not launch) with hostArch from detectPlatform', async () => {
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    const stdout = new Sink();
+    const stderr = new Sink();
+    let captured: Record<string, unknown> | null = null;
+    const code = await run(linuxDeps({
+      argv: ['init'],
+      cwd: () => repoDir,
+      stdout, stderr,
+      runAudit: async (input) => {
+        captured = input as unknown as Record<string, unknown>;
+        return { exitCode: 0 };
+      },
+    }));
+    expect(code).toBe(0);
+    expect(captured).not.toBeNull();
+    expect(typeof captured!['execute']).toBe('function');
+    expect(captured!['launch']).toBeUndefined();
+    expect(captured!['hostArch']).toBe('x64');
+    expect(captured!['baseRootfsPath']).toBeUndefined();
+  });
+
+  it('LINUX ctx: execute(...) routes through runSelectedBackend with the right backend context', async () => {
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    const stdout = new Sink();
+    const stderr = new Sink();
+    let capturedCtx: Record<string, unknown> | null = null;
+    let capturedRequested: string | null = null;
+    const code = await run(linuxDeps({
+      argv: ['init'],
+      cwd: () => repoDir,
+      stdout, stderr,
+      // Real runAudit override that drives the execute closure once so the CLI
+      // actually builds the BackendContext and calls runSelectedBackend.
+      runAudit: async (input) => {
+        await input.execute!({
+          repoDir,
+          configPath: join(testDir, 'cfg.yml'),
+          extraRepoOverlayFiles: [],
+          scratchDir: testDir,
+          pm: 'pnpm',
+          hostArch: 'x64',
+          mode: 'update',
+        });
+        return { exitCode: 0 };
+      },
+      runSelectedBackend: async (sel) => {
+        capturedRequested = sel.requested;
+        capturedCtx = sel.ctx as unknown as Record<string, unknown>;
+        return { finalYaml: 'x: 1\n', nonFatalWarnings: [] };
+      },
+    }));
+    expect(code).toBe(0);
+    expect(capturedRequested).toBe('auto');
+    expect(capturedCtx).not.toBeNull();
+    expect(capturedCtx!['runnerImage']).toBe('ubuntu-24.04');
+    expect(capturedCtx!['arch']).toBe('x64');
+    expect(capturedCtx!['manifest']).toBe(PINNED_MANIFEST);
+    expect(capturedCtx!['selfTest']).toBe(false);
+    expect(typeof capturedCtx!['imagesDir']).toBe('string');
+    expect((capturedCtx!['imagesDir'] as string).length).toBeGreaterThan(0);
+    expect(capturedCtx!['http']).toBeDefined();
+  });
+
+  it('LINUX no-validateManifest: placeholder PINNED_MANIFEST does NOT block reaching the backend', async () => {
+    // The CLI must NEVER call validateManifest. With the real (placeholder-SHA)
+    // PINNED_MANIFEST flowing into ctx, run() must reach runAudit/execute and
+    // NOT exit 1 with a packaging-bug message before backend selection.
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    const stdout = new Sink();
+    const stderr = new Sink();
+    let reachedBackend = false;
+    const code = await run(linuxDeps({
+      argv: ['init'],
+      cwd: () => repoDir,
+      stdout, stderr,
+      runAudit: async (input) => {
+        await input.execute!({
+          repoDir,
+          configPath: join(testDir, 'cfg.yml'),
+          extraRepoOverlayFiles: [],
+          scratchDir: testDir,
+          pm: 'pnpm',
+          hostArch: 'x64',
+          mode: 'update',
+        });
+        return { exitCode: 0 };
+      },
+      runSelectedBackend: async () => {
+        reachedBackend = true;
+        return { finalYaml: 'x: 1\n', nonFatalWarnings: [] };
+      },
+    }));
+    expect(code).toBe(0);
+    expect(reachedBackend).toBe(true);
+    expect(stderr.text).not.toMatch(/packaging bug/i);
+  });
+
+  it('LINUX friendly-error: a PlatformPackageMissingError exits 1 naming the package', async () => {
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    const stdout = new Sink();
+    const stderr = new Sink();
+    const code = await run(linuxDeps({
+      argv: ['init'],
+      cwd: () => repoDir,
+      stdout, stderr,
+      resolvePlatformPackageDir: () => {
+        throw new PlatformPackageMissingError('@script-jail/linux-x64');
+      },
+    }));
+    expect(code).toBe(1);
+    expect(stderr.text).toMatch(/@script-jail\/linux-x64/);
   });
 });

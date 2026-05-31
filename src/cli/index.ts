@@ -30,30 +30,48 @@
 //   owns only the macOS-specific bits: host detection, artifact lookup,
 //   and the VZ launcher closure.
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   detectHost,
-  NotMacOSError,
-  UnsupportedMacOSError,
-  UnsupportedArchError,
   type DetectedHost,
 } from './detect-host.js';
+import {
+  detectPlatform,
+  platformPackageName,
+  NotMacOSError,
+  NotSupportedPlatformError,
+  UnsupportedMacOSError,
+  UnsupportedArchError,
+  UnsupportedDarwinArchError,
+  type DetectedPlatform,
+} from './detect-platform.js';
 import { spawnVm, type VmConfig, type VmMode } from './spawn-vm.js';
 import { parseArgs } from './parse-args.js';
 import { detectPm, BunUnsupportedError } from '../shared/detect-pm.js';
 import { warn as sharedWarn } from '../shared/log.js';
-import { resolveArtifacts } from '../shared/artifacts.js';
+import {
+  resolveArtifacts,
+  resolvePlatformPackageDir,
+  PlatformPackageMissingError,
+} from '../shared/artifacts.js';
 import { ensureRootfs } from './rootfs-cache.js';
+import { createLocalPreFetchArtifacts } from './local-artifacts.js';
 import {
   makeOverlay,
   type OverlayResult,
 } from '../action/firecracker/overlay.js';
 import { runAudit, type LauncherResult } from '../shared/run-audit.js';
 import { buildArchFlagOverlay } from './arch-flags.js';
+import { NodeHttpClient } from '../action/firecracker/download.js';
+import { PINNED_MANIFEST } from '../action/artifact-manifest.js';
+import { createFirecrackerBackend } from '../action/backend/firecracker.js';
+import { createDockerBackend } from '../action/backend/docker.js';
+import { createBareBackend } from '../action/backend/bare.js';
+import { runSelectedBackend, type BackendMap } from '../action/backend/select.js';
 
 // ---------------------------------------------------------------------------
 // Help text
@@ -129,7 +147,36 @@ export interface CliDeps {
   stdout?: { write(s: string): unknown };
   stderr?: { write(s: string): unknown };
   warn?: (msg: string) => void;
+  /**
+   * Generalized host/platform detector (darwin-arm64 / linux-x64 / linux-arm64).
+   * Production callers leave this undefined; the default reads
+   * `process.{platform,arch}` + `os.release()` via `detectPlatform`.
+   */
+  detectPlatform?: typeof detectPlatform;
+  /**
+   * Legacy macOS-only host detector.  Retained as an ACCEPTED ALIAS seam: the
+   * existing I2 regression tests inject `detectHost: () => ({ macosMajor,
+   * hostArch })` and expect that legacy shape to drive the darwin path
+   * unchanged.  When supplied, its return is adapted into a darwin
+   * `DetectedPlatform` directly (NOT routed through `detectPlatform`, which
+   * would reject the injected `darwin/x64` shape).  `detectPlatform` takes
+   * precedence when both are set.
+   */
   detectHost?: typeof detectHost;
+  /**
+   * Locate the directory that holds the platform-package runtime artifacts
+   * (rootfs + shim).  Injection seam so the friendly-error path
+   * (`PlatformPackageMissingError`) and the dev-fallback path are exercised
+   * without a real `@script-jail/*` install.
+   */
+  resolvePlatformPackageDir?: typeof resolvePlatformPackageDir;
+  /**
+   * Backend-execution seam for the Linux path.  Injected by smoke tests so
+   * they never `.run()` a real firecracker/docker/bare backend (which would
+   * probe `/dev/kvm`, tap devices, or the docker daemon).  Production callers
+   * leave this undefined; the default is the shared `runSelectedBackend`.
+   */
+  runSelectedBackend?: typeof runSelectedBackend;
   detectPm?: typeof detectPm;
   spawnVm?: typeof spawnVm;
   /**
@@ -168,11 +215,25 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   // CLI user sees warnings on the diagnostic stream.  The action keeps the
   // GitHub-Actions ::warning:: form by using the shared default elsewhere.
   const warn = deps.warn ?? ((msg: string) => sharedWarn(msg, (s) => { stderr.write(s); }));
-  const doDetectHost = deps.detectHost ?? detectHost;
   const doDetectPm = deps.detectPm ?? detectPm;
   const doSpawnVm = deps.spawnVm ?? spawnVm;
   const doMakeOverlay = deps.makeOverlay ?? makeOverlay;
   const doRunAudit = deps.runAudit ?? runAudit;
+  const doResolvePlatformPackageDir =
+    deps.resolvePlatformPackageDir ?? resolvePlatformPackageDir;
+  const doRunSelectedBackend = deps.runSelectedBackend ?? runSelectedBackend;
+  // Platform detection seam.  When a test injects the LEGACY `detectHost`
+  // (`{ macosMajor, hostArch }`) but no `detectPlatform`, adapt it to a darwin
+  // `DetectedPlatform` directly — do NOT route through `detectPlatform`, which
+  // would reject the injected `darwin/x64` shape some I2 tests rely on.
+  const doDetectPlatform: typeof detectPlatform =
+    deps.detectPlatform ??
+    (deps.detectHost !== undefined
+      ? (input) => {
+          const host: DetectedHost = deps.detectHost!(input);
+          return { os: 'darwin', arch: host.hostArch, macosMajor: host.macosMajor };
+        }
+      : detectPlatform);
   // buildArchFlagOverlay is threaded through to runAudit (see below).
   // Captured here so the production default flows through identically to
   // pre-refactor behaviour when no override is supplied.
@@ -188,13 +249,15 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   if (args.version) { stdout.write(`${readPackageVersion(cwd)}\n`); return 0; }
 
   // --- Host check ---------------------------------------------------------
-  let host: DetectedHost;
+  let platform: DetectedPlatform;
   try {
-    host = doDetectHost();
+    platform = doDetectPlatform();
   } catch (err) {
     if (
       err instanceof NotMacOSError ||
+      err instanceof NotSupportedPlatformError ||
       err instanceof UnsupportedMacOSError ||
+      err instanceof UnsupportedDarwinArchError ||
       err instanceof UnsupportedArchError
     ) {
       stderr.write(`script-jail: ${err.message}\n`);
@@ -206,7 +269,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   // --- Resolve paths + subcommand defaulting -------------------------------
   const configPath = resolve(cwd, args.configPath);
   const lockPath = resolve(cwd, args.lockPath);
-  const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : host.hostArch;
+  const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : platform.arch;
   // init when no lockfile exists, check otherwise.  update is an alias for
   // init (both overwrite).
   const subcommand = args.subcommand ?? (existsSync(lockPath) ? 'check' : 'init');
@@ -231,15 +294,68 @@ export async function run(deps: CliDeps = {}): Promise<number> {
     throw err;
   }
 
-  // --- Resolve artifacts ---------------------------------------------------
-  // Repo root for artifact discovery: prefer the script-jail package's own
-  // root (so a developer running `node dist/cli.cjs` from a consumer repo
-  // still resolves `images/` under the installed package).  Fallback to cwd.
+  // --- Resolve the platform-package artifact directory --------------------
+  // Repo root anchors the dev-checkout `images/` fallback.  Prefer the
+  // script-jail package's own root (so a developer running `node dist/cli.cjs`
+  // from a consumer repo still resolves `images/` under the installed
+  // package).  The version lookup (`readPackageVersion`) also uses this root.
   const repoRoot = resolveScriptJailRoot(cwd);
 
+  // The runtime artifacts (rootfs[.gz], shim, VZ helper) ship in the
+  // locally-installed `@script-jail/<os>-<arch>` optional dependency, or — in
+  // a dev checkout — the repo `images/` dir.  Resolve that directory once;
+  // both branches consume it.  A missing package (no install + no dev images)
+  // surfaces a friendly `PlatformPackageMissingError`.
+  let packageImagesDir: string;
+  try {
+    packageImagesDir = doResolvePlatformPackageDir({
+      packageName: platformPackageName(platform),
+      devImagesDir: join(repoRoot, 'images'),
+    }).imagesDir;
+  } catch (err) {
+    if (err instanceof PlatformPackageMissingError) {
+      stderr.write(`script-jail: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
+
+  // -----------------------------------------------------------------------
+  // Linux: reuse the Action's firecracker → docker → bare backends through
+  // `runAudit({ execute })`.  The CLI NEVER calls `validateManifest`:
+  // PINNED_MANIFEST flows into `ctx` ONLY so the Docker backend can look up
+  // its image digest.  `selfTest:false` is mandatory (else Docker would
+  // require a pre-pulled local image).
+  // -----------------------------------------------------------------------
+  if (platform.os === 'linux') {
+    return runLinux({
+      platform,
+      packageImagesDir,
+      cwd,
+      configPath,
+      lockPath,
+      mode,
+      pm,
+      spoofPlatform: args.spoofPlatform,
+      effectiveSpoofArch,
+      warn,
+      stdout,
+      stderr,
+      doRunAudit,
+      doRunSelectedBackend,
+      doBuildArchFlagOverlay,
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // macOS (arm64): boot the install inside Apple Virtualization.framework.
+  // Byte-for-byte the same path as before, except the artifact directory now
+  // comes from the resolved platform package (npm install) / dev `images/`
+  // fallback instead of always `<repoRoot>/images`.
+  // -----------------------------------------------------------------------
   const artifacts = resolveArtifacts({
-    repoRoot,
-    hostArch: host.hostArch,
+    imagesDir: packageImagesDir,
+    hostArch: platform.arch,
     ubuntuMajor: DEFAULT_UBUNTU_MAJOR,
   });
   let baseRootfsPath = artifacts.rootfsPath;
@@ -258,7 +374,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   }
   if (deps.makeOverlay === undefined && !existsSync(baseRootfsPath)) {
     const buildHint =
-      host.hostArch === 'arm64'
+      platform.arch === 'arm64'
         ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64`
         : `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR}`;
     stderr.write(
@@ -326,10 +442,10 @@ export async function run(deps: CliDeps = {}): Promise<number> {
         spoofArch: effectiveSpoofArch,
       },
       pm,
-      // hostArch comes from the injected detectHost (NOT re-derived from
+      // hostArch comes from the injected detectPlatform (NOT re-derived from
       // process.arch) so unit tests can exercise the arm64 codepath from
       // an x64 dev box without monkey-patching process.arch.
-      hostArch: host.hostArch,
+      hostArch: platform.arch,
       baseRootfsPath,
       // os.tmpdir() — never `cwd` — so the rewritten config YAML and any
       // arch-flag sidecars (.yarnrc.yml / pm-flags.json) cannot pollute
@@ -350,6 +466,116 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       // they did pre-refactor.
       buildArchFlagOverlay: doBuildArchFlagOverlay,
       makeOverlay: doMakeOverlay,
+    });
+    return result.exitCode;
+  } catch (err) {
+    if (err instanceof Error) {
+      stderr.write(`script-jail: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Linux backend path
+// ---------------------------------------------------------------------------
+
+interface RunLinuxInput {
+  platform: DetectedPlatform;
+  packageImagesDir: string;
+  cwd: string;
+  configPath: string;
+  lockPath: string;
+  mode: VmMode;
+  pm: 'npm' | 'pnpm' | 'yarn';
+  spoofPlatform: 'linux' | 'darwin' | 'win32';
+  effectiveSpoofArch: 'x64' | 'arm64';
+  warn: (msg: string) => void;
+  stdout: { write(s: string): unknown };
+  stderr: { write(s: string): unknown };
+  doRunAudit: typeof runAudit;
+  doRunSelectedBackend: typeof runSelectedBackend;
+  doBuildArchFlagOverlay: typeof buildArchFlagOverlay;
+}
+
+/**
+ * Linux audit path.  Reuses the Action's firecracker → docker → bare backends
+ * via `runAudit({ execute })`, materializing the platform-package rootfs+shim
+ * locally (no GitHub-release download, no manifest validation).
+ */
+async function runLinux(input: RunLinuxInput): Promise<number> {
+  const { platform, stderr } = input;
+  const arch = platform.arch;
+
+  // CLI cache root for the materialized rootfs + shim.  Honour an explicit
+  // SCRIPT_JAIL_CACHE_DIR; otherwise fall back to os.tmpdir() — NOT
+  // RUNNER_TEMP, which is Action-only and absent for a developer CLI run.
+  const imagesDir = process.env['SCRIPT_JAIL_CACHE_DIR']
+    ? join(process.env['SCRIPT_JAIL_CACHE_DIR'], 'script-jail-images')
+    : join(tmpdir(), 'script-jail-images');
+  mkdirSync(imagesDir, { recursive: true });
+
+  const http = new NodeHttpClient();
+  const localPreFetch = createLocalPreFetchArtifacts({
+    packageImagesDir: input.packageImagesDir,
+    hostArch: arch,
+    ubuntuMajor: DEFAULT_UBUNTU_MAJOR,
+  });
+
+  // Same backend-map shape as src/main.ts.  Differences from the Action:
+  //   - firecracker/bare use the CLI-local pre-fetch (materialize from the
+  //     platform package) instead of the release download;
+  //   - cacheFirecracker:false (the CLI has no GitHub Actions cache);
+  //   - the Docker backend opts into pull-by-tag fallback so a placeholder
+  //     digest in the (pre-v0.1.1) manifest still resolves a usable tag.
+  const backends: BackendMap = {
+    firecracker: createFirecrackerBackend({
+      preFetchArtifacts: localPreFetch,
+      cacheFirecracker: false,
+      warn: input.warn,
+    }),
+    docker: createDockerBackend({ stderr, allowTagFallback: true }),
+    bare: createBareBackend({ preFetchArtifacts: localPreFetch, stderr }),
+  };
+
+  try {
+    const result = await input.doRunAudit({
+      repoDir: input.cwd,
+      configPath: input.configPath,
+      lockPath: input.lockPath,
+      mode: input.mode,
+      overrides: {
+        spoofPlatform: input.spoofPlatform,
+        spoofArch: input.effectiveSpoofArch,
+      },
+      pm: input.pm,
+      hostArch: arch,
+      workDir: tmpdir(),
+      // Backend executor: runAudit prepares the common config/sidecars, then
+      // hands control here to pick + run a Linux backend.  CRITICAL: no
+      // `validateManifest` anywhere on this path.
+      execute: (auditInput) =>
+        input.doRunSelectedBackend({
+          requested: 'auto',
+          backends,
+          warn: input.warn,
+          ctx: {
+            ...auditInput,
+            imagesDir,
+            runnerImage: 'ubuntu-24.04',
+            arch,
+            manifest: PINNED_MANIFEST,
+            http,
+            selfTest: false,
+          },
+        }),
+      io: {
+        warn: input.warn,
+        stdout: input.stdout,
+        stderr,
+      },
+      buildArchFlagOverlay: input.doBuildArchFlagOverlay,
     });
     return result.exitCode;
   } catch (err) {

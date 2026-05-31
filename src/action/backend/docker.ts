@@ -9,6 +9,15 @@ import type { StagedRepo } from './stage.js';
 export interface DockerBackendDeps {
   stderr?: { write(s: string): unknown };
   env?: NodeJS.ProcessEnv;
+  /**
+   * When true, a manifest entry that is still a bootstrap placeholder digest
+   * (`...@sha256:PLACEHOLDER_*`) falls back to the tag-only ref so a fresh
+   * first release works before the manifest is backfilled.  The CLI passes
+   * `true`; the Action leaves it `false` (default), preserving its existing
+   * behavior of returning the placeholder verbatim (which `docker pull` then
+   * rejects — but `validateManifest` already fails the Action earlier).
+   */
+  allowTagFallback?: boolean;
 }
 
 interface HostOwner {
@@ -31,7 +40,10 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
         throw new BackendUnavailableError('docker', 'docker is not installed or the daemon is unavailable');
       }
 
-      const imageRef = resolveDockerImage(ctx);
+      const { ref: imageRef, warning } = resolveDockerImageRef(ctx, {
+        allowTagFallback: deps.allowTagFallback ?? false,
+      });
+      if (warning !== undefined) writeDockerWarning(deps.stderr, warning);
       if (ctx.selfTest) {
         if (!commandSucceeds('docker', ['image', 'inspect', imageRef], { env })) {
           throw new BackendUnavailableError('docker', `local image ${imageRef} is missing`);
@@ -186,11 +198,34 @@ function formatError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function resolveDockerImage(ctx: BackendContext): string {
+export interface ResolvedDockerImage {
+  ref: string;
+  /** Set when a placeholder digest was downgraded to a tag-only ref. */
+  warning?: string;
+}
+
+/**
+ * Resolve the Docker image ref for this run.
+ *
+ * Throws `BackendUnavailableError` only when the manifest has NO entry for
+ * `(arch, runnerImage)` — a genuine config error.  When the entry is still a
+ * bootstrap placeholder digest and `allowTagFallback` is set, downgrade to the
+ * tag-only ref (`split('@')[0]`) and return a warning; otherwise return the
+ * (placeholder) ref verbatim — the Action's pre-flight `validateManifest`
+ * rejects placeholders before any backend runs, so this preserves today's
+ * behavior for the Action.
+ */
+export function resolveDockerImageRef(
+  ctx: BackendContext,
+  opts: { allowTagFallback?: boolean } = {},
+): ResolvedDockerImage {
   if (ctx.selfTest) {
-    return ctx.arch === 'arm64'
-      ? `script-jail-rootfs:${ctx.runnerImage}-arm64`
-      : `script-jail-rootfs:${ctx.runnerImage}`;
+    return {
+      ref:
+        ctx.arch === 'arm64'
+          ? `script-jail-rootfs:${ctx.runnerImage}-arm64`
+          : `script-jail-rootfs:${ctx.runnerImage}`,
+    };
   }
   const ref = ctx.manifest.dockerImages?.[ctx.arch]?.[ctx.runnerImage];
   if (ref === undefined || ref.trim() === '') {
@@ -199,5 +234,14 @@ function resolveDockerImage(ctx: BackendContext): string {
       `manifest has no Docker image for ${ctx.runnerImage}/${ctx.arch}`,
     );
   }
-  return ref;
+  if (ref.includes('PLACEHOLDER') && opts.allowTagFallback) {
+    const tagRef = ref.split('@')[0] ?? ref;
+    return {
+      ref: tagRef,
+      warning:
+        `using non-digest-pinned image ${tagRef} (manifest digest is a bootstrap ` +
+        `placeholder); pin a real digest in src/action/artifact-manifest.ts at v0.1.1`,
+    };
+  }
+  return { ref };
 }

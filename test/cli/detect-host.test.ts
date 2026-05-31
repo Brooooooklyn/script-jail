@@ -2,6 +2,13 @@
 //
 // Tests for src/cli/detect-host.ts.  All inputs are injected so the suite is
 // cross-platform; no `os.release()` / `process.platform` reads happen here.
+//
+// detect-host.ts is now a thin compat shim over detect-platform.ts: it keeps
+// the legacy `{ macosMajor, hostArch }` shape for untouched callers but the
+// arch gate has been unified.  Intel macs (darwin/x64) are no longer
+// supported, so `detectHost` throws on them (delete-and-redirect of the old
+// acceptance test); the canonical Intel-mac rejection is asserted in
+// test/cli/detect-platform.test.ts.
 
 import { describe, it, expect } from 'vitest';
 
@@ -10,6 +17,7 @@ import {
   NotMacOSError,
   UnsupportedMacOSError,
   UnsupportedArchError,
+  UnsupportedDarwinArchError,
 } from '../../src/cli/detect-host.js';
 
 describe('detectHost', () => {
@@ -18,9 +26,13 @@ describe('detectHost', () => {
       .toEqual({ macosMajor: 14, hostArch: 'arm64' });
   });
 
-  it('returns macosMajor=14 + x64 on macOS Sonoma (Darwin 23) x64', () => {
-    expect(detectHost({ platform: 'darwin', release: '23.0.0', arch: 'x64' }))
-      .toEqual({ macosMajor: 14, hostArch: 'x64' });
+  it('throws on macOS Sonoma (Darwin 23) x64 — Intel macs are no longer supported', () => {
+    // Delete-and-redirect of the old darwin/x64 acceptance: the unified arch
+    // gate now rejects Intel macs.  The canonical typed-error assertion lives
+    // in test/cli/detect-platform.test.ts; here we only confirm the shim no
+    // longer returns the legacy `{ macosMajor:14, hostArch:'x64' }` shape.
+    expect(() => detectHost({ platform: 'darwin', release: '23.0.0', arch: 'x64' }))
+      .toThrow(UnsupportedDarwinArchError);
   });
 
   it('returns macosMajor=15 on macOS Sequoia (Darwin 24)', () => {

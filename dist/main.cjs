@@ -43491,7 +43491,10 @@ function createDockerBackend(deps = {}) {
       if (!commandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env })) {
         throw new BackendUnavailableError("docker", "docker is not installed or the daemon is unavailable");
       }
-      const imageRef = resolveDockerImage(ctx);
+      const { ref: imageRef, warning } = resolveDockerImageRef(ctx, {
+        allowTagFallback: deps.allowTagFallback ?? false
+      });
+      if (warning !== void 0) writeDockerWarning(deps.stderr, warning);
       if (ctx.selfTest) {
         if (!commandSucceeds("docker", ["image", "inspect", imageRef], { env })) {
           throw new BackendUnavailableError("docker", `local image ${imageRef} is missing`);
@@ -43624,9 +43627,11 @@ function writeDockerWarning(stderr, message) {
 function formatError2(err) {
   return err instanceof Error ? err.message : String(err);
 }
-function resolveDockerImage(ctx) {
+function resolveDockerImageRef(ctx, opts = {}) {
   if (ctx.selfTest) {
-    return ctx.arch === "arm64" ? `script-jail-rootfs:${ctx.runnerImage}-arm64` : `script-jail-rootfs:${ctx.runnerImage}`;
+    return {
+      ref: ctx.arch === "arm64" ? `script-jail-rootfs:${ctx.runnerImage}-arm64` : `script-jail-rootfs:${ctx.runnerImage}`
+    };
   }
   const ref = ctx.manifest.dockerImages?.[ctx.arch]?.[ctx.runnerImage];
   if (ref === void 0 || ref.trim() === "") {
@@ -43635,7 +43640,14 @@ function resolveDockerImage(ctx) {
       `manifest has no Docker image for ${ctx.runnerImage}/${ctx.arch}`
     );
   }
-  return ref;
+  if (ref.includes("PLACEHOLDER") && opts.allowTagFallback) {
+    const tagRef = ref.split("@")[0] ?? ref;
+    return {
+      ref: tagRef,
+      warning: `using non-digest-pinned image ${tagRef} (manifest digest is a bootstrap placeholder); pin a real digest in src/action/artifact-manifest.ts at v0.1.1`
+    };
+  }
+  return { ref };
 }
 
 // src/action/backend/bare.ts
