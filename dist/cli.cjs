@@ -7364,9 +7364,9 @@ __export(index_exports, {
   run: () => run
 });
 module.exports = __toCommonJS(index_exports);
-var import_node_fs6 = require("node:fs");
-var import_node_os5 = require("node:os");
-var import_node_path7 = require("node:path");
+var import_node_fs7 = require("node:fs");
+var import_node_os6 = require("node:os");
+var import_node_path8 = require("node:path");
 var import_node_url2 = require("node:url");
 
 // src/cli/detect-host.ts
@@ -7898,18 +7898,124 @@ function resolveArtifacts(input) {
   const kernelPath = (0, import_node_path3.join)(imagesDir, `vmlinux-vz-${kernelArch}`);
   const rootfsName = hostArch === "arm64" ? `rootfs-ubuntu-${ubuntuMajor}-arm64.ext4` : `rootfs-ubuntu-${ubuntuMajor}.ext4`;
   const rootfsPath = (0, import_node_path3.join)(imagesDir, rootfsName);
+  const compressedRootfsPath = `${rootfsPath}.gz`;
   const libscriptjailSoPath = (0, import_node_path3.join)(
     imagesDir,
     hostArch === "x64" ? "libscriptjail.so" : "libscriptjail-arm64.so"
   );
-  return { kernelPath, rootfsPath, libscriptjailSoPath };
+  return { kernelPath, rootfsPath, compressedRootfsPath, libscriptjailSoPath };
+}
+
+// src/cli/rootfs-cache.ts
+var import_node_fs3 = require("node:fs");
+var import_node_crypto2 = require("node:crypto");
+var import_node_os3 = require("node:os");
+var import_node_path4 = require("node:path");
+var import_node_zlib = require("node:zlib");
+async function ensureRootfs(input) {
+  if ((0, import_node_fs3.existsSync)(input.rootfsPath)) return input.rootfsPath;
+  if (!(0, import_node_fs3.existsSync)(input.compressedRootfsPath)) return input.rootfsPath;
+  const cacheDir = input.cacheDir ?? defaultCacheDir();
+  (0, import_node_fs3.mkdirSync)(cacheDir, { recursive: true });
+  const digest = await sha256File(input.compressedRootfsPath);
+  const ext4Name = (0, import_node_path4.basename)(input.rootfsPath);
+  const cached2 = (0, import_node_path4.join)(cacheDir, `${stripExt4Suffix(ext4Name)}-${digest.slice(0, 16)}.ext4`);
+  const metaPath = `${cached2}.json`;
+  if (isReusableCachedRootfs(cached2, metaPath, digest)) return cached2;
+  (0, import_node_fs3.rmSync)(cached2, { force: true });
+  (0, import_node_fs3.rmSync)(metaPath, { force: true });
+  const tmp = (0, import_node_path4.join)(cacheDir, `.${(0, import_node_path4.basename)(cached2)}.${process.pid}.${Date.now()}.tmp`);
+  const tmpMeta = `${tmp}.json`;
+  try {
+    const logicalSize = await sparseGunzip(input.compressedRootfsPath, tmp);
+    (0, import_node_fs3.writeFileSync)(
+      tmpMeta,
+      JSON.stringify({ compressedSha256: digest, logicalSize }, null, 2) + "\n"
+    );
+    (0, import_node_fs3.renameSync)(tmp, cached2);
+    (0, import_node_fs3.renameSync)(tmpMeta, metaPath);
+  } catch (err) {
+    (0, import_node_fs3.rmSync)(tmp, { force: true });
+    (0, import_node_fs3.rmSync)(tmpMeta, { force: true });
+    throw err;
+  }
+  return cached2;
+}
+function defaultCacheDir() {
+  const override = process.env["SCRIPT_JAIL_CACHE_DIR"];
+  if (override !== void 0 && override !== "") return override;
+  const home = (0, import_node_os3.homedir)();
+  if (home !== "") return (0, import_node_path4.join)(home, "Library", "Caches", "script-jail");
+  return (0, import_node_path4.join)((0, import_node_os3.tmpdir)(), "script-jail-cache");
+}
+async function sha256File(path) {
+  const hash2 = (0, import_node_crypto2.createHash)("sha256");
+  for await (const chunk of (0, import_node_fs3.createReadStream)(path)) {
+    hash2.update(chunk);
+  }
+  return hash2.digest("hex");
+}
+async function sparseGunzip(source, dest) {
+  (0, import_node_fs3.mkdirSync)((0, import_node_path4.dirname)(dest), { recursive: true });
+  const fd = (0, import_node_fs3.openSync)(dest, "w", 420);
+  let offset = 0;
+  try {
+    const stream = (0, import_node_fs3.createReadStream)(source, { highWaterMark: 1024 * 1024 }).pipe((0, import_node_zlib.createGunzip)());
+    for await (const chunk of stream) {
+      const buf = chunk;
+      writeNonZeroRanges(fd, buf, offset);
+      offset += buf.length;
+    }
+    (0, import_node_fs3.ftruncateSync)(fd, offset);
+  } finally {
+    (0, import_node_fs3.closeSync)(fd);
+  }
+  (0, import_node_fs3.statSync)(dest);
+  return offset;
+}
+function writeNonZeroRanges(fd, buf, baseOffset) {
+  let start = -1;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] !== 0) {
+      if (start === -1) start = i;
+      continue;
+    }
+    if (start !== -1) {
+      (0, import_node_fs3.writeSync)(fd, buf, start, i - start, baseOffset + start);
+      start = -1;
+    }
+  }
+  if (start !== -1) {
+    (0, import_node_fs3.writeSync)(fd, buf, start, buf.length - start, baseOffset + start);
+  }
+}
+function stripExt4Suffix(name) {
+  return name.endsWith(".ext4") ? name.slice(0, -".ext4".length) : name;
+}
+function isReusableCachedRootfs(cached2, metaPath, digest) {
+  if (!(0, import_node_fs3.existsSync)(cached2) || !(0, import_node_fs3.existsSync)(metaPath)) return false;
+  const meta3 = readCacheMeta(metaPath);
+  if (meta3 === void 0) return false;
+  if (meta3.compressedSha256 !== digest) return false;
+  if (!Number.isSafeInteger(meta3.logicalSize) || meta3.logicalSize < 0) return false;
+  return (0, import_node_fs3.statSync)(cached2).size === meta3.logicalSize;
+}
+function readCacheMeta(path) {
+  try {
+    const parsed = JSON.parse((0, import_node_fs3.readFileSync)(path, "utf8"));
+    const { compressedSha256, logicalSize } = parsed;
+    if (typeof compressedSha256 !== "string" || typeof logicalSize !== "number") return void 0;
+    return { compressedSha256, logicalSize };
+  } catch {
+    return void 0;
+  }
 }
 
 // src/action/firecracker/overlay.ts
-var import_node_fs3 = require("node:fs");
+var import_node_fs4 = require("node:fs");
 var import_promises = require("node:fs/promises");
-var import_node_path4 = require("node:path");
-var import_node_os3 = require("node:os");
+var import_node_path5 = require("node:path");
+var import_node_os4 = require("node:os");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
@@ -7920,20 +8026,20 @@ async function makeOverlay(input) {
     workDir: maybeWorkDir,
     extraRepoOverlayFiles
   } = input;
-  const workDir = maybeWorkDir ?? (0, import_node_fs3.mkdtempSync)((0, import_node_path4.join)((0, import_node_os3.tmpdir)(), "script-jail-run-"));
-  (0, import_node_fs3.mkdirSync)(workDir, { recursive: true });
-  const rootfsCopyPath = (0, import_node_path4.join)(workDir, "rootfs.ext4");
+  const workDir = maybeWorkDir ?? (0, import_node_fs4.mkdtempSync)((0, import_node_path5.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
+  (0, import_node_fs4.mkdirSync)(workDir, { recursive: true });
+  const rootfsCopyPath = (0, import_node_path5.join)(workDir, "rootfs.ext4");
   copyRootfs(baseRootfsPath, rootfsCopyPath);
-  const repoStageDir = (0, import_node_path4.join)(workDir, "repo-stage");
-  (0, import_node_fs3.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs3.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
-  const configDestDir = (0, import_node_path4.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs3.mkdirSync)(configDestDir, { recursive: true });
-  (0, import_node_fs3.copyFileSync)(configPath, (0, import_node_path4.join)(configDestDir, "config.yml"));
+  const repoStageDir = (0, import_node_path5.join)(workDir, "repo-stage");
+  (0, import_node_fs4.mkdirSync)(repoStageDir, { recursive: true });
+  (0, import_node_fs4.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  const configDestDir = (0, import_node_path5.join)(repoStageDir, "etc", "script-jail");
+  (0, import_node_fs4.mkdirSync)(configDestDir, { recursive: true });
+  (0, import_node_fs4.copyFileSync)(configPath, (0, import_node_path5.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
-    const stageRoot = (0, import_node_path4.resolve)(repoStageDir);
+    const stageRoot = (0, import_node_path5.resolve)(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
-      const dest = (0, import_node_path4.resolve)(stageRoot, entry.relPath);
+      const dest = (0, import_node_path5.resolve)(stageRoot, entry.relPath);
       if (dest !== stageRoot && !dest.startsWith(stageRoot + "/")) {
         throw new Error(
           `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`
@@ -7942,7 +8048,7 @@ async function makeOverlay(input) {
       writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
-  const repoDiskPath = (0, import_node_path4.join)(workDir, "repo.ext4");
+  const repoDiskPath = (0, import_node_path5.join)(workDir, "repo.ext4");
   await buildRepoDisk(repoStageDir, repoDiskPath);
   const cleanup = async () => {
     try {
@@ -7962,29 +8068,29 @@ function writeOverlayFile(root, relPath, content) {
   }
   let dir = root;
   for (const part of parts.slice(0, -1)) {
-    dir = (0, import_node_path4.join)(dir, part);
+    dir = (0, import_node_path5.join)(dir, part);
     ensureRealDirectory(dir);
   }
-  const dest = (0, import_node_path4.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs3.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs3.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  const dest = (0, import_node_path5.join)(dir, parts[parts.length - 1]);
+  (0, import_node_fs4.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs4.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory(path) {
-  if (!(0, import_node_fs3.existsSync)(path)) {
-    (0, import_node_fs3.mkdirSync)(path, { recursive: true });
+  if (!(0, import_node_fs4.existsSync)(path)) {
+    (0, import_node_fs4.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs3.lstatSync)(path);
+  const stat = (0, import_node_fs4.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs3.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs3.mkdirSync)(path, { recursive: true });
+  (0, import_node_fs4.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs4.mkdirSync)(path, { recursive: true });
 }
 function copyRootfs(src, dest) {
   if (import_node_process.platform === "linux") {
     const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
     if (result.status === 0) return;
   }
-  (0, import_node_fs3.cpSync)(src, dest);
+  (0, import_node_fs4.cpSync)(src, dest);
 }
 async function buildRepoDisk(srcDir, outPath) {
   const sizeMB = estimateDiskSizeMB(srcDir);
@@ -8014,8 +8120,8 @@ async function buildRepoDisk(srcDir, outPath) {
     }
     return;
   }
-  const outDir = (0, import_node_path4.join)(outPath, "..");
-  const imageName = (0, import_node_path4.basename)(outPath);
+  const outDir = (0, import_node_path5.join)(outPath, "..");
+  const imageName = (0, import_node_path5.basename)(outPath);
   (0, import_node_child_process2.execSync)(
     `docker run --rm -v "${srcDir}:/work:ro" -v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
     { stdio: "inherit" }
@@ -8028,7 +8134,7 @@ function resolveMkfsExt4() {
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
     "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
   ]) {
-    if ((0, import_node_fs3.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs4.existsSync)(candidate)) return candidate;
   }
   const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
@@ -8039,10 +8145,10 @@ function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat = (0, import_node_fs3.statSync)(p, { bigint: false });
+      const stat = (0, import_node_fs4.statSync)(p, { bigint: false });
       if (stat.isDirectory()) {
-        for (const child of (0, import_node_fs3.readdirSync)(p)) {
-          visit((0, import_node_path4.join)(p, child));
+        for (const child of (0, import_node_fs4.readdirSync)(p)) {
+          visit((0, import_node_path5.join)(p, child));
         }
       } else if (stat.isFile() || stat.isSymbolicLink()) {
         totalBytes += stat.size;
@@ -8050,15 +8156,15 @@ function estimateDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs3.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs4.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 
 // src/shared/run-audit.ts
-var import_node_fs5 = require("node:fs");
+var import_node_fs6 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
-var import_node_path6 = require("node:path");
+var import_node_path7 = require("node:path");
 
 // src/cli/arch-flags.ts
 function buildArchFlagOverlay(_input) {
@@ -23383,12 +23489,12 @@ function countLines(s) {
 }
 
 // src/action/config-override.ts
-var import_node_fs4 = require("node:fs");
-var import_node_os4 = require("node:os");
-var import_node_path5 = require("node:path");
+var import_node_fs5 = require("node:fs");
+var import_node_os5 = require("node:os");
+var import_node_path6 = require("node:path");
 var import_yaml2 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
-  const text = (0, import_node_fs4.readFileSync)(input.userConfigPath, "utf8");
+  const text = (0, import_node_fs5.readFileSync)(input.userConfigPath, "utf8");
   const parsed = (0, import_yaml2.parse)(text);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   const existingSpoof = config2["spoof"] !== null && typeof config2["spoof"] === "object" && !Array.isArray(config2["spoof"]) ? config2["spoof"] : {};
@@ -23397,25 +23503,25 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
-  const outDir = input.workDir ?? (0, import_node_fs4.mkdtempSync)((0, import_node_path5.join)((0, import_node_os4.tmpdir)(), "script-jail-config-"));
-  const configPath = (0, import_node_path5.join)(outDir, "config.yml");
-  (0, import_node_fs4.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  const outDir = input.workDir ?? (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)((0, import_node_os5.tmpdir)(), "script-jail-config-"));
+  const configPath = (0, import_node_path6.join)(outDir, "config.yml");
+  (0, import_node_fs5.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
   const result = { configPath };
   if (input.yarnrcOverlay !== void 0) {
-    const yarnrcPath = (0, import_node_path5.join)(outDir, ".yarnrc.yml");
-    (0, import_node_fs4.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    const yarnrcPath = (0, import_node_path6.join)(outDir, ".yarnrc.yml");
+    (0, import_node_fs5.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
     result.yarnrcPath = yarnrcPath;
   }
   if (input.pmFlagsJson !== void 0) {
-    const pmFlagsPath = (0, import_node_path5.join)(outDir, "etc", "script-jail", "pm-flags.json");
-    (0, import_node_fs4.mkdirSync)((0, import_node_path5.dirname)(pmFlagsPath), { recursive: true });
-    (0, import_node_fs4.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    const pmFlagsPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pm-flags.json");
+    (0, import_node_fs5.mkdirSync)((0, import_node_path6.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs5.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
     result.pmFlagsPath = pmFlagsPath;
   }
   if (input.pnpmArchOverlay !== void 0) {
-    const pnpmArchPath = (0, import_node_path5.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
-    (0, import_node_fs4.mkdirSync)((0, import_node_path5.dirname)(pnpmArchPath), { recursive: true });
-    (0, import_node_fs4.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
+    const pnpmArchPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
+    (0, import_node_fs5.mkdirSync)((0, import_node_path6.dirname)(pnpmArchPath), { recursive: true });
+    (0, import_node_fs5.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
     result.pnpmArchPath = pnpmArchPath;
   }
   return result;
@@ -23432,7 +23538,7 @@ async function runAudit(input) {
     spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
-  const scratchDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(input.workDir, "script-jail-config-"));
+  const scratchDir = (0, import_node_fs6.mkdtempSync)((0, import_node_path7.join)(input.workDir, "script-jail-config-"));
   let result;
   let overlay = null;
   try {
@@ -23454,19 +23560,19 @@ async function runAudit(input) {
     if (effectiveConfig.yarnrcPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: ".yarnrc.yml",
-        content: (0, import_node_fs5.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
+        content: (0, import_node_fs6.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
       });
     }
     if (effectiveConfig.pmFlagsPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pm-flags.json",
-        content: (0, import_node_fs5.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+        content: (0, import_node_fs6.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
       });
     }
     if (effectiveConfig.pnpmArchPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pnpm-arch.json",
-        content: (0, import_node_fs5.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
+        content: (0, import_node_fs6.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
     if (input.execute !== void 0) {
@@ -23507,7 +23613,7 @@ async function runAudit(input) {
     }
   }
   if (input.mode === "update") {
-    (0, import_node_fs5.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
+    (0, import_node_fs6.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
     input.io.stderr.write(
       `[script-jail] wrote ${Buffer.byteLength(result.finalYaml, "utf8")} bytes to ${input.lockPath}
 `
@@ -23516,7 +23622,7 @@ async function runAudit(input) {
     input.io.setOutput?.("diff", "");
     return { exitCode: 0 };
   }
-  const committed = (0, import_node_fs5.existsSync)(input.lockPath) ? (0, import_node_fs5.readFileSync)(input.lockPath, "utf8") : "";
+  const committed = (0, import_node_fs6.existsSync)(input.lockPath) ? (0, import_node_fs6.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
   const diff = renderDiff({
     lockPath: lockLabel,
@@ -23544,14 +23650,13 @@ async function runAudit(input) {
   return { exitCode: diff.match ? 0 : 1 };
 }
 function relativeForDisplay(absPath, repoDir) {
-  const rel = (0, import_node_path6.relative)(repoDir, absPath);
-  if (rel.startsWith("..") || (0, import_node_path6.isAbsolute)(rel)) return absPath;
+  const rel = (0, import_node_path7.relative)(repoDir, absPath);
+  if (rel.startsWith("..") || (0, import_node_path7.isAbsolute)(rel)) return absPath;
   return rel;
 }
 
 // src/cli/index.ts
 var import_meta2 = {};
-var VERSION = "0.0.0";
 var USAGE = `script-jail \u2014 Firecracker/VZ-sandboxed npm/pnpm/yarn lifecycle auditor.
 
 Usage:
@@ -23603,7 +23708,7 @@ async function run(deps = {}) {
     return 0;
   }
   if (args.version) {
-    stdout.write(`${VERSION}
+    stdout.write(`${readPackageVersion(cwd)}
 `);
     return 0;
   }
@@ -23618,10 +23723,10 @@ async function run(deps = {}) {
     }
     throw err;
   }
-  const configPath = (0, import_node_path7.resolve)(cwd, args.configPath);
-  const lockPath = (0, import_node_path7.resolve)(cwd, args.lockPath);
+  const configPath = (0, import_node_path8.resolve)(cwd, args.configPath);
+  const lockPath = (0, import_node_path8.resolve)(cwd, args.lockPath);
   const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : host.hostArch;
-  const subcommand = args.subcommand ?? ((0, import_node_fs6.existsSync)(lockPath) ? "check" : "init");
+  const subcommand = args.subcommand ?? ((0, import_node_fs7.existsSync)(lockPath) ? "check" : "init");
   const mode = subcommand === "check" ? "check" : "update";
   let pm;
   try {
@@ -23645,7 +23750,14 @@ async function run(deps = {}) {
     hostArch: host.hostArch,
     ubuntuMajor: DEFAULT_UBUNTU_MAJOR
   });
-  if (deps.makeOverlay === void 0 && !(0, import_node_fs6.existsSync)(artifacts.rootfsPath)) {
+  let baseRootfsPath = artifacts.rootfsPath;
+  if (deps.makeOverlay === void 0) {
+    baseRootfsPath = await ensureRootfs({
+      rootfsPath: artifacts.rootfsPath,
+      compressedRootfsPath: artifacts.compressedRootfsPath
+    });
+  }
+  if (deps.makeOverlay === void 0 && !(0, import_node_fs7.existsSync)(baseRootfsPath)) {
     const buildHint = host.hostArch === "arm64" ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64` : `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR}`;
     stderr.write(
       `script-jail: rootfs not found at ${artifacts.rootfsPath}. Run \`${buildHint}\` (or fetch the release artifact) to produce it.
@@ -23667,7 +23779,7 @@ async function run(deps = {}) {
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs
       // distinguish it from any real UDS.
-      vsockUdsPath: (0, import_node_path7.resolve)(overlay.workDir, "vsock.sock"),
+      vsockUdsPath: (0, import_node_path8.resolve)(overlay.workDir, "vsock.sock"),
       vsockPort: VSOCK_PORT,
       vcpuCount: DEFAULT_VCPU_COUNT,
       memoryMb: DEFAULT_MEMORY_MB,
@@ -23698,12 +23810,12 @@ async function run(deps = {}) {
       // process.arch) so unit tests can exercise the arm64 codepath from
       // an x64 dev box without monkey-patching process.arch.
       hostArch: host.hostArch,
-      baseRootfsPath: artifacts.rootfsPath,
+      baseRootfsPath,
       // os.tmpdir() — never `cwd` — so the rewritten config YAML and any
       // arch-flag sidecars (.yarnrc.yml / pm-flags.json) cannot pollute
       // the user's repo.  runAudit creates a private mkdtemp dir under
       // this parent and removes it in `finally` even on crash.
-      workDir: (0, import_node_os5.tmpdir)(),
+      workDir: (0, import_node_os6.tmpdir)(),
       launch,
       io: {
         warn: warn2,
@@ -23744,13 +23856,22 @@ function resolveScriptJailRoot(cwd) {
   }
   if (here === "") return cwd;
   const candidates = [
-    (0, import_node_path7.resolve)((0, import_node_path7.dirname)((0, import_node_path7.dirname)(here))),
-    (0, import_node_path7.resolve)((0, import_node_path7.dirname)((0, import_node_path7.dirname)((0, import_node_path7.dirname)(here))))
+    (0, import_node_path8.resolve)((0, import_node_path8.dirname)((0, import_node_path8.dirname)(here))),
+    (0, import_node_path8.resolve)((0, import_node_path8.dirname)((0, import_node_path8.dirname)((0, import_node_path8.dirname)(here))))
   ];
   for (const c of candidates) {
-    if ((0, import_node_fs6.existsSync)((0, import_node_path7.join)(c, "package.json"))) return c;
+    if ((0, import_node_fs7.existsSync)((0, import_node_path8.join)(c, "package.json"))) return c;
   }
   return cwd;
+}
+function readPackageVersion(cwd) {
+  const packageJsonPath = (0, import_node_path8.join)(resolveScriptJailRoot(cwd), "package.json");
+  try {
+    const pkg = JSON.parse(String((0, import_node_fs7.readFileSync)(packageJsonPath, "utf8")));
+    if (typeof pkg["version"] === "string") return pkg["version"];
+  } catch {
+  }
+  return "0.0.0";
 }
 function hasSpoofArchArg(argv) {
   return argv.includes("--spoof-arch");

@@ -45,6 +45,7 @@ Tagged releases (`release.yml`) bundle:
 - The Darwin arm64 `script-jail-vm` helper used by the macOS CLI backend.
 - Digest-pinned Docker rootfs images in GHCR for each supported runner image and architecture.
 - A manifest pinning Firecracker binaries, kernels, rootfs SHAs, Docker image refs, shim SHAs, and macOS helper artifacts.
+- An npm package containing `dist/cli.cjs` plus the macOS arm64 runtime artifacts (`bin/darwin-arm64/script-jail-vm`, `images/vmlinux-vz-arm64`, `images/libscriptjail-arm64.so`, and `images/rootfs-ubuntu-24.04-arm64.ext4.gz`).
 
 When bumping any pinned artifact:
 
@@ -52,6 +53,13 @@ When bumping any pinned artifact:
 2. Copy the release summary's URLs, SHAs, and Docker image refs into `src/action/artifact-manifest.ts`.
 3. Run `scripts/validate-manifest.ts` to confirm hashes/image refs match.
 4. Bump the version tag only after the manifest validates against the published assets.
+
+The npm publish step requires `package.json`'s `version` to match the pushed
+tag without the leading `v`, and it uses `NPM_TOKEN` plus GitHub OIDC
+provenance. Before uploading GitHub release assets or publishing to npm, the
+release job runs `scripts/assert-npm-packlist.mjs`; that gate fails if npm
+would omit a required macOS asset, if the helper loses executable mode, or if
+the packed tarball exceeds the size ceiling.
 
 The repo's own CI sets `SCRIPT_JAIL_E2E_SELF_TEST=1` to skip manifest validation (so the action under test isn't gated on the very artifacts it's building).
 

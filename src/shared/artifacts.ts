@@ -59,6 +59,8 @@ export interface ResolvedArtifacts {
   kernelPath: string;
   /** Absolute path to the rootfs ext4 image for `(hostArch, ubuntuMajor)`. */
   rootfsPath: string;
+  /** Absolute path to the compressed npm-shipped rootfs, when present. */
+  compressedRootfsPath: string;
   /** Absolute path to the libscriptjail.so ELF for `hostArch`. */
   libscriptjailSoPath: string;
 }
@@ -101,6 +103,7 @@ export function resolveArtifacts(input: ArtifactInput): ResolvedArtifacts {
       ? `rootfs-ubuntu-${ubuntuMajor}-arm64.ext4`
       : `rootfs-ubuntu-${ubuntuMajor}.ext4`;
   const rootfsPath = join(imagesDir, rootfsName);
+  const compressedRootfsPath = `${rootfsPath}.gz`;
 
   // libscriptjail.so: the existing x86_64 file ships as `libscriptjail.so`
   // (no arch suffix) to keep the action surface backwards compatible.  The
@@ -110,7 +113,7 @@ export function resolveArtifacts(input: ArtifactInput): ResolvedArtifacts {
     hostArch === 'x64' ? 'libscriptjail.so' : 'libscriptjail-arm64.so',
   );
 
-  return { kernelPath, rootfsPath, libscriptjailSoPath };
+  return { kernelPath, rootfsPath, compressedRootfsPath, libscriptjailSoPath };
 }
 
 // ---------------------------------------------------------------------------
