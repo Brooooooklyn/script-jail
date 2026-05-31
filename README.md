@@ -146,11 +146,29 @@ VZ kernel, per-arch rootfs, and `libscriptjail` release artifacts; in this repo
 checkout those are produced by the release/build workflows and resolved from
 `images/`.
 
-The npm package currently ships the Apple Silicon runtime artifacts needed by
-the CLI: `script-jail-vm`, the VZ kernel, `libscriptjail-arm64.so`, and a
-compressed Ubuntu 24.04 arm64 rootfs. On first run, the CLI expands the
-compressed rootfs into a sparse cache under `~/Library/Caches/script-jail` (or
-`SCRIPT_JAIL_CACHE_DIR` when set).
+## Installation and packaging
+
+The main `script-jail` npm package is JS-only: it ships `dist/cli.cjs`, the
+guest agent (`dist/guest-agent.cjs`), the Node preloads, and this README — no
+runtime artifacts. The platform-specific runtime payloads live in three
+optional dependency packages, one per supported host:
+
+- `@script-jail/darwin-arm64` — VZ helper (`script-jail-vm`), VZ kernel
+  (`vmlinux-vz-arm64`), `libscriptjail-arm64.so`, and a compressed Ubuntu 24.04
+  arm64 rootfs.
+- `@script-jail/linux-x64` — `libscriptjail.so` and a compressed Ubuntu 24.04
+  x64 rootfs.
+- `@script-jail/linux-arm64` — `libscriptjail-arm64.so` and a compressed Ubuntu
+  24.04 arm64 rootfs.
+
+Each optional package declares matching `os`/`cpu`, so `npx script-jail` (or any
+install) automatically pulls only the `@script-jail/<os>-<arch>` that matches
+the current host and skips the rest. Intel macOS (`darwin-x64`) is not
+supported. In a repo checkout the CLI instead resolves these artifacts from
+`images/` as a development fallback. On first run, the CLI expands the
+compressed rootfs into a sparse cache under `~/Library/Caches/script-jail` on
+macOS, or under `SCRIPT_JAIL_CACHE_DIR` (falling back to the system temp dir) on
+Linux.
 
 ## How It Works
 

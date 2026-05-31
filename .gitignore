@@ -21,6 +21,10 @@ bin/darwin-*/
 # be a stale duplicate that bypasses any gates added to the .cjs bundle.
 dist/main.js
 
+# npm package staging root produced by scripts/assemble-npm-packages.mjs
+# during the release publish job (and by its tests).
+npm-staging/
+
 # Local research scratch
 .firecrawl/
 

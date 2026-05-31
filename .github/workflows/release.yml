@@ -550,7 +550,20 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Stage npm macOS package assets
+      # Stage all four publishable npm packages from the downloaded build
+      # artifacts. scripts/npm-packages.mjs is the single source of truth for
+      # the package set (the tiny JS-only main `script-jail` plus the three
+      # per-platform optional packages @script-jail/{darwin-arm64,linux-x64,
+      # linux-arm64}); scripts/assemble-npm-packages.mjs stages each into
+      # npm-staging/<dir>/, gzipping the rootfs ext4s and copying the shims /
+      # VZ kernel / VZ helper. The build job already downloaded every input
+      # under ./artifacts (the x64/arm64 ext4s, libscriptjail{,-arm64}.so, the
+      # VZ kernel `vmlinux-vz-arm64`, the Mach-O `script-jail-vm-arm64-darwin`,
+      # and the committed dist/ JS bundles).
+      #
+      # The version==tag gate stays here: the main package.json version (which
+      # the assembler propagates to every staged manifest) must equal the tag.
+      - name: Stage npm packages
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
@@ -560,15 +573,24 @@ jobs:
             exit 1
           fi
 
-          mkdir -p bin/darwin-arm64 images dist
-          cp artifacts/dist/cli.cjs dist/cli.cjs
-          cp artifacts/script-jail-vm-arm64-darwin bin/darwin-arm64/script-jail-vm
-          chmod 755 bin/darwin-arm64/script-jail-vm
-          cp artifacts/images/vmlinux-vz-arm64 images/vmlinux-vz-arm64
-          cp artifacts/images/libscriptjail-arm64.so images/libscriptjail-arm64.so
-          gzip -n -c artifacts/images/rootfs-ubuntu-24.04-arm64.ext4 > images/rootfs-ubuntu-24.04-arm64.ext4.gz
+          node scripts/assemble-npm-packages.mjs \
+            --artifacts artifacts \
+            --out npm-staging \
+            --version "${version}"
 
-          node scripts/assert-npm-packlist.mjs
+      # npm silently drops missing `files` entries, so `npm pack --dry-run`
+      # alone is not a gate. Assert each staged package's packed file list,
+      # exec bit (darwin VZ helper), and size against its canonical spec before
+      # any publish runs.
+      #
+      # NOTE (WS2 reviewer #6): adding a 4th default preload requires updating
+      # THREE places — the build-job upload glob (`dist/preloads/*.cjs`, already
+      # a glob), the assembler's main-bundle copy list, and the hard-coded
+      # `cmp -s` list in "Verify Docker runtime JS artifacts" above (NOT a
+      # glob). The packlist gate here resolves `dist/preloads/*.cjs` by glob so
+      # it picks up a new preload automatically.
+      - name: Validate npm packlists
+        run: node scripts/assert-npm-packlist.mjs --all npm-staging
 
       # softprops/action-gh-release@v3 auto-creates the release for the tag
       # (or appends to an existing one) and uploads each listed file.  We pin
@@ -590,7 +612,25 @@ jobs:
             artifacts/dist/main.cjs
             artifacts/dist/cli.cjs
 
-      - name: Publish npm package
+      # Publish the platform packages FIRST, then the main `script-jail`
+      # package LAST. This order is load-bearing: the main package's
+      # optionalDependencies (@script-jail/{darwin-arm64,linux-x64,linux-arm64})
+      # must already be on the registry so a consumer `npm install script-jail`
+      # can resolve the matching one for its os/cpu. The staging dir names below
+      # are exactly the sanitized `dir` values produced by
+      # scripts/npm-packages.mjs / assemble-npm-packages.mjs.
+      #
+      # npm publish is the only NON-re-runnable step in this job: a version that
+      # has already been published cannot be re-published. If a later package
+      # fails after an earlier one succeeded, recovery is to re-run only the
+      # still-unpublished packages, or bump the version and re-tag — there is no
+      # in-place fix for an already-published version.
+      - name: Publish npm packages (platform-first, main last)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: |
+          set -euo pipefail
+          for pkg in script-jail-darwin-arm64 script-jail-linux-x64 script-jail-linux-arm64; do
+            (cd "npm-staging/${pkg}" && npm publish --provenance --access public)
+          done
+          (cd npm-staging/script-jail && npm publish --provenance --access public)
