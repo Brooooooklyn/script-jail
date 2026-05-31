@@ -1,42 +1,53 @@
 // script-jail — src/cli/detect-host.ts
 //
-// Host capability detection for the macOS CLI surface.
+// Backwards-compatibility shim over `detect-platform.ts`.
 //
-// script-jail v1 runs the audited install inside a microVM.  On Linux CI the
-// hypervisor is Firecracker + KVM; on a developer's laptop we use Apple's
-// Virtualization.framework (VZ) via the native `script-jail-vm` helper.
-// VZ has a hard floor at macOS 14 (Sonoma) because that is the first release
-// to expose the `LinuxBootLoader` + vsock APIs we need without extra
-// entitlements.  This module is the single gatekeeper that decides whether
-// the host can even attempt to launch a VM; the CLI bails out here BEFORE
-// touching any artifacts so we can surface a clear actionable message rather
-// than letting a generic ENOENT/permission error surface from deep inside
-// the VZ helper.
+// The CLI host gate was originally macOS-only and returned the legacy shape
+// `{ macosMajor, hostArch }`.  Detection has since been generalized into
+// `detect-platform.ts` (`detectPlatform` → `DetectedPlatform`) to also cover
+// Linux x64/arm64.  Until `src/cli/index.ts` migrates to `detectPlatform`
+// (Phase 1 Task 1.4), the existing call sites and their injected test doubles
+// keep importing from here, so this module:
 //
-// Detection rules:
-//   - `process.platform === 'darwin'`  (anything else → NotMacOSError)
-//   - `os.release()` parses as `<darwinMajor>.<minor>.<patch>` and
-//     `darwinMajor - 9 >= 14` (Sonoma).  Darwin major → macOS major mapping
-//     (kernel version, not marketing name):
-//       - Darwin 23 = macOS 14 (Sonoma)
-//       - Darwin 24 = macOS 15 (Sequoia)
-//       - Darwin 25 = macOS 16
-//     Marketing names (e.g. Apple's "macOS 26" branding) are derived from
-//     year and are not tied to the kernel major.  We gate on the
-//     kernel-derived major.  See
-//     https://en.wikipedia.org/wiki/Darwin_(operating_system)#Release_history.
-//   - `process.arch === 'arm64'` or `process.arch === 'x64'`.  Any other arch
-//     (ia32 / mips / ppc / s390x / arm) → UnsupportedArchError.
+//   - re-exports the typed error classes (including the new
+//     `UnsupportedDarwinArchError`),
+//   - keeps the `DetectedHost` / `HostArch` / `DetectHostInput` types, and
+//   - provides a `detectHost` adapter that delegates the OS/arch gate to
+//     `detectPlatform` and maps the macOS-arm64 result back to the legacy
+//     `{ macosMajor, hostArch }` shape.
 //
-// All three fields on `DetectHostInput` are injection seams used by the unit
-// tests in test/cli/detect-host.test.ts.  Production callers pass no
-// argument; the defaults read `process.platform`, `os.release()`,
-// `process.arch`.
+// Behaviour change (intentional, single-sourced via `detectPlatform`): Intel
+// macs (darwin/x64) are no longer accepted — `detectHost` now throws
+// `UnsupportedDarwinArchError` for them instead of returning
+// `{ macosMajor, hostArch: 'x64' }`.  Linux hosts still throw `NotMacOSError`
+// here (this adapter only ever returns the macOS shape); the Linux runtime
+// path uses `detectPlatform` directly.
 
-import { release as realRelease } from 'node:os';
+import {
+  detectPlatform,
+  MIN_MACOS_MAJOR,
+  NotMacOSError,
+  NotSupportedPlatformError,
+  UnsupportedMacOSError,
+  UnsupportedArchError,
+  UnsupportedDarwinArchError,
+  type DetectPlatformInput,
+} from './detect-platform.js';
 
 // ---------------------------------------------------------------------------
-// Public types
+// Re-exports (preserve the legacy public surface)
+// ---------------------------------------------------------------------------
+
+export {
+  MIN_MACOS_MAJOR,
+  NotMacOSError,
+  UnsupportedMacOSError,
+  UnsupportedArchError,
+  UnsupportedDarwinArchError,
+};
+
+// ---------------------------------------------------------------------------
+// Legacy types
 // ---------------------------------------------------------------------------
 
 export type HostArch = 'x64' | 'arm64';
@@ -47,88 +58,43 @@ export interface DetectedHost {
   hostArch: HostArch;
 }
 
-export interface DetectHostInput {
-  /** Defaults to `process.platform`. */
-  platform?: NodeJS.Platform;
-  /** Defaults to `os.release()`.  Darwin kernel version, e.g. '23.6.0'. */
-  release?: string;
-  /** Defaults to `process.arch`. */
-  arch?: NodeJS.Architecture;
-}
+/** @deprecated use `DetectPlatformInput` from `./detect-platform.js`. */
+export type DetectHostInput = DetectPlatformInput;
 
 // ---------------------------------------------------------------------------
-// Errors
+// Adapter
 // ---------------------------------------------------------------------------
-
-/** Thrown when the host is not macOS. */
-export class NotMacOSError extends Error {
-  constructor(actualPlatform: string) {
-    super(
-      `script-jail CLI requires macOS (detected '${actualPlatform}'). ` +
-      `On Linux CI, use the GitHub Action (uses: Brooooooklyn/scriptjail@<pinned-tag>) instead.`,
-    );
-    this.name = 'NotMacOSError';
-  }
-}
-
-/** Thrown when macOS is too old (anything pre-14 Sonoma). */
-export class UnsupportedMacOSError extends Error {
-  constructor(public readonly resolvedMajor: number, public readonly minimum: number) {
-    super(
-      `script-jail CLI requires macOS ${minimum}+ (Sonoma or newer); ` +
-      `detected macOS ${resolvedMajor}. Upgrade macOS or run the audit on Linux CI.`,
-    );
-    this.name = 'UnsupportedMacOSError';
-  }
-}
-
-/** Thrown when the host CPU architecture is neither x64 nor arm64. */
-export class UnsupportedArchError extends Error {
-  constructor(actualArch: string) {
-    super(
-      `script-jail CLI requires an x64 or arm64 host (detected '${actualArch}').`,
-    );
-    this.name = 'UnsupportedArchError';
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Detection
-// ---------------------------------------------------------------------------
-
-/** Minimum supported macOS major (Sonoma). */
-const MIN_MACOS_MAJOR = 14;
 
 /**
- * Inspect the host and return `{ macosMajor, hostArch }` or throw a typed
- * error explaining why the CLI cannot run here.
+ * Legacy macOS-only host gate.  Delegates to `detectPlatform` and maps the
+ * macOS-arm64 result to `{ macosMajor, hostArch }`.
  *
- * Pure-ish: no filesystem or network IO; only reads `os.release()` and
- * `process.{platform,arch}` (or the injected equivalents).
+ * - macOS arm64 (Sonoma+) → `{ macosMajor, hostArch: 'arm64' }`.
+ * - Intel mac (darwin/x64) → throws `UnsupportedDarwinArchError`.
+ * - too-old macOS → throws `UnsupportedMacOSError`.
+ * - non-macOS → throws `NotMacOSError` (this adapter never returns a Linux
+ *   shape; Linux callers use `detectPlatform` directly).
  */
 export function detectHost(input: DetectHostInput = {}): DetectedHost {
-  const platform = input.platform ?? process.platform;
-  if (platform !== 'darwin') {
-    throw new NotMacOSError(platform);
+  let platform;
+  try {
+    platform = detectPlatform(input);
+  } catch (err) {
+    // `detectPlatform` throws `NotSupportedPlatformError` for non-macOS,
+    // non-Linux hosts and `NotMacOSError`/etc. are macOS-specific.  This
+    // adapter's contract is macOS-only, so translate the generalized
+    // "unsupported OS" into the legacy `NotMacOSError`.
+    if (err instanceof NotSupportedPlatformError) {
+      throw new NotMacOSError(input.platform ?? process.platform);
+    }
+    throw err;
   }
 
-  const release = input.release ?? realRelease();
-  const darwinMajor = parseInt(release.split('.')[0] ?? '', 10);
-  if (!Number.isFinite(darwinMajor)) {
-    // Defensive: os.release() always returns a parseable form on macOS, but
-    // an injected garbage string would otherwise yield NaN and silently pass
-    // the `< MIN_MACOS_MAJOR` check via NaN-comparison weirdness.
-    throw new UnsupportedMacOSError(0, MIN_MACOS_MAJOR);
-  }
-  const macosMajor = darwinMajor - 9;
-  if (macosMajor < MIN_MACOS_MAJOR) {
-    throw new UnsupportedMacOSError(macosMajor, MIN_MACOS_MAJOR);
+  if (platform.os !== 'darwin') {
+    // Linux is a supported platform for `detectPlatform`, but this legacy
+    // adapter only models macOS.  Preserve the historical `NotMacOSError`.
+    throw new NotMacOSError(platform.os);
   }
 
-  const arch = input.arch ?? process.arch;
-  if (arch !== 'arm64' && arch !== 'x64') {
-    throw new UnsupportedArchError(arch);
-  }
-
-  return { macosMajor, hostArch: arch };
+  return { macosMajor: platform.macosMajor!, hostArch: platform.arch };
 }

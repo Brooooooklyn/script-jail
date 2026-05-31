@@ -8,11 +8,52 @@
 //             (no arch suffix on the .so — backwards compat with the existing
 //             release pipeline).
 
-import { describe, it, expect } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { manifestKey, resolveArtifacts } from '../../src/shared/artifacts.js';
+import { afterAll, describe, it, expect } from 'vitest';
+
+import {
+  manifestKey,
+  resolveArtifacts,
+  resolvePlatformPackageDir,
+  PlatformPackageMissingError,
+} from '../../src/shared/artifacts.js';
 
 const FAKE_REPO = '/Users/test/repo';
+
+// ---------------------------------------------------------------------------
+// Fake NodeRequire helpers for resolvePlatformPackageDir injection tests.
+//
+// No `@script-jail/*` platform package is installed during this phase, so the
+// "package" branch is only ever exercised through an injected fake `require`.
+// The real, working resolution path until WS2 publishes is the dev fallback.
+// ---------------------------------------------------------------------------
+
+/** A fake `require` whose `.resolve` returns a fixed path. */
+function fakeRequireResolving(resolvedPath: string): NodeRequire {
+  const req = (() => {
+    throw new Error('not used');
+  }) as unknown as NodeRequire;
+  const resolve = (() => resolvedPath) as unknown as NodeRequire['resolve'];
+  req.resolve = resolve;
+  return req;
+}
+
+/** A fake `require` whose `.resolve` throws an error with the given `code`. */
+function fakeRequireThrowing(code: string): NodeRequire {
+  const req = (() => {
+    throw new Error('not used');
+  }) as unknown as NodeRequire;
+  const resolve = (() => {
+    const err = new Error(`cannot resolve (${code})`) as Error & { code?: string };
+    err.code = code;
+    throw err;
+  }) as unknown as NodeRequire['resolve'];
+  req.resolve = resolve;
+  return req;
+}
 
 describe('resolveArtifacts — arm64', () => {
   const arm = resolveArtifacts({
@@ -162,5 +203,131 @@ describe('resolveArtifacts — ubuntu major versions', () => {
     expect(a.compressedRootfsPath).toBe(`${a.rootfsPath}.gz`);
     expect(b.compressedRootfsPath).toBe(`${b.rootfsPath}.gz`);
     expect(a.kernelPath).toBe(b.kernelPath);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolvePlatformPackageDir
+// ---------------------------------------------------------------------------
+
+describe('resolvePlatformPackageDir', () => {
+  // A real, existing directory used as the dev `images/` fallback.  We create
+  // a throwaway temp dir so the `existsSync` guard sees it as present.
+  const devImagesDir = mkdtempSync(join(tmpdir(), 'script-jail-images-'));
+
+  afterAll(() => {
+    rmSync(devImagesDir, { recursive: true, force: true });
+  });
+
+  it('uses the installed platform package when require.resolve succeeds', () => {
+    const resolved = resolvePlatformPackageDir({
+      packageName: '@script-jail/linux-x64',
+      require: fakeRequireResolving(
+        '/fake/node_modules/@script-jail/linux-x64/package.json',
+      ),
+      devImagesDir,
+    });
+    expect(resolved).toEqual({
+      imagesDir: '/fake/node_modules/@script-jail/linux-x64',
+      source: 'package',
+    });
+  });
+
+  it('falls back to devImagesDir when require throws MODULE_NOT_FOUND', () => {
+    const resolved = resolvePlatformPackageDir({
+      packageName: '@script-jail/linux-x64',
+      require: fakeRequireThrowing('MODULE_NOT_FOUND'),
+      devImagesDir,
+    });
+    expect(resolved).toEqual({ imagesDir: devImagesDir, source: 'dev' });
+  });
+
+  it('falls back when require throws ERR_PACKAGE_PATH_NOT_EXPORTED (fix #5)', () => {
+    // Any resolve failure — not only MODULE_NOT_FOUND — must be treated as
+    // "package not usable → try devImagesDir".
+    const resolved = resolvePlatformPackageDir({
+      packageName: '@script-jail/linux-x64',
+      require: fakeRequireThrowing('ERR_PACKAGE_PATH_NOT_EXPORTED'),
+      devImagesDir,
+    });
+    expect(resolved).toEqual({ imagesDir: devImagesDir, source: 'dev' });
+  });
+
+  it('throws PlatformPackageMissingError when package + devImagesDir both missing', () => {
+    const missingDev = join(devImagesDir, 'does-not-exist');
+    let thrown: unknown;
+    try {
+      resolvePlatformPackageDir({
+        packageName: '@script-jail/linux-arm64',
+        require: fakeRequireThrowing('MODULE_NOT_FOUND'),
+        devImagesDir: missingDev,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(PlatformPackageMissingError);
+    expect((thrown as Error).message).toContain('@script-jail/linux-arm64');
+  });
+
+  it('throws PlatformPackageMissingError when no devImagesDir is given and package missing', () => {
+    let thrown: unknown;
+    try {
+      resolvePlatformPackageDir({
+        packageName: '@script-jail/linux-arm64',
+        require: fakeRequireThrowing('MODULE_NOT_FOUND'),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(PlatformPackageMissingError);
+    expect((thrown as Error).message).toContain('@script-jail/linux-arm64');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveArtifacts — imagesDir override (platform-package root)
+// ---------------------------------------------------------------------------
+
+describe('resolveArtifacts — imagesDir override', () => {
+  it('resolves x64 artifacts directly under the provided imagesDir', () => {
+    const r = resolveArtifacts({
+      imagesDir: '/pkg',
+      hostArch: 'x64',
+      ubuntuMajor: '24.04',
+    });
+    expect(r.rootfsPath).toBe('/pkg/rootfs-ubuntu-24.04.ext4');
+    expect(r.compressedRootfsPath).toBe('/pkg/rootfs-ubuntu-24.04.ext4.gz');
+    expect(r.libscriptjailSoPath).toBe('/pkg/libscriptjail.so');
+  });
+
+  it('resolves arm64 artifacts (suffix on rootfs and .so) under imagesDir', () => {
+    const r = resolveArtifacts({
+      imagesDir: '/pkg',
+      hostArch: 'arm64',
+      ubuntuMajor: '24.04',
+    });
+    expect(r.rootfsPath).toBe('/pkg/rootfs-ubuntu-24.04-arm64.ext4');
+    expect(r.compressedRootfsPath).toBe('/pkg/rootfs-ubuntu-24.04-arm64.ext4.gz');
+    expect(r.libscriptjailSoPath).toBe('/pkg/libscriptjail-arm64.so');
+  });
+
+  it('throws when both repoRoot and imagesDir are provided', () => {
+    expect(() =>
+      resolveArtifacts({
+        repoRoot: FAKE_REPO,
+        imagesDir: '/pkg',
+        hostArch: 'x64',
+        ubuntuMajor: '24.04',
+      } as unknown as Parameters<typeof resolveArtifacts>[0]),
+    ).toThrow();
+  });
+
+  it('throws when neither repoRoot nor imagesDir is provided', () => {
+    expect(() =>
+      resolveArtifacts({
+        hostArch: 'x64',
+        ubuntuMajor: '24.04',
+      } as unknown as Parameters<typeof resolveArtifacts>[0]),
+    ).toThrow();
   });
 });

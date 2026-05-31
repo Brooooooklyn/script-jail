@@ -30,7 +30,9 @@
 // divergent rootfs, add an explicit artifact key rather than overloading
 // the existing names.
 
-import { join } from 'node:path';
+import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -43,8 +45,18 @@ export type ArtifactArch = 'x64' | 'arm64';
 export type ArtifactUbuntuMajor = '22.04' | '24.04';
 
 export interface ArtifactInput {
-  /** Absolute path to the repository root. */
-  repoRoot: string;
+  /**
+   * Absolute path to the repository root.  `images/` is appended.  Exactly one
+   * of `repoRoot` / `imagesDir` must be provided.
+   */
+  repoRoot?: string;
+  /**
+   * Absolute path to the directory that contains the artifacts directly (no
+   * `images/` suffix is appended).  Platform packages ship their artifacts at
+   * the package root, so the CLI passes the resolved package dir here.
+   * Exactly one of `repoRoot` / `imagesDir` must be provided.
+   */
+  imagesDir?: string;
   /** Host architecture (matches the in-VM guest arch). */
   hostArch: ArtifactArch;
   /**
@@ -84,7 +96,19 @@ export type ArtifactKind = 'kernel' | 'rootfs' | 'libscriptjail';
  */
 export function resolveArtifacts(input: ArtifactInput): ResolvedArtifacts {
   const { repoRoot, hostArch, ubuntuMajor } = input;
-  const imagesDir = join(repoRoot, 'images');
+
+  // Exactly one of `repoRoot` / `imagesDir` is the artifact-directory source:
+  //   - `repoRoot`  → dev checkout / Action repo, artifacts live under images/.
+  //   - `imagesDir` → an already-resolved directory (e.g. a platform package
+  //                   root) whose artifacts sit directly inside it.
+  const hasRepoRoot = repoRoot !== undefined;
+  const hasImagesDir = input.imagesDir !== undefined;
+  if (hasRepoRoot === hasImagesDir) {
+    throw new Error(
+      'resolveArtifacts: provide exactly one of { repoRoot, imagesDir }',
+    );
+  }
+  const imagesDir = hasImagesDir ? input.imagesDir! : join(repoRoot!, 'images');
 
   // Kernel naming mirrors `vmlinux-vz-<arch>` where <arch> is the canonical
   // Linux kernel arch label (x86_64 / arm64), not Node's process.arch label
@@ -114,6 +138,99 @@ export function resolveArtifacts(input: ArtifactInput): ResolvedArtifacts {
   );
 
   return { kernelPath, rootfsPath, compressedRootfsPath, libscriptjailSoPath };
+}
+
+// ---------------------------------------------------------------------------
+// resolvePlatformPackageDir
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when neither the installed `@script-jail/<os>-<arch>` platform
+ * package nor a dev `images/` fallback directory could be located.  The
+ * message names the expected package so the user can install it, and hints
+ * that the platform may simply be unsupported.
+ */
+export class PlatformPackageMissingError extends Error {
+  constructor(packageName: string) {
+    super(
+      `Could not locate runtime artifacts for ${packageName}: the optional ` +
+        `platform package is not installed and no dev images/ directory was ` +
+        `found. Reinstall script-jail so npm can fetch ${packageName}, or — ` +
+        `if your OS/CPU has no matching package — this platform is not ` +
+        `supported.`,
+    );
+    this.name = 'PlatformPackageMissingError';
+  }
+}
+
+export interface ResolvePlatformPackageDirInput {
+  /** The scoped package name, e.g. `@script-jail/linux-x64`. */
+  packageName: string;
+  /**
+   * Injection seam for the resolver.  Defaults to the ambient CJS `require`
+   * when available (the bundled `dist/cli.cjs`), otherwise a `createRequire`
+   * built from `import.meta.url` (ESM dev / oxnode).
+   */
+  require?: NodeRequire;
+  /**
+   * Dev-checkout fallback directory (typically `<repoRoot>/images`).  Used
+   * when the platform package is not installed/resolvable.
+   */
+  devImagesDir?: string;
+}
+
+export interface ResolvedPlatformPackageDir {
+  /** Directory that contains the runtime artifacts directly (no images/). */
+  imagesDir: string;
+  /** Where the artifacts came from. */
+  source: 'package' | 'dev';
+}
+
+/**
+ * Locate the directory that holds the runtime artifacts (rootfs, shim, VZ
+ * helper) for `packageName`.
+ *
+ * Resolution order:
+ *   1. The installed platform package — `require.resolve(`${packageName}/package.json`)`.
+ *      On success, the artifacts ship at the package **root** (spec §4.1), so
+ *      we return `dirname(resolvedPkgJson)` with `source:'package'`.
+ *   2. The dev `images/` fallback — when the package cannot be resolved for
+ *      ANY reason (MODULE_NOT_FOUND, ERR_PACKAGE_PATH_NOT_EXPORTED, or any
+ *      other throw), fall back to `devImagesDir` if it exists on disk, with
+ *      `source:'dev'`.
+ *   3. Otherwise throw `PlatformPackageMissingError`.
+ *
+ * No `@script-jail/*` platform package is published yet during this phase, so
+ * the only working real path is the dev `images/` fallback; the package branch
+ * is exercised exclusively via injected `require` in unit tests.
+ */
+export function resolvePlatformPackageDir(
+  input: ResolvePlatformPackageDirInput,
+): ResolvedPlatformPackageDir {
+  const { packageName, devImagesDir } = input;
+
+  // Mirror the `__filename` / `import.meta.url` dance in `src/cli/index.ts`:
+  // prefer the injected/ambient `require` (CJS bundle), else synthesize one
+  // from the ESM module URL (dev / oxnode).
+  const req: NodeRequire =
+    input.require ??
+    (typeof require !== 'undefined'
+      ? require
+      : createRequire(import.meta.url));
+
+  try {
+    const resolvedPkgJson = req.resolve(`${packageName}/package.json`);
+    return { imagesDir: dirname(resolvedPkgJson), source: 'package' };
+  } catch {
+    // Any resolve failure means the package is not usable: fall through to the
+    // dev fallback rather than rethrowing (fix #5: do not gate on err.code).
+  }
+
+  if (devImagesDir !== undefined && existsSync(devImagesDir)) {
+    return { imagesDir: devImagesDir, source: 'dev' };
+  }
+
+  throw new PlatformPackageMissingError(packageName);
 }
 
 // ---------------------------------------------------------------------------
