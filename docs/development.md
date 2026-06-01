@@ -69,6 +69,8 @@ published **before** the main `script-jail` package so that the
 
 The repo's own CI sets `SCRIPT_JAIL_E2E_SELF_TEST=1` to skip manifest validation (so the action under test isn't gated on the very artifacts it's building).
 
+For the first-release bootstrap loop (Phase 0 → 1 → 2, the `v0.1.0` placeholder-publish followed by the `v0.1.1` SHA backfill) and the per-target works/degraded matrix, see [releasing.md](./releasing.md) (`docs/releasing.md`).
+
 ## CI overview
 
 - `test.yml` — typecheck + unit/guest/integration/fake-e2e Vitest projects on matrix of Ubuntu 22.04/24.04 × Node 22/24/26; verifies `dist/main.cjs`, `dist/guest-agent.cjs`, and `dist/cli.cjs` are current.

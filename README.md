@@ -192,6 +192,7 @@ syscall/preload audit available on runners without KVM.
 - [Design](./docs/design.md) - rationale, threat model, and tradeoffs.
 - [Architecture](./docs/architecture.md) - host/guest split and audit pipeline.
 - [Development](./docs/development.md) - build, release, and CI conventions.
+- [Releasing](./docs/releasing.md) - first-release runbook and version-bump sequence.
 - [Testing](./docs/testing.md) - Vitest projects, fixtures, and e2e workflows.
 - [Divergence](./docs/divergence.md) - cross-host parity limits.
 - [Parity testing](./docs/parity-testing.md) - Linux/macOS parity workflow.

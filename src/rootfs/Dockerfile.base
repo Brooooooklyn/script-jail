@@ -1,5 +1,27 @@
 # syntax=docker/dockerfile:1
+
+# Base image. `UBUNTU_MAJOR` is declared FIRST and `UBUNTU_REF` DEFAULTS to
+# `ubuntu:${UBUNTU_MAJOR}` so any caller that passes only `--build-arg
+# UBUNTU_MAJOR=22.04` (e.g. the GHCR publish path in release.yml) still builds
+# FROM the correct `ubuntu:22.04` tag — NOT a hard-coded 24.04 default.  The
+# local rootfs build (dockerBuild() → buildDockerBuildArgs in
+# src/rootfs/build.ts) OVERRIDES `UBUNTU_REF` with the per-arch digest from
+# `UBUNTU_BASE_DIGEST` for byte-reproducibility (R1).  `UBUNTU_MAJOR` is still
+# consumed by the apt-mirror sed/RUN logic below, so do NOT remove it.
 ARG UBUNTU_MAJOR=24.04
+ARG UBUNTU_REF=ubuntu:${UBUNTU_MAJOR}
+
+# Frozen Ubuntu archive snapshot.  snapshot.ubuntu.com serves the EXACT archive
+# state as-of this UTC instant, so `apt-get install` resolves the SAME package
+# versions on every CI run — a precondition for the byte-reproducible rootfs
+# (R1).  Live mirrors (archive/azure/ports/leaseweb) drift the instant Canonical
+# publishes a security/point update, so they cannot be used here.
+#
+# Refresh: bump UBUNTU_SNAPSHOT to a newer in-the-past UTC instant, then
+# re-validate in CI (the snapshot build must still succeed and the resulting
+# rootfs SHA is expected to change).  The timestamp MUST resolve on
+# snapshot.ubuntu.com — that is only provable in a Linux+docker CI build.
+ARG UBUNTU_SNAPSHOT=20260501T000000Z
 
 # vite-plus toolchain provisioning args.  Defaults are PLACEHOLDERS — the real
 # values come from `src/rootfs/vite-plus.ts` via `--build-arg` (see
@@ -10,8 +32,12 @@ ARG VP_ARCH=x64
 ARG VP_SHA256=0000000000000000000000000000000000000000000000000000000000000000
 ARG NODE_VERSION=0.0.0
 
-FROM ubuntu:${UBUNTU_MAJOR}
+FROM ${UBUNTU_REF}
 
+# Re-declare post-FROM so the value is in scope inside the RUN apt-mirror
+# rewrite below (ARGs declared before the first FROM do not propagate into the
+# build stage automatically).
+ARG UBUNTU_SNAPSHOT
 ARG VP_VERSION
 ARG VP_ARCH
 ARG VP_SHA256
@@ -25,44 +51,135 @@ ARG NODE_VERSION
 # locale payloads never get committed to a layer in the first place.  A
 # follow-up `RUN rm -rf …` would only mask the bytes, not shrink the image.
 #
-# Swap the default Ubuntu apt mirrors before `apt-get update`:
-#   - x86_64 main archive  →  azure.archive.ubuntu.com (in-network on Azure-
-#     hosted GitHub runners).
-#   - arm64 ports archive  →  mirror.us.leaseweb.net/ubuntu-ports/ (Canonical's
-#     own `ports.ubuntu.com` and CNAME `azure.ports.ubuntu.com` resolve to the
-#     same overloaded 91.189.91.x bank, which has been TCP-blackholing from
-#     GitHub-hosted runners for sustained windows).  Leaseweb runs an
-#     independent US mirror with very high uptime.
+# Two-phase apt, in ONE RUN:
+#
+#   Phase 1 — bootstrap ca-certificates from the LIVE mirror.
+#     The base ubuntu image ships WITHOUT a CA bundle (ca-certificates is
+#     status 'un', /etc/ssl/certs/ca-certificates.crt is absent, and apt's
+#     https method is a symlink to http).  Repointing apt at the HTTPS
+#     snapshot archive BEFORE a CA bundle exists makes `apt-get update` fail
+#     cert verification ("No system certificates available. Try installing
+#     ca-certificates.") on every InRelease — and snapshot.ubuntu.com
+#     301-redirects http->https, so a plain-http rewrite cannot dodge it.
+#     So we FIRST update + install ca-certificates against the original live
+#     mirror (which is plain http and needs no CA bundle), giving apt the
+#     trust store it needs to talk to the HTTPS snapshot.
+#
+#   Phase 2 — repoint to the frozen snapshot and install the real set.
+#     snapshot.ubuntu.com pins every package to its version as-of
+#     UBUNTU_SNAPSHOT, so the installed set is identical across CI runs —
+#     byte-reproducible rootfs (R1).  This replaces the live mirrors
+#     (archive.ubuntu.com / azure.archive.ubuntu.com for amd64,
+#     ports.ubuntu.com / mirror.us.leaseweb.net for arm64), which served
+#     whatever versions were current at build time and therefore drifted
+#     whenever Canonical published an update.  ca-certificates is RE-installed
+#     in the Phase 2 step PINNED to the snapshot CANDIDATE version (with
+#     --allow-downgrades) so its baked-in version is always the snapshot's —
+#     a plain re-list would NOT downgrade the (possibly newer) live version
+#     Phase 1 installed, which would drift across runs.
 #
 # Sources files differ across releases (sources.list on 22.04, deb822
-# ubuntu.sources on 24.04), so we rewrite every matching file under
+# ubuntu.sources on 24.04), and on 24.04 the amd64 `-security` pocket is a
+# SEPARATE `security.ubuntu.com` stanza — so we rewrite that host too and then
+# ASSERT (allowlist) that every active apt source is the snapshot before the
+# phase-2 install; any leftover live mirror fails the build loudly rather than
+# silently baking drifting bytes.  We rewrite every matching file under
 # /etc/apt without caring which exists.  The retry loop is a backstop.
+#
+# CRITICAL: snapshot Release files carry an old `Valid-Until`, so apt would
+# REJECT them as expired unless validity checking is disabled — hence the
+# `Acquire::Check-Valid-Until "false"` line below.
 #
 # `curl` is added to the package set: it downloads the `vp` tarball below.
 RUN set -eu; \
-    find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
-      -exec sed -i \
-        -e 's|http://ports\.ubuntu\.com/ubuntu-ports|http://mirror.us.leaseweb.net/ubuntu-ports|g' \
-        -e 's|http://archive\.ubuntu\.com|http://azure.archive.ubuntu.com|g' \
-        {} +; \
-    echo 'Acquire::http::Timeout "30";' > /etc/apt/apt.conf.d/99script-jail-net; \
-    echo 'Acquire::Retries "3";'       >> /etc/apt/apt.conf.d/99script-jail-net; \
-    echo 'Acquire::ForceIPv4 "true";'  >> /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::http::Timeout "30";'        > /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::Retries "3";'              >> /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::ForceIPv4 "true";'         >> /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::Check-Valid-Until "false";' >> /etc/apt/apt.conf.d/99script-jail-net; \
     for attempt in 1 2 3 4 5; do \
       if apt-get update && \
-         apt-get install -y --no-install-recommends \
-           strace busybox dumb-init ca-certificates socat curl; then \
+         apt-get install -y --no-install-recommends ca-certificates; then \
         break; \
       fi; \
       if [ "$attempt" = "5" ]; then \
-        echo "apt install failed after 5 attempts" >&2; exit 1; \
+        echo "ca-certificates bootstrap failed after 5 attempts" >&2; exit 1; \
       fi; \
-      echo "apt install attempt $attempt failed; sleeping before retry" >&2; \
+      echo "ca-certificates bootstrap attempt $attempt failed; sleeping before retry" >&2; \
+      sleep $((attempt * 5)); \
+    done; \
+    find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+      -exec sed -i \
+        -e "s|http://ports\.ubuntu\.com/ubuntu-ports|https://snapshot.ubuntu.com/ubuntu-ports/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://mirror\.us\.leaseweb\.net/ubuntu-ports|https://snapshot.ubuntu.com/ubuntu-ports/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://ports\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu-ports/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://azure\.archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://archive\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://azure\.archive\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://security\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+        -e "s|http://security\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+        {} +; \
+    # Reproducibility guard: after the rewrite EVERY active apt source MUST be
+    # the frozen snapshot.  A leftover live host — security.ubuntu.com (the
+    # amd64 `-security` pocket, which lives in a SEPARATE deb822 stanza on
+    # 24.04), or any mirror a future base image introduces — would let the
+    # phase-2 install resolve drifting package versions and silently break the
+    # v0.1.1 cross-run reproduction.  An allowlist (must be snapshot) is airtight
+    # where a host blocklist would miss a newly-introduced mirror.  `#` comments
+    # are stripped first so commented example URLs (e.g. help.ubuntu.com) cannot
+    # false-trip it.
+    bad="$(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec cat {} + 2>/dev/null \
+            | sed 's/#.*//' \
+            | grep -oE 'https?://[^[:space:]]+' \
+            | grep -vE '^https://snapshot\.ubuntu\.com/' || true)"; \
+    if [ -n "$bad" ]; then \
+      echo "non-snapshot apt source remains after rewrite:" >&2; \
+      printf '%s\n' "$bad" >&2; \
+      exit 1; \
+    fi; \
+    # Drop the phase-1 (live-mirror) package lists so the phase-2 update and the
+    # candidate-version resolution below see ONLY the snapshot archive.
+    rm -rf /var/lib/apt/lists/*; \
+    # Phase 2 — install the real set from the frozen snapshot.  `update`,
+    # ca-certificates candidate resolution, AND `install` live in ONE retry loop
+    # on purpose: snapshot.ubuntu.com intermittently 5xxs a large index file,
+    # which `apt-get update` reports as a WARNING (exit 0) yet leaves a `universe`
+    # package (busybox / dumb-init / socat) unresolvable — so the install fails.
+    # Re-running `update` on the next attempt re-fetches the missing index; a
+    # split update/install loop would instead hammer a doomed install against
+    # incomplete lists and never recover.
+    #
+    # Phase 1 installed ca-certificates from the LIVE mirror, whose version can
+    # be NEWER than the snapshot's; a plain `apt-get install ca-certificates`
+    # will NOT downgrade it, so the live (drifting) bytes would bake into the
+    # rootfs and break the v0.1.1 SHA backfill.  Pinning to the snapshot
+    # CANDIDATE version with --allow-downgrades forces the baked version to the
+    # snapshot's, regardless of what the live mirror served.  (apt's candidate is
+    # the snapshot version even when a newer one is installed, because the
+    # configured source outranks the dpkg-status pseudo-version.)  cc_ver is
+    # resolved INSIDE the loop, after each fresh update, so it reflects the
+    # fully-fetched snapshot lists; an empty resolution fails the attempt.
+    for attempt in 1 2 3 4 5; do \
+      if apt-get update \
+         && cc_ver="$(apt-cache policy ca-certificates | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p')" \
+         && [ -n "${cc_ver}" ] \
+         && apt-get install -y --no-install-recommends --allow-downgrades \
+              "ca-certificates=${cc_ver}" \
+              strace busybox dumb-init socat curl; then \
+        break; \
+      fi; \
+      if [ "$attempt" = "5" ]; then \
+        echo "snapshot apt update/install failed after 5 attempts" >&2; exit 1; \
+      fi; \
+      echo "snapshot apt attempt $attempt failed; sleeping before retry" >&2; \
       sleep $((attempt * 5)); \
     done && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /usr/share/doc /usr/share/man /usr/share/locale \
-           /var/cache/apt /var/lib/dpkg/info/*.md5sums
+           /var/cache/apt /var/lib/dpkg/info/*.md5sums && \
+    rm -f /var/log/dpkg.log /var/log/alternatives.log /var/log/bootstrap.log && \
+    rm -rf /var/log/apt && \
+    : > /etc/machine-id
 
 # Build dirs the agent + init script expect.  /opt/vp is the runtime VP_HOME
 # (pre-created so init.sh can write into it under the rw rootfs without an

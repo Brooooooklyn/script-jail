@@ -21,11 +21,15 @@
 #
 # Bootstrap path:
 #   On the very first tag of a fresh fork, every entry in
-#   `PINNED_MANIFEST.expected.{linux,darwin}` is a placeholder — there are no
+#   `PINNED_MANIFEST.expected.{linux,darwin}` AND every digest-pinned ref in
+#   `PINNED_MANIFEST.dockerImages.{x64,arm64}` is a placeholder — there are no
 #   real SHAs to verify against yet.  In that documented case we emit a
 #   warning and proceed so the maintainer can copy the published SHAs into
 #   the manifest and cut the next tag.  Mixed manifests (some real, some
-#   placeholder) are treated as bugs and rejected.
+#   placeholder) are treated as bugs and rejected.  The all-or-nothing
+#   classification spans BOTH the 9 file SHAs and the 4 Docker image refs:
+#   pasting real file SHAs while leaving the Docker refs as placeholders (or
+#   vice versa) trips the mixed-manifest reject.
 #
 # Manifest shape:
 #   `PINNED_MANIFEST.expected` is platform-keyed:
@@ -37,6 +41,23 @@
 #   keys it cares about.  The `<platform>` prefix in offender messages
 #   disambiguates the two sections (`linux/libscriptjail.so` vs.
 #   `darwin/libscriptjail-arm64.so`).
+#
+#   `PINNED_MANIFEST.dockerImages` is arch-keyed, each arch holding two
+#   Ubuntu-major image refs:
+#     dockerImages: {
+#       x64:   { 'ubuntu-22.04': '<ref>', 'ubuntu-24.04': '<ref>' },
+#       arm64: { 'ubuntu-22.04': '<ref>', 'ubuntu-24.04': '<ref>' },
+#     }
+#   Each `<ref>` is a digest-pinned GHCR pull spec of the form
+#   `ghcr.io/<owner>/script-jail-rootfs:<tag>@sha256:<digest-or-placeholder>`.
+#   We extract all 4 refs and fold them into the placeholder/real
+#   classification.  Note a Docker ref NEVER starts with the
+#   `PLACEHOLDER_SHA256_` prefix (it starts with `ghcr.io/`), so a ref is
+#   classified as a placeholder when it CONTAINS the `PLACEHOLDER_SHA256_`
+#   substring (the placeholder digest token), else real.  Docker refs are NOT
+#   SHA-verified against downloaded files here (there is no local file to
+#   hash); they participate only in the all-or-nothing placeholder/real
+#   classification so a partially-backfilled manifest is caught before tagging.
 #
 # Flags:
 #   --manifest <path>          Path to src/action/artifact-manifest.ts (required).
@@ -188,6 +209,56 @@ if [ -z "$DARWIN_BLOCK" ]; then
   exit 1
 fi
 
+# Extract the `dockerImages: { ... }` block of PINNED_MANIFEST into a variable.
+# `dockerImages` lives at the same nesting level as `expected` (a direct
+# property of PINNED_MANIFEST), NOT inside it — so we re-run the same
+# brace-counting awk state machine over the whole manifest rather than carving
+# it out of EXPECTED_BLOCK.  The depth counter starts at 1 immediately after
+# seeing `dockerImages: {` and echoes every line until depth returns to 0,
+# surviving the nested `x64: { ... }` / `arm64: { ... }` arch sub-blocks.
+DOCKER_BLOCK="$(awk '
+  BEGIN { in_manifest = 0; in_docker = 0; depth = 0 }
+  /export[[:space:]]+const[[:space:]]+PINNED_MANIFEST/ { in_manifest = 1; next }
+  in_manifest && /^[[:space:]]*dockerImages:[[:space:]]*\{/ { in_docker = 1; depth = 1; next }
+  in_docker {
+    opens  = gsub(/\{/, "{", $0)
+    closes = gsub(/\}/, "}", $0)
+    depth += opens - closes
+    if (depth <= 0) { in_docker = 0; in_manifest = 0; exit }
+    print
+  }
+' "$MANIFEST")"
+
+if [ -z "$DOCKER_BLOCK" ]; then
+  echo "check-publish-artifacts: could not locate PINNED_MANIFEST.dockerImages { ... } block in $MANIFEST" >&2
+  exit 1
+fi
+
+# Carve an arch sub-block out of DOCKER_BLOCK.  Mirrors extract_platform_block:
+# the same `<key>: { ... }` opener/closer pattern.  Arch keys (`x64`, `arm64`)
+# MUST appear at the start of their line.
+extract_arch_block() {
+  local arch="$1"
+  printf '%s\n' "$DOCKER_BLOCK" | awk -v a="$arch" '
+    BEGIN { in_section = 0 }
+    !in_section && $0 ~ ("^[[:space:]]*" a ":[[:space:]]*\\{") { in_section = 1; next }
+    in_section && /^[[:space:]]*\},?[[:space:]]*$/ { in_section = 0; exit }
+    in_section { print }
+  '
+}
+
+DOCKER_X64_BLOCK="$(extract_arch_block 'x64')"
+DOCKER_ARM64_BLOCK="$(extract_arch_block 'arm64')"
+
+if [ -z "$DOCKER_X64_BLOCK" ]; then
+  echo "check-publish-artifacts: could not locate x64: { ... } sub-block inside PINNED_MANIFEST.dockerImages" >&2
+  exit 1
+fi
+if [ -z "$DOCKER_ARM64_BLOCK" ]; then
+  echo "check-publish-artifacts: could not locate arm64: { ... } sub-block inside PINNED_MANIFEST.dockerImages" >&2
+  exit 1
+fi
+
 # Escape regex metacharacters in a string so it can be interpolated into a
 # POSIX/ERE pattern as a literal.  We escape the BRE/ERE special set; the
 # manifest keys we care about contain `.` and `-`, neither of which appears
@@ -259,6 +330,23 @@ fi
 # runners are deprecated and v1 does not ship that binary.  Adding the key
 # here would force a stub artifact in the build job.
 
+# --- Docker image refs --------------------------------------------------------
+# The 4 digest-pinned GHCR refs live in PINNED_MANIFEST.dockerImages, keyed by
+# arch then Ubuntu major.  Each value is a single-quoted string so the same
+# extract_from_block helper applies; the arch is the diagnostic prefix.
+if ! DOCKER_X64_22="$(extract_from_block 'x64' "$DOCKER_X64_BLOCK" 'ubuntu-22.04')"; then
+  exit 1
+fi
+if ! DOCKER_X64_24="$(extract_from_block 'x64' "$DOCKER_X64_BLOCK" 'ubuntu-24.04')"; then
+  exit 1
+fi
+if ! DOCKER_ARM64_22="$(extract_from_block 'arm64' "$DOCKER_ARM64_BLOCK" 'ubuntu-22.04')"; then
+  exit 1
+fi
+if ! DOCKER_ARM64_24="$(extract_from_block 'arm64' "$DOCKER_ARM64_BLOCK" 'ubuntu-24.04')"; then
+  exit 1
+fi
+
 # --- Classify placeholders ----------------------------------------------------
 
 PLACEHOLDER_PREFIX="PLACEHOLDER_SHA256_"
@@ -270,8 +358,20 @@ is_placeholder() {
   esac
 }
 
+# Docker refs never START with the placeholder prefix — they start with
+# `ghcr.io/` and carry the placeholder token in the `@sha256:` digest position
+# (`...@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_<...>`).  So a ref is a
+# placeholder when it CONTAINS the prefix substring anywhere, else real.
+is_docker_placeholder() {
+  case "$1" in
+    *"${PLACEHOLDER_PREFIX}"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 PLACEHOLDER_COUNT=0
 REAL_COUNT=0
+# The 9 file SHAs use the prefix-anchored placeholder test.
 for v in \
   "$EXPECTED_LINUX_ROOTFS_22" "$EXPECTED_LINUX_ROOTFS_24" "$EXPECTED_LINUX_LIBSO" \
   "$EXPECTED_DARWIN_ROOTFS_22_ARM64" "$EXPECTED_DARWIN_ROOTFS_24_ARM64" \
@@ -280,6 +380,22 @@ for v in \
   "$EXPECTED_SJ_VM_ARM64_DARWIN"
 do
   if is_placeholder "$v"; then
+    PLACEHOLDER_COUNT=$((PLACEHOLDER_COUNT + 1))
+  else
+    REAL_COUNT=$((REAL_COUNT + 1))
+  fi
+done
+
+# The 4 Docker image refs participate in the SAME all-or-nothing
+# classification, but use the substring placeholder test (a ref carries the
+# placeholder token inside its `@sha256:` digest, not at the start).  Folding
+# them in here means a real-files + placeholder-docker (or vice versa) manifest
+# trips the mixed-manifest reject below.
+for ref in \
+  "$DOCKER_X64_22" "$DOCKER_X64_24" \
+  "$DOCKER_ARM64_22" "$DOCKER_ARM64_24"
+do
+  if is_docker_placeholder "$ref"; then
     PLACEHOLDER_COUNT=$((PLACEHOLDER_COUNT + 1))
   else
     REAL_COUNT=$((REAL_COUNT + 1))
