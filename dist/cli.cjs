@@ -7619,16 +7619,11 @@ function resolveScriptJailVmBinary(opts) {
   const localTarget = (0, import_node_path.join)(repoRoot, "target", "release", "script-jail-vm");
   searched.push(localTarget);
   if ((0, import_node_fs.existsSync)(localTarget)) return localTarget;
-  const packageRoot = opts?.packageRoot ?? resolvePackageRoot();
-  const arch = opts?.arch ?? (process.arch === "arm64" ? "arm64" : "x64");
-  const installedBin = (0, import_node_path.join)(
-    packageRoot,
-    "bin",
-    `darwin-${arch}`,
-    "script-jail-vm"
-  );
-  searched.push(installedBin);
-  if ((0, import_node_fs.existsSync)(installedBin)) return installedBin;
+  if (opts?.platformPackageDir !== void 0) {
+    const installedBin = (0, import_node_path.join)(opts.platformPackageDir, "script-jail-vm");
+    searched.push(installedBin);
+    if ((0, import_node_fs.existsSync)(installedBin)) return installedBin;
+  }
   throw new MacOSVmBinaryNotFoundError(searched);
 }
 function checkArtifacts(cfg) {
@@ -7669,7 +7664,10 @@ var StderrTail = class {
   }
 };
 async function spawnVm(vmConfig, options = {}) {
-  const binary = options.binary ?? resolveScriptJailVmBinary();
+  const binary = options.binary ?? resolveScriptJailVmBinary({
+    ...options.repoRoot !== void 0 ? { repoRoot: options.repoRoot } : {},
+    ...options.platformPackageDir !== void 0 ? { platformPackageDir: options.platformPackageDir } : {}
+  });
   const stderrSink = options.stderr ?? process.stderr;
   checkArtifacts({
     kernelPath: vmConfig.kernelPath,
@@ -25330,7 +25328,10 @@ async function run(deps = {}) {
       configPath,
       lockPath
     };
-    const result = await doSpawnVm(vmConfig);
+    const result = await doSpawnVm(vmConfig, {
+      platformPackageDir: packageImagesDir,
+      repoRoot
+    });
     return {
       finalYaml: result.finalYaml,
       nonFatalWarnings: result.warnings

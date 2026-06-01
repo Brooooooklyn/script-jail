@@ -14,12 +14,16 @@
 // Binary lookup order (highest priority first):
 //   1. `SCRIPT_JAIL_VM_BIN`           env override; used in tests.
 //   2. `<repoRoot>/target/release/script-jail-vm`  for local `cargo build`.
-//   3. `<packageRoot>/bin/darwin-<arch>/script-jail-vm` for the published
-//      npm package.
+//   3. `<platformPackageDir>/script-jail-vm`  for the published npm package —
+//      the VZ helper ships at the ROOT of the `@script-jail/darwin-<arch>`
+//      optional package (alongside the rootfs/shim/kernel), NOT under a
+//      `bin/darwin-<arch>/` subdir; the package is already os/cpu-specific.
+//      `src/cli/index.ts` resolves that dir via `resolvePlatformPackageDir`
+//      and threads it through `SpawnVmOptions.platformPackageDir`.
 //
-// All three paths are checked before raising — the error message lists every
-// one we tried so a dev who forgot to `cargo build` knows where the binary
-// is expected to live.
+// All checked paths are listed before raising — the error message names every
+// one we tried so a dev who forgot to `cargo build` (or a user whose platform
+// package failed to install) knows where the binary is expected to live.
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -206,8 +210,12 @@ declare const __filename: string | undefined;
 export function resolveScriptJailVmBinary(opts?: {
   envOverride?: string;
   repoRoot?: string;
-  packageRoot?: string;
-  arch?: 'x64' | 'arm64';
+  /**
+   * Resolved `@script-jail/<os>-<arch>` platform-package directory.  The VZ
+   * helper ships as `script-jail-vm` at this dir's root.  Supplied by the CLI
+   * (`resolvePlatformPackageDir`); omitted in dev where the cargo target wins.
+   */
+  platformPackageDir?: string;
 }): string {
   const searched: string[] = [];
 
@@ -219,23 +227,20 @@ export function resolveScriptJailVmBinary(opts?: {
     if (existsSync(envBin)) return envBin;
   }
 
-  // 2. Local cargo target dir.
+  // 2. Local cargo target dir (dev checkout).
   const repoRoot = opts?.repoRoot ?? resolvePackageRoot();
   const localTarget = join(repoRoot, 'target', 'release', 'script-jail-vm');
   searched.push(localTarget);
   if (existsSync(localTarget)) return localTarget;
 
-  // 3. Published npm package bin/.
-  const packageRoot = opts?.packageRoot ?? resolvePackageRoot();
-  const arch = opts?.arch ?? (process.arch === 'arm64' ? 'arm64' : 'x64');
-  const installedBin = join(
-    packageRoot,
-    'bin',
-    `darwin-${arch}`,
-    'script-jail-vm',
-  );
-  searched.push(installedBin);
-  if (existsSync(installedBin)) return installedBin;
+  // 3. Installed platform package root (npm install).  The helper sits at the
+  // package root, not under bin/darwin-<arch>/, because the package is already
+  // os/cpu-specific (see file-level docs + scripts/npm-packages.mjs).
+  if (opts?.platformPackageDir !== undefined) {
+    const installedBin = join(opts.platformPackageDir, 'script-jail-vm');
+    searched.push(installedBin);
+    if (existsSync(installedBin)) return installedBin;
+  }
 
   throw new MacOSVmBinaryNotFoundError(searched);
 }
@@ -338,6 +343,17 @@ export interface SpawnVmOptions {
   binary?: string;
   /** Override the stderr sink (test seam).  Defaults to `process.stderr`. */
   stderr?: NodeJS.WritableStream;
+  /**
+   * Resolved `@script-jail/<os>-<arch>` platform-package dir, forwarded to
+   * `resolveScriptJailVmBinary` so an npm-installed helper (shipped at the
+   * package root) is found.  Ignored when `binary` is set.
+   */
+  platformPackageDir?: string;
+  /**
+   * Repo/package root for the dev `target/release/script-jail-vm` lookup.
+   * Forwarded to `resolveScriptJailVmBinary`.  Ignored when `binary` is set.
+   */
+  repoRoot?: string;
 }
 
 /**
@@ -352,7 +368,14 @@ export async function spawnVm(
   vmConfig: VmConfig,
   options: SpawnVmOptions = {},
 ): Promise<VmRunResult> {
-  const binary = options.binary ?? resolveScriptJailVmBinary();
+  const binary =
+    options.binary ??
+    resolveScriptJailVmBinary({
+      ...(options.repoRoot !== undefined ? { repoRoot: options.repoRoot } : {}),
+      ...(options.platformPackageDir !== undefined
+        ? { platformPackageDir: options.platformPackageDir }
+        : {}),
+    });
   const stderrSink = options.stderr ?? process.stderr;
 
   // Pre-flight: every host-side artifact the helper will need.  Surfaces a
