@@ -1,21 +1,31 @@
 // script-jail — test/scripts/main-package-manifest.test.ts
 //
-// PKG-4 guard for the MAIN `package.json` published as `script-jail`.
+// PKG-4 guard for the repo-root `package.json` (the dev manifest from which
+// the published `script-jail` main package is derived).
 //
 // After the cross-platform split, the main package is JS-only: it ships
 // `dist/cli.cjs`, `dist/guest-agent.cjs`, the preload bundles, and the
 // README. The runtime artifacts (rootfs / shim / VZ helper) now live in the
 // three per-platform optional packages `@script-jail/{darwin-arm64,linux-x64,
-// linux-arm64}`. The main package therefore must:
+// linux-arm64}`.
+//
+// IMPORTANT — `optionalDependencies` live in the SPEC, not here. The repo-root
+// `package.json` MUST NOT declare the `@script-jail/*` optional deps: those
+// packages do not exist on the registry until the release publishes them, so
+// listing them here makes `pnpm install --frozen-lockfile` fail with
+// ERR_PNPM_OUTDATED_LOCKFILE on every clean checkout (including the release
+// `build` job that produces the very artifacts being published). The published
+// main manifest gets its `optionalDependencies` from `scripts/npm-packages.mjs`
+// (PKG-1), injected by `scripts/assemble-npm-packages.mjs::buildMainManifest`
+// (guarded by npm-packages.test.ts + assemble-npm-packages.test.ts). This test
+// guards the repo-root manifest against re-introducing that lockfile break.
+//
+// The repo-root manifest therefore must:
 //   - NOT declare `os`/`cpu` (it must install everywhere so npm can pick the
 //     one matching `optionalDependencies` entry for the host platform),
+//   - NOT declare `optionalDependencies` (see above),
 //   - list exactly the four JS-only `files` entries (no `images/` or `bin/`),
-//   - pin all three optional deps to the package's own `version`,
 //   - keep `bin.script-jail` pointed at `dist/cli.cjs`.
-//
-// This test reads the real `package.json` from the repo root directly (the
-// canonical spec module `scripts/npm-packages.mjs` is PKG-1 and lands after
-// PKG-4; PKG-4 is the authoritative source for these fields).
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -30,14 +40,12 @@ const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as Record<
 const EXPECTED_FILES = [
   'dist/cli.cjs',
   'dist/guest-agent.cjs',
-  'dist/preloads/*.cjs',
+  // Preloads are listed EXPLICITLY (not a `dist/preloads/*.cjs` glob) so the
+  // packlist gate can detect a missing one — see scripts/npm-packages.mjs.
+  'dist/preloads/env-spy.cjs',
+  'dist/preloads/platform-spoof.cjs',
+  'dist/preloads/dlopen-block.cjs',
   'README.md',
-];
-
-const OPTIONAL_DEP_NAMES = [
-  '@script-jail/darwin-arm64',
-  '@script-jail/linux-x64',
-  '@script-jail/linux-arm64',
 ];
 
 describe('main package.json (PKG-4)', () => {
@@ -46,7 +54,7 @@ describe('main package.json (PKG-4)', () => {
     expect(pkg).not.toHaveProperty('cpu');
   });
 
-  it('files is exactly the four JS-only entries', () => {
+  it('files is exactly the JS-only entries (explicit preloads, no glob)', () => {
     expect(pkg.files).toEqual(EXPECTED_FILES);
   });
 
@@ -58,12 +66,13 @@ describe('main package.json (PKG-4)', () => {
     }
   });
 
-  it('optionalDependencies are exactly the three scoped platform packages, all pinned to version', () => {
-    const optional = pkg.optionalDependencies as Record<string, string>;
-    expect(Object.keys(optional).sort()).toEqual([...OPTIONAL_DEP_NAMES].sort());
-    for (const name of OPTIONAL_DEP_NAMES) {
-      expect(optional[name]).toBe(pkg.version);
-    }
+  it('does NOT declare optionalDependencies (they live in the spec; declaring them here breaks frozen-lockfile installs)', () => {
+    // The @script-jail/* platform packages are not on the registry until the
+    // release publishes them, so a repo-root `optionalDependencies` entry has
+    // no lockfile counterpart and fails `pnpm install --frozen-lockfile`. The
+    // published manifest gets these deps from scripts/npm-packages.mjs via the
+    // assembler instead.
+    expect(pkg).not.toHaveProperty('optionalDependencies');
   });
 
   it('bin.script-jail points at dist/cli.cjs', () => {

@@ -31,7 +31,10 @@ import type {
 const MAIN_FILES = [
   'dist/cli.cjs',
   'dist/guest-agent.cjs',
-  'dist/preloads/*.cjs',
+  // Preloads explicit (not globbed) so the packlist gate catches a missing one.
+  'dist/preloads/env-spy.cjs',
+  'dist/preloads/platform-spoof.cjs',
+  'dist/preloads/dlopen-block.cjs',
   'README.md',
 ];
 

@@ -414,7 +414,13 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       lockPath,
     };
 
-    const result = await doSpawnVm(vmConfig);
+    // The VZ helper ships at the root of the resolved `@script-jail/<os>-<arch>`
+    // package (packageImagesDir); pass it (plus repoRoot for the dev cargo-target
+    // lookup) so resolveScriptJailVmBinary finds the npm-installed binary.
+    const result = await doSpawnVm(vmConfig, {
+      platformPackageDir: packageImagesDir,
+      repoRoot,
+    });
     // spawnVm surfaces non-fatal `error` frames via `result.warnings`.
     // Pass them through verbatim so runAudit (or future callers) can wire
     // them into a "no final frame" diagnostic — today they are unused

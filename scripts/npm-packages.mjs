@@ -23,8 +23,18 @@
 // test (Phase 4, Task 4.1). Do not rename these here without updating the
 // resolver in lockstep.
 //
-// The main package's `files` array is a MIRROR of the authoritative PKG-4
-// `package.json` (Task 2.1). PKG-4 is authoritative; this module mirrors it.
+// This module is the single source of truth for the published main package's
+// `files`; the repo-root `package.json` (PKG-4) lists the same entries and is
+// guarded against drift by main-package-manifest.test.ts + npm-packages.test.ts.
+//
+// PRELOADS ARE LISTED EXPLICITLY (not via a `dist/preloads/*.cjs` glob): a glob
+// makes the packlist gate (scripts/assert-npm-packlist.mjs) blind to a MISSING
+// preload, because it would derive the expected set by globbing the same staged
+// dir it checks. Enumerating `MAIN_PRELOADS` lets the gate fail when a required
+// preload is absent, and keeps the published set deterministic for a security
+// tool (a stray preload cannot ride along, a dropped one cannot slip through).
+// scripts/assemble-npm-packages.mjs imports MAIN_PRELOADS so the staged set and
+// the gated set come from this one list.
 //
 // Reproducible-gzip note: artifact gzipping uses Node's `zlib` at a fixed
 // level, which is run-to-run deterministic (no mtime / FNAME header). The gz
@@ -40,10 +50,20 @@ const PLATFORM_MAX_PACK_BYTES = 200 * 1024 * 1024; // 200 MiB
 // inclusion of a runtime artifact).
 const MAIN_MAX_PACK_BYTES = 16 * 1024 * 1024; // 16 MiB
 
+/**
+ * The default preloads injected at build time and shipped by the main package,
+ * enumerated explicitly (see header). Basenames under `dist/preloads/`.
+ */
+export const MAIN_PRELOADS = [
+  'env-spy.cjs',
+  'platform-spoof.cjs',
+  'dlopen-block.cjs',
+];
+
 const MAIN_FILES = [
   'dist/cli.cjs',
   'dist/guest-agent.cjs',
-  'dist/preloads/*.cjs',
+  ...MAIN_PRELOADS.map((name) => `dist/preloads/${name}`),
   'README.md',
 ];
 

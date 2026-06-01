@@ -7,14 +7,11 @@
   "files": [
     "dist/cli.cjs",
     "dist/guest-agent.cjs",
-    "dist/preloads/*.cjs",
+    "dist/preloads/env-spy.cjs",
+    "dist/preloads/platform-spoof.cjs",
+    "dist/preloads/dlopen-block.cjs",
     "README.md"
   ],
-  "optionalDependencies": {
-    "@script-jail/darwin-arm64": "0.1.0",
-    "@script-jail/linux-x64": "0.1.0",
-    "@script-jail/linux-arm64": "0.1.0"
-  },
   "publishConfig": {
     "access": "public"
   },

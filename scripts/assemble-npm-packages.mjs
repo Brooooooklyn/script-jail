@@ -53,7 +53,7 @@ import { createGzip, constants as zlibConstants } from 'node:zlib';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { npmPackages } from './npm-packages.mjs';
+import { npmPackages, MAIN_PRELOADS } from './npm-packages.mjs';
 
 // Fixed zlib level → run-to-run deterministic gz bytes (see header).
 const GZIP_LEVEL = zlibConstants.Z_BEST_COMPRESSION;
@@ -61,14 +61,12 @@ const GZIP_LEVEL = zlibConstants.Z_BEST_COMPRESSION;
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // The committed JS bundles shipped by the main package, relative to the
-// artifacts dir's `dist/`. Mirrors the main spec `files` (the preload glob is
-// expanded to the three default preloads injected at build time).
+// artifacts dir's `dist/`. The preload list comes from MAIN_PRELOADS (PKG-1) so
+// the staged set and the packlist-gated set are the same single source.
 const MAIN_BUNDLE_FILES = [
   'dist/cli.cjs',
   'dist/guest-agent.cjs',
-  'dist/preloads/env-spy.cjs',
-  'dist/preloads/platform-spoof.cjs',
-  'dist/preloads/dlopen-block.cjs',
+  ...MAIN_PRELOADS.map((name) => `dist/preloads/${name}`),
 ];
 
 await main(process.argv.slice(2));

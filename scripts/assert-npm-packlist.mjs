@@ -4,11 +4,15 @@
 // npm silently omits missing `files` entries, so `npm pack --dry-run` alone is
 // not a release gate. This script reads a *staged* package's `package.json`,
 // looks up its canonical spec in scripts/npm-packages.mjs (the single source of
-// truth for the cross-platform split), expands the spec's `files` — resolving
-// the `dist/preloads/*.cjs` glob against the staged dir — and asserts the
-// `npm pack --dry-run --json` output matches exactly, plus:
+// truth for the cross-platform split), and asserts the `npm pack --dry-run
+// --json` output matches the spec's `files` exactly, plus:
 //   - the darwin VZ helper `script-jail-vm` is executable (mode 0o755), and
 //   - the packed size is within the package's `maxPackBytes`.
+//
+// The canonical `files` lists are fully explicit (the main package enumerates
+// its preloads rather than globbing `dist/preloads/*.cjs`), so a MISSING file
+// is a real mismatch here. A leftover glob-expansion branch remains for
+// defensiveness but is not exercised by the canonical packages.
 //
 // Usage:
 //   node scripts/assert-npm-packlist.mjs [<stagingDir>]   # one package (default ".")
@@ -34,15 +38,34 @@ function main(argv) {
   if (argv[0] === '--all') {
     const root = argv[1];
     if (!root) fail('--all requires a staging root directory');
-    const entries = readdirSync(root, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => join(root, e.name))
+    // The staged dirs MUST be EXACTLY the canonical package set. An incomplete
+    // (or extra) staging that slipped through would otherwise publish a partial
+    // set — and `npm publish` is non-transactional and non-re-runnable for an
+    // already-published version, so a half-published release cannot be retried.
+    // Dir names do not depend on the version, so a placeholder is fine here.
+    const expectedDirs = npmPackages('0.0.0')
+      .map((p) => p.dir)
       .sort();
-    if (entries.length === 0) fail(`no package directories under ${root}`);
-    for (const dir of entries) {
-      assertPackage(dir);
+    const actualDirs = readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+    const missing = expectedDirs.filter((d) => !actualDirs.includes(d));
+    const extra = actualDirs.filter((d) => !expectedDirs.includes(d));
+    if (missing.length > 0 || extra.length > 0) {
+      fail(
+        `staged package dirs under ${root} do not match the canonical set\n` +
+          `  expected:   ${expectedDirs.join(', ')}\n` +
+          `  missing:    ${missing.length ? missing.join(', ') : '(none)'}\n` +
+          `  unexpected: ${extra.length ? extra.join(', ') : '(none)'}`,
+      );
     }
-    console.log(`npm packlist ok: ${entries.length} package(s) under ${root}`);
+    for (const dir of expectedDirs) {
+      assertPackage(join(root, dir));
+    }
+    console.log(
+      `npm packlist ok: ${expectedDirs.length} canonical package(s) under ${root}`,
+    );
     return;
   }
 

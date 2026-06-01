@@ -34,6 +34,12 @@ export interface NpmPackageSpec {
 }
 
 /**
+ * The default preloads shipped by the main package, enumerated explicitly so
+ * the packlist gate can detect a missing one. Basenames under `dist/preloads/`.
+ */
+export const MAIN_PRELOADS: string[];
+
+/**
  * The canonical 4-package source of truth, with `version` threaded into every
  * package's `version` and the main package's `optionalDependencies` ranges.
  */

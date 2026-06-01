@@ -54,50 +54,49 @@ describe('resolveScriptJailVmBinary', () => {
     const found = resolveScriptJailVmBinary({
       envOverride: '',
       repoRoot,
-      packageRoot: join(scratch, 'package-root-empty'),
+      platformPackageDir: join(scratch, 'platform-dir-empty'),
     });
     expect(found).toBe(cargoBin);
   });
 
-  it('falls back to bin/darwin-<arch>/script-jail-vm when target/ is missing', () => {
-    const packageRoot = join(scratch, 'pkg');
-    const installedBin = touchExe(
-      join(packageRoot, 'bin', 'darwin-arm64', 'script-jail-vm'),
-    );
+  it('falls back to <platformPackageDir>/script-jail-vm when target/ is missing', () => {
+    // The published @script-jail/<os>-<arch> package ships the VZ helper at its
+    // ROOT (alongside the rootfs/shim/kernel), NOT under a bin/darwin-<arch>/
+    // subdir — the package itself is already os/cpu-specific.
+    const platformPackageDir = join(scratch, 'script-jail-darwin-arm64');
+    const installedBin = touchExe(join(platformPackageDir, 'script-jail-vm'));
     const found = resolveScriptJailVmBinary({
       envOverride: '',
       repoRoot: join(scratch, 'no-repo'),
-      packageRoot,
-      arch: 'arm64',
+      platformPackageDir,
     });
     expect(found).toBe(installedBin);
   });
 
   it('throws MacOSVmBinaryNotFoundError listing every checked path', () => {
+    const platformPackageDir = join(scratch, 'no-platform-pkg');
     expect(() =>
       resolveScriptJailVmBinary({
         envOverride: '',
         repoRoot: join(scratch, 'no-repo'),
-        packageRoot: join(scratch, 'no-pkg'),
-        arch: 'arm64',
+        platformPackageDir,
       }),
     ).toThrow(MacOSVmBinaryNotFoundError);
 
     // The error message should mention both the cargo target path and the
-    // installed bin path so a confused dev sees what was tried.
+    // platform-package helper path so a confused dev sees what was tried.
     try {
       resolveScriptJailVmBinary({
         envOverride: '',
         repoRoot: join(scratch, 'no-repo'),
-        packageRoot: join(scratch, 'no-pkg'),
-        arch: 'x64',
+        platformPackageDir,
       });
       throw new Error('should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(MacOSVmBinaryNotFoundError);
       const msg = (err as Error).message;
       expect(msg).toContain('target/release/script-jail-vm');
-      expect(msg).toContain('darwin-x64');
+      expect(msg).toContain(join(platformPackageDir, 'script-jail-vm'));
     }
   });
 });
