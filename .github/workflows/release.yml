@@ -258,6 +258,44 @@ jobs:
       - name: Build rootfs (ubuntu-24.04, x64)
         run: pnpm build -- --runner-image=ubuntu-24.04 --skip-bundle --skip-shim
 
+      # Determinism guard (R1 — byte-reproducible rootfs).  Must run HERE:
+      # after BOTH x64 builds but BEFORE any arm64 rootfs build and BEFORE
+      # "Restore x64 shim artifact" — the arm64 steps stage libscriptjail-arm64.so
+      # over images/libscriptjail.so, so a rebuild after them would compare a
+      # shim-contaminated image and false-pass/fail.
+      #
+      # For each x64 major: snapshot the just-built image, rebuild it in place
+      # (same x64 / same major, skipping the bundle+shim), and assert the two
+      # ext4s are byte-identical.  The in-place rebuild becomes the uploaded
+      # artifact (identical by construction).  Rationale: the v0.1.1 manifest
+      # backfill must reproduce v0.1.0's released SHAs, so reproducibility
+      # regressions have to fail the release build, not surface later as a
+      # manifest diff.
+      #
+      # We cover BOTH x64 majors (ubuntu-24.04 AND ubuntu-22.04) via the same
+      # cheap native mkfs path.  arm64 reproducibility is intentionally NOT
+      # rebuilt here — that would require slow qemu arm64 rebuilds; arm64 is
+      # instead left to the authoritative cross-run gate (the strict
+      # scripts/check-publish-artifacts.sh comparison at the v0.1.1 manifest
+      # backfill, which compares released SHAs across runs).
+      - name: Assert x64 rootfs ext4s are byte-reproducible (ubuntu-24.04, ubuntu-22.04)
+        run: |
+          set -euo pipefail
+          assert_reproducible() {
+            local major="$1"
+            local image="images/rootfs-${major}.ext4"
+            local first="/tmp/first-${major}.ext4"
+            cp "${image}" "${first}"
+            pnpm build -- --runner-image="${major}" --skip-bundle --skip-shim
+            local sha1 sha2
+            sha1="$(sha256sum "${first}" | cut -d' ' -f1)"
+            sha2="$(sha256sum "${image}" | cut -d' ' -f1)"
+            echo "${major}: first=${sha1} rebuild=${sha2}"
+            [ "${sha1}" = "${sha2}" ] || { echo "::error::rootfs ext4 ${major} is not byte-reproducible"; exit 1; }
+          }
+          assert_reproducible ubuntu-24.04
+          assert_reproducible ubuntu-22.04
+
       # Build the two arm64 rootfs ext4 images for the macOS CLI.
       # `--arch=arm64` selects the arm64 base image AND skips the redundant
       # x64 shim build (the arm64 .so above already produced
@@ -493,12 +531,46 @@ jobs:
             local tag="$6"
             local metadata
             local digest
+            local ubuntu_ref
             metadata="$(mktemp)"
+
+            # Pin the GHCR build's base image to the SAME per-(runner_image,arch)
+            # `ubuntu@sha256:…` digest the local rootfs build threads as
+            # UBUNTU_REF (src/rootfs/build.ts UBUNTU_BASE_DIGEST).  Without this
+            # the published image would `FROM` a floating `ubuntu:<major>` tag
+            # and drift away from the rootfs ext4s the v0.1.1 manifest backfill
+            # must reproduce.
+            #
+            # This job is deliberately install-free (no `pnpm install`, so no
+            # `oxnode`), so we read the committed map with the bundled `node`
+            # instead of importing the TS module: scope to the runner-image
+            # block, then pull the per-arch `ubuntu@sha256:…` string.
+            # runner_image/arch are passed via env (not interpolated into the JS
+            # literal) to avoid quoting/injection issues; an unknown key writes
+            # an empty string so the guard below fails loudly rather than
+            # leaking an `undefined` into --build-arg.
+            ubuntu_ref="$(SJ_RUNNER_IMAGE="${runner_image}" SJ_ARCH="${arch}" node -e '
+              const fs = require("fs");
+              const src = fs.readFileSync("src/rootfs/build.ts", "utf8");
+              const ri = process.env.SJ_RUNNER_IMAGE.replace(/[.]/g, "\\.");
+              const block = src.match(new RegExp("[\"\x27]" + ri + "[\"\x27]\\s*:\\s*\\{([\\s\\S]*?)\\}"));
+              let out = "";
+              if (block) {
+                const am = block[1].match(new RegExp("\\b" + process.env.SJ_ARCH + "\\s*:\\s*[\"\x27]([^\"\x27]+)[\"\x27]"));
+                if (am) out = am[1];
+              }
+              process.stdout.write(out);
+            ')"
+            if [ -z "${ubuntu_ref}" ]; then
+              echo "::error::no pinned UBUNTU_REF for ${runner_image}/${arch} in src/rootfs/build.ts" >&2
+              exit 1
+            fi
 
             docker buildx build \
               --platform="${platform}" \
               --push \
               --metadata-file="${metadata}" \
+              --build-arg "UBUNTU_REF=${ubuntu_ref}" \
               --build-arg "UBUNTU_MAJOR=${ubuntu_major}" \
               --build-arg "VP_VERSION=${vp_version}" \
               --build-arg "VP_ARCH=${arch}" \
@@ -549,6 +621,58 @@ jobs:
             echo "  },"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Backfill gate: when the pinned `dockerImages` in the tagged
+      # src/action/artifact-manifest.ts are REAL (not placeholders), verify each
+      # digest actually resolves in GHCR before any npm publish runs. The Docker
+      # rootfs images are NOT byte-reproducible, so we cannot assert
+      # manifest==fresh-push equality (that would fail every backfill); we assert
+      # EXISTENCE, which catches a hand-copy typo or a stale/GC'd digest that
+      # would otherwise ship inside dist/main.cjs and break Docker-backend
+      # consumers (`docker pull <ref>` → manifest unknown). Placeholders (the
+      # v0.1.0 bootstrap) are skipped — there is nothing to resolve yet. Runs
+      # after GHCR login + this release's push, before publish, so a bad digest
+      # blocks the (irreversible) npm publish. The manifest is read with the
+      # bundled `node` (this job is install-free, so no oxnode), mirroring the
+      # UBUNTU_REF resolver above; the 4 refs are the only `ghcr.io/…@sha256:`
+      # string literals in the file.
+      - name: Verify pinned Docker digests resolve in GHCR (backfill gate)
+        run: |
+          set -euo pipefail
+          refs="$(node -e '
+            const fs = require("fs");
+            const s = fs.readFileSync("src/action/artifact-manifest.ts", "utf8");
+            const re = /["\x27](ghcr\.io\/[^"\x27]+@sha256:[^"\x27]+)["\x27]/g;
+            let m; const out = [];
+            while ((m = re.exec(s)) !== null) out.push(m[1]);
+            process.stdout.write(out.join("\n"));
+          ')"
+          if [ -z "${refs}" ]; then
+            echo "::error::could not extract any dockerImages refs from src/action/artifact-manifest.ts" >&2
+            exit 1
+          fi
+          # refs are newline-separated and contain no whitespace/glob chars, so
+          # the unquoted word-split below is intentional and safe.
+          rc=0
+          for ref in ${refs}; do
+            case "${ref}" in
+              *PLACEHOLDER_SHA256_*)
+                echo "skip (bootstrap placeholder): ${ref}"
+                ;;
+              *)
+                if docker buildx imagetools inspect "${ref}" >/dev/null 2>&1; then
+                  echo "ok (resolves in GHCR): ${ref}"
+                else
+                  echo "::error::pinned Docker digest does not resolve in GHCR: ${ref}" >&2
+                  rc=1
+                fi
+                ;;
+            esac
+          done
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error::one or more pinned Docker digests are missing from GHCR; refusing to publish" >&2
+            exit 1
+          fi
 
       # Stage all four publishable npm packages from the downloaded build
       # artifacts. scripts/npm-packages.mjs is the single source of truth for

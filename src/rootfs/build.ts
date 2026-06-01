@@ -27,6 +27,7 @@ import {
   openSync,
   readSync,
   closeSync,
+  writeFileSync,
 } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -129,6 +130,67 @@ export function ubuntuBaseTag(input: Pick<BuildInput, 'runnerImage'>): string {
 export function ubuntuMajor(input: Pick<BuildInput, 'runnerImage'>): string {
   // ubuntuBaseTag is `ubuntu:<version>`; strip the prefix.
   return ubuntuBaseTag(input).slice('ubuntu:'.length);
+}
+
+// ---------------------------------------------------------------------------
+// Digest-pinned base images (R1: byte-reproducible rootfs)
+// ---------------------------------------------------------------------------
+//
+// Pinning the Ubuntu base to a PER-ARCH image digest (not the manifest-list
+// tag) makes `docker build`/`buildx --platform` resolve to the exact same
+// layers across builds, which is a precondition for a byte-stable ext4.  A
+// bare `ubuntu:24.04` tag would silently float to a new daily rebuild.
+//
+// Refresh after a base bump with:
+//   docker buildx imagetools inspect ubuntu:24.04 --raw
+// and copy the per-`linux/<arch>` manifest digest below (NOT the index/list
+// digest, NOT the attestation manifest).  `BuildArch` x64↔amd64 / arm64↔arm64.
+//
+// These were resolved 2026-06-01 from Docker Hub (real, not placeholder).
+
+/** Per-arch, digest-pinned `ubuntu@sha256:…` refs threaded as UBUNTU_REF. */
+export const UBUNTU_BASE_DIGEST: Record<RunnerImage, Record<BuildArch, string>> = {
+  'ubuntu-22.04': {
+    x64: 'ubuntu@sha256:ce941a2a18bbb922e434d6d6d2b31e571a5c3826eaf6ada0a41dcc905bd2d906',
+    arm64: 'ubuntu@sha256:c1fc012913af7a4dd0d86553d9dae19b323e7fb60d5407e800cbfbc8f7e6aa63',
+  },
+  'ubuntu-24.04': {
+    x64: 'ubuntu@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff',
+    arm64: 'ubuntu@sha256:7607b6f97024ef850f1bd6e91a89273beb5973d04432c5b87f15f813d64b9c05',
+  },
+};
+
+/**
+ * Digest-pinned Alpine helper image used by the macOS ext4 conversion path
+ * (makeExt4ViaDocker).  This is the multi-arch index digest so the local host
+ * arch resolves correctly; the helper only runs on the best-effort macOS path,
+ * so an index pin (vs per-arch) is sufficient here.
+ *
+ * Refresh with: docker buildx imagetools inspect alpine:latest
+ */
+export const ALPINE_HELPER_REF =
+  'alpine@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11';
+
+/**
+ * Build the shared `--build-arg …` string consumed by BOTH docker build paths
+ * (plain `docker build` x64 and `docker buildx build` arm64).  Threads the
+ * pinned per-arch `UBUNTU_REF` (so the byte-stable base is inherited
+ * everywhere) while RETAINING `UBUNTU_MAJOR` (still consumed by the
+ * Dockerfile's apt-mirror sed logic).  Pure; unit-tested.
+ *
+ * Returns a string with a trailing space so it concatenates cleanly into the
+ * existing command builders in `dockerBuild`.
+ */
+export function buildDockerBuildArgs(input: BuildInput): string {
+  const arch = input.arch ?? 'x64';
+  return (
+    `--build-arg UBUNTU_REF=${UBUNTU_BASE_DIGEST[input.runnerImage][arch]} ` +
+    `--build-arg UBUNTU_MAJOR=${ubuntuMajor(input)} ` +
+    `--build-arg VP_VERSION=${VITE_PLUS_VERSION} ` +
+    `--build-arg VP_ARCH=${arch} ` +
+    `--build-arg VP_SHA256=${VITE_PLUS_SHA256[arch]} ` +
+    `--build-arg NODE_VERSION=${NODE_VERSION} `
+  );
 }
 
 /** Return true when the process is running on macOS. */
@@ -499,6 +561,18 @@ function commandExists(cmd: string): boolean {
   return result.status === 0;
 }
 
+/**
+ * Wrap `s` in POSIX single quotes so it survives intact through an outer shell
+ * (e.g. the host `/bin/sh -c` that `run()`/execSync uses) and reaches an inner
+ * `sh -c` verbatim — no `$`, backtick, or `"` expansion.  The only character
+ * that cannot appear literally inside single quotes is `'` itself, which is
+ * emitted as the standard `'\''` (close-quote, escaped quote, re-open).  Pure;
+ * unit-tested.
+ */
+export function singleQuoteForSh(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 // ---------------------------------------------------------------------------
 // Step 1 — Bundle agent
 // ---------------------------------------------------------------------------
@@ -669,16 +743,12 @@ function dockerBuild(input: BuildInput): void {
   const dockerfile = join(REPO_ROOT, 'src', 'rootfs', 'Dockerfile.base');
   const arch = input.arch ?? 'x64';
 
-  // vite-plus toolchain build args.  `VP_ARCH` matches our BuildArch values
+  // Shared build args: digest-pinned UBUNTU_REF + UBUNTU_MAJOR (apt-mirror sed)
+  // + the vite-plus toolchain args.  `VP_ARCH` matches our BuildArch values
   // (`x64` / `arm64`) one-to-one — the vp npm package name embeds the same
   // tokens.  The SHA-256 is pinned per-arch so the Dockerfile can verify the
-  // download.  See src/rootfs/vite-plus.ts.
-  const buildArgs =
-    `--build-arg UBUNTU_MAJOR=${ubuntuMajor(input)} ` +
-    `--build-arg VP_VERSION=${VITE_PLUS_VERSION} ` +
-    `--build-arg VP_ARCH=${arch} ` +
-    `--build-arg VP_SHA256=${VITE_PLUS_SHA256[arch]} ` +
-    `--build-arg NODE_VERSION=${NODE_VERSION} `;
+  // download.  See src/rootfs/vite-plus.ts and buildDockerBuildArgs().
+  const buildArgs = buildDockerBuildArgs(input);
 
   // arm64 uses `docker buildx build --platform=linux/arm64` (qemu on x86_64
   // hosts; native on arm64).  x64 keeps the plain `docker build` path so the
@@ -719,15 +789,364 @@ function dockerBuild(input: BuildInput): void {
  */
 export const ROOTFS_SIZE_MB = 1024;
 
-/** On Linux, use native mkfs.ext4 (from e2fsprogs). */
-function makeExt4Native(exportDir: string, outImage: string): void {
-  run(
-    `mkfs.ext4 -d "${exportDir}" ` +
-    `-L rootfs -O ^has_journal ` +
-    `-m 0 ` +
-    `"${outImage}" ` +
-    `${ROOTFS_SIZE_MB}M`,
+// ---------------------------------------------------------------------------
+// Reproducible-ext4 determinism (R1)
+// ---------------------------------------------------------------------------
+//
+// mkfs.ext4 bakes three sources of nondeterminism into the image: the
+// filesystem UUID (random by default), the directory-hash seed (also random),
+// and wall-clock timestamps (superblock create/write, and every inode's
+// atime/ctime/mtime/crtime).  The UUID and hash-seed are pinned via mkfs argv
+// (`-U` / `-E hash_seed`); the UUID is the ASCII bytes of "SJ-jail-root..."
+// laid out as a UUID — recognisable in `tune2fs -l` and impossible to collide
+// with a real random UUID by accident.
+//
+// SOURCE_DATE_EPOCH is set too, BUT it is NOT sufficient on the build runner:
+// it is only honoured by e2fsprogs >= 1.47.1, and the build runners ship older
+// e2fsprogs (ubuntu-24.04 → 1.47.0, ubuntu-22.04 → 1.46.5).  With 1.47.0 /
+// 1.46.5, mkfs.ext4 STILL writes wall-clock build time into the superblock
+// (Filesystem created / Last write), into the reserved inodes (root=2,
+// lost+found=11, …), and into the crtime/ctime of every `-d`-populated file —
+// so two rebuilds seconds apart diverge.  We therefore run a deterministic
+// `debugfs -w` POST-PASS (pinExt4TimestampsViaDebugfs) that rewrites the
+// superblock time fields and every inode's atime/ctime/mtime/crtime to the
+// fixed epoch.  debugfs is checksum-aware, so rewriting inodes also re-stamps
+// the (now-deterministic) metadata_csum.  SOURCE_DATE_EPOCH is kept so that a
+// future runner with e2fsprogs >= 1.47.1 produces the same bytes WITHOUT the
+// post-pass having anything left to change (the post-pass stays a no-op-by-
+// value belt-and-suspenders, not a correctness dependency).
+//
+// All of this is load-bearing for the v0.1.1 manifest backfill, which must
+// reproduce v0.1.0's released SHAs.  The two-run byte-identity guard lives in
+// CI (test/integration/rootfs-reproducibility.test.ts and the
+// "Assert x64 rootfs ext4s are byte-reproducible" step in release.yml) — it
+// cannot be exercised on macOS, which has no native mkfs.ext4 / debugfs.
+
+/** Fixed filesystem UUID for the rootfs ext4 (byte-reproducibility). */
+export const ROOTFS_FIXED_UUID = '5343524a-2d6a-6169-6c2d-726f6f746673';
+
+/** Fixed SOURCE_DATE_EPOCH (seconds) for ext4 timestamps + mtime normalize. */
+export const ROOTFS_SOURCE_DATE_EPOCH = 1700000000;
+
+/**
+ * Build the `mkfs.ext4` argv for the rootfs image.  Pure; unit-tested.
+ *
+ * `-U`/`-E hash_seed` pin the two random sources; `-d`/`-L`/`-m` are the
+ * pre-existing populate/label/no-reserve flags.  The two positionals
+ * (`<outImage>`, `<sizeMB>M`) come last, as mke2fs requires.
+ *
+ * Geometry/feature flags pin the on-disk layout so it does NOT depend on the
+ * host's e2fsprogs-version defaults (R1 byte-reproducibility):
+ *   - `-b 4096`  fixed block size (else mke2fs heuristically picks 1k/4k by size)
+ *   - `-I 256`   fixed inode size (default has varied across e2fsprogs versions)
+ *   - `-i 16384` fixed bytes-per-inode (inode COUNT).  Pinned on argv — NOT left
+ *     to the conf — because mke2fs resolves inode_ratio from a size-class
+ *     `[fs_types]` entry (small/default/big/huge) selected by image size, and the
+ *     checked-in mke2fs.conf intentionally omits those size classes.  Without an
+ *     argv `-i`, the effective ratio falls back to a path that differs across
+ *     e2fsprogs versions, so a runner-image e2fsprogs bump between the v0.1.0 and
+ *     v0.1.1 builds could change the inode count and break the SHA backfill.  The
+ *     value matches the conf's `inode_ratio` (belt-and-suspenders).
+ *   - `-O ^has_journal,^metadata_csum_seed`  no journal AND no independent
+ *     metadata-checksum seed.  Disabling metadata_csum_seed makes the metadata
+ *     checksum seed derive from the pinned `-U` UUID instead of an independent
+ *     random seed — the classic remaining ext4 nondeterminism.
+ *
+ * The `MKE2FS_CONFIG` env (see mkfsEnv) pins the rest of the feature set; these
+ * argv flags pin the size-dependent geometry that the conf cannot express.
+ */
+export function buildMkfsExt4Args(
+  exportDir: string,
+  outImage: string,
+  sizeMB: number,
+): string[] {
+  return [
+    '-b', '4096',
+    '-I', '256',
+    '-i', '16384',
+    '-d', exportDir,
+    '-L', 'rootfs',
+    '-O', '^has_journal,^metadata_csum_seed',
+    '-m', '0',
+    '-U', ROOTFS_FIXED_UUID,
+    '-E', `hash_seed=${ROOTFS_FIXED_UUID}`,
+    outImage,
+    `${sizeMB}M`,
+  ];
+}
+
+/**
+ * Absolute path to the checked-in `mke2fs.conf` (lives next to this module in
+ * `src/rootfs/`).  Resolved via `__dirname` (derived from
+ * `fileURLToPath(import.meta.url)` above) so it works under `oxnode` running
+ * the source directly.  `build.ts` is build-time-only and is never folded into
+ * the action bundle, so `__dirname` is reliably `src/rootfs/`.
+ */
+export const ROOTFS_MKE2FS_CONFIG_PATH = join(__dirname, 'mke2fs.conf');
+
+/**
+ * Container-side path the checked-in `mke2fs.conf` is bind-mounted to (see
+ * makeExt4ViaDocker), exported as `MKE2FS_CONFIG` in the helper script so the
+ * Alpine path pins the same feature set as the native path instead of reading
+ * Alpine's stock `/etc/mke2fs.conf`.
+ */
+const DOCKER_MKE2FS_CONFIG_PATH = '/etc/script-jail/mke2fs.conf';
+
+/**
+ * Env overlay merged onto `process.env` when spawning `mkfs.ext4`.  Exported
+ * for unit assertion; in production it is spread into the spawn env.
+ *
+ * `MKE2FS_CONFIG` points mke2fs at the checked-in conf instead of the host's
+ * `/etc/mke2fs.conf`, so the [defaults]/[fs_types] feature set + sizes are
+ * pinned and do NOT inherit the runner host's config (R1 byte-reproducibility).
+ * `SOURCE_DATE_EPOCH` clamps inode/superblock timestamps.
+ */
+export function mkfsEnv(): { SOURCE_DATE_EPOCH: string; MKE2FS_CONFIG: string } {
+  return {
+    SOURCE_DATE_EPOCH: String(ROOTFS_SOURCE_DATE_EPOCH),
+    MKE2FS_CONFIG: ROOTFS_MKE2FS_CONFIG_PATH,
+  };
+}
+
+/**
+ * argv to normalize every file/dir/symlink mtime under `dir` to `epoch`.
+ * `touch --no-dereference` stamps symlinks themselves (not their targets);
+ * `-exec ... +` batches into few touch invocations.  Pure; unit-tested.
+ */
+export function buildNormalizeMtimesArgv(dir: string, epoch: number): string[] {
+  return [
+    'find', dir,
+    '-exec', 'touch', '--no-dereference', `--date=@${epoch}`, '{}', '+',
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Export-tree content sanitization (R1 — drop build-time-volatile CONTENT)
+// ---------------------------------------------------------------------------
+//
+// mtime normalization fixes timestamps, but it does NOTHING for build-time-
+// volatile FILE CONTENT that `docker export` bakes into the tree:
+//
+//   - /etc/hostname        — the random per-build container ID
+//   - /etc/hosts           — carries that container ID + its assigned IP
+//   - /etc/resolv.conf     — the build host's resolver(s)
+//   - /etc/machine-id      — a random per-build machine id
+//   - /var/log/dpkg.log,
+//     /var/log/alternatives.log,
+//     /var/log/apt/*,
+//     /var/log/bootstrap.log — embed wall-clock timestamps AS CONTENT
+//
+// Docker REGENERATES the /etc trio at `docker create` time, so even though the
+// Dockerfile cleanup RUN removes/zeroes them in the image layer they reappear
+// in the exported container.  We therefore canonicalize/remove them in the
+// EXPORTED TREE (the bytes that actually feed mkfs.ext4), which is the only
+// place guaranteed to win.  Canonicalizing the /etc trio to empty is safe: the
+// guest's init.sh rewrites /etc/resolv.conf unconditionally at boot, and
+// /etc/hostname + /etc/hosts are not read by init/orchestrate.
+
+/**
+ * Relative paths under the export root whose CONTENT is build-time-volatile.
+ * `truncate` entries are zeroed (kept as empty files so anything that opens
+ * them still finds a file); `remove` entries are deleted outright.  Pure;
+ * unit-tested.  The Alpine helper script mirrors this exact list.
+ */
+export const EXPORT_TREE_VOLATILE_CONTENT: {
+  truncate: ReadonlyArray<string>;
+  remove: ReadonlyArray<string>;
+} = {
+  truncate: ['etc/hostname', 'etc/hosts', 'etc/resolv.conf', 'etc/machine-id'],
+  remove: [
+    'var/log/dpkg.log',
+    'var/log/alternatives.log',
+    'var/log/bootstrap.log',
+    'var/log/apt',
+  ],
+};
+
+/**
+ * Canonicalize the export tree in place: zero the volatile /etc files and
+ * delete the timestamped logs.  Only touches paths that exist (a future base
+ * image that drops one of these must not make the build fail).  `var/log/apt`
+ * is a directory, so it is removed recursively.
+ */
+function sanitizeExportTree(exportDir: string): void {
+  for (const rel of EXPORT_TREE_VOLATILE_CONTENT.truncate) {
+    const p = join(exportDir, rel);
+    if (existsSync(p)) writeFileSync(p, '');
+  }
+  for (const rel of EXPORT_TREE_VOLATILE_CONTENT.remove) {
+    const p = join(exportDir, rel);
+    if (existsSync(p)) rmSync(p, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// debugfs timestamp post-pass (R1 — works around e2fsprogs < 1.47.1)
+// ---------------------------------------------------------------------------
+//
+// See the determinism comment block above for WHY this is needed.  These pure
+// helpers build the `debugfs -w` command stream that pins every wall-clock
+// timestamp to the fixed epoch.  debugfs time values use the `@<seconds>` form
+// (decimal seconds since the Unix epoch); inodes are referenced as `<N>`.
+
+/**
+ * debugfs commands that pin the SUPERBLOCK time fields to `epoch`.  Returns a
+ * newline-joined string (no trailing newline) suitable for a `debugfs -f`
+ * command file.  Pure; unit-tested.
+ *
+ * `wtime` (last-write time) is set LAST so debugfs persists the pinned value
+ * rather than a wall-clock write time when it flushes the superblock on close.
+ */
+export function buildDebugfsSuperblockTimeCommands(epoch: number): string {
+  return [
+    `ssv mkfs_time @${epoch}`,
+    `ssv lastcheck @${epoch}`,
+    `ssv wtime @${epoch}`,
+  ].join('\n');
+}
+
+/**
+ * debugfs commands that pin all four time fields of a single inode to `epoch`.
+ * `set_inode_field` (`sif`) takes one field per command, so we emit four.
+ * Returns a newline-joined string (no trailing newline).  Pure; unit-tested.
+ */
+export function buildDebugfsInodeTimeCommands(inode: number, epoch: number): string {
+  return [
+    `sif <${inode}> atime @${epoch}`,
+    `sif <${inode}> ctime @${epoch}`,
+    `sif <${inode}> mtime @${epoch}`,
+    `sif <${inode}> crtime @${epoch}`,
+  ].join('\n');
+}
+
+/**
+ * Full debugfs `-f` command stream that pins the superblock AND every inode
+ * (1..inodeCount inclusive) to `epoch`.  Pure; unit-tested.  The native path
+ * (pinExt4TimestampsViaDebugfs) computes `inodeCount` from the image's
+ * superblock and feeds it here; the Alpine path mirrors this with an in-shell
+ * `seq` loop so it does not have to ship a multi-thousand-line literal.
+ */
+export function buildDebugfsTimeScript(epoch: number, inodeCount: number): string {
+  const lines: string[] = [buildDebugfsSuperblockTimeCommands(epoch)];
+  for (let inode = 1; inode <= inodeCount; inode++) {
+    lines.push(buildDebugfsInodeTimeCommands(inode, epoch));
+  }
+  // Trailing `quit` is implicit (EOF), but an explicit one keeps the intent
+  // obvious when the command file is dumped for debugging.
+  lines.push('quit');
+  return lines.join('\n');
+}
+
+/**
+ * Read the total inode count out of an ext4 image's superblock via
+ * `dumpe2fs -h`.  Throws on parse failure (a missing count would silently skip
+ * the timestamp sweep and reintroduce the nondeterminism this guards against).
+ */
+function readExt4InodeCount(outImage: string): number {
+  const result = spawnSync('dumpe2fs', ['-h', outImage], {
+    encoding: 'utf8',
+    env: { ...process.env, ...mkfsEnv() },
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      `dumpe2fs -h failed for ${outImage} (exit ${result.status ?? 'unknown'}, ` +
+      `signal ${result.signal ?? 'none'})`,
+    );
+  }
+  const m = /^Inode count:\s*(\d+)\s*$/m.exec(result.stdout);
+  if (m === null) {
+    throw new Error(`could not parse "Inode count:" from dumpe2fs -h ${outImage}`);
+  }
+  return Number(m[1]);
+}
+
+/**
+ * Deterministic timestamp post-pass for the native (Linux) path.  Computes the
+ * image's inode count, then runs a single `debugfs -w -f <cmdfile>` that pins
+ * the superblock + every inode's times to the fixed epoch.  A nonzero status
+ * is FATAL — a partially-applied sweep would leave wall-clock bytes behind and
+ * break reproducibility silently.
+ */
+function pinExt4TimestampsViaDebugfs(outImage: string): void {
+  const inodeCount = readExt4InodeCount(outImage);
+  const script = buildDebugfsTimeScript(ROOTFS_SOURCE_DATE_EPOCH, inodeCount);
+
+  const cmdFile = join(
+    tmpdir(),
+    `script-jail-debugfs-${randomBytes(6).toString('hex')}.cmd`,
   );
+  try {
+    writeFileSync(cmdFile, script);
+    const result = spawnSync('debugfs', ['-w', '-f', cmdFile, outImage], {
+      stdio: 'inherit',
+      env: { ...process.env, ...mkfsEnv() },
+    });
+    if (result.status !== 0) {
+      throw new Error(
+        `debugfs timestamp post-pass failed for ${outImage} ` +
+        `(exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
+      );
+    }
+  } finally {
+    try { rmSync(cmdFile, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+/** On Linux, use native mkfs.ext4 (from e2fsprogs), then pin timestamps. */
+function makeExt4Native(exportDir: string, outImage: string): void {
+  runMkfs(buildMkfsExt4Args(exportDir, outImage, ROOTFS_SIZE_MB));
+  pinExt4TimestampsViaDebugfs(outImage);
+}
+
+/**
+ * Conversion seam (Linux only): normalize the export tree's mtimes to the
+ * fixed epoch, then run native `mkfs.ext4` with the pinned UUID/hash-seed.
+ * Exported so the reproducibility integration test can build the docker image
+ * ONCE and run this twice over the same exported tree, comparing SHAs — which
+ * isolates mkfs+normalize determinism from the (non-deterministic) docker
+ * build/export cost.  Production callers go through `exportAndConvert`.
+ */
+export function convertExportTreeToExt4(exportDir: string, outImage: string): void {
+  // Order matters: drop build-time-volatile CONTENT first (this rewrites
+  // mtimes on the truncated files), THEN normalize every mtime to the fixed
+  // epoch, THEN mkfs + the debugfs timestamp post-pass.
+  sanitizeExportTree(exportDir);
+  normalizeMtimes(exportDir);
+  makeExt4Native(exportDir, outImage);
+}
+
+/**
+ * Spawn `mkfs.ext4 <args>` with `SOURCE_DATE_EPOCH` set, mirroring the argv
+ * form + explicit nonzero-status throw used by the Firecracker overlay builder
+ * (src/action/firecracker/overlay.ts).  Using spawnSync (not the shell `run`)
+ * avoids quoting the export-dir path and keeps the determinism env scoped.
+ */
+function runMkfs(args: ReadonlyArray<string>): void {
+  const result = spawnSync('mkfs.ext4', [...args], {
+    stdio: 'inherit',
+    env: { ...process.env, ...mkfsEnv() },
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      `mkfs.ext4 failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
+    );
+  }
+}
+
+/**
+ * Normalize all mtimes under `dir` to the fixed epoch.  Touch failures are
+ * FATAL (a stray un-normalized mtime would silently break reproducibility),
+ * so a nonzero status throws rather than being swallowed.
+ */
+function normalizeMtimes(dir: string): void {
+  const argv = buildNormalizeMtimesArgv(dir, ROOTFS_SOURCE_DATE_EPOCH);
+  const result = spawnSync(argv[0]!, argv.slice(1), { stdio: 'inherit' });
+  if (result.status !== 0) {
+    throw new Error(
+      `mtime normalize (find/touch) failed (exit ${result.status ?? 'unknown'}, ` +
+      `signal ${result.signal ?? 'none'}) for ${dir}`,
+    );
+  }
 }
 
 /**
@@ -745,18 +1164,102 @@ function makeExt4Native(exportDir: string, outImage: string): void {
 function makeExt4ViaDocker(containerId: string, outImage: string): void {
   const outDir = dirname(outImage);
   const imageName = 'rootfs.ext4';
+  // The helper script is a real POSIX sh program containing shell variables
+  // (`$i`, `$cmd`, …), command substitution, and double quotes — all of which
+  // the OUTER host `/bin/sh -c` (run() → execSync) would otherwise expand
+  // BEFORE handing the line to docker.  Single-quote the whole script for the
+  // host so it reaches the container's `sh -c` verbatim; the only character
+  // that needs escaping inside POSIX single quotes is `'` itself (`'\''`).
+  const script = singleQuoteForSh(buildMkfsExt4ViaDockerScript(imageName, ROOTFS_SIZE_MB));
+  // Mount the checked-in mke2fs.conf into the container `:ro` so the Alpine
+  // helper's mkfs.ext4 pins the same feature set as the native path (the
+  // helper script exports MKE2FS_CONFIG=<this path>).
   run(
     `docker export "${containerId}" | ` +
-    `docker run --rm -i -v "${outDir}:/out" alpine:latest sh -c ` +
-    `"apk add --no-cache e2fsprogs tar && ` +
-    ` mkdir /rootfs && tar -x -C /rootfs && ` +
-    ` mkfs.ext4 -d /rootfs -L rootfs -O ^has_journal -m 0 /out/${imageName} ${ROOTFS_SIZE_MB}M"`,
+    `docker run --rm -i -v "${outDir}:/out" ` +
+    `-v "${ROOTFS_MKE2FS_CONFIG_PATH}:${DOCKER_MKE2FS_CONFIG_PATH}:ro" ` +
+    `${ALPINE_HELPER_REF} sh -c ${script}`,
   );
   // The container writes rootfs.ext4 into outDir; rename to the expected filename.
   const tmpOut = join(outDir, imageName);
   if (tmpOut !== outImage) {
     execSync(`mv "${tmpOut}" "${outImage}"`);
   }
+}
+
+/**
+ * The Alpine-helper shell script: extract the piped export tar, normalize
+ * mtimes, `mkfs.ext4` with the SAME UUID/hash-seed/SOURCE_DATE_EPOCH AND
+ * MKE2FS_CONFIG as the native Linux path, then run the SAME deterministic
+ * debugfs timestamp post-pass (mirrors pinExt4TimestampsViaDebugfs).  Pure;
+ * unit-tested.  This best-effort macOS path mirrors the determinism flags so a
+ * mac-built image matches the native one; the authoritative released SHA still
+ * comes from the native Linux build.
+ *
+ * The post-pass reads the image's inode count from `dumpe2fs -h`, then writes a
+ * debugfs command file: the fixed superblock commands followed by one inode's
+ * commands per inode (1..count) via a `seq` loop, mirroring
+ * `buildDebugfsTimeScript`.  We loop in-shell rather than embedding a
+ * multi-thousand-line literal so the script stays compact.
+ *
+ * `MKE2FS_CONFIG` points at the bind-mounted conf (makeExt4ViaDocker mounts the
+ * checked-in src/rootfs/mke2fs.conf to that path `:ro`).
+ *
+ * Embedded inside a double-quoted `sh -c "..."` (see makeExt4ViaDocker), so it
+ * must contain no unescaped double quotes — single quotes only.
+ */
+export function buildMkfsExt4ViaDockerScript(imageName: string, sizeMB: number): string {
+  const outImage = `/out/${imageName}`;
+  // mkfs argv with /rootfs as the populate dir and /out/<image> as the target.
+  const mkfsArgs = buildMkfsExt4Args('/rootfs', outImage, sizeMB).join(' ');
+  const normalize = buildNormalizeMtimesArgv('/rootfs', ROOTFS_SOURCE_DATE_EPOCH).join(' ');
+  const epoch = ROOTFS_SOURCE_DATE_EPOCH;
+  // Drop build-time-volatile CONTENT before the normalize (mirrors
+  // sanitizeExportTree on the native path): zero the Docker-injected /etc files
+  // and delete the timestamped logs.  Generated from EXPORT_TREE_VOLATILE_CONTENT
+  // so the two paths cannot drift.  Each truncate is guarded on existence (so a
+  // missing file is NOT created, matching the native existsSync gate); `rm -rf`
+  // is a no-op when the log is absent.
+  const sanitize = [
+    ...EXPORT_TREE_VOLATILE_CONTENT.truncate.map(
+      (rel) => `if [ -e /rootfs/${rel} ]; then : > /rootfs/${rel}; fi`,
+    ),
+    ...EXPORT_TREE_VOLATILE_CONTENT.remove.map((rel) => `rm -rf /rootfs/${rel}`),
+  ].join('; ');
+  // Superblock commands (fixed; printed verbatim into the debugfs command file).
+  // Each becomes one `printf '%s\n'` argument so the lines survive intact.
+  const superblockArgs = buildDebugfsSuperblockTimeCommands(epoch)
+    .split('\n')
+    .map((line) => `'${line}'`)
+    .join(' ');
+  // Per-inode commands: four `sif <%s> <field> @epoch` lines fed the loop
+  // counter via printf's `%s` (NOT shell-expanded `$i`, which single quotes
+  // would suppress).  Mirrors buildDebugfsInodeTimeCommands.
+  const inodeFmt =
+    `sif <%s> atime @${epoch}\\n` +
+    `sif <%s> ctime @${epoch}\\n` +
+    `sif <%s> mtime @${epoch}\\n` +
+    `sif <%s> crtime @${epoch}\\n`;
+  // Build the debugfs command file, then apply it in one `debugfs -w` pass.
+  // The inode count is parsed from dumpe2fs -h with the SAME MKE2FS_CONFIG in
+  // scope (the export above stays set for the whole `sh -c`).
+  const postPass =
+    `ic=$(dumpe2fs -h ${outImage} 2>/dev/null | sed -n 's/^Inode count:[[:space:]]*//p') && ` +
+    `cmd=/tmp/sj-debugfs.cmd && ` +
+    `printf '%s\\n' ${superblockArgs} > "$cmd" && ` +
+    `i=1; while [ "$i" -le "$ic" ]; do ` +
+    `printf '${inodeFmt}' "$i" "$i" "$i" "$i" >> "$cmd"; i=$((i+1)); done && ` +
+    `printf 'quit\\n' >> "$cmd" && ` +
+    `debugfs -w -f "$cmd" ${outImage}`;
+  return (
+    `apk add --no-cache e2fsprogs tar && ` +
+    `mkdir /rootfs && tar -x -C /rootfs && ` +
+    `${sanitize} && ` +
+    `${normalize} && ` +
+    `export MKE2FS_CONFIG=${DOCKER_MKE2FS_CONFIG_PATH} && ` +
+    `SOURCE_DATE_EPOCH=${epoch} mkfs.ext4 ${mkfsArgs} && ` +
+    `${postPass}`
+  );
 }
 
 function exportAndConvert(input: BuildInput): void {
@@ -783,7 +1286,7 @@ function exportAndConvert(input: BuildInput): void {
           throw new Error(`[rootfs] docker export produced an empty directory: ${tmpDir}`);
         }
         console.log(`[rootfs] Creating ext4 image (native mkfs.ext4) …`);
-        makeExt4Native(tmpDir, outImage);
+        convertExportTreeToExt4(tmpDir, outImage);
       } finally {
         try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }

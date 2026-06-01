@@ -156,4 +156,36 @@ describe('release.yml publish job (PKG-5)', () => {
       'secrets.NPM_TOKEN',
     );
   });
+
+  it('verifies real pinned Docker digests resolve in GHCR (backfill gate)', () => {
+    // The gate reads the pinned dockerImages from src/action/artifact-manifest.ts
+    // and `docker buildx imagetools inspect`s each REAL ref; placeholders (the
+    // v0.1.0 bootstrap) are skipped. Docker images are not byte-reproducible, so
+    // it asserts EXISTENCE — catching a hand-copy typo / stale digest that would
+    // otherwise ship in dist/main.cjs and break Docker-backend consumers.
+    const step = runScripts.find(
+      (s) =>
+        s.includes('artifact-manifest.ts') && s.includes('imagetools inspect'),
+    );
+    expect(
+      step,
+      'a publish step must verify pinned Docker digests against GHCR',
+    ).toBeDefined();
+    expect(step).toContain('PLACEHOLDER_SHA256_');
+    expect(step).toMatch(/does not resolve in GHCR/);
+    expect(step).toContain('exit 1');
+  });
+
+  it('runs the Docker-digest GHCR gate before any npm publish', () => {
+    // A bad digest must block the irreversible npm publish, so the gate's
+    // `imagetools inspect` must precede the first `npm publish` in step order.
+    const gateIdx = allRun.indexOf('imagetools inspect');
+    const publishIdx = allRun.search(/\bnpm publish\b/);
+    expect(gateIdx, 'GHCR digest gate must be present').toBeGreaterThan(-1);
+    expect(publishIdx, 'an npm publish must be present').toBeGreaterThan(-1);
+    expect(
+      gateIdx,
+      'the GHCR digest gate must run before any npm publish',
+    ).toBeLessThan(publishIdx);
+  });
 });

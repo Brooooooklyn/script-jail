@@ -71,6 +71,15 @@ interface ManifestEntries {
   vmlinuxVzX86_64: string;
   vmlinuxVzArm64: string;
   scriptJailVmArm64Darwin: string;
+  // dockerImages section (arch-keyed GHCR refs). These do NOT carry the
+  // `PLACEHOLDER_SHA256_` prefix at the START — a placeholder ref carries the
+  // token inside its `@sha256:` digest position — so the script classifies
+  // them via a substring check. All four refs participate in the same
+  // all-or-nothing placeholder/real classification as the 9 file SHAs.
+  dockerX64Ubuntu22: string;
+  dockerX64Ubuntu24: string;
+  dockerArm64Ubuntu22: string;
+  dockerArm64Ubuntu24: string;
 }
 
 const PLACEHOLDER_LINUX_ROOTFS_22 = 'PLACEHOLDER_SHA256_LINUX_ROOTFS_UBUNTU_22_04';
@@ -83,6 +92,26 @@ const PLACEHOLDER_VMLINUX_VZ_X86_64 = 'PLACEHOLDER_SHA256_VMLINUX_VZ_X86_64';
 const PLACEHOLDER_VMLINUX_VZ_ARM64 = 'PLACEHOLDER_SHA256_VMLINUX_VZ_ARM64';
 const PLACEHOLDER_SJ_VM_ARM64_DARWIN = 'PLACEHOLDER_SHA256_SCRIPT_JAIL_VM_ARM64_DARWIN';
 
+// Docker placeholder refs mirror the manifest's real shape: a `ghcr.io/...`
+// pull spec whose `@sha256:` digest is the `PLACEHOLDER_SHA256_DOCKER_ROOTFS_*`
+// token. The key property under test is that they start with `ghcr.io/`, NOT
+// the placeholder prefix — so the script must use a substring (not prefix)
+// check to classify them as placeholders.
+const PLACEHOLDER_DOCKER_X64_22 =
+  'ghcr.io/brooklyn/script-jail-rootfs:ubuntu-22.04@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_22_04_X64';
+const PLACEHOLDER_DOCKER_X64_24 =
+  'ghcr.io/brooklyn/script-jail-rootfs:ubuntu-24.04@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_24_04_X64';
+const PLACEHOLDER_DOCKER_ARM64_22 =
+  'ghcr.io/brooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_22_04_ARM64';
+const PLACEHOLDER_DOCKER_ARM64_24 =
+  'ghcr.io/brooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:PLACEHOLDER_SHA256_DOCKER_ROOTFS_UBUNTU_24_04_ARM64';
+
+// A syntactically valid "real" digest-pinned ref: 64-hex sha256 digest, no
+// placeholder token anywhere.
+function realDockerRef(tag: string, digestChar: string): string {
+  return `ghcr.io/brooklyn/script-jail-rootfs:${tag}@sha256:${digestChar.repeat(64)}`;
+}
+
 function allPlaceholders(): ManifestEntries {
   return {
     linuxRootfs22: PLACEHOLDER_LINUX_ROOTFS_22,
@@ -94,7 +123,28 @@ function allPlaceholders(): ManifestEntries {
     vmlinuxVzX86_64: PLACEHOLDER_VMLINUX_VZ_X86_64,
     vmlinuxVzArm64: PLACEHOLDER_VMLINUX_VZ_ARM64,
     scriptJailVmArm64Darwin: PLACEHOLDER_SJ_VM_ARM64_DARWIN,
+    dockerX64Ubuntu22: PLACEHOLDER_DOCKER_X64_22,
+    dockerX64Ubuntu24: PLACEHOLDER_DOCKER_X64_24,
+    dockerArm64Ubuntu22: PLACEHOLDER_DOCKER_ARM64_22,
+    dockerArm64Ubuntu24: PLACEHOLDER_DOCKER_ARM64_24,
   };
+}
+
+// Promote a (typically all-placeholder) entry set's darwin + docker sections to
+// real values so a test that pastes real linux SHAs does not trip the
+// mixed-manifest reject.  Mirrors what the linux-only tests already did inline
+// for the darwin keys; now also covers the 4 docker refs.
+function promoteDarwinAndDockerToReal(entries: ManifestEntries): void {
+  entries.darwinRootfs22Arm64 = 'a'.repeat(64);
+  entries.darwinRootfs24Arm64 = 'b'.repeat(64);
+  entries.darwinLibsoArm64 = 'c'.repeat(64);
+  entries.vmlinuxVzX86_64 = 'd'.repeat(64);
+  entries.vmlinuxVzArm64 = 'e'.repeat(64);
+  entries.scriptJailVmArm64Darwin = 'f'.repeat(64);
+  entries.dockerX64Ubuntu22 = realDockerRef('ubuntu-22.04', '0');
+  entries.dockerX64Ubuntu24 = realDockerRef('ubuntu-24.04', '1');
+  entries.dockerArm64Ubuntu22 = realDockerRef('ubuntu-22.04-arm64', '2');
+  entries.dockerArm64Ubuntu24 = realDockerRef('ubuntu-24.04-arm64', '3');
 }
 
 function writeManifest(workspace: string, entries: ManifestEntries): string {
@@ -118,6 +168,16 @@ function writeManifest(workspace: string, entries: ManifestEntries): string {
     `      'vmlinux-vz-x86_64':              '${entries.vmlinuxVzX86_64}',`,
     `      'vmlinux-vz-arm64':               '${entries.vmlinuxVzArm64}',`,
     `      'script-jail-vm-arm64-darwin':    '${entries.scriptJailVmArm64Darwin}',`,
+    '    },',
+    '  },',
+    '  dockerImages: {',
+    '    x64: {',
+    `      'ubuntu-22.04': '${entries.dockerX64Ubuntu22}',`,
+    `      'ubuntu-24.04': '${entries.dockerX64Ubuntu24}',`,
+    '    },',
+    '    arm64: {',
+    `      'ubuntu-22.04': '${entries.dockerArm64Ubuntu22}',`,
+    `      'ubuntu-24.04': '${entries.dockerArm64Ubuntu24}',`,
     '    },',
     '  },',
     '};',
@@ -306,16 +366,12 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
     entries.linuxRootfs22 = shas.rootfs22;
     entries.linuxRootfs24 = shas.rootfs24;
     entries.linuxLibso = shas.libso;
-    // Real linux SHAs + still-placeholder darwin SHAs would be a "mixed"
-    // manifest the script rejects.  Promote the darwin keys to real SHAs
-    // too (any 64-hex string will do — the darwin artifacts are not even
-    // checked when CHECK_DARWIN_ARTIFACTS=0).
-    entries.darwinRootfs22Arm64 = 'a'.repeat(64);
-    entries.darwinRootfs24Arm64 = 'b'.repeat(64);
-    entries.darwinLibsoArm64 = 'c'.repeat(64);
-    entries.vmlinuxVzX86_64 = 'd'.repeat(64);
-    entries.vmlinuxVzArm64 = 'e'.repeat(64);
-    entries.scriptJailVmArm64Darwin = 'f'.repeat(64);
+    // Real linux SHAs + still-placeholder darwin/docker entries would be a
+    // "mixed" manifest the script rejects.  Promote the darwin keys AND the 4
+    // docker refs to real values too (any 64-hex string / digest will do — the
+    // darwin artifacts are not even checked when CHECK_DARWIN_ARTIFACTS=0, and
+    // docker refs are never SHA-verified against local files here).
+    promoteDarwinAndDockerToReal(entries);
     const manifestPath = writeManifest(ws, entries);
 
     const distSource = join(ws, 'dist-source.js');
@@ -350,12 +406,10 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
     entries.linuxRootfs22 = wrong;
     entries.linuxRootfs24 = shas.rootfs24;
     entries.linuxLibso = shas.libso;
-    entries.darwinRootfs22Arm64 = 'b'.repeat(64);
-    entries.darwinRootfs24Arm64 = 'c'.repeat(64);
-    entries.darwinLibsoArm64 = 'd'.repeat(64);
-    entries.vmlinuxVzX86_64 = 'e'.repeat(64);
-    entries.vmlinuxVzArm64 = 'f'.repeat(64);
-    entries.scriptJailVmArm64Darwin = '0'.repeat(64);
+    // All-real manifest (a wrong-but-real linux SHA is still a real, not
+    // placeholder, entry); promote darwin + docker so this stays non-mixed and
+    // reaches the SHA-comparison path.
+    promoteDarwinAndDockerToReal(entries);
     const manifestPath = writeManifest(ws, entries);
 
     const r = runScript(['--manifest', manifestPath, '--dir', dir], env);
@@ -479,6 +533,16 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
       `      'script-jail-vm-arm64-darwin':    '${'0'.repeat(64)}',`,
       '    },',
       '  },',
+      '  dockerImages: {',
+      '    x64: {',
+      `      'ubuntu-22.04': '${realDockerRef('ubuntu-22.04', '0')}',`,
+      `      'ubuntu-24.04': '${realDockerRef('ubuntu-24.04', '1')}',`,
+      '    },',
+      '    arm64: {',
+      `      'ubuntu-22.04': '${realDockerRef('ubuntu-22.04-arm64', '2')}',`,
+      `      'ubuntu-24.04': '${realDockerRef('ubuntu-24.04-arm64', '3')}',`,
+      '    },',
+      '  },',
       '};',
       '',
     ].join('\n');
@@ -522,6 +586,16 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
       `      'vmlinux-vz-x86_64':              '${'d'.repeat(64)}',`,
       `      'vmlinux-vz-arm64':               '${'e'.repeat(64)}',`,
       `      'script-jail-vm-arm64-darwin':    '${'0'.repeat(64)}',`,
+      '    },',
+      '  },',
+      '  dockerImages: {',
+      '    x64: {',
+      `      'ubuntu-22.04': '${realDockerRef('ubuntu-22.04', '0')}',`,
+      `      'ubuntu-24.04': '${realDockerRef('ubuntu-24.04', '1')}',`,
+      '    },',
+      '    arm64: {',
+      `      'ubuntu-22.04': '${realDockerRef('ubuntu-22.04-arm64', '2')}',`,
+      `      'ubuntu-24.04': '${realDockerRef('ubuntu-24.04-arm64', '3')}',`,
       '    },',
       '  },',
       '};',
@@ -568,12 +642,7 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
     entries.linuxRootfs22 = shas.rootfs22;
     entries.linuxRootfs24 = shas.rootfs24;
     entries.linuxLibso = shas.libso;
-    entries.darwinRootfs22Arm64 = 'a'.repeat(64);
-    entries.darwinRootfs24Arm64 = 'b'.repeat(64);
-    entries.darwinLibsoArm64 = 'c'.repeat(64);
-    entries.vmlinuxVzX86_64 = 'd'.repeat(64);
-    entries.vmlinuxVzArm64 = 'e'.repeat(64);
-    entries.scriptJailVmArm64Darwin = 'f'.repeat(64);
+    promoteDarwinAndDockerToReal(entries);
     const manifestPath = writeManifest(ws, entries);
 
     const distSource = join(ws, 'dist-source.js');
@@ -623,12 +692,7 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
     entries.linuxRootfs22 = shas.rootfs22;
     entries.linuxRootfs24 = shas.rootfs24;
     entries.linuxLibso = shas.libso;
-    entries.darwinRootfs22Arm64 = 'a'.repeat(64);
-    entries.darwinRootfs24Arm64 = 'b'.repeat(64);
-    entries.darwinLibsoArm64 = 'c'.repeat(64);
-    entries.vmlinuxVzX86_64 = 'd'.repeat(64);
-    entries.vmlinuxVzArm64 = 'e'.repeat(64);
-    entries.scriptJailVmArm64Darwin = 'f'.repeat(64);
+    promoteDarwinAndDockerToReal(entries);
     const manifestPath = writeManifest(ws, entries);
 
     const distSource = join(ws, 'dist-source.js');
@@ -718,6 +782,11 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
       vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
       scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
+      // Real docker refs so the manifest is uniformly "real" (else mixed).
+      dockerX64Ubuntu22: realDockerRef('ubuntu-22.04', '0'),
+      dockerX64Ubuntu24: realDockerRef('ubuntu-24.04', '1'),
+      dockerArm64Ubuntu22: realDockerRef('ubuntu-22.04-arm64', '2'),
+      dockerArm64Ubuntu24: realDockerRef('ubuntu-24.04-arm64', '3'),
     };
     const manifestPath = writeManifest(ws, entries);
     const distSource = join(ws, 'dist-source.js');
@@ -763,6 +832,12 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       vmlinuxVzX86_64: wrongKernel, // lie about kernel SHA
       vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
       scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
+      // Real docker refs — keeps the manifest non-mixed so it reaches the
+      // SHA-comparison path where the wrong kernel SHA is caught.
+      dockerX64Ubuntu22: realDockerRef('ubuntu-22.04', '0'),
+      dockerX64Ubuntu24: realDockerRef('ubuntu-24.04', '1'),
+      dockerArm64Ubuntu22: realDockerRef('ubuntu-22.04-arm64', '2'),
+      dockerArm64Ubuntu24: realDockerRef('ubuntu-24.04-arm64', '3'),
     };
     const manifestPath = writeManifest(ws, entries);
 
@@ -884,6 +959,13 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       vmlinuxVzX86_64: PLACEHOLDER_VMLINUX_VZ_X86_64,
       vmlinuxVzArm64: PLACEHOLDER_VMLINUX_VZ_ARM64,
       scriptJailVmArm64Darwin: PLACEHOLDER_SJ_VM_ARM64_DARWIN,
+      // Docker refs left as placeholders too — consistent with the still-
+      // unfilled darwin section; the real-linux + placeholder-rest mix is what
+      // trips the reject.
+      dockerX64Ubuntu22: PLACEHOLDER_DOCKER_X64_22,
+      dockerX64Ubuntu24: PLACEHOLDER_DOCKER_X64_24,
+      dockerArm64Ubuntu22: PLACEHOLDER_DOCKER_ARM64_22,
+      dockerArm64Ubuntu24: PLACEHOLDER_DOCKER_ARM64_24,
     };
     const manifestPath = writeManifest(ws, entries);
 
@@ -893,5 +975,139 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
     // No bootstrap-warning — this is a hard rejection, not a documented
     // bootstrap loop.
     expect(r.stdout).not.toMatch(/::warning::/);
+  });
+
+  it('rejects a manifest with real file SHAs but placeholder docker refs (mixed)', () => {
+    // S4 regression: the gate's all-or-nothing classification now spans the 4
+    // dockerImages refs.  A backfill that pastes all 9 real file SHAs but
+    // leaves the docker refs as `ghcr.io/...@sha256:PLACEHOLDER_SHA256_...`
+    // placeholders must trip the mixed-manifest reject — NOT silently pass.
+    const ws = makeWorkspace();
+    const linux: LinuxArtifactBytes = {
+      rootfs22: 'lr22',
+      rootfs24: 'lr24',
+      libso: 'lso',
+      dist: 'dist-bytes',
+    };
+    const darwin: DarwinArtifactBytes = {
+      rootfs22Arm64: 'dr22a',
+      rootfs24Arm64: 'dr24a',
+      libsoArm64: 'dsoa',
+      vmlinuxVzX86_64: 'kx86',
+      vmlinuxVzArm64: 'karm',
+      scriptJailVmArm64Darwin: 'sjvm',
+    };
+    const { dir, linuxShas, darwinShas } = writeAllArtifacts(ws, linux, darwin);
+    const entries: ManifestEntries = {
+      // All 9 file SHAs real (and matching the artifacts).
+      linuxRootfs22: linuxShas.rootfs22,
+      linuxRootfs24: linuxShas.rootfs24,
+      linuxLibso: linuxShas.libso,
+      darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
+      darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
+      darwinLibsoArm64: darwinShas.libsoArm64,
+      vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
+      vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
+      scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
+      // ...but the 4 docker refs are still placeholders.  Note these start
+      // with `ghcr.io/` (NOT the placeholder prefix) — the gate must detect
+      // the placeholder token by SUBSTRING, else it would misclassify them as
+      // real and let this mixed manifest through.
+      dockerX64Ubuntu22: PLACEHOLDER_DOCKER_X64_22,
+      dockerX64Ubuntu24: PLACEHOLDER_DOCKER_X64_24,
+      dockerArm64Ubuntu22: PLACEHOLDER_DOCKER_ARM64_22,
+      dockerArm64Ubuntu24: PLACEHOLDER_DOCKER_ARM64_24,
+    };
+    const manifestPath = writeManifest(ws, entries);
+
+    const r = runScript(['--manifest', manifestPath, '--dir', dir]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/mixed with/);
+    // 9 real file SHAs + 4 placeholder docker refs.
+    expect(r.stderr).toMatch(/4 placeholder entr/);
+    expect(r.stderr).toMatch(/9 real SHA/);
+    expect(r.stdout).not.toMatch(/::warning::/);
+  });
+
+  it('takes the bootstrap path for an all-placeholder manifest including docker refs', () => {
+    // The all-placeholder case (9 file placeholders + 4 docker placeholders)
+    // must still take the documented bootstrap path — a warning + exit 0 — and
+    // must NOT be flagged as mixed now that docker refs are classified.
+    const ws = makeWorkspace();
+    const manifestPath = writeManifest(ws, allPlaceholders());
+    const linux: LinuxArtifactBytes = {
+      rootfs22: 'lr22',
+      rootfs24: 'lr24',
+      libso: 'lso',
+      dist: 'dist',
+    };
+    const darwin: DarwinArtifactBytes = {
+      rootfs22Arm64: 'dr22a',
+      rootfs24Arm64: 'dr24a',
+      libsoArm64: 'dsoa',
+      vmlinuxVzX86_64: 'kx86',
+      vmlinuxVzArm64: 'karm',
+      scriptJailVmArm64Darwin: 'sjvm',
+    };
+    const { dir } = writeAllArtifacts(ws, linux, darwin);
+
+    const r = runScript(['--manifest', manifestPath, '--dir', dir]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/::warning::/);
+    expect(r.stdout).toMatch(/bootstrap path/);
+    expect(r.stderr).not.toMatch(/mixed with/);
+  });
+
+  it('does NOT reject an all-real manifest (files + docker) as mixed', () => {
+    // The inverse guard: all 9 file SHAs AND all 4 docker refs are real
+    // (syntactically valid sha256 digests).  The gate must reach the normal
+    // SHA-comparison path and pass — never the mixed reject.
+    const ws = makeWorkspace();
+    const linux: LinuxArtifactBytes = {
+      rootfs22: 'lr22',
+      rootfs24: 'lr24',
+      libso: 'lso',
+      dist: 'dist-bytes',
+    };
+    const darwin: DarwinArtifactBytes = {
+      rootfs22Arm64: 'dr22a',
+      rootfs24Arm64: 'dr24a',
+      libsoArm64: 'dsoa',
+      vmlinuxVzX86_64: 'kx86',
+      vmlinuxVzArm64: 'karm',
+      scriptJailVmArm64Darwin: 'sjvm',
+    };
+    const { dir, linuxShas, darwinShas } = writeAllArtifacts(ws, linux, darwin);
+    const entries: ManifestEntries = {
+      linuxRootfs22: linuxShas.rootfs22,
+      linuxRootfs24: linuxShas.rootfs24,
+      linuxLibso: linuxShas.libso,
+      darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
+      darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
+      darwinLibsoArm64: darwinShas.libsoArm64,
+      vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
+      vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
+      scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
+      // All 4 docker refs real (64-hex sha256 digests, no placeholder token).
+      dockerX64Ubuntu22: realDockerRef('ubuntu-22.04', '0'),
+      dockerX64Ubuntu24: realDockerRef('ubuntu-24.04', '1'),
+      dockerArm64Ubuntu22: realDockerRef('ubuntu-22.04-arm64', '2'),
+      dockerArm64Ubuntu24: realDockerRef('ubuntu-24.04-arm64', '3'),
+    };
+    const manifestPath = writeManifest(ws, entries);
+    const distSource = join(ws, 'dist-source.js');
+    writeFileSync(distSource, linux.dist);
+
+    const r = runScript([
+      '--manifest',
+      manifestPath,
+      '--dir',
+      dir,
+      '--dist-source',
+      distSource,
+    ]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/OK — all artifact SHAs match/);
+    expect(r.stderr).not.toMatch(/mixed with/);
   });
 });
