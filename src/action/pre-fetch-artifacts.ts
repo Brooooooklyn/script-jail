@@ -25,11 +25,12 @@
 // and underlying download logic are reused from `./firecracker/download.ts`
 // so unit tests can inject a fake HTTP client without touching the network.
 
-import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { HttpClient } from './firecracker/download.js';
+import { sha256File } from '../shared/http-download.js';
+import { canonicalRootfsHash } from '../rootfs/repro-hash.js';
 import type { RunnerImage } from './runner-image.js';
 
 // ---------------------------------------------------------------------------
@@ -132,26 +133,41 @@ export async function preFetchArtifacts(input: PreFetchInput): Promise<void> {
   const wantedRootfs = rootfsAssetName(runnerImage, arch);
   const wantedLibscriptjail = libscriptjailAssetName(arch);
 
-  // Build the list of (asset, destPath, expectedSha) tuples we actually need.
-  const assets: ReadonlyArray<{ name: string; expected: string }> = [
+  // Build the list of (asset, destPath, expected, digest-fn) tuples we need.
+  // Each asset carries HOW its on-disk bytes are hashed: the rootfs ext4 by its
+  // canonical (time-masked) digest, the shim by a plain SHA-256.
+  const assets: ReadonlyArray<{
+    name: string;
+    expected: string;
+    digest: (filePath: string) => Promise<string>;
+  }> = [
     {
       name: wantedRootfs,
       expected: requireExpected(manifest, platform, wantedRootfs),
+      // The rootfs ext4 is pinned by its CANONICAL (time-masked) hash — see
+      // src/rootfs/repro-hash.ts.  Both the cache-hit check and the download
+      // verification below must hash it this way or every consumer rejects a
+      // perfectly valid release (raw bytes carry a build-time s_wtime that the
+      // manifest digest deliberately ignores).
+      digest: canonicalRootfsHash,
     },
     {
       name: wantedLibscriptjail,
       expected: requireExpected(manifest, platform, wantedLibscriptjail),
+      // The shim is a plain ELF: a raw SHA-256 of the released bytes.
+      digest: sha256File,
     },
   ];
 
   // Download all assets in parallel; each call is independently idempotent.
   await Promise.all(
-    assets.map(({ name, expected }) =>
+    assets.map(({ name, expected, digest }) =>
       ensureAsset({
         http,
         url: assetUrl(manifest, name),
         destPath: join(imagesDir, name),
-        expectedSha256: expected,
+        expectedDigest: expected,
+        computeDigest: digest,
       }),
     ),
   );
@@ -191,39 +207,31 @@ function requireExpected(
 }
 
 /**
- * Download `url` to `destPath` if missing or hash-stale.
+ * Download `url` to `destPath` if missing or digest-stale.
  *
- * Mirrors `ensureFile` from `./firecracker/download.ts`: present + SHA-256
+ * Mirrors `ensureFile` from `./firecracker/download.ts`: present + digest
  * match → skip; otherwise (re-)download via the injected HttpClient (which
- * itself verifies the SHA before renaming into place).
+ * itself verifies the digest before renaming into place).  `computeDigest`
+ * selects the hash kind (plain SHA-256, or canonical/time-masked for the
+ * rootfs) and is used for BOTH the cache-hit check and the download.
  */
 async function ensureAsset(args: {
   http: HttpClient;
   url: string;
   destPath: string;
-  expectedSha256: string;
+  expectedDigest: string;
+  computeDigest: (filePath: string) => Promise<string>;
 }): Promise<void> {
-  const { http, url, destPath, expectedSha256 } = args;
+  const { http, url, destPath, expectedDigest, computeDigest } = args;
 
   if (existsSync(destPath)) {
-    const actual = await sha256File(destPath);
-    if (actual === expectedSha256) return; // cache hit
+    const actual = await computeDigest(destPath);
+    if (actual === expectedDigest) return; // cache hit
     console.warn(
-      `[pre-fetch] SHA-256 mismatch for cached ${destPath}. ` +
-      `Expected ${expectedSha256}, got ${actual}. Re-downloading.`,
+      `[pre-fetch] digest mismatch for cached ${destPath}. ` +
+      `Expected ${expectedDigest}, got ${actual}. Re-downloading.`,
     );
   }
 
-  await http.download(url, destPath, expectedSha256);
-}
-
-/** Returns the SHA-256 hex digest of a local file. */
-async function sha256File(filePath: string): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const hash = createHash('sha256');
-    const stream = createReadStream(filePath);
-    stream.on('data', (chunk: Buffer) => hash.update(chunk));
-    stream.on('end', () => resolve(hash.digest('hex')));
-    stream.on('error', reject);
-  });
+  await http.download(url, destPath, expectedDigest, computeDigest);
 }

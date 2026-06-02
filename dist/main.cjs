@@ -26428,7 +26428,7 @@ function setOutput(name, value) {
 }
 
 // src/main.ts
-var import_node_fs15 = require("node:fs");
+var import_node_fs16 = require("node:fs");
 var import_node_os5 = require("node:os");
 var import_node_path12 = require("node:path");
 
@@ -26669,14 +26669,14 @@ async function sha256File(filePath) {
   });
 }
 var NodeHttpClient = class {
-  async download(url2, destPath, expectedSha256) {
+  async download(url2, destPath, expectedDigest, computeDigest = sha256File) {
     const tmpPath = `${destPath}.tmp.${(0, import_node_crypto2.randomBytes)(4).toString("hex")}`;
     try {
       await downloadToFile(url2, tmpPath, 0);
-      const actual = await sha256File(tmpPath);
-      if (actual !== expectedSha256) {
+      const actual = await computeDigest(tmpPath);
+      if (actual !== expectedDigest) {
         throw new Error(
-          `SHA-256 mismatch for ${url2}: expected ${expectedSha256}, got ${actual}`
+          `SHA-256 mismatch for ${url2}: expected ${expectedDigest}, got ${actual}`
         );
       }
       await (0, import_promises.rename)(tmpPath, destPath);
@@ -26852,9 +26852,87 @@ function firecrackerReleaseArch(arch2) {
 }
 
 // src/action/pre-fetch-artifacts.ts
+var import_node_fs6 = require("node:fs");
+var import_node_path4 = require("node:path");
+
+// src/rootfs/repro-hash.ts
 var import_node_crypto4 = require("node:crypto");
 var import_node_fs5 = require("node:fs");
-var import_node_path4 = require("node:path");
+var EXT4_BLOCK_SIZE = 4096;
+var EXT4_BLOCKS_PER_GROUP = 8 * EXT4_BLOCK_SIZE;
+var EXT4_VOLATILE_SUPERBLOCK_FIELDS = [
+  [44, 4],
+  // s_mtime
+  [48, 4],
+  // s_wtime      — re-stamped to wall-clock on close (the real culprit)
+  [64, 4],
+  // s_lastcheck
+  [264, 4],
+  // s_mkfs_time
+  [1020, 4]
+  // s_checksum   — metadata_csum over the superblock, follows s_wtime
+];
+var SUPERBLOCK_STRUCT_BYTES = 1024;
+function hasSuperblock(group) {
+  if (group === 0 || group === 1) return true;
+  for (const base of [3, 5, 7]) {
+    let power = base;
+    while (power < group) power *= base;
+    if (power === group) return true;
+  }
+  return false;
+}
+function superblockByteOffset(group) {
+  return group === 0 ? SUPERBLOCK_STRUCT_BYTES : group * EXT4_BLOCKS_PER_GROUP * EXT4_BLOCK_SIZE;
+}
+function ext4VolatileByteRanges(imageSizeBytes) {
+  const totalBlocks = Math.floor(imageSizeBytes / EXT4_BLOCK_SIZE);
+  const numGroups = Math.ceil(totalBlocks / EXT4_BLOCKS_PER_GROUP);
+  const ranges = [];
+  for (let group = 0; group < numGroups; group += 1) {
+    if (!hasSuperblock(group)) continue;
+    const base = superblockByteOffset(group);
+    if (base + SUPERBLOCK_STRUCT_BYTES > imageSizeBytes) continue;
+    for (const [fieldOffset, length] of EXT4_VOLATILE_SUPERBLOCK_FIELDS) {
+      ranges.push([base + fieldOffset, length]);
+    }
+  }
+  return ranges;
+}
+function applyMaskToBuffer(buf, bufStart, ranges) {
+  const bufEnd = bufStart + buf.length;
+  for (const [rangeStart, length] of ranges) {
+    const rangeEnd = rangeStart + length;
+    const start = Math.max(rangeStart, bufStart);
+    const end = Math.min(rangeEnd, bufEnd);
+    if (start >= end) continue;
+    buf.fill(0, start - bufStart, end - bufStart);
+  }
+}
+function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
+  return new Promise((resolve4, reject) => {
+    const hash2 = (0, import_node_crypto4.createHash)("sha256");
+    const stream = (0, import_node_fs5.createReadStream)(
+      filePath,
+      chunkSize === void 0 ? void 0 : { highWaterMark: chunkSize }
+    );
+    let offset = 0;
+    stream.on("data", (chunk) => {
+      applyMaskToBuffer(chunk, offset, ranges);
+      offset += chunk.length;
+      hash2.update(chunk);
+    });
+    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("error", reject);
+  });
+}
+async function canonicalRootfsHash(filePath, chunkSize) {
+  const size = (0, import_node_fs5.statSync)(filePath).size;
+  const ranges = ext4VolatileByteRanges(size);
+  return hashFileWithMaskedRanges(filePath, ranges, chunkSize);
+}
+
+// src/action/pre-fetch-artifacts.ts
 function rootfsAssetName(runnerImage, arch2) {
   return arch2 === "arm64" ? `rootfs-${runnerImage}-arm64.ext4` : `rootfs-${runnerImage}.ext4`;
 }
@@ -26865,26 +26943,35 @@ async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
   const platform6 = input.platform ?? "linux";
   const arch2 = input.arch ?? "x64";
-  (0, import_node_fs5.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName(runnerImage, arch2);
   const wantedLibscriptjail = libscriptjailAssetName(arch2);
   const assets = [
     {
       name: wantedRootfs,
-      expected: requireExpected(manifest, platform6, wantedRootfs)
+      expected: requireExpected(manifest, platform6, wantedRootfs),
+      // The rootfs ext4 is pinned by its CANONICAL (time-masked) hash — see
+      // src/rootfs/repro-hash.ts.  Both the cache-hit check and the download
+      // verification below must hash it this way or every consumer rejects a
+      // perfectly valid release (raw bytes carry a build-time s_wtime that the
+      // manifest digest deliberately ignores).
+      digest: canonicalRootfsHash
     },
     {
       name: wantedLibscriptjail,
-      expected: requireExpected(manifest, platform6, wantedLibscriptjail)
+      expected: requireExpected(manifest, platform6, wantedLibscriptjail),
+      // The shim is a plain ELF: a raw SHA-256 of the released bytes.
+      digest: sha256File
     }
   ];
   await Promise.all(
     assets.map(
-      ({ name, expected }) => ensureAsset({
+      ({ name, expected, digest }) => ensureAsset({
         http,
         url: assetUrl(manifest, name),
         destPath: (0, import_node_path4.join)(imagesDir, name),
-        expectedSha256: expected
+        expectedDigest: expected,
+        computeDigest: digest
       })
     )
   );
@@ -26908,24 +26995,15 @@ function requireExpected(manifest, platform6, asset) {
   return sha;
 }
 async function ensureAsset(args) {
-  const { http, url: url2, destPath, expectedSha256 } = args;
-  if ((0, import_node_fs5.existsSync)(destPath)) {
-    const actual = await sha256File2(destPath);
-    if (actual === expectedSha256) return;
+  const { http, url: url2, destPath, expectedDigest, computeDigest } = args;
+  if ((0, import_node_fs6.existsSync)(destPath)) {
+    const actual = await computeDigest(destPath);
+    if (actual === expectedDigest) return;
     console.warn(
-      `[pre-fetch] SHA-256 mismatch for cached ${destPath}. Expected ${expectedSha256}, got ${actual}. Re-downloading.`
+      `[pre-fetch] digest mismatch for cached ${destPath}. Expected ${expectedDigest}, got ${actual}. Re-downloading.`
     );
   }
-  await http.download(url2, destPath, expectedSha256);
-}
-async function sha256File2(filePath) {
-  return new Promise((resolve4, reject) => {
-    const hash2 = (0, import_node_crypto4.createHash)("sha256");
-    const stream = (0, import_node_fs5.createReadStream)(filePath);
-    stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve4(hash2.digest("hex")));
-    stream.on("error", reject);
-  });
+  await http.download(url2, destPath, expectedDigest, computeDigest);
 }
 
 // src/action/artifact-manifest.ts
@@ -26999,7 +27077,7 @@ function validateManifest(manifest) {
 }
 
 // src/action/firecracker/overlay.ts
-var import_node_fs6 = require("node:fs");
+var import_node_fs7 = require("node:fs");
 var import_promises3 = require("node:fs/promises");
 var import_node_path5 = require("node:path");
 var import_node_os2 = require("node:os");
@@ -27013,16 +27091,16 @@ async function makeOverlay(input) {
     workDir: maybeWorkDir,
     extraRepoOverlayFiles
   } = input;
-  const workDir = maybeWorkDir ?? (0, import_node_fs6.mkdtempSync)((0, import_node_path5.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
-  (0, import_node_fs6.mkdirSync)(workDir, { recursive: true });
+  const workDir = maybeWorkDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path5.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
+  (0, import_node_fs7.mkdirSync)(workDir, { recursive: true });
   const rootfsCopyPath = (0, import_node_path5.join)(workDir, "rootfs.ext4");
   copyRootfs(baseRootfsPath, rootfsCopyPath);
   const repoStageDir = (0, import_node_path5.join)(workDir, "repo-stage");
-  (0, import_node_fs6.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs6.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  (0, import_node_fs7.mkdirSync)(repoStageDir, { recursive: true });
+  (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
   const configDestDir = (0, import_node_path5.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs6.mkdirSync)(configDestDir, { recursive: true });
-  (0, import_node_fs6.copyFileSync)(configPath, (0, import_node_path5.join)(configDestDir, "config.yml"));
+  (0, import_node_fs7.mkdirSync)(configDestDir, { recursive: true });
+  (0, import_node_fs7.copyFileSync)(configPath, (0, import_node_path5.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
     const stageRoot = (0, import_node_path5.resolve)(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
@@ -27059,25 +27137,25 @@ function writeOverlayFile(root, relPath, content) {
     ensureRealDirectory(dir);
   }
   const dest = (0, import_node_path5.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs6.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs6.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  (0, import_node_fs7.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs7.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory(path) {
-  if (!(0, import_node_fs6.existsSync)(path)) {
-    (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+  if (!(0, import_node_fs7.existsSync)(path)) {
+    (0, import_node_fs7.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat2 = (0, import_node_fs6.lstatSync)(path);
+  const stat2 = (0, import_node_fs7.lstatSync)(path);
   if (stat2.isDirectory() && !stat2.isSymbolicLink()) return;
-  (0, import_node_fs6.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+  (0, import_node_fs7.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs7.mkdirSync)(path, { recursive: true });
 }
 function copyRootfs(src, dest) {
   if (import_node_process.platform === "linux") {
     const result = (0, import_node_child_process.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
     if (result.status === 0) return;
   }
-  (0, import_node_fs6.cpSync)(src, dest);
+  (0, import_node_fs7.cpSync)(src, dest);
 }
 async function buildRepoDisk(srcDir, outPath) {
   const sizeMB = estimateDiskSizeMB(srcDir);
@@ -27121,7 +27199,7 @@ function resolveMkfsExt4() {
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
     "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
   ]) {
-    if ((0, import_node_fs6.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs7.existsSync)(candidate)) return candidate;
   }
   const lookup = (0, import_node_child_process.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
@@ -27132,9 +27210,9 @@ function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat2 = (0, import_node_fs6.statSync)(p, { bigint: false });
+      const stat2 = (0, import_node_fs7.statSync)(p, { bigint: false });
       if (stat2.isDirectory()) {
-        for (const child of (0, import_node_fs6.readdirSync)(p)) {
+        for (const child of (0, import_node_fs7.readdirSync)(p)) {
           visit((0, import_node_path5.join)(p, child));
         }
       } else if (stat2.isFile() || stat2.isSymbolicLink()) {
@@ -27143,14 +27221,14 @@ function estimateDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs6.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs7.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 
 // src/action/firecracker/launch.ts
 var import_node_http2 = require("node:http");
-var import_node_fs7 = require("node:fs");
+var import_node_fs8 = require("node:fs");
 var import_promises4 = require("node:fs/promises");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process2 = require("node:process");
@@ -27175,7 +27253,7 @@ async function launchVm(input) {
         `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
-    if (!(0, import_node_fs7.existsSync)("/dev/kvm")) {
+    if (!(0, import_node_fs8.existsSync)("/dev/kvm")) {
       throw new Error(
         "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
@@ -27327,7 +27405,7 @@ var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((0, import_node_fs7.existsSync)(socketPath)) return;
+      if ((0, import_node_fs8.existsSync)(socketPath)) return;
       await sleep(50);
     }
     throw new Error(`Timeout waiting for socket: ${socketPath}`);
@@ -27610,7 +27688,7 @@ function socketToDuplex(sock) {
 
 // src/action/firecracker/teardown.ts
 var import_promises5 = require("node:fs/promises");
-var import_node_fs8 = require("node:fs");
+var import_node_fs9 = require("node:fs");
 async function teardown(handles) {
   if (handles.vsock !== null) {
     await safeRun("close vsock session", () => handles.vsock.close());
@@ -27651,7 +27729,7 @@ async function safeRun(label, fn) {
   }
 }
 async function removeIfExists(filePath) {
-  if (!(0, import_node_fs8.existsSync)(filePath)) return;
+  if (!(0, import_node_fs9.existsSync)(filePath)) return;
   try {
     await (0, import_promises5.unlink)(filePath);
   } catch (err) {
@@ -27663,7 +27741,7 @@ function timeout(ms) {
 }
 
 // src/shared/run-audit.ts
-var import_node_fs10 = require("node:fs");
+var import_node_fs11 = require("node:fs");
 var import_promises6 = require("node:fs/promises");
 var import_node_path7 = require("node:path");
 
@@ -42990,12 +43068,12 @@ function countLines(s) {
 }
 
 // src/action/config-override.ts
-var import_node_fs9 = require("node:fs");
+var import_node_fs10 = require("node:fs");
 var import_node_os3 = require("node:os");
 var import_node_path6 = require("node:path");
 var import_yaml2 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
-  const text = (0, import_node_fs9.readFileSync)(input.userConfigPath, "utf8");
+  const text = (0, import_node_fs10.readFileSync)(input.userConfigPath, "utf8");
   const parsed = (0, import_yaml2.parse)(text);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   const existingSpoof = config2["spoof"] !== null && typeof config2["spoof"] === "object" && !Array.isArray(config2["spoof"]) ? config2["spoof"] : {};
@@ -43004,25 +43082,25 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
-  const outDir = input.workDir ?? (0, import_node_fs9.mkdtempSync)((0, import_node_path6.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
+  const outDir = input.workDir ?? (0, import_node_fs10.mkdtempSync)((0, import_node_path6.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
   const configPath = (0, import_node_path6.join)(outDir, "config.yml");
-  (0, import_node_fs9.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  (0, import_node_fs10.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
   const result = { configPath };
   if (input.yarnrcOverlay !== void 0) {
     const yarnrcPath = (0, import_node_path6.join)(outDir, ".yarnrc.yml");
-    (0, import_node_fs9.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    (0, import_node_fs10.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
     result.yarnrcPath = yarnrcPath;
   }
   if (input.pmFlagsJson !== void 0) {
     const pmFlagsPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pm-flags.json");
-    (0, import_node_fs9.mkdirSync)((0, import_node_path6.dirname)(pmFlagsPath), { recursive: true });
-    (0, import_node_fs9.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    (0, import_node_fs10.mkdirSync)((0, import_node_path6.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs10.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
     result.pmFlagsPath = pmFlagsPath;
   }
   if (input.pnpmArchOverlay !== void 0) {
     const pnpmArchPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
-    (0, import_node_fs9.mkdirSync)((0, import_node_path6.dirname)(pnpmArchPath), { recursive: true });
-    (0, import_node_fs9.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
+    (0, import_node_fs10.mkdirSync)((0, import_node_path6.dirname)(pnpmArchPath), { recursive: true });
+    (0, import_node_fs10.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
     result.pnpmArchPath = pnpmArchPath;
   }
   return result;
@@ -43039,7 +43117,7 @@ async function runAudit(input) {
     spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
-  const scratchDir = (0, import_node_fs10.mkdtempSync)((0, import_node_path7.join)(input.workDir, "script-jail-config-"));
+  const scratchDir = (0, import_node_fs11.mkdtempSync)((0, import_node_path7.join)(input.workDir, "script-jail-config-"));
   let result;
   let overlay = null;
   try {
@@ -43061,19 +43139,19 @@ async function runAudit(input) {
     if (effectiveConfig.yarnrcPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: ".yarnrc.yml",
-        content: (0, import_node_fs10.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
+        content: (0, import_node_fs11.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
       });
     }
     if (effectiveConfig.pmFlagsPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pm-flags.json",
-        content: (0, import_node_fs10.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+        content: (0, import_node_fs11.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
       });
     }
     if (effectiveConfig.pnpmArchPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pnpm-arch.json",
-        content: (0, import_node_fs10.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
+        content: (0, import_node_fs11.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
     if (input.execute !== void 0) {
@@ -43114,7 +43192,7 @@ async function runAudit(input) {
     }
   }
   if (input.mode === "update") {
-    (0, import_node_fs10.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
+    (0, import_node_fs11.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
     input.io.stderr.write(
       `[script-jail] wrote ${Buffer.byteLength(result.finalYaml, "utf8")} bytes to ${input.lockPath}
 `
@@ -43123,7 +43201,7 @@ async function runAudit(input) {
     input.io.setOutput?.("diff", "");
     return { exitCode: 0 };
   }
-  const committed = (0, import_node_fs10.existsSync)(input.lockPath) ? (0, import_node_fs10.readFileSync)(input.lockPath, "utf8") : "";
+  const committed = (0, import_node_fs11.existsSync)(input.lockPath) ? (0, import_node_fs11.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
   const diff = renderDiff({
     lockPath: lockLabel,
@@ -43158,17 +43236,17 @@ function relativeForDisplay(absPath, repoDir) {
 
 // src/action/backend/firecracker.ts
 var import_node_crypto5 = require("node:crypto");
-var import_node_fs12 = require("node:fs");
+var import_node_fs13 = require("node:fs");
 var import_node_os4 = require("node:os");
 var import_node_path9 = require("node:path");
 var import_node_process3 = require("node:process");
 
 // src/action/cache.ts
-var import_node_fs11 = require("node:fs");
+var import_node_fs12 = require("node:fs");
 var import_node_path8 = require("node:path");
 function maybeClearCache(input) {
   if (input.cacheFirecracker) return;
-  const fs3 = input.fs ?? { rmSync: import_node_fs11.rmSync };
+  const fs3 = input.fs ?? { rmSync: import_node_fs12.rmSync };
   const releaseArch = input.arch === "arm64" ? "aarch64" : "x86_64";
   const tarPath = (0, import_node_path8.join)(
     input.imagesDir,
@@ -43292,7 +43370,7 @@ function createFirecrackerBackend(deps) {
   const doLaunchVm = deps.launchVm ?? launchVm;
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
-  const checkExists = deps.existsSync ?? import_node_fs12.existsSync;
+  const checkExists = deps.existsSync ?? import_node_fs13.existsSync;
   const hostPlatform = deps.platform ?? import_node_process3.platform;
   return {
     name: "firecracker",
@@ -43419,18 +43497,18 @@ async function launchFirecracker(input) {
 var import_node_crypto6 = require("node:crypto");
 
 // src/action/backend/stage.ts
-var import_node_fs13 = require("node:fs");
+var import_node_fs14 = require("node:fs");
 var import_node_path10 = require("node:path");
 var import_yaml3 = __toESM(require_dist(), 1);
 function stageRepoDirectory(input) {
-  const stageRoot = (0, import_node_fs13.mkdtempSync)((0, import_node_path10.join)(input.parentDir, "repo-stage-"));
+  const stageRoot = (0, import_node_fs14.mkdtempSync)((0, import_node_path10.join)(input.parentDir, "repo-stage-"));
   const repoStage = (0, import_node_path10.join)(stageRoot, "work");
-  (0, import_node_fs13.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
+  (0, import_node_fs14.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
   materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
   return {
     path: repoStage,
     cleanup: () => {
-      (0, import_node_fs13.rmSync)(stageRoot, { recursive: true, force: true });
+      (0, import_node_fs14.rmSync)(stageRoot, { recursive: true, force: true });
     }
   };
 }
@@ -43459,26 +43537,26 @@ function writeOverlayFile2(root, relPath, content) {
     ensureRealDirectory2(dir);
   }
   const dest = (0, import_node_path10.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs13.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs13.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  (0, import_node_fs14.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs14.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory2(path) {
-  if (!(0, import_node_fs13.existsSync)(path)) {
-    (0, import_node_fs13.mkdirSync)(path, { recursive: true });
+  if (!(0, import_node_fs14.existsSync)(path)) {
+    (0, import_node_fs14.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat2 = (0, import_node_fs13.lstatSync)(path);
+  const stat2 = (0, import_node_fs14.lstatSync)(path);
   if (stat2.isDirectory() && !stat2.isSymbolicLink()) return;
-  (0, import_node_fs13.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs13.mkdirSync)(path, { recursive: true });
+  (0, import_node_fs14.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs14.mkdirSync)(path, { recursive: true });
 }
 function rewriteConfigWorkDir(input) {
-  const raw = (0, import_node_fs13.readFileSync)(input.configPath, "utf8");
+  const raw = (0, import_node_fs14.readFileSync)(input.configPath, "utf8");
   const parsed = (0, import_yaml3.parse)(raw);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   config2["work_dir"] = input.workDir;
   const outPath = (0, import_node_path10.join)(input.outDir, "config.backend.yml");
-  (0, import_node_fs13.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
+  (0, import_node_fs14.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
   return outPath;
 }
 
@@ -43651,7 +43729,7 @@ function resolveDockerImageRef(ctx, opts = {}) {
 }
 
 // src/action/backend/bare.ts
-var import_node_fs14 = require("node:fs");
+var import_node_fs15 = require("node:fs");
 var import_node_path11 = require("node:path");
 var import_node_process4 = require("node:process");
 function createBareBackend(deps = {}) {
@@ -43755,7 +43833,7 @@ function currentModuleDir() {
 }
 function findFirst(candidates, label) {
   for (const candidate of candidates) {
-    if ((0, import_node_fs14.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs15.existsSync)(candidate)) return candidate;
   }
   throw new BackendUnavailableError("bare", `${label} was not found`);
 }
@@ -43816,7 +43894,7 @@ async function main(deps = {}) {
   }
   const runnerImage = detectRunnerImage();
   const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path12.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
-  (0, import_node_fs15.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs16.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
   const backends = {
     firecracker: createFirecrackerBackend({

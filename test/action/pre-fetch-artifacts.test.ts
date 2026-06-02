@@ -21,6 +21,7 @@ import {
   type ArtifactManifest,
 } from '../../src/action/pre-fetch-artifacts.js';
 import type { HttpClient } from '../../src/action/firecracker/download.js';
+import { canonicalRootfsHash } from '../../src/rootfs/repro-hash.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -46,28 +47,32 @@ interface MockHttp {
 }
 
 /**
- * Build a mock HttpClient backed by a `url → payload` map.  The mock
- * verifies the SHA-256 of the payload against the caller's `expectedSha256`
- * (matching production behaviour) and writes the payload to `destPath`
- * on success.
+ * Build a mock HttpClient backed by a `url → payload` map.  The mock writes the
+ * payload to `destPath` then verifies it via the caller-supplied `computeDigest`
+ * (so the rootfs path's canonical/time-masked digest is exercised exactly as in
+ * production) against `expectedDigest`, throwing on mismatch.  Writing before
+ * hashing mirrors NodeHttpClient, which hashes its on-disk temp file before
+ * renaming into place.  When `computeDigest` is omitted it falls back to a plain
+ * SHA-256 of the payload bytes.
  */
 function mockHttpClient(payloads: Readonly<Record<string, string>>): MockHttp {
   const calls: MockHttp['calls'] = [];
 
   const client: HttpClient = {
-    async download(url, destPath, expectedSha256) {
-      calls.push({ url, dest: destPath, expected: expectedSha256 });
+    async download(url, destPath, expectedDigest, computeDigest) {
+      calls.push({ url, dest: destPath, expected: expectedDigest });
       const payload = payloads[url];
       if (payload === undefined) {
         throw new Error(`Mock: no payload registered for ${url}`);
       }
-      const actual = sha(payload);
-      if (actual !== expectedSha256) {
+      writeFileSync(destPath, payload);
+      const actual = computeDigest ? await computeDigest(destPath) : sha(payload);
+      if (actual !== expectedDigest) {
+        rmSync(destPath, { force: true });
         throw new Error(
-          `Mock: SHA-256 mismatch for ${url}: expected ${expectedSha256}, got ${actual}`,
+          `Mock: SHA-256 mismatch for ${url}: expected ${expectedDigest}, got ${actual}`,
         );
       }
-      writeFileSync(destPath, payload);
     },
   };
 
@@ -388,5 +393,94 @@ describe('preFetchArtifacts', () => {
       'https://github.com/someone/elsewhere/releases/download/v9.9.9/libscriptjail.so',
       'https://github.com/someone/elsewhere/releases/download/v9.9.9/rootfs-ubuntu-22.04.ext4',
     ]);
+  });
+});
+
+describe('preFetchArtifacts — rootfs verified by its canonical (time-masked) digest', () => {
+  // The earlier tests use tiny rootfs payloads (< 2048 bytes), where masking is
+  // a no-op and canonical == raw sha256 — so they cannot tell the two apart.
+  // These use a payload big enough to carry a primary superblock, filled with
+  // 0x41 so the masked superblock fields are non-zero and canonical ≠ raw.
+  const BIG_ROOTFS = 'A'.repeat(4096);
+
+  async function canonicalOf(content: string): Promise<string> {
+    const probe = join(testDir, '__canon_probe');
+    writeFileSync(probe, content);
+    const h = await canonicalRootfsHash(probe);
+    rmSync(probe, { force: true });
+    return h;
+  }
+
+  function bigManifest(rootfs22Expected: string): ArtifactManifest {
+    return {
+      repo: REPO,
+      tag: TAG,
+      expected: {
+        linux: {
+          'rootfs-ubuntu-22.04.ext4': rootfs22Expected,
+          'rootfs-ubuntu-24.04.ext4': sha(ROOTFS_24_CONTENT),
+          'libscriptjail.so': sha(LIB_CONTENT),
+        },
+        darwin: {},
+      },
+    };
+  }
+
+  function bigPayloads(): Record<string, string> {
+    return {
+      [urlFor('rootfs-ubuntu-22.04.ext4')]: BIG_ROOTFS,
+      [urlFor('libscriptjail.so')]: LIB_CONTENT,
+    };
+  }
+
+  it('accepts a rootfs whose CANONICAL digest matches (a raw sha would not)', async () => {
+    const canon = await canonicalOf(BIG_ROOTFS);
+    // The masking must actually change the digest for this blob, else the test
+    // proves nothing.
+    expect(canon).not.toBe(sha(BIG_ROOTFS));
+
+    const { client, calls } = mockHttpClient(bigPayloads());
+    await preFetchArtifacts({
+      imagesDir: testDir,
+      runnerImage: 'ubuntu-22.04',
+      manifest: bigManifest(canon),
+      http: client,
+    });
+
+    expect(existsSync(join(testDir, 'rootfs-ubuntu-22.04.ext4'))).toBe(true);
+    // The rootfs download was asked to verify the canonical digest, not a raw one.
+    const rootfsCall = calls.find(
+      (c) => c.url === urlFor('rootfs-ubuntu-22.04.ext4'),
+    );
+    expect(rootfsCall?.expected).toBe(canon);
+  });
+
+  it('rejects a rootfs pinned by a plain sha256 (canonical mismatch)', async () => {
+    const { client } = mockHttpClient(bigPayloads());
+    await expect(
+      preFetchArtifacts({
+        imagesDir: testDir,
+        runnerImage: 'ubuntu-22.04',
+        // WRONG: a raw sha256, not the canonical digest the consumer computes.
+        manifest: bigManifest(sha(BIG_ROOTFS)),
+        http: client,
+      }),
+    ).rejects.toThrow(/SHA-256 mismatch/);
+  });
+
+  it('cache hit: a cached rootfs is matched by its canonical digest', async () => {
+    const canon = await canonicalOf(BIG_ROOTFS);
+    writeFileSync(join(testDir, 'rootfs-ubuntu-22.04.ext4'), BIG_ROOTFS);
+    writeFileSync(join(testDir, 'libscriptjail.so'), LIB_CONTENT);
+
+    const { client, calls } = mockHttpClient(bigPayloads());
+    await preFetchArtifacts({
+      imagesDir: testDir,
+      runnerImage: 'ubuntu-22.04',
+      manifest: bigManifest(canon),
+      http: client,
+    });
+
+    expect(calls).toHaveLength(0); // both assets cache-hit by their own digest kind
   });
 });

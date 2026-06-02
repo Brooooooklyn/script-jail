@@ -27,6 +27,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { canonicalRootfsHash } from '../../src/rootfs/repro-hash.js';
+
 // Resolve the script path from the repo root.
 const repoRoot = new URL('../../', import.meta.url).pathname.replace(
   /\/$/,
@@ -1109,5 +1111,89 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/OK — all artifact SHAs match/);
     expect(r.stderr).not.toMatch(/mixed with/);
+  });
+});
+
+describe('scripts/check-publish-artifacts.sh — rootfs uses CANONICAL hash', () => {
+  // The 4 rootfs ext4 entries are pinned by their canonical (time-masked) hash,
+  // NOT a plain sha256sum.  The tiny string artifacts used elsewhere in this
+  // file are < 2048 bytes, so masking is a no-op there and canonical == raw —
+  // which means a regression to `sha_of` would NOT be caught by those tests.
+  // These two tests use a rootfs blob big enough to carry a primary superblock,
+  // with a non-zero byte planted at the masked s_wtime offset, so canonical and
+  // raw sha256 necessarily differ.
+  const env = { SCRIPT_JAIL_CHECK_DARWIN_ARTIFACTS: '0' };
+
+  function bigRootfs(fill: number, wtime: number): Buffer {
+    const b = Buffer.alloc(4096, fill);
+    b.writeUInt32LE(wtime >>> 0, 1024 + 0x30); // s_wtime — inside a masked range
+    return b;
+  }
+
+  async function setup(ws: string): Promise<{
+    dir: string;
+    canon22: string;
+    canon24: string;
+    raw22: string;
+    libso: string;
+  }> {
+    const dir = join(ws, 'art');
+    const r22 = bigRootfs(0xab, 0xdeadbeef);
+    const r24 = bigRootfs(0xcd, 0x12345678);
+    const p22 = join(dir, 'images/rootfs-ubuntu-22.04.ext4');
+    const p24 = join(dir, 'images/rootfs-ubuntu-24.04.ext4');
+    writeFileSync(p22, r22);
+    writeFileSync(p24, r24);
+    writeFileSync(join(dir, 'images/libscriptjail.so'), 'libso-bytes');
+    writeFileSync(join(dir, 'dist/main.cjs'), 'dist-bytes');
+    return {
+      dir,
+      canon22: await canonicalRootfsHash(p22),
+      canon24: await canonicalRootfsHash(p24),
+      raw22: sha256(r22),
+      libso: sha256('libso-bytes'),
+    };
+  }
+
+  it('accepts rootfs pinned by its canonical (time-masked) hash', async () => {
+    const ws = makeWorkspace();
+    const s = await setup(ws);
+    // Sanity: masking actually changed the digest for this blob.
+    expect(s.canon22).not.toBe(s.raw22);
+
+    const entries = allPlaceholders();
+    entries.linuxRootfs22 = s.canon22;
+    entries.linuxRootfs24 = s.canon24;
+    entries.linuxLibso = s.libso;
+    promoteDarwinAndDockerToReal(entries);
+    const manifestPath = writeManifest(ws, entries);
+    const distSource = join(ws, 'dist-source.js');
+    writeFileSync(distSource, 'dist-bytes');
+
+    const r = runScript(
+      ['--manifest', manifestPath, '--dir', s.dir, '--dist-source', distSource],
+      env,
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/OK — all artifact SHAs match/);
+  });
+
+  it('rejects rootfs pinned by a plain sha256 — computed value is the canonical hash', async () => {
+    const ws = makeWorkspace();
+    const s = await setup(ws);
+    const entries = allPlaceholders();
+    entries.linuxRootfs22 = s.raw22; // WRONG: plain sha256sum, not the canonical hash
+    entries.linuxRootfs24 = s.canon24;
+    entries.linuxLibso = s.libso;
+    promoteDarwinAndDockerToReal(entries);
+    const manifestPath = writeManifest(ws, entries);
+
+    const r = runScript(['--manifest', manifestPath, '--dir', s.dir], env);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/SHA mismatch/);
+    expect(r.stderr).toMatch(/linux\/rootfs-ubuntu-22\.04\.ext4/);
+    expect(r.stderr).toMatch(new RegExp(`expected=${s.raw22}`));
+    // The gate computed the CANONICAL hash, not the plain sha256 we pinned.
+    expect(r.stderr).toMatch(new RegExp(`computed=${s.canon22}`));
   });
 });
