@@ -466,6 +466,13 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
+      # Trusted publishing (OIDC) requires npm >= 11.5.1 (and Node >= 22.14.0,
+      # satisfied by node 24). The npm bundled with the Node 24 setup can be
+      # older, so pin a known-good version that performs the OIDC token exchange
+      # and sends the registry payload the current trust API expects.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@11.16.0
+
       # Independently verify the downloaded artifacts against the SHAs the
       # tagged source committed.  See scripts/check-publish-artifacts.sh for
       # the threat model and bootstrap-path handling.  Crucially, this runs
@@ -750,11 +757,15 @@ jobs:
       # still-unpublished packages, or bump the version and re-tag — there is no
       # in-place fix for an already-published version.
       - name: Publish npm packages (platform-first, main last)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Trusted publishing (OIDC) — no auth-token secret. The `id-token: write`
+        # permission on this job lets npm (>= 11.5.1, upgraded above) exchange a
+        # short-lived OIDC token with the registry against the trusted-publisher
+        # configs (repo Brooooooklyn/scriptjail, workflow release.yml, permission
+        # publish) set for all four packages. Provenance attestations are
+        # generated and published automatically, so no --provenance flag.
         run: |
           set -euo pipefail
           for pkg in script-jail-darwin-arm64 script-jail-linux-x64 script-jail-linux-arm64; do
-            (cd "npm-staging/${pkg}" && npm publish --provenance --access public)
+            (cd "npm-staging/${pkg}" && npm publish --access public)
           done
-          (cd npm-staging/script-jail && npm publish --provenance --access public)
+          (cd npm-staging/script-jail && npm publish --access public)

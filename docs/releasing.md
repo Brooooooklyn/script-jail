@@ -28,13 +28,23 @@ sequence and what each tag delivers.
 These steps are done by hand, once, before the first tag is pushed. None of
 them are enforced by CI on a fresh fork, so confirm each explicitly.
 
-1. **npm name + scope + token ownership (manual prerequisite O2).** Own the
-   unscoped main package name `script-jail` AND the `@script-jail` scope on the
-   registry, and have an `NPM_TOKEN` with publish rights to **both**. The
-   release publishes one unscoped package (`script-jail`) and three scoped
-   platform packages (`@script-jail/darwin-arm64`, `@script-jail/linux-x64`,
-   `@script-jail/linux-arm64`); a token that can publish only one of the two
-   namespaces fails partway through the publish loop.
+1. **npm namespace ownership + trusted publishers (manual prerequisite O2).** Own
+   the unscoped main package name `script-jail` AND the `@script-jail` scope on
+   the registry, and have a **trusted publisher** configured for **all four**
+   published packages (`script-jail` + `@script-jail/darwin-arm64`,
+   `@script-jail/linux-x64`, `@script-jail/linux-arm64`), each pointing at this
+   repo's `release.yml`. Set once per package with
+   `npm trust github <pkg> --file release.yml --repo Brooooooklyn/scriptjail --allow-publish`
+   (needs npm >= 11.16.0 and an interactive 2FA login — `npm login --auth-type=web`;
+   a bypass-2FA automation token is rejected by `npm trust`). The publish job then
+   authenticates by OIDC (`id-token: write`), so **no npm auth-token secret is
+   required** and provenance is attached automatically. A config missing on even
+   one of the four packages fails partway through the publish loop.
+
+   > **Bootstrap exception.** Trusted publishing requires the package to already
+   > exist on the registry, so the *very first* publish of a brand-new name
+   > cannot use OIDC. v0.1.0 was that one-time bootstrap (published with a
+   > token / locally); v0.1.0 → v0.1.1 and every release after it use OIDC.
 
 2. **Manifest is in the documented bootstrap state.** In
    `src/action/artifact-manifest.ts` confirm:
@@ -287,10 +297,11 @@ snapshot and may drift — re-grep before relying on them.
 | Ubuntu base digest pinned (UBUNTU_REF) | `src/rootfs/build.ts` — `UBUNTU_BASE_DIGEST` / `buildDockerBuildArgs` | 152 / 184 |
 | frozen apt snapshot | `src/rootfs/Dockerfile.base` — `ARG UBUNTU_SNAPSHOT` / `Acquire::Check-Valid-Until "false"` | 24 / 92 |
 | pinned mkfs layout | `src/rootfs/build.ts` — `buildMkfsExt4Args` / `mkfsEnv` (`MKE2FS_CONFIG`) + `src/rootfs/mke2fs.conf` | 850 / 895 |
-| GHCR publish pins same UBUNTU_REF | `.github/workflows/release.yml` — `Pin the GHCR build's base image` / `--build-arg "UBUNTU_REF=…"` | 537 / 573 |
+| GHCR publish pins same UBUNTU_REF | `.github/workflows/release.yml` — `Pin the GHCR build's base image` / `--build-arg "UBUNTU_REF=…"` | 544 / 580 |
 | same-run reproducibility smoke test | `.github/workflows/release.yml` — `Assert x64 rootfs ext4s are byte-reproducible` | 281 |
-| authoritative cross-run gate (strict SHA compare) | `.github/workflows/release.yml` — `Verify downloaded artifacts against tagged manifest` → `check-publish-artifacts.sh` | 473 |
-| publish step names + multi-package order | `.github/workflows/release.yml` — "Stage npm packages" / "Validate npm packlists" / "Publish npm packages (platform-first, main last)" | 638 / 664 / 700 |
+| authoritative cross-run gate (strict SHA compare) | `.github/workflows/release.yml` — `Verify downloaded artifacts against tagged manifest` → `check-publish-artifacts.sh` | 480 |
+| OIDC trusted publish (npm upgrade, no token) | `.github/workflows/release.yml` — `Upgrade npm for OIDC trusted publishing` (`npm install -g npm@11.16.0`) + publish job `id-token: write` | 473 / 427 |
+| publish step names + multi-package order | `.github/workflows/release.yml` — "Stage npm packages" / "Validate npm packlists" / "Publish npm packages (platform-first, main last)" | 697 / 723 / 759 |
 
 **dist note.** `release.yml` does NOT gate on committed-`dist/` freshness — it
 has no git-diff drift check. It verifies the build-job-produced `dist/main.cjs` /
