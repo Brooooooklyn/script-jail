@@ -293,17 +293,17 @@ jobs:
       # manifest diff.
       #
       # We cover BOTH x64 majors (ubuntu-24.04 AND ubuntu-22.04) via the same
-      # cheap native mkfs path.  arm64 is intentionally NOT rebuilt+compared
-      # here — and, unlike x64, it is NOT cross-run reproducible at all: it is
-      # built from the LIVE ports.ubuntu.com mirror because snapshot.ubuntu.com
-      # serves no public ubuntu-ports pocket (see src/rootfs/Dockerfile.base), so
-      # its packages drift run-to-run.  OPEN v0.1.1 BLOCKER: the arm64 rootfs ext4
-      # IS still strictly compared by scripts/check-publish-artifacts.sh at the
-      # backfill (darwin section), a comparison that can only pass if arm64
-      # reproduces a prior run's bytes — which it currently will not.  Resolving
-      # arm64's participation in the backfill (a reproducible arm64 source, or
-      # exempting arm64 ext4s from the strict cross-run compare) is deferred to
-      # v0.1.1; it does not affect the v0.1.0 all-placeholder bootstrap.
+      # cheap native mkfs path.  arm64 is byte/canonical-reproducible too — it
+      # pins the FROZEN ubuntu-ports release pocket (see src/rootfs/Dockerfile.base;
+      # no public ubuntu-ports snapshot exists, but the release pocket is itself
+      # immutable + GPG-signed for the release's support life).  arm64 gets its
+      # OWN in-run reproducibility gate too — a separate step AFTER the arm64
+      # builds below (it needs the qemu buildx path, so it can't share this
+      # native-mkfs loop).  Both arches are therefore PROVEN reproducible in-run
+      # before the irreversible v0.1.0 bootstrap publish, rather than first
+      # tested at the v0.1.1 backfill (by which point v0.1.0's bytes are
+      # immutable).  Both also remain strictly compared at the backfill by
+      # scripts/check-publish-artifacts.sh.
       - name: Assert x64 rootfs ext4s are canonical-reproducible (ubuntu-24.04, ubuntu-22.04)
         run: |
           set -euo pipefail
@@ -338,6 +338,37 @@ jobs:
 
       - name: Build rootfs (ubuntu-24.04, arm64)
         run: pnpm build -- --runner-image=ubuntu-24.04 --arch=arm64 --skip-bundle --skip-shim
+
+      # arm64 in-run reproducibility gate — the arm64 analogue of the x64 gate
+      # above, REQUIRED before the irreversible v0.1.0 bootstrap publish. arm64
+      # is pinned to the FROZEN ubuntu-ports release pocket (Dockerfile.base),
+      # but like x64 that claim must be PROVEN in-run, not first tested at the
+      # v0.1.1 backfill — by which point v0.1.0's arm64 bytes are immutable and a
+      # drift would only surface as a backfill SHA mismatch with nothing to fix.
+      # For each major: snapshot the just-built arm64 ext4, rebuild it (the qemu
+      # buildx layer cache from the builds above makes the rebuild's docker phase
+      # a cache hit; only the export+mkfs re-runs), and assert the two CANONICAL
+      # hashes match — the same masked digest the manifest pins and the backfill
+      # compares. The rebuild re-stages the arm64 shim itself (build.ts maps
+      # libscriptjail-arm64.so → images/libscriptjail.so for --arch=arm64), so it
+      # is correct to run BEFORE "Restore x64 shim artifact" below.
+      - name: Assert arm64 rootfs ext4s are canonical-reproducible (ubuntu-24.04, ubuntu-22.04)
+        run: |
+          set -euo pipefail
+          assert_reproducible_arm64() {
+            local major="$1"
+            local image="images/rootfs-${major}-arm64.ext4"
+            local first="/tmp/first-${major}-arm64.ext4"
+            cp "${image}" "${first}"
+            pnpm build -- --runner-image="${major}" --arch=arm64 --skip-bundle --skip-shim
+            local sha1 sha2
+            sha1="$(node dist/repro-hash-cli.cjs "${first}")"
+            sha2="$(node dist/repro-hash-cli.cjs "${image}")"
+            echo "${major}-arm64: first=${sha1} rebuild=${sha2}"
+            [ "${sha1}" = "${sha2}" ] || { echo "::error::arm64 rootfs ext4 ${major} is not canonical-reproducible"; exit 1; }
+          }
+          assert_reproducible_arm64 ubuntu-24.04
+          assert_reproducible_arm64 ubuntu-22.04
 
       # The arm64 rootfs build stages libscriptjail-arm64.so to the canonical
       # images/libscriptjail.so path because Dockerfile.base has one COPY

@@ -235,17 +235,21 @@ reproducibility regression before the slower publish job. (A raw `sha256sum`
 compare here would flake purely on which wall-clock second each in-place rebuild
 landed in — the very `s_wtime` drift the canonical hash masks.)
 
-arm64 is NOT rebuilt in-run either (qemu is slow) — but, unlike x64, the arm64
-rootfs is **not cross-run reproducible at all**: it is built from the live
-`ports.ubuntu.com` mirror because `snapshot.ubuntu.com` serves no public
-`ubuntu-ports` pocket (see `src/rootfs/Dockerfile.base`), so its packages drift
-run-to-run. That makes the two arm64 rootfs ext4s a known **open `v0.1.1`
-blocker**: `check-publish-artifacts.sh` still strictly compares them (darwin
-section) at the backfill, a comparison that can only pass once arm64 reproduces
-a prior run's bytes — which it currently will not. Resolving it (a reproducible
-arm64 source, or exempting the arm64 ext4s from the strict cross-run compare) is
-deferred to `v0.1.1`; it does not affect the `v0.1.0` all-placeholder bootstrap,
-where every artifact comparison is skipped.
+arm64 is NOT rebuilt in-run either (qemu is slow), but it **is** cross-run
+reproducible and **is** strictly compared at the backfill (the darwin rootfs
+ext4 entries in `check-publish-artifacts.sh`). `snapshot.ubuntu.com` serves no
+public `ubuntu-ports` pocket (every path 401s), so arm64 cannot use the
+snapshot — but it does not need to: `src/rootfs/Dockerfile.base` pins arm64 to
+the **frozen release pocket** on `ports.ubuntu.com` (the bare `<codename>`
+suite, dropping the moving `-updates`/`-security`/`-backports` pockets the base
+image enables — those were the only arm64 drift source). The release pocket is
+immutable and GPG-signed for the release's whole support life, so a build months
+later resolves the same package versions and the arm64 ext4 reproduces the same
+canonical hash. (arm64 skips the phase-1 live `ca-certificates` bootstrap that
+x64 needs for the HTTPS snapshot — `ports.ubuntu.com` is plain HTTP — so it
+installs `ca-certificates` fresh from the frozen pocket and does not bake a
+drifting `-updates` version.) Its in-run reproduction is left to the
+authoritative cross-run backfill comparison rather than a slow qemu rebuild.
 
 **Refresh knobs (both change the released SHAs, so a refresh forces a new
 backfill):**

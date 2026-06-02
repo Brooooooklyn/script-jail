@@ -71,11 +71,17 @@ ARG NODE_VERSION
 #     byte-reproducible rootfs (R1).  This replaces the live amd64 mirrors
 #     (archive.ubuntu.com / azure.archive.ubuntu.com), which served whatever
 #     versions were current at build time and therefore drifted whenever
-#     Canonical published an update.  ARM64 IS THE EXCEPTION: snapshot.ubuntu.com
-#     serves NO public ubuntu-ports mirror (every ubuntu-ports path 401s), so
-#     arm64 keeps the live ports.ubuntu.com mirror and is intentionally NOT
-#     byte-reproducible (it is the macOS CLI image, gated by its per-package SHA,
-#     not the cross-run manifest backfill).  ca-certificates is RE-installed
+#     Canonical published an update.  ARM64 IS HANDLED DIFFERENTLY:
+#     snapshot.ubuntu.com serves NO public ubuntu-ports mirror (every
+#     ubuntu-ports path 401s), so arm64 cannot use the snapshot.  Instead it
+#     pins the FROZEN RELEASE POCKET on the live ports.ubuntu.com — the bare
+#     `<codename>` suite, dropping the moving -updates/-security/-backports
+#     pockets the base image enables.  The release pocket is immutable and
+#     GPG-signed for the release's whole support life, so its versions do NOT
+#     drift run-to-run; arm64 is therefore byte/canonical-reproducible too and
+#     DOES participate in the cross-run manifest backfill.  (The drift the old
+#     arm64 path suffered was the enabled -updates/-security pockets, never the
+#     release pocket itself.)  ca-certificates is RE-installed
 #     in the Phase 2 step PINNED to the snapshot CANDIDATE version (with
 #     --allow-downgrades) so its baked-in version is always the snapshot's —
 #     a plain re-list would NOT downgrade the (possibly newer) live version
@@ -83,12 +89,13 @@ ARG NODE_VERSION
 #
 # Sources files differ across releases (sources.list on 22.04, deb822
 # ubuntu.sources on 24.04), and on 24.04 the amd64 `-security` pocket is a
-# SEPARATE `security.ubuntu.com` stanza — so we rewrite that host too and then
-# ASSERT (allowlist, x64 only) that every active apt source is the snapshot
-# before the phase-2 install; any leftover live mirror fails the build loudly
-# rather than
-# silently baking drifting bytes.  We rewrite every matching file under
-# /etc/apt without caring which exists.  The retry loop is a backstop.
+# SEPARATE `security.ubuntu.com` stanza — so on x64 we rewrite that host too and
+# then ASSERT (allowlist) that every active apt source is the snapshot before
+# the phase-2 install.  arm64 takes a parallel branch (no snapshot exists for
+# ports): it OVERWRITES the base sources with one frozen-release-pocket stanza
+# and runs its OWN allowlist guard (must be ports.ubuntu.com, no moving pocket).
+# Either way any leftover/ drifting source fails the build loudly rather than
+# silently baking drifting bytes.  The retry loop is a backstop.
 #
 # CRITICAL: snapshot Release files carry an old `Valid-Until`, so apt would
 # REJECT them as expired unless validity checking is disabled — hence the
@@ -100,42 +107,83 @@ RUN set -eu; \
     echo 'Acquire::Retries "3";'              >> /etc/apt/apt.conf.d/99script-jail-net; \
     echo 'Acquire::ForceIPv4 "true";'         >> /etc/apt/apt.conf.d/99script-jail-net; \
     echo 'Acquire::Check-Valid-Until "false";' >> /etc/apt/apt.conf.d/99script-jail-net; \
-    for attempt in 1 2 3 4 5; do \
-      if apt-get update && \
-         apt-get install -y --no-install-recommends ca-certificates; then \
-        break; \
+    # Pin apt to a frozen archive so phase-2 resolves identical package versions
+    # on every run (byte/canonical-reproducible rootfs).  x64 → snapshot.ubuntu.com
+    # (the sed rewrite in the else branch).  arm64 → the FROZEN RELEASE POCKET on
+    # ports.ubuntu.com (no public ubuntu-ports snapshot exists — see the comment
+    # block above), by OVERWRITING the base sources with a single deb822 stanza
+    # for the bare `<codename>` suite, dropping the moving -updates/-security/
+    # -backports pockets the base image enables (the ONLY arm64 drift source).
+    # deb822 + the pinned keyring works on BOTH 22.04 (one-line sources.list
+    # base) and 24.04 (deb822 base): both arm64 images ship
+    # /usr/share/keyrings/ubuntu-archive-keyring.gpg.
+    if [ "${VP_ARCH}" = "arm64" ]; then \
+      codename="$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")"; \
+      [ -n "$codename" ] || { echo "could not resolve VERSION_CODENAME from /etc/os-release" >&2; exit 1; }; \
+      rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; \
+      { printf 'Types: deb\n'; \
+        printf 'URIs: http://ports.ubuntu.com/ubuntu-ports/\n'; \
+        printf 'Suites: %s\n' "$codename"; \
+        printf 'Components: main restricted universe multiverse\n'; \
+        printf 'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n'; \
+      } > /etc/apt/sources.list.d/ubuntu.sources; \
+      # arm64 allowlist guard (mirrors the x64 snapshot guard): every active apt
+      # source MUST be ports.ubuntu.com/ubuntu-ports AND no moving-pocket suite
+      # (-updates/-security/-backports) may survive — either would re-introduce
+      # run-to-run drift and silently break the v0.1.1 cross-run reproduction.
+      # `#` comments are stripped first so a commented example URL cannot
+      # false-trip the host check.
+      bad="$(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec cat {} + 2>/dev/null \
+              | sed 's/#.*//' \
+              | grep -oE 'https?://[^[:space:]]+' \
+              | grep -vE '^http://ports\.ubuntu\.com/ubuntu-ports/?$' || true)"; \
+      badpocket="$(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec cat {} + 2>/dev/null \
+              | sed 's/#.*//' \
+              | grep -oE '[a-z]+-(updates|security|backports)' || true)"; \
+      if [ -n "$bad" ] || [ -n "$badpocket" ]; then \
+        echo "arm64 apt source is not the frozen ports.ubuntu.com release pocket:" >&2; \
+        printf '%s\n' "$bad" "$badpocket" >&2; \
+        exit 1; \
       fi; \
-      if [ "$attempt" = "5" ]; then \
-        echo "ca-certificates bootstrap failed after 5 attempts" >&2; exit 1; \
-      fi; \
-      echo "ca-certificates bootstrap attempt $attempt failed; sleeping before retry" >&2; \
-      sleep $((attempt * 5)); \
-    done; \
-    find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
-      -exec sed -i \
-        -e "s|http://archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
-        -e "s|http://azure\.archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
-        -e "s|http://archive\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
-        -e "s|http://azure\.archive\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
-        -e "s|http://security\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
-        -e "s|http://security\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
-        {} +; \
-    # Reproducibility guard: after the rewrite EVERY active apt source MUST be
-    # the frozen snapshot.  A leftover live host — security.ubuntu.com (the
-    # amd64 `-security` pocket, which lives in a SEPARATE deb822 stanza on
-    # 24.04), or any mirror a future base image introduces — would let the
-    # phase-2 install resolve drifting package versions and silently break the
-    # v0.1.1 cross-run reproduction.  An allowlist (must be snapshot) is airtight
-    # where a host blocklist would miss a newly-introduced mirror.  `#` comments
-    # are stripped first so commented example URLs (e.g. help.ubuntu.com) cannot
-    # false-trip it.
-    # The snapshot allowlist guard runs for x64 ONLY.  arm64 legitimately keeps
-    # the live ports.ubuntu.com mirror (snapshot.ubuntu.com serves NO public
-    # ubuntu-ports — every ubuntu-ports path 401s), so on arm64 a "must be
-    # snapshot" allowlist would always trip.  arm64 is therefore intentionally
-    # NOT byte-reproducible (it is the macOS CLI image, gated by its per-package
-    # SHA, not the cross-run manifest backfill).
-    if [ "${VP_ARCH}" != "arm64" ]; then \
+    else \
+      # x64: bootstrap ca-certificates from the LIVE mirror FIRST — the snapshot
+      # archive is HTTPS and apt's https method needs a CA bundle the base image
+      # lacks.  arm64 SKIPS this entirely: ports.ubuntu.com is plain HTTP, so no
+      # trust store is needed to talk to it, AND bootstrapping from the live
+      # -updates pocket would bake a DRIFTING ca-certificates version that the
+      # release-pocket candidate-pin below cannot downgrade away from (the
+      # release pocket only carries the older release-day version, so apt would
+      # keep the newer live one).  By skipping it, arm64 installs ca-certificates
+      # fresh from the frozen release pocket in phase 2 → reproducible.
+      for attempt in 1 2 3 4 5; do \
+        if apt-get update && \
+           apt-get install -y --no-install-recommends ca-certificates; then \
+          break; \
+        fi; \
+        if [ "$attempt" = "5" ]; then \
+          echo "ca-certificates bootstrap failed after 5 attempts" >&2; exit 1; \
+        fi; \
+        echo "ca-certificates bootstrap attempt $attempt failed; sleeping before retry" >&2; \
+        sleep $((attempt * 5)); \
+      done; \
+      find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i \
+          -e "s|http://archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+          -e "s|http://azure\.archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+          -e "s|http://archive\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+          -e "s|http://azure\.archive\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+          -e "s|http://security\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+          -e "s|http://security\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
+          {} +; \
+      # Reproducibility guard: after the rewrite EVERY active apt source MUST be
+      # the frozen snapshot.  A leftover live host — security.ubuntu.com (the
+      # amd64 `-security` pocket, a SEPARATE deb822 stanza on 24.04), or any
+      # mirror a future base image introduces — would let phase-2 resolve
+      # drifting package versions and silently break the v0.1.1 cross-run
+      # reproduction.  An allowlist (must be snapshot) is airtight where a host
+      # blocklist would miss a newly-introduced mirror.  `#` comments are
+      # stripped first so commented example URLs (e.g. help.ubuntu.com) cannot
+      # false-trip it.
       bad="$(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec cat {} + 2>/dev/null \
               | sed 's/#.*//' \
               | grep -oE 'https?://[^[:space:]]+' \
@@ -146,8 +194,9 @@ RUN set -eu; \
         exit 1; \
       fi; \
     fi; \
-    # Drop the phase-1 (live-mirror) package lists so the phase-2 update and the
-    # candidate-version resolution below see ONLY the snapshot archive.
+    # Drop the phase-1 / base-image package lists so the phase-2 update and the
+    # candidate-version resolution below see ONLY the frozen archive (x64
+    # snapshot, or the arm64 ports.ubuntu.com release pocket).
     rm -rf /var/lib/apt/lists/*; \
     # Phase 2 — install the real set from the frozen snapshot.  `update`,
     # ca-certificates candidate resolution, AND `install` live in ONE retry loop
@@ -158,16 +207,15 @@ RUN set -eu; \
     # split update/install loop would instead hammer a doomed install against
     # incomplete lists and never recover.
     #
-    # Phase 1 installed ca-certificates from the LIVE mirror, whose version can
-    # be NEWER than the snapshot's; a plain `apt-get install ca-certificates`
-    # will NOT downgrade it, so the live (drifting) bytes would bake into the
-    # rootfs and break the v0.1.1 SHA backfill.  Pinning to the snapshot
-    # CANDIDATE version with --allow-downgrades forces the baked version to the
-    # snapshot's, regardless of what the live mirror served.  (apt's candidate is
-    # the snapshot version even when a newer one is installed, because the
-    # configured source outranks the dpkg-status pseudo-version.)  cc_ver is
-    # resolved INSIDE the loop, after each fresh update, so it reflects the
-    # fully-fetched snapshot lists; an empty resolution fails the attempt.
+    # On x64, phase 1 installed ca-certificates from the LIVE mirror, whose
+    # version can differ from the snapshot's; pinning to the snapshot CANDIDATE
+    # version with --allow-downgrades forces the baked version to the snapshot's
+    # (frozen), regardless of what the live mirror served.  On arm64 nothing was
+    # pre-installed (phase 1 is skipped), so the candidate IS the frozen ports
+    # release-pocket version and no downgrade is needed — the same pin bakes the
+    # frozen version on both arches.  cc_ver is resolved INSIDE the loop, after
+    # each fresh update, so it reflects the fully-fetched lists; an empty
+    # resolution fails the attempt.
     for attempt in 1 2 3 4 5; do \
       if apt-get update \
          && cc_ver="$(apt-cache policy ca-certificates | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p')" \
