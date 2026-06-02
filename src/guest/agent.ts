@@ -355,6 +355,23 @@ export interface StraceTailerOptions {
   /** Extra drain time in ms after child exit to catch final writes (default 100). */
   drainMs?: number;
   /**
+   * Hard cap (ms) on the post-exit settle loop that re-scans the per-pid
+   * strace files until the capture stops growing (default 2000).  The loop
+   * NEVER kills strace — by the time it runs strace has already exited and
+   * flushed+closed every per-pid file, so this only bounds how long the
+   * tailer keeps RE-READING.  Generous because all files are already final.
+   */
+  settleHardCapMs?: number;
+  /**
+   * Number of consecutive settle passes that must observe NO new per-pid
+   * file and NO new bytes before the tailer concludes the capture is
+   * complete (default 2).  A single `readdirSync` can momentarily miss a
+   * just-created per-pid file (the sub-millisecond cmd-shim helpers
+   * `dirname`/`sed`/`uname` are the motivating case); requiring two quiet
+   * passes closes that enumeration window deterministically.
+   */
+  settleQuietPasses?: number;
+  /**
    * Optional callback invoked once with the pid of the FIRST per-pid
    * strace output file discovered during tailing — i.e. the install
    * command's pid (strace's direct child).  Used by
@@ -402,6 +419,16 @@ export async function* runStraceTailer(
 ): AsyncGenerator<{ pid: number; line: string; source: LineSource }> {
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const drainMs = opts.drainMs ?? 100;
+  const settleHardCapMs = opts.settleHardCapMs ?? 2000;
+  const settleQuietPasses = opts.settleQuietPasses ?? 2;
+
+  // Bounded async sleep used by the post-exit settle loop.  `unref` so a
+  // pending delay never by itself keeps the process alive.
+  const delay = (ms: number): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, ms);
+      (t as unknown as { unref?: () => void }).unref?.();
+    });
 
   // Shared queue: all sources push here; the generator drains it.
   const queue: Array<{ pid: number; line: string; source: LineSource }> = [];
@@ -920,43 +947,100 @@ export async function* runStraceTailer(
 
   // ---- wait for child exit, then drain -------------------------------------
 
-  opts.exitPromise.then(() => {
-    // Give strace one more drain interval to flush trailing writes.
-    setTimeout(() => {
-      // Final poll
-      pollDir();
+  opts.exitPromise.then(async () => {
+    // By the time exitPromise resolves, strace has already fclose()'d every
+    // per-pid file: it exits only after the whole traced process tree has
+    // exited, and the agent NEVER kills it (no SIGKILL/SIGTERM anywhere in
+    // LinuxStraceRunner.run).  So every byte of the capture is already on
+    // disk — the only remaining job is to make sure the tailer READS all of
+    // it.  A single `readdirSync` can momentarily miss a just-created per-pid
+    // file (the sub-millisecond cmd-shim helpers dirname/sed/uname are the
+    // motivating case: each writes a tiny `<basePrefix>.<pid>` file that can
+    // come and go between two 50ms polls and be visible only now).  The old
+    // code did ONE final pollDir() after a blind drainMs wait, so any file
+    // not yet listed — or read short — on that single sweep was dropped,
+    // producing a nondeterministic capture that diverged from the macOS
+    // backend.  Replace it with a bounded settle loop that re-enumerates and
+    // re-reads until the capture stops growing.
+    //
+    // INVARIANT: this loop must NEVER kill strace.  A SIGKILL would truncate
+    // per-pid files mid-flush — the exact data loss being fixed.  The hard
+    // cap only stops TAILING; strace has already exited by construction, so
+    // file sizes are final and the loop reaches a fixed point quickly.
+    const hardDeadline = Date.now() + settleHardCapMs;
+    let quiet = 0;
+    let prev = '';
+    // Monotonic snapshot of total capture progress: per-pid file count +
+    // summed read offsets + buffered partial lengths + the events-file
+    // offset/partial.  It only ever increases while data is discovered or
+    // read, so equality across two passes means nothing new appeared.
+    const progressKey = (): string => {
+      let posSum = 0;
+      for (const p of filePos.values()) posSum += p;
+      let bufSum = 0;
+      for (const b of fileBuf.values()) bufSum += b.length;
+      return `${filePos.size}:${posSum}:${eventsPos}:${bufSum}:${eventsBuf.length}`;
+    };
+    // First tick keeps the old short drainMs grace (cheap initial settle for
+    // filesystems with lazy dirent visibility); completeness no longer
+    // depends on it — the loop below is what guarantees it.
+    await delay(drainMs);
+    for (;;) {
+      pollDir(); // re-enumerates ALL matching files; drainFile reads each to current EOF
       drainEventsFile();
-      // Flush any partial lines in per-pid buffers (strace may omit final \n).
-      for (const [name, partial] of fileBuf) {
-        if (partial.length > 0) {
-          const pid = parsePidFromFilename(name);
-          queue.push({ pid, line: partial, source: 'strace' });
-          fileBuf.set(name, '');
-        }
+      const cur = progressKey();
+      if (cur === prev) {
+        if (++quiet >= settleQuietPasses) break;
+      } else {
+        quiet = 0;
       }
-      // Same for the events-file partial buffer (defensive — writers always
-      // emit \n-terminated lines, but POSIX doesn't require atomic writes
-      // across newlines so a partial chunk is technically possible).
-      if (eventsBuf.length > 0) {
-        // A trailing partial chunk on the shim channel is unusual but not
-        // necessarily malicious (writer crashed mid-line, kernel buffer
-        // boundary, etc.).  Still tag it `'shim'` so the install-phase
-        // dispatcher routes it to the shim parser; a parse failure there
-        // will record tamper, which is the right outcome — we cannot
-        // distinguish a benign torn write from a deliberate prefix
-        // injection at this layer.
-        queue.push({ pid: 0, line: eventsBuf, source: 'shim' });
-        eventsBuf = '';
+      prev = cur;
+      if (Date.now() >= hardDeadline) break; // safety net — never hang
+      await delay(pollIntervalMs);
+    }
+    if (quiet < settleQuietPasses) {
+      // Cap hit before quiescence.  Surface a visible diagnostic so an
+      // incomplete capture is never silently clean, but do NOT fail closed
+      // here: a false positive would break CI on a slow backend, and the cap
+      // is generous precisely because every per-pid file is already closed.
+      try {
+        process.stderr.write(
+          `[strace-tailer] settle cap (${settleHardCapMs}ms) hit before quiescence; capture may be incomplete\n`,
+        );
+      } catch {
+        // stderr write is best-effort.
       }
-      // Stop the poll timer.
-      if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
-      // Stop fs.watch.
-      if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
-      if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
-      if (eventsDirWatcher !== null) { try { eventsDirWatcher.close(); } catch { /* ignore */ } eventsDirWatcher = null; }
-      done = true;
-      wake();
-    }, drainMs);
+    }
+    // Flush any partial lines in per-pid buffers (strace may omit final \n).
+    for (const [name, partial] of fileBuf) {
+      if (partial.length > 0) {
+        const pid = parsePidFromFilename(name);
+        queue.push({ pid, line: partial, source: 'strace' });
+        fileBuf.set(name, '');
+      }
+    }
+    // Same for the events-file partial buffer (defensive — writers always
+    // emit \n-terminated lines, but POSIX doesn't require atomic writes
+    // across newlines so a partial chunk is technically possible).
+    if (eventsBuf.length > 0) {
+      // A trailing partial chunk on the shim channel is unusual but not
+      // necessarily malicious (writer crashed mid-line, kernel buffer
+      // boundary, etc.).  Still tag it `'shim'` so the install-phase
+      // dispatcher routes it to the shim parser; a parse failure there
+      // will record tamper, which is the right outcome — we cannot
+      // distinguish a benign torn write from a deliberate prefix
+      // injection at this layer.
+      queue.push({ pid: 0, line: eventsBuf, source: 'shim' });
+      eventsBuf = '';
+    }
+    // Stop the poll timer.
+    if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+    // Stop fs.watch.
+    if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
+    if (eventsWatcher !== null) { try { eventsWatcher.close(); } catch { /* ignore */ } eventsWatcher = null; }
+    if (eventsDirWatcher !== null) { try { eventsDirWatcher.close(); } catch { /* ignore */ } eventsDirWatcher = null; }
+    done = true;
+    wake();
   }).catch(() => {
     done = true;
     wake();

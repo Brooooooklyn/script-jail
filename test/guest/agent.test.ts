@@ -1718,6 +1718,180 @@ describe('runStraceTailer', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Post-exit settle-loop completeness (capture-race regression, parity fix)
+  //
+  // strace `-ff` writes one file per traced pid; sub-millisecond cmd-shim
+  // helpers (dirname/sed/uname) each leave a tiny per-pid file that a single
+  // terminal `readdirSync` can miss or read short. The old tailer did ONE
+  // final poll after a blind drainMs and dropped anything not listed then,
+  // producing a capture that diverged from the macOS backend. The fix gates
+  // on strace's own exit (all per-pid files already flushed) and re-scans in
+  // a bounded settle loop until two passes see no new file and no new bytes.
+  // -------------------------------------------------------------------------
+
+  it('captures short-lived per-pid files that appear after the initial drain (re-enumerates until quiescent)', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    // The install-root pid file exists throughout, as in a real run.
+    writeFileSync(`${basePath}.1000`, 'execve("/usr/bin/node", ["node"], ...) = 0\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 10,
+      settleQuietPasses: 2,
+      settleHardCapMs: 4000,
+    });
+
+    resolveExit();
+
+    // Keep the root file growing so the settle loop stays non-quiescent, and
+    // partway through materialize three sub-millisecond cmd-shim helper files
+    // (dirname/sed/uname analogues). They appear well AFTER the old single
+    // drainMs sweep, so the old single-shot terminal poll dropped them; the
+    // settle loop must re-enumerate and pick all three up. Then stop the
+    // keep-alive so the loop quiesces. The keep-alive window (~100ms) is wide
+    // relative to scheduling jitter, so the helper writes land deterministically
+    // before quiescence without a tight timing assumption.
+    let ticks = 0;
+    const keepalive = setInterval(() => {
+      ticks += 1;
+      try {
+        appendFileSync(`${basePath}.1000`, `read(${ticks}) = 0\n`);
+        if (ticks === 3) {
+          writeFileSync(`${basePath}.1001`, 'execve("/usr/bin/dirname", ["dirname"], ...) = 0\n', 'utf8');
+          writeFileSync(`${basePath}.1002`, 'execve("/usr/bin/sed", ["sed"], ...) = 0\n', 'utf8');
+          writeFileSync(`${basePath}.1003`, 'execve("/usr/bin/uname", ["uname"], ...) = 0\n', 'utf8');
+        }
+      } catch { /* dir may be torn down once the tailer finishes */ }
+      if (ticks >= 5) { clearInterval(keepalive); }
+    }, 20);
+
+    const items = await collect(tailer, 4000);
+    clearInterval(keepalive);
+
+    const helperPids = items
+      .map((i) => i.pid)
+      .filter((p) => p >= 1001 && p <= 1003)
+      .sort((a, b) => a - b);
+    expect(helperPids).toEqual([1001, 1002, 1003]);
+    // The root file's execve is captured too.
+    expect(items.some((i) => i.pid === 1000 && i.line.includes('node'))).toBe(true);
+  });
+
+  it('completes a per-pid line that was only partially written at exit time', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    // A partial line (no trailing newline) is present when the child exits;
+    // the remainder + newline arrives a few ms into the settle window. The
+    // settle loop must read the file to EOF across passes and emit the full
+    // line — not a torn fragment.
+    writeFileSync(`${basePath}.2002`, 'execve("/usr/bin/uname", ["unam', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 10,
+      settleQuietPasses: 2,
+      settleHardCapMs: 4000,
+    });
+
+    resolveExit();
+    setTimeout(() => {
+      try { appendFileSync(`${basePath}.2002`, 'e"], ...) = 0\n'); } catch { /* ignore */ }
+    }, 25);
+
+    const items = await collect(tailer, 4000);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toEqual({
+      pid: 2002,
+      line: 'execve("/usr/bin/uname", ["uname"], ...) = 0',
+      source: 'strace',
+    });
+  });
+
+  it('terminates promptly once the capture is quiescent (does not run to the hard cap)', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+    writeFileSync(`${basePath}.3003`, 'execve("/bin/true", ["true"], ...) = 0\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 10,
+      drainMs: 10,
+      settleQuietPasses: 2,
+      settleHardCapMs: 5000, // generous; must finish far sooner via quiescence
+    });
+
+    resolveExit();
+    const start = Date.now();
+    const items = await collect(tailer, 4000);
+    const elapsed = Date.now() - start;
+
+    expect(items).toHaveLength(1);
+    // drainMs(10) + ~2 quiet passes * pollInterval(10) ≈ 30ms; assert it is
+    // nowhere near the 5000ms hard cap (generous slack for CI scheduling).
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it('always terminates by the hard cap even if new per-pid files keep appearing', async () => {
+    const basePath = join(tailerDir, 'strace.out');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 10,
+      settleQuietPasses: 2,
+      settleHardCapMs: 150, // small cap so the no-hang guarantee is fast to test
+    });
+
+    resolveExit();
+    // Create a new per-pid file faster than the poll interval so every settle
+    // pass sees fresh progress and the quiet target can never be met — only
+    // the hard cap can stop the loop. The cap must NOT kill strace (there is
+    // none here); it only stops tailing.
+    let n = 0;
+    const spawner = setInterval(() => {
+      n += 1;
+      try {
+        writeFileSync(`${basePath}.${5000 + n}`, `execve("/bin/x${n}", ["x"], ...) = 0\n`, 'utf8');
+      } catch { /* ignore */ }
+    }, 5);
+
+    const start = Date.now();
+    const items = await collect(tailer, 4000);
+    const elapsed = Date.now() - start;
+    clearInterval(spawner);
+
+    // It terminated (no hang) and yielded what it had seen. Bounded by the
+    // 150ms cap plus a final flush + scheduling slack — far below collect()'s
+    // 4000ms timeout.
+    expect(elapsed).toBeLessThan(2000);
+    expect(items.length).toBeGreaterThan(0);
+  });
+
+  // -------------------------------------------------------------------------
   // Events-file tail tests (the production channel for shim + JS preloads)
   // -------------------------------------------------------------------------
 
