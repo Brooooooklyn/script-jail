@@ -69,3 +69,64 @@ describe('Dockerfile.base snapshot/reproducibility wiring', () => {
     expect(DOCKERFILE).toMatch(/Acquire::Check-Valid-Until "false"/);
   });
 });
+
+describe('Dockerfile.base arm64 frozen-release-pocket wiring (Option A)', () => {
+  // arm64 has no public ubuntu-ports snapshot (every ubuntu-ports path 401s on
+  // snapshot.ubuntu.com), so instead of the snapshot it OVERWRITES the base apt
+  // sources with a single deb822 stanza for the FROZEN release pocket — the bare
+  // `<codename>` suite on ports.ubuntu.com, dropping the moving
+  // -updates/-security/-backports pockets that were the only arm64 drift source.
+  // The release pocket is immutable + GPG-signed for the release's whole support
+  // life, so package versions reproduce across runs (verified empirically in a
+  // local linux/arm64 container). These text assertions lock that wiring in.
+  it('takes a dedicated arm64 branch keyed on VP_ARCH', () => {
+    expect(DOCKERFILE).toMatch(/if \[ "\$\{VP_ARCH\}" = "arm64" \]; then/);
+  });
+
+  it('writes a deb822 release-pocket source on ports.ubuntu.com with the bare codename suite + pinned keyring', () => {
+    expect(DOCKERFILE).toContain('URIs: http://ports.ubuntu.com/ubuntu-ports/');
+    // Bare `<codename>` suite (no -updates/-security/-backports), resolved from
+    // /etc/os-release so it works for both jammy (22.04) and noble (24.04).
+    expect(DOCKERFILE).toContain("printf 'Suites: %s\\n' \"$codename\"");
+    expect(DOCKERFILE).toContain(
+      'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg',
+    );
+    // Overwrite (rm) the base sources — both the 22.04 one-line sources.list and
+    // the 24.04 deb822 ubuntu.sources (incl. its separate -security stanza).
+    expect(DOCKERFILE).toMatch(
+      /rm -f \/etc\/apt\/sources\.list \/etc\/apt\/sources\.list\.d\/\*\.list \/etc\/apt\/sources\.list\.d\/\*\.sources/,
+    );
+  });
+
+  it('runs an arm64 allowlist guard (ports host AND no moving pocket) that hard-fails', () => {
+    // Host allowlist: every active source must be ports.ubuntu.com/ubuntu-ports.
+    expect(DOCKERFILE).toContain(
+      "grep -vE '^http://ports\\.ubuntu\\.com/ubuntu-ports/?$'",
+    );
+    // Pocket guard: no -updates/-security/-backports suite may survive.
+    expect(DOCKERFILE).toContain(
+      "grep -oE '[a-z]+-(updates|security|backports)'",
+    );
+    expect(DOCKERFILE).toMatch(/arm64 apt source is not the frozen/);
+    // Must hard-fail the build (exit 1), considering BOTH the host and pocket checks.
+    expect(DOCKERFILE).toMatch(
+      /if \[ -n "\$bad" \] \|\| \[ -n "\$badpocket" \]; then[\s\S]*?exit 1;/,
+    );
+  });
+
+  it('skips the live ca-certificates bootstrap on arm64 (it lives only in the x64 else branch)', () => {
+    // The phase-1 live-mirror bootstrap MUST appear after the `else` (x64), not
+    // before the arch `if` — else arm64 would install a DRIFTING live -updates
+    // ca-certificates that the release-pocket candidate-pin cannot downgrade.
+    const elseIdx = DOCKERFILE.indexOf('else \\');
+    const bootstrapIdx = DOCKERFILE.indexOf(
+      'ca-certificates bootstrap failed after 5 attempts',
+    );
+    expect(elseIdx, 'arch if/else must exist').toBeGreaterThan(-1);
+    expect(bootstrapIdx, 'phase-1 bootstrap must exist').toBeGreaterThan(-1);
+    expect(
+      bootstrapIdx,
+      'phase-1 ca-cert bootstrap must be inside the x64 else branch',
+    ).toBeGreaterThan(elseIdx);
+  });
+});

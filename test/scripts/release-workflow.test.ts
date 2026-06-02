@@ -46,6 +46,7 @@ interface WorkflowStep {
 
 interface ParsedJob {
   permissions?: Record<string, string> | string;
+  needs?: string | string[];
   steps?: WorkflowStep[];
 }
 
@@ -233,5 +234,94 @@ describe('release.yml publish job (PKG-5)', () => {
       gateIdx,
       'the GHCR digest gate must run before any npm publish',
     ).toBeLessThan(publishIdx);
+  });
+});
+
+// The `build` job rebuilds each rootfs ext4 in-run and asserts its CANONICAL
+// hash (volatile superblock time fields masked) reproduces — for BOTH arches.
+// This is load-bearing for the two-tag manifest bootstrap: v0.1.0 publishes
+// PLACEHOLDER SHAs and v0.1.1 backfills the REAL canonical hashes, so the
+// v0.1.1 build must reproduce v0.1.0's released bytes. A reproducibility
+// regression therefore has to FAIL the release build, not surface later as an
+// unfixable backfill SHA mismatch (by which point v0.1.0 is immutable on npm).
+// arm64 can't share the x64 snapshot (no public ubuntu-ports snapshot) so it
+// pins the frozen ports.ubuntu.com release pocket and gets its own gate; this
+// block guards that the arm64 gate exists and runs pre-publish.
+describe('release.yml build job rootfs reproducibility gates', () => {
+  const parsed = parseYaml(readFileSync(WORKFLOW_PATH, 'utf8')) as ParsedWorkflow;
+  const buildJob = parsed.jobs?.build;
+  const publishJob = parsed.jobs?.publish;
+  const steps = buildJob?.steps ?? [];
+  const stepNames = steps.map((s) => s.name ?? '');
+  const byName = (re: RegExp): WorkflowStep | undefined =>
+    steps.find((s) => re.test(s.name ?? ''));
+
+  it('defines a build job with an x64 canonical-reproducibility gate (both majors)', () => {
+    const gate = byName(/x64 rootfs ext4s are canonical-reproducible/i);
+    expect(gate, 'x64 reproducibility gate step must exist').toBeDefined();
+    const run = gate!.run ?? '';
+    expect(run, 'gate must compare CANONICAL hashes via repro-hash-cli').toContain(
+      'repro-hash-cli.cjs',
+    );
+    expect(run).toContain('ubuntu-24.04');
+    expect(run).toContain('ubuntu-22.04');
+    expect(run).toMatch(/is not canonical-reproducible/);
+    expect(run).toContain('exit 1');
+  });
+
+  it('defines an arm64 canonical-reproducibility gate covering both majors', () => {
+    // The review-mandated gate: arm64 reproducibility must be PROVEN in-run
+    // before the irreversible v0.1.0 publish, not first tested at the v0.1.1
+    // backfill (when v0.1.0's arm64 bytes are already immutable on npm).
+    const gate = byName(/arm64 rootfs ext4s are canonical-reproducible/i);
+    expect(gate, 'arm64 reproducibility gate step must exist').toBeDefined();
+    const run = gate!.run ?? '';
+    expect(run, 'gate must compare CANONICAL hashes via repro-hash-cli').toContain(
+      'repro-hash-cli.cjs',
+    );
+    expect(run, 'gate must rebuild the arm64 image').toContain('--arch=arm64');
+    expect(run, 'gate must compare the arm64 ext4 artifacts').toMatch(
+      /rootfs-\$\{major\}-arm64\.ext4/,
+    );
+    expect(run).toContain('assert_reproducible_arm64 ubuntu-24.04');
+    expect(run).toContain('assert_reproducible_arm64 ubuntu-22.04');
+    expect(run).toMatch(/is not canonical-reproducible/);
+    expect(run).toContain('exit 1');
+  });
+
+  it('runs the arm64 gate after the arm64 builds and before the x64 shim restore', () => {
+    // The gate rebuilds the arm64 image, which re-stages the arm64 shim to the
+    // single images/libscriptjail.so COPY target — so it must run while that
+    // path still holds the arm64 shim, i.e. before "Restore x64 shim artifact".
+    const armBuildIdx = stepNames.findIndex((n) =>
+      /Build rootfs \(ubuntu-24\.04, arm64\)/.test(n),
+    );
+    const gateIdx = stepNames.findIndex((n) =>
+      /arm64 rootfs ext4s are canonical-reproducible/i.test(n),
+    );
+    const restoreIdx = stepNames.findIndex((n) => /Restore x64 shim/i.test(n));
+    expect(armBuildIdx, 'arm64 build step must exist').toBeGreaterThan(-1);
+    expect(gateIdx, 'arm64 gate must exist').toBeGreaterThan(-1);
+    expect(restoreIdx, 'x64 shim restore step must exist').toBeGreaterThan(-1);
+    expect(
+      gateIdx,
+      'arm64 gate must run after the arm64 rootfs builds',
+    ).toBeGreaterThan(armBuildIdx);
+    expect(
+      gateIdx,
+      'arm64 gate must run before the x64 shim restore (rebuild needs the arm64 shim staged)',
+    ).toBeLessThan(restoreIdx);
+  });
+
+  it('gates reproducibility before publish (publish depends on build)', () => {
+    // The gates live in `build`; the irreversible npm publish lives in
+    // `publish`. `publish: needs: build` is what makes the gates block the
+    // publish — without it the publish could run on a non-reproducible build.
+    const needs = publishJob?.needs;
+    const needsArr = Array.isArray(needs) ? needs : needs ? [needs] : [];
+    expect(
+      needsArr,
+      'publish job must `needs: build` so the reproducibility gates run first',
+    ).toContain('build');
   });
 });
