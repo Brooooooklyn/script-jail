@@ -28691,6 +28691,9 @@ async function* runStraceTailer(opts) {
       await delay(pollIntervalMs);
     }
     if (quiet < settleQuietPasses) {
+      recordTamper(
+        `strace capture did not quiesce within ${settleHardCapMs}ms after the traced process tree exited; capture may be incomplete`
+      );
       try {
         process.stderr.write(
           `[strace-tailer] settle cap (${settleHardCapMs}ms) hit before quiescence; capture may be incomplete

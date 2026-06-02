@@ -1849,8 +1849,13 @@ describe('runStraceTailer', () => {
     expect(elapsed).toBeLessThan(1000);
   });
 
-  it('always terminates by the hard cap even if new per-pid files keep appearing', async () => {
+  it('fails closed (records tamper) and terminates when the capture never quiesces by the hard cap', async () => {
     const basePath = join(tailerDir, 'strace.out');
+    // Fail-closed contract: a capture the tailer could not confirm complete
+    // must NOT pass as a clean lockfile. The cap-hit records tamper through
+    // tamperRef, which runInstallPhase/main read via getTamperReason() to
+    // refuse emitting a final lockfile.
+    const tamperRef: { reason: string | null } = { reason: null };
 
     let resolveExit!: () => void;
     const exitPromise = new Promise<void>((r) => { resolveExit = r; });
@@ -1860,6 +1865,7 @@ describe('runStraceTailer', () => {
       basePrefix: 'strace.out',
       fd3Stream: null,
       exitPromise,
+      tamperRef,
       pollIntervalMs: 20,
       drainMs: 10,
       settleQuietPasses: 2,
@@ -1884,11 +1890,15 @@ describe('runStraceTailer', () => {
     const elapsed = Date.now() - start;
     clearInterval(spawner);
 
-    // It terminated (no hang) and yielded what it had seen. Bounded by the
-    // 150ms cap plus a final flush + scheduling slack — far below collect()'s
-    // 4000ms timeout.
+    // It terminated (no hang) — bounded by the 150ms cap plus a final flush +
+    // scheduling slack, far below collect()'s 4000ms timeout — and yielded
+    // what it had seen.
     expect(elapsed).toBeLessThan(2000);
     expect(items.length).toBeGreaterThan(0);
+    // …and it fails closed: the incomplete capture is recorded as tamper so it
+    // can never be emitted as a clean lockfile.
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/did not quiesce|capture may be incomplete/);
   });
 
   // -------------------------------------------------------------------------

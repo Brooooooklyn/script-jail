@@ -360,6 +360,10 @@ export interface StraceTailerOptions {
    * NEVER kills strace — by the time it runs strace has already exited and
    * flushed+closed every per-pid file, so this only bounds how long the
    * tailer keeps RE-READING.  Generous because all files are already final.
+   * If the loop reaches this cap WITHOUT two quiet passes, the capture could
+   * not be confirmed complete: the tailer records tamper (via {@link
+   * tamperRef}) so the agent fails closed rather than emit a clean-looking
+   * lockfile from a possibly-incomplete capture.
    */
   settleHardCapMs?: number;
   /**
@@ -999,10 +1003,24 @@ export async function* runStraceTailer(
       await delay(pollIntervalMs);
     }
     if (quiet < settleQuietPasses) {
-      // Cap hit before quiescence.  Surface a visible diagnostic so an
-      // incomplete capture is never silently clean, but do NOT fail closed
-      // here: a false positive would break CI on a slow backend, and the cap
-      // is generous precisely because every per-pid file is already closed.
+      // Cap hit before quiescence.  FAIL CLOSED: this is a security audit
+      // tool, and a capture the tailer could not confirm complete must never
+      // pass as a clean lockfile (a dropped execve/open/connect line could be
+      // the only evidence of escaped behavior).  Record it through the same
+      // tamperRef the events-file watcher uses, so runInstallPhase / main
+      // refuse to emit a final lockfile (see getTamperReason() consumers).
+      //
+      // This is NOT expected to fire in normal OR adversarial operation: by
+      // the time this loop runs strace has exited, so every per-pid file is
+      // closed and the shim writers are dead — the capture is final and
+      // quiesces within ~2 passes, orders of magnitude under the cap.  Hitting
+      // the cap means the filesystem never settled (or an unexpected writer is
+      // still active), which is itself an anomaly worth failing closed on.
+      recordTamper(
+        `strace capture did not quiesce within ${settleHardCapMs}ms after the traced ` +
+          `process tree exited; capture may be incomplete`,
+      );
+      // Also log to stderr for immediate visibility in the guest console.
       try {
         process.stderr.write(
           `[strace-tailer] settle cap (${settleHardCapMs}ms) hit before quiescence; capture may be incomplete\n`,
