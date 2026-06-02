@@ -7364,7 +7364,7 @@ __export(index_exports, {
   run: () => run
 });
 module.exports = __toCommonJS(index_exports);
-var import_node_fs18 = require("node:fs");
+var import_node_fs19 = require("node:fs");
 var import_node_os8 = require("node:os");
 var import_node_path15 = require("node:path");
 var import_node_url2 = require("node:url");
@@ -23800,14 +23800,14 @@ async function sha256File2(filePath) {
   });
 }
 var NodeHttpClient = class {
-  async download(url2, destPath, expectedSha256) {
+  async download(url2, destPath, expectedDigest, computeDigest = sha256File2) {
     const tmpPath = `${destPath}.tmp.${(0, import_node_crypto3.randomBytes)(4).toString("hex")}`;
     try {
       await downloadToFile(url2, tmpPath, 0);
-      const actual = await sha256File2(tmpPath);
-      if (actual !== expectedSha256) {
+      const actual = await computeDigest(tmpPath);
+      if (actual !== expectedDigest) {
         throw new Error(
-          `SHA-256 mismatch for ${url2}: expected ${expectedSha256}, got ${actual}`
+          `SHA-256 mismatch for ${url2}: expected ${expectedDigest}, got ${actual}`
         );
       }
       await (0, import_promises3.rename)(tmpPath, destPath);
@@ -24018,7 +24018,7 @@ var PINNED_MANIFEST = {
 
 // src/action/backend/firecracker.ts
 var import_node_crypto6 = require("node:crypto");
-var import_node_fs15 = require("node:fs");
+var import_node_fs16 = require("node:fs");
 var import_node_os7 = require("node:os");
 var import_node_path12 = require("node:path");
 var import_node_process3 = require("node:process");
@@ -24045,9 +24045,87 @@ function maybeClearCache(input) {
 }
 
 // src/action/pre-fetch-artifacts.ts
+var import_node_fs13 = require("node:fs");
+var import_node_path11 = require("node:path");
+
+// src/rootfs/repro-hash.ts
 var import_node_crypto5 = require("node:crypto");
 var import_node_fs12 = require("node:fs");
-var import_node_path11 = require("node:path");
+var EXT4_BLOCK_SIZE = 4096;
+var EXT4_BLOCKS_PER_GROUP = 8 * EXT4_BLOCK_SIZE;
+var EXT4_VOLATILE_SUPERBLOCK_FIELDS = [
+  [44, 4],
+  // s_mtime
+  [48, 4],
+  // s_wtime      — re-stamped to wall-clock on close (the real culprit)
+  [64, 4],
+  // s_lastcheck
+  [264, 4],
+  // s_mkfs_time
+  [1020, 4]
+  // s_checksum   — metadata_csum over the superblock, follows s_wtime
+];
+var SUPERBLOCK_STRUCT_BYTES = 1024;
+function hasSuperblock(group) {
+  if (group === 0 || group === 1) return true;
+  for (const base of [3, 5, 7]) {
+    let power = base;
+    while (power < group) power *= base;
+    if (power === group) return true;
+  }
+  return false;
+}
+function superblockByteOffset(group) {
+  return group === 0 ? SUPERBLOCK_STRUCT_BYTES : group * EXT4_BLOCKS_PER_GROUP * EXT4_BLOCK_SIZE;
+}
+function ext4VolatileByteRanges(imageSizeBytes) {
+  const totalBlocks = Math.floor(imageSizeBytes / EXT4_BLOCK_SIZE);
+  const numGroups = Math.ceil(totalBlocks / EXT4_BLOCKS_PER_GROUP);
+  const ranges = [];
+  for (let group = 0; group < numGroups; group += 1) {
+    if (!hasSuperblock(group)) continue;
+    const base = superblockByteOffset(group);
+    if (base + SUPERBLOCK_STRUCT_BYTES > imageSizeBytes) continue;
+    for (const [fieldOffset, length] of EXT4_VOLATILE_SUPERBLOCK_FIELDS) {
+      ranges.push([base + fieldOffset, length]);
+    }
+  }
+  return ranges;
+}
+function applyMaskToBuffer(buf, bufStart, ranges) {
+  const bufEnd = bufStart + buf.length;
+  for (const [rangeStart, length] of ranges) {
+    const rangeEnd = rangeStart + length;
+    const start = Math.max(rangeStart, bufStart);
+    const end = Math.min(rangeEnd, bufEnd);
+    if (start >= end) continue;
+    buf.fill(0, start - bufStart, end - bufStart);
+  }
+}
+function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
+  return new Promise((resolve4, reject) => {
+    const hash2 = (0, import_node_crypto5.createHash)("sha256");
+    const stream = (0, import_node_fs12.createReadStream)(
+      filePath,
+      chunkSize === void 0 ? void 0 : { highWaterMark: chunkSize }
+    );
+    let offset = 0;
+    stream.on("data", (chunk) => {
+      applyMaskToBuffer(chunk, offset, ranges);
+      offset += chunk.length;
+      hash2.update(chunk);
+    });
+    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("error", reject);
+  });
+}
+async function canonicalRootfsHash(filePath, chunkSize) {
+  const size = (0, import_node_fs12.statSync)(filePath).size;
+  const ranges = ext4VolatileByteRanges(size);
+  return hashFileWithMaskedRanges(filePath, ranges, chunkSize);
+}
+
+// src/action/pre-fetch-artifacts.ts
 function rootfsAssetName2(runnerImage, arch) {
   return arch === "arm64" ? `rootfs-${runnerImage}-arm64.ext4` : `rootfs-${runnerImage}.ext4`;
 }
@@ -24058,26 +24136,35 @@ async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
   const platform5 = input.platform ?? "linux";
   const arch = input.arch ?? "x64";
-  (0, import_node_fs12.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs13.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName2(runnerImage, arch);
   const wantedLibscriptjail = libscriptjailAssetName2(arch);
   const assets = [
     {
       name: wantedRootfs,
-      expected: requireExpected(manifest, platform5, wantedRootfs)
+      expected: requireExpected(manifest, platform5, wantedRootfs),
+      // The rootfs ext4 is pinned by its CANONICAL (time-masked) hash — see
+      // src/rootfs/repro-hash.ts.  Both the cache-hit check and the download
+      // verification below must hash it this way or every consumer rejects a
+      // perfectly valid release (raw bytes carry a build-time s_wtime that the
+      // manifest digest deliberately ignores).
+      digest: canonicalRootfsHash
     },
     {
       name: wantedLibscriptjail,
-      expected: requireExpected(manifest, platform5, wantedLibscriptjail)
+      expected: requireExpected(manifest, platform5, wantedLibscriptjail),
+      // The shim is a plain ELF: a raw SHA-256 of the released bytes.
+      digest: sha256File2
     }
   ];
   await Promise.all(
     assets.map(
-      ({ name, expected }) => ensureAsset({
+      ({ name, expected, digest }) => ensureAsset({
         http,
         url: assetUrl(manifest, name),
         destPath: (0, import_node_path11.join)(imagesDir, name),
-        expectedSha256: expected
+        expectedDigest: expected,
+        computeDigest: digest
       })
     )
   );
@@ -24101,29 +24188,20 @@ function requireExpected(manifest, platform5, asset) {
   return sha;
 }
 async function ensureAsset(args) {
-  const { http, url: url2, destPath, expectedSha256 } = args;
-  if ((0, import_node_fs12.existsSync)(destPath)) {
-    const actual = await sha256File3(destPath);
-    if (actual === expectedSha256) return;
+  const { http, url: url2, destPath, expectedDigest, computeDigest } = args;
+  if ((0, import_node_fs13.existsSync)(destPath)) {
+    const actual = await computeDigest(destPath);
+    if (actual === expectedDigest) return;
     console.warn(
-      `[pre-fetch] SHA-256 mismatch for cached ${destPath}. Expected ${expectedSha256}, got ${actual}. Re-downloading.`
+      `[pre-fetch] digest mismatch for cached ${destPath}. Expected ${expectedDigest}, got ${actual}. Re-downloading.`
     );
   }
-  await http.download(url2, destPath, expectedSha256);
-}
-async function sha256File3(filePath) {
-  return new Promise((resolve4, reject) => {
-    const hash2 = (0, import_node_crypto5.createHash)("sha256");
-    const stream = (0, import_node_fs12.createReadStream)(filePath);
-    stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve4(hash2.digest("hex")));
-    stream.on("error", reject);
-  });
+  await http.download(url2, destPath, expectedDigest, computeDigest);
 }
 
 // src/action/firecracker/launch.ts
 var import_node_http2 = require("node:http");
-var import_node_fs13 = require("node:fs");
+var import_node_fs14 = require("node:fs");
 var import_promises5 = require("node:fs/promises");
 var import_node_child_process3 = require("node:child_process");
 var import_node_process2 = require("node:process");
@@ -24148,7 +24226,7 @@ async function launchVm(input) {
         `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
-    if (!(0, import_node_fs13.existsSync)("/dev/kvm")) {
+    if (!(0, import_node_fs14.existsSync)("/dev/kvm")) {
       throw new Error(
         "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
@@ -24300,7 +24378,7 @@ var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((0, import_node_fs13.existsSync)(socketPath)) return;
+      if ((0, import_node_fs14.existsSync)(socketPath)) return;
       await sleep(50);
     }
     throw new Error(`Timeout waiting for socket: ${socketPath}`);
@@ -24505,7 +24583,7 @@ function socketToDuplex(sock) {
 
 // src/action/firecracker/teardown.ts
 var import_promises6 = require("node:fs/promises");
-var import_node_fs14 = require("node:fs");
+var import_node_fs15 = require("node:fs");
 async function teardown(handles) {
   if (handles.vsock !== null) {
     await safeRun("close vsock session", () => handles.vsock.close());
@@ -24546,7 +24624,7 @@ async function safeRun(label, fn) {
   }
 }
 async function removeIfExists(filePath) {
-  if (!(0, import_node_fs14.existsSync)(filePath)) return;
+  if (!(0, import_node_fs15.existsSync)(filePath)) return;
   try {
     await (0, import_promises6.unlink)(filePath);
   } catch (err) {
@@ -24665,7 +24743,7 @@ function createFirecrackerBackend(deps) {
   const doLaunchVm = deps.launchVm ?? launchVm;
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
-  const checkExists = deps.existsSync ?? import_node_fs15.existsSync;
+  const checkExists = deps.existsSync ?? import_node_fs16.existsSync;
   const hostPlatform = deps.platform ?? import_node_process3.platform;
   return {
     name: "firecracker",
@@ -24792,18 +24870,18 @@ async function launchFirecracker(input) {
 var import_node_crypto7 = require("node:crypto");
 
 // src/action/backend/stage.ts
-var import_node_fs16 = require("node:fs");
+var import_node_fs17 = require("node:fs");
 var import_node_path13 = require("node:path");
 var import_yaml3 = __toESM(require_dist(), 1);
 function stageRepoDirectory(input) {
-  const stageRoot = (0, import_node_fs16.mkdtempSync)((0, import_node_path13.join)(input.parentDir, "repo-stage-"));
+  const stageRoot = (0, import_node_fs17.mkdtempSync)((0, import_node_path13.join)(input.parentDir, "repo-stage-"));
   const repoStage = (0, import_node_path13.join)(stageRoot, "work");
-  (0, import_node_fs16.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
+  (0, import_node_fs17.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
   materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
   return {
     path: repoStage,
     cleanup: () => {
-      (0, import_node_fs16.rmSync)(stageRoot, { recursive: true, force: true });
+      (0, import_node_fs17.rmSync)(stageRoot, { recursive: true, force: true });
     }
   };
 }
@@ -24832,26 +24910,26 @@ function writeOverlayFile2(root, relPath, content) {
     ensureRealDirectory2(dir);
   }
   const dest = (0, import_node_path13.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs16.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs16.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  (0, import_node_fs17.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs17.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory2(path) {
-  if (!(0, import_node_fs16.existsSync)(path)) {
-    (0, import_node_fs16.mkdirSync)(path, { recursive: true });
+  if (!(0, import_node_fs17.existsSync)(path)) {
+    (0, import_node_fs17.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs16.lstatSync)(path);
+  const stat = (0, import_node_fs17.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs16.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs16.mkdirSync)(path, { recursive: true });
+  (0, import_node_fs17.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs17.mkdirSync)(path, { recursive: true });
 }
 function rewriteConfigWorkDir(input) {
-  const raw = (0, import_node_fs16.readFileSync)(input.configPath, "utf8");
+  const raw = (0, import_node_fs17.readFileSync)(input.configPath, "utf8");
   const parsed = (0, import_yaml3.parse)(raw);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   config2["work_dir"] = input.workDir;
   const outPath = (0, import_node_path13.join)(input.outDir, "config.backend.yml");
-  (0, import_node_fs16.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
+  (0, import_node_fs17.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
   return outPath;
 }
 
@@ -25024,7 +25102,7 @@ function resolveDockerImageRef(ctx, opts = {}) {
 }
 
 // src/action/backend/bare.ts
-var import_node_fs17 = require("node:fs");
+var import_node_fs18 = require("node:fs");
 var import_node_path14 = require("node:path");
 var import_node_process4 = require("node:process");
 function createBareBackend(deps = {}) {
@@ -25128,7 +25206,7 @@ function currentModuleDir() {
 }
 function findFirst(candidates, label) {
   for (const candidate of candidates) {
-    if ((0, import_node_fs17.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs18.existsSync)(candidate)) return candidate;
   }
   throw new BackendUnavailableError("bare", `${label} was not found`);
 }
@@ -25232,7 +25310,7 @@ async function run(deps = {}) {
   const configPath = (0, import_node_path15.resolve)(cwd, args.configPath);
   const lockPath = (0, import_node_path15.resolve)(cwd, args.lockPath);
   const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : platform5.arch;
-  const subcommand = args.subcommand ?? ((0, import_node_fs18.existsSync)(lockPath) ? "check" : "init");
+  const subcommand = args.subcommand ?? ((0, import_node_fs19.existsSync)(lockPath) ? "check" : "init");
   const mode = subcommand === "check" ? "check" : "update";
   let pm;
   try {
@@ -25296,7 +25374,7 @@ async function run(deps = {}) {
       compressedRootfsPath: artifacts.compressedRootfsPath
     });
   }
-  if (deps.makeOverlay === void 0 && !(0, import_node_fs18.existsSync)(baseRootfsPath)) {
+  if (deps.makeOverlay === void 0 && !(0, import_node_fs19.existsSync)(baseRootfsPath)) {
     const buildHint = platform5.arch === "arm64" ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64` : `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR}`;
     stderr.write(
       `script-jail: rootfs not found at ${artifacts.rootfsPath}. Run \`${buildHint}\` (or fetch the release artifact) to produce it.
@@ -25387,7 +25465,7 @@ async function runLinux(input) {
   const { platform: platform5, stderr } = input;
   const arch = platform5.arch;
   const imagesDir = process.env["SCRIPT_JAIL_CACHE_DIR"] ? (0, import_node_path15.join)(process.env["SCRIPT_JAIL_CACHE_DIR"], "script-jail-images") : (0, import_node_path15.join)((0, import_node_os8.tmpdir)(), "script-jail-images");
-  (0, import_node_fs18.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs19.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
   const localPreFetch = createLocalPreFetchArtifacts({
     packageImagesDir: input.packageImagesDir,
@@ -25469,14 +25547,14 @@ function resolveScriptJailRoot(cwd) {
     (0, import_node_path15.resolve)((0, import_node_path15.dirname)((0, import_node_path15.dirname)((0, import_node_path15.dirname)(here))))
   ];
   for (const c of candidates) {
-    if ((0, import_node_fs18.existsSync)((0, import_node_path15.join)(c, "package.json"))) return c;
+    if ((0, import_node_fs19.existsSync)((0, import_node_path15.join)(c, "package.json"))) return c;
   }
   return cwd;
 }
 function readPackageVersion(cwd) {
   const packageJsonPath = (0, import_node_path15.join)(resolveScriptJailRoot(cwd), "package.json");
   try {
-    const pkg = JSON.parse(String((0, import_node_fs18.readFileSync)(packageJsonPath, "utf8")));
+    const pkg = JSON.parse(String((0, import_node_fs19.readFileSync)(packageJsonPath, "utf8")));
     if (typeof pkg["version"] === "string") return pkg["version"];
   } catch {
   }

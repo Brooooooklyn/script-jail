@@ -198,6 +198,26 @@ jobs:
         # tarball that pairs with this tag carries an up-to-date CLI.
         run: pnpm build:cli
 
+      # The standalone canonical-rootfs-hash tool (dist/repro-hash-cli.cjs) is run
+      # BELOW — by this job's reproducibility gate + "Compute SHAs" step, and by
+      # the install-free publish job + scripts/check-publish-artifacts.sh — always
+      # straight from the COMMITTED bundle (the publish job has no `pnpm install`,
+      # so it cannot rebuild it).  Rebuild it here and fail the release if the
+      # committed copy is stale, so a source change to src/rootfs/repro-hash*.ts
+      # can never pin (or later verify) a manifest SHA with masking logic that
+      # differs from what consumers run.  Both jobs check out the same tag, so
+      # this build-job gate also protects the publish job's use of the same file.
+      # Mirrors test.yml's gate, enforced at tag-push time too.
+      - name: Build repro-hash CLI bundle
+        run: pnpm build:repro-hash
+
+      - name: Verify dist/repro-hash-cli.cjs is up to date
+        run: |
+          if ! git diff --exit-code -- dist/repro-hash-cli.cjs; then
+            echo "::error::dist/repro-hash-cli.cjs is out of date. Run 'pnpm build:repro-hash' locally and commit the result."
+            exit 1
+          fi
+
       - name: Build Rust shim (x86_64)
         run: |
           cargo build --release --manifest-path src/shim/Cargo.toml
@@ -273,14 +293,27 @@ jobs:
       # manifest diff.
       #
       # We cover BOTH x64 majors (ubuntu-24.04 AND ubuntu-22.04) via the same
-      # cheap native mkfs path.  arm64 reproducibility is intentionally NOT
-      # rebuilt here — that would require slow qemu arm64 rebuilds; arm64 is
-      # instead left to the authoritative cross-run gate (the strict
-      # scripts/check-publish-artifacts.sh comparison at the v0.1.1 manifest
-      # backfill, which compares released SHAs across runs).
-      - name: Assert x64 rootfs ext4s are byte-reproducible (ubuntu-24.04, ubuntu-22.04)
+      # cheap native mkfs path.  arm64 is intentionally NOT rebuilt+compared
+      # here — and, unlike x64, it is NOT cross-run reproducible at all: it is
+      # built from the LIVE ports.ubuntu.com mirror because snapshot.ubuntu.com
+      # serves no public ubuntu-ports pocket (see src/rootfs/Dockerfile.base), so
+      # its packages drift run-to-run.  OPEN v0.1.1 BLOCKER: the arm64 rootfs ext4
+      # IS still strictly compared by scripts/check-publish-artifacts.sh at the
+      # backfill (darwin section), a comparison that can only pass if arm64
+      # reproduces a prior run's bytes — which it currently will not.  Resolving
+      # arm64's participation in the backfill (a reproducible arm64 source, or
+      # exempting arm64 ext4s from the strict cross-run compare) is deferred to
+      # v0.1.1; it does not affect the v0.1.0 all-placeholder bootstrap.
+      - name: Assert x64 rootfs ext4s are canonical-reproducible (ubuntu-24.04, ubuntu-22.04)
         run: |
           set -euo pipefail
+          # Compare CANONICAL hashes (volatile superblock time fields masked) —
+          # not raw sha256sum.  The shipped e2fsprogs (< 1.47.1) re-stamps the
+          # superblock s_wtime to wall-clock on close, so a raw compare would
+          # flake purely on which wall-clock second each in-place rebuild lands
+          # in.  The canonical hash is the SAME value pinned into the manifest
+          # (Compute SHAs below) and re-verified by check-publish-artifacts.sh,
+          # so this gate proves the very digest the v0.1.1 backfill must match.
           assert_reproducible() {
             local major="$1"
             local image="images/rootfs-${major}.ext4"
@@ -288,10 +321,10 @@ jobs:
             cp "${image}" "${first}"
             pnpm build -- --runner-image="${major}" --skip-bundle --skip-shim
             local sha1 sha2
-            sha1="$(sha256sum "${first}" | cut -d' ' -f1)"
-            sha2="$(sha256sum "${image}" | cut -d' ' -f1)"
+            sha1="$(node dist/repro-hash-cli.cjs "${first}")"
+            sha2="$(node dist/repro-hash-cli.cjs "${image}")"
             echo "${major}: first=${sha1} rebuild=${sha2}"
-            [ "${sha1}" = "${sha2}" ] || { echo "::error::rootfs ext4 ${major} is not byte-reproducible"; exit 1; }
+            [ "${sha1}" = "${sha2}" ] || { echo "::error::rootfs ext4 ${major} is not canonical-reproducible"; exit 1; }
           }
           assert_reproducible ubuntu-24.04
           assert_reproducible ubuntu-22.04
@@ -337,13 +370,21 @@ jobs:
         id: shas
         run: |
           set -euo pipefail
+          # Rootfs ext4 images are pinned by their CANONICAL hash (volatile
+          # superblock time fields masked — see src/rootfs/repro-hash.ts), so the
+          # value survives the e2fsprogs close-flush s_wtime re-stamp and the
+          # v0.1.1 backfill reproduces it.  Everything else (the .so shims, the
+          # VZ kernels, the Mach-O binary) is pinned by a plain sha256sum.  These
+          # two digest kinds MUST match how check-publish-artifacts.sh recomputes
+          # them in the publish job and how preFetchArtifacts verifies the rootfs
+          # at consumer runtime.
           # --- Linux platform artifacts ---
-          LINUX_ROOTFS_22="$(sha256sum images/rootfs-ubuntu-22.04.ext4 | cut -d' ' -f1)"
-          LINUX_ROOTFS_24="$(sha256sum images/rootfs-ubuntu-24.04.ext4 | cut -d' ' -f1)"
+          LINUX_ROOTFS_22="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-22.04.ext4)"
+          LINUX_ROOTFS_24="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-24.04.ext4)"
           LINUX_LIBSO="$(sha256sum images/libscriptjail.so | cut -d' ' -f1)"
           # --- Darwin platform artifacts ---
-          DARWIN_ROOTFS_22_ARM64="$(sha256sum images/rootfs-ubuntu-22.04-arm64.ext4 | cut -d' ' -f1)"
-          DARWIN_ROOTFS_24_ARM64="$(sha256sum images/rootfs-ubuntu-24.04-arm64.ext4 | cut -d' ' -f1)"
+          DARWIN_ROOTFS_22_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-22.04-arm64.ext4)"
+          DARWIN_ROOTFS_24_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-24.04-arm64.ext4)"
           DARWIN_LIBSO_ARM64="$(sha256sum images/libscriptjail-arm64.so | cut -d' ' -f1)"
           VMLINUX_VZ_X86_64="$(sha256sum images/vmlinux-vz-x86_64 | cut -d' ' -f1)"
           VMLINUX_VZ_ARM64="$(sha256sum images/vmlinux-vz-arm64 | cut -d' ' -f1)"

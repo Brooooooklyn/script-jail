@@ -114,3 +114,20 @@ jobs:
             echo "::error::dist/cli.cjs is out of date. Run 'pnpm build:cli' locally and commit the result."
             exit 1
           fi
+
+      # dist/repro-hash-cli.cjs is the standalone canonical-rootfs-hash tool the
+      # release publish job and scripts/check-publish-artifacts.sh run with
+      # `node dist/repro-hash-cli.cjs` (no pnpm install in that job).  A source
+      # change to src/rootfs/repro-hash*.ts that ships without rebundling would
+      # let the no-install job compute the rootfs digest with stale masking
+      # logic — pinning a manifest SHA that the consumer then can't match.
+      # Mirror the dist/main.cjs gate.
+      - name: Bundle repro-hash CLI
+        run: pnpm build:repro-hash
+
+      - name: Verify dist/repro-hash-cli.cjs is up to date
+        run: |
+          if ! git diff --exit-code -- dist/repro-hash-cli.cjs; then
+            echo "::error::dist/repro-hash-cli.cjs is out of date. Run 'pnpm build:repro-hash' locally and commit the result."
+            exit 1
+          fi

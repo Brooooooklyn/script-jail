@@ -171,12 +171,18 @@ digests. Backfill them and cut the second tag.
    this catches.
 7. **Green CI, then push `v0.1.1`.**
 
-### Why the `v0.1.1` build reproduces `v0.1.0`'s SHAs (R1 — true cross-run reproducibility)
+### Why the `v0.1.1` build reproduces `v0.1.0`'s SHAs (R1 — cross-run reproducibility)
 
 The `v0.1.1` backfill only works if a rootfs ext4 built weeks later, on a
-different runner, hashes to the EXACT bytes `v0.1.0` released. That is not free —
-it is engineered, and the early R1 attempt missed three drift sources that this
-build now pins:
+different runner, produces the SAME pinned digest `v0.1.0` did. That pinned
+digest is the **canonical (time-masked) hash** of the ext4 — NOT a raw
+`sha256sum` of the released bytes — computed by `src/rootfs/repro-hash.ts`. The
+content and layout are engineered to reproduce byte-for-byte (the three pins
+below); the one field that cannot — the superblock `s_wtime`, which the shipped
+e2fsprogs (< 1.47.1) re-stamps to the wall clock when it flushes on close — is
+masked OUT of the hash instead of pinned, which is why no build-clock pinning
+(libfaketime) is needed. The early R1 attempt missed three drift sources that
+this build now pins:
 
 1. **Pinned per-arch Ubuntu base digest.** The Dockerfile's `FROM` resolves
    `ubuntu@sha256:…` (not a floating `ubuntu:<major>` tag) from the per-arch
@@ -201,24 +207,45 @@ build now pins:
    express — `-b 4096 -I 256`, a fixed `-U`/`-E hash_seed` (the
    `ROOTFS_FIXED_UUID`), and `-O ^has_journal,^metadata_csum_seed` (no journal,
    and the metadata-checksum seed derives from the pinned UUID rather than an
-   independent random seed). `SOURCE_DATE_EPOCH` plus the `debugfs` mtime-
-   normalize post-pass clamp every timestamp to a fixed instant.
+   independent random seed). `SOURCE_DATE_EPOCH` plus the `debugfs` timestamp
+   post-pass clamp every inode + superblock timestamp to a fixed instant —
+   except the superblock `s_wtime` (and the `metadata_csum` covering it), which
+   `debugfs` re-stamps to the wall clock on close; that residual field is
+   handled by the canonical hash's mask, not pinned here.
 
 **The authoritative cross-run gate is `check-publish-artifacts.sh`.** At
 `v0.1.1` the manifest is fully real (no longer all-placeholder), so the script
-takes its strict path: it recomputes the SHAs of the freshly-built artifacts and
-compares them against the pinned `v0.1.0` values you just pasted in. If
-reproduction fails — any of the three pins above regressed — the SHAs diverge,
-the comparison fails LOUD, and the publish is blocked rather than shipping a
-manifest whose pinned SHAs do not match the bytes consumers will download.
+takes its strict path: it recomputes each artifact's digest — the canonical
+(time-masked) hash for the rootfs ext4s (via the committed
+`dist/repro-hash-cli.cjs`, since the publish job runs without `pnpm install`), a
+plain `sha256sum` for everything else — and compares them against the pinned
+`v0.1.0` values you just pasted in. If reproduction fails — any of the three
+pins above regressed, OR a non-time byte drifted (masking ignores time, it does
+not hide content drift) — the digests diverge, the comparison fails LOUD, and
+the publish is blocked rather than shipping a manifest whose pinned digests do
+not match what consumers will download. Consumers verify the rootfs the same
+canonical way (`preFetchArtifacts` → `canonicalRootfsHash`), so the pinned
+canonical digest is what they check too.
 
-The same-run "Assert x64 rootfs ext4s are byte-reproducible (ubuntu-24.04,
+The same-run "Assert x64 rootfs ext4s are canonical-reproducible (ubuntu-24.04,
 ubuntu-22.04)" step in `release.yml` (now covering BOTH x64 majors) is an early
 smoke test, not the authoritative gate: it rebuilds each x64 rootfs in place and
-asserts the two ext4s are byte-identical WITHIN one run, catching a reproduc-
-ibility regression before the slower publish job. arm64 reproducibility is left
-to the authoritative cross-run comparison above (rebuilding arm64 in-run would
-need slow qemu).
+asserts the two ext4s share the same canonical hash WITHIN one run, catching a
+reproducibility regression before the slower publish job. (A raw `sha256sum`
+compare here would flake purely on which wall-clock second each in-place rebuild
+landed in — the very `s_wtime` drift the canonical hash masks.)
+
+arm64 is NOT rebuilt in-run either (qemu is slow) — but, unlike x64, the arm64
+rootfs is **not cross-run reproducible at all**: it is built from the live
+`ports.ubuntu.com` mirror because `snapshot.ubuntu.com` serves no public
+`ubuntu-ports` pocket (see `src/rootfs/Dockerfile.base`), so its packages drift
+run-to-run. That makes the two arm64 rootfs ext4s a known **open `v0.1.1`
+blocker**: `check-publish-artifacts.sh` still strictly compares them (darwin
+section) at the backfill, a comparison that can only pass once arm64 reproduces
+a prior run's bytes — which it currently will not. Resolving it (a reproducible
+arm64 source, or exempting the arm64 ext4s from the strict cross-run compare) is
+deferred to `v0.1.1`; it does not affect the `v0.1.0` all-placeholder bootstrap,
+where every artifact comparison is skipped.
 
 **Refresh knobs (both change the released SHAs, so a refresh forces a new
 backfill):**
@@ -298,7 +325,8 @@ snapshot and may drift — re-grep before relying on them.
 | frozen apt snapshot | `src/rootfs/Dockerfile.base` — `ARG UBUNTU_SNAPSHOT` / `Acquire::Check-Valid-Until "false"` | 24 / 92 |
 | pinned mkfs layout | `src/rootfs/build.ts` — `buildMkfsExt4Args` / `mkfsEnv` (`MKE2FS_CONFIG`) + `src/rootfs/mke2fs.conf` | 850 / 895 |
 | GHCR publish pins same UBUNTU_REF | `.github/workflows/release.yml` — `Pin the GHCR build's base image` / `--build-arg "UBUNTU_REF=…"` | 544 / 580 |
-| same-run reproducibility smoke test | `.github/workflows/release.yml` — `Assert x64 rootfs ext4s are byte-reproducible` | 281 |
+| same-run reproducibility smoke test | `.github/workflows/release.yml` — `Assert x64 rootfs ext4s are canonical-reproducible` | 281 |
+| rootfs pinned by canonical (time-masked) hash | `src/rootfs/repro-hash.ts` — `canonicalRootfsHash`; recomputed in `scripts/check-publish-artifacts.sh` — `canonical_rootfs_hash`; consumed in `src/action/pre-fetch-artifacts.ts` | n/a |
 | authoritative cross-run gate (strict SHA compare) | `.github/workflows/release.yml` — `Verify downloaded artifacts against tagged manifest` → `check-publish-artifacts.sh` | 480 |
 | OIDC trusted publish (npm upgrade, no token) | `.github/workflows/release.yml` — `Upgrade npm for OIDC trusted publishing` (`npm install -g npm@11.16.0`) + publish job `id-token: write` | 473 / 427 |
 | publish step names + multi-package order | `.github/workflows/release.yml` — "Stage npm packages" / "Validate npm packlists" / "Publish npm packages (platform-first, main last)" | 697 / 723 / 759 |

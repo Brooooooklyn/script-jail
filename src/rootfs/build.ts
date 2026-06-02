@@ -1077,6 +1077,10 @@ function pinExt4TimestampsViaDebugfs(outImage: string): void {
   );
   try {
     writeFileSync(cmdFile, script);
+    // `debugfs -w` re-stamps the superblock s_wtime to wall-clock when it
+    // flushes on close (e2fsprogs < 1.47.1 ignores SOURCE_DATE_EPOCH).  That
+    // single drifting field (plus the metadata_csum it feeds) is masked out at
+    // hashing time — see canonicalRootfsHash in src/rootfs/repro-hash.ts.
     const result = spawnSync('debugfs', ['-w', '-f', cmdFile, outImage], {
       stdio: 'inherit',
       env: { ...process.env, ...mkfsEnv() },
@@ -1250,6 +1254,9 @@ export function buildMkfsExt4ViaDockerScript(imageName: string, sizeMB: number):
     `i=1; while [ "$i" -le "$ic" ]; do ` +
     `printf '${inodeFmt}' "$i" "$i" "$i" "$i" >> "$cmd"; i=$((i+1)); done && ` +
     `printf 'quit\\n' >> "$cmd" && ` +
+    // `debugfs -w` re-stamps the superblock s_wtime to wall-clock on close
+    // (e2fsprogs < 1.47.1); that one drifting field (and its metadata_csum) is
+    // masked at hashing time, not pinned here.  Mirrors the native path.
     `debugfs -w -f "$cmd" ${outImage}`;
   return (
     `apk add --no-cache e2fsprogs tar && ` +

@@ -77,10 +77,21 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 MANIFEST=""
 DIR=""
 DIST_SOURCE=""
 DIST_CLI_SOURCE=""
+# Standalone canonical-rootfs-hash bundle (dist/repro-hash-cli.cjs).  The rootfs
+# ext4 entries in the manifest are pinned by their CANONICAL hash (volatile
+# superblock time fields masked — see src/rootfs/repro-hash.ts), NOT a plain
+# sha256sum, so we recompute them the same way the build job's "Compute SHAs"
+# step did and the consumer's preFetchArtifacts does.  We run the COMMITTED
+# bundle with `node` (no pnpm install in the publish job — that would
+# reintroduce the third-party-code threat this gate defends against).  Default
+# is the bundle in the tagged checkout; --repro-hash-cli overrides it (tests).
+REPRO_HASH_CLI=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -100,6 +111,10 @@ while [ "$#" -gt 0 ]; do
       DIST_CLI_SOURCE="${2:-}"
       shift 2
       ;;
+    --repro-hash-cli)
+      REPRO_HASH_CLI="${2:-}"
+      shift 2
+      ;;
     *)
       echo "check-publish-artifacts: unknown argument: $1" >&2
       exit 2
@@ -110,6 +125,16 @@ done
 if [ -z "$MANIFEST" ] || [ -z "$DIR" ]; then
   echo "check-publish-artifacts: --manifest and --dir are required" >&2
   exit 2
+fi
+
+# Resolve the canonical-rootfs-hash bundle (default: tagged checkout's dist/).
+if [ -z "$REPRO_HASH_CLI" ]; then
+  REPRO_HASH_CLI="$SCRIPT_DIR/../dist/repro-hash-cli.cjs"
+fi
+if [ ! -f "$REPRO_HASH_CLI" ]; then
+  echo "check-publish-artifacts: repro-hash CLI not found: $REPRO_HASH_CLI" >&2
+  echo "  (run 'pnpm build:repro-hash' and commit dist/repro-hash-cli.cjs)" >&2
+  exit 1
 fi
 
 if [ ! -f "$MANIFEST" ]; then
@@ -468,12 +493,22 @@ fi
 
 # --- Compute artifact SHAs ----------------------------------------------------
 
+# Plain sha256 for the .so shims, VZ kernels, Mach-O binary, and dist bundles.
 sha_of() {
   sha256sum "$1" | cut -d' ' -f1
 }
 
-COMPUTED_LINUX_ROOTFS_22="$(sha_of "$ART_LINUX_ROOTFS_22")"
-COMPUTED_LINUX_ROOTFS_24="$(sha_of "$ART_LINUX_ROOTFS_24")"
+# Canonical (time-masked) hash for the rootfs ext4 images — the digest kind the
+# manifest pins for them.  `node` exits non-zero (and prints to stderr) on any
+# error, and command substitution under `set -e` propagates that, so a broken
+# hasher fails the gate rather than yielding an empty digest that string-matches
+# an empty manifest value.
+canonical_rootfs_hash() {
+  node "$REPRO_HASH_CLI" "$1"
+}
+
+COMPUTED_LINUX_ROOTFS_22="$(canonical_rootfs_hash "$ART_LINUX_ROOTFS_22")"
+COMPUTED_LINUX_ROOTFS_24="$(canonical_rootfs_hash "$ART_LINUX_ROOTFS_24")"
 COMPUTED_LINUX_LIBSO="$(sha_of "$ART_LINUX_LIBSO")"
 COMPUTED_DIST="$(sha_of "$ART_DIST")"
 if [ -n "$DIST_CLI_SOURCE" ]; then
@@ -481,8 +516,8 @@ if [ -n "$DIST_CLI_SOURCE" ]; then
 fi
 
 if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
-  COMPUTED_DARWIN_ROOTFS_22_ARM64="$(sha_of "$ART_DARWIN_ROOTFS_22_ARM64")"
-  COMPUTED_DARWIN_ROOTFS_24_ARM64="$(sha_of "$ART_DARWIN_ROOTFS_24_ARM64")"
+  COMPUTED_DARWIN_ROOTFS_22_ARM64="$(canonical_rootfs_hash "$ART_DARWIN_ROOTFS_22_ARM64")"
+  COMPUTED_DARWIN_ROOTFS_24_ARM64="$(canonical_rootfs_hash "$ART_DARWIN_ROOTFS_24_ARM64")"
   COMPUTED_DARWIN_LIBSO_ARM64="$(sha_of "$ART_DARWIN_LIBSO_ARM64")"
   COMPUTED_VMLINUX_VZ_X86_64="$(sha_of "$ART_VMLINUX_VZ_X86_64")"
   COMPUTED_VMLINUX_VZ_ARM64="$(sha_of "$ART_VMLINUX_VZ_ARM64")"

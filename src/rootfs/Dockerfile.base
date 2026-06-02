@@ -68,11 +68,14 @@ ARG NODE_VERSION
 #   Phase 2 — repoint to the frozen snapshot and install the real set.
 #     snapshot.ubuntu.com pins every package to its version as-of
 #     UBUNTU_SNAPSHOT, so the installed set is identical across CI runs —
-#     byte-reproducible rootfs (R1).  This replaces the live mirrors
-#     (archive.ubuntu.com / azure.archive.ubuntu.com for amd64,
-#     ports.ubuntu.com / mirror.us.leaseweb.net for arm64), which served
-#     whatever versions were current at build time and therefore drifted
-#     whenever Canonical published an update.  ca-certificates is RE-installed
+#     byte-reproducible rootfs (R1).  This replaces the live amd64 mirrors
+#     (archive.ubuntu.com / azure.archive.ubuntu.com), which served whatever
+#     versions were current at build time and therefore drifted whenever
+#     Canonical published an update.  ARM64 IS THE EXCEPTION: snapshot.ubuntu.com
+#     serves NO public ubuntu-ports mirror (every ubuntu-ports path 401s), so
+#     arm64 keeps the live ports.ubuntu.com mirror and is intentionally NOT
+#     byte-reproducible (it is the macOS CLI image, gated by its per-package SHA,
+#     not the cross-run manifest backfill).  ca-certificates is RE-installed
 #     in the Phase 2 step PINNED to the snapshot CANDIDATE version (with
 #     --allow-downgrades) so its baked-in version is always the snapshot's —
 #     a plain re-list would NOT downgrade the (possibly newer) live version
@@ -81,8 +84,9 @@ ARG NODE_VERSION
 # Sources files differ across releases (sources.list on 22.04, deb822
 # ubuntu.sources on 24.04), and on 24.04 the amd64 `-security` pocket is a
 # SEPARATE `security.ubuntu.com` stanza — so we rewrite that host too and then
-# ASSERT (allowlist) that every active apt source is the snapshot before the
-# phase-2 install; any leftover live mirror fails the build loudly rather than
+# ASSERT (allowlist, x64 only) that every active apt source is the snapshot
+# before the phase-2 install; any leftover live mirror fails the build loudly
+# rather than
 # silently baking drifting bytes.  We rewrite every matching file under
 # /etc/apt without caring which exists.  The retry loop is a backstop.
 #
@@ -109,9 +113,6 @@ RUN set -eu; \
     done; \
     find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
       -exec sed -i \
-        -e "s|http://ports\.ubuntu\.com/ubuntu-ports|https://snapshot.ubuntu.com/ubuntu-ports/${UBUNTU_SNAPSHOT}|g" \
-        -e "s|http://mirror\.us\.leaseweb\.net/ubuntu-ports|https://snapshot.ubuntu.com/ubuntu-ports/${UBUNTU_SNAPSHOT}|g" \
-        -e "s|http://ports\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu-ports/${UBUNTU_SNAPSHOT}|g" \
         -e "s|http://archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
         -e "s|http://azure\.archive\.ubuntu\.com/ubuntu|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
         -e "s|http://archive\.ubuntu\.com|https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}|g" \
@@ -128,14 +129,22 @@ RUN set -eu; \
     # where a host blocklist would miss a newly-introduced mirror.  `#` comments
     # are stripped first so commented example URLs (e.g. help.ubuntu.com) cannot
     # false-trip it.
-    bad="$(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec cat {} + 2>/dev/null \
-            | sed 's/#.*//' \
-            | grep -oE 'https?://[^[:space:]]+' \
-            | grep -vE '^https://snapshot\.ubuntu\.com/' || true)"; \
-    if [ -n "$bad" ]; then \
-      echo "non-snapshot apt source remains after rewrite:" >&2; \
-      printf '%s\n' "$bad" >&2; \
-      exit 1; \
+    # The snapshot allowlist guard runs for x64 ONLY.  arm64 legitimately keeps
+    # the live ports.ubuntu.com mirror (snapshot.ubuntu.com serves NO public
+    # ubuntu-ports — every ubuntu-ports path 401s), so on arm64 a "must be
+    # snapshot" allowlist would always trip.  arm64 is therefore intentionally
+    # NOT byte-reproducible (it is the macOS CLI image, gated by its per-package
+    # SHA, not the cross-run manifest backfill).
+    if [ "${VP_ARCH}" != "arm64" ]; then \
+      bad="$(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec cat {} + 2>/dev/null \
+              | sed 's/#.*//' \
+              | grep -oE 'https?://[^[:space:]]+' \
+              | grep -vE '^https://snapshot\.ubuntu\.com/' || true)"; \
+      if [ -n "$bad" ]; then \
+        echo "non-snapshot apt source remains after rewrite:" >&2; \
+        printf '%s\n' "$bad" >&2; \
+        exit 1; \
+      fi; \
     fi; \
     # Drop the phase-1 (live-mirror) package lists so the phase-2 update and the
     # candidate-version resolution below see ONLY the snapshot archive.

@@ -24,8 +24,22 @@ import { get as httpGet } from 'node:http';
 // ---------------------------------------------------------------------------
 
 export interface HttpClient {
-  /** Download `url` to `destPath`, verify SHA-256, throw on mismatch. */
-  download(url: string, destPath: string, expectedSha256: string): Promise<void>;
+  /**
+   * Download `url` to `destPath`, verify its digest against `expectedDigest`,
+   * throw on mismatch.
+   *
+   * `computeDigest` selects HOW the on-disk file is hashed.  It defaults to a
+   * plain streaming SHA-256 (`sha256File`) — the digest kind used for every
+   * artifact except the rootfs ext4.  The rootfs path passes
+   * `canonicalRootfsHash` (time-masked SHA-256) so verification matches the
+   * canonical digest the manifest pins; see src/rootfs/repro-hash.ts.
+   */
+  download(
+    url: string,
+    destPath: string,
+    expectedDigest: string,
+    computeDigest?: (filePath: string) => Promise<string>,
+  ): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,17 +66,23 @@ export async function sha256File(filePath: string): Promise<string> {
  * the downloaded file's SHA-256 before moving it into place.
  */
 export class NodeHttpClient implements HttpClient {
-  async download(url: string, destPath: string, expectedSha256: string): Promise<void> {
+  async download(
+    url: string,
+    destPath: string,
+    expectedDigest: string,
+    computeDigest: (filePath: string) => Promise<string> = sha256File,
+  ): Promise<void> {
     const tmpPath = `${destPath}.tmp.${randomBytes(4).toString('hex')}`;
 
     try {
       await downloadToFile(url, tmpPath, 0);
 
-      // Verify hash.
-      const actual = await sha256File(tmpPath);
-      if (actual !== expectedSha256) {
+      // Verify digest (plain SHA-256 by default; canonical/time-masked for the
+      // rootfs ext4 — see the HttpClient.download doc comment).
+      const actual = await computeDigest(tmpPath);
+      if (actual !== expectedDigest) {
         throw new Error(
-          `SHA-256 mismatch for ${url}: expected ${expectedSha256}, got ${actual}`,
+          `SHA-256 mismatch for ${url}: expected ${expectedDigest}, got ${actual}`,
         );
       }
 
