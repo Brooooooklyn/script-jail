@@ -28377,6 +28377,12 @@ var LinuxSpawner = class {
 async function* runStraceTailer(opts) {
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const drainMs = opts.drainMs ?? 100;
+  const settleHardCapMs = opts.settleHardCapMs ?? 2e3;
+  const settleQuietPasses = opts.settleQuietPasses ?? 2;
+  const delay = (ms) => new Promise((resolve2) => {
+    const t = setTimeout(resolve2, ms);
+    t.unref?.();
+  });
   const queue = [];
   let done = false;
   let wakeResolve = null;
@@ -28659,49 +28665,78 @@ async function* runStraceTailer(opts) {
     drainEventsFile();
     wake();
   }, pollIntervalMs);
-  opts.exitPromise.then(() => {
-    setTimeout(() => {
+  opts.exitPromise.then(async () => {
+    const hardDeadline = Date.now() + settleHardCapMs;
+    let quiet = 0;
+    let prev = "";
+    const progressKey = () => {
+      let posSum = 0;
+      for (const p of filePos.values()) posSum += p;
+      let bufSum = 0;
+      for (const b of fileBuf.values()) bufSum += b.length;
+      return `${filePos.size}:${posSum}:${eventsPos}:${bufSum}:${eventsBuf.length}`;
+    };
+    await delay(drainMs);
+    for (; ; ) {
       pollDir();
       drainEventsFile();
-      for (const [name, partial2] of fileBuf) {
-        if (partial2.length > 0) {
-          const pid = parsePidFromFilename(name);
-          queue.push({ pid, line: partial2, source: "strace" });
-          fileBuf.set(name, "");
-        }
+      const cur = progressKey();
+      if (cur === prev) {
+        if (++quiet >= settleQuietPasses) break;
+      } else {
+        quiet = 0;
       }
-      if (eventsBuf.length > 0) {
-        queue.push({ pid: 0, line: eventsBuf, source: "shim" });
-        eventsBuf = "";
+      prev = cur;
+      if (Date.now() >= hardDeadline) break;
+      await delay(pollIntervalMs);
+    }
+    if (quiet < settleQuietPasses) {
+      try {
+        process.stderr.write(
+          `[strace-tailer] settle cap (${settleHardCapMs}ms) hit before quiescence; capture may be incomplete
+`
+        );
+      } catch {
       }
-      if (pollTimer !== null) {
-        clearInterval(pollTimer);
-        pollTimer = null;
+    }
+    for (const [name, partial2] of fileBuf) {
+      if (partial2.length > 0) {
+        const pid = parsePidFromFilename(name);
+        queue.push({ pid, line: partial2, source: "strace" });
+        fileBuf.set(name, "");
       }
-      if (watcher !== null) {
-        try {
-          watcher.close();
-        } catch {
-        }
-        watcher = null;
+    }
+    if (eventsBuf.length > 0) {
+      queue.push({ pid: 0, line: eventsBuf, source: "shim" });
+      eventsBuf = "";
+    }
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (watcher !== null) {
+      try {
+        watcher.close();
+      } catch {
       }
-      if (eventsWatcher !== null) {
-        try {
-          eventsWatcher.close();
-        } catch {
-        }
-        eventsWatcher = null;
+      watcher = null;
+    }
+    if (eventsWatcher !== null) {
+      try {
+        eventsWatcher.close();
+      } catch {
       }
-      if (eventsDirWatcher !== null) {
-        try {
-          eventsDirWatcher.close();
-        } catch {
-        }
-        eventsDirWatcher = null;
+      eventsWatcher = null;
+    }
+    if (eventsDirWatcher !== null) {
+      try {
+        eventsDirWatcher.close();
+      } catch {
       }
-      done = true;
-      wake();
-    }, drainMs);
+      eventsDirWatcher = null;
+    }
+    done = true;
+    wake();
   }).catch(() => {
     done = true;
     wake();
