@@ -1547,6 +1547,123 @@ describe('runInstallPhase', () => {
       expect(spawns).toHaveLength(0);
     });
 
+    // Deterministic in-process attribution (2026-06-03): the LD_PRELOAD shim
+    // stamps the spawning process's own npm lifecycle env into its `exec`
+    // record.  Because the tailer yields shim records before the strace lines
+    // for the same exec (the shim's emit_exec write precedes real_execve,
+    // which precedes strace's execve line), the dispatcher seeds the pid's
+    // attribution from that authoritative in-process env BEFORE it processes
+    // the strace `spawn` — so the spawn is attributed even though the helper's
+    // /proc is already reaped (attribute → null).  This replaces the
+    // clone-ordering deferral: the helper (e.g. a `.bin` shell shim's
+    // dirname/sed/uname fork) is recovered without any /proc walk or buffer,
+    // identically on every backend — closing the macOS-VZ-vs-Docker parity
+    // divergence at its root.
+    it('shim exec attribution seeds a reaped-pid strace spawn deterministically', async () => {
+      // Helper pid 502 has NO /proc entry (reaped before its strace execve
+      // line is tailed) — attribute(502) returns null.  Only the shim's
+      // in-process record carries its package identity.
+      const proc = mockProcReader({});
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // 1. Shim exec record (yielded FIRST — shim-before-strace) carrying the
+        //    helper's own npm lifecycle env.  Seeds attribution for pid 502.
+        {
+          pid: 0,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/dirname',
+            argv0: 'dirname',
+            envp_alloc_failed: false,
+            result: 'ok',
+            pid: 502,
+            ts: 10,
+            npm_package_name: 'unrs-resolver',
+            npm_package_version: '1.11.1',
+            npm_lifecycle_event: 'postinstall',
+          }),
+          source: 'shim',
+        },
+        // 2. Strace spawn for the SAME pid.  attribute(502) → null (reaped),
+        //    but the shim-seeded snapshot attributes it under unrs-resolver.
+        {
+          pid: 502,
+          line: 'execve("/usr/bin/dirname", ["dirname", "/work/node_modules/.bin/napi-postinstall"], 0x2 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 502;
+      });
+      expect(spawns).toHaveLength(1);
+      expect(spawns[0]!['pkg']).toBe('unrs-resolver@1.11.1');
+      expect(spawns[0]!['lifecycle']).toBe('postinstall');
+      expect((spawns[0]!['raw'] as Record<string, unknown>)['argv']).toEqual([
+        'dirname',
+        '/work/node_modules/.bin/napi-postinstall',
+      ]);
+    });
+
+    // Negative control: with NO shim attribution (an unshimmed process —
+    // static/setuid/env-scrubbed) the reaped-pid strace spawn has no seed and
+    // no /proc, so it is dropped exactly as before.  Shim attribution only
+    // ADDS deterministic recovery; it never broadens emission of genuinely
+    // unattributable spawns.
+    it('reaped-pid strace spawn with no shim attribution is still dropped', async () => {
+      const proc = mockProcReader({});
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Shim exec record WITHOUT npm fields (e.g. npm/pnpm itself, or an
+        // unshimmed child that emitted no attribution).
+        {
+          pid: 0,
+          line: JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/dirname',
+            argv0: 'dirname',
+            envp_alloc_failed: false,
+            result: 'ok',
+            pid: 502,
+            ts: 10,
+          }),
+          source: 'shim',
+        },
+        {
+          pid: 502,
+          line: 'execve("/usr/bin/dirname", ["dirname", "/work/node_modules/.bin/napi-postinstall"], 0x2 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const spawns = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'spawn' && raw['pid'] === 502;
+      });
+      expect(spawns).toHaveLength(0);
+    });
+
     // Audit-trust follow-up to the clone-propagation fix (Codex review of
     // commit e5af2be, 2026-05-19): the propagation block reads
     // `attributionSnapshotByPid.get(parentPid)` which is empty when the
@@ -8164,6 +8281,110 @@ describe('runInstallPhase', () => {
         ts: 7,
       });
       expect(parseShimLine(line)).toBeNull();
+    });
+
+    // The shim stamps npm attribution into the exec line, but ExecEvent is a
+    // non-strict zod object so parseShimLine STRIPS those fields from the
+    // emitted RawEvent.  This keeps the byte-stable lockfile and the e2e
+    // goldens unaffected — the attribution is consumed only via
+    // shimExecAttribution (below), never emitted.
+    it('strips npm attribution fields from the exec RawEvent', async () => {
+      const { parseShimLine } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/usr/bin/dirname',
+        argv0: 'dirname',
+        envp_alloc_failed: false,
+        pid: 502,
+        ts: 9,
+        npm_package_name: 'unrs-resolver',
+        npm_package_version: '1.11.1',
+        npm_lifecycle_event: 'postinstall',
+      });
+      const ev = parseShimLine(line);
+      expect(ev?.kind).toBe('exec');
+      expect(ev).not.toHaveProperty('npm_package_name');
+      expect(ev).not.toHaveProperty('npm_package_version');
+      expect(ev).not.toHaveProperty('npm_lifecycle_event');
+    });
+  });
+
+  describe('shimExecAttribution (exported for testing)', () => {
+    it('composes pkg@version + lifecycle from a shim exec line', async () => {
+      const { shimExecAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/usr/bin/dirname',
+        argv0: 'dirname',
+        envp_alloc_failed: false,
+        pid: 502,
+        ts: 1,
+        npm_package_name: 'unrs-resolver',
+        npm_package_version: '1.11.1',
+        npm_lifecycle_event: 'postinstall',
+      });
+      expect(shimExecAttribution(line)).toEqual({
+        pkg: 'unrs-resolver@1.11.1',
+        lifecycle: 'postinstall',
+      });
+    });
+
+    it('falls back to bare name when version is absent', async () => {
+      const { shimExecAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/usr/bin/dirname',
+        argv0: 'dirname',
+        envp_alloc_failed: false,
+        pid: 502,
+        ts: 1,
+        npm_package_name: 'unrs-resolver',
+        npm_lifecycle_event: 'install',
+      });
+      expect(shimExecAttribution(line)).toEqual({
+        pkg: 'unrs-resolver',
+        lifecycle: 'install',
+      });
+    });
+
+    it('returns null for a non-canonical lifecycle event (falls back to /proc)', async () => {
+      const { shimExecAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/usr/bin/dirname',
+        argv0: 'dirname',
+        envp_alloc_failed: false,
+        pid: 502,
+        ts: 1,
+        npm_package_name: 'unrs-resolver',
+        npm_package_version: '1.11.1',
+        npm_lifecycle_event: 'test',
+      });
+      expect(shimExecAttribution(line)).toBeNull();
+    });
+
+    it('returns null when npm_package_name is missing', async () => {
+      const { shimExecAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/bin/sh',
+        argv0: 'sh',
+        envp_alloc_failed: false,
+        pid: 3,
+        ts: 1,
+        npm_lifecycle_event: 'postinstall',
+      });
+      expect(shimExecAttribution(line)).toBeNull();
+    });
+
+    it('returns null for non-exec kinds and malformed JSON', async () => {
+      const { shimExecAttribution } = await import('../../src/guest/phase-install.js');
+      expect(
+        shimExecAttribution(
+          JSON.stringify({ kind: 'env_read', name: 'HOME', pid: 1, ts: 0, hidden: false }),
+        ),
+      ).toBeNull();
+      expect(shimExecAttribution('not json')).toBeNull();
     });
   });
 

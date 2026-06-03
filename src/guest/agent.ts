@@ -850,7 +850,20 @@ export async function* runStraceTailer(
   let watcher: ReturnType<typeof fsWatch> | null = null;
   try {
     watcher = fsWatch(opts.watchDir, (_event, _filename) => {
+      // Shim-first, matching the poll timer and settle loop below (2026-06-03).
+      // This callback fires when a per-pid strace file changes; the events-file
+      // inotify watcher (eventsWatcher) is a SEPARATE watch that can fire later
+      // or in a different tick.  If this path enqueued the strace `spawn` before
+      // the shim's `exec` record for the same exec was drained, the dispatcher
+      // would process the spawn with no seeded attribution and drop a
+      // reaped-helper spawn — reintroducing the cross-backend parity
+      // nondeterminism this change fixes.  Draining the events file first seeds
+      // the pid's attribution (from the shim's in-process npm env, written
+      // before real_execve) ahead of the matching strace spawn regardless of
+      // which watcher fires first.
+      drainEventsFile();
       pollDir();
+      wake();
     });
     watcher.on('error', () => { /* ignore — polling is the fallback */ });
   } catch {
@@ -943,9 +956,22 @@ export async function* runStraceTailer(
   }
 
   // Poll on a fixed interval as fallback / complement to fs.watch.
+  //
+  // Drain the shim events file BEFORE the per-pid strace dir (2026-06-03): the
+  // shim's `emit_exec` write happens in-process BEFORE `real_execve`, which is
+  // what strace logs the execve syscall from — so for any given exec the shim
+  // record exists in the events file before strace's execve line exists in the
+  // per-pid file.  Draining shim-first queues that record ahead of the strace
+  // `spawn` line for the same exec within a poll cycle, so the dispatcher has
+  // already seeded the pid's attribution (from the shim's in-process npm env)
+  // by the time it processes the strace spawn.  On the real Linux backends the
+  // events-file inotify watcher (see eventsWatcher above) already drains the
+  // shim record the instant it is written; this ordering makes the polling
+  // fallback behave the same so attribution stays deterministic across
+  // backends.
   let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
-    pollDir();
     drainEventsFile();
+    pollDir();
     wake();
   }, pollIntervalMs);
 
@@ -990,8 +1016,12 @@ export async function* runStraceTailer(
     // depends on it — the loop below is what guarantees it.
     await delay(drainMs);
     for (;;) {
-      pollDir(); // re-enumerates ALL matching files; drainFile reads each to current EOF
+      // Shim-first (see the poll-timer comment above): seed attribution from
+      // the shim's in-process npm env before the matching strace spawn line is
+      // dispatched.  By now strace has exited and all files are final, so this
+      // is purely about queue order, not capture completeness.
       drainEventsFile();
+      pollDir(); // re-enumerates ALL matching files; drainFile reads each to current EOF
       const cur = progressKey();
       if (cur === prev) {
         if (++quiet >= settleQuietPasses) break;

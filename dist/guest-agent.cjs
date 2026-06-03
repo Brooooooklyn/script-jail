@@ -25068,6 +25068,12 @@ function isCanonicalStage(s) {
 function buildPkg(name, version2) {
   return version2 !== void 0 ? `${name}@${version2}` : name;
 }
+function attributionFromEnvVars(name, version2, event) {
+  if (name !== void 0 && name.length > 0 && event !== void 0 && isCanonicalStage(event)) {
+    return { pkg: buildPkg(name, version2), lifecycle: event };
+  }
+  return null;
+}
 var Attribution = class {
   reader;
   // Terminal-only cache: keyed by starting pid. Intermediate pids are not
@@ -25132,10 +25138,13 @@ var Attribution = class {
       }
       const env = this.reader.readEnviron(current);
       if (env !== null) {
-        const name = env.get("npm_package_name");
-        const event = env.get("npm_lifecycle_event");
-        if (name !== void 0 && name.length > 0 && event !== void 0 && isCanonicalStage(event)) {
-          return { pkg: buildPkg(name, env.get("npm_package_version")), lifecycle: event };
+        const attrib = attributionFromEnvVars(
+          env.get("npm_package_name"),
+          env.get("npm_package_version"),
+          env.get("npm_lifecycle_event")
+        );
+        if (attrib !== null) {
+          return attrib;
         }
       }
       const ppid = this.reader.readPpid(current);
@@ -25980,6 +25989,22 @@ function parseShimLine(line) {
     return null;
   }
 }
+function shimExecAttribution(line) {
+  try {
+    const obj = JSON.parse(line);
+    if (obj["kind"] !== "exec") return null;
+    const name = obj["npm_package_name"];
+    const version2 = obj["npm_package_version"];
+    const event = obj["npm_lifecycle_event"];
+    return attributionFromEnvVars(
+      typeof name === "string" ? name : void 0,
+      typeof version2 === "string" ? version2 : void 0,
+      typeof event === "string" ? event : void 0
+    );
+  } catch {
+    return null;
+  }
+}
 function pathBasename(pathLike) {
   const nul = pathLike.indexOf("\0");
   const value = nul === -1 ? pathLike : pathLike.slice(0, nul);
@@ -26761,6 +26786,7 @@ async function runInstallPhase(input) {
         continue;
       }
       const result = input.attribution.attribute(shimEvent.pid);
+      const shimAttrib = shimExecAttribution(line);
       if (shimEvent.kind === "exec") {
         const current = shimExecCountByPid.get(shimEvent.pid) ?? 0;
         const next = shimEvent.result === "failed" ? current > 0 ? current - 1 : 0 : current + 1;
@@ -26769,10 +26795,11 @@ async function runInstallPhase(input) {
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
         continue;
       }
-      const attribution = result ?? snapshotAttribution(shimEvent.pid);
+      const attribution = shimAttrib ?? result ?? snapshotAttribution(shimEvent.pid);
       if (attribution !== null) {
-        if (result !== null) {
-          recordAttribution(shimEvent.pid, result, lineTs);
+        const seed = shimAttrib ?? result;
+        if (seed !== null) {
+          recordAttribution(shimEvent.pid, seed, lineTs);
         }
         const attributed = {
           raw: shimEvent,
@@ -28620,7 +28647,9 @@ async function* runStraceTailer(opts) {
   let watcher = null;
   try {
     watcher = (0, import_node_fs3.watch)(opts.watchDir, (_event, _filename) => {
+      drainEventsFile();
       pollDir();
+      wake();
     });
     watcher.on("error", () => {
     });
@@ -28661,8 +28690,8 @@ async function* runStraceTailer(opts) {
     }
   }
   let pollTimer = setInterval(() => {
-    pollDir();
     drainEventsFile();
+    pollDir();
     wake();
   }, pollIntervalMs);
   opts.exitPromise.then(async () => {
@@ -28678,8 +28707,8 @@ async function* runStraceTailer(opts) {
     };
     await delay(drainMs);
     for (; ; ) {
-      pollDir();
       drainEventsFile();
+      pollDir();
       const cur = progressKey();
       if (cur === prev) {
         if (++quiet >= settleQuietPasses) break;

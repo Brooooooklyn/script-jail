@@ -64,6 +64,49 @@ function buildPkg(name: string, version: string | undefined): string {
   return version !== undefined ? `${name}@${version}` : name;
 }
 
+/**
+ * Compose an {@link AttributionResult} from raw npm lifecycle env vars, applying
+ * the SAME match rules as the /proc walk: `npm_package_name` must be non-empty
+ * AND `npm_lifecycle_event` must be one of the canonical {@link LifecycleStage}
+ * values. Returns null otherwise.
+ *
+ * Shared by {@link Attribution._walk} (reading /proc/<pid>/environ) and the
+ * phase-install dispatcher's shim-exec fast path (reading the
+ * `npm_package_name`/`npm_package_version`/`npm_lifecycle_event` fields the
+ * LD_PRELOAD shim stamps into its `exec` record). Centralising it guarantees a
+ * shim-sourced attribution renders BYTE-IDENTICALLY to the /proc-sourced one —
+ * the invariant the macOS-VZ-vs-Docker parity test depends on.
+ *
+ * TRUST (audit-trust, 2026-06-03): both inputs are trusted at face value and at
+ * the SAME level. The /proc path reads a process's own (script-settable) env
+ * (see the {@link Attribution._walk} `TODO(v2)` note); the shim path reads
+ * fields the shim stamped from that same env at ctor time, carried over the
+ * events-file channel. A malicious lifecycle script can MIS-LABEL a spawn
+ * through either path. Reading these fields adds an attribution LABEL to the
+ * shim's events-file channel but does not change that channel's integrity: it
+ * was already forgeable by an already-shim-loaded pid (the out-of-scope
+ * "advanced attack" the phase-install events-file forgery detector documents),
+ * and that same forgery can ALSO suppress `<SYSCALL_EXEC_BYPASS>` synthesis
+ * (under-capture) — see the trust notes at the phase-install seed site. Do not
+ * read this helper as a guarantee that forged attribution can only mislabel
+ * and never hide; the bypass-suppression path is the counterexample.
+ */
+export function attributionFromEnvVars(
+  name: string | undefined,
+  version: string | undefined,
+  event: string | undefined,
+): AttributionResult | null {
+  if (
+    name !== undefined &&
+    name.length > 0 &&
+    event !== undefined &&
+    isCanonicalStage(event)
+  ) {
+    return { pkg: buildPkg(name, version), lifecycle: event };
+  }
+  return null;
+}
+
 export class Attribution {
   private readonly reader: ProcReader;
   // Terminal-only cache: keyed by starting pid. Intermediate pids are not
@@ -152,10 +195,13 @@ export class Attribution {
       // roots rather than reading unchecked env from arbitrary ancestors.
       const env = this.reader.readEnviron(current);
       if (env !== null) {
-        const name = env.get('npm_package_name');
-        const event = env.get('npm_lifecycle_event');
-        if (name !== undefined && name.length > 0 && event !== undefined && isCanonicalStage(event)) {
-          return { pkg: buildPkg(name, env.get('npm_package_version')), lifecycle: event };
+        const attrib = attributionFromEnvVars(
+          env.get('npm_package_name'),
+          env.get('npm_package_version'),
+          env.get('npm_lifecycle_event'),
+        );
+        if (attrib !== null) {
+          return attrib;
         }
         // npm_package_name is set but event is not canonical (or missing):
         // continue walking up.
