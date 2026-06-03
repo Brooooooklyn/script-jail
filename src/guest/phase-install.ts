@@ -35,7 +35,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import type { Emitter } from './emit.js';
-import type { Attribution } from './attribution.js';
+import type { Attribution, AttributionResult } from './attribution.js';
+import { attributionFromEnvVars } from './attribution.js';
 import { parseStraceLine, unescapeStraceString } from './strace-parser.js';
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
 import {
@@ -336,6 +337,41 @@ export function parseShimLine(line: string): ShimLineEvent | null {
   }
 }
 
+/**
+ * Extract the in-process npm lifecycle attribution the LD_PRELOAD shim stamps
+ * into its `exec` record (`npm_package_name` / `npm_package_version` /
+ * `npm_lifecycle_event`).  Returns an {@link AttributionResult} composed via
+ * {@link attributionFromEnvVars} (byte-identical to the /proc-walk path), or
+ * null when the line is not a shim `exec` record / carries no usable
+ * attribution.
+ *
+ * Parsed SEPARATELY from {@link parseShimLine} on purpose: `ExecEvent`
+ * (non-strict zod) strips these fields from the emitted `RawEvent`, so they
+ * never reach the byte-stable lockfile or the e2e goldens — they exist ONLY to
+ * seed attribution.  The shim record is authoritative (read from the process's
+ * own environ, never reaped) and the tailer yields shim records before the
+ * strace lines for the same exec, so seeding `recordAttribution` here lets the
+ * later strace `spawn` for this pid attribute deterministically — closing the
+ * macOS-VZ-vs-Docker race for short-lived `.bin` shell-shim helpers without a
+ * /proc walk.
+ */
+export function shimExecAttribution(line: string): AttributionResult | null {
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    if (obj['kind'] !== 'exec') return null;
+    const name = obj['npm_package_name'];
+    const version = obj['npm_package_version'];
+    const event = obj['npm_lifecycle_event'];
+    return attributionFromEnvVars(
+      typeof name === 'string' ? name : undefined,
+      typeof version === 'string' ? version : undefined,
+      typeof event === 'string' ? event : undefined,
+    );
+  } catch {
+    return null;
+  }
+}
+
 function pathBasename(pathLike: string): string {
   const nul = pathLike.indexOf('\0');
   const value = nul === -1 ? pathLike : pathLike.slice(0, nul);
@@ -523,6 +559,20 @@ export async function runInstallPhase(
   // attack and out of scope for this fix — the canonical, demonstrated
   // attack pattern (raw-syscall exec + scrubbed envp + forged JSONL)
   // is what we are closing.
+  //
+  // This caveat also bounds shim self-attribution (2026-06-03): the
+  // dispatcher reads npm_package_name/version/lifecycle out of the shim's
+  // `exec` JSONL to attribute a reaped-helper spawn deterministically (see
+  // `shimExecAttribution` and the seed site near `recordAttribution`).  A
+  // forged `exec` line from such a trusted pid can mis-label a spawn — and,
+  // exactly as the `result:"ok"` forgery described above does, can inflate
+  // `shimExecCountByPid` to suppress a `<SYSCALL_EXEC_BYPASS>` synthesis
+  // (under-capture, NOT merely mis-attribution).  Reading the npm fields adds
+  // an attribution label to this same already-forgeable channel; it does not
+  // create a new write primitive and does not widen this boundary.  Same
+  // out-of-scope advanced attack; the forgery detector only backstops
+  // NON-shim-loaded writers.  Do not assume the lockfile diff always catches
+  // it: a suppressed bypass leaves no event to diff.
   const SHIM_LIBRARY_PATH = '/lib/libscriptjail.so';
   const eventsFilePathRaw = input.env['SCRIPT_JAIL_LOG_FILE'];
   const eventsFilePath: string | null =
@@ -2450,6 +2500,16 @@ export async function runInstallPhase(
         continue;
       }
       const result = input.attribution.attribute(shimEvent.pid);
+      // Deterministic in-process attribution (2026-06-03): when this is a shim
+      // `exec` record carrying the process's own npm lifecycle env, prefer it
+      // over the /proc walk.  It is authoritative (read in-process, never
+      // reaped) and, because the tailer yields shim records before the strace
+      // lines for the same exec, seeding it via recordAttribution below lets the
+      // later strace `spawn` for this pid attribute deterministically — closing
+      // the macOS-VZ-vs-Docker capture race for short-lived `.bin` shell-shim
+      // helpers.  Non-exec shim records / unshimmed processes yield null here
+      // and fall back to /proc exactly as before.
+      const shimAttrib = shimExecAttribution(line);
       // Audit-trust Finding 1: track the shim's exec events per pid so
       // the post-loop cross-check can pair each strace execve with a
       // shim exec.  We count regardless of whether attribution succeeded
@@ -2510,7 +2570,7 @@ export async function runInstallPhase(
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
         continue;
       }
-      const attribution = result ?? snapshotAttribution(shimEvent.pid);
+      const attribution = shimAttrib ?? result ?? snapshotAttribution(shimEvent.pid);
       if (attribution !== null) {
         // Finding 3 (audit-trust): snapshot attribution for this pid on
         // every successful observation.  A later raw execve from the
@@ -2518,8 +2578,43 @@ export async function runInstallPhase(
         // lifecycle context and slip past the bypass detector.  The
         // refresh semantics (see `recordAttribution` declaration) also
         // keep same-pid re-execs into a new package context current.
-        if (result !== null) {
-          recordAttribution(shimEvent.pid, result, lineTs);
+        //
+        // Seed with the shim's in-process attribution when present (it is
+        // not subject to /proc reaping, which is what makes the reaped-helper
+        // spawn deterministic); otherwise the /proc result.  This seeded
+        // snapshot is what the subsequently-processed strace `spawn` for the
+        // same pid consumes — the determinism that fixes the parity divergence.
+        //
+        // TRUST (audit-trust, 2026-06-03): `shimAttrib` (from
+        // `shimExecAttribution`) reads npm_package_name/version/lifecycle out
+        // of the shim's events-file JSONL line.  Those fields are trusted at
+        // the SAME level as the /proc-walk env they mirror (see
+        // attribution.ts:_walk TODO(v2)) — not higher.  A lifecycle script
+        // running inside an already-shim-loaded pid can append a forged `exec`
+        // line (forged npm fields + an arbitrary `pid`) to mis-label a spawn.
+        // This is the SAME out-of-scope "more advanced attack" the events-file
+        // forgery detector already documents (see the trust-model caveat near
+        // `shimLoadedPids`); this change neither closes nor widens that
+        // boundary — it only adds an attribution LABEL to a channel the same
+        // forger could already write to.  IMPORTANTLY, that pre-existing
+        // forgery is NOT limited to mis-attribution: a forged `result:"ok"`
+        // exec line inflates `shimExecCountByPid` for its target pid, which can
+        // push `straceCount <= shimCount` in the post-loop bypass cross-check
+        // (see the `<SYSCALL_EXEC_BYPASS>` synthesis) and SUPPRESS the bypass
+        // signal for a raw-syscall exec — i.e. under-capture, not merely a
+        // mislabel.  So do not assume the lockfile diff necessarily surfaces a
+        // forged-line attack: a mislabel usually changes the rendered lockfile,
+        // but a suppressed bypass removes the evidence entirely, and a forger
+        // can also target a package that legitimately performs the same action.
+        // What this change DOES guarantee: cross-tree framing is racy because
+        // `lineTs` is the agent-assigned dispatch counter, NOT the line's `ts`
+        // field, so a forged line only wins recordAttribution monotonicity if
+        // it is *read after* the victim's real shim line.  The forgery detector
+        // remains the kernel-observed backstop, but ONLY for non-shim-loaded
+        // writers; an already-shim-loaded forger is out of scope by design.
+        const seed = shimAttrib ?? result;
+        if (seed !== null) {
+          recordAttribution(shimEvent.pid, seed, lineTs);
         }
         const attributed: AttributedEvent = {
           raw: shimEvent,
@@ -5211,6 +5306,22 @@ export async function runInstallPhase(
                 lifecycle: isStale ? 'install' : spawnSnapshot.lifecycle,
               });
             }
+            // No snapshot: the spawning pid is unattributable via /proc (the
+            // short-lived helper is already reaped) and no clone-propagated or
+            // shim-seeded snapshot exists for it.  Drop it — emitting an
+            // unattributable spawn would attribute it under no package.  The
+            // common short-lived-helper case (e.g. the `dirname`/`sed`/`uname`
+            // forks of an npm/pnpm `.bin` shell shim) is instead recovered
+            // DETERMINISTICALLY upstream: the LD_PRELOAD shim stamps the
+            // process's own `npm_package_name`/`npm_lifecycle_event` into its
+            // `exec` record, and the tailer yields shim records before the
+            // strace lines for the same exec (the shim's `emit_exec` write
+            // precedes `real_execve`, which precedes strace's execve line — see
+            // `runStraceTailer`), so `recordAttribution` has already seeded a
+            // FRESH snapshot for this pid by the time the strace spawn is
+            // processed.  This branch therefore only fires for genuinely
+            // unshimmed processes (static/setuid/env-scrubbed), which fall back
+            // to /proc exactly as before.
           }
           continue;
         }

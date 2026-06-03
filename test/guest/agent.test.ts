@@ -1533,6 +1533,138 @@ describe('runStraceTailer', () => {
     expect(items[1]).toEqual({ pid: 1234, line: 'execve("/bin/sh", ["sh"], ...) = 0', source: 'strace' });
   });
 
+  it('drains the shim events file before per-pid strace files (shim-first ordering)', async () => {
+    // For any given exec the shim's `emit_exec` write lands in the events file
+    // BEFORE strace logs the execve (the shim writes in-process, before
+    // real_execve).  The tailer must therefore yield the shim `exec` record
+    // ahead of the matching strace `spawn` for the same pid, so the dispatcher
+    // has seeded that pid's attribution from the shim's in-process npm env
+    // before it processes the spawn.  Both files are present before start, so
+    // this asserts the invariant deterministically via the settle drain.
+    const basePath = join(tailerDir, 'strace.out');
+    const eventsFile = join(tailerDir, 'events.jsonl');
+    const shimExec = JSON.stringify({
+      kind: 'exec', prog: '/usr/bin/dirname', argv0: 'dirname', pid: 502,
+      ts: 10, envp_alloc_failed: false, result: 'ok',
+      npm_package_name: 'unrs-resolver', npm_package_version: '1.11.1',
+      npm_lifecycle_event: 'postinstall',
+    });
+    writeFileSync(eventsFile, shimExec + '\n', 'utf8');
+    writeFileSync(`${basePath}.502`, 'execve("/usr/bin/dirname", ["dirname", "/x"], ...) = 0\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsFile,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 50,
+    });
+
+    resolveExit();
+
+    const items = await collect(tailer);
+    const shimIdx = items.findIndex((i) => i.source === 'shim' && i.line.includes('"kind":"exec"'));
+    const straceIdx = items.findIndex((i) => i.source === 'strace' && i.pid === 502);
+    expect(shimIdx).toBeGreaterThanOrEqual(0);
+    expect(straceIdx).toBeGreaterThanOrEqual(0);
+    expect(shimIdx).toBeLessThan(straceIdx);
+  });
+
+  it('the watchDir callback drains the events file before the strace spawn it fires on', async () => {
+    // Regression guard for the per-pid directory watcher's shim-first ordering
+    // (2026-06-03).  The directory watcher is a SEPARATE fs.watch from the
+    // events-file watcher and can fire first.  If its callback enqueued the
+    // strace spawn before the shim `exec` record (which seeds attribution) was
+    // drained, the dispatcher would process the spawn with no seed and drop a
+    // reaped-helper spawn.
+    //
+    // The test must isolate the WATCHER callback as the first drain — not the
+    // exit settle loop (which also drains shim-first and would mask a
+    // regression) nor the periodic poll.  So: the shim line is already in the
+    // events file (a pre-existing file does NOT trigger the events-file inotify
+    // watch); the poll interval is far longer than the assertion window (the
+    // poll never fires here); and `exitPromise` is left UNRESOLVED while we
+    // assert, so the settle loop cannot run.  The strace file is written after
+    // iteration begins, so the directory watcher fires on it and is the ONLY
+    // possible first drain.  We assert the FIRST yielded item is the shim line:
+    // with the pollDir-only bug the watcher enqueues the strace spawn first, so
+    // the first item would be the strace line.  Teardown resolves exit and
+    // drains to completion (guarded) so the generator clears its own timers.
+    const basePath = join(tailerDir, 'strace.out');
+    const eventsFile = join(tailerDir, 'events.jsonl');
+    const shimExec = JSON.stringify({
+      kind: 'exec', prog: '/usr/bin/dirname', argv0: 'dirname', pid: 777,
+      ts: 5, envp_alloc_failed: false, result: 'ok',
+      npm_package_name: 'pkg', npm_package_version: '2.0.0',
+      npm_lifecycle_event: 'install',
+    });
+    writeFileSync(eventsFile, shimExec + '\n', 'utf8');
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsFile,
+      exitPromise,
+      // The watcher callback fires within ~ms of the strace write; the first
+      // poll tick is 1000ms out, so the periodic poll cannot be the first drain
+      // (it only serves to wake the generator for teardown in the failure path
+      // where the watcher never fires).
+      pollIntervalMs: 1000,
+      drainMs: 20,
+    });
+    const iterator = tailer[Symbol.asyncIterator]();
+    // CRITICAL: `runStraceTailer` is an async generator — its body (which
+    // installs the fs.watch handlers) does NOT run until the first next().  Pull
+    // the first item BEFORE creating the strace file so the watchers are
+    // installed first and the directory watcher genuinely fires on the new file.
+    // A file created before next() would be seen only by a poll/settle drain.
+    const nextPromise = iterator.next();
+    // exitPromise is intentionally never resolved: the settle loop must not run
+    // (it would drain shim-first and mask a watcher regression).  Teardown is
+    // via iterator.return(), which runs the generator's finally and clears its
+    // own poll timer + watchers.
+    void resolveExit;
+
+    try {
+      // Give the generator body a tick to run to its wake await and install the
+      // watchers, THEN create the strace file so the directory watcher fires on
+      // it.  With the pollDir-only bug the watcher enqueues the strace line
+      // first, so the first yielded item is the strace spawn (fast assertion
+      // failure); with the shim-first fix it is the shim `exec` record.
+      await new Promise<void>((r) => setTimeout(r, 40));
+      writeFileSync(`${basePath}.777`, 'execve("/usr/bin/dirname", ["dirname"], ...) = 0\n', 'utf8');
+
+      const first = await Promise.race([
+        nextPromise,
+        new Promise<IteratorResult<{ pid: number; line: string; source: 'shim' | 'strace' }>>(
+          (_, reject) => setTimeout(() => reject(new Error('next() timed out — watcher did not drain')), 4000),
+        ),
+      ]);
+      expect(first.done).toBe(false);
+      expect(first.value.source).toBe('shim');
+      expect(first.value.line).toContain('"pid":777');
+    } finally {
+      // After a single yielded item the generator is parked at its `yield`, so
+      // return() resumes it there and runs the finally promptly (no settle loop,
+      // no leaked timer).  Guarded for the failure path where the generator is
+      // parked on its wake await — the 1000ms poll tick wakes it and lets the
+      // pending return complete.
+      await Promise.race([
+        Promise.resolve(iterator.return?.(undefined)),
+        new Promise<void>((r) => setTimeout(r, 4000)),
+      ]);
+    }
+  });
+
   it('yields lines from multiple per-pid files with correct pids', async () => {
     const basePath = join(tailerDir, 'strace.out');
     writeFileSync(`${basePath}.100`, 'openat(AT_FDCWD, "/a", O_RDONLY) = 3\n', 'utf8');

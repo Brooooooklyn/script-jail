@@ -149,6 +149,32 @@ static CANON_SPOOF_ARCH: CanonBuf = CanonBuf {
     len: AtomicUsize::new(0),
 };
 
+// npm lifecycle attribution, snapshotted at shim_init from THIS process's own
+// (inherited) environ.  Stamped into every `exec` record (emit_exec_for_pid) so
+// the guest agent can attribute a spawn to its owning package WITHOUT walking
+// /proc — the in-process read is authoritative (never reaped) and deterministic
+// across backends, which is what closes the macOS-VZ-vs-Docker attribution race
+// for short-lived `.bin` shell-shim helpers (dirname/sed/uname).  Captured at
+// ctor (not exec-time): npm sets these per-script and they are constant for the
+// process, and a ctor snapshot resists a script mutating npm_package_name
+// mid-run to frame a sibling package.  These are NOT sticky/re-injected (unlike
+// the SCRIPT_JAIL_* / LD_PRELOAD vars) — they propagate naturally via fork/exec
+// env inheritance and the agent only needs to READ them.
+static CANON_NPM_PACKAGE_NAME: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+static CANON_NPM_PACKAGE_VERSION: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+static CANON_NPM_LIFECYCLE_EVENT: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
 /// Returns the live byte slice of a CanonBuf (without the NUL terminator).
 /// Safe to call after INIT_DONE is observed via Acquire — by then the ctor has
 /// finished writing and `len` is stable.
@@ -842,7 +868,16 @@ unsafe fn json_escape(dst: &mut [u8], src: *const c_char) -> usize {
         }
         p += 1;
     }
-    if truncated {
+    // The loop's `n + needed + reserve > dst.len()` guard keeps a full
+    // `reserve = TRUNC_MARKER.len() + 1` bytes free after every char it writes,
+    // so a loop-driven truncation always leaves room for the marker.  The one
+    // exception is an immediate truncation at `n == 0` when `dst` itself is
+    // narrower than the marker (a value slice < TRUNC_MARKER.len()); without
+    // this fit-check the copy_from_slice below would run past `dst` and abort
+    // the shim.  Callers should size the slice ≥ TRUNC_MARKER.len()
+    // (append_canon_field does), but guarding here removes the out-of-bounds
+    // primitive for every caller — on a too-small slice we simply emit nothing.
+    if truncated && n + TRUNC_MARKER.len() <= dst.len() {
         dst[n..n + TRUNC_MARKER.len()].copy_from_slice(TRUNC_MARKER);
         n += TRUNC_MARKER.len();
     }
@@ -1176,6 +1211,22 @@ unsafe fn shim_init() {
         &CANON_SPOOF_ARCH,
         b"SCRIPT_JAIL_SPOOF_ARCH\0".as_ptr() as *const c_char,
     );
+    // npm lifecycle attribution — snapshotted from this process's own environ
+    // so emit_exec_for_pid can stamp the owning package into every exec record
+    // (deterministic, reap-proof in-process attribution; see the CANON_NPM_*
+    // static defs).  Same ctor-time safety rationale as the SCRIPT_JAIL_* vars.
+    capture_canon(
+        &CANON_NPM_PACKAGE_NAME,
+        b"npm_package_name\0".as_ptr() as *const c_char,
+    );
+    capture_canon(
+        &CANON_NPM_PACKAGE_VERSION,
+        b"npm_package_version\0".as_ptr() as *const c_char,
+    );
+    capture_canon(
+        &CANON_NPM_LIFECYCLE_EVENT,
+        b"npm_lifecycle_event\0".as_ptr() as *const c_char,
+    );
 
     // 6. Load the protect-list FROM the captured env-var snapshot (Finding 4).
     //    Reading the names directly out of CANON_PROTECTED_ENV_NAMES means
@@ -1375,6 +1426,68 @@ unsafe fn emit_exec(
     emit_exec_for_pid(prog, argv0, envp_alloc_failed, pid, result);
 }
 
+/// Append `,"<key>":"<json-escaped value>"` from a CanonBuf into the JSONL
+/// scratch buffer at `pos`, returning the new write position.  Omits the field
+/// entirely (returns `pos` unchanged) when the CanonBuf is empty OR the field
+/// would not fit while leaving room for the closing `}\n` — the guest agent
+/// treats a missing attribution field as "no shim attribution" and falls back
+/// to its /proc walk, so omission is always safe.  The value is json-escaped
+/// (it originates from the process's environ, which a lifecycle script can set
+/// to arbitrary bytes) and truncated safely by `json_escape` if pathologically
+/// long.
+unsafe fn append_canon_field(
+    buf: &mut [u8],
+    mut pos: usize,
+    key: &[u8],
+    canon: &CanonBuf,
+) -> usize {
+    if canon.len.load(Ordering::Acquire) == 0 {
+        return pos;
+    }
+    // Opening run is `,"<key>":"` = key.len() + 5 bytes.  Reserve 3 trailing
+    // bytes: the closing value quote (1) and the record's `}\n` tail (2).  Bail
+    // (omit) unless the opening run plus at least one value byte plus the
+    // reserve all fit.
+    let open_len = key.len() + 5;
+    // Bail (omit) unless the opening run, a value region at least
+    // TRUNC_MARKER.len() bytes wide, and the 3-byte reserve (the closing value
+    // quote + the record's `}\n` tail) all fit.  json_escape writes its
+    // TRUNC_MARKER on truncation; a value slice narrower than the marker would
+    // (absent json_escape's own fit-check) copy it past the slice and abort the
+    // no_std shim.  Requiring marker-width here keeps the slice handed to
+    // json_escape always ≥ the marker, so it never has to drop the marker and
+    // never produces a malformed value.  A long argv0 + long npm_package_name
+    // can otherwise leave npm_package_version with only a handful of value
+    // bytes while still clearing a `>= 1 byte` guard — exactly the panic this
+    // closes.  Omission is safe: the guest treats a missing attribution field
+    // as "no shim attribution" and falls back to its /proc walk.
+    if pos + open_len + 3 + TRUNC_MARKER.len() > buf.len() {
+        return pos;
+    }
+    buf[pos] = b',';
+    pos += 1;
+    buf[pos] = b'"';
+    pos += 1;
+    buf[pos..pos + key.len()].copy_from_slice(key);
+    pos += key.len();
+    buf[pos] = b'"';
+    pos += 1;
+    buf[pos] = b':';
+    pos += 1;
+    buf[pos] = b'"';
+    pos += 1;
+    // Escape the value into the space that remains after reserving the closing
+    // quote (1) and the `}\n` tail (2).  json_escape never writes past the
+    // slice it is given and truncates with its own marker if needed.
+    let value_end = buf.len() - 3;
+    let canon_ptr = (*canon.bytes.get()).as_ptr() as *const c_char;
+    let written = json_escape(&mut buf[pos..value_end], canon_ptr);
+    pos += written;
+    buf[pos] = b'"';
+    pos += 1;
+    pos
+}
+
 // Audit-trust Finding 1 (high): posix_spawn dispatch must emit the shim
 // `exec` event tagged with the CHILD pid (the one strace records the
 // child's execve under), not the parent pid.  Otherwise the
@@ -1403,11 +1516,16 @@ unsafe fn emit_exec_for_pid(
     let mut pos = 0usize;
 
     // Reserve trailing budget for the suffix: closing argv0 quote (or "null"),
-    // ","pid":<20>,"ts":<20>,"envp_alloc_failed":<5>,"result":"failed"}\n.
-    // The "result":"failed" tail is the widest variant (16 bytes including
-    // the leading comma and quotes); SUFFIX_RESERVE was 96 — bumping to 128
-    // gives a comfortable margin without crowding the prog/argv0 budget.
-    const SUFFIX_RESERVE: usize = 128;
+    // ","pid":<20>,"ts":<20>,"envp_alloc_failed":<5>,"result":"failed", the
+    // three optional npm attribution fields, and the closing `}\n`.
+    // npm_package_name is ≤214 bytes (npm naming limit) and needs no escaping
+    // in practice; with the field keys + version + lifecycle the attribution
+    // run is ~320 bytes worst-case.  512 reserves comfortably for it plus the
+    // fixed pid/ts/result tail without crowding the prog/argv0 budget (the
+    // 4096-byte buffer still leaves ~1.7 KiB each for prog and argv0).  Every
+    // append below is independently bounds-guarded, so an oversized value is
+    // safely truncated/omitted regardless of this reserve.
+    const SUFFIX_RESERVE: usize = 512;
 
     let prefix = br#"{"kind":"exec","prog":""#;
     if prefix.len() > buf.len() {
@@ -1494,6 +1612,27 @@ unsafe fn emit_exec_for_pid(
     }
     buf[pos..pos + result_tail.len()].copy_from_slice(result_tail);
     pos += result_tail.len();
+
+    // npm lifecycle attribution (deterministic, in-process, reap-proof).  Each
+    // field is omitted when its CanonBuf is empty (process is not inside a
+    // lifecycle script — e.g. npm/pnpm itself) so non-lifecycle exec records
+    // are byte-identical to the pre-change shim output.  The guest agent
+    // composes `pkg = npm_package_name[@npm_package_version]` and uses it to
+    // attribute the strace-observed spawn for this pid, matching
+    // Attribution.buildPkg exactly.
+    pos = append_canon_field(&mut buf, pos, b"npm_package_name", &CANON_NPM_PACKAGE_NAME);
+    pos = append_canon_field(
+        &mut buf,
+        pos,
+        b"npm_package_version",
+        &CANON_NPM_PACKAGE_VERSION,
+    );
+    pos = append_canon_field(
+        &mut buf,
+        pos,
+        b"npm_lifecycle_event",
+        &CANON_NPM_LIFECYCLE_EVENT,
+    );
 
     buf[pos] = b'}';
     pos += 1;
