@@ -1,41 +1,49 @@
 # Releasing
 
-First-release runbook for script-jail: the Phase 0 → 1 → 2 bootstrap loop that
-takes a fresh fork from placeholder manifest to a fully runnable Action, plus
-the works/degraded matrix that explains exactly what is usable at each tag.
+Release runbook for script-jail under the **build-once / download-forever**
+single-tag flow: a manually-dispatched producer (`release-build.yml`) builds
+every VM-image asset exactly once, the operator backfills the producer's SHAs +
+digests into the committed manifest, and pushing the single release tag
+`vX.Y.Z` runs `release.yml`, which **downloads and verifies** those exact
+artifacts (it never rebuilds them) and publishes. This document covers that
+sequence plus the works/degraded matrix that explains what is usable before vs.
+after the first producer-backed release.
 
-The release repo is **`Brooooooklyn/scriptjail`**. The bootstrap loop spans two
-tags. The 0.1.0 npm packages were published **manually / locally** as a one-time
-bootstrap (no `v0.1.0` tag was pushed for that publish — see the Phase 0
-bootstrap exception). Pushing the **`v0.1.0`** tag then runs `release.yml` to
-build the artifacts and upload the release assets while the pinned manifest
-still carries placeholders; its npm-publish step is idempotent and SKIPS the
-already-published 0.1.0 packages. **`v0.1.1`** backfills the real SHAs/digests
-that run emits so the GitHub Action validates and runs.
+The release repo is **`Brooooooklyn/scriptjail`**.
 
-> Why two tags? The pinned artifact manifest in
-> `src/action/artifact-manifest.ts` references the SHA-256 of every release
-> asset and the digest of every GHCR image — but those values only exist once a
-> release has actually built and uploaded them. The first tag produces the
-> artifacts; the second tag pins them. This mirrors the bootstrap caveat
-> documented in `src/action/artifact-manifest.ts` and `release.yml`.
+> **Why a separate producer?** The pinned artifact manifest in
+> `src/action/artifact-manifest.ts` records the SHA-256 of every release asset
+> and the digest of every GHCR image, and the Action/CLI verify downloaded
+> assets against it at runtime. Several of those assets — the VZ kernels, the
+> Mach-O VZ helper, the GHCR Docker images — are NOT byte-reproducible, so they
+> cannot be rebuilt at tag time and compared. Instead `release-build.yml` builds
+> every asset **once** and stores them as tag-suffixed Actions artifacts; the
+> later `release.yml` run on the tag downloads those exact bytes and verifies
+> them against the committed manifest. Build once, download forever.
+>
+> **Reproducibility is no longer a release gate.** Because the release publishes
+> the exact bytes the producer built (and verifies them against the committed
+> SHAs), byte-reproducibility of the binaries is not required and is not gated
+> in either workflow. The rootfs ext4s are still pinned by their **canonical
+> (time-masked) hash** (`src/rootfs/repro-hash.ts`) — that is simply *how* those
+> assets are verified, and it lets an auditor optionally rebuild a rootfs and
+> confirm it matches — but a divergent rebuild does not block a release.
 
 For day-to-day build/dist conventions and the packaging topology (four npm
 packages, single source of truth in `scripts/npm-packages.mjs`), see
 [development.md](./development.md). This runbook covers only the release
-sequence and what each tag delivers.
+sequence and what each phase delivers.
 
 ---
 
-## Phase 0 — pre-tag manual gates
+## Phase 0 — pre-release manual gates
 
-These steps are done by hand, once, before the first tag is pushed. None of
-them are enforced by CI on a fresh fork, so confirm each explicitly.
+These steps are done by hand before the tag is pushed. Confirm each explicitly.
 
-1. **npm namespace ownership + trusted publishers (manual prerequisite O2).** Own
-   the unscoped main package name `script-jail` AND the `@script-jail` scope on
-   the registry, and have a **trusted publisher** configured for **all four**
-   published packages (`script-jail` + `@script-jail/darwin-arm64`,
+1. **npm namespace ownership + trusted publishers (OIDC).** Own the unscoped
+   main package name `script-jail` AND the `@script-jail` scope on the registry,
+   and have a **trusted publisher** configured for **all four** published
+   packages (`script-jail` + `@script-jail/darwin-arm64`,
    `@script-jail/linux-x64`, `@script-jail/linux-arm64`), each pointing at this
    repo's `release.yml`. Set once per package with
    `npm trust github <pkg> --file release.yml --repo Brooooooklyn/scriptjail --allow-publish`
@@ -45,83 +53,175 @@ them are enforced by CI on a fresh fork, so confirm each explicitly.
    required** and provenance is attached automatically. A config missing on even
    one of the four packages fails partway through the publish loop.
 
-   > **Bootstrap exception.** Trusted publishing requires the package to already
-   > exist on the registry, so the *very first* publish of a brand-new name
-   > cannot use OIDC. v0.1.0 was that one-time bootstrap (published with a
-   > token / locally); v0.1.0 → v0.1.1 and every release after it use OIDC.
+   > **Bootstrap exception (historical).** Trusted publishing requires the
+   > package to already exist on the registry, so the *very first* publish of a
+   > brand-new name cannot use OIDC. `0.1.0` was that one-time **manual / local**
+   > bootstrap publish (no `v0.1.0` tag was pushed for it). Every release from
+   > the first producer-backed one onward uses OIDC via `release.yml`.
 
-2. **Manifest is in the documented bootstrap state.** In
-   `src/action/artifact-manifest.ts` confirm:
-   - `repo` is `'Brooooooklyn/scriptjail'`,
-   - `tag` is `'v0.1.0'`,
-   - **every** SHA value is still a `PLACEHOLDER_SHA256_*` token (no real SHAs
-     mixed in — a mixed manifest is rejected, see Phase 2).
+2. **Versions are aligned at `X.Y.Z`.** The main `package.json` `version` must be
+   `X.Y.Z` on `main`. The three platform packages do not carry a committed
+   version — they are stamped from the tag at publish time by
+   `scripts/assemble-npm-packages.mjs` (and the main version is gated against the
+   tag by the version==tag check in the publish job). You bump the main version
+   during the backfill commit (Phase 2), so on a fresh branch it may still read
+   the previous release's value here.
 
-3. **Rebuild and commit the bundles.** Any `src/` change since the last build
-   means `dist/` is stale. Run the build, then commit the regenerated bundles
-   (`dist/main.cjs`, `dist/cli.cjs`, `dist/guest-agent.cjs`,
-   `dist/preloads/*.cjs`) so the tagged commit carries the bytes the release job
-   verifies. The freshness gate that catches a stale `dist/` is `test.yml` (see
-   the dist note in the appendix).
-
-4. **Versions are aligned at `0.1.0`.** The main `package.json` `version` must
-   be `0.1.0` on `main`, and the three platform packages assemble to the same
-   version (they are stamped from the tag by `scripts/assemble-npm-packages.mjs`
-   and gated by the version==tag check in the publish job).
-
-5. **Green CI on the exact tagged commit.** `test.yml` (incl. the dist
+3. **Green CI on the exact release commit.** `test.yml` (incl. the dist
    freshness gate), `e2e.yml`, `test-macos.yml`, and `parity-test.yml` must be
-   green on the commit you are about to tag — the tag should point at an
-   already-green commit, not trigger the first run.
+   green on the commit you are about to release — the producer and the tag should
+   point at an already-green commit, not trigger the first run.
 
 ---
 
-## Phase 1 — tag `v0.1.0`
+## Phase 1 — run the producer (`release-build.yml`)
 
-Pushing the `v0.1.0` tag runs `release.yml`, whose jobs run in order:
+Dispatch the producer manually: **Actions → release-build → Run workflow**, with
+`tag = vX.Y.Z`, on the **target release commit** (select that commit's branch as
+the workflow ref). Under `workflow_dispatch` the tag must be supplied
+explicitly — `github.ref_name` is the dispatched *branch*, not a `v*.*.*` tag.
 
-1. **`build-mac-bin`** — cross-build the Darwin arm64 `script-jail-vm` Mach-O
-   helper on the macOS runner (it cannot be built on the Linux publish runner)
-   and upload it as a workflow artifact.
-2. **`build`** — install / typecheck / test / build the bundles, build the
-   rootfs ext4 images, the Rust shim `.so`s, and the VZ kernels. The
-   "Validate pinned artifact manifest (bootstrap-aware)" step runs
-   `validate-manifest.ts --warn-only-placeholders`: with an all-placeholder
-   manifest it **warns** (and writes the "this release will NOT run as an
-   action" notice to the step summary) but exits 0, so the build proceeds.
-3. **`publish`** — the only job with write-scoped credentials.
+The producer builds every image asset exactly once:
 
-### publish-job side-effect order
+1. **`build-mac-bin`** (macOS Apple-Silicon runner) — cross-build the Darwin
+   arm64 `script-jail-vm` Mach-O helper and upload it as the tag-suffixed
+   artifact `mac-bin-vX.Y.Z`. (It cannot be built on a Linux runner.)
+2. **`build`** (Linux runner) — install / bundle, build both x64 + arm64 rootfs
+   ext4s for each Ubuntu major, build the x64 + cross-compiled arm64 Rust shims,
+   build both VZ vmlinux kernels, **push the 4 GHCR rootfs Docker images**, and
+   upload the 8 binary image assets as the tag-suffixed artifact
+   `release-assets-vX.Y.Z`. It then prints two paste-blocks to the job summary:
+   the **9 file SHAs** ("Artifact SHAs" — from the *Compute SHAs* step) and the
+   **4 Docker digests** ("Docker image refs" — from the *Publish Docker rootfs
+   images* step).
 
-The `publish` job performs its irreversible side effects in a deliberate order
-so that the single non-re-runnable step is last:
+> The producer **never** publishes to npm, creates a GitHub release, or verifies
+> the manifest — those stay in `release.yml`. The artifacts ship ONLY the binary
+> image assets, deliberately **not** `dist/*`: the producer runs on the
+> *pre-backfill* commit, whose `dist/main.cjs` still embeds the placeholder
+> manifest, so shipping it would publish a broken Action. The npm package's
+> `dist/*` is staged from the **tagged** checkout in `release.yml` instead.
+>
+> Because the binaries do **not** depend on the manifest or the version, it is
+> correct that the producer runs *before* the manifest backfill (Phase 2).
 
-1. **Verify downloaded artifacts against tagged manifest** —
-   `check-publish-artifacts.sh` recomputes the SHAs of the downloaded assets and
-   compares them to the manifest, and verifies the build-job-produced
-   `dist/main.cjs` / `dist/cli.cjs` content. Runs BEFORE any upload, so a
-   mismatch refuses to publish. (Re-runnable.)
-2. **Verify Docker runtime JS artifacts** — `cmp -s` the guest agent and
-   preload bundles against the checked-out tree. (Re-runnable.)
-3. **GHCR push** — push the four digest-pinned Docker rootfs images. (Idempotent
-   / re-runnable: re-pushing an identical layer set is a no-op.)
+---
+
+## Phase 2 — backfill the manifest and commit
+
+Paste the producer's values into `src/action/artifact-manifest.ts` and commit.
+
+> **Backfill from the LATEST successful producer run for the tag.** `release.yml`
+> locates the producer artifacts by scanning successful `release-build.yml` runs
+> **newest-first** and taking the first that carries `release-assets-vX.Y.Z`. If
+> you re-dispatched the producer (e.g. after a transient failure), backfill the
+> SHAs from that **newest** run's paste-blocks — the kernel/Mach-O bytes are not
+> reproducible, so SHAs from an older run would not match the binaries the
+> release actually downloads, and the verify step would fail.
+
+1. **Paste the 9 file SHAs + 4 Docker digests.** Copy the **9 file SHAs**
+   (3 `expected.linux` + 6 `expected.darwin`) from the *Compute SHAs* paste-block
+   and the **4 Docker digests** (2 `dockerImages.x64` + 2 `dockerImages.arm64`)
+   from the *Docker image refs* paste-block of the LATEST producer run, replacing
+   every `PLACEHOLDER_SHA256_*` token.
+2. **Set `tag` to `'vX.Y.Z'`** in the same file.
+3. **All-or-nothing across all 13 pinned entries.** A manifest with SOME real
+   values and SOME placeholders is a packaging bug and is rejected by
+   `check-publish-artifacts.sh` (the mixed-manifest gate:
+   `[ "$PLACEHOLDER_COUNT" -gt 0 ] && [ "$REAL_COUNT" -gt 0 ]` → `exit 1`). The
+   classification folds **all 13 pinned entries — the 9 file SHAs AND the 4
+   Docker digests** — into one `PLACEHOLDER_COUNT` / `REAL_COUNT` tally, so
+   pasting the real file SHAs while leaving the Docker refs as placeholders (or
+   vice versa) trips the reject. Replace every placeholder, or none. (File SHAs
+   are matched by the `PLACEHOLDER_SHA256_` prefix; a Docker ref instead carries
+   that token inside its `@sha256:` digest position, so refs are matched by the
+   placeholder substring — but both feed the same tally.)
+4. **Bump the version to `X.Y.Z`** in the main `package.json` (the platform
+   packages are stamped from the tag by `scripts/assemble-npm-packages.mjs`), to
+   satisfy the version==tag gate in the publish job.
+5. **Rebuild `dist/` and commit.** Run `pnpm build:bundle` (re-embeds the updated
+   manifest into `dist/main.cjs` — the Action consumes the manifest from the
+   bundled bytes, not from `src/`), plus `pnpm build:cli`,
+   `pnpm build:guest-agent`, and `pnpm build:repro-hash` if those sources
+   changed, then commit the regenerated bundles. The `verify` job re-bundles and
+   diffs, so a stale committed `dist/` fails the release.
+
+---
+
+## Phase 3 — push the tag `vX.Y.Z`
+
+Pushing the `vX.Y.Z` tag runs `release.yml`, whose two jobs run in order. It
+**never rebuilds** the rootfs ext4s, shims, VZ kernels, Mach-O helper, or GHCR
+images — it downloads the producer's artifacts and verifies them.
+
+### `verify` job
+
+Runs with NO write credentials and `persist-credentials: false`. It builds
+nothing that ships. It enforces, in order:
+
+1. **Manifest-no-placeholders gate** ("Gate manifest contains no placeholders
+   (must be fully backfilled)"). Any remaining `PLACEHOLDER_SHA256_*` token
+   fails LOUD — an un-backfilled manifest would brick every Action consumer and
+   ship a placeholder `dist/main.cjs` to npm. Unlike the old two-tag bootstrap,
+   there is no documented placeholder-at-tag-time case. It also runs
+   `validate-manifest.ts` (no `--warn-only-placeholders`) to enforce shape
+   (lowercase 64-hex, etc.).
+2. **Typecheck + test** (`pnpm typecheck`, `pnpm test`).
+3. **Committed-dist freshness gate** — re-bundles `dist/main.cjs`, `dist/cli.cjs`,
+   `dist/guest-agent.cjs`, `dist/repro-hash-cli.cjs` and `git diff --exit-code`s
+   them, the same drift gate `test.yml` enforces. A stale committed `dist/` at
+   the tag fails here, because the npm package + the GitHub-release `dist` assets
+   ship the COMMITTED bundles (the release never re-bundles for shipping).
+
+`publish` depends on `verify`, so a failed gate blocks the irreversible publish.
+
+### `publish` job
+
+The only job with write scopes (`contents: write` + `id-token: write`) plus
+`actions: read` / `packages: read` to fetch the cross-run producer artifacts and
+inspect the GHCR digests. Its irreversible side effects run in a deliberate
+order so the single non-re-runnable step is last:
+
+1. **Download producer build artifacts (by tag-suffixed name)** — walks
+   successful `release-build.yml` runs newest-first, finds the first carrying
+   `release-assets-vX.Y.Z`, and downloads the 8 binary image assets into
+   `artifacts/images/` plus the Mach-O helper into `artifacts/`. Matched by the
+   tag-suffixed artifact NAME, because the producer ran on a different commit
+   than the tag (commit-SHA match is impossible). (Re-runnable.)
+2. **Verify downloaded artifacts against tagged manifest** —
+   `check-publish-artifacts.sh` recomputes each downloaded asset's digest (the
+   canonical time-masked hash for the rootfs ext4s, via the committed
+   `dist/repro-hash-cli.cjs`; a plain `sha256sum` for everything else) and
+   compares them to the manifest SHAs. This is the **integrity backstop** that
+   detects a tampered or wrong artifact. It runs BEFORE any upload/publish, so a
+   mismatch refuses to publish. (No `--dist-source`/`--dist-cli-source` is passed
+   — the producer no longer ships `dist/*`; the `dist/*` that ships comes from
+   this tagged checkout and is already covered by the `verify` freshness gate.)
+   (Re-runnable.)
+3. **Verify pinned Docker digests resolve in GHCR (backfill gate)** — runs
+   `docker buildx imagetools inspect` on every real `dockerImages` ref, asserting
+   each digest the producer pushed actually **exists** in GHCR (not equality —
+   the Docker rootfs images are not byte-reproducible). Catches a hand-copy typo
+   or a stale/GC'd digest before any publish. (Re-runnable.)
 4. **Stage npm packages** — `assemble-npm-packages.mjs` builds the four staging
-   dirs from the artifacts. This step also enforces the **version==tag gate**
-   (`package.json` version must equal the tag without the leading `v`). (Re-runnable.)
+   dirs: `dist/*` from THIS tagged checkout (real manifest), binaries from the
+   downloaded `./artifacts`. Also enforces the **version==tag gate**
+   (`package.json` version must equal the tag without the leading `v`).
+   (Re-runnable.)
 5. **Validate npm packlists** — `assert-npm-packlist.mjs --all` asserts each
    staged package's packed `files`, the VZ helper exec bit, and the per-package
    size ceiling. (Re-runnable.)
 6. **Upload release assets** — `gh release` upload of the rootfs/kernel/shim/
-   helper/dist assets. (Re-runnable: re-uploading overwrites.)
-7. **`npm publish` LAST** — the publish of an *unpublished* version is the only
-   non-re-runnable side effect (a version that has already been published cannot
-   be re-published). The step is **idempotent**: it probes each package with a
-   read-only `npm view "$name@$version"` and SKIPS any version that already
-   exists, publishing only the absent ones. So on the `v0.1.0` generating-run it
-   skips all four already-bootstrap-published 0.1.0 packages and the run still
-   finishes green; on a re-run of a partially-failed release it republishes only
-   the still-unpublished packages. Because it is last, every re-runnable side
-   effect has already succeeded by the time publish fires.
+   helper assets (from the downloaded artifacts) plus `dist/main.cjs` /
+   `dist/cli.cjs` (from this tagged checkout). (Re-runnable: re-uploading
+   overwrites.)
+7. **Publish npm packages (platform-first, main last)** — the publish of an
+   *unpublished* version is the only non-re-runnable side effect. The step is
+   **idempotent**: it probes each package with a read-only
+   `npm view "$name@$version"` and SKIPS any version already on the registry,
+   publishing only the absent ones. So a re-run of a partially-failed release
+   republishes only the still-unpublished packages. Because it is last, every
+   re-runnable side effect has already succeeded by the time publish fires.
 
 ### multi-package publish order
 
@@ -137,201 +237,69 @@ This order is load-bearing: the main package's `optionalDependencies` reference
 the three platform packages by exact version, so they must already be on the
 registry for a consumer's `npm install script-jail` to resolve the matching
 `os`/`cpu` one. If a later package in the loop fails after an earlier one
-published, recovery is to simply re-run the job — the idempotent skip
-republishes only the still-unpublished packages (or bump the version and re-tag
-for a genuinely new release) — there is no in-place fix for an already-published
-version.
+published, recovery is to re-run the job — the idempotent skip republishes only
+the still-unpublished packages (or bump the version and re-tag for a genuinely
+new release). There is no in-place fix for an already-published version.
 
 ---
 
-## Phase 2 — backfill → `v0.1.1`
+## Optional — GitHub immutable releases
 
-The 13 real values are produced by an actual `release.yml` run, NOT by the
-manual v0.1.0 bootstrap. v0.1.0's npm packages were published **manually /
-locally** as a one-time bootstrap (see the Phase 0 bootstrap exception); no `v*`
-tag was ever pushed for that publish, so `release.yml` never ran for it and
-there are no v0.1.0 job summaries (and GHCR holds no images yet). To obtain the
-real SHAs/digests, push the `v0.1.0` **tag** to run `release.yml` once. That run
-builds all artifacts, pushes the 4 GHCR images, and emits the **9 file SHAs**
-(the `build` job's "Compute SHAs" summary) + **4 Docker digests** (the `publish`
-job's "Docker image refs" summary); its terminal npm-publish step is idempotent,
-so it **SKIPS** the already-published 0.1.0 packages (probing each
-`name@version` with `npm view`) and the tagged run finishes green without
-attempting to re-publish 0.1.0. Backfill the emitted values and cut the second
-tag.
-
-1. **Paste the real values into `src/action/artifact-manifest.ts`.** Copy the
-   **9 file SHAs** (3 `expected.linux` + 6 `expected.darwin`) and the
-   **4 Docker digests** (2 `dockerImages.x64` + 2 `dockerImages.arm64`) from the
-   `release.yml` run triggered by the `v0.1.0` tag — the **9 file SHAs** from the
-   `build` job's "Compute SHAs" step summary and the **4 Docker digests** from
-   the `publish` job's "Docker image refs" step summary — replacing every
-   `PLACEHOLDER_SHA256_*` token.
-2. **Set `tag` to `'v0.1.1'`** in the same file.
-3. **All-or-nothing across all 13 entries.** A manifest with SOME real values
-   and SOME placeholders is a packaging bug and is rejected by
-   `check-publish-artifacts.sh` (the mixed-manifest gate:
-   `[ "$PLACEHOLDER_COUNT" -gt 0 ] && [ "$REAL_COUNT" -gt 0 ]` → `exit 1`). The
-   classification spans **all 13 pinned entries — the 9 file SHAs AND the 4
-   Docker digests** — folded into one `PLACEHOLDER_COUNT` / `REAL_COUNT` tally.
-   Pasting the real file SHAs while leaving the Docker refs as placeholders (or
-   vice versa) trips the reject. Replace every placeholder, or none. (File SHAs
-   are matched by the `PLACEHOLDER_SHA256_` prefix; a Docker ref instead carries
-   that token inside its `@sha256:` digest position, so refs are matched by the
-   placeholder substring — but both feed the same tally.)
-4. **Bump all versions to `0.1.1`** — the main `package.json` and the platform
-   package versions, to satisfy the version==tag gate at the next tag.
-5. **`pnpm build:bundle`** to re-embed the updated manifest into
-   `dist/main.cjs` (the Action consumes the manifest from the bundled bytes, not
-   from `src/`), and commit the regenerated bundle.
-6. **Verify the pinned Docker digests actually resolve in GHCR.** The release
-   workflow hard-gates this automatically — the *Verify pinned Docker digests
-   resolve in GHCR (backfill gate)* step in `release.yml` runs `docker buildx
-   imagetools inspect` on every real `dockerImages` ref **before any `npm
-   publish`** and fails the release on a missing or mistyped digest. (The Docker
-   rootfs images are NOT byte-reproducible, so the gate asserts the pinned digest
-   **exists** in GHCR, not that a re-push would reproduce it.) Bootstrap
-   placeholders are skipped. Sanity-check locally before tagging, e.g.
-   `docker buildx imagetools inspect ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:<digest>`
-   for each of the 4 refs — a hand-copy typo from the job summary is the failure
-   this catches.
-7. **Green CI, then push `v0.1.1`.**
-
-### Why the `v0.1.1` build reproduces `v0.1.0`'s SHAs (R1 — cross-run reproducibility)
-
-The `v0.1.1` backfill only works if a rootfs ext4 built weeks later, on a
-different runner, produces the SAME pinned digest `v0.1.0` did. That pinned
-digest is the **canonical (time-masked) hash** of the ext4 — NOT a raw
-`sha256sum` of the released bytes — computed by `src/rootfs/repro-hash.ts`. The
-content and layout are engineered to reproduce byte-for-byte (the three pins
-below); the one field that cannot — the superblock `s_wtime`, which the shipped
-e2fsprogs (< 1.47.1) re-stamps to the wall clock when it flushes on close — is
-masked OUT of the hash instead of pinned, which is why no build-clock pinning
-(libfaketime) is needed. The early R1 attempt missed three drift sources that
-this build now pins:
-
-1. **Pinned per-arch Ubuntu base digest.** The Dockerfile's `FROM` resolves
-   `ubuntu@sha256:…` (not a floating `ubuntu:<major>` tag) from the per-arch
-   `UBUNTU_BASE_DIGEST` map in `src/rootfs/build.ts`. It is threaded into BOTH
-   paths: the local rootfs build (`buildDockerBuildArgs` → `--build-arg
-   UBUNTU_REF=…`) and the GHCR publish (the `build_one` helper in `release.yml`
-   reads the same map and passes `--build-arg UBUNTU_REF=…`), so the ext4s and
-   the published Docker images share one base.
-
-2. **Frozen apt snapshot.** The Dockerfile repoints apt at
-   `snapshot.ubuntu.com/.../${UBUNTU_SNAPSHOT}` (default
-   `UBUNTU_SNAPSHOT=20260501T000000Z`), which serves the archive state as-of
-   that UTC instant, so `apt-get install` resolves the SAME package versions on
-   every run instead of whatever the live mirrors currently carry. Because the
-   snapshot's `Release` files carry an old `Valid-Until`, apt is told
-   `Acquire::Check-Valid-Until "false"` so it does not reject them as expired.
-
-3. **Pinned mkfs layout.** `mkfs.ext4` no longer inherits the runner host's
-   `/etc/mke2fs.conf` or e2fsprogs compiled-in defaults: the checked-in
-   `src/rootfs/mke2fs.conf` is pointed at via `MKE2FS_CONFIG` (`mkfsEnv()`),
-   and `buildMkfsExt4Args` pins the size-dependent geometry the conf cannot
-   express — `-b 4096 -I 256`, a fixed `-U`/`-E hash_seed` (the
-   `ROOTFS_FIXED_UUID`), and `-O ^has_journal,^metadata_csum_seed` (no journal,
-   and the metadata-checksum seed derives from the pinned UUID rather than an
-   independent random seed). `SOURCE_DATE_EPOCH` plus the `debugfs` timestamp
-   post-pass clamp every inode + superblock timestamp to a fixed instant —
-   except the superblock `s_wtime` (and the `metadata_csum` covering it), which
-   `debugfs` re-stamps to the wall clock on close; that residual field is
-   handled by the canonical hash's mask, not pinned here.
-
-**The authoritative cross-run gate is `check-publish-artifacts.sh`.** At
-`v0.1.1` the manifest is fully real (no longer all-placeholder), so the script
-takes its strict path: it recomputes each artifact's digest — the canonical
-(time-masked) hash for the rootfs ext4s (via the committed
-`dist/repro-hash-cli.cjs`, since the publish job runs without `pnpm install`), a
-plain `sha256sum` for everything else — and compares them against the pinned
-`v0.1.0` values you just pasted in. If reproduction fails — any of the three
-pins above regressed, OR a non-time byte drifted (masking ignores time, it does
-not hide content drift) — the digests diverge, the comparison fails LOUD, and
-the publish is blocked rather than shipping a manifest whose pinned digests do
-not match what consumers will download. Consumers verify the rootfs the same
-canonical way (`preFetchArtifacts` → `canonicalRootfsHash`), so the pinned
-canonical digest is what they check too.
-
-The same-run "Assert x64 rootfs ext4s are canonical-reproducible (ubuntu-24.04,
-ubuntu-22.04)" step in `release.yml` (now covering BOTH x64 majors) is an early
-smoke test, not the authoritative gate: it rebuilds each x64 rootfs in place and
-asserts the two ext4s share the same canonical hash WITHIN one run, catching a
-reproducibility regression before the slower publish job. (A raw `sha256sum`
-compare here would flake purely on which wall-clock second each in-place rebuild
-landed in — the very `s_wtime` drift the canonical hash masks.)
-
-arm64 is NOT rebuilt in-run either (qemu is slow), but it **is** cross-run
-reproducible and **is** strictly compared at the backfill (the darwin rootfs
-ext4 entries in `check-publish-artifacts.sh`). `snapshot.ubuntu.com` serves no
-public `ubuntu-ports` pocket (every path 401s), so arm64 cannot use the
-snapshot — but it does not need to: `src/rootfs/Dockerfile.base` pins arm64 to
-the **frozen release pocket** on `ports.ubuntu.com` (the bare `<codename>`
-suite, dropping the moving `-updates`/`-security`/`-backports` pockets the base
-image enables — those were the only arm64 drift source). The release pocket is
-immutable and GPG-signed for the release's whole support life, so a build months
-later resolves the same package versions and the arm64 ext4 reproduces the same
-canonical hash. (arm64 skips the phase-1 live `ca-certificates` bootstrap that
-x64 needs for the HTTPS snapshot — `ports.ubuntu.com` is plain HTTP — so it
-installs `ca-certificates` fresh from the frozen pocket and does not bake a
-drifting `-updates` version.) Its in-run reproduction is left to the
-authoritative cross-run backfill comparison rather than a slow qemu rebuild.
-
-**Refresh knobs (both change the released SHAs, so a refresh forces a new
-backfill):**
-
-- **`UBUNTU_SNAPSHOT`** — the apt snapshot date, the `ARG UBUNTU_SNAPSHOT`
-  default in `src/rootfs/Dockerfile.base`. Bump it to a newer in-the-past UTC
-  instant to pick up newer package versions.
-- **`UBUNTU_BASE_DIGEST`** — the per-arch base-image digests in
-  `src/rootfs/build.ts`. Re-resolve with `docker buildx imagetools inspect
-  ubuntu:<major> --raw` (per-`linux/<arch>` manifest digest, not the index
-  digest) and update both arches.
-
-All of this is validated in CI on a real Linux runner — the snapshot resolution,
-the mkfs layout, and the byte-identity guards cannot be exercised on macOS
-(which has no native `mkfs.ext4` / `debugfs`).
+As complementary defense-in-depth, consider enabling **immutable releases** in
+the repo settings (Settings → General → Releases). GitHub then enforces that a
+published release's assets cannot be changed after the fact; the manifest's
+pinned SHAs verify *what* those assets are, and immutability guarantees they
+*stay* that way. This is optional — the manifest SHA check is the primary
+integrity control — but it closes the window where a release asset could be
+silently swapped after publish.
 
 ---
 
 ## Works / degraded matrix
 
-What is usable at each tag, and why.
+What is usable before vs. after the **first producer-backed release**, and why.
+Before that release the committed manifest is all placeholders; after it the
+manifest is fully backfilled and verified.
 
-| Target | v0.1.0 | v0.1.1 | Why |
+| Target | Placeholder manifest (pre-first-release) | Backfilled manifest | Why |
 | --- | --- | --- | --- |
 | macOS-arm64 CLI | **WORKS** | WORKS | Manifest-independent — the CLI never calls `validateManifest`, so placeholder SHAs do not gate it. |
 | Linux bare CLI | **WORKS** | WORKS | Bare backend fetches the shim directly; no manifest gate in the CLI path. |
 | Linux firecracker CLI | **WORKS*** | WORKS* | Works where `/dev/kvm` + a tap device exist; otherwise `backend: auto` falls through to another backend. |
-| Linux docker CLI | **DEGRADED** | WORKS | See below — usable day-one with a warning via the tag-fallback path. |
+| Linux docker CLI | **DEGRADED** | WORKS | See below — usable with a warning via the tag-fallback path. |
 | GitHub Action | **BROKEN** | WORKS | The Action fail-fasts on a placeholder manifest; recovers once real SHAs are pinned. |
 
-### macOS-arm64 CLI = WORKS day-one
+> Note: a placeholder manifest cannot reach a *published* release at all — the
+> `verify` job's manifest gate fails the tag push before publish. The
+> placeholder column describes the state of an un-released fresh fork / branch
+> (the committed default before the first backfill), which is what a developer
+> building locally from source sees.
+
+### macOS-arm64 CLI = WORKS even with a placeholder manifest
 
 The CLI never validates the pinned manifest: `src/cli/index.ts` does NOT call
 `validateManifest(`. The macOS path resolves its artifacts from the installed
 `@script-jail/darwin-arm64` package, not from the manifest's SHAs, so it is
-fully usable at `v0.1.0` even while the manifest is all placeholders.
+fully usable even while the manifest is all placeholders.
 
-### Linux docker CLI = DEGRADED on v0.1.0 (usable with a warning)
+### Linux docker CLI = DEGRADED with a placeholder manifest (usable with a warning)
 
-On `v0.1.0` the manifest's Docker ref is a **non-empty placeholder**
+With a placeholder manifest the Docker ref is a **non-empty placeholder**
 (`...@sha256:PLACEHOLDER_...`). `resolveDockerImageRef` only throws
 `BackendUnavailableError` when there is NO entry for the `(arch, runnerImage)`
 pair; a non-empty placeholder is not "missing", so the function **returns** it
-rather than throwing. With the Action's default behavior the failure would
-surface later, at the actual `docker pull` of an unresolvable digest. The CLI
-passes `allowTagFallback: true`, which downgrades the placeholder digest ref to
-its tag-only form (`split('@')[0]`) and emits a warning, making the docker
-backend usable on day-one — pulling by tag instead of by pinned digest.
+rather than throwing. The CLI passes `allowTagFallback: true`, which downgrades
+the placeholder digest ref to its tag-only form (`split('@')[0]`) and emits a
+warning, making the docker backend usable — pulling by tag instead of by pinned
+digest.
 
-### GitHub Action = BROKEN on v0.1.0
+### GitHub Action = BROKEN with a placeholder manifest
 
 The Action hard-fails before doing any work: `doValidateManifest(PINNED_MANIFEST)`
 runs as the first real statement of `main()` (skipped only under the
 `SCRIPT_JAIL_E2E_SELF_TEST` self-test bypass this repo's own CI sets), and a
-placeholder manifest fails that gate. The README Status section documents this
-state. The Action recovers at `v0.1.1` once the real SHAs are pinned.
+placeholder manifest fails that gate. The Action works once the real SHAs are
+pinned (which, as noted above, is a precondition for the tag to publish at all).
 
 ---
 
@@ -342,27 +310,32 @@ snapshot and may drift — re-grep before relying on them.
 
 | Claim | Source | Line (snapshot) |
 | --- | --- | --- |
+| producer is workflow_dispatch with a required `tag` | `.github/workflows/release-build.yml` — `workflow_dispatch:` / `inputs: tag` | 34 / 36 |
+| producer builds + uploads binary assets (no dist) | `.github/workflows/release-build.yml` — `name: Upload build artifacts` (only `images/*`) | 364 |
+| producer pushes the 4 GHCR images | `.github/workflows/release-build.yml` — `name: Publish Docker rootfs images` | 409 |
+| producer prints the SHA + digest paste-blocks | `.github/workflows/release-build.yml` — `## Artifact SHAs` / `## Docker image refs` | 308 / 514 |
+| release downloads (never rebuilds) producer artifacts | `.github/workflows/release.yml` — `name: Download producer build artifacts (by tag-suffixed name)` | 206 |
+| backfill from the LATEST producer run (newest-first lookup) | `.github/workflows/release.yml` — `gh run list --workflow release-build.yml --status success` (newest-first) | 217 |
 | Action fail-fast manifest gate | `src/main.ts` — `doValidateManifest(PINNED_MANIFEST)` | 121 |
 | self-test bypass skips the gate | `src/main.ts` — `SCRIPT_JAIL_E2E_SELF_TEST` | 108 |
-| backend map (CLI/Action backend wiring) | `src/main.ts` — `const backends: BackendMap = {` | 180 |
 | CLI skips the manifest | `src/cli/index.ts` — no `validateManifest(` call | n/a |
-| mixed-manifest reject condition | `scripts/check-publish-artifacts.sh` — `[ "$PLACEHOLDER_COUNT" -gt 0 ] && [ "$REAL_COUNT" -gt 0 ]` | 494 |
-| mixed-manifest reject (comment header) | `scripts/check-publish-artifacts.sh` — `This is a packaging bug` | 496 |
-| all-or-nothing spans 9 files + 4 docker | `scripts/check-publish-artifacts.sh` — `The 4 Docker image refs participate in the SAME all-or-nothing` | 389 |
-| docker tag-fallback / placeholder handling | `src/action/backend/docker.ts` — `resolveDockerImageRef` | 218 |
-| pinned manifest (repo/tag/counts) | `src/action/artifact-manifest.ts` — `PINNED_MANIFEST` | 44 |
-| Ubuntu base digest pinned (UBUNTU_REF) | `src/rootfs/build.ts` — `UBUNTU_BASE_DIGEST` / `buildDockerBuildArgs` | 152 / 184 |
-| frozen apt snapshot | `src/rootfs/Dockerfile.base` — `ARG UBUNTU_SNAPSHOT` / `Acquire::Check-Valid-Until "false"` | 24 / 92 |
-| pinned mkfs layout | `src/rootfs/build.ts` — `buildMkfsExt4Args` / `mkfsEnv` (`MKE2FS_CONFIG`) + `src/rootfs/mke2fs.conf` | 850 / 895 |
-| GHCR publish pins same UBUNTU_REF | `.github/workflows/release.yml` — `Pin the GHCR build's base image` / `--build-arg "UBUNTU_REF=…"` | 544 / 580 |
-| same-run reproducibility smoke test | `.github/workflows/release.yml` — `Assert x64 rootfs ext4s are canonical-reproducible` | 281 |
+| tag-time manifest-no-placeholders gate | `.github/workflows/release.yml` — `Gate manifest contains no placeholders (must be fully backfilled)` | 109 |
+| committed-dist freshness gate (verify job) | `.github/workflows/release.yml` — `Verify committed dist bundles are up to date` | 145 |
+| mixed-manifest reject condition | `scripts/check-publish-artifacts.sh` — `[ "$PLACEHOLDER_COUNT" -gt 0 ] && [ "$REAL_COUNT" -gt 0 ]` | 547 |
+| mixed-manifest reject (comment header) | `scripts/check-publish-artifacts.sh` — `This is a packaging bug` | 549 |
+| all-or-nothing spans 9 files + 4 docker | `scripts/check-publish-artifacts.sh` — `The 4 Docker image refs participate in the SAME all-or-nothing` | 419 |
+| docker tag-fallback / placeholder handling | `src/action/backend/docker.ts` — `resolveDockerImageRef` | n/a |
+| pinned manifest (repo/tag/counts) | `src/action/artifact-manifest.ts` — `PINNED_MANIFEST` | 54 |
 | rootfs pinned by canonical (time-masked) hash | `src/rootfs/repro-hash.ts` — `canonicalRootfsHash`; recomputed in `scripts/check-publish-artifacts.sh` — `canonical_rootfs_hash`; consumed in `src/action/pre-fetch-artifacts.ts` | n/a |
-| authoritative cross-run gate (strict SHA compare) | `.github/workflows/release.yml` — `Verify downloaded artifacts against tagged manifest` → `check-publish-artifacts.sh` | 480 |
-| OIDC trusted publish (npm upgrade, no token) | `.github/workflows/release.yml` — `Upgrade npm for OIDC trusted publishing` (`npm install -g npm@11.16.0`) + publish job `id-token: write` | 473 / 427 |
-| publish step names + multi-package order | `.github/workflows/release.yml` — "Stage npm packages" / "Validate npm packlists" / "Publish npm packages (platform-first, main last)" | 697 / 723 / 759 |
+| integrity backstop (SHA verify of downloads) | `.github/workflows/release.yml` — `Verify downloaded artifacts against tagged manifest` → `check-publish-artifacts.sh` | 293 |
+| GHCR digest-resolves gate | `.github/workflows/release.yml` — `Verify pinned Docker digests resolve in GHCR (backfill gate)` | 327 |
+| OIDC trusted publish (npm upgrade, no token) | `.github/workflows/release.yml` — `Upgrade npm for OIDC trusted publishing` (`npm install -g npm@11.16.0`) + publish job `id-token: write` | 283 / 176 |
+| publish step names + multi-package order | `.github/workflows/release.yml` — "Stage npm packages" / "Validate npm packlists" / "Publish npm packages (platform-first, main last)" | 376 / 395 / 435 |
 
-**dist note.** `release.yml` does NOT gate on committed-`dist/` freshness — it
-has no git-diff drift check. It verifies the build-job-produced `dist/main.cjs` /
-`dist/cli.cjs` *content* via `check-publish-artifacts.sh` (the `--dist-source` /
-`--dist-cli-source` arguments). The freshness gate — that the committed `dist/`
-matches a fresh rebuild of `src/` — is `test.yml`.
+**dist note.** The release ships the COMMITTED `dist/` bundles (the publish job
+never re-bundles for shipping). The freshness gate — that the committed `dist/`
+matches a fresh rebuild of `src/` — runs in `release.yml`'s `verify` job
+("Verify committed dist bundles are up to date") and in `test.yml`. The npm
+package's `dist/*` is staged from the tagged checkout by
+`scripts/assemble-npm-packages.mjs`; the producer's artifacts deliberately
+exclude `dist/*`.

@@ -1,20 +1,18 @@
 // script-jail — test/docs/releasing-claims.test.ts
 //
-// Phase 5 Task 5.1 (WS4): doc-claim cross-check for `docs/releasing.md`.
+// Doc-claim cross-check for `docs/releasing.md` (the release runbook).
 //
-// `docs/releasing.md` is the first-release runbook. It hard-codes facts that
-// live in source (the pinned-manifest artifact COUNTS, the repo slug / release
-// tags, the `release.yml` publish-job step names, and the load-bearing
-// CLI-skips-manifest / Action-gates-on-manifest invariant). When the source of
+// `docs/releasing.md` documents the build-once / download-forever single-tag
+// release flow. It hard-codes facts that live in source (the pinned-manifest
+// artifact COUNTS, the repo slug, the `release.yml` publish-job step names, the
+// producer→backfill→download-and-verify invariants, and the load-bearing
+// CLI-skips-manifest / Action-gates-on-manifest asymmetry). When the source of
 // truth drifts, this test fails in the cheap `unit` vitest project instead of
 // silently leaving the runbook wrong for the one person who follows it once.
 //
 // This file lives under `test/docs/**`. The `unit` vitest project includes
 // `test/**/*.test.ts` and excludes only `integration|guest|e2e`
 // (vitest.config.ts:9-10), so `test/docs/**` IS picked up with no relocation.
-//
-// TDD note: until `docs/releasing.md` exists (Task 5.2) every assertion below
-// is RED, by design.
 
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -47,13 +45,47 @@ describe('docs/releasing.md claims', () => {
     expect(readReleasing().trim().length).toBeGreaterThan(0);
   });
 
-  // Claim: the runbook names the release repo slug and BOTH release tags of the
-  // bootstrap loop (v0.1.0 = placeholder publish, v0.1.1 = SHA backfill).
-  it('mentions the repo slug and both release tags', () => {
+  // Claim: the runbook names the release repo slug, describes the SINGLE-tag
+  // release (`vX.Y.Z`, no two-tag bootstrap loop), and preserves the
+  // historically-true note that 0.1.0 was the one-time MANUAL bootstrap publish.
+  it('names the repo slug, the single release tag, and the 0.1.0 bootstrap note', () => {
     const doc = readReleasing();
     expect(doc).toContain('Brooooooklyn/scriptjail');
-    expect(doc).toContain('v0.1.0');
-    expect(doc).toContain('v0.1.1');
+    // Single-tag flow: the runbook templates the tag as vX.Y.Z, not a fixed
+    // bootstrap pair.
+    expect(doc).toContain('vX.Y.Z');
+    // The historical 0.1.0 manual bootstrap exception is preserved.
+    expect(doc).toContain('0.1.0');
+    // The old two-tag rebuild/backfill narrative must be gone: there is no
+    // v0.1.1 "backfill reproduces v0.1.0's SHAs" second tag in this flow.
+    expect(doc).not.toContain('v0.1.1');
+  });
+
+  // Claim: the runbook describes the build-once / download-forever split — a
+  // producer (`release-build.yml`) builds the assets once, and `release.yml`
+  // DOWNLOADS + VERIFIES them rather than rebuilding. Guard both halves.
+  it('describes the producer build-once / download-and-verify split', () => {
+    const doc = readReleasing();
+    expect(doc).toContain('release-build.yml');
+    expect(doc).toContain('build-once');
+    // The release must download + verify, never rebuild.
+    expect(doc.toLowerCase()).toContain('never rebuild');
+    expect(doc.toLowerCase()).toContain('download');
+    // Backfill must come from the LATEST producer run (the release lookup picks
+    // newest-first — backfilling from an older run breaks the SHA verify).
+    expect(doc).toMatch(/latest[^.\n]*producer run/i);
+  });
+
+  // Claim: the runbook states plainly that byte-reproducibility is NO LONGER a
+  // release gate (build-once means the exact producer bytes are downloaded and
+  // verified), while the canonical (time-masked) rootfs hash is still HOW those
+  // assets are verified.
+  it('states reproducibility is not a release gate but is the verify mechanism', () => {
+    const doc = readReleasing();
+    expect(doc.toLowerCase()).toContain('canonical (time-masked) hash');
+    // It must NOT re-introduce reproducibility as a release gate.
+    expect(doc).not.toContain("reproduces v0.1.0's SHAs");
+    expect(doc).not.toMatch(/cross-run reproducibility/i);
   });
 
   // Claim: the artifact COUNTS the runbook tells the maintainer to backfill
@@ -81,8 +113,8 @@ describe('docs/releasing.md claims', () => {
     expect(Number(dockerMatch![1])).toBe(dockerCount);
   });
 
-  // Claim (R1 cross-run): the all-or-nothing mixed-manifest reject spans ALL
-  // pinned entries — the file SHAs AND the Docker digests, not just the files.
+  // Claim: the all-or-nothing mixed-manifest reject spans ALL pinned entries —
+  // the file SHAs AND the Docker digests, not just the files.
   // Single-sourced: the total (9 files + 4 docker = 13) is computed from
   // PINNED_MANIFEST and compared to the count the doc prints, and we confirm
   // the gate the doc attributes it to (check-publish-artifacts.sh) actually
@@ -136,7 +168,7 @@ describe('docs/releasing.md claims', () => {
     expect(main).toContain('doValidateManifest(PINNED_MANIFEST)');
   });
 
-  // Claim (Task 5.3): the runbook is linked from README's Docs list and from
+  // Claim: the runbook is linked from README's Docs list and from
   // docs/development.md's Release flow.
   it('is linked from README and docs/development.md', () => {
     const readme = readFileSync(readmePath, 'utf8');
