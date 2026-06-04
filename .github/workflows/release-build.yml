@@ -1,0 +1,502 @@
+# script-jail — .github/workflows/release-build.yml
+#
+# Producer workflow ("build once, download forever").
+#
+# Why this exists:
+#   The release pins each VM-image asset's SHA in a committed manifest
+#   (src/action/artifact-manifest.ts) and the Action verifies downloaded assets
+#   against it at runtime. The previous two-tag bootstrap REBUILT the images at
+#   the second tag and byte-compared them to SHAs pinned from the first tag —
+#   which forced a byte-reproducibility the kernels / Mach-O cannot satisfy.
+#
+#   This workflow builds EVERY image asset exactly once and stores them as
+#   GitHub Actions artifacts (retention 90 days). A later `release.yml` run
+#   DOWNLOADS those exact artifacts and verifies them (no rebuild). Because the
+#   bytes are never regenerated, the determinism gates that the old release
+#   build carried are intentionally absent here.
+#
+#   This workflow ALSO pushes the 4 GHCR rootfs Docker images and prints their
+#   `image:tag@sha256:digest` refs, so the operator gets the full paste-block —
+#   the 9 file SHAs plus the 4 Docker digests — needed to update
+#   src/action/artifact-manifest.ts.
+#
+# Scope:
+#   This workflow NEVER publishes to npm, creates a GitHub release, or verifies
+#   the manifest. Those stay in release.yml, which consumes the artifacts this
+#   workflow produces. It is dispatched manually against whatever ref the
+#   operator selects (no required inputs).
+
+name: release-build
+
+on:
+  workflow_dispatch:
+
+# Job-level permissions (set per-job below) override this default; we still
+# pin contents:read at the workflow level so any future job that forgets to
+# declare its own permissions gets the safest default.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # build-mac-bin — produce the Mach-O `script-jail-vm-arm64-darwin` binary.
+  # Runs on a macos-latest Apple-Silicon runner; emits the binary as a workflow
+  # artifact that the main `build` job downloads to compute its SHA and that the
+  # downstream release run uploads to the release.
+  #
+  # We keep this job tightly scoped — no `pnpm install`, no Docker, no
+  # access to the consumer-tree of the action — so the macOS runner only
+  # ever runs `cargo build` against the in-repo Rust workspace.  Splitting
+  # this off (vs. running it inside `build`) also lets the (much cheaper)
+  # rootfs build proceed in parallel on the Linux runner.
+  # ---------------------------------------------------------------------------
+  build-mac-bin:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: . -> target
+
+      - name: cargo build (release)
+        run: cargo build --release -p script-jail-host-mac
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/mac-bin
+          cp target/release/script-jail-vm \
+             artifacts/mac-bin/script-jail-vm-arm64-darwin
+
+      - name: Upload Mach-O artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: script-jail-vm-arm64-darwin
+          path: artifacts/mac-bin/script-jail-vm-arm64-darwin
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # build — produce every Linux/Darwin image asset + push the 4 GHCR rootfs
+  # images, exactly once.  Runs with NO write capabilities to the repo (only
+  # `packages: write` for the GHCR push) and no persisted checkout credentials.
+  # The assets are uploaded as the `release-assets` artifact; a later
+  # release.yml run downloads + verifies them.
+  # ---------------------------------------------------------------------------
+  build:
+    # Requires `build-mac-bin` because the SHA paste-block needs to include the
+    # Mach-O binary's hash.  The runner downloads that artifact mid-job to feed
+    # it into `Compute SHAs`.
+    needs: build-mac-bin
+    runs-on: ubuntu-24.04
+    # The rootfs build invokes Docker + mkfs.ext4 for each runner image and
+    # architecture. The VZ kernel build adds another pair of long native
+    # builds, and the GHCR push re-runs the 4 buildx builds, so the total
+    # budget needs a wide ceiling.
+    timeout-minutes: 60
+    permissions:
+      # contents:read for checkout; packages:write for the GHCR rootfs push.
+      # NO id-token (no npm publish) and NO contents:write (no GitHub release)
+      # — those stay in release.yml.
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Don't leave the GITHUB_TOKEN persisted as a git credential after
+          # checkout.  install/build phases run npm/pnpm lifecycle scripts and
+          # Docker — a compromised dep should not inherit a repo token, even a
+          # read-only one.
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      # The shim is a Rust cdylib (`src/shim/`); cargo is required before
+      # `pnpm build` or the explicit shim-build step further down.  The
+      # version pin matches `rust-toolchain.toml`.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build action bundle
+        run: pnpm build:bundle
+
+      - name: Build CLI bundle
+        # The macOS CLI ships as `dist/cli.cjs` and is consumed by `npm install`
+        # users on Darwin.  We bundle it in the same build flow so the npm
+        # tarball that pairs with this run carries an up-to-date CLI.
+        run: pnpm build:cli
+
+      # The standalone canonical-rootfs-hash tool (dist/repro-hash-cli.cjs) is
+      # run BELOW by this job's "Compute SHAs" step (and by the downstream
+      # release.yml publish job + scripts/check-publish-artifacts.sh) always
+      # straight from the COMMITTED bundle.  Rebuild it here and fail the build
+      # if the committed copy is stale, so a source change to
+      # src/rootfs/repro-hash*.ts can never pin (or later verify) a manifest SHA
+      # with masking logic that differs from what consumers run.  Mirrors
+      # test.yml's gate.
+      - name: Build repro-hash CLI bundle
+        run: pnpm build:repro-hash
+
+      - name: Verify dist/repro-hash-cli.cjs is up to date
+        run: |
+          if ! git diff --exit-code -- dist/repro-hash-cli.cjs; then
+            echo "::error::dist/repro-hash-cli.cjs is out of date. Run 'pnpm build:repro-hash' locally and commit the result."
+            exit 1
+          fi
+
+      - name: Build Rust shim (x86_64)
+        run: |
+          cargo build --release --manifest-path src/shim/Cargo.toml
+          cp target/release/libscriptjail.so images/libscriptjail.so
+
+      # The cross-toolchain is required so cargo-zigbuild + zig produce the
+      # aarch64-unknown-linux-gnu ELF .so from the amd64 release runner.
+      # The same tool also works from macOS, so a future move to a different
+      # runner doesn't require
+      # touching the build script.  rustup-target-add is invoked first
+      # because dtolnay/rust-toolchain's `stable` does not pre-install it.
+      - name: Install arm64 cross-toolchain (kernel deps only)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            flex \
+            bison \
+            libelf-dev \
+            libssl-dev \
+            bc \
+            xz-utils \
+            gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build Rust shim (arm64 — cross-compile via cargo-zigbuild)
+        run: pnpm build -- --skip-rootfs --skip-bundle --shim-arm64
+
+      # The arm64 rootfs builds below run `docker buildx --platform=linux/arm64`
+      # on an x86_64 runner.  Without QEMU binfmt registration the runner
+      # kernel can't execute the arm64 `/bin/sh` (etc.) the buildx steps
+      # invoke, surfacing as `exec /bin/sh: exec format error`.  Registered
+      # once here so both arm64 rootfs build steps (ubuntu-22.04, ubuntu-24.04)
+      # AND the arm64 GHCR push below see it.  No-op for the x64 builds.
+      - name: Register QEMU binfmt handlers (for linux/arm64 build)
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      # Build BOTH x64 rootfs ext4 images, reusing the bundle + shim built above.
+      # `--skip-bundle` and `--skip-shim` avoid the redundant work the build
+      # script would otherwise repeat per --runner-image invocation.
+      - name: Build rootfs (ubuntu-22.04, x64)
+        run: pnpm build -- --runner-image=ubuntu-22.04 --skip-bundle --skip-shim
+
+      - name: Build rootfs (ubuntu-24.04, x64)
+        run: pnpm build -- --runner-image=ubuntu-24.04 --skip-bundle --skip-shim
+
+      # Build the two arm64 rootfs ext4 images for the macOS CLI.
+      # `--arch=arm64` selects the arm64 base image AND skips the redundant
+      # x64 shim build (the arm64 .so above already produced
+      # `images/libscriptjail-arm64.so`).
+      - name: Build rootfs (ubuntu-22.04, arm64)
+        run: pnpm build -- --runner-image=ubuntu-22.04 --arch=arm64 --skip-bundle --skip-shim
+
+      - name: Build rootfs (ubuntu-24.04, arm64)
+        run: pnpm build -- --runner-image=ubuntu-24.04 --arch=arm64 --skip-bundle --skip-shim
+
+      # The arm64 rootfs build stages libscriptjail-arm64.so to the canonical
+      # images/libscriptjail.so path because Dockerfile.base has one COPY
+      # target. Restore the x64 shim before computing/uploading the Linux
+      # action artifact.
+      - name: Restore x64 shim artifact
+        run: cp target/release/libscriptjail.so images/libscriptjail.so
+
+      # Build the two VZ kernels. Pinned upstream version + per-arch config;
+      # see images/kernel/build.sh for the full pipeline.
+      - name: Build vmlinux-vz (x86_64)
+        run: bash images/kernel/build.sh --arch=x86_64 --force
+
+      - name: Build vmlinux-vz (arm64)
+        run: bash images/kernel/build.sh --arch=arm64 --force
+
+      # Compute SHA-256 of every released artifact and surface them in the
+      # job summary so the maintainer can copy the digests into
+      # src/action/artifact-manifest.ts before cutting the next release.
+      # The Mach-O binary (`script-jail-vm-arm64-darwin`) is produced by
+      # the `build-mac-bin` job above; we re-fetch it here via a workflow
+      # artifact so the SHA summary can include it in the paste-block.
+      - name: Download script-jail-vm Mach-O artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: script-jail-vm-arm64-darwin
+          path: artifacts/mac-bin
+
+      - name: Compute SHAs
+        id: shas
+        run: |
+          set -euo pipefail
+          # Rootfs ext4 images are pinned by their CANONICAL hash (volatile
+          # superblock time fields masked — see src/rootfs/repro-hash.ts), so the
+          # value survives the e2fsprogs close-flush s_wtime re-stamp.  Everything
+          # else (the .so shims, the VZ kernels, the Mach-O binary) is pinned by a
+          # plain sha256sum.  These two digest kinds MUST match how
+          # check-publish-artifacts.sh recomputes them in the release.yml publish
+          # job and how preFetchArtifacts verifies the rootfs at consumer runtime.
+          # --- Linux platform artifacts ---
+          LINUX_ROOTFS_22="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-22.04.ext4)"
+          LINUX_ROOTFS_24="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-24.04.ext4)"
+          LINUX_LIBSO="$(sha256sum images/libscriptjail.so | cut -d' ' -f1)"
+          # --- Darwin platform artifacts ---
+          DARWIN_ROOTFS_22_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-22.04-arm64.ext4)"
+          DARWIN_ROOTFS_24_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-24.04-arm64.ext4)"
+          DARWIN_LIBSO_ARM64="$(sha256sum images/libscriptjail-arm64.so | cut -d' ' -f1)"
+          VMLINUX_VZ_X86_64="$(sha256sum images/vmlinux-vz-x86_64 | cut -d' ' -f1)"
+          VMLINUX_VZ_ARM64="$(sha256sum images/vmlinux-vz-arm64 | cut -d' ' -f1)"
+          SJ_VM_ARM64_DARWIN="$(sha256sum artifacts/mac-bin/script-jail-vm-arm64-darwin | cut -d' ' -f1)"
+          # --- Surface as job outputs (also useful for downstream steps) ---
+          {
+            echo "linux_rootfs_22=${LINUX_ROOTFS_22}"
+            echo "linux_rootfs_24=${LINUX_ROOTFS_24}"
+            echo "linux_libso=${LINUX_LIBSO}"
+            echo "darwin_rootfs_22_arm64=${DARWIN_ROOTFS_22_ARM64}"
+            echo "darwin_rootfs_24_arm64=${DARWIN_ROOTFS_24_ARM64}"
+            echo "darwin_libso_arm64=${DARWIN_LIBSO_ARM64}"
+            echo "vmlinux_vz_x86_64=${VMLINUX_VZ_X86_64}"
+            echo "vmlinux_vz_arm64=${VMLINUX_VZ_ARM64}"
+            echo "sj_vm_arm64_darwin=${SJ_VM_ARM64_DARWIN}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Artifact SHAs"
+            echo
+            echo "Update \`src/action/artifact-manifest.ts\` with:"
+            echo
+            echo '```ts'
+            echo "export const PINNED_MANIFEST: ArtifactManifest = {"
+            echo "  repo: '${{ github.repository }}',"
+            echo "  tag: '${{ github.ref_name }}',"
+            echo "  expected: {"
+            echo "    linux: {"
+            echo "      'rootfs-ubuntu-22.04.ext4': '${LINUX_ROOTFS_22}',"
+            echo "      'rootfs-ubuntu-24.04.ext4': '${LINUX_ROOTFS_24}',"
+            echo "      'libscriptjail.so':         '${LINUX_LIBSO}',"
+            echo "    },"
+            echo "    darwin: {"
+            echo "      'rootfs-ubuntu-22.04-arm64.ext4': '${DARWIN_ROOTFS_22_ARM64}',"
+            echo "      'rootfs-ubuntu-24.04-arm64.ext4': '${DARWIN_ROOTFS_24_ARM64}',"
+            echo "      'libscriptjail-arm64.so':         '${DARWIN_LIBSO_ARM64}',"
+            echo "      'vmlinux-vz-x86_64':              '${VMLINUX_VZ_X86_64}',"
+            echo "      'vmlinux-vz-arm64':               '${VMLINUX_VZ_ARM64}',"
+            echo "      'script-jail-vm-arm64-darwin':    '${SJ_VM_ARM64_DARWIN}',"
+            echo "    },"
+            echo "  },"
+            echo "};"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Hand the assets to the downstream release.yml run via a workflow
+      # artifact.  Using a workflow artifact (rather than a job output or cache)
+      # keeps the build job side-effect-free outside its own filesystem.  The
+      # `name` and `path:` list MUST stay byte-identical to what release.yml's
+      # build job uploaded before — check-publish-artifacts.sh + the rewired
+      # publish job consume these by exact path.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: |
+            images/rootfs-ubuntu-22.04.ext4
+            images/rootfs-ubuntu-24.04.ext4
+            images/rootfs-ubuntu-22.04-arm64.ext4
+            images/rootfs-ubuntu-24.04-arm64.ext4
+            images/libscriptjail.so
+            images/libscriptjail-arm64.so
+            images/vmlinux-vz-x86_64
+            images/vmlinux-vz-arm64
+            dist/main.cjs
+            dist/guest-agent.cjs
+            dist/cli.cjs
+            dist/preloads/*.cjs
+          if-no-files-found: error
+          retention-days: 90
+
+      # ---------------------------------------------------------------------
+      # GHCR push (relocated from release.yml's publish job).  The 4 rootfs
+      # Docker images are NOT byte-reproducible, so they too must be built
+      # ONCE here and only their digests verified later.  We push them and
+      # emit the 4 `image:tag@sha256:digest` refs to the step summary so the
+      # operator can paste them into the manifest's `dockerImages` block.
+      #
+      # QEMU binfmt is already registered above (the arm64 rootfs builds need
+      # it); Buildx + GHCR login are set up immediately before the push.
+      # ---------------------------------------------------------------------
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish Docker rootfs images
+        run: |
+          set -euo pipefail
+
+          # In this producer job every input already lives at its final in-tree
+          # path: the dist/ bundles were built above, images/libscriptjail.so is
+          # the restored x64 shim, and images/libscriptjail-arm64.so is the
+          # cross-built arm64 shim.  (In release.yml's old publish job these were
+          # copied out of the downloaded `artifacts/` tree first; here there is
+          # no such copy because nothing was downloaded.)
+          vp_version="$(sed -nE "s/^export const VITE_PLUS_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          node_version="$(sed -nE "s/^export const NODE_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          vp_sha_x64="$(sed -nE "s/^[[:space:]]*x64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          vp_sha_arm64="$(sed -nE "s/^[[:space:]]*arm64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner_lc}/script-jail-rootfs"
+          : > docker-image-refs.txt
+
+          if [ -z "${vp_version}" ] || [ -z "${node_version}" ] || [ -z "${vp_sha_x64}" ] || [ -z "${vp_sha_arm64}" ]; then
+            echo "failed to parse src/rootfs/vite-plus.ts" >&2
+            exit 1
+          fi
+
+          build_one() {
+            local runner_image="$1"
+            local ubuntu_major="$2"
+            local arch="$3"
+            local platform="$4"
+            local vp_sha="$5"
+            local tag="$6"
+            local metadata
+            local digest
+            local ubuntu_ref
+            metadata="$(mktemp)"
+
+            # Pin the GHCR build's base image to the SAME per-(runner_image,arch)
+            # `ubuntu@sha256:…` digest the local rootfs build threads as
+            # UBUNTU_REF (src/rootfs/build.ts UBUNTU_BASE_DIGEST).  Without this
+            # the published image would `FROM` a floating `ubuntu:<major>` tag
+            # and drift away from the rootfs ext4s the manifest backfill must
+            # reproduce.
+            #
+            # We read the committed map with the bundled `node` (this step does
+            # not need oxnode): scope to the runner-image block, then pull the
+            # per-arch `ubuntu@sha256:…` string.  runner_image/arch are passed
+            # via env (not interpolated into the JS literal) to avoid
+            # quoting/injection issues; an unknown key writes an empty string so
+            # the guard below fails loudly rather than leaking an `undefined`
+            # into --build-arg.
+            ubuntu_ref="$(SJ_RUNNER_IMAGE="${runner_image}" SJ_ARCH="${arch}" node -e '
+              const fs = require("fs");
+              const src = fs.readFileSync("src/rootfs/build.ts", "utf8");
+              const ri = process.env.SJ_RUNNER_IMAGE.replace(/[.]/g, "\\.");
+              const block = src.match(new RegExp("[\"\x27]" + ri + "[\"\x27]\\s*:\\s*\\{([\\s\\S]*?)\\}"));
+              let out = "";
+              if (block) {
+                const am = block[1].match(new RegExp("\\b" + process.env.SJ_ARCH + "\\s*:\\s*[\"\x27]([^\"\x27]+)[\"\x27]"));
+                if (am) out = am[1];
+              }
+              process.stdout.write(out);
+            ')"
+            if [ -z "${ubuntu_ref}" ]; then
+              echo "::error::no pinned UBUNTU_REF for ${runner_image}/${arch} in src/rootfs/build.ts" >&2
+              exit 1
+            fi
+
+            docker buildx build \
+              --platform="${platform}" \
+              --push \
+              --metadata-file="${metadata}" \
+              --build-arg "UBUNTU_REF=${ubuntu_ref}" \
+              --build-arg "UBUNTU_MAJOR=${ubuntu_major}" \
+              --build-arg "VP_VERSION=${vp_version}" \
+              --build-arg "VP_ARCH=${arch}" \
+              --build-arg "VP_SHA256=${vp_sha}" \
+              --build-arg "NODE_VERSION=${node_version}" \
+              -f src/rootfs/Dockerfile.base \
+              -t "${image}:${tag}" \
+              -t "${image}:${tag}-${{ github.ref_name }}" \
+              .
+
+            digest="$(jq -r '."containerimage.digest"' "${metadata}")"
+            if [ -z "${digest}" ] || [ "${digest}" = "null" ]; then
+              echo "docker buildx did not report a digest for ${tag}" >&2
+              exit 1
+            fi
+            printf '%s=%s@%s\n' "${runner_image}_${arch}" "${image}:${tag}" "${digest}" >> docker-image-refs.txt
+          }
+
+          # x64 push uses the restored x64 shim already at images/libscriptjail.so.
+          build_one ubuntu-22.04 22.04 x64 linux/amd64 "${vp_sha_x64}" ubuntu-22.04
+          build_one ubuntu-24.04 24.04 x64 linux/amd64 "${vp_sha_x64}" ubuntu-24.04
+
+          # arm64 push needs the arm64 shim at the single Dockerfile COPY target.
+          cp images/libscriptjail-arm64.so images/libscriptjail.so
+          build_one ubuntu-22.04 22.04 arm64 linux/arm64 "${vp_sha_arm64}" ubuntu-22.04-arm64
+          build_one ubuntu-24.04 24.04 arm64 linux/arm64 "${vp_sha_arm64}" ubuntu-24.04-arm64
+
+          linux_22="$(sed -n 's/^ubuntu-22.04_x64=//p' docker-image-refs.txt)"
+          linux_24="$(sed -n 's/^ubuntu-24.04_x64=//p' docker-image-refs.txt)"
+          arm64_22="$(sed -n 's/^ubuntu-22.04_arm64=//p' docker-image-refs.txt)"
+          arm64_24="$(sed -n 's/^ubuntu-24.04_arm64=//p' docker-image-refs.txt)"
+
+          {
+            echo
+            echo "## Docker image refs"
+            echo
+            echo "Update \`src/action/artifact-manifest.ts\` \`dockerImages\` with:"
+            echo
+            echo '```ts'
+            echo "  dockerImages: {"
+            echo "    x64: {"
+            echo "      'ubuntu-22.04': '${linux_22}',"
+            echo "      'ubuntu-24.04': '${linux_24}',"
+            echo "    },"
+            echo "    arm64: {"
+            echo "      'ubuntu-22.04': '${arm64_22}',"
+            echo "      'ubuntu-24.04': '${arm64_24}',"
+            echo "    },"
+            echo "  },"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
