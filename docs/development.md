@@ -69,7 +69,7 @@ published **before** the main `script-jail` package so that the
 
 The repo's own CI sets `SCRIPT_JAIL_E2E_SELF_TEST=1` to skip manifest validation (so the action under test isn't gated on the very artifacts it's building).
 
-For the first-release bootstrap loop (Phase 0 → 1 → 2, the `v0.1.0` placeholder-publish followed by the `v0.1.1` SHA backfill) and the per-target works/degraded matrix, see [releasing.md](./releasing.md) (`docs/releasing.md`).
+For the build-once / download-forever single-tag release flow (run the `release-build.yml` producer, backfill the manifest SHAs/digests, push `vX.Y.Z` so `release.yml` downloads and verifies the producer's artifacts) and the per-target works/degraded matrix, see [releasing.md](./releasing.md) (`docs/releasing.md`).
 
 ## CI overview
 
