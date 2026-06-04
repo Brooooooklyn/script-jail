@@ -131,3 +131,32 @@ jobs:
             echo "::error::dist/repro-hash-cli.cjs is out of date. Run 'pnpm build:repro-hash' locally and commit the result."
             exit 1
           fi
+
+      # dist/preloads/*.cjs are PLAIN COPIES of their src/guest/*.cjs sources
+      # (src/rootfs/build.ts copyPreloads() copyFileSyncs them verbatim — no
+      # esbuild transform), and the npm main `script-jail` package SHIPS them.
+      # No bundle gate above covers them, so a source edit to src/guest/env-spy.cjs
+      # (etc.) that ships without refreshing dist/preloads/env-spy.cjs would push a
+      # STALE preload to npm undetected. Gate by direct byte-equality per preload.
+      # The basenames are read from the MAIN_PRELOADS single source of truth in
+      # scripts/npm-packages.mjs (enumerated explicitly, never globbed, on purpose)
+      # so this gate can never drift from the published set.
+      - name: Verify dist/preloads/*.cjs match their src/guest/*.cjs sources
+        run: |
+          set -euo pipefail
+          names="$(node -e 'import("./scripts/npm-packages.mjs").then((m) => process.stdout.write(m.MAIN_PRELOADS.join("\n")))')"
+          if [ -z "${names}" ]; then
+            echo "::error::could not read MAIN_PRELOADS from scripts/npm-packages.mjs"
+            exit 1
+          fi
+          rc=0
+          while IFS= read -r name; do
+            [ -z "${name}" ] && continue
+            if ! cmp -s "src/guest/${name}" "dist/preloads/${name}"; then
+              echo "::error::dist/preloads/${name} is out of date (differs from src/guest/${name}). The preloads are plain copies — run 'pnpm build' (or copy src/guest/${name} → dist/preloads/${name}) and commit the result."
+              rc=1
+            fi
+          done <<EOF
+          ${names}
+          EOF
+          exit "${rc}"

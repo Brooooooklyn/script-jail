@@ -104,6 +104,17 @@ The producer builds every image asset exactly once:
 >
 > Because the binaries do **not** depend on the manifest or the version, it is
 > correct that the producer runs *before* the manifest backfill (Phase 2).
+>
+> **90-day artifact retention.** Both producer artifacts
+> (`release-assets-vX.Y.Z`, `mac-bin-vX.Y.Z`) are uploaded with
+> `retention-days: 90` (set in `release-build.yml`). The tag MUST be pushed
+> (Phase 3) within that window — once the artifacts expire, `release.yml`'s
+> download step has nothing to fetch and the only recovery is to **re-dispatch
+> the producer** (a fresh build, whose non-reproducible kernel/Mach-O bytes
+> change, so you must re-backfill the manifest from the new run's SHAs). After a
+> successful publish the **durable** copies are the **GitHub release assets** and
+> the **npm tarballs** — NOT the Actions artifacts; a release rerun after the
+> artifacts expire cannot re-download them.
 
 ---
 
@@ -252,6 +263,18 @@ pinned SHAs verify *what* those assets are, and immutability guarantees they
 *stay* that way. This is optional — the manifest SHA check is the primary
 integrity control — but it closes the window where a release asset could be
 silently swapped after publish.
+
+> **Caveat — incompatible with the current rerun-recovery path.** Immutable
+> releases are **not** compatible with the overwrite-based rerun recovery
+> described in Phase 3. The publish job's "Upload release assets" step (step 6)
+> runs BEFORE the idempotent npm-publish loop (step 7) and re-uploads the assets
+> by overwriting. With an immutable release, that re-upload to an
+> already-published release is blocked, so a rerun (e.g. to republish a package
+> that failed after the release was created) would fail at the asset step and
+> never reach the npm recovery — stranding the still-unpublished packages.
+> Enable immutable releases only if you instead recover by **bumping the version
+> and re-tagging** (a brand-new release, no overwrite) rather than re-running the
+> same tag.
 
 ---
 
