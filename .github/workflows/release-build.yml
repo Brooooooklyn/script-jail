@@ -24,12 +24,19 @@
 #   This workflow NEVER publishes to npm, creates a GitHub release, or verifies
 #   the manifest. Those stay in release.yml, which consumes the artifacts this
 #   workflow produces. It is dispatched manually against whatever ref the
-#   operator selects (no required inputs).
+#   operator selects, with the release tag passed as the required `tag` input
+#   (under workflow_dispatch, github.ref_name is the dispatched BRANCH, not a
+#   v*.*.* tag, so the tag must be supplied explicitly).
 
 name: release-build
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to cut, e.g. v0.1.1'
+        required: true
+        type: string
 
 # Job-level permissions (set per-job below) override this default; we still
 # pin contents:read at the workflow level so any future job that forgets to
@@ -41,8 +48,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # build-mac-bin — produce the Mach-O `script-jail-vm-arm64-darwin` binary.
   # Runs on a macos-latest Apple-Silicon runner; emits the binary as a workflow
-  # artifact that the main `build` job downloads to compute its SHA and that the
-  # downstream release run uploads to the release.
+  # artifact that (a) the `build` job downloads to compute its SHA for the
+  # paste-block and (b) a later, separate `release.yml` run downloads to publish.
   #
   # We keep this job tightly scoped — no `pnpm install`, no Docker, no
   # access to the consumer-tree of the action — so the macOS runner only
@@ -271,7 +278,6 @@ jobs:
           path: artifacts/mac-bin
 
       - name: Compute SHAs
-        id: shas
         run: |
           set -euo pipefail
           # Rootfs ext4 images are pinned by their CANONICAL hash (volatile
@@ -292,18 +298,7 @@ jobs:
           VMLINUX_VZ_X86_64="$(sha256sum images/vmlinux-vz-x86_64 | cut -d' ' -f1)"
           VMLINUX_VZ_ARM64="$(sha256sum images/vmlinux-vz-arm64 | cut -d' ' -f1)"
           SJ_VM_ARM64_DARWIN="$(sha256sum artifacts/mac-bin/script-jail-vm-arm64-darwin | cut -d' ' -f1)"
-          # --- Surface as job outputs (also useful for downstream steps) ---
-          {
-            echo "linux_rootfs_22=${LINUX_ROOTFS_22}"
-            echo "linux_rootfs_24=${LINUX_ROOTFS_24}"
-            echo "linux_libso=${LINUX_LIBSO}"
-            echo "darwin_rootfs_22_arm64=${DARWIN_ROOTFS_22_ARM64}"
-            echo "darwin_rootfs_24_arm64=${DARWIN_ROOTFS_24_ARM64}"
-            echo "darwin_libso_arm64=${DARWIN_LIBSO_ARM64}"
-            echo "vmlinux_vz_x86_64=${VMLINUX_VZ_X86_64}"
-            echo "vmlinux_vz_arm64=${VMLINUX_VZ_ARM64}"
-            echo "sj_vm_arm64_darwin=${SJ_VM_ARM64_DARWIN}"
-          } >> "$GITHUB_OUTPUT"
+          # --- Emit the manifest paste-block to the job summary ---
           {
             echo "## Artifact SHAs"
             echo
@@ -312,7 +307,7 @@ jobs:
             echo '```ts'
             echo "export const PINNED_MANIFEST: ArtifactManifest = {"
             echo "  repo: '${{ github.repository }}',"
-            echo "  tag: '${{ github.ref_name }}',"
+            echo "  tag: '${{ inputs.tag }}',"
             echo "  expected: {"
             echo "    linux: {"
             echo "      'rootfs-ubuntu-22.04.ext4': '${LINUX_ROOTFS_22}',"
@@ -364,6 +359,15 @@ jobs:
       # ONCE here and only their digests verified later.  We push them and
       # emit the 4 `image:tag@sha256:digest` refs to the step summary so the
       # operator can paste them into the manifest's `dockerImages` block.
+      #
+      # This producer pushes the FLOATING stable tags (`:ubuntu-22.04`,
+      # `:ubuntu-24.04`, and the `-arm64` variants), so it MUST be dispatched
+      # deliberately on the exact commit being released.  We intentionally do
+      # NOT gate the push on `github.ref_type == 'tag'`: this is dispatched from
+      # a BRANCH, so such a guard would wrongly skip the push.  Moving a floating
+      # tag is safe for real consumers because they pin by `@sha256:` digest (the
+      # digest recorded in the manifest), not by tag — a tag move never affects a
+      # digest-pinned consumer.
       #
       # QEMU binfmt is already registered above (the arm64 rootfs builds need
       # it); Buildx + GHCR login are set up immediately before the push.
@@ -456,7 +460,7 @@ jobs:
               --build-arg "NODE_VERSION=${node_version}" \
               -f src/rootfs/Dockerfile.base \
               -t "${image}:${tag}" \
-              -t "${image}:${tag}-${{ github.ref_name }}" \
+              -t "${image}:${tag}-${{ inputs.tag }}" \
               .
 
             digest="$(jq -r '."containerimage.digest"' "${metadata}")"
