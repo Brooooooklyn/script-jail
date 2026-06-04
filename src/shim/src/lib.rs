@@ -1006,7 +1006,14 @@ unsafe fn emit_node_startup_done() {
     let ns: i64 = (ts.tv_sec as i64) * 1_000_000_000i64 + ts.tv_nsec as i64;
     let pid = libc::getpid();
 
-    let mut buf = [0u8; 128];
+    // 1024 (== CANON_BUF_LEN) holds the fixed prefix/pid/ts (~80 B) plus the
+    // three optional npm attribution fields.  capture_canon caps EACH field at
+    // CANON_BUF_LEN-1 bytes, so a single field can never exceed the buffer; the
+    // size + the field ORDER below guarantee the attribution-critical pair fits.
+    // Every append is independently bounds-guarded (append_canon_field omits a
+    // field that would not fit while leaving room for the closing `}\n`), so an
+    // oversized value is safely omitted rather than overflowing this buffer.
+    let mut buf = [0u8; 1024];
     let mut pos = 0usize;
     let prefix = br#"{"kind":"node_startup_done","pid":"#;
     buf[..prefix.len()].copy_from_slice(prefix);
@@ -1018,9 +1025,60 @@ unsafe fn emit_node_startup_done() {
     pos += mid.len();
     pos += write_i64(&mut buf[pos..], ns);
 
-    let suffix = b"}\n";
-    buf[pos..pos + suffix.len()].copy_from_slice(suffix);
-    pos += suffix.len();
+    // npm lifecycle attribution (deterministic, in-process, reap-proof) — the
+    // SAME ctor snapshot stamped into `exec` records (see emit_exec_for_pid).
+    // It lets the guest seed this pid's attribution the instant env-spy signals
+    // node-startup-done, BEFORE any post-bootstrap env read is dispatched, so a
+    // short-lived spawned Node child (e.g. puppeteer's `node install.mjs`) whose
+    // /proc is reaped before its env reads are tailed still attributes those
+    // reads to the right package instead of dropping them — the env_read analog
+    // of the reaped-helper exec fix.  Each field is omitted when its CanonBuf is
+    // empty (non-lifecycle process such as npm/pnpm itself), keeping
+    // non-lifecycle markers byte-identical to the pre-change output.
+    //
+    // ORDER MATTERS (do not reorder to match emit_exec_for_pid): the guest's
+    // shimNodeStartupAttribution requires BOTH npm_package_name AND a canonical
+    // npm_lifecycle_event to seed at all — npm_package_version is only the
+    // render suffix.  append_canon_field reserves room solely for the field it
+    // is writing plus the closing `}\n`; it does NOT pre-reserve space for
+    // later fields.  capture_canon caps each value at CANON_BUF_LEN-1 and does
+    // NOT enforce npm's 214-byte name limit, so a child-controlled overlong
+    // npm_package_name (or version) could otherwise consume the buffer.  We
+    // therefore write the SMALLEST attribution-critical field FIRST:
+    //   1. npm_lifecycle_event — canonical, ≤ ~12 bytes, needs no escaping;
+    //      written into a near-empty buffer it ALWAYS fits, so the seed's
+    //      go/no-go gate (canonical lifecycle) can never be silently dropped.
+    //   2. npm_package_name — required for the pkg; ≤214 B for any real npm
+    //      name, far under the buffer, so it fits in full alongside lifecycle.
+    //   3. npm_package_version — OPTIONAL render suffix, LAST: a pathologically
+    //      long value truncates/omits only itself and never starves 1 or 2.
+    // Net: for any realistic package all three fit; a pathological field can
+    // only ever cost the optional version, never the deterministic seed (which
+    // would otherwise fall back to /proc on the reaped-child path this fixes).
+    pos = append_canon_field(
+        &mut buf,
+        pos,
+        b"npm_lifecycle_event",
+        &CANON_NPM_LIFECYCLE_EVENT,
+    );
+    pos = append_canon_field(&mut buf, pos, b"npm_package_name", &CANON_NPM_PACKAGE_NAME);
+    pos = append_canon_field(
+        &mut buf,
+        pos,
+        b"npm_package_version",
+        &CANON_NPM_PACKAGE_VERSION,
+    );
+
+    // Closing `}\n`.  append_canon_field guarantees ≥3 trailing bytes remain (it
+    // reserves the value-closing quote plus this tail), but guard defensively so
+    // a future buffer-size change can never overflow the no_std shim.
+    if pos + 2 > buf.len() {
+        return;
+    }
+    buf[pos] = b'}';
+    pos += 1;
+    buf[pos] = b'\n';
+    pos += 1;
 
     write_all(log_fd, &buf[..pos]);
 }

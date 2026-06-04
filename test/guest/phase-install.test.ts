@@ -4540,6 +4540,435 @@ describe('runInstallPhase', () => {
     });
   });
 
+  describe('node_startup_done seeds attribution for a reaped spawned Node child', () => {
+    // Cross-backend parity regression (2026-06-04): puppeteer's `node
+    // install.mjs` reads ~90 env vars then exits in a sub-millisecond burst.
+    // On a fast backend the child's /proc is reaped before the tailer drains
+    // those reads, so the /proc walk returns null and — absent any seed — every
+    // read is dropped, diverging nondeterministically from the macOS-arm64
+    // capture (which committed the full list).  The shim now stamps the
+    // process's own ctor-snapshotted npm env into the node_startup_done marker;
+    // seeding the pid's attribution from it (env-spy fires the marker BEFORE any
+    // post-bootstrap read) makes those reads attribute deterministically whether
+    // or not /proc is still alive.  This is the env_read analog of
+    // shimExecAttribution's reaped-helper exec fix.
+    const PUP_ENV = {
+      npm_package_name: 'puppeteer',
+      npm_package_version: '24.0.0',
+      npm_lifecycle_event: 'install',
+    };
+
+    const findRead = (lines: string[], name: string): Record<string, unknown> | undefined =>
+      lines
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .find(
+          (e) =>
+            (e['raw'] as Record<string, unknown>)['kind'] === 'env_read' &&
+            (e['raw'] as Record<string, unknown>)['name'] === name,
+        );
+
+    it('attributes post-bootstrap env reads via the marker even when /proc is reaped', async () => {
+      // pid 99 is the reaped child: NOT in the proc reader, so attribute(99)
+      // always returns null — the marker seed is the ONLY path to attribution.
+      const proc = mockProcReader({});
+      const straceLines = [
+        { pid: 99, line: 'execve("/usr/local/bin/node", ["node", "install.mjs"], 0x7ffd) = 0' },
+        // Pre-marker bootstrap read (filtered as Node bootstrap noise).
+        { pid: 99, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'NODE_OPTIONS', pid: 99, ts: 1, hidden: false }) },
+        // Marker carries the shim's reap-proof ctor snapshot.
+        { pid: 99, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 99, ts: 2, ...PUP_ENV }) },
+        // Post-marker user-code read: must attribute to puppeteer.
+        { pid: 99, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PUPPETEER_SKIP_DOWNLOAD', pid: 99, ts: 3, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const read = findRead(lines, 'PUPPETEER_SKIP_DOWNLOAD');
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe('puppeteer@24.0.0');
+      expect(read!['lifecycle']).toBe('install');
+    });
+
+    it('drops the same reads when the marker carries no npm attribution (control)', async () => {
+      const proc = mockProcReader({});
+      const straceLines = [
+        { pid: 99, line: 'execve("/usr/local/bin/node", ["node", "install.mjs"], 0x7ffd) = 0' },
+        { pid: 99, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'NODE_OPTIONS', pid: 99, ts: 1, hidden: false }) },
+        // Same marker WITHOUT npm fields (a non-lifecycle Node process): nothing
+        // seeds pid 99's snapshot, and /proc is reaped, so the read drops.
+        { pid: 99, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 99, ts: 2 }) },
+        { pid: 99, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PUPPETEER_SKIP_DOWNLOAD', pid: 99, ts: 3, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(findRead(lines, 'PUPPETEER_SKIP_DOWNLOAD')).toBeUndefined();
+    });
+
+    it('does not override a non-canonical lifecycle (marker attribution falls back to /proc)', async () => {
+      // A live child whose marker carries a NON-canonical lifecycle event must
+      // NOT be seeded from the marker (attributionFromEnvVars returns null); its
+      // reads attribute via the /proc walk exactly as before.
+      const proc = mockProcReader({
+        77: { ppid: 1, env: { npm_package_name: 'live-pkg', npm_package_version: '2.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      const straceLines = [
+        { pid: 77, line: 'execve("/usr/local/bin/node", ["node", "run.mjs"], 0x7ffd) = 0' },
+        { pid: 77, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 77, ts: 1, npm_package_name: 'forged', npm_package_version: '9.9.9', npm_lifecycle_event: 'test' }) },
+        { pid: 77, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'SOME_PACKAGE_ENV', pid: 77, ts: 2, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const read = findRead(lines, 'SOME_PACKAGE_ENV');
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe('live-pkg@2.0.0');
+    });
+
+    it('marker attribution stays isolated from the strace bypass path', async () => {
+      // Finding 2 (adversarial review, 2026-06-04): the marker is stored in its
+      // OWN map, consulted ONLY by the shim-event chain — it must NEVER reach
+      // the strace spawn/bypass/clone fallbacks (which read /proc + the shared
+      // snapshot).  pid 105 is reaped and its ONLY shim record is a marker
+      // carrying puppeteer.  A raw execve with no paired shim exec must still
+      // synthesise a <SYSCALL_EXEC_BYPASS> under <unattributed> — NOT puppeteer.
+      // If the marker were seeded through recordAttribution (the rejected
+      // design), it would freshen the shared snapshot and this bypass would be
+      // mis-attributed to puppeteer@24.0.0, so this assertion is fix-sensitive.
+      const proc = mockProcReader({});
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 105,
+          source: 'shim',
+          line: JSON.stringify({ kind: 'node_startup_done', pid: 105, ts: 1, npm_package_name: 'puppeteer', npm_package_version: '24.0.0', npm_lifecycle_event: 'install' }),
+        },
+        {
+          pid: 105,
+          line: 'execve("/usr/bin/curl", ["curl", "https://evil"], 0x1 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synth = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synth).toBeDefined();
+      expect(synth!['pkg']).toBe('<unattributed>');
+    });
+
+    it('a fresh marker beats a DEAD generation\'s stale snapshot on a recycled pid', async () => {
+      // Finding (adversarial re-review, 2026-06-04): the shim-event chain used
+      // to consult the stale-accepting `snapshotAttribution` BEFORE the marker,
+      // so a recycled pid whose previous generation left a stale snapshot would
+      // mis-attribute the NEW generation's reaped reads to the DEAD package.
+      // The chain now prefers a FRESH snapshot over the marker but the marker
+      // over a STALE one (`... ?? freshSnapshotAttribution ?? nodeStartupAttribution
+      // ?? snapshotAttribution`).  This test pins that ordering.
+      //
+      // /proc is empty throughout (pid 88 is never live to the tailer), so the
+      // generation-1 snapshot is seeded purely from a shim `exec` record:
+      //   1. gen-1 shim exec carries old-pkg → recordAttribution writes a FRESH
+      //      snapshot for pid 88 (old-pkg@1.0.0).
+      //   2. `+++ exited +++`: attribute(88) is null (reaped) → snapshot marked
+      //      STALE (never evicted, per the exit-line model).
+      //   3. pid 88 is recycled; its gen-2 node_startup_done marker carries
+      //      puppeteer → seeds nodeStartupAttributionByPid[88].
+      //   4. a post-marker env_read for pid 88 MUST attribute to puppeteer (the
+      //      live generation's marker), NOT old-pkg (the dead generation's
+      //      stale snapshot).
+      // Pre-fix (stale snapshot consulted first) this would render old-pkg@1.0.0,
+      // so the puppeteer assertion is fix-sensitive.
+      const proc = mockProcReader({});
+      const straceLines = [
+        // gen 1: shim exec stamps old-pkg → fresh snapshot for pid 88.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'exec', prog: '/usr/local/bin/node', argv0: 'node', envp_alloc_failed: false, result: 'ok', pid: 88, ts: 1, npm_package_name: 'old-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'install' }) },
+        // gen 1 exits while reaped → snapshot for pid 88 goes stale.
+        { pid: 88, source: 'strace' as const, line: '+++ exited with 0 +++' },
+        // gen 2 (recycled pid 88) bootstrap completes: marker carries puppeteer.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 3, ...PUP_ENV }) },
+        // gen 2 user-code read: must attribute to the marker, not the stale snapshot.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PUPPETEER_SKIP_DOWNLOAD', pid: 88, ts: 4, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const read = findRead(lines, 'PUPPETEER_SKIP_DOWNLOAD');
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe('puppeteer@24.0.0');
+      expect(read!['lifecycle']).toBe('install');
+    });
+
+    it('a fresh marker beats a not-yet-stale old snapshot when the old exit is DELAYED', async () => {
+      // Re-review finding (2026-06-04): the `stale` bit is only set once the old
+      // generation's `+++ exited +++` line is drained.  strace -ff files are
+      // tailed in filesystem order, so a recycled pid's gen-2 marker + reaped
+      // env_read can be processed BEFORE the delayed gen-1 exit line — at which
+      // point gen-1's snapshot is still stale:false.  The marker-ts demotion
+      // (snapshot.recordedAtTs < markerTs) makes the marker win anyway.  Pre-fix
+      // (freshSnapshotAttribution returns the not-yet-stale gen-1 snapshot) this
+      // renders old-pkg@1.0.0, so the puppeteer assertion is fix-sensitive.
+      const proc = mockProcReader({});
+      const straceLines = [
+        // gen 1 exec → fresh snapshot for pid 88 (recordedAtTs precedes marker).
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'exec', prog: '/usr/local/bin/node', argv0: 'node', envp_alloc_failed: false, result: 'ok', pid: 88, ts: 1, npm_package_name: 'old-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'install' }) },
+        // gen 2 (recycled pid 88) bootstrap completes BEFORE gen 1's exit drains.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 2, ...PUP_ENV }) },
+        // gen 2 read — gen 1 snapshot is still stale:false here, but predates the marker.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'PUPPETEER_SKIP_DOWNLOAD', pid: 88, ts: 3, hidden: false }) },
+        // DELAYED gen 1 exit, drained only now.
+        { pid: 88, source: 'strace' as const, line: '+++ exited with 0 +++' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const read = findRead(lines, 'PUPPETEER_SKIP_DOWNLOAD');
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe('puppeteer@24.0.0');
+    });
+
+    it('an invalid (overlong-name) marker on a recycled pid CLEARS the dead generation marker', async () => {
+      // Re-review finding (2026-06-04): the marker map survives exit, so a
+      // recycled pid emitting a bare/overlong/non-canonical marker must DELETE
+      // the prior generation's entry — otherwise the env_read site falls through
+      // to it and the overlong-name fail-closed guard never actually fails
+      // closed.  Here pid 88's gen-1 marker is puppeteer; gen-2 emits an
+      // overlong-name marker (rejected) then a reaped read — which must NOT
+      // attribute to puppeteer.  Pre-fix (no delete) it would.
+      const proc = mockProcReader({});
+      const straceLines = [
+        // gen 1 valid marker → puppeteer recorded for pid 88.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 1, ...PUP_ENV }) },
+        // gen 2 (recycled) emits an overlong-name marker → rejected → must clear gen 1.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 2, npm_package_name: 'p'.repeat(2000), npm_package_version: '9.9.9', npm_lifecycle_event: 'install' }) },
+        // gen 2 read, /proc reaped → no surviving attribution → dropped.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'GEN2_READ', pid: 88, ts: 3, hidden: false }) },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // Fails closed: no attribution survives, so the reaped read is dropped —
+      // and crucially is NOT mis-attributed to the dead generation's puppeteer.
+      expect(findRead(lines, 'GEN2_READ')).toBeUndefined();
+    });
+
+    it('an overlong-name gen-2 marker does NOT let a reaped read inherit gen-1\'s SHARED SNAPSHOT', async () => {
+      // Re-review Finding 1 (2026-06-04): the "CLEARS the dead generation
+      // marker" test above only proves the MARKER MAP entry is cleared.  This
+      // covers the orthogonal path where gen-1 seeded the SHARED SNAPSHOT
+      // (attributionSnapshotByPid) via a shim `exec` record.  A recycled pid's
+      // gen-2 marker that is overlong (pathological) deletes the marker-map
+      // entry but leaves NO valid attribution to compare — pre-fix the
+      // supersession guard refused to demote without a valid marker, so gen-2's
+      // reaped read fell through to gen-1's not-yet-stale snapshot.  The
+      // `pathological` generation barrier now demotes it, so the read FAILS
+      // CLOSED.  Pre-fix this renders old-pkg@1.0.0, so the assertion is
+      // fix-sensitive.
+      const proc = mockProcReader({});
+      const straceLines = [
+        // gen 1 shim exec → fresh SHARED snapshot old-pkg for pid 88.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'exec', prog: '/usr/local/bin/node', argv0: 'node', envp_alloc_failed: false, result: 'ok', pid: 88, ts: 1, npm_package_name: 'old-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'install' }) },
+        // gen 2 (recycled) overlong-name marker — pathological → generation barrier.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 2, npm_package_name: 'p'.repeat(2000), npm_package_version: '9.9.9', npm_lifecycle_event: 'install' }) },
+        // gen 2 reaped read — gen 1 snapshot is still stale:false (exit DELAYED).
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'GEN2_SNAPSHOT_READ', pid: 88, ts: 3, hidden: false }) },
+        // DELAYED gen 1 exit, drained last.
+        { pid: 88, source: 'strace' as const, line: '+++ exited with 0 +++' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // Must NOT inherit the dead generation's shared snapshot (old-pkg).
+      expect(findRead(lines, 'GEN2_SNAPSHOT_READ')).toBeUndefined();
+    });
+
+    it('a recycled pid reused across LIFECYCLE STAGES of the same package attributes to the marker\'s stage', async () => {
+      // Re-review Finding 2 (2026-06-04): the supersession guard compared the
+      // marker's PACKAGE only.  If a pid is reused between lifecycle stages of
+      // the SAME pkg@version (e.g. gen-1 preinstall, gen-2 postinstall) with the
+      // gen-1 exit DELAYED, the gen-1 snapshot predates the marker but carries
+      // the same package — so pre-fix it was NOT demoted and gen-2's reaped read
+      // attributed to the DEAD stage (preinstall).  Comparing the full
+      // (pkg, lifecycle) tuple demotes it, so the read attributes to the
+      // marker's current stage (postinstall).  Both render `samepkg@1.0.0`, so
+      // the LIFECYCLE assertion is the fix-sensitive one.
+      const proc = mockProcReader({});
+      const straceLines = [
+        // gen 1 shim exec: samepkg@1.0.0 / preinstall → fresh snapshot.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'exec', prog: '/usr/local/bin/node', argv0: 'node', envp_alloc_failed: false, result: 'ok', pid: 88, ts: 1, npm_package_name: 'samepkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'preinstall' }) },
+        // gen 2 (recycled) marker: SAME pkg@version, DIFFERENT stage (postinstall).
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 2, npm_package_name: 'samepkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' }) },
+        // gen 2 reaped read — must attribute to postinstall (marker), not preinstall (snapshot).
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'STAGE_READ', pid: 88, ts: 3, hidden: false }) },
+        // DELAYED gen 1 exit — snapshot is still stale:false during the read.
+        { pid: 88, source: 'strace' as const, line: '+++ exited with 0 +++' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      const read = findRead(lines, 'STAGE_READ');
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe('samepkg@1.0.0');
+      expect(read!['lifecycle']).toBe('postinstall');
+    });
+
+    // ACCEPTED RESIDUAL (round-4 adversarial review, 2026-06-04).  These two
+    // characterise — they do NOT bless a bug — the one pid-reuse case the
+    // generation barrier deliberately does NOT close: a BARE or NON-CANONICAL
+    // gen-2 marker on a recycled pid whose gen-1 exit is DELAYED.  Such a marker
+    // carries no identity, so it is treated as a legitimate same-generation
+    // helper (a non-lifecycle child / `npm run <task>` process) and its reaped
+    // reads inherit the predating snapshot.  That favours ATTRIBUTION over
+    // fail-closed because this input is byte-identical to the legitimate
+    // same-generation "attributes fast-exit Node env reads from the pid snapshot
+    // after /proc is gone" case (search this file): both are (bare/invalid
+    // marker + predating snapshot + reaped read), differing only in whether a
+    // recycle actually happened — which is unobservable in-band without the
+    // undrained gen-1 exit line.  Failing closed here would drop that legitimate
+    // helper's reads (benign AND protected).  If a future change makes either of
+    // these route to `<unattributed>`, it has almost certainly ALSO broken the
+    // fast-exit test — re-read the predicate's ACCEPTED RESIDUAL comment before
+    // "fixing" them.  Worst-case impact: one read mislabeled to a SIBLING
+    // package of the same install (not a confidentiality breach — `hidden`
+    // surfacing is independent of pkg attribution).
+
+    it('characterises the accepted residual: a BARE gen-2 marker reaped read inherits the predating snapshot', async () => {
+      const proc = mockProcReader({});
+      const straceLines = [
+        // gen 1 shim exec → fresh SHARED snapshot old-pkg for pid 88.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'exec', prog: '/usr/local/bin/node', argv0: 'node', envp_alloc_failed: false, result: 'ok', pid: 88, ts: 1, npm_package_name: 'old-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'install' }) },
+        // gen 2 (recycled) BARE marker — no identity, not pathological.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 2 }) },
+        // gen 2 reaped read — gen 1 snapshot still stale:false (exit DELAYED).
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'BARE_GEN2_READ', pid: 88, ts: 3, hidden: false }) },
+        // DELAYED gen 1 exit, drained last.
+        { pid: 88, source: 'strace' as const, line: '+++ exited with 0 +++' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // Accepted residual: favours attribution (the predating sibling snapshot)
+      // over fail-closed — see the block comment above.
+      const read = findRead(lines, 'BARE_GEN2_READ');
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe('old-pkg@1.0.0');
+    });
+
+    it('characterises the accepted residual: a NON-CANONICAL gen-2 marker reaped read inherits the predating snapshot', async () => {
+      const proc = mockProcReader({});
+      const straceLines = [
+        // gen 1 shim exec → fresh SHARED snapshot old-pkg for pid 88.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'exec', prog: '/usr/local/bin/node', argv0: 'node', envp_alloc_failed: false, result: 'ok', pid: 88, ts: 1, npm_package_name: 'old-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'install' }) },
+        // gen 2 (recycled) NON-CANONICAL marker — has a name but lifecycle='build'
+        // (an `npm run build` child); attribution null, not pathological.
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 2, npm_package_name: 'gen2-pkg', npm_package_version: '2.0.0', npm_lifecycle_event: 'build' }) },
+        // gen 2 reaped read — gen 1 snapshot still stale:false (exit DELAYED).
+        { pid: 88, source: 'shim' as const, line: JSON.stringify({ kind: 'env_read', name: 'NONCANON_GEN2_READ', pid: 88, ts: 3, hidden: false }) },
+        // DELAYED gen 1 exit, drained last.
+        { pid: 88, source: 'strace' as const, line: '+++ exited with 0 +++' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      // Accepted residual: favours attribution (the predating sibling snapshot)
+      // over fail-closed — see the block comment above.
+      const read = findRead(lines, 'NONCANON_GEN2_READ');
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe('old-pkg@1.0.0');
+    });
+  });
+
   describe('protected-paths policy filter', () => {
     const roots = {
       repo: '/work',
@@ -4763,6 +5192,81 @@ describe('runInstallPhase', () => {
       const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
       expect(raw['hidden']).toBe(false);
       expect(raw).not.toHaveProperty('errno');
+    });
+
+    // ── Benign $NODE_MODULES read suppression (integration, 2026-06-04) ───────
+    // These drive the real applyProtectedPathsPolicy through runInstallPhase
+    // (not a hand-stamped hidden flag), so they exercise the matcher-aware drop
+    // decision end to end — the path the prior adversarial review flagged as
+    // untested.
+    it('benign cross-package read under $NODE_MODULES → dropped before emit', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/work/node_modules/debug/src/index.js", O_RDONLY) = 5' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      expect(lines).toHaveLength(0);
+    });
+
+    it('SUCCESSFUL protected node_modules read still surfaces (opt-in beats the benign drop)', async () => {
+      // The blind spot from the prior review: a successful read carries
+      // hidden=false, so only matcher knowledge can exempt it. With a
+      // protected pattern matching the path, it must be emitted (plain).
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/work/node_modules/victim/.npmrc", O_RDONLY) = 5' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['$NODE_MODULES/**']),
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['kind']).toBe('read');
+      expect(raw['path']).toBe('/work/node_modules/victim/.npmrc');
+      expect(raw['hidden']).toBe(false);
+    });
+
+    it('a WRITE under $NODE_MODULES is never dropped (tampering surfaces)', async () => {
+      const proc = mockProcReader({ 42: { ppid: 1, env: npmEnv } });
+      const straceLines = [
+        { pid: 42, line: 'openat(AT_FDCWD, "/work/node_modules/victim/index.js", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 5' },
+      ];
+      const { emitter, lines } = makeEmitter();
+
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(straceLines),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: makeProtectedMatcher(['~/.ssh/**']),
+      });
+
+      expect(lines).toHaveLength(1);
+      const raw = (JSON.parse(lines[0]!) as Record<string, unknown>)['raw'] as Record<string, unknown>;
+      expect(raw['kind']).toBe('write');
+      expect(raw['path']).toBe('/work/node_modules/victim/index.js');
     });
 
     it('filters unprotected Node bootstrap reads until env-spy startup marker', async () => {
@@ -8385,6 +8889,202 @@ describe('runInstallPhase', () => {
         ),
       ).toBeNull();
       expect(shimExecAttribution('not json')).toBeNull();
+    });
+
+    it('does NOT read attribution off a node_startup_done line', async () => {
+      // Each gate is kind-specific: an exec extractor must ignore a marker line
+      // and vice versa, so the two seed sites never cross-wire.
+      const { shimExecAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'node_startup_done',
+        pid: 99,
+        ts: 1,
+        npm_package_name: 'puppeteer',
+        npm_package_version: '24.0.0',
+        npm_lifecycle_event: 'install',
+      });
+      expect(shimExecAttribution(line)).toBeNull();
+    });
+  });
+
+  describe('shimNodeStartupAttribution (exported for testing)', () => {
+    it('composes pkg@version + lifecycle from a node_startup_done line', async () => {
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'node_startup_done',
+        pid: 99,
+        ts: 1,
+        npm_package_name: 'puppeteer',
+        npm_package_version: '24.0.0',
+        npm_lifecycle_event: 'install',
+      });
+      expect(shimNodeStartupAttribution(line)).toEqual({
+        pkg: 'puppeteer@24.0.0',
+        lifecycle: 'install',
+      });
+    });
+
+    it('falls back to bare name when version is absent', async () => {
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'node_startup_done',
+        pid: 99,
+        ts: 1,
+        npm_package_name: 'puppeteer',
+        npm_lifecycle_event: 'preinstall',
+      });
+      expect(shimNodeStartupAttribution(line)).toEqual({
+        pkg: 'puppeteer',
+        lifecycle: 'preinstall',
+      });
+    });
+
+    it('returns null for a non-canonical lifecycle event (falls back to /proc)', async () => {
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'node_startup_done',
+        pid: 99,
+        ts: 1,
+        npm_package_name: 'puppeteer',
+        npm_package_version: '24.0.0',
+        npm_lifecycle_event: 'test',
+      });
+      expect(shimNodeStartupAttribution(line)).toBeNull();
+    });
+
+    it('returns null when npm_package_name is missing (a bare marker)', async () => {
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      expect(
+        shimNodeStartupAttribution(JSON.stringify({ kind: 'node_startup_done', pid: 99, ts: 1 })),
+      ).toBeNull();
+    });
+
+    it('returns null for a pathological overlong name (fail closed, no truncated seed)', async () => {
+      // The shim truncates an overlong name into its fixed marker buffer; seeding
+      // off it would attribute a reaped child to a SYNTHETIC truncated package.
+      // shimNpmAttribution rejects anything past npm's 214-byte name limit so the
+      // dispatcher falls back to /proc instead.
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'node_startup_done',
+        pid: 99,
+        ts: 1,
+        npm_package_name: 'p'.repeat(2000),
+        npm_package_version: '1.0.0',
+        npm_lifecycle_event: 'install',
+      });
+      expect(shimNodeStartupAttribution(line)).toBeNull();
+    });
+
+    it('returns null for a pathological overlong version (fail closed, no truncated@version seed)', async () => {
+      // A truncated version would compose name@<partial>… — a synthetic id that
+      // also breaks normalize's pkgDirs lookup. Reject past a generous semver cap.
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      const line = JSON.stringify({
+        kind: 'node_startup_done',
+        pid: 99,
+        ts: 1,
+        npm_package_name: 'puppeteer',
+        npm_package_version: `1.0.0-${'x'.repeat(2000)}`,
+        npm_lifecycle_event: 'install',
+      });
+      expect(shimNodeStartupAttribution(line)).toBeNull();
+    });
+
+    it('accepts a name exactly at the 214-byte npm limit', async () => {
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      const name = 'a'.repeat(214);
+      const line = JSON.stringify({
+        kind: 'node_startup_done',
+        pid: 99,
+        ts: 1,
+        npm_package_name: name,
+        npm_lifecycle_event: 'install',
+      });
+      expect(shimNodeStartupAttribution(line)).toEqual({ pkg: name, lifecycle: 'install' });
+    });
+
+    it('returns null for non-marker kinds and malformed JSON', async () => {
+      const { shimNodeStartupAttribution } = await import('../../src/guest/phase-install.js');
+      expect(
+        shimNodeStartupAttribution(
+          JSON.stringify({
+            kind: 'exec',
+            prog: '/usr/bin/dirname',
+            argv0: 'dirname',
+            envp_alloc_failed: false,
+            pid: 1,
+            ts: 0,
+            npm_package_name: 'puppeteer',
+            npm_lifecycle_event: 'install',
+          }),
+        ),
+      ).toBeNull();
+      expect(shimNodeStartupAttribution('not json')).toBeNull();
+    });
+  });
+
+  describe('classifyShimNodeStartupMarker (pathological generation barrier)', () => {
+    // The dispatcher uses `pathological` to fail closed on a recycled pid whose
+    // gen-2 marker asserts a forged/truncated synthetic id, WITHOUT regressing a
+    // legitimate bare or non-canonical same-generation marker (which must keep
+    // its ancestor-propagated snapshot).  These pin that exact distinction.
+    const marker = (extra: Record<string, unknown>): string =>
+      JSON.stringify({ kind: 'node_startup_done', pid: 88, ts: 1, ...extra });
+
+    it('flags an overlong name as pathological (a generation barrier)', async () => {
+      const { classifyShimNodeStartupMarker } = await import('../../src/guest/phase-install.js');
+      expect(
+        classifyShimNodeStartupMarker(
+          marker({ npm_package_name: 'p'.repeat(2000), npm_package_version: '1.0.0', npm_lifecycle_event: 'install' }),
+        ),
+      ).toEqual({ attribution: null, pathological: true });
+    });
+
+    it('flags an overlong version as pathological', async () => {
+      const { classifyShimNodeStartupMarker } = await import('../../src/guest/phase-install.js');
+      expect(
+        classifyShimNodeStartupMarker(
+          marker({ npm_package_name: 'puppeteer', npm_package_version: `1.0.0-${'x'.repeat(2000)}`, npm_lifecycle_event: 'install' }),
+        ),
+      ).toEqual({ attribution: null, pathological: true });
+    });
+
+    it('does NOT flag a bare marker as pathological (same-generation helper)', async () => {
+      const { classifyShimNodeStartupMarker } = await import('../../src/guest/phase-install.js');
+      expect(classifyShimNodeStartupMarker(marker({}))).toEqual({
+        attribution: null,
+        pathological: false,
+      });
+    });
+
+    it('does NOT flag a non-canonical lifecycle marker as pathological (npm run <task> child)', async () => {
+      const { classifyShimNodeStartupMarker } = await import('../../src/guest/phase-install.js');
+      // Has a real name but a non-canonical own lifecycle: attribution is null
+      // (falls back to /proc / ancestor snapshot) but it is NOT a barrier.
+      expect(
+        classifyShimNodeStartupMarker(
+          marker({ npm_package_name: 'samepkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'build' }),
+        ),
+      ).toEqual({ attribution: null, pathological: false });
+    });
+
+    it('returns the attribution with pathological:false for a valid marker', async () => {
+      const { classifyShimNodeStartupMarker } = await import('../../src/guest/phase-install.js');
+      expect(
+        classifyShimNodeStartupMarker(
+          marker({ npm_package_name: 'puppeteer', npm_package_version: '24.0.0', npm_lifecycle_event: 'install' }),
+        ),
+      ).toEqual({ attribution: { pkg: 'puppeteer@24.0.0', lifecycle: 'install' }, pathological: false });
+    });
+
+    it('returns attribution:null, pathological:false for a non-marker kind', async () => {
+      const { classifyShimNodeStartupMarker } = await import('../../src/guest/phase-install.js');
+      expect(
+        classifyShimNodeStartupMarker(
+          JSON.stringify({ kind: 'env_read', name: 'X', pid: 88, ts: 1, hidden: false }),
+        ),
+      ).toEqual({ attribution: null, pathological: false });
     });
   });
 

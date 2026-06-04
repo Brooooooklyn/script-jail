@@ -524,6 +524,99 @@ describe.skipIf(!isLinux)('env-shim LD_PRELOAD', () => {
     expect(tamperEvents.length).toBe(0);
   });
 
+  // ── Test 10b: node_startup_done carries reap-proof npm attribution ────────
+  //
+  // The shim stamps its ctor-snapshotted npm_package_name / version /
+  // lifecycle into the node_startup_done marker so the guest can seed a
+  // short-lived spawned Node child's env-read attribution without a /proc walk.
+  // setenv("SCRIPT_JAIL_NODE_STARTUP_DONE", …) is exactly how env-spy triggers
+  // the marker, and `process.env.X = …` compiles to libc setenv (see Test 8).
+  it('node_startup_done marker carries npm attribution from the ctor snapshot', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const res = runWithShim({
+      cmd: `node -e 'process.env.SCRIPT_JAIL_NODE_STARTUP_DONE = "1"'`,
+      env: {
+        npm_package_name: 'puppeteer',
+        npm_package_version: '24.0.0',
+        npm_lifecycle_event: 'install',
+      },
+    });
+
+    const marker = parseLogObjects(res.logLines).find(
+      (o) => o['kind'] === 'node_startup_done',
+    );
+    expect(marker).toBeDefined();
+    expect(marker!['npm_package_name']).toBe('puppeteer');
+    expect(marker!['npm_package_version']).toBe('24.0.0');
+    expect(marker!['npm_lifecycle_event']).toBe('install');
+  });
+
+  // ── Test 10c (Finding 1, adversarial review 2026-06-04): atomic tuple ─────
+  //
+  // append_canon_field reserves room only for the field it writes plus the
+  // closing `}\n`, NOT for later fields.  npm_package_version is appended LAST
+  // (after the attribution-critical name + lifecycle) precisely so a long (but
+  // valid-semver) version can never crowd out npm_lifecycle_event and silently
+  // disable the seed.  With a ~400-char prerelease version, the marker MUST
+  // still carry name + lifecycle (the version may be truncated/omitted).
+  it('node_startup_done keeps name + lifecycle even under a very long version', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const longVersion = `1.0.0-${'x'.repeat(400)}`;
+    const res = runWithShim({
+      cmd: `node -e 'process.env.SCRIPT_JAIL_NODE_STARTUP_DONE = "1"'`,
+      env: {
+        npm_package_name: 'puppeteer',
+        npm_package_version: longVersion,
+        npm_lifecycle_event: 'install',
+      },
+    });
+
+    const marker = parseLogObjects(res.logLines).find(
+      (o) => o['kind'] === 'node_startup_done',
+    );
+    expect(marker).toBeDefined();
+    // Attribution-critical fields survive the long version → the guest seed
+    // (attributionFromEnvVars) succeeds instead of falling back to /proc.
+    expect(marker!['npm_package_name']).toBe('puppeteer');
+    expect(marker!['npm_lifecycle_event']).toBe('install');
+  });
+
+  // ── Test 10d (Finding 2, adversarial review 2026-06-04): lifecycle wins ────
+  //
+  // capture_canon caps each value at CANON_BUF_LEN-1 and does NOT enforce npm's
+  // 214-byte name limit, so a child-controlled overlong npm_package_name could
+  // otherwise consume the buffer before lifecycle is written.  emit_node_startup_done
+  // therefore writes the SMALLEST attribution-critical field FIRST:
+  // npm_lifecycle_event (canonical, ≤ ~12 B) into a near-empty buffer, so it can
+  // never be crowded out — only the name/version that follow may truncate.  With
+  // a ~2000-char name (well past CANON_BUF_LEN), the marker MUST still carry the
+  // canonical lifecycle.  (The guest-side seed declines such a truncated name
+  // anyway — shimNpmAttribution rejects names past npm's 214-byte limit and
+  // falls back to /proc; see the shimNodeStartupAttribution unit tests in
+  // phase-install.test.ts.  This test only pins the shim buffer invariant.)
+  it('node_startup_done keeps lifecycle even under a pathologically long name', (ctx) => {
+    if (!shimAvailable) ctx.skip();
+
+    const longName = 'p'.repeat(2000);
+    const res = runWithShim({
+      cmd: `node -e 'process.env.SCRIPT_JAIL_NODE_STARTUP_DONE = "1"'`,
+      env: {
+        npm_package_name: longName,
+        npm_package_version: '24.0.0',
+        npm_lifecycle_event: 'install',
+      },
+    });
+
+    const marker = parseLogObjects(res.logLines).find(
+      (o) => o['kind'] === 'node_startup_done',
+    );
+    expect(marker).toBeDefined();
+    // lifecycle written first → never starved regardless of the name length.
+    expect(marker!['npm_lifecycle_event']).toBe('install');
+  });
+
   // ── Test 11 (Finding A): caller-supplied sticky var is REMOVED when canon empty ─
   //
   // The parent runs the shim with SCRIPT_JAIL_LOG_FD only.  No

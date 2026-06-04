@@ -6,6 +6,11 @@
 //   - Writes inside $PKG/** are dropped.
 //   - Writes that land inside $NODE_MODULES/** but outside the current $PKG
 //     get a `<CROSS_PACKAGE>` prefix.
+//   - Benign cross-package READS under $NODE_MODULES are dropped UPSTREAM by
+//     applyProtectedPathsPolicy (src/guest/protected-paths.ts), which has the
+//     ProtectedPathsMatcher and so can exempt auditor-opted-in protected paths;
+//     they never reach normalize.  Reads here are therefore either intra-package
+//     ($PKG, dropped just below) or genuinely external ($REPO/$HOME/$CACHE/etc).
 //   - Hidden events (protected files / env vars) are prefixed `<HIDDEN>`.
 //   - When an event is both hidden and cross-package, both prefixes are emitted:
 //     `<HIDDEN> <CROSS_PACKAGE> $NODE_MODULES/foo/bar`.

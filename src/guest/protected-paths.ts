@@ -53,6 +53,23 @@ export class ProtectedPathsMatcher {
     const tokenized = tokenize(rawPath, this.roots);
     return micromatch.isMatch(tokenized, this.tokenizedPatterns, { dot: true });
   }
+
+  /**
+   * Returns true when `rawPath` is the node_modules root or anything beneath
+   * it.  Matched on the RAW absolute path (not tokenized) because the drop
+   * decision in {@link applyProtectedPathsPolicy} runs per-event before the
+   * package-relative `$PKG` token is known; a sibling-package read and the
+   * current package's own read both live under this root and are both meant to
+   * be dropped (normalize would drop the `$PKG` ones anyway).
+   *
+   * Returns false for the no-op matcher (empty `nodeModules` root), so a
+   * pipeline constructed without real roots never suppresses reads.
+   */
+  isUnderNodeModules(rawPath: string): boolean {
+    const nm = this.roots.nodeModules;
+    if (nm.length === 0) return false;
+    return rawPath === nm || rawPath.startsWith(`${nm}/`);
+  }
 }
 
 /**
@@ -72,6 +89,19 @@ export class ProtectedPathsMatcher {
  *     emitted with transport-only fields stripped (the attempt is still
  *     useful audit signal).
  *
+ * Benign cross-package read suppression (2026-06-04): a lifecycle script
+ * READING a file under $NODE_MODULES — a sibling installed package's
+ * package.json / .node addon / source, or its own files — is normal install
+ * behavior, not an escape, so the read is dropped before emission REGARDLESS of
+ * success/ENOENT/EACCES.  The single exception is a path matching a configured
+ * protected pattern: that is an explicit auditor opt-in, so it falls through to
+ * the logic below and surfaces exactly as any other protected read (plainly on
+ * success, `<HIDDEN>` on a failed probe).  This is the matcher-aware home for
+ * the policy precisely because `hidden` is NOT set on successful reads, so a
+ * normalize-side check could not tell a protected node_modules read from a
+ * benign one.  WRITES under $NODE_MODULES are never dropped here — they are
+ * tampering and `lock/normalize.ts` tags them `<CROSS_PACKAGE>`.
+ *
  * Transport-only fields (`errno`, `dirfd`, `retFd`) are always stripped
  * before the event leaves this function; they must never reach
  * lock/normalize.ts (which doesn't reference them) or lock/render.ts
@@ -83,6 +113,18 @@ export function applyProtectedPathsPolicy(
   matcher: ProtectedPathsMatcher,
 ): AttributedEvent | null {
   if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') return ev;
+
+  // Drop benign cross-package reads under $NODE_MODULES (any success/errno),
+  // EXCEPT auditor-opted-in protected paths which fall through and surface
+  // normally.  Writes are never dropped here — they continue below.
+  if (
+    ev.raw.kind === 'read' &&
+    matcher.isUnderNodeModules(ev.raw.path) &&
+    !matcher.isProtected(ev.raw.path)
+  ) {
+    return null;
+  }
+
   if (ev.raw.errno === undefined) {
     // Successful syscall — no errno-based filtering, but we still must
     // strip the transport-only fd-table fields so they don't leak into
