@@ -106,7 +106,7 @@ jobs:
   # build — produce every Linux/Darwin image asset + push the 4 GHCR rootfs
   # images, exactly once.  Runs with NO write capabilities to the repo (only
   # `packages: write` for the GHCR push) and no persisted checkout credentials.
-  # The assets are uploaded as the `release-assets` artifact; a later
+  # The assets are uploaded as the `release-assets-<tag>` artifact; a later
   # release.yml run downloads + verifies them.
   # ---------------------------------------------------------------------------
   build:

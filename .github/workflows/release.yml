@@ -197,6 +197,12 @@ jobs:
       # producer (e.g. after a transient failure) resolves to the latest build.
       # ${TAG} = github.ref_name (this job runs on the tag, so ref_name IS the
       # tag here).
+      #
+      # NOTE: the committed manifest MUST be backfilled from the LATEST successful
+      # producer run for the tag — because this lookup picks newest-first,
+      # backfilling SHAs from an older run's paste-block while a newer run exists
+      # downloads the newer run's binaries, whose kernel/Mach-O bytes are not
+      # reproducible, and the SHA verify below will fail.
       - name: Download producer build artifacts (by tag-suffixed name)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -222,9 +228,15 @@ jobs:
           found_run=""
           for run_id in ${run_ids}; do
             # Does THIS run carry the tag-suffixed binary artifact?
+            # A transient per-run API error (rate-limit, 5xx, GC'd run) must NOT
+            # abort the whole lookup under `set -euo pipefail` before we reach the
+            # wanted run — soft-skip the failing run and keep scanning newest-first.
             names="$(gh api \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
-              --jq '.artifacts[].name')"
+              --jq '.artifacts[].name')" || {
+              echo "warn: could not list artifacts for run ${run_id}, skipping" >&2
+              continue
+            }
             if printf '%s\n' "${names}" | grep -qx "${assets_name}"; then
               found_run="${run_id}"
               break
@@ -290,6 +302,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+
+      # `docker buildx imagetools inspect` (the digest-resolve gate below) needs
+      # a buildx builder; set one up explicitly so the gate does not depend on the
+      # hosted runner having a default builder configured. This pushes NOTHING —
+      # the GHCR `docker buildx build --push` lives only in the producer
+      # (release-build.yml); here we only inspect the digests it already pushed.
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       # Backfill gate: the pinned `dockerImages` in the tagged
       # src/action/artifact-manifest.ts must actually resolve in GHCR before any
