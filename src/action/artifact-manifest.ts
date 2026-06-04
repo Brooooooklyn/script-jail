@@ -3,31 +3,39 @@
 // Pinned manifest of release artifacts the action AND the macOS CLI consume
 // at runtime.  See `./pre-fetch-artifacts.ts` for release-asset downloads,
 // `./backend/docker.ts` for digest-pinned GHCR image pulls, and
-// `.github/workflows/release.yml` for the workflow that builds and publishes
-// both forms. `expected` is split by platform so the action (Linux-only) and
-// the macOS CLI can pin distinct asset sets from one source of truth.
+// `.github/workflows/release.yml` for the tag-triggered workflow that
+// downloads and publishes both forms. `expected` is split by platform so the
+// action (Linux-only) and the macOS CLI can pin distinct asset sets from one
+// source of truth.
 //
-// Manifest-update workflow:
+// Build-once / download-forever release flow:
 //
-//   1. Cut a new tag (e.g. `v0.2.0`).  The release workflow runs, builds the
-//      rootfs ext4 (per runner image + arm64 variants), Docker rootfs images,
+//   1. Run `.github/workflows/release-build.yml` (workflow_dispatch, required
+//      `tag` input).  The producer builds every image asset ONCE — rootfs
+//      ext4s (per runner image + arm64 variants), Docker rootfs images,
 //      libscriptjail.so / libscriptjail-arm64.so, the VZ vmlinux kernels, and
-//      the script-jail-vm-arm64-darwin Mach-O binary, uploads/pushes them,
-//      and prints SHA/image-ref summaries in the job's GITHUB_STEP_SUMMARY.
-//   2. Copy the SHAs and Docker image refs from the job summary into the maps
-//      below.
+//      the script-jail-vm-arm64-darwin Mach-O binary — pushes the 4 GHCR
+//      rootfs images, and prints a paste-block of the 9 file SHAs + 4 GHCR
+//      digests in the job output.
+//   2. Paste the 9 file SHAs and 4 GHCR digests from the producer run's
+//      paste-block into the maps below.
 //   3. Bump `tag` to match the new release.
-//   4. Commit, then cut the NEXT release.
+//   4. Rebuild `dist/` (`pnpm build:bundle`), commit, and push the tag.
+//   5. `release.yml` fires on the tag, DOWNLOADS the producer's artifacts,
+//      and verifies them against this manifest — it never rebuilds the images.
+//
+// Supply-chain note:
+//
+//   At Action/CLI runtime, `./pre-fetch-artifacts.ts` re-checks every
+//   downloaded asset against the SHAs pinned here.  That supply-chain
+//   verification is independent of the release flow above and is always on.
 //
 // Bootstrap caveat:
 //
-//   The values below are PLACEHOLDERS until the first release is cut.  This
-//   mirrors the pre-`KNOWN_VERSIONS`-pinning state of
-//   `./firecracker/download.ts`: the very first tag pushed to a new fork will
-//   produce assets whose SHAs do not match these placeholders, and the
-//   first run of the action against that tag will (correctly) fail the
-//   hash check.  After copying the real SHAs in and cutting the next tag,
-//   the manifest is self-consistent.
+//   The values below are PLACEHOLDERS until the first producer-backed release
+//   is cut.  Until then, any action run will (correctly) fail the hash check.
+//   After pasting in the real SHAs/digests from a `release-build.yml` run and
+//   tagging, the manifest is self-consistent.
 //
 // Why no `script-jail-vm-x86_64-darwin`:
 //   The Intel macOS runner is deprecated by GitHub; building an Intel
@@ -38,8 +46,10 @@
 import type { ArtifactManifest } from './pre-fetch-artifacts.js';
 
 /**
- * Pinned manifest.  Bump CURRENT_TAG and the SHAs together when cutting a
- * new release.  See the file header for the full update workflow.
+ * Pinned manifest.  Paste the 9 file SHAs + 4 GHCR digests from the
+ * `release-build.yml` producer run's paste-block, bump `tag`, rebuild
+ * `dist/`, and commit before pushing the release tag.  See the file header
+ * for the full build-once / download-forever update workflow.
  */
 export const PINNED_MANIFEST: ArtifactManifest = {
   repo: 'Brooooooklyn/scriptjail', // update when forked
