@@ -40,7 +40,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 
 // eslint-disable-next-line import/no-unresolved
-import { npmPackages } from '../../scripts/npm-packages.mjs';
+import { npmPackages, MAIN_PRELOADS } from '../../scripts/npm-packages.mjs';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WORKFLOW_PATH = join(REPO_ROOT, '.github', 'workflows', 'release.yml');
@@ -50,6 +50,7 @@ const PRODUCER_PATH = join(
   'workflows',
   'release-build.yml',
 );
+const TEST_WORKFLOW_PATH = join(REPO_ROOT, '.github', 'workflows', 'test.yml');
 
 interface WorkflowStep {
   name?: string;
@@ -396,6 +397,34 @@ describe('release.yml verify job (no rebuild, manifest gate)', () => {
     expect(run).toContain('dist/main.cjs');
     expect(run).toContain('dist/guest-agent.cjs');
   });
+
+  // FIX-SENSITIVE: dist/preloads/*.cjs are plain copies of src/guest/*.cjs that
+  // the main npm package SHIPS, but no esbuild rebuild regenerates them, so the
+  // bundle-rebuild diff above cannot catch a stale preload. verify must gate them
+  // by direct source byte-equality (`cmp` src/guest/<name> vs dist/preloads/<name>)
+  // and fail closed. If this gate is removed, this test fails.
+  it('verify gates dist/preloads against their src/guest sources (byte-equality)', () => {
+    const steps = parsed.jobs.verify?.steps ?? [];
+    const step = steps.find(
+      (s) =>
+        (s.run ?? '').includes('dist/preloads/') &&
+        (s.run ?? '').includes('src/guest/'),
+    );
+    expect(
+      step,
+      'verify must contain a step comparing dist/preloads/* to src/guest/*',
+    ).toBeDefined();
+    const run = step!.run ?? '';
+    // Byte-equality (not a rebuild diff) and fail-closed.
+    expect(run).toContain('cmp -s');
+    expect(run).toContain('exit 1');
+    expect(run).toContain('rc=1');
+    // Enumerated from the MAIN_PRELOADS single source of truth, never globbed.
+    expect(run).toContain('MAIN_PRELOADS');
+    expect(run).toContain('scripts/npm-packages.mjs');
+    // The error must point at the stale dist/preloads copy.
+    expect(run).toMatch(/dist\/preloads\/\$\{name\} is out of date/);
+  });
 });
 
 // The PRODUCER builds + pushes everything once. Guard its contract: it pushes
@@ -508,6 +537,49 @@ describe('release-build.yml producer contract', () => {
     // The on-disk filename inside the artifact is unchanged.
     expect(String(macUpload!.with?.path)).toContain(
       'script-jail-vm-arm64-darwin',
+    );
+  });
+});
+
+// The preload freshness gate (FIX #3): dist/preloads/*.cjs are plain copies of
+// src/guest/*.cjs that the main npm package SHIPS. The canonical gate lives in
+// test.yml (every PR/push); release.yml's verify job mirrors it at tag time.
+// Both enumerate MAIN_PRELOADS (never globbed) and fail CLOSED on any byte
+// difference. These tests are FIX-SENSITIVE: removing the gate fails them.
+describe('test.yml preload freshness gate (FIX #3)', () => {
+  const parsed = loadWorkflow(TEST_WORKFLOW_PATH);
+  const steps = parsed.jobs.test?.steps ?? [];
+
+  it('gates dist/preloads against their src/guest sources by byte-equality', () => {
+    const step = steps.find(
+      (s) =>
+        (s.run ?? '').includes('dist/preloads/') &&
+        (s.run ?? '').includes('src/guest/'),
+    );
+    expect(
+      step,
+      'test.yml must contain a step comparing dist/preloads/* to src/guest/*',
+    ).toBeDefined();
+    const run = step!.run ?? '';
+    // Direct byte-equality (the preloads are plain copies, not rebuilt).
+    expect(run).toContain('cmp -s');
+    // Fail-closed.
+    expect(run).toContain('rc=1');
+    expect(run).toMatch(/exit "\$\{rc\}"|exit 1/);
+    // Enumerated from the single source of truth, never globbed.
+    expect(run).toContain('MAIN_PRELOADS');
+    expect(run).toContain('scripts/npm-packages.mjs');
+    expect(run).not.toContain('dist/preloads/*.cjs');
+    // Actionable error pointing at the stale dist copy.
+    expect(run).toMatch(/dist\/preloads\/\$\{name\} is out of date/);
+  });
+
+  it('enumerates exactly the MAIN_PRELOADS source-of-truth set (no hardcoded drift)', () => {
+    // The gates read MAIN_PRELOADS at runtime rather than hardcoding the list,
+    // so they cannot drift from the published set. Assert the source of truth is
+    // the expected default-preload trio so a silent drop/add here is caught.
+    expect([...MAIN_PRELOADS].sort()).toEqual(
+      ['dlopen-block.cjs', 'env-spy.cjs', 'platform-spoof.cjs'].sort(),
     );
   });
 });
