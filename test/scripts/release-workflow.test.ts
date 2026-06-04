@@ -456,6 +456,47 @@ describe('release-build.yml producer contract', () => {
     expect(paths).not.toContain('dist/preloads');
   });
 
+  it('uploads ONLY images/ paths under release-assets-<tag> (LCA contract)', () => {
+    // The release run's cross-run download targets `artifacts/images` on the
+    // ASSUMPTION that upload-artifact collapses the common-ancestor prefix to
+    // the `images/` contents — which holds ONLY while every uploaded path lives
+    // under `images/`. If someone later adds a non-`images/` path (e.g.
+    // `bin/foo`), the least-common-ancestor shifts to the repo root, the
+    // artifact gains an `images/` subdir, and `gh run download --dir
+    // artifacts/images` silently resolves to `artifacts/images/images/<name>`
+    // — breaking check-publish-artifacts.sh while the other producer-contract
+    // tests stay green. Mechanically guard the contract: assert EVERY non-empty
+    // path line in the release-assets upload step's `path:` block starts with
+    // `images/`.
+    const upload = buildSteps.find(
+      (s) =>
+        s.uses?.includes('upload-artifact') &&
+        String(s.with?.name ?? '').startsWith('release-assets'),
+    );
+    expect(
+      upload,
+      'producer must define a release-assets upload step',
+    ).toBeDefined();
+    const rawPaths = String(upload!.with?.path ?? '');
+    expect(rawPaths, 'release-assets upload must declare a path block').not.toBe(
+      '',
+    );
+    const pathLines = rawPaths
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    expect(
+      pathLines.length,
+      'release-assets upload path block must list at least one path',
+    ).toBeGreaterThan(0);
+    for (const p of pathLines) {
+      expect(
+        p,
+        `every release-assets path must live under images/ to keep the download LCA stable (offending: ${p})`,
+      ).toMatch(/^images\//);
+    }
+  });
+
   it('uploads the Mach-O helper under mac-bin-<tag>', () => {
     const macUpload = parsed.jobs?.['build-mac-bin']?.steps?.find(
       (s) =>
