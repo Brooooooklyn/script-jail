@@ -94,14 +94,16 @@ describe('release.yml publish job (PKG-5)', () => {
   });
 
   it('publishes the three platform packages before the main package', () => {
-    // The platform dirs appear bare in the `for pkg in ...` loop list; the
-    // main dir appears as the literal `npm-staging/script-jail` `cd` after the
-    // loop. (The loop body itself uses `npm-staging/${pkg}`, so the literal
-    // `npm-staging/script-jail` offset is unambiguously the main publish.)
-    const mainIndex = allRun.indexOf(`npm-staging/${MAIN_DIR}`);
+    // The platform dirs appear bare in the `for pkg in ...` loop list; the main
+    // dir is published last via the literal `publish_if_absent script-jail`
+    // call AFTER the loop. We anchor the main offset on that trailing call (the
+    // platform loop uses `publish_if_absent "${pkg}"` with a variable, so the
+    // bare `publish_if_absent script-jail` literal is unambiguously the main
+    // publish — and the platform dir names are not a prefix of it).
+    const mainIndex = allRun.lastIndexOf(`publish_if_absent ${MAIN_DIR}`);
     expect(
       mainIndex,
-      'main package (npm-staging/script-jail) publish must appear',
+      'main package (publish_if_absent script-jail) publish must appear last',
     ).toBeGreaterThan(-1);
     for (const dir of PLATFORM_DIRS) {
       const platformIndex = allRun.indexOf(dir);
@@ -140,6 +142,29 @@ describe('release.yml publish job (PKG-5)', () => {
         `package dir ${dir} must be referenced in the publish step`,
       ).toContain(dir);
     }
+  });
+
+  it('is idempotent — skips a package whose exact version is already published', () => {
+    // The publish step must probe the registry per package and skip an
+    // already-published name@version instead of letting a bare `npm publish`
+    // 409 abort the `set -euo pipefail` job. This is load-bearing for the
+    // v0.1.0 generating-run (whose 0.1.0 packages were bootstrap-published
+    // already) and for re-running a partially-failed release (the documented
+    // recovery: republish only the still-unpublished packages).
+    const step = runScripts.find((s) => /\bnpm view\b/.test(s));
+    expect(
+      step,
+      'the publish step must use a read-only `npm view` existence probe to skip already-published versions',
+    ).toBeDefined();
+    // The probe must guard the publish (skip path) rather than always publish.
+    expect(step).toMatch(/already published/i);
+    expect(step).toMatch(/npm view .*version/);
+    // The skip-or-publish decision must wrap the actual `npm publish`.
+    const viewIdx = step!.search(/\bnpm view\b/);
+    const publishIdx = step!.search(/\bnpm publish\b/);
+    expect(viewIdx, 'existence probe must precede the npm publish').toBeLessThan(
+      publishIdx,
+    );
   });
 
   it('preserves the version==tag gate', () => {

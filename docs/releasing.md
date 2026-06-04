@@ -5,9 +5,13 @@ takes a fresh fork from placeholder manifest to a fully runnable Action, plus
 the works/degraded matrix that explains exactly what is usable at each tag.
 
 The release repo is **`Brooooooklyn/scriptjail`**. The bootstrap loop spans two
-tags: **`v0.1.0`** publishes the npm packages and release assets while the
-pinned manifest still carries placeholders, and **`v0.1.1`** backfills the real
-SHAs/digests so the GitHub Action validates and runs.
+tags. The 0.1.0 npm packages were published **manually / locally** as a one-time
+bootstrap (no `v0.1.0` tag was pushed for that publish — see the Phase 0
+bootstrap exception). Pushing the **`v0.1.0`** tag then runs `release.yml` to
+build the artifacts and upload the release assets while the pinned manifest
+still carries placeholders; its npm-publish step is idempotent and SKIPS the
+already-published 0.1.0 packages. **`v0.1.1`** backfills the real SHAs/digests
+that run emits so the GitHub Action validates and runs.
 
 > Why two tags? The pinned artifact manifest in
 > `src/action/artifact-manifest.ts` references the SHA-256 of every release
@@ -109,9 +113,15 @@ so that the single non-re-runnable step is last:
    size ceiling. (Re-runnable.)
 6. **Upload release assets** — `gh release` upload of the rootfs/kernel/shim/
    helper/dist assets. (Re-runnable: re-uploading overwrites.)
-7. **`npm publish` LAST** — the **only non-re-runnable step**. A version that
-   has already been published cannot be re-published. Because it is last, every
-   re-runnable side effect has already succeeded by the time publish fires.
+7. **`npm publish` LAST** — the publish of an *unpublished* version is the only
+   non-re-runnable side effect (a version that has already been published cannot
+   be re-published). The step is **idempotent**: it probes each package with a
+   read-only `npm view "$name@$version"` and SKIPS any version that already
+   exists, publishing only the absent ones. So on the `v0.1.0` generating-run it
+   skips all four already-bootstrap-published 0.1.0 packages and the run still
+   finishes green; on a re-run of a partially-failed release it republishes only
+   the still-unpublished packages. Because it is last, every re-runnable side
+   effect has already succeeded by the time publish fires.
 
 ### multi-package publish order
 
@@ -127,20 +137,36 @@ This order is load-bearing: the main package's `optionalDependencies` reference
 the three platform packages by exact version, so they must already be on the
 registry for a consumer's `npm install script-jail` to resolve the matching
 `os`/`cpu` one. If a later package in the loop fails after an earlier one
-published, recovery is to re-run only the still-unpublished packages or bump the
-version and re-tag — there is no in-place fix for an already-published version.
+published, recovery is to simply re-run the job — the idempotent skip
+republishes only the still-unpublished packages (or bump the version and re-tag
+for a genuinely new release) — there is no in-place fix for an already-published
+version.
 
 ---
 
 ## Phase 2 — backfill → `v0.1.1`
 
-After `v0.1.0` has published, the job summaries hold the real SHAs and image
-digests. Backfill them and cut the second tag.
+The 13 real values are produced by an actual `release.yml` run, NOT by the
+manual v0.1.0 bootstrap. v0.1.0's npm packages were published **manually /
+locally** as a one-time bootstrap (see the Phase 0 bootstrap exception); no `v*`
+tag was ever pushed for that publish, so `release.yml` never ran for it and
+there are no v0.1.0 job summaries (and GHCR holds no images yet). To obtain the
+real SHAs/digests, push the `v0.1.0` **tag** to run `release.yml` once. That run
+builds all artifacts, pushes the 4 GHCR images, and emits the **9 file SHAs**
+(the `build` job's "Compute SHAs" summary) + **4 Docker digests** (the `publish`
+job's "Docker image refs" summary); its terminal npm-publish step is idempotent,
+so it **SKIPS** the already-published 0.1.0 packages (probing each
+`name@version` with `npm view`) and the tagged run finishes green without
+attempting to re-publish 0.1.0. Backfill the emitted values and cut the second
+tag.
 
 1. **Paste the real values into `src/action/artifact-manifest.ts`.** Copy the
    **9 file SHAs** (3 `expected.linux` + 6 `expected.darwin`) and the
    **4 Docker digests** (2 `dockerImages.x64` + 2 `dockerImages.arm64`) from the
-   `v0.1.0` job summaries, replacing every `PLACEHOLDER_SHA256_*` token.
+   `release.yml` run triggered by the `v0.1.0` tag — the **9 file SHAs** from the
+   `build` job's "Compute SHAs" step summary and the **4 Docker digests** from
+   the `publish` job's "Docker image refs" step summary — replacing every
+   `PLACEHOLDER_SHA256_*` token.
 2. **Set `tag` to `'v0.1.1'`** in the same file.
 3. **All-or-nothing across all 13 entries.** A manifest with SOME real values
    and SOME placeholders is a packaging bug and is rejected by

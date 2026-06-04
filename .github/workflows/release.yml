@@ -837,7 +837,34 @@ jobs:
         # generated and published automatically, so no --provenance flag.
         run: |
           set -euo pipefail
+          # Idempotent publish: skip any package whose exact name@version is
+          # already on the registry, publish the rest. WHY:
+          #   - The v0.1.0 generating-run pushes the SAME tag whose 0.1.0
+          #     packages were already bootstrap-published manually/locally
+          #     (see docs/releasing.md Phase 2 / Phase 0 bootstrap exception),
+          #     so a bare re-publish would 409 ("cannot publish over an
+          #     existing version") and abort this `set -euo pipefail` job RED —
+          #     yet we still need the run to finish GREEN to build artifacts,
+          #     push the 4 GHCR images, and emit the SHA/digest summaries.
+          #   - It also makes every release re-run safe: if a later package
+          #     fails after an earlier one published, re-running republishes
+          #     only the still-unpublished packages (the documented recovery).
+          # `npm view <name>@<version> version` is a read-only, no-auth probe;
+          # its non-zero exit (version absent) is consumed by the `if`, so it
+          # never trips `pipefail`. Platform packages first, main last — the
+          # main package's optionalDependencies must resolve at install time.
+          publish_if_absent() {
+            local dir="$1"
+            local name version
+            name="$(node -p "require('./npm-staging/${dir}/package.json').name")"
+            version="$(node -p "require('./npm-staging/${dir}/package.json').version")"
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "Skipping ${name}@${version} — already published"
+            else
+              (cd "npm-staging/${dir}" && npm publish --access public)
+            fi
+          }
           for pkg in script-jail-darwin-arm64 script-jail-linux-x64 script-jail-linux-arm64; do
-            (cd "npm-staging/${pkg}" && npm publish --access public)
+            publish_if_absent "${pkg}"
           done
-          (cd npm-staging/script-jail && npm publish --access public)
+          publish_if_absent script-jail
