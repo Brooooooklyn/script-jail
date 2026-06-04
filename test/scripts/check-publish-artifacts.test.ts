@@ -1114,6 +1114,128 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
   });
 });
 
+describe('scripts/check-publish-artifacts.sh — binary-only (download-forever) layout', () => {
+  // Build-once / download-forever: the producer ships ONLY the binary image
+  // assets — NO dist/* subtree in the downloaded artifact dir. release.yml
+  // therefore calls the gate with NEITHER --dist-source NOR --dist-cli-source.
+  // The gate must NOT require artifacts/dist/main.cjs (it isn't downloaded) and
+  // must pass on the full real manifest. Regression test for the publish step
+  // that would otherwise fail every real release before any upload/publish.
+
+  // Write the full binary artifact set (linux + darwin) WITHOUT any dist/ files,
+  // mirroring exactly what gh run download lands under ./artifacts.
+  function writeBinaryOnlyArtifacts(
+    workspace: string,
+    linux: { rootfs22: string; rootfs24: string; libso: string },
+    darwin: DarwinArtifactBytes,
+  ): { dir: string; linuxShas: { rootfs22: string; rootfs24: string; libso: string }; darwinShas: FullArtifactsOutput['darwinShas'] } {
+    const dir = join(workspace, 'art');
+    writeFileSync(join(dir, 'images/rootfs-ubuntu-22.04.ext4'), linux.rootfs22);
+    writeFileSync(join(dir, 'images/rootfs-ubuntu-24.04.ext4'), linux.rootfs24);
+    writeFileSync(join(dir, 'images/libscriptjail.so'), linux.libso);
+    writeFileSync(
+      join(dir, 'images/rootfs-ubuntu-22.04-arm64.ext4'),
+      darwin.rootfs22Arm64,
+    );
+    writeFileSync(
+      join(dir, 'images/rootfs-ubuntu-24.04-arm64.ext4'),
+      darwin.rootfs24Arm64,
+    );
+    writeFileSync(join(dir, 'images/libscriptjail-arm64.so'), darwin.libsoArm64);
+    writeFileSync(join(dir, 'images/vmlinux-vz-x86_64'), darwin.vmlinuxVzX86_64);
+    writeFileSync(join(dir, 'images/vmlinux-vz-arm64'), darwin.vmlinuxVzArm64);
+    writeFileSync(
+      join(dir, 'script-jail-vm-arm64-darwin'),
+      darwin.scriptJailVmArm64Darwin,
+    );
+    return {
+      dir,
+      linuxShas: {
+        rootfs22: sha256(linux.rootfs22),
+        rootfs24: sha256(linux.rootfs24),
+        libso: sha256(linux.libso),
+      },
+      darwinShas: {
+        rootfs22Arm64: sha256(darwin.rootfs22Arm64),
+        rootfs24Arm64: sha256(darwin.rootfs24Arm64),
+        libsoArm64: sha256(darwin.libsoArm64),
+        vmlinuxVzX86_64: sha256(darwin.vmlinuxVzX86_64),
+        vmlinuxVzArm64: sha256(darwin.vmlinuxVzArm64),
+        scriptJailVmArm64Darwin: sha256(darwin.scriptJailVmArm64Darwin),
+      },
+    };
+  }
+
+  it('passes a full real manifest with NO dist/ files and NO --dist-source/--dist-cli-source', () => {
+    const ws = makeWorkspace();
+    const linux = { rootfs22: 'lr22', rootfs24: 'lr24', libso: 'lso' };
+    const darwin: DarwinArtifactBytes = {
+      rootfs22Arm64: 'dr22a',
+      rootfs24Arm64: 'dr24a',
+      libsoArm64: 'dsoa',
+      vmlinuxVzX86_64: 'kx86',
+      vmlinuxVzArm64: 'karm',
+      scriptJailVmArm64Darwin: 'sjvm',
+    };
+    const { dir, linuxShas, darwinShas } = writeBinaryOnlyArtifacts(
+      ws,
+      linux,
+      darwin,
+    );
+    const entries: ManifestEntries = {
+      linuxRootfs22: linuxShas.rootfs22,
+      linuxRootfs24: linuxShas.rootfs24,
+      linuxLibso: linuxShas.libso,
+      darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
+      darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
+      darwinLibsoArm64: darwinShas.libsoArm64,
+      vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
+      vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
+      scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
+      dockerX64Ubuntu22: realDockerRef('ubuntu-22.04', '0'),
+      dockerX64Ubuntu24: realDockerRef('ubuntu-24.04', '1'),
+      dockerArm64Ubuntu22: realDockerRef('ubuntu-22.04-arm64', '2'),
+      dockerArm64Ubuntu24: realDockerRef('ubuntu-24.04-arm64', '3'),
+    };
+    const manifestPath = writeManifest(ws, entries);
+
+    // EXACTLY the release.yml invocation: --manifest + --dir only.
+    const r = runScript(['--manifest', manifestPath, '--dir', dir]);
+    expect(
+      r.status,
+      `expected OK; got status=${r.status}\n${r.stdout}${r.stderr}`,
+    ).toBe(0);
+    expect(r.stdout).toMatch(/OK — all artifact SHAs match/);
+    // The gate must NOT complain about a missing dist/main.cjs.
+    expect(r.stderr).not.toMatch(/dist\/main\.cjs/);
+    expect(r.stderr).not.toMatch(/required artifact\(s\) missing/);
+  });
+
+  it('does not require dist/main.cjs when --dist-source is omitted (linux subset)', () => {
+    const env = { SCRIPT_JAIL_CHECK_DARWIN_ARTIFACTS: '0' };
+    const ws = makeWorkspace();
+    // images only, no dist/ subtree at all.
+    const dir = join(ws, 'art');
+    writeFileSync(join(dir, 'images/rootfs-ubuntu-22.04.ext4'), 'r22');
+    writeFileSync(join(dir, 'images/rootfs-ubuntu-24.04.ext4'), 'r24');
+    writeFileSync(join(dir, 'images/libscriptjail.so'), 'libso');
+    const entries = allPlaceholders();
+    entries.linuxRootfs22 = sha256('r22');
+    entries.linuxRootfs24 = sha256('r24');
+    entries.linuxLibso = sha256('libso');
+    promoteDarwinAndDockerToReal(entries);
+    const manifestPath = writeManifest(ws, entries);
+
+    const r = runScript(['--manifest', manifestPath, '--dir', dir], env);
+    expect(
+      r.status,
+      `expected OK; got status=${r.status}\n${r.stdout}${r.stderr}`,
+    ).toBe(0);
+    expect(r.stdout).toMatch(/OK — all artifact SHAs match/);
+    expect(r.stderr).not.toMatch(/dist\/main\.cjs/);
+  });
+});
+
 describe('scripts/check-publish-artifacts.sh — rootfs uses CANONICAL hash', () => {
   // The 4 rootfs ext4 entries are pinned by their canonical (time-masked) hash,
   // NOT a plain sha256sum.  The tiny string artifacts used elsewhere in this

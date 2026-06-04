@@ -89,10 +89,15 @@ jobs:
           cp target/release/script-jail-vm \
              artifacts/mac-bin/script-jail-vm-arm64-darwin
 
+      # The ARTIFACT name is tag-suffixed (`mac-bin-<tag>`) so a later
+      # release.yml run on the tag can locate exactly this producer run's
+      # output by name across runs.  The on-disk FILENAME inside the artifact
+      # stays `script-jail-vm-arm64-darwin` (the name check-publish-artifacts.sh
+      # and assemble-npm-packages.mjs expect at the artifacts root).
       - name: Upload Mach-O artifact
         uses: actions/upload-artifact@v7
         with:
-          name: script-jail-vm-arm64-darwin
+          name: mac-bin-${{ inputs.tag }}
           path: artifacts/mac-bin/script-jail-vm-arm64-darwin
           if-no-files-found: error
           retention-days: 90
@@ -274,7 +279,7 @@ jobs:
       - name: Download script-jail-vm Mach-O artifact
         uses: actions/download-artifact@v8
         with:
-          name: script-jail-vm-arm64-darwin
+          name: mac-bin-${{ inputs.tag }}
           path: artifacts/mac-bin
 
       - name: Compute SHAs
@@ -327,16 +332,39 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Hand the assets to the downstream release.yml run via a workflow
-      # artifact.  Using a workflow artifact (rather than a job output or cache)
-      # keeps the build job side-effect-free outside its own filesystem.  The
-      # `name` and `path:` list MUST stay byte-identical to what release.yml's
-      # build job uploaded before — check-publish-artifacts.sh + the rewired
-      # publish job consume these by exact path.
+      # Hand the BINARY image assets to the downstream release.yml run via a
+      # workflow artifact.  Using a workflow artifact (rather than a job output
+      # or cache) keeps the build job side-effect-free outside its own
+      # filesystem.
+      #
+      # The artifact NAME is tag-suffixed (`release-assets-<tag>`) so a later
+      # release.yml run on the tag can locate exactly this producer run's
+      # output by name across runs (the producer runs on a DIFFERENT commit
+      # than the tag, so a commit-SHA match is impossible — the tag value is
+      # the join key).
+      #
+      # We deliberately ship ONLY the binary image assets — NOT `dist/*`.  The
+      # npm package's JS bundles (`dist/main.cjs`, `dist/cli.cjs`,
+      # `dist/guest-agent.cjs`, `dist/preloads/*.cjs`) are staged by
+      # release.yml from the TAGGED checkout (REPO_ROOT), which carries the
+      # real backfilled manifest; this producer's `dist/main.cjs` still embeds
+      # the PRE-backfill placeholder manifest, so shipping it would publish a
+      # broken Action.  (The GHCR build above reads dist/guest-agent.cjs +
+      # preloads from this checkout — that's fine: those bundles are
+      # manifest-invariant and committed.)
+      #
+      # LAYOUT CONTRACT: every path below shares a single `images/` prefix, so
+      # upload-artifact collapses the common ancestor and the artifact contents
+      # are FLAT (rootfs-*.ext4, libscriptjail*.so, vmlinux-vz-* at the artifact
+      # root). release.yml's download step relies on this by downloading into
+      # `artifacts/images/` to restore the `artifacts/images/<name>` layout
+      # check-publish-artifacts.sh expects. Adding a path OUTSIDE `images/` here
+      # would shift the common ancestor to the repo root and break that download
+      # target — keep every entry under `images/`.
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: release-assets
+          name: release-assets-${{ inputs.tag }}
           path: |
             images/rootfs-ubuntu-22.04.ext4
             images/rootfs-ubuntu-24.04.ext4
@@ -346,10 +374,6 @@ jobs:
             images/libscriptjail-arm64.so
             images/vmlinux-vz-x86_64
             images/vmlinux-vz-arm64
-            dist/main.cjs
-            dist/guest-agent.cjs
-            dist/cli.cjs
-            dist/preloads/*.cjs
           if-no-files-found: error
           retention-days: 90
 

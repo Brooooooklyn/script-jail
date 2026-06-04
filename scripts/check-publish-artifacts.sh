@@ -65,8 +65,13 @@
 #                              (expects images/ and dist/ subdirs).
 #   --dist-source <path>       Optional path to the tagged dist/main.cjs to compare
 #                              the artifact's dist/main.cjs against.  When omitted,
-#                              dist/main.cjs verification is skipped (useful for
-#                              tests that only exercise the manifest path).
+#                              dist/main.cjs is neither REQUIRED in the artifact
+#                              dir nor verified — under the build-once/download-
+#                              forever contract the producer ships no dist/* in
+#                              the artifact set (the dist that ships comes from the
+#                              tagged checkout), so release.yml omits this flag and
+#                              the downloaded dir has no dist/ subtree.  Also used
+#                              by tests that only exercise the manifest path.
 #   --dist-cli-source <path>   Optional path to the tagged dist/cli.cjs to compare
 #                              the artifact's dist/cli.cjs against.  Same threat
 #                              class as --dist-source: the publish job downloads
@@ -458,11 +463,19 @@ ART_SJ_VM_ARM64_DARWIN="$DIR/script-jail-vm-arm64-darwin"
 # can override.
 CHECK_DARWIN_ARTIFACTS="${SCRIPT_JAIL_CHECK_DARWIN_ARTIFACTS:-1}"
 
-required_files=("$ART_LINUX_ROOTFS_22" "$ART_LINUX_ROOTFS_24" "$ART_LINUX_LIBSO" "$ART_DIST")
-# dist/cli.cjs is only required when the caller supplies a source to compare
-# against.  The "source" path is the tagged fresh-checkout copy; without it,
-# we have nothing to compare against and skipping is the only safe answer.
-# Back-compat: tests that don't exercise cli.cjs simply omit the flag.
+required_files=("$ART_LINUX_ROOTFS_22" "$ART_LINUX_ROOTFS_24" "$ART_LINUX_LIBSO")
+# dist/main.cjs and dist/cli.cjs are only required when the caller supplies a
+# source to compare against.  The "source" path is the tagged fresh-checkout
+# copy; without it, we have nothing to compare against AND nothing to require —
+# under the build-once/download-forever contract the producer no longer ships
+# dist/* in the artifact set (the dist that ships comes from the tagged
+# checkout), so release.yml omits both flags and the downloaded artifact dir
+# carries NO dist/ subtree.  Requiring it unconditionally would fail every
+# real release.  Back-compat: tests that exercise the dist path pass the
+# matching --dist-source / --dist-cli-source.
+if [ -n "$DIST_SOURCE" ]; then
+  required_files+=("$ART_DIST")
+fi
 if [ -n "$DIST_CLI_SOURCE" ]; then
   required_files+=("$ART_DIST_CLI")
 fi
@@ -510,7 +523,12 @@ canonical_rootfs_hash() {
 COMPUTED_LINUX_ROOTFS_22="$(canonical_rootfs_hash "$ART_LINUX_ROOTFS_22")"
 COMPUTED_LINUX_ROOTFS_24="$(canonical_rootfs_hash "$ART_LINUX_ROOTFS_24")"
 COMPUTED_LINUX_LIBSO="$(sha_of "$ART_LINUX_LIBSO")"
-COMPUTED_DIST="$(sha_of "$ART_DIST")"
+# Hash the dist bundles ONLY when their source is supplied — see the
+# required_files note above: without --dist-source the artifact dir carries no
+# dist/main.cjs to hash (it would `sha_of` a non-existent file and fail).
+if [ -n "$DIST_SOURCE" ]; then
+  COMPUTED_DIST="$(sha_of "$ART_DIST")"
+fi
 if [ -n "$DIST_CLI_SOURCE" ]; then
   COMPUTED_DIST_CLI="$(sha_of "$ART_DIST_CLI")"
 fi
@@ -598,7 +616,9 @@ if [ "$ALL_PLACEHOLDERS" -eq 1 ]; then
     echo "  darwin/vmlinux-vz-arm64:               $COMPUTED_VMLINUX_VZ_ARM64" >&2
     echo "  darwin/script-jail-vm-arm64-darwin:    $COMPUTED_SJ_VM_ARM64_DARWIN" >&2
   fi
-  echo "  dist/main.cjs:                         $COMPUTED_DIST" >&2
+  if [ -n "$DIST_SOURCE" ]; then
+    echo "  dist/main.cjs:                         $COMPUTED_DIST" >&2
+  fi
   if [ -n "$DIST_CLI_SOURCE" ]; then
     echo "  dist/cli.cjs:                          $COMPUTED_DIST_CLI" >&2
   fi

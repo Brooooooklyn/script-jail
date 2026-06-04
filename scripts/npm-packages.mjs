@@ -149,9 +149,10 @@ export function npmPackages(version) {
         dest: 'libscriptjail-arm64.so',
         mode: 0o644,
       },
-      // The VZ helper Mach-O binary is uploaded to the artifacts root by the
-      // release `build-mac-bin` job as `script-jail-vm-arm64-darwin`; it ships
-      // as the executable `script-jail-vm`.
+      // The VZ helper Mach-O binary is built by the release-build.yml producer
+      // `build-mac-bin` job and downloaded to the artifacts root by release.yml
+      // as `script-jail-vm-arm64-darwin`; it ships as the executable
+      // `script-jail-vm`.
       {
         src: 'script-jail-vm-arm64-darwin',
         dest: 'script-jail-vm',

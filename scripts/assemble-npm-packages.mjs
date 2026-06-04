@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // PKG-3: stage the four publishable npm package dirs from CI build artifacts.
 //
-// The release `publish` job downloads every build artifact into ./artifacts
-// (the FC/Docker rootfs ext4s, the libscriptjail shims, the VZ kernel, the
-// Mach-O VZ helper, and the committed dist/ JS bundles). This script turns
-// those raw artifacts into four ready-to-`npm publish` package dirs under a
+// The release `publish` job downloads the producer's BINARY build artifacts
+// into ./artifacts (the FC/Docker rootfs ext4s, the libscriptjail shims, the
+// VZ kernel, and the Mach-O VZ helper). The committed dist/ JS bundles are NOT
+// downloaded — they are read from REPO_ROOT (the tagged checkout). This script
+// turns those inputs into four ready-to-`npm publish` package dirs under a
 // staging root, using scripts/npm-packages.mjs as the single source of truth:
 //
 //   node scripts/assemble-npm-packages.mjs \
@@ -15,11 +16,22 @@
 //   - write a clean published package.json (2-space indent + trailing newline),
 //   - materialize its artifacts (gzip or copy) with the spec file mode.
 //
+// DIST vs BINARY SOURCE SPLIT (build-once / download-forever):
+//   - The JS bundles (`dist/*`: cli.cjs, guest-agent.cjs, preloads) come from
+//     REPO_ROOT — the TAGGED checkout, whose committed bundles carry the REAL
+//     backfilled manifest. The producer workflow's artifacts intentionally do
+//     NOT carry dist/* (its dist/main.cjs would embed the PRE-backfill
+//     placeholder manifest), so taking dist from the producer would publish a
+//     broken Action.
+//   - The BINARY image assets (rootfs ext4s, shims, kernels, Mach-O VZ helper)
+//     come from `--artifacts` (the producer's uploaded build artifacts). These
+//     are manifest-invariant and cannot be rebuilt at tag time.
+//
 // MAIN PACKAGE: derived from the repo-root package.json so the published
 // manifest stays in lockstep with the committed metadata, but with `files`
 // and `optionalDependencies` overwritten from the canonical spec and the
 // dev-only fields (devDependencies / scripts / packageManager) dropped. Its
-// JS lives in the committed bundles, copied from <artifacts>/dist/...; the
+// JS lives in the committed bundles, copied from REPO_ROOT/dist/...; the
 // README is taken from the repo root. The main spec carries no `artifacts`.
 //
 // PLATFORM PACKAGES: each `artifacts` entry's `src` is resolved against the
@@ -60,9 +72,10 @@ const GZIP_LEVEL = zlibConstants.Z_BEST_COMPRESSION;
 
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
-// The committed JS bundles shipped by the main package, relative to the
-// artifacts dir's `dist/`. The preload list comes from MAIN_PRELOADS (PKG-1) so
-// the staged set and the packlist-gated set are the same single source.
+// The committed JS bundles shipped by the main package, relative to REPO_ROOT's
+// `dist/` (NOT the artifacts dir — see the dist-vs-binary split in the header).
+// The preload list comes from MAIN_PRELOADS (PKG-1) so the staged set and the
+// packlist-gated set are the same single source.
 const MAIN_BUNDLE_FILES = [
   'dist/cli.cjs',
   'dist/guest-agent.cjs',
@@ -89,7 +102,7 @@ async function main(argv) {
     writeManifest(pkg, pkgDir);
 
     if (pkg.name === 'script-jail') {
-      stageMainBundles(opts.artifactsDir, pkgDir);
+      stageMainBundles(pkgDir);
     }
 
     for (const art of pkg.artifacts) {
@@ -132,23 +145,30 @@ function parseArgs(argv) {
 }
 
 // Confirm every source path exists before mutating the staging root, naming
-// the first missing artifact (relative to the artifacts dir, plus the README).
+// the first missing artifact. The dist/* JS bundles + README resolve against
+// REPO_ROOT (the tagged checkout); the binary `artifacts` resolve against the
+// producer's downloaded artifacts dir (see the dist-vs-binary split header).
 function validateSources(packages, artifactsDir) {
   const missing = [];
   for (const pkg of packages) {
     if (pkg.name === 'script-jail') {
       for (const rel of MAIN_BUNDLE_FILES) {
-        if (!existsSync(join(artifactsDir, rel))) missing.push(rel);
+        if (!existsSync(join(REPO_ROOT, rel))) missing.push(`${rel} (REPO_ROOT)`);
       }
-      if (!existsSync(join(REPO_ROOT, 'README.md'))) missing.push('README.md');
+      if (!existsSync(join(REPO_ROOT, 'README.md'))) {
+        missing.push('README.md (REPO_ROOT)');
+      }
     }
     for (const art of pkg.artifacts) {
-      if (!existsSync(join(artifactsDir, art.src))) missing.push(art.src);
+      if (!existsSync(join(artifactsDir, art.src))) {
+        missing.push(`${art.src} (artifacts)`);
+      }
     }
   }
   if (missing.length > 0) {
     fail(
-      `missing artifact(s) under ${artifactsDir}:\n` +
+      `missing source(s) (dist/* + README from REPO_ROOT, binaries from ` +
+        `${artifactsDir}):\n` +
         missing.map((m) => `  ${m}`).join('\n'),
     );
   }
@@ -188,11 +208,14 @@ function buildMainManifest(pkg) {
   };
 }
 
-function stageMainBundles(artifactsDir, pkgDir) {
+// Stage the main package's committed JS bundles + README from REPO_ROOT — the
+// TAGGED checkout, whose dist/* carries the real backfilled manifest. These are
+// deliberately NOT sourced from the producer's artifacts (see header).
+function stageMainBundles(pkgDir) {
   for (const rel of MAIN_BUNDLE_FILES) {
     const dest = join(pkgDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
-    copyFileSync(join(artifactsDir, rel), dest);
+    copyFileSync(join(REPO_ROOT, rel), dest);
     chmodSync(dest, 0o644);
   }
   const readmeDest = join(pkgDir, 'README.md');

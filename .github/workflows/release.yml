@@ -1,8 +1,21 @@
 # script-jail — .github/workflows/release.yml
 #
-# Release pipeline: on every `v*.*.*` tag push, build the per-runner rootfs
-# ext4 images, the Docker rootfs images, the libscriptjail.so Rust shim, and
-# the action bundle, then publish the artifacts.
+# Release pipeline: on every `v*.*.*` tag push, DOWNLOAD the binary image
+# assets a `release-build.yml` producer run already built for this tag, verify
+# them against the committed manifest, and publish (GitHub release + npm).
+#
+# Build-once / download-forever:
+#   This workflow NEVER rebuilds the rootfs ext4s, the Rust shims, the VZ
+#   kernels, the Mach-O VZ helper, or the GHCR Docker images. Those are built
+#   exactly once by the `release-build.yml` producer (dispatched manually on the
+#   release commit with the same `tag`), which uploads the binary assets as
+#   tag-suffixed Actions artifacts (`release-assets-<tag>`, `mac-bin-<tag>`) and
+#   pushes the 4 GHCR rootfs images. This release run locates that producer run
+#   by the tag-suffixed artifact NAME (the producer runs on a DIFFERENT commit
+#   than the tag — the pre-backfill commit — so a commit-SHA match is
+#   impossible; the binary assets are invariant across the manifest backfill, so
+#   matching by tag is correct). The committed-manifest SHA verification in
+#   check-publish-artifacts.sh is the integrity backstop.
 #
 # Why this exists:
 #   Firecracker/bare backends consume the rootfs + .so via
@@ -10,25 +23,20 @@
 #   https://github.com/<repo>/releases/download/<tag>/<asset> and verifies
 #   each file against a pinned SHA-256 in src/action/artifact-manifest.ts.
 #   The Docker backend consumes digest-pinned GHCR images from the same
-#   manifest. This workflow produces both forms.
-#
-# Bootstrap caveat:
-#   The first release tagged on a fresh fork will produce real SHAs that do
-#   NOT match the placeholders in src/action/artifact-manifest.ts.  The
-#   workflow prints the real SHAs and Docker image refs in its step summary;
-#   copy them into the manifest and cut the NEXT tag.  From the second release
-#   onward, the manifest matches each tag's assets and image refs.
+#   manifest. This workflow uploads the release assets and verifies the GHCR
+#   digests resolve; the producer already pushed the images.
 #
 # Supply-chain hardening:
 #   We split into two jobs so the GITHUB_TOKEN with write scopes only exists
 #   during the final publish step:
-#     - `build` runs install / typecheck / test / build with the
+#     - `verify` runs install / typecheck / test / bundle-freshness with the
 #       default-read token AND `persist-credentials: false`, so a malicious
-#       dependency lifecycle script cannot write to the repo or its
-#       releases via the runner's git credentials.
-#     - `publish` is a minimal job that only downloads verified build
-#       artifacts, pushes GHCR images, and uploads release assets. Only this
-#       job carries contents:write/packages:write.
+#       dependency lifecycle script cannot write to the repo or its releases
+#       via the runner's git credentials. It also gates that the committed
+#       manifest is fully real (no placeholders) at tag time.
+#     - `publish` is a minimal job that downloads the producer's verified
+#       binary artifacts, checks them against the manifest, and uploads release
+#       assets + publishes npm. Only this job carries contents:write/id-token.
 
 name: release
 
@@ -44,72 +52,17 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # build-mac-bin — produce the Mach-O `script-jail-vm-arm64-darwin` binary.
-  # Runs on a macos-latest Apple-Silicon runner; emits the binary as a workflow
-  # artifact that the main `build` job downloads to compute its SHA and that
-  # `publish` uploads to the release.
-  #
-  # We keep this job tightly scoped — no `pnpm install`, no Docker, no
-  # access to the consumer-tree of the action — so the macOS runner only
-  # ever runs `cargo build` against the in-repo Rust workspace.  Splitting
-  # this off (vs. running it inside `build`) also lets the (much cheaper)
-  # rootfs build proceed in parallel on the Linux runner.
+  # verify — install / typecheck / test, rebuild the committed dist bundles and
+  # assert they are fresh (the same drift gate test.yml enforces), and gate that
+  # the pinned manifest is fully real (no PLACEHOLDER_SHA256_* tokens) at tag
+  # time. Runs with NO write capabilities and no persisted checkout credentials.
+  # It builds NOTHING that ships (no rootfs/shim/kernel/Mach-O/GHCR) — those are
+  # the producer's job. `publish` depends on this job so a failed gate blocks the
+  # irreversible publish.
   # ---------------------------------------------------------------------------
-  build-mac-bin:
-    runs-on: macos-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2.9.1
-        with:
-          workspaces: . -> target
-
-      - name: cargo build (release)
-        run: cargo build --release -p script-jail-host-mac
-
-      - name: Stage binary
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts/mac-bin
-          cp target/release/script-jail-vm \
-             artifacts/mac-bin/script-jail-vm-arm64-darwin
-
-      - name: Upload Mach-O artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: script-jail-vm-arm64-darwin
-          path: artifacts/mac-bin/script-jail-vm-arm64-darwin
-          if-no-files-found: error
-          retention-days: 1
-
-  # ---------------------------------------------------------------------------
-  # build — install/test/build with NO write capabilities and no persisted
-  # checkout credentials.  Hands the final artifacts off to `publish` via the
-  # standard actions/upload-artifact mechanism.
-  # ---------------------------------------------------------------------------
-  build:
-    # Requires `build-mac-bin` because the SHA paste-block + manifest
-    # bootstrap path need to include the Mach-O binary's hash.  The runner
-    # downloads that artifact mid-job to feed it into `Compute SHAs`.
-    needs: build-mac-bin
+  verify:
     runs-on: ubuntu-24.04
-    # The rootfs build invokes Docker + mkfs.ext4 for each runner image and
-    # architecture. The VZ kernel build adds another pair of long native
-    # builds, so the total budget needs a wider ceiling than the test matrix.
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       contents: read
 
@@ -119,8 +72,8 @@ jobs:
         with:
           # Don't leave the GITHUB_TOKEN persisted as a git credential after
           # checkout.  install/test/build phases run npm/pnpm lifecycle
-          # scripts and Docker — a compromised dep should not inherit a
-          # repo token, even a read-only one.
+          # scripts — a compromised dep should not inherit a repo token, even
+          # a read-only one.
           persist-credentials: false
 
       - name: Setup pnpm
@@ -134,9 +87,8 @@ jobs:
           node-version: '24'
           cache: 'pnpm'
 
-      # The shim is a Rust cdylib (`src/shim/`); cargo is required before
-      # `pnpm build` or the explicit shim-build step further down.  The
-      # version pin matches `rust-toolchain.toml`.
+      # The shim is a Rust cdylib (`src/shim/`); cargo is required for the
+      # bundle build flow below. The version pin matches `rust-toolchain.toml`.
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -144,44 +96,24 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Surface manifest status at tag-push time.  This step INVOKES the
-      # same validator that protects consumers at action runtime
-      # (`src/main.ts` → `validateManifest`); the script's
-      # `--warn-only-placeholders` flag narrowly suppresses ONLY the
-      # documented bootstrap case — every entry is still the literal
-      # `PLACEHOLDER_SHA256_*` string the manifest ships with.  Any other
-      # malformed value (typo'd hash, uppercase hex, wrong length) still
-      # exits 1 and fails the publish, because those represent real
-      # packaging bugs that would brick every consumer.
-      #
-      # Why warn-only for placeholders: the first tag on a fresh fork by
-      # definition has placeholders (no release exists yet to compute real
-      # SHAs from); a hard gate here would make the documented bootstrap
-      # loop — publish → copy SHAs from job summary → cut next tag —
-      # unreachable.  Consumer protection still lives in
-      # `src/action/validate-manifest.ts`, which throws unconditionally.
-      - name: Validate pinned artifact manifest (bootstrap-aware)
-        # Run the validator unguarded under `set -e`: with `--warn-only-placeholders`
-        # the script exits 0 when every offender is a known bootstrap
-        # placeholder, and exits non-zero for any genuine validation
-        # failure (uppercase hex, wrong length, typo, etc.). Wrapping the
-        # invocation in `if … then … fi` would swallow that non-zero exit,
-        # so we run it directly and only the placeholder-warning text is
-        # conditional on grep.
+      # Manifest-no-placeholders gate. At tag time the committed manifest MUST
+      # be fully real: the producer→backfill flow requires the operator to paste
+      # the real SHAs/digests before pushing the tag, so any remaining
+      # PLACEHOLDER_SHA256_* token is an un-backfilled (broken) release that
+      # would brick every Action consumer (and ship a placeholder dist/main.cjs
+      # to npm). Unlike the old two-tag bootstrap, there is no documented
+      # placeholder-at-tag-time case here, so this fails LOUD rather than warns.
+      # validate-manifest.ts (no --warn-only-placeholders) also enforces shape
+      # (lowercase 64-hex, etc.); the explicit grep adds a tag-time, human-
+      # readable refusal naming the exact failure mode.
+      - name: Gate manifest contains no placeholders (must be fully backfilled)
         run: |
           set -euo pipefail
-          pnpm exec oxnode scripts/validate-manifest.ts --warn-only-placeholders
           if grep -q 'PLACEHOLDER_SHA256_' src/action/artifact-manifest.ts; then
-            echo "::warning::Manifest contains placeholder SHAs. This release will NOT run as an action for consumers. After publishing, copy the SHAs computed below into src/action/artifact-manifest.ts and cut the next release."
-            {
-              echo "## :warning: Manifest contains placeholder SHAs"
-              echo
-              echo "This release will **NOT** run as an action for consumers."
-              echo "After publishing, copy the SHAs printed by the"
-              echo "\"Compute SHAs\" step into \`src/action/artifact-manifest.ts\`"
-              echo "and cut the next release."
-            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::src/action/artifact-manifest.ts still contains PLACEHOLDER_SHA256_* tokens. Backfill the real SHAs/digests from the release-build.yml run (paste-block) before tagging — a placeholder manifest ships a broken Action and a broken dist/main.cjs."
+            exit 1
           fi
+          pnpm exec oxnode scripts/validate-manifest.ts
 
       - name: Typecheck
         run: pnpm typecheck
@@ -189,348 +121,142 @@ jobs:
       - name: Test
         run: pnpm test
 
+      # Rebuild the committed bundles and assert they are byte-identical to what
+      # the tag carries. This mirrors test.yml's dist-freshness gate, enforced at
+      # tag-push time too: the npm package + GitHub-release dist assets ship the
+      # COMMITTED bundles (release.yml never re-bundles for shipping), so a stale
+      # dist/ at the tag would publish source that doesn't match src/.
       - name: Build action bundle
         run: pnpm build:bundle
 
       - name: Build CLI bundle
-        # The macOS CLI ships as `dist/cli.cjs` and is consumed by `npm install`
-        # users on Darwin.  We bundle it in the same release flow so the npm
-        # tarball that pairs with this tag carries an up-to-date CLI.
         run: pnpm build:cli
 
-      # The standalone canonical-rootfs-hash tool (dist/repro-hash-cli.cjs) is run
-      # BELOW — by this job's reproducibility gate + "Compute SHAs" step, and by
-      # the install-free publish job + scripts/check-publish-artifacts.sh — always
-      # straight from the COMMITTED bundle (the publish job has no `pnpm install`,
-      # so it cannot rebuild it).  Rebuild it here and fail the release if the
-      # committed copy is stale, so a source change to src/rootfs/repro-hash*.ts
-      # can never pin (or later verify) a manifest SHA with masking logic that
-      # differs from what consumers run.  Both jobs check out the same tag, so
-      # this build-job gate also protects the publish job's use of the same file.
-      # Mirrors test.yml's gate, enforced at tag-push time too.
       - name: Build repro-hash CLI bundle
         run: pnpm build:repro-hash
 
-      - name: Verify dist/repro-hash-cli.cjs is up to date
+      - name: Build guest agent bundle
+        run: pnpm build:guest-agent
+
+      # Gate the four esbuild bundles (the same set test.yml gates). The
+      # dist/preloads/*.cjs are authored static copies of src/guest/*.cjs (no
+      # esbuild step regenerates them), so they are not part of this rebuild
+      # freshness diff — they ship verbatim from the committed tree.
+      - name: Verify committed dist bundles are up to date
         run: |
-          if ! git diff --exit-code -- dist/repro-hash-cli.cjs; then
-            echo "::error::dist/repro-hash-cli.cjs is out of date. Run 'pnpm build:repro-hash' locally and commit the result."
+          if ! git diff --exit-code -- \
+            dist/main.cjs \
+            dist/cli.cjs \
+            dist/guest-agent.cjs \
+            dist/repro-hash-cli.cjs; then
+            echo "::error::Committed dist bundles are out of date. Run 'pnpm build:bundle && pnpm build:cli && pnpm build:guest-agent && pnpm build:repro-hash' locally and commit the result."
             exit 1
           fi
 
-      - name: Build Rust shim (x86_64)
-        run: |
-          cargo build --release --manifest-path src/shim/Cargo.toml
-          cp target/release/libscriptjail.so images/libscriptjail.so
-
-      # The cross-toolchain is required so cargo-zigbuild + zig produce the
-      # aarch64-unknown-linux-gnu ELF .so from the amd64 release runner.
-      # The same tool also works from macOS, so a future move to a different
-      # runner doesn't require
-      # touching the build script.  rustup-target-add is invoked first
-      # because dtolnay/rust-toolchain's `stable` does not pre-install it.
-      - name: Install arm64 cross-toolchain (kernel deps only)
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            flex \
-            bison \
-            libelf-dev \
-            libssl-dev \
-            bc \
-            xz-utils \
-            gcc-aarch64-linux-gnu
-          rustup target add aarch64-unknown-linux-gnu
-
-      - name: Install zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Build Rust shim (arm64 — cross-compile via cargo-zigbuild)
-        run: pnpm build -- --skip-rootfs --skip-bundle --shim-arm64
-
-      # The arm64 rootfs builds below run `docker buildx --platform=linux/arm64`
-      # on an x86_64 runner.  Without QEMU binfmt registration the runner
-      # kernel can't execute the arm64 `/bin/sh` (etc.) the buildx steps
-      # invoke, surfacing as `exec /bin/sh: exec format error`.  Registered
-      # once here so both arm64 rootfs build steps (ubuntu-22.04, ubuntu-24.04)
-      # see it.  No-op for the x64 rootfs builds.
-      - name: Register QEMU binfmt handlers (for linux/arm64 build)
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
-
-      # Build BOTH x64 rootfs ext4 images, reusing the bundle + shim built above.
-      # `--skip-bundle` and `--skip-shim` avoid the redundant work the build
-      # script would otherwise repeat per --runner-image invocation.
-      - name: Build rootfs (ubuntu-22.04, x64)
-        run: pnpm build -- --runner-image=ubuntu-22.04 --skip-bundle --skip-shim
-
-      - name: Build rootfs (ubuntu-24.04, x64)
-        run: pnpm build -- --runner-image=ubuntu-24.04 --skip-bundle --skip-shim
-
-      # Determinism guard (R1 — byte-reproducible rootfs).  Must run HERE:
-      # after BOTH x64 builds but BEFORE any arm64 rootfs build and BEFORE
-      # "Restore x64 shim artifact" — the arm64 steps stage libscriptjail-arm64.so
-      # over images/libscriptjail.so, so a rebuild after them would compare a
-      # shim-contaminated image and false-pass/fail.
-      #
-      # For each x64 major: snapshot the just-built image, rebuild it in place
-      # (same x64 / same major, skipping the bundle+shim), and assert the two
-      # ext4s are byte-identical.  The in-place rebuild becomes the uploaded
-      # artifact (identical by construction).  Rationale: the v0.1.1 manifest
-      # backfill must reproduce v0.1.0's released SHAs, so reproducibility
-      # regressions have to fail the release build, not surface later as a
-      # manifest diff.
-      #
-      # We cover BOTH x64 majors (ubuntu-24.04 AND ubuntu-22.04) via the same
-      # cheap native mkfs path.  arm64 is byte/canonical-reproducible too — it
-      # pins the FROZEN ubuntu-ports release pocket (see src/rootfs/Dockerfile.base;
-      # no public ubuntu-ports snapshot exists, but the release pocket is itself
-      # immutable + GPG-signed for the release's support life).  arm64 gets its
-      # OWN in-run reproducibility gate too — a separate step AFTER the arm64
-      # builds below (it needs the qemu buildx path, so it can't share this
-      # native-mkfs loop).  Both arches are therefore PROVEN reproducible in-run
-      # before the irreversible v0.1.0 bootstrap publish, rather than first
-      # tested at the v0.1.1 backfill (by which point v0.1.0's bytes are
-      # immutable).  Both also remain strictly compared at the backfill by
-      # scripts/check-publish-artifacts.sh.
-      - name: Assert x64 rootfs ext4s are canonical-reproducible (ubuntu-24.04, ubuntu-22.04)
-        run: |
-          set -euo pipefail
-          # Compare CANONICAL hashes (volatile superblock time fields masked) —
-          # not raw sha256sum.  The shipped e2fsprogs (< 1.47.1) re-stamps the
-          # superblock s_wtime to wall-clock on close, so a raw compare would
-          # flake purely on which wall-clock second each in-place rebuild lands
-          # in.  The canonical hash is the SAME value pinned into the manifest
-          # (Compute SHAs below) and re-verified by check-publish-artifacts.sh,
-          # so this gate proves the very digest the v0.1.1 backfill must match.
-          assert_reproducible() {
-            local major="$1"
-            local image="images/rootfs-${major}.ext4"
-            local first="/tmp/first-${major}.ext4"
-            cp "${image}" "${first}"
-            pnpm build -- --runner-image="${major}" --skip-bundle --skip-shim
-            local sha1 sha2
-            sha1="$(node dist/repro-hash-cli.cjs "${first}")"
-            sha2="$(node dist/repro-hash-cli.cjs "${image}")"
-            echo "${major}: first=${sha1} rebuild=${sha2}"
-            [ "${sha1}" = "${sha2}" ] || { echo "::error::rootfs ext4 ${major} is not canonical-reproducible"; exit 1; }
-          }
-          assert_reproducible ubuntu-24.04
-          assert_reproducible ubuntu-22.04
-
-      # Build the two arm64 rootfs ext4 images for the macOS CLI.
-      # `--arch=arm64` selects the arm64 base image AND skips the redundant
-      # x64 shim build (the arm64 .so above already produced
-      # `images/libscriptjail-arm64.so`).
-      - name: Build rootfs (ubuntu-22.04, arm64)
-        run: pnpm build -- --runner-image=ubuntu-22.04 --arch=arm64 --skip-bundle --skip-shim
-
-      - name: Build rootfs (ubuntu-24.04, arm64)
-        run: pnpm build -- --runner-image=ubuntu-24.04 --arch=arm64 --skip-bundle --skip-shim
-
-      # arm64 in-run reproducibility gate — the arm64 analogue of the x64 gate
-      # above, REQUIRED before the irreversible v0.1.0 bootstrap publish. arm64
-      # is pinned to the FROZEN ubuntu-ports release pocket (Dockerfile.base),
-      # but like x64 that claim must be PROVEN in-run, not first tested at the
-      # v0.1.1 backfill — by which point v0.1.0's arm64 bytes are immutable and a
-      # drift would only surface as a backfill SHA mismatch with nothing to fix.
-      # For each major: snapshot the just-built arm64 ext4, rebuild it (the qemu
-      # buildx layer cache from the builds above makes the rebuild's docker phase
-      # a cache hit; only the export+mkfs re-runs), and assert the two CANONICAL
-      # hashes match — the same masked digest the manifest pins and the backfill
-      # compares. The rebuild re-stages the arm64 shim itself (build.ts maps
-      # libscriptjail-arm64.so → images/libscriptjail.so for --arch=arm64), so it
-      # is correct to run BEFORE "Restore x64 shim artifact" below.
-      - name: Assert arm64 rootfs ext4s are canonical-reproducible (ubuntu-24.04, ubuntu-22.04)
-        run: |
-          set -euo pipefail
-          assert_reproducible_arm64() {
-            local major="$1"
-            local image="images/rootfs-${major}-arm64.ext4"
-            local first="/tmp/first-${major}-arm64.ext4"
-            cp "${image}" "${first}"
-            pnpm build -- --runner-image="${major}" --arch=arm64 --skip-bundle --skip-shim
-            local sha1 sha2
-            sha1="$(node dist/repro-hash-cli.cjs "${first}")"
-            sha2="$(node dist/repro-hash-cli.cjs "${image}")"
-            echo "${major}-arm64: first=${sha1} rebuild=${sha2}"
-            [ "${sha1}" = "${sha2}" ] || { echo "::error::arm64 rootfs ext4 ${major} is not canonical-reproducible"; exit 1; }
-          }
-          assert_reproducible_arm64 ubuntu-24.04
-          assert_reproducible_arm64 ubuntu-22.04
-
-      # The arm64 rootfs build stages libscriptjail-arm64.so to the canonical
-      # images/libscriptjail.so path because Dockerfile.base has one COPY
-      # target. Restore the x64 shim before computing/uploading the Linux
-      # action artifact.
-      - name: Restore x64 shim artifact
-        run: cp target/release/libscriptjail.so images/libscriptjail.so
-
-      # Build the two VZ kernels. Pinned upstream version + per-arch config;
-      # see images/kernel/build.sh for the full pipeline.
-      - name: Build vmlinux-vz (x86_64)
-        run: bash images/kernel/build.sh --arch=x86_64 --force
-
-      - name: Build vmlinux-vz (arm64)
-        run: bash images/kernel/build.sh --arch=arm64 --force
-
-      # Compute SHA-256 of every released artifact and surface them in the
-      # job summary so the maintainer can copy the digests into
-      # src/action/artifact-manifest.ts before cutting the next release.
-      # The Mach-O binary (`script-jail-vm-arm64-darwin`) is produced by
-      # the `build-mac-bin` job below; we re-fetch it here via a workflow
-      # artifact so the SHA summary can include it in the paste-block.
-      - name: Download script-jail-vm Mach-O artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: script-jail-vm-arm64-darwin
-          path: artifacts/mac-bin
-
-      - name: Compute SHAs
-        id: shas
-        run: |
-          set -euo pipefail
-          # Rootfs ext4 images are pinned by their CANONICAL hash (volatile
-          # superblock time fields masked — see src/rootfs/repro-hash.ts), so the
-          # value survives the e2fsprogs close-flush s_wtime re-stamp and the
-          # v0.1.1 backfill reproduces it.  Everything else (the .so shims, the
-          # VZ kernels, the Mach-O binary) is pinned by a plain sha256sum.  These
-          # two digest kinds MUST match how check-publish-artifacts.sh recomputes
-          # them in the publish job and how preFetchArtifacts verifies the rootfs
-          # at consumer runtime.
-          # --- Linux platform artifacts ---
-          LINUX_ROOTFS_22="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-22.04.ext4)"
-          LINUX_ROOTFS_24="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-24.04.ext4)"
-          LINUX_LIBSO="$(sha256sum images/libscriptjail.so | cut -d' ' -f1)"
-          # --- Darwin platform artifacts ---
-          DARWIN_ROOTFS_22_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-22.04-arm64.ext4)"
-          DARWIN_ROOTFS_24_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-24.04-arm64.ext4)"
-          DARWIN_LIBSO_ARM64="$(sha256sum images/libscriptjail-arm64.so | cut -d' ' -f1)"
-          VMLINUX_VZ_X86_64="$(sha256sum images/vmlinux-vz-x86_64 | cut -d' ' -f1)"
-          VMLINUX_VZ_ARM64="$(sha256sum images/vmlinux-vz-arm64 | cut -d' ' -f1)"
-          SJ_VM_ARM64_DARWIN="$(sha256sum artifacts/mac-bin/script-jail-vm-arm64-darwin | cut -d' ' -f1)"
-          # --- Surface as job outputs (also useful for downstream steps) ---
-          {
-            echo "linux_rootfs_22=${LINUX_ROOTFS_22}"
-            echo "linux_rootfs_24=${LINUX_ROOTFS_24}"
-            echo "linux_libso=${LINUX_LIBSO}"
-            echo "darwin_rootfs_22_arm64=${DARWIN_ROOTFS_22_ARM64}"
-            echo "darwin_rootfs_24_arm64=${DARWIN_ROOTFS_24_ARM64}"
-            echo "darwin_libso_arm64=${DARWIN_LIBSO_ARM64}"
-            echo "vmlinux_vz_x86_64=${VMLINUX_VZ_X86_64}"
-            echo "vmlinux_vz_arm64=${VMLINUX_VZ_ARM64}"
-            echo "sj_vm_arm64_darwin=${SJ_VM_ARM64_DARWIN}"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "## Artifact SHAs"
-            echo
-            echo "Update \`src/action/artifact-manifest.ts\` with:"
-            echo
-            echo '```ts'
-            echo "export const PINNED_MANIFEST: ArtifactManifest = {"
-            echo "  repo: '${{ github.repository }}',"
-            echo "  tag: '${{ github.ref_name }}',"
-            echo "  expected: {"
-            echo "    linux: {"
-            echo "      'rootfs-ubuntu-22.04.ext4': '${LINUX_ROOTFS_22}',"
-            echo "      'rootfs-ubuntu-24.04.ext4': '${LINUX_ROOTFS_24}',"
-            echo "      'libscriptjail.so':         '${LINUX_LIBSO}',"
-            echo "    },"
-            echo "    darwin: {"
-            echo "      'rootfs-ubuntu-22.04-arm64.ext4': '${DARWIN_ROOTFS_22_ARM64}',"
-            echo "      'rootfs-ubuntu-24.04-arm64.ext4': '${DARWIN_ROOTFS_24_ARM64}',"
-            echo "      'libscriptjail-arm64.so':         '${DARWIN_LIBSO_ARM64}',"
-            echo "      'vmlinux-vz-x86_64':              '${VMLINUX_VZ_X86_64}',"
-            echo "      'vmlinux-vz-arm64':               '${VMLINUX_VZ_ARM64}',"
-            echo "      'script-jail-vm-arm64-darwin':    '${SJ_VM_ARM64_DARWIN}',"
-            echo "    },"
-            echo "  },"
-            echo "};"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Hand artifacts to the publish job.  Using a workflow artifact (rather
-      # than a job output or cache) keeps the build job side-effect-free
-      # outside its own filesystem.
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-assets
-          path: |
-            images/rootfs-ubuntu-22.04.ext4
-            images/rootfs-ubuntu-24.04.ext4
-            images/rootfs-ubuntu-22.04-arm64.ext4
-            images/rootfs-ubuntu-24.04-arm64.ext4
-            images/libscriptjail.so
-            images/libscriptjail-arm64.so
-            images/vmlinux-vz-x86_64
-            images/vmlinux-vz-arm64
-            dist/main.cjs
-            dist/guest-agent.cjs
-            dist/cli.cjs
-            dist/preloads/*.cjs
-          if-no-files-found: error
-          retention-days: 1
-
   # ---------------------------------------------------------------------------
-  # publish — minimal job that has release/package write scopes, downloads the
-  # build job artifacts, verifies them, publishes Docker rootfs images, and
-  # uploads the release assets. No install, no test runs — nothing that
-  # executes third-party dependency code.
+  # publish — minimal job that has release write scopes + OIDC. It downloads the
+  # producer's tag-suffixed binary artifacts (NEVER rebuilds them), verifies them
+  # against the committed manifest, uploads the release assets, and publishes the
+  # four npm packages. The npm package's dist/* ships from THIS tagged checkout
+  # (REPO_ROOT) — the producer's dist is never shipped.
   # ---------------------------------------------------------------------------
   publish:
-    needs: build
+    needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: write
-      packages: write
+      # `actions: read` is required to list + download artifacts from a DIFFERENT
+      # workflow run (the release-build.yml producer). `packages: read` lets the
+      # GHCR login + imagetools inspect (digest-resolve gate) read the images the
+      # producer already pushed — no `packages: write` because this job no longer
+      # pushes any image.
+      packages: read
+      actions: read
       id-token: write
 
     steps:
-      # Re-checkout the tagged source on a separate runner whose filesystem
-      # has NOT seen `pnpm install`.  This gives us a clean, independently-
-      # obtained copy of src/action/artifact-manifest.ts and dist/main.cjs
-      # that the build job's third-party code could not have tampered with.
+      # Re-checkout the tagged source on a runner whose filesystem has NOT seen
+      # `pnpm install`. This gives a clean, independently-obtained copy of
+      # src/action/artifact-manifest.ts and the committed dist/* bundles that the
+      # producer's third-party code could not have tampered with.
       # `persist-credentials: false` keeps the GITHUB_TOKEN out of git
-      # credentials; the release upload below receives the write-scoped
-      # token via the workflow env, not via git.
+      # credentials; the release upload below receives the write-scoped token via
+      # the workflow env, not via git.
       - name: Checkout (verification source)
         uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: release-assets
-          # download-artifact@v4 preserves the directory structure under the
-          # given path.  We isolate the downloaded artifacts under ./artifacts
-          # so they cannot overwrite the freshly-checked-out source tree
-          # (in particular dist/main.cjs, which we compare against below).
-          path: artifacts
+      # Locate the release-build.yml producer run that carries this tag's binary
+      # artifacts and download them into ./artifacts. The producer ran on a
+      # DIFFERENT commit (the pre-backfill commit), so we cannot match by commit
+      # SHA — we match by the tag-suffixed artifact NAME (`release-assets-<tag>`
+      # / `mac-bin-<tag>`). We walk successful release-build runs newest-first
+      # and take the first that actually carries the artifact, so a re-dispatched
+      # producer (e.g. after a transient failure) resolves to the latest build.
+      # ${TAG} = github.ref_name (this job runs on the tag, so ref_name IS the
+      # tag here).
+      - name: Download producer build artifacts (by tag-suffixed name)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          assets_name="release-assets-${TAG}"
+          mac_name="mac-bin-${TAG}"
 
-      # The macOS Mach-O binary is uploaded as a separate workflow artifact by
-      # the `build-mac-bin` job (it can't be cross-built on the Linux runner).
-      # Land it under `artifacts/` so
-      # `check-publish-artifacts.sh` finds it at
-      # `artifacts/script-jail-vm-arm64-darwin`.
-      - name: Download Mach-O artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: script-jail-vm-arm64-darwin
-          path: artifacts
+          # Newest-first list of successful release-build runs (run IDs only).
+          run_ids="$(gh run list \
+            --workflow release-build.yml \
+            --status success \
+            --limit 50 \
+            --json databaseId \
+            --jq '.[].databaseId')"
+          if [ -z "${run_ids}" ]; then
+            echo "::error::no successful release-build.yml runs found; dispatch release-build.yml with tag=${TAG} on the release commit first" >&2
+            exit 1
+          fi
+
+          found_run=""
+          for run_id in ${run_ids}; do
+            # Does THIS run carry the tag-suffixed binary artifact?
+            names="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
+              --jq '.artifacts[].name')"
+            if printf '%s\n' "${names}" | grep -qx "${assets_name}"; then
+              found_run="${run_id}"
+              break
+            fi
+          done
+
+          if [ -z "${found_run}" ]; then
+            echo "::error::no release-build run found carrying ${assets_name}; dispatch release-build.yml with tag=${TAG} on the release commit first" >&2
+            exit 1
+          fi
+
+          echo "Using release-build run ${found_run} for ${assets_name} / ${mac_name}"
+
+          # Download the binary image assets into artifacts/images. The producer
+          # uploaded all 8 entries under a single `images/` prefix, so
+          # upload-artifact collapses the common ancestor and the artifact
+          # contents are FLAT (rootfs-*.ext4, libscriptjail*.so, vmlinux-vz-* at
+          # the artifact root). Targeting `--dir artifacts/images` restores the
+          # `artifacts/images/<name>` layout that check-publish-artifacts.sh and
+          # the release-asset upload below both expect.
+          mkdir -p artifacts/images
+          gh run download "${found_run}" \
+            --name "${assets_name}" \
+            --dir artifacts/images
+
+          # Download the Mach-O VZ helper to the artifacts ROOT (the on-disk
+          # filename inside the artifact stays script-jail-vm-arm64-darwin, which
+          # check-publish-artifacts.sh + assemble-npm-packages.mjs expect at
+          # artifacts/script-jail-vm-arm64-darwin).
+          gh run download "${found_run}" \
+            --name "${mac_name}" \
+            --dir artifacts
 
       - name: Setup Node.js for npm publish
         uses: actions/setup-node@v6
@@ -545,33 +271,18 @@ jobs:
       - name: Upgrade npm for OIDC trusted publishing
         run: npm install -g npm@11.16.0
 
-      # Independently verify the downloaded artifacts against the SHAs the
-      # tagged source committed.  See scripts/check-publish-artifacts.sh for
-      # the threat model and bootstrap-path handling.  Crucially, this runs
-      # BEFORE the upload step, so a mismatch refuses to publish.
+      # Independently verify the downloaded binary artifacts against the SHAs the
+      # tagged source committed. See scripts/check-publish-artifacts.sh for the
+      # threat model. Crucially, this runs BEFORE the upload step, so a mismatch
+      # refuses to publish. We DO NOT pass --dist-source/--dist-cli-source: the
+      # producer no longer ships dist/*, so there is nothing downloaded to
+      # compare; the dist/* that ships comes from this tagged checkout and is
+      # already verified by the `verify` job's freshness gate (and test.yml).
       - name: Verify downloaded artifacts against tagged manifest
         run: |
           bash scripts/check-publish-artifacts.sh \
             --manifest src/action/artifact-manifest.ts \
-            --dir artifacts \
-            --dist-source dist/main.cjs \
-            --dist-cli-source dist/cli.cjs
-
-      - name: Verify Docker runtime JS artifacts
-        run: |
-          set -euo pipefail
-          cmp -s artifacts/dist/guest-agent.cjs dist/guest-agent.cjs
-          cmp -s artifacts/dist/preloads/platform-spoof.cjs dist/preloads/platform-spoof.cjs
-          cmp -s artifacts/dist/preloads/env-spy.cjs dist/preloads/env-spy.cjs
-          cmp -s artifacts/dist/preloads/dlopen-block.cjs dist/preloads/dlopen-block.cjs
-
-      - name: Register QEMU binfmt handlers (for linux/arm64 Docker publish)
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4
+            --dir artifacts
 
       - name: Login to GHCR
         uses: docker/login-action@v4
@@ -580,141 +291,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Publish Docker rootfs images
-        run: |
-          set -euo pipefail
-
-          mkdir -p dist/preloads images
-          cp artifacts/dist/guest-agent.cjs dist/guest-agent.cjs
-          cp artifacts/dist/preloads/*.cjs dist/preloads/
-
-          vp_version="$(sed -nE "s/^export const VITE_PLUS_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          node_version="$(sed -nE "s/^export const NODE_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          vp_sha_x64="$(sed -nE "s/^[[:space:]]*x64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          vp_sha_arm64="$(sed -nE "s/^[[:space:]]*arm64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          image="ghcr.io/${owner_lc}/script-jail-rootfs"
-          : > docker-image-refs.txt
-
-          if [ -z "${vp_version}" ] || [ -z "${node_version}" ] || [ -z "${vp_sha_x64}" ] || [ -z "${vp_sha_arm64}" ]; then
-            echo "failed to parse src/rootfs/vite-plus.ts" >&2
-            exit 1
-          fi
-
-          build_one() {
-            local runner_image="$1"
-            local ubuntu_major="$2"
-            local arch="$3"
-            local platform="$4"
-            local vp_sha="$5"
-            local tag="$6"
-            local metadata
-            local digest
-            local ubuntu_ref
-            metadata="$(mktemp)"
-
-            # Pin the GHCR build's base image to the SAME per-(runner_image,arch)
-            # `ubuntu@sha256:…` digest the local rootfs build threads as
-            # UBUNTU_REF (src/rootfs/build.ts UBUNTU_BASE_DIGEST).  Without this
-            # the published image would `FROM` a floating `ubuntu:<major>` tag
-            # and drift away from the rootfs ext4s the v0.1.1 manifest backfill
-            # must reproduce.
-            #
-            # This job is deliberately install-free (no `pnpm install`, so no
-            # `oxnode`), so we read the committed map with the bundled `node`
-            # instead of importing the TS module: scope to the runner-image
-            # block, then pull the per-arch `ubuntu@sha256:…` string.
-            # runner_image/arch are passed via env (not interpolated into the JS
-            # literal) to avoid quoting/injection issues; an unknown key writes
-            # an empty string so the guard below fails loudly rather than
-            # leaking an `undefined` into --build-arg.
-            ubuntu_ref="$(SJ_RUNNER_IMAGE="${runner_image}" SJ_ARCH="${arch}" node -e '
-              const fs = require("fs");
-              const src = fs.readFileSync("src/rootfs/build.ts", "utf8");
-              const ri = process.env.SJ_RUNNER_IMAGE.replace(/[.]/g, "\\.");
-              const block = src.match(new RegExp("[\"\x27]" + ri + "[\"\x27]\\s*:\\s*\\{([\\s\\S]*?)\\}"));
-              let out = "";
-              if (block) {
-                const am = block[1].match(new RegExp("\\b" + process.env.SJ_ARCH + "\\s*:\\s*[\"\x27]([^\"\x27]+)[\"\x27]"));
-                if (am) out = am[1];
-              }
-              process.stdout.write(out);
-            ')"
-            if [ -z "${ubuntu_ref}" ]; then
-              echo "::error::no pinned UBUNTU_REF for ${runner_image}/${arch} in src/rootfs/build.ts" >&2
-              exit 1
-            fi
-
-            docker buildx build \
-              --platform="${platform}" \
-              --push \
-              --metadata-file="${metadata}" \
-              --build-arg "UBUNTU_REF=${ubuntu_ref}" \
-              --build-arg "UBUNTU_MAJOR=${ubuntu_major}" \
-              --build-arg "VP_VERSION=${vp_version}" \
-              --build-arg "VP_ARCH=${arch}" \
-              --build-arg "VP_SHA256=${vp_sha}" \
-              --build-arg "NODE_VERSION=${node_version}" \
-              -f src/rootfs/Dockerfile.base \
-              -t "${image}:${tag}" \
-              -t "${image}:${tag}-${{ github.ref_name }}" \
-              .
-
-            digest="$(jq -r '."containerimage.digest"' "${metadata}")"
-            if [ -z "${digest}" ] || [ "${digest}" = "null" ]; then
-              echo "docker buildx did not report a digest for ${tag}" >&2
-              exit 1
-            fi
-            printf '%s=%s@%s\n' "${runner_image}_${arch}" "${image}:${tag}" "${digest}" >> docker-image-refs.txt
-          }
-
-          cp artifacts/images/libscriptjail.so images/libscriptjail.so
-          build_one ubuntu-22.04 22.04 x64 linux/amd64 "${vp_sha_x64}" ubuntu-22.04
-          build_one ubuntu-24.04 24.04 x64 linux/amd64 "${vp_sha_x64}" ubuntu-24.04
-
-          cp artifacts/images/libscriptjail-arm64.so images/libscriptjail.so
-          build_one ubuntu-22.04 22.04 arm64 linux/arm64 "${vp_sha_arm64}" ubuntu-22.04-arm64
-          build_one ubuntu-24.04 24.04 arm64 linux/arm64 "${vp_sha_arm64}" ubuntu-24.04-arm64
-
-          linux_22="$(sed -n 's/^ubuntu-22.04_x64=//p' docker-image-refs.txt)"
-          linux_24="$(sed -n 's/^ubuntu-24.04_x64=//p' docker-image-refs.txt)"
-          arm64_22="$(sed -n 's/^ubuntu-22.04_arm64=//p' docker-image-refs.txt)"
-          arm64_24="$(sed -n 's/^ubuntu-24.04_arm64=//p' docker-image-refs.txt)"
-
-          {
-            echo
-            echo "## Docker image refs"
-            echo
-            echo "Update \`src/action/artifact-manifest.ts\` \`dockerImages\` with:"
-            echo
-            echo '```ts'
-            echo "  dockerImages: {"
-            echo "    x64: {"
-            echo "      'ubuntu-22.04': '${linux_22}',"
-            echo "      'ubuntu-24.04': '${linux_24}',"
-            echo "    },"
-            echo "    arm64: {"
-            echo "      'ubuntu-22.04': '${arm64_22}',"
-            echo "      'ubuntu-24.04': '${arm64_24}',"
-            echo "    },"
-            echo "  },"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Backfill gate: when the pinned `dockerImages` in the tagged
-      # src/action/artifact-manifest.ts are REAL (not placeholders), verify each
-      # digest actually resolves in GHCR before any npm publish runs. The Docker
-      # rootfs images are NOT byte-reproducible, so we cannot assert
-      # manifest==fresh-push equality (that would fail every backfill); we assert
-      # EXISTENCE, which catches a hand-copy typo or a stale/GC'd digest that
-      # would otherwise ship inside dist/main.cjs and break Docker-backend
-      # consumers (`docker pull <ref>` → manifest unknown). Placeholders (the
-      # v0.1.0 bootstrap) are skipped — there is nothing to resolve yet. Runs
-      # after GHCR login + this release's push, before publish, so a bad digest
-      # blocks the (irreversible) npm publish. The manifest is read with the
-      # bundled `node` (this job is install-free, so no oxnode), mirroring the
-      # UBUNTU_REF resolver above; the 4 refs are the only `ghcr.io/…@sha256:`
-      # string literals in the file.
+      # Backfill gate: the pinned `dockerImages` in the tagged
+      # src/action/artifact-manifest.ts must actually resolve in GHCR before any
+      # npm publish runs. The producer pushed these images on the release commit;
+      # this gate catches a hand-copy typo or a stale/GC'd digest that would
+      # otherwise ship inside dist/main.cjs and break Docker-backend consumers
+      # (`docker pull <ref>` → manifest unknown). The Docker rootfs images are
+      # NOT byte-reproducible, so we assert EXISTENCE, not equality. Runs after
+      # GHCR login, before publish, so a bad digest blocks the (irreversible) npm
+      # publish. The manifest is read with the bundled `node` (this job is
+      # install-free, so no oxnode); the 4 refs are the only
+      # `ghcr.io/…@sha256:` string literals in the file. Placeholders are
+      # impossible at tag time (the `verify` job's manifest gate fails first),
+      # but the skip branch is kept defensively.
       - name: Verify pinned Docker digests resolve in GHCR (backfill gate)
         run: |
           set -euo pipefail
@@ -753,16 +342,14 @@ jobs:
             exit 1
           fi
 
-      # Stage all four publishable npm packages from the downloaded build
-      # artifacts. scripts/npm-packages.mjs is the single source of truth for
-      # the package set (the tiny JS-only main `script-jail` plus the three
-      # per-platform optional packages @script-jail/{darwin-arm64,linux-x64,
-      # linux-arm64}); scripts/assemble-npm-packages.mjs stages each into
-      # npm-staging/<dir>/, gzipping the rootfs ext4s and copying the shims /
-      # VZ kernel / VZ helper. The build job already downloaded every input
-      # under ./artifacts (the x64/arm64 ext4s, libscriptjail{,-arm64}.so, the
-      # VZ kernel `vmlinux-vz-arm64`, the Mach-O `script-jail-vm-arm64-darwin`,
-      # and the committed dist/ JS bundles).
+      # Stage all four publishable npm packages. scripts/npm-packages.mjs is the
+      # single source of truth for the package set (the tiny JS-only main
+      # `script-jail` plus the three per-platform optional packages
+      # @script-jail/{darwin-arm64,linux-x64,linux-arm64}). assemble-npm-packages.mjs
+      # stages each into npm-staging/<dir>/: the dist/* JS bundles come from THIS
+      # tagged checkout (REPO_ROOT, real manifest), and the BINARY artifacts
+      # (gzipped rootfs ext4s, shims, VZ kernel, Mach-O helper) come from the
+      # downloaded ./artifacts dir.
       #
       # The version==tag gate stays here: the main package.json version (which
       # the assembler propagates to every staged manifest) must equal the tag.
@@ -785,13 +372,6 @@ jobs:
       # alone is not a gate. Assert each staged package's packed file list,
       # exec bit (darwin VZ helper), and size against its canonical spec before
       # any publish runs.
-      #
-      # NOTE (WS2 reviewer #6): adding a 4th default preload requires updating
-      # THREE places — the build-job upload glob (`dist/preloads/*.cjs`, already
-      # a glob), the assembler's main-bundle copy list, and the hard-coded
-      # `cmp -s` list in "Verify Docker runtime JS artifacts" above (NOT a
-      # glob). The packlist gate here resolves `dist/preloads/*.cjs` by glob so
-      # it picks up a new preload automatically.
       - name: Validate npm packlists
         run: node scripts/assert-npm-packlist.mjs --all npm-staging
 
@@ -799,6 +379,10 @@ jobs:
       # (or appends to an existing one) and uploads each listed file.  We pin
       # to the major tag — the maintainer's standard practice in this repo
       # for actions that publish frequent patch releases.
+      #
+      # The binary assets come from the downloaded producer artifacts; the
+      # dist/* action bundles (main.cjs/cli.cjs) come from THIS tagged checkout
+      # (REPO_ROOT), so the GitHub release carries the real-manifest bundle.
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
@@ -812,8 +396,8 @@ jobs:
             artifacts/images/vmlinux-vz-x86_64
             artifacts/images/vmlinux-vz-arm64
             artifacts/script-jail-vm-arm64-darwin
-            artifacts/dist/main.cjs
-            artifacts/dist/cli.cjs
+            dist/main.cjs
+            dist/cli.cjs
 
       # Publish the platform packages FIRST, then the main `script-jail`
       # package LAST. This order is load-bearing: the main package's
@@ -839,16 +423,12 @@ jobs:
           set -euo pipefail
           # Idempotent publish: skip any package whose exact name@version is
           # already on the registry, publish the rest. WHY:
-          #   - The v0.1.0 generating-run pushes the SAME tag whose 0.1.0
-          #     packages were already bootstrap-published manually/locally
-          #     (see docs/releasing.md Phase 2 / Phase 0 bootstrap exception),
-          #     so a bare re-publish would 409 ("cannot publish over an
-          #     existing version") and abort this `set -euo pipefail` job RED —
-          #     yet we still need the run to finish GREEN to build artifacts,
-          #     push the 4 GHCR images, and emit the SHA/digest summaries.
-          #   - It also makes every release re-run safe: if a later package
-          #     fails after an earlier one published, re-running republishes
-          #     only the still-unpublished packages (the documented recovery).
+          #   - It makes every release re-run safe: if a later package fails
+          #     after an earlier one published, re-running republishes only the
+          #     still-unpublished packages (the documented recovery).
+          #   - It also keeps a re-run that re-pushes the same tag from 409ing
+          #     ("cannot publish over an existing version") and aborting this
+          #     `set -euo pipefail` job RED.
           # `npm view <name>@<version> version` is a read-only, no-auth probe;
           # its non-zero exit (version absent) is consumed by the `if`, so it
           # never trips `pipefail`. Platform packages first, main last — the
