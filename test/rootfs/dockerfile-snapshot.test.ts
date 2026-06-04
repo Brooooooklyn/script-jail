@@ -120,7 +120,7 @@ describe('Dockerfile.base arm64 frozen-release-pocket wiring (Option A)', () => 
     // ca-certificates that the release-pocket candidate-pin cannot downgrade.
     const elseIdx = DOCKERFILE.indexOf('else \\');
     const bootstrapIdx = DOCKERFILE.indexOf(
-      'ca-certificates bootstrap failed after 5 attempts',
+      'ca-certificates bootstrap failed after 8 attempts',
     );
     expect(elseIdx, 'arch if/else must exist').toBeGreaterThan(-1);
     expect(bootstrapIdx, 'phase-1 bootstrap must exist').toBeGreaterThan(-1);

@@ -47,9 +47,12 @@ jobs:
   e2e:
     name: e2e (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # 20 minutes covers worst-case: cold pnpm install + Docker rootfs build
-    # (~8 min on ubuntu-22.04) + two VM boots.  Typical run is ~12 min.
-    timeout-minutes: 20
+    # 40 minutes covers worst-case: cold pnpm install + Docker rootfs build
+    # (~8 min on ubuntu-22.04) + two VM boots, PLUS headroom for the apt
+    # retry/backoff loops to ride out transient snapshot.ubuntu.com 503s
+    # (up to 8 attempts with growing 5,10,…,35s backoff per loop).  Typical
+    # run is ~12 min; release.yml's build job is already 60.
+    timeout-minutes: 40
 
     # Self-test escape hatch.  This env var disables BOTH the manifest
     # validation gate and the release-artifact pre-fetch step in

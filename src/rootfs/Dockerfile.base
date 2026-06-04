@@ -103,8 +103,9 @@ ARG NODE_VERSION
 #
 # `curl` is added to the package set: it downloads the `vp` tarball below.
 RUN set -eu; \
-    echo 'Acquire::http::Timeout "30";'        > /etc/apt/apt.conf.d/99script-jail-net; \
-    echo 'Acquire::Retries "3";'              >> /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::http::Timeout "60";'        > /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::https::Timeout "60";'       >> /etc/apt/apt.conf.d/99script-jail-net; \
+    echo 'Acquire::Retries "5";'              >> /etc/apt/apt.conf.d/99script-jail-net; \
     echo 'Acquire::ForceIPv4 "true";'         >> /etc/apt/apt.conf.d/99script-jail-net; \
     echo 'Acquire::Check-Valid-Until "false";' >> /etc/apt/apt.conf.d/99script-jail-net; \
     # Pin apt to a frozen archive so phase-2 resolves identical package versions
@@ -155,13 +156,13 @@ RUN set -eu; \
       # release pocket only carries the older release-day version, so apt would
       # keep the newer live one).  By skipping it, arm64 installs ca-certificates
       # fresh from the frozen release pocket in phase 2 → reproducible.
-      for attempt in 1 2 3 4 5; do \
+      for attempt in 1 2 3 4 5 6 7 8; do \
         if apt-get update && \
            apt-get install -y --no-install-recommends ca-certificates; then \
           break; \
         fi; \
-        if [ "$attempt" = "5" ]; then \
-          echo "ca-certificates bootstrap failed after 5 attempts" >&2; exit 1; \
+        if [ "$attempt" = "8" ]; then \
+          echo "ca-certificates bootstrap failed after 8 attempts" >&2; exit 1; \
         fi; \
         echo "ca-certificates bootstrap attempt $attempt failed; sleeping before retry" >&2; \
         sleep $((attempt * 5)); \
@@ -216,7 +217,7 @@ RUN set -eu; \
     # frozen version on both arches.  cc_ver is resolved INSIDE the loop, after
     # each fresh update, so it reflects the fully-fetched lists; an empty
     # resolution fails the attempt.
-    for attempt in 1 2 3 4 5; do \
+    for attempt in 1 2 3 4 5 6 7 8; do \
       if apt-get update \
          && cc_ver="$(apt-cache policy ca-certificates | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p')" \
          && [ -n "${cc_ver}" ] \
@@ -225,8 +226,8 @@ RUN set -eu; \
               strace busybox dumb-init socat curl; then \
         break; \
       fi; \
-      if [ "$attempt" = "5" ]; then \
-        echo "snapshot apt update/install failed after 5 attempts" >&2; exit 1; \
+      if [ "$attempt" = "8" ]; then \
+        echo "snapshot apt update/install failed after 8 attempts" >&2; exit 1; \
       fi; \
       echo "snapshot apt attempt $attempt failed; sleeping before retry" >&2; \
       sleep $((attempt * 5)); \
@@ -254,10 +255,10 @@ RUN mkdir -p /work /etc/script-jail /usr/local/lib/script-jail /usr/local/bin /o
 # load-bearing for the byte-stable lockfile (a bare major would drift).
 RUN set -eu; \
     url="https://registry.npmjs.org/@voidzero-dev/vite-plus-cli-linux-${VP_ARCH}-gnu/-/vite-plus-cli-linux-${VP_ARCH}-gnu-${VP_VERSION}.tgz"; \
-    for attempt in 1 2 3 4 5; do \
-      if curl -fsSL --retry 3 -o /tmp/vp.tgz "$url"; then break; fi; \
-      if [ "$attempt" = "5" ]; then \
-        echo "vp download failed after 5 attempts: $url" >&2; exit 1; \
+    for attempt in 1 2 3 4 5 6 7 8; do \
+      if curl -fsSL --retry 5 -o /tmp/vp.tgz "$url"; then break; fi; \
+      if [ "$attempt" = "8" ]; then \
+        echo "vp download failed after 8 attempts: $url" >&2; exit 1; \
       fi; \
       echo "vp download attempt $attempt failed; retrying" >&2; sleep $((attempt * 5)); \
     done; \
