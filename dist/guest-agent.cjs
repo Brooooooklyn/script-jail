@@ -25922,9 +25922,28 @@ var ProtectedPathsMatcher = class {
     const tokenized = tokenize(rawPath, this.roots);
     return import_micromatch.default.isMatch(tokenized, this.tokenizedPatterns, { dot: true });
   }
+  /**
+   * Returns true when `rawPath` is the node_modules root or anything beneath
+   * it.  Matched on the RAW absolute path (not tokenized) because the drop
+   * decision in {@link applyProtectedPathsPolicy} runs per-event before the
+   * package-relative `$PKG` token is known; a sibling-package read and the
+   * current package's own read both live under this root and are both meant to
+   * be dropped (normalize would drop the `$PKG` ones anyway).
+   *
+   * Returns false for the no-op matcher (empty `nodeModules` root), so a
+   * pipeline constructed without real roots never suppresses reads.
+   */
+  isUnderNodeModules(rawPath) {
+    const nm = this.roots.nodeModules;
+    if (nm.length === 0) return false;
+    return rawPath === nm || rawPath.startsWith(`${nm}/`);
+  }
 };
 function applyProtectedPathsPolicy(ev, matcher) {
   if (ev.raw.kind !== "read" && ev.raw.kind !== "write") return ev;
+  if (ev.raw.kind === "read" && matcher.isUnderNodeModules(ev.raw.path) && !matcher.isProtected(ev.raw.path)) {
+    return null;
+  }
   if (ev.raw.errno === void 0) {
     if (ev.raw.dirfd === void 0 && ev.raw.retFd === void 0) return ev;
     return { ...ev, raw: stripTransport(ev.raw) };
@@ -25990,20 +26009,39 @@ function parseShimLine(line) {
   }
 }
 function shimExecAttribution(line) {
+  return shimNpmAttribution(line, "exec");
+}
+function shimNpmFields(line, kind) {
   try {
     const obj = JSON.parse(line);
-    if (obj["kind"] !== "exec") return null;
+    if (obj["kind"] !== kind) return null;
     const name = obj["npm_package_name"];
     const version2 = obj["npm_package_version"];
     const event = obj["npm_lifecycle_event"];
-    return attributionFromEnvVars(
-      typeof name === "string" ? name : void 0,
-      typeof version2 === "string" ? version2 : void 0,
-      typeof event === "string" ? event : void 0
-    );
+    const pathological = typeof name === "string" && name.length > 214 || typeof version2 === "string" && version2.length > 256;
+    return {
+      name: typeof name === "string" ? name : void 0,
+      version: typeof version2 === "string" ? version2 : void 0,
+      event: typeof event === "string" ? event : void 0,
+      pathological
+    };
   } catch {
     return null;
   }
+}
+function shimNpmAttribution(line, kind) {
+  const fields = shimNpmFields(line, kind);
+  if (fields === null || fields.pathological) return null;
+  return attributionFromEnvVars(fields.name, fields.version, fields.event);
+}
+function classifyShimNodeStartupMarker(line) {
+  const fields = shimNpmFields(line, "node_startup_done");
+  if (fields === null) return { attribution: null, pathological: false };
+  if (fields.pathological) return { attribution: null, pathological: true };
+  return {
+    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event),
+    pathological: false
+  };
 }
 function pathBasename(pathLike) {
   const nul = pathLike.indexOf("\0");
@@ -26553,9 +26591,29 @@ async function runInstallPhase(input) {
   const forgerySamples = [];
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
+  const nodeStartupMarkerByPid = /* @__PURE__ */ new Map();
+  const supersededByDifferentGenerationMarker = (pid, snapshot) => {
+    const marker = nodeStartupMarkerByPid.get(pid);
+    if (marker === void 0 || snapshot.recordedAtTs >= marker.ts) return false;
+    const attrib = nodeStartupAttributionByPid.get(pid);
+    if (attrib !== void 0) {
+      return attrib.pkg !== snapshot.pkg || attrib.lifecycle !== snapshot.lifecycle;
+    }
+    return marker.pathological;
+  };
   const snapshotAttribution = (pid) => {
     const snapshot = attributionSnapshotByPid.get(pid);
     if (snapshot === void 0) return null;
+    if (supersededByDifferentGenerationMarker(pid, snapshot)) return null;
+    return {
+      pkg: snapshot.pkg,
+      lifecycle: snapshot.lifecycle
+    };
+  };
+  const freshSnapshotAttribution = (pid) => {
+    const snapshot = attributionSnapshotByPid.get(pid);
+    if (snapshot === void 0 || snapshot.stale) return null;
+    if (supersededByDifferentGenerationMarker(pid, snapshot)) return null;
     return {
       pkg: snapshot.pkg,
       lifecycle: snapshot.lifecycle
@@ -26572,6 +26630,8 @@ async function runInstallPhase(input) {
       });
     }
   };
+  const nodeStartupAttributionByPid = /* @__PURE__ */ new Map();
+  const nodeStartupAttribution = (pid) => nodeStartupAttributionByPid.get(pid) ?? null;
   const nodeBootstrapEnvPendingPids = /* @__PURE__ */ new Set();
   const nodeBootstrapFilePendingPids = /* @__PURE__ */ new Set();
   const nodeBootstrapFileCompletedPids = /* @__PURE__ */ new Set();
@@ -26778,6 +26838,16 @@ async function runInstallPhase(input) {
           completedPackageManagerClientPids.delete(shimEvent.pid);
           packageManagerClientPids.add(shimEvent.pid);
         }
+        const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line);
+        nodeStartupMarkerByPid.set(shimEvent.pid, {
+          ts: lineTs,
+          pathological: startupPathological
+        });
+        if (startupAttrib !== null) {
+          nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
+        } else {
+          nodeStartupAttributionByPid.delete(shimEvent.pid);
+        }
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
         if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
           nodeBootstrapFilePendingPids.add(shimEvent.pid);
@@ -26795,7 +26865,7 @@ async function runInstallPhase(input) {
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
         continue;
       }
-      const attribution = shimAttrib ?? result ?? snapshotAttribution(shimEvent.pid);
+      const attribution = shimAttrib ?? result ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
       if (attribution !== null) {
         const seed = shimAttrib ?? result;
         if (seed !== null) {

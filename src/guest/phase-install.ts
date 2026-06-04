@@ -356,20 +356,125 @@ export function parseShimLine(line: string): ShimLineEvent | null {
  * /proc walk.
  */
 export function shimExecAttribution(line: string): AttributionResult | null {
+  return shimNpmAttribution(line, 'exec');
+}
+
+/**
+ * Extract the in-process npm lifecycle attribution the LD_PRELOAD shim stamps
+ * into its `node_startup_done` marker (same `npm_package_name` /
+ * `npm_package_version` / `npm_lifecycle_event` ctor snapshot it stamps into
+ * `exec`).  Returns an {@link AttributionResult} (byte-identical to the
+ * /proc-walk path) or null when not a `node_startup_done` record / carries no
+ * canonical attribution.
+ *
+ * Why this exists separately from {@link shimExecAttribution}: a short-lived
+ * spawned Node child (the motivating case is puppeteer's `node install.mjs`,
+ * which reads ~90 env vars then exits in a sub-millisecond burst) may emit NO
+ * `exec` record of its own — it was exec'd by its parent — yet env-spy still
+ * fires this marker the instant the Node bootstrap completes, BEFORE any
+ * post-bootstrap `process.env` / libc env read is dispatched.  Seeding the
+ * pid's attribution snapshot from this marker (see the `node_startup_done`
+ * handler in the dispatch loop) means those env reads attribute deterministically
+ * even when the child's /proc is reaped before the tailer drains them — the
+ * env_read analog of {@link shimExecAttribution}'s reaped-helper exec fix.
+ */
+export function shimNodeStartupAttribution(
+  line: string,
+): AttributionResult | null {
+  return shimNpmAttribution(line, 'node_startup_done');
+}
+
+/**
+ * Lowest-level parse of the npm lifecycle fields the shim stamps into its `exec`
+ * and `node_startup_done` records, gated on the record `kind`.  Returns the
+ * three raw fields plus a `pathological` flag, or null when the line is not the
+ * requested kind / not JSON.
+ *
+ * `pathological` is true when an npm name/version field is PRESENT but exceeds
+ * the npm limits (name > 214 or version > 256) — audit-trust re-review,
+ * 2026-06-04.  The shim stamps these fields into a fixed 1024-byte marker
+ * buffer; an overlong, child-controlled value is TRUNCATED there (the shim
+ * appends a `<truncated>` marker) rather than omitted, and `<`/`>` cannot appear
+ * in a real npm name (max 214 bytes) while 256 is far beyond any real semver.
+ * So both thresholds cleanly separate a truncated/forged synthetic id from a
+ * legitimate value.  Seeding off such a value would deterministically attribute
+ * a reaped child to a SYNTHETIC package id (and break normalize's pkgDirs lookup,
+ * keyed by the real name@version) instead of falling back to the /proc walk.
+ */
+function shimNpmFields(
+  line: string,
+  kind: 'exec' | 'node_startup_done',
+): {
+  name: string | undefined;
+  version: string | undefined;
+  event: string | undefined;
+  pathological: boolean;
+} | null {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
-    if (obj['kind'] !== 'exec') return null;
+    if (obj['kind'] !== kind) return null;
     const name = obj['npm_package_name'];
     const version = obj['npm_package_version'];
     const event = obj['npm_lifecycle_event'];
-    return attributionFromEnvVars(
-      typeof name === 'string' ? name : undefined,
-      typeof version === 'string' ? version : undefined,
-      typeof event === 'string' ? event : undefined,
-    );
+    const pathological =
+      (typeof name === 'string' && name.length > 214) ||
+      (typeof version === 'string' && version.length > 256);
+    return {
+      name: typeof name === 'string' ? name : undefined,
+      version: typeof version === 'string' ? version : undefined,
+      event: typeof event === 'string' ? event : undefined,
+      pathological,
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * Shared extractor for the npm lifecycle attribution the shim stamps into its
+ * `exec` and `node_startup_done` records, gated on the record `kind`.  Composes
+ * via {@link attributionFromEnvVars} so a shim-sourced attribution renders
+ * byte-identically to the /proc-walk path.  Fails CLOSED (null) on a pathological
+ * name/version (see {@link shimNpmFields}) so the dispatcher chain falls back to
+ * the /proc walk / `<unattributed>` rather than a truncated synthetic id.
+ */
+function shimNpmAttribution(
+  line: string,
+  kind: 'exec' | 'node_startup_done',
+): AttributionResult | null {
+  const fields = shimNpmFields(line, kind);
+  if (fields === null || fields.pathological) return null;
+  return attributionFromEnvVars(fields.name, fields.version, fields.event);
+}
+
+/**
+ * Classify a `node_startup_done` marker into the attribution it can seed PLUS a
+ * `pathological` flag the dispatcher uses as a generation barrier.
+ *
+ *   - `attribution`: the seedable {@link AttributionResult}, or null for a bare
+ *     (no name), non-canonical-lifecycle, or pathological marker.
+ *   - `pathological`: true ONLY for an overlong-name/version marker (a truncated
+ *     / forged synthetic id; see {@link shimNpmFields}).  A recycled pid emitting
+ *     such a marker is treated as a generation barrier so its reaped reads FAIL
+ *     CLOSED rather than inheriting an earlier generation's shared snapshot
+ *     (Finding 1, audit-trust re-review 2026-06-04).  A bare or non-canonical
+ *     marker is deliberately NOT a barrier: those are legitimate
+ *     same-generation processes — a non-lifecycle helper, or a `npm run <task>`
+ *     child whose own `npm_lifecycle_event` is non-canonical — whose late-drained
+ *     reads still belong to their ancestor-propagated snapshot.  Demoting them
+ *     would regress the very fast-exit attribution this machinery provides.
+ */
+export function classifyShimNodeStartupMarker(line: string): {
+  attribution: AttributionResult | null;
+  pathological: boolean;
+} {
+  const fields = shimNpmFields(line, 'node_startup_done');
+  if (fields === null) return { attribution: null, pathological: false };
+  if (fields.pathological) return { attribution: null, pathological: true };
+  return {
+    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event),
+    pathological: false,
+  };
 }
 
 function pathBasename(pathLike: string): string {
@@ -2146,13 +2251,118 @@ export async function runInstallPhase(
       stale: boolean;
     }
   > = new Map();
+  // Per-pid record of the most recent node_startup_done marker observed for the
+  // pid: its dispatch ts (the monotonic `lineTs`) and whether it was
+  // `pathological` (an overlong/forged synthetic npm id; see
+  // {@link classifyShimNodeStartupMarker}).  Stamped on EVERY marker (valid or
+  // not) because a marker proves a NEW process bootstrap completed on that pid —
+  // a process emits it exactly once.  The two snapshot helpers below use it to
+  // DEMOTE a shared snapshot recorded BEFORE the current generation's marker:
+  // such a snapshot belongs to an earlier generation whose `+++ exited +++` line
+  // may not have been drained yet (strace -ff cross-file reorder), so its
+  // `stale` bit alone is unreliable for the recycled-pid case (audit-trust
+  // re-review, 2026-06-04).  Scoped to the shim-event chain only — the strace
+  // spawn/bypass/clone fallbacks read `attributionSnapshotByPid` directly and
+  // are unaffected.
+  const nodeStartupMarkerByPid: Map<number, { ts: number; pathological: boolean }> =
+    new Map();
+  // A shared snapshot is superseded by the marker only when it is a genuinely
+  // EARLIER generation: it predates the pid's current bootstrap marker
+  // (recordedAtTs < marker.ts) AND the marker is evidence of a DIFFERENT
+  // generation.  Both signals are required.  The normal flow records a snapshot
+  // at exec time and fires the marker at bootstrap-done, so a SAME-generation
+  // snapshot also predates its marker — so predating alone is insufficient.  The
+  // second signal depends on what the marker carries:
+  //   - VALID marker: demote when it names a different generation — a different
+  //     package OR a different lifecycle stage of the same package (Finding 2,
+  //     re-review 2026-06-04: comparing pkg alone let a same-pkg cross-stage
+  //     recycle keep the dead stage's snapshot).  A matching (pkg, lifecycle)
+  //     marker is the same generation, so it is NOT demoted and a fast-exit
+  //     Node's late-drained reads still attribute from the snapshot.
+  //   - NO valid attribution: demote ONLY when the marker is `pathological`
+  //     (overlong/forged id) — a recycled generation asserting a synthetic
+  //     identity must fail closed rather than inherit the dead generation's
+  //     snapshot (Finding 1).  A BARE or NON-CANONICAL marker is NOT demoted:
+  //     it is a legitimate same-generation process (a non-lifecycle helper, or a
+  //     `npm run <task>` child) whose reads belong to its ancestor-propagated
+  //     snapshot.
+  //
+  // ACCEPTED RESIDUAL (round-4 adversarial review, 2026-06-04): the bare /
+  // non-canonical branch leaves one theoretical pid-reuse misattribution open.
+  // If a pid is recycled before its gen-1 `+++ exited +++` line drains (so the
+  // gen-1 snapshot is still `stale:false`) AND gen-2 emits a bare/non-canonical
+  // marker AND gen-2's own clone/execve is NOT observed before its reaped read,
+  // then gen-2's late-drained env reads inherit gen-1's not-yet-stale snapshot.
+  // This is NOT fixable in-band: the signature (bare marker + predating
+  // snapshot + identical ts-ordering) is BYTE-IDENTICAL to the legitimate
+  // same-generation fast-exit case pinned by the "attributes fast-exit Node env
+  // reads from the pid snapshot after /proc is gone" test — the only difference
+  // is whether a recycle actually occurred, which is unobservable without the
+  // undrained gen-1 exit line.  Failing closed here (the reviewer's suggestion)
+  // would drop that legitimate helper's reads (benign AND protected — `hidden`
+  // surfacing is independent of pkg attribution, so failing closed loses signal
+  // a credential read would otherwise carry).  When gen-2's clone IS observed,
+  // clone-propagation already overwrites the dead snapshot via recordAttribution
+  // monotonicity (see the clone handler), so the hole is non-empty only in the
+  // unobserved-clone case where no in-band generation signal exists.  This is
+  // the shim-channel analog of the same PID_MAX-wrap-bounded reorder race the
+  // strace path documents and accepts (see `attributionSnapshotByPid` and the
+  // exit-line handler); worst case is one read mislabeled to a SIBLING package
+  // of the same install — not a confidentiality breach.  Characterised by the
+  // "bare/non-canonical recycled-pid reaped read (accepted residual)" tests.
+  //
+  // References `nodeStartupAttributionByPid`, declared below; only called from
+  // the event loop, so the closure resolves it after declaration.
+  const supersededByDifferentGenerationMarker = (
+    pid: number,
+    snapshot: { pkg: string; lifecycle: AttributedEvent['lifecycle']; recordedAtTs: number },
+  ): boolean => {
+    const marker = nodeStartupMarkerByPid.get(pid);
+    if (marker === undefined || snapshot.recordedAtTs >= marker.ts) return false;
+    const attrib = nodeStartupAttributionByPid.get(pid);
+    if (attrib !== undefined) {
+      return attrib.pkg !== snapshot.pkg || attrib.lifecycle !== snapshot.lifecycle;
+    }
+    return marker.pathological;
+  };
   const snapshotAttribution = (
     pid: number,
   ): { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null => {
     const snapshot = attributionSnapshotByPid.get(pid);
     if (snapshot === undefined) return null;
+    // Never attribute under an earlier generation's snapshot, even as a last
+    // resort, or a recycled pid's late-drained reads route to the dead package.
+    if (supersededByDifferentGenerationMarker(pid, snapshot)) return null;
     // Shim JSONL can be written before process exit but drained after /proc is
-    // gone, so this fallback intentionally accepts stale snapshots.
+    // gone, so this fallback otherwise intentionally accepts stale snapshots.
+    return {
+      pkg: snapshot.pkg,
+      lifecycle: snapshot.lifecycle,
+    };
+  };
+  // Like {@link snapshotAttribution} but returns null for a STALE snapshot.
+  // A stale entry is a DEAD generation's attribution (set by the exit-line
+  // handler when /proc is also reaped).  The shim-event fallback chain consults
+  // this fresh-only view BEFORE the node_startup_done marker so a freshly
+  // recorded current-generation attribution (one recorded AFTER the marker —
+  // e.g. a post-bootstrap exec into a new package context) still wins, then
+  // falls back to the marker (the live generation's own ctor snapshot), and only
+  // LAST to the stale-accepting `snapshotAttribution`.  Without this split a
+  // recycled pid's stale dead-generation snapshot would outrank the new
+  // generation's marker and mis-attribute the new generation's reaped shim
+  // reads (audit-trust re-review, 2026-06-04).  The marker-ts demotion below
+  // additionally covers the case where the dead generation's exit line has NOT
+  // been drained yet, so its snapshot is still `stale:false`.
+  const freshSnapshotAttribution = (
+    pid: number,
+  ): { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null => {
+    const snapshot = attributionSnapshotByPid.get(pid);
+    if (snapshot === undefined || snapshot.stale) return null;
+    // Defer to the marker when this snapshot is an earlier generation superseded
+    // by a different-package marker (the delayed-exit recycled-pid case, where
+    // the dead generation's exit line has not been drained so `stale` is still
+    // false; see supersededByDifferentGenerationMarker).
+    if (supersededByDifferentGenerationMarker(pid, snapshot)) return null;
     return {
       pkg: snapshot.pkg,
       lifecycle: snapshot.lifecycle,
@@ -2184,6 +2394,34 @@ export async function runInstallPhase(
       });
     }
   };
+
+  // node_startup_done attribution — deliberately SEPARATE from
+  // `attributionSnapshotByPid` (audit-trust, 2026-06-04).  The shim stamps a
+  // process's own ctor-snapshotted npm lifecycle env into its
+  // `node_startup_done` marker; this map records it per pid so the shim-event
+  // attribution chain below can fall back to it when the /proc walk has already
+  // been reaped (the motivating case: puppeteer's `node install.mjs` reads ~90
+  // env vars then exits before the tailer drains them).
+  //
+  // Why a SEPARATE map and NOT `recordAttribution`: `recordAttribution` writes
+  // `stale:false`, which would CLEAR the stale flag the exit-line handler sets
+  // on a reaped pid's shared snapshot.  That flag exists precisely so the
+  // strace spawn/bypass/clone fallbacks route a dead generation's observations
+  // to `<unattributed>` rather than confidently mis-attributing them after a
+  // pid is recycled.  Routing the marker through the shared snapshot would
+  // freshen that flag and reopen the pid-reuse misattribution window.  Keeping
+  // the marker in its own map — consulted ONLY by the shim-event chain (env_read
+  // / dlopen), never by the strace spawn/bypass/clone fallbacks — gives the
+  // reaped-child env_read fix without touching the shared snapshot at all.  Like
+  // the stale-accepting `snapshotAttribution`, it intentionally SURVIVES the
+  // pid's exit (the env reads are drained after exit); a recycled generation's
+  // own marker REPLACES the entry (valid → set, invalid → DELETE; see the marker
+  // handler) and records its dispatch ts in `nodeStartupMarkerByPid` so an
+  // older generation's shared snapshot is demoted.  The live /proc walk
+  // (`result`) is always tried first, so a live recycled pid is unaffected.
+  const nodeStartupAttributionByPid: Map<number, AttributionResult> = new Map();
+  const nodeStartupAttribution = (pid: number): AttributionResult | null =>
+    nodeStartupAttributionByPid.get(pid) ?? null;
 
   const nodeBootstrapEnvPendingPids = new Set<number>();
   const nodeBootstrapFilePendingPids = new Set<number>();
@@ -2492,6 +2730,51 @@ export async function runInstallPhase(
           completedPackageManagerClientPids.delete(shimEvent.pid);
           packageManagerClientPids.add(shimEvent.pid);
         }
+        // Deterministic, reap-proof attribution seed (2026-06-04).  The shim
+        // stamps this process's own ctor-snapshotted npm lifecycle env into the
+        // marker; env-spy fires it the instant the Node bootstrap completes,
+        // BEFORE any post-bootstrap env read is dispatched.  Recording the pid's
+        // attribution here means a short-lived spawned Node child whose /proc is
+        // reaped before its env reads are tailed (puppeteer's `node install.mjs`:
+        // ~90 reads then immediate exit) still attributes every read — closing
+        // the cross-backend env_read capture race the way shimExecAttribution
+        // closed the reaped-helper exec race.  Purely additive: the shim-event
+        // chain below consults this map only AFTER `shimAttrib`, the /proc walk
+        // (`result`), and the shared snapshot all return null, so packages whose
+        // process is still alive (or already seeded by an exec record) are
+        // attributed exactly as before.  It is stored in its OWN map — NOT the
+        // shared snapshot via recordAttribution — so it never clears the
+        // exit-line `stale` flag and never reaches the strace spawn/bypass/clone
+        // fallbacks (see the nodeStartupAttributionByPid declaration).
+        //
+        // TRUST: the npm fields ride the shim's events-file channel, trusted at
+        // the SAME level as the /proc-walk env they mirror (see
+        // attribution.ts:_walk TODO(v2) and the seed-site trust note below) —
+        // not higher.  attributionFromEnvVars returns null unless
+        // npm_lifecycle_event is canonical, so npm/pnpm's own client Node
+        // processes (no canonical lifecycle) record nothing, and a pm-client
+        // pid's reads are filtered regardless.
+        // Record the marker generation for this pid.  Stamp the marker ts +
+        // `pathological` flag on EVERY marker (the snapshot helpers use the ts to
+        // demote older-generation snapshots, and the flag to fail closed on a
+        // forged synthetic id; see supersededByDifferentGenerationMarker), and
+        // REPLACE the attribution entry: set it for a valid marker, DELETE it for
+        // a bare / non-canonical / overlong-rejected one.  Deleting is essential —
+        // the map survives the pid's exit, so a recycled pid emitting an invalid
+        // marker must clear the dead generation's entry; otherwise the env_read
+        // site would fall through to it and the overlong-name fail-closed guard
+        // would not actually fail closed (audit-trust re-review, 2026-06-04).
+        const { attribution: startupAttrib, pathological: startupPathological } =
+          classifyShimNodeStartupMarker(line);
+        nodeStartupMarkerByPid.set(shimEvent.pid, {
+          ts: lineTs,
+          pathological: startupPathological,
+        });
+        if (startupAttrib !== null) {
+          nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
+        } else {
+          nodeStartupAttributionByPid.delete(shimEvent.pid);
+        }
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
         if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
           nodeBootstrapFilePendingPids.add(shimEvent.pid);
@@ -2570,7 +2853,24 @@ export async function runInstallPhase(
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) {
         continue;
       }
-      const attribution = shimAttrib ?? result ?? snapshotAttribution(shimEvent.pid);
+      // Fallback order (audit-trust re-review, 2026-06-04): shim self-
+      // attribution (exec records) → live /proc walk → FRESH shared snapshot →
+      // node_startup_done marker → STALE shared snapshot.  The marker sits
+      // BETWEEN fresh and stale on purpose: a current-generation snapshot still
+      // wins, but the marker (the live generation's own ctor snapshot) must
+      // outrank a DEAD generation's stale snapshot so a recycled pid's reaped
+      // shim reads attribute to the new package, not the dead one.  The marker
+      // is isolated to this shim-event chain: it never feeds the strace
+      // spawn/bypass/clone fallbacks (see the nodeStartupAttributionByPid
+      // declaration).  The stale-accepting snapshot remains the LAST resort so a
+      // non-Node process that emitted no marker still attributes its own late-
+      // drained reads (the case `snapshotAttribution` was built for).
+      const attribution =
+        shimAttrib ??
+        result ??
+        freshSnapshotAttribution(shimEvent.pid) ??
+        nodeStartupAttribution(shimEvent.pid) ??
+        snapshotAttribution(shimEvent.pid);
       if (attribution !== null) {
         // Finding 3 (audit-trust): snapshot attribution for this pid on
         // every successful observation.  A later raw execve from the

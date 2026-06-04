@@ -220,6 +220,93 @@ describe('applyProtectedPathsPolicy', () => {
     });
   });
 
+  describe('benign cross-package reads under $NODE_MODULES (DROPPED)', () => {
+    // A lifecycle script reading a sibling installed package is normal install
+    // behavior; these reads are dropped before emission regardless of
+    // success/ENOENT/EACCES. Writes under node_modules are tampering and are
+    // never dropped. Protected paths (auditor opt-in) are exempt — see the
+    // separate describe below.
+    it('drops a successful read under $NODE_MODULES', () => {
+      const ev = readEv('/work/node_modules/debug/src/index.js');
+      expect(applyProtectedPathsPolicy(ev, matcher)).toBeNull();
+    });
+
+    it('drops an ENOENT read under $NODE_MODULES', () => {
+      const ev = readEv('/work/node_modules/.pnpm/x@1/node_modules/x/missing.js', 'ENOENT');
+      expect(applyProtectedPathsPolicy(ev, matcher)).toBeNull();
+    });
+
+    it('drops an EACCES read under $NODE_MODULES', () => {
+      const ev = readEv('/work/node_modules/victim/secret', 'EACCES');
+      expect(applyProtectedPathsPolicy(ev, matcher)).toBeNull();
+    });
+
+    it('drops a read of the bare $NODE_MODULES root', () => {
+      const ev = readEv('/work/node_modules');
+      expect(applyProtectedPathsPolicy(ev, matcher)).toBeNull();
+    });
+
+    it('does NOT drop a WRITE under $NODE_MODULES (tampering must surface)', () => {
+      const ev = writeEv('/work/node_modules/victim/index.js');
+      const out = applyProtectedPathsPolicy(ev, matcher);
+      expect(out).not.toBeNull();
+      expect(out!.raw.kind).toBe('write');
+    });
+
+    it('does NOT drop a read OUTSIDE $NODE_MODULES', () => {
+      // /work/node_modules_evil is a sibling of node_modules, NOT under it —
+      // the prefix check must require an exact root or a trailing-slash child.
+      const outside = readEv('/work/node_modules_evil/x.js');
+      expect(applyProtectedPathsPolicy(outside, matcher)).toBe(outside);
+      const repoRead = readEv('/work/src/index.ts');
+      expect(applyProtectedPathsPolicy(repoRead, matcher)).toBe(repoRead);
+    });
+  });
+
+  describe('protected reads under $NODE_MODULES are EXEMPT from the drop', () => {
+    // Auditor opted into a node_modules path via protected.files. The benign
+    // drop must NOT swallow it; it surfaces exactly like any protected read.
+    const protectedNm = new ProtectedPathsMatcher({
+      patterns: ['$NODE_MODULES/**'],
+      roots,
+    });
+
+    it('preserves a SUCCESSFUL protected node_modules read (plain, like elsewhere)', () => {
+      const ev = readEv('/work/node_modules/victim/.npmrc'); // no errno
+      // Successful protected reads pass through unchanged (hidden=false) — the
+      // same contract as a successful protected read anywhere else.
+      expect(applyProtectedPathsPolicy(ev, protectedNm)).toBe(ev);
+    });
+
+    it('surfaces a FAILED protected node_modules read as hidden=true', () => {
+      const ev = readEv('/work/node_modules/victim/.npmrc', 'ENOENT');
+      const out = applyProtectedPathsPolicy(ev, protectedNm);
+      expect(out).not.toBeNull();
+      if (out!.raw.kind === 'read') {
+        expect(out!.raw.hidden).toBe(true);
+        expect(out!.raw).not.toHaveProperty('errno');
+      }
+    });
+  });
+
+  describe('ProtectedPathsMatcher.isUnderNodeModules', () => {
+    it('matches the root and any descendant, not siblings', () => {
+      const m = new ProtectedPathsMatcher({ patterns: [], roots });
+      expect(m.isUnderNodeModules('/work/node_modules')).toBe(true);
+      expect(m.isUnderNodeModules('/work/node_modules/debug/index.js')).toBe(true);
+      expect(m.isUnderNodeModules('/work/node_modules_evil/x')).toBe(false);
+      expect(m.isUnderNodeModules('/work/src/index.ts')).toBe(false);
+    });
+
+    it('is a no-op for a matcher with an empty nodeModules root', () => {
+      const noop = new ProtectedPathsMatcher({
+        patterns: [],
+        roots: { repo: '', nodeModules: '', home: '', tmp: '', cache: '' },
+      });
+      expect(noop.isUnderNodeModules('/anything/node_modules/x')).toBe(false);
+    });
+  });
+
   describe('protected ENOENT writes', () => {
     it('stamps hidden=true and strips errno', () => {
       const ev = writeEv('/work/.env', 'ENOENT');
