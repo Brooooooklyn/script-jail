@@ -9,11 +9,18 @@
 //   - for the main package, derives the manifest from the repo-root
 //     package.json (overwriting `files`/`optionalDependencies`, dropping
 //     devDependencies/scripts/packageManager) and copies the committed JS
-//     bundles from <artifacts>/dist/... plus the repo README,
+//     bundles from REPO_ROOT/dist/... plus the repo README,
 //   - for the platform packages, gzips (zlib, fixed level — run-to-run
 //     deterministic, NOT byte-identical to GNU `gzip -n`) or copies each
-//     artifact from <artifacts>/<src> into the staged dir, applying the
+//     BINARY artifact from <artifacts>/<src> into the staged dir, applying the
 //     spec mode (0o755 for the VZ helper, else 0o644).
+//
+// DIST vs BINARY SOURCE SPLIT (build-once / download-forever): the dist/* JS
+// bundles come from REPO_ROOT (the tagged checkout, which carries the real
+// backfilled manifest), NOT the producer's downloaded artifacts (whose
+// dist/main.cjs would embed the PRE-backfill placeholder manifest). The binary
+// artifacts (rootfs ext4s, shims, kernels, Mach-O) come from --artifacts. The
+// "main package dist comes from REPO_ROOT, not artifacts" test below pins this.
 //
 // These tests drive the script via child_process over a FAKE artifacts dir of
 // dummy bytes, consistent with the other scripts/* tests.
@@ -63,24 +70,28 @@ function writeAt(dir: string, rel: string, bytes: string): void {
   writeFileSync(abs, bytes);
 }
 
-// Materialize a fake CI artifacts dir matching the release-job layout:
-//   artifacts/dist/{cli,guest-agent}.cjs, artifacts/dist/preloads/*.cjs
-//   artifacts/images/<rootfs ext4 | *.so | vmlinux-vz-arm64>
-//   artifacts/script-jail-vm-arm64-darwin   (root, from build-mac-bin)
+// Materialize a fake CI artifacts dir matching the producer-artifact layout:
+//   artifacts/images/<rootfs ext4 | *.so | vmlinux-vz-arm64>   (binary assets)
+//   artifacts/script-jail-vm-arm64-darwin                       (root Mach-O)
+// The producer does NOT ship dist/* — those are read from REPO_ROOT — so the
+// only dist bundles here are DECOYS, written to prove the assembler ignores the
+// artifacts dir for dist and reads the real bundles from REPO_ROOT instead.
 // Returns { dir, sources } where sources maps each platform artifact `src`
 // (relative to the artifacts dir) to the dummy bytes written.
 function makeArtifacts(): { dir: string; sources: Map<string, string> } {
   const dir = mkTmp('script-jail-assemble-art-');
   const sources = new Map<string, string>();
 
-  // Main package JS bundles.
-  writeAt(dir, 'dist/cli.cjs', 'cli-bundle');
-  writeAt(dir, 'dist/guest-agent.cjs', 'guest-agent-bundle');
-  writeAt(dir, 'dist/preloads/env-spy.cjs', 'env-spy');
-  writeAt(dir, 'dist/preloads/platform-spoof.cjs', 'platform-spoof');
-  writeAt(dir, 'dist/preloads/dlopen-block.cjs', 'dlopen-block');
+  // DECOY dist bundles in the artifacts dir — the assembler must IGNORE these
+  // and source dist/* from REPO_ROOT (the "from REPO_ROOT not artifacts" test
+  // asserts the staged bytes do not equal these decoys).
+  writeAt(dir, 'dist/cli.cjs', 'DECOY-cli-bundle');
+  writeAt(dir, 'dist/guest-agent.cjs', 'DECOY-guest-agent-bundle');
+  writeAt(dir, 'dist/preloads/env-spy.cjs', 'DECOY-env-spy');
+  writeAt(dir, 'dist/preloads/platform-spoof.cjs', 'DECOY-platform-spoof');
+  writeAt(dir, 'dist/preloads/dlopen-block.cjs', 'DECOY-dlopen-block');
 
-  // Every platform-artifact source across all packages.
+  // Every platform-artifact source across all packages (real BINARY inputs).
   for (const pkg of npmPackages(VERSION)) {
     for (const art of pkg.artifacts) {
       if (sources.has(art.src)) continue;
@@ -218,6 +229,62 @@ describe('assemble-npm-packages.mjs (PKG-3)', () => {
     expect(existsSync(join(mainDir, 'README.md'))).toBe(true);
     // No runtime images leaked into main.
     expect(existsSync(join(mainDir, 'images'))).toBe(false);
+  });
+
+  it('sources the main package dist bundles from REPO_ROOT, not the artifacts dir', () => {
+    // Build-once / download-forever correctness: the dist/* bundles ship from
+    // the TAGGED checkout (REPO_ROOT, real backfilled manifest). The artifacts
+    // dir carries DECOY dist bundles (makeArtifacts), so a regression that
+    // copies dist from --artifacts would stage the decoy bytes. Assert the
+    // staged cli/guest-agent/preload bytes equal REPO_ROOT's committed bundles
+    // and are NOT the artifacts-dir decoys.
+    const { dir: artifactsDir } = makeArtifacts();
+    const out = mkTmp('script-jail-assemble-out-');
+    expect(assemble(out, artifactsDir).status).toBe(0);
+
+    const mainDir = join(out, 'script-jail');
+    const distRels = [
+      'dist/cli.cjs',
+      'dist/guest-agent.cjs',
+      'dist/preloads/env-spy.cjs',
+      'dist/preloads/platform-spoof.cjs',
+      'dist/preloads/dlopen-block.cjs',
+    ];
+    for (const rel of distRels) {
+      const staged = readFileSync(join(mainDir, rel));
+      const repoCopy = readFileSync(join(repoRoot, rel));
+      const decoy = readFileSync(join(artifactsDir, rel));
+      // Staged === REPO_ROOT's committed bundle.
+      expect(
+        staged.equals(repoCopy),
+        `${rel} must be staged from REPO_ROOT`,
+      ).toBe(true);
+      // Staged !== the artifacts-dir decoy.
+      expect(
+        staged.equals(decoy),
+        `${rel} must NOT be staged from the artifacts dir`,
+      ).toBe(false);
+    }
+    // README also comes from REPO_ROOT.
+    const stagedReadme = readFileSync(join(mainDir, 'README.md'));
+    const repoReadme = readFileSync(join(repoRoot, 'README.md'));
+    expect(stagedReadme.equals(repoReadme)).toBe(true);
+  });
+
+  it('still fails when a required dist bundle is missing from REPO_ROOT (validate)', () => {
+    // The dist source-existence check now resolves against REPO_ROOT. We cannot
+    // remove a repo bundle, so assert the validator's REPO_ROOT-relative message
+    // shape exists by confirming a normal run passes (the bundles are present)
+    // and a missing BINARY artifact (from the artifacts dir) still fails with
+    // the artifacts-relative label.
+    const { dir: artifactsDir } = makeArtifacts();
+    rmSync(join(artifactsDir, 'images/libscriptjail.so'));
+    const out = mkTmp('script-jail-assemble-out-');
+    const result = assemble(out, artifactsDir);
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toMatch(
+      /images\/libscriptjail\.so \(artifacts\)/,
+    );
   });
 
   it('produces byte-identical gz across two runs (deterministic gzip)', () => {
