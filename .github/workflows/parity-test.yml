@@ -281,10 +281,15 @@ jobs:
       - name: Install deps
         run: pnpm install --frozen-lockfile
 
-      # Build the CLI/guest bundles + the ad-hoc-signed arm64 Mach-O shim from
+      # Build the action bundle + the ad-hoc-signed arm64 Mach-O shim + the
+      # bare-backend substitution binaries (coreutils-arm64 / bash-arm64) from
       # THIS branch.  The parity test must run against the code under review.
+      # `--skip-rootfs`: this is a macOS runner — it cannot build the Linux ext4
+      # rootfs (no Docker / no cross-build), and the bare backend never needs it.
+      # The committed dist/cli.cjs (verified fresh by the test.yml diff gate) is
+      # the CLI entry the next step invokes.
       - name: Build bundles + Mach-O shim (arm64)
-        run: pnpm build
+        run: pnpm build -- --skip-rootfs
 
       # A minimal config so the CLI has a config to overlay; the bare backend
       # rewrites work_dir to its staged copy of the fixture.
