@@ -105,8 +105,18 @@ describe('npmPackages (PKG-1)', () => {
       'rootfs-ubuntu-24.04-arm64.ext4.gz',
       'vmlinux-vz-arm64',
       'libscriptjail-arm64.so',
+      'libscriptjail-arm64.dylib',
       'script-jail-vm',
     ]);
+  });
+
+  it('darwin-arm64 ships the macOS-native shim dylib (mode 0o644, copied)', () => {
+    const pkg = get(byName('0.1.0'), '@script-jail/darwin-arm64');
+    const dylib = findArtifact(pkg, 'libscriptjail-arm64.dylib');
+    expect(dylib.mode).toBe(0o644);
+    // Copied (not gzipped) from the mac-bin artifact at the artifacts root.
+    expect(dylib.gzip).toBeFalsy();
+    expect(dylib.src).toBe('libscriptjail-arm64.dylib');
   });
 
   it('linux-x64 has the exact os/cpu/files', () => {

@@ -10353,14 +10353,17 @@ __export(agent_exports, {
   PassThrough: () => import_node_stream.PassThrough,
   StdioConnection: () => StdioConnection,
   buildChildEnv: () => buildChildEnv,
+  buildChildEnvMacos: () => buildChildEnvMacos,
   createEventsFile: () => createEventsFile,
+  macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
   readStraceChildPid: () => readStraceChildPid,
   runStraceTailer: () => runStraceTailer
 });
 module.exports = __toCommonJS(agent_exports);
 var import_node_fs3 = require("node:fs");
-var import_node_readline = require("node:readline");
+var import_node_os = require("node:os");
+var import_node_readline2 = require("node:readline");
 var import_node_net = require("node:net");
 var import_node_dns = require("node:dns");
 var import_node_stream = require("node:stream");
@@ -24881,7 +24884,7 @@ function date4(params) {
 config(en_default());
 
 // src/guest/agent.ts
-var import_node_path2 = require("node:path");
+var import_node_path3 = require("node:path");
 
 // src/lock/schema.ts
 var LifecycleStage = external_exports.enum(["preinstall", "install", "postinstall", "prepare"]);
@@ -25206,6 +25209,65 @@ var LinuxProcReader = class {
         map2.set(key, val);
       }
       return map2;
+    } catch {
+      return null;
+    }
+  }
+};
+
+// src/guest/proc-reader-macos.ts
+var import_node_child_process = require("node:child_process");
+var MacOSProcReader = class {
+  /**
+   * Absolute path to the `sj-procinfo` helper binary, or null to disable
+   * ppid resolution entirely (attribution then leans 100% on the shim seed).
+   * Resolved from `SCRIPT_JAIL_PROCINFO_PATH` when not supplied explicitly.
+   */
+  procinfoPath;
+  /**
+   * @param procinfoPath  Path to the `sj-procinfo` helper.  When undefined,
+   *                      falls back to the `SCRIPT_JAIL_PROCINFO_PATH` env var;
+   *                      when that is also unset, ppid resolution is disabled.
+   */
+  constructor(procinfoPath) {
+    if (procinfoPath !== void 0) {
+      this.procinfoPath = procinfoPath;
+    } else {
+      const fromEnv = process.env["SCRIPT_JAIL_PROCINFO_PATH"];
+      this.procinfoPath = fromEnv !== void 0 && fromEnv.length > 0 ? fromEnv : null;
+    }
+  }
+  /**
+   * macOS has no /proc/<pid>/environ.  `Attribution._walk` treats a null
+   * return as "this process contributes no environ; keep walking the ppid
+   * chain" — so attribution flows through the shim event seed.  Never throws.
+   */
+  readEnviron(_pid) {
+    return null;
+  }
+  /**
+   * Best-effort parent pid via the `sj-procinfo` helper.  Returns null when
+   * the helper is unconfigured, fails to spawn, exits non-zero (pid gone /
+   * not permitted), or prints an unparseable value.  Never throws — the
+   * ProcReader contract requires it, and a null here just means the walk
+   * terminates and we lean on the shim seed for this pid.
+   */
+  readPpid(pid) {
+    if (this.procinfoPath === null) return null;
+    try {
+      const result = (0, import_node_child_process.spawnSync)(this.procinfoPath, [String(pid)], {
+        encoding: "utf8",
+        // Don't go through a shell — the path is trusted but argument-injection
+        // hardening costs nothing, and a shell would also strip our DYLD env.
+        shell: false,
+        // Bound the call: the helper does a single proc_pidinfo() and prints.
+        timeout: 1e3
+      });
+      if (result.status !== 0) return null;
+      const out = typeof result.stdout === "string" ? result.stdout.trim() : "";
+      if (out.length === 0) return null;
+      const ppid = parseInt(out, 10);
+      return Number.isFinite(ppid) && ppid > 0 ? ppid : null;
     } catch {
       return null;
     }
@@ -27931,6 +27993,460 @@ async function runInstallPhase(input) {
   return { exitCode, eventCount, tamperReason: phaseTamperReason };
 }
 
+// src/guest/phase-install-macos.ts
+function parseMacosShimLine(line) {
+  let obj;
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const kind = obj["kind"];
+  if (kind === "read") {
+    const parsed = FsReadEvent.safeParse(obj);
+    return parsed.success ? parsed.data : null;
+  }
+  if (kind === "write") {
+    const parsed = FsWriteEvent.safeParse(obj);
+    return parsed.success ? parsed.data : null;
+  }
+  if (kind === "connect") {
+    const parsed = NetworkEvent.safeParse(obj);
+    return parsed.success ? parsed.data : null;
+  }
+  return parseShimLine(line);
+}
+var INSTALL_CMD2 = {
+  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
+  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
+  yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
+};
+function pathBasename2(pathLike) {
+  const nul = pathLike.indexOf("\0");
+  const value = nul === -1 ? pathLike : pathLike.slice(0, nul);
+  const slash = value.lastIndexOf("/");
+  return slash === -1 ? value : value.slice(slash + 1);
+}
+async function runInstallPhaseMacos(input) {
+  const { cmd, args: baseArgs } = INSTALL_CMD2[input.manager];
+  const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
+  const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
+  const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
+    patterns: [],
+    roots: { repo: "", nodeModules: "", home: "", tmp: "", cache: "" }
+  });
+  let eventCount = 0;
+  let phaseTamperReason = null;
+  const setPhaseTamper = (reason) => {
+    if (phaseTamperReason === null) phaseTamperReason = reason;
+    input.strace.recordTamper(reason);
+  };
+  const emit = (ev) => {
+    const filtered = applyProtectedPathsPolicy(ev, matcher);
+    if (filtered === null) return;
+    input.emitter.emitEvent(filtered);
+    eventCount++;
+  };
+  const attributionSnapshotByPid = /* @__PURE__ */ new Map();
+  const nodeStartupMarkerByPid = /* @__PURE__ */ new Map();
+  const nodeStartupAttributionByPid = /* @__PURE__ */ new Map();
+  const recordAttribution = (pid, attr, ts) => {
+    const existing = attributionSnapshotByPid.get(pid);
+    if (existing === void 0 || existing.recordedAtTs <= ts) {
+      attributionSnapshotByPid.set(pid, {
+        pkg: attr.pkg,
+        lifecycle: attr.lifecycle,
+        recordedAtTs: ts,
+        stale: false
+      });
+    }
+  };
+  const supersededByDifferentGenerationMarker = (pid, snapshot) => {
+    const marker = nodeStartupMarkerByPid.get(pid);
+    if (marker === void 0 || snapshot.recordedAtTs >= marker.ts) return false;
+    const attrib = nodeStartupAttributionByPid.get(pid);
+    if (attrib !== void 0) {
+      return attrib.pkg !== snapshot.pkg || attrib.lifecycle !== snapshot.lifecycle;
+    }
+    return marker.pathological;
+  };
+  const snapshotAttribution = (pid) => {
+    const snapshot = attributionSnapshotByPid.get(pid);
+    if (snapshot === void 0) return null;
+    if (supersededByDifferentGenerationMarker(pid, snapshot)) return null;
+    return { pkg: snapshot.pkg, lifecycle: snapshot.lifecycle };
+  };
+  const freshSnapshotAttribution = (pid) => {
+    const snapshot = attributionSnapshotByPid.get(pid);
+    if (snapshot === void 0 || snapshot.stale) return null;
+    if (supersededByDifferentGenerationMarker(pid, snapshot)) return null;
+    return { pkg: snapshot.pkg, lifecycle: snapshot.lifecycle };
+  };
+  const nodeStartupAttribution = (pid) => nodeStartupAttributionByPid.get(pid) ?? null;
+  const nodeBootstrapEnvPendingPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapFilePendingPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapChildrenByPid = /* @__PURE__ */ new Map();
+  const nodeBootstrapCandidateEventsByPid = /* @__PURE__ */ new Map();
+  const nodeBootstrapCandidateConfirmedPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapCandidateFileMarkerPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapEnvReads = /* @__PURE__ */ new Set();
+  const nodeBootstrapFileReads = /* @__PURE__ */ new Set();
+  const packageManagerClientPids = /* @__PURE__ */ new Set();
+  const completedPackageManagerClientPids = /* @__PURE__ */ new Set();
+  const nodeBootstrapSubtree = (rootPid) => {
+    const stack = [rootPid];
+    for (let i = 0; i < stack.length; i++) {
+      const current = stack[i];
+      const children = nodeBootstrapChildrenByPid.get(current);
+      if (children !== void 0) stack.push(...children);
+    }
+    return stack;
+  };
+  const clearNodeBootstrap = (rootPid) => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapEnvPendingPids.delete(current);
+      nodeBootstrapFilePendingPids.delete(current);
+      nodeBootstrapChildrenByPid.delete(current);
+    }
+  };
+  const clearNodeBootstrapEnv = (rootPid) => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapEnvPendingPids.delete(current);
+    }
+  };
+  const clearNodeBootstrapFile = (rootPid) => {
+    for (const current of nodeBootstrapSubtree(rootPid)) {
+      nodeBootstrapFilePendingPids.delete(current);
+      if (!nodeBootstrapEnvPendingPids.has(current)) {
+        nodeBootstrapChildrenByPid.delete(current);
+      }
+    }
+  };
+  const beginNodeBootstrap = (pid) => {
+    clearNodeBootstrap(pid);
+    nodeBootstrapEnvPendingPids.add(pid);
+    nodeBootstrapFilePendingPids.add(pid);
+  };
+  const flushNodeBootstrapCandidate = (pid) => {
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
+    if (buffered === void 0) return;
+    nodeBootstrapCandidateEventsByPid.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    for (const ev of buffered) emit(ev);
+  };
+  const dropNodeBootstrapCandidateAsNode = (pid) => {
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
+    if (buffered === void 0) return;
+    nodeBootstrapCandidateEventsByPid.delete(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    const recordEnvBaseline = !packageManagerClientPids.has(pid);
+    for (const ev of buffered) {
+      if (ev.raw.kind === "read") {
+        nodeBootstrapFileReads.add(ev.raw.path);
+      } else if (ev.raw.kind === "env_read" && recordEnvBaseline) {
+        nodeBootstrapEnvReads.add(ev.raw.name);
+      }
+    }
+  };
+  const dropNodeBootstrapCandidateEnvReadsAsNode = (pid) => {
+    const buffered = nodeBootstrapCandidateEventsByPid.get(pid);
+    if (buffered === void 0) return;
+    const recordEnvBaseline = !packageManagerClientPids.has(pid);
+    const keep = [];
+    for (const ev of buffered) {
+      if (ev.raw.kind === "env_read") {
+        if (recordEnvBaseline) nodeBootstrapEnvReads.add(ev.raw.name);
+      } else {
+        keep.push(ev);
+      }
+    }
+    nodeBootstrapCandidateEventsByPid.set(pid, keep);
+  };
+  const beginNodeBootstrapCandidate = (pid) => {
+    flushNodeBootstrapCandidate(pid);
+    nodeBootstrapCandidateConfirmedPids.delete(pid);
+    nodeBootstrapCandidateFileMarkerPids.delete(pid);
+    nodeBootstrapCandidateEventsByPid.set(pid, []);
+  };
+  const flushAllNodeBootstrapCandidates = () => {
+    for (const pid of [...nodeBootstrapCandidateEventsByPid.keys()]) {
+      flushNodeBootstrapCandidate(pid);
+    }
+  };
+  const confirmNodeBootstrapCandidate = (pid) => {
+    if (!nodeBootstrapCandidateEventsByPid.has(pid)) return false;
+    nodeBootstrapCandidateConfirmedPids.add(pid);
+    dropNodeBootstrapCandidateEnvReadsAsNode(pid);
+    if (nodeBootstrapCandidateFileMarkerPids.has(pid)) {
+      dropNodeBootstrapCandidateAsNode(pid);
+    }
+    return true;
+  };
+  const completeNodeBootstrapCandidateFileMarker = (pid) => {
+    if (!nodeBootstrapCandidateEventsByPid.has(pid)) return false;
+    nodeBootstrapCandidateFileMarkerPids.add(pid);
+    if (nodeBootstrapCandidateConfirmedPids.has(pid)) {
+      dropNodeBootstrapCandidateAsNode(pid);
+    }
+    return true;
+  };
+  const shouldFilterNodeBootstrapEnvRead = (raw) => {
+    if (raw.kind !== "env_read" || raw.hidden) return false;
+    if (nodeBootstrapEnvPendingPids.has(raw.pid)) {
+      if (!packageManagerClientPids.has(raw.pid)) nodeBootstrapEnvReads.add(raw.name);
+      return true;
+    }
+    return nodeBootstrapEnvReads.has(raw.name);
+  };
+  const shouldFilterPackageManagerClientEnvRead = (raw) => {
+    if (raw.kind !== "env_read" || raw.hidden) return false;
+    return packageManagerClientPids.has(raw.pid) || completedPackageManagerClientPids.has(raw.pid);
+  };
+  const shouldFilterNodeBootstrapFileRead = (raw) => {
+    if (raw.kind !== "read" || raw.hidden || matcher.isProtected(raw.path)) return false;
+    if (nodeBootstrapFilePendingPids.has(raw.pid)) {
+      nodeBootstrapFileReads.add(raw.path);
+      return true;
+    }
+    return nodeBootstrapFileReads.has(raw.path);
+  };
+  const shouldBufferNodeBootstrapCandidateFileRead = (ev) => {
+    if (ev.raw.kind !== "read" || ev.raw.hidden || matcher.isProtected(ev.raw.path)) return false;
+    const buffered = nodeBootstrapCandidateEventsByPid.get(ev.raw.pid);
+    if (buffered === void 0) return false;
+    if (nodeBootstrapCandidateFileMarkerPids.has(ev.raw.pid)) return false;
+    buffered.push(ev);
+    return true;
+  };
+  const shouldBufferNodeBootstrapCandidateEnvRead = (ev) => {
+    if (ev.raw.kind !== "env_read" || ev.raw.hidden) return false;
+    const buffered = nodeBootstrapCandidateEventsByPid.get(ev.raw.pid);
+    if (buffered === void 0) return false;
+    if (nodeBootstrapCandidateConfirmedPids.has(ev.raw.pid)) return false;
+    buffered.push(ev);
+    return true;
+  };
+  let dispatchTs = 0;
+  for await (const record2 of input.strace.run(cmd, args, {
+    env: input.env,
+    cwd: input.cwd,
+    basePath
+  })) {
+    const { pid, line, source } = record2;
+    const explicitTs = record2.ts;
+    const lineTs = explicitTs !== void 0 ? explicitTs : dispatchTs;
+    dispatchTs++;
+    if (source !== "shim") {
+      const sourceStr = typeof source === "string" ? source : `<${typeof source}>`;
+      const MAX_SRC = 40;
+      const sourceForReason = sourceStr.length > MAX_SRC ? `${sourceStr.slice(0, MAX_SRC)}\u2026` : sourceStr;
+      setPhaseTamper(
+        `unexpected LineSource on macOS-bare (pid=${pid}, source=${JSON.stringify(sourceForReason)}). The Mach-O shim is the sole event source; only "shim" lines are expected.`
+      );
+      continue;
+    }
+    const shimEvent = parseMacosShimLine(line);
+    if (shimEvent === null) {
+      const MAX_PREFIX = 100;
+      const prefix = line.length > MAX_PREFIX ? `${line.slice(0, MAX_PREFIX)}\u2026` : line;
+      setPhaseTamper(
+        `shim channel had unparseable JSONL line (pid=${pid}): ${JSON.stringify(prefix)}`
+      );
+      continue;
+    }
+    if (shimEvent.kind === "node_startup_done") {
+      const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line);
+      nodeStartupMarkerByPid.set(shimEvent.pid, { ts: lineTs, pathological: startupPathological });
+      if (startupAttrib !== null) {
+        nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
+      } else {
+        nodeStartupAttributionByPid.delete(shimEvent.pid);
+      }
+      confirmNodeBootstrapCandidate(shimEvent.pid);
+      completeNodeBootstrapCandidateFileMarker(shimEvent.pid);
+      clearNodeBootstrapEnv(shimEvent.pid);
+      clearNodeBootstrapFile(shimEvent.pid);
+      continue;
+    }
+    if (shimEvent.kind === "exec") {
+      const shimAttrib = shimExecAttribution(line);
+      if (shimAttrib !== null) recordAttribution(shimEvent.pid, shimAttrib, lineTs);
+      if (shimEvent.envp_alloc_failed) {
+        const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
+        if (attribution2 !== null) {
+          emit({ raw: shimEvent, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+        }
+      }
+      if (shimEvent.result === "ok") {
+        const progBase = pathBasename2(shimEvent.argv0 ?? shimEvent.prog);
+        const isPmClient = isPackageManagerClientBasename(progBase);
+        flushNodeBootstrapCandidate(shimEvent.pid);
+        packageManagerClientPids.delete(shimEvent.pid);
+        completedPackageManagerClientPids.delete(shimEvent.pid);
+        if (isNodeBasename(progBase)) {
+          beginNodeBootstrap(shimEvent.pid);
+        } else {
+          clearNodeBootstrap(shimEvent.pid);
+          beginNodeBootstrapCandidate(shimEvent.pid);
+        }
+        if (isPmClient) packageManagerClientPids.add(shimEvent.pid);
+        const spawnRaw = {
+          kind: "spawn",
+          argv: [shimEvent.argv0 ?? shimEvent.prog],
+          result: "ok",
+          pid: shimEvent.pid,
+          ts: shimEvent.ts
+        };
+        const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
+        if (attribution2 !== null) {
+          emit({ raw: spawnRaw, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+        }
+      }
+      continue;
+    }
+    if (shimEvent.kind === "env_read") {
+      if (shouldFilterNodeBootstrapEnvRead(shimEvent)) continue;
+    }
+    const attribution = freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
+    if (attribution === null) continue;
+    const attributed = {
+      raw: shimEvent,
+      pkg: attribution.pkg,
+      lifecycle: attribution.lifecycle
+    };
+    if (shimEvent.kind === "read" || shimEvent.kind === "write") {
+      if (shouldFilterNodeBootstrapFileRead(shimEvent)) continue;
+      if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) continue;
+      emit(attributed);
+      continue;
+    }
+    if (shimEvent.kind === "env_read") {
+      if (shouldBufferNodeBootstrapCandidateEnvRead(attributed)) continue;
+      if (shouldFilterPackageManagerClientEnvRead(shimEvent)) continue;
+      emit(attributed);
+      continue;
+    }
+    emit(attributed);
+  }
+  flushAllNodeBootstrapCandidates();
+  return {
+    exitCode: input.strace.getExitCode(),
+    eventCount,
+    tamperReason: phaseTamperReason
+  };
+}
+
+// src/guest/macos-install-runner.ts
+var import_node_child_process2 = require("node:child_process");
+var import_node_path = require("node:path");
+var import_node_readline = require("node:readline");
+var MacOSInstallRunner = class {
+  _exitCode = 0;
+  _spawnImpl;
+  _eventsFile;
+  _tamperRef = { reason: null };
+  /**
+   * @param spawnImpl  Injection seam for tests.  Production passes through to
+   *                   `node:child_process.spawn`.
+   * @param eventsFile Per-run events-file handle (path + baseline inode/dev)
+   *                   created by the agent before the install launches.  When
+   *                   `null`, the runner does not tail a shared events file
+   *                   (used by tests that supply a pre-set environment via the
+   *                   `opts.env` passed to `run()`).
+   */
+  constructor(spawnImpl, eventsFile) {
+    this._spawnImpl = spawnImpl ?? import_node_child_process2.spawn;
+    this._eventsFile = eventsFile ?? null;
+  }
+  getExitCode() {
+    return this._exitCode;
+  }
+  /**
+   * Returns the human-readable tamper reason recorded by the tailer's
+   * events-file watcher, or null.  The fs-based tamper detector (inode/dev
+   * baseline, mtime/ctime/size monotonicity, parent-dir rename) is the SAME
+   * one the Linux runner uses and carries over unchanged; macOS drops only the
+   * strace-derived <SYSCALL_EXEC_BYPASS> / <EVENTS_FILE_FORGERY> detectors
+   * (no kernel channel to cross-check against).
+   */
+  getTamperReason() {
+    return this._tamperRef.reason;
+  }
+  /**
+   * Plumb a tamper reason from {@link runInstallPhaseMacos} (shim-channel JSONL
+   * parse failures) into the same `_tamperRef` slot the events-file watcher
+   * uses.  First-writer-wins — once non-null, subsequent calls are dropped so
+   * the earliest signal survives.
+   */
+  recordTamper(reason) {
+    if (this._tamperRef.reason === null) {
+      this._tamperRef.reason = reason;
+    }
+  }
+  /**
+   * No strace direct-child to pin, and the macOS dispatch loop does no
+   * cwd/dirfd resolution that needs a seeded root pid (paths are already
+   * absolute).  Opt out with null — the dispatcher then seeds nothing and
+   * every event flows through the lean shim-only path.
+   */
+  getRootPid() {
+    return null;
+  }
+  async *run(cmd, args, opts) {
+    const child = this._spawnImpl(cmd, args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ["ignore", "ignore", "pipe", "pipe"]
+    });
+    const exitPromise = new Promise((resolve2) => {
+      child.on("close", (code) => {
+        this._exitCode = code ?? 1;
+        resolve2();
+      });
+      child.on("error", () => {
+        this._exitCode = 1;
+        resolve2();
+      });
+    });
+    const watchDir = (0, import_node_path.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path.basename)(opts.basePath);
+    const fd3Stream = child.stdio[3];
+    let stderrRl = null;
+    if (child.stderr) {
+      stderrRl = (0, import_node_readline.createInterface)({ input: child.stderr, crlfDelay: Infinity });
+      stderrRl.on("line", (line) => {
+        process.stderr.write(`[macos] ${line}
+`);
+      });
+    }
+    try {
+      yield* runStraceTailer({
+        watchDir,
+        basePrefix,
+        fd3Stream,
+        ...this._eventsFile !== null ? {
+          eventsFilePath: this._eventsFile.path,
+          eventsBaseline: this._eventsFile.baseline,
+          eventsDirPath: this._eventsFile.dirPath,
+          eventsFileBasename: (0, import_node_path.basename)(this._eventsFile.path),
+          tamperRef: this._tamperRef
+        } : {},
+        exitPromise
+        // No root-pid seeding: getRootPid() is null on macOS by design.  We do
+        // NOT install recordRootPid — the install root would otherwise be
+        // mis-pinned to the first phantom per-pid file (there are none here).
+      });
+    } finally {
+      if (stderrRl !== null) {
+        stderrRl.close();
+        stderrRl = null;
+      }
+    }
+  }
+};
+
 // src/lock/normalize.ts
 var NORMALIZABLE_BINARIES = /* @__PURE__ */ new Set([
   "node",
@@ -27968,11 +28484,46 @@ var SYSTEM_NOISE_PREFIXES = [
   // toolchain.  See src/rootfs/init.sh (VP_HOME=/opt/vp).
   "/opt"
 ];
+var SYSTEM_NOISE_PREFIXES_DARWIN = [
+  // System frameworks/dylibs and the protected system volume — the macOS
+  // analog of /lib + /lib64 on Linux.
+  "/System/",
+  // Apple-shipped frameworks, resource bundles, and the dyld closure caches
+  // a hardened-runtime Node and the re-signed shell shims read at startup.
+  // Root-level /Library only (NOT the per-user /Users/<u>/Library, which can
+  // hold real package writes); /Library/Caches/com.apple.dyld/ is a subset
+  // listed explicitly for documentation.
+  "/Library/",
+  "/Library/Caches/com.apple.dyld/",
+  // dyld launch-closure / shared-cache state under the private system store.
+  // Post-canon form of /private/var/db/dyld/.
+  "/var/db/dyld/",
+  // The dyld shared cache image directory (the OS-major leaf varies; the
+  // basename `dyld_shared_cache_*` is matched separately in isSystemNoise).
+  "/System/Library/dyld/"
+];
+var DYLD_SHARED_CACHE_BASENAME = "dyld_shared_cache_";
+var PROVISIONED_NODE_CACHE_SEGMENT = "/script-jail-cache/";
+var PRIVATE_REALPATH_PREFIXES = [
+  ["/private/var", "/var"],
+  ["/private/tmp", "/tmp"],
+  ["/private/etc", "/etc"]
+];
+function canonicalizePrivateRealpath(path3) {
+  for (const [from, to] of PRIVATE_REALPATH_PREFIXES) {
+    if (path3 === from || path3.startsWith(`${from}/`)) {
+      return `${to}${path3.slice(from.length)}`;
+    }
+  }
+  return path3;
+}
 var NPM_DEBUG_LOG_BASENAME = /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(\d+)\.log$/;
 function normalize(events, ctx) {
   const out = /* @__PURE__ */ new Map();
+  const os = ctx.os ?? "linux";
   for (const ev of events) {
-    if (isSystemNoise(ev)) continue;
+    const fsPath = (ev.raw.kind === "read" || ev.raw.kind === "write") && os === "darwin" ? canonicalizePrivateRealpath(ev.raw.path) : ev.raw.kind === "read" || ev.raw.kind === "write" ? ev.raw.path : void 0;
+    if (isSystemNoise(ev, fsPath, os)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
     if (pkgDir === void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
@@ -27982,14 +28533,14 @@ function normalize(events, ctx) {
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
     switch (ev.raw.kind) {
       case "read": {
-        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
+        const tokenized = normalizeVolatilePath(tokenize(fsPath, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
         const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
         block.external_reads.push(tagged);
         break;
       }
       case "write": {
-        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
+        const tokenized = normalizeVolatilePath(tokenize(fsPath, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
         const hiddenPrefix = ev.raw.hidden ? "<HIDDEN> " : "";
         const crossPrefix = isCrossPackage(tokenized) ? "<CROSS_PACKAGE> " : "";
@@ -28149,10 +28700,19 @@ function parseBlockedSpawn(entry) {
   if (!match) return null;
   return { command: match[1] };
 }
-function isSystemNoise(ev) {
+function isSystemNoise(ev, fsPath, os) {
   if (ev.raw.kind !== "read" && ev.raw.kind !== "write") return false;
-  const p = ev.raw.path;
-  return SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix));
+  const p = fsPath ?? ev.raw.path;
+  if (SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix))) return true;
+  if (os === "darwin") {
+    if (SYSTEM_NOISE_PREFIXES_DARWIN.some((prefix) => p.startsWith(prefix))) return true;
+    if (basename3(p).startsWith(DYLD_SHARED_CACHE_BASENAME)) return true;
+    if (p.includes(PROVISIONED_NODE_CACHE_SEGMENT)) return true;
+  }
+  return false;
+}
+function basename3(path3) {
+  return path3.slice(path3.lastIndexOf("/") + 1);
 }
 
 // src/lock/render.ts
@@ -28226,7 +28786,7 @@ function renderBlock(block) {
 
 // src/guest/discover-pkg-dirs.ts
 var import_node_fs2 = require("node:fs");
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 function discoverPkgDirs(nodeModulesDir) {
   const result = /* @__PURE__ */ new Map();
   let entries;
@@ -28237,7 +28797,7 @@ function discoverPkgDirs(nodeModulesDir) {
   }
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
-    const entryPath = (0, import_node_path.join)(nodeModulesDir, entry.name);
+    const entryPath = (0, import_node_path2.join)(nodeModulesDir, entry.name);
     if (entry.name.startsWith("@")) {
       let scopeEntries;
       try {
@@ -28248,7 +28808,7 @@ function discoverPkgDirs(nodeModulesDir) {
       for (const scopeEntry of scopeEntries) {
         if (scopeEntry.name.startsWith(".")) continue;
         if (!scopeEntry.isDirectory() && !scopeEntry.isSymbolicLink()) continue;
-        const pkgPath = (0, import_node_path.join)(entryPath, scopeEntry.name);
+        const pkgPath = (0, import_node_path2.join)(entryPath, scopeEntry.name);
         readAndRegister(pkgPath, result);
       }
     } else {
@@ -28256,7 +28816,7 @@ function discoverPkgDirs(nodeModulesDir) {
       readAndRegister(entryPath, result);
     }
   }
-  scanPnpmVirtualStore((0, import_node_path.join)(nodeModulesDir, ".pnpm"), result);
+  scanPnpmVirtualStore((0, import_node_path2.join)(nodeModulesDir, ".pnpm"), result);
   return result;
 }
 function scanPnpmVirtualStore(pnpmDir, result) {
@@ -28268,7 +28828,7 @@ function scanPnpmVirtualStore(pnpmDir, result) {
   }
   for (const flat of flatEntries) {
     if (!flat.isDirectory()) continue;
-    const innerNm = (0, import_node_path.join)(pnpmDir, flat.name, "node_modules");
+    const innerNm = (0, import_node_path2.join)(pnpmDir, flat.name, "node_modules");
     let innerEntries;
     try {
       innerEntries = (0, import_node_fs2.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
@@ -28279,7 +28839,7 @@ function scanPnpmVirtualStore(pnpmDir, result) {
       if (inner.name.startsWith(".")) continue;
       if (inner.isSymbolicLink() || !inner.isDirectory()) continue;
       if (inner.name.startsWith("@")) {
-        const scopeDir = (0, import_node_path.join)(innerNm, inner.name);
+        const scopeDir = (0, import_node_path2.join)(innerNm, inner.name);
         let scopeEntries;
         try {
           scopeEntries = (0, import_node_fs2.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
@@ -28289,16 +28849,16 @@ function scanPnpmVirtualStore(pnpmDir, result) {
         for (const se of scopeEntries) {
           if (se.name.startsWith(".")) continue;
           if (se.isSymbolicLink() || !se.isDirectory()) continue;
-          readAndRegister((0, import_node_path.join)(scopeDir, se.name), result);
+          readAndRegister((0, import_node_path2.join)(scopeDir, se.name), result);
         }
       } else {
-        readAndRegister((0, import_node_path.join)(innerNm, inner.name), result);
+        readAndRegister((0, import_node_path2.join)(innerNm, inner.name), result);
       }
     }
   }
 }
 function readAndRegister(pkgPath, result) {
-  const manifestPath = (0, import_node_path.join)(pkgPath, "package.json");
+  const manifestPath = (0, import_node_path2.join)(pkgPath, "package.json");
   let raw;
   try {
     raw = (0, import_node_fs2.readFileSync)(manifestPath, "utf8");
@@ -28331,7 +28891,7 @@ function readAndRegister(pkgPath, result) {
 }
 
 // src/guest/agent.ts
-var import_node_child_process = require("node:child_process");
+var import_node_child_process3 = require("node:child_process");
 var import_node_crypto = require("node:crypto");
 
 // src/shim/canon-buf-len.ts
@@ -28451,7 +29011,7 @@ var StdioConnection = class {
 var LinuxSpawner = class {
   async spawn(cmd, args, opts) {
     return new Promise((resolve2, reject) => {
-      const child = (0, import_node_child_process.spawn)(cmd, args, {
+      const child = (0, import_node_child_process3.spawn)(cmd, args, {
         cwd: opts.cwd,
         env: opts.env,
         stdio: ["ignore", "pipe", "pipe"]
@@ -28700,7 +29260,7 @@ async function* runStraceTailer(opts) {
   }
   let fd3Done = false;
   if (opts.fd3Stream !== null) {
-    const rl = (0, import_node_readline.createInterface)({ input: opts.fd3Stream, crlfDelay: Infinity });
+    const rl = (0, import_node_readline2.createInterface)({ input: opts.fd3Stream, crlfDelay: Infinity });
     rl.on("line", (line) => {
       if (line.length > 0) {
         queue.push({ pid: 0, line, source: "shim" });
@@ -28945,7 +29505,7 @@ var LinuxStraceRunner = class {
    *                   `run()`.
    */
   constructor(spawnImpl, eventsFile) {
-    this._spawnImpl = spawnImpl ?? import_node_child_process.spawn;
+    this._spawnImpl = spawnImpl ?? import_node_child_process3.spawn;
     this._eventsFile = eventsFile ?? null;
   }
   getExitCode() {
@@ -29015,12 +29575,12 @@ var LinuxStraceRunner = class {
         resolve2();
       });
     });
-    const watchDir = (0, import_node_path2.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path2.basename)(opts.basePath);
+    const watchDir = (0, import_node_path3.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path3.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
-      stderrRl = (0, import_node_readline.createInterface)({ input: child.stderr, crlfDelay: Infinity });
+      stderrRl = (0, import_node_readline2.createInterface)({ input: child.stderr, crlfDelay: Infinity });
       stderrRl.on("line", (line) => {
         process.stderr.write(`[strace] ${line}
 `);
@@ -29035,7 +29595,7 @@ var LinuxStraceRunner = class {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
           eventsDirPath: this._eventsFile.dirPath,
-          eventsFileBasename: (0, import_node_path2.basename)(this._eventsFile.path),
+          eventsFileBasename: (0, import_node_path3.basename)(this._eventsFile.path),
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
@@ -29071,7 +29631,7 @@ function detectManager(cwd) {
 }
 async function waitForGo(readable) {
   return new Promise((resolve2, reject) => {
-    const rl = (0, import_node_readline.createInterface)({ input: readable, crlfDelay: Infinity });
+    const rl = (0, import_node_readline2.createInterface)({ input: readable, crlfDelay: Infinity });
     const cleanup = () => {
       rl.removeListener("line", onLine);
       rl.removeListener("close", onClose);
@@ -29106,7 +29666,18 @@ var LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = /* @__PURE__ */ new Set([
   "SCRIPT_JAIL_PRELOAD_PATH",
   "SCRIPT_JAIL_PROTECTED_ENV_NAMES",
   "SCRIPT_JAIL_SPOOF_ARCH",
-  "SCRIPT_JAIL_SPOOF_PLATFORM"
+  "SCRIPT_JAIL_SPOOF_PLATFORM",
+  // macOS-bare only.  When set to '1', env-spy.cjs writes the
+  // node_startup_done JSONL marker DIRECTLY (the Mach-O shim may not load into
+  // a hardened node, so it cannot be relied on to fire the marker via setenv
+  // interception).  Allowed so descendants that re-require env-spy via the
+  // inherited NODE_OPTIONS see it.  No effect on Linux (the var is never set).
+  "SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL",
+  // macOS-bare only.  Directory of the materialized, re-signed /bin/sh,
+  // /bin/bash, and coreutils copies the shim's sip_redirect rewrites system
+  // binaries to (SIP strips DYLD_* for /bin and /usr/bin).  The shim captures
+  // it at ctor; allowed so descendants see the same sticky value.
+  "SCRIPT_JAIL_SHELL_SHIM_DIR"
 ]);
 var LIFECYCLE_HOST_NOISE_ENV_NAMES = /* @__PURE__ */ new Set([
   "COLS",
@@ -29224,11 +29795,46 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     npm_config_store_dir: `${config2.work_dir}/.pnpm-store`
   };
 }
+function buildChildEnvMacos(baseEnv, config2, eventsFilePath, preloadPaths) {
+  const base = buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths);
+  const { LD_PRELOAD: nativePreload, ...rest } = base;
+  const env = {
+    ...rest,
+    // dyld injection (vs ELF LD_PRELOAD).  Flat namespace is required for
+    // __interpose to take effect across images.
+    DYLD_INSERT_LIBRARIES: nativePreload,
+    DYLD_FORCE_FLAT_NAMESPACE: "1",
+    // env-spy writes the node_startup_done JSONL marker directly on macOS.
+    SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL: "1"
+  };
+  const shellShimDir = baseEnv["SCRIPT_JAIL_SHELL_SHIM_DIR"];
+  if (shellShimDir !== void 0 && shellShimDir.length > 0) {
+    env["SCRIPT_JAIL_SHELL_SHIM_DIR"] = shellShimDir;
+  }
+  return env;
+}
+function macosTokenizeRoots(workDir) {
+  const home = (0, import_node_os.homedir)();
+  const rawTmp = (0, import_node_os.tmpdir)();
+  let tmp;
+  try {
+    tmp = (0, import_node_fs3.realpathSync)(rawTmp);
+  } catch {
+    tmp = rawTmp;
+  }
+  return {
+    repo: workDir,
+    nodeModules: `${workDir}/node_modules`,
+    home,
+    tmp,
+    cache: `${home}/Library/Caches/pnpm`
+  };
+}
 function createEventsFile(parentDir = "/tmp") {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
-  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path2.join)(parentDir, `script-jail-events-${tag}-`));
+  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path3.join)(parentDir, `script-jail-events-${tag}-`));
   (0, import_node_fs3.chmodSync)(dirPath, 448);
-  const path3 = (0, import_node_path2.join)(dirPath, `events-${tag}.jsonl`);
+  const path3 = (0, import_node_path3.join)(dirPath, `events-${tag}.jsonl`);
   const fd = (0, import_node_fs3.openSync)(
     path3,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition
@@ -29314,10 +29920,13 @@ async function main(input) {
     return;
   }
   const eventsFilePath = eventsFile.path;
-  const childEnv = buildChildEnv(process.env, config2, eventsFilePath, input.preloadPaths);
+  const isMacosBare = process.env["SCRIPT_JAIL_BACKEND"] === "macos-bare" || process.platform === "darwin" && input.strace === void 0;
+  const childEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, eventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, eventsFilePath, input.preloadPaths);
   const spawner = input.spawner ?? new LinuxSpawner();
-  const straceRunner = input.strace ?? new LinuxStraceRunner(void 0, eventsFile);
-  const attribution = new Attribution(new LinuxProcReader());
+  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(void 0, eventsFile));
+  const attribution = new Attribution(
+    isMacosBare ? new MacOSProcReader() : new LinuxProcReader()
+  );
   diag(input, `Phase A starting: ${manager} fetch in ${config2.work_dir}`);
   const fetchResult = await runFetchPhase({
     manager,
@@ -29345,7 +29954,8 @@ ${fetchResult.stderr}
     return;
   }
   const phaseBUsesUnshareNet = process.env["SCRIPT_JAIL_PHASE_B_UNSHARE_NET"] === "1";
-  if (!phaseBUsesUnshareNet) {
+  const skipOfflineEnforcement = phaseBUsesUnshareNet || isMacosBare;
+  if (!skipOfflineEnforcement) {
     try {
       if (input.dropEth0) {
         await input.dropEth0();
@@ -29359,7 +29969,7 @@ ${fetchResult.stderr}
       );
     }
   }
-  if (!phaseBUsesUnshareNet) {
+  if (!skipOfflineEnforcement) {
     const lookupFn = input.dnsLookup ?? import_node_dns.lookup;
     const offline = await verifyOfflineWithTimeout(
       lookupFn,
@@ -29400,7 +30010,7 @@ ${fetchResult.stderr}
       }
     }()
   );
-  const roots = {
+  const roots = isMacosBare ? macosTokenizeRoots(config2.work_dir) : {
     repo: config2.work_dir,
     nodeModules: `${config2.work_dir}/node_modules`,
     home: "/root",
@@ -29411,7 +30021,7 @@ ${fetchResult.stderr}
     patterns: config2.protected.files,
     roots
   });
-  const installResult = await runInstallPhase({
+  const installInput = {
     manager,
     cwd: config2.work_dir,
     env: childEnv,
@@ -29420,7 +30030,8 @@ ${fetchResult.stderr}
     emitter: collectingEmitter,
     straceBasePath: "/tmp/script-jail-strace/strace.out",
     protectedPaths
-  });
+  };
+  const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
     if (installResult.eventCount === 0) {
       emitter.emitError(
@@ -29450,7 +30061,7 @@ ${fetchResult.stderr}
   diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
   const pkgDirs = new Map(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
-  const ctx = { roots, pkgDirs };
+  const ctx = isMacosBare ? { roots, pkgDirs, os: "darwin" } : { roots, pkgDirs };
   let yaml;
   try {
     const packages = normalize(collectedEvents, ctx);
@@ -29525,7 +30136,9 @@ if (isMain) {
   PassThrough,
   StdioConnection,
   buildChildEnv,
+  buildChildEnvMacos,
   createEventsFile,
+  macosTokenizeRoots,
   main,
   readStraceChildPid,
   runStraceTailer

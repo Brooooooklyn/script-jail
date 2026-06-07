@@ -54,6 +54,7 @@ function resolvedBasenames(hostArch: ArtifactArch) {
     compressedRootfs: basename(resolved.compressedRootfsPath),
     kernel: basename(resolved.kernelPath),
     libscriptjail: basename(resolved.libscriptjailSoPath),
+    macShim: basename(resolved.macShimDylibPath),
   };
 }
 
@@ -95,6 +96,12 @@ describe('filename contract: npm-packages files ↔ resolveArtifacts basenames',
 
     expect(files).toContain(expected.libscriptjail);
     expect(expected.libscriptjail).toBe('libscriptjail-arm64.so');
+
+    // The macOS-native shim dylib (bare backend) is resolved by
+    // `resolveArtifacts` as `macShimDylibPath`; its basename must match the
+    // darwin `files` entry the package ships.
+    expect(files).toContain(expected.macShim);
+    expect(expected.macShim).toBe('libscriptjail-arm64.dylib');
 
     // The VZ helper Mach-O has no `resolveArtifacts` entry — it is resolved by
     // `src/cli/spawn-vm.ts` from the platform-package root — so we only assert

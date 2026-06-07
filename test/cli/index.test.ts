@@ -172,25 +172,44 @@ describe('CLI — VM-launch stub', () => {
     expect(capturedHostArch).toBe('arm64');
   });
 
-  it('hostArch=x64 from detectHost reaches buildArchFlagOverlay even on an arm64 dev box', async () => {
+  it('hostArch=x64 from detectHost reaches buildArchFlagOverlay even on an arm64 dev box (now via the bare backend)', async () => {
     // The complementary half of the I2 regression: injecting `x64` from
     // an arm64 dev box must also be honoured.  Without the fix, hostArch
     // would mirror process.arch.
+    //
+    // Behaviour change (Phase 5): darwin/x64 now defaults to the `bare`
+    // backend (VZ is arm64-only), so this exercises runMacBare → runAudit.
+    // `buildArchFlagOverlay` is still threaded into runAudit's input on the
+    // bare path; we capture it from the injected runAudit (which never runs a
+    // real VM) and invoke it to assert the propagated hostArch.
     const repoDir = fakeRepo('package-lock.json');
     let capturedHostArch: string | null = null;
-    await run({
+    const code = await run({
       argv: ['init'],
       cwd: () => repoDir,
       stdout: new Sink(),
       stderr: new Sink(),
       detectHost: () => ({ macosMajor: 14, hostArch: 'x64' }),
+      runAudit: async (input) => {
+        // The CLI threads its buildArchFlagOverlay through to runAudit; drive
+        // it once with the audit's hostArch (as the real runAudit would).
+        const buildOverlay = input.buildArchFlagOverlay;
+        if (buildOverlay) {
+          buildOverlay({
+            pm: input.pm,
+            hostArch: input.hostArch,
+            spoofPlatform: input.overrides.spoofPlatform ?? 'linux',
+            spoofArch: input.overrides.spoofArch ?? input.hostArch,
+          });
+        }
+        return { exitCode: 0 };
+      },
       buildArchFlagOverlay: (input) => {
         capturedHostArch = input.hostArch;
         return { warnings: [] };
       },
-      makeOverlay: async () => fakeOverlay(testDir),
-      spawnVm: async () => { throw new MacOSVmNotImplementedError(); },
     });
+    expect(code).toBe(0);
     expect(capturedHostArch).toBe('x64');
   });
 
@@ -261,6 +280,111 @@ describe('CLI — VM-launch stub', () => {
       },
     }));
     expect(capturedMode).toBe('check');
+  });
+});
+
+describe('CLI — macOS backend selection (vz vs bare)', () => {
+  // detectPlatform seam: report a concrete darwin host so the CLI's
+  // effective-backend resolution (args.backend ?? (arm64 ? vz : bare)) and the
+  // darwin+vz+x64 gate are exercised without reading the real host.
+  function macPlatformDeps(
+    platform: { os: 'darwin'; arch: 'x64' | 'arm64'; macosMajor: number },
+    over: Partial<CliDeps>,
+  ): CliDeps {
+    return {
+      detectPlatform: () => platform,
+      resolvePlatformPackageDir: () => ({ imagesDir: join(testDir, 'pkg'), source: 'dev' }),
+      ...over,
+    };
+  }
+
+  it('darwin/x64 + explicit --backend vz → exits 1 with the Intel-mac VZ error (gate lives in index.ts)', async () => {
+    // detectPlatform now RETURNS darwin/x64 (it no longer throws); the VZ-only
+    // arm64 gate is enforced here in the CLI.  An Intel mac that explicitly
+    // asks for `--backend vz` must hit the typed UnsupportedDarwinArchError
+    // message and exit 1 BEFORE any provisioning/VM work.
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    const stdout = new Sink();
+    const stderr = new Sink();
+    let reachedExecute = false;
+    let reachedAudit = false;
+    const code = await run(macPlatformDeps(
+      { os: 'darwin', arch: 'x64', macosMajor: 14 },
+      {
+        argv: ['check', '--backend', 'vz'],
+        cwd: () => repoDir,
+        stdout, stderr,
+        createMacBareExecute: () => { reachedExecute = true; return async () => ({ finalYaml: '', nonFatalWarnings: [] }); },
+        runAudit: async () => { reachedAudit = true; return { exitCode: 0 }; },
+        spawnVm: async () => { throw new MacOSVmNotImplementedError(); },
+      },
+    ));
+    expect(code).toBe(1);
+    expect(stderr.text).toMatch(/darwin-x64/);
+    expect(stderr.text).toMatch(/Virtualization\.framework|VZ/);
+    // The gate fires before backend execution: neither the bare execute nor
+    // runAudit is reached.
+    expect(reachedExecute).toBe(false);
+    expect(reachedAudit).toBe(false);
+  });
+
+  it('darwin/x64 defaults to the bare backend → builds createMacBareExecute and hands runAudit an execute closure', async () => {
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    const stdout = new Sink();
+    const stderr = new Sink();
+    let macBareArgs: Record<string, unknown> | null = null;
+    let capturedExecute: unknown = null;
+    const code = await run(macPlatformDeps(
+      { os: 'darwin', arch: 'x64', macosMajor: 14 },
+      {
+        argv: ['check'], // no --backend → x64 defaults to bare
+        cwd: () => repoDir,
+        stdout, stderr,
+        createMacBareExecute: (deps) => {
+          macBareArgs = deps as unknown as Record<string, unknown>;
+          return async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] });
+        },
+        runAudit: async (input) => {
+          capturedExecute = input.execute ?? null;
+          // The bare path must NOT use the VZ launch closure.
+          expect(input.launch).toBeUndefined();
+          expect(input.hostArch).toBe('x64');
+          return { exitCode: 0 };
+        },
+      },
+    ));
+    expect(code).toBe(0);
+    expect(macBareArgs).not.toBeNull();
+    expect(macBareArgs!['arch']).toBe('x64');
+    expect(typeof capturedExecute).toBe('function');
+  });
+
+  it('darwin/arm64 + explicit --backend bare → uses the bare backend (overrides the vz default)', async () => {
+    const repoDir = fakeRepo('pnpm-lock.yaml');
+    const stdout = new Sink();
+    const stderr = new Sink();
+    let builtBare = false;
+    const code = await run(macPlatformDeps(
+      { os: 'darwin', arch: 'arm64', macosMajor: 15 },
+      {
+        argv: ['check', '--backend', 'bare'],
+        cwd: () => repoDir,
+        stdout, stderr,
+        createMacBareExecute: (deps) => {
+          builtBare = true;
+          expect((deps as unknown as Record<string, unknown>)['arch']).toBe('arm64');
+          return async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] });
+        },
+        runAudit: async (input) => {
+          expect(typeof input.execute).toBe('function');
+          return { exitCode: 0 };
+        },
+        // If the vz default leaked through, spawnVm would throw and fail us.
+        spawnVm: async () => { throw new MacOSVmNotImplementedError('vz path should not run'); },
+      },
+    ));
+    expect(code).toBe(0);
+    expect(builtBare).toBe(true);
   });
 });
 

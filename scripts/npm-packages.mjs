@@ -16,12 +16,12 @@
 //
 // LOAD-BEARING FILENAME CONTRACT: the platform packages' `files` basenames
 // (rootfs-ubuntu-24.04.ext4.gz / rootfs-ubuntu-24.04-arm64.ext4.gz,
-// libscriptjail.so / libscriptjail-arm64.so, vmlinux-vz-arm64,
-// script-jail-vm) MUST match what `src/shared/artifacts.ts` resolves at
-// runtime (Phase 1). A drift would only surface at install time on a real
-// Linux/macOS box, so it is mechanically enforced by the filename-contract
-// test (Phase 4, Task 4.1). Do not rename these here without updating the
-// resolver in lockstep.
+// libscriptjail.so / libscriptjail-arm64.so, libscriptjail-arm64.dylib,
+// vmlinux-vz-arm64, script-jail-vm) MUST match what `src/shared/artifacts.ts`
+// resolves at runtime (Phase 1). A drift would only surface at install time on
+// a real Linux/macOS box, so it is mechanically enforced by the
+// filename-contract test (Phase 4, Task 4.1). Do not rename these here without
+// updating the resolver in lockstep.
 //
 // This module is the single source of truth for the published main package's
 // `files`; the repo-root `package.json` (PKG-4) lists the same entries and is
@@ -133,6 +133,7 @@ export function npmPackages(version) {
         'rootfs-ubuntu-24.04-arm64.ext4.gz',
         'vmlinux-vz-arm64',
         'libscriptjail-arm64.so',
+        'libscriptjail-arm64.dylib',
         'script-jail-vm',
       ],
     },
@@ -147,6 +148,16 @@ export function npmPackages(version) {
       {
         src: 'images/libscriptjail-arm64.so',
         dest: 'libscriptjail-arm64.so',
+        mode: 0o644,
+      },
+      // The macOS-native Mach-O shim (DYLD_INSERT_LIBRARIES, bare backend) is
+      // built + ad-hoc signed by the release-build.yml producer `build-mac-bin`
+      // job and downloaded to the artifacts ROOT by release.yml as
+      // `libscriptjail-arm64.dylib` (alongside `script-jail-vm-arm64-darwin`).
+      // It is data, not executable — mode 0o644, mirroring the .so shims.
+      {
+        src: 'libscriptjail-arm64.dylib',
+        dest: 'libscriptjail-arm64.dylib',
         mode: 0o644,
       },
       // The VZ helper Mach-O binary is built by the release-build.yml producer

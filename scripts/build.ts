@@ -240,12 +240,64 @@ function buildShimArm64(): void {
   console.log(`[build] images/libscriptjail-arm64.so built.`);
 }
 
+/**
+ * Build the macOS-native Mach-O shim (`libscriptjail-arm64.dylib`) for the
+ * `bare` (no-VM) macOS audit backend.  Unlike the Linux `.so`, macOS cargo
+ * CAN produce this natively (it's the host target), so there is no CI-only
+ * short-circuit.  Steps:
+ *   1. `cargo build --release --target aarch64-apple-darwin`
+ *   2. copy `target/aarch64-apple-darwin/release/libscriptjail.dylib`
+ *      → `images/libscriptjail-arm64.dylib`
+ *   3. ad-hoc codesign (`codesign --force --sign -`) — MANDATORY on Apple
+ *      Silicon and required for injection into the re-signed node (Phase 4).
+ *   4. `codesign --verify` so a broken signature fails the build.
+ *
+ * (x86_64-apple-darwin + `lipo` universal is a documented follow-up — arm64
+ * ships first per the plan's R10 decision.)
+ */
+function buildShimMac(): void {
+  const target = 'aarch64-apple-darwin';
+  const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
+  const shimOut = join(REPO_ROOT, 'images', 'libscriptjail-arm64.dylib');
+
+  // Freshness: reuse the existing dylib only when every shim source input is
+  // older than it (same rule as the Linux .so).  shimArtifactIsStale compares
+  // the artifact mtime against the shared shimSourceInputs (which now include
+  // interpose.rs / fileops.rs / net.rs — see shim-freshness.ts).
+  if (!shimArtifactIsStale(shimOut)) {
+    console.log(
+      '[build] images/libscriptjail-arm64.dylib is up-to-date relative to shim ' +
+      'sources; skipping macOS shim build.',
+    );
+    return;
+  }
+
+  console.log(`[build] Building macOS shim via cargo build --target ${target} …`);
+  execSync(
+    `cargo build --release --manifest-path "${manifest}" --target ${target}`,
+    { stdio: 'inherit', cwd: REPO_ROOT },
+  );
+
+  mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
+  copyFileSync(
+    join(REPO_ROOT, 'target', target, 'release', 'libscriptjail.dylib'),
+    shimOut,
+  );
+
+  // Ad-hoc sign + verify.  `--force` re-stamps the linker's adhoc+linker-signed
+  // signature as a plain adhoc one (the spike's codesignDylibCmd).
+  console.log('[build] Ad-hoc signing the dylib (codesign --force --sign -) …');
+  execSync(`codesign --force --sign - "${shimOut}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+  execSync(`codesign --verify --verbose "${shimOut}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+  console.log('[build] images/libscriptjail-arm64.dylib built + signed.');
+}
+
 function buildShim(): void {
   if (process.platform === 'darwin') {
-    console.warn(
-      '[build] WARNING: Running on macOS — skipping shim build (requires Linux toolchain).\n' +
-      '[build]          The .so is not needed for macOS development; build in CI or Linux.',
-    );
+    // macOS produces the native Mach-O shim for the bare backend.  The Linux
+    // `.so` cannot be cross-built from this toolchain (cargo would emit a
+    // Mach-O); --shim-arm64 (cargo-zigbuild) handles the Linux arm64 .so in CI.
+    buildShimMac();
     return;
   }
 
@@ -335,7 +387,14 @@ async function main(): Promise<void> {
   } else {
     buildShim();
   }
-  artifacts.push({ path: join(REPO_ROOT, 'images', 'libscriptjail.so') });
+  // On macOS buildShim produces the Mach-O dylib (bare backend); on Linux the
+  // ELF .so.  Report whichever one the host build produced.
+  artifacts.push({
+    path:
+      process.platform === 'darwin'
+        ? join(REPO_ROOT, 'images', 'libscriptjail-arm64.dylib')
+        : join(REPO_ROOT, 'images', 'libscriptjail.so'),
+  });
 
   // Step 2b: optional arm64 shim cross-compile.  Surfaces a clear error on
   // macOS (where cargo cannot produce a Linux .so) so dev hosts know the

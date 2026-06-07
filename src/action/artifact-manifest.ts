@@ -13,11 +13,12 @@
 //   1. Run `.github/workflows/release-build.yml` (workflow_dispatch, required
 //      `tag` input).  The producer builds every image asset ONCE — rootfs
 //      ext4s (per runner image + arm64 variants), Docker rootfs images,
-//      libscriptjail.so / libscriptjail-arm64.so, the VZ vmlinux kernels, and
-//      the script-jail-vm-arm64-darwin Mach-O binary — pushes the 4 GHCR
-//      rootfs images, and prints a paste-block of the 9 file SHAs + 4 GHCR
-//      digests in the job output.
-//   2. Paste the 9 file SHAs and 4 GHCR digests from the producer run's
+//      libscriptjail.so / libscriptjail-arm64.so, the VZ vmlinux kernels, the
+//      script-jail-vm-arm64-darwin Mach-O binary, and the macOS-native
+//      libscriptjail-arm64.dylib shim — pushes the 4 GHCR rootfs images, and
+//      prints a paste-block of the 10 file SHAs + 4 GHCR digests in the job
+//      output.
+//   2. Paste the 10 file SHAs and 4 GHCR digests from the producer run's
 //      paste-block into the maps below.
 //   3. Bump `tag` to match the new release.
 //   4. Rebuild `dist/` (`pnpm build:bundle`), commit, and push the tag.
@@ -64,6 +65,15 @@ export const PINNED_MANIFEST: ArtifactManifest = {
       'rootfs-ubuntu-22.04-arm64.ext4': 'e29dd8113b08fdc81441d2be3709127bf2ccaeaba3798b103ce7a57abca5039d',
       'rootfs-ubuntu-24.04-arm64.ext4': 'b45c85495f6537223d74e0903efe9d9148d38c4027f00fbe497b113680489eff',
       'libscriptjail-arm64.so':         '31d98f738131a11f58cdf7b07d1576511b2fd3906d46937b953e7f4b4cab5ec3',
+      // macOS-native Mach-O shim for the bare backend (DYLD_INSERT_LIBRARIES).
+      // PLACEHOLDER until the first release-build.yml run that emits its SHA:
+      // the dylib is a NEW artifact with no producer-backed bytes yet.  This
+      // makes the manifest MIXED (real entries + this placeholder), so the
+      // publish-job gate (scripts/check-publish-artifacts.sh) will reject a
+      // release until this is backfilled from a producer run that built the
+      // dylib — exactly the all-or-nothing contract.  Paste the real SHA from
+      // the producer paste-block, then cut the tag.
+      'libscriptjail-arm64.dylib':      'PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_DYLIB',
       'vmlinux-vz-x86_64':              '012e33842367483ffad908d878d5682fa891d2a4f476a229b631e16780404953',
       'vmlinux-vz-arm64':               '4b42d3b912065a92a3816c788ed9c4dac92a12ece4c478c4fb1396c76cffd255',
       // No `script-jail-vm-x86_64-darwin` — see the file header for the

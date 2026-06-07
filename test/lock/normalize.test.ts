@@ -520,6 +520,96 @@ describe('normalize', () => {
     });
   });
 
+  // macOS-bare backend: os:'darwin' enables the macOS-only system-noise
+  // prefixes AND the /private realpath canonicalization.  Both are gated on the
+  // flag (NOT on path shape) as a security boundary: a malicious Linux lockfile
+  // must never be able to smuggle macOS-shaped paths past a Linux audit gate.
+  describe('macOS noise prefixes + /private canonicalization (os:darwin)', () => {
+    const darwinCtx: NormalizeContext = { ...ctx, os: 'darwin' };
+
+    // The macOS-only system-noise paths (post-/private-canonicalization form).
+    const darwinNoisePaths = [
+      '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation',
+      '/Library/Apple/System/Library/Frameworks/Foo.framework/Foo',
+      '/Library/Caches/com.apple.dyld/closures',
+      // dyld launch-closure state under /private/var/db/dyld → canonicalized to
+      // /var/db/dyld/ BEFORE the noise check, so it must drop on darwin.
+      '/private/var/db/dyld/dyld_closures',
+      // dyld shared cache image — matched by basename, dir leaf varies by OS.
+      '/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e',
+    ];
+
+    for (const p of darwinNoisePaths) {
+      it(`drops macOS system noise when os:darwin: ${p}`, () => {
+        const block = getBlock(normalize([readEv(p)], darwinCtx));
+        expect(block?.external_reads ?? []).toEqual([]);
+      });
+
+      it(`RECORDS the same path when os:linux (gating boundary): ${p}`, () => {
+        // The default ctx is os:'linux'.  None of these prefixes are in the
+        // shared list, so a Linux gate must NOT drop them — it records the
+        // external read.  This is the security boundary: a Linux lockfile can
+        // never smuggle a macOS-shaped path past the Linux audit by relying on
+        // the darwin-only drop.
+        const block = getBlock(normalize([readEv(p)], ctx));
+        expect((block?.external_reads ?? []).length).toBeGreaterThan(0);
+      });
+    }
+
+    it('drops the provisioned-node toolchain cache (host-variable root, fixed segment) on darwin', () => {
+      const p = '/var/folders/abc/T/script-jail-cache/node/24.15.0/bin/lib/node_modules/npm/index.js';
+      expect(getBlock(normalize([readEv(p)], darwinCtx))?.external_reads ?? []).toEqual([]);
+    });
+
+    it('does NOT drop the provisioned-node cache segment on linux (it is darwin-gated)', () => {
+      const p = '/var/folders/abc/T/script-jail-cache/node/24.15.0/bin/lib/node_modules/npm/index.js';
+      // os:'linux' default: the segment match never runs, but the /var/folders
+      // path canonicalizes to nothing on linux and is not in any shared prefix,
+      // so it surfaces as an external read.
+      expect((getBlock(normalize([readEv(p)], ctx))?.external_reads ?? []).length).toBeGreaterThan(0);
+    });
+
+    it('canonicalizes /private/var → /var before tokenizing (darwin)', () => {
+      // The Mach-O shim resolves macOS paths via F_GETPATH/realpath, so /tmp
+      // comes back as /private/tmp.  With roots.tmp = '/tmp', a /private/tmp
+      // path must canonicalize and then tokenize to $TMPDIR.
+      const block = getBlock(normalize([readEv('/private/tmp/build-artifact')], darwinCtx));
+      expect(block?.external_reads).toContain('$TMPDIR/build-artifact');
+    });
+
+    it('canonicalizes /private/etc → /etc, then drops it via the shared /etc/resolv.conf noise prefix (darwin)', () => {
+      // /private/etc/resolv.conf → /etc/resolv.conf (shared noise) → dropped.
+      const block = getBlock(normalize([readEv('/private/etc/resolv.conf')], darwinCtx));
+      expect(block?.external_reads ?? []).toEqual([]);
+    });
+
+    it('does NOT canonicalize /private on linux — /private/tmp stays a literal external read', () => {
+      // os:'linux' default: the /private rewrite never runs.  /private/tmp/...
+      // matches no root, so it surfaces verbatim — NOT collapsed to $TMPDIR.
+      const block = getBlock(normalize([readEv('/private/tmp/build-artifact')], ctx));
+      expect(block?.external_reads).toContain('/private/tmp/build-artifact');
+      expect(block?.external_reads).not.toContain('$TMPDIR/build-artifact');
+    });
+
+    it('does NOT canonicalize a /private*-but-not-segment-boundary path (darwin)', () => {
+      // /private/variant is NOT /private/var/... — the rewrite only fires on a
+      // true path-segment boundary, so this passes through untouched.
+      const block = getBlock(normalize([readEv('/private/variant/data')], darwinCtx));
+      expect(block?.external_reads).toContain('/private/variant/data');
+    });
+
+    it('Linux output is byte-identical regardless of the os flag for a shared-noise / non-macOS path', () => {
+      // A path that is NOT macOS-shaped must normalize identically under both
+      // os values — the gating only ADDS macOS drops; it never changes Linux
+      // behaviour for shared paths.
+      const events = [readEv('/root/.npmrc'), readEv('/usr/lib/x86_64-linux-gnu/libssl.so.1.1')];
+      const linux = getBlock(normalize(events, ctx));
+      const darwin = getBlock(normalize(events, darwinCtx));
+      expect(darwin?.external_reads).toEqual(linux?.external_reads);
+      expect(linux?.external_reads).toEqual(['$HOME/.npmrc']);
+    });
+  });
+
   // Imp 5: hidden + cross-package writes must compound both prefixes.
   describe('compound <HIDDEN> + <CROSS_PACKAGE> tags (Imp 5)', () => {
     it('emits <HIDDEN> <CROSS_PACKAGE> for a write that is both hidden and cross-package', () => {

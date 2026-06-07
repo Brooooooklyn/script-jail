@@ -446,6 +446,7 @@ jobs:
             artifacts/images/vmlinux-vz-x86_64
             artifacts/images/vmlinux-vz-arm64
             artifacts/script-jail-vm-arm64-darwin
+            artifacts/libscriptjail-arm64.dylib
             dist/main.cjs
             dist/cli.cjs
 

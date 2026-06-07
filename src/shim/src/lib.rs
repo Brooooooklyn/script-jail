@@ -26,9 +26,22 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
+#[cfg(target_os = "linux")]
 use core::mem::transmute;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+
+// macOS-only modules: the Mach-O `__interpose` machinery plus the file-op and
+// connect hooks that Linux gets from strace.  Each is `#[cfg(target_os =
+// "macos")]` end-to-end so the Linux ELF build is byte-for-byte unchanged.
+#[cfg(target_os = "macos")]
+mod fileops;
+#[cfg(target_os = "macos")]
+mod interpose;
+#[cfg(target_os = "macos")]
+mod net;
 
 // ── panic handler ──────────────────────────────────────────────────────────
 
@@ -69,6 +82,29 @@ const CANON_BUF_LEN: usize = 1024;
 const MAX_ENVP_GROWTH: usize = 12;
 /// Sanity cap on input envp length — rejects hostile or corrupted envps.
 const MAX_ENVP_SANITY: usize = 8192;
+
+// ── platform linker-var names ───────────────────────────────────────────────
+//
+// The env var that names the preloaded shim (re-injected on every exec from
+// CANON_PRELOAD_PATH), plus the dynamic-linker search-path vars that must be
+// STRIPPED so an attacker cannot load a malicious DSO before our wrappers
+// shadow the audited symbols.  These differ between the two loaders:
+//   LINUX  (ld.so):   LD_PRELOAD; strip LD_AUDIT + LD_LIBRARY_PATH.
+//   MACOS  (dyld):    DYLD_INSERT_LIBRARIES; strip DYLD_LIBRARY_PATH +
+//                     DYLD_FRAMEWORK_PATH.
+// Both names are also listed in AUDIT_PROTECTED_NAMES so the in-process
+// setenv/unsetenv/putenv guards refuse to restore them between the exec-time
+// strip and the next exec.
+#[cfg(target_os = "linux")]
+const PRELOAD_VAR: &[u8] = b"LD_PRELOAD";
+#[cfg(target_os = "macos")]
+const PRELOAD_VAR: &[u8] = b"DYLD_INSERT_LIBRARIES";
+
+/// Dynamic-linker search-path vars stripped from every child envp.
+#[cfg(target_os = "linux")]
+const LINKER_STRIP_VARS: &[&[u8]] = &[b"LD_AUDIT", b"LD_LIBRARY_PATH"];
+#[cfg(target_os = "macos")]
+const LINKER_STRIP_VARS: &[&[u8]] = &[b"DYLD_LIBRARY_PATH", b"DYLD_FRAMEWORK_PATH"];
 
 // ── protect-list (fixed-size, written once at constructor time) ────────────
 
@@ -149,6 +185,20 @@ static CANON_SPOOF_ARCH: CanonBuf = CanonBuf {
     len: AtomicUsize::new(0),
 };
 
+// MACOS only: directory holding the materialized, ad-hoc-re-signed copies of
+// `/bin/sh`, `/bin/bash`, and the coreutils a lifecycle script may exec.  SIP
+// strips `DYLD_INSERT_LIBRARIES` for system binaries under `/bin` and
+// `/usr/bin`, so the shim would never load into them; `sip_redirect`
+// (dispatch_exec / dispatch_spawn) rewrites the program path into this
+// directory's re-signed copy, which DOES honor DYLD.  Snapshotted at ctor like
+// every other sticky var (tamper-proof) and re-injected on every exec.  Shares
+// the CanonBuf cap (see canon-buf-len.ts).
+#[cfg(target_os = "macos")]
+static CANON_SHELL_SHIM_DIR: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
 // npm lifecycle attribution, snapshotted at shim_init from THIS process's own
 // (inherited) environ.  Stamped into every `exec` record (emit_exec_for_pid) so
 // the guest agent can attribute a spawn to its owning package WITHOUT walking
@@ -189,24 +239,48 @@ unsafe fn canon_bytes(buf: &CanonBuf) -> &[u8] {
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 
 // ── real symbol pointers (resolved via dlsym at ctor time) ─────────────────
+//
+// LINUX: the preloaded shadow symbols are reached by name, so we must dlsym
+// `RTLD_NEXT` for the genuine libc implementation and call THROUGH the saved
+// pointer.  MACOS: dyld `__interpose` rewrites the audited binary's bindings,
+// and (proven by the spike) a DIRECT `libc::<fn>` reference from inside our
+// replacement reaches the real symbol WITHOUT re-entering the interpose table.
+// So on macOS the `real_*_raw` helpers below call `libc::` directly and there
+// are no `REAL_*` AtomicPtr slots / dlsym block at all.
 
+#[cfg(target_os = "linux")]
 type GetenvFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 
+#[cfg(target_os = "linux")]
 static REAL_CLEARENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_EXECV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_EXECVE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_EXECVEAT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_EXECVP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_EXECVPE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_FEXECVE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_GETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_POSIX_SPAWN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_POSIX_SPAWNP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_PUTENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_SECURE_GETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_SETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(target_os = "linux")]
 static REAL_UNSETENV: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
+#[cfg(target_os = "linux")]
 unsafe fn real_getenv_raw(name: *const c_char) -> *mut c_char {
     let p = REAL_GETENV.load(Ordering::Acquire);
     if p.is_null() {
@@ -216,6 +290,7 @@ unsafe fn real_getenv_raw(name: *const c_char) -> *mut c_char {
     f(name)
 }
 
+#[cfg(target_os = "linux")]
 unsafe fn real_secure_getenv_raw(name: *const c_char) -> *mut c_char {
     let p = REAL_SECURE_GETENV.load(Ordering::Acquire);
     if !p.is_null() {
@@ -225,6 +300,21 @@ unsafe fn real_secure_getenv_raw(name: *const c_char) -> *mut c_char {
     // musl fallback: secure_getenv absent, but script-jail guests are never
     // setuid, so secure_getenv == getenv semantically.
     real_getenv_raw(name)
+}
+
+// MACOS: direct same-image libc reference (no interpose recursion — R8).
+#[cfg(target_os = "macos")]
+unsafe fn real_getenv_raw(name: *const c_char) -> *mut c_char {
+    libc::getenv(name)
+}
+
+// MACOS has no secure_getenv / __secure_getenv (and the guests are never
+// setuid), so secure_getenv == getenv.  The interpose table only ever rebinds
+// `getenv`; this exists so shared code that calls `real_secure_getenv_raw`
+// compiles, but no `secure_getenv` interpose entry is emitted on macOS.
+#[cfg(target_os = "macos")]
+unsafe fn real_secure_getenv_raw(name: *const c_char) -> *mut c_char {
+    libc::getenv(name)
 }
 
 // ── init state + pthread-key-backed recursion guard ────────────────────────
@@ -1083,6 +1173,274 @@ unsafe fn emit_node_startup_done() {
     write_all(log_fd, &buf[..pos]);
 }
 
+// ── MACOS fs + connect emit + path resolution ──────────────────────────────
+//
+// Linux gets fs (read/write) and connect events from strace; macOS has no
+// strace, so the shim must emit them itself.  These functions are the Mach-O
+// analog of strace-parser.ts's read/write/connect rows.  They are
+// zero-allocation (raw stack buffers + write_all), matching the macOS hot-path
+// discipline proven necessary by the spike (getenv/file ops can fire during
+// libSystem/malloc bootstrap, before the Rust allocator is live).
+
+/// Access classification for a file-op event.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(crate) enum FsKind {
+    Read,
+    Write,
+}
+
+/// errno to surface on a failed file-op.  Only ENOENT / EACCES are carried
+/// (matching schema.ts FsReadEvent/FsWriteEvent.errno enum); everything else is
+/// treated as success-shaped (no errno field) so protected-paths.ts's
+/// ENOENT-drop and the macOS noise filter behave like the strace path.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(crate) enum FsErrno {
+    None,
+    Enoent,
+    Eacces,
+}
+
+/// Map a raw errno into the carried subset.  Anything other than ENOENT/EACCES
+/// is reported as None (no errno field).
+#[cfg(target_os = "macos")]
+pub(crate) fn classify_fs_errno(e: c_int) -> FsErrno {
+    if e == libc::ENOENT {
+        FsErrno::Enoent
+    } else if e == libc::EACCES {
+        FsErrno::Eacces
+    } else {
+        FsErrno::None
+    }
+}
+
+/// Emit one JSONL fs event:
+///   {"kind":"read"|"write","path":"<esc>","pid":N,"ts":N,"hidden":false[,"errno":"ENOENT"|"EACCES"]}
+/// matching `FsReadEvent`/`FsWriteEvent` in src/lock/schema.ts.  `path` is the
+/// already-resolved absolute path as a NUL-terminated C string.  `hidden` is
+/// always false from the shim (protected-paths.ts decides hiding host-side).
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn emit_fs(kind: FsKind, path: *const c_char, errno_kind: FsErrno) {
+    let log_fd = LOG_FD.load(Ordering::Acquire);
+    if log_fd < 0 {
+        return;
+    }
+
+    let mut ts: libc::timespec = core::mem::zeroed();
+    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    let ns: i64 = (ts.tv_sec as i64) * 1_000_000_000i64 + ts.tv_nsec as i64;
+    let pid = libc::getpid();
+
+    let mut buf = [0u8; JSONL_BUF];
+    let mut pos = 0usize;
+
+    // Reserve trailing budget for ","pid":...,"ts":...,"hidden":false,"errno":"EACCES"}\n
+    const SUFFIX_RESERVE: usize = 96;
+
+    let prefix: &[u8] = match kind {
+        FsKind::Read => br#"{"kind":"read","path":""#,
+        FsKind::Write => br#"{"kind":"write","path":""#,
+    };
+    buf[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+
+    let escape_budget_end = JSONL_BUF.saturating_sub(SUFFIX_RESERVE);
+    if pos < escape_budget_end {
+        let written = json_escape(&mut buf[pos..escape_budget_end], path);
+        pos += written;
+    }
+
+    let mid1 = br#"","pid":"#;
+    buf[pos..pos + mid1.len()].copy_from_slice(mid1);
+    pos += mid1.len();
+    pos += write_i64(&mut buf[pos..], pid as i64);
+
+    let mid2 = br#","ts":"#;
+    buf[pos..pos + mid2.len()].copy_from_slice(mid2);
+    pos += mid2.len();
+    pos += write_i64(&mut buf[pos..], ns);
+
+    let mid3 = br#","hidden":false"#;
+    buf[pos..pos + mid3.len()].copy_from_slice(mid3);
+    pos += mid3.len();
+
+    match errno_kind {
+        FsErrno::None => {}
+        FsErrno::Enoent => {
+            let e = br#","errno":"ENOENT""#;
+            buf[pos..pos + e.len()].copy_from_slice(e);
+            pos += e.len();
+        }
+        FsErrno::Eacces => {
+            let e = br#","errno":"EACCES""#;
+            buf[pos..pos + e.len()].copy_from_slice(e);
+            pos += e.len();
+        }
+    }
+
+    buf[pos] = b'}';
+    pos += 1;
+    buf[pos] = b'\n';
+    pos += 1;
+
+    if pos > 0 && pos <= JSONL_BUF {
+        write_all(log_fd, &buf[..pos]);
+    }
+}
+
+/// connect() result classification.  Mirrors strace-parser.ts:
+///   rc == 0           → "ok"
+///   any error (incl. EINPROGRESS) → "blocked"
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(crate) enum ConnectResult {
+    Ok,
+    Blocked,
+}
+
+/// Emit one JSONL connect event:
+///   {"kind":"connect","host":"<ip>","port":N,"result":"ok"|"blocked","pid":N,"ts":N}
+/// matching `NetworkEvent` in src/lock/schema.ts.  `host` is the already
+/// hand-formatted IP literal (IPv4 dotted-quad or IPv6 colon form) as a
+/// NUL-terminated C string; `port` is host-order.
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn emit_connect(host: *const c_char, port: u16, result: ConnectResult) {
+    let log_fd = LOG_FD.load(Ordering::Acquire);
+    if log_fd < 0 {
+        return;
+    }
+
+    let mut ts: libc::timespec = core::mem::zeroed();
+    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    let ns: i64 = (ts.tv_sec as i64) * 1_000_000_000i64 + ts.tv_nsec as i64;
+    let pid = libc::getpid();
+
+    let mut buf = [0u8; JSONL_BUF];
+    let mut pos = 0usize;
+
+    const SUFFIX_RESERVE: usize = 96;
+
+    let prefix = br#"{"kind":"connect","host":""#;
+    buf[..prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+
+    let escape_budget_end = JSONL_BUF.saturating_sub(SUFFIX_RESERVE);
+    if pos < escape_budget_end {
+        let written = json_escape(&mut buf[pos..escape_budget_end], host);
+        pos += written;
+    }
+
+    let mid1 = br#"","port":"#;
+    buf[pos..pos + mid1.len()].copy_from_slice(mid1);
+    pos += mid1.len();
+    pos += write_i64(&mut buf[pos..], port as i64);
+
+    let result_tail: &[u8] = match result {
+        ConnectResult::Ok => br#","result":"ok""#,
+        ConnectResult::Blocked => br#","result":"blocked""#,
+    };
+    buf[pos..pos + result_tail.len()].copy_from_slice(result_tail);
+    pos += result_tail.len();
+
+    let mid2 = br#","pid":"#;
+    buf[pos..pos + mid2.len()].copy_from_slice(mid2);
+    pos += mid2.len();
+    pos += write_i64(&mut buf[pos..], pid as i64);
+
+    let mid3 = br#","ts":"#;
+    buf[pos..pos + mid3.len()].copy_from_slice(mid3);
+    pos += mid3.len();
+    pos += write_i64(&mut buf[pos..], ns);
+
+    buf[pos] = b'}';
+    pos += 1;
+    buf[pos] = b'\n';
+    pos += 1;
+
+    if pos > 0 && pos <= JSONL_BUF {
+        write_all(log_fd, &buf[..pos]);
+    }
+}
+
+/// Resolve `(dirfd, path)` to an ABSOLUTE NUL-terminated path written into
+/// `out`, returning the length (excluding NUL) on success or None on overflow /
+/// unresolvable dirfd.  Mirrors fspy `convert.rs` `ToAbsolutePath`:
+///   - an absolute `path` (leading '/') is copied verbatim;
+///   - `AT_FDCWD` resolves the relative path against getcwd();
+///   - a numeric dirfd resolves via fcntl(F_GETPATH) then joins the relative.
+/// Zero-allocation: `out` is a caller stack buffer (size PATH_MAX+1 expected).
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn abs_path_into(dirfd: c_int, path: *const c_char, out: &mut [u8]) -> Option<usize> {
+    if path.is_null() {
+        return None;
+    }
+    // Absolute path → copy verbatim.
+    if *path as u8 == b'/' {
+        return copy_cstr_into(path, out);
+    }
+
+    // Relative path: resolve the base directory.
+    let mut base = [0u8; (libc::PATH_MAX as usize) + 1];
+    let base_len = if dirfd == libc::AT_FDCWD {
+        if libc::getcwd(base.as_mut_ptr() as *mut c_char, base.len()).is_null() {
+            return None;
+        }
+        cstr_len(base.as_ptr() as *const c_char)
+    } else {
+        // F_GETPATH writes the fd's path into a PATH_MAX buffer.
+        if libc::fcntl(dirfd, libc::F_GETPATH, base.as_mut_ptr() as *mut c_char) != 0 {
+            return None;
+        }
+        cstr_len(base.as_ptr() as *const c_char)
+    };
+
+    // Join `<base>/<path>`.  An empty `path` (e.g. AT_EMPTY_PATH style) yields
+    // just the base.
+    let path_len = cstr_len(path);
+    // base + '/' + path + NUL
+    let need = base_len + 1 + path_len + 1;
+    if need > out.len() {
+        return None;
+    }
+    out[..base_len].copy_from_slice(&base[..base_len]);
+    let mut pos = base_len;
+    if path_len > 0 {
+        out[pos] = b'/';
+        pos += 1;
+        core::ptr::copy_nonoverlapping(path as *const u8, out.as_mut_ptr().add(pos), path_len);
+        pos += path_len;
+    }
+    out[pos] = 0;
+    Some(pos)
+}
+
+/// Copy a NUL-terminated C string into `out` (with its NUL), returning the
+/// length excluding NUL, or None if it would overflow.
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn copy_cstr_into(s: *const c_char, out: &mut [u8]) -> Option<usize> {
+    let len = cstr_len(s);
+    if len + 1 > out.len() {
+        return None;
+    }
+    core::ptr::copy_nonoverlapping(s as *const u8, out.as_mut_ptr(), len);
+    out[len] = 0;
+    Some(len)
+}
+
+/// Length of a NUL-terminated C string (excluding the NUL).
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn cstr_len(s: *const c_char) -> usize {
+    if s.is_null() {
+        return 0;
+    }
+    let mut n = 0usize;
+    while *s.add(n) != 0 {
+        n += 1;
+    }
+    n
+}
+
 // ── constructor ────────────────────────────────────────────────────────────
 
 #[ctor::ctor]
@@ -1100,61 +1458,69 @@ unsafe fn shim_init() {
         set_in_shim(true);
     }
 
-    // 3. Resolve real symbols unconditionally. dlsym may internally call
-    //    getenv; if the key was created our wrapper sees in_shim==true and
-    //    forwards. If the key was NOT created, INIT_DONE is still false so
-    //    the wrapper takes the pre-init bypass path and forwards to
-    //    real_getenv_raw (null-safe when REAL_GETENV is still NULL).
-    let getenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"getenv\0".as_ptr() as *const c_char);
-    REAL_GETENV.store(getenv_ptr as *mut c_void, Ordering::Release);
+    // 3. Resolve real symbols unconditionally (LINUX only). dlsym may
+    //    internally call getenv; if the key was created our wrapper sees
+    //    in_shim==true and forwards. If the key was NOT created, INIT_DONE is
+    //    still false so the wrapper takes the pre-init bypass path and forwards
+    //    to real_getenv_raw (null-safe when REAL_GETENV is still NULL).
+    //
+    //    MACOS does NOT do this: there is no `RTLD_NEXT` shadow chain to walk —
+    //    dyld `__interpose` rebinds the audited binary's call sites, and our
+    //    replacements reach the real symbol via a direct `libc::<fn>` reference
+    //    (proven non-recursive — see real_getenv_raw's macos branch).
+    #[cfg(target_os = "linux")]
+    {
+        let getenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"getenv\0".as_ptr() as *const c_char);
+        REAL_GETENV.store(getenv_ptr as *mut c_void, Ordering::Release);
 
-    let mut sec_ptr =
-        libc::dlsym(libc::RTLD_NEXT, b"secure_getenv\0".as_ptr() as *const c_char);
-    if sec_ptr.is_null() {
-        sec_ptr = libc::dlsym(
-            libc::RTLD_NEXT,
-            b"__secure_getenv\0".as_ptr() as *const c_char,
-        );
+        let mut sec_ptr =
+            libc::dlsym(libc::RTLD_NEXT, b"secure_getenv\0".as_ptr() as *const c_char);
+        if sec_ptr.is_null() {
+            sec_ptr = libc::dlsym(
+                libc::RTLD_NEXT,
+                b"__secure_getenv\0".as_ptr() as *const c_char,
+            );
+        }
+        REAL_SECURE_GETENV.store(sec_ptr as *mut c_void, Ordering::Release);
+
+        let clearenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"clearenv\0".as_ptr() as *const c_char);
+        REAL_CLEARENV.store(clearenv_ptr as *mut c_void, Ordering::Release);
+
+        let execve_ptr = libc::dlsym(libc::RTLD_NEXT, b"execve\0".as_ptr() as *const c_char);
+        REAL_EXECVE.store(execve_ptr as *mut c_void, Ordering::Release);
+
+        let execv_ptr = libc::dlsym(libc::RTLD_NEXT, b"execv\0".as_ptr() as *const c_char);
+        REAL_EXECV.store(execv_ptr as *mut c_void, Ordering::Release);
+
+        let execvp_ptr = libc::dlsym(libc::RTLD_NEXT, b"execvp\0".as_ptr() as *const c_char);
+        REAL_EXECVP.store(execvp_ptr as *mut c_void, Ordering::Release);
+
+        let execvpe_ptr = libc::dlsym(libc::RTLD_NEXT, b"execvpe\0".as_ptr() as *const c_char);
+        REAL_EXECVPE.store(execvpe_ptr as *mut c_void, Ordering::Release);
+
+        let execveat_ptr = libc::dlsym(libc::RTLD_NEXT, b"execveat\0".as_ptr() as *const c_char);
+        REAL_EXECVEAT.store(execveat_ptr as *mut c_void, Ordering::Release);
+
+        let fexecve_ptr = libc::dlsym(libc::RTLD_NEXT, b"fexecve\0".as_ptr() as *const c_char);
+        REAL_FEXECVE.store(fexecve_ptr as *mut c_void, Ordering::Release);
+
+        let posix_spawn_ptr =
+            libc::dlsym(libc::RTLD_NEXT, b"posix_spawn\0".as_ptr() as *const c_char);
+        REAL_POSIX_SPAWN.store(posix_spawn_ptr as *mut c_void, Ordering::Release);
+
+        let posix_spawnp_ptr =
+            libc::dlsym(libc::RTLD_NEXT, b"posix_spawnp\0".as_ptr() as *const c_char);
+        REAL_POSIX_SPAWNP.store(posix_spawnp_ptr as *mut c_void, Ordering::Release);
+
+        let putenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"putenv\0".as_ptr() as *const c_char);
+        REAL_PUTENV.store(putenv_ptr as *mut c_void, Ordering::Release);
+
+        let setenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"setenv\0".as_ptr() as *const c_char);
+        REAL_SETENV.store(setenv_ptr as *mut c_void, Ordering::Release);
+
+        let unsetenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"unsetenv\0".as_ptr() as *const c_char);
+        REAL_UNSETENV.store(unsetenv_ptr as *mut c_void, Ordering::Release);
     }
-    REAL_SECURE_GETENV.store(sec_ptr as *mut c_void, Ordering::Release);
-
-    let clearenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"clearenv\0".as_ptr() as *const c_char);
-    REAL_CLEARENV.store(clearenv_ptr as *mut c_void, Ordering::Release);
-
-    let execve_ptr = libc::dlsym(libc::RTLD_NEXT, b"execve\0".as_ptr() as *const c_char);
-    REAL_EXECVE.store(execve_ptr as *mut c_void, Ordering::Release);
-
-    let execv_ptr = libc::dlsym(libc::RTLD_NEXT, b"execv\0".as_ptr() as *const c_char);
-    REAL_EXECV.store(execv_ptr as *mut c_void, Ordering::Release);
-
-    let execvp_ptr = libc::dlsym(libc::RTLD_NEXT, b"execvp\0".as_ptr() as *const c_char);
-    REAL_EXECVP.store(execvp_ptr as *mut c_void, Ordering::Release);
-
-    let execvpe_ptr = libc::dlsym(libc::RTLD_NEXT, b"execvpe\0".as_ptr() as *const c_char);
-    REAL_EXECVPE.store(execvpe_ptr as *mut c_void, Ordering::Release);
-
-    let execveat_ptr = libc::dlsym(libc::RTLD_NEXT, b"execveat\0".as_ptr() as *const c_char);
-    REAL_EXECVEAT.store(execveat_ptr as *mut c_void, Ordering::Release);
-
-    let fexecve_ptr = libc::dlsym(libc::RTLD_NEXT, b"fexecve\0".as_ptr() as *const c_char);
-    REAL_FEXECVE.store(fexecve_ptr as *mut c_void, Ordering::Release);
-
-    let posix_spawn_ptr =
-        libc::dlsym(libc::RTLD_NEXT, b"posix_spawn\0".as_ptr() as *const c_char);
-    REAL_POSIX_SPAWN.store(posix_spawn_ptr as *mut c_void, Ordering::Release);
-
-    let posix_spawnp_ptr =
-        libc::dlsym(libc::RTLD_NEXT, b"posix_spawnp\0".as_ptr() as *const c_char);
-    REAL_POSIX_SPAWNP.store(posix_spawnp_ptr as *mut c_void, Ordering::Release);
-
-    let putenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"putenv\0".as_ptr() as *const c_char);
-    REAL_PUTENV.store(putenv_ptr as *mut c_void, Ordering::Release);
-
-    let setenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"setenv\0".as_ptr() as *const c_char);
-    REAL_SETENV.store(setenv_ptr as *mut c_void, Ordering::Release);
-
-    let unsetenv_ptr = libc::dlsym(libc::RTLD_NEXT, b"unsetenv\0".as_ptr() as *const c_char);
-    REAL_UNSETENV.store(unsetenv_ptr as *mut c_void, Ordering::Release);
 
     // Without a working pthread key we cannot safely guard recursion in the
     // audit path; degrade to transparent passthrough by leaving INIT_DONE
@@ -1269,6 +1635,14 @@ unsafe fn shim_init() {
         &CANON_SPOOF_ARCH,
         b"SCRIPT_JAIL_SPOOF_ARCH\0".as_ptr() as *const c_char,
     );
+    // MACOS only: the re-signed shell/coreutils shim directory used by
+    // sip_redirect.  Captured (and re-injected) like every other sticky var so
+    // a descendant cannot strip it.  No-op / absent on Linux.
+    #[cfg(target_os = "macos")]
+    capture_canon(
+        &CANON_SHELL_SHIM_DIR,
+        b"SCRIPT_JAIL_SHELL_SHIM_DIR\0".as_ptr() as *const c_char,
+    );
     // npm lifecycle attribution — snapshotted from this process's own environ
     // so emit_exec_for_pid can stamp the owning package into every exec record
     // (deterministic, reap-proof in-process attribution; see the CANON_NPM_*
@@ -1313,51 +1687,67 @@ unsafe fn shim_init() {
 //     getenv (e.g., emit's clock_gettime / write), and clear it before
 //     returning so the next call audits.
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
+// Shared body for the getenv family.  Both the Linux `#[no_mangle]` export
+// (reached via LD_PRELOAD shadowing) and the macOS interpose wrapper (reached
+// via the __interpose table) call this so the audit/hide behaviour is
+// byte-identical across platforms.  `secure` selects the real forwarder; the
+// audit/hide logic is the same either way.
+#[inline]
+unsafe fn getenv_impl(name: *const c_char, secure: bool) -> *mut c_char {
+    let real = |n: *const c_char| -> *mut c_char {
+        if secure {
+            real_secure_getenv_raw(n)
+        } else {
+            real_getenv_raw(n)
+        }
+    };
     if in_shim() {
-        return real_getenv_raw(name);
+        return real(name);
     }
     if !INIT_DONE.load(Ordering::Acquire) {
-        return real_getenv_raw(name);
+        return real(name);
     }
     set_in_shim(true);
     let hidden = is_protected(name);
     emit(name, hidden);
-    let val = if hidden {
-        ptr::null_mut()
-    } else {
-        real_getenv_raw(name)
-    };
+    let val = if hidden { ptr::null_mut() } else { real(name) };
     set_in_shim(false);
     val
 }
 
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
+    getenv_impl(name, false)
+}
+
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
-    if in_shim() {
-        return real_secure_getenv_raw(name);
-    }
-    if !INIT_DONE.load(Ordering::Acquire) {
-        return real_secure_getenv_raw(name);
-    }
-    set_in_shim(true);
-    let hidden = is_protected(name);
-    emit(name, hidden);
-    let val = if hidden {
-        ptr::null_mut()
-    } else {
-        real_secure_getenv_raw(name)
-    };
-    set_in_shim(false);
-    val
+    getenv_impl(name, true)
 }
 
 // __secure_getenv is a deprecated glibc alias for secure_getenv.
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __secure_getenv(name: *const c_char) -> *mut c_char {
-    secure_getenv(name)
+    getenv_impl(name, true)
 }
+
+// MACOS: getenv interpose wrapper.  macOS has NO secure_getenv /
+// __secure_getenv, so only `getenv` is interposed.  `secure=false`.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn getenv_interpose(name: *const c_char) -> *mut c_char {
+    getenv_impl(name, false)
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_GETENV,
+    getenv_interpose,
+    libc::getenv,
+    unsafe extern "C" fn(*const c_char) -> *mut c_char
+);
 
 // ── exec wrappers ──────────────────────────────────────────────────────────
 //
@@ -1377,8 +1767,10 @@ pub unsafe extern "C" fn __secure_getenv(name: *const c_char) -> *mut c_char {
 
 // ── real-symbol callers (transmute wrappers around the AtomicPtr slots) ────
 
+#[cfg(target_os = "linux")]
 type ExecveFn =
     unsafe extern "C" fn(*const c_char, *const *const c_char, *const *const c_char) -> c_int;
+#[cfg(target_os = "linux")]
 type PosixSpawnFn = unsafe extern "C" fn(
     *mut libc::pid_t,
     *const c_char,
@@ -1388,6 +1780,7 @@ type PosixSpawnFn = unsafe extern "C" fn(
     *const *mut c_char,
 ) -> c_int;
 
+#[cfg(target_os = "linux")]
 unsafe fn real_execve_raw(
     prog: *const c_char,
     argv: *const *const c_char,
@@ -1397,13 +1790,8 @@ unsafe fn real_execve_raw(
     if p.is_null() {
         // dlsym failed — return -1 with errno=ENOSYS, the safest forwarding
         // semantics for a missing exec implementation.
-        #[cfg(target_os = "linux")]
         unsafe {
             *libc::__errno_location() = libc::ENOSYS;
-        }
-        #[cfg(target_os = "macos")]
-        unsafe {
-            *libc::__error() = libc::ENOSYS;
         }
         return -1;
     }
@@ -1411,6 +1799,17 @@ unsafe fn real_execve_raw(
     f(prog, argv, envp)
 }
 
+// MACOS: direct same-image libc reference (no interpose recursion — R8).
+#[cfg(target_os = "macos")]
+unsafe fn real_execve_raw(
+    prog: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    libc::execve(prog, argv, envp)
+}
+
+#[cfg(target_os = "linux")]
 unsafe fn real_posix_spawn_raw(
     slot: &AtomicPtr<c_void>,
     pid: *mut libc::pid_t,
@@ -1428,6 +1827,26 @@ unsafe fn real_posix_spawn_raw(
     f(pid, path, file_actions, attrp, argv, envp)
 }
 
+// MACOS: `which` selects the real posix_spawn vs posix_spawnp (the macOS
+// dispatch path passes a bool rather than an AtomicPtr slot since there are no
+// dlsym slots).  Direct libc references, non-recursive (R8).
+#[cfg(target_os = "macos")]
+unsafe fn real_posix_spawn_raw_macos(
+    spawnp: bool,
+    pid: *mut libc::pid_t,
+    path: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+) -> c_int {
+    if spawnp {
+        libc::posix_spawnp(pid, path, file_actions, attrp, argv, envp)
+    } else {
+        libc::posix_spawn(pid, path, file_actions, attrp, argv, envp)
+    }
+}
+
 // ── environ access ─────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
@@ -1440,7 +1859,20 @@ unsafe fn environ_ptr() -> *const *const c_char {
     environ
 }
 
-#[cfg(not(target_os = "linux"))]
+// MACOS: the loader does NOT export a public `environ` symbol the way glibc
+// does; the supported accessor is `_NSGetEnviron()`, which returns a pointer to
+// the process's `char ***environ` cell.  Dereference once to get the live
+// `char **`.
+#[cfg(target_os = "macos")]
+unsafe fn environ_ptr() -> *const *const c_char {
+    let p = libc::_NSGetEnviron();
+    if p.is_null() {
+        return ptr::null();
+    }
+    *p as *const *const c_char
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 unsafe fn environ_ptr() -> *const *const c_char {
     ptr::null()
 }
@@ -1752,6 +2184,13 @@ const STICKY_VARS: &[StickyVar] = &[
         name: b"SCRIPT_JAIL_NODE_OPTIONS",
         canon: &CANON_NODE_OPTIONS,
     },
+    // MACOS only: the re-signed shell/coreutils shim dir consulted by
+    // sip_redirect.  Re-injected on every exec so a descendant can't strip it.
+    #[cfg(target_os = "macos")]
+    StickyVar {
+        name: b"SCRIPT_JAIL_SHELL_SHIM_DIR",
+        canon: &CANON_SHELL_SHIM_DIR,
+    },
 ];
 
 /// Build a rewritten EnvBuf from the input envp.  `envp_in` may be NULL — that
@@ -1799,7 +2238,7 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
     // caller-supplied entry, which is the desired behavior (we won't
     // honor an attacker-controlled LD_PRELOAD/NODE_OPTIONS that the
     // parent never sanctioned).  No special-casing in this function.
-    if !overwrite_env(&mut buf, b"LD_PRELOAD", preload) {
+    if !overwrite_env(&mut buf, PRELOAD_VAR, preload) {
         free_envbuf(&mut buf);
         return None;
     }
@@ -1832,8 +2271,12 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
     // wrappers (setenv/unsetenv/putenv) refuse to set them in-process; this
     // closes the in-process mutation path that would otherwise let a script
     // restore the value AFTER the shim's exec-time strip.
-    envbuf_remove(&mut buf, b"LD_AUDIT");
-    envbuf_remove(&mut buf, b"LD_LIBRARY_PATH");
+    //
+    // MACOS dyld uses DYLD_LIBRARY_PATH / DYLD_FRAMEWORK_PATH for the same
+    // attacker primitive; LINKER_STRIP_VARS selects the right pair per loader.
+    for name in LINKER_STRIP_VARS {
+        envbuf_remove(&mut buf, name);
+    }
 
     // Re-inject SCRIPT_JAIL_* sticky values from the init-time CanonBufs.
     //
@@ -1882,6 +2325,11 @@ unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
 // emit/real_* internals (clock_gettime, write, libc init paths) do not
 // reenter the audited path.
 
+// LINUX: the full execve-family forwarder.  macOS funnels every exec through a
+// single `real_execve_raw` (libSystem routes execl*/execvp/execv through the
+// public execve, proven by the spike), so it does NOT need this enum or the
+// execvpe/execveat/fexecve variants — see the `dispatch_exec` macos branch.
+#[cfg(target_os = "linux")]
 enum RealExecForward {
     Execve,    // real_execve(prog, argv, envp)
     Execvpe,   // real_execvpe(prog, argv, envp)
@@ -1894,7 +2342,9 @@ enum RealExecForward {
     },
 }
 
+#[cfg(target_os = "linux")]
 type ExecvFn = unsafe extern "C" fn(*const c_char, *const *const c_char) -> c_int;
+#[cfg(target_os = "linux")]
 type ExecveatFn = unsafe extern "C" fn(
     c_int,
     *const c_char,
@@ -1902,9 +2352,11 @@ type ExecveatFn = unsafe extern "C" fn(
     *const *const c_char,
     c_int,
 ) -> c_int;
+#[cfg(target_os = "linux")]
 type FexecveFn =
     unsafe extern "C" fn(c_int, *const *const c_char, *const *const c_char) -> c_int;
 
+#[cfg(target_os = "linux")]
 unsafe fn forward_to_real(
     kind: &RealExecForward,
     prog: *const c_char,
@@ -1979,6 +2431,7 @@ unsafe fn forward_to_real(
     }
 }
 
+#[cfg(target_os = "linux")]
 unsafe fn dispatch_exec(
     kind: RealExecForward,
     prog: *const c_char,
@@ -2042,6 +2495,7 @@ unsafe fn dispatch_exec(
 // forks+execs a child and returns control to the parent regardless of
 // outcome.  The parent owns the rewritten EnvBuf and frees it on return.
 
+#[cfg(target_os = "linux")]
 unsafe fn dispatch_spawn(
     real_slot: &AtomicPtr<c_void>,
     pid: *mut libc::pid_t,
@@ -2136,7 +2590,14 @@ unsafe fn dispatch_spawn(
 }
 
 // ── execve(prog, argv, envp) ───────────────────────────────────────────────
+//
+// LINUX wrappers (reached via LD_PRELOAD symbol shadowing).  The macOS exec /
+// spawn interpose wrappers live in the `#[cfg(target_os = "macos")]` block
+// further below — they share dispatch_exec_macos / dispatch_spawn_macos /
+// rewrite_envp / emit_exec but use direct libc real calls and the __interpose
+// table instead of dlsym slots.
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execve(
     prog: *const c_char,
@@ -2168,6 +2629,7 @@ pub unsafe extern "C" fn execve(
 // one the child sees; execv historically just calls execve with environ
 // under the hood, so this preserves API semantics.
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execv(
     prog: *const c_char,
@@ -2204,6 +2666,7 @@ pub unsafe extern "C" fn execv(
 // apply.  Skipping rewrite_envp here would let a native script bypass the
 // audit chain by mutating environ directly and then calling execvp.
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execvp(
     file: *const c_char,
@@ -2232,7 +2695,10 @@ pub unsafe extern "C" fn execvp(
 }
 
 // ── execvpe(file, argv, envp) ──────────────────────────────────────────────
+// LINUX only — macOS libc has no execvpe (and PATH-resolving execvp is handled
+// in-process by the macOS execvp interpose wrapper).
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execvpe(
     file: *const c_char,
@@ -2265,7 +2731,9 @@ pub unsafe extern "C" fn execvpe(
 }
 
 // ── execveat(dirfd, pathname, argv, envp, flags) ───────────────────────────
+// LINUX only — macOS has no execveat syscall/libc wrapper.
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execveat(
     dirfd: c_int,
@@ -2304,7 +2772,11 @@ pub unsafe extern "C" fn execveat(
 }
 
 // ── fexecve(fd, argv, envp) ────────────────────────────────────────────────
+// LINUX only — macOS fexecve has no `/proc/self/fd` fallback and is not
+// exercised by the audited install path, so it is not interposed (the exec
+// attempt would still be visible if it routed through execve).
 
+#[cfg(target_os = "linux")]
 unsafe fn proc_fd_only(fd: c_int, out_buf: &mut [u8; 64]) -> Option<usize> {
     let prefix = b"/proc/self/fd/";
     let mut pos = 0usize;
@@ -2322,6 +2794,7 @@ unsafe fn proc_fd_only(fd: c_int, out_buf: &mut [u8; 64]) -> Option<usize> {
     Some(pos)
 }
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fexecve(
     fd: c_int,
@@ -2342,6 +2815,7 @@ pub unsafe extern "C" fn fexecve(
 
 // ── posix_spawn(pid, path, file_actions, attrp, argv, envp) ────────────────
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn posix_spawn(
     pid: *mut libc::pid_t,
@@ -2365,6 +2839,7 @@ pub unsafe extern "C" fn posix_spawn(
 
 // ── posix_spawnp(pid, file, file_actions, attrp, argv, envp) ───────────────
 
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn posix_spawnp(
     pid: *mut libc::pid_t,
@@ -2405,6 +2880,453 @@ pub unsafe extern "C" fn posix_spawnp(
     rc
 }
 
+// ── MACOS exec / spawn dispatch + interpose wrappers ───────────────────────
+//
+// macOS funnels every exec-family entry through a single `real_execve_raw`
+// (libSystem routes execl* / execvp / execv through the public, interposable
+// execve — proven by the spike), so there is no execvpe/execveat/fexecve and
+// no PATH-resolving libc forwarder.  dispatch_exec_macos / dispatch_spawn_macos
+// mirror the Linux dispatchers (same emit/rewrite_envp/fail-closed semantics)
+// but call libc directly and run sip_redirect on the program path first.
+
+#[cfg(target_os = "macos")]
+unsafe fn dispatch_exec_macos(
+    prog: *const c_char,
+    argv: *const *const c_char,
+    envp_in: *const *const c_char,
+) -> c_int {
+    let argv0 = if argv.is_null() { ptr::null() } else { *argv };
+
+    // SIP redirect: when prog is /bin/{sh,bash} or a /usr/bin coreutil, dyld
+    // strips DYLD_INSERT_LIBRARIES on exec, so the child would run un-audited.
+    // Rewrite to the materialized re-signed copy (if available).  The buffer
+    // is stack-local and outlives the libc::execve call.
+    let mut redirect_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let prog = sip_redirect(prog, &mut redirect_buf);
+
+    match rewrite_envp(envp_in) {
+        Some(mut buf) => {
+            set_in_shim(true);
+            // result:"ok" emitted BEFORE the real exec — a successful exec
+            // replaces the image and never returns, so this is the only chance
+            // to record the attempt with the calling pid.
+            emit_exec(prog, argv0, false, ExecResult::Ok);
+            let rewritten = buf.ptrs as *const *const c_char;
+            let rc = real_execve_raw(prog, argv, rewritten);
+            // Only reached on failure.
+            emit_exec(prog, argv0, false, ExecResult::Failed);
+            free_envbuf(&mut buf);
+            set_in_shim(false);
+            rc
+        }
+        None => {
+            set_in_shim(true);
+            emit_exec(prog, argv0, true, ExecResult::Failed);
+            set_errno(libc::ENOMEM);
+            set_in_shim(false);
+            -1
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn dispatch_spawn_macos(
+    spawnp: bool,
+    pid: *mut libc::pid_t,
+    path: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp_in: *const *mut c_char,
+) -> c_int {
+    let argv0 = if argv.is_null() {
+        ptr::null()
+    } else {
+        *argv as *const c_char
+    };
+
+    let mut redirect_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let path = sip_redirect(path, &mut redirect_buf);
+
+    match rewrite_envp(envp_in as *const *const c_char) {
+        Some(mut buf) => {
+            set_in_shim(true);
+            let rc = real_posix_spawn_raw_macos(
+                spawnp,
+                pid,
+                path,
+                file_actions,
+                attrp,
+                argv,
+                buf.ptrs as *const *mut c_char,
+            );
+            if rc == 0 {
+                // posix_spawn writes the child pid; the strace-equivalent
+                // attribution wants the CHILD pid (matches Linux dispatch).
+                let child_pid = if !pid.is_null() { *pid } else { libc::getpid() };
+                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok);
+            } else {
+                emit_exec(path, argv0, false, ExecResult::Failed);
+            }
+            free_envbuf(&mut buf);
+            set_in_shim(false);
+            rc
+        }
+        None => {
+            set_in_shim(true);
+            emit_exec(path, argv0, true, ExecResult::Failed);
+            set_in_shim(false);
+            libc::ENOMEM
+        }
+    }
+}
+
+// SIP redirect (macOS).  System binaries under /bin and /usr/bin run with
+// DYLD_INSERT_LIBRARIES stripped (SIP), so the shim would never load into a
+// child shell or coreutil.  If SCRIPT_JAIL_SHELL_SHIM_DIR is set and `prog` is
+// one of the covered system binaries, rewrite the path to
+// `<dir>/<basename>` — a materialized, re-signed copy that DOES honor DYLD.
+// Returns `prog` unchanged when no redirect applies (non-system binary, dir
+// unset, or the formatted path would overflow `out`).
+//
+// `out` must outlive the returned pointer (the caller stack-allocates it for
+// the duration of the exec/spawn).  Zero-alloc (no heap) per the macOS hot-path
+// discipline.
+#[cfg(target_os = "macos")]
+unsafe fn sip_redirect(prog: *const c_char, out: &mut [u8]) -> *const c_char {
+    if prog.is_null() {
+        return prog;
+    }
+    let dir = canon_bytes(&CANON_SHELL_SHIM_DIR);
+    if dir.is_empty() {
+        return prog;
+    }
+    // Only redirect known system-binary paths.  We match the FULL path against
+    // /bin/sh, /bin/bash, and /usr/bin/<coreutil>.
+    let basename = match sip_covered_basename(prog) {
+        Some(b) => b,
+        None => return prog,
+    };
+    // Format `<dir>/<basename>\0` into `out`.  Bail (no redirect) on overflow.
+    let need = dir.len() + 1 + basename.len() + 1;
+    if need > out.len() {
+        return prog;
+    }
+    let mut pos = 0usize;
+    out[..dir.len()].copy_from_slice(dir);
+    pos += dir.len();
+    out[pos] = b'/';
+    pos += 1;
+    out[pos..pos + basename.len()].copy_from_slice(basename);
+    pos += basename.len();
+    out[pos] = 0;
+    out.as_ptr() as *const c_char
+}
+
+// The coreutils + shells whose system copies SIP de-privileges.  Ported as a
+// static byte-slice set (the fspy COREUTILS trick).  A match returns the bare
+// basename slice to splice into SCRIPT_JAIL_SHELL_SHIM_DIR.
+#[cfg(target_os = "macos")]
+static SIP_SHELLS: &[(&[u8], &[u8])] = &[
+    (b"/bin/sh", b"sh"),
+    (b"/bin/bash", b"bash"),
+];
+
+#[cfg(target_os = "macos")]
+static SIP_COREUTILS: &[&[u8]] = &[
+    b"cat", b"chmod", b"chown", b"cp", b"date", b"dd", b"df", b"echo", b"expr",
+    b"ln", b"ls", b"mkdir", b"mv", b"pwd", b"rm", b"rmdir", b"sleep", b"stty",
+    b"sync", b"test", b"basename", b"dirname", b"env", b"head", b"tail",
+    b"sed", b"awk", b"grep", b"cut", b"tr", b"uname", b"sort", b"uniq", b"wc",
+    b"true", b"false", b"printf", b"touch", b"cmp", b"find", b"xargs", b"which",
+];
+
+// Returns the basename to redirect to if `prog` is a covered system binary.
+// Matches exactly: /bin/sh, /bin/bash, and BOTH /usr/bin/<coreutil> and
+// /bin/<coreutil> (coreutils live under /bin on macOS — e.g. /bin/cat,
+// /bin/echo, /bin/test — and under /usr/bin too; SIP de-privileges both).
+#[cfg(target_os = "macos")]
+unsafe fn sip_covered_basename(prog: *const c_char) -> Option<&'static [u8]> {
+    for (full, base) in SIP_SHELLS {
+        if cstr_eq_bytes(prog, full) {
+            return Some(base);
+        }
+    }
+    // Try each covered system bin dir prefix; on a match, compare the tail
+    // against the coreutil set.  Both /usr/bin and /bin are SIP-protected.
+    const SYS_BIN_DIRS: &[&[u8]] = &[b"/usr/bin/", b"/bin/"];
+    for prefix in SYS_BIN_DIRS {
+        let mut i = 0usize;
+        let mut matched = true;
+        while i < prefix.len() {
+            if *prog.add(i) as u8 != prefix[i] {
+                matched = false;
+                break;
+            }
+            i += 1;
+        }
+        if !matched {
+            continue;
+        }
+        let tail = prog.add(prefix.len());
+        for name in SIP_COREUTILS {
+            if cstr_eq_bytes(tail, name) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+// ── MACOS exec interpose wrappers ──────────────────────────────────────────
+//
+// execve / execv / execvp interpose the public libc symbols.  execvp resolves
+// PATH IN-PROCESS to an absolute path, then dispatches through the SAME
+// dispatch_exec_macos(Execve) so the "every exec goes through rewrite_envp"
+// invariant holds.
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn execve_interpose(
+    prog: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        return real_execve_raw(prog, argv, envp);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_execve_raw(prog, argv, envp);
+    }
+    set_in_shim(true);
+    let rc = dispatch_exec_macos(prog, argv, envp);
+    set_in_shim(false);
+    rc
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_EXECVE,
+    execve_interpose,
+    libc::execve,
+    unsafe extern "C" fn(*const c_char, *const *const c_char, *const *const c_char) -> c_int
+);
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn execv_interpose(
+    prog: *const c_char,
+    argv: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        return libc::execv(prog, argv);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return libc::execv(prog, argv);
+    }
+    set_in_shim(true);
+    // execv runs with the current environ; route through dispatch_exec_macos so
+    // the snapshot is rewritten and the audit chain survives into the child.
+    let rc = dispatch_exec_macos(prog, argv, environ_ptr());
+    set_in_shim(false);
+    rc
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_EXECV,
+    execv_interpose,
+    libc::execv,
+    unsafe extern "C" fn(*const c_char, *const *const c_char) -> c_int
+);
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn execvp_interpose(
+    file: *const c_char,
+    argv: *const *const c_char,
+) -> c_int {
+    if in_shim() {
+        return libc::execvp(file, argv);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return libc::execvp(file, argv);
+    }
+    set_in_shim(true);
+    // Resolve PATH in-process to an absolute prog, then dispatch through the
+    // Execve path so rewrite_envp + sip_redirect + emit all apply.  On
+    // resolution failure forward to the real execvp (which sets ENOENT/EACCES).
+    let mut resolved = [0u8; (libc::PATH_MAX as usize) + 1];
+    let prog = resolve_path_search(file, &mut resolved);
+    let rc = match prog {
+        Some(p) => dispatch_exec_macos(p, argv, environ_ptr()),
+        None => {
+            set_in_shim(false);
+            return libc::execvp(file, argv);
+        }
+    };
+    set_in_shim(false);
+    rc
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_EXECVP,
+    execvp_interpose,
+    libc::execvp,
+    unsafe extern "C" fn(*const c_char, *const *const c_char) -> c_int
+);
+
+// In-process PATH search for execvp (macOS).  If `file` already contains a '/'
+// it is returned verbatim (no PATH search, per execvp semantics).  Otherwise
+// each PATH entry is joined with `file` and probed with access(X_OK); the first
+// executable match is written NUL-terminated into `out` and returned.  Returns
+// None when no candidate is found (caller forwards to the real execvp).
+// Zero-alloc; reads PATH via real_getenv_raw (we hold in_shim).
+#[cfg(target_os = "macos")]
+unsafe fn resolve_path_search(file: *const c_char, out: &mut [u8]) -> Option<*const c_char> {
+    if file.is_null() {
+        return None;
+    }
+    // Contains a slash → no PATH search.
+    let mut i = 0usize;
+    let flen = loop {
+        let c = *file.add(i) as u8;
+        if c == 0 {
+            break i;
+        }
+        if c == b'/' {
+            return Some(file);
+        }
+        i += 1;
+        if i > out.len() {
+            return None;
+        }
+    };
+    if flen == 0 {
+        return None;
+    }
+    let path_var = real_getenv_raw(b"PATH\0".as_ptr() as *const c_char);
+    // POSIX: when PATH is unset, use a default.  Keep it minimal.
+    let default_path = b"/usr/bin:/bin";
+    let mut p = if path_var.is_null() {
+        default_path.as_ptr()
+    } else {
+        path_var as *const u8
+    };
+    loop {
+        // Read one PATH entry (up to ':' or NUL).
+        let seg_start = p;
+        let mut seg_len = 0usize;
+        loop {
+            let c = *seg_start.add(seg_len);
+            if c == 0 || c == b':' {
+                break;
+            }
+            seg_len += 1;
+        }
+        // Build `<seg>/<file>\0`.  Empty segment means "current dir" (".").
+        let dir_len = if seg_len == 0 { 1 } else { seg_len };
+        let need = dir_len + 1 + flen + 1;
+        if need <= out.len() {
+            let mut pos = if seg_len == 0 {
+                out[0] = b'.';
+                1
+            } else {
+                core::ptr::copy_nonoverlapping(seg_start, out.as_mut_ptr(), seg_len);
+                seg_len
+            };
+            out[pos] = b'/';
+            pos += 1;
+            core::ptr::copy_nonoverlapping(file as *const u8, out.as_mut_ptr().add(pos), flen);
+            pos += flen;
+            out[pos] = 0;
+            if libc::access(out.as_ptr() as *const c_char, libc::X_OK) == 0 {
+                return Some(out.as_ptr() as *const c_char);
+            }
+        }
+        // Advance past this segment.
+        let term = *seg_start.add(seg_len);
+        if term == 0 {
+            return None;
+        }
+        p = seg_start.add(seg_len + 1);
+    }
+}
+
+// ── MACOS posix_spawn / posix_spawnp interpose wrappers ────────────────────
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn posix_spawn_interpose(
+    pid: *mut libc::pid_t,
+    path: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+) -> c_int {
+    if in_shim() {
+        return real_posix_spawn_raw_macos(false, pid, path, file_actions, attrp, argv, envp);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_posix_spawn_raw_macos(false, pid, path, file_actions, attrp, argv, envp);
+    }
+    set_in_shim(true);
+    let rc = dispatch_spawn_macos(false, pid, path, file_actions, attrp, argv, envp);
+    set_in_shim(false);
+    rc
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_POSIX_SPAWN,
+    posix_spawn_interpose,
+    libc::posix_spawn,
+    unsafe extern "C" fn(
+        *mut libc::pid_t,
+        *const c_char,
+        *const libc::posix_spawn_file_actions_t,
+        *const libc::posix_spawnattr_t,
+        *const *mut c_char,
+        *const *mut c_char,
+    ) -> c_int
+);
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn posix_spawnp_interpose(
+    pid: *mut libc::pid_t,
+    file: *const c_char,
+    file_actions: *const libc::posix_spawn_file_actions_t,
+    attrp: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+) -> c_int {
+    if in_shim() {
+        return real_posix_spawn_raw_macos(true, pid, file, file_actions, attrp, argv, envp);
+    }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return real_posix_spawn_raw_macos(true, pid, file, file_actions, attrp, argv, envp);
+    }
+    set_in_shim(true);
+    // posix_spawnp does its own PATH search in the child; we keep that
+    // behaviour (sip_redirect only fires for absolute system paths).
+    let rc = dispatch_spawn_macos(true, pid, file, file_actions, attrp, argv, envp);
+    set_in_shim(false);
+    rc
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_POSIX_SPAWNP,
+    posix_spawnp_interpose,
+    libc::posix_spawnp,
+    unsafe extern "C" fn(
+        *mut libc::pid_t,
+        *const c_char,
+        *const libc::posix_spawn_file_actions_t,
+        *const libc::posix_spawnattr_t,
+        *const *mut c_char,
+        *const *mut c_char,
+    ) -> c_int
+);
+
 // ── env mutator guards ──────────────────────────────────────────────────────
 //
 // These wrappers intercept setenv/unsetenv/putenv/clearenv to refuse in-process
@@ -2422,7 +3344,11 @@ pub unsafe extern "C" fn posix_spawnp(
 /// to survive.  Stored as byte-slice literals (no NUL terminator) so we can
 /// walk them with cstr_eq_bytes / cstr_starts_with_eq_or_nul.
 static AUDIT_PROTECTED_NAMES: &[&[u8]] = &[
+    // PRELOAD_VAR per platform: LD_PRELOAD (linux) / DYLD_INSERT_LIBRARIES (macos).
+    #[cfg(target_os = "linux")]
     b"LD_PRELOAD",
+    #[cfg(target_os = "macos")]
+    b"DYLD_INSERT_LIBRARIES",
     b"NODE_OPTIONS",
     b"SCRIPT_JAIL_LOG_FILE",
     b"SCRIPT_JAIL_LOG_FD",
@@ -2436,9 +3362,21 @@ static AUDIT_PROTECTED_NAMES: &[&[u8]] = &[
     // ld.so's library lookup to attacker-controlled directories.  Both are
     // stripped from the child envp by rewrite_envp at exec-time AND refused
     // in-process via the setenv/unsetenv/putenv guards below, so a script
-    // cannot restore them between the strip and the next exec.
+    // cannot restore them between the strip and the next exec.  On macOS dyld
+    // the equivalents are DYLD_LIBRARY_PATH / DYLD_FRAMEWORK_PATH.
+    #[cfg(target_os = "linux")]
     b"LD_AUDIT",
+    #[cfg(target_os = "linux")]
     b"LD_LIBRARY_PATH",
+    #[cfg(target_os = "macos")]
+    b"DYLD_LIBRARY_PATH",
+    #[cfg(target_os = "macos")]
+    b"DYLD_FRAMEWORK_PATH",
+    // MACOS only: the re-signed shell/coreutils shim dir consulted by
+    // sip_redirect must stay canonical — a script restoring/redirecting it
+    // could steer execs at an attacker-controlled binary.
+    #[cfg(target_os = "macos")]
+    b"SCRIPT_JAIL_SHELL_SHIM_DIR",
 ];
 
 /// Compare a C-string against a Rust byte slice (no NUL in `bytes`).
@@ -2645,13 +3583,22 @@ unsafe fn emit_tamper(op: &[u8], name: Option<*const c_char>) {
     write_all(log_fd, &buf[..pos]);
 }
 
-// Raw forwarders for the 4 env-mutator real symbols.
+// Raw forwarders for the env-mutator real symbols.
+//
+// LINUX uses the dlsym'd AtomicPtr slots; MACOS calls libc directly (same-image
+// reference, non-recursive — R8).  macOS has NO `clearenv` (and no dlsym
+// chain), so the clearenv path is Linux-only.
 
+#[cfg(target_os = "linux")]
 type SetenvFn = unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> c_int;
+#[cfg(target_os = "linux")]
 type UnsetenvFn = unsafe extern "C" fn(*const c_char) -> c_int;
+#[cfg(target_os = "linux")]
 type PutenvFn = unsafe extern "C" fn(*mut c_char) -> c_int;
+#[cfg(target_os = "linux")]
 type ClearenvFn = unsafe extern "C" fn() -> c_int;
 
+#[cfg(target_os = "linux")]
 unsafe fn real_setenv_raw(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int {
     let p = REAL_SETENV.load(Ordering::Acquire);
     if p.is_null() {
@@ -2661,6 +3608,12 @@ unsafe fn real_setenv_raw(name: *const c_char, value: *const c_char, overwrite: 
     f(name, value, overwrite)
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn real_setenv_raw(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int {
+    libc::setenv(name, value, overwrite)
+}
+
+#[cfg(target_os = "linux")]
 unsafe fn real_unsetenv_raw(name: *const c_char) -> c_int {
     let p = REAL_UNSETENV.load(Ordering::Acquire);
     if p.is_null() {
@@ -2670,6 +3623,12 @@ unsafe fn real_unsetenv_raw(name: *const c_char) -> c_int {
     f(name)
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn real_unsetenv_raw(name: *const c_char) -> c_int {
+    libc::unsetenv(name)
+}
+
+#[cfg(target_os = "linux")]
 unsafe fn real_putenv_raw(string: *mut c_char) -> c_int {
     let p = REAL_PUTENV.load(Ordering::Acquire);
     if p.is_null() {
@@ -2679,6 +3638,12 @@ unsafe fn real_putenv_raw(string: *mut c_char) -> c_int {
     f(string)
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn real_putenv_raw(string: *mut c_char) -> c_int {
+    libc::putenv(string)
+}
+
+#[cfg(target_os = "linux")]
 unsafe fn real_clearenv_raw() -> c_int {
     let p = REAL_CLEARENV.load(Ordering::Acquire);
     if p.is_null() {
@@ -2690,12 +3655,8 @@ unsafe fn real_clearenv_raw() -> c_int {
 
 // ── setenv(name, value, overwrite) ─────────────────────────────────────────
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn setenv(
-    name: *const c_char,
-    value: *const c_char,
-    overwrite: c_int,
-) -> c_int {
+#[inline]
+unsafe fn setenv_impl(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int {
     if in_shim() {
         return real_setenv_raw(name, value, overwrite);
     }
@@ -2718,10 +3679,37 @@ pub unsafe extern "C" fn setenv(
     rc
 }
 
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setenv(
+    name: *const c_char,
+    value: *const c_char,
+    overwrite: c_int,
+) -> c_int {
+    setenv_impl(name, value, overwrite)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn setenv_interpose(
+    name: *const c_char,
+    value: *const c_char,
+    overwrite: c_int,
+) -> c_int {
+    setenv_impl(name, value, overwrite)
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_SETENV,
+    setenv_interpose,
+    libc::setenv,
+    unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> c_int
+);
+
 // ── unsetenv(name) ──────────────────────────────────────────────────────────
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
+#[inline]
+unsafe fn unsetenv_impl(name: *const c_char) -> c_int {
     if in_shim() {
         return real_unsetenv_raw(name);
     }
@@ -2739,10 +3727,29 @@ pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
     rc
 }
 
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
+    unsetenv_impl(name)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn unsetenv_interpose(name: *const c_char) -> c_int {
+    unsetenv_impl(name)
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_UNSETENV,
+    unsetenv_interpose,
+    libc::unsetenv,
+    unsafe extern "C" fn(*const c_char) -> c_int
+);
+
 // ── putenv("NAME=VALUE") ────────────────────────────────────────────────────
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
+#[inline]
+unsafe fn putenv_impl(string: *mut c_char) -> c_int {
     if in_shim() {
         return real_putenv_raw(string);
     }
@@ -2781,8 +3788,29 @@ pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
     rc
 }
 
-// ── clearenv() ──────────────────────────────────────────────────────────────
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
+    putenv_impl(string)
+}
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn putenv_interpose(string: *mut c_char) -> c_int {
+    putenv_impl(string)
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_PUTENV,
+    putenv_interpose,
+    libc::putenv,
+    unsafe extern "C" fn(*mut c_char) -> c_int
+);
+
+// ── clearenv() ──────────────────────────────────────────────────────────────
+// LINUX only — macOS libc has no clearenv.
+
+#[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clearenv() -> c_int {
     if in_shim() {

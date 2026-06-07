@@ -5,12 +5,16 @@
 // This is the generalized successor to the macOS-only `detect-host.ts`.  The
 // CLI now runs the audited install on two host families:
 //
-//   - macOS (arm64 only): the install runs inside an Apple
-//     Virtualization.framework (VZ) microVM via the native `script-jail-vm`
-//     helper.  VZ has a hard floor at macOS 14 (Sonoma) — the first release to
-//     expose the `LinuxBootLoader` + vsock APIs we need without extra
-//     entitlements.  Intel macs (darwin/x64) are NOT supported: the VZ helper
-//     and the kernel/rootfs artifacts we ship are arm64-only.
+//   - macOS: two backends.  `vz` (arm64 only) boots the Linux guest inside an
+//     Apple Virtualization.framework (VZ) microVM via the native
+//     `script-jail-vm` helper — VZ has a hard floor at macOS 14 (Sonoma), the
+//     first release to expose the `LinuxBootLoader` + vsock APIs we need
+//     without extra entitlements, and the helper/kernel/rootfs artifacts are
+//     arm64-only.  `bare` runs the install natively on the Mac under the
+//     Mach-O shim (no VM), so it also works on Intel macs (darwin/x64).  Both
+//     share the macOS 14 floor.  `detectPlatform` therefore DETECTS darwin-x64
+//     (it no longer throws); the VZ-only arm64 gate lives in
+//     `src/cli/index.ts`.
 //
 //   - Linux (x64 / arm64): the install runs through the same firecracker →
 //     docker → bare backends the GitHub Action uses, materializing the
@@ -170,12 +174,15 @@ export function detectPlatform(input: DetectPlatformInput = {}): DetectedPlatfor
       throw new UnsupportedMacOSError(macosMajor, MIN_MACOS_MAJOR);
     }
 
-    // Intel macs are rejected outright: the VZ path ships arm64-only
-    // artifacts, so no Intel mac is ever supported regardless of macOS
-    // version.  (The version floor is checked first only so an ancient Intel
-    // mac on a too-old OS still gets a sensible message; either way it fails.)
+    // darwin-x64 (Intel mac) is DETECTED, not rejected here.  The bare macOS
+    // backend builds the Mach-O shim from source and runs natively (no VM), so
+    // an Intel mac CAN audit via `--backend bare`.  Only the VZ path is
+    // arm64-only — that gate moved into `src/cli/index.ts`
+    // (`darwin + vz + x64` → `UnsupportedDarwinArchError`) so detection stays a
+    // pure capability report.  (The legacy `detectHost` shim still throws for
+    // x64 to preserve its macOS-VZ-only contract; see detect-host.ts.)
     if (arch === 'x64') {
-      throw new UnsupportedDarwinArchError();
+      return { os: 'darwin', arch: 'x64', macosMajor };
     }
     if (arch !== 'arm64') {
       throw new UnsupportedArchError(arch);

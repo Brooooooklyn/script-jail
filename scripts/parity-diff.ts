@@ -91,13 +91,24 @@ const PARITY_ONLY_ENV_READS = new Set([
   '__FAKE_PLATFORM__',
 ]);
 
+// Resolver-address noise.  Entries are stored in their POST-canonicalization
+// form: `canonicalize` strips the `<BLOCKED> ` prefix from connect entries on
+// BOTH sides (see canonicalizeConnect) before `filterParityOnlyNoise` runs, so
+// these are matched without the prefix.  A blocked Linux/VZ DNS attempt and an
+// (online) macOS-bare DNS attempt therefore both reduce to `connect <addr>:53`
+// and filter identically.
 const PARITY_ONLY_NETWORK_ATTEMPTS = new Set([
   // Apple Virtualization.framework NAT resolver observed in local arm64 VZ
   // lockfiles. Linux action backends see public resolvers instead.
-  '<BLOCKED> connect 192.168.64.1:53',
+  'connect 192.168.64.1:53',
   // Azure-hosted runner DNS endpoint observed from the Docker backend on
   // ubuntu-24.04-arm. It is host resolver plumbing, not dependency behavior.
-  '<BLOCKED> connect 168.63.129.16:53',
+  'connect 168.63.129.16:53',
+  // macOS-bare backend: the system stub resolver (mDNSResponder) listens on
+  // the loopback DNS port, so a name lookup the install triggers connects to
+  // 127.0.0.1:53.  That is host resolver plumbing on macOS, the same class of
+  // noise as the VZ NAT and Azure entries above — not dependency behavior.
+  'connect 127.0.0.1:53',
 ]);
 
 const PARITY_ONLY_SPAWN_ATTEMPTS = new Set([
@@ -135,10 +146,27 @@ function canonicalize(content: string): string {
       if (/^manager_lockfile_sha256:\s/.test(line)) {
         return 'manager_lockfile_sha256: <canonical>';
       }
-      return canonicalizeNpmDebugLog(line);
+      return canonicalizeConnect(canonicalizeNpmDebugLog(line));
     })
     .join('\n');
   return filterParityOnlyNoise(volatileCanonicalized);
+}
+
+// Strip the `<BLOCKED> ` prefix from connect entries on BOTH sides before
+// comparison (same precedent as the volatile generated_at/SHA fields).  The
+// Linux/Firecracker backends run Phase B offline, so every observed connect()
+// is recorded as `<BLOCKED> connect <host>:<port>`.  The macOS-bare backend is
+// observe-only and stays ONLINE, so its connect() succeeds and normalize emits
+// the same line with NO prefix.  Both lockfiles stay faithful to what their
+// backend actually saw (we do NOT weaken the Linux blocked-vs-succeeded signal
+// inside normalize); we only reconcile the attempt at diff time so one
+// committed lock satisfies both backends.  The match is narrow: only
+// `<BLOCKED> connect ` list items are touched — dlopen entries (also
+// `<BLOCKED> <path>`) never start with `connect `, so they are untouched.
+function canonicalizeConnect(line: string): string {
+  const match = /^(\s*-\s+)<BLOCKED> (connect .*)$/.exec(line);
+  if (!match) return line;
+  return `${match[1]}${match[2]}`;
 }
 
 function filterParityOnlyNoise(content: string): string {

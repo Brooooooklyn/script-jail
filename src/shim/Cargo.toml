@@ -9,6 +9,15 @@ description      = "LD_PRELOAD shim that audits getenv / secure_getenv / __secur
 name        = "scriptjail"
 crate-type  = ["cdylib"]
 
+# macOS-only helper that prints a pid's parent pid via
+# proc_pidinfo(PROC_PIDTBSDINFO) for the guest's MacOSProcReader (no /proc on
+# macOS).  A standalone std binary — NOT the no_std cdylib — never injected
+# into an audited process.  Compiles to a no-op stub on non-macOS so the Linux
+# ELF cdylib build is unaffected.
+[[bin]]
+name = "sj-procinfo"
+path = "src/bin/procinfo.rs"
+
 [dependencies]
 libc = { version = "0.2", default-features = false }
 ctor = { version = "1.0", default-features = false, features = ["proc_macro"] }

@@ -81,6 +81,11 @@ const _stderrWrite =
     ? process.stderr.write.bind(process.stderr)
     : null;
 const NODE_STARTUP_DONE_ENV = 'SCRIPT_JAIL_NODE_STARTUP_DONE';
+// macOS-bare: when set to '1', signalNodeStartupDone writes the
+// node_startup_done JSONL marker directly into the events file (see
+// signalNodeStartupDone).  Set by buildChildEnvMacos in the agent.  On Linux
+// this var is never set, so the direct-write branch is dead code there.
+const NODE_STARTUP_DONE_JSONL_ENV = 'SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL';
 // LOAD-BEARING: phase-install.ts watches this exact absolute path in the
 // per-pid strace stream. The open is intentionally expected to fail with
 // ENOENT; the syscall is only a same-pid ordering marker for file-read
@@ -301,6 +306,39 @@ function logEnvRead(name, hidden) {
 }
 
 function signalNodeStartupDone() {
+  // macOS-bare (SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL=1): write the
+  // node_startup_done JSONL marker DIRECTLY into the events file.  On Linux the
+  // marker rides the Rust shim's setenv interception (the setenv assignment
+  // below), but on macOS the Mach-O shim may not load into a hardened node, so
+  // the setenv-intercept path cannot be relied on.  Writing it here — via the
+  // same captured, monkeypatch-proof writeAuditLine sink env reads use — gives
+  // the phase-install-macos dispatcher its single bootstrap boundary + the
+  // reap-proof attribution seed.  We stamp the npm lifecycle fields the same
+  // way the shim does (read from the underlying env store, before the Proxy)
+  // so classifyShimNodeStartupMarker can seed attribution byte-identically.
+  if (origEnv[NODE_STARTUP_DONE_JSONL_ENV] === '1') {
+    const ts = Number(process.hrtime.bigint() / 1_000_000n);
+    /** @type {Record<string, string | number>} */
+    const marker = {
+      kind: 'node_startup_done',
+      pid: process.pid,
+      ts,
+    };
+    const npmName = origEnv['npm_package_name'];
+    const npmVersion = origEnv['npm_package_version'];
+    const npmEvent = origEnv['npm_lifecycle_event'];
+    if (typeof npmName === 'string' && npmName.length > 0) {
+      marker.npm_package_name = npmName;
+    }
+    if (typeof npmVersion === 'string' && npmVersion.length > 0) {
+      marker.npm_package_version = npmVersion;
+    }
+    if (typeof npmEvent === 'string' && npmEvent.length > 0) {
+      marker.npm_lifecycle_event = npmEvent;
+    }
+    writeAuditLine(JSON.stringify(marker) + '\n');
+  }
+
   try {
     // The Rust shim's setenv/putenv wrappers consume this assignment and emit
     // a shim-channel marker. phase-install uses that same-stream marker to

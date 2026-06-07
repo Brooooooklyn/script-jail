@@ -81,6 +81,12 @@ describe('resolveArtifacts — arm64', () => {
     );
   });
 
+  it('macShimDylibPath resolves to the arm64-only Mach-O shim', () => {
+    expect(arm.macShimDylibPath).toBe(
+      '/Users/test/repo/images/libscriptjail-arm64.dylib',
+    );
+  });
+
 });
 
 describe('resolveArtifacts — x64', () => {
@@ -113,6 +119,15 @@ describe('resolveArtifacts — x64', () => {
     // produced asset names.
     expect(x64.libscriptjailSoPath).toBe(
       '/Users/test/repo/images/libscriptjail.so',
+    );
+  });
+
+  it('macShimDylibPath is the arm64-only name even on an x64 host', () => {
+    // The macOS-native shim is arm64-only (R10); the resolved name carries no
+    // x64 variant.  A darwin-x64 host has no published dylib and builds from
+    // source, but the pure resolver still returns the canonical arm64 name.
+    expect(x64.macShimDylibPath).toBe(
+      '/Users/test/repo/images/libscriptjail-arm64.dylib',
     );
   });
 });
@@ -160,6 +175,16 @@ describe('manifestKey', () => {
         kind: 'libscriptjail',
       }),
     ).toBe('libscriptjail-arm64.so');
+  });
+
+  it('macshim key is the arm64-only dylib name regardless of host arch', () => {
+    // arm64-only (R10): both arches map to the single pinned manifest asset.
+    expect(
+      manifestKey({ hostArch: 'arm64', ubuntuMajor: '24.04', kind: 'macshim' }),
+    ).toBe('libscriptjail-arm64.dylib');
+    expect(
+      manifestKey({ hostArch: 'x64', ubuntuMajor: '24.04', kind: 'macshim' }),
+    ).toBe('libscriptjail-arm64.dylib');
   });
 
   it('returned key matches the basename of resolveArtifacts() paths', () => {

@@ -545,6 +545,30 @@ export function validateShimFile(path: string, expectedMachine: number): string 
 }
 
 // ---------------------------------------------------------------------------
+// Mach-O validation for libscriptjail-arm64.dylib (macOS bare backend)
+// ---------------------------------------------------------------------------
+//
+// MOVED to ./macho.ts.  These helpers are now consumed on the RUNTIME path
+// (src/action/backend/mac-bare.ts validates the shim before each audit), so
+// they must live in an `import.meta`-free module — build.ts's top-level
+// `fileURLToPath(import.meta.url)` is rewritten to an empty value in the CJS
+// `dist/` bundles and would throw at load if dragged into the CLI bundle.
+// Re-exported here so existing `from './build.js'` importers keep working.
+export {
+  MH_MAGIC_64,
+  FAT_MAGIC,
+  FAT_MAGIC_CIGAM,
+  MH_DYLIB,
+  LC_SEGMENT_64,
+  CPU_TYPE_ARM64,
+  CPU_TYPE_X86_64,
+  MACHO64_HEADER_SIZE,
+  expectedMachOCpuType,
+  cpuTypeLabel,
+  validateMachOShimFile,
+} from './macho.js';
+
+// ---------------------------------------------------------------------------
 // Shell helpers
 // ---------------------------------------------------------------------------
 

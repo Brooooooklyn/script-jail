@@ -223,14 +223,105 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # macos-bare — run the macOS-NATIVE bare backend against the SAME pinned
+  # upstream checkout, on a hosted macos-14 runner.
+  #
+  # WHY THIS IS CI-NATIVE (unlike the VZ path):
+  #   The VZ-backed CLI cannot boot in CI because GitHub-hosted macOS runners
+  #   are themselves virtualized and Apple's Virtualization.framework does not
+  #   nest.  The BARE backend needs NO VM — it runs the install directly on the
+  #   Mac under the Mach-O shim (DYLD_INSERT_LIBRARIES), so it runs fine on a
+  #   hosted runner.  This is the first CI-native macOS parity gate the VZ path
+  #   could never provide.
+  #
+  #   macos-14 hosted runners are Apple Silicon (arm64), matching the Linux side
+  #   (ubuntu-24.04-arm).  The bare backend provisions + ad-hoc re-signs its own
+  #   Node at runtime (so DYLD_INSERT_LIBRARIES is honoured); the dylib is built
+  #   from this branch by `pnpm build` below.
+  # ---------------------------------------------------------------------------
+  macos-bare:
+    needs: resolve-fixture
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout script-jail
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Checkout upstream fixture (${{ needs.resolve-fixture.outputs.repo }}@${{ needs.resolve-fixture.outputs.tag }})
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.resolve-fixture.outputs.repo }}
+          ref: ${{ needs.resolve-fixture.outputs.sha }}
+          path: fixture
+          persist-credentials: false
+
+      # The bare backend stages the repo into a private scratch dir before the
+      # install, but the deep vuejs/core .git history is dead weight for the
+      # audit (neither pnpm nor the shim touches it) — strip it to keep the
+      # staged copy lean.
+      - name: Strip fixture .git before staging
+        run: rm -rf fixture/.git
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # Build the CLI/guest bundles + the ad-hoc-signed arm64 Mach-O shim from
+      # THIS branch.  The parity test must run against the code under review.
+      - name: Build bundles + Mach-O shim (arm64)
+        run: pnpm build
+
+      # A minimal config so the CLI has a config to overlay; the bare backend
+      # rewrites work_dir to its staged copy of the fixture.
+      - name: Write a minimal script-jail config
+        run: |
+          printf 'spoof:\n  platform: linux\n  arch: arm64\n' > .script-jail.yml
+
+      - name: Run script-jail check --backend bare against fixture
+        env:
+          # Re-signed node + shell-shim cache root for the bare backend.
+          SCRIPT_JAIL_CACHE_DIR: ${{ runner.temp }}/script-jail-cache
+        run: |
+          node dist/cli.cjs update \
+            --backend bare \
+            --config "${{ github.workspace }}/.script-jail.yml" \
+            --lock "${{ github.workspace }}/macos-bare-lockfile.yml" \
+            --spoof-arch arm64
+        working-directory: ${{ github.workspace }}/fixture
+
+      - name: Upload macOS-bare lockfile
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-bare-lockfile
+          path: macos-bare-lockfile.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # diff — compare the freshly generated Linux lockfile against the committed
   # macOS lockfile (test/parity/macos-arm64-lockfile.yml).
   #
-  # The macOS side is NOT generated in CI — GitHub-hosted macOS runners
-  # cannot boot a nested VM (see the file header).  A maintainer regenerates
-  # the committed lockfile locally whenever the fixture pin or the audit
-  # logic changes; this job fails when the generated Linux lockfile diverges
-  # from that committed baseline after canonicalization and parity-only filters.
+  # The committed-macOS side is NOT generated in CI — GitHub-hosted macOS
+  # runners cannot boot a nested VM (see the file header).  A maintainer
+  # regenerates the committed lockfile locally whenever the fixture pin or the
+  # audit logic changes; this job fails when the generated Linux lockfile
+  # diverges from that committed baseline after canonicalization and
+  # parity-only filters.
   # ---------------------------------------------------------------------------
   diff:
     needs: linux-backend
@@ -304,5 +395,86 @@ jobs:
         with:
           name: parity-report
           path: parity-report.md
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # diff-macos-bare — compare the freshly generated Linux lockfile against the
+  # freshly generated macOS-BARE lockfile (both produced in CI this run).
+  #
+  # Unlike the committed-VZ `diff` job above, BOTH sides here are generated on
+  # this run (Linux on ubuntu-24.04-arm, macOS-bare on macos-14), so this is a
+  # fully CI-native parity gate.  scripts/parity-diff.ts reconciles the one
+  # documented backend difference — the Linux side runs Phase B OFFLINE so its
+  # connects are `<BLOCKED>`, while macOS-bare is observe-only/ONLINE so its
+  # connects succeed — by stripping the `<BLOCKED> ` prefix from connect entries
+  # on both sides before comparison.  Any remaining byte difference fails here.
+  # ---------------------------------------------------------------------------
+  diff-macos-bare:
+    needs: [linux-backend, macos-bare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-lockfile
+          path: artifacts/linux
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-bare-lockfile
+          path: artifacts/macos-bare
+
+      - name: Run parity diff (linux vs macos-bare)
+        id: diff
+        # Exit 0 = parity, 1 = diverged, 2 = usage error / missing input.
+        # Only 0 is accepted.
+        run: |
+          set +e
+          pnpm exec oxnode scripts/parity-diff.ts \
+            --left  artifacts/linux/linux-lockfile.yml \
+            --right artifacts/macos-bare/macos-bare-lockfile.yml \
+            --left-label  linux \
+            --right-label macos-bare \
+            --report parity-report-macos-bare.md
+          RC=$?
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -eq 1 ]; then
+            echo "::error::Linux vs macOS-bare lockfiles diverged — see the parity-report-macos-bare artifact."
+            exit 1
+          fi
+          if [ "$RC" -gt 1 ]; then
+            echo "::error::parity-diff exited $RC (usage error or missing input)"
+            exit 1
+          fi
+
+      - name: Append report to step summary
+        if: always()
+        run: |
+          if [ -f parity-report-macos-bare.md ]; then
+            cat parity-report-macos-bare.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: parity-report-macos-bare
+          path: parity-report-macos-bare.md
           if-no-files-found: warn
           retention-days: 30

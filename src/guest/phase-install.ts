@@ -484,13 +484,13 @@ function pathBasename(pathLike: string): string {
   return slash === -1 ? value : value.slice(slash + 1);
 }
 
-function isNodeBasename(pathLike: string | undefined): boolean {
+export function isNodeBasename(pathLike: string | undefined): boolean {
   if (pathLike === undefined || pathLike.length === 0) return false;
   const base = pathBasename(pathLike);
   return base === 'node' || base === 'nodejs';
 }
 
-function isPackageManagerClientBasename(pathLike: string | undefined): boolean {
+export function isPackageManagerClientBasename(pathLike: string | undefined): boolean {
   if (pathLike === undefined || pathLike.length === 0) return false;
   const base = pathBasename(pathLike);
   return (

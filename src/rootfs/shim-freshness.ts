@@ -36,6 +36,12 @@ export function shimSourceInputs(repoRoot: string): ReadonlyArray<string> {
     join(repoRoot, 'Cargo.lock'),
     join(repoRoot, 'rust-toolchain.toml'),
     join(repoRoot, 'src', 'shim', 'src', 'lib.rs'),
+    // macOS Mach-O port modules (cfg-gated to darwin in lib.rs).  They only
+    // affect the dylib, but listing them keeps the freshness gate honest when
+    // a macOS-only hook changes without touching lib.rs.
+    join(repoRoot, 'src', 'shim', 'src', 'interpose.rs'),
+    join(repoRoot, 'src', 'shim', 'src', 'fileops.rs'),
+    join(repoRoot, 'src', 'shim', 'src', 'net.rs'),
   ];
 }
 

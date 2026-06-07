@@ -50,7 +50,7 @@ import {
   type DetectedPlatform,
 } from './detect-platform.js';
 import { spawnVm, type VmConfig, type VmMode } from './spawn-vm.js';
-import { parseArgs } from './parse-args.js';
+import { parseArgs, type CliBackend } from './parse-args.js';
 import { detectPm, BunUnsupportedError } from '../shared/detect-pm.js';
 import { warn as sharedWarn } from '../shared/log.js';
 import {
@@ -72,6 +72,7 @@ import { createFirecrackerBackend } from '../action/backend/firecracker.js';
 import { createDockerBackend } from '../action/backend/docker.js';
 import { createBareBackend } from '../action/backend/bare.js';
 import { runSelectedBackend, type BackendMap } from '../action/backend/select.js';
+import { createMacBareExecute } from '../action/backend/mac-bare.js';
 
 // ---------------------------------------------------------------------------
 // Help text
@@ -92,6 +93,11 @@ Subcommands:
 Options:
   --config <path>        Path to .script-jail.yml (default: ./.script-jail.yml)
   --lock <path>          Path to .script-jail.lock.yml (default: ./.script-jail.lock.yml)
+  --backend <b>          macOS audit backend: vz | bare. vz boots the Linux guest
+                         inside Apple Virtualization.framework (arm64 only); bare
+                         runs the install natively on the Mac under the Mach-O
+                         shim (no VM). Default: vz on Apple Silicon, bare on Intel.
+                         Ignored on Linux (a warning is printed).
   --spoof-platform <p>   linux | darwin | win32 (default: linux)
   --spoof-arch <a>       x64 | arm64 (default: host arch)
   --help                 Print this help and exit.
@@ -177,6 +183,13 @@ export interface CliDeps {
    * leave this undefined; the default is the shared `runSelectedBackend`.
    */
   runSelectedBackend?: typeof runSelectedBackend;
+  /**
+   * Backend-execution seam for the macOS `bare` path.  Injected by smoke tests
+   * so they never provision/re-sign a real node or spawn the orchestrator.
+   * Production callers leave this undefined; the default is the shared
+   * `createMacBareExecute`.
+   */
+  createMacBareExecute?: typeof createMacBareExecute;
   detectPm?: typeof detectPm;
   spawnVm?: typeof spawnVm;
   /**
@@ -222,6 +235,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   const doResolvePlatformPackageDir =
     deps.resolvePlatformPackageDir ?? resolvePlatformPackageDir;
   const doRunSelectedBackend = deps.runSelectedBackend ?? runSelectedBackend;
+  const doCreateMacBareExecute = deps.createMacBareExecute ?? createMacBareExecute;
   // Platform detection seam.  When a test injects the LEGACY `detectHost`
   // (`{ macosMajor, hostArch }`) but no `detectPlatform`, adapt it to a darwin
   // `DetectedPlatform` directly — do NOT route through `detectPlatform`, which
@@ -328,6 +342,12 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   // require a pre-pulled local image).
   // -----------------------------------------------------------------------
   if (platform.os === 'linux') {
+    // --backend is a darwin-only selector (vz vs bare).  Linux always uses the
+    // firecracker → docker → bare auto order; warn (don't fail) so a script
+    // sharing one invocation across OSes is not broken by the stray flag.
+    if (args.backend !== null) {
+      warn(`--backend is darwin-only; ignoring '--backend ${args.backend}' on Linux.`);
+    }
     return runLinux({
       platform,
       packageImagesDir,
@@ -348,7 +368,50 @@ export async function run(deps: CliDeps = {}): Promise<number> {
   }
 
   // -----------------------------------------------------------------------
-  // macOS (arm64): boot the install inside Apple Virtualization.framework.
+  // macOS: resolve the effective backend.  Explicit --backend wins; otherwise
+  // default to vz on Apple Silicon (the VZ microVM is arm64-only) and bare on
+  // Intel (no VZ artifacts — the Mach-O shim runs natively).
+  // -----------------------------------------------------------------------
+  const effectiveBackend: CliBackend =
+    args.backend ?? (platform.arch === 'arm64' ? 'vz' : 'bare');
+
+  // VZ is arm64-only: its kernel/rootfs/helper artifacts are not shipped for
+  // x64.  An Intel mac explicitly asking for --backend vz fails here with the
+  // same typed error detectPlatform used to throw outright (now detection is
+  // backend-agnostic and this gate lives in the CLI).
+  if (effectiveBackend === 'vz' && platform.arch === 'x64') {
+    stderr.write(`script-jail: ${new UnsupportedDarwinArchError().message}\n`);
+    return 1;
+  }
+
+  // -----------------------------------------------------------------------
+  // macOS bare: run the install NATIVELY on the Mac (no VM), observed by the
+  // Mach-O shim.  Shares runAudit's diff / write / audit-bypass gate via the
+  // `execute` closure — no overlay, no makeOverlay, no spawnVm.
+  // -----------------------------------------------------------------------
+  if (effectiveBackend === 'bare') {
+    return runMacBare({
+      platform,
+      packageImagesDir,
+      repoRoot,
+      cwd,
+      configPath,
+      lockPath,
+      mode,
+      pm,
+      spoofPlatform: args.spoofPlatform,
+      effectiveSpoofArch,
+      warn,
+      stdout,
+      stderr,
+      doRunAudit,
+      doBuildArchFlagOverlay,
+      doCreateMacBareExecute,
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // macOS (arm64, vz): boot the install inside Apple Virtualization.framework.
   // Byte-for-byte the same path as before, except the artifact directory now
   // comes from the resolved platform package (npm install) / dev `images/`
   // fallback instead of always `<repoRoot>/images`.
@@ -576,6 +639,78 @@ async function runLinux(input: RunLinuxInput): Promise<number> {
             selfTest: false,
           },
         }),
+      io: {
+        warn: input.warn,
+        stdout: input.stdout,
+        stderr,
+      },
+      buildArchFlagOverlay: input.doBuildArchFlagOverlay,
+    });
+    return result.exitCode;
+  } catch (err) {
+    if (err instanceof Error) {
+      stderr.write(`script-jail: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// macOS bare backend path
+// ---------------------------------------------------------------------------
+
+interface RunMacBareInput {
+  platform: DetectedPlatform;
+  packageImagesDir: string;
+  repoRoot: string;
+  cwd: string;
+  configPath: string;
+  lockPath: string;
+  mode: VmMode;
+  pm: 'npm' | 'pnpm' | 'yarn';
+  spoofPlatform: 'linux' | 'darwin' | 'win32';
+  effectiveSpoofArch: 'x64' | 'arm64';
+  warn: (msg: string) => void;
+  stdout: { write(s: string): unknown };
+  stderr: { write(s: string): unknown };
+  doRunAudit: typeof runAudit;
+  doBuildArchFlagOverlay: typeof buildArchFlagOverlay;
+  doCreateMacBareExecute: typeof createMacBareExecute;
+}
+
+/**
+ * macOS-native bare audit path.  Runs the install DIRECTLY on the Mac (no VM)
+ * under the Mach-O shim, reusing runAudit's shared diff / write /
+ * audit-bypass gate via the `execute` closure (no overlay, no makeOverlay,
+ * no spawnVm).  Observe-only + online (no offline enforcement).
+ */
+async function runMacBare(input: RunMacBareInput): Promise<number> {
+  const { platform, stderr } = input;
+
+  const execute = input.doCreateMacBareExecute({
+    imagesDir: input.packageImagesDir,
+    repoRoot: input.repoRoot,
+    arch: platform.arch,
+    stderr,
+  });
+
+  try {
+    const result = await input.doRunAudit({
+      repoDir: input.cwd,
+      configPath: input.configPath,
+      lockPath: input.lockPath,
+      mode: input.mode,
+      overrides: {
+        spoofPlatform: input.spoofPlatform,
+        spoofArch: input.effectiveSpoofArch,
+      },
+      pm: input.pm,
+      hostArch: platform.arch,
+      // os.tmpdir() — never `cwd` — so the rewritten config + sidecars cannot
+      // pollute the user's repo.  runAudit creates a private mkdtemp dir here.
+      workDir: tmpdir(),
+      execute,
       io: {
         warn: input.warn,
         stdout: input.stdout,

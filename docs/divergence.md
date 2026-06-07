@@ -46,6 +46,103 @@ generation, not as expected divergence.
   any audit runs. v1 will not add support; the JS-only env hooks bun
   ignores would leave too much unaudited.
 
+## macOS bare backend
+
+`script-jail check --backend bare` on a Mac audits the install **directly on
+the host** (no VM, no container). It mirrors the Linux `bare` backend but,
+because macOS has no `strace` and no `/proc`, the Mach-O `__interpose` shim is
+the **sole** event source. That single difference drives every reconciliation
+rule below. The goal is unchanged: one committed `.script-jail.lock.yml` that
+reconciles against the Linux Action backend after `scripts/parity-diff.ts`
+canonicalization. These are the macOS-specific cases that filter must absorb.
+
+- **Connect: attempt-only canonicalization.** Per the observe-only network
+  posture, the macOS bare backend stays **online** — the shim hooks `connect()`,
+  records the attempt, and lets it proceed. The Linux backends run Phase B
+  **offline**, so the same `connect()` is recorded as `<BLOCKED> connect
+  <host>:<port>`. Each committed lock stays faithful to what its backend
+  actually saw (`src/lock/normalize.ts` does **not** rewrite the per-host
+  connect result), so `scripts/parity-diff.ts` strips the `<BLOCKED> ` prefix
+  from `connect` entries on **both** sides before comparison — the same
+  diff-time precedent as `generated_at`. After stripping, a Linux blocked
+  attempt and a macOS succeeded attempt to the **same** host:port reconcile,
+  while a connect to a **different** host still surfaces as a diff hunk. This
+  preserves the Linux audit's blocked-vs-succeeded signal in its own committed
+  lock without weakening it.
+
+  > **Security note.** Observe-only means the macOS backend **records** but does
+  > not **prevent** egress: a malicious `connect()` actually succeeds, unlike
+  > Linux's offline Phase B. This is an intentional posture difference for the
+  > bare backend; Firecracker remains the high-assurance backend when egress
+  > prevention matters.
+
+- **Resolver-address filter.** A name lookup the install triggers connects to
+  the host's DNS endpoint. The parity filter already drops the Apple
+  Virtualization.framework NAT resolver (`192.168.64.1:53`) and the Azure
+  runner endpoint (`168.63.129.16:53`); the macOS bare backend adds the system
+  stub resolver on loopback (`127.0.0.1:53`, mDNSResponder). These are host
+  resolver plumbing, not dependency behavior. Because the connect prefix is
+  stripped first, the filter set stores these entries in their prefix-less
+  `connect <addr>:53` form.
+
+- **`/private` realpath canonicalization.** On macOS `/var`, `/tmp`, and `/etc`
+  are symlinks into `/private`, so the absolute path the shim resolves (via
+  `F_GETPATH`/`realpath`) comes back as `/private/var/...`, `/private/tmp/...`,
+  `/private/etc/...`. `normalize.ts` strips the `/private` prefix (darwin-gated)
+  **before** tokenization and noise filtering, so the canonical `/var`, `/tmp`,
+  `/etc` forms match both the tokenize roots and the shared system-noise
+  prefixes the Linux side uses. The rewrite is segment-bounded: `/private/var`
+  rewrites, `/private/variant` does not.
+
+- **macOS system-noise prefixes.** The shim, unlike strace, surfaces the dyld
+  runtime and Apple framework reads a hardened-runtime Node and the re-signed
+  shell shims perform at startup. `normalize.ts` drops these as system noise
+  **only when `os === 'darwin'`**: `/System/`, root-level `/Library/` (the
+  per-user `/Users/<u>/Library` is **not** dropped — it can hold real package
+  writes), the `dyld_shared_cache_*` image, the dyld state store under
+  `/var/db/dyld/`, and the provisioned-node toolchain cache (matched by its
+  fixed `script-jail-cache` directory segment — the macOS analog of the Linux
+  `/opt/vp` noise prefix). The darwin gate is a **security boundary**: a
+  malicious Linux lockfile must never be able to smuggle macOS-shaped paths
+  (e.g. a `/System/...` write inside a package dir) past a Linux audit gate
+  that would otherwise drop them. The shared `/usr/lib`, `/usr/share`, and
+  `/dev` prefixes apply on both platforms.
+
+- **Case-insensitive filesystem caveat.** The default macOS volume (APFS) is
+  **case-insensitive but case-preserving**, whereas the Linux audit rootfs is
+  case-sensitive. A lifecycle script that reads `README.md` then `readme.md`
+  observes one inode on macOS and two distinct paths on Linux; tokenization
+  preserves the as-spelled casing, so the two sides can render different
+  `external_reads` entries. Real packages rarely depend on this, but a fixture
+  that exercises mixed-case paths can diverge. If you hit it, normalize the
+  fixture's casing rather than weakening the comparator — case-folding paths
+  globally would mask genuine cross-package escapes that differ only by case.
+
+- **Host-toolchain exec: ENOENT vs ok.** The Linux audit ships a deliberately
+  minimal rootfs (no `gcc`, no `python`, no host `git`), so a script that
+  shells out to a build toolchain records the `exec` attempt with an ENOENT
+  result. A developer Mac (or a `macos-14` runner) usually has the Xcode
+  Command Line Tools installed, so the **same** exec succeeds (`ok`). Both
+  sides record the spawn attempt, but the result differs. Constrain the parity
+  fixture to packages that do not shell to host toolchains; if a fixture must,
+  the spawn result — not just the path — will surface as a diff. Do **not**
+  blanket-canonicalize spawn results to attempt-only: that would erase the
+  Linux signal that an exec was blocked.
+
+- **Dropped `audit_bypass` detectors.** Three `audit_bypass` event kinds are
+  **strace-derived** and have no macOS equivalent, because there is no kernel
+  syscall channel to cross-check the libc-level shim against:
+  `<SYSCALL_EXEC_BYPASS>` (a raw `syscall(SYS_execve, …)` that skipped every
+  libc wrapper), `<EVENTS_FILE_FORGERY>` (a non-shim-loaded pid writing forged
+  events into the trusted JSONL channel), and `<UNRESOLVED_PATH>` (a
+  dirfd/cwd-relative open the strace canonicalizer could not resolve). These
+  **never** appear in macOS-bare goldens. The filesystem-based events-file
+  tamper detector still fails closed on macOS, and `<EXEC_FAIL_OPEN>` /
+  `<AUDIT_FD_LOST>` are still emitted by the shim/preload layers. This is an
+  inherent fidelity gap of a no-strace backend: **Firecracker remains the
+  high-assurance backend**; the macOS bare backend trades some kernel-level
+  cross-checks for a VM-free, CI-native macOS audit.
+
 ## Cross-host parity testing
 
 Two separate contracts back the "byte-equal lockfile" claim, and they are

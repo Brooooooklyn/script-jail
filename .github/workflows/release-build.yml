@@ -46,10 +46,17 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # build-mac-bin — produce the Mach-O `script-jail-vm-arm64-darwin` binary.
-  # Runs on a macos-latest Apple-Silicon runner; emits the binary as a workflow
-  # artifact that (a) the `build` job downloads to compute its SHA for the
-  # paste-block and (b) a later, separate `release.yml` run downloads to publish.
+  # build-mac-bin — produce the macOS Mach-O artifacts: the VZ helper
+  # `script-jail-vm-arm64-darwin` binary AND the native shim
+  # `libscriptjail-arm64.dylib`.  Runs on a macos-latest Apple-Silicon runner;
+  # emits both as a single workflow artifact that (a) the `build` job downloads
+  # to compute their SHAs for the paste-block and (b) a later, separate
+  # release.yml run downloads to publish.
+  #
+  # The dylib is the macOS-native (`DYLD_INSERT_LIBRARIES`) shim for the bare
+  # backend; it can only be produced + ad-hoc signed on a macOS runner (the
+  # Linux `cargo build` would emit an ELF, and `codesign` is macOS-only), which
+  # is exactly why it lives here next to the VZ helper rather than in `build`.
   #
   # We keep this job tightly scoped — no `pnpm install`, no Docker, no
   # access to the consumer-tree of the action — so the macOS runner only
@@ -82,23 +89,46 @@ jobs:
       - name: cargo build (release)
         run: cargo build --release -p script-jail-host-mac
 
-      - name: Stage binary
+      # Build the macOS-native shim cdylib.  Mirrors scripts/build.ts
+      # `buildShimMac`: explicit `--target aarch64-apple-darwin` (the runner's
+      # host target, already installed) so the output path is deterministic.
+      - name: Build macOS shim dylib (release)
+        run: cargo build --release --manifest-path src/shim/Cargo.toml --target aarch64-apple-darwin
+
+      - name: Stage binaries
         run: |
           set -euo pipefail
           mkdir -p artifacts/mac-bin
           cp target/release/script-jail-vm \
              artifacts/mac-bin/script-jail-vm-arm64-darwin
+          cp target/aarch64-apple-darwin/release/libscriptjail.dylib \
+             artifacts/mac-bin/libscriptjail-arm64.dylib
+
+      # Ad-hoc sign + verify the dylib.  MANDATORY on Apple Silicon and required
+      # for injection into the re-signed node (Phase 4).  `--force` re-stamps the
+      # linker's adhoc+linker-signed signature as a plain adhoc one, matching
+      # scripts/build.ts.  The SHA pinned in the manifest is the POST-sign SHA, so
+      # signing MUST happen before the upload (and before the `build` job's
+      # `Compute SHAs` step hashes the downloaded copy).
+      - name: Ad-hoc sign + verify macOS shim dylib
+        run: |
+          set -euo pipefail
+          codesign --force --sign - artifacts/mac-bin/libscriptjail-arm64.dylib
+          codesign --verify --verbose artifacts/mac-bin/libscriptjail-arm64.dylib
 
       # The ARTIFACT name is tag-suffixed (`mac-bin-<tag>`) so a later
       # release.yml run on the tag can locate exactly this producer run's
-      # output by name across runs.  The on-disk FILENAME inside the artifact
-      # stays `script-jail-vm-arm64-darwin` (the name check-publish-artifacts.sh
-      # and assemble-npm-packages.mjs expect at the artifacts root).
-      - name: Upload Mach-O artifact
+      # output by name across runs.  The on-disk FILENAMEs inside the artifact
+      # stay `script-jail-vm-arm64-darwin` / `libscriptjail-arm64.dylib` (the
+      # names check-publish-artifacts.sh and assemble-npm-packages.mjs expect at
+      # the artifacts root).
+      - name: Upload Mach-O artifacts
         uses: actions/upload-artifact@v7
         with:
           name: mac-bin-${{ inputs.tag }}
-          path: artifacts/mac-bin/script-jail-vm-arm64-darwin
+          path: |
+            artifacts/mac-bin/script-jail-vm-arm64-darwin
+            artifacts/mac-bin/libscriptjail-arm64.dylib
           if-no-files-found: error
           retention-days: 90
 
@@ -273,10 +303,11 @@ jobs:
       # Compute SHA-256 of every released artifact and surface them in the
       # job summary so the maintainer can copy the digests into
       # src/action/artifact-manifest.ts before cutting the next release.
-      # The Mach-O binary (`script-jail-vm-arm64-darwin`) is produced by
-      # the `build-mac-bin` job above; we re-fetch it here via a workflow
-      # artifact so the SHA summary can include it in the paste-block.
-      - name: Download script-jail-vm Mach-O artifact
+      # The macOS Mach-O artifacts (`script-jail-vm-arm64-darwin` and the signed
+      # `libscriptjail-arm64.dylib`) are produced by the `build-mac-bin` job
+      # above; we re-fetch them here via the single workflow artifact so the SHA
+      # summary can include both in the paste-block.
+      - name: Download macOS Mach-O artifacts
         uses: actions/download-artifact@v8
         with:
           name: mac-bin-${{ inputs.tag }}
@@ -300,6 +331,10 @@ jobs:
           DARWIN_ROOTFS_22_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-22.04-arm64.ext4)"
           DARWIN_ROOTFS_24_ARM64="$(node dist/repro-hash-cli.cjs images/rootfs-ubuntu-24.04-arm64.ext4)"
           DARWIN_LIBSO_ARM64="$(sha256sum images/libscriptjail-arm64.so | cut -d' ' -f1)"
+          # The macOS-native shim dylib is pinned by a PLAIN sha256 (it is the
+          # SIGNED Mach-O produced + ad-hoc signed in build-mac-bin), not the
+          # canonical rootfs hash.
+          DARWIN_DYLIB_ARM64="$(sha256sum artifacts/mac-bin/libscriptjail-arm64.dylib | cut -d' ' -f1)"
           VMLINUX_VZ_X86_64="$(sha256sum images/vmlinux-vz-x86_64 | cut -d' ' -f1)"
           VMLINUX_VZ_ARM64="$(sha256sum images/vmlinux-vz-arm64 | cut -d' ' -f1)"
           SJ_VM_ARM64_DARWIN="$(sha256sum artifacts/mac-bin/script-jail-vm-arm64-darwin | cut -d' ' -f1)"
@@ -323,6 +358,7 @@ jobs:
             echo "      'rootfs-ubuntu-22.04-arm64.ext4': '${DARWIN_ROOTFS_22_ARM64}',"
             echo "      'rootfs-ubuntu-24.04-arm64.ext4': '${DARWIN_ROOTFS_24_ARM64}',"
             echo "      'libscriptjail-arm64.so':         '${DARWIN_LIBSO_ARM64}',"
+            echo "      'libscriptjail-arm64.dylib':      '${DARWIN_DYLIB_ARM64}',"
             echo "      'vmlinux-vz-x86_64':              '${VMLINUX_VZ_X86_64}',"
             echo "      'vmlinux-vz-arm64':               '${VMLINUX_VZ_ARM64}',"
             echo "      'script-jail-vm-arm64-darwin':    '${SJ_VM_ARM64_DARWIN}',"
