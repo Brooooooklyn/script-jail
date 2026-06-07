@@ -77,7 +77,11 @@ export const MACHO64_HEADER_SIZE = 32;
 /** Map the dylib arch to its expected Mach-O cputype. */
 export function expectedMachOCpuType(arch: BuildArch | undefined): number {
   // arm64 is the only published darwin package today (R10); x64 build-from-
-  // source still validates against CPU_TYPE_X86_64.
+  // source still validates against CPU_TYPE_X86_64.  We expect a THIN
+  // aarch64-apple-darwin slice (CPU_TYPE_ARM64, plain arm64, no arm64e): the
+  // shim is only ever injected into the (arm64) provisioned node, never into
+  // arm64e SIP binaries — those are handled by plain-arm64 substitutes
+  // (bundled uutils + from-source bash), so no arm64e slice is needed.
   return arch === 'x64' ? CPU_TYPE_X86_64 : CPU_TYPE_ARM64;
 }
 

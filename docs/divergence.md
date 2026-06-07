@@ -56,6 +56,64 @@ rule below. The goal is unchanged: one committed `.script-jail.lock.yml` that
 reconciles against the Linux Action backend after `scripts/parity-diff.ts`
 canonicalization. These are the macOS-specific cases that filter must absorb.
 
+- **SIP-binary substitution (why there is no arm64e dylib).** On Apple Silicon
+  the system shells (`/bin/sh`, `/bin/bash`) and coreutils (`/bin/echo`, …) are
+  **arm64e**, and dyld refuses to inject a plain-arm64 dylib into an arm64e
+  process. Rather than ship a universal arm64+arm64e dylib (which needs a nightly
+  `-Z build-std` toolchain), the shim **never runs the arm64e binary**: at exec
+  time it rewrites any `/bin`/`/usr/bin` program whose basename is `sh`/`bash`
+  to a bundled **from-source bash** (`bash-arm64`), and any uutils applet to a
+  bundled **uutils/coreutils** multi-call binary (`coreutils-arm64`) — both plain
+  arm64, both ad-hoc signed. `argv[0]` is preserved so bash self-selects sh/bash
+  mode and uutils dispatches the right applet. The dylib then loads cleanly into
+  the substitute, so script-jail ships a **thin `aarch64-apple-darwin` dylib**.
+  Two consequences for divergence:
+  - **Audit-blind residual, surfaced as `<AUDIT_BLIND>`.** Any `/bin`/`/usr/bin`
+    binary that is *not* a shell or a uutils applet — `sed`, `awk`, `grep`,
+    `find`, `xargs`, `which`, `cmp`, `/usr/bin/python3`, `/usr/bin/git`, `perl`,
+    `ruby`, … — has no plain-arm64 substitute, so when `sip_redirect` leaves the
+    path unchanged the real arm64e binary runs with `DYLD_INSERT_LIBRARIES`
+    stripped by SIP: it and its descendants run **un-instrumented** (a malicious
+    `find . -exec /bin/sh -c '<exfil>' \;` would otherwise hide the exfil
+    entirely). The shim tags such execs `audit_blind`, and `normalize.ts` renders
+    them with an **`<AUDIT_BLIND>` prefix in `spawn_attempts`/`spawn_blocked`** so
+    the lock diff exposes the blind subtree. This is **informational, not an
+    `audit_bypass` hard-fail** — benign `find`/`sed`/`grep` use stays green; a
+    reviewer simply sees *which* exec escaped instrumentation and must inspect it.
+    Note this is a deliberate **coverage trade of the no-arm64e substitution
+    model**, not parity with fspy: the prior re-signing approach *did* instrument
+    these tools (via a universal arm64+arm64e dylib), at the cost of a nightly
+    `-Z build-std` toolchain. Firecracker remains the high-assurance backend when
+    full subtree coverage matters.
+  - **Blind-classification robustness (lexical canon + spawnp PATH search).** The
+    `audit_blind` tag and `sip_redirect` both key off the program path, so a
+    non-canonical path could dodge them: `/usr/lib/../bin/find` does not byte-match
+    `/usr/bin/` yet still execs the real `find`. Before classifying *and* before
+    redirect matching, the shim runs a **purely lexical** canonicalizer that
+    collapses `.`, `..`, and `//` in **absolute** paths — so `/usr/lib/../bin/find`
+    → `/usr/bin/find` is still marked `<AUDIT_BLIND>`, and `/usr/lib/../../bin/sh`
+    → `/bin/sh` is still redirected to the bundled bash. `posix_spawnp` with a
+    **bare name** (no slash) is run through the same in-process `PATH` search that
+    `execvp` uses, so `posix_spawnp("find", …)` resolves to `/usr/bin/find` and is
+    marked too. **Residual (lexical, not realpath):** the canonicalizer does **not**
+    resolve symlinks and does **not** rewrite **relative** (cwd-anchored) paths, so a
+    symlink that points at a SIP binary, or a `../../bin/find` resolved against the
+    cwd, can still run blind **and unmarked**. These are narrow — Node's
+    `child_process` always hands libuv an **absolute, resolved** path — but real;
+    Firecracker remains the high-assurance backend.
+  - **Fingerprinting + BSD-semantics caveat.** The substitutes are uutils (GNU
+    semantics) and bash 5.3, not the macOS BSD system binaries, so behaviour
+    diverges in two ways. (1) *Fingerprint:* a script can detect the sandbox from
+    version banners (`date --version` succeeds under uutils, fails on real macOS)
+    **and** from BSD-vs-GNU flag handling — `date -j`, `stat -f`, `cp -X` are
+    rejected by uutils; `du`/`df` report different block-size units; `uname -p`
+    prints `unknown` vs `arm`. A benign-when-watched payload *could* gate on these
+    and evade. (2) *Correctness:* a lifecycle script relying on those BSD-specific
+    flags behaves differently under the bare backend than on the host. Both are
+    inherent to substitution-based observation (the Linux backend has the
+    analogous "GNU coreutils + dash in the rootfs" property). For evasion- and
+    fidelity-sensitive audits, use **Firecracker**.
+
 - **Connect: attempt-only canonicalization.** Per the observe-only network
   posture, the macOS bare backend stays **online** — the shim hooks `connect()`,
   records the attempt, and lets it proceed. The Linux backends run Phase B
@@ -95,8 +153,8 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   rewrites, `/private/variant` does not.
 
 - **macOS system-noise prefixes.** The shim, unlike strace, surfaces the dyld
-  runtime and Apple framework reads a hardened-runtime Node and the re-signed
-  shell shims perform at startup. `normalize.ts` drops these as system noise
+  runtime and Apple framework reads a hardened-runtime Node and the bundled
+  plain-arm64 shell/coreutils substitutes perform at startup. `normalize.ts` drops these as system noise
   **only when `os === 'darwin'`**: `/System/`, root-level `/Library/` (the
   per-user `/Users/<u>/Library` is **not** dropped — it can hold real package
   writes), the `dyld_shared_cache_*` image, the dyld state store under

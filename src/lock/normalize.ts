@@ -235,8 +235,16 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
           return tokenized;
         });
         const cmd = tokenizedArgv.join(' ');
-        if (ev.raw.result === 'ok') block.spawn_attempts.push(cmd);
-        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${cmd}`);
+        // macOS bare backend: a SIP system binary the shim could not redirect ran
+        // un-instrumented (DYLD stripped), so its env/fs/exec/connect activity is
+        // invisible.  Surface it as an `<AUDIT_BLIND>` prefix so the lock diff
+        // exposes the un-audited subtree.  This is informational (it lands in
+        // spawn_attempts/spawn_blocked, NOT audit_bypass), so benign find/sed use
+        // stays green while a reviewer still sees which exec escaped the audit.
+        // The marker sits AFTER any result tag, e.g. `<ENOENT> <AUDIT_BLIND> …`.
+        const auditBlind = ev.raw.audit_blind === true ? '<AUDIT_BLIND> ' : '';
+        if (ev.raw.result === 'ok') block.spawn_attempts.push(`${auditBlind}${cmd}`);
+        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`);
         break;
       }
       case 'dlopen': {

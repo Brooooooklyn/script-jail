@@ -24924,7 +24924,18 @@ var SpawnEvent = external_exports.object({
   // 'eacces' = found but not executable
   result: external_exports.enum(["ok", "enoent", "eacces"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux for byte-stability). Carried from
+  // the Mach-O shim's exec event: `true` when the exec target resolved to a
+  // SIP-protected system binary (under /bin or /usr/bin) that sip_redirect could
+  // NOT redirect to a bundled substitute (e.g. find/sed/awk/grep/xargs/which/
+  // python3/git/perl/ruby). The real arm64e binary ran with DYLD stripped, so it
+  // and its descendants executed OUTSIDE the audit envelope. normalize.ts surfaces
+  // it as an `<AUDIT_BLIND>` prefix in spawn_attempts/spawn_blocked so the lock
+  // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
+  // benign find/sed use stays green; a reviewer just sees the marker). Omitted
+  // (never `false`) so existing/non-blind records stay byte-identical.
+  audit_blind: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -24995,7 +25006,15 @@ var ExecEvent = external_exports.object({
   // are built together but this gives us a safety net.
   result: external_exports.enum(["ok", "failed"]).default("ok"),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux). Set `true` by the Mach-O shim
+  // when `prog` resolved to a SIP-protected system binary under /bin or /usr/bin
+  // that sip_redirect left unchanged (no bundled substitute covers it), so the
+  // real arm64e image ran with DYLD_INSERT_LIBRARIES stripped — un-audited. The
+  // macOS guest dispatcher (phase-install-macos.ts) carries this onto the
+  // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
+  // blind shim records parse byte-identically (zod would otherwise drop it).
+  audit_blind: external_exports.boolean().optional()
 });
 var EnvTamperEvent = external_exports.object({
   kind: external_exports.literal("env_tamper"),
@@ -28309,7 +28328,12 @@ async function runInstallPhaseMacos(input) {
           argv: [shimEvent.argv0 ?? shimEvent.prog],
           result: "ok",
           pid: shimEvent.pid,
-          ts: shimEvent.ts
+          ts: shimEvent.ts,
+          // Carry the shim's audit-blind signal: this exec ran a SIP system
+          // binary we could not instrument.  Only set when true (omit otherwise)
+          // so non-blind spawns stay byte-identical.  normalize.ts renders it as
+          // an `<AUDIT_BLIND>` prefix in spawn_attempts.
+          ...shimEvent.audit_blind ? { audit_blind: true } : {}
         };
         const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
         if (attribution2 !== null) {
@@ -28585,8 +28609,9 @@ function normalize(events, ctx) {
           return tokenized;
         });
         const cmd = tokenizedArgv.join(" ");
-        if (ev.raw.result === "ok") block.spawn_attempts.push(cmd);
-        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${cmd}`);
+        const auditBlind = ev.raw.audit_blind === true ? "<AUDIT_BLIND> " : "";
+        if (ev.raw.result === "ok") block.spawn_attempts.push(`${auditBlind}${cmd}`);
+        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`);
         break;
       }
       case "dlopen": {

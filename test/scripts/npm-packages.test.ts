@@ -106,8 +106,22 @@ describe('npmPackages (PKG-1)', () => {
       'vmlinux-vz-arm64',
       'libscriptjail-arm64.so',
       'libscriptjail-arm64.dylib',
+      'coreutils-arm64',
+      'bash-arm64',
       'script-jail-vm',
     ]);
+  });
+
+  it('darwin-arm64 ships the bare-backend SIP-substitution binaries (mode 0o755, copied)', () => {
+    const pkg = get(byName('0.1.0'), '@script-jail/darwin-arm64');
+    for (const name of ['coreutils-arm64', 'bash-arm64']) {
+      const bin = findArtifact(pkg, name);
+      expect(bin.mode).toBe(0o755);
+      expect(bin.gzip).toBeFalsy();
+      // Sourced from the mac-bin artifacts ROOT (no images/ prefix), like the dylib.
+      expect(bin.src).toBe(name);
+      expect(bin.dest).toBe(name);
+    }
   });
 
   it('darwin-arm64 ships the macOS-native shim dylib (mode 0o644, copied)', () => {

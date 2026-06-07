@@ -7955,12 +7955,16 @@ function resolveArtifacts(input) {
     hostArch === "x64" ? "libscriptjail.so" : "libscriptjail-arm64.so"
   );
   const macShimDylibPath = (0, import_node_path3.join)(imagesDir, "libscriptjail-arm64.dylib");
+  const macCoreutilsPath = (0, import_node_path3.join)(imagesDir, "coreutils-arm64");
+  const macBashPath = (0, import_node_path3.join)(imagesDir, "bash-arm64");
   return {
     kernelPath,
     rootfsPath,
     compressedRootfsPath,
     libscriptjailSoPath,
-    macShimDylibPath
+    macShimDylibPath,
+    macCoreutilsPath,
+    macBashPath
   };
 }
 var PlatformPackageMissingError = class extends Error {
@@ -23378,7 +23382,18 @@ var SpawnEvent = external_exports.object({
   // 'eacces' = found but not executable
   result: external_exports.enum(["ok", "enoent", "eacces"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux for byte-stability). Carried from
+  // the Mach-O shim's exec event: `true` when the exec target resolved to a
+  // SIP-protected system binary (under /bin or /usr/bin) that sip_redirect could
+  // NOT redirect to a bundled substitute (e.g. find/sed/awk/grep/xargs/which/
+  // python3/git/perl/ruby). The real arm64e binary ran with DYLD stripped, so it
+  // and its descendants executed OUTSIDE the audit envelope. normalize.ts surfaces
+  // it as an `<AUDIT_BLIND>` prefix in spawn_attempts/spawn_blocked so the lock
+  // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
+  // benign find/sed use stays green; a reviewer just sees the marker). Omitted
+  // (never `false`) so existing/non-blind records stay byte-identical.
+  audit_blind: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -23449,7 +23464,15 @@ var ExecEvent = external_exports.object({
   // are built together but this gives us a safety net.
   result: external_exports.enum(["ok", "failed"]).default("ok"),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux). Set `true` by the Mach-O shim
+  // when `prog` resolved to a SIP-protected system binary under /bin or /usr/bin
+  // that sip_redirect left unchanged (no bundled substitute covers it), so the
+  // real arm64e image ran with DYLD_INSERT_LIBRARIES stripped — un-audited. The
+  // macOS guest dispatcher (phase-install-macos.ts) carries this onto the
+  // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
+  // blind shim records parse byte-identically (zod would otherwise drop it).
+  audit_blind: external_exports.boolean().optional()
 });
 var EnvTamperEvent = external_exports.object({
   kind: external_exports.literal("env_tamper"),
@@ -24028,6 +24051,15 @@ var PINNED_MANIFEST = {
       // dylib — exactly the all-or-nothing contract.  Paste the real SHA from
       // the producer paste-block, then cut the tag.
       "libscriptjail-arm64.dylib": "PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_DYLIB",
+      // Bare-backend SIP-substitution binaries (the shim redirects /bin/sh +
+      // coreutils to these plain-arm64 binaries, so no arm64e dylib is needed).
+      // coreutils-arm64 is the official uutils 0.4.0 prebuilt — a fixed upstream
+      // artifact with a stable BINARY sha, so it is pinned real now.  bash-arm64
+      // is built-from-source by the producer (not byte-reproducible across
+      // toolchains), so it is a PLACEHOLDER until a release-build.yml run emits
+      // its SHA — same backfill contract as the dylib above.
+      "coreutils-arm64": "8e8f38d9323135a19a73d617336fce85380f3c46fcb83d3ae3e031d1c0372f21",
+      "bash-arm64": "PLACEHOLDER_SHA256_DARWIN_BASH_ARM64",
       "vmlinux-vz-x86_64": "012e33842367483ffad908d878d5682fa891d2a4f476a229b631e16780404953",
       "vmlinux-vz-arm64": "4b42d3b912065a92a3816c788ed9c4dac92a12ece4c478c4fb1396c76cffd255",
       // No `script-jail-vm-x86_64-darwin` — see the file header for the
@@ -25295,54 +25327,8 @@ function defaultProvisionCacheDir(env = process.env) {
   if (override !== void 0 && override !== "") return override;
   return (0, import_node_os8.tmpdir)();
 }
-var SIP_SHELLS = [
-  { src: "/bin/sh", name: "sh" },
-  { src: "/bin/bash", name: "bash" }
-];
-var SIP_COREUTILS = [
-  "cat",
-  "chmod",
-  "chown",
-  "cp",
-  "date",
-  "dd",
-  "df",
-  "echo",
-  "expr",
-  "ln",
-  "ls",
-  "mkdir",
-  "mv",
-  "pwd",
-  "rm",
-  "rmdir",
-  "sleep",
-  "stty",
-  "sync",
-  "test",
-  "basename",
-  "dirname",
-  "env",
-  "head",
-  "tail",
-  "sed",
-  "awk",
-  "grep",
-  "cut",
-  "tr",
-  "uname",
-  "sort",
-  "uniq",
-  "wc",
-  "true",
-  "false",
-  "printf",
-  "touch",
-  "cmp",
-  "find",
-  "xargs",
-  "which"
-];
+var SHELL_SHIM_BASH = "bash";
+var SHELL_SHIM_COREUTILS = "coreutils";
 async function provisionNodeMac(input) {
   const doRunCommand = input.runCommand ?? runCommand;
   const http = input.http ?? new NodeHttpClient();
@@ -25359,7 +25345,7 @@ async function provisionNodeMac(input) {
   const cached2 = readMarker(markerPath);
   if (cached2 !== void 0) {
     const nodePath2 = cached2.nodePath;
-    if ((0, import_node_fs19.existsSync)(nodePath2) && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(shellShimDir, "sh")) && codesignVerifies(nodePath2)) {
+    if ((0, import_node_fs19.existsSync)(nodePath2) && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(shellShimDir, SHELL_SHIM_BASH)) && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(shellShimDir, SHELL_SHIM_COREUTILS)) && codesignVerifies(nodePath2)) {
       return {
         nodeBinDir: cached2.nodeBinDir,
         nodePath: nodePath2,
@@ -25392,7 +25378,7 @@ async function provisionNodeMac(input) {
   const corepackPath = (0, import_node_path15.join)(nodeBinDir, "corepack");
   doRunCommand(corepackPath, ["enable"], { env: { ...vpEnv, PATH: prependPath(nodeBinDir, vpEnv) } });
   resignAdHoc(nodePath, doRunCommand);
-  materializeShellShims(shellShimDir, doRunCommand);
+  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
   writeMarker(markerPath, { nodeBinDir, nodePath, preResignSha256 });
   return {
     nodeBinDir,
@@ -25477,17 +25463,16 @@ function codesignVerifies(binPath) {
   const r = (0, import_node_child_process5.spawnSync)("codesign", ["--verify", binPath], { stdio: "ignore" });
   return r.status === 0;
 }
-function materializeShellShims(shellShimDir, doRunCommand) {
-  for (const { src, name } of SIP_SHELLS) {
-    materializeOne(src, (0, import_node_path15.join)(shellShimDir, name), doRunCommand);
-  }
-  for (const name of SIP_COREUTILS) {
-    const src = (0, import_node_fs19.existsSync)(`/bin/${name}`) ? `/bin/${name}` : `/usr/bin/${name}`;
-    materializeOne(src, (0, import_node_path15.join)(shellShimDir, name), doRunCommand);
-  }
+function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand) {
+  materializeOne(macBashPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
+  materializeOne(macCoreutilsPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
 }
 function materializeOne(src, dest, doRunCommand) {
-  if (!(0, import_node_fs19.existsSync)(src)) return;
+  if (!(0, import_node_fs19.existsSync)(src)) {
+    throw new Error(
+      `script-jail: bundled shell-shim binary not found at ${src}. Build it with \`pnpm build\` on an Apple Silicon mac (or fetch the release artifact).`
+    );
+  }
   (0, import_node_fs19.copyFileSync)(src, dest);
   (0, import_node_fs19.chmodSync)(dest, 493);
   resignAdHoc(dest, doRunCommand);
@@ -25680,7 +25665,11 @@ function createMacBareExecute(deps) {
     }
     const provisioned = await doProvision({
       arch: deps.arch,
-      cacheDir: defaultProvisionCacheDir(baseEnv)
+      cacheDir: defaultProvisionCacheDir(baseEnv),
+      // The bundled plain-arm64 substitutes the shim's SIP redirect points at:
+      // staged as <shellShimDir>/bash and <shellShimDir>/coreutils.
+      macBashPath: runtime.bashPath,
+      macCoreutilsPath: runtime.coreutilsPath
     });
     if (!doExists(provisioned.nodePath)) {
       throw new MacBareUnavailableError(
@@ -25763,7 +25752,28 @@ function resolveRuntimePaths2(repoRoot, imagesDir, doExists) {
     ],
     doExists
   );
-  return { agentPath, platformPreloadPath, envSpyPreloadPath, nativePreloadPath };
+  const bashPath = firstExistingOrDefault(
+    [
+      (0, import_node_path16.join)(imagesDir, "bash-arm64"),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "bash-arm64"))
+    ],
+    doExists
+  );
+  const coreutilsPath = firstExistingOrDefault(
+    [
+      (0, import_node_path16.join)(imagesDir, "coreutils-arm64"),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "coreutils-arm64"))
+    ],
+    doExists
+  );
+  return {
+    agentPath,
+    platformPreloadPath,
+    envSpyPreloadPath,
+    nativePreloadPath,
+    bashPath,
+    coreutilsPath
+  };
 }
 function findFirst2(candidates, label, doExists) {
   for (const candidate of candidates) {

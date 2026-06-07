@@ -134,6 +134,10 @@ export function createMacBareExecute(
     const provisioned: ProvisionedNodeMac = await doProvision({
       arch: deps.arch,
       cacheDir: defaultProvisionCacheDir(baseEnv),
+      // The bundled plain-arm64 substitutes the shim's SIP redirect points at:
+      // staged as <shellShimDir>/bash and <shellShimDir>/coreutils.
+      macBashPath: runtime.bashPath,
+      macCoreutilsPath: runtime.coreutilsPath,
     });
     if (!doExists(provisioned.nodePath)) {
       throw new MacBareUnavailableError(
@@ -193,6 +197,10 @@ interface MacBareRuntimePaths {
   platformPreloadPath: string;
   envSpyPreloadPath: string;
   nativePreloadPath: string;
+  /** Bundled bash-from-source (arm64) staged as <shellShimDir>/bash. */
+  bashPath: string;
+  /** Bundled uutils multi-call binary (arm64) staged as <shellShimDir>/coreutils. */
+  coreutilsPath: string;
 }
 
 /**
@@ -255,7 +263,33 @@ function resolveRuntimePaths(
     doExists,
   );
 
-  return { agentPath, platformPreloadPath, envSpyPreloadPath, nativePreloadPath };
+  // arm64-only bundled shell-shim substitutes (R10).  Resolved the same way as
+  // the dylib (imagesDir first, then dev `images/` fallbacks).  Returned even
+  // when absent — provisionNodeMac hard-fails with an actionable "build it"
+  // message if the source is missing when it stages the shell-shim dir.
+  const bashPath = firstExistingOrDefault(
+    [
+      join(imagesDir, 'bash-arm64'),
+      ...roots.map((root) => join(root, 'images', 'bash-arm64')),
+    ],
+    doExists,
+  );
+  const coreutilsPath = firstExistingOrDefault(
+    [
+      join(imagesDir, 'coreutils-arm64'),
+      ...roots.map((root) => join(root, 'images', 'coreutils-arm64')),
+    ],
+    doExists,
+  );
+
+  return {
+    agentPath,
+    platformPreloadPath,
+    envSpyPreloadPath,
+    nativePreloadPath,
+    bashPath,
+    coreutilsPath,
+  };
 }
 
 function findFirst(

@@ -17,10 +17,18 @@
 //        codesign --verify node
 //      Without dropping the hardened runtime the OS would refuse the injected
 //      dylib; an ad-hoc signature with no runtime flag honours DYLD_*.
-//   4. Materialize + re-sign /bin/sh, /bin/bash, and the coreutils the shim's
-//      sip_redirect covers into SCRIPT_JAIL_SHELL_SHIM_DIR (SIP strips DYLD_*
-//      for /bin and /usr/bin, so the shim rewrites child shells/coreutils to
-//      these re-signed copies — the fspy trick).
+//   4. Stage + re-sign the TWO bundled multi-call binaries into
+//      SCRIPT_JAIL_SHELL_SHIM_DIR (SIP strips DYLD_* for /bin and /usr/bin, so
+//      the shim rewrites child shells/coreutils to these ad-hoc-signed copies):
+//        * <dir>/bash      — bash built from source (images/bash-arm64); covers
+//          both /bin/sh (sh-compat via argv[0]) and /bin/bash.
+//        * <dir>/coreutils — the uutils single multi-call binary
+//          (images/coreutils-arm64); covers every uutils applet the shim's
+//          sip_redirect_target maps under /bin or /usr/bin.
+//      We stage PLAIN-arm64 substitutes (NOT copies of the system arm64e
+//      binaries) so the ad-hoc re-sign produces a binary that honours DYLD_*;
+//      argv[0] is preserved by the shim so each binary dispatches to the right
+//      shell mode / applet via basename(argv[0]).
 //
 // Supply-chain integrity: we capture the PRE-re-sign SHA-256 of the node binary
 // vp downloaded and key the cache on (NODE_VERSION, arch, that SHA).  Re-signing
@@ -73,6 +81,18 @@ export interface ProvisionNodeMacInput {
   http?: { download: NodeHttpClient['download'] };
   /** Test seam: run an external command (default: `runCommand`). */
   runCommand?: typeof runCommand;
+  /**
+   * Absolute path to the bundled `bash` binary (bash built from source, plain
+   * arm64; `images/bash-arm64`) staged as `<shellShimDir>/bash`.  Both /bin/sh
+   * and /bin/bash redirect here — one multi-call binary covers both shells.
+   */
+  macBashPath: string;
+  /**
+   * Absolute path to the bundled `coreutils` multi-call binary (uutils prebuilt;
+   * `images/coreutils-arm64`) staged as `<shellShimDir>/coreutils`.  Every
+   * covered uutils applet under /bin or /usr/bin redirects here.
+   */
+  macCoreutilsPath: string;
 }
 
 export interface ProvisionedNodeMac {
@@ -86,9 +106,10 @@ export interface ProvisionedNodeMac {
   /** Absolute path to the re-signed `node` binary itself. */
   nodePath: string;
   /**
-   * Absolute path to the directory of materialized, re-signed /bin/sh,
-   * /bin/bash, and coreutils copies — the value to export as
-   * `SCRIPT_JAIL_SHELL_SHIM_DIR`.
+   * Absolute path to the directory holding the TWO staged, ad-hoc-signed
+   * multi-call binaries — `bash` (bash-from-source) and `coreutils` (uutils) —
+   * the value to export as `SCRIPT_JAIL_SHELL_SHIM_DIR`.  The shim redirects
+   * /bin/sh + /bin/bash → `bash` and any covered uutils applet → `coreutils`.
    */
   shellShimDir: string;
   /** Pinned Node version (== Linux), for diagnostics. */
@@ -107,24 +128,17 @@ export function defaultProvisionCacheDir(env: NodeJS.ProcessEnv = process.env): 
   return tmpdir();
 }
 
-// The shells + coreutils whose SYSTEM copies SIP de-privileges.  This list is
-// the EXACT TS mirror of the shim's `SIP_SHELLS` / `SIP_COREUTILS` in
-// src/shim/src/lib.rs — they MUST stay in lockstep: the shim rewrites
-// `/bin/sh`, `/bin/bash`, and `/usr/bin/<coreutil>` to
-// `<SCRIPT_JAIL_SHELL_SHIM_DIR>/<basename>`, so every name here must be
-// materialized + re-signed below or the redirect would point at a missing file.
-const SIP_SHELLS: ReadonlyArray<{ src: string; name: string }> = [
-  { src: '/bin/sh', name: 'sh' },
-  { src: '/bin/bash', name: 'bash' },
-];
-
-const SIP_COREUTILS: readonly string[] = [
-  'cat', 'chmod', 'chown', 'cp', 'date', 'dd', 'df', 'echo', 'expr',
-  'ln', 'ls', 'mkdir', 'mv', 'pwd', 'rm', 'rmdir', 'sleep', 'stty',
-  'sync', 'test', 'basename', 'dirname', 'env', 'head', 'tail',
-  'sed', 'awk', 'grep', 'cut', 'tr', 'uname', 'sort', 'uniq', 'wc',
-  'true', 'false', 'printf', 'touch', 'cmp', 'find', 'xargs', 'which',
-];
+// The two FIXED filenames the shim's `sip_redirect_target` (src/shim/src/lib.rs)
+// rewrites to.  They MUST stay in lockstep with the shim: it maps /bin/sh +
+// /bin/bash → `<SCRIPT_JAIL_SHELL_SHIM_DIR>/bash` and any covered uutils applet
+// under /bin or /usr/bin → `<SCRIPT_JAIL_SHELL_SHIM_DIR>/coreutils`, so both of
+// these names must be staged + re-signed below or the redirect would point at a
+// missing file (exec ENOENT).  Unlike the old per-applet approach we no longer
+// copy the SYSTEM binaries (arm64e, DYLD-stripped under SIP) — we stage the
+// bundled PLAIN-arm64 substitutes the build produced (images/bash-arm64 +
+// images/coreutils-arm64) so the ad-hoc re-sign yields a DYLD-honouring binary.
+const SHELL_SHIM_BASH = 'bash';
+const SHELL_SHIM_COREUTILS = 'coreutils';
 
 // ---------------------------------------------------------------------------
 // provisionNodeMac
@@ -167,7 +181,8 @@ export async function provisionNodeMac(
     const nodePath = cached.nodePath;
     if (
       existsSync(nodePath) &&
-      existsSync(join(shellShimDir, 'sh')) &&
+      existsSync(join(shellShimDir, SHELL_SHIM_BASH)) &&
+      existsSync(join(shellShimDir, SHELL_SHIM_COREUTILS)) &&
       codesignVerifies(nodePath)
     ) {
       return {
@@ -230,9 +245,9 @@ export async function provisionNodeMac(
   //    spawned directly.
   resignAdHoc(nodePath, doRunCommand);
 
-  // 7. Materialize + re-sign /bin/sh, /bin/bash, and the covered coreutils into
-  //    shellShimDir.  Names MUST match the shim's sip_redirect basenames.
-  materializeShellShims(shellShimDir, doRunCommand);
+  // 7. Stage + re-sign the two bundled multi-call binaries (bash + coreutils)
+  //    into shellShimDir.  Filenames MUST match the shim's sip_redirect_target.
+  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
 
   // 8. Write the resign-marker LAST — its presence is the "fully provisioned"
   //    signal the fast path keys on.
@@ -377,31 +392,32 @@ function codesignVerifies(binPath: string): boolean {
 }
 
 /**
- * Copy /bin/sh, /bin/bash, and the covered /usr/bin coreutils into
- * `shellShimDir` and re-sign each ad-hoc.  The copy names match the shim's
- * sip_redirect basenames EXACTLY (kept in lockstep with src/shim/src/lib.rs).
- * Missing system binaries are skipped (best-effort: not every coreutil exists
- * at /usr/bin on every macOS).
+ * Stage the TWO bundled multi-call binaries into `shellShimDir` under the FIXED
+ * filenames the shim's sip_redirect_target rewrites to (`bash` + `coreutils`,
+ * kept in lockstep with src/shim/src/lib.rs) and re-sign each ad-hoc so DYLD_*
+ * is honoured.  Unlike the old per-applet copy of the SYSTEM binaries, both
+ * sources are REQUIRED (a missing one would leave the redirect pointing at a
+ * non-existent file → exec ENOENT inside the audited install), so we hard-fail
+ * rather than skip.
  */
-function materializeShellShims(shellShimDir: string, doRunCommand: typeof runCommand): void {
-  for (const { src, name } of SIP_SHELLS) {
-    materializeOne(src, join(shellShimDir, name), doRunCommand);
-  }
-  for (const name of SIP_COREUTILS) {
-    // Coreutils are split across /bin (cat, echo, cp, ls, rm, mkdir, pwd,
-    // date, test, …) and /usr/bin (sed, awk, grep, env, head, …).  The shim
-    // redirects BOTH /bin/<name> and /usr/bin/<name> to this single
-    // basename-keyed copy, so source from whichever real location exists —
-    // prefer /bin (the canonical coreutil home).  Materializing only from
-    // /usr/bin silently dropped every /bin-only coreutil, so the shim's
-    // /bin/<name> redirect pointed at a missing file → exec ENOENT.
-    const src = existsSync(`/bin/${name}`) ? `/bin/${name}` : `/usr/bin/${name}`;
-    materializeOne(src, join(shellShimDir, name), doRunCommand);
-  }
+function materializeShellShims(
+  shellShimDir: string,
+  macBashPath: string,
+  macCoreutilsPath: string,
+  doRunCommand: typeof runCommand,
+): void {
+  materializeOne(macBashPath, join(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
+  materializeOne(macCoreutilsPath, join(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
 }
 
 function materializeOne(src: string, dest: string, doRunCommand: typeof runCommand): void {
-  if (!existsSync(src)) return;
+  if (!existsSync(src)) {
+    throw new Error(
+      `script-jail: bundled shell-shim binary not found at ${src}. ` +
+        `Build it with \`pnpm build\` on an Apple Silicon mac (or fetch the ` +
+        `release artifact).`,
+    );
+  }
   copyFileSync(src, dest);
   chmodSync(dest, 0o755);
   resignAdHoc(dest, doRunCommand);

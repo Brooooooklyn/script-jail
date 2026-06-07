@@ -561,6 +561,11 @@ export async function runInstallPhaseMacos(
           result: 'ok',
           pid: shimEvent.pid,
           ts: shimEvent.ts,
+          // Carry the shim's audit-blind signal: this exec ran a SIP system
+          // binary we could not instrument.  Only set when true (omit otherwise)
+          // so non-blind spawns stay byte-identical.  normalize.ts renders it as
+          // an `<AUDIT_BLIND>` prefix in spawn_attempts.
+          ...(shimEvent.audit_blind ? { audit_blind: true as const } : {}),
         };
         const attribution =
           shimAttrib ??

@@ -1940,9 +1940,10 @@ unsafe fn emit_exec(
     argv0: *const c_char,
     envp_alloc_failed: bool,
     result: ExecResult,
+    audit_blind: bool,
 ) {
     let pid = libc::getpid();
-    emit_exec_for_pid(prog, argv0, envp_alloc_failed, pid, result);
+    emit_exec_for_pid(prog, argv0, envp_alloc_failed, pid, result, audit_blind);
 }
 
 /// Append `,"<key>":"<json-escaped value>"` from a CanonBuf into the JSONL
@@ -2021,6 +2022,12 @@ unsafe fn emit_exec_for_pid(
     envp_alloc_failed: bool,
     pid: libc::pid_t,
     result: ExecResult,
+    // macOS-only: `true` when this exec ran a SIP-protected system binary the
+    // shim could NOT redirect to a bundled substitute (the real arm64e image
+    // runs with DYLD_INSERT_LIBRARIES stripped, so it + its descendants execute
+    // outside the audit envelope).  Serialized as `"audit_blind":true` ONLY when
+    // true so non-blind records — and every Linux record — stay byte-identical.
+    audit_blind: bool,
 ) {
     let log_fd = LOG_FD.load(Ordering::Acquire);
     if log_fd < 0 {
@@ -2131,6 +2138,20 @@ unsafe fn emit_exec_for_pid(
     }
     buf[pos..pos + result_tail.len()].copy_from_slice(result_tail);
     pos += result_tail.len();
+
+    // macOS audit-blind signal.  Emitted ONLY when true so non-blind records and
+    // every Linux record are byte-identical to the pre-change shim output.  A
+    // blind exec ran a real, SIP-de-privileged system binary (under /bin or
+    // /usr/bin) the shim could not instrument; normalize.ts surfaces it as an
+    // `<AUDIT_BLIND>` prefix in spawn_attempts so the lock diff exposes the
+    // un-audited subtree.  `+ 2` reserves the closing `}\n`.
+    if audit_blind {
+        let audit_blind_tail = br#","audit_blind":true"#;
+        if pos + audit_blind_tail.len() + 2 <= buf.len() {
+            buf[pos..pos + audit_blind_tail.len()].copy_from_slice(audit_blind_tail);
+            pos += audit_blind_tail.len();
+        }
+    }
 
     // npm lifecycle attribution (deterministic, in-process, reap-proof).  Each
     // field is omitted when its CanonBuf is empty (process is not inside a
@@ -2486,14 +2507,14 @@ unsafe fn dispatch_exec(
             // exec FAILED — we emit a second event with `result:"failed"`
             // below so the phase-install cross-check can cancel out the
             // pre-call optimistic event when computing per-pid counts.
-            emit_exec(prog, argv0, false, ExecResult::Ok);
+            emit_exec(prog, argv0, false, ExecResult::Ok, false);
             let rewritten = buf.ptrs as *const *const c_char;
             let rc = forward_to_real(&kind, prog, argv, rewritten);
             // real_* only returns on failure.  Emit the failure marker
             // BEFORE freeing the envbuf so any allocator-side errno
             // change inside free_envbuf can't clobber the value strace
             // reports for the failed exec.
-            emit_exec(prog, argv0, false, ExecResult::Failed);
+            emit_exec(prog, argv0, false, ExecResult::Failed, false);
             free_envbuf(&mut buf);
             set_in_shim(false);
             rc
@@ -2510,7 +2531,7 @@ unsafe fn dispatch_exec(
             // This path never reaches a real exec (we refuse), so the
             // event is tagged `result:"failed"` — the child never ran.
             set_in_shim(true);
-            emit_exec(prog, argv0, true, ExecResult::Failed);
+            emit_exec(prog, argv0, true, ExecResult::Failed, false);
             set_errno(libc::ENOMEM);
             set_in_shim(false);
             -1
@@ -2580,7 +2601,7 @@ unsafe fn dispatch_spawn(
                 } else {
                     libc::getpid()
                 };
-                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok);
+                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok, false);
             } else {
                 // Audit-trust Finding (2026-05-18): record failed
                 // posix_spawn attempts so the phase-install cross-check
@@ -2592,7 +2613,7 @@ unsafe fn dispatch_spawn(
                 // attempt (no child was created), so this event is
                 // purely a forensic marker and contributes 0 net to
                 // the cross-check (no matching strace observation).
-                emit_exec(path, argv0, false, ExecResult::Failed);
+                emit_exec(path, argv0, false, ExecResult::Failed, false);
             }
             free_envbuf(&mut buf);
             set_in_shim(false);
@@ -2611,7 +2632,7 @@ unsafe fn dispatch_spawn(
             // separate signal (`envp_alloc_failed`), not as part of the
             // strace/shim pairing for `<SYSCALL_EXEC_BYPASS>`.
             set_in_shim(true);
-            emit_exec(path, argv0, true, ExecResult::Failed);
+            emit_exec(path, argv0, true, ExecResult::Failed, false);
             set_in_shim(false);
             libc::ENOMEM
         }
@@ -2928,10 +2949,24 @@ unsafe fn dispatch_exec_macos(
 
     // SIP redirect: when prog is /bin/{sh,bash} or a /usr/bin coreutil, dyld
     // strips DYLD_INSERT_LIBRARIES on exec, so the child would run un-audited.
-    // Rewrite to the materialized re-signed copy (if available).  The buffer
-    // is stack-local and outlives the libc::execve call.
+    // Rewrite to the bundled plain-arm64 substitute (bash / coreutils) if one
+    // covers it; otherwise the real arm64e binary runs and we mark it
+    // audit_blind below.  The buffer is stack-local and outlives the exec call.
+    let mut canon_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let canon = lexical_canon(prog, &mut canon_buf);
     let mut redirect_buf = [0u8; (libc::PATH_MAX as usize) + 1];
-    let prog = sip_redirect(prog, &mut redirect_buf);
+    // Match/redirect against the CANONICAL path (so `/tmp/../bin/sh` redirects and
+    // `/tmp/../usr/bin/find` is classified), but keep exec'ing the caller's
+    // ORIGINAL `prog` when no substitute applies (same binary, minimal change).
+    let redirected = sip_redirect(canon, &mut redirect_buf);
+    let (prog, audit_blind) = if redirected != canon {
+        // Canon matched a shell/coreutil → run the instrumented substitute.
+        (redirected, false)
+    } else {
+        // No substitute → the real arm64e binary runs; it is audit-blind iff the
+        // canonical path is under a SIP system bin dir (DYLD stripped, un-audited).
+        (prog, is_under_sip_bin_dir(canon))
+    };
 
     match rewrite_envp(envp_in) {
         Some(mut buf) => {
@@ -2939,18 +2974,18 @@ unsafe fn dispatch_exec_macos(
             // result:"ok" emitted BEFORE the real exec — a successful exec
             // replaces the image and never returns, so this is the only chance
             // to record the attempt with the calling pid.
-            emit_exec(prog, argv0, false, ExecResult::Ok);
+            emit_exec(prog, argv0, false, ExecResult::Ok, audit_blind);
             let rewritten = buf.ptrs as *const *const c_char;
             let rc = real_execve_raw(prog, argv, rewritten);
             // Only reached on failure.
-            emit_exec(prog, argv0, false, ExecResult::Failed);
+            emit_exec(prog, argv0, false, ExecResult::Failed, audit_blind);
             free_envbuf(&mut buf);
             set_in_shim(false);
             rc
         }
         None => {
             set_in_shim(true);
-            emit_exec(prog, argv0, true, ExecResult::Failed);
+            emit_exec(prog, argv0, true, ExecResult::Failed, audit_blind);
             set_errno(libc::ENOMEM);
             set_in_shim(false);
             -1
@@ -2974,8 +3009,16 @@ unsafe fn dispatch_spawn_macos(
         *argv as *const c_char
     };
 
+    let mut canon_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let canon = lexical_canon(path, &mut canon_buf);
     let mut redirect_buf = [0u8; (libc::PATH_MAX as usize) + 1];
-    let path = sip_redirect(path, &mut redirect_buf);
+    // Same canonical-match rule as dispatch_exec_macos.
+    let redirected = sip_redirect(canon, &mut redirect_buf);
+    let (path, audit_blind) = if redirected != canon {
+        (redirected, false)
+    } else {
+        (path, is_under_sip_bin_dir(canon))
+    };
 
     match rewrite_envp(envp_in as *const *const c_char) {
         Some(mut buf) => {
@@ -2993,9 +3036,9 @@ unsafe fn dispatch_spawn_macos(
                 // posix_spawn writes the child pid; the strace-equivalent
                 // attribution wants the CHILD pid (matches Linux dispatch).
                 let child_pid = if !pid.is_null() { *pid } else { libc::getpid() };
-                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok);
+                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok, audit_blind);
             } else {
-                emit_exec(path, argv0, false, ExecResult::Failed);
+                emit_exec(path, argv0, false, ExecResult::Failed, audit_blind);
             }
             free_envbuf(&mut buf);
             set_in_shim(false);
@@ -3003,20 +3046,132 @@ unsafe fn dispatch_spawn_macos(
         }
         None => {
             set_in_shim(true);
-            emit_exec(path, argv0, true, ExecResult::Failed);
+            emit_exec(path, argv0, true, ExecResult::Failed, audit_blind);
             set_in_shim(false);
             libc::ENOMEM
         }
     }
 }
 
+// True when `prog` lies under a SIP-protected system bin dir (/bin/ or
+// /usr/bin/).  The macOS dispatchers call this on the LEXICALLY-CANONICALIZED
+// path (see lexical_canon) together with "did sip_redirect rewrite the path?"
+// to compute audit_blind: a canonical path under these dirs that sip_redirect
+// left UNCHANGED ran the real arm64e image (DYLD stripped) and is therefore
+// audit-blind.  Uses the SAME prefixes as sip_redirect_target so the two stay
+// in lockstep.  Correct even when sip_redirect bails on buffer overflow for a
+// covered applet: the real SIP binary genuinely ran, so flagging it blind is
+// accurate (more so than re-walking the applet set).
+#[cfg(target_os = "macos")]
+unsafe fn is_under_sip_bin_dir(prog: *const c_char) -> bool {
+    if prog.is_null() {
+        return false;
+    }
+    const SYS_BIN_DIRS: &[&[u8]] = &[b"/usr/bin/", b"/bin/"];
+    for prefix in SYS_BIN_DIRS {
+        let mut i = 0usize;
+        let mut matched = true;
+        while i < prefix.len() {
+            if *prog.add(i) as u8 != prefix[i] {
+                matched = false;
+                break;
+            }
+            i += 1;
+        }
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+// Lexically canonicalize an ABSOLUTE path — collapse `.`, `..`, and `//` — into
+// `out` as a NUL-terminated string, returning the `out` pointer.  Returns `prog`
+// unchanged for a relative or NULL path (no cwd is available in the hot path) or
+// on overflow / pathological depth.  Used ONLY to CLASSIFY a path for SIP
+// redirect + audit_blind (the exec still runs the caller's original path), so a
+// crafted `/tmp/../usr/bin/find` is matched on its real target rather than its
+// surface bytes — closing the trivial `..` evasion of both the redirect and the
+// audit_blind marker.  Purely lexical: it does NOT resolve symlinks (a symlink
+// INTO a SIP dir, or a deep relative `..` path, remains a documented bare-backend
+// residual — see docs/divergence.md).  Zero-alloc, no syscalls — safe to call
+// before set_in_shim without polluting the audit or re-entering the shim.
+#[cfg(target_os = "macos")]
+unsafe fn lexical_canon(prog: *const c_char, out: &mut [u8]) -> *const c_char {
+    if prog.is_null() || *prog as u8 != b'/' {
+        return prog; // relative / NULL → leave as-is (classification residual)
+    }
+    // Record the write-cursor start of each emitted segment so `..` can pop one.
+    let mut seg_starts = [0usize; 64];
+    let mut nseg = 0usize;
+    let mut w = 0usize;
+    let mut i = 0usize;
+    loop {
+        // Skip a run of '/'.
+        while *prog.add(i) as u8 == b'/' {
+            i += 1;
+        }
+        if *prog.add(i) as u8 == 0 {
+            break;
+        }
+        // Measure the next segment [seg, seg+len).
+        let seg = i;
+        let mut len = 0usize;
+        loop {
+            let ch = *prog.add(seg + len) as u8;
+            if ch == 0 || ch == b'/' {
+                break;
+            }
+            len += 1;
+        }
+        i = seg + len;
+        if len == 1 && *prog.add(seg) as u8 == b'.' {
+            // "." → drop.
+        } else if len == 2 && *prog.add(seg) as u8 == b'.' && *prog.add(seg + 1) as u8 == b'.' {
+            // ".." → pop one segment (clamp at root).
+            if nseg > 0 {
+                nseg -= 1;
+                w = seg_starts[nseg];
+            }
+        } else {
+            // Normal segment → append "/<seg>".
+            if nseg >= seg_starts.len() || w + 1 + len + 1 > out.len() {
+                return prog; // too deep / would overflow → leave un-canonicalized
+            }
+            seg_starts[nseg] = w;
+            nseg += 1;
+            out[w] = b'/';
+            w += 1;
+            core::ptr::copy_nonoverlapping(prog.add(seg) as *const u8, out.as_mut_ptr().add(w), len);
+            w += len;
+        }
+    }
+    if w == 0 {
+        // Everything collapsed to root.
+        if out.len() < 2 {
+            return prog;
+        }
+        out[0] = b'/';
+        w = 1;
+    }
+    out[w] = 0;
+    out.as_ptr() as *const c_char
+}
+
 // SIP redirect (macOS).  System binaries under /bin and /usr/bin run with
 // DYLD_INSERT_LIBRARIES stripped (SIP), so the shim would never load into a
 // child shell or coreutil.  If SCRIPT_JAIL_SHELL_SHIM_DIR is set and `prog` is
-// one of the covered system binaries, rewrite the path to
-// `<dir>/<basename>` — a materialized, re-signed copy that DOES honor DYLD.
-// Returns `prog` unchanged when no redirect applies (non-system binary, dir
-// unset, or the formatted path would overflow `out`).
+// one of the covered system binaries, rewrite the path to one of TWO bundled,
+// ad-hoc-signed multi-call binaries that DO honor DYLD:
+//   * `<dir>/bash`      — bash built from source; covers both /bin/sh (sh-compat
+//     mode via argv[0]) and /bin/bash.
+//   * `<dir>/coreutils` — the uutils single multi-call binary; covers every
+//     uutils applet under /bin or /usr/bin.
+// argv[0] is preserved by the caller so each binary dispatches to the right
+// shell mode / applet via basename(argv[0]).  Returns `prog` unchanged when no
+// redirect applies (non-system binary, dir unset, or the formatted path would
+// overflow `out`).  Callers pass the LEXICALLY-CANONICALIZED path so a crafted
+// `/tmp/../bin/sh` still redirects.
 //
 // `out` must outlive the returned pointer (the caller stack-allocates it for
 // the duration of the exec/spawn).  Zero-alloc (no heap) per the macOS hot-path
@@ -3031,13 +3186,17 @@ unsafe fn sip_redirect(prog: *const c_char, out: &mut [u8]) -> *const c_char {
         return prog;
     }
     // Only redirect known system-binary paths.  We match the FULL path against
-    // /bin/sh, /bin/bash, and /usr/bin/<coreutil>.
-    let basename = match sip_covered_basename(prog) {
-        Some(b) => b,
+    // /bin/sh, /bin/bash, and /{usr/,}bin/<coreutil>.  The returned target is a
+    // FIXED multi-call binary name — "bash" for shells, "coreutils" for any
+    // uutils applet — NOT the original applet basename (argv[0] still carries
+    // that, see below).
+    let target = match sip_redirect_target(prog) {
+        Some(t) => t,
         None => return prog,
     };
-    // Format `<dir>/<basename>\0` into `out`.  Bail (no redirect) on overflow.
-    let need = dir.len() + 1 + basename.len() + 1;
+    // Format `<dir>/<target>\0` into `out` (e.g. <dir>/bash or <dir>/coreutils).
+    // Bail (no redirect) on overflow.
+    let need = dir.len() + 1 + target.len() + 1;
     if need > out.len() {
         return prog;
     }
@@ -3046,43 +3205,70 @@ unsafe fn sip_redirect(prog: *const c_char, out: &mut [u8]) -> *const c_char {
     pos += dir.len();
     out[pos] = b'/';
     pos += 1;
-    out[pos..pos + basename.len()].copy_from_slice(basename);
-    pos += basename.len();
+    out[pos..pos + target.len()].copy_from_slice(target);
+    pos += target.len();
     out[pos] = 0;
+    // argv[0] is intentionally left UNCHANGED by the caller: uutils and bash are
+    // multi-call binaries that dispatch on basename(argv[0]), so the original
+    // program path must reach the child for it to behave as the right applet.
     out.as_ptr() as *const c_char
 }
 
-// The coreutils + shells whose system copies SIP de-privileges.  Ported as a
-// static byte-slice set (the fspy COREUTILS trick).  A match returns the bare
-// basename slice to splice into SCRIPT_JAIL_SHELL_SHIM_DIR.
+// The shells whose system copies SIP de-privileges.  Both /bin/sh and /bin/bash
+// redirect to the SAME bundled binary: a bash built from source (plain arm64,
+// ad-hoc signed) materialized as `bash` inside SCRIPT_JAIL_SHELL_SHIM_DIR.  It
+// honors sh-compat mode when invoked as `sh` (basename(argv[0]) is preserved),
+// so one binary covers both shells.
 #[cfg(target_os = "macos")]
 static SIP_SHELLS: &[(&[u8], &[u8])] = &[
-    (b"/bin/sh", b"sh"),
+    (b"/bin/sh", b"bash"),
     (b"/bin/bash", b"bash"),
 ];
 
+// The coreutils applets whose system copies SIP de-privileges.  Every entry
+// redirects to the SINGLE bundled `coreutils` multi-call binary (uutils 0.4.0),
+// which dispatches on basename(argv[0]).  This is the AUTHORITATIVE uutils 0.4.0
+// applet set (108 names, starting with the test bracket "[").  Names NOT shipped
+// by uutils (sed/awk/grep/find/xargs/which/cmp, …) are deliberately absent: a
+// redirect for them would resolve to an "unknown applet" inside coreutils.
 #[cfg(target_os = "macos")]
 static SIP_COREUTILS: &[&[u8]] = &[
-    b"cat", b"chmod", b"chown", b"cp", b"date", b"dd", b"df", b"echo", b"expr",
-    b"ln", b"ls", b"mkdir", b"mv", b"pwd", b"rm", b"rmdir", b"sleep", b"stty",
-    b"sync", b"test", b"basename", b"dirname", b"env", b"head", b"tail",
-    b"sed", b"awk", b"grep", b"cut", b"tr", b"uname", b"sort", b"uniq", b"wc",
-    b"true", b"false", b"printf", b"touch", b"cmp", b"find", b"xargs", b"which",
+    b"[", b"arch", b"b2sum", b"base32", b"base64", b"basename", b"basenc",
+    b"cat", b"chgrp", b"chmod", b"chown", b"chroot", b"cksum", b"comm", b"cp",
+    b"csplit", b"cut", b"date", b"dd", b"df", b"dir", b"dircolors", b"dirname",
+    b"du", b"echo", b"env", b"expand", b"expr", b"factor", b"false", b"fmt",
+    b"fold", b"groups", b"hashsum", b"head", b"hostid", b"hostname", b"id",
+    b"install", b"join", b"kill", b"link", b"ln", b"logname", b"ls", b"md5sum",
+    b"mkdir", b"mkfifo", b"mknod", b"mktemp", b"more", b"mv", b"nice", b"nl",
+    b"nohup", b"nproc", b"numfmt", b"od", b"paste", b"pathchk", b"pinky", b"pr",
+    b"printenv", b"printf", b"ptx", b"pwd", b"readlink", b"realpath", b"rm",
+    b"rmdir", b"seq", b"sha1sum", b"sha224sum", b"sha256sum", b"sha384sum",
+    b"sha512sum", b"shred", b"shuf", b"sleep", b"sort", b"split", b"stat",
+    b"stdbuf", b"stty", b"sum", b"sync", b"tac", b"tail", b"tee", b"test",
+    b"timeout", b"touch", b"tr", b"true", b"truncate", b"tsort", b"tty",
+    b"uname", b"unexpand", b"uniq", b"unlink", b"uptime", b"users", b"vdir",
+    b"wc", b"who", b"whoami", b"yes",
 ];
 
-// Returns the basename to redirect to if `prog` is a covered system binary.
-// Matches exactly: /bin/sh, /bin/bash, and BOTH /usr/bin/<coreutil> and
-// /bin/<coreutil> (coreutils live under /bin on macOS — e.g. /bin/cat,
-// /bin/echo, /bin/test — and under /usr/bin too; SIP de-privileges both).
+// Returns the FIXED bundled-binary name to redirect to if `prog` is a covered
+// system binary, else None.  Two multi-call binaries cover everything:
+//   * shells  — /bin/sh and /bin/bash both map to "bash" (bash-from-source).
+//   * coreutils — any uutils applet under /bin or /usr/bin maps to "coreutils"
+//     (the single uutils multi-call binary), NOT the applet's own basename.
+// The applet identity is carried by argv[0] (left unchanged by the caller), so
+// the multi-call binary dispatches to the right applet on basename(argv[0]).
+// Both /usr/bin and /bin are SIP-protected and coreutils live under both on
+// macOS (e.g. /bin/cat, /bin/echo, /bin/test as well as /usr/bin/...).
 #[cfg(target_os = "macos")]
-unsafe fn sip_covered_basename(prog: *const c_char) -> Option<&'static [u8]> {
-    for (full, base) in SIP_SHELLS {
+unsafe fn sip_redirect_target(prog: *const c_char) -> Option<&'static [u8]> {
+    for (full, target) in SIP_SHELLS {
         if cstr_eq_bytes(prog, full) {
-            return Some(base);
+            return Some(target);
         }
     }
     // Try each covered system bin dir prefix; on a match, compare the tail
-    // against the coreutil set.  Both /usr/bin and /bin are SIP-protected.
+    // against the uutils applet set.  Any hit redirects to the single
+    // "coreutils" multi-call binary (the applet name lives in argv[0]).
     const SYS_BIN_DIRS: &[&[u8]] = &[b"/usr/bin/", b"/bin/"];
     for prefix in SYS_BIN_DIRS {
         let mut i = 0usize;
@@ -3100,7 +3286,7 @@ unsafe fn sip_covered_basename(prog: *const c_char) -> Option<&'static [u8]> {
         let tail = prog.add(prefix.len());
         for name in SIP_COREUTILS {
             if cstr_eq_bytes(tail, name) {
-                return Some(name);
+                return Some(b"coreutils");
             }
         }
     }
@@ -3334,9 +3520,15 @@ unsafe extern "C" fn posix_spawnp_interpose(
         return real_posix_spawn_raw_macos(true, pid, file, file_actions, attrp, argv, envp);
     }
     set_in_shim(true);
-    // posix_spawnp does its own PATH search in the child; we keep that
-    // behaviour (sip_redirect only fires for absolute system paths).
-    let rc = dispatch_spawn_macos(true, pid, file, file_actions, attrp, argv, envp);
+    // Resolve a bare-name spawnp via PATH IN-PROCESS (mirrors execvp_interpose) so
+    // sip_redirect + audit_blind see the absolute /bin·/usr/bin target instead of a
+    // bare "sh"/"find" that matches nothing — which would otherwise run the real
+    // SIP binary un-redirected AND unmarked.  resolve_path_search returns `file`
+    // verbatim when it already contains '/', and None when no PATH entry matches
+    // (then fall back to `file` and let the real spawnp do its own search).
+    let mut spawnp_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let resolved = resolve_path_search(file, &mut spawnp_buf).unwrap_or(file);
+    let rc = dispatch_spawn_macos(true, pid, resolved, file_actions, attrp, argv, envp);
     set_in_shim(false);
     rc
 }

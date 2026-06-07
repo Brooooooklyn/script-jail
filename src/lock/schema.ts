@@ -79,6 +79,17 @@ export const SpawnEvent = z.object({
   result: z.enum(['ok', 'enoent', 'eacces']),
   pid: z.number(),
   ts: z.number(),
+  // macOS bare backend only (omitted on Linux for byte-stability). Carried from
+  // the Mach-O shim's exec event: `true` when the exec target resolved to a
+  // SIP-protected system binary (under /bin or /usr/bin) that sip_redirect could
+  // NOT redirect to a bundled substitute (e.g. find/sed/awk/grep/xargs/which/
+  // python3/git/perl/ruby). The real arm64e binary ran with DYLD stripped, so it
+  // and its descendants executed OUTSIDE the audit envelope. normalize.ts surfaces
+  // it as an `<AUDIT_BLIND>` prefix in spawn_attempts/spawn_blocked so the lock
+  // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
+  // benign find/sed use stays green; a reviewer just sees the marker). Omitted
+  // (never `false`) so existing/non-blind records stay byte-identical.
+  audit_blind: z.boolean().optional(),
 });
 export type SpawnEvent = z.infer<typeof SpawnEvent>;
 
@@ -173,6 +184,14 @@ export const ExecEvent = z.object({
   result: z.enum(['ok', 'failed']).default('ok'),
   pid: z.number(),
   ts: z.number(),
+  // macOS bare backend only (omitted on Linux). Set `true` by the Mach-O shim
+  // when `prog` resolved to a SIP-protected system binary under /bin or /usr/bin
+  // that sip_redirect left unchanged (no bundled substitute covers it), so the
+  // real arm64e image ran with DYLD_INSERT_LIBRARIES stripped — un-audited. The
+  // macOS guest dispatcher (phase-install-macos.ts) carries this onto the
+  // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
+  // blind shim records parse byte-identically (zod would otherwise drop it).
+  audit_blind: z.boolean().optional(),
 });
 export type ExecEvent = z.infer<typeof ExecEvent>;
 

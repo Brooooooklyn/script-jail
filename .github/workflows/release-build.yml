@@ -116,6 +116,50 @@ jobs:
           codesign --force --sign - artifacts/mac-bin/libscriptjail-arm64.dylib
           codesign --verify --verbose artifacts/mac-bin/libscriptjail-arm64.dylib
 
+      # Bare-backend SIP-substitution binaries (plain arm64, NO arm64e): the shim
+      # redirects /bin/sh + /bin/bash → bash-arm64 and coreutils → coreutils-arm64
+      # so a thin-arm64 dylib suffices.  Mirrors scripts/build.ts
+      # `fetchMacCoreutils` + `buildMacBash`.  uutils is the official prebuilt —
+      # verify the BINARY sha (stable; the upstream .tar.gz is recompressed
+      # periodically so its archive sha drifts).  bash is built from source as
+      # plain arm64 + ad-hoc signed.  Both SHAs flow into the build job's
+      # `Compute SHAs` paste-block for manifest backfill.
+      - name: Build bare-backend substitution binaries (uutils + bash)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/mac-bin
+          # --- uutils coreutils 0.4.0 (official prebuilt, verify BINARY sha) ---
+          UU_URL="https://github.com/uutils/coreutils/releases/download/0.4.0/coreutils-0.4.0-aarch64-apple-darwin.tar.gz"
+          UU_BIN_SHA="8e8f38d9323135a19a73d617336fce85380f3c46fcb83d3ae3e031d1c0372f21"
+          curl -fsSL --retry 3 -o /tmp/uu.tgz "$UU_URL"
+          mkdir -p /tmp/uu && tar -xzf /tmp/uu.tgz -C /tmp/uu
+          UU_BIN="$(find /tmp/uu -type f -name coreutils | head -1)"
+          GOT="$(shasum -a 256 "$UU_BIN" | cut -d' ' -f1)"
+          if [ "$GOT" != "$UU_BIN_SHA" ]; then
+            echo "uutils coreutils BINARY sha mismatch: expected $UU_BIN_SHA got $GOT" >&2; exit 1
+          fi
+          cp "$UU_BIN" artifacts/mac-bin/coreutils-arm64
+          chmod 0755 artifacts/mac-bin/coreutils-arm64
+          # --- bash 5.3 from source (plain arm64, verify SOURCE sha) ---
+          BASH_URL="https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz"
+          BASH_SRC_SHA="0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba"
+          curl -fsSL --retry 3 --retry-delay 2 -o /tmp/bash.tgz "$BASH_URL"
+          GOT="$(shasum -a 256 /tmp/bash.tgz | cut -d' ' -f1)"
+          if [ "$GOT" != "$BASH_SRC_SHA" ]; then
+            echo "bash source sha mismatch: expected $BASH_SRC_SHA got $GOT" >&2; exit 1
+          fi
+          mkdir -p /tmp/bash && tar -xzf /tmp/bash.tgz -C /tmp/bash
+          BASH_SRC="$(find /tmp/bash -maxdepth 1 -type d -name 'bash-*' | head -1)"
+          ( cd "$BASH_SRC" && ./configure --without-bash-malloc CFLAGS="-arch arm64 -Os" && make -j )
+          codesign --force --sign - "$BASH_SRC/bash"
+          ARCHS="$(lipo -archs "$BASH_SRC/bash" | tr -d '[:space:]')"
+          if [ "$ARCHS" != "arm64" ]; then
+            echo "bash is not thin arm64 (archs=$ARCHS)" >&2; exit 1
+          fi
+          cp "$BASH_SRC/bash" artifacts/mac-bin/bash-arm64
+          chmod 0755 artifacts/mac-bin/bash-arm64
+          file artifacts/mac-bin/coreutils-arm64 artifacts/mac-bin/bash-arm64
+
       # The ARTIFACT name is tag-suffixed (`mac-bin-<tag>`) so a later
       # release.yml run on the tag can locate exactly this producer run's
       # output by name across runs.  The on-disk FILENAMEs inside the artifact
@@ -129,6 +173,8 @@ jobs:
           path: |
             artifacts/mac-bin/script-jail-vm-arm64-darwin
             artifacts/mac-bin/libscriptjail-arm64.dylib
+            artifacts/mac-bin/coreutils-arm64
+            artifacts/mac-bin/bash-arm64
           if-no-files-found: error
           retention-days: 90
 
@@ -335,6 +381,9 @@ jobs:
           # SIGNED Mach-O produced + ad-hoc signed in build-mac-bin), not the
           # canonical rootfs hash.
           DARWIN_DYLIB_ARM64="$(sha256sum artifacts/mac-bin/libscriptjail-arm64.dylib | cut -d' ' -f1)"
+          # Bare-backend substitution binaries (plain sha256 of the BINARY).
+          DARWIN_COREUTILS_ARM64="$(sha256sum artifacts/mac-bin/coreutils-arm64 | cut -d' ' -f1)"
+          DARWIN_BASH_ARM64="$(sha256sum artifacts/mac-bin/bash-arm64 | cut -d' ' -f1)"
           VMLINUX_VZ_X86_64="$(sha256sum images/vmlinux-vz-x86_64 | cut -d' ' -f1)"
           VMLINUX_VZ_ARM64="$(sha256sum images/vmlinux-vz-arm64 | cut -d' ' -f1)"
           SJ_VM_ARM64_DARWIN="$(sha256sum artifacts/mac-bin/script-jail-vm-arm64-darwin | cut -d' ' -f1)"
@@ -359,6 +408,8 @@ jobs:
             echo "      'rootfs-ubuntu-24.04-arm64.ext4': '${DARWIN_ROOTFS_24_ARM64}',"
             echo "      'libscriptjail-arm64.so':         '${DARWIN_LIBSO_ARM64}',"
             echo "      'libscriptjail-arm64.dylib':      '${DARWIN_DYLIB_ARM64}',"
+            echo "      'coreutils-arm64':                '${DARWIN_COREUTILS_ARM64}',"
+            echo "      'bash-arm64':                     '${DARWIN_BASH_ARM64}',"
             echo "      'vmlinux-vz-x86_64':              '${VMLINUX_VZ_X86_64}',"
             echo "      'vmlinux-vz-arm64':               '${VMLINUX_VZ_ARM64}',"
             echo "      'script-jail-vm-arm64-darwin':    '${SJ_VM_ARM64_DARWIN}',"

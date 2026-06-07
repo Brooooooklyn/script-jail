@@ -134,6 +134,8 @@ export function npmPackages(version) {
         'vmlinux-vz-arm64',
         'libscriptjail-arm64.so',
         'libscriptjail-arm64.dylib',
+        'coreutils-arm64',
+        'bash-arm64',
         'script-jail-vm',
       ],
     },
@@ -160,6 +162,13 @@ export function npmPackages(version) {
         dest: 'libscriptjail-arm64.dylib',
         mode: 0o644,
       },
+      // Bare-backend SIP-substitution binaries (plain arm64): the shim redirects
+      // /bin/sh + /bin/bash → bash-arm64 and coreutils → coreutils-arm64 so no
+      // arm64e dylib is needed.  Produced by the `build-mac-bin` producer job
+      // (uutils prebuilt fetched + bash built from source) and downloaded to the
+      // artifacts ROOT by release.yml.  Executables — mode 0o755.
+      { src: 'coreutils-arm64', dest: 'coreutils-arm64', mode: 0o755 },
+      { src: 'bash-arm64', dest: 'bash-arm64', mode: 0o755 },
       // The VZ helper Mach-O binary is built by the release-build.yml producer
       // `build-mac-bin` job and downloaded to the artifacts root by release.yml
       // as `script-jail-vm-arm64-darwin`; it ships as the executable

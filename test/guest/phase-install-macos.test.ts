@@ -227,6 +227,37 @@ describe('runInstallPhaseMacos — shim-only dispatch', () => {
     expect((spawn!.raw as { result: string }).result).toBe('ok');
   });
 
+  it('carries the shim audit_blind flag onto the synthesized spawn (un-instrumented SIP exec)', async () => {
+    // The shim could not redirect /usr/bin/find (not a uutils applet / shell), so
+    // the real arm64e binary ran with DYLD stripped and the shim tagged the exec
+    // audit_blind. The dispatcher must carry that onto the spawn so normalize.ts
+    // surfaces it as `<AUDIT_BLIND>` in spawn_attempts.
+    const blindExec = JSON.stringify({
+      kind: 'exec',
+      prog: '/usr/bin/find',
+      argv0: '/usr/bin/find',
+      envp_alloc_failed: false,
+      result: 'ok',
+      audit_blind: true,
+      pid: PID,
+      ts: 1,
+      npm_package_name: 'evil-pkg',
+      npm_package_version: '1.0.0',
+      npm_lifecycle_event: 'postinstall',
+    });
+    const { events } = await drive([blindExec]);
+    const spawn = events.find((e) => e.raw.kind === 'spawn');
+    expect(spawn).toBeDefined();
+    expect((spawn!.raw as { audit_blind?: boolean }).audit_blind).toBe(true);
+  });
+
+  it('leaves audit_blind unset on the spawn for an ordinary (redirected/non-SIP) exec', async () => {
+    const { events } = await drive([execLine({ basename: 'install.sh' })]);
+    const spawn = events.find((e) => e.raw.kind === 'spawn');
+    expect(spawn).toBeDefined();
+    expect((spawn!.raw as { audit_blind?: boolean }).audit_blind).toBeUndefined();
+  });
+
   it('FAILS CLOSED (tamper) on an unparseable shim line', async () => {
     // The trusted shim channel must never fall through to a best-effort drop.
     const { result } = await drive([

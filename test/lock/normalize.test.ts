@@ -30,8 +30,16 @@ function envEv(name: string, hidden = false): AttributedEvent {
   return { raw: { kind: 'env_read', name, pid: 1, ts: 0, hidden }, pkg: pkgId, lifecycle: 'postinstall' };
 }
 
-function spawnEv(argv: string[], result: 'ok' | 'enoent' | 'eacces' = 'ok'): AttributedEvent {
-  return { raw: { kind: 'spawn', argv, result, pid: 1, ts: 0 }, pkg: pkgId, lifecycle: 'postinstall' };
+function spawnEv(
+  argv: string[],
+  result: 'ok' | 'enoent' | 'eacces' = 'ok',
+  auditBlind = false,
+): AttributedEvent {
+  return {
+    raw: { kind: 'spawn', argv, result, pid: 1, ts: 0, ...(auditBlind ? { audit_blind: true as const } : {}) },
+    pkg: pkgId,
+    lifecycle: 'postinstall',
+  };
 }
 
 function dlopenEv(filename: string): AttributedEvent {
@@ -273,6 +281,29 @@ describe('normalize', () => {
       const block = getBlock(result);
       expect(block?.spawn_attempts).toEqual(['sh -c node postinstall.js']);
       expect(block?.spawn_blocked).toEqual(['<ENOENT> sh -c node postinstall.js']);
+    });
+
+    // macOS bare backend: a SIP system binary the shim could not redirect ran
+    // un-instrumented. normalize surfaces it as an `<AUDIT_BLIND>` prefix so the
+    // lock diff exposes the blind subtree — informational (spawn_attempts), NOT
+    // an audit_bypass hard-fail.
+    it('prefixes <AUDIT_BLIND> in spawn_attempts for an un-instrumented SIP exec', () => {
+      const events = [spawnEv(['/usr/bin/find', '.', '-maxdepth', '0'], 'ok', true)];
+      const block = getBlock(normalize(events, ctx));
+      expect(block?.spawn_attempts[0]).toMatch(/^<AUDIT_BLIND> /);
+      expect(block?.spawn_blocked).toEqual([]);
+    });
+
+    it('does NOT prefix <AUDIT_BLIND> when audit_blind is absent (byte-stable with Linux)', () => {
+      const events = [spawnEv(['node', 'install.js'], 'ok')];
+      const block = getBlock(normalize(events, ctx));
+      expect(block?.spawn_attempts[0]).not.toContain('<AUDIT_BLIND>');
+    });
+
+    it('places <AUDIT_BLIND> after the result tag on a blocked blind spawn', () => {
+      const events = [spawnEv(['/usr/bin/sed', 's/a/b/'], 'enoent', true)];
+      const block = getBlock(normalize(events, ctx));
+      expect(block?.spawn_blocked[0]).toMatch(/^<ENOENT> <AUDIT_BLIND> /);
     });
   });
 
