@@ -10349,6 +10349,7 @@ __export(agent_exports, {
   LinuxSpawner: () => LinuxSpawner,
   LinuxStraceRunner: () => LinuxStraceRunner,
   LinuxVsockConnection: () => LinuxVsockConnection,
+  MacOSSpawner: () => MacOSSpawner,
   MemoryConnection: () => MemoryConnection,
   PassThrough: () => import_node_stream.PassThrough,
   StdioConnection: () => StdioConnection,
@@ -28041,17 +28042,20 @@ var INSTALL_CMD2 = {
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
   yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
 };
-function buildMacosInstallCommand(manager, cwd) {
+function macosManagerLaunch(manager, subArgs) {
   const node = process.execPath;
   const toolchainRoot = (0, import_node_path.dirname)((0, import_node_path.dirname)(node));
-  const base = INSTALL_CMD2[manager];
-  const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
   if (manager === "npm") {
     const npmCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
-    return { cmd: node, args: [npmCli, ...managerArgs] };
+    return { cmd: node, args: [npmCli, ...subArgs] };
   }
   const corepackCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
-  return { cmd: node, args: [corepackCli, manager, ...managerArgs] };
+  return { cmd: node, args: [corepackCli, manager, ...subArgs] };
+}
+function buildMacosInstallCommand(manager, cwd) {
+  const base = INSTALL_CMD2[manager];
+  const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
+  return macosManagerLaunch(manager, managerArgs);
 }
 function pathBasename2(pathLike) {
   const nul = pathLike.indexOf("\0");
@@ -29078,6 +29082,12 @@ var LinuxSpawner = class {
     });
   }
 };
+var MacOSSpawner = class {
+  async spawn(cmd, args, opts) {
+    const launch = cmd === "npm" || cmd === "pnpm" || cmd === "yarn" ? macosManagerLaunch(cmd, args) : { cmd, args };
+    return new LinuxSpawner().spawn(launch.cmd, launch.args, opts);
+  }
+};
 async function* runStraceTailer(opts) {
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const drainMs = opts.drainMs ?? 100;
@@ -29969,7 +29979,7 @@ async function main(input) {
   const eventsFilePath = eventsFile.path;
   const isMacosBare = process.env["SCRIPT_JAIL_BACKEND"] === "macos-bare" || process.platform === "darwin" && input.strace === void 0;
   const childEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, eventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, eventsFilePath, input.preloadPaths);
-  const spawner = input.spawner ?? new LinuxSpawner();
+  const spawner = input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
   const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(void 0, eventsFile));
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader()
@@ -30179,6 +30189,7 @@ if (isMain) {
   LinuxSpawner,
   LinuxStraceRunner,
   LinuxVsockConnection,
+  MacOSSpawner,
   MemoryConnection,
   PassThrough,
   StdioConnection,

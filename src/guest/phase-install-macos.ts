@@ -102,44 +102,62 @@ const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[]
 };
 
 /**
- * Build the Phase-B install command for macOS.
+ * Launch a package-manager command on macOS as `<re-signed node> <manager-cli.js>`
+ * (npm) / `<re-signed node> <corepack.js> <manager>` (pnpm·yarn) instead of the
+ * bare `npm`/`pnpm`/`yarn` bin.  Shared by BOTH install phases (the Phase-A fetch
+ * spawner and the Phase-B install runner) — see the two failure modes below.
  *
- * CRITICAL difference from Linux: we MUST launch the package manager as
- * `<re-signed node> <manager-cli.js>`, NOT the bare `npm`/`pnpm`/`yarn` bin.
- * Those bins are `#!/usr/bin/env node` shebang scripts; spawning one routes the
- * VERY FIRST exec through `/usr/bin/env` — a SIP/platform binary that STRIPS
- * `DYLD_INSERT_LIBRARIES` before node ever starts.  The Mach-O shim then never
- * loads, and only env-spy (injected via NODE_OPTIONS, which SIP does NOT strip)
- * fires — so the lock captures env reads but no spawn/connect/file events.
+ * CRITICAL difference from Linux. The bare bins are `#!/usr/bin/env node` shebang
+ * scripts, and on a fresh runner the bare name also resolves on PATH to whatever
+ * pm the environment supplies. Spawning the bare bin breaks in two ways, both of
+ * which strip or reject our instrumentation before the manager ever does work:
+ *   1. shebang → `/usr/bin/env`, a SIP/platform binary that STRIPS
+ *      `DYLD_INSERT_LIBRARIES` before node starts → the Mach-O shim never loads
+ *      and only env-spy (via NODE_OPTIONS, which SIP does not strip) fires, so the
+ *      lock captures env reads but no spawn/connect/file events; and
+ *   2. the ambient pm bin may itself be an **arm64e** (or universal-without-plain-
+ *      arm64) standalone NOT under SIP, so dyld does NOT strip the insert and
+ *      instead tries to load our THIN-arm64 dylib into it → `incompatible
+ *      architecture (have 'arm64', need 'arm64e')` and the phase dies at launch.
  *
- * The orchestrator itself runs UNDER the provisioned, re-signed node, so
- * `process.execPath` IS that node.  Executing it directly (with the manager's
- * JS entry as argv[1]) preserves DYLD into node; from there the shim's SIP
- * redirect re-signs every later `sh`/coreutil hop, so the whole lifecycle
- * subtree stays instrumented.  On Linux this indirection is unnecessary
- * (LD_PRELOAD survives `/usr/bin/env`), which is why `runInstallPhase` keeps
- * the bare-bin form.
+ * The orchestrator already runs UNDER the provisioned, re-signed, plain-arm64
+ * node, so `process.execPath` IS that node. Executing it directly (manager JS
+ * entry as argv[1]) keeps the first exec plain-arm64 — DYLD survives, the shim
+ * loads — and never touches the ambient pm bin. From there the shim's SIP redirect
+ * re-signs every later `sh`/coreutil hop, so the whole subtree stays instrumented.
+ * pnpm/yarn route through corepack's JS entry (also under the provisioned node),
+ * so BOTH phases drive the SAME corepack-pinned pm (previously Phase A used the
+ * ambient pm and Phase B used corepack — a silent version split). On Linux this
+ * indirection is unnecessary (LD_PRELOAD survives `/usr/bin/env`), so only the
+ * macOS spawner + install runner call this.
+ */
+export function macosManagerLaunch(
+  manager: 'npm' | 'pnpm' | 'yarn',
+  subArgs: string[],
+): { cmd: string; args: string[] } {
+  const node = process.execPath;
+  const toolchainRoot = dirname(dirname(node)); // .../node/<version>
+  if (manager === 'npm') {
+    const npmCli = join(toolchainRoot, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    return { cmd: node, args: [npmCli, ...subArgs] };
+  }
+  const corepackCli = join(toolchainRoot, 'lib', 'node_modules', 'corepack', 'dist', 'corepack.js');
+  return { cmd: node, args: [corepackCli, manager, ...subArgs] };
+}
+
+/**
+ * Build the Phase-B install command for macOS — `macosManagerLaunch` with the
+ * Phase-B subcommand (`rebuild`/`install`) and pnpm's repo-disk store-dir pin
+ * (IDENTICAL store-dir value to the one the fetch phase splices).
  */
 function buildMacosInstallCommand(
   manager: 'npm' | 'pnpm' | 'yarn',
   cwd: string,
 ): { cmd: string; args: string[] } {
-  const node = process.execPath;
-  const toolchainRoot = dirname(dirname(node)); // .../node/<version>
   const base = INSTALL_CMD[manager];
   const managerArgs =
     manager === 'pnpm' ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
-
-  if (manager === 'npm') {
-    const npmCli = join(toolchainRoot, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
-    return { cmd: node, args: [npmCli, ...managerArgs] };
-  }
-  // pnpm / yarn are corepack-managed; drive them through corepack's JS entry so
-  // the first hop is still the re-signed node (DYLD-preserving).  Corepack runs
-  // under the shim and its child pm node inherits DYLD via the shim's
-  // rewrite_envp, keeping the subtree instrumented.
-  const corepackCli = join(toolchainRoot, 'lib', 'node_modules', 'corepack', 'dist', 'corepack.js');
-  return { cmd: node, args: [corepackCli, manager, ...managerArgs] };
+  return macosManagerLaunch(manager, managerArgs);
 }
 
 /** Basename of a possibly-NUL-truncated prog/argv path (mirrors phase-install). */

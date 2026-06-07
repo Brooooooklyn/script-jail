@@ -28,7 +28,7 @@ import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
 import { runFetchPhase, type Spawner } from './phase-fetch.js';
 import { runInstallPhase, type LineSource, type StraceRunner } from './phase-install.js';
-import { runInstallPhaseMacos } from './phase-install-macos.js';
+import { runInstallPhaseMacos, macosManagerLaunch } from './phase-install-macos.js';
 import { MacOSInstallRunner } from './macos-install-runner.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
@@ -260,6 +260,32 @@ export class LinuxSpawner implements Spawner {
         resolve({ exitCode: code ?? 1, stdout, stderr });
       });
     });
+  }
+}
+
+/**
+ * macOS Phase-A (fetch) spawner.  Rewrites the bare `npm`/`pnpm`/`yarn` fetch
+ * command into the provisioned `<re-signed node> <cli.js>` / corepack launch
+ * (see `macosManagerLaunch`) so the first exec stays plain-arm64 and DYLD
+ * survives.  The bare bin would otherwise shebang through `/usr/bin/env` (SIP
+ * strips DYLD) or resolve to an arm64e ambient pm (dyld rejects our thin-arm64
+ * insert) — Phase A would either run un-instrumented or crash at launch.  This
+ * makes Phase A symmetric with the Phase-B `MacOSInstallRunner`, which already
+ * launches via the same node+cli form.  The actual child-process plumbing is
+ * delegated to `LinuxSpawner`; only the command is rewritten.  A non-manager
+ * `cmd` (none today on the fetch path) passes through unchanged.
+ */
+export class MacOSSpawner implements Spawner {
+  async spawn(
+    cmd: string,
+    args: string[],
+    opts: { env: NodeJS.ProcessEnv; cwd: string },
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    const launch =
+      cmd === 'npm' || cmd === 'pnpm' || cmd === 'yarn'
+        ? macosManagerLaunch(cmd, args)
+        : { cmd, args };
+    return new LinuxSpawner().spawn(launch.cmd, launch.args, opts);
   }
 }
 
@@ -2367,7 +2393,8 @@ export async function main(input: AgentInput): Promise<void> {
   // 6. Set up spawner (Phase A) and install runner (Phase B).  On macOS the
   //    runner spawns the install DIRECTLY (no strace/unshare) and the Mach-O
   //    shim is the sole event source.
-  const spawner: Spawner = input.spawner ?? new LinuxSpawner();
+  const spawner: Spawner =
+    input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
   const straceRunner: StraceRunner =
     input.strace ??
     (isMacosBare
