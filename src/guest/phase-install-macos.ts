@@ -32,6 +32,8 @@
 // Linux behaviour is untouched — this module is only invoked on the
 // macOS-bare path (see agent.ts main()).
 
+import { join, dirname } from 'node:path';
+
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
 import type { AttributionResult } from './attribution.js';
 import {
@@ -99,6 +101,47 @@ const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[]
   yarn: { cmd: 'yarn', args: ['install', '--immutable', '--offline'] },
 };
 
+/**
+ * Build the Phase-B install command for macOS.
+ *
+ * CRITICAL difference from Linux: we MUST launch the package manager as
+ * `<re-signed node> <manager-cli.js>`, NOT the bare `npm`/`pnpm`/`yarn` bin.
+ * Those bins are `#!/usr/bin/env node` shebang scripts; spawning one routes the
+ * VERY FIRST exec through `/usr/bin/env` — a SIP/platform binary that STRIPS
+ * `DYLD_INSERT_LIBRARIES` before node ever starts.  The Mach-O shim then never
+ * loads, and only env-spy (injected via NODE_OPTIONS, which SIP does NOT strip)
+ * fires — so the lock captures env reads but no spawn/connect/file events.
+ *
+ * The orchestrator itself runs UNDER the provisioned, re-signed node, so
+ * `process.execPath` IS that node.  Executing it directly (with the manager's
+ * JS entry as argv[1]) preserves DYLD into node; from there the shim's SIP
+ * redirect re-signs every later `sh`/coreutil hop, so the whole lifecycle
+ * subtree stays instrumented.  On Linux this indirection is unnecessary
+ * (LD_PRELOAD survives `/usr/bin/env`), which is why `runInstallPhase` keeps
+ * the bare-bin form.
+ */
+function buildMacosInstallCommand(
+  manager: 'npm' | 'pnpm' | 'yarn',
+  cwd: string,
+): { cmd: string; args: string[] } {
+  const node = process.execPath;
+  const toolchainRoot = dirname(dirname(node)); // .../node/<version>
+  const base = INSTALL_CMD[manager];
+  const managerArgs =
+    manager === 'pnpm' ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
+
+  if (manager === 'npm') {
+    const npmCli = join(toolchainRoot, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    return { cmd: node, args: [npmCli, ...managerArgs] };
+  }
+  // pnpm / yarn are corepack-managed; drive them through corepack's JS entry so
+  // the first hop is still the re-signed node (DYLD-preserving).  Corepack runs
+  // under the shim and its child pm node inherits DYLD via the shim's
+  // rewrite_envp, keeping the subtree instrumented.
+  const corepackCli = join(toolchainRoot, 'lib', 'node_modules', 'corepack', 'dist', 'corepack.js');
+  return { cmd: node, args: [corepackCli, manager, ...managerArgs] };
+}
+
 /** Basename of a possibly-NUL-truncated prog/argv path (mirrors phase-install). */
 function pathBasename(pathLike: string): string {
   const nul = pathLike.indexOf('\0');
@@ -110,12 +153,10 @@ function pathBasename(pathLike: string): string {
 export async function runInstallPhaseMacos(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
-  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
-  // For pnpm: pin the store-dir to the repo cwd — IDENTICAL to the value the
-  // fetch phase splices.  Mirrors runInstallPhase so both phases agree.
-  const args = input.manager === 'pnpm'
-    ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`]
-    : baseArgs;
+  // Launch as `<re-signed node> <manager-cli.js> …` so DYLD survives the first
+  // exec (see buildMacosInstallCommand).  pnpm's store-dir pin is folded in
+  // there, IDENTICAL to the value the fetch phase splices.
+  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
   // No per-pid strace files on macOS; the basePath still gives runStraceTailer
   // a watchDir.  Default to a macOS tmp path when the caller didn't supply one.
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';

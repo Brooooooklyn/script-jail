@@ -100,6 +100,13 @@ unsafe fn audit_path(kind: FsKind, dirfd: c_int, path: *const c_char, rc_failed:
     };
     let mut buf = [0u8; PATH_BUF];
     if abs_path_into(dirfd, path, &mut buf).is_some() {
+        // Never record file ops on our OWN events file (env-spy writes
+        // node_startup_done JSONL there).  That is audit infrastructure, not
+        // lifecycle-script behaviour, and would otherwise leak into the lock as
+        // a spurious read/write of the events-file path.
+        if crate::path_is_audit_log(buf.as_ptr() as *const c_char) {
+            return;
+        }
         emit_fs(kind, buf.as_ptr() as *const c_char, errno_kind);
     }
 }

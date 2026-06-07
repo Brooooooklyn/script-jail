@@ -25482,7 +25482,8 @@ function materializeShellShims(shellShimDir, doRunCommand) {
     materializeOne(src, (0, import_node_path15.join)(shellShimDir, name), doRunCommand);
   }
   for (const name of SIP_COREUTILS) {
-    materializeOne(`/usr/bin/${name}`, (0, import_node_path15.join)(shellShimDir, name), doRunCommand);
+    const src = (0, import_node_fs19.existsSync)(`/bin/${name}`) ? `/bin/${name}` : `/usr/bin/${name}`;
+    materializeOne(src, (0, import_node_path15.join)(shellShimDir, name), doRunCommand);
   }
 }
 function materializeOne(src, dest, doRunCommand) {
@@ -25497,6 +25498,11 @@ var import_node_fs20 = require("node:fs");
 function readU32LE(buf, off) {
   return (buf[off] | buf[off + 1] << 8 | buf[off + 2] << 16 | buf[off + 3] << 24) >>> 0;
 }
+function readU32BE(buf, off) {
+  return (buf[off] << 24 | buf[off + 1] << 16 | buf[off + 2] << 8 | buf[off + 3]) >>> 0;
+}
+var FAT_HEADER_SIZE = 8;
+var FAT_ARCH_SIZE = 20;
 var MH_MAGIC_64 = 4277009103;
 var FAT_MAGIC = 3405691582;
 var FAT_MAGIC_CIGAM = 3199925962;
@@ -25536,80 +25542,107 @@ function validateMachOShimFile(path, expectedCpuType) {
     } catch (err) {
       return `cannot stat: ${err instanceof Error ? err.message : String(err)}`;
     }
-    const hdr = Buffer.alloc(MACHO64_HEADER_SIZE);
-    const n = (0, import_node_fs20.readSync)(fd, hdr, 0, MACHO64_HEADER_SIZE, 0);
-    if (n < MACHO64_HEADER_SIZE) {
-      return `header too short (${n} bytes; need \u2265 ${MACHO64_HEADER_SIZE})`;
+    const prelude = Buffer.alloc(FAT_HEADER_SIZE);
+    if ((0, import_node_fs20.readSync)(fd, prelude, 0, FAT_HEADER_SIZE, 0) < FAT_HEADER_SIZE) {
+      return `file too short (< ${FAT_HEADER_SIZE} bytes)`;
     }
-    const magic = readU32LE(hdr, 0);
+    const magic = readU32LE(prelude, 0);
     if (magic === FAT_MAGIC || magic === FAT_MAGIC_CIGAM) {
-      return "file is a Mach-O universal (fat) binary; expected a thin arm64 dylib";
-    }
-    if (magic !== MH_MAGIC_64) {
-      if (magic === 1179403647) {
-        return "file is a Linux ELF object, not a macOS Mach-O dylib";
+      const nfat = readU32BE(prelude, 4);
+      if (nfat === 0 || nfat > 32) {
+        return `universal binary has implausible nfat_arch=${nfat}`;
       }
-      return `bad Mach-O magic: expected 0x${MH_MAGIC_64.toString(16)}, got 0x${magic.toString(16)}`;
-    }
-    const cputype = readU32LE(hdr, 4);
-    if (cputype !== expectedCpuType) {
-      return `wrong architecture: got ${cpuTypeLabel(cputype)}, expected ${cpuTypeLabel(expectedCpuType)}`;
-    }
-    const filetype = readU32LE(hdr, 12);
-    if (filetype !== MH_DYLIB) {
-      return `unexpected filetype=0x${filetype.toString(16)} (expected 0x${MH_DYLIB.toString(16)} = MH_DYLIB)`;
-    }
-    const ncmds = readU32LE(hdr, 16);
-    const sizeofcmds = readU32LE(hdr, 20);
-    if (ncmds === 0 || sizeofcmds === 0) {
-      return "no load commands; not a loadable dylib";
-    }
-    if (MACHO64_HEADER_SIZE + sizeofcmds > fileSize) {
-      return `load-command region runs past end of file (header ${MACHO64_HEADER_SIZE} + sizeofcmds ${sizeofcmds} > file_size ${fileSize})`;
-    }
-    const cmds = Buffer.alloc(sizeofcmds);
-    const m = (0, import_node_fs20.readSync)(fd, cmds, 0, sizeofcmds, MACHO64_HEADER_SIZE);
-    if (m < sizeofcmds) {
-      return `short read of load commands (got ${m}; need ${sizeofcmds})`;
-    }
-    let off = 0;
-    let sawInterpose = false;
-    for (let i = 0; i < ncmds; i++) {
-      if (off + 8 > sizeofcmds) {
-        return `load command ${i} runs past the command region (off=${off})`;
+      const tableBytes = nfat * FAT_ARCH_SIZE;
+      const table = Buffer.alloc(tableBytes);
+      if ((0, import_node_fs20.readSync)(fd, table, 0, tableBytes, FAT_HEADER_SIZE) < tableBytes) {
+        return `short read of fat_arch table (need ${tableBytes} bytes)`;
       }
-      const cmd = readU32LE(cmds, off);
-      const cmdsize = readU32LE(cmds, off + 4);
-      if (cmdsize < 8 || off + cmdsize > sizeofcmds) {
-        return `load command ${i} has invalid cmdsize=${cmdsize} at off=${off}`;
-      }
-      if (cmd === LC_SEGMENT_64) {
-        const segnameOff = off + 8;
-        const nsects = readU32LE(cmds, off + 64);
-        const sectsBase = off + 72;
-        for (let s = 0; s < nsects; s++) {
-          const secOff = sectsBase + s * 80;
-          if (secOff + 32 > off + cmdsize) break;
-          const sectnameOff = secOff;
-          const secSegnameOff = secOff + 16;
-          if (machoNameEquals(cmds, secSegnameOff, 16, "__DATA") && machoNameEquals(cmds, sectnameOff, 16, "__interpose")) {
-            sawInterpose = true;
+      for (let i = 0; i < nfat; i++) {
+        const e = i * FAT_ARCH_SIZE;
+        const cputype = readU32BE(table, e);
+        const offset = readU32BE(table, e + 8);
+        const size = readU32BE(table, e + 12);
+        if (cputype === expectedCpuType) {
+          if (offset + size > fileSize) {
+            return `fat slice for ${cpuTypeLabel(expectedCpuType)} runs past EOF (offset ${offset} + size ${size} > ${fileSize})`;
           }
+          return validateThinMachOAt(fd, offset, offset + size, expectedCpuType);
         }
-        void segnameOff;
       }
-      off += cmdsize;
+      return `universal binary has no slice for ${cpuTypeLabel(expectedCpuType)}`;
     }
-    if (!sawInterpose) {
-      return "no __DATA,__interpose section; dyld has nothing to rebind (the dylib would load but intercept nothing)";
-    }
-    return null;
+    return validateThinMachOAt(fd, 0, fileSize, expectedCpuType);
   } finally {
     try {
       (0, import_node_fs20.closeSync)(fd);
     } catch {
     }
   }
+}
+function validateThinMachOAt(fd, base, limit, expectedCpuType) {
+  const hdr = Buffer.alloc(MACHO64_HEADER_SIZE);
+  const n = (0, import_node_fs20.readSync)(fd, hdr, 0, MACHO64_HEADER_SIZE, base);
+  if (n < MACHO64_HEADER_SIZE) {
+    return `header too short at offset ${base} (${n} bytes; need \u2265 ${MACHO64_HEADER_SIZE})`;
+  }
+  const magic = readU32LE(hdr, 0);
+  if (magic !== MH_MAGIC_64) {
+    if (magic === 1179403647) {
+      return "file is a Linux ELF object, not a macOS Mach-O dylib";
+    }
+    return `bad Mach-O magic at offset ${base}: expected 0x${MH_MAGIC_64.toString(16)}, got 0x${magic.toString(16)}`;
+  }
+  const cputype = readU32LE(hdr, 4);
+  if (cputype !== expectedCpuType) {
+    return `wrong architecture: got ${cpuTypeLabel(cputype)}, expected ${cpuTypeLabel(expectedCpuType)}`;
+  }
+  const filetype = readU32LE(hdr, 12);
+  if (filetype !== MH_DYLIB) {
+    return `unexpected filetype=0x${filetype.toString(16)} (expected 0x${MH_DYLIB.toString(16)} = MH_DYLIB)`;
+  }
+  const ncmds = readU32LE(hdr, 16);
+  const sizeofcmds = readU32LE(hdr, 20);
+  if (ncmds === 0 || sizeofcmds === 0) {
+    return "no load commands; not a loadable dylib";
+  }
+  if (base + MACHO64_HEADER_SIZE + sizeofcmds > limit) {
+    return `load-command region runs past slice end (header ${MACHO64_HEADER_SIZE} + sizeofcmds ${sizeofcmds} > slice ${limit - base})`;
+  }
+  const cmds = Buffer.alloc(sizeofcmds);
+  const m = (0, import_node_fs20.readSync)(fd, cmds, 0, sizeofcmds, base + MACHO64_HEADER_SIZE);
+  if (m < sizeofcmds) {
+    return `short read of load commands (got ${m}; need ${sizeofcmds})`;
+  }
+  let off = 0;
+  let sawInterpose = false;
+  for (let i = 0; i < ncmds; i++) {
+    if (off + 8 > sizeofcmds) {
+      return `load command ${i} runs past the command region (off=${off})`;
+    }
+    const cmd = readU32LE(cmds, off);
+    const cmdsize = readU32LE(cmds, off + 4);
+    if (cmdsize < 8 || off + cmdsize > sizeofcmds) {
+      return `load command ${i} has invalid cmdsize=${cmdsize} at off=${off}`;
+    }
+    if (cmd === LC_SEGMENT_64) {
+      const nsects = readU32LE(cmds, off + 64);
+      const sectsBase = off + 72;
+      for (let s = 0; s < nsects; s++) {
+        const secOff = sectsBase + s * 80;
+        if (secOff + 32 > off + cmdsize) break;
+        const sectnameOff = secOff;
+        const secSegnameOff = secOff + 16;
+        if (machoNameEquals(cmds, secSegnameOff, 16, "__DATA") && machoNameEquals(cmds, sectnameOff, 16, "__interpose")) {
+          sawInterpose = true;
+        }
+      }
+    }
+    off += cmdsize;
+  }
+  if (!sawInterpose) {
+    return "no __DATA,__interpose section; dyld has nothing to rebind (the dylib would load but intercept nothing)";
+  }
+  return null;
 }
 
 // src/action/backend/mac-bare.ts

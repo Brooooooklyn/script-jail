@@ -111,7 +111,7 @@ function execLine(opts: { basename: string; pid?: number } = { basename: 'instal
 }
 
 describe('runInstallPhaseMacos — shim-only dispatch', () => {
-  it('runs the pnpm rebuild command via the StraceRunner', async () => {
+  it('runs pnpm rebuild via <re-signed node> <corepack-cli> (DYLD-preserving launch)', async () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const strace: StraceRunner = {
       async *run(cmd, args) { calls.push({ cmd, args }); },
@@ -129,10 +129,40 @@ describe('runInstallPhaseMacos — shim-only dispatch', () => {
       emitter: new Emitter(new PassThrough()),
     });
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.cmd).toBe('pnpm');
-    expect(calls[0]!.args[0]).toBe('rebuild');
+    // The manager MUST be launched as `<node> <manager-cli.js> …`, never the
+    // bare `pnpm` shim: a shebang shim routes the first exec through the SIP
+    // binary /usr/bin/env, which strips DYLD_INSERT_LIBRARIES before node starts
+    // (so the Mach-O shim never loads).  The orchestrator runs under the
+    // re-signed node, so cmd === process.execPath.
+    expect(calls[0]!.cmd).toBe(process.execPath);
+    expect(calls[0]!.args[0]).toMatch(/corepack\.js$/);
+    expect(calls[0]!.args).toContain('pnpm');
+    expect(calls[0]!.args).toContain('rebuild');
     // The store-dir is pinned to the cwd (parity with the fetch phase).
     expect(calls[0]!.args.some((a) => a.startsWith('--store-dir='))).toBe(true);
+  });
+
+  it('runs npm rebuild via <re-signed node> <npm-cli.js> (DYLD-preserving launch)', async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const strace: StraceRunner = {
+      async *run(cmd, args) { calls.push({ cmd, args }); },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper() { /* no-op */ },
+      getRootPid() { return null; },
+    };
+    await runInstallPhaseMacos({
+      manager: 'npm',
+      cwd: '/work',
+      env: { PATH: '/usr/bin' },
+      strace,
+      attribution: new Attribution(NULL_PROC_READER),
+      emitter: new Emitter(new PassThrough()),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.cmd).toBe(process.execPath);
+    expect(calls[0]!.args[0]).toMatch(/npm-cli\.js$/);
+    expect(calls[0]!.args).toContain('rebuild');
   });
 
   it('parses a shim `write` JSONL line and attributes it to the exec-seeded package', async () => {

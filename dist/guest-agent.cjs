@@ -24884,7 +24884,7 @@ function date4(params) {
 config(en_default());
 
 // src/guest/agent.ts
-var import_node_path3 = require("node:path");
+var import_node_path4 = require("node:path");
 
 // src/lock/schema.ts
 var LifecycleStage = external_exports.enum(["preinstall", "install", "postinstall", "prepare"]);
@@ -27994,6 +27994,7 @@ async function runInstallPhase(input) {
 }
 
 // src/guest/phase-install-macos.ts
+var import_node_path = require("node:path");
 function parseMacosShimLine(line) {
   let obj;
   try {
@@ -28021,6 +28022,18 @@ var INSTALL_CMD2 = {
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
   yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
 };
+function buildMacosInstallCommand(manager, cwd) {
+  const node = process.execPath;
+  const toolchainRoot = (0, import_node_path.dirname)((0, import_node_path.dirname)(node));
+  const base = INSTALL_CMD2[manager];
+  const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
+  if (manager === "npm") {
+    const npmCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    return { cmd: node, args: [npmCli, ...managerArgs] };
+  }
+  const corepackCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
+  return { cmd: node, args: [corepackCli, manager, ...managerArgs] };
+}
 function pathBasename2(pathLike) {
   const nul = pathLike.indexOf("\0");
   const value = nul === -1 ? pathLike : pathLike.slice(0, nul);
@@ -28028,8 +28041,7 @@ function pathBasename2(pathLike) {
   return slash === -1 ? value : value.slice(slash + 1);
 }
 async function runInstallPhaseMacos(input) {
-  const { cmd, args: baseArgs } = INSTALL_CMD2[input.manager];
-  const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
+  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -28340,7 +28352,7 @@ async function runInstallPhaseMacos(input) {
 
 // src/guest/macos-install-runner.ts
 var import_node_child_process2 = require("node:child_process");
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 var import_node_readline = require("node:readline");
 var MacOSInstallRunner = class {
   _exitCode = 0;
@@ -28365,11 +28377,11 @@ var MacOSInstallRunner = class {
   }
   /**
    * Returns the human-readable tamper reason recorded by the tailer's
-   * events-file watcher, or null.  The fs-based tamper detector (inode/dev
-   * baseline, mtime/ctime/size monotonicity, parent-dir rename) is the SAME
-   * one the Linux runner uses and carries over unchanged; macOS drops only the
-   * strace-derived <SYSCALL_EXEC_BYPASS> / <EVENTS_FILE_FORGERY> detectors
-   * (no kernel channel to cross-check against).
+   * events-file watcher, or null.  macOS keeps the fs-based inode/dev baseline +
+   * mtime/ctime/size monotonicity (the SAME checks the Linux runner uses) but
+   * omits the parent-dir rename watcher (FSEvents reports 'rename' for ordinary
+   * appends → false positives) and the strace-derived <SYSCALL_EXEC_BYPASS> /
+   * <EVENTS_FILE_FORGERY> detectors (no kernel channel to cross-check against).
    */
   getTamperReason() {
     return this._tamperRef.reason;
@@ -28410,8 +28422,8 @@ var MacOSInstallRunner = class {
         resolve2();
       });
     });
-    const watchDir = (0, import_node_path.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path.basename)(opts.basePath);
+    const watchDir = (0, import_node_path2.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path2.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
@@ -28429,8 +28441,18 @@ var MacOSInstallRunner = class {
         ...this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
-          eventsDirPath: this._eventsFile.dirPath,
-          eventsFileBasename: (0, import_node_path.basename)(this._eventsFile.path),
+          // macOS DELIBERATELY omits eventsDirPath (+ eventsFileBasename) so the
+          // parent-dir rename watcher stays OFF.  That watcher is tuned for Linux
+          // inotify, where a Node 'rename' event means IN_MOVED/IN_CREATE/
+          // IN_DELETE.  On macOS `fs.watch` is backed by FSEvents, which reports
+          // 'rename' for ORDINARY appends too — so it would record a false
+          // "events file parent directory rename detected" tamper on every run
+          // and refuse to emit a lock.  The robust inode/dev/mtime/ctime baseline
+          // and the events-FILE watcher remain active (they key off
+          // eventsFilePath/eventsBaseline and are FS-semantics-agnostic), so the
+          // lock is still trustworthy; we lose only the transient
+          // rename-aside-and-back detection (a documented macOS fidelity gap,
+          // alongside the dropped strace-derived detectors).
           tamperRef: this._tamperRef
         } : {},
         exitPromise
@@ -28786,7 +28808,7 @@ function renderBlock(block) {
 
 // src/guest/discover-pkg-dirs.ts
 var import_node_fs2 = require("node:fs");
-var import_node_path2 = require("node:path");
+var import_node_path3 = require("node:path");
 function discoverPkgDirs(nodeModulesDir) {
   const result = /* @__PURE__ */ new Map();
   let entries;
@@ -28797,7 +28819,7 @@ function discoverPkgDirs(nodeModulesDir) {
   }
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
-    const entryPath = (0, import_node_path2.join)(nodeModulesDir, entry.name);
+    const entryPath = (0, import_node_path3.join)(nodeModulesDir, entry.name);
     if (entry.name.startsWith("@")) {
       let scopeEntries;
       try {
@@ -28808,7 +28830,7 @@ function discoverPkgDirs(nodeModulesDir) {
       for (const scopeEntry of scopeEntries) {
         if (scopeEntry.name.startsWith(".")) continue;
         if (!scopeEntry.isDirectory() && !scopeEntry.isSymbolicLink()) continue;
-        const pkgPath = (0, import_node_path2.join)(entryPath, scopeEntry.name);
+        const pkgPath = (0, import_node_path3.join)(entryPath, scopeEntry.name);
         readAndRegister(pkgPath, result);
       }
     } else {
@@ -28816,7 +28838,7 @@ function discoverPkgDirs(nodeModulesDir) {
       readAndRegister(entryPath, result);
     }
   }
-  scanPnpmVirtualStore((0, import_node_path2.join)(nodeModulesDir, ".pnpm"), result);
+  scanPnpmVirtualStore((0, import_node_path3.join)(nodeModulesDir, ".pnpm"), result);
   return result;
 }
 function scanPnpmVirtualStore(pnpmDir, result) {
@@ -28828,7 +28850,7 @@ function scanPnpmVirtualStore(pnpmDir, result) {
   }
   for (const flat of flatEntries) {
     if (!flat.isDirectory()) continue;
-    const innerNm = (0, import_node_path2.join)(pnpmDir, flat.name, "node_modules");
+    const innerNm = (0, import_node_path3.join)(pnpmDir, flat.name, "node_modules");
     let innerEntries;
     try {
       innerEntries = (0, import_node_fs2.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
@@ -28839,7 +28861,7 @@ function scanPnpmVirtualStore(pnpmDir, result) {
       if (inner.name.startsWith(".")) continue;
       if (inner.isSymbolicLink() || !inner.isDirectory()) continue;
       if (inner.name.startsWith("@")) {
-        const scopeDir = (0, import_node_path2.join)(innerNm, inner.name);
+        const scopeDir = (0, import_node_path3.join)(innerNm, inner.name);
         let scopeEntries;
         try {
           scopeEntries = (0, import_node_fs2.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
@@ -28849,16 +28871,16 @@ function scanPnpmVirtualStore(pnpmDir, result) {
         for (const se of scopeEntries) {
           if (se.name.startsWith(".")) continue;
           if (se.isSymbolicLink() || !se.isDirectory()) continue;
-          readAndRegister((0, import_node_path2.join)(scopeDir, se.name), result);
+          readAndRegister((0, import_node_path3.join)(scopeDir, se.name), result);
         }
       } else {
-        readAndRegister((0, import_node_path2.join)(innerNm, inner.name), result);
+        readAndRegister((0, import_node_path3.join)(innerNm, inner.name), result);
       }
     }
   }
 }
 function readAndRegister(pkgPath, result) {
-  const manifestPath = (0, import_node_path2.join)(pkgPath, "package.json");
+  const manifestPath = (0, import_node_path3.join)(pkgPath, "package.json");
   let raw;
   try {
     raw = (0, import_node_fs2.readFileSync)(manifestPath, "utf8");
@@ -29575,8 +29597,8 @@ var LinuxStraceRunner = class {
         resolve2();
       });
     });
-    const watchDir = (0, import_node_path3.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path3.basename)(opts.basePath);
+    const watchDir = (0, import_node_path4.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path4.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
@@ -29595,7 +29617,7 @@ var LinuxStraceRunner = class {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
           eventsDirPath: this._eventsFile.dirPath,
-          eventsFileBasename: (0, import_node_path3.basename)(this._eventsFile.path),
+          eventsFileBasename: (0, import_node_path4.basename)(this._eventsFile.path),
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
@@ -29832,9 +29854,9 @@ function macosTokenizeRoots(workDir) {
 }
 function createEventsFile(parentDir = "/tmp") {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
-  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path3.join)(parentDir, `script-jail-events-${tag}-`));
+  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path4.join)(parentDir, `script-jail-events-${tag}-`));
   (0, import_node_fs3.chmodSync)(dirPath, 448);
-  const path3 = (0, import_node_path3.join)(dirPath, `events-${tag}.jsonl`);
+  const path3 = (0, import_node_path4.join)(dirPath, `events-${tag}.jsonl`);
   const fd = (0, import_node_fs3.openSync)(
     path3,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition

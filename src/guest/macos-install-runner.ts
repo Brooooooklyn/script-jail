@@ -14,9 +14,13 @@
 //     macOS backend is observe-only and stays online per the plan),
 //   - reuses `runStraceTailer` for the events-file + fd-3 channel ONLY (every
 //     yielded line carries `source:'shim'`; there are no per-pid strace files
-//     so the strace text channel never fires), inheriting all of the fs-based
-//     events-file tamper machinery (inode/dev baseline, mtime/ctime/size
-//     monotonicity, parent-dir rename watch) verbatim,
+//     so the strace text channel never fires), inheriting the fs-based
+//     events-file tamper machinery (inode/dev baseline + mtime/ctime/size
+//     monotonicity) BUT omitting the parent-dir rename watcher: that watcher is
+//     Linux-inotify-specific and FSEvents (which backs macOS `fs.watch`) reports
+//     'rename' for ordinary appends, so it would false-positive on every run.
+//     The transient rename-aside-and-back case it guards is a documented macOS
+//     fidelity gap; the inode/dev/mtime/ctime baseline still fails closed,
 //   - returns `getRootPid()→null`: there is no strace direct-child to pin, and
 //     the macOS dispatch loop (`runInstallPhaseMacos`) does no cwd/dirfd
 //     resolution that would need a seeded root pid (paths are already absolute).
@@ -66,11 +70,11 @@ export class MacOSInstallRunner implements StraceRunner {
 
   /**
    * Returns the human-readable tamper reason recorded by the tailer's
-   * events-file watcher, or null.  The fs-based tamper detector (inode/dev
-   * baseline, mtime/ctime/size monotonicity, parent-dir rename) is the SAME
-   * one the Linux runner uses and carries over unchanged; macOS drops only the
-   * strace-derived <SYSCALL_EXEC_BYPASS> / <EVENTS_FILE_FORGERY> detectors
-   * (no kernel channel to cross-check against).
+   * events-file watcher, or null.  macOS keeps the fs-based inode/dev baseline +
+   * mtime/ctime/size monotonicity (the SAME checks the Linux runner uses) but
+   * omits the parent-dir rename watcher (FSEvents reports 'rename' for ordinary
+   * appends → false positives) and the strace-derived <SYSCALL_EXEC_BYPASS> /
+   * <EVENTS_FILE_FORGERY> detectors (no kernel channel to cross-check against).
    */
   getTamperReason(): string | null {
     return this._tamperRef.reason;
@@ -154,8 +158,18 @@ export class MacOSInstallRunner implements StraceRunner {
         ...(this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
-          eventsDirPath: this._eventsFile.dirPath,
-          eventsFileBasename: basename(this._eventsFile.path),
+          // macOS DELIBERATELY omits eventsDirPath (+ eventsFileBasename) so the
+          // parent-dir rename watcher stays OFF.  That watcher is tuned for Linux
+          // inotify, where a Node 'rename' event means IN_MOVED/IN_CREATE/
+          // IN_DELETE.  On macOS `fs.watch` is backed by FSEvents, which reports
+          // 'rename' for ORDINARY appends too — so it would record a false
+          // "events file parent directory rename detected" tamper on every run
+          // and refuse to emit a lock.  The robust inode/dev/mtime/ctime baseline
+          // and the events-FILE watcher remain active (they key off
+          // eventsFilePath/eventsBaseline and are FS-semantics-agnostic), so the
+          // lock is still trustworthy; we lose only the transient
+          // rename-aside-and-back detection (a documented macOS fidelity gap,
+          // alongside the dropped strace-derived detectors).
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,

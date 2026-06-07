@@ -388,7 +388,15 @@ function materializeShellShims(shellShimDir: string, doRunCommand: typeof runCom
     materializeOne(src, join(shellShimDir, name), doRunCommand);
   }
   for (const name of SIP_COREUTILS) {
-    materializeOne(`/usr/bin/${name}`, join(shellShimDir, name), doRunCommand);
+    // Coreutils are split across /bin (cat, echo, cp, ls, rm, mkdir, pwd,
+    // date, test, …) and /usr/bin (sed, awk, grep, env, head, …).  The shim
+    // redirects BOTH /bin/<name> and /usr/bin/<name> to this single
+    // basename-keyed copy, so source from whichever real location exists —
+    // prefer /bin (the canonical coreutil home).  Materializing only from
+    // /usr/bin silently dropped every /bin-only coreutil, so the shim's
+    // /bin/<name> redirect pointed at a missing file → exec ENOENT.
+    const src = existsSync(`/bin/${name}`) ? `/bin/${name}` : `/usr/bin/${name}`;
+    materializeOne(src, join(shellShimDir, name), doRunCommand);
   }
 }
 

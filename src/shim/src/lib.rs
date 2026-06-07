@@ -234,6 +234,35 @@ unsafe fn canon_bytes(buf: &CanonBuf) -> &[u8] {
     &bytes[..len]
 }
 
+/// True when the NUL-terminated `cpath` equals the audit events-file path
+/// (SCRIPT_JAIL_LOG_FILE, captured into CANON_LOG_FILE at ctor).
+///
+/// The macOS fileops hooks must NEVER record operations on the shim's OWN
+/// events file: env-spy writes `node_startup_done` JSONL there, and without this
+/// skip that write would surface as a spurious `write` event attributed to the
+/// running lifecycle script (self-observation of the audit channel).  On Linux
+/// the file-op stream comes from strace, not the shim, so this only matters for
+/// the macOS hooks — hence `#[cfg(target_os = "macos")]`.  Returns false when no
+/// log path was captured (e.g. the fd-only test configuration).
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn path_is_audit_log(cpath: *const c_char) -> bool {
+    let log = canon_bytes(&CANON_LOG_FILE);
+    if log.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    loop {
+        let b = *cpath.add(i) as u8;
+        if b == 0 {
+            return i == log.len();
+        }
+        if i >= log.len() || log[i] != b {
+            return false;
+        }
+        i += 1;
+    }
+}
+
 // ── log fd ─────────────────────────────────────────────────────────────────
 
 static LOG_FD: AtomicI32 = AtomicI32::new(-1);
