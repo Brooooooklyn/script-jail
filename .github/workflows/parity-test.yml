@@ -302,7 +302,11 @@ jobs:
           # Re-signed node + shell-shim cache root for the bare backend.
           SCRIPT_JAIL_CACHE_DIR: ${{ runner.temp }}/script-jail-cache
         run: |
-          node dist/cli.cjs update \
+          # working-directory is the fixture (the CLI audits cwd as the install
+          # dir), so dist/cli.cjs MUST be referenced by ABSOLUTE path — a relative
+          # path would resolve under fixture/, not the repo root.  --config/--lock
+          # are already absolute (resolve(cwd, abs) returns abs).
+          node "${{ github.workspace }}/dist/cli.cjs" update \
             --backend bare \
             --config "${{ github.workspace }}/.script-jail.yml" \
             --lock "${{ github.workspace }}/macos-bare-lockfile.yml" \
