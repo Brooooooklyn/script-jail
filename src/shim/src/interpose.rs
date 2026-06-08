@@ -62,14 +62,9 @@ macro_rules! interpose_entry {
 pub(crate) use interpose_entry;
 
 /// Like `interpose_entry!` but WITHOUT the ABI-equality `const` assertion.
-/// Required for variadic libc symbols (`open`, `openat`, `creat`*, …) where the
-/// replacement uses the fixed-arity "accept and ignore the trailing mode arg"
-/// trick: the genuine `libc::<fn>` is variadic (`fn(..., ...) -> _`) and would
-/// not type-check against a fixed-arity replacement signature, even though the
-/// register-level ABI is compatible on arm64/x86_64 (the SysV/AAPCS calling
-/// convention lets a callee read a fixed register slot the caller may or may
-/// not have populated).  Both pointers are erased to `*const c_void` for the
-/// table; correctness of the trick is the caller's responsibility.
+/// Required when the replacement is implemented outside Rust or otherwise has
+/// an erased signature.  Both pointers are erased to `*const c_void` for the
+/// table; correctness of the replacement ABI is the caller's responsibility.
 macro_rules! interpose_entry_raw {
     ($entry:ident, $new:path, $old:path) => {
         #[used]

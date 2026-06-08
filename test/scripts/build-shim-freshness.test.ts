@@ -156,4 +156,16 @@ describe('shimSourceInputs', () => {
     expect(inputs).toContain('/repo/rust-toolchain.toml');
     expect(inputs).toContain('/repo/src/shim/src/lib.rs');
   });
+
+  it('includes the macOS Mach-O port modules and the C variadic bridge', () => {
+    const inputs = shimSourceInputs('/repo');
+    // Mach-O hook modules (cfg-gated to darwin in lib.rs).
+    expect(inputs).toContain('/repo/src/shim/src/interpose.rs');
+    expect(inputs).toContain('/repo/src/shim/src/fileops.rs');
+    expect(inputs).toContain('/repo/src/shim/src/net.rs');
+    // C variadic bridge for open/openat (Darwin arm64 stack-passed `mode`):
+    // editing either must bust the freshness gate so the cached dylib rebuilds.
+    expect(inputs).toContain('/repo/src/shim/build.rs');
+    expect(inputs).toContain('/repo/src/shim/src/open_variadic.c');
+  });
 });

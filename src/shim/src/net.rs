@@ -21,7 +21,9 @@ use core::ffi::{c_char, c_int};
 use libc::{sockaddr, socklen_t};
 
 use crate::interpose::interpose_entry;
-use crate::{emit_connect, in_shim, ConnectResult, INIT_DONE};
+use crate::{
+    ConnectResult, INIT_DONE, emit_connect, errno, in_shim, macos_audit_ops_enabled, set_errno,
+};
 
 use core::sync::atomic::Ordering;
 
@@ -32,11 +34,14 @@ unsafe extern "C" fn connect_interpose(
 ) -> c_int {
     // Forward FIRST (observe-only) so errno reflects the real outcome.
     let rc = libc::connect(sockfd, addr, addrlen);
+    let saved_errno = errno();
 
-    if in_shim() || !INIT_DONE.load(Ordering::Acquire) {
+    if in_shim() || !INIT_DONE.load(Ordering::Acquire) || !macos_audit_ops_enabled() {
+        set_errno(saved_errno);
         return rc;
     }
     if addr.is_null() {
+        set_errno(saved_errno);
         return rc;
     }
 
@@ -59,6 +64,7 @@ unsafe extern "C" fn connect_interpose(
     let alen = addrlen as usize;
     if alen < 2 {
         crate::set_in_shim(false);
+        set_errno(saved_errno);
         return rc;
     }
     let family = (*addr).sa_family as c_int;
@@ -91,6 +97,7 @@ unsafe extern "C" fn connect_interpose(
     // else: AF_UNIX / other family / sockaddr too short for its family → drop.
 
     crate::set_in_shim(false);
+    set_errno(saved_errno);
     rc
 }
 

@@ -1667,6 +1667,15 @@ const LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = new Set([
   // binaries to (SIP strips DYLD_* for /bin and /usr/bin).  The shim captures
   // it at ctor; allowed so descendants see the same sticky value.
   'SCRIPT_JAIL_SHELL_SHIM_DIR',
+  // NOTE: SCRIPT_JAIL_MACOS_AUDIT_OPS is deliberately NOT allow-listed here.
+  // It is an internal per-phase control set solely by main() (deleted from the
+  // Phase-A fetch env, set to '1' on the Phase-B install env).  Allow-listing it
+  // would let an AMBIENT value survive sanitization into audited children —
+  // harmless-but-leaky on macOS and a real regression on Linux (the ELF .so has
+  // no audit-ops gate, yet the var would still ride into the Linux lifecycle env
+  // and break the "strip unknown SCRIPT_JAIL_* vars" invariant).  Keeping it off
+  // the list means an ambient value is always stripped; main() is the sole
+  // authority.  See the Phase A/B split in main().
 ]);
 
 const LIFECYCLE_HOST_NOISE_ENV_NAMES = new Set([
@@ -1932,6 +1941,9 @@ export function buildChildEnv(
  *   - `SCRIPT_JAIL_SHELL_SHIM_DIR` is threaded through (from `baseEnv`) so the
  *     shim's sip_redirect can rewrite /bin/sh, /bin/bash, and coreutils to the
  *     materialized re-signed copies (SIP strips DYLD_* for system binaries).
+ *   - `SCRIPT_JAIL_MACOS_AUDIT_OPS` is intentionally NOT set here.  main()
+ *     adds it only for Phase B so Phase A keeps env_read coverage without
+ *     native file/connect auditing.
  *
  * @internal Exported for unit tests and the macOS-bare main() path.
  */
@@ -2389,6 +2401,13 @@ export async function main(input: AgentInput): Promise<void> {
   const childEnv = isMacosBare
     ? buildChildEnvMacos(process.env, config, eventsFilePath, input.preloadPaths)
     : buildChildEnv(process.env, config, eventsFilePath, input.preloadPaths);
+  const fetchEnv = isMacosBare ? { ...childEnv } : childEnv;
+  if (isMacosBare) {
+    delete fetchEnv['SCRIPT_JAIL_MACOS_AUDIT_OPS'];
+  }
+  const installEnv = isMacosBare
+    ? { ...childEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: '1' }
+    : childEnv;
 
   // 6. Set up spawner (Phase A) and install runner (Phase B).  On macOS the
   //    runner spawns the install DIRECTLY (no strace/unshare) and the Mach-O
@@ -2413,7 +2432,7 @@ export async function main(input: AgentInput): Promise<void> {
   const fetchResult = await runFetchPhase({
     manager,
     cwd: config.work_dir,
-    env: childEnv,
+    env: fetchEnv,
     spawner,
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
@@ -2567,7 +2586,7 @@ export async function main(input: AgentInput): Promise<void> {
   const installInput = {
     manager,
     cwd: config.work_dir,
-    env: childEnv,
+    env: installEnv,
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,

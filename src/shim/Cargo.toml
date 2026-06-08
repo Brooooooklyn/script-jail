@@ -22,6 +22,9 @@ path = "src/bin/procinfo.rs"
 libc = { version = "0.2", default-features = false }
 ctor = { version = "1.0", default-features = false, features = ["proc_macro"] }
 
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.2.63"
+
 # NOTE: `[profile.release]` for this crate lives in the workspace root
 # Cargo.toml (one level up).  Cargo ignores profile blocks in workspace
 # members and emits a warning if duplicated here.

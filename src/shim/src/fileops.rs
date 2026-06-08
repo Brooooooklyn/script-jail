@@ -15,24 +15,30 @@
 // strace path.  All hooks are zero-allocation (raw stack buffers) per the macOS
 // hot-path discipline.
 //
-// Variadic `open`/`openat` are NOT declared variadic here: we use the
-// fixed-arity "accept and ignore a trailing mode arg" trick (safe on
-// arm64/x86_64), wired through `interpose_entry_raw!` (no ABI const assertion).
-// Technique ported from fspy `interceptions/open.rs` / `convert.rs`.
+// `open`/`openat` are variadic and need a C bridge on Apple arm64: Darwin's
+// arm64 variadic ABI does not pass the trailing `mode` where a fixed-arity Rust
+// replacement expects it.  The C bridge reads mode with `va_arg` and then calls
+// the fixed-ABI Rust implementation below.
 #![cfg(target_os = "macos")]
 
 use core::ffi::{c_char, c_int, c_uint};
 
-use libc::{mode_t, FILE};
+use libc::{FILE, mode_t};
 
 use crate::interpose::{interpose_entry, interpose_entry_raw};
 use crate::{
-    abs_path_into, classify_fs_errno, emit_fs, errno, in_shim, FsErrno, FsKind, INIT_DONE,
+    FsErrno, FsKind, INIT_DONE, abs_path_into, classify_fs_errno, emit_fs, errno, in_shim,
+    macos_audit_ops_enabled, set_errno,
 };
 
 use core::sync::atomic::Ordering;
 
 const PATH_BUF: usize = (libc::PATH_MAX as usize) + 1;
+
+unsafe extern "C" {
+    fn script_jail_open_variadic();
+    fn script_jail_openat_variadic();
+}
 
 /// Classify open()/openat() flags into read vs write.  Matches fspy
 /// convert.rs: O_WRONLY → write, O_RDWR → write (mutates), else read.
@@ -86,15 +92,21 @@ unsafe fn fopen_kind(mode: *const c_char) -> FsKind {
 /// without emitting.
 #[inline]
 fn should_audit() -> bool {
-    !in_shim() && INIT_DONE.load(Ordering::Acquire)
+    macos_audit_ops_enabled() && !in_shim() && INIT_DONE.load(Ordering::Acquire)
 }
 
 /// Resolve `(dirfd, path)` and emit one fs event with the rc-derived errno.
 /// `rc_failed`/`raw_errno` come from the just-completed real call.
 #[inline]
-unsafe fn audit_path(kind: FsKind, dirfd: c_int, path: *const c_char, rc_failed: bool) {
+unsafe fn audit_path(
+    kind: FsKind,
+    dirfd: c_int,
+    path: *const c_char,
+    rc_failed: bool,
+    raw_errno: c_int,
+) {
     let errno_kind: FsErrno = if rc_failed {
-        classify_fs_errno(errno())
+        classify_fs_errno(raw_errno)
     } else {
         FsErrno::None
     };
@@ -111,47 +123,62 @@ unsafe fn audit_path(kind: FsKind, dirfd: c_int, path: *const c_char, rc_failed:
     }
 }
 
-// ── open / openat (fixed-arity trick) ──────────────────────────────────────
+// ── open / openat (C variadic bridge) ──────────────────────────────────────
 
-unsafe extern "C" fn open_interpose(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn script_jail_open_impl(
+    path: *const c_char,
+    flags: c_int,
+    mode: c_uint,
+) -> c_int {
     // Forward FIRST so errno reflects the real outcome before we read it.
     let rc = libc::open(path, flags, mode);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         // Re-assert the guard for the emit (errno read + abs-path resolution +
         // write all) so the resolution's own libc calls don't re-enter us.
         crate::set_in_shim(true);
-        audit_path(open_kind(flags), libc::AT_FDCWD, path, rc < 0);
+        audit_path(open_kind(flags), libc::AT_FDCWD, path, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
-interpose_entry_raw!(SJ_OPEN, open_interpose, libc::open);
+interpose_entry_raw!(SJ_OPEN, script_jail_open_variadic, libc::open);
 
-unsafe extern "C" fn openat_interpose(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn script_jail_openat_impl(
     dirfd: c_int,
     path: *const c_char,
     flags: c_int,
     mode: c_uint,
 ) -> c_int {
     let rc = libc::openat(dirfd, path, flags, mode);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(open_kind(flags), dirfd, path, rc < 0);
+        audit_path(open_kind(flags), dirfd, path, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
-interpose_entry_raw!(SJ_OPENAT, openat_interpose, libc::openat);
+interpose_entry_raw!(SJ_OPENAT, script_jail_openat_variadic, libc::openat);
 
 // ── creat (always write) ───────────────────────────────────────────────────
 
 unsafe extern "C" fn creat_interpose(path: *const c_char, mode: mode_t) -> c_int {
     let rc = libc::creat(path, mode);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(FsKind::Write, libc::AT_FDCWD, path, rc < 0);
+        audit_path(FsKind::Write, libc::AT_FDCWD, path, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -165,11 +192,20 @@ interpose_entry!(
 
 unsafe extern "C" fn fopen_interpose(path: *const c_char, mode: *const c_char) -> *mut FILE {
     let rc = libc::fopen(path, mode);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(fopen_kind(mode), libc::AT_FDCWD, path, rc.is_null());
+        audit_path(
+            fopen_kind(mode),
+            libc::AT_FDCWD,
+            path,
+            rc.is_null(),
+            saved_errno,
+        );
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -185,11 +221,20 @@ unsafe extern "C" fn freopen_interpose(
     stream: *mut FILE,
 ) -> *mut FILE {
     let rc = libc::freopen(path, mode, stream);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(fopen_kind(mode), libc::AT_FDCWD, path, rc.is_null());
+        audit_path(
+            fopen_kind(mode),
+            libc::AT_FDCWD,
+            path,
+            rc.is_null(),
+            saved_errno,
+        );
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -203,11 +248,14 @@ interpose_entry!(
 
 unsafe extern "C" fn unlink_interpose(path: *const c_char) -> c_int {
     let rc = libc::unlink(path);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(FsKind::Write, libc::AT_FDCWD, path, rc < 0);
+        audit_path(FsKind::Write, libc::AT_FDCWD, path, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -219,11 +267,14 @@ interpose_entry!(
 
 unsafe extern "C" fn unlinkat_interpose(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
     let rc = libc::unlinkat(dirfd, path, flags);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(FsKind::Write, dirfd, path, rc < 0);
+        audit_path(FsKind::Write, dirfd, path, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -244,12 +295,15 @@ interpose_entry!(
 
 unsafe extern "C" fn rename_interpose(old: *const c_char, new: *const c_char) -> c_int {
     let rc = libc::rename(old, new);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(FsKind::Write, libc::AT_FDCWD, old, rc < 0);
-        audit_path(FsKind::Write, libc::AT_FDCWD, new, rc < 0);
+        audit_path(FsKind::Write, libc::AT_FDCWD, old, rc < 0, saved_errno);
+        audit_path(FsKind::Write, libc::AT_FDCWD, new, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -266,12 +320,15 @@ unsafe extern "C" fn renameat_interpose(
     new: *const c_char,
 ) -> c_int {
     let rc = libc::renameat(oldfd, old, newfd, new);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(FsKind::Write, oldfd, old, rc < 0);
-        audit_path(FsKind::Write, newfd, new, rc < 0);
+        audit_path(FsKind::Write, oldfd, old, rc < 0, saved_errno);
+        audit_path(FsKind::Write, newfd, new, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -285,11 +342,14 @@ interpose_entry!(
 
 unsafe extern "C" fn mkdir_interpose(path: *const c_char, mode: mode_t) -> c_int {
     let rc = libc::mkdir(path, mode);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(FsKind::Write, libc::AT_FDCWD, path, rc < 0);
+        audit_path(FsKind::Write, libc::AT_FDCWD, path, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(
@@ -301,11 +361,14 @@ interpose_entry!(
 
 unsafe extern "C" fn mkdirat_interpose(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
     let rc = libc::mkdirat(dirfd, path, mode);
-    if should_audit() {
+    let saved_errno = errno();
+    let audit = should_audit();
+    if audit {
         crate::set_in_shim(true);
-        audit_path(FsKind::Write, dirfd, path, rc < 0);
+        audit_path(FsKind::Write, dirfd, path, rc < 0, saved_errno);
         crate::set_in_shim(false);
     }
+    set_errno(saved_errno);
     rc
 }
 interpose_entry!(

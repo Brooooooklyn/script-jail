@@ -42,6 +42,12 @@ export function shimSourceInputs(repoRoot: string): ReadonlyArray<string> {
     join(repoRoot, 'src', 'shim', 'src', 'interpose.rs'),
     join(repoRoot, 'src', 'shim', 'src', 'fileops.rs'),
     join(repoRoot, 'src', 'shim', 'src', 'net.rs'),
+    // macOS C variadic bridge for open/openat (Darwin arm64 passes the
+    // trailing `mode` on the stack, not in a register).  `build.rs` compiles
+    // `open_variadic.c` via the `cc` crate, so BOTH gate the dylib: edit
+    // either and the cached dylib must rebuild.  cfg-gated to macOS in build.rs.
+    join(repoRoot, 'src', 'shim', 'build.rs'),
+    join(repoRoot, 'src', 'shim', 'src', 'open_variadic.c'),
   ];
 }
 

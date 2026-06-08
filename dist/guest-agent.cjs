@@ -29735,6 +29735,15 @@ var LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = /* @__PURE__ */ new Set([
   // binaries to (SIP strips DYLD_* for /bin and /usr/bin).  The shim captures
   // it at ctor; allowed so descendants see the same sticky value.
   "SCRIPT_JAIL_SHELL_SHIM_DIR"
+  // NOTE: SCRIPT_JAIL_MACOS_AUDIT_OPS is deliberately NOT allow-listed here.
+  // It is an internal per-phase control set solely by main() (deleted from the
+  // Phase-A fetch env, set to '1' on the Phase-B install env).  Allow-listing it
+  // would let an AMBIENT value survive sanitization into audited children —
+  // harmless-but-leaky on macOS and a real regression on Linux (the ELF .so has
+  // no audit-ops gate, yet the var would still ride into the Linux lifecycle env
+  // and break the "strip unknown SCRIPT_JAIL_* vars" invariant).  Keeping it off
+  // the list means an ambient value is always stripped; main() is the sole
+  // authority.  See the Phase A/B split in main().
 ]);
 var LIFECYCLE_HOST_NOISE_ENV_NAMES = /* @__PURE__ */ new Set([
   "COLS",
@@ -29979,6 +29988,11 @@ async function main(input) {
   const eventsFilePath = eventsFile.path;
   const isMacosBare = process.env["SCRIPT_JAIL_BACKEND"] === "macos-bare" || process.platform === "darwin" && input.strace === void 0;
   const childEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, eventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, eventsFilePath, input.preloadPaths);
+  const fetchEnv = isMacosBare ? { ...childEnv } : childEnv;
+  if (isMacosBare) {
+    delete fetchEnv["SCRIPT_JAIL_MACOS_AUDIT_OPS"];
+  }
+  const installEnv = isMacosBare ? { ...childEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : childEnv;
   const spawner = input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
   const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(void 0, eventsFile));
   const attribution = new Attribution(
@@ -29988,7 +30002,7 @@ async function main(input) {
   const fetchResult = await runFetchPhase({
     manager,
     cwd: config2.work_dir,
-    env: childEnv,
+    env: fetchEnv,
     spawner
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
@@ -30081,7 +30095,7 @@ ${fetchResult.stderr}
   const installInput = {
     manager,
     cwd: config2.work_dir,
-    env: childEnv,
+    env: installEnv,
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
