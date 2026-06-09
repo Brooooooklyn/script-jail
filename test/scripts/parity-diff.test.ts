@@ -507,6 +507,19 @@ function swcDivergentLock(fields: string): string {
 ${fields}`;
 }
 
+// A full lock: invariant esbuild + one puppeteer@ (divergent, network-download)
+// block carrying the given postinstall fields.  Used by the observe-only
+// reconciliation suite — puppeteer is the canonical example of a package that
+// ATTEMPTS egress on offline Linux but COMPLETES the download (writes + connect)
+// on observe-only macOS-bare.  Its only allowlisted spawn is `node install.mjs`,
+// so callers override `spawn_attempts` away from the postinstallFields default.
+function puppeteerDivergentLock(fields: string): string {
+  return `${LOCK_HEADER}${INVARIANT_ESBUILD}  puppeteer@24.10.0:
+    lifecycle:
+      postinstall:
+${fields}`;
+}
+
 // A full lock with a single NON-divergent package block (used for the finding
 // #2/#3/#4 filter regressions, where the block DOES enter byte comparison).
 function singlePackageLock(pkgKey: string, fields: string): string {
@@ -1610,6 +1623,309 @@ describe('scripts/parity-diff.ts — symmetric divergent-package presence (findi
     expect(result.status).toBe(1);
     expect(result.stdout).toContain('DANGER');
     expect(result.stdout).toContain('@swc/core@1.15.33');
+    expect(result.stderr).toBe('');
+  });
+});
+
+describe('scripts/parity-diff.ts — observe-only divergence reconciliation (--source-of-truth)', () => {
+  // macOS-bare is OBSERVE-ONLY on the network: a network-download divergent
+  // package (puppeteer@) ACTUALLY downloads on macOS (real escaped_writes of the
+  // downloaded files + a connect to the CDN), while offline Linux Phase B only
+  // ATTEMPTS egress (`<BLOCKED> connect …`) and writes nothing.  Under the
+  // asymmetric `--source-of-truth left` model the macOS-side downstream effect
+  // (writes/connect completing the egress Linux already attempted) is reconciled —
+  // but ONLY for escaped_writes/network, ONLY when Linux attempted egress for the
+  // same pkg+phase, and (for writes) ONLY under a NON-broad path Linux touched.
+
+  // Linux (source of truth): attempts the CDN egress (blocked offline → resolver
+  // DNS lookup is `<BLOCKED>`), references the puppeteer cache root.  The
+  // 2-segment-trailing `$HOME/.cache/puppeteer` is the binding anchor; `$REPO`
+  // and `/` are broad roots that must NOT bind a write.
+  const linuxAttempted = puppeteerDivergentLock(
+    postinstallFields({
+      external_reads: ['$HOME/.cache/puppeteer', '$REPO', '/'],
+      spawn_attempts: ['node install.mjs'],
+      network_attempts: ['<BLOCKED> connect 168.63.129.16:53'],
+    }),
+  );
+
+  it('1. RECONCILE PASS: macOS download (write under a Linux-touched cache dir + CDN connect) is waived → exit 0', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, linuxAttempted, 'utf8');
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.cache/puppeteer/chrome/147-chrome-linux64.zip'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('');
+  });
+
+  it('1b. RECONCILE the download ROOT: a write that EQUALS a non-broad Linux read is waived → exit 0', () => {
+    // The real puppeteer macOS download writes the cache dir `$HOME/.cache/
+    // puppeteer` itself (not just files under it).  Linux READ that exact dir
+    // (a non-broad external_read), so the equal-path write reconciles too.
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, linuxAttempted, 'utf8');
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.cache/puppeteer'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('');
+  });
+
+  it('2. ATTACKER WRITE still flagged: a write NOT under any non-broad Linux path is not waived → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, linuxAttempted, 'utf8');
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.ssh/authorized_keys'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('DANGER');
+    expect(result.stdout).toContain('$HOME/.ssh/authorized_keys');
+    expect(result.stderr).toBe('');
+  });
+
+  it('3. NO LINUX EGRESS → the CONNECT is not waived (the cache write still is, via the allowlist) → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    // Linux did NOT reference the cache AND attempted NO egress.  The macOS write
+    // sits under puppeteer's HARDCODED download root, so it waives on the allowlist
+    // alone (independent of what Linux read) — but the CONNECT has no trusted-side
+    // egress evidence, so it stays flagged.
+    writeFileSync(
+      left,
+      puppeteerDivergentLock(
+        postinstallFields({
+          external_reads: ['$REPO'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: [],
+        }),
+      ),
+      'utf8',
+    );
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.cache/puppeteer/chrome/147-chrome-linux64.zip'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('DANGER');
+    // The connect stays (no egress evidence on the trusted side)...
+    expect(result.stdout).toContain('connect 142.251.218.187:443');
+    // ...but the cache write is waived by the download-root allowlist alone.
+    expect(result.stdout).not.toContain('$HOME/.cache/puppeteer/chrome/147-chrome-linux64.zip');
+    expect(result.stderr).toBe('');
+  });
+
+  it('4. LAUNDERING CLOSED: a write OUTSIDE the package download root is flagged even with a matching Linux read + egress → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    // Adversarial-review reproduction: a compromised divergent package reads a
+    // benign path on Linux and writes a persistence payload under it on macOS,
+    // alongside a real exfil connect.  The write waiver keys on puppeteer's
+    // HARDCODED download root ($HOME/.cache/puppeteer) — NOT on the (influenceable)
+    // trusted-side reads — so the autostart payload is flagged regardless of the
+    // matching Linux read.  (The connect IS waived as the observe-only egress
+    // residual, but the flagged write fails the gate — the laundering is closed.)
+    writeFileSync(
+      left,
+      puppeteerDivergentLock(
+        postinstallFields({
+          external_reads: ['$HOME/.config/autostart'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['<BLOCKED> connect 168.63.129.16:53'],
+        }),
+      ),
+      'utf8',
+    );
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.config/autostart/payload.desktop'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 203.0.113.10:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('DANGER');
+    // The persistence write is flagged (not under any approved download root)...
+    expect(result.stdout).toContain('$HOME/.config/autostart/payload.desktop');
+    // ...even though the arbitrary connect is waived (observe-only egress residual).
+    expect(result.stdout).not.toContain('connect 203.0.113.10:443');
+    expect(result.stderr).toBe('');
+  });
+
+  it('4b. TRAVERSAL CLOSED: a `..` escape out of the download root is flagged, not waived → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    // Adversarial-review reproduction: the macOS escaped_writes value STARTS WITH
+    // the approved root ($HOME/.cache/puppeteer/) but traverses out of it with `..`,
+    // so the kernel write lands in $HOME/.ssh.  The raw prefix check would waive it;
+    // lexicalNormalizeToken collapses the `..` first, so the value resolves to
+    // $HOME/.ssh/authorized_keys — outside the root — and stays flagged.
+    writeFileSync(left, linuxAttempted, 'utf8');
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.cache/puppeteer/../../.ssh/authorized_keys'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('DANGER');
+    expect(result.stdout).toContain('$HOME/.cache/puppeteer/../../.ssh/authorized_keys');
+    expect(result.stderr).toBe('');
+  });
+
+  it('4c. OVER-TRAVERSAL CLOSED: `..` escaping above $HOME then re-entering the cache name is flagged → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    // Adversarial-review reproduction of the token-head underflow: the value pops
+    // THREE levels (../../../) from $HOME/.cache/puppeteer — escaping ABOVE $HOME —
+    // then re-enters a same-named `.cache/puppeteer/payload` suffix.  A normalizer
+    // that merely CLAMPS `..` at the head would collapse this to
+    // $HOME/.cache/puppeteer/payload and waive it, even though the real write lands
+    // OUTSIDE $HOME.  lexicalNormalizeToken fails closed on head-underflow, so the
+    // value never matches the download root and stays flagged.
+    writeFileSync(left, linuxAttempted, 'utf8');
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.cache/puppeteer/../../../.cache/puppeteer/payload'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('DANGER');
+    expect(result.stdout).toContain('$HOME/.cache/puppeteer/../../../.cache/puppeteer/payload');
+    expect(result.stderr).toBe('');
+  });
+
+  it('5. SYMMETRIC DEFAULT (no --source-of-truth): no reconciliation, the macOS download fails → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, linuxAttempted, 'utf8');
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          escaped_writes: ['$HOME/.cache/puppeteer/chrome/147-chrome-linux64.zip'],
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right); // no --source-of-truth → symmetric
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('DANGER');
+    expect(result.stdout).toContain('$HOME/.cache/puppeteer/chrome/147-chrome-linux64.zip');
+    expect(result.stderr).toBe('');
+  });
+
+  it('6. NETWORK reconciled but a NON-network danger in the same block is STILL flagged → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, linuxAttempted, 'utf8');
+    // The connect IS waivable (Linux attempted egress), but an env_tamper in the
+    // SAME divergent block is never a downstream consequence of egress — it stays
+    // fully default-deny, proving we only ever waive escaped_writes + network.
+    writeFileSync(
+      right,
+      puppeteerDivergentLock(
+        postinstallFields({
+          spawn_attempts: ['node install.mjs'],
+          network_attempts: ['connect 142.251.218.187:443'],
+          env_tamper: ['unset SCRIPT_JAIL_MACOS_AUDIT_OPS'],
+        }),
+      ),
+      'utf8',
+    );
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('DANGER');
+    expect(result.stdout).toContain('unset SCRIPT_JAIL_MACOS_AUDIT_OPS');
+    // The connect was waived: it must NOT appear as a blocking finding.
+    expect(result.stdout).not.toContain('connect 142.251.218.187:443');
     expect(result.stderr).toBe('');
   });
 });

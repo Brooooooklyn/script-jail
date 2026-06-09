@@ -85,6 +85,37 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
     these tools (via a universal arm64+arm64e dylib), at the cost of a nightly
     `-Z build-std` toolchain. Firecracker remains the high-assurance backend when
     full subtree coverage matters.
+  - **External (non-SIP) system tools are also audit-blind.** SIP only strips
+    `DYLD_INSERT_LIBRARIES` for `/bin` and `/usr/bin`; a tool resolved to a
+    **non-SIP** location — Homebrew (`/opt/homebrew`, `/usr/local`), `/nix`,
+    `/Library`, a user's `~/.foo/bin`, etc. — would otherwise **load the dylib**
+    and emit *its own* `getenv`/file/connect traffic (e.g. Homebrew `git`'s 20+
+    `GIT_*` reads + `$HOME/.gitconfig`) under the spawning package's attribution.
+    That is pure macOS-only noise the Linux microVM never produces (Linux records
+    only the spawn line for such a tool), so it diverges the lock. The shim
+    classifies any exec target resolved **outside every keep-audited root** (the
+    provisioned-toolchain root = parent of the shell-shim dir, this process's own
+    exec dir, the shell-shim dir, the **live** install cwd, the **immutable** cwd
+    snapshotted at ctor before any lifecycle `chdir`, and the **install/repo root**
+    `SCRIPT_JAIL_WORK_DIR` = the agent's `config.work_dir`) as an **external system
+    tool**: it strips `DYLD_INSERT_LIBRARIES` / `DYLD_FORCE_FLAT_NAMESPACE` /
+    `NODE_OPTIONS` / the sticky `SCRIPT_JAIL_*` vars from the child env (so the
+    shim never loads into it **or its subtree**) and tags the exec `audit_blind`,
+    surfaced as `<AUDIT_BLIND>` exactly like the SIP case above. This **widens the
+    blind set** to match the SIP model rather than instrumenting non-SIP tools
+    half-way (which produced wrong, package-attributed reads). **Same trade as the
+    SIP residual:** a malicious package can run code via an external interpreter
+    (`/opt/homebrew/bin/python3 ./postinstall.py`, `perl ./x.pl`, a `git` alias/
+    hook) un-instrumented — but the blind subtree is **surfaced** (`<AUDIT_BLIND>`)
+    for a reviewer, and **Firecracker is the enforcement boundary**. **Keep-audited
+    by design:** the provisioned node + its node-spawned-node children + every
+    `node_modules/.bin`/`.pnpm-store`/package-owned binary under the **install
+    root** stay instrumented (they are package code Linux audits), so this only
+    blinds genuine *system* tools. The install-root anchor (`SCRIPT_JAIL_WORK_DIR`,
+    sticky + re-injected) is what keeps a top-level `node_modules/.bin` helper
+    audited even when a lifecycle script `chdir`s into a package dir first — such a
+    helper is a *sibling* of the per-package cwd, so the live/immutable-cwd anchors
+    alone would miss it.
   - **Blind-classification robustness (lexical canon + spawnp PATH search).** The
     `audit_blind` tag and `sip_redirect` both key off the program path, so a
     non-canonical path could dodge them: `/usr/lib/../bin/find` does not byte-match
@@ -95,12 +126,119 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
     → `/bin/sh` is still redirected to the bundled bash. `posix_spawnp` with a
     **bare name** (no slash) is run through the same in-process `PATH` search that
     `execvp` uses, so `posix_spawnp("find", …)` resolves to `/usr/bin/find` and is
-    marked too. **Residual (lexical, not realpath):** the canonicalizer does **not**
-    resolve symlinks and does **not** rewrite **relative** (cwd-anchored) paths, so a
-    symlink that points at a SIP binary, or a `../../bin/find` resolved against the
-    cwd, can still run blind **and unmarked**. These are narrow — Node's
-    `child_process` always hands libuv an **absolute, resolved** path — but real;
-    Firecracker remains the high-assurance backend.
+    marked too. The `sip_redirect` **substitution** match (which swaps `/bin/sh` →
+    bundled bash, a coreutil → uutils) is still purely lexical, so a symlink to a
+    SIP shell/coreutil is **not** substituted — but it is still caught as an
+    external tool (see next).
+  - **External-tool classification resolves symlinks (realpath).**
+    `is_external_system_tool` — which decides whether to strip DYLD + sticky vars
+    and mark `<AUDIT_BLIND>` for a spawn outside every keep-audited root — runs the
+    program path through the **real `realpath`** before classifying (adversarial
+    review). That both **absolutizes** a relative path (against this process's live
+    cwd — exact for an `execve`, which does not change cwd; see the `posix_spawn`
+    caveat below) and **resolves symlinks**, so an
+    *in-tree* symlink such as `node_modules/.bin/git` → `/opt/homebrew/bin/git` (or
+    a relative `./node_modules/.bin/git`) classifies on its TRUE target → EXTERNAL
+    → `<AUDIT_BLIND>`, instead of being lexically kept and run shimmed (which would
+    leak the tool's reads) or run dyld-stripped-but-unmarked. This does **not**
+    false-strip legit package code: pnpm's store is pinned in-tree
+    (`--store-dir=${cwd}/.pnpm-store`, under work-dir keep-root #6) so store
+    symlinks resolve back under the install root, and the provisioned toolchain
+    path has no non-`/private` symlink component (its realpath differs from the
+    lexical anchor only by the `/private` bridge the keep-root checks already
+    reconcile). **Residuals (accepted, Firecracker is the enforcement boundary):**
+    (1) *TOCTOU* — the classifier realpaths the path but the kernel later `exec`s
+    the original pathname, so a **concurrent** process racing a symlink swap in the
+    tiny classify→exec window can desync the decision; the outcome is fail-closed
+    (an external tool kept → macOS-only noise → byte-divergence fails the gate) or
+    audit-blind-recorded (an in-tree payload run stripped is still surfaced as
+    `<AUDIT_BLIND>`). Closing it fully needs `fexecve` on an O_NOFOLLOW fd, which
+    would break the bundled coreutils' argv[0]-based multi-call dispatch. (2)
+    *Hardlinks* — `realpath` resolves symlinks, not hardlinks; a same-volume
+    hardlink to a system tool's inode placed in-tree would read as in-tree (system
+    bins are typically SIP/read-only, so this is narrow). (3) A `realpath` **failure**
+    on an **absolute** input falls back to the lexical path — err-toward-keep; that
+    exec would generally `ENOENT` too. A failure on a **relative** input does NOT
+    strip; `posix_spawn`'s child-cwd ambiguity is handled by chdir tracking instead
+    (next bullet).
+  - **`posix_spawn` relative-program targets are audit-blind under a tracked chdir**
+    (adversarial-review HIGH, 2026-06). `execve` resolves a relative program path
+    against the calling process's cwd — exactly the cwd `is_external_system_tool`'s
+    `realpath` used — so it is provable. `posix_spawn`/`posix_spawnp` can carry a
+    `posix_spawn_file_actions_addchdir_np` / `_addfchdir_np` action that moves the
+    **child's** cwd before it resolves a relative path, so the parent-cwd classify
+    is for the wrong directory — `./tool` could resolve under the chdir target to a
+    SIP binary (or symlink to one) that runs un-audited with **no** marker. There is
+    **no public API** to read a `posix_spawn_file_actions_t` back, so the shim
+    **interposes the functions that add a chdir action** — the 10.15
+    `addchdir_np` / `_addfchdir_np` (in Rust) **and** the macOS-26 non-`_np`
+    replacements `addchdir` / `_addfchdir` — plus `init`/`destroy`, and records
+    which file-actions carry a child-cwd change (a fixed spinlocked set,
+    `CHDIR_FA_SLOTS`; insert on add, clear on init/destroy, overflow fails closed).
+    The set is keyed by the file-actions **handle address** (the
+    `posix_spawn_file_actions_t *` the caller passes), **not** the heap object: a
+    later `addopen`/`addclose` **reallocs** the object (verified — its pointer
+    moves), so an object value captured at `addchdir` time would not match
+    `*file_actions` at spawn time, whereas the handle address is stable.
+    `dispatch_spawn_macos` then marks a spawn **`<AUDIT_BLIND>`**
+    while **keeping DYLD** (`external` stays false) iff its program path is
+    **relative** AND its file-actions handle is **tracked as carrying a chdir** — an
+    honest "could not see what the child execs," yet an auditable plain-arm64 child
+    still loads the shim and emits its own events. This fires **only** on a real
+    child-cwd change: the stdio-only file-actions libuv attaches to *every* spawn are
+    not chdir actions, so ordinary relative spawns are unaffected. Absolute program
+    paths are cwd-independent (a chdir cannot move them) and are never affected. This
+    closes the **decoy** variant — a benign `./tool` planted in the parent cwd so
+    `realpath` succeeds there while the chdir target holds a different binary — which
+    a parent-cwd realpath check alone would miss (verified end-to-end: the decoy,
+    a `_np` chdir followed by enough `addclose` to realloc the object, and a non-`_np`
+    chdir all render `<AUDIT_BLIND>`; a no-chdir relative spawn and an absolute-under-
+    keep-root spawn do not). The non-`_np` symbols are `__API_AVAILABLE(macos(26.0))`,
+    so their interpose lives in C (stable Rust has no weak extern). Making it both
+    **build** and **load** on the pre-26 `macos-14` parity runner — whose SDK omits
+    these symbols from `libSystem.tbd` entirely (only the `_np` forms exist; verified
+    in `MacOSX15.4.sdk`) — takes **two** mechanisms working together:
+    1. **Compile:** on a sub-26 SDK the C file declares the two functions manually with
+       `__attribute__((weak_import))` (guarded off on the macOS-26 SDK, which already
+       declares them availability-weak at the sub-26 deployment target). Without this
+       a bare reference is an implicit-declaration error.
+    2. **Link:** the kept `__interpose` tuples still emit relocations to those symbols,
+       so the final cdylib link would fail with *Undefined symbols …
+       `_posix_spawn_file_actions_add{,f}chdir`* before the runtime weak-NULL behavior
+       is ever reached. `src/shim/build.rs` adds `-Wl,-U,_posix_spawn_file_actions_addchdir`
+       and `…_addfchdir` (cdylib-scoped, exactly those two symbols) to allow them
+       undefined at link. Paired with the `weak_import` reference, each becomes a
+       **weak, dynamically-looked-up** undefined: dyld binds it to the real function on
+       macOS 26+ and to **NULL** on older macOS, where a `{ replacement, NULL }`
+       interpose tuple is an inert no-op so the dylib still loads (verified on both
+       SDKs: 15.4 → link OK, symbols `weak external … dynamically looked up`; 26.5 →
+       symbols `weak external … from libSystem`, dylib loads under injection). The
+       `-U` flags are a harmless no-op on the 26 SDK, where the symbols are present.
+    **Reachability:** the parity fixture (`vuejs/core`) has
+    **zero** relative-program spawns — its only `./` line is `node ./postinstall.js`,
+    where the program is `node` (PATH-resolved to the absolute provisioned node) and
+    `./postinstall.js` is an argument — so this is **gate-neutral**. A bare-name
+    `posix_spawnp` that DOES carry a tracked chdir (libuv adds one for its `cwd`
+    option, so ordinary lifecycle `sh`/`node` spawns have one) is still resolved
+    through the **absolute** `PATH` dirs (`resolve_path_search_chdir_safe`), which a
+    chdir cannot move, so it stays PROVABLE (resolved → `sip_redirect` / correct
+    marking) and is NOT falsely `<AUDIT_BLIND>`; only a name the kernel could reach
+    via a cwd-dependent `PATH` segment (empty / relative / `.`) — the actual attack
+    surface — is left bare and marked. **Residual
+    (accepted):** the set is keyed by handle address, so a caller that copies the
+    `posix_spawn_file_actions_t` **value** into a second variable and spawns with
+    `&copy` presents a different handle and is not tracked — but the type is opaque,
+    copying it is unsupported (a `destroy` of one would double-free the shared
+    object) and no real toolchain does this; and macOS-bare is observe-only, so
+    Firecracker remains the enforcement boundary. This is the same class as the
+    raw-syscall interpose bypass below: a determined native attacker can already
+    evade an `LD_PRELOAD`/`__interpose` auditor, so closing it is out of scope for
+    this observation layer. The two alternatives are deliberately rejected: keying
+    on the object **value** instead of the handle would reintroduce the realloc
+    miss this design fixes (appending later actions moves the heap object), and
+    pessimistically blinding *every* relative-program `posix_spawn` with a non-null
+    `file_actions` would over-blind the benign stdio-only spawns libuv attaches to
+    nearly every child and risk diverging from Linux.
   - **Fingerprinting + BSD-semantics caveat.** The substitutes are uutils (GNU
     semantics) and bash 5.3, not the macOS BSD system binaries, so behaviour
     diverges in two ways. (1) *Fingerprint:* a script can detect the sandbox from
@@ -334,6 +472,25 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   > **Firecracker (offline Phase B) is the enforcement boundary**. Closing it for
   > real needs producer-side qname capture (v2) or offline enforcement, not a
   > diff-time waiver change.
+
+  > **Observe-only download WRITE waiver + traversal guard.** A network-download
+  > divergent package (puppeteer) actually writes the downloaded files on the
+  > online macOS-bare backend while offline Linux blocks the fetch and writes
+  > nothing. Under `--source-of-truth left`, `reconcileObserveOnly` waives a macOS
+  > `escaped_writes` ONLY when (a) the package matches `PARITY_DIVERGENT_PACKAGES`
+  > and (b) the value sits at/under one of THAT package's **hardcoded** download
+  > roots (`PARITY_DIVERGENT_DOWNLOAD_ROOTS`, e.g. `puppeteer@` → `$HOME/.cache/
+  > puppeteer`) — never under a path the (influenceable) trusted side merely read.
+  > The value is **lexically normalized** (`.`/`..`/`//` collapsed over the
+  > `$TOKEN` tail) before the prefix test, so a traversal escape that *starts* with
+  > the root but lands outside it (`$HOME/.cache/puppeteer/../../.ssh/
+  > authorized_keys` → `$HOME/.ssh/authorized_keys`) is **not** waived — the shim
+  > records `open()`'s path argument verbatim and neither the shim's fs path-builder
+  > nor the tokenizer collapses `..` (adversarial review). A bounded residual
+  > remains by design: a write *genuinely* under the package's own cache root is
+  > waived un-flagged — that is the package's own download dir, not a system
+  > persistence location, and Firecracker (offline Phase B) is the enforcement
+  > boundary.
 
 - **Parity-only noise filters: env/read GLOBAL, spawn PACKAGE-SCOPED.** The
   reconciliation waivers in `scripts/parity-diff.ts` are split by how the signal

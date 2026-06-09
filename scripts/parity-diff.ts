@@ -578,10 +578,30 @@ class ParityArgError extends Error {
   }
 }
 
+// The observe-only EGRESS-EVIDENCE of a divergent-package lifecycle stage,
+// captured per side BEFORE the block is dropped from the byte comparison.  The
+// reconciliation pass in main() cross-checks the VALIDATED side's waivable
+// network_attempts against the SOURCE-OF-TRUTH side's block for the SAME
+// `${pkg}\t${phase}` composite (see reconcileObserveOnly).  We deliberately do
+// NOT carry the truth side's external_reads/escaped_writes: an earlier design
+// used them as write anchors, but a divergent package can INFLUENCE what it reads
+// (a non-sensitive path it chooses), which let a compromised package launder a
+// real escaped write under an attacker-picked anchor (adversarial review).  Write
+// waiving is now gated on a HARDCODED per-package download-root allowlist
+// (PARITY_DIVERGENT_DOWNLOAD_ROOTS), never on truth-side content.
+interface DivergentBlockContent {
+  networkAttempts: readonly string[];
+}
+
 interface CanonResult {
   text: string;
   dangers: DangerFinding[];
   divergentKeys: Set<string>;
+  // Per divergent-package lifecycle stage, keyed by the same `${pkg}\t${phase}`
+  // composite as divergentKeys, the raw (strict-validated) network/read/write
+  // lists that side recorded.  Only populated for PARITY_DIVERGENT_PACKAGES (the
+  // observe-only reconciliation in main() never touches anything else).
+  divergentBlocks: Map<string, DivergentBlockContent>;
 }
 
 // A whole-lock fatal danger (parse / structure / schema).  When present on
@@ -601,17 +621,18 @@ function wholeLockDanger(side: string, field: string, value: string): DangerFind
 // backends yields identical bytes, and only a real difference survives the diff.
 function canonicalize(content: string, side: string): CanonResult {
   const noKeys = new Set<string>();
+  const noBlocks = new Map<string, DivergentBlockContent>();
 
   let doc: ReturnType<typeof parseDocument>;
   try {
     doc = parseDocument(content, { merge: false });
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys };
+    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys, divergentBlocks: noBlocks };
   }
   if (doc.errors.length > 0) {
     const detail = doc.errors.slice(0, 3).map((e) => e.message).join('; ');
-    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys };
+    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys, divergentBlocks: noBlocks };
   }
 
   // Reject the YAML features that let raw text and parsed structure disagree
@@ -620,7 +641,7 @@ function canonicalize(content: string, side: string): CanonResult {
   // a conformant lock has none — a tampered one fails CLOSED here.
   const structural = structuralReject(doc);
   if (structural !== null) {
-    return { text: '', dangers: [wholeLockDanger(side, 'structure', structural)], divergentKeys: noKeys };
+    return { text: '', dangers: [wholeLockDanger(side, 'structure', structural)], divergentKeys: noKeys, divergentBlocks: noBlocks };
   }
 
   // Strict schema validation.  Guarantees every watched field is a string[] and
@@ -636,6 +657,7 @@ function canonicalize(content: string, side: string): CanonResult {
       text: '',
       dangers: [wholeLockDanger(side, 'schema', `lockfile does not conform to the lock schema: ${detail}`)],
       divergentKeys: noKeys,
+      divergentBlocks: noBlocks,
     };
   }
 
@@ -646,6 +668,7 @@ function canonicalize(content: string, side: string): CanonResult {
   // from the rest.  render.ts always emits a list that filters down to empty as
   // `[]`, so no separate "collapse empty list" pass is needed.
   const divergentKeys = new Set<string>();
+  const divergentBlocks = new Map<string, DivergentBlockContent>();
   const packages = new Map<string, PackageBlock>();
   for (const [key, pkgVal] of Object.entries(parsed.data.packages)) {
     if (PARITY_DIVERGENT_PACKAGES.some((p) => key.startsWith(p))) {
@@ -656,8 +679,15 @@ function canonicalize(content: string, side: string): CanonResult {
       // other (adversarial review round-5).  `\t` cannot appear in a package key
       // or lifecycle stage name, so it is an unambiguous composite separator.
       divergentKeys.add(key);
-      for (const stage of Object.keys(pkgVal.lifecycle)) {
+      for (const [stage, block] of Object.entries(pkgVal.lifecycle)) {
         divergentKeys.add(`${key}\t${stage}`);
+        // Capture this stage's RAW (strict-validated) network attempts keyed by
+        // the same composite, so the observe-only reconciliation in main() can
+        // confirm the source-of-truth side ALSO attempted egress here before
+        // waiving the validated side's network finding.
+        divergentBlocks.set(`${key}\t${stage}`, {
+          networkAttempts: block.network_attempts,
+        });
       }
       continue;
     }
@@ -676,7 +706,7 @@ function canonicalize(content: string, side: string): CanonResult {
     packages,
   });
 
-  return { text, dangers, divergentKeys };
+  return { text, dangers, divergentKeys, divergentBlocks };
 }
 
 // Reject YAML aliases, anchors, and merge keys.  Returns a reason string when
@@ -937,6 +967,162 @@ function stripBlockedConnect(item: string): string {
   return item.startsWith('<BLOCKED> connect ') ? item.slice('<BLOCKED> '.length) : item;
 }
 
+// ── Observe-only divergence reconciliation (`--source-of-truth`) ─────────────
+//
+// WHY THIS EXISTS.  macOS-bare is OBSERVE-ONLY on the network (owner-locked F1
+// posture): the shim FORWARDS `connect`/`connectx` and records the true result —
+// it never enforces offline.  So a network-download divergent package
+// (PARITY_DIVERGENT_PACKAGES — puppeteer@, @swc/core@, unrs-resolver@) ACTUALLY
+// completes its download on macOS — a real `connect` to the CDN plus real
+// `escaped_writes` of the downloaded files — whereas Linux Phase B runs offline
+// (`unshare -n`), so the SAME package only ATTEMPTS egress (`<BLOCKED> connect …`)
+// and writes nothing.  `collectDivergentDangers` hard default-denies every
+// `escaped_writes` and every non-resolver `network_attempts` inside a divergent
+// package, so that macOS download fails the diff-macos-bare gate even though it is
+// the legitimate downstream effect of the egress Linux already attempted.
+//
+// THE ASYMMETRIC-SUBSET MODEL.  Under `--source-of-truth left`, Linux is the
+// single source of truth (the committed lockfile is generated there) and macOS is
+// VALIDATED as a SUBSET of it.  When the trusted side ATTEMPTED the egress for a
+// given divergent package/stage, the macOS-side consequence of observe-only
+// COMPLETING that egress (the download's writes + the connect that reached the
+// CDN) is accepted — but ONLY against evidence on the trusted side, and ONLY for
+// the two observe-only-network consequence fields.
+//
+// WHY ONLY escaped_writes + network_attempts.  These are the only fields whose
+// macOS-side presence is the direct, expected consequence of observe-only letting
+// a Linux-attempted egress finish.  dlopen_attempts, audit_bypass, env_tamper, a
+// sensitive env/file READ, and an unapproved spawn are NEVER downstream of a
+// blocked connect — they are independent escape signals, so they stay fully
+// default-deny and are never waived here.
+//
+// THE WRITE-ROOT ALLOWLIST.  A waived `escaped_writes` value must sit AT or UNDER
+// a HARDCODED per-package download root (PARITY_DIVERGENT_DOWNLOAD_ROOTS) — the dir
+// that package is known to populate when observe-only lets its install download
+// finish.  An earlier design bound the write to any path the TRUSTED side
+// referenced (its external_reads ∪ escaped_writes), but a divergent package can
+// INFLUENCE what it reads (any non-sensitive path it chooses), so it could read a
+// benign 2-segment dir and then launder a real payload write under that attacker-
+// picked anchor — adversarial review reproduced a `$HOME/.config/autostart/
+// payload.desktop` write passing the gate this way.  Anchoring on a FIXED allowlist
+// instead means an escaped write outside the package's own known cache (an autostart
+// entry, `$HOME/.ssh/authorized_keys`, …) is ALWAYS flagged, no matter what the
+// trusted side read.
+//
+// WHY NO EGRESS REQUIREMENT FOR WRITES.  The download-root allowlist is itself the
+// tight gate: a write under a package's OWN cache dir is the benign download
+// consequence regardless of whether the trusted side happened to attempt egress in
+// this particular run (it may have hit a warm cache).  network_attempts DO require
+// trusted-side egress evidence (below) — they have no path to anchor on.
+//
+// ACCEPTED RESIDUALS (owner decision, F1/F2 — see docs/divergence.md).  (1) A
+// compromised divergent-allowlisted package could write a payload UNDER its own
+// download root (e.g. `$HOME/.cache/puppeteer/evil`) un-flagged — bounded to that
+// package's own cache dir (not a system-persistence location), and Firecracker
+// (offline Phase B) is the enforcement boundary.  (2) network_attempts to an
+// arbitrary host are waived on the trusted side's egress evidence with NO host
+// match: observe-only legitimately reaches a different/further host than offline
+// Linux blocked (the blocked DNS resolver vs. the CDN the lookup resolves to), and
+// macOS-bare is explicitly NOT the egress boundary — egress prevention + DNS-qname
+// capture are Firecracker's job, not this diff's.  Do NOT "tighten" the network
+// waiver by host; it cannot be done soundly on an observe-only backend.
+
+// Per-divergent-package download roots: the dir(s) a package is known to populate
+// when observe-only lets its install download finish.  A macOS escaped_write is
+// waivable ONLY at or under one of ITS package's roots — never under a path the
+// trusted side merely read.  Extend this (with real evidence) if another divergent
+// package's observed download root surfaces; an unlisted package waives NO writes.
+const PARITY_DIVERGENT_DOWNLOAD_ROOTS: ReadonlyArray<{ prefix: string; roots: readonly string[] }> = [
+  // puppeteer's install.mjs downloads Chrome / chrome-headless-shell into the
+  // puppeteer cache (tokenized `$HOME/.cache/puppeteer`; PUPPETEER_CACHE_DIR can
+  // relocate it, but the parity fixture uses the default).
+  { prefix: 'puppeteer@', roots: ['$HOME/.cache/puppeteer'] },
+];
+
+// The approved download roots for a divergent package key (empty if none listed —
+// such a package waives no escaped_writes at all).
+function downloadRootsFor(pkg: string): readonly string[] {
+  const entry = PARITY_DIVERGENT_DOWNLOAD_ROOTS.find((e) => pkg.startsWith(e.prefix));
+  return entry ? entry.roots : [];
+}
+
+// Lexically collapse `.`/`..` over a TOKENIZED path before the download-root
+// allowlist test.  A tokenized escaped_writes value is a `$TOKEN/...` symbol, NOT
+// a real FS path — so `path.resolve` must NOT be used (it would treat the `$TOKEN`
+// head as relative and prepend cwd).  We split on `/`, keep the leading token
+// segment fixed, drop `.`, and pop on `..`.  Without this, a raw prefix check
+// waives a traversal escape such as `$HOME/.cache/puppeteer/../../.ssh/
+// authorized_keys` (which starts with the root but whose kernel write lands in
+// `$HOME/.ssh`): the shim records open()'s path argument verbatim and neither the
+// shim's fs path-builder nor the tokenizer collapses `..` (lexical_canon is
+// exec-path-only).
+//
+// FAIL CLOSED on head-underflow.  A `..` with nothing left to pop means the path
+// escaped ABOVE the token head — return `null` so the caller never waives it.
+// Clamping at the head (an earlier bug) let `$HOME/.cache/puppeteer/../../../
+// .cache/puppeteer/payload` (which escapes above `$HOME` then re-enters a
+// same-named suffix, landing OUTSIDE `$HOME`) normalize back to
+// `$HOME/.cache/puppeteer/payload` and be waived (adversarial review).
+//
+// Markered values (`<HIDDEN> `/`<CROSS_PACKAGE> `) keep their marker in the head
+// segment and so still fail the root match — markered writes are never waived.
+function lexicalNormalizeToken(value: string): string | null {
+  const parts = value.split('/');
+  const head = parts[0] ?? ''; // split always yields >=1 element; '' = leading-slash path
+  const tail: string[] = [];
+  for (const seg of parts.slice(1)) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (tail.length === 0) return null; // escaped above the token head → never waive
+      tail.pop();
+      continue;
+    }
+    tail.push(seg);
+  }
+  return tail.length > 0 ? `${head}/${tail.join('/')}` : head;
+}
+
+// Filter the VALIDATED side's escaped_writes / network_attempts findings against
+// the SOURCE-OF-TRUTH side's divergent blocks, per the observe-only model above.
+// Returns a NEW findings array; every other finding (and the source-of-truth
+// side's findings) passes through unchanged.  `null` source-of-truth → identity
+// (preserves the strict symmetric default).  A pure post-filter: it never adds a
+// finding and never touches collectDivergentDangers, filterBlock, or presence.
+function reconcileObserveOnly(
+  validated: CanonResult,
+  truth: CanonResult,
+): DangerFinding[] {
+  return validated.dangers.filter((f) => {
+    // Only the two observe-only-network consequence fields are ever waivable.
+    if (f.field !== 'escaped_writes' && f.field !== 'network_attempts') return true;
+    // By construction every finding from collectDivergentDangers in these fields
+    // is inside a divergent package, but guard explicitly rather than assume.
+    if (!PARITY_DIVERGENT_PACKAGES.some((p) => f.pkg.startsWith(p))) return true;
+
+    if (f.field === 'escaped_writes') {
+      // Waive ONLY a write at/under one of THIS package's hardcoded download roots
+      // (the equality case covers the download root dir itself, which observe-only
+      // creates to begin the download).  Never derive the anchor from the
+      // (influenceable) trusted side — see THE WRITE-ROOT ALLOWLIST above.
+      // Normalize `.`/`..` first so a traversal escape under the root prefix
+      // (`$HOME/.cache/puppeteer/../../.ssh/...`) cannot launder a write outside it.
+      const roots = downloadRootsFor(f.pkg);
+      const canon = lexicalNormalizeToken(f.value);
+      if (canon === null) return true; // traversal escaped the token head → keep (never waive)
+      return !roots.some((root) => canon === root || canon.startsWith(`${root}/`));
+    }
+
+    // network_attempts: waive only when the SOURCE-OF-TRUTH side ALSO attempted
+    // egress for this exact pkg+phase (evidence the package reaches for the network
+    // here).  No block, or a block with no network attempt, means there is nothing
+    // to validate against → keep the finding.  No host match — observe-only
+    // legitimately reaches a different/further host than offline Linux blocked.
+    const truthBlock = truth.divergentBlocks.get(`${f.pkg}\t${f.phase}`);
+    if (truthBlock === undefined || truthBlock.networkAttempts.length === 0) return true;
+    return false; // egress evidence present → waive the macOS-side connect
+  });
+}
+
 function canonicalizeNpmDebugLog(line: string): string {
   const match = NPM_DEBUG_LOG_BASENAME.exec(line);
   if (!match) return line;
@@ -1134,7 +1320,18 @@ function main(argv: ReadonlyArray<string>): number {
   const left = canonicalize(leftRaw, opts.leftLabel);
   const right = canonicalize(rightRaw, opts.rightLabel);
 
-  const blockDangers = [...left.dangers, ...right.dangers];
+  // Observe-only divergence reconciliation (see reconcileObserveOnly).  Under the
+  // asymmetric `--source-of-truth` model, drop the VALIDATED side's escaped_writes
+  // / network_attempts findings that are the legitimate downstream effect of an
+  // egress the SOURCE-OF-TRUTH side already attempted.  `null` → no reconciliation
+  // (strict symmetric default).  Pure post-filter: only the validated side's
+  // waivable findings are dropped; everything else is unchanged.
+  const leftDangers =
+    opts.sourceOfTruth === 'right' ? reconcileObserveOnly(left, right) : left.dangers;
+  const rightDangers =
+    opts.sourceOfTruth === 'left' ? reconcileObserveOnly(right, left) : right.dangers;
+
+  const blockDangers = [...leftDangers, ...rightDangers];
   // A whole-lock fatal danger (parse / structure / schema) means one render is
   // empty and untrustworthy — skip the symmetric-presence check (its divergent
   // key set is empty) and suppress the byte diff (it would be a noisy full-file
