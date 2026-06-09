@@ -208,6 +208,95 @@ static CANON_SHELL_SHIM_DIR: CanonBuf = CanonBuf {
     len: AtomicUsize::new(0),
 };
 
+// MACOS only: the DIRECTORY holding THIS process's own executable, snapshotted
+// at shim_init via _NSGetExecutablePath (then lexically canonicalized and
+// trimmed to its parent dir).  Under the bare backend the shim is loaded into
+// the PROVISIONED, re-signed node, whose layout is
+//   <cacheDir>/script-jail-node-mac/node-<ver>-<arch>-vp<v>/vp-home/js_runtime/.../bin/node
+// and the corepack/pnpm/npm/npx/yarn shims sit in that SAME bin/ dir.  So a
+// node-spawned-node (pnpm worker, npm child) and every package-manager shim
+// resolve to a path UNDER this directory — it is a "keep-audited" root.
+//
+// WHY a captured self-exec dir and NOT a SCRIPT_JAIL_CACHE_DIR getenv: the bare
+// backend's lifecycle child env is sanitized (sanitizeLifecycleBaseEnv,
+// src/guest/agent.ts) which STRIPS every SCRIPT_JAIL_* var not on a small
+// allow-list — SCRIPT_JAIL_CACHE_DIR is NOT on it, so the var is absent inside
+// the very install children where the classifier runs.  _NSGetExecutablePath is
+// always available and points at the audited node regardless of env scrubbing,
+// which makes it the robust signal.  Cap-shared with the other CanonBufs
+// (CANON_BUF_LEN == 1024 == PATH_MAX, so a real toolchain path always fits).
+// FAIL-SAFE: if capture fails and this dir stays empty, is_external_system_tool
+// disables the strip entirely (treats everything as keep-audited) rather than
+// risk blinding the audited node — see the empty-anchor guard there.
+#[cfg(target_os = "macos")]
+static CANON_SELF_EXEC_DIR: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+// MACOS only: the process's working directory snapshotted ONCE at shim_init via
+// getcwd (then lexically canonicalized).  For the ROOT audited process this is
+// the INSTALL ROOT — captured BEFORE any lifecycle script can `chdir` — covering
+// node_modules/.bin, the in-repo .pnpm-store, and package-owned native helpers
+// that live under the install dir.
+//
+// WHY an IMMUTABLE init-cwd in ADDITION to the live getcwd() read in
+// is_external_system_tool (adversarial-review finding, high, 2026-06): the live
+// getcwd() check classifies against the CURRENT cwd, so attacker-controlled
+// lifecycle code can `chdir('/tmp')` and THEN exec an ABSOLUTE package-owned
+// helper from the original install dir.  That target is outside the provision
+// roots AND outside the new cwd, so the live check would FALSE-STRIP a
+// package-owned helper that Linux still audits — blinding it (and its subtree)
+// and producing a byte-divergence against the Linux source-of-truth.  Capturing
+// the cwd once at ctor (before user code runs) and adding it as a keep root
+// closes that chdir window: a helper under the install root stays audited
+// regardless of any runtime chdir.  This is a UNION with — not a replacement for
+// — the live getcwd() check (the union only EXPANDS the keep set, so it can never
+// newly false-STRIP something the current code keeps).
+//
+// Same CanonBuf / ctor-only-writer / Ordering::Release pattern as
+// CANON_SELF_EXEC_DIR.  FAIL-SAFE: if capture fails the buf stays empty and the
+// keep-root check ignores it (empty root never matches) — it simply does not
+// contribute, falling back to the other anchors.
+#[cfg(target_os = "macos")]
+static CANON_INIT_CWD: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
+// MACOS only: the install/repo root (the agent's `config.work_dir`), passed in
+// via the SCRIPT_JAIL_WORK_DIR env var and snapshotted at shim_init like every
+// other sticky var.  This is the WHOLE install tree — it covers BOTH
+// `node_modules/<pkg>` (a lifecycle child's ctor cwd) AND its SIBLING
+// `node_modules/.bin/<helper>` (top-level shims).  is_external_system_tool uses
+// it as keep-root #6 to close a false-strip class the init-cwd anchor misses:
+// after a lifecycle script `chdir`s into `node_modules/<pkg>`, a top-level
+// `node_modules/.bin/<helper>` lies OUTSIDE the per-package init-cwd anchor (it
+// is a SIBLING of the package dir, not under it) — so the helper would be
+// FALSE-STRIPPED of DYLD and run un-shimmed, blinding it (and its subtree) and
+// producing a spurious parity GATE FAILURE vs the Linux source-of-truth, which
+// still audits it.  Anchoring on the install root keeps the entire tree audited
+// regardless of any per-package chdir.
+//
+// WHY a sticky env var (and not the live getcwd / init-cwd snapshot): the agent
+// KNOWS the install root authoritatively (config.work_dir) and passes it down,
+// so it is process-independent — the SAME value in the orchestrator node, the
+// substituted bash, and every node-spawned helper, no matter which process is
+// classifying.  Captured (and re-injected) like every other sticky var so a
+// descendant cannot strip it; unsetting it is additionally audited as
+// env_tamper (AUDIT_PROTECTED_NAMES), so tampering is self-defeating.  This does
+// NOT over-broaden: a real system tool (/usr/bin/git, /opt/homebrew/bin/git)
+// lives OUTSIDE work_dir → still classified external → the git-leak audit-blind
+// fix stays intact.  Shares the CanonBuf cap (see canon-buf-len.ts).
+// FAIL-SAFE: if the var is absent the buf stays empty and the keep-root check
+// in is_external_system_tool ignores it (empty root never matches) — it simply
+// does not contribute, falling back to the other anchors (NOT "keep all").
+#[cfg(target_os = "macos")]
+static CANON_WORK_DIR: CanonBuf = CanonBuf {
+    bytes: core::cell::UnsafeCell::new([0u8; CANON_BUF_LEN]),
+    len: AtomicUsize::new(0),
+};
+
 // MACOS only: native file/connect auditing is enabled for Phase B, but kept
 // off during Phase A fetch.  Linux Phase A has the env preload but no strace
 // syscall stream; this flag gives macOS the same phase boundary while still
@@ -381,6 +470,22 @@ unsafe fn real_getenv_raw(name: *const c_char) -> *mut c_char {
 #[cfg(target_os = "macos")]
 unsafe fn real_secure_getenv_raw(name: *const c_char) -> *mut c_char {
     libc::getenv(name)
+}
+
+// MACOS: REAL realpath — resolve `path` (collapsing symlinks + `.`/`..`) into the
+// caller-provided `resolved` buffer (MUST be >= PATH_MAX bytes).  Like the other
+// `real_*_raw` helpers this is a DIRECT same-image `libc::realpath` reference: we
+// never interpose `realpath` (it is not in our interpose table — the only
+// `b"realpath"` byte string elsewhere is a SIP_COREUTILS *applet name*), and even
+// if a downstream load DID interpose it, a direct `libc::<fn>` call from inside
+// our own image reaches the genuine symbol WITHOUT re-entering the interpose
+// table (see the real-symbol note above — R8).  No malloc: we pass a non-NULL
+// buffer (passing NULL would make libc malloc the result, which is forbidden in
+// our no_std hot path).  Returns NULL (errno set) on ENOENT / ELOOP / etc., which
+// the sole caller treats as "unresolvable → fall back to the lexical path".
+#[cfg(target_os = "macos")]
+unsafe fn real_realpath_raw(path: *const c_char, resolved: *mut c_char) -> *mut c_char {
+    libc::realpath(path, resolved)
 }
 
 // ── init state + pthread-key-backed recursion guard ────────────────────────
@@ -1707,6 +1812,26 @@ unsafe fn shim_init() {
         &CANON_SHELL_SHIM_DIR,
         b"SCRIPT_JAIL_SHELL_SHIM_DIR\0".as_ptr() as *const c_char,
     );
+    // MACOS only: snapshot THIS process's own executable dir (the provisioned
+    // node's bin/) so is_external_system_tool can keep node-spawned-node + the
+    // package-manager shims audited.  Done at ctor (before user code can chdir
+    // or re-exec), reading via _NSGetExecutablePath + lexical_canon — no env var,
+    // so it survives the lifecycle env scrub.  See CANON_SELF_EXEC_DIR.
+    #[cfg(target_os = "macos")]
+    capture_self_exec_dir();
+    // MACOS only: snapshot the install cwd NOW — before any lifecycle script can
+    // chdir — so is_external_system_tool keeps package-owned helpers under the
+    // install root audited even after a malicious/legit `chdir` away (the
+    // chdir-then-exec-absolute-helper false-strip finding).  See CANON_INIT_CWD.
+    #[cfg(target_os = "macos")]
+    capture_init_cwd();
+    // MACOS only: snapshot the install/repo root from SCRIPT_JAIL_WORK_DIR (the
+    // agent's config.work_dir) so is_external_system_tool keeps the WHOLE install
+    // tree — incl. top-level node_modules/.bin helpers that are SIBLINGS of a
+    // lifecycle child's chdir'd cwd — audited.  Captured (and re-injected via
+    // STICKY_VARS) like every other sticky var.  See CANON_WORK_DIR.
+    #[cfg(target_os = "macos")]
+    capture_work_dir();
     #[cfg(target_os = "macos")]
     {
         let audit_ops = real_getenv_raw(b"SCRIPT_JAIL_MACOS_AUDIT_OPS\0".as_ptr() as *const c_char);
@@ -2450,6 +2575,16 @@ const STICKY_VARS: &[StickyVar] = &[
         name: b"SCRIPT_JAIL_SHELL_SHIM_DIR",
         canon: &CANON_SHELL_SHIM_DIR,
     },
+    // MACOS only: the install/repo root used as is_external_system_tool keep-root
+    // #6 (covers top-level node_modules/.bin helpers after a lifecycle chdir).
+    // Re-injected on every exec from the init-time CanonBuf — NOT the live envp —
+    // so a descendant that unsets SCRIPT_JAIL_WORK_DIR cannot defeat the keep-root
+    // for KEPT children (and the unset is itself audited as env_tamper).
+    #[cfg(target_os = "macos")]
+    StickyVar {
+        name: b"SCRIPT_JAIL_WORK_DIR",
+        canon: &CANON_WORK_DIR,
+    },
     #[cfg(target_os = "macos")]
     StickyVar {
         name: b"SCRIPT_JAIL_MACOS_AUDIT_OPS",
@@ -2468,13 +2603,56 @@ const STICKY_VARS: &[StickyVar] = &[
 ///
 /// The returned buf is the caller's responsibility to `free_envbuf` on real_*
 /// return.
-unsafe fn rewrite_envp(envp_in: *const *const c_char) -> Option<EnvBuf> {
+unsafe fn rewrite_envp(envp_in: *const *const c_char, external: bool) -> Option<EnvBuf> {
+    // `external` only gates the macOS un-shim path below; on Linux every spawn
+    // is in-microVM and always re-shimmed (no external-tool concept), so the
+    // arg is unused there.
+    #[cfg(not(target_os = "macos"))]
+    let _ = external;
     // Read canon values BEFORE envbuf_from — those helpers do not hold the
     // recursion guard across calls.  canon_bytes is a memory read.
     let preload = canon_bytes(&CANON_PRELOAD_PATH);
     let node_opts = canon_bytes(&CANON_NODE_OPTIONS);
 
     let mut buf = envbuf_from(envp_in)?;
+
+    // MACOS Option B (2026-06): the spawn target was classified as an EXTERNAL
+    // SYSTEM TOOL — a binary resolved OUTSIDE every "keep-audited" root (the
+    // provisioned-node bin dir, the bundled shell/coreutils shim dir, and the
+    // install cwd).  Examples: /opt/homebrew/bin/git, /usr/bin/sed, /usr/bin/perl.
+    //
+    // These tools are NOT package code; Linux records only the spawn line for
+    // them and never audits their internals (strace pairs the spawn but the
+    // tool's own getenv/open reads are not in the lock).  On a non-SIP path like
+    // Homebrew git, dyld does NOT strip DYLD_INSERT_LIBRARIES, so the shim WOULD
+    // load into git and leak 30-40 of git's own GIT_* getenv reads + its
+    // open($HOME/.gitconfig) into the lock under the spawning package's
+    // attribution — pure macOS-only noise that breaks the parity gate.
+    //
+    // Fix: strip the dynamic-linker injection AND the sticky SCRIPT_JAIL_* vars
+    // from the child env so the shim never loads into the tool and the WHOLE
+    // subtree it spawns stays un-shimmed (matches the SIP-stripped Linux/audit-
+    // blind target).  The exec record is also marked audit_blind:true by the
+    // caller, so the spawn line renders `<AUDIT_BLIND> git config …` (already
+    // waived in scripts/parity-diff.ts).
+    //
+    // We do NOT re-inject PRELOAD_VAR / NODE_OPTIONS / the sticky vars below;
+    // we remove every entry for each instead.  The linker-strip vars
+    // (DYLD_LIBRARY_PATH / DYLD_FRAMEWORK_PATH) and DYLD_FORCE_FLAT_NAMESPACE
+    // are also removed so no residual dyld surface survives into the tool.
+    #[cfg(target_os = "macos")]
+    if external {
+        envbuf_remove(&mut buf, PRELOAD_VAR); // DYLD_INSERT_LIBRARIES
+        envbuf_remove(&mut buf, b"DYLD_FORCE_FLAT_NAMESPACE");
+        envbuf_remove(&mut buf, b"NODE_OPTIONS");
+        for name in LINKER_STRIP_VARS {
+            envbuf_remove(&mut buf, name);
+        }
+        for sticky in STICKY_VARS {
+            envbuf_remove(&mut buf, sticky.name);
+        }
+        return Some(buf);
+    }
 
     // Re-inject LD_PRELOAD and NODE_OPTIONS.  We OVERWRITE rather than
     // merge: an earlier implementation prepended the canonical value to
@@ -2699,7 +2877,7 @@ unsafe fn dispatch_exec(
 ) -> c_int {
     let argv0 = if argv.is_null() { ptr::null() } else { *argv };
 
-    match rewrite_envp(envp_in) {
+    match rewrite_envp(envp_in, false) {
         Some(mut buf) => {
             // Re-assert the recursion guard: rewrite_envp's helpers cleared
             // it on each malloc, so we are now `in_shim==false`.
@@ -2768,7 +2946,7 @@ unsafe fn dispatch_spawn(
         *argv as *const c_char
     };
 
-    match rewrite_envp(envp_in as *const *const c_char) {
+    match rewrite_envp(envp_in as *const *const c_char, false) {
         Some(mut buf) => {
             // Audit-trust Finding 1 (high, 2026-05-18): defer the audit
             // event until AFTER `real_posix_spawn_raw` returns.  Unlike
@@ -3197,16 +3375,25 @@ unsafe fn dispatch_exec_macos(
     // `/tmp/../usr/bin/find` is classified), but keep exec'ing the caller's
     // ORIGINAL `prog` when no substitute applies (same binary, minimal change).
     let redirected = sip_redirect(canon, &mut redirect_buf);
-    let (prog, audit_blind) = if redirected != canon {
+    let (prog, audit_blind, external) = if redirected != canon {
         // Canon matched a shell/coreutil → run the instrumented substitute.
-        (redirected, false)
+        // A substituted shell is one of OUR bundled binaries under the shim dir;
+        // it is always a keep-audited root (external == false).
+        (redirected, false, false)
     } else {
-        // No substitute → the real arm64e binary runs; it is audit-blind iff the
-        // canonical path is under a SIP system bin dir (DYLD stripped, un-audited).
-        (prog, is_under_sip_bin_dir(canon))
+        // No substitute → the real binary runs.  It is audit-blind when EITHER:
+        //   - the canonical path is under a SIP system bin dir (/bin, /usr/bin):
+        //     dyld strips DYLD_INSERT_LIBRARIES on exec, so it ran un-audited; OR
+        //   - the canonical path is an EXTERNAL SYSTEM TOOL — resolved outside
+        //     every keep-audited root (provisioned-node bin, shell-shim dir, cwd).
+        //     On a non-SIP path (Homebrew git, /usr/local, …) dyld would NOT
+        //     strip DYLD, so we must strip it ourselves in rewrite_envp to keep
+        //     the tool + its subtree un-shimmed (matches Linux spawn-only).
+        let external = is_external_system_tool(canon);
+        (prog, is_under_sip_bin_dir(canon) || external, external)
     };
 
-    match rewrite_envp(envp_in) {
+    match rewrite_envp(envp_in, external) {
         Some(mut buf) => {
             set_in_shim(true);
             // result:"ok" emitted BEFORE the real exec — a successful exec
@@ -3245,6 +3432,169 @@ unsafe fn dispatch_exec_macos(
     }
 }
 
+// ── posix_spawn child-cwd (chdir) action tracking (macOS) ──────────────────
+//
+// Adversarial-review HIGH (2026-06).  A `posix_spawn` resolves a RELATIVE program
+// path against the CHILD's cwd, which a `posix_spawn_file_actions_add{,f}chdir`
+// action (the `_np` 10.15 variant OR the macOS-26 non-`_np` replacement) can move
+// away from this (parent) process's cwd BEFORE the exec.  is_external_system_tool
+// resolves a relative path against OUR cwd, so when a chdir action is present its
+// classification is for the WRONG directory and the child could resolve `./tool`
+// to a SIP binary (or symlink to one) that runs un-audited with NO marker.  There
+// is no public API to read a file_actions object back, so we OBSERVE chdir actions
+// by interposing the functions that add them and recording the file_actions HANDLE.
+// dispatch_spawn_macos then marks a relative-program spawn audit_blind IFF its
+// file_actions handle is tracked here — firing ONLY on a real child-cwd change,
+// never on the stdio-only file_actions libuv attaches to every spawn.
+//
+// KEY = the file_actions HANDLE address (the `posix_spawn_file_actions_t *` the
+// caller passes — `actions` in the add/init/destroy wrappers, `file_actions` in
+// dispatch), NOT the heap object behind it.  The object pointer (`*actions`) is
+// NOT stable: appending later actions (`addopen`/`addclose`/`adddup2`) REALLOCs
+// it, so the value captured at `addchdir` time differs from `*file_actions` at
+// spawn time (adversarial-review: `after_chdir != final`).  The handle address is
+// stable for the file_actions' lifetime.  Lifecycle: insert on add{,f}chdir{,_np};
+// CLEAR on `posix_spawn_file_actions_init` (a fresh init re-uses a stack/heap
+// handle address from a prior, possibly-undestroyed file_actions); remove on
+// `..._destroy`.  Residual: a caller that copies the opaque handle VALUE into a
+// second variable and spawns with `&copy` presents a different handle address —
+// not tracked (the type is opaque; copying it is unsupported and `destroy` would
+// double-free).  See docs/divergence.md.
+//
+// Fixed capacity + spinlock (no_std, no heap growth).  Live count is ~0-2 in a real
+// install (one file_actions built, spawned, destroyed), so 64 is far more than
+// enough; OVERFLOW fails CLOSED — once the table is full, `contains` returns true
+// for every handle so a chdir can never be silently dropped.  All ops are cold
+// (file_actions construction is not a hot path).
+#[cfg(target_os = "macos")]
+const CHDIR_FA_CAP: usize = 64;
+#[cfg(target_os = "macos")]
+static CHDIR_FA_SLOTS: [AtomicUsize; CHDIR_FA_CAP] =
+    [const { AtomicUsize::new(0) }; CHDIR_FA_CAP];
+#[cfg(target_os = "macos")]
+static CHDIR_FA_LOCK: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static CHDIR_FA_OVERFLOW: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+unsafe fn chdir_fa_lock() {
+    while CHDIR_FA_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn chdir_fa_unlock() {
+    CHDIR_FA_LOCK.store(false, Ordering::Release);
+}
+
+// Record that the file_actions handle `key` carries a child-cwd change.  Idempotent.
+#[cfg(target_os = "macos")]
+unsafe fn chdir_fa_insert(key: usize) {
+    if key == 0 {
+        return;
+    }
+    chdir_fa_lock();
+    let mut free: isize = -1;
+    let mut present = false;
+    let mut i = 0;
+    while i < CHDIR_FA_CAP {
+        let v = CHDIR_FA_SLOTS[i].load(Ordering::Relaxed);
+        if v == key {
+            present = true;
+            break;
+        }
+        if v == 0 && free < 0 {
+            free = i as isize;
+        }
+        i += 1;
+    }
+    if !present {
+        if free >= 0 {
+            CHDIR_FA_SLOTS[free as usize].store(key, Ordering::Relaxed);
+        } else {
+            CHDIR_FA_OVERFLOW.store(true, Ordering::Relaxed);
+        }
+    }
+    chdir_fa_unlock();
+}
+
+// Drop handle `key` from the tracking set (on file_actions init/destroy).
+#[cfg(target_os = "macos")]
+unsafe fn chdir_fa_remove(key: usize) {
+    if key == 0 {
+        return;
+    }
+    chdir_fa_lock();
+    let mut i = 0;
+    while i < CHDIR_FA_CAP {
+        if CHDIR_FA_SLOTS[i].load(Ordering::Relaxed) == key {
+            CHDIR_FA_SLOTS[i].store(0, Ordering::Relaxed);
+        }
+        i += 1;
+    }
+    chdir_fa_unlock();
+}
+
+// True if file_actions handle `key` is known to carry a child-cwd change.
+// Fails CLOSED on overflow (treat unknown as "has chdir").
+#[cfg(target_os = "macos")]
+unsafe fn chdir_fa_contains(key: usize) -> bool {
+    if key == 0 {
+        return false;
+    }
+    if CHDIR_FA_OVERFLOW.load(Ordering::Relaxed) {
+        return true;
+    }
+    chdir_fa_lock();
+    let mut found = false;
+    let mut i = 0;
+    while i < CHDIR_FA_CAP {
+        if CHDIR_FA_SLOTS[i].load(Ordering::Relaxed) == key {
+            found = true;
+            break;
+        }
+        i += 1;
+    }
+    chdir_fa_unlock();
+    found
+}
+
+// C-side entry point for the macOS-26 non-`_np` add{,f}chdir interposes (see
+// src/sj_spawn_chdir_np2.c).  Those symbols are weak-imported in C — they bind on
+// macOS 26+ and resolve NULL on older macOS, where their C interpose is an inert
+// no-op — so the non-`_np` chdir adds feed the SAME tracking set as the `_np`
+// (Rust) ones.  `handle` is the file_actions handle address (`(uintptr_t)fa`).
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sj_note_chdir_handle(handle: usize) {
+    chdir_fa_insert(handle);
+}
+
+// Force the linker to pull in src/sj_spawn_chdir_np2.c from its static archive:
+// that object's only contents are static `__DATA,__interpose` tuples (data, not
+// called from anywhere), so without a referenced symbol the archive link semantics
+// would drop the whole object — and the non-`_np` interposes with it.  Referencing
+// this anchor via a `#[used]` static keeps the relocation, which forces inclusion.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sj_spawn_chdir_np2_anchor();
+}
+#[cfg(target_os = "macos")]
+#[used]
+static SJ_SPAWN_CHDIR_NP2_ANCHOR: unsafe extern "C" fn() = sj_spawn_chdir_np2_anchor;
+
+// True when `canon` is a cwd-RELATIVE program path (non-NULL, no leading '/').  A
+// relative posix_spawn target is resolved by the kernel against the child's cwd;
+// an absolute one is cwd-independent (a chdir action cannot move it).
+#[cfg(target_os = "macos")]
+unsafe fn is_relative_prog(canon: *const c_char) -> bool {
+    !canon.is_null() && *canon as u8 != b'/'
+}
+
 #[cfg(target_os = "macos")]
 unsafe fn dispatch_spawn_macos(
     spawnp: bool,
@@ -3266,13 +3616,41 @@ unsafe fn dispatch_spawn_macos(
     let mut redirect_buf = [0u8; (libc::PATH_MAX as usize) + 1];
     // Same canonical-match rule as dispatch_exec_macos.
     let redirected = sip_redirect(canon, &mut redirect_buf);
-    let (path, audit_blind) = if redirected != canon {
-        (redirected, false)
+    let (path, audit_blind, external) = if redirected != canon {
+        (redirected, false, false)
     } else {
-        (path, is_under_sip_bin_dir(canon))
+        // Same external-system-tool classification as dispatch_exec_macos.
+        let mut external = is_external_system_tool(canon);
+        // posix_spawn-only (adversarial-review HIGH 2026-06): unlike execve, a
+        // posix_spawn can carry a `posix_spawn_file_actions_add{,f}chdir{,_np}`
+        // action that moves the CHILD's cwd before it resolves a RELATIVE program
+        // path, so the cwd is_external_system_tool resolved against (ours) is NOT
+        // the cwd the kernel execs from — `./tool` could resolve under the chdir
+        // target to a SIP binary / symlink that runs un-audited with NO marker.  We
+        // OBSERVE chdir actions by interposing the functions that add them (see
+        // CHDIR_FA_SLOTS); when this spawn's file_actions handle is tracked AND the
+        // program path is relative, the target is unprovable.  Fires ONLY on
+        // relative-prog + a real child-cwd change — never on the stdio-only
+        // file_actions libuv attaches to every spawn.  Absolute targets are
+        // cwd-independent → unaffected.  See docs/divergence.md.
+        let chdir_unprovable =
+            is_relative_prog(canon) && chdir_fa_contains(file_actions as usize);
+        // CRITICAL (adversarial-review HIGH): when the target is unprovable we must
+        // NOT trust `external` either — is_external_system_tool realpath'd the
+        // relative path in OUR cwd, the WRONG directory.  A parent-cwd EXTERNAL
+        // symlink decoy (`./tool` → /opt/homebrew/...) would set external=true and
+        // STRIP DYLD, blinding the PACKAGE-owned binary the child actually execs
+        // after the chdir.  Force external=false so DYLD stays for an auditable
+        // child; rely solely on audit_blind to surface the unprovable subtree
+        // (honest "could not see"), never on env stripping.
+        if chdir_unprovable {
+            external = false;
+        }
+        let audit_blind = is_under_sip_bin_dir(canon) || external || chdir_unprovable;
+        (path, audit_blind, external)
     };
 
-    match rewrite_envp(envp_in as *const *const c_char) {
+    match rewrite_envp(envp_in as *const *const c_char, external) {
         Some(mut buf) => {
             set_in_shim(true);
             let rc = real_posix_spawn_raw_macos(
@@ -3367,6 +3745,452 @@ unsafe fn is_under_sip_bin_dir(prog: *const c_char) -> bool {
         }
     }
     false
+}
+
+// True when NUL-terminated `canon` is the directory `root` (a byte slice, no
+// trailing slash) OR lies strictly under it — i.e. `canon` starts with `root`
+// AND the next byte is '/' or the NUL terminator.  The boundary check prevents
+// `/a/binutils` from matching root `/a/bin` (a plain byte-prefix would).  Zero
+// alloc.  An empty `root` never matches (avoids matching everything).
+//
+// LENGTH-AWARE (adversarial-review #2): `cstr_len` first, then bail when `canon`
+// is shorter than `root`.  This makes the bound self-evident: lexical_canon can
+// return the ORIGINAL caller pointer (on overflow/depth), and although a valid
+// C string would terminate before any over-read, the explicit length guard
+// removes all doubt and cannot read past the NUL even if `canon` were crafted.
+#[cfg(target_os = "macos")]
+unsafe fn canon_under_dir(canon: *const c_char, root: &[u8]) -> bool {
+    if canon.is_null() || root.is_empty() {
+        return false;
+    }
+    let canon_len = cstr_len(canon);
+    if canon_len < root.len() {
+        return false;
+    }
+    let canon_slice = core::slice::from_raw_parts(canon as *const u8, canon_len);
+    if &canon_slice[..root.len()] != root {
+        return false;
+    }
+    // `canon` matched all of `root`; require a path boundary at root.len()
+    // (either the NUL terminator — exact dir match — or a '/' — strictly under).
+    canon_len == root.len() || canon_slice[root.len()] == b'/'
+}
+
+// MACOS only: capture THIS process's executable directory into
+// CANON_SELF_EXEC_DIR.  Reads the path via _NSGetExecutablePath, lexically
+// canonicalizes it (collapse `.` / `..` / `//`, same residual class as
+// lexical_canon — symlinks not resolved), then trims the trailing `/<basename>`
+// so the stored value is the BIN DIRECTORY (not the node binary itself).  On any
+// failure (oversized path, no '/' segment) the buf stays empty and
+// is_external_system_tool's empty-anchor fail-safe keeps everything audited.
+// ctor-only writer; no concurrent readers (INIT_DONE is still false).
+//
+// `#[allow(deprecated)]`: libc deprecates `_NSGetExecutablePath` in favor of the
+// `mach2` crate, but it is a stable libSystem symbol and adding a dependency to
+// this `#![no_std]` cdylib for one call is not worth it.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+unsafe fn capture_self_exec_dir() {
+    // _NSGetExecutablePath wants a buffer + an in/out u32 size; PATH_MAX+1 is
+    // ample for the provisioned-node path.
+    let mut raw = [0u8; (libc::PATH_MAX as usize) + 1];
+    let mut size = raw.len() as u32;
+    if libc::_NSGetExecutablePath(raw.as_mut_ptr() as *mut c_char, &mut size as *mut u32) != 0 {
+        return; // buffer too small (returns required size in `size`) → give up
+    }
+    // NUL-terminate defensively (the API NUL-terminates, but be explicit).
+    let raw_len = cstr_len(raw.as_ptr() as *const c_char);
+    if raw_len == 0 || raw_len >= raw.len() {
+        return;
+    }
+    // Lexically canonicalize into a second buffer.
+    let mut canon_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let canon = lexical_canon(raw.as_ptr() as *const c_char, &mut canon_buf);
+    let canon_len = cstr_len(canon);
+    if canon_len == 0 || *canon as u8 != b'/' {
+        return; // relative / unresolved → no usable anchor
+    }
+    // Trim the trailing `/<basename>` to get the directory.  Walk back to the
+    // last '/'; the dir is canon[..last_slash] (kept WITHOUT a trailing slash to
+    // match the other keep roots' format).
+    let mut last_slash: Option<usize> = None;
+    let mut i = 0usize;
+    while i < canon_len {
+        if *canon.add(i) as u8 == b'/' {
+            last_slash = Some(i);
+        }
+        i += 1;
+    }
+    let dir_len = match last_slash {
+        // The leading '/' is at index 0; a dir of just "/" (slash at 0) means the
+        // executable sits at root — keep "/" (len 1) so canon_under_dir works.
+        Some(0) => 1,
+        Some(n) => n,
+        None => return, // no '/' at all → not absolute (shouldn't happen here)
+    };
+    if dir_len >= CANON_BUF_LEN {
+        return; // would not fit the CanonBuf → leave empty (fail-safe keeps audit)
+    }
+    let dst = &mut *CANON_SELF_EXEC_DIR.bytes.get();
+    core::ptr::copy_nonoverlapping(canon as *const u8, dst.as_mut_ptr(), dir_len);
+    dst[dir_len] = 0;
+    CANON_SELF_EXEC_DIR.len.store(dir_len, Ordering::Release);
+}
+
+// MACOS only: capture THIS process's working directory ONCE at shim_init into
+// CANON_INIT_CWD.  Reads it via getcwd, lexically canonicalizes it (collapse
+// `.` / `..` / `//`, same residual class as lexical_canon — symlinks not
+// resolved), and stores the directory itself (no trailing-basename trim: a cwd
+// IS a directory).  For the root audited process this is the install root,
+// captured before any lifecycle `chdir`.  On any failure (getcwd error,
+// oversized path, relative result) the buf stays empty and the keep-root check
+// in is_external_system_tool ignores it (empty root never matches).  ctor-only
+// writer; no concurrent readers (INIT_DONE is still false).
+//
+// See CANON_INIT_CWD for WHY the immutable snapshot is needed alongside the live
+// getcwd() read (the chdir false-strip finding).
+#[cfg(target_os = "macos")]
+unsafe fn capture_init_cwd() {
+    let mut raw = [0u8; (libc::PATH_MAX as usize) + 1];
+    if libc::getcwd(raw.as_mut_ptr() as *mut c_char, raw.len()).is_null() {
+        return; // getcwd failed (e.g. cwd unlinked) → leave empty, fall back
+    }
+    let raw_len = cstr_len(raw.as_ptr() as *const c_char);
+    if raw_len == 0 || raw_len >= raw.len() {
+        return;
+    }
+    // Lexically canonicalize into a second buffer (match the other anchors'
+    // canonical form so the private-aware comparison reconciles).
+    let mut canon_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let canon = lexical_canon(raw.as_ptr() as *const c_char, &mut canon_buf);
+    let canon_len = cstr_len(canon);
+    if canon_len == 0 || *canon as u8 != b'/' {
+        return; // relative / unresolved → no usable anchor
+    }
+    if canon_len >= CANON_BUF_LEN {
+        return; // would not fit the CanonBuf → leave empty (fail-safe ignores it)
+    }
+    let dst = &mut *CANON_INIT_CWD.bytes.get();
+    core::ptr::copy_nonoverlapping(canon as *const u8, dst.as_mut_ptr(), canon_len);
+    dst[canon_len] = 0;
+    CANON_INIT_CWD.len.store(canon_len, Ordering::Release);
+}
+
+// MACOS only: capture the install/repo root from the SCRIPT_JAIL_WORK_DIR env
+// var ONCE at shim_init into CANON_WORK_DIR.  Reads the var via real_getenv_raw
+// (trusted parent environ at ctor — before any user code runs), lexically
+// canonicalizes it (collapse `.` / `..` / `//`, same residual class as
+// lexical_canon — symlinks not resolved) so the stored value reconciles with the
+// lexically-canon'd spawn targets is_external_system_tool compares against, and
+// stores the directory itself (a work_dir IS a directory, no trailing-basename
+// trim).  On any failure (var absent/empty, oversized path, relative result) the
+// buf stays empty and the keep-root check in is_external_system_tool ignores it
+// (empty root never matches) — fall back to the other anchors, NEVER "keep all".
+// ctor-only writer; no concurrent readers (INIT_DONE is still false).
+//
+// See CANON_WORK_DIR for WHY this whole-install-tree anchor is needed alongside
+// the per-package init-cwd snapshot (the top-level node_modules/.bin false-strip
+// after a lifecycle chdir).
+#[cfg(target_os = "macos")]
+unsafe fn capture_work_dir() {
+    let val = real_getenv_raw(b"SCRIPT_JAIL_WORK_DIR\0".as_ptr() as *const c_char);
+    if cstr_is_empty(val) {
+        return; // var absent/empty → leave empty, fall back to the other anchors
+    }
+    // Lexically canonicalize into a scratch buffer (match the other anchors'
+    // canonical form so the private-aware comparison reconciles).
+    let mut canon_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let canon = lexical_canon(val, &mut canon_buf);
+    let canon_len = cstr_len(canon);
+    if canon_len == 0 || *canon as u8 != b'/' {
+        return; // relative / unresolved → no usable anchor
+    }
+    if canon_len >= CANON_BUF_LEN {
+        return; // would not fit the CanonBuf → leave empty (fail-safe ignores it)
+    }
+    let dst = &mut *CANON_WORK_DIR.bytes.get();
+    core::ptr::copy_nonoverlapping(canon as *const u8, dst.as_mut_ptr(), canon_len);
+    dst[canon_len] = 0;
+    CANON_WORK_DIR.len.store(canon_len, Ordering::Release);
+}
+
+// Strip a leading `/private` SEGMENT from an absolute path, returning the
+// remaining slice.  On macOS `/var`, `/tmp`, and `/etc` are symlinks into
+// `/private`, and `getcwd()` / F_GETPATH resolve through them while a lexically-
+// canonicalized argv path does NOT — so the same directory can surface as
+// `/private/tmp/x` from one source and `/tmp/x` from another.  Mirrors
+// normalize.ts's darwin `/private` strip (segment-bounded: `/private/var`
+// strips, `/privatevar` does not).  Returns the input unchanged when there is
+// no `/private` segment.  Pure slice math, no alloc.
+#[cfg(target_os = "macos")]
+fn strip_private_prefix(path: &[u8]) -> &[u8] {
+    const P: &[u8] = b"/private";
+    if path.len() >= P.len() && &path[..P.len()] == P {
+        // Require a segment boundary after "/private": next byte is '/' or end.
+        if path.len() == P.len() {
+            return &path[P.len()..]; // exactly "/private" → ""
+        }
+        if path[P.len()] == b'/' {
+            return &path[P.len()..]; // "/private/..." → "/..."
+        }
+    }
+    path
+}
+
+// `/private`-aware variant of canon_under_dir: matches if `canon` lies under
+// `root` after BOTH have had an optional leading `/private` segment stripped, so
+// a `/private/tmp/...` root and a `/tmp/...` target (or vice versa) reconcile.
+// `canon` is NUL-terminated; we read its byte length to slice it.
+#[cfg(target_os = "macos")]
+unsafe fn canon_under_dir_private_aware(canon: *const c_char, root: &[u8]) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    // Fast path: exact (private-inclusive) match first.
+    if canon_under_dir(canon, root) {
+        return true;
+    }
+    let canon_len = cstr_len(canon);
+    if canon_len == 0 {
+        return false;
+    }
+    let canon_slice = core::slice::from_raw_parts(canon as *const u8, canon_len);
+    let cs = strip_private_prefix(canon_slice);
+    let rs = strip_private_prefix(root);
+    // Compare cs under rs with a directory boundary, mirroring canon_under_dir.
+    if rs.is_empty() || cs.len() < rs.len() {
+        return false;
+    }
+    if &cs[..rs.len()] != rs {
+        return false;
+    }
+    cs.len() == rs.len() || cs[rs.len()] == b'/'
+}
+
+// Return the parent directory of `dir` (a byte slice, no trailing slash) by
+// trimming the trailing `/<basename>`.  `/a/b/c` → `/a/b`; `/a` → `/` (root);
+// `/` or empty → empty (no parent).  Used to derive the provisioned-toolchain
+// root from the sticky shell-shim dir.  Pure slice math.
+#[cfg(target_os = "macos")]
+fn parent_dir(dir: &[u8]) -> &[u8] {
+    if dir.is_empty() {
+        return dir;
+    }
+    // Find the last '/'.
+    let mut last = None;
+    let mut i = 0usize;
+    while i < dir.len() {
+        if dir[i] == b'/' {
+            last = Some(i);
+        }
+        i += 1;
+    }
+    match last {
+        Some(0) => &dir[..1], // parent is root "/"
+        Some(n) => &dir[..n],
+        None => &[], // no '/' (not absolute) → no usable parent
+    }
+}
+
+// MACOS Option B classifier (2026-06).  True when the LEXICALLY-CANONICALIZED
+// spawn target `canon` is an EXTERNAL SYSTEM TOOL — an ABSOLUTE path that lies
+// OUTSIDE every "keep-audited" root.  When true, the macOS dispatchers strip the
+// dyld injection + sticky vars from the child env (rewrite_envp's `external`
+// path) and mark the exec record audit_blind, so the tool + its whole subtree
+// run un-shimmed and emit nothing — matching the Linux source-of-truth, which
+// records only the spawn line for such tools (git, sed, awk, perl, python3,
+// under /usr, /opt/homebrew, /bin, /sbin, /Library, /System, /nix, …).
+//
+// KEEP-AUDITED roots (return false → keep DYLD, audit the child):
+//   1. PROVISION ROOT (PRIMARY) = parent of CANON_SHELL_SHIM_DIR.  The shell-shim
+//      dir is a STICKY var re-injected into every audited child, so its parent —
+//      the provisioned-toolchain root `.../node-<ver>-<arch>-vp<v>/` — is the SAME
+//      value in the orchestrator node, the substituted bash, AND every
+//      node-spawned-node.  That root holds BOTH `vp-home/.../bin/node` (the node
+//      + corepack/pnpm/npm/npx shims) AND `shell-shim/` (bash/coreutils).  This
+//      MUST be process-independent: when bash (self-exec = shell-shim) spawns the
+//      node, a per-process self-exec keep would FALSE-STRIP node and blind the
+//      whole lifecycle subtree — proven against vuejs/core locally.
+//   2. CANON_SELF_EXEC_DIR (secondary) — this process's own exec dir; covers the
+//      orchestrator before shell-shim is known and same-dir sibling re-spawns.
+//   3. CANON_SHELL_SHIM_DIR — the bundled bash/coreutils substitutes (also under
+//      the provision root; kept explicit).
+//   4. getcwd() (LIVE) — the CURRENT install cwd: node_modules/.bin, the in-repo
+//      .pnpm-store, and any native helper a package ships and runs from its own
+//      subdir.  Linux audits these (strace + preload), so macOS must too.
+//   5. CANON_INIT_CWD (IMMUTABLE) — the cwd snapshotted at ctor (the install
+//      root, before any lifecycle chdir).  UNION'd with #4 to close the
+//      adversarial-review chdir false-strip: lifecycle code can `chdir('/tmp')`
+//      then exec an ABSOLUTE package-owned helper still under the ORIGINAL
+//      install root, which #4 (cwd now /tmp) would miss and FALSE-STRIP.  The
+//      union only EXPANDS the keep set, so it can never newly false-strip
+//      anything #1–#4 keep — it only ADDS protection.  See CANON_INIT_CWD.
+//
+// SYMLINK RESOLUTION (adversarial-review HIGH, 2026-06): the keep-root checks run
+// against the REAL realpath of `canon`, not its surface bytes.  `canon` is only
+// LEXICALLY canonicalized (lexical_canon collapses `.`/`..`/`//` but does NOT
+// resolve symlinks), so a package could plant an in-tree symlink
+// `node_modules/.bin/git` → `/opt/homebrew/bin/git` (or `/usr/bin/git`): the
+// lexical path lies under a keep root (#4 live-cwd / #5 init-cwd / #6 work_dir),
+// so a lexical-only classify would KEEP it — running a NON-SIP external tool
+// (Homebrew git) SHIMMED and leaking its GIT_* reads (the exact leak audit_blind
+// exists to stop), or a SIP target un-instrumented with NO `<AUDIT_BLIND>` marker.
+// Resolving symlinks first re-anchors the classify on the tool's TRUE location, so
+// such a symlink classifies EXTERNAL (audit_blind).
+//
+// WHY THIS DOES NOT FALSE-STRIP LEGIT PACKAGE / TOOLCHAIN CODE (verified):
+//   * pnpm's content-addressed store is pinned IN-TREE at `${work_dir}/.pnpm-store`
+//     (phase-install-macos.ts: `--store-dir=${cwd}/.pnpm-store`, cwd == work_dir ==
+//     SCRIPT_JAIL_WORK_DIR == keep root #6).  So pnpm's `node_modules/<pkg>` →
+//     `<work>/.pnpm-store/...` symlinks RESOLVE to a path still UNDER work_dir →
+//     stay KEPT.
+//   * The provisioned toolchain path has NO non-`/private` symlink component (every
+//     dir is real, node + bundled bash/coreutils are copied files), so the realpath
+//     of an audited toolchain binary differs from its lexical canon ONLY by a
+//     leading `/tmp`→`/private/tmp` bridge — which the `/private`-aware keep-root
+//     checks below already reconcile.  No legit kept path's realpath escapes the
+//     keep roots.
+//
+// RELATIVE PATHS are resolved too (adversarial review).  `real_realpath_raw`
+// runs FIRST — it absolutizes a relative path against THIS process's live cwd AND
+// resolves symlinks — so a RELATIVE symlink (`./node_modules/.bin/git` →
+// `/opt/homebrew/bin/git`, or a relative/empty PATH-search hit) cannot skip the
+// resolved-target classify by being non-absolute.  For an execve the live cwd IS
+// the cwd the kernel resolves against (execve does not change cwd), so this is
+// exact.  For a posix_spawn it is NOT necessarily exact: an `add{,f}chdir_np` file
+// action can move the CHILD's cwd, so a relative target is handled conservatively
+// by the SPAWN dispatcher (it marks the spawn audit_blind — DYLD kept — when the
+// file_actions object is tracked as carrying a chdir; see CHDIR_FA_SLOTS), NOT by
+// stripping in this classifier.  ERR TOWARD KEEP only when realpath FAILS: a NULL result
+// (ENOENT / ELOOP / oversized / not-yet-existing target) on a relative input
+// leaves the path non-absolute → return false (keep) — a leaked system-tool read
+// is a parity nuisance whereas blinding package behavior is a security +
+// byte-divergence regression.  (A bare-name spawn is also PATH-resolved by
+// resolve_path_search before this runs, so the residual is narrow — a broken/
+// nonexistent relative symlink only.)  On an ABSOLUTE input a realpath failure
+// falls back to the lexical `canon`, preserving the prior (lexical) behavior —
+// NEVER strip when resolution is unsure.
+//
+// EMPTY-ANCHOR FAIL-SAFE: if BOTH CANON_SHELL_SHIM_DIR and CANON_SELF_EXEC_DIR are
+// empty (no toolchain anchor established at init), return false unconditionally —
+// never strip DYLD when we cannot tell which tree is ours.
+#[cfg(target_os = "macos")]
+unsafe fn is_external_system_tool(canon_in: *const c_char) -> bool {
+    if canon_in.is_null() {
+        return false;
+    }
+    // Resolve via REAL realpath FIRST (before the absolute-path gate): this BOTH
+    // absolutizes a relative path (against the live cwd — the same cwd the kernel
+    // uses for a relative exec) AND resolves symlinks, so neither a relative
+    // symlink nor a relative PATH-search hit can skip the resolved-target classify
+    // (see RELATIVE PATHS above).  No malloc (non-NULL resolved arg; PATH_MAX+1
+    // buffer, the size macOS realpath requires).  The caller (dispatch_{exec,
+    // spawn}_macos) holds set_in_shim(true), so this real call does not re-enter
+    // the audit, and realpath is not interposed regardless.
+    let mut resolved_buf = [0u8; (libc::PATH_MAX as usize) + 1];
+    let resolved = real_realpath_raw(canon_in, resolved_buf.as_mut_ptr() as *mut c_char);
+    // realpath guarantees a NUL-terminated absolute result on success; defend
+    // anyway (a non-'/' or empty result is treated as a failure → keep lexical).
+    let canon: *const c_char = if !resolved.is_null() && *resolved as u8 == b'/' {
+        resolved as *const c_char
+    } else {
+        canon_in
+    };
+    // Classify ABSOLUTE paths only.  realpath yields one on success; if it FAILED
+    // and the lexical input was relative, `canon` is still non-absolute → ERR
+    // TOWARD KEEP (see above).
+    if *canon as u8 != b'/' {
+        return false;
+    }
+    // PRIMARY anchor: the bundled shell/coreutils shim dir, which is a STICKY var
+    // (re-injected into every audited child) so it is the SAME value in the
+    // orchestrator node, the substituted bash, AND every node-spawned-node.  Its
+    // PARENT is the provisioned-toolchain root
+    //   <cacheDir>/script-jail-node-mac/node-<ver>-<arch>-vp<v>/
+    // which contains BOTH `shell-shim/` AND `vp-home/.../bin/node`.  Anchoring on
+    // this (not the PER-PROCESS self-exec dir) is essential: when the substituted
+    // BASH spawns the provisioned node, bash's self-exec dir is `shell-shim/`, so
+    // a self-exec-only keep would FALSE-STRIP the node and blind the whole
+    // lifecycle subtree.  See the provision-root keep below.
+    let shell_shim_dir = canon_bytes(&CANON_SHELL_SHIM_DIR);
+    let self_exec_dir = canon_bytes(&CANON_SELF_EXEC_DIR);
+    if shell_shim_dir.is_empty() && self_exec_dir.is_empty() {
+        // Fail-safe: no audited-toolchain anchor at all → keep everything.
+        return false;
+    }
+    // All keep-root checks are `/private`-aware (see canon_under_dir_private_aware):
+    // getcwd()/F_GETPATH resolve the /tmp,/var,/etc → /private symlinks while a
+    // lexical argv path does not, so a raw byte match would FALSE-STRIP a package
+    // binary whose cwd surfaces as /private/... — a security + parity regression.
+    // ERR TOWARD KEEP.
+    //
+    // Keep root #1 (PRIMARY): the provisioned-toolchain root = parent of the
+    // shell-shim dir.  Covers the provisioned node, corepack/pnpm/npm shims, AND
+    // the bundled bash/coreutils — process-independent (sticky), so it holds no
+    // matter which audited process is doing the spawning.
+    let provision_root = parent_dir(shell_shim_dir);
+    if canon_under_dir_private_aware(canon, provision_root) {
+        return false;
+    }
+    // Keep root #2: this process's own executable dir (secondary anchor).  Covers
+    // the orchestrator node BEFORE shell-shim is known, and any audited binary
+    // that re-spawns a sibling in its own dir.
+    if canon_under_dir_private_aware(canon, self_exec_dir) {
+        return false;
+    }
+    // Keep root #3: the bundled shell/coreutils shim dir itself (also covered by
+    // the provision root, kept explicit for clarity + for the unusual case where
+    // the shim dir is NOT under a single provision parent).
+    if canon_under_dir_private_aware(canon, shell_shim_dir) {
+        return false;
+    }
+    // Keep root #4: the install cwd (node_modules/.bin, .pnpm-store, package
+    // native helpers).  getcwd() is read live: the install runner does not
+    // chdir away mid-run, and reading it here (in_shim is asserted by the
+    // caller) does not re-enter the audit.
+    let mut cwd = [0u8; (libc::PATH_MAX as usize) + 1];
+    if !libc::getcwd(cwd.as_mut_ptr() as *mut c_char, cwd.len()).is_null() {
+        let cwd_len = cstr_len(cwd.as_ptr() as *const c_char);
+        if cwd_len > 0 && canon_under_dir_private_aware(canon, &cwd[..cwd_len]) {
+            return false;
+        }
+    }
+    // Keep root #5: the IMMUTABLE init cwd (the install root, snapshotted at ctor
+    // before any lifecycle chdir; see CANON_INIT_CWD).  Closes the adversarial-
+    // review chdir false-strip (high, 2026-06): lifecycle code can `chdir('/tmp')`
+    // and THEN exec an ABSOLUTE package-owned helper still living under the
+    // ORIGINAL install root.  The live getcwd() check above would miss it (cwd is
+    // now /tmp) and the provision/self-exec/shell-shim roots don't cover a
+    // package's own dir, so the helper would be FALSE-STRIPPED and run un-shimmed
+    // — a security + byte-divergence regression vs Linux, which still audits it.
+    // Matching against the immutable init cwd keeps any helper under the install
+    // root audited REGARDLESS of a runtime chdir.  This is a UNION with the live
+    // check (it only EXPANDS the keep set), and the empty-root guard in
+    // canon_under_dir_private_aware means a failed capture simply doesn't match.
+    let init_cwd = canon_bytes(&CANON_INIT_CWD);
+    if canon_under_dir_private_aware(canon, init_cwd) {
+        return false;
+    }
+    // Keep root #6: the install/repo root (SCRIPT_JAIL_WORK_DIR = the agent's
+    // config.work_dir; see CANON_WORK_DIR).  This is the WHOLE install tree, so
+    // it covers BOTH node_modules/<pkg> AND its SIBLING node_modules/.bin/<helper>.
+    // Closes the top-level-.bin false-strip: after a lifecycle script `chdir`s
+    // into node_modules/<pkg>, a top-level node_modules/.bin/<helper> is a SIBLING
+    // of that per-package init-cwd anchor (not UNDER it), so roots #4/#5 miss it —
+    // the helper would be FALSE-STRIPPED of DYLD and run un-shimmed, blinding it
+    // (and its subtree) and producing a spurious parity GATE FAILURE vs Linux,
+    // which still audits it.  This is a UNION with the other roots (it only
+    // EXPANDS the keep set, never newly false-strips), and does NOT over-broaden:
+    // a real system tool (/usr/bin/git, /opt/homebrew/bin/git) lives OUTSIDE
+    // work_dir → still external → the git-leak audit-blind fix stays intact.  The
+    // empty-root guard in canon_under_dir_private_aware means an absent var simply
+    // doesn't match (NOT "keep all").
+    let work_dir = canon_bytes(&CANON_WORK_DIR);
+    if canon_under_dir_private_aware(canon, work_dir) {
+        return false;
+    }
+    // Absolute, and under NONE of the keep roots → external system tool.
+    true
 }
 
 // Lexically canonicalize an ABSOLUTE path — collapse `.`, `..`, and `//` — into
@@ -3792,7 +4616,11 @@ unsafe fn resolve_path_search(file: *const c_char, out: &mut [u8]) -> Option<*co
     }
     let path_var = real_getenv_raw(b"PATH\0".as_ptr() as *const c_char);
     // POSIX: when PATH is unset, use a default.  Keep it minimal.
-    let default_path = b"/usr/bin:/bin";
+    // NUL-terminated: the scanner below treats this as a C string and stops at
+    // the trailing 0.  Without the \0 the final "/bin" segment is not terminated
+    // and the scan reads PAST the literal into adjacent memory (adversarial-review
+    // HIGH 2026-06).  Only used when PATH is unset.
+    let default_path = b"/usr/bin:/bin\0";
     let mut p = if path_var.is_null() {
         default_path.as_ptr()
     } else {
@@ -3830,6 +4658,101 @@ unsafe fn resolve_path_search(file: *const c_char, out: &mut [u8]) -> Option<*co
             }
         }
         // Advance past this segment.
+        let term = *seg_start.add(seg_len);
+        if term == 0 {
+            return None;
+        }
+        p = seg_start.add(seg_len + 1);
+    }
+}
+
+// PATH resolution for the posix_spawnp-under-tracked-chdir case (macOS).  The
+// real spawnp runs its PATH search AFTER the child cwd change, so any PATH entry
+// whose meaning depends on the cwd — an empty entry (POSIX "." == cwd) or a
+// relative dir — could resolve to a DIFFERENT binary than the parent sees and is
+// unprovable.  But an ABSOLUTE PATH dir is cwd-independent: a chdir cannot move
+// it.  So (adversarial-review HIGH 2026-06, refining the earlier blanket skip):
+//   * resolve through ABSOLUTE dirs; a match reached BEFORE any cwd-dependent
+//     segment is the binary the kernel will run regardless of the chdir → return
+//     it, so the caller dispatches it normally (sip_redirect to the bundled shell
+//     and the external/SIP marking all apply, exactly as without a chdir — this
+//     is what keeps a cwd-bearing `sh`/`node` spawn PROVABLE instead of falsely
+//     `<AUDIT_BLIND>`);
+//   * at the FIRST cwd-dependent segment (empty or relative), STOP and return
+//     None: the kernel searches it post-chdir, BEFORE any later absolute segment,
+//     and we cannot predict the result → the caller keeps the bare name so
+//     dispatch_spawn_macos marks it audit_blind via the relative-program rule;
+//   * PATH exhausted with no absolute match → None (same as resolve_path_search).
+// A path already containing '/' is returned verbatim; a cwd-relative such path
+// (`./tool`) is then caught by the is_relative_prog chdir_unprovable rule.
+#[cfg(target_os = "macos")]
+unsafe fn resolve_path_search_chdir_safe(
+    file: *const c_char,
+    out: &mut [u8],
+) -> Option<*const c_char> {
+    if file.is_null() {
+        return None;
+    }
+    // Contains a slash → no PATH search (verbatim), like resolve_path_search.
+    let mut i = 0usize;
+    let flen = loop {
+        let c = *file.add(i) as u8;
+        if c == 0 {
+            break i;
+        }
+        if c == b'/' {
+            return Some(file);
+        }
+        i += 1;
+        if i > out.len() {
+            return None;
+        }
+    };
+    if flen == 0 {
+        return None;
+    }
+    let path_var = real_getenv_raw(b"PATH\0".as_ptr() as *const c_char);
+    // NUL-terminated: the scanner below treats this as a C string and stops at
+    // the trailing 0.  Without the \0 the final "/bin" segment is not terminated
+    // and the scan reads PAST the literal into adjacent memory (adversarial-review
+    // HIGH 2026-06).  Only used when PATH is unset.
+    let default_path = b"/usr/bin:/bin\0";
+    let mut p = if path_var.is_null() {
+        default_path.as_ptr()
+    } else {
+        path_var as *const u8
+    };
+    loop {
+        let seg_start = p;
+        let mut seg_len = 0usize;
+        loop {
+            let c = *seg_start.add(seg_len);
+            if c == 0 || c == b':' {
+                break;
+            }
+            seg_len += 1;
+        }
+        // A cwd-DEPENDENT segment — empty ("." == cwd) or relative (no leading
+        // '/') — is searched by the real spawnp AFTER the child chdir, and BEFORE
+        // any later absolute segment.  We cannot prove its result, so stop here
+        // and report unprovable (None → caller keeps the bare name).
+        if seg_len == 0 || *seg_start != b'/' {
+            return None;
+        }
+        // Absolute segment: cwd-independent → safe to probe.
+        let need = seg_len + 1 + flen + 1;
+        if need <= out.len() {
+            core::ptr::copy_nonoverlapping(seg_start, out.as_mut_ptr(), seg_len);
+            let mut pos = seg_len;
+            out[pos] = b'/';
+            pos += 1;
+            core::ptr::copy_nonoverlapping(file as *const u8, out.as_mut_ptr().add(pos), flen);
+            pos += flen;
+            out[pos] = 0;
+            if libc::access(out.as_ptr() as *const c_char, libc::X_OK) == 0 {
+                return Some(out.as_ptr() as *const c_char);
+            }
+        }
         let term = *seg_start.add(seg_len);
         if term == 0 {
             return None;
@@ -3898,8 +4821,27 @@ unsafe extern "C" fn posix_spawnp_interpose(
     // SIP binary un-redirected AND unmarked.  resolve_path_search returns `file`
     // verbatim when it already contains '/', and None when no PATH entry matches
     // (then fall back to `file` and let the real spawnp do its own search).
+    //
+    // EXCEPTION (adversarial-review HIGH 2026-06): when this spawn's file_actions
+    // carries a tracked child-cwd change, the REAL spawnp runs its PATH search
+    // AFTER the chdir, so a PATH entry whose meaning depends on the cwd — an empty
+    // "." entry or a relative dir — could resolve a DIFFERENT binary than the
+    // parent sees.  We must NOT pre-resolve such an entry against the parent cwd.
+    // But an ABSOLUTE PATH dir is cwd-independent (a chdir cannot move it), so we
+    // STILL resolve through absolute dirs via resolve_path_search_chdir_safe,
+    // stopping at the first cwd-dependent segment.  This keeps an ordinary
+    // cwd-bearing `sh` / `node` spawn PROVABLE (resolved → sip_redirect to the
+    // bundled shell, correct external/SIP marking — NOT a false `<AUDIT_BLIND>`),
+    // while a bare name the kernel could only find via a cwd-dependent segment
+    // stays bare → dispatch_spawn_macos sees is_relative_prog()==true, marks it
+    // audit_blind and keeps DYLD, and the real spawnp does its own post-chdir
+    // search.  A path that already contains '/' is returned verbatim either way.
     let mut spawnp_buf = [0u8; (libc::PATH_MAX as usize) + 1];
-    let resolved = resolve_path_search(file, &mut spawnp_buf).unwrap_or(file);
+    let resolved = if chdir_fa_contains(file_actions as usize) {
+        resolve_path_search_chdir_safe(file, &mut spawnp_buf).unwrap_or(file)
+    } else {
+        resolve_path_search(file, &mut spawnp_buf).unwrap_or(file)
+    };
     let rc = dispatch_spawn_macos(true, pid, resolved, file_actions, attrp, argv, envp);
     set_in_shim(false);
     rc
@@ -3918,6 +4860,109 @@ interpose::interpose_entry!(
         *const *mut c_char,
         *const *mut c_char,
     ) -> c_int
+);
+
+// ── posix_spawn child-cwd (chdir) action interpose wrappers (macOS) ─────────
+//
+// We interpose the two functions that add a child-cwd change to a file_actions
+// object, plus its destructor, to track which objects carry a chdir (see
+// CHDIR_FA_SLOTS / dispatch_spawn_macos).  addchdir_np / addfchdir_np are NOT in
+// the pinned libc crate (0.2.186), so they are declared here; the real symbols
+// resolve from libSystem at link time, and a same-image call inside the
+// replacement reaches the REAL function without re-entering the interpose table
+// (the "R8" finding — see interpose.rs).  These wrappers emit nothing and never
+// re-enter the audit, so they run unconditionally (no in_shim / INIT_DONE gate):
+// the tracking set must be complete by the time a later posix_spawn consults it.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn posix_spawn_file_actions_addchdir_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        path: *const c_char,
+    ) -> c_int;
+    fn posix_spawn_file_actions_addfchdir_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        filedes: c_int,
+    ) -> c_int;
+}
+
+// Key on the HANDLE (`actions`), not `*actions`: the object pointer reallocs as
+// later actions are appended (see CHDIR_FA_SLOTS), so a value captured here would
+// not match `*file_actions` at spawn time.  The handle address is stable.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn posix_spawn_fa_addchdir_interpose(
+    actions: *mut libc::posix_spawn_file_actions_t,
+    path: *const c_char,
+) -> c_int {
+    let rc = posix_spawn_file_actions_addchdir_np(actions, path);
+    if rc == 0 {
+        chdir_fa_insert(actions as usize);
+    }
+    rc
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn posix_spawn_fa_addfchdir_interpose(
+    actions: *mut libc::posix_spawn_file_actions_t,
+    filedes: c_int,
+) -> c_int {
+    let rc = posix_spawn_file_actions_addfchdir_np(actions, filedes);
+    if rc == 0 {
+        chdir_fa_insert(actions as usize);
+    }
+    rc
+}
+
+// Clear the handle on a fresh init: a stack/heap `posix_spawn_file_actions_t`
+// address is routinely re-used by a later, distinct file_actions, and init starts
+// it with NO actions — so any chdir tracked for a prior occupant of this address
+// must not leak forward.  (destroy also clears; init covers the no-destroy reuse.)
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn posix_spawn_fa_init_interpose(
+    actions: *mut libc::posix_spawn_file_actions_t,
+) -> c_int {
+    let rc = libc::posix_spawn_file_actions_init(actions);
+    chdir_fa_remove(actions as usize);
+    rc
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn posix_spawn_fa_destroy_interpose(
+    actions: *mut libc::posix_spawn_file_actions_t,
+) -> c_int {
+    chdir_fa_remove(actions as usize);
+    libc::posix_spawn_file_actions_destroy(actions)
+}
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_POSIX_SPAWN_FA_ADDCHDIR,
+    posix_spawn_fa_addchdir_interpose,
+    posix_spawn_file_actions_addchdir_np,
+    unsafe extern "C" fn(*mut libc::posix_spawn_file_actions_t, *const c_char) -> c_int
+);
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_POSIX_SPAWN_FA_ADDFCHDIR,
+    posix_spawn_fa_addfchdir_interpose,
+    posix_spawn_file_actions_addfchdir_np,
+    unsafe extern "C" fn(*mut libc::posix_spawn_file_actions_t, c_int) -> c_int
+);
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_POSIX_SPAWN_FA_INIT,
+    posix_spawn_fa_init_interpose,
+    libc::posix_spawn_file_actions_init,
+    unsafe extern "C" fn(*mut libc::posix_spawn_file_actions_t) -> c_int
+);
+
+#[cfg(target_os = "macos")]
+interpose::interpose_entry!(
+    SJ_POSIX_SPAWN_FA_DESTROY,
+    posix_spawn_fa_destroy_interpose,
+    libc::posix_spawn_file_actions_destroy,
+    unsafe extern "C" fn(*mut libc::posix_spawn_file_actions_t) -> c_int
 );
 
 // ── env mutator guards ──────────────────────────────────────────────────────
@@ -3970,6 +5015,14 @@ static AUDIT_PROTECTED_NAMES: &[&[u8]] = &[
     // could steer execs at an attacker-controlled binary.
     #[cfg(target_os = "macos")]
     b"SCRIPT_JAIL_SHELL_SHIM_DIR",
+    // MACOS only: the install/repo root keep-root (is_external_system_tool #6).
+    // A script unsetting/redirecting it must be refused + audited as env_tamper —
+    // it could otherwise try to FALSE-STRIP DYLD off a package-owned helper.  (The
+    // keep-root is sourced from the init-time CanonBuf either way, so the in-env
+    // value is non-authoritative; refusing the mutation closes the in-process path
+    // and surfaces the tamper.)
+    #[cfg(target_os = "macos")]
+    b"SCRIPT_JAIL_WORK_DIR",
     #[cfg(target_os = "macos")]
     b"SCRIPT_JAIL_MACOS_AUDIT_OPS",
 ];

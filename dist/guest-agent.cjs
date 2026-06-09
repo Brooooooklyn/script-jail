@@ -29792,7 +29792,14 @@ var LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = /* @__PURE__ */ new Set([
   // /bin/bash, and coreutils copies the shim's sip_redirect rewrites system
   // binaries to (SIP strips DYLD_* for /bin and /usr/bin).  The shim captures
   // it at ctor; allowed so descendants see the same sticky value.
-  "SCRIPT_JAIL_SHELL_SHIM_DIR"
+  "SCRIPT_JAIL_SHELL_SHIM_DIR",
+  // macOS-bare only.  The install/repo root (config.work_dir).  The shim
+  // captures it at ctor into CANON_WORK_DIR and uses it as is_external_system_tool
+  // keep-root #6 so the WHOLE install tree — incl. top-level node_modules/.bin
+  // helpers that are SIBLINGS of a lifecycle child's chdir'd cwd — stays audited
+  // (the top-level-.bin false-strip).  Allowed so descendants see the same sticky
+  // value; the shim re-injects it on every kept exec regardless.
+  "SCRIPT_JAIL_WORK_DIR"
   // NOTE: SCRIPT_JAIL_MACOS_AUDIT_OPS is deliberately NOT allow-listed here.
   // It is an internal per-phase control set solely by main() (deleted from the
   // Phase-A fetch env, set to '1' on the Phase-B install env).  Allow-listing it
@@ -29935,6 +29942,7 @@ function buildChildEnvMacos(baseEnv, config2, eventsFilePath, preloadPaths) {
   if (shellShimDir !== void 0 && shellShimDir.length > 0) {
     env["SCRIPT_JAIL_SHELL_SHIM_DIR"] = shellShimDir;
   }
+  env["SCRIPT_JAIL_WORK_DIR"] = config2.work_dir;
   return env;
 }
 function macosTokenizeRoots(workDir) {

@@ -264,27 +264,65 @@ function buildShimArm64(): void {
  *      Silicon and required for injection into the re-signed node (Phase 4).
  *   4. `codesign --verify` so a broken signature fails the build.
  */
+// Deployment target the macOS shim dylib MUST carry so it loads on the lowest
+// supported runner (the macos-14 parity runner).  Pinned for the cargo link and
+// asserted on BOTH the cache-hit and freshly-built paths.
+const SHIM_PINNED_MINOS = '11.0';
+
+/**
+ * Read the Mach-O minOS (LC_BUILD_VERSION) of `dylib` as "major.minor" via vtool.
+ * Throws if it cannot be parsed (fail closed).
+ */
+function shimDylibMinOS(dylib: string): string {
+  const out = execSync(`vtool -show-build "${dylib}"`, { cwd: REPO_ROOT }).toString();
+  const minos = out.match(/minos\s+(\d+(?:\.\d+)?)/)?.[1];
+  if (minos === undefined) {
+    throw new Error(`[build] could not parse minOS from vtool output for ${dylib}`);
+  }
+  return minos;
+}
+
 function buildShimMac(): void {
   const target = 'aarch64-apple-darwin';
   const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
   const shimOut = join(REPO_ROOT, 'images', 'libscriptjail-arm64.dylib');
 
   // Freshness: reuse the existing dylib only when every shim source input is
-  // older than it (same rule as the Linux .so).  shimArtifactIsStale compares
-  // the artifact mtime against the shared shimSourceInputs (which now include
-  // interpose.rs / fileops.rs / net.rs — see shim-freshness.ts).
+  // older than it (shimArtifactIsStale fails closed on a missing declared source
+  // — see shim-freshness.ts).  BUT also validate the cached dylib's minOS: a
+  // too-new cached artifact (e.g. built before the deployment-target pin) must
+  // not slip through the freshness skip and then fail to load on macos-14
+  // (adversarial-review MEDIUM 2026-06).
   if (!shimArtifactIsStale(shimOut)) {
+    const cachedMinOS = shimDylibMinOS(shimOut);
+    if (cachedMinOS === SHIM_PINNED_MINOS) {
+      console.log(
+        `[build] images/libscriptjail-arm64.dylib is up-to-date (minOS ${cachedMinOS}); ` +
+        'skipping macOS shim build.',
+      );
+      return;
+    }
     console.log(
-      '[build] images/libscriptjail-arm64.dylib is up-to-date relative to shim ' +
-      'sources; skipping macOS shim build.',
+      `[build] cached dylib minOS ${cachedMinOS} != pinned ${SHIM_PINNED_MINOS}; rebuilding.`,
     );
-    return;
   }
 
   console.log(`[build] Building macOS shim via cargo build --target ${target} …`);
   execSync(
     `cargo build --release --manifest-path "${manifest}" --target ${target}`,
-    { stdio: 'inherit', cwd: REPO_ROOT },
+    {
+      stdio: 'inherit',
+      cwd: REPO_ROOT,
+      // Pin the FINAL cdylib's LC_BUILD_VERSION minOS to 11.0 so it loads on the
+      // macos-14 parity runner regardless of the host's default deployment target.
+      // build.rs pins only the cc objects (-mmacosx-version-min=11.0); the Rust
+      // cdylib link otherwise inherits MACOSX_DEPLOYMENT_TARGET from the caller —
+      // a macOS-26 host/release runner would stamp minos 26.0 → UNLOADABLE on
+      // macos-14.  arm64 macOS floors at 11.0, and the macOS-26 non-_np symbols
+      // are weak (so an 11.0 binary may still reference them).  (adversarial-
+      // review MEDIUM 2026-06)
+      env: { ...process.env, MACOSX_DEPLOYMENT_TARGET: SHIM_PINNED_MINOS },
+    },
   );
 
   mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
@@ -292,6 +330,18 @@ function buildShimMac(): void {
     join(REPO_ROOT, 'target', target, 'release', 'libscriptjail.dylib'),
     shimOut,
   );
+
+  // Fail closed if the freshly-built dylib's minOS is not exactly the pin — any
+  // other value means MACOSX_DEPLOYMENT_TARGET did not take and the parity / bare
+  // backend would fail to inject on the macos-14 runner.
+  const builtMinOS = shimDylibMinOS(shimOut);
+  if (builtMinOS !== SHIM_PINNED_MINOS) {
+    throw new Error(
+      `[build] macOS shim minOS is ${builtMinOS}, expected ${SHIM_PINNED_MINOS}. ` +
+      'Ensure MACOSX_DEPLOYMENT_TARGET=11.0 is honored for the shim cargo build.',
+    );
+  }
+  console.log(`[build] macOS shim minOS = ${builtMinOS} (loads on macos-14).`);
 
   // Ad-hoc sign + verify.  `--force` re-stamps the linker's adhoc+linker-signed
   // signature as a plain adhoc one (the spike's codesignDylibCmd).

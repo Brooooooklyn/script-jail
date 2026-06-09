@@ -48,6 +48,11 @@ export function shimSourceInputs(repoRoot: string): ReadonlyArray<string> {
     // either and the cached dylib must rebuild.  cfg-gated to macOS in build.rs.
     join(repoRoot, 'src', 'shim', 'build.rs'),
     join(repoRoot, 'src', 'shim', 'src', 'open_variadic.c'),
+    // macOS-26 non-`_np` posix_spawn chdir interposes.  `build.rs` compiles this
+    // via the `cc` crate too (and emits the `-Wl,-U` link allowances for its
+    // weak-imported symbols), so — like open_variadic.c — editing it must rebuild
+    // the cached dylib.  cfg-gated to macOS in build.rs.
+    join(repoRoot, 'src', 'shim', 'src', 'sj_spawn_chdir_np2.c'),
   ];
 }
 
@@ -81,9 +86,12 @@ export function decideShimRebuild(
  * Inspect the filesystem and decide whether `libscriptjail.so` needs to be
  * rebuilt. See `decideShimRebuild` for the rule.
  *
- * Missing source files are skipped silently — they cannot have been an input
- * to whatever produced the artifact, so treating them as "ancient" would be
- * misleading.
+ * Fail closed on a MISSING declared source: every path in `shimSourceInputs` is
+ * a real input cargo/cc consume, so if one is absent the checkout is incomplete
+ * (or a source was renamed without updating the list) and the artifact cannot be
+ * trusted as fresh. Returning stale forces a rebuild, which then fails loudly on
+ * the truly-missing input (e.g. cc cannot find a `.c` file) instead of silently
+ * reusing a stale-or-incomplete dylib. (adversarial-review HIGH 2026-06)
  */
 export function shimArtifactIsStale(
   shimOut: string,
@@ -92,7 +100,7 @@ export function shimArtifactIsStale(
   const artifactMtime = existsSync(shimOut) ? statSync(shimOut).mtimeMs : null;
   const sourceMtimes: number[] = [];
   for (const path of sources) {
-    if (!existsSync(path)) continue;
+    if (!existsSync(path)) return true;
     sourceMtimes.push(statSync(path).mtimeMs);
   }
   return decideShimRebuild(artifactMtime, sourceMtimes);

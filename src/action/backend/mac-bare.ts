@@ -221,6 +221,14 @@ export function createMacBareExecute(
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
           SCRIPT_JAIL_SHELL_SHIM_DIR: provisioned.shellShimDir,
+          // The install/repo root (== the rewritten config work_dir, `staged.path`).
+          // The shim's `shim_init` captures it into CANON_WORK_DIR and uses it as
+          // is_external_system_tool keep-root #6 so the WHOLE install tree — incl.
+          // top-level node_modules/.bin helpers that are SIBLINGS of a lifecycle
+          // child's chdir'd cwd — stays audited (the top-level-.bin false-strip).
+          // Sticky + re-injected into every kept child, exactly like
+          // SCRIPT_JAIL_SHELL_SHIM_DIR.
+          SCRIPT_JAIL_WORK_DIR: staged.path,
           // NO SCRIPT_JAIL_PHASE_B_UNSHARE_NET: macOS has no network namespace
           // to drop, and macOS-bare does NOT enforce offline.  It is OBSERVE-ONLY
           // and stays ONLINE: net.rs forwards connect/connectx and records the

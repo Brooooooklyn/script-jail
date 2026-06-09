@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 
 import {
   createMacBareExecute,
@@ -136,6 +137,18 @@ describe('createMacBareExecute — valid shim flows through', () => {
     expect(env['SCRIPT_JAIL_CONNECTION']).toBe('stdio');
     expect(env['SCRIPT_JAIL_NATIVE_PRELOAD_PATH']).toMatch(/libscriptjail-arm64\.dylib$/);
     expect(env['SCRIPT_JAIL_SHELL_SHIM_DIR']).toBe(PROVISIONED.shellShimDir);
+    // The install/repo root keep-root (is_external_system_tool #6): the shim
+    // captures SCRIPT_JAIL_WORK_DIR at ctor so top-level node_modules/.bin
+    // helpers stay audited after a lifecycle chdir.  It MUST equal the rewritten
+    // backend config's work_dir (the staged repo), so the agent's config.work_dir
+    // and the shim's CANON_WORK_DIR anchor are the SAME tree.
+    const workDir = env['SCRIPT_JAIL_WORK_DIR'];
+    expect(workDir).toBeDefined();
+    expect(workDir!.startsWith(scratchDir + '/')).toBe(true);
+    const backendConfig = parseYaml(
+      readFileSync(join(scratchDir, 'config.backend.yml'), 'utf8'),
+    ) as { work_dir?: string };
+    expect(workDir).toBe(backendConfig.work_dir);
     // Observe-only: macOS bare stays ONLINE — it must NOT drop the network.
     expect(env['SCRIPT_JAIL_PHASE_B_UNSHARE_NET']).toBeUndefined();
     // Provisioned bin dir is PREPENDED so bare npm/pnpm/yarn resolve to it.

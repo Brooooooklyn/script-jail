@@ -1667,6 +1667,13 @@ const LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = new Set([
   // binaries to (SIP strips DYLD_* for /bin and /usr/bin).  The shim captures
   // it at ctor; allowed so descendants see the same sticky value.
   'SCRIPT_JAIL_SHELL_SHIM_DIR',
+  // macOS-bare only.  The install/repo root (config.work_dir).  The shim
+  // captures it at ctor into CANON_WORK_DIR and uses it as is_external_system_tool
+  // keep-root #6 so the WHOLE install tree — incl. top-level node_modules/.bin
+  // helpers that are SIBLINGS of a lifecycle child's chdir'd cwd — stays audited
+  // (the top-level-.bin false-strip).  Allowed so descendants see the same sticky
+  // value; the shim re-injects it on every kept exec regardless.
+  'SCRIPT_JAIL_WORK_DIR',
   // NOTE: SCRIPT_JAIL_MACOS_AUDIT_OPS is deliberately NOT allow-listed here.
   // It is an internal per-phase control set solely by main() (deleted from the
   // Phase-A fetch env, set to '1' on the Phase-B install env).  Allow-listing it
@@ -1978,6 +1985,16 @@ export function buildChildEnvMacos(
   if (shellShimDir !== undefined && shellShimDir.length > 0) {
     env['SCRIPT_JAIL_SHELL_SHIM_DIR'] = shellShimDir;
   }
+
+  // Pass the install/repo root down so the shim's `shim_init` captures it into
+  // CANON_WORK_DIR and `is_external_system_tool` keeps the WHOLE install tree —
+  // node_modules/<pkg> AND its SIBLING node_modules/.bin/<helper> — audited.
+  // Without this, a top-level `.bin` helper that runs after a lifecycle script
+  // `chdir`s into a package dir falls outside every other keep-root and would be
+  // FALSE-STRIPPED of DYLD, blinding it (and its subtree) and tripping a spurious
+  // parity GATE FAILURE vs Linux.  Sticky + re-injected by the shim (and audited
+  // as env_tamper if a script unsets it), exactly like SCRIPT_JAIL_SHELL_SHIM_DIR.
+  env['SCRIPT_JAIL_WORK_DIR'] = config.work_dir;
 
   return env;
 }

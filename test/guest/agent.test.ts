@@ -1412,6 +1412,57 @@ describe('buildChildEnv lifecycle env sanitization', () => {
   });
 });
 
+describe('buildChildEnvMacos macOS sticky env contract', () => {
+  function makeConfig(workDir: string): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: [] },
+      spoof: { platform: 'darwin', arch: 'arm64' },
+      node_version: '24.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: workDir,
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('sets SCRIPT_JAIL_WORK_DIR to config.work_dir so the shim keeps node_modules/.bin audited', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+
+    const env = buildChildEnvMacos(
+      { PATH: '/usr/bin:/bin', SCRIPT_JAIL_SHELL_SHIM_DIR: '/fake/shims' },
+      makeConfig('/staged/repo/work'),
+      '/tmp/events.jsonl',
+    );
+
+    // Mirrors the SCRIPT_JAIL_SHELL_SHIM_DIR contract: the shim captures this at
+    // ctor into CANON_WORK_DIR (keep-root #6) so a top-level node_modules/.bin
+    // helper stays audited after a lifecycle chdir (the false-strip class).
+    expect(env['SCRIPT_JAIL_WORK_DIR']).toBe('/staged/repo/work');
+    expect(env['SCRIPT_JAIL_SHELL_SHIM_DIR']).toBe('/fake/shims');
+  });
+
+  it('keeps SCRIPT_JAIL_WORK_DIR on a lifecycle child (allow-listed, not sanitized away)', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+
+    // baseEnv carries an AMBIENT SCRIPT_JAIL_WORK_DIR; it must survive
+    // sanitizeLifecycleBaseEnv (allow-listed) and be re-asserted to config.work_dir.
+    const env = buildChildEnvMacos(
+      {
+        PATH: '/usr/bin:/bin',
+        SCRIPT_JAIL_WORK_DIR: '/ambient/work',
+        SCRIPT_JAIL_UNKNOWN_VAR: 'stripped',
+      },
+      makeConfig('/staged/repo/work'),
+      '/tmp/events.jsonl',
+    );
+
+    expect(env['SCRIPT_JAIL_WORK_DIR']).toBe('/staged/repo/work');
+    // Unknown SCRIPT_JAIL_* vars are still stripped (allow-list invariant intact).
+    expect(env).not.toHaveProperty('SCRIPT_JAIL_UNKNOWN_VAR');
+  });
+});
+
 describe('MemoryConnection', () => {
   it('readable and writable are the passed streams', () => {
     const r = new PassThrough();

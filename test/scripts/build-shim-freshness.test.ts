@@ -109,7 +109,7 @@ describe('shimArtifactIsStale', () => {
     }
   });
 
-  it('skips missing sources rather than treating them as ancient', () => {
+  it('fails closed (stale) when a declared source is missing, even if the rest are older', () => {
     const dir = mkdtempSync(join(tmpdir(), 'shim-missing-'));
     try {
       const artifact = join(dir, 'libscriptjail.so');
@@ -123,9 +123,10 @@ describe('shimArtifactIsStale', () => {
       const now = new Date();
       utimesSync(artifact, now, now);
 
-      // The missing path is silently skipped; only `present` factors in,
-      // and it's older than the artifact → fresh.
-      expect(shimArtifactIsStale(artifact, [present, missing])).toBe(false);
+      // Even though `present` is older than the artifact, a MISSING declared
+      // source means the checkout is incomplete → force a rebuild (which then
+      // fails loudly on the real missing input) rather than trust the artifact.
+      expect(shimArtifactIsStale(artifact, [present, missing])).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -167,5 +168,8 @@ describe('shimSourceInputs', () => {
     // editing either must bust the freshness gate so the cached dylib rebuilds.
     expect(inputs).toContain('/repo/src/shim/build.rs');
     expect(inputs).toContain('/repo/src/shim/src/open_variadic.c');
+    // macOS-26 non-`_np` posix_spawn chdir interposes — also compiled by build.rs
+    // via the cc crate, so editing it must bust the freshness gate too.
+    expect(inputs).toContain('/repo/src/shim/src/sj_spawn_chdir_np2.c');
   });
 });
