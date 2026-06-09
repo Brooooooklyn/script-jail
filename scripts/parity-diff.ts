@@ -268,6 +268,15 @@ const PARITY_ONLY_ENV_READS = new Set([
   'COREPACK_HOME',
   'SCRIPT_JAIL_MACOS_AUDIT_OPS',
   'SCRIPT_JAIL_SHELL_SHIM_DIR',
+  // The macOS-bare guest passes the per-install work dir to its provisioned
+  // node/shell via SCRIPT_JAIL_WORK_DIR (the keep-root anchor for the external-
+  // tool blinding — see is_external_system_tool in src/shim/src/lib.rs).  Lifecycle
+  // scripts inherit it and env-spy records the read, so it surfaces on macOS-bare
+  // for every package; the Linux backend has no analog.  Like the other
+  // SCRIPT_JAIL_* provisioning vars above, it is harness plumbing, not dependency
+  // behavior — a package READING it is still recorded in the macOS lock; only the
+  // cross-backend one-sided presence is reconciled here.
+  'SCRIPT_JAIL_WORK_DIR',
   '_',
   'SHLVL',
   'TMPDIR',
@@ -578,30 +587,10 @@ class ParityArgError extends Error {
   }
 }
 
-// The observe-only EGRESS-EVIDENCE of a divergent-package lifecycle stage,
-// captured per side BEFORE the block is dropped from the byte comparison.  The
-// reconciliation pass in main() cross-checks the VALIDATED side's waivable
-// network_attempts against the SOURCE-OF-TRUTH side's block for the SAME
-// `${pkg}\t${phase}` composite (see reconcileObserveOnly).  We deliberately do
-// NOT carry the truth side's external_reads/escaped_writes: an earlier design
-// used them as write anchors, but a divergent package can INFLUENCE what it reads
-// (a non-sensitive path it chooses), which let a compromised package launder a
-// real escaped write under an attacker-picked anchor (adversarial review).  Write
-// waiving is now gated on a HARDCODED per-package download-root allowlist
-// (PARITY_DIVERGENT_DOWNLOAD_ROOTS), never on truth-side content.
-interface DivergentBlockContent {
-  networkAttempts: readonly string[];
-}
-
 interface CanonResult {
   text: string;
   dangers: DangerFinding[];
   divergentKeys: Set<string>;
-  // Per divergent-package lifecycle stage, keyed by the same `${pkg}\t${phase}`
-  // composite as divergentKeys, the raw (strict-validated) network/read/write
-  // lists that side recorded.  Only populated for PARITY_DIVERGENT_PACKAGES (the
-  // observe-only reconciliation in main() never touches anything else).
-  divergentBlocks: Map<string, DivergentBlockContent>;
 }
 
 // A whole-lock fatal danger (parse / structure / schema).  When present on
@@ -621,18 +610,17 @@ function wholeLockDanger(side: string, field: string, value: string): DangerFind
 // backends yields identical bytes, and only a real difference survives the diff.
 function canonicalize(content: string, side: string): CanonResult {
   const noKeys = new Set<string>();
-  const noBlocks = new Map<string, DivergentBlockContent>();
 
   let doc: ReturnType<typeof parseDocument>;
   try {
     doc = parseDocument(content, { merge: false });
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys, divergentBlocks: noBlocks };
+    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys };
   }
   if (doc.errors.length > 0) {
     const detail = doc.errors.slice(0, 3).map((e) => e.message).join('; ');
-    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys, divergentBlocks: noBlocks };
+    return { text: '', dangers: [wholeLockDanger(side, 'yaml', `lockfile did not parse as YAML: ${detail}`)], divergentKeys: noKeys };
   }
 
   // Reject the YAML features that let raw text and parsed structure disagree
@@ -641,7 +629,7 @@ function canonicalize(content: string, side: string): CanonResult {
   // a conformant lock has none — a tampered one fails CLOSED here.
   const structural = structuralReject(doc);
   if (structural !== null) {
-    return { text: '', dangers: [wholeLockDanger(side, 'structure', structural)], divergentKeys: noKeys, divergentBlocks: noBlocks };
+    return { text: '', dangers: [wholeLockDanger(side, 'structure', structural)], divergentKeys: noKeys };
   }
 
   // Strict schema validation.  Guarantees every watched field is a string[] and
@@ -657,7 +645,6 @@ function canonicalize(content: string, side: string): CanonResult {
       text: '',
       dangers: [wholeLockDanger(side, 'schema', `lockfile does not conform to the lock schema: ${detail}`)],
       divergentKeys: noKeys,
-      divergentBlocks: noBlocks,
     };
   }
 
@@ -668,7 +655,6 @@ function canonicalize(content: string, side: string): CanonResult {
   // from the rest.  render.ts always emits a list that filters down to empty as
   // `[]`, so no separate "collapse empty list" pass is needed.
   const divergentKeys = new Set<string>();
-  const divergentBlocks = new Map<string, DivergentBlockContent>();
   const packages = new Map<string, PackageBlock>();
   for (const [key, pkgVal] of Object.entries(parsed.data.packages)) {
     if (PARITY_DIVERGENT_PACKAGES.some((p) => key.startsWith(p))) {
@@ -679,15 +665,8 @@ function canonicalize(content: string, side: string): CanonResult {
       // other (adversarial review round-5).  `\t` cannot appear in a package key
       // or lifecycle stage name, so it is an unambiguous composite separator.
       divergentKeys.add(key);
-      for (const [stage, block] of Object.entries(pkgVal.lifecycle)) {
+      for (const stage of Object.keys(pkgVal.lifecycle)) {
         divergentKeys.add(`${key}\t${stage}`);
-        // Capture this stage's RAW (strict-validated) network attempts keyed by
-        // the same composite, so the observe-only reconciliation in main() can
-        // confirm the source-of-truth side ALSO attempted egress here before
-        // waiving the validated side's network finding.
-        divergentBlocks.set(`${key}\t${stage}`, {
-          networkAttempts: block.network_attempts,
-        });
       }
       continue;
     }
@@ -706,7 +685,7 @@ function canonicalize(content: string, side: string): CanonResult {
     packages,
   });
 
-  return { text, dangers, divergentKeys, divergentBlocks };
+  return { text, dangers, divergentKeys };
 }
 
 // Reject YAML aliases, anchors, and merge keys.  Returns a reason string when
@@ -974,32 +953,40 @@ function stripBlockedConnect(item: string): string {
 // it never enforces offline.  So a network-download divergent package
 // (PARITY_DIVERGENT_PACKAGES — puppeteer@, @swc/core@, unrs-resolver@) ACTUALLY
 // completes its download on macOS — a real `connect` to the CDN plus real
-// `escaped_writes` of the downloaded files — whereas Linux Phase B runs offline
-// (`unshare -n`), so the SAME package only ATTEMPTS egress (`<BLOCKED> connect …`)
-// and writes nothing.  `collectDivergentDangers` hard default-denies every
-// `escaped_writes` and every non-resolver `network_attempts` inside a divergent
-// package, so that macOS download fails the diff-macos-bare gate even though it is
-// the legitimate downstream effect of the egress Linux already attempted.
+// `escaped_writes` of the downloaded files.  Linux Phase B runs offline
+// (`unshare -n`): the SAME download dies at DNS resolution before any connect
+// survives, so the Linux lock records `network_attempts: []` and writes nothing
+// (VERIFIED across the whole parity fixture — every Linux block is empty).
+// `collectDivergentDangers` hard default-denies every `escaped_writes` and every
+// non-resolver `network_attempts` inside a divergent package, so that macOS
+// download would fail the diff-macos-bare gate even though it is the legitimate
+// downstream effect of the package's own install.
 //
 // THE ASYMMETRIC-SUBSET MODEL.  Under `--source-of-truth left`, Linux is the
 // single source of truth (the committed lockfile is generated there) and macOS is
-// VALIDATED as a SUBSET of it.  When the trusted side ATTEMPTED the egress for a
-// given divergent package/stage, the macOS-side consequence of observe-only
-// COMPLETING that egress (the download's writes + the connect that reached the
-// CDN) is accepted — but ONLY against evidence on the trusted side, and ONLY for
-// the two observe-only-network consequence fields.
+// VALIDATED as a SUBSET of it.  The macOS-side consequence of observe-only
+// COMPLETING a download (its writes + the connect that reached the CDN) is
+// accepted — but ONLY for the two observe-only-network consequence fields, and each
+// behind its OWN curated bound: a WRITE waives only at/under the package's HARDCODED
+// download root (PARITY_DIVERGENT_DOWNLOAD_ROOTS); a CONNECT is tolerated only for a
+// (package, phase) on the EXPLICIT egress allowlist (PARITY_OBSERVE_ONLY_EGRESS_ALLOW
+// — a curated CI decision, NOT derived from any package write).  Both bounds are
+// repo-committed, NOT trusted-side content (offline Linux produces no comparable
+// signal to anchor on — see below).
 //
 // WHY ONLY escaped_writes + network_attempts.  These are the only fields whose
 // macOS-side presence is the direct, expected consequence of observe-only letting
-// a Linux-attempted egress finish.  dlopen_attempts, audit_bypass, env_tamper, a
-// sensitive env/file READ, and an unapproved spawn are NEVER downstream of a
-// blocked connect — they are independent escape signals, so they stay fully
-// default-deny and are never waived here.
+// a download finish.  dlopen_attempts, audit_bypass, env_tamper, a sensitive
+// env/file READ, and an unapproved spawn are NEVER downstream of a download — they
+// are independent escape signals, so they stay fully default-deny and are never
+// waived here.
 //
-// THE WRITE-ROOT ALLOWLIST.  A waived `escaped_writes` value must sit AT or UNDER
-// a HARDCODED per-package download root (PARITY_DIVERGENT_DOWNLOAD_ROOTS) — the dir
-// that package is known to populate when observe-only lets its install download
-// finish.  An earlier design bound the write to any path the TRUSTED side
+// THE WRITE WAIVER — HARDCODED DOWNLOAD ROOT.  An escaped_write is waived ONLY
+// when its package has a HARDCODED download root (PARITY_DIVERGENT_DOWNLOAD_ROOTS)
+// AND the (lexically `.`/`..`-collapsed) value is at/under that root — the dir the
+// package is known to populate when observe-only lets its install download finish.
+// A divergent package with NO listed root (e.g. @swc/core, unrs-resolver) waives no
+// writes at all.  An earlier design bound the WRITE to any path the TRUSTED side
 // referenced (its external_reads ∪ escaped_writes), but a divergent package can
 // INFLUENCE what it reads (any non-sensitive path it chooses), so it could read a
 // benign 2-segment dir and then launder a real payload write under that attacker-
@@ -1009,23 +996,41 @@ function stripBlockedConnect(item: string): string {
 // entry, `$HOME/.ssh/authorized_keys`, …) is ALWAYS flagged, no matter what the
 // trusted side read.
 //
-// WHY NO EGRESS REQUIREMENT FOR WRITES.  The download-root allowlist is itself the
-// tight gate: a write under a package's OWN cache dir is the benign download
-// consequence regardless of whether the trusted side happened to attempt egress in
-// this particular run (it may have hit a warm cache).  network_attempts DO require
-// trusted-side egress evidence (below) — they have no path to anchor on.
+// THE CONNECT WAIVER — EXPLICIT, REPO-COMMITTED EGRESS ALLOWLIST (NOT a package
+// write).  An earlier revision derived the connect waiver from a package-controlled
+// write: a connect was demoted whenever THIS package also recorded a waivable
+// escaped_write under its own download root in the same phase.  Adversarial review
+// (round 3) showed that is FORGEABLE — a compromised puppeteer can write a throwaway
+// `$HOME/.cache/puppeteer/.sentinel` to mint the "download evidence" and ride an
+// arbitrary `connect 8.8.8.8:443` through.  Demoting it to a non-failing TOLERATED
+// line did not fix that: CI fails only on a non-zero exit, so a tolerated connect
+// still SHIPS.  The fix per that review: the connect exception is now a CURATED,
+// repo-committed (pkg-prefix, phase) allowlist — PARITY_OBSERVE_ONLY_EGRESS_ALLOW —
+// that no package can influence.  `egressAcknowledged(pkg, phase)` is the ONLY gate:
+// a connect is TOLERATED iff the package+phase is on that list (puppeteer@/postinstall
+// today) and BLOCKING otherwise — independent of any write.  @swc/core, unrs-resolver,
+// and puppeteer in any non-acknowledged phase all keep their connects default-deny, so
+// they still fail the gate.  Host is NOT matched: the CDN rotates IPs run-to-run
+// (142.251.218.187 → .219) and the lock stores raw IPs, so no sound host pin exists.
+//
+// WHY TOLERATED-AND-SURFACED, NOT SILENT.  Even an acknowledged connect is printed
+// as a non-failing `~~ TOLERATED` line (formatTolerated) and listed in the markdown
+// report.  macOS-bare is observe-only — it records egress, it never blocks it — so
+// the curated exception is destination-agnostic by necessity; surfacing keeps the
+// (rare, curated) egress auditable instead of erasing it.
 //
 // ACCEPTED RESIDUALS (owner decision, F1/F2 — see docs/divergence.md).  (1) A
 // compromised divergent-allowlisted package could write a payload UNDER its own
 // download root (e.g. `$HOME/.cache/puppeteer/evil`) un-flagged — bounded to that
-// package's own cache dir (not a system-persistence location), and Firecracker
-// (offline Phase B) is the enforcement boundary.  (2) network_attempts to an
-// arbitrary host are waived on the trusted side's egress evidence with NO host
-// match: observe-only legitimately reaches a different/further host than offline
-// Linux blocked (the blocked DNS resolver vs. the CDN the lookup resolves to), and
-// macOS-bare is explicitly NOT the egress boundary — egress prevention + DNS-qname
-// capture are Firecracker's job, not this diff's.  Do NOT "tighten" the network
-// waiver by host; it cannot be done soundly on an observe-only backend.
+// package's own cache dir (not a system-persistence location).  (2) A compromised
+// puppeteer could, in its acknowledged postinstall phase, `connect` to an ARBITRARY
+// host and have it TOLERATED (the waiver is destination-agnostic; the exception is
+// puppeteer@/postinstall by curated policy).  Both are bounded by: the exception is a
+// FIXED repo-committed list no package can grow, the connect stays SURFACED for audit,
+// and Firecracker (offline Phase B) — never macOS-bare — is the egress enforcement
+// boundary.  Do NOT re-derive the connect waiver from package writes or from trusted-
+// side egress; neither can be done soundly on an observe-only backend whose offline
+// counterpart records nothing.
 
 // Per-divergent-package download roots: the dir(s) a package is known to populate
 // when observe-only lets its install download finish.  A macOS escaped_write is
@@ -1044,6 +1049,53 @@ const PARITY_DIVERGENT_DOWNLOAD_ROOTS: ReadonlyArray<{ prefix: string; roots: re
 function downloadRootsFor(pkg: string): readonly string[] {
   const entry = PARITY_DIVERGENT_DOWNLOAD_ROOTS.find((e) => pkg.startsWith(e.prefix));
   return entry ? entry.roots : [];
+}
+
+// EXPLICIT, repo-committed acknowledgement of which observe-only divergent packages
+// legitimately egress (download) in which install phase.  This is the CI-controlled
+// policy that gates the connect waiver — the fix for adversarial review round 3,
+// which showed that deriving the waiver from a package-controlled write (a cache
+// file the package itself creates) is forgeable.  A connect is TOLERATED iff its
+// (package-prefix, phase) is listed here; nothing a package DOES at install time can
+// add itself.  Keep this list MINIMAL and evidence-backed — every entry is a host
+// promising "this package really does reach the network in this phase, and macOS-bare
+// (observe-only) cannot block it; Firecracker is where that egress is actually
+// stopped."  A divergent package NOT listed here (or listed but in a different phase)
+// keeps every non-resolver connect BLOCKING.
+//
+// INHERITED RESIDUAL — forgeable package LABEL (adversarial review round 11, ACCEPTED
+// owner decision).  This gate keys on `f.pkg`, the package label.  That label is NOT
+// a CI-controlled fact: the guest derives it from the observed process's own
+// `npm_package_name` / `npm_package_version` env via a `/proc/<pid>/environ` walk
+// (src/guest/attribution.ts:188-205), and a malicious lifecycle script can spawn a
+// child with forged `npm_package_name=puppeteer` so that child's connect is recorded
+// under `puppeteer@…` upstream — a KNOWN, documented v1 attribution limitation
+// (attribution.ts:188-195 `TODO(v2)`; docs/design.md "Not defended … UID separation";
+// pinned by test/guest/attribution.test.ts).  So a forged-puppeteer connect to an
+// ARBITRARY host is tolerated here.  This is NOT closeable in the differ: the entire
+// divergent block (its writes, its connects, its key) is attributed by the same
+// forgeable env, so there is no un-forgeable signal in the lock to tell real puppeteer
+// from a forgery — and tolerating puppeteer's real download connect (required for a
+// green gate) inherently tolerates a forged one.  It is BOUNDED because (1) the label
+// is orthogonal to enforcement: Firecracker/Linux Phase B is offline, so egress is
+// BLOCKED regardless of which package it is labelled under — this name-keyed allowlist
+// only applies on macOS-bare, which is explicitly NOT the egress boundary; and (2) the
+// connect stays SURFACED (formatTolerated + report), mislabelled but never hidden.
+// The complete fix is v2 attribution hardening (trusted lifecycle roots / UID
+// separation), out of scope here.  See docs/divergence.md.
+const PARITY_OBSERVE_ONLY_EGRESS_ALLOW: ReadonlyArray<{ prefix: string; phases: readonly string[] }> = [
+  // puppeteer's postinstall (install.mjs → puppeteer/internal/node/install.js)
+  // downloads Chrome / chrome-headless-shell from the Google CDN.  macOS-bare
+  // observe-only lets it complete; offline Linux Phase B blocks it (DNS dies under
+  // `unshare -n`).  This is the single intentional egress divergence on the gate.
+  { prefix: 'puppeteer@', phases: ['postinstall'] },
+];
+
+// Is this package+phase an explicitly acknowledged observe-only egress?  The ONLY
+// gate for the connect waiver — independent of any (forgeable) package write.
+function egressAcknowledged(pkg: string, phase: string): boolean {
+  const entry = PARITY_OBSERVE_ONLY_EGRESS_ALLOW.find((e) => pkg.startsWith(e.prefix));
+  return entry ? entry.phases.includes(phase) : false;
 }
 
 // Lexically collapse `.`/`..` over a TOKENIZED path before the download-root
@@ -1082,45 +1134,65 @@ function lexicalNormalizeToken(value: string): string | null {
   return tail.length > 0 ? `${head}/${tail.join('/')}` : head;
 }
 
-// Filter the VALIDATED side's escaped_writes / network_attempts findings against
-// the SOURCE-OF-TRUTH side's divergent blocks, per the observe-only model above.
-// Returns a NEW findings array; every other finding (and the source-of-truth
-// side's findings) passes through unchanged.  `null` source-of-truth → identity
-// (preserves the strict symmetric default).  A pure post-filter: it never adds a
-// finding and never touches collectDivergentDangers, filterBlock, or presence.
+// Partition the VALIDATED side's escaped_writes / network_attempts findings per the
+// observe-only model above.  Returns { kept, tolerated }:
+//   - kept      → still BLOCKING (fail the gate): everything not waivable, every
+//                 non-divergent finding, every write outside the package's own
+//                 download root, and every connect whose (package, phase) is NOT on
+//                 the explicit egress allowlist.
+//   - tolerated → a connect whose (package, phase) IS on the egress allowlist
+//                 (egressAcknowledged → PARITY_OBSERVE_ONLY_EGRESS_ALLOW).  NOT
+//                 blocking, but SURFACED as a non-failing warning (formatTolerated)
+//                 so the curated egress is never silently dropped.
+// `null` source-of-truth → caller uses the identity { kept: dangers, tolerated: [] }.
+// A pure post-pass: it never adds a finding and never touches collectDivergentDangers,
+// filterBlock, or presence.  Waived under-root WRITES are dropped silently (benign
+// own-cache writes); only CONNECTS are tolerated-but-visible (the egress signal).
 function reconcileObserveOnly(
   validated: CanonResult,
-  truth: CanonResult,
-): DangerFinding[] {
-  return validated.dangers.filter((f) => {
+): { kept: DangerFinding[]; tolerated: DangerFinding[] } {
+  const kept: DangerFinding[] = [];
+  const tolerated: DangerFinding[] = [];
+  for (const f of validated.dangers) {
     // Only the two observe-only-network consequence fields are ever waivable.
-    if (f.field !== 'escaped_writes' && f.field !== 'network_attempts') return true;
+    if (f.field !== 'escaped_writes' && f.field !== 'network_attempts') { kept.push(f); continue; }
     // By construction every finding from collectDivergentDangers in these fields
     // is inside a divergent package, but guard explicitly rather than assume.
-    if (!PARITY_DIVERGENT_PACKAGES.some((p) => f.pkg.startsWith(p))) return true;
+    if (!PARITY_DIVERGENT_PACKAGES.some((p) => f.pkg.startsWith(p))) { kept.push(f); continue; }
 
     if (f.field === 'escaped_writes') {
-      // Waive ONLY a write at/under one of THIS package's hardcoded download roots
-      // (the equality case covers the download root dir itself, which observe-only
-      // creates to begin the download).  Never derive the anchor from the
-      // (influenceable) trusted side — see THE WRITE-ROOT ALLOWLIST above.
-      // Normalize `.`/`..` first so a traversal escape under the root prefix
-      // (`$HOME/.cache/puppeteer/../../.ssh/...`) cannot launder a write outside it.
+      // Waive (drop silently) ONLY a write at/under one of THIS package's HARDCODED
+      // download roots (PARITY_DIVERGENT_DOWNLOAD_ROOTS; the equality case covers the
+      // root dir itself, which observe-only creates to begin the download).  A
+      // divergent package with NO listed root (e.g. @swc/core, unrs-resolver) waives
+      // no writes.  Normalize `.`/`..` first so a traversal escape under the prefix
+      // (`$HOME/.cache/puppeteer/../../.ssh/...`) cannot launder a write outside it —
+      // see THE WRITE WAIVER above.
       const roots = downloadRootsFor(f.pkg);
+      if (roots.length === 0) { kept.push(f); continue; }
       const canon = lexicalNormalizeToken(f.value);
-      if (canon === null) return true; // traversal escaped the token head → keep (never waive)
-      return !roots.some((root) => canon === root || canon.startsWith(`${root}/`));
+      if (canon === null) { kept.push(f); continue; } // traversal escaped the token head → keep
+      if (roots.some((root) => canon === root || canon.startsWith(`${root}/`))) continue; // benign cache write
+      kept.push(f); continue;
     }
 
-    // network_attempts: waive only when the SOURCE-OF-TRUTH side ALSO attempted
-    // egress for this exact pkg+phase (evidence the package reaches for the network
-    // here).  No block, or a block with no network attempt, means there is nothing
-    // to validate against → keep the finding.  No host match — observe-only
-    // legitimately reaches a different/further host than offline Linux blocked.
-    const truthBlock = truth.divergentBlocks.get(`${f.pkg}\t${f.phase}`);
-    if (truthBlock === undefined || truthBlock.networkAttempts.length === 0) return true;
-    return false; // egress evidence present → waive the macOS-side connect
-  });
+    // network_attempts: a non-resolver connect is TOLERATED (non-failing, but
+    // SURFACED) ONLY when its (package, phase) is on the EXPLICIT repo-committed
+    // egress allowlist (egressAcknowledged → PARITY_OBSERVE_ONLY_EGRESS_ALLOW).  This
+    // gate is INDEPENDENT of any package write — a compromised package cannot mint it
+    // by writing a cache file (the round-3 forgery the same-phase-download rule was
+    // vulnerable to).  Everything else — @swc/core, unrs-resolver, puppeteer in a
+    // non-acknowledged phase — stays BLOCKING.  We do NOT fail the gate on an
+    // acknowledged connect: macOS-bare is observe-only (records, never blocks),
+    // Firecracker (offline Linux) is the enforcement boundary, and the destination is
+    // NOT matched (the CDN rotates IPs run-to-run, and the lock stores raw IPs).
+    // Because the exception is a curated host decision rather than a sound parity
+    // match, the connect stays VISIBLE as a non-failing warning (formatTolerated),
+    // never silently erased.  See docs/divergence.md.
+    if (egressAcknowledged(f.pkg, f.phase)) tolerated.push(f);
+    else kept.push(f);
+  }
+  return { kept, tolerated };
 }
 
 function canonicalizeNpmDebugLog(line: string): string {
@@ -1221,8 +1293,9 @@ function renderMarkdownReport(args: {
   ok: boolean;
   diff: string;
   dangers: DangerFinding[];
+  tolerated: DangerFinding[];
 }): string {
-  const { opts, ok, diff, dangers } = args;
+  const { opts, ok, diff, dangers, tolerated } = args;
   const table = [
     '| side | path | label |',
     '|---|---|---|',
@@ -1231,6 +1304,22 @@ function renderMarkdownReport(args: {
     '',
   ];
 
+  // Non-failing tolerated observe-only egress, surfaced (never silently dropped)
+  // for audit on BOTH a passing and a diverging report — see docs/divergence.md.
+  const toleratedSection: string[] = [];
+  if (tolerated.length > 0) {
+    toleratedSection.push(
+      `**Tolerated observe-only egress (${tolerated.length}, NON-failing):** these connects come from a package+phase on the explicit, repo-committed egress allowlist (\`PARITY_OBSERVE_ONLY_EGRESS_ALLOW\`) — not derived from any package write. macOS-bare observes but never blocks; Firecracker (offline Linux) is the enforcement boundary. The exception is a curated, destination-agnostic host decision, so these connects are surfaced for audit rather than silently waived — they do NOT fail parity.`,
+      '',
+      '| side | package | phase | field | value |',
+      '|---|---|---|---|---|',
+      ...tolerated.map(
+        (d) => `| ${d.side} | \`${d.pkg}\` | ${d.phase} | ${d.field} | \`${d.value.replace(/\|/g, '\\|')}\` |`,
+      ),
+      '',
+    );
+  }
+
   if (ok) {
     return [
       '# Parity report',
@@ -1238,6 +1327,7 @@ function renderMarkdownReport(args: {
       `**Verdict:** parity holds — the canonical re-renders are byte-equal, every divergent package is present on both sides, and no dangerous signal was found in any excluded divergent package.`,
       '',
       ...table,
+      ...toleratedSection,
       'Volatile fields (`generated_at`, `manager_lockfile_sha256`) and known parity-only host/VMM noise were canonicalised before comparison.',
       '',
     ].join('\n');
@@ -1264,6 +1354,8 @@ function renderMarkdownReport(args: {
       '',
     );
   }
+
+  parts.push(...toleratedSection);
 
   if (diff.trim() !== '') {
     const { insertions, deletions, hunks } = summariseDiff(diff);
@@ -1321,17 +1413,17 @@ function main(argv: ReadonlyArray<string>): number {
   const right = canonicalize(rightRaw, opts.rightLabel);
 
   // Observe-only divergence reconciliation (see reconcileObserveOnly).  Under the
-  // asymmetric `--source-of-truth` model, drop the VALIDATED side's escaped_writes
-  // / network_attempts findings that are the legitimate downstream effect of an
-  // egress the SOURCE-OF-TRUTH side already attempted.  `null` → no reconciliation
-  // (strict symmetric default).  Pure post-filter: only the validated side's
-  // waivable findings are dropped; everything else is unchanged.
-  const leftDangers =
-    opts.sourceOfTruth === 'right' ? reconcileObserveOnly(left, right) : left.dangers;
-  const rightDangers =
-    opts.sourceOfTruth === 'left' ? reconcileObserveOnly(right, left) : right.dangers;
+  // asymmetric `--source-of-truth` model, the VALIDATED side's download-root cache
+  // writes are dropped and its download-phase connects are demoted from BLOCKING to
+  // TOLERATED (surfaced as a non-failing warning, never silently erased).  `null` →
+  // no reconciliation (strict symmetric default): identity { kept, tolerated: [] }.
+  const leftRec =
+    opts.sourceOfTruth === 'right' ? reconcileObserveOnly(left) : { kept: left.dangers, tolerated: [] as DangerFinding[] };
+  const rightRec =
+    opts.sourceOfTruth === 'left' ? reconcileObserveOnly(right) : { kept: right.dangers, tolerated: [] as DangerFinding[] };
 
-  const blockDangers = [...leftDangers, ...rightDangers];
+  const toleratedEgress = [...leftRec.tolerated, ...rightRec.tolerated];
+  const blockDangers = [...leftRec.kept, ...rightRec.kept];
   // A whole-lock fatal danger (parse / structure / schema) means one render is
   // empty and untrustworthy — skip the symmetric-presence check (its divergent
   // key set is empty) and suppress the byte diff (it would be a noisy full-file
@@ -1367,8 +1459,17 @@ function main(argv: ReadonlyArray<string>): number {
     process.stdout.write(formatDangers(dangers));
   }
 
+  // Tolerated observe-only egress is NON-failing but must stay VISIBLE: an
+  // allowlisted (package, phase)'s connect cannot be soundly distinguished from
+  // exfil on an observe-only backend (the exception is a curated, destination-
+  // agnostic host decision), so we surface every such connect rather than dropping
+  // it.  It never changes the exit code — only `dangers` does.
+  if (toleratedEgress.length > 0) {
+    process.stdout.write(formatTolerated(toleratedEgress));
+  }
+
   if (opts.reportPath !== null) {
-    writeFileSync(opts.reportPath, renderMarkdownReport({ opts, ok, diff, dangers }));
+    writeFileSync(opts.reportPath, renderMarkdownReport({ opts, ok, diff, dangers, tolerated: toleratedEgress }));
   }
 
   return ok ? 0 : 1;
@@ -1385,6 +1486,29 @@ function formatDangers(dangers: DangerFinding[]): string {
     '',
   ];
   for (const d of dangers) {
+    lines.push(`  [${d.side}] ${d.pkg} ${d.phase}.${d.field}: ${d.value}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+// Non-failing visibility block for observe-only egress that was tolerated (a
+// connect whose package+phase is on the EXPLICIT egress allowlist,
+// PARITY_OBSERVE_ONLY_EGRESS_ALLOW).  This does NOT fail the gate — macOS-bare
+// records but never blocks egress and the exception is a curated host decision, so
+// the connect is surfaced here for human/audit review rather than silently dropped
+// (adversarial review).  See docs/divergence.md.
+function formatTolerated(tolerated: DangerFinding[]): string {
+  const lines = [
+    '',
+    '~~ TOLERATED observe-only egress (NON-failing) — these connects come from a',
+    '~~ package+phase on the explicit egress allowlist (PARITY_OBSERVE_ONLY_EGRESS_',
+    '~~ ALLOW).  macOS-bare records but never blocks egress; Firecracker (offline',
+    '~~ Linux) is the enforcement boundary.  Surfaced for audit; they do NOT fail',
+    '~~ parity:',
+    '',
+  ];
+  for (const d of tolerated) {
     lines.push(`  [${d.side}] ${d.pkg} ${d.phase}.${d.field}: ${d.value}`);
   }
   lines.push('');

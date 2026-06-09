@@ -492,6 +492,70 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   > persistence location, and Firecracker (offline Phase B) is the enforcement
   > boundary.
 
+  > **Observe-only download CONNECT — explicit egress allowlist, TOLERATED-and-
+  > surfaced.** The same network-download package also makes a real `connect` to the
+  > CDN on macOS-bare, which offline Linux never records: its Phase B (`unshare -n`)
+  > lookup dies at DNS before any connect survives, so EVERY Linux package block is
+  > `network_attempts: []` (verified across the whole parity fixture). A non-resolver
+  > connect is **demoted from blocking to tolerated** by `reconcileObserveOnly` ONLY
+  > when its `(package-prefix, phase)` is on the **explicit, repo-committed egress
+  > allowlist** `PARITY_OBSERVE_ONLY_EGRESS_ALLOW` (`egressAcknowledged`) — today the
+  > single entry `puppeteer@` → `['postinstall']`. This gate is **independent of any
+  > package write**: a divergent package not on the list (`@swc/core`, `unrs-resolver`),
+  > or `puppeteer@` in any other phase (e.g. `preinstall`), gets NO demotion — its
+  > connect stays a BLOCKING danger (the `3b`/`3c` tests pin both bounds). Host is not
+  > matched (the CDN rotates IPs run-to-run, `142.251.218.187` → `.219`, and the lock
+  > stores raw IPs) and there is no trusted-side connect to anchor on.
+  >
+  > **Why an explicit allowlist, not a write-derived gate (adversarial review round
+  > 3).** An earlier revision derived the connect waiver from a same-phase
+  > `escaped_write` under the package's own cache root — "download evidence". That is
+  > **package-controlled and forgeable**: a compromised `puppeteer@` could mint it by
+  > writing a throwaway `$HOME/.cache/puppeteer/.sentinel` and then `connect` anywhere.
+  > Because CI fails only on a non-zero exit, demoting that connect to a non-failing
+  > `TOLERATED` line did not close the hole — the egress still shipped. The fix is to
+  > gate the connect on a **curated CI decision no package can influence**: the
+  > acknowledgement now lives in source (`PARITY_OBSERVE_ONLY_EGRESS_ALLOW`), reviewed
+  > like any other code, and nothing a package does at install time can add itself.
+  > Every acknowledged connect is still **surfaced** as a non-failing `TOLERATED
+  > observe-only egress` entry (stdout block + report table, `formatTolerated`), never
+  > silently dropped (`3d` pins that a connect is tolerated with NO write at all —
+  > proof the gate is allowlist-derived, not write-derived). The gate exits 0 for the
+  > known CDN download (otherwise it false-fails every run — puppeteer always
+  > downloads). **Accepted residual (owner decision):** a compromised `puppeteer@` in
+  > its acknowledged `postinstall` phase could `connect` to an **arbitrary** host and
+  > have it tolerated — the exception is destination-agnostic by necessity (no sound
+  > host pin on an observe-only backend whose offline counterpart records nothing). It
+  > is bounded by: the allowlist is a FIXED repo-committed list, the connect stays
+  > VISIBLE in both the lock and the parity report, and **Firecracker (offline Phase B)
+  > — never macOS-bare — is the egress enforcement boundary**.
+  >
+  > **Inherited residual — forgeable package LABEL (adversarial review round 11,
+  > ACCEPTED owner decision).** The allowlist keys on the package label `f.pkg`, and
+  > that label is **not** a CI-controlled fact: the guest derives it from the observed
+  > process's own `npm_package_name`/`npm_package_version` env via a `/proc/<pid>/environ`
+  > walk (`src/guest/attribution.ts:188-205`). A malicious lifecycle script of *some
+  > other* package can spawn a child with forged `npm_package_name=puppeteer`, so that
+  > child's exfil `connect` is recorded under `puppeteer@…` **upstream**, and the differ
+  > — seeing only the lock — tolerates it. This is the **known, documented v1
+  > attribution limitation** (`attribution.ts:188-195` `TODO(v2)`; `docs/design.md` "Not
+  > defended … the complete fix is UID separation"; pinned by
+  > `test/guest/attribution.test.ts`), surfacing through a new path — **not** a new
+  > hole. It is **not closeable in the differ**: the *entire* divergent block (its
+  > writes, its connects, its key) is attributed by the same forgeable env, so there is
+  > no un-forgeable signal in the lock to distinguish a real puppeteer download from a
+  > forgery, and tolerating puppeteer's *legitimate* download connect (required for a
+  > green gate) inherently tolerates a forged one. The earlier write-derived gate was
+  > forgeable the *same* way (`.sentinel` mint, round 3); moving to a label key did not
+  > add forgeability, it exposed the shared root cause. It is **bounded** by the same
+  > two facts as above: (1) the label is **orthogonal to enforcement** — Firecracker/
+  > Linux Phase B is offline, so egress is BLOCKED regardless of which package the
+  > connect is labelled under; this name-keyed allowlist only applies on macOS-bare,
+  > which is explicitly *not* the egress boundary; and (2) the connect stays **SURFACED**
+  > (mislabelled, never hidden) in both the lock and the parity report (`3e` pins both
+  > bounds). The complete fix is **v2 attribution hardening** (trusted lifecycle roots /
+  > UID separation), out of scope for the parity differ.
+
 - **Parity-only noise filters: env/read GLOBAL, spawn PACKAGE-SCOPED.** The
   reconciliation waivers in `scripts/parity-diff.ts` are split by how the signal
   arises (adversarial review finding #3). The env reads (`LD_PRELOAD` ⇄
