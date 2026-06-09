@@ -67,6 +67,15 @@ const MAX_PROTECTED: usize = 64;
 const NAME_MAX_LEN: usize = 256;
 const JSONL_BUF: usize = 4096;
 const TRUNC_MARKER: &[u8] = b"<truncated>";
+// macOS-only: caps for the `"argv"` array serialized into the exec JSONL record
+// (see `append_argv_field`).  Fixed so the output is DETERMINISTIC regardless of
+// how long / how many argv entries a lifecycle script supplies — a process that
+// times its exec differently must produce byte-identical JSONL.  Truncation past
+// these caps is deterministic (drop trailing elements / clamp per-element).
+#[cfg(target_os = "macos")]
+const MAX_ARGV_ELEMS: usize = 64;
+#[cfg(target_os = "macos")]
+const MAX_ARGV_ELEM_LEN: usize = 512;
 // LOAD-BEARING: must stay in lockstep with `CANON_PROTECTED_ENV_NAMES_MAX_LEN`
 // in `src/shim/canon-buf-len.ts`.  That constant equals `CANON_BUF_LEN - 1`
 // (max payload bytes excluding the NUL terminator) and gates the agent's
@@ -256,12 +265,22 @@ unsafe fn canon_bytes(buf: &CanonBuf) -> &[u8] {
 /// (SCRIPT_JAIL_LOG_FILE, captured into CANON_LOG_FILE at ctor).
 ///
 /// The macOS fileops hooks must NEVER record operations on the shim's OWN
-/// events file: env-spy writes `node_startup_done` JSONL there, and without this
-/// skip that write would surface as a spurious `write` event attributed to the
+/// events file: env-spy opens SCRIPT_JAIL_LOG_FILE BY PATH as its env_read sink
+/// (and re-opens it by path on EBADF — anti-tamper Finding 4), and without this
+/// skip that open would surface as a spurious `write` event attributed to the
 /// running lifecycle script (self-observation of the audit channel).  On Linux
-/// the file-op stream comes from strace, not the shim, so this only matters for
-/// the macOS hooks — hence `#[cfg(target_os = "macos")]`.  Returns false when no
-/// log path was captured (e.g. the fd-only test configuration).
+/// the file-op stream comes from strace and this suppression lives in the
+/// producer (phase-install.ts); here it is applied at source — hence
+/// `#[cfg(target_os = "macos")]`.  Returns false when no log path was captured
+/// (e.g. the fd-only test configuration).
+///
+/// KNOWN RESIDUAL (adversarial review round-10, finding F3): the events path is
+/// READABLE by package code, so a malicious shim-loaded pid that opens this exact
+/// path is also suppressed here — the SAME accepted trusted-pid residual as the
+/// Linux producer drop.  env-spy's legitimate by-path reopen is indistinguishable
+/// from a malicious open at the open() layer, so flagging package opens of the
+/// log path would break the reopen and flake the parity gate.  See the matching
+/// note in src/guest/phase-install.ts and docs/divergence.md.
 #[cfg(target_os = "macos")]
 pub(crate) unsafe fn path_is_audit_log(cpath: *const c_char) -> bool {
     let log = canon_bytes(&CANON_LOG_FILE);
@@ -1328,9 +1347,10 @@ pub(crate) unsafe fn emit_fs(kind: FsKind, path: *const c_char, errno_kind: FsEr
     }
 }
 
-/// connect() result classification.  Mirrors strace-parser.ts:
-///   rc == 0           → "ok"
-///   any error (incl. EINPROGRESS) → "blocked"
+/// connect() result classification.  Mirrors strace-parser.ts (round-12 F3):
+///   rc == 0, or EINPROGRESS / EALREADY / EISCONN (egress in flight or
+///                                    established — SYN already sent) → "ok"
+///   any genuine failure (refused / timed out / unreachable / denied) → "blocked"
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 pub(crate) enum ConnectResult {
@@ -1959,15 +1979,30 @@ enum ExecResult {
     Failed,
 }
 
+// On Linux the trailing macOS-only params (`argv`, `exec_errno`) are unused —
+// the ELF JSONL must stay byte-identical, so they are never serialized there.
+// They are still threaded through the signature so the shared call sites in the
+// exec/spawn dispatchers compile on both targets.
 unsafe fn emit_exec(
     prog: *const c_char,
     argv0: *const c_char,
     envp_alloc_failed: bool,
     result: ExecResult,
     audit_blind: bool,
+    argv: *const *const c_char,
+    exec_errno: c_int,
 ) {
     let pid = libc::getpid();
-    emit_exec_for_pid(prog, argv0, envp_alloc_failed, pid, result, audit_blind);
+    emit_exec_for_pid(
+        prog,
+        argv0,
+        envp_alloc_failed,
+        pid,
+        result,
+        audit_blind,
+        argv,
+        exec_errno,
+    );
 }
 
 /// Append `,"<key>":"<json-escaped value>"` from a CanonBuf into the JSONL
@@ -2032,6 +2067,115 @@ unsafe fn append_canon_field(
     pos
 }
 
+/// macOS-only: append `,"argv":["<esc>","<esc>",…]` (the FULL argv vector) to the
+/// exec JSONL record.  Linux drops exec events in normalize.ts and its goldens
+/// must not move, so this field is gated to `target_os = "macos"` and never
+/// emitted on the ELF build.
+///
+/// Determinism + bounds: the caller passes a 3-byte reserve in `tail_reserve`
+/// (the record's closing `}\n` plus any optional fields emitted after argv).
+/// Every byte is bounds-checked against `buf.len() - tail_reserve`; if the next
+/// element (or the next byte of an element) would not fit, the array is closed
+/// EARLY and we return.  The element COUNT is capped at MAX_ARGV_ELEMS and each
+/// element body at MAX_ARGV_ELEM_LEN escaped bytes, so the output is identical
+/// regardless of how the script timed its exec.  Returns the new write position;
+/// on any failure to fit it leaves a well-formed (possibly truncated) array.
+#[cfg(target_os = "macos")]
+unsafe fn append_argv_field(
+    buf: &mut [u8],
+    mut pos: usize,
+    argv: *const *const c_char,
+    tail_reserve: usize,
+) -> usize {
+    // Hard ceiling every write must respect so the caller's tail (`}\n` + any
+    // post-argv field) always fits.  saturating_sub keeps the limit valid even
+    // if the buffer were ever smaller than the reserve.
+    let limit = buf.len().saturating_sub(tail_reserve);
+
+    // Opening run `,"argv":[` — bail entirely (omit the field) if it would not
+    // fit, leaving `pos` untouched so the caller still produces valid JSON.
+    let open = br#","argv":["#;
+    if pos + open.len() > limit {
+        return pos;
+    }
+    buf[pos..pos + open.len()].copy_from_slice(open);
+    pos += open.len();
+
+    if argv.is_null() {
+        // Null argv → empty array `[]`.  The opening `[` is already written.
+        if pos < limit {
+            buf[pos] = b']';
+            pos += 1;
+        }
+        return pos;
+    }
+
+    let mut first = true;
+    let mut i = 0usize;
+    while i < MAX_ARGV_ELEMS {
+        let elem = *argv.add(i);
+        if elem.is_null() {
+            break; // NULL terminator → end of argv.
+        }
+        // Separator + opening quote for this element.  Need at least
+        // `[,]"` (≤2) + the closing `"` + closing `]` to fit; if the element
+        // opener can't fit we stop and close the array deterministically.
+        let sep_len = if first { 1 } else { 2 }; // `"` or `,"`
+        // Need: sep+open quote (sep_len) + at least the closing value quote (1)
+        // + the array close `]` (1).  If even an empty element won't fit, stop.
+        if pos + sep_len + 1 + 1 > limit {
+            break;
+        }
+        if !first {
+            buf[pos] = b',';
+            pos += 1;
+        }
+        buf[pos] = b'"';
+        pos += 1;
+        first = false;
+
+        // Escape the element body into the space that remains AFTER reserving the
+        // closing value quote (1) and the array close `]` (1).  json_escape never
+        // writes past the slice it is given and clamps with its own marker if
+        // needed.  Additionally clamp the slice to MAX_ARGV_ELEM_LEN so a single
+        // huge arg cannot dominate the whole budget — keeping later elements'
+        // presence deterministic up to the buffer limit.
+        let value_end_cap = (pos + MAX_ARGV_ELEM_LEN).min(limit.saturating_sub(1));
+        let value_end = value_end_cap.max(pos); // never < pos
+        let written = json_escape(&mut buf[pos..value_end], elem);
+        pos += written;
+
+        // Closing value quote — guaranteed to fit by the `+1` reserve above.
+        buf[pos] = b'"';
+        pos += 1;
+        i += 1;
+    }
+
+    // Close the array.  The element loop reserved a byte for `]` on every entry,
+    // and the opening-run check reserved room too, so this fits; guard anyway so
+    // a degenerate buffer can never write out of bounds.
+    if pos < limit {
+        buf[pos] = b']';
+        pos += 1;
+    }
+    pos
+}
+
+/// macOS-only: map a (positive) errno to the short uppercase string the Linux
+/// strace-parser emits (`ENOENT` / `EACCES`).  normalize.ts only renders the two
+/// blocked spawn results derived from these; any other errno yields `None` so the
+/// guest synth drops the failed exec rather than inventing a spurious result.
+#[cfg(target_os = "macos")]
+fn exec_errno_str(e: c_int) -> Option<&'static [u8]> {
+    if e == libc::ENOENT {
+        Some(b"ENOENT")
+    } else if e == libc::EACCES {
+        Some(b"EACCES")
+    } else {
+        None
+    }
+}
+
 // Audit-trust Finding 1 (high): posix_spawn dispatch must emit the shim
 // `exec` event tagged with the CHILD pid (the one strace records the
 // child's execve under), not the parent pid.  Otherwise the
@@ -2052,6 +2196,17 @@ unsafe fn emit_exec_for_pid(
     // outside the audit envelope).  Serialized as `"audit_blind":true` ONLY when
     // true so non-blind records — and every Linux record — stay byte-identical.
     audit_blind: bool,
+    // macOS-only: the FULL argv vector for this exec.  Serialized as
+    // `"argv":[…]` ONLY on macOS so the guest can synthesize a spawn whose
+    // command line matches Linux's full strace argv.  Linux never serializes it
+    // (its ELF JSONL must stay byte-identical and normalize drops exec events).
+    // `_argv` so the Linux build (which ignores it) does not warn.
+    _argv: *const *const c_char,
+    // macOS-only: on a FAILED exec, the errno (execve) or rc-as-errno
+    // (posix_spawn).  Serialized as `"exec_errno":"ENOENT"|"EACCES"` ONLY on
+    // macOS, ONLY for ExecResult::Failed, and ONLY for errnos Linux's strace
+    // parser would record.  Linux passes 0 and never serializes it.
+    _exec_errno: c_int,
 ) {
     let log_fd = LOG_FD.load(Ordering::Acquire);
     if log_fd < 0 {
@@ -2174,6 +2329,36 @@ unsafe fn emit_exec_for_pid(
         if pos + audit_blind_tail.len() + 2 <= buf.len() {
             buf[pos..pos + audit_blind_tail.len()].copy_from_slice(audit_blind_tail);
             pos += audit_blind_tail.len();
+        }
+    }
+
+    // macOS-only: full argv array + failed-exec errno.  Both are gated to
+    // `target_os = "macos"` so the Linux ELF JSONL stays byte-identical (Linux
+    // normalize drops exec events and its goldens must not move).  argv is
+    // emitted BEFORE the npm attribution fields so field ordering is fixed; its
+    // `tail_reserve` is SUFFIX_RESERVE, which already budgets the npm attribution
+    // run (~320 B worst case) + the optional exec_errno field + the `}\n` tail,
+    // so neither argv nor the attribution fields can crowd the closing bytes.
+    #[cfg(target_os = "macos")]
+    {
+        pos = append_argv_field(&mut buf, pos, _argv, SUFFIX_RESERVE);
+        // exec_errno: emitted ONLY for a failed exec and ONLY for an errno Linux's
+        // strace parser would record (ENOENT / EACCES).  The guest synth turns
+        // this into a `<ENOENT>`/`<EACCES>` spawn_blocked entry; an unmapped errno
+        // is omitted (the failed exec is then dropped, matching Linux).
+        if matches!(result, ExecResult::Failed) {
+            if let Some(errno_str) = exec_errno_str(_exec_errno) {
+                // `,"exec_errno":"<str>"` ; `+ 2` reserves the closing `}\n`.
+                let open = br#","exec_errno":""#;
+                if pos + open.len() + errno_str.len() + 1 + 2 <= buf.len() {
+                    buf[pos..pos + open.len()].copy_from_slice(open);
+                    pos += open.len();
+                    buf[pos..pos + errno_str.len()].copy_from_slice(errno_str);
+                    pos += errno_str.len();
+                    buf[pos] = b'"';
+                    pos += 1;
+                }
+            }
         }
     }
 
@@ -2527,14 +2712,16 @@ unsafe fn dispatch_exec(
             // exec FAILED — we emit a second event with `result:"failed"`
             // below so the phase-install cross-check can cancel out the
             // pre-call optimistic event when computing per-pid counts.
-            emit_exec(prog, argv0, false, ExecResult::Ok, false);
+            // Linux: argv/exec_errno are ignored (the ELF JSONL must stay
+            // byte-identical), so pass null/0.
+            emit_exec(prog, argv0, false, ExecResult::Ok, false, ptr::null(), 0);
             let rewritten = buf.ptrs as *const *const c_char;
             let rc = forward_to_real(&kind, prog, argv, rewritten);
             // real_* only returns on failure.  Emit the failure marker
             // BEFORE freeing the envbuf so any allocator-side errno
             // change inside free_envbuf can't clobber the value strace
             // reports for the failed exec.
-            emit_exec(prog, argv0, false, ExecResult::Failed, false);
+            emit_exec(prog, argv0, false, ExecResult::Failed, false, ptr::null(), 0);
             free_envbuf(&mut buf);
             set_in_shim(false);
             rc
@@ -2551,7 +2738,7 @@ unsafe fn dispatch_exec(
             // This path never reaches a real exec (we refuse), so the
             // event is tagged `result:"failed"` — the child never ran.
             set_in_shim(true);
-            emit_exec(prog, argv0, true, ExecResult::Failed, false);
+            emit_exec(prog, argv0, true, ExecResult::Failed, false, ptr::null(), 0);
             set_errno(libc::ENOMEM);
             set_in_shim(false);
             -1
@@ -2617,7 +2804,16 @@ unsafe fn dispatch_spawn(
                 // a degraded but better-than-nothing audit signal and
                 // matches the pre-fix behaviour for that rare case.
                 let child_pid = if !pid.is_null() { *pid } else { libc::getpid() };
-                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok, false);
+                emit_exec_for_pid(
+                    path,
+                    argv0,
+                    false,
+                    child_pid,
+                    ExecResult::Ok,
+                    false,
+                    ptr::null(),
+                    0,
+                );
             } else {
                 // Audit-trust Finding (2026-05-18): record failed
                 // posix_spawn attempts so the phase-install cross-check
@@ -2629,7 +2825,7 @@ unsafe fn dispatch_spawn(
                 // attempt (no child was created), so this event is
                 // purely a forensic marker and contributes 0 net to
                 // the cross-check (no matching strace observation).
-                emit_exec(path, argv0, false, ExecResult::Failed, false);
+                emit_exec(path, argv0, false, ExecResult::Failed, false, ptr::null(), 0);
             }
             free_envbuf(&mut buf);
             set_in_shim(false);
@@ -2648,7 +2844,7 @@ unsafe fn dispatch_spawn(
             // separate signal (`envp_alloc_failed`), not as part of the
             // strace/shim pairing for `<SYSCALL_EXEC_BYPASS>`.
             set_in_shim(true);
-            emit_exec(path, argv0, true, ExecResult::Failed, false);
+            emit_exec(path, argv0, true, ExecResult::Failed, false, ptr::null(), 0);
             set_in_shim(false);
             libc::ENOMEM
         }
@@ -3015,19 +3211,33 @@ unsafe fn dispatch_exec_macos(
             set_in_shim(true);
             // result:"ok" emitted BEFORE the real exec — a successful exec
             // replaces the image and never returns, so this is the only chance
-            // to record the attempt with the calling pid.
-            emit_exec(prog, argv0, false, ExecResult::Ok, audit_blind);
+            // to record the attempt with the calling pid.  Pass the FULL argv so
+            // the macOS record carries the complete command line (Fix E); errno
+            // is irrelevant for the optimistic event so pass 0.
+            emit_exec(prog, argv0, false, ExecResult::Ok, audit_blind, argv, 0);
             let rewritten = buf.ptrs as *const *const c_char;
             let rc = real_execve_raw(prog, argv, rewritten);
-            // Only reached on failure.
-            emit_exec(prog, argv0, false, ExecResult::Failed, audit_blind);
+            // Only reached on failure.  Capture errno IMMEDIATELY (before any
+            // other libc call can clobber it) so the failed-exec record can carry
+            // `exec_errno` (ENOENT/EACCES → `<ENOENT>`/`<EACCES>` spawn_blocked).
+            let exec_errno = errno();
+            emit_exec(
+                prog,
+                argv0,
+                false,
+                ExecResult::Failed,
+                audit_blind,
+                argv,
+                exec_errno,
+            );
             free_envbuf(&mut buf);
             set_in_shim(false);
             rc
         }
         None => {
             set_in_shim(true);
-            emit_exec(prog, argv0, true, ExecResult::Failed, audit_blind);
+            // envp alloc failed: the child never ran, so there is no exec errno.
+            emit_exec(prog, argv0, true, ExecResult::Failed, audit_blind, argv, 0);
             set_errno(libc::ENOMEM);
             set_in_shim(false);
             -1
@@ -3074,13 +3284,36 @@ unsafe fn dispatch_spawn_macos(
                 argv,
                 buf.ptrs as *const *mut c_char,
             );
+            // posix_spawn takes `char *const argv[]` (*const *mut c_char); the
+            // emit helpers want `*const *const c_char`.  The cast is read-only
+            // (the serializer never mutates argv), so it is sound.
+            let argv_const = argv as *const *const c_char;
             if rc == 0 {
                 // posix_spawn writes the child pid; the strace-equivalent
                 // attribution wants the CHILD pid (matches Linux dispatch).
                 let child_pid = if !pid.is_null() { *pid } else { libc::getpid() };
-                emit_exec_for_pid(path, argv0, false, child_pid, ExecResult::Ok, audit_blind);
+                emit_exec_for_pid(
+                    path,
+                    argv0,
+                    false,
+                    child_pid,
+                    ExecResult::Ok,
+                    audit_blind,
+                    argv_const,
+                    0,
+                );
             } else {
-                emit_exec(path, argv0, false, ExecResult::Failed, audit_blind);
+                // posix_spawn RETURNS the errno (it does NOT set errno + return
+                // -1), so `rc` IS the exec errno (e.g. ENOENT).
+                emit_exec(
+                    path,
+                    argv0,
+                    false,
+                    ExecResult::Failed,
+                    audit_blind,
+                    argv_const,
+                    rc,
+                );
             }
             free_envbuf(&mut buf);
             set_in_shim(false);
@@ -3088,7 +3321,16 @@ unsafe fn dispatch_spawn_macos(
         }
         None => {
             set_in_shim(true);
-            emit_exec(path, argv0, true, ExecResult::Failed, audit_blind);
+            // envp alloc failed: the child never ran, so there is no exec errno.
+            emit_exec(
+                path,
+                argv0,
+                true,
+                ExecResult::Failed,
+                audit_blind,
+                argv as *const *const c_char,
+                0,
+            );
             set_in_shim(false);
             libc::ENOMEM
         }

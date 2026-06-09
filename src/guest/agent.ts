@@ -2581,6 +2581,10 @@ export async function main(input: AgentInput): Promise<void> {
   const protectedPaths = new ProtectedPathsMatcher({
     patterns: config.protected.files,
     roots,
+    // macOS-bare shim paths come back /private-canonicalized (F_GETPATH); the
+    // matcher must collapse /private to match the non-/private `roots`, or the
+    // benign cross-package read suppression misfires and floods external_reads.
+    os: isMacosBare ? 'darwin' : 'linux',
   });
 
   const installInput = {

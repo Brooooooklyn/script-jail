@@ -413,11 +413,15 @@ jobs:
   #
   # Unlike the committed-VZ `diff` job above, BOTH sides here are generated on
   # this run (Linux on ubuntu-24.04-arm, macOS-bare on macos-14), so this is a
-  # fully CI-native parity gate.  scripts/parity-diff.ts reconciles the one
-  # documented backend difference — the Linux side runs Phase B OFFLINE so its
-  # connects are `<BLOCKED>`, while macOS-bare is observe-only/ONLINE so its
-  # connects succeed — by stripping the `<BLOCKED> ` prefix from connect entries
-  # on both sides before comparison.  Any remaining byte difference fails here.
+  # fully CI-native parity gate.  Linux runs Phase B OFFLINE via `unshare -n` so
+  # it records `<BLOCKED> connect …`; macOS-bare is OBSERVE-ONLY and stays ONLINE
+  # (the shim forwards connect/connectx and records the TRUE result, gated on
+  # SCRIPT_JAIL_MACOS_AUDIT_OPS).  scripts/parity-diff.ts reconciles the two by
+  # stripping the `<BLOCKED> ` connect prefix, plus the documented host/VMM + macOS-platform
+  # plumbing differences (injection/provisioning env, libSystem/CoreFoundation
+  # runtime probes, the SIP `<AUDIT_BLIND>` git framing, and the intrinsically
+  # platform-divergent package set @swc/core/puppeteer/unrs-resolver).  Any
+  # remaining byte difference fails here.
   # ---------------------------------------------------------------------------
   diff-macos-bare:
     needs: [linux-backend, macos-bare]

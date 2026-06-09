@@ -11,8 +11,7 @@ packages:
           - $REPO
           - $REPO/package.json
           - /usr/bin/ldd
-        escaped_writes:
-          - $TMPDIR/<hash>/<hash>.jsonl
+        escaped_writes: []
         env_read:
           - FORCE_COLOR
           - INIT_CWD
@@ -28,8 +27,7 @@ packages:
       postinstall:
         external_reads:
           - $REPO
-        escaped_writes:
-          - $TMPDIR/<hash>/<hash>.jsonl
+        escaped_writes: []
         env_read:
           - COREPACK_ENABLE_DOWNLOAD_PROMPT
           - COREPACK_HOME
@@ -85,8 +83,7 @@ packages:
           - $REPO
           - $REPO/package.json
           - /
-        escaped_writes:
-          - $TMPDIR/<hash>/<hash>.jsonl
+        escaped_writes: []
         env_read:
           - ALL_PROXY
           - CI
@@ -183,8 +180,7 @@ packages:
         external_reads:
           - $REPO
           - $REPO/package.json
-        escaped_writes:
-          - $TMPDIR/<hash>/<hash>.jsonl
+        escaped_writes: []
         env_read:
           - COREPACK_ENABLE_DOWNLOAD_PROMPT
           - COREPACK_HOME
@@ -238,8 +234,7 @@ packages:
         external_reads:
           - $REPO
           - /usr/bin/ldd
-        escaped_writes:
-          - $TMPDIR/<hash>/<hash>.jsonl
+        escaped_writes: []
         env_read:
           - COLS
           - POSIXLY_CORRECT

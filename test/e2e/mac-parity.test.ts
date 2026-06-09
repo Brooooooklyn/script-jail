@@ -226,8 +226,11 @@ describe.runIf(canRunBare)('macOS bare fake-orchestrator parity', () => {
   //   - a hidden env_read of NPM_TOKEN  → `<HIDDEN> NPM_TOKEN`.
   //   - a write outside the package dir → an escaped write.
   //   - a read of a dyld system framework → dropped by the darwin noise filter.
-  //   - a connect attempt → recorded WITHOUT a prefix on macOS (online,
-  //     observe-only); the Linux side records `<BLOCKED>` (offline Phase B).
+  //   - a connect attempt → recorded with its TRUE result per backend: Linux runs
+  //     Phase B offline (`unshare -n`) so it records `<BLOCKED> connect …`, while
+  //     macOS-bare stays ONLINE (observe-only shim forwards connect) so it records
+  //     a succeeded `connect …` with no prefix.  parity-diff strips the `<BLOCKED> `
+  //     prefix at diff time so the two reconcile.
   const SHIM_LINES = [
     JSON.stringify({
       kind: 'exec', prog: '/usr/local/bin/node', argv0: 'node',
@@ -247,9 +250,12 @@ describe.runIf(canRunBare)('macOS bare fake-orchestrator parity', () => {
     JSON.stringify({ kind: 'read', path: '/System/Library/Frameworks/Foundation.framework/Foundation', pid: INSTALL_PID, ts: 5, hidden: false }),
   ];
 
-  // The connect line differs only in `result` between the two backends.
-  const macosConnect = JSON.stringify({ kind: 'connect', host: '198.51.100.7', port: 443, result: 'ok', pid: INSTALL_PID, ts: 6 });
-  const linuxConnect = JSON.stringify({ kind: 'connect', host: '198.51.100.7', port: 443, result: 'blocked', pid: INSTALL_PID, ts: 6 });
+  // Observe-only: macOS-bare stays ONLINE (the shim forwards connect and records
+  // the TRUE result → `result:'ok'` → normalize emits `connect …` with NO prefix),
+  // while Linux runs Phase B offline → `result:'blocked'` → `<BLOCKED> connect …`.
+  // parity-diff strips the `<BLOCKED> ` prefix so the two reconcile.
+  const connectOnlineMacos = JSON.stringify({ kind: 'connect', host: '198.51.100.7', port: 443, result: 'ok', pid: INSTALL_PID, ts: 6 });
+  const connectBlockedLinux = JSON.stringify({ kind: 'connect', host: '198.51.100.7', port: 443, result: 'blocked', pid: INSTALL_PID, ts: 6 });
 
   const tmpDirs: string[] = [];
   function workspace(): string {
@@ -259,8 +265,8 @@ describe.runIf(canRunBare)('macOS bare fake-orchestrator parity', () => {
   }
 
   it('macOS-bare frames render a lockfile that reconciles with the Linux golden after parity-diff canonicalization', async () => {
-    // --- macOS side: real runInstallPhaseMacos dispatcher, connect=ok --------
-    const macosFrames = await collectMacosFrames([...SHIM_LINES, macosConnect]);
+    // --- macOS side: real runInstallPhaseMacos dispatcher, connect=blocked ----
+    const macosFrames = await collectMacosFrames([...SHIM_LINES, connectOnlineMacos]);
     const darwinCtx: NormalizeContext = {
       roots: ROOTS,
       pkgDirs: new Map([[PKG_ID, PKG_DIR]]),
@@ -272,16 +278,17 @@ describe.runIf(canRunBare)('macOS bare fake-orchestrator parity', () => {
     expect(macosLock).toContain('evil-pkg@1.0.0:');
     expect(macosLock).toContain('<HIDDEN> NPM_TOKEN');
     expect(macosLock).toContain('$REPO/escaped.txt');
-    expect(macosLock).toContain('connect 198.51.100.7:443');
-    expect(macosLock).not.toContain('<BLOCKED>'); // online → no prefix on macOS
+    expect(macosLock).toContain('connect 198.51.100.7:443'); // online → succeeded connect, no prefix
+    expect(macosLock).not.toContain('<BLOCKED> connect 198.51.100.7:443');
     expect(macosLock).not.toContain('Foundation.framework'); // dyld noise dropped
 
-    // --- Linux golden: same logical events, connect=blocked, os:'linux' ------
-    // The same frames drive the Linux normalize path; only the connect result
-    // (offline Phase B → blocked) and the absence of the macOS noise prefixes
-    // differ.  (The dyld read is not a Linux-shaped path, so we omit it from
-    // the Linux frame stream — the Linux shim would never observe it.)
-    const linuxFrames = await collectMacosFrames([...SHIM_LINES.filter((l) => !l.includes('Foundation.framework')), linuxConnect]);
+    // --- Linux golden: same logical events, same blocked connect, os:'linux' --
+    // The same frames drive the Linux normalize path; only the absence of the
+    // macOS-only dyld noise differs (the dyld read is not a Linux-shaped path,
+    // so we omit it — the Linux shim would never observe it).  Linux runs Phase B
+    // offline, so the connect is BLOCKED there (`connectBlockedLinux`); it
+    // reconciles with the macOS online connect via the `<BLOCKED> ` strip.
+    const linuxFrames = await collectMacosFrames([...SHIM_LINES.filter((l) => !l.includes('Foundation.framework')), connectBlockedLinux]);
     const linuxCtx: NormalizeContext = {
       roots: ROOTS,
       pkgDirs: new Map([[PKG_ID, PKG_DIR]]),

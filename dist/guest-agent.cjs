@@ -25015,7 +25015,22 @@ var ExecEvent = external_exports.object({
   // macOS guest dispatcher (phase-install-macos.ts) carries this onto the
   // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
   // blind shim records parse byte-identically (zod would otherwise drop it).
-  audit_blind: external_exports.boolean().optional()
+  audit_blind: external_exports.boolean().optional(),
+  // macOS bare backend only (omitted on Linux). The FULL argv vector for the
+  // exec, serialized by the Mach-O shim's `append_argv_field` (capped/truncated
+  // deterministically). The macOS guest dispatcher synthesizes a spawn whose
+  // `argv` is this array (vs the single-element `[argv0 ?? prog]` fallback), so
+  // the rendered spawn_attempts command line matches Linux's full strace argv
+  // (e.g. `node postinstall.js` instead of just `node`). Optional so Linux
+  // records (no `argv` field) and pre-change shim builds still parse.
+  argv: external_exports.array(external_exports.string()).optional(),
+  // macOS bare backend only (omitted on Linux). On a FAILED exec the Mach-O shim
+  // records the errno as a short uppercase string (`ENOENT` / `EACCES` — the
+  // only two Linux's strace parser would surface). The macOS guest dispatcher
+  // maps it onto a `spawn` RawEvent with `result:'enoent'|'eacces'` so normalize
+  // renders `<ENOENT> <full argv>` in spawn_blocked (parity with Linux strace).
+  // Optional so Linux/successful records parse byte-identically.
+  exec_errno: external_exports.string().optional()
 });
 var EnvTamperEvent = external_exports.object({
   kind: external_exports.literal("env_tamper"),
@@ -25864,7 +25879,7 @@ function parseConnect(args, retVal, pid, ts) {
   const structToken = args[1] ?? "";
   const addr = parseConnectStruct(structToken);
   if (addr === null) return null;
-  const result = retVal.isError ? "blocked" : "ok";
+  const result = !retVal.isError || retVal.errno === "EINPROGRESS" || retVal.errno === "EALREADY" || retVal.errno === "EISCONN" ? "ok" : "blocked";
   return [{ kind: "connect", host: addr.host, port: addr.port, result, pid, ts }];
 }
 function parseReadlinkat(args, retVal, pid, ts) {
@@ -25981,13 +25996,38 @@ function isCrossPackage(tokenizedPath) {
   return !isInsidePkg(tokenizedPath) && (tokenizedPath === "$NODE_MODULES" || tokenizedPath.startsWith("$NODE_MODULES/"));
 }
 
+// src/lock/private-realpath.ts
+var PRIVATE_REALPATH_PREFIXES = [
+  ["/private/var", "/var"],
+  ["/private/tmp", "/tmp"],
+  ["/private/etc", "/etc"]
+];
+function canonicalizePrivateRealpath(path3) {
+  for (const [from, to] of PRIVATE_REALPATH_PREFIXES) {
+    if (path3 === from || path3.startsWith(`${from}/`)) {
+      return `${to}${path3.slice(from.length)}`;
+    }
+  }
+  return path3;
+}
+
 // src/guest/protected-paths.ts
 var ProtectedPathsMatcher = class {
   tokenizedPatterns;
   roots;
+  os;
   constructor(input) {
     this.roots = input.roots;
     this.tokenizedPatterns = input.patterns.map(normalizePattern);
+    this.os = input.os ?? "linux";
+  }
+  /**
+   * Collapse the macOS /private realpath prefix when auditing on darwin so the
+   * raw shim path (/private/var/folders/.../node_modules/...) matches the
+   * non-/private `roots`.  No-op on linux.
+   */
+  canon(rawPath) {
+    return this.os === "darwin" ? canonicalizePrivateRealpath(rawPath) : rawPath;
   }
   /**
    * Returns true when `rawPath` (an absolute Linux path) matches any
@@ -26001,7 +26041,7 @@ var ProtectedPathsMatcher = class {
    */
   isProtected(rawPath) {
     if (this.tokenizedPatterns.length === 0) return false;
-    const tokenized = tokenize(rawPath, this.roots);
+    const tokenized = tokenize(this.canon(rawPath), this.roots);
     return import_micromatch.default.isMatch(tokenized, this.tokenizedPatterns, { dot: true });
   }
   /**
@@ -26018,7 +26058,8 @@ var ProtectedPathsMatcher = class {
   isUnderNodeModules(rawPath) {
     const nm = this.roots.nodeModules;
     if (nm.length === 0) return false;
-    return rawPath === nm || rawPath.startsWith(`${nm}/`);
+    const p = this.canon(rawPath);
+    return p === nm || p.startsWith(`${nm}/`);
   }
 };
 function applyProtectedPathsPolicy(ev, matcher) {
@@ -26196,6 +26237,7 @@ async function runInstallPhase(input) {
       return path2.resolve(eventsFilePath);
     }
   })();
+  const eventsFilePathResolved = eventsFilePath === null ? null : path2.resolve(eventsFilePath);
   const eventsFileBasename = eventsFilePathCanonical !== null ? path2.basename(eventsFilePathCanonical) : null;
   const cwdParent = /* @__PURE__ */ new Map();
   const fdParent = /* @__PURE__ */ new Map();
@@ -27911,6 +27953,9 @@ async function runInstallPhase(input) {
             });
             continue;
           }
+          if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
+            continue;
+          }
           const resolved = rawEvent.kind === "read" ? { ...rawEvent, path: canonical } : { ...rawEvent, path: canonical };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
@@ -28042,6 +28087,11 @@ var INSTALL_CMD2 = {
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
   yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
 };
+var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
+  "npm_package_name",
+  "npm_package_version",
+  "npm_lifecycle_event"
+]);
 function macosManagerLaunch(manager, subArgs) {
   const node = process.execPath;
   const toolchainRoot = (0, import_node_path.dirname)((0, import_node_path.dirname)(node));
@@ -28180,7 +28230,7 @@ async function runInstallPhaseMacos(input) {
     for (const ev of buffered) {
       if (ev.raw.kind === "read") {
         nodeBootstrapFileReads.add(ev.raw.path);
-      } else if (ev.raw.kind === "env_read" && recordEnvBaseline) {
+      } else if (ev.raw.kind === "env_read" && recordEnvBaseline && !STARTUP_MARKER_NPM_FIELDS.has(ev.raw.name)) {
         nodeBootstrapEnvReads.add(ev.raw.name);
       }
     }
@@ -28192,7 +28242,9 @@ async function runInstallPhaseMacos(input) {
     const keep = [];
     for (const ev of buffered) {
       if (ev.raw.kind === "env_read") {
-        if (recordEnvBaseline) nodeBootstrapEnvReads.add(ev.raw.name);
+        if (recordEnvBaseline && !STARTUP_MARKER_NPM_FIELDS.has(ev.raw.name)) {
+          nodeBootstrapEnvReads.add(ev.raw.name);
+        }
       } else {
         keep.push(ev);
       }
@@ -28230,7 +28282,9 @@ async function runInstallPhaseMacos(input) {
   const shouldFilterNodeBootstrapEnvRead = (raw) => {
     if (raw.kind !== "env_read" || raw.hidden) return false;
     if (nodeBootstrapEnvPendingPids.has(raw.pid)) {
-      if (!packageManagerClientPids.has(raw.pid)) nodeBootstrapEnvReads.add(raw.name);
+      if (!packageManagerClientPids.has(raw.pid) && !STARTUP_MARKER_NPM_FIELDS.has(raw.name)) {
+        nodeBootstrapEnvReads.add(raw.name);
+      }
       return true;
     }
     return nodeBootstrapEnvReads.has(raw.name);
@@ -28314,6 +28368,7 @@ async function runInstallPhaseMacos(input) {
           emit({ raw: shimEvent, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
         }
       }
+      const spawnArgv = shimEvent.argv && shimEvent.argv.length > 0 ? shimEvent.argv : [shimEvent.argv0 ?? shimEvent.prog];
       if (shimEvent.result === "ok") {
         const progBase = pathBasename2(shimEvent.argv0 ?? shimEvent.prog);
         const isPmClient = isPackageManagerClientBasename(progBase);
@@ -28329,7 +28384,7 @@ async function runInstallPhaseMacos(input) {
         if (isPmClient) packageManagerClientPids.add(shimEvent.pid);
         const spawnRaw = {
           kind: "spawn",
-          argv: [shimEvent.argv0 ?? shimEvent.prog],
+          argv: spawnArgv,
           result: "ok",
           pid: shimEvent.pid,
           ts: shimEvent.ts,
@@ -28342,6 +28397,22 @@ async function runInstallPhaseMacos(input) {
         const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
         if (attribution2 !== null) {
           emit({ raw: spawnRaw, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+        }
+      } else {
+        const failedResult = shimEvent.exec_errno === "ENOENT" ? "enoent" : shimEvent.exec_errno === "EACCES" ? "eacces" : null;
+        if (failedResult !== null) {
+          const spawnRaw = {
+            kind: "spawn",
+            argv: spawnArgv,
+            result: failedResult,
+            pid: shimEvent.pid,
+            ts: shimEvent.ts,
+            ...shimEvent.audit_blind ? { audit_blind: true } : {}
+          };
+          const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
+          if (attribution2 !== null) {
+            emit({ raw: spawnRaw, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+          }
         }
       }
       continue;
@@ -28554,19 +28625,6 @@ var SYSTEM_NOISE_PREFIXES_DARWIN = [
 ];
 var DYLD_SHARED_CACHE_BASENAME = "dyld_shared_cache_";
 var PROVISIONED_NODE_CACHE_SEGMENT = "/script-jail-cache/";
-var PRIVATE_REALPATH_PREFIXES = [
-  ["/private/var", "/var"],
-  ["/private/tmp", "/tmp"],
-  ["/private/etc", "/etc"]
-];
-function canonicalizePrivateRealpath(path3) {
-  for (const [from, to] of PRIVATE_REALPATH_PREFIXES) {
-    if (path3 === from || path3.startsWith(`${from}/`)) {
-      return `${to}${path3.slice(from.length)}`;
-    }
-  }
-  return path3;
-}
 var NPM_DEBUG_LOG_BASENAME = /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(\d+)\.log$/;
 function normalize(events, ctx) {
   const out = /* @__PURE__ */ new Map();
@@ -30090,7 +30148,11 @@ ${fetchResult.stderr}
   };
   const protectedPaths = new ProtectedPathsMatcher({
     patterns: config2.protected.files,
-    roots
+    roots,
+    // macOS-bare shim paths come back /private-canonicalized (F_GETPATH); the
+    // matcher must collapse /private to match the non-/private `roots`, or the
+    // benign cross-package read suppression misfires and floods external_reads.
+    os: isMacosBare ? "darwin" : "linux"
   });
   const installInput = {
     manager,

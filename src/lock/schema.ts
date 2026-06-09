@@ -192,6 +192,21 @@ export const ExecEvent = z.object({
   // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
   // blind shim records parse byte-identically (zod would otherwise drop it).
   audit_blind: z.boolean().optional(),
+  // macOS bare backend only (omitted on Linux). The FULL argv vector for the
+  // exec, serialized by the Mach-O shim's `append_argv_field` (capped/truncated
+  // deterministically). The macOS guest dispatcher synthesizes a spawn whose
+  // `argv` is this array (vs the single-element `[argv0 ?? prog]` fallback), so
+  // the rendered spawn_attempts command line matches Linux's full strace argv
+  // (e.g. `node postinstall.js` instead of just `node`). Optional so Linux
+  // records (no `argv` field) and pre-change shim builds still parse.
+  argv: z.array(z.string()).optional(),
+  // macOS bare backend only (omitted on Linux). On a FAILED exec the Mach-O shim
+  // records the errno as a short uppercase string (`ENOENT` / `EACCES` — the
+  // only two Linux's strace parser would surface). The macOS guest dispatcher
+  // maps it onto a `spawn` RawEvent with `result:'enoent'|'eacces'` so normalize
+  // renders `<ENOENT> <full argv>` in spawn_blocked (parity with Linux strace).
+  // Optional so Linux/successful records parse byte-identically.
+  exec_errno: z.string().optional(),
 });
 export type ExecEvent = z.infer<typeof ExecEvent>;
 

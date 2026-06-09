@@ -22,7 +22,12 @@
 //      reads (SCRIPT_JAIL_CONNECTION=stdio + SCRIPT_JAIL_BACKEND=macos-bare +
 //      config path + dylib + JS preloads + shell-shim dir + the provisioned
 //      node bin dir PREPENDED to PATH).  NO SCRIPT_JAIL_PHASE_B_UNSHARE_NET —
-//      macOS bare is observe-only and stays online.
+//      macOS has no network namespace to drop, and macOS-bare does NOT enforce
+//      offline: it is OBSERVE-ONLY and stays ONLINE.  net.rs forwards
+//      connect/connectx and records the TRUE result (gated on
+//      SCRIPT_JAIL_MACOS_AUDIT_OPS, Phase B only); parity-diff reconciles the
+//      offline-Linux / online-macOS split by stripping the `<BLOCKED> ` prefix.
+//      Firecracker is the high-assurance backend (see docs/divergence.md).
 //
 // Everything here is darwin-only.  No Linux path imports this module.
 
@@ -72,6 +77,45 @@ export interface MacBareExecuteDeps {
   provisionNodeMac?: typeof provisionNodeMac;
   runAgentProcess?: typeof runAgentProcess;
   validateMachOShimFile?: typeof validateMachOShimFile;
+}
+
+/**
+ * Host env vars whose VALUE the orchestrator forwards into the audited install
+ * children.  Everything else is reconstructed (PATH below) or pnpm-injected at
+ * lifecycle time — so the macOS child env mirrors the Linux container's curated
+ * set instead of inheriting the full host/CI env.
+ *
+ * Why this matters for parity: the install children enumerate `process.env`
+ * (env-spy's Proxy records every key), so any host var present in the child env
+ * lands in the lock's `env_read`.  Spreading the full GitHub-runner env floods
+ * `env_read` with ~120 `ACTIONS_*` / `GITHUB_*` / `RUNNER_*` / `HOMEBREW_*` /
+ * `JAVA_HOME_*` / … names that the Linux backend never sees (Docker/Firecracker
+ * reconstruct env from scratch — see `src/rootfs/init.sh` + `docker.ts`).
+ *
+ * Keep this list MINIMAL and mirror init.sh:
+ *   - PATH is rebuilt explicitly (`prependPath`) below, not forwarded here.
+ *   - SCRIPT_JAIL_* control vars are set explicitly below.
+ *   - npm_config_* / npm_package_* / INIT_CWD / NODE / PNPM_SCRIPT_SRC_DIR are
+ *     injected by pnpm per-lifecycle on BOTH platforms — do NOT hoist them.
+ *   - VP_HOME / COREPACK_HOME are Linux-only (the bare backend has no /opt/vp);
+ *     they are reconciled as parity-only residuals at diff time, not forwarded.
+ *   - HOME / TMPDIR are genuinely needed (npm/pnpm/corepack cache roots, the
+ *     events-file dir, and `$HOME`/`$TMPDIR` path tokenization).
+ */
+const MACOS_ORCHESTRATOR_ENV_ALLOWLIST = ['HOME', 'TMPDIR'] as const;
+
+/**
+ * Reconstruct the orchestrator child env from `baseEnv` using
+ * {@link MACOS_ORCHESTRATOR_ENV_ALLOWLIST} (allowlist, never a denylist — a new
+ * host var must be opted in, not remembered-to-be-excluded).
+ */
+function pickOrchestratorEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const name of MACOS_ORCHESTRATOR_ENV_ALLOWLIST) {
+    const value = baseEnv[name];
+    if (value !== undefined) out[name] = value;
+  }
+  return out;
 }
 
 /**
@@ -166,7 +210,9 @@ export function createMacBareExecute(
         cmd: provisioned.nodePath,
         args: [runtime.agentPath],
         env: {
-          ...baseEnv,
+          ...pickOrchestratorEnv(baseEnv),
+          // Mirror init.sh / docker.ts: corepack must not prompt offline.
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
           PATH: prependPath(provisioned.nodeBinDir, baseEnv),
           SCRIPT_JAIL_CONNECTION: 'stdio',
           SCRIPT_JAIL_BACKEND: 'macos-bare',
@@ -175,9 +221,15 @@ export function createMacBareExecute(
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
           SCRIPT_JAIL_SHELL_SHIM_DIR: provisioned.shellShimDir,
-          // NO SCRIPT_JAIL_PHASE_B_UNSHARE_NET: macOS bare is observe-only and
-          // stays online (the shim records connect() attempts; it does not
-          // enforce offline).  No eth0/VM to drop.
+          // NO SCRIPT_JAIL_PHASE_B_UNSHARE_NET: macOS has no network namespace
+          // to drop, and macOS-bare does NOT enforce offline.  It is OBSERVE-ONLY
+          // and stays ONLINE: net.rs forwards connect/connectx and records the
+          // TRUE result once SCRIPT_JAIL_MACOS_AUDIT_OPS is set (Phase B only);
+          // parity-diff reconciles the offline-Linux / online-macOS split by
+          // stripping the `<BLOCKED> ` prefix at diff time.  Audit-blind SIP
+          // children and raw syscalls egress unrecorded — Firecracker is the
+          // high-assurance backend (see docs/divergence.md).  So the host
+          // launcher sets no network env here.
         },
         label: 'mac-bare',
         ...(deps.stderr !== undefined ? { stderr: deps.stderr } : {}),

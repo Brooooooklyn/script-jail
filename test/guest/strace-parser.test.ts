@@ -576,11 +576,30 @@ describe('connect', () => {
     expect(evs).toEqual([{ kind: 'connect', host: '8.8.8.8', port: 80, result: 'blocked', pid: 1, ts: 0 }]);
   });
 
-  it('AF_INET EINPROGRESS (non-blocking) → blocked', () => {
+  // Round-12 finding F3: a non-blocking connect (libuv's default, so EVERY Node
+  // connect) returns EINPROGRESS while the SYN is already on the wire — egress
+  // HAPPENED.  An exfil-detection audit must record that as "ok" (reached out),
+  // not "blocked".  EALREADY (pending) and EISCONN (already connected) are the
+  // same egress-occurred class.  Matches the macOS-bare shim (net.rs).
+  it('AF_INET EINPROGRESS (non-blocking, egress in flight) → ok', () => {
     const line = 'connect(4, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("192.168.1.1")}, 16) = -1 EINPROGRESS (Operation now in progress)';
     const evs = parseStraceLine(line, 1, 0);
     expect(evs).not.toBeNull();
-    expect(evs![0]).toMatchObject({ kind: 'connect', result: 'blocked' });
+    expect(evs![0]).toMatchObject({ kind: 'connect', result: 'ok' });
+  });
+
+  it('AF_INET EISCONN (already connected) → ok', () => {
+    const line = 'connect(4, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("192.168.1.1")}, 16) = -1 EISCONN (Socket is already connected)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'connect', result: 'ok' });
+  });
+
+  it('AF_INET EALREADY (non-blocking, prior attempt pending) → ok', () => {
+    const line = 'connect(4, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("192.168.1.1")}, 16) = -1 EALREADY (Operation already in progress)';
+    const evs = parseStraceLine(line, 1, 0);
+    expect(evs).not.toBeNull();
+    expect(evs![0]).toMatchObject({ kind: 'connect', result: 'ok' });
   });
 
   it('AF_INET6 success → connect event with IPv6 host', () => {

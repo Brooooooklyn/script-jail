@@ -101,6 +101,28 @@ const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[]
   yarn: { cmd: 'yarn', args: ['install', '--immutable', '--offline'] },
 };
 
+// env-spy.cjs stamps its `node_startup_done` JSONL marker by reading these three
+// npm lifecycle fields off `process.env` (signalNodeStartupDone, env-spy.cjs
+// :327-329).  That JS read is `origEnv = process.env` → V8 `uv_os_getenv` → libc
+// `getenv` → the Mach-O shim's getenv hook, so on macOS it surfaces as a
+// PRE-marker `env_read` for EVERY Node pid env-spy loads into (it does not exist
+// on Linux, where the marker block is inert because SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL
+// is unset).  Those self-reads must NOT contaminate the GLOBAL
+// `nodeBootstrapEnvReads` noise baseline: unlike genuine bootstrap noise
+// (NODE_*/CF*/NS*/…), these names are also read POST-marker by the package's own
+// lifecycle machinery and are recorded per-package on Linux.  A single
+// non-pm-client pid's pre-marker self-read would otherwise globally suppress the
+// name and drop every package's legitimate post-marker reads — observed: 6
+// pre-marker self-reads poisoning 63 post-marker reads across 4 packages.  The
+// pre-marker self-read is STILL filtered per-pid (it is bootstrap); we only keep
+// these names out of the shared baseline so post-marker reads survive, matching
+// Linux.  Must equal the field set env-spy stamps in signalNodeStartupDone.
+const STARTUP_MARKER_NPM_FIELDS: ReadonlySet<string> = new Set([
+  'npm_package_name',
+  'npm_package_version',
+  'npm_lifecycle_event',
+]);
+
 /**
  * Launch a package-manager command on macOS as `<re-signed node> <manager-cli.js>`
  * (npm) / `<re-signed node> <corepack.js> <manager>` (pnpm·yarn) instead of the
@@ -359,7 +381,11 @@ export async function runInstallPhaseMacos(
     for (const ev of buffered) {
       if (ev.raw.kind === 'read') {
         nodeBootstrapFileReads.add(ev.raw.path);
-      } else if (ev.raw.kind === 'env_read' && recordEnvBaseline) {
+      } else if (
+        ev.raw.kind === 'env_read' &&
+        recordEnvBaseline &&
+        !STARTUP_MARKER_NPM_FIELDS.has(ev.raw.name)
+      ) {
         nodeBootstrapEnvReads.add(ev.raw.name);
       }
     }
@@ -372,7 +398,9 @@ export async function runInstallPhaseMacos(
     const keep: AttributedEvent[] = [];
     for (const ev of buffered) {
       if (ev.raw.kind === 'env_read') {
-        if (recordEnvBaseline) nodeBootstrapEnvReads.add(ev.raw.name);
+        if (recordEnvBaseline && !STARTUP_MARKER_NPM_FIELDS.has(ev.raw.name)) {
+          nodeBootstrapEnvReads.add(ev.raw.name);
+        }
       } else {
         keep.push(ev);
       }
@@ -415,7 +443,12 @@ export async function runInstallPhaseMacos(
   const shouldFilterNodeBootstrapEnvRead = (raw: RawEvent): boolean => {
     if (raw.kind !== 'env_read' || raw.hidden) return false;
     if (nodeBootstrapEnvPendingPids.has(raw.pid)) {
-      if (!packageManagerClientPids.has(raw.pid)) nodeBootstrapEnvReads.add(raw.name);
+      if (
+        !packageManagerClientPids.has(raw.pid) &&
+        !STARTUP_MARKER_NPM_FIELDS.has(raw.name)
+      ) {
+        nodeBootstrapEnvReads.add(raw.name);
+      }
       return true;
     }
     return nodeBootstrapEnvReads.has(raw.name);
@@ -547,16 +580,29 @@ export async function runInstallPhaseMacos(
         }
       }
 
+      // Full argv for the synthesized spawn.  The macOS shim now serializes the
+      // complete argv vector (Fix E); fall back to the single-element
+      // [argv0 ?? prog] when it is absent (older shim / Linux-shaped records) so
+      // the command line still renders something.  normalize.ts tokenizes + joins
+      // with ' ' and unwraps `sh -c`, so a full argv renders byte-identically to
+      // Linux's strace argv (e.g. `node postinstall.js`).
+      const spawnArgv: string[] =
+        shimEvent.argv && shimEvent.argv.length > 0
+          ? shimEvent.argv
+          : [shimEvent.argv0 ?? shimEvent.prog];
+
       // The shim emits an optimistic result:'ok' BEFORE the exec and a
       // result:'failed' AFTER it returns (failure only).  The spawn attempt is
-      // the optimistic 'ok'; a 'failed' event is the failed-exec counterpart
-      // (the macOS bypass cross-check is dropped, so we just ignore it for the
-      // spawn).  Synthesize the spawn ONLY for result:'ok'.
+      // the optimistic 'ok'; a 'failed' event with a recordable errno is the
+      // ENOENT/EACCES blocked-spawn counterpart (parity with Linux's strace
+      // `<ENOENT> node …/cli.js`).  Synthesize a spawn for BOTH, with the
+      // appropriate `result`.
       if (shimEvent.result === 'ok') {
         // Bootstrap / pm-client classification keyed on the exec basename
         // (vs the Linux strace spawn argv).  A node basename begins the
         // bootstrap window; a non-node basename (shebang npm/pnpm) begins a
-        // candidate that node_startup_done later confirms.
+        // candidate that node_startup_done later confirms.  Only the SUCCESSFUL
+        // exec opens a bootstrap window (a failed exec ran no child).
         const progBase = pathBasename(shimEvent.argv0 ?? shimEvent.prog);
         const isPmClient = isPackageManagerClientBasename(progBase);
         flushNodeBootstrapCandidate(shimEvent.pid);
@@ -571,11 +617,11 @@ export async function runInstallPhaseMacos(
         if (isPmClient) packageManagerClientPids.add(shimEvent.pid);
 
         // Map exec → spawn RawEvent so normalize.ts lands it in spawn_attempts
-        // untouched.  argv is [argv0 ?? prog] (the shim records prog/argv0, not
-        // the full argv); result:'ok' is a successful spawn.
+        // untouched.  argv is the full vector (Fix E); result:'ok' is a
+        // successful spawn.
         const spawnRaw: SpawnEvent = {
           kind: 'spawn',
-          argv: [shimEvent.argv0 ?? shimEvent.prog],
+          argv: spawnArgv,
           result: 'ok',
           pid: shimEvent.pid,
           ts: shimEvent.ts,
@@ -592,6 +638,38 @@ export async function runInstallPhaseMacos(
           snapshotAttribution(shimEvent.pid);
         if (attribution !== null) {
           emit({ raw: spawnRaw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
+        }
+      } else {
+        // result:'failed'.  Linux's strace parser records a failed execve as a
+        // `spawn` with result 'enoent' (binary missing — how native binaries are
+        // "blocked") or 'eacces' (found but not executable); normalize renders
+        // `<ENOENT>`/`<EACCES>` <full argv> in spawn_blocked.  Mirror that ONLY
+        // for the two errnos Linux surfaces — every other failure (incl. a shim
+        // build with no `exec_errno`) is dropped, matching the old behavior and
+        // avoiding inventing a spurious blocked-spawn result.
+        const failedResult: SpawnEvent['result'] | null =
+          shimEvent.exec_errno === 'ENOENT'
+            ? 'enoent'
+            : shimEvent.exec_errno === 'EACCES'
+              ? 'eacces'
+              : null;
+        if (failedResult !== null) {
+          const spawnRaw: SpawnEvent = {
+            kind: 'spawn',
+            argv: spawnArgv,
+            result: failedResult,
+            pid: shimEvent.pid,
+            ts: shimEvent.ts,
+            ...(shimEvent.audit_blind ? { audit_blind: true as const } : {}),
+          };
+          const attribution =
+            shimAttrib ??
+            freshSnapshotAttribution(shimEvent.pid) ??
+            nodeStartupAttribution(shimEvent.pid) ??
+            snapshotAttribution(shimEvent.pid);
+          if (attribution !== null) {
+            emit({ raw: spawnRaw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
+          }
         }
       }
       continue;

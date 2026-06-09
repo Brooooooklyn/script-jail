@@ -23472,7 +23472,22 @@ var ExecEvent = external_exports.object({
   // macOS guest dispatcher (phase-install-macos.ts) carries this onto the
   // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
   // blind shim records parse byte-identically (zod would otherwise drop it).
-  audit_blind: external_exports.boolean().optional()
+  audit_blind: external_exports.boolean().optional(),
+  // macOS bare backend only (omitted on Linux). The FULL argv vector for the
+  // exec, serialized by the Mach-O shim's `append_argv_field` (capped/truncated
+  // deterministically). The macOS guest dispatcher synthesizes a spawn whose
+  // `argv` is this array (vs the single-element `[argv0 ?? prog]` fallback), so
+  // the rendered spawn_attempts command line matches Linux's full strace argv
+  // (e.g. `node postinstall.js` instead of just `node`). Optional so Linux
+  // records (no `argv` field) and pre-change shim builds still parse.
+  argv: external_exports.array(external_exports.string()).optional(),
+  // macOS bare backend only (omitted on Linux). On a FAILED exec the Mach-O shim
+  // records the errno as a short uppercase string (`ENOENT` / `EACCES` — the
+  // only two Linux's strace parser would surface). The macOS guest dispatcher
+  // maps it onto a `spawn` RawEvent with `result:'enoent'|'eacces'` so normalize
+  // renders `<ENOENT> <full argv>` in spawn_blocked (parity with Linux strace).
+  // Optional so Linux/successful records parse byte-identically.
+  exec_errno: external_exports.string().optional()
 });
 var EnvTamperEvent = external_exports.object({
   kind: external_exports.literal("env_tamper"),
@@ -25637,6 +25652,15 @@ var MacBareUnavailableError = class extends Error {
     this.name = "MacBareUnavailableError";
   }
 };
+var MACOS_ORCHESTRATOR_ENV_ALLOWLIST = ["HOME", "TMPDIR"];
+function pickOrchestratorEnv(baseEnv) {
+  const out = {};
+  for (const name of MACOS_ORCHESTRATOR_ENV_ALLOWLIST) {
+    const value = baseEnv[name];
+    if (value !== void 0) out[name] = value;
+  }
+  return out;
+}
 function createMacBareExecute(deps) {
   const platform5 = deps.platform ?? import_node_process5.platform;
   const doExists = deps.existsSync ?? import_node_fs21.existsSync;
@@ -25691,7 +25715,9 @@ function createMacBareExecute(deps) {
         cmd: provisioned.nodePath,
         args: [runtime.agentPath],
         env: {
-          ...baseEnv,
+          ...pickOrchestratorEnv(baseEnv),
+          // Mirror init.sh / docker.ts: corepack must not prompt offline.
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
           PATH: prependPath2(provisioned.nodeBinDir, baseEnv),
           SCRIPT_JAIL_CONNECTION: "stdio",
           SCRIPT_JAIL_BACKEND: "macos-bare",
@@ -25700,9 +25726,15 @@ function createMacBareExecute(deps) {
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
           SCRIPT_JAIL_SHELL_SHIM_DIR: provisioned.shellShimDir
-          // NO SCRIPT_JAIL_PHASE_B_UNSHARE_NET: macOS bare is observe-only and
-          // stays online (the shim records connect() attempts; it does not
-          // enforce offline).  No eth0/VM to drop.
+          // NO SCRIPT_JAIL_PHASE_B_UNSHARE_NET: macOS has no network namespace
+          // to drop, and macOS-bare does NOT enforce offline.  It is OBSERVE-ONLY
+          // and stays ONLINE: net.rs forwards connect/connectx and records the
+          // TRUE result once SCRIPT_JAIL_MACOS_AUDIT_OPS is set (Phase B only);
+          // parity-diff reconciles the offline-Linux / online-macOS split by
+          // stripping the `<BLOCKED> ` prefix at diff time.  Audit-blind SIP
+          // children and raw syscalls egress unrecorded — Firecracker is the
+          // high-assurance backend (see docs/divergence.md).  So the host
+          // launcher sets no network env here.
         },
         label: "mac-bare",
         ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}

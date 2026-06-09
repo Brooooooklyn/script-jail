@@ -18,6 +18,7 @@
 //   - Each list is deduped and sorted ascending.
 
 import type { AttributedEvent, LifecycleBlock, PackageBlock } from './schema.js';
+import { canonicalizePrivateRealpath } from './private-realpath.js';
 import { isCrossPackage, isInsidePkg, tokenize, type TokenizeRoots } from './tokenize.js';
 
 // Binaries whose absolute argv[0] paths are collapsed to the bare basename in
@@ -113,29 +114,9 @@ const DYLD_SHARED_CACHE_BASENAME = 'dyld_shared_cache_';
 // startsWith() prefix (darwin-only, see isSystemNoise).
 const PROVISIONED_NODE_CACHE_SEGMENT = '/script-jail-cache/';
 
-// /private realpath canonicalization (macOS-only).  On macOS /var, /tmp, and
-// /etc are symlinks into /private, so the kernel-reported absolute path that
-// the Mach-O shim resolves (via F_GETPATH / realpath) comes back as
-// /private/var/..., /private/tmp/..., /private/etc/...  The Linux side and the
-// tokenize roots both use the bare /var, /tmp, /etc forms, so we strip the
-// /private prefix BEFORE tokenize runs.  Order matters: longest/most specific
-// match wins, but these three are disjoint so order is irrelevant in practice.
-const PRIVATE_REALPATH_PREFIXES: Array<[string, string]> = [
-  ['/private/var', '/var'],
-  ['/private/tmp', '/tmp'],
-  ['/private/etc', '/etc'],
-];
-
-function canonicalizePrivateRealpath(path: string): string {
-  for (const [from, to] of PRIVATE_REALPATH_PREFIXES) {
-    // Only rewrite a true path-segment boundary: /private/var and
-    // /private/var/x rewrite, /private/variant does not.
-    if (path === from || path.startsWith(`${from}/`)) {
-      return `${to}${path.slice(from.length)}`;
-    }
-  }
-  return path;
-}
+// /private realpath canonicalization (macOS-only) lives in a shared helper so
+// normalize.ts and the protected-paths matcher collapse it identically — see
+// src/lock/private-realpath.ts for why both must agree.
 
 const NPM_DEBUG_LOG_BASENAME =
   /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(\d+)\.log$/;

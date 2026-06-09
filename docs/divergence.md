@@ -114,34 +114,256 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
     analogous "GNU coreutils + dash in the rootfs" property). For evasion- and
     fidelity-sensitive audits, use **Firecracker**.
 
-- **Connect: attempt-only canonicalization.** Per the observe-only network
-  posture, the macOS bare backend stays **online** — the shim hooks `connect()`,
-  records the attempt, and lets it proceed. The Linux backends run Phase B
-  **offline**, so the same `connect()` is recorded as `<BLOCKED> connect
-  <host>:<port>`. Each committed lock stays faithful to what its backend
-  actually saw (`src/lock/normalize.ts` does **not** rewrite the per-host
-  connect result), so `scripts/parity-diff.ts` strips the `<BLOCKED> ` prefix
-  from `connect` entries on **both** sides before comparison — the same
-  diff-time precedent as `generated_at`. After stripping, a Linux blocked
-  attempt and a macOS succeeded attempt to the **same** host:port reconcile,
-  while a connect to a **different** host still surfaces as a diff hunk. This
-  preserves the Linux audit's blocked-vs-succeeded signal in its own committed
-  lock without weakening it.
+- **Connect: blocked on Linux, online on macOS-bare, reconciled by prefix strip.**
+  Linux runs Phase B **offline** via `unshare -n`, so every observed connect is
+  recorded `<BLOCKED> connect <host>:<port>`. The macOS bare backend is
+  **observe-only and stays ONLINE** (user decision 3): the Rust shim interposes
+  `connect`/`connectx` (`src/shim/src/net.rs`), gated on `SCRIPT_JAIL_MACOS_AUDIT_OPS`
+  which `src/guest/agent.ts` sets for Phase B only, but it does **not** enforce
+  offline — it FORWARDS the real call and records the attempt with its TRUE result
+  (a succeeded connect → `connect <host>:<port>` with no prefix; a failed one →
+  `<BLOCKED> connect …`). A non-blocking connect — which is how libuv, and thus
+  **all** Node networking, issues connects — returns `EINPROGRESS` (or `EALREADY`/
+  `EISCONN`) while the SYN is already on the wire: that counts as **egress-occurred
+  → "ok"**, not blocked (round-12 finding F3). Both classifiers agree
+  (`src/guest/strace-parser.ts` for Linux, `src/shim/src/net.rs` for macOS-bare);
+  resolving the *final* result of an in-flight connect would need an `SO_ERROR`
+  follow-up, tracked as v2. `connectx` (the Darwin connect-equivalent) is observed
+  the same way, since a connect-only interpose would miss it. `AF_UNIX`/other
+  local-IPC families are not inet and are dropped. Each committed lock stays
+  faithful to what its backend saw (`src/lock/normalize.ts` does **not** rewrite
+  the per-host result), and `scripts/parity-diff.ts` reconciles the offline/online
+  split by **stripping the `<BLOCKED> ` prefix from connect entries on both sides**
+  (narrowly — only `<BLOCKED> connect ` entries, never dlopen), so a Linux blocked
+  connect and a macOS online connect to the SAME host reduce to
+  `connect <host>:<port>` and match. A connect to a **different** host, or one
+  present on only one side, still surfaces as a diff hunk; inside a danger-checked
+  divergent package, any non-resolver connect surfaces regardless of result.
+  Host-resolver noise is reconciled by an **exact-match** allowlist of the three
+  observed resolver endpoints (see below), compared in their post-strip
+  `connect <addr>:53` form.
 
-  > **Security note.** Observe-only means the macOS backend **records** but does
-  > not **prevent** egress: a malicious `connect()` actually succeeds, unlike
-  > Linux's offline Phase B. This is an intentional posture difference for the
-  > bare backend; Firecracker remains the high-assurance backend when egress
-  > prevention matters.
+  > **The strip is attempt-parity, not enforcement-parity (round-12 finding F1,
+  > kept by decision).** Collapsing a Linux-`<BLOCKED>` connect and a macOS-`ok`
+  > connect to the same `host:port` is deliberate: the parity gate exists to prove
+  > the two backends observed the **same dependency behaviour** (a byte-stable,
+  > cross-backend-reproducible lock), **not** to assert macOS prevented egress. The
+  > alternative — failing or flagging every Linux-blocked-vs-macOS-ok connect —
+  > would diverge on *every* benign network-using package (puppeteer fetching
+  > Chrome, @swc fetching wasm, any registry/DNS touch), making the gate useless.
+  > The honest enforcement claim lives in the security note below: macOS-bare does
+  > **not** enforce; **Firecracker** does. The raw macOS lock still shows the true
+  > `ok`/`<BLOCKED>` per host (normalize never rewrites it) — only the diff
+  > reconciles the offline/online split.
+
+  > **Security note — macOS-bare does NOT enforce offline.** Unlike Linux's
+  > `unshare -n` (a kernel network namespace), the macOS bare backend has no
+  > kernel-level network-off: it is **observe-only**, and even the observation
+  > only covers processes the Mach-O shim is loaded into. Three gaps follow — all
+  > closed by Firecracker, none by macOS-bare:
+  >   1. **Audit-blind children egress for real.** SIP-protected system binaries
+  >      that are not substituted (`curl`, `git`, `python3`, `perl`, `ruby`, …)
+  >      strip `DYLD_INSERT_LIBRARIES` on exec, so the shim never loads — a
+  >      lifecycle script that runs `curl https://evil` reaches the live host
+  >      network and the connect is never recorded (only the `<AUDIT_BLIND>`
+  >      spawn is).
+  >   2. **Raw syscalls bypass the interpose.** Native code that issues
+  >      `syscall(SYS_connect)` / `SYS_connectx` / `SYS_sendto` / `SYS_sendmsg(_x)`
+  >      directly never touches the `__interpose` table, so it egresses with no
+  >      `NetworkEvent`.
+  >   3. **Connectionless datagrams are neither blocked nor recorded** —
+  >      `sendto`/`sendmsg` are not interposed in the observe-only model (see the
+  >      residual list below).
+  > Phase A fetch is online by design (lifecycle scripts do not run in Phase A —
+  > npm/pnpm fetch with `--ignore-scripts`). **For any audit where egress
+  > prevention or completeness matters, use Firecracker** — it is the
+  > high-assurance backend; macOS-bare is a local convenience whose network
+  > recording is best-effort over instrumented processes only.
 
 - **Resolver-address filter.** A name lookup the install triggers connects to
-  the host's DNS endpoint. The parity filter already drops the Apple
-  Virtualization.framework NAT resolver (`192.168.64.1:53`) and the Azure
-  runner endpoint (`168.63.129.16:53`); the macOS bare backend adds the system
-  stub resolver on loopback (`127.0.0.1:53`, mDNSResponder). These are host
-  resolver plumbing, not dependency behavior. Because the connect prefix is
-  stripped first, the filter set stores these entries in their prefix-less
-  `connect <addr>:53` form.
+  the host's DNS endpoint. On macOS-bare these succeed (online); on Linux they
+  are blocked (offline). After the `<BLOCKED> ` strip both reduce to
+  `connect <addr>:53`, and the parity filter drops the three observed resolver
+  endpoints: the Apple Virtualization.framework NAT resolver (`192.168.64.1:53`),
+  the Azure runner endpoint (`168.63.129.16:53`), and the macOS system stub
+  resolver on loopback (`127.0.0.1:53`, mDNSResponder). These are host resolver
+  plumbing, not dependency behavior. A connect to any other endpoint — or to one
+  of these on a port other than 53 — still surfaces.
+
+- **Intrinsically platform-divergent packages (danger-checked exclusion).** Three
+  packages install via a genuinely different code path on the bare backend's
+  "Darwin-pretending-to-be-Linux" environment (it spoofs `platform=linux`), so
+  `scripts/parity-diff.ts` excludes the **per-package lock block** for each from
+  **both** lockfiles before the byte comparison. They are matched by **name
+  prefix** (`@swc/core@`, `puppeteer@`, `unrs-resolver@`) so a fixture version
+  bump cannot silently un-exclude them. **The comparison is structural, not
+  line-based:** each lock is parsed, strict-validated, danger-walked, then the
+  divergent packages are dropped and the parity-only noise filtered **on the
+  parsed structure**, and the result is re-rendered through the canonical
+  byte-stable serializer (`src/lock/render.ts`) before the two renders are
+  diffed. Because the parser and the strip/filter operate on the same structure,
+  they can never disagree the way a line scanner and the parser could — the class
+  of evasions a text stripper allowed (YAML aliases splicing one package's
+  content into another, non-canonical key spellings desyncing the scanner,
+  unknown top-level sections escaping the byte compare) is eliminated
+  structurally. To keep that guarantee, the gate rejects the YAML features that
+  reintroduce ambiguity: **aliases, anchors, merge keys, non-string keys,
+  `__proto__`, and keys carrying a control character (e.g. TAB) all fail CLOSED**
+  as a whole-lock danger (the canonical renderer never emits any of them, so a
+  conformant lock has none — the control-char rejection in particular stops a key
+  from forging a `package\tstage` presence composite). Both locks are validated against a **fully
+  `.strict()`** parity schema (`ParityLock` in `scripts/parity-diff.ts`, built on
+  `src/lock/schema.ts`) at **every** level — top section, package entry, and
+  lifecycle block — so a malformed shape (an `external_reads` that is an object),
+  an unknown extra field (`secret_reads: [$HOME/.ssh/id_rsa]`), and an unknown
+  top-level **section** (e.g. a `metadata:` sibling) all fail CLOSED as a danger
+  rather than being silently dropped from both re-renders. Top-level strictness is
+  load-bearing here: the re-render only serializes known fields, so a permissive
+  schema would drop an unknown section from both sides and launder a one-sided
+  escape to a clean exit 0. The exclusion is **not** blind: before a block is
+  dropped, `collectDivergentDangers` screens the parsed block on **each** side for
+  any signal a one-sided escape could hide behind. The exfil-vector screens are
+  **default-deny over what the producer records** — *every* non-events-file
+  `escaped_writes`, *every* recorded `network_attempts` that is not a known DNS
+  resolver, *every* `dlopen_attempts`/`audit_bypass`/`env_tamper`, and *every* spawn
+  outside the per-package benign allowlist fails the gate. This is the strongest
+  control, but it is bounded by audit coverage, so it is **not** an unconditional
+  "a secret can never leave": see the **connectionless-egress residual** below. The
+  credential **read** screen is therefore a co-equal control, not a fallback — it
+  flags the suspicious READ itself: a `<HIDDEN>` **or credential-named** `env_read`
+  and a
+  `<HIDDEN>`/sensitive `external_reads`. Because a divergent package legitimately
+  reads a large, platform-varying set of benign config/proxy/locale vars (the
+  committed baseline alone has 88) and the screen runs per side **including the
+  fresh Linux side**, the read screens cannot be default-deny without false-failing
+  on a benign read — so they match credential **shape** categorically rather than by
+  name list (adversarial review rounds 5/6/7): credential env substrings
+  (`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTHORIZATION`/`PRIVATEKEY`/`BEARER`/…,
+  case-insensitive) plus whole-**token** markers `AUTH`/`KEY`/`PAT` (split on
+  separators and camelCase, so `NPM_AUTH`/`SERVICE_ACCOUNT_KEY`/`GITHUB_PAT` hit but
+  `…UNAUTHORIZED`/`MONKEY`/`*_PATH` and the benign `npm_config_always_auth` flag do
+  not). The file screen matches the repo default protected set (`.ssh`/`.aws`/
+  `.npmrc`/`.netrc`/`.gnupg`) **plus** cloud-CLI / package-manager credential stores
+  the default set omits (`.config/gcloud`, `.azure`, `.kube`, `.docker/config`,
+  `.git-credentials`, `.pypirc`, `.cargo/credentials`, composer `auth.json`, NuGet
+  config) and key-file suffixes (`.pem`/`.p12`/`.pfx`/`.key`) and `.env`/`.env.*`,
+  segment/suffix-aware so a credential dir does not over-match a benign sibling
+  (`.cargo/credentials`, not the `.cargo` registry cache; `/.env`, not
+  `/.environment`). **Known residuals** (neither is unique to a stripped package —
+  both are audit-coverage limits of the engine, documented so the gate's guarantee
+  is not overstated):
+  - **Innocuously-named env secret.** A secret in an env var with no credential
+    token/keyword (e.g. `DEPLOY_HOOK` holding a token) is not flagged by the read
+    screen. To *leave*, it still needs a recorded exfil vector (network/spawn/
+    cross-package or external write), which the default-deny screens catch.
+  - **Connectionless datagram egress (macOS-bare): neither prevented nor recorded.**
+    A connectionless `sendto`/`sendmsg` to an IP literal skips `connect()`/
+    `getaddrinfo()`. On **Linux** Phase B runs under `unshare -n`, so the datagram
+    cannot leave (prevented, loopback only). On **macOS-bare** the backend is
+    observe-only and stays online, and `sendto`/`sendmsg` are **not** interposed,
+    so such a datagram DOES leave the host and produces no `network_attempts`
+    entry (the lock schema's `NetworkEvent` is `connect`-only). This is the same
+    class of gap as the audit-blind / raw-syscall egress called out in the connect
+    security note above — macOS-bare does not enforce offline. Recording datagram
+    egress on macOS would also require adding `sendto`/`sendmsg` to the Linux
+    strace set + the `NetworkEvent` schema (a one-sided macOS event would break
+    byte parity). Use **Firecracker** when datagram egress must be prevented.
+  - **Package writes to the audit events file are dropped (trusted-pid residual).**
+    Shim-instrumented lifecycle processes append their `env_read` audit lines to
+    `SCRIPT_JAIL_LOG_FILE` BY PATH (fd 3 does not survive the npm/pnpm/yarn
+    `stdio:'inherit'` spawn) and re-open it by path on EBADF as an anti-tamper
+    measure. The producer (Linux: `phase-install.ts`; macOS: the shim's
+    `path_is_audit_log`) drops writes to that exact path so the audit channel does
+    not self-observe. The events path is **readable** by package code (not a
+    read-protected env name), so a malicious shim-loaded pid that opens the same
+    path also has its write dropped. This is not separately defensible —
+    env-spy's own legitimate by-path reopen is indistinguishable from a malicious
+    open at the `open()` layer, and flagging would break the reopen and flake the
+    parity gate — so it is accepted as the **same trusted-pid residual** already
+    documented in `phase-install.ts` (an attacker inside an already-shim-loaded
+    pid can write forged JSONL regardless; the forgery detector only backstops
+    NON-shim-loaded writers). Firecracker's strace-sourced event stream is not
+    user-space-writable and does not share this channel.
+  Any finding **fails the gate** even when the
+  comparable text is byte-equal, so the exclusion can never launder a real
+  escape. The exclusion is also **symmetric down to the lifecycle stage**: a
+  divergent package present on only **one** side — *or* present on both but with a
+  one-sided / mismatched lifecycle stage (e.g. an empty `lifecycle: {}` vs a real
+  `postinstall`) — is a resolution/producer desync, not a free pass; the
+  cross-side presence check (package **and** stage) fails the gate and names the
+  missing side, so a one-sided absence can no longer be silently accepted. Each block is still
+  recorded in each backend's uploaded lockfile for manual inspection, and the
+  platform-**invariant** packages (`esbuild`, `simple-git-hooks`) stay under full
+  byte comparison, so real audit drift is still caught. Root cause per package:
+  - **@swc/core** — the linux-arm64 native binding cannot load on Darwin, so its
+    `postinstall.js` spawns `npm install @swc/wasm` (a whole nested npm
+    invocation), absent on Linux where the native binding loads.
+  - **puppeteer** — `install.mjs`'s `await import('puppeteer/internal/node/install.js')`
+    throws on the bare backend and it `process.exit(0)`s early, so it never
+    reaches the ~50 config/proxy env reads + the DNS connect that the Linux
+    install performs.
+  - **unrs-resolver** — `@napi-rs/postinstall` detects the platform without
+    shelling out to `uname`/`sed`/`dirname` on Darwin, so the Linux run records
+    the helper spawns are absent.
+
+  > **Residual — resolver waiver inside the divergent-package danger check**
+  > (adversarial review round-11, finding F2). The 3-IP host-resolver allowlist
+  > (`127.0.0.1:53` / `192.168.64.1:53` / `168.63.129.16:53`) is honored by
+  > `collectDivergentDangers`, not only by the byte-comparison filter. This is
+  > **load-bearing**: @swc/core's nested `npm install @swc/wasm` performs a live
+  > registry DNS lookup on the **online** macOS-bare backend (it is
+  > `<BLOCKED>`/absent on offline Linux), and attribution folds that child's
+  > `connect 127.0.0.1:53` into @swc/core's danger-checked block — so without the
+  > waiver the freshly generated macOS-bare CI leg would false-fail every run. The
+  > laundering surface is bounded to those 3 exact infra IPs on port 53 — loopback
+  > (local mDNSResponder, no remote reach), the VZ NAT gateway (absent on the bare
+  > backend), and the Azure magic IP — so it cannot exfil to an
+  > attacker-controlled remote host; any **other** `host:port` still fails the
+  > danger check. It is strictly narrower than, and the same class as, the
+  > accepted connectionless-`sendto` egress residual above.
+  >
+  > **Round-12 re-challenge (kept by decision).** A later review re-flagged this
+  > as a DNS-tunnel laundering channel: `NetworkEvent` records only `host:port`,
+  > not the DNS *qname*, so a lifecycle could in principle encode bytes into
+  > lookup names sent through the waived `:53` resolver and out to an authoritative
+  > nameserver — invisible in the lock. Two facts bound it and it is **kept as
+  > designed**: (1) removing the waiver from `collectDivergentDangers` does **not**
+  > close the channel — qnames are uncaptured on *both* backends, so the only
+  > effect is to false-fail @swc/core every run; (2) DNS-over-resolver exfil is
+  > inherent to *any* online backend, which is exactly why this is observe-only and
+  > **Firecracker (offline Phase B) is the enforcement boundary**. Closing it for
+  > real needs producer-side qname capture (v2) or offline enforcement, not a
+  > diff-time waiver change.
+
+- **Parity-only noise filters: env/read GLOBAL, spawn PACKAGE-SCOPED.** The
+  reconciliation waivers in `scripts/parity-diff.ts` are split by how the signal
+  arises (adversarial review finding #3). The env reads (`LD_PRELOAD` ⇄
+  `DYLD_INSERT_LIBRARIES`, `SCRIPT_JAIL_*`, `COREPACK_HOME`, `VP_HOME`, the
+  libSystem/CF/dyld probes, locale internals) and the host-resolver connects are
+  **global**: each is read AMBIENTLY by the harness's own injection/loader
+  machinery inside EVERY audited process, so it appears in every package's list,
+  deduped to a set, and is one-sided BY CONSTRUCTION (each OS reads its own
+  injection var — verified against real linux + macOS-bare locks). Scoping those
+  to a package would mean listing them under all packages for zero gain, and a
+  deliberate package read is invisible anyway (it folds into the ever-present
+  ambient entry; removing the waiver would just fail parity on every run). The
+  only sound separation of "harness read it" vs "package read it" is producer-side
+  bootstrap tagging — future work, out of scope for the diff layer. By contrast
+  the **spawn** waivers (esbuild's `$PKG/bin/esbuild --version`; simple-git-hooks'
+  `git config` probe in both its `sh -c …` and `<AUDIT_BLIND> …` forms) are
+  **package-scoped**: each is reconciled ONLY inside the package it was observed
+  in, so an unrelated package cannot launder it as host noise. Every waiver is an
+  EXACT match (no prefixes), so a novel env name or spawn fails closed as a diff.
+
+- **Agent events-file write.** The audit agent writes its own event stream to a
+  JSONL file at `$TMPDIR/<hash>/<hash>.jsonl`. That is the agent's **own**
+  instrumentation write, not dependency behavior, so `src/guest/phase-install.ts`
+  drops the write to the agent's own events-file path from `escaped_writes`
+  (matched against the canonical + resolved events-file path) and it never
+  appears in the lock. This runs in the guest, so it applies on **both**
+  platforms — Linux Firecracker/Docker and the VZ Linux guest alike. A committed
+  baseline generated **before** this fix still lists `$TMPDIR/<hash>/<hash>.jsonl`
+  in `escaped_writes` and must be regenerated.
 
 - **`/private` realpath canonicalization.** On macOS `/var`, `/tmp`, and `/etc`
   are symlinks into `/private`, so the absolute path the shim resolves (via
