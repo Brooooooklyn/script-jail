@@ -33,7 +33,11 @@ function makeWorkspace(): string {
   return dir;
 }
 
-function runParityDiff(left: string, right: string): { status: number | null; stdout: string; stderr: string } {
+function runParityDiff(
+  left: string,
+  right: string,
+  extraArgs: ReadonlyArray<string> = [],
+): { status: number | null; stdout: string; stderr: string } {
   const result = spawnSync(
     OXNODE,
     [
@@ -42,6 +46,7 @@ function runParityDiff(left: string, right: string): { status: number | null; st
       '--right', right,
       '--left-label', 'linux-backend',
       '--right-label', 'macos-arm64-vz',
+      ...extraArgs,
     ],
     {
       cwd: repoRoot,
@@ -818,6 +823,72 @@ describe('scripts/parity-diff.ts — divergent-package danger check (adversarial
     expect(result.stdout).toContain('$HOME/.aws/credentials');
     expect(result.stdout).toContain('<HIDDEN> AWS_SECRET_ACCESS_KEY');
     expect(result.stderr).toBe('');
+  });
+});
+
+describe('scripts/parity-diff.ts — asymmetric validation (--source-of-truth)', () => {
+  // Linux is the single source of truth (the lockfile is generated there);
+  // macOS/Windows VALIDATE against it as a SUBSET.  A divergent package present in
+  // the source-of-truth lock but ABSENT on the validated platform is safe (it
+  // legitimately did less — e.g. puppeteer/unrs-resolver early-exit on Darwin); a
+  // divergent package present on the VALIDATED side yet absent from the source of
+  // truth still fails.  `LOCK_HEADER + INVARIANT_ESBUILD` is the same lock without
+  // the @swc/core block, i.e. @swc absent on that side.
+  const withSwc = swcDivergentLock(postinstallFields({}));
+  const withoutSwc = `${LOCK_HEADER}${INVARIANT_ESBUILD}`;
+
+  it('SAFE: divergent package present in source-of-truth (left) but absent on the validated side → exit 0', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, withSwc, 'utf8'); // linux = source of truth: @swc present
+    writeFileSync(right, withoutSwc, 'utf8'); // macos = validated: @swc absent (early-exit)
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('');
+  });
+
+  it('FAILS: divergent package present on the VALIDATED side but absent from the source of truth → exit 1', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, withoutSwc, 'utf8'); // linux = source of truth: @swc absent
+    writeFileSync(right, withSwc, 'utf8'); // macos = validated: @swc present (NOT in truth)
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'left']);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('divergent_presence');
+    expect(result.stderr).toBe('');
+  });
+
+  it('SYMMETRIC DEFAULT (no flag): a one-sided divergent package still fails either direction', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, withSwc, 'utf8');
+    writeFileSync(right, withoutSwc, 'utf8');
+
+    const result = runParityDiff(left, right); // no --source-of-truth → symmetric
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('divergent_presence');
+    expect(result.stderr).toBe('');
+  });
+
+  it('rejects an invalid --source-of-truth value (exit 2)', () => {
+    const dir = makeWorkspace();
+    const left = join(dir, 'linux.yml');
+    const right = join(dir, 'macos.yml');
+    writeFileSync(left, withSwc, 'utf8');
+    writeFileSync(right, withSwc, 'utf8');
+
+    const result = runParityDiff(left, right, ['--source-of-truth', 'middle']);
+
+    expect(result.status).toBe(2);
   });
 });
 

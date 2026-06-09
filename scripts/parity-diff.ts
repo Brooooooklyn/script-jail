@@ -26,7 +26,16 @@
 //   pnpm exec oxnode scripts/parity-diff.ts \
 //     --left  artifacts/linux/linux-lockfile.yml      --left-label  linux-firecracker \
 //     --right artifacts/macos-arm64/macos-lockfile.yml --right-label macos-arm64-vz \
+//     --source-of-truth left \
 //     --report parity-report.md
+//
+// `--source-of-truth left|right` enables ASYMMETRIC validation: Linux is the
+// single source of truth (the lockfile is generated there), and macOS/Windows
+// VALIDATE against it as a subset. A divergent package/stage present in the
+// source-of-truth lock but absent on the validated platform is SAFE (it
+// legitimately did less — e.g. puppeteer/unrs-resolver early-exit on Darwin); a
+// package present on the validated side but NOT in the source of truth still
+// fails. Omitted → symmetric (a one-sided divergent package fails either way).
 //
 // Exit codes:
 //   0 — renders are byte-equal and no danger fired (parity holds).
@@ -159,6 +168,17 @@ interface ParityOptions {
   leftLabel: string;
   rightLabel: string;
   reportPath: string | null;
+  // Asymmetric validation. When set, that side is the AUTHORITATIVE lockfile
+  // (the single source of truth, generated on Linux) and the OTHER side is being
+  // validated as a SUBSET of it: a divergent package/stage present on the
+  // source-of-truth side but ABSENT on the validated side is SAFE (the validated
+  // platform legitimately did less — e.g. puppeteer/unrs-resolver early-exit on
+  // Darwin), so it is not a presence danger. The reverse — a divergent package
+  // present on the VALIDATED side but absent in the source of truth — still fails
+  // (the validated platform did something the trusted lockfile never recorded).
+  // null → symmetric (one-sided in EITHER direction fails); the default, and what
+  // every non-cross-platform test relies on.
+  sourceOfTruth: 'left' | 'right' | null;
 }
 
 const PARITY_ONLY_EXTERNAL_READS = new Set([
@@ -230,6 +250,12 @@ const PARITY_ONLY_ENV_READS = new Set([
   'TESTING_TAR_FAKE_PLATFORM',
   '__FAKE_FS_O_FILENAME__',
   '__FAKE_PLATFORM__',
+  // OpenSSL's ARMv8 capability override: libcrypto reads OPENSSL_armcap via getenv
+  // during OPENSSL_cpuid_setup on linux-arm (ELF) to let the CPU crypto-feature
+  // mask be overridden. macOS-arm OpenSSL detects features via commpage/sysctl, not
+  // this env var, so it is a one-sided linux-arm ambient loader read — not a secret
+  // (the value is a numeric capability mask) and not dependency behaviour.
+  'OPENSSL_armcap',
   // ── macOS-bare ⇄ Linux harness/platform env (added with the bare backend) ──
   // The audit harness's OWN injection + provisioning + shell vars.  These are
   // inherently platform-asymmetric (Linux injects LD_PRELOAD; macOS-bare injects
@@ -275,6 +301,7 @@ const PARITY_ONLY_ENV_READS = new Set([
   'LIBTRACE_DRIVERKIT',
   'OSLogRateLimit',
   'OS_ACTIVITY_DT_MODE',
+  'OS_ACTIVITY_ENABLE_DYNAMIC',
   'OS_ACTIVITY_MODE',
   'OS_ACTIVITY_PROPAGATE_MODE',
   'OS_ACTIVITY_STREAM',
@@ -342,11 +369,14 @@ const PARITY_ONLY_SCOPED_SPAWNS: ReadonlyArray<{ pkg: string; spawn: string }> =
   // workspace has a usable .git directory. Container backends can run from a
   // copied workspace without that git metadata, so this is host shape noise.
   { pkg: 'simple-git-hooks@', spawn: 'sh -c git config --local core.hooksPath' },
-  // The macOS-bare representation of the SAME `git config` action: the bundled
-  // bash hop reaches the SIP `git`, whose DYLD insert is stripped, so its
-  // internals are audit-blind and normalize tags the spawn `<AUDIT_BLIND>`.
-  // Linux records the strace-visible `sh -c git config …` form above; both name
-  // the identical action, so the platform-specific framing is reconciled here.
+  // The macOS-bare representation of the SAME `git config` action. The bundled
+  // bash hop reaches the SIP `git`; depending on how the spawn is resolved it is
+  // recorded either as the bare resolved argv (`git config …`, after the
+  // spawnp/lexical-canon PATH resolution) OR — when the SIP target's DYLD insert
+  // is stripped and its internals are audit-blind — with normalize's
+  // `<AUDIT_BLIND>` tag. Linux records the strace-visible `sh -c git config …`
+  // form above; all three name the identical benign action, reconciled here.
+  { pkg: 'simple-git-hooks@', spawn: 'git config --local core.hooksPath' },
   { pkg: 'simple-git-hooks@', spawn: '<AUDIT_BLIND> git config --local core.hooksPath' },
 ];
 
@@ -874,8 +904,23 @@ function presenceDangers(left: CanonResult, right: CanonResult, opts: ParityOpti
       });
     }
   };
-  oneSided(left, right, opts.leftLabel, opts.rightLabel);
-  oneSided(right, left, opts.rightLabel, opts.leftLabel);
+  // Symmetric (default): a one-sided divergent package fails in EITHER direction.
+  // Asymmetric (--source-of-truth): the source-of-truth lockfile is authoritative
+  // and the other side is validated as a subset, so a package present on the
+  // source-of-truth side but absent on the validated side is SAFE (the validated
+  // platform legitimately did less) and is NOT flagged — only a package present on
+  // the VALIDATED side yet absent from the source of truth fails (it did something
+  // the trusted lockfile never recorded). collectDivergentDangers still screens
+  // the present side's CONTENT in both modes, so this never launders an escape: it
+  // only stops treating a smaller validated platform as a desync.
+  if (opts.sourceOfTruth !== 'left') {
+    // left is validated (or symmetric): a left-only divergent package must fail.
+    oneSided(left, right, opts.leftLabel, opts.rightLabel);
+  }
+  if (opts.sourceOfTruth !== 'right') {
+    // right is validated (or symmetric): a right-only divergent package must fail.
+    oneSided(right, left, opts.rightLabel, opts.leftLabel);
+  }
   return out;
 }
 
@@ -917,6 +962,7 @@ function parseArguments(argv: ReadonlyArray<string>): ParityOptions {
       'left-label': { type: 'string', default: 'left' },
       'right-label': { type: 'string', default: 'right' },
       report: { type: 'string' },
+      'source-of-truth': { type: 'string' },
     },
     strict: true,
     allowPositionals: false,
@@ -928,6 +974,10 @@ function parseArguments(argv: ReadonlyArray<string>): ParityOptions {
   if (typeof values.right !== 'string' || values.right.length === 0) {
     throw new ParityArgError('--right <path> is required');
   }
+  const sot = values['source-of-truth'];
+  if (sot !== undefined && sot !== 'left' && sot !== 'right') {
+    throw new ParityArgError("--source-of-truth must be 'left' or 'right'");
+  }
 
   return {
     left: values.left,
@@ -935,6 +985,7 @@ function parseArguments(argv: ReadonlyArray<string>): ParityOptions {
     leftLabel: values['left-label'] ?? 'left',
     rightLabel: values['right-label'] ?? 'right',
     reportPath: typeof values.report === 'string' ? values.report : null,
+    sourceOfTruth: sot === 'left' || sot === 'right' ? sot : null,
   };
 }
 
@@ -1059,6 +1110,7 @@ function main(argv: ReadonlyArray<string>): number {
       process.stderr.write(`parity-diff: ${err.message}\n`);
       process.stderr.write('usage: parity-diff.ts --left <path> --right <path>\n');
       process.stderr.write('                      [--left-label <name>] [--right-label <name>] [--report <path>]\n');
+      process.stderr.write('                      [--source-of-truth left|right]\n');
       return 2;
     }
     throw err;

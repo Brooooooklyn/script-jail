@@ -379,6 +379,7 @@ jobs:
             --right test/parity/macos-arm64-lockfile.yml \
             --left-label  linux-backend \
             --right-label macos-arm64-vz-committed \
+            --source-of-truth left \
             --report parity-report.md
           RC=$?
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
@@ -464,6 +465,7 @@ jobs:
             --right artifacts/macos-bare/macos-bare-lockfile.yml \
             --left-label  linux \
             --right-label macos-bare \
+            --source-of-truth left \
             --report parity-report-macos-bare.md
           RC=$?
           echo "rc=$RC" >> "$GITHUB_OUTPUT"

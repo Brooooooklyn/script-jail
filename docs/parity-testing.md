@@ -193,6 +193,18 @@ text is byte-equal. There are four shapes:
   so a one-sided absence — or a `lifecycle: {}` / wrong-stage block — would
   otherwise pass silently; it is a resolution/producer desync and fails the gate,
   naming the side (and stage) it is missing from.
+  - **Asymmetric validation (`--source-of-truth`).** Linux is the single source
+    of truth (the lockfile is *generated* there); macOS/Windows **validate** that
+    lockfile as a SUBSET. Under `--source-of-truth left` (Linux is `--left`), a
+    divergent package/stage present in the source-of-truth lock but **absent** on
+    the validated platform is **safe** — the validated platform legitimately did
+    *less* (e.g. `puppeteer`/`unrs-resolver` early-exit on Darwin, producing no
+    lifecycle block). The reverse — a divergent package present on the **validated**
+    side but absent from the source of truth — still **fails** (the validated
+    platform did something the trusted lockfile never recorded). The present side's
+    **content** is danger-screened in both modes, so this never launders an escape;
+    it only stops treating a smaller validated platform as a desync. Omit the flag
+    for symmetric comparison (a one-sided divergent package fails either way).
 - **Malformed / unknown shape.** A lock that fails the strict parity schema
   (`field: schema`) — a non-array field, an unknown lifecycle field, an unknown
   sibling next to `lifecycle`, or an unknown **top-level section**.
