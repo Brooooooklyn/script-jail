@@ -35,6 +35,18 @@
 // necessarily mutates the binary (notarization is removed), so the integrity
 // anchor is the pre-re-sign hash, not the final on-disk file.
 //
+// Shell-shim staging: the two shims are restaged from the bundled sources on
+// EVERY provision call — node-cache hits included.  Staged bytes can never be
+// trusted from a marker: a marker only attests the SOURCES it was written
+// against, never the bytes currently staged on disk, so any marker-based
+// coherency scheme leaves a window where a stale or attacker-shaped marker
+// keeps wrong staged shims alive.  Restaging (~12 MB copy + ad-hoc codesign)
+// is trivial next to node provisioning, so we delete the trust problem
+// instead of proving coherency.  The resign-marker's sole job is node resign
+// tracking.  Each restage replaces its file ATOMICALLY (full copy + chmod +
+// re-sign against a same-dir temp file, then rename) so a concurrent audit
+// sharing the deterministic shim dir never execs a half-written binary.
+//
 // Everything here is darwin-only; the bare backend is the sole caller.  No
 // Linux path imports this module.
 
@@ -46,12 +58,13 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { NodeHttpClient, sha256File } from '../shared/http-download.js';
 import {
@@ -71,10 +84,11 @@ export interface ProvisionNodeMacInput {
   /** Host arch (darwin-arm64 or darwin-x64). */
   arch: VitePlusArch;
   /**
-   * Cache root.  Honours `SCRIPT_JAIL_CACHE_DIR` else `os.tmpdir()` (NOT
-   * `Library/Caches`, per the plan — keeps a CI runner's ephemeral provision
-   * under RUNNER_TEMP-equivalent space).  Defaulted by the caller via
-   * `defaultProvisionCacheDir()`.
+   * Cache root.  Honours `SCRIPT_JAIL_CACHE_DIR` else
+   * `<os.tmpdir()>/script-jail-cache` (NOT `Library/Caches`, per the plan —
+   * keeps a CI runner's ephemeral provision under RUNNER_TEMP-equivalent
+   * space).  Defaulted by the caller via `defaultProvisionCacheDir()`, whose
+   * doc comment explains why the `script-jail-cache` segment is load-bearing.
    */
   cacheDir: string;
   /** Test seam: download the vp tarball (default: NodeHttpClient). */
@@ -120,12 +134,20 @@ export interface ProvisionedNodeMac {
 
 /**
  * Cache root for the provisioned toolchain.  `SCRIPT_JAIL_CACHE_DIR` when set,
- * else `os.tmpdir()` (per Phase 4).
+ * else `<os.tmpdir()>/script-jail-cache`.
+ *
+ * The `script-jail-cache` leaf is LOAD-BEARING: the darwin lock normalizer
+ * drops provisioned-toolchain reads only when the path contains the
+ * `/script-jail-cache/` segment (PROVISIONED_NODE_CACHE_SEGMENT in
+ * src/lock/normalize.ts).  A raw `os.tmpdir()` fallback would make a local
+ * no-env run record toolchain reads into the lock that a CI run (which sets
+ * SCRIPT_JAIL_CACHE_DIR to a `.../script-jail-cache` dir) does not — same
+ * audit, divergent lockfiles.
  */
 export function defaultProvisionCacheDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env['SCRIPT_JAIL_CACHE_DIR'];
   if (override !== undefined && override !== '') return override;
-  return tmpdir();
+  return join(tmpdir(), 'script-jail-cache');
 }
 
 // The two FIXED filenames the shim's `sip_redirect_target` (src/shim/src/lib.rs)
@@ -148,11 +170,13 @@ const SHELL_SHIM_COREUTILS = 'coreutils';
  * Provision (or reuse a cached) re-signed Node toolchain + re-signed shell/
  * coreutils shim directory for the macOS bare backend.
  *
- * Idempotent + content-addressed: the cache is keyed on
- * `(NODE_VERSION, arch, preResignSha256)` plus a `resign-marker` written ONLY
- * after the full re-sign + verify + shell-shim materialization succeeds.  A
- * partially-provisioned cache (crash between steps) is detected via the missing
- * marker and rebuilt.
+ * Idempotent + content-addressed: the node half is keyed on
+ * `(NODE_VERSION, arch, preResignSha256)` plus a versioned `resign-marker`
+ * written ONLY after the full re-sign + verify + shell-shim materialization
+ * succeeds.  A partially-provisioned cache (crash between steps) is detected
+ * via the missing/unparseable marker and rebuilt.  The shell shims are NOT
+ * cache-tracked: every call restages them from the current bundled sources
+ * (see the fast path), so a crash mid-restage just restages again next run.
  */
 export async function provisionNodeMac(
   input: ProvisionNodeMacInput,
@@ -174,17 +198,32 @@ export async function provisionNodeMac(
   const shellShimDir = join(root, 'shell-shim');
   const markerPath = join(root, 'resign-marker.json');
 
-  // Fast path: a complete, verified provision already exists.  We re-verify the
-  // codesign signature so a tampered cache is rebuilt (cheap; defence-in-depth).
+  // Fast path: a verified node provision already exists.  Two halves, two
+  // policies:
+  //   * node half — the marker parses (exact schema version + required
+  //     fields) and the binary exists and codesign-verifies (cheap
+  //     defence-in-depth against a tampered cache).  Failure here means the
+  //     whole provision is suspect → full teardown + rebuild.
+  //   * shell-shim half — ALWAYS restaged from the current bundled sources,
+  //     never validated.  Staged bytes can never be trusted from a marker (it
+  //     attests the sources it was written against, not what is on disk now),
+  //     so instead of proving coherency we re-copy + re-sign every call —
+  //     ~12 MB + codesign, trivial vs node provisioning.  This also makes the
+  //     restage crash-safe for free: nothing reads the staged files before
+  //     this point, so a crash mid-restage just restages again next run.
+  // TOCTOU note: the binary can still be swapped/stripped between this check
+  // and the eventual spawn.  Accepted: the cache lives in a user-writable temp
+  // dir and is NOT a trust boundary (write access there implies owning the
+  // user account), and the spawn fails closed — macOS kills an exec of an
+  // invalidly-signed binary, so the audit errors out loudly (no final frame)
+  // instead of running unaudited.  This check only turns a stale/tampered
+  // cache into a clean rebuild; it does not defend against a concurrent writer.
   const cached = readMarker(markerPath);
   if (cached !== undefined) {
     const nodePath = cached.nodePath;
-    if (
-      existsSync(nodePath) &&
-      existsSync(join(shellShimDir, SHELL_SHIM_BASH)) &&
-      existsSync(join(shellShimDir, SHELL_SHIM_COREUTILS)) &&
-      codesignVerifies(nodePath)
-    ) {
+    if (existsSync(nodePath) && codesignVerifies(nodePath, doRunCommand)) {
+      mkdirSync(shellShimDir, { recursive: true });
+      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
       return {
         nodeBinDir: cached.nodeBinDir,
         nodePath,
@@ -193,7 +232,7 @@ export async function provisionNodeMac(
         preResignSha256: cached.preResignSha256,
       };
     }
-    // Stale / partial: tear down and rebuild from scratch.
+    // Node half stale / partial / tampered: tear down and rebuild from scratch.
     rmSync(root, { recursive: true, force: true });
   }
 
@@ -240,18 +279,27 @@ export async function provisionNodeMac(
   const corepackPath = join(nodeBinDir, 'corepack');
   doRunCommand(corepackPath, ['enable'], { env: { ...vpEnv, PATH: prependPath(nodeBinDir, vpEnv) } });
 
-  // 6. Re-sign node ad-hoc to drop the hardened runtime (see header).  Also
-  //    re-sign the corepack-installed shims so they too honour DYLD_* when
-  //    spawned directly.
+  // 6. Re-sign node ad-hoc to drop the hardened runtime (see header).  Only
+  //    the `node` Mach-O needs this: the corepack-installed pnpm / yarn / npx
+  //    shims are plain shell scripts (no code signature to strip) that re-exec
+  //    this same node binary, so re-signing node alone is sufficient for
+  //    DYLD_* to be honoured across the whole toolchain.
   resignAdHoc(nodePath, doRunCommand);
 
   // 7. Stage + re-sign the two bundled multi-call binaries (bash + coreutils)
   //    into shellShimDir.  Filenames MUST match the shim's sip_redirect_target.
+  //    Deliberately untracked by the marker — the fast path restages them on
+  //    every cache hit (see above).
   materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
 
   // 8. Write the resign-marker LAST — its presence is the "fully provisioned"
   //    signal the fast path keys on.
-  writeMarker(markerPath, { nodeBinDir, nodePath, preResignSha256 });
+  writeMarker(markerPath, {
+    version: RESIGN_MARKER_VERSION,
+    nodeBinDir,
+    nodePath,
+    preResignSha256,
+  });
 
   return {
     nodeBinDir,
@@ -266,7 +314,23 @@ export async function provisionNodeMac(
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Marker schema version — guards the NODE-HALF parsing only.  readMarker
+// requires an exact match: a marker written by any other schema (v1 had no
+// version, v2 carried now-removed shim-source shas) is treated as unparseable,
+// which funnels into the existing fail-closed path (full teardown + rebuild).
+// Bump this whenever the meaning of nodeBinDir / nodePath / preResignSha256
+// changes.  The shell shims are NOT marker-tracked — they are restaged from
+// the bundled sources on every call — so no shim state belongs in here.
+const RESIGN_MARKER_VERSION = 3;
+
+/**
+ * The marker's one job: node resign tracking.  Where the re-signed toolchain
+ * lives and the pre-re-sign SHA-256 supply-chain anchor.  Its presence is the
+ * "node fully provisioned" signal; it deliberately says NOTHING about the
+ * staged shell shims (see the always-restage contract in the fast path).
+ */
 interface ResignMarker {
+  version: number;
   nodeBinDir: string;
   nodePath: string;
   preResignSha256: string;
@@ -275,15 +339,16 @@ interface ResignMarker {
 function readMarker(path: string): ResignMarker | undefined {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-    const { nodeBinDir, nodePath, preResignSha256 } = parsed;
+    const { version, nodeBinDir, nodePath, preResignSha256 } = parsed;
     if (
+      version !== RESIGN_MARKER_VERSION ||
       typeof nodeBinDir !== 'string' ||
       typeof nodePath !== 'string' ||
       typeof preResignSha256 !== 'string'
     ) {
       return undefined;
     }
-    return { nodeBinDir, nodePath, preResignSha256 };
+    return { version: RESIGN_MARKER_VERSION, nodeBinDir, nodePath, preResignSha256 };
   } catch {
     return undefined;
   }
@@ -371,13 +436,29 @@ function prependPath(dir: string, env: NodeJS.ProcessEnv): string {
  * Re-sign a Mach-O binary ad-hoc, dropping any hardened runtime / notarization
  * so DYLD_INSERT_LIBRARIES is honoured.  Idempotent: --remove-signature is a
  * no-op on an already-unsigned/ad-hoc binary.
+ *
+ * `identifier` (optional) pins the signing identifier explicitly.  Without it
+ * codesign infers the identifier from the file's basename — fine when signing
+ * in place (node), wrong when signing a temp file that is renamed into place
+ * afterwards (the shell shims): the identifier must stay the FINAL basename.
+ * The signature itself survives the rename either way (the CDHash covers
+ * content, not path).
  */
-function resignAdHoc(binPath: string, doRunCommand: typeof runCommand): void {
+function resignAdHoc(
+  binPath: string,
+  doRunCommand: typeof runCommand,
+  identifier?: string,
+): void {
   // 1. Strip the existing (notarized/hardened) signature.
   doRunCommand('codesign', ['--remove-signature', binPath]);
   // 2. Re-sign ad-hoc.  CRITICAL: NO `--options=runtime` — the hardened runtime
   //    is exactly what strips DYLD_INSERT_LIBRARIES.
-  doRunCommand('codesign', ['--force', '--sign', '-', binPath]);
+  doRunCommand(
+    'codesign',
+    identifier === undefined
+      ? ['--force', '--sign', '-', binPath]
+      : ['--force', '--sign', '-', '--identifier', identifier, binPath],
+  );
   // 3. Strip the quarantine xattr (Gatekeeper would otherwise re-add hardened
   //    enforcement on first exec).  Best-effort: the attr may be absent.
   spawnSync('xattr', ['-d', 'com.apple.quarantine', binPath], { stdio: 'ignore' });
@@ -385,10 +466,19 @@ function resignAdHoc(binPath: string, doRunCommand: typeof runCommand): void {
   doRunCommand('codesign', ['--verify', binPath]);
 }
 
-/** True iff `codesign --verify` succeeds for `binPath`. */
-function codesignVerifies(binPath: string): boolean {
-  const r = spawnSync('codesign', ['--verify', binPath], { stdio: 'ignore' });
-  return r.status === 0;
+/**
+ * True iff `codesign --verify` succeeds for `binPath`.  Routed through the
+ * runCommand seam (which throws on non-zero exit) so the cache fast path is
+ * unit-testable; the criterion — codesign --verify's exit status — is
+ * unchanged.
+ */
+function codesignVerifies(binPath: string, doRunCommand: typeof runCommand): boolean {
+  try {
+    doRunCommand('codesign', ['--verify', binPath]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -398,7 +488,11 @@ function codesignVerifies(binPath: string): boolean {
  * is honoured.  Unlike the old per-applet copy of the SYSTEM binaries, both
  * sources are REQUIRED (a missing one would leave the redirect pointing at a
  * non-existent file → exec ENOENT inside the audited install), so we hard-fail
- * rather than skip.
+ * rather than skip.  Each file is replaced atomically (see materializeOne);
+ * per-FILE atomicity is deliberately sufficient — no set-level (both-files)
+ * transaction is needed because each binary is valid and self-contained at
+ * every instant, both generations come from the same bundled sources within
+ * any given build, and bash / coreutils have no cross-file dependency.
  */
 function materializeShellShims(
   shellShimDir: string,
@@ -410,7 +504,37 @@ function materializeShellShims(
   materializeOne(macCoreutilsPath, join(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
 }
 
+/**
+ * Stage ONE shim binary atomically: copy the source to a unique temp name in
+ * the SAME directory as `dest` (same dir ⇒ same filesystem ⇒ renameSync is an
+ * atomic swap), run the FULL chmod + quarantine-strip + ad-hoc re-sign
+ * sequence against the temp file, and only then rename it over `dest`.  A
+ * concurrent audit sharing this deterministic shim dir therefore only ever
+ * execs a COMPLETE binary — old generation or new — never a truncated /
+ * unsigned / mid-signature copy.  On ANY failure the temp file is removed and
+ * `dest` is left untouched.  (Temp-name shape mirrors src/cli/rootfs-cache.ts.)
+ */
 function materializeOne(src: string, dest: string, doRunCommand: typeof runCommand): void {
+  requireShimSource(src);
+  const tmp = join(dirname(dest), `.${basename(dest)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    copyFileSync(src, tmp);
+    chmodSync(tmp, 0o755);
+    // Sign the TEMP bytes but pin the signing identifier to the DESTINATION
+    // basename (`bash` / `coreutils`) — codesign would otherwise infer it from
+    // the temp filename.  The signature survives the rename (CDHash covers
+    // content, not path).
+    resignAdHoc(tmp, doRunCommand, basename(dest));
+    renameSync(tmp, dest);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
+/** Hard-fail when a bundled shell-shim SOURCE binary is missing (a staged copy
+ *  from nothing is meaningless). */
+function requireShimSource(src: string): void {
   if (!existsSync(src)) {
     throw new Error(
       `script-jail: bundled shell-shim binary not found at ${src}. ` +
@@ -418,7 +542,4 @@ function materializeOne(src: string, dest: string, doRunCommand: typeof runComma
         `release artifact).`,
     );
   }
-  copyFileSync(src, dest);
-  chmodSync(dest, 0o755);
-  resignAdHoc(dest, doRunCommand);
 }

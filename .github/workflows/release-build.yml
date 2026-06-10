@@ -86,14 +86,57 @@ jobs:
         with:
           workspaces: . -> target
 
+      # MACOSX_DEPLOYMENT_TARGET pins the VZ helper's LC_BUILD_VERSION minOS to
+      # the documented VZ floor: macOS 14+ (README "On macOS 14 or newer",
+      # docs/architecture.md, and src/cli/detect-platform.ts MIN_MACOS_MAJOR = 14
+      # — the CLI refuses to run the VZ path below 14, so the helper never needs
+      # to load there).  NOT the dylib's 11.0: that floor belongs to the bare
+      # backend's injection artifacts; the helper's contract is the VZ floor.
+      # rustc's aarch64-apple-darwin default happens to be 11.0 today, but the
+      # explicit env + vtool assert makes the contract survive toolchain/SDK
+      # bumps instead of riding an undocumented default.  The lipo assert pins
+      # thin arm64 (the host-target build has no explicit --target, so a runner
+      # arch change would otherwise slip through to the staged/hashed artifact).
+      # Keep this pin in lockstep with MIN_MACOS_MAJOR.
       - name: cargo build (release)
-        run: cargo build --release -p script-jail-host-mac
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '14.0'
+        run: |
+          set -euo pipefail
+          cargo build --release -p script-jail-host-mac
+          HELPER=target/release/script-jail-vm
+          ARCHS="$(lipo -archs "$HELPER" | tr -d '[:space:]')"
+          if [ "$ARCHS" != "arm64" ]; then
+            echo "::error::script-jail-vm is not a thin arm64 Mach-O (lipo -archs = ${ARCHS:-<unreadable>})" >&2
+            exit 1
+          fi
+          MINOS="$(vtool -show-build "$HELPER" | awk '/minos/ { print $2; exit }')"
+          if [ "$MINOS" != "14.0" ]; then
+            echo "::error::script-jail-vm minOS is '${MINOS:-<unparsable>}', expected 14.0 (the documented VZ floor) — MACOSX_DEPLOYMENT_TARGET was not honored by the cargo link" >&2
+            exit 1
+          fi
 
       # Build the macOS-native shim cdylib.  Mirrors scripts/build.ts
       # `buildShimMac`: explicit `--target aarch64-apple-darwin` (the runner's
       # host target, already installed) so the output path is deterministic.
+      # MACOSX_DEPLOYMENT_TARGET pins the cdylib link's LC_BUILD_VERSION minOS —
+      # a newer runner SDK would otherwise stamp its own default (e.g. 26.0),
+      # producing a dylib that fails to load on the documented macOS floor
+      # (macOS 14+, dylib floor 11.0).  The post-build vtool assert mirrors
+      # scripts/build.ts shimDylibMinOS / SHIM_PINNED_MINOS — keep both pins in
+      # lockstep so they don't drift silently.
       - name: Build macOS shim dylib (release)
-        run: cargo build --release --manifest-path src/shim/Cargo.toml --target aarch64-apple-darwin
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path src/shim/Cargo.toml --target aarch64-apple-darwin
+          DYLIB=target/aarch64-apple-darwin/release/libscriptjail.dylib
+          MINOS="$(vtool -show-build "$DYLIB" | awk '/minos/ { print $2; exit }')"
+          if [ "$MINOS" != "11.0" ]; then
+            echo "::error::libscriptjail.dylib minOS is '${MINOS:-<unparsable>}', expected 11.0 — MACOSX_DEPLOYMENT_TARGET was not honored by the cargo link" >&2
+            exit 1
+          fi
 
       - name: Stage binaries
         run: |
@@ -140,6 +183,21 @@ jobs:
           fi
           cp "$UU_BIN" artifacts/mac-bin/coreutils-arm64
           chmod 0755 artifacts/mac-bin/coreutils-arm64
+          ARCHS="$(lipo -archs artifacts/mac-bin/coreutils-arm64 | tr -d '[:space:]')"
+          if [ "$ARCHS" != "arm64" ]; then
+            echo "coreutils is not thin arm64 (archs=$ARCHS)" >&2; exit 1
+          fi
+          # uutils is a PREBUILT we don't control, so the minOS gate is
+          # "loads on the documented macOS floor" (minos <= 11.0), NOT the
+          # exact-equality pin the dylib/bash builds use — a lower minOS is
+          # fine, only a minOS above the floor would fail to load.  The 0.4.0
+          # prebuilt carries minos 11.0 today; this catches a future pin bump
+          # to a binary stamped above the floor.  Mirrors scripts/build.ts
+          # validateMacCoreutils.
+          MINOS="$(vtool -show-build artifacts/mac-bin/coreutils-arm64 | awk '/minos/ { print $2; exit }')"
+          if [ -z "$MINOS" ] || [ "$(printf '%s\n%s\n' "$MINOS" "11.0" | sort -V | tail -1)" != "11.0" ]; then
+            echo "coreutils minOS is '${MINOS:-<unparsable>}', expected <= 11.0 (must load on the documented macOS floor)" >&2; exit 1
+          fi
           # --- bash 5.3 from source (plain arm64, verify SOURCE sha) ---
           BASH_URL="https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz"
           BASH_SRC_SHA="0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba"
@@ -150,11 +208,19 @@ jobs:
           fi
           mkdir -p /tmp/bash && tar -xzf /tmp/bash.tgz -C /tmp/bash
           BASH_SRC="$(find /tmp/bash -maxdepth 1 -type d -name 'bash-*' | head -1)"
-          ( cd "$BASH_SRC" && ./configure --without-bash-malloc CFLAGS="-arch arm64 -Os" && make -j )
+          # -mmacosx-version-min pins bash's minOS to the dylib floor (11.0);
+          # bash's Makefile propagates CFLAGS to the link line via BASE_LDFLAGS,
+          # so no separate LDFLAGS is needed.  Mirrors scripts/build.ts
+          # buildMacBash / SHIM_PINNED_MINOS.
+          ( cd "$BASH_SRC" && ./configure --without-bash-malloc CFLAGS="-arch arm64 -Os -mmacosx-version-min=11.0" && make -j )
           codesign --force --sign - "$BASH_SRC/bash"
           ARCHS="$(lipo -archs "$BASH_SRC/bash" | tr -d '[:space:]')"
           if [ "$ARCHS" != "arm64" ]; then
             echo "bash is not thin arm64 (archs=$ARCHS)" >&2; exit 1
+          fi
+          MINOS="$(vtool -show-build "$BASH_SRC/bash" | awk '/minos/ { print $2; exit }')"
+          if [ "$MINOS" != "11.0" ]; then
+            echo "bash minOS is '${MINOS:-<unparsable>}', expected 11.0" >&2; exit 1
           fi
           cp "$BASH_SRC/bash" artifacts/mac-bin/bash-arm64
           chmod 0755 artifacts/mac-bin/bash-arm64

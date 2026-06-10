@@ -14,8 +14,14 @@ fn main() {
     println!("cargo:rerun-if-changed=src/open_variadic.c");
     println!("cargo:rerun-if-changed=src/sj_spawn_chdir_np2.c");
 
+    // Pin the cc object's deployment target to the dylib floor (11.0, the same
+    // pin as SHIM_PINNED_MINOS in scripts/build.ts) so a newer host SDK default
+    // can never raise this object's minOS above the final cdylib link's.
+    // (macOS-only: the CARGO_CFG_TARGET_OS guard above already skips this whole
+    // body for Linux, where clang/gcc would reject the flag.)
     cc::Build::new()
         .file("src/open_variadic.c")
+        .flag("-mmacosx-version-min=11.0")
         .warnings(false)
         .compile("scriptjail_open_variadic");
 

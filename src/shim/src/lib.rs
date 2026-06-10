@@ -85,9 +85,11 @@ const MAX_ARGV_ELEM_LEN: usize = 512;
 // env-spy / shim getenv unannotated.  Any change to CANON_BUF_LEN here MUST
 // be mirrored in `src/shim/canon-buf-len.ts` (and vice versa).
 const CANON_BUF_LEN: usize = 1024;
-/// Room for: LD_PRELOAD + NODE_OPTIONS + 9 × SCRIPT_JAIL_* injected entries
-/// (must be >= 2 + STICKY_VARS.len()).  Margin keeps small future additions
-/// safe.
+/// Room for: the preload var (LD_PRELOAD / DYLD_INSERT_LIBRARIES) +
+/// NODE_OPTIONS + the SCRIPT_JAIL_* injected entries — STICKY_VARS holds
+/// 7 universal + 3 macOS-only entries, i.e. 10 on macOS / 7 on Linux
+/// (must be >= 2 + STICKY_VARS.len(): 12 on macOS, 9 on Linux).  14 keeps
+/// margin for small future additions (2 spare on macOS, 5 on Linux).
 const MAX_ENVP_GROWTH: usize = 14;
 /// Sanity cap on input envp length — rejects hostile or corrupted envps.
 const MAX_ENVP_SANITY: usize = 8192;

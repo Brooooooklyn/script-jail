@@ -70,6 +70,25 @@ describe('createMacBareExecute — fail-closed preconditions', () => {
     await expect(exec(makeInput())).rejects.toThrow(/shim not found/i);
   });
 
+  it('hard-fails when a bundled runtime file cannot be resolved (guest-agent / preloads)', async () => {
+    // resolveRuntimePaths walks the same root-candidate list for all three
+    // bundled JS artifacts (root/<name> and root/dist/[preloads/]<name> across
+    // SCRIPT_JAIL_ACTION_ROOT / GITHUB_ACTION_PATH / repoRoot / repoRoot/.. /
+    // cwd), so one loop covers them; each iteration blanks exactly ONE file so
+    // the MacBareUnavailableError must name the missing artifact.
+    for (const missing of ['guest-agent.cjs', 'platform-spoof.cjs', 'env-spy.cjs']) {
+      const exec = createMacBareExecute(
+        makeDeps({
+          existsSync: ((p: unknown) =>
+            !String(p).includes(missing)) as unknown as NonNullable<MacBareExecuteDeps['existsSync']>,
+        }),
+      );
+      const err = await exec(makeInput()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(MacBareUnavailableError);
+      expect(String((err as Error).message)).toContain(`${missing} was not found`);
+    }
+  });
+
   it('hard-fails when the dylib is PRESENT but BROKEN — R2 present-but-invalid guard', async () => {
     // The shim is the sole event source on macOS; a present-but-unloadable
     // dylib (wrong arch / ELF / fat / no __interpose) would otherwise produce a

@@ -264,22 +264,40 @@ function buildShimArm64(): void {
  *      Silicon and required for injection into the re-signed node (Phase 4).
  *   4. `codesign --verify` so a broken signature fails the build.
  */
-// Deployment target the macOS shim dylib MUST carry so it loads on the lowest
-// supported runner (the macos-14 parity runner).  Pinned for the cargo link and
-// asserted on BOTH the cache-hit and freshly-built paths.
+// Deployment target the macOS shim dylib AND the bash-arm64 substitution
+// binary MUST carry so they load on the lowest supported runner (the macos-14
+// parity runner).  Pinned for the cargo link / bash CFLAGS and asserted on
+// BOTH the cache-hit and freshly-built paths.  The release producer
+// (.github/workflows/release-build.yml) carries the same pin — keep them in
+// lockstep.
 const SHIM_PINNED_MINOS = '11.0';
 
 /**
- * Read the Mach-O minOS (LC_BUILD_VERSION) of `dylib` as "major.minor" via vtool.
+ * Read the Mach-O minOS (LC_BUILD_VERSION) of `machoPath` as "major.minor" via
+ * vtool.  Works on MH_DYLIB and MH_EXECUTE alike (the dylib AND bash-arm64).
  * Throws if it cannot be parsed (fail closed).
  */
-function shimDylibMinOS(dylib: string): string {
-  const out = execSync(`vtool -show-build "${dylib}"`, { cwd: REPO_ROOT }).toString();
+function machoMinOS(machoPath: string): string {
+  const out = execSync(`vtool -show-build "${machoPath}"`, { cwd: REPO_ROOT }).toString();
   const minos = out.match(/minos\s+(\d+(?:\.\d+)?)/)?.[1];
   if (minos === undefined) {
-    throw new Error(`[build] could not parse minOS from vtool output for ${dylib}`);
+    throw new Error(`[build] could not parse minOS from vtool output for ${machoPath}`);
   }
   return minos;
+}
+
+/**
+ * True when Mach-O minOS `actual` is at or below `floor` (both "major[.minor]").
+ * Compared per component, NOT via parseFloat ("10.15" is a HIGHER version than
+ * "10.2" but a lower float).  Used for PREBUILT binaries we don't control
+ * (uutils coreutils): their contract is "loads on the documented macOS floor",
+ * so a LOWER minOS is fine — only a minOS above the floor must fail.  An
+ * unparsable component compares as NaN and fails closed.
+ */
+function minosAtMost(actual: string, floor: string): boolean {
+  const [aMaj, aMin = 0] = actual.split('.').map(Number);
+  const [fMaj, fMin = 0] = floor.split('.').map(Number);
+  return aMaj! < fMaj! || (aMaj === fMaj && aMin <= fMin);
 }
 
 function buildShimMac(): void {
@@ -294,7 +312,7 @@ function buildShimMac(): void {
   // not slip through the freshness skip and then fail to load on macos-14
   // (adversarial-review MEDIUM 2026-06).
   if (!shimArtifactIsStale(shimOut)) {
-    const cachedMinOS = shimDylibMinOS(shimOut);
+    const cachedMinOS = machoMinOS(shimOut);
     if (cachedMinOS === SHIM_PINNED_MINOS) {
       console.log(
         `[build] images/libscriptjail-arm64.dylib is up-to-date (minOS ${cachedMinOS}); ` +
@@ -334,7 +352,7 @@ function buildShimMac(): void {
   // Fail closed if the freshly-built dylib's minOS is not exactly the pin — any
   // other value means MACOSX_DEPLOYMENT_TARGET did not take and the parity / bare
   // backend would fail to inject on the macos-14 runner.
-  const builtMinOS = shimDylibMinOS(shimOut);
+  const builtMinOS = machoMinOS(shimOut);
   if (builtMinOS !== SHIM_PINNED_MINOS) {
     throw new Error(
       `[build] macOS shim minOS is ${builtMinOS}, expected ${SHIM_PINNED_MINOS}. ` +
@@ -389,10 +407,41 @@ const MAC_BASH_SRC_SHA256 =
   '0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba';
 
 /**
+ * Arch + minOS gates for images/coreutils-arm64, shared by BOTH the
+ * freshly-downloaded and the pinned-SHA cache-hit paths of fetchMacCoreutils
+ * (a stale local cache predating these gates, or a future pin bump to a
+ * wrong-arch / too-new upstream binary, must not skip validation).
+ * Mirrors the lipo/vtool asserts in .github/workflows/release-build.yml.
+ */
+function validateMacCoreutils(dest: string): void {
+  // Same thin-arm64 gate as bash-arm64 (rejects arm64e, fat, or x86_64 —
+  // the SHA pin alone would accept a re-pinned wrong-arch upstream binary).
+  const archs = machoArchs(dest);
+  if (archs !== 'arm64') {
+    throw new Error(
+      `[build] images/coreutils-arm64 is not a thin arm64 Mach-O (lipo -archs = ${archs ?? 'unreadable'}).`,
+    );
+  }
+  // uutils is a PREBUILT we don't control, so the minOS gate is `<= floor`
+  // ("loads on the documented macOS floor"), NOT the exact-equality pin the
+  // dylib/bash builds use.  The 0.4.0 prebuilt carries minos 11.0 today; a
+  // pin bump to a binary stamped above the floor must fail here, not at
+  // exec time on the oldest supported runner.
+  const minos = machoMinOS(dest);
+  if (!minosAtMost(minos, SHIM_PINNED_MINOS)) {
+    throw new Error(
+      `[build] images/coreutils-arm64 minOS is ${minos}, expected <= ${SHIM_PINNED_MINOS} ` +
+      '(must load on the documented macOS floor).',
+    );
+  }
+}
+
+/**
  * Download the official uutils coreutils prebuilt, verify its SHA-256, extract
  * the single `coreutils` multi-call binary to images/coreutils-arm64, and
  * chmod 0o755.  Skips the re-download when images/coreutils-arm64 already
- * exists and hashes to the pinned SHA-256.
+ * exists and hashes to the pinned SHA-256 (the arch/minOS gates still run on
+ * that cache-hit path — see validateMacCoreutils).
  */
 async function fetchMacCoreutils(): Promise<void> {
   const imagesDir = join(REPO_ROOT, 'images');
@@ -401,9 +450,10 @@ async function fetchMacCoreutils(): Promise<void> {
   if (existsSync(dest)) {
     const sha = await sha256File(dest);
     if (sha === MAC_COREUTILS_SHA256) {
+      validateMacCoreutils(dest);
       console.log(
-        '[build] images/coreutils-arm64 already matches the pinned SHA-256; ' +
-        'skipping uutils download.',
+        '[build] images/coreutils-arm64 already matches the pinned SHA-256 ' +
+        '(thin arm64, minOS within floor); skipping uutils download.',
       );
       return;
     }
@@ -446,7 +496,12 @@ async function fetchMacCoreutils(): Promise<void> {
 
     copyFileSync(coreutilsBin, dest);
     chmodSync(dest, 0o755);
-    console.log('[build] images/coreutils-arm64 extracted, SHA-256 verified, chmod 0o755.');
+
+    validateMacCoreutils(dest);
+    console.log(
+      '[build] images/coreutils-arm64 extracted, SHA-256 verified, ' +
+      'arch/minOS validated, chmod 0o755.',
+    );
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -468,12 +523,21 @@ async function buildMacBash(): Promise<void> {
   const imagesDir = join(REPO_ROOT, 'images');
   const dest = join(imagesDir, 'bash-arm64');
 
+  // Like the dylib cache path: a cached bash built before the deployment-target
+  // pin would carry the host SDK's default minOS and fail to load on macos-14,
+  // so the skip also requires minOS == SHIM_PINNED_MINOS.
   if (existsSync(dest) && machoArchs(dest) === 'arm64') {
+    const cachedMinOS = machoMinOS(dest);
+    if (cachedMinOS === SHIM_PINNED_MINOS) {
+      console.log(
+        `[build] images/bash-arm64 already exists (thin arm64, minOS ${cachedMinOS}); ` +
+        'skipping bash build.',
+      );
+      return;
+    }
     console.log(
-      '[build] images/bash-arm64 already exists and is a thin arm64 Mach-O; ' +
-      'skipping bash build.',
+      `[build] cached bash-arm64 minOS ${cachedMinOS} != pinned ${SHIM_PINNED_MINOS}; rebuilding.`,
     );
-    return;
   }
 
   mkdirSync(imagesDir, { recursive: true });
@@ -506,9 +570,15 @@ async function buildMacBash(): Promise<void> {
       .filter((e) => e.isDirectory());
     const srcDir = entries.length === 1 ? join(extractDir, entries[0]!.name) : extractDir;
 
-    console.log('[build] Configuring bash (--without-bash-malloc, -arch arm64 -Os) …');
+    console.log(
+      '[build] Configuring bash (--without-bash-malloc, -arch arm64 -Os ' +
+      `-mmacosx-version-min=${SHIM_PINNED_MINOS}) …`,
+    );
+    // -mmacosx-version-min pins bash's minOS to the dylib floor; bash's
+    // Makefile propagates CFLAGS to the link line via BASE_LDFLAGS, so no
+    // separate LDFLAGS is needed.
     execSync(
-      `./configure --without-bash-malloc CFLAGS="-arch arm64 -Os"`,
+      `./configure --without-bash-malloc CFLAGS="-arch arm64 -Os -mmacosx-version-min=${SHIM_PINNED_MINOS}"`,
       { stdio: 'inherit', cwd: srcDir },
     );
     console.log('[build] Building bash (make -j) …');
@@ -535,7 +605,18 @@ async function buildMacBash(): Promise<void> {
         `[build] images/bash-arm64 is not a thin arm64 Mach-O (lipo -archs = ${archs ?? 'unreadable'}).`,
       );
     }
-    console.log('[build] images/bash-arm64 built + signed + chmod 0o755.');
+    // Fail closed if the built bash's minOS is not exactly the pin — same
+    // contract as the dylib (a higher minOS won't load on macos-14).
+    const builtMinOS = machoMinOS(dest);
+    if (builtMinOS !== SHIM_PINNED_MINOS) {
+      throw new Error(
+        `[build] images/bash-arm64 minOS is ${builtMinOS}, expected ${SHIM_PINNED_MINOS}. ` +
+        'Ensure -mmacosx-version-min reaches both the compile and link steps.',
+      );
+    }
+    console.log(
+      `[build] images/bash-arm64 built + signed + chmod 0o755 (minOS ${builtMinOS}).`,
+    );
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

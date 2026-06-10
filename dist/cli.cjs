@@ -25340,7 +25340,7 @@ function vitePlusTarballUrl(arch, os = "linux") {
 function defaultProvisionCacheDir(env = process.env) {
   const override = env["SCRIPT_JAIL_CACHE_DIR"];
   if (override !== void 0 && override !== "") return override;
-  return (0, import_node_os8.tmpdir)();
+  return (0, import_node_path15.join)((0, import_node_os8.tmpdir)(), "script-jail-cache");
 }
 var SHELL_SHIM_BASH = "bash";
 var SHELL_SHIM_COREUTILS = "coreutils";
@@ -25360,7 +25360,9 @@ async function provisionNodeMac(input) {
   const cached2 = readMarker(markerPath);
   if (cached2 !== void 0) {
     const nodePath2 = cached2.nodePath;
-    if ((0, import_node_fs19.existsSync)(nodePath2) && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(shellShimDir, SHELL_SHIM_BASH)) && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(shellShimDir, SHELL_SHIM_COREUTILS)) && codesignVerifies(nodePath2)) {
+    if ((0, import_node_fs19.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand)) {
+      (0, import_node_fs19.mkdirSync)(shellShimDir, { recursive: true });
+      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
       return {
         nodeBinDir: cached2.nodeBinDir,
         nodePath: nodePath2,
@@ -25394,7 +25396,12 @@ async function provisionNodeMac(input) {
   doRunCommand(corepackPath, ["enable"], { env: { ...vpEnv, PATH: prependPath(nodeBinDir, vpEnv) } });
   resignAdHoc(nodePath, doRunCommand);
   materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
-  writeMarker(markerPath, { nodeBinDir, nodePath, preResignSha256 });
+  writeMarker(markerPath, {
+    version: RESIGN_MARKER_VERSION,
+    nodeBinDir,
+    nodePath,
+    preResignSha256
+  });
   return {
     nodeBinDir,
     nodePath,
@@ -25403,14 +25410,15 @@ async function provisionNodeMac(input) {
     preResignSha256
   };
 }
+var RESIGN_MARKER_VERSION = 3;
 function readMarker(path) {
   try {
     const parsed = JSON.parse((0, import_node_fs19.readFileSync)(path, "utf8"));
-    const { nodeBinDir, nodePath, preResignSha256 } = parsed;
-    if (typeof nodeBinDir !== "string" || typeof nodePath !== "string" || typeof preResignSha256 !== "string") {
+    const { version: version2, nodeBinDir, nodePath, preResignSha256 } = parsed;
+    if (version2 !== RESIGN_MARKER_VERSION || typeof nodeBinDir !== "string" || typeof nodePath !== "string" || typeof preResignSha256 !== "string") {
       return void 0;
     }
-    return { nodeBinDir, nodePath, preResignSha256 };
+    return { version: RESIGN_MARKER_VERSION, nodeBinDir, nodePath, preResignSha256 };
   } catch {
     return void 0;
   }
@@ -25468,29 +25476,46 @@ function prependPath(dir, env) {
   const existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin";
   return `${dir}:${existing}`;
 }
-function resignAdHoc(binPath, doRunCommand) {
+function resignAdHoc(binPath, doRunCommand, identifier) {
   doRunCommand("codesign", ["--remove-signature", binPath]);
-  doRunCommand("codesign", ["--force", "--sign", "-", binPath]);
+  doRunCommand(
+    "codesign",
+    identifier === void 0 ? ["--force", "--sign", "-", binPath] : ["--force", "--sign", "-", "--identifier", identifier, binPath]
+  );
   (0, import_node_child_process5.spawnSync)("xattr", ["-d", "com.apple.quarantine", binPath], { stdio: "ignore" });
   doRunCommand("codesign", ["--verify", binPath]);
 }
-function codesignVerifies(binPath) {
-  const r = (0, import_node_child_process5.spawnSync)("codesign", ["--verify", binPath], { stdio: "ignore" });
-  return r.status === 0;
+function codesignVerifies(binPath, doRunCommand) {
+  try {
+    doRunCommand("codesign", ["--verify", binPath]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand) {
   materializeOne(macBashPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
   materializeOne(macCoreutilsPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
 }
 function materializeOne(src, dest, doRunCommand) {
+  requireShimSource(src);
+  const tmp = (0, import_node_path15.join)((0, import_node_path15.dirname)(dest), `.${(0, import_node_path15.basename)(dest)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    (0, import_node_fs19.copyFileSync)(src, tmp);
+    (0, import_node_fs19.chmodSync)(tmp, 493);
+    resignAdHoc(tmp, doRunCommand, (0, import_node_path15.basename)(dest));
+    (0, import_node_fs19.renameSync)(tmp, dest);
+  } catch (err) {
+    (0, import_node_fs19.rmSync)(tmp, { force: true });
+    throw err;
+  }
+}
+function requireShimSource(src) {
   if (!(0, import_node_fs19.existsSync)(src)) {
     throw new Error(
       `script-jail: bundled shell-shim binary not found at ${src}. Build it with \`pnpm build\` on an Apple Silicon mac (or fetch the release artifact).`
     );
   }
-  (0, import_node_fs19.copyFileSync)(src, dest);
-  (0, import_node_fs19.chmodSync)(dest, 493);
-  resignAdHoc(dest, doRunCommand);
 }
 
 // src/rootfs/macho.ts
