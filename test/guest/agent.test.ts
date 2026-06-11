@@ -2447,6 +2447,10 @@ describe('runStraceTailer', () => {
       eventsBaseline: baseline,
       tamperRef,
       exitPromise,
+      // Clean strace exit (code 0, no signal): the runner publishes this and the
+      // tailer engages the post-exit meta-gate freeze.  Without it the freeze
+      // stays OFF (fail-closed default) and this benign finalize would trip.
+      exitStatusRef: { code: 0, signal: null },
       pollIntervalMs: 20,
       drainMs: 30,
       // Keep the post-exit settle loop polling long enough that several polls
@@ -2469,6 +2473,121 @@ describe('runStraceTailer', () => {
     const items = await collect(tailer, 4000);
     expect(tamperRef.reason).toBeNull();
     // The legitimate appended line must still be yielded.
+    expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
+  });
+
+  // 2026-06-12 SECURITY (Codex finding 1): the post-exit meta-gate freeze must
+  // engage ONLY on a CLEAN strace exit.  exitPromise resolves on ANY strace
+  // close — including a tracee (same UID) SIGKILLing its own tracer to detach
+  // and keep running.  If the freeze engaged on that, the survivor could
+  // append->truncate->utimes-restore (size===eventsPos, mtime pinned) entirely
+  // unobserved.  So an ABNORMAL strace termination (signal set, or non-zero
+  // code) is itself a fatal tamper — a killed/crashed tracer means the capture
+  // can no longer be trusted.  Here strace "exits" via SIGKILL with the events
+  // file left completely benign (only one legitimately-consumed line): the
+  // killed tracer ALONE must refuse the lockfile.
+  it('records a tamper reason when strace exits abnormally (killed tracer), even with a benign events file', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+    // The runner mutates this ref in strace's `close` handler BEFORE resolving
+    // exitPromise.  A tracee-driven SIGKILL surfaces as code=null, signal set.
+    const exitStatusRef: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null };
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      exitStatusRef,
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 2,
+      settleHardCapMs: 400,
+    });
+
+    // t=40: one legitimate event, consumed during the active phase — proves the
+    // file itself is untouched; ONLY the tracer's death drives the tamper.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: strace is SIGKILLed — publish the abnormal disposition, then resolve.
+    setTimeout(() => {
+      exitStatusRef.code = null;
+      exitStatusRef.signal = 'SIGKILL';
+      resolveExit();
+    }, 120);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/terminated abnormally|SIGKILL|killed or crashed tracer/);
+  });
+
+  // 2026-06-12 SECURITY (Codex finding 1, corollary): a NON-ZERO strace exit
+  // with NO signal is a legitimately-failing-but-audited install — `strace -f`
+  // propagates the tracee's exit code, and the whole tree still exited, so the
+  // freeze MUST engage and the benign end-of-audit ctime finalize must NOT trip.
+  // Treating a non-zero code as tamper would refuse a lockfile for every offline
+  // postinstall (see main()'s non-zero-Phase-B leniency at agent main() tests).
+  it('does NOT record tamper on a NORMAL non-zero strace exit + benign post-exit ctime finalize', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      // Normal exit, non-zero code (a failing install), NO signal → freeze engages.
+      exitStatusRef: { code: 1, signal: null },
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 8,
+      settleHardCapMs: 600,
+    });
+
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    setTimeout(() => { resolveExit(); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
     expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
   });
 

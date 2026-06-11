@@ -380,6 +380,28 @@ export interface StraceTailerOptions {
    * The tailer waits for this, then does one final drain poll, then ends.
    */
   exitPromise: Promise<void>;
+  /**
+   * Disposition of the traced process (strace) at exit, populated by the
+   * runner's close/error handler BEFORE {@link exitPromise} resolves.
+   *
+   * The post-exit freeze of the two "advanced WITHOUT new bytes" meta gates
+   * (see the `childExited` flag in {@link runStraceTailer}) is a RELAXATION, so
+   * it engages ONLY when strace exited NORMALLY — i.e. by exit(), `signal ===
+   * null`, REGARDLESS of the exit code.  `strace -f` exits only after the WHOLE
+   * traced tree has exited, so a normal strace exit (even a non-zero code,
+   * which it propagates from a legitimately-failing-but-audited install) means
+   * no in-model writer remains to race the polling window.  When strace is
+   * instead terminated by a SIGNAL (`signal !== null`) — or fails to spawn
+   * (`spawnError`) — a tracee may have killed its tracer and detached, or the
+   * audit never ran; the tailer records a fatal tamper and leaves the gates
+   * ARMED (fail closed).  A non-zero exit code alone is NOT abnormal here: it is
+   * the tracee's propagated status, and treating it as tamper would refuse a
+   * lockfile for every offline/failing postinstall (see the non-zero-Phase-B
+   * leniency in main()).  When the disposition is absent (unit tests that don't
+   * model exit status) the relaxation also stays OFF: fail-closed by default.
+   * Production runners (Linux + macOS) ALWAYS populate this.
+   */
+  exitStatusRef?: { code: number | null; signal: NodeJS.Signals | null; spawnError?: boolean };
   /** Poll interval in ms for directory scan and file growth checks (default 50). */
   pollIntervalMs?: number;
   /** Extra drain time in ms after child exit to catch final writes (default 100). */
@@ -1037,11 +1059,42 @@ export async function* runStraceTailer(
   // ---- wait for child exit, then drain -------------------------------------
 
   opts.exitPromise.then(async () => {
-    // Mark the traced tree exited so the two "advanced without new bytes" meta
-    // gates freeze (see the childExited declaration).  Set BEFORE the settle
-    // drains below so the kernel's permanent end-of-audit ctime finalize cannot
+    // Decide whether to freeze the two "advanced WITHOUT new bytes" meta gates
+    // (see the childExited declaration).  The freeze is a RELAXATION, so it
+    // engages ONLY when strace exited NORMALLY (by exit(), signal === null) —
+    // the whole traced tree exited and strace flushed normally, leaving no
+    // in-model writer to race the polling window.  Set BEFORE the settle drains
+    // below so the kernel's permanent end-of-audit ctime finalize cannot
     // accumulate a false positive while we tail out the remaining bytes.
-    childExited = true;
+    //
+    // SECURITY (Codex 2026-06-12, finding 1): exitPromise resolves on ANY strace
+    // close — including a tracee (same UID) SIGKILLing its own tracer to detach
+    // and keep running.  Freezing the gates on that would let the survivor do an
+    // append->truncate->utimes-restore (size===eventsPos, mtime pinned) entirely
+    // unobserved.  So a strace terminated by a SIGNAL (or that failed to spawn)
+    // is a fatal tamper — a killed/crashed tracer can leave a detached survivor,
+    // so the capture can no longer be trusted — and the gates stay ARMED.
+    //
+    // A non-zero exit CODE is NOT abnormal: `strace -f` propagates the tracee's
+    // exit status, so a non-zero code is just a legitimately-failing-but-audited
+    // install (offline postinstall, etc.).  The tracee tree still exited, so no
+    // survivor remains and the freeze is safe — and treating it as tamper would
+    // refuse a lockfile for every failing install (see main()'s non-zero-Phase-B
+    // leniency).  Absent disposition (unit tests) leaves the relaxation OFF:
+    // fail-closed default.  (A child that escaped the tracer via CLONE_UNTRACED
+    // is caught separately at clone-parse time — see phase-install.ts.)
+    const exitStatus = opts.exitStatusRef;
+    if (exitStatus !== undefined) {
+      if (exitStatus.signal !== null || exitStatus.spawnError === true) {
+        recordTamper(
+          `strace terminated abnormally (signal=${exitStatus.signal ?? '<none>'}` +
+            `${exitStatus.spawnError === true ? ', spawn error' : ''}) — a killed or ` +
+            `crashed tracer can leave a detached tracee alive; audit capture cannot be trusted`,
+        );
+      } else {
+        childExited = true;
+      }
+    }
     // By the time exitPromise resolves, strace has already fclose()'d every
     // per-pid file: it exits only after the whole traced process tree has
     // exited, and the agent NEVER kills it (no SIGKILL/SIGTERM anywhere in
@@ -1219,7 +1272,10 @@ export interface SpawnResult {
    * tailer's "first per-pid file observed" heuristic in that case.
    */
   pid: number | undefined;
-  on(event: 'close', listener: (code: number | null) => void): this;
+  on(
+    event: 'close',
+    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
+  ): this;
   on(event: 'error', listener: (err: Error) => void): this;
 }
 
@@ -1557,9 +1613,29 @@ export class LinuxStraceRunner implements StraceRunner {
     // Else: child.pid is undefined → spawn-stub / test path; allow the
     // per-pid-file fallback to seed _rootPid below.
 
+    // Capture strace's exit disposition (code + signal) so the tailer can tell
+    // a CLEAN whole-tree exit from an ABNORMAL termination (e.g. a tracee
+    // SIGKILLing its tracer to detach and survive).  Mutated BEFORE resolve()
+    // so the tailer's exitPromise.then() observes it.  See
+    // StraceTailerOptions.exitStatusRef.
+    const exitStatus: { code: number | null; signal: NodeJS.Signals | null; spawnError?: boolean } = {
+      code: null,
+      signal: null,
+    };
     const exitPromise = new Promise<void>((resolve) => {
-      child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });
-      child.on('error', () => { this._exitCode = 1; resolve(); });
+      child.on('close', (code, signal) => {
+        exitStatus.code = code;
+        exitStatus.signal = signal;
+        this._exitCode = code ?? 1;
+        resolve();
+      });
+      child.on('error', () => {
+        // Spawn/runtime error: strace never ran → classify as a spawn error so
+        // the tailer fails closed instead of freezing its meta gates.
+        exitStatus.spawnError = true;
+        this._exitCode = 1;
+        resolve();
+      });
     });
 
     const watchDir = dirname(opts.basePath);
@@ -1592,6 +1668,7 @@ export class LinuxStraceRunner implements StraceRunner {
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,
+        exitStatusRef: exitStatus,
         // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
         // fallback runs ONLY when the /proc-based deterministic
         // resolution was not attempted (i.e. child.pid was undefined,

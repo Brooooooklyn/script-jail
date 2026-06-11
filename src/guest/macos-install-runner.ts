@@ -124,9 +124,26 @@ export class MacOSInstallRunner implements StraceRunner {
       stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
     });
 
+    // Capture the install command's exit disposition (code + signal) so the
+    // tailer can tell a CLEAN exit from an ABNORMAL termination.  Mutated BEFORE
+    // resolve() so exitPromise.then() observes it.  See
+    // StraceTailerOptions.exitStatusRef.
+    const exitStatus: { code: number | null; signal: NodeJS.Signals | null; spawnError?: boolean } = {
+      code: null,
+      signal: null,
+    };
     const exitPromise = new Promise<void>((resolve) => {
-      child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });
-      child.on('error', () => { this._exitCode = 1; resolve(); });
+      child.on('close', (code, signal) => {
+        exitStatus.code = code;
+        exitStatus.signal = signal;
+        this._exitCode = code ?? 1;
+        resolve();
+      });
+      child.on('error', () => {
+        exitStatus.spawnError = true;
+        this._exitCode = 1;
+        resolve();
+      });
     });
 
     // There are no per-pid strace files on macOS.  `runStraceTailer` still
@@ -173,6 +190,7 @@ export class MacOSInstallRunner implements StraceRunner {
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,
+        exitStatusRef: exitStatus,
         // No root-pid seeding: getRootPid() is null on macOS by design.  We do
         // NOT install recordRootPid — the install root would otherwise be
         // mis-pinned to the first phantom per-pid file (there are none here).

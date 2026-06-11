@@ -27071,6 +27071,7 @@ async function runInstallPhase(input) {
             propagateNodeBootstrap(pid, childPid);
             let cloneFs = false;
             let cloneFiles = false;
+            let cloneUntraced = false;
             if (syscallName === "clone" || syscallName === "clone3") {
               const flagsMatch = line.match(/flags=([A-Z0-9_|]+)/);
               if (flagsMatch !== null) {
@@ -27078,8 +27079,14 @@ async function runInstallPhase(input) {
                 for (const tok of flagTokens) {
                   if (tok === "CLONE_FS") cloneFs = true;
                   else if (tok === "CLONE_FILES") cloneFiles = true;
+                  else if (tok === "CLONE_UNTRACED") cloneUntraced = true;
                 }
               }
+            }
+            if (cloneUntraced) {
+              setPhaseTamper(
+                `pid=${pid} created child pid=${childPid} with CLONE_UNTRACED \u2014 the child escapes strace -ff and cannot be observed; audit capture cannot be trusted`
+              );
             }
             const childCwdSnap = pendingCwdDetach.get(childPid);
             pendingCwdDetach.delete(childPid);
@@ -28511,12 +28518,19 @@ var MacOSInstallRunner = class {
       env: opts.env,
       stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
+    const exitStatus = {
+      code: null,
+      signal: null
+    };
     const exitPromise = new Promise((resolve2) => {
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
+        exitStatus.code = code;
+        exitStatus.signal = signal;
         this._exitCode = code ?? 1;
         resolve2();
       });
       child.on("error", () => {
+        exitStatus.spawnError = true;
         this._exitCode = 1;
         resolve2();
       });
@@ -28554,7 +28568,8 @@ var MacOSInstallRunner = class {
           // alongside the dropped strace-derived detectors).
           tamperRef: this._tamperRef
         } : {},
-        exitPromise
+        exitPromise,
+        exitStatusRef: exitStatus
         // No root-pid seeding: getRootPid() is null on macOS by design.  We do
         // NOT install recordRootPid — the install root would otherwise be
         // mis-pinned to the first phantom per-pid file (there are none here).
@@ -29441,7 +29456,16 @@ async function* runStraceTailer(opts) {
     wake();
   }, pollIntervalMs);
   opts.exitPromise.then(async () => {
-    childExited = true;
+    const exitStatus = opts.exitStatusRef;
+    if (exitStatus !== void 0) {
+      if (exitStatus.signal !== null || exitStatus.spawnError === true) {
+        recordTamper(
+          `strace terminated abnormally (signal=${exitStatus.signal ?? "<none>"}${exitStatus.spawnError === true ? ", spawn error" : ""}) \u2014 a killed or crashed tracer can leave a detached tracee alive; audit capture cannot be trusted`
+        );
+      } else {
+        childExited = true;
+      }
+    }
     const hardDeadline = Date.now() + settleHardCapMs;
     let quiet = 0;
     let prev = "";
@@ -29682,12 +29706,19 @@ var LinuxStraceRunner = class {
         this._rootPid = pid;
       }
     }
+    const exitStatus = {
+      code: null,
+      signal: null
+    };
     const exitPromise = new Promise((resolve2) => {
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
+        exitStatus.code = code;
+        exitStatus.signal = signal;
         this._exitCode = code ?? 1;
         resolve2();
       });
       child.on("error", () => {
+        exitStatus.spawnError = true;
         this._exitCode = 1;
         resolve2();
       });
@@ -29716,6 +29747,7 @@ var LinuxStraceRunner = class {
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
+        exitStatusRef: exitStatus,
         // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
         // fallback runs ONLY when the /proc-based deterministic
         // resolution was not attempted (i.e. child.pid was undefined,

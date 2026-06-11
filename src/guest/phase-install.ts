@@ -3261,6 +3261,7 @@ export async function runInstallPhase(
             // fork/vfork have no flags field.
             let cloneFs = false;
             let cloneFiles = false;
+            let cloneUntraced = false;
             if (syscallName === 'clone' || syscallName === 'clone3') {
               const flagsMatch = line.match(/flags=([A-Z0-9_|]+)/);
               if (flagsMatch !== null) {
@@ -3268,8 +3269,31 @@ export async function runInstallPhase(
                 for (const tok of flagTokens) {
                   if (tok === 'CLONE_FS') cloneFs = true;
                   else if (tok === 'CLONE_FILES') cloneFiles = true;
+                  else if (tok === 'CLONE_UNTRACED') cloneUntraced = true;
                 }
               }
+            }
+
+            // SECURITY (Codex 2026-06-12, finding 2): CLONE_UNTRACED tells the
+            // kernel that "a tracing process cannot force CLONE_PTRACE on this
+            // child" — i.e. `strace -ff` will NOT auto-attach to this descendant.
+            // Such a child escapes observation entirely and can outlive the
+            // traced tree, then tamper with the events file during the post-exit
+            // window the meta gates stop guarding once strace exits cleanly.
+            // That is a hard audit-integrity breach, so fail closed: refuse to
+            // emit a lockfile rather than ship one from an audit with a blind
+            // spot.  (Plain fork/vfork and double-fork/setsid are still followed
+            // by `-ff`; CLONE_UNTRACED is the specific ptrace-follow bypass.)
+            //
+            // A numeric `flags=0x...` rendering would slip this literal-token
+            // check — the same accepted parity limitation as CLONE_FS /
+            // CLONE_FILES above; strace symbolizes CLONE_* names by default.
+            if (cloneUntraced) {
+              setPhaseTamper(
+                `pid=${pid} created child pid=${childPid} with CLONE_UNTRACED — the ` +
+                  `child escapes strace -ff and cannot be observed; audit capture ` +
+                  `cannot be trusted`,
+              );
             }
 
             // --- cwd group: union if CLONE_FS, else copy. -----------
