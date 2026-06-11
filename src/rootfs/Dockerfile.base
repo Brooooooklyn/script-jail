@@ -254,37 +254,27 @@ RUN mkdir -p /work /etc/script-jail /usr/local/lib/script-jail /usr/local/bin /o
 # run `vp env install "$(cat …)"` with an EXACT version — reproducibility is
 # load-bearing for the byte-stable lockfile (a bare major would drift).
 #
-# Multi-source fetch + verify-in-loop.  npm's Cloudflare edge for some GitHub-
-# runner regions has served a STALE wrong object for the fixed tarball URL — a
-# deterministic sha256 mismatch reproduced across THREE producer runs.  The edge
-# cache key is query-INSENSITIVE (a `?cb=` buster returned the same stale bytes
-# on all 8 tries) and ignores client `Cache-Control`/`Pragma`, so cache-busting
-# the npm host alone cannot recover.  Instead we fail over across INDEPENDENT
-# mirrors: yarnpkg is a separate Cloudflare zone, npmmirror is fully independent
-# infrastructure.  Every source is verified against the pinned ${VP_SHA256}, so
-# a mirror CANNOT inject bad bytes — only matching bytes are accepted; the first
-# source that verifies wins.  (`?cb=` retained as a cheap best-effort bust on the
-# rare cooperating cache.)
+# Fetch + verify is a SINGLE retry unit: a curl failure AND a sha256sum
+# mismatch both retry (deleting the partial file first), so a transient
+# HTTP-200-with-wrong-bytes response — a half-written object, a stale edge,
+# any successful-but-wrong content — does not abort the producer; only 8
+# consecutive fetch-or-verify failures do.  Single source (npmjs) by design:
+# the pinned ${VP_SHA256} is the trust anchor, so a mirror could not inject
+# bad bytes anyway, and the one historical "wrong bytes" report was actually a
+# build-arg parse bug (two-line VP_SHA256), not a CDN problem.
 RUN set -eu; \
-    rel="@voidzero-dev/vite-plus-cli-linux-${VP_ARCH}-gnu/-/vite-plus-cli-linux-${VP_ARCH}-gnu-${VP_VERSION}.tgz"; \
+    url="https://registry.npmjs.org/@voidzero-dev/vite-plus-cli-linux-${VP_ARCH}-gnu/-/vite-plus-cli-linux-${VP_ARCH}-gnu-${VP_VERSION}.tgz"; \
     ok=0; \
-    for host in \
-        "https://registry.npmjs.org" \
-        "https://registry.yarnpkg.com" \
-        "https://registry.npmmirror.com"; do \
-      for attempt in 1 2 3; do \
-        if curl -fsSL --retry 5 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
-             -o /tmp/vp.tgz "${host}/${rel}?cb=${attempt}" \
-           && echo "${VP_SHA256}  /tmp/vp.tgz" | sha256sum -c -; then \
-          ok=1; break; \
-        fi; \
-        echo "vp fetch+verify failed: ${host} attempt ${attempt}" >&2; \
-        rm -f /tmp/vp.tgz; \
-        sleep $((attempt * 2)); \
-      done; \
-      [ "$ok" = 1 ] && break; \
+    for attempt in 1 2 3 4 5 6 7 8; do \
+      if curl -fsSL --retry 5 -o /tmp/vp.tgz "$url" \
+         && echo "${VP_SHA256}  /tmp/vp.tgz" | sha256sum -c -; then \
+        ok=1; break; \
+      fi; \
+      echo "vp fetch+verify attempt $attempt failed; retrying" >&2; \
+      rm -f /tmp/vp.tgz; \
+      sleep $((attempt * 5)); \
     done; \
-    [ "$ok" = 1 ] || { echo "vp download+verify failed from all sources: ${rel}" >&2; exit 1; }; \
+    [ "$ok" = 1 ] || { echo "vp download+verify failed after 8 attempts: $url" >&2; exit 1; }; \
     tar -xzf /tmp/vp.tgz -C /tmp; \
     install -m 0755 /tmp/package/vp /usr/local/bin/vp; \
     rm -rf /tmp/vp.tgz /tmp/package; \

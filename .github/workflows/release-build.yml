@@ -571,16 +571,36 @@ jobs:
           # no such copy because nothing was downloaded.)
           vp_version="$(sed -nE "s/^export const VITE_PLUS_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
           node_version="$(sed -nE "s/^export const NODE_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          vp_sha_x64="$(sed -nE "s/^[[:space:]]*x64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          vp_sha_arm64="$(sed -nE "s/^[[:space:]]*arm64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+
+          # Read the per-arch vp tarball SHA from the TYPED `VITE_PLUS_SHA256`
+          # object, NOT by text-parsing vite-plus.ts.  vite-plus.ts also exports
+          # `VITE_PLUS_DARWIN_SHA256` (same x64/arm64 keys), so a bare
+          # `sed .../x64:/` matched BOTH objects and emitted a two-line value —
+          # the original v0.2.0 producer bug, which made sha256sum verify the
+          # linux tarball against the darwin hash and fail every run.  This job
+          # already ran `pnpm install` + `pnpm build` above, so oxnode is proven
+          # working; importing the constant (same source of truth as
+          # src/rootfs/build.ts) cannot select the darwin block or a comment,
+          # and the script's 64-hex assertion fails closed on a malformed pin.
+          # Invoke the bin directly (NOT `pnpm exec`, whose "Done in …ms" banner
+          # would pollute the captured stdout) so the value is the sha alone.
+          vp_sha_x64="$(./node_modules/.bin/oxnode scripts/print-vite-plus-sha.ts x64)"
+          vp_sha_arm64="$(./node_modules/.bin/oxnode scripts/print-vite-plus-sha.ts arm64)"
           owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/${owner_lc}/script-jail-rootfs"
           : > docker-image-refs.txt
 
-          if [ -z "${vp_version}" ] || [ -z "${node_version}" ] || [ -z "${vp_sha_x64}" ] || [ -z "${vp_sha_arm64}" ]; then
-            echo "failed to parse src/rootfs/vite-plus.ts" >&2
+          # Belt-and-suspenders: the script already asserts 64-hex and exits
+          # non-zero on a bad arch, but re-check here so a wrong-shaped value can
+          # never reach the expensive buildx work or the VP_SHA256 build-arg.
+          if [ -z "${vp_version}" ] || [ -z "${node_version}" ]; then
+            echo "failed to parse VITE_PLUS_VERSION / NODE_VERSION from src/rootfs/vite-plus.ts" >&2
             exit 1
           fi
+          case "${vp_sha_x64}" in *[!0-9a-f]* | "") echo "vp_sha_x64 is not 64-hex: '${vp_sha_x64}'" >&2; exit 1 ;; esac
+          case "${vp_sha_arm64}" in *[!0-9a-f]* | "") echo "vp_sha_arm64 is not 64-hex: '${vp_sha_arm64}'" >&2; exit 1 ;; esac
+          [ "${#vp_sha_x64}" = 64 ] || { echo "vp_sha_x64 wrong length: '${vp_sha_x64}'" >&2; exit 1; }
+          [ "${#vp_sha_arm64}" = 64 ] || { echo "vp_sha_arm64 wrong length: '${vp_sha_arm64}'" >&2; exit 1; }
 
           build_one() {
             local runner_image="$1"
