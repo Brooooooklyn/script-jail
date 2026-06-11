@@ -254,30 +254,37 @@ RUN mkdir -p /work /etc/script-jail /usr/local/lib/script-jail /usr/local/bin /o
 # run `vp env install "$(cat …)"` with an EXACT version — reproducibility is
 # load-bearing for the byte-stable lockfile (a bare major would drift).
 #
-# Cache-busting + verify-in-loop: a GitHub-runner egress cache was observed
-# serving a STALE wrong object for the fixed tarball URL — a deterministic
-# sha256 mismatch reproduced across two producer runs (each fetch returned in
-# ~0.3s from a co-located cache, not the npm origin). A unique `?cb=<attempt>`
-# query forces an intermediary cache MISS so the fetch reaches the npm origin
-# (which ignores the query and returns the canonical bytes); the no-cache
-# headers cover a query-stripping cache. The SHA is verified INSIDE the retry
-# loop so a stale hit retries under a fresh cache key instead of failing the
-# whole build — a bare re-fetch of the same URL would just return the same
-# stale object.
+# Multi-source fetch + verify-in-loop.  npm's Cloudflare edge for some GitHub-
+# runner regions has served a STALE wrong object for the fixed tarball URL — a
+# deterministic sha256 mismatch reproduced across THREE producer runs.  The edge
+# cache key is query-INSENSITIVE (a `?cb=` buster returned the same stale bytes
+# on all 8 tries) and ignores client `Cache-Control`/`Pragma`, so cache-busting
+# the npm host alone cannot recover.  Instead we fail over across INDEPENDENT
+# mirrors: yarnpkg is a separate Cloudflare zone, npmmirror is fully independent
+# infrastructure.  Every source is verified against the pinned ${VP_SHA256}, so
+# a mirror CANNOT inject bad bytes — only matching bytes are accepted; the first
+# source that verifies wins.  (`?cb=` retained as a cheap best-effort bust on the
+# rare cooperating cache.)
 RUN set -eu; \
-    base="https://registry.npmjs.org/@voidzero-dev/vite-plus-cli-linux-${VP_ARCH}-gnu/-/vite-plus-cli-linux-${VP_ARCH}-gnu-${VP_VERSION}.tgz"; \
+    rel="@voidzero-dev/vite-plus-cli-linux-${VP_ARCH}-gnu/-/vite-plus-cli-linux-${VP_ARCH}-gnu-${VP_VERSION}.tgz"; \
     ok=0; \
-    for attempt in 1 2 3 4 5 6 7 8; do \
-      if curl -fsSL --retry 5 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
-           -o /tmp/vp.tgz "${base}?cb=${attempt}" \
-         && echo "${VP_SHA256}  /tmp/vp.tgz" | sha256sum -c -; then \
-        ok=1; break; \
-      fi; \
-      echo "vp fetch+verify attempt $attempt failed; retrying with a fresh cache key" >&2; \
-      rm -f /tmp/vp.tgz; \
-      sleep $((attempt * 3)); \
+    for host in \
+        "https://registry.npmjs.org" \
+        "https://registry.yarnpkg.com" \
+        "https://registry.npmmirror.com"; do \
+      for attempt in 1 2 3; do \
+        if curl -fsSL --retry 5 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+             -o /tmp/vp.tgz "${host}/${rel}?cb=${attempt}" \
+           && echo "${VP_SHA256}  /tmp/vp.tgz" | sha256sum -c -; then \
+          ok=1; break; \
+        fi; \
+        echo "vp fetch+verify failed: ${host} attempt ${attempt}" >&2; \
+        rm -f /tmp/vp.tgz; \
+        sleep $((attempt * 2)); \
+      done; \
+      [ "$ok" = 1 ] && break; \
     done; \
-    [ "$ok" = 1 ] || { echo "vp download+verify failed after 8 attempts: ${base}" >&2; exit 1; }; \
+    [ "$ok" = 1 ] || { echo "vp download+verify failed from all sources: ${rel}" >&2; exit 1; }; \
     tar -xzf /tmp/vp.tgz -C /tmp; \
     install -m 0755 /tmp/package/vp /usr/local/bin/vp; \
     rm -rf /tmp/vp.tgz /tmp/package; \
