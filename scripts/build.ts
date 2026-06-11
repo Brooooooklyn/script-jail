@@ -34,7 +34,18 @@
 // (e.g. on macOS dev hosts).
 
 import { execSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  type Dirent,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -54,6 +65,7 @@ import {
   shimArtifactIsStale as shimArtifactIsStaleShared,
   shimSourceInputs as shimSourceInputsShared,
 } from '../src/rootfs/shim-freshness.js';
+import { sha256File } from '../src/shared/http-download.js';
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -240,12 +252,423 @@ function buildShimArm64(): void {
   console.log(`[build] images/libscriptjail-arm64.so built.`);
 }
 
+/**
+ * Build the macOS-native Mach-O shim (`libscriptjail-arm64.dylib`) for the
+ * `bare` (no-VM) macOS audit backend.  Unlike the Linux `.so`, macOS cargo
+ * CAN produce this natively (it's the host target), so there is no CI-only
+ * short-circuit.  Steps:
+ *   1. `cargo build --release --target aarch64-apple-darwin`
+ *   2. copy `target/aarch64-apple-darwin/release/libscriptjail.dylib`
+ *      → `images/libscriptjail-arm64.dylib`
+ *   3. ad-hoc codesign (`codesign --force --sign -`) — MANDATORY on Apple
+ *      Silicon and required for injection into the re-signed node (Phase 4).
+ *   4. `codesign --verify` so a broken signature fails the build.
+ */
+// Deployment target the macOS shim dylib AND the bash-arm64 substitution
+// binary MUST carry so they load on the lowest supported runner (the macos-14
+// parity runner).  Pinned for the cargo link / bash CFLAGS and asserted on
+// BOTH the cache-hit and freshly-built paths.  The release producer
+// (.github/workflows/release-build.yml) carries the same pin — keep them in
+// lockstep.
+const SHIM_PINNED_MINOS = '11.0';
+
+/**
+ * Read the Mach-O minOS (LC_BUILD_VERSION) of `machoPath` as "major.minor" via
+ * vtool.  Works on MH_DYLIB and MH_EXECUTE alike (the dylib AND bash-arm64).
+ * Throws if it cannot be parsed (fail closed).
+ */
+function machoMinOS(machoPath: string): string {
+  const out = execSync(`vtool -show-build "${machoPath}"`, { cwd: REPO_ROOT }).toString();
+  const minos = out.match(/minos\s+(\d+(?:\.\d+)?)/)?.[1];
+  if (minos === undefined) {
+    throw new Error(`[build] could not parse minOS from vtool output for ${machoPath}`);
+  }
+  return minos;
+}
+
+/**
+ * True when Mach-O minOS `actual` is at or below `floor` (both "major[.minor]").
+ * Compared per component, NOT via parseFloat ("10.15" is a HIGHER version than
+ * "10.2" but a lower float).  Used for PREBUILT binaries we don't control
+ * (uutils coreutils): their contract is "loads on the documented macOS floor",
+ * so a LOWER minOS is fine — only a minOS above the floor must fail.  An
+ * unparsable component compares as NaN and fails closed.
+ */
+function minosAtMost(actual: string, floor: string): boolean {
+  const [aMaj, aMin = 0] = actual.split('.').map(Number);
+  const [fMaj, fMin = 0] = floor.split('.').map(Number);
+  return aMaj! < fMaj! || (aMaj === fMaj && aMin <= fMin);
+}
+
+function buildShimMac(): void {
+  const target = 'aarch64-apple-darwin';
+  const manifest = join(REPO_ROOT, 'src', 'shim', 'Cargo.toml');
+  const shimOut = join(REPO_ROOT, 'images', 'libscriptjail-arm64.dylib');
+
+  // Freshness: reuse the existing dylib only when every shim source input is
+  // older than it (shimArtifactIsStale fails closed on a missing declared source
+  // — see shim-freshness.ts).  BUT also validate the cached dylib's minOS: a
+  // too-new cached artifact (e.g. built before the deployment-target pin) must
+  // not slip through the freshness skip and then fail to load on macos-14
+  // (adversarial-review MEDIUM 2026-06).
+  if (!shimArtifactIsStale(shimOut)) {
+    const cachedMinOS = machoMinOS(shimOut);
+    if (cachedMinOS === SHIM_PINNED_MINOS) {
+      console.log(
+        `[build] images/libscriptjail-arm64.dylib is up-to-date (minOS ${cachedMinOS}); ` +
+        'skipping macOS shim build.',
+      );
+      return;
+    }
+    console.log(
+      `[build] cached dylib minOS ${cachedMinOS} != pinned ${SHIM_PINNED_MINOS}; rebuilding.`,
+    );
+  }
+
+  console.log(`[build] Building macOS shim via cargo build --target ${target} …`);
+  execSync(
+    `cargo build --release --manifest-path "${manifest}" --target ${target}`,
+    {
+      stdio: 'inherit',
+      cwd: REPO_ROOT,
+      // Pin the FINAL cdylib's LC_BUILD_VERSION minOS to 11.0 so it loads on the
+      // macos-14 parity runner regardless of the host's default deployment target.
+      // build.rs pins only the cc objects (-mmacosx-version-min=11.0); the Rust
+      // cdylib link otherwise inherits MACOSX_DEPLOYMENT_TARGET from the caller —
+      // a macOS-26 host/release runner would stamp minos 26.0 → UNLOADABLE on
+      // macos-14.  arm64 macOS floors at 11.0, and the macOS-26 non-_np symbols
+      // are weak (so an 11.0 binary may still reference them).  (adversarial-
+      // review MEDIUM 2026-06)
+      env: { ...process.env, MACOSX_DEPLOYMENT_TARGET: SHIM_PINNED_MINOS },
+    },
+  );
+
+  mkdirSync(join(REPO_ROOT, 'images'), { recursive: true });
+  copyFileSync(
+    join(REPO_ROOT, 'target', target, 'release', 'libscriptjail.dylib'),
+    shimOut,
+  );
+
+  // Fail closed if the freshly-built dylib's minOS is not exactly the pin — any
+  // other value means MACOSX_DEPLOYMENT_TARGET did not take and the parity / bare
+  // backend would fail to inject on the macos-14 runner.
+  const builtMinOS = machoMinOS(shimOut);
+  if (builtMinOS !== SHIM_PINNED_MINOS) {
+    throw new Error(
+      `[build] macOS shim minOS is ${builtMinOS}, expected ${SHIM_PINNED_MINOS}. ` +
+      'Ensure MACOSX_DEPLOYMENT_TARGET=11.0 is honored for the shim cargo build.',
+    );
+  }
+  console.log(`[build] macOS shim minOS = ${builtMinOS} (loads on macos-14).`);
+
+  // Ad-hoc sign + verify.  `--force` re-stamps the linker's adhoc+linker-signed
+  // signature as a plain adhoc one (the spike's codesignDylibCmd).
+  console.log('[build] Ad-hoc signing the dylib (codesign --force --sign -) …');
+  execSync(`codesign --force --sign - "${shimOut}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+  execSync(`codesign --verify --verbose "${shimOut}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+  console.log('[build] images/libscriptjail-arm64.dylib built + signed.');
+}
+
+// ---------------------------------------------------------------------------
+// Step 2c — macOS audit-shell binaries (coreutils + bash)
+// ---------------------------------------------------------------------------
+//
+// The macOS `bare` backend's SIP redirect (SCRIPT_JAIL_SHELL_SHIM_DIR) points
+// at a DIRECTORY holding exactly two files — `bash` and `coreutils` — that the
+// shim resolves /bin/sh + /bin/bash → `bash` and any uutils applet under
+// /bin or /usr/bin → `coreutils` to (argv[0] is left UNCHANGED for multi-call
+// dispatch).  We acquire both here, right after the dylib is built + signed,
+// using the same SHA-verified download precedent as fetchVpBinary
+// (src/cli/provision-node-mac.ts) — NodeHttpClient.download verifies the
+// pinned SHA-256 before moving the file into place and throws on mismatch.
+
+/**
+ * uutils coreutils 0.4.0 official aarch64-apple-darwin prebuilt.  Extracted to
+ * images/coreutils-arm64.
+ *
+ * MAC_COREUTILS_SHA256 is the SHA-256 of the EXTRACTED BINARY, not the tarball.
+ * Upstream periodically recompresses the `.tar.gz` release asset (its archive
+ * SHA drifts — e.g. the 0.4.0 asset was re-published 2025-11-09) while the inner
+ * binary bytes are stable, so the binary is the real supply-chain gate (this is
+ * also how the fspy reference and uutils' own build pin it).
+ */
+const MAC_COREUTILS_URL =
+  'https://github.com/uutils/coreutils/releases/download/0.4.0/coreutils-0.4.0-aarch64-apple-darwin.tar.gz';
+const MAC_COREUTILS_SHA256 =
+  '8e8f38d9323135a19a73d617336fce85380f3c46fcb83d3ae3e031d1c0372f21';
+
+/**
+ * GNU bash source tarball (built from source for a plain arm64, ad-hoc signed
+ * binary).  Pinned SHA-256 of the source tarball (GNU release tarballs are
+ * stable), verified by NodeHttpClient.download.
+ */
+const MAC_BASH_SRC_URL = 'https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz';
+const MAC_BASH_SRC_SHA256 =
+  '0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba';
+
+/**
+ * Arch + minOS gates for images/coreutils-arm64, shared by BOTH the
+ * freshly-downloaded and the pinned-SHA cache-hit paths of fetchMacCoreutils
+ * (a stale local cache predating these gates, or a future pin bump to a
+ * wrong-arch / too-new upstream binary, must not skip validation).
+ * Mirrors the lipo/vtool asserts in .github/workflows/release-build.yml.
+ */
+function validateMacCoreutils(dest: string): void {
+  // Same thin-arm64 gate as bash-arm64 (rejects arm64e, fat, or x86_64 —
+  // the SHA pin alone would accept a re-pinned wrong-arch upstream binary).
+  const archs = machoArchs(dest);
+  if (archs !== 'arm64') {
+    throw new Error(
+      `[build] images/coreutils-arm64 is not a thin arm64 Mach-O (lipo -archs = ${archs ?? 'unreadable'}).`,
+    );
+  }
+  // uutils is a PREBUILT we don't control, so the minOS gate is `<= floor`
+  // ("loads on the documented macOS floor"), NOT the exact-equality pin the
+  // dylib/bash builds use.  The 0.4.0 prebuilt carries minos 11.0 today; a
+  // pin bump to a binary stamped above the floor must fail here, not at
+  // exec time on the oldest supported runner.
+  const minos = machoMinOS(dest);
+  if (!minosAtMost(minos, SHIM_PINNED_MINOS)) {
+    throw new Error(
+      `[build] images/coreutils-arm64 minOS is ${minos}, expected <= ${SHIM_PINNED_MINOS} ` +
+      '(must load on the documented macOS floor).',
+    );
+  }
+}
+
+/**
+ * Download the official uutils coreutils prebuilt, verify its SHA-256, extract
+ * the single `coreutils` multi-call binary to images/coreutils-arm64, and
+ * chmod 0o755.  Skips the re-download when images/coreutils-arm64 already
+ * exists and hashes to the pinned SHA-256 (the arch/minOS gates still run on
+ * that cache-hit path — see validateMacCoreutils).
+ */
+async function fetchMacCoreutils(): Promise<void> {
+  const imagesDir = join(REPO_ROOT, 'images');
+  const dest = join(imagesDir, 'coreutils-arm64');
+
+  if (existsSync(dest)) {
+    const sha = await sha256File(dest);
+    if (sha === MAC_COREUTILS_SHA256) {
+      validateMacCoreutils(dest);
+      console.log(
+        '[build] images/coreutils-arm64 already matches the pinned SHA-256 ' +
+        '(thin arm64, minOS within floor); skipping uutils download.',
+      );
+      return;
+    }
+    console.log(
+      `[build] images/coreutils-arm64 SHA-256 mismatch (have ${sha}); re-downloading.`,
+    );
+  }
+
+  mkdirSync(imagesDir, { recursive: true });
+  const tmp = mkdtempSync(join(tmpdir(), 'script-jail-coreutils-'));
+  try {
+    const tgzPath = join(tmp, 'coreutils.tar.gz');
+    console.log(`[build] Downloading uutils coreutils prebuilt: ${MAC_COREUTILS_URL} …`);
+    // Fetch the tarball, then verify the EXTRACTED BINARY's SHA-256 (not the
+    // archive's — upstream recompresses the .tar.gz, so its SHA drifts while
+    // the binary is stable; the binary is the supply-chain gate).
+    execSync(`curl -fsSL -o "${tgzPath}" "${MAC_COREUTILS_URL}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+
+    const extractDir = join(tmp, 'extract');
+    mkdirSync(extractDir, { recursive: true });
+    execSync(`tar -xzf "${tgzPath}" -C "${extractDir}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+
+    // The uutils tarball wraps everything under a single
+    // `coreutils-0.4.0-aarch64-apple-darwin/` directory; the multi-call binary
+    // is named `coreutils` inside it.  Locate it without hardcoding layout.
+    const coreutilsBin = findFileNamed(extractDir, 'coreutils');
+    if (!coreutilsBin) {
+      throw new Error(
+        `[build] coreutils binary not found under ${extractDir} after extracting ${MAC_COREUTILS_URL}.`,
+      );
+    }
+
+    const sha = await sha256File(coreutilsBin);
+    if (sha !== MAC_COREUTILS_SHA256) {
+      throw new Error(
+        `[build] uutils coreutils binary SHA-256 mismatch: expected ` +
+        `${MAC_COREUTILS_SHA256}, got ${sha} (from ${MAC_COREUTILS_URL}).`,
+      );
+    }
+
+    copyFileSync(coreutilsBin, dest);
+    chmodSync(dest, 0o755);
+
+    validateMacCoreutils(dest);
+    console.log(
+      '[build] images/coreutils-arm64 extracted, SHA-256 verified, ' +
+      'arch/minOS validated, chmod 0o755.',
+    );
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Build bash from source for a plain arm64, ad-hoc-signed binary at
+ * images/bash-arm64.  Downloads + SHA-verifies the GNU bash source tarball to
+ * a temp dir, extracts, then:
+ *   1. `./configure --without-bash-malloc CFLAGS="-arch arm64 -Os"`
+ *   2. `make -j`
+ *   3. `codesign --force --sign -` the resulting bash
+ *   4. copy → images/bash-arm64 (chmod 0o755)
+ * Skips the rebuild when images/bash-arm64 already exists and is a thin arm64
+ * Mach-O.  NOTE: bash is an MH_EXECUTE, not an MH_DYLIB, so it is validated with
+ * a `lipo -archs` arch check (not validateMachOShimFile, which is dylib-only).
+ */
+async function buildMacBash(): Promise<void> {
+  const imagesDir = join(REPO_ROOT, 'images');
+  const dest = join(imagesDir, 'bash-arm64');
+
+  // Like the dylib cache path: a cached bash built before the deployment-target
+  // pin would carry the host SDK's default minOS and fail to load on macos-14,
+  // so the skip also requires minOS == SHIM_PINNED_MINOS.
+  if (existsSync(dest) && machoArchs(dest) === 'arm64') {
+    const cachedMinOS = machoMinOS(dest);
+    if (cachedMinOS === SHIM_PINNED_MINOS) {
+      console.log(
+        `[build] images/bash-arm64 already exists (thin arm64, minOS ${cachedMinOS}); ` +
+        'skipping bash build.',
+      );
+      return;
+    }
+    console.log(
+      `[build] cached bash-arm64 minOS ${cachedMinOS} != pinned ${SHIM_PINNED_MINOS}; rebuilding.`,
+    );
+  }
+
+  mkdirSync(imagesDir, { recursive: true });
+  const tmp = mkdtempSync(join(tmpdir(), 'script-jail-bash-'));
+  try {
+    const tgzPath = join(tmp, 'bash.tar.gz');
+    console.log(`[build] Downloading bash source: ${MAC_BASH_SRC_URL} …`);
+    // curl (not NodeHttpClient): ftp.gnu.org 403s plain GETs that lack a UA /
+    // don't follow its mirror redirect.  Verify the pinned source-tarball
+    // SHA-256 after download (GNU release tarballs are stable — supply-chain
+    // gate for the bash source).
+    execSync(`curl -fsSL --retry 3 --retry-delay 2 -o "${tgzPath}" "${MAC_BASH_SRC_URL}"`, {
+      stdio: 'inherit',
+      cwd: REPO_ROOT,
+    });
+    const srcSha = await sha256File(tgzPath);
+    if (srcSha !== MAC_BASH_SRC_SHA256) {
+      throw new Error(
+        `[build] bash source tarball SHA-256 mismatch: expected ` +
+        `${MAC_BASH_SRC_SHA256}, got ${srcSha} (from ${MAC_BASH_SRC_URL}).`,
+      );
+    }
+
+    const extractDir = join(tmp, 'extract');
+    mkdirSync(extractDir, { recursive: true });
+    execSync(`tar -xzf "${tgzPath}" -C "${extractDir}"`, { stdio: 'inherit', cwd: REPO_ROOT });
+
+    // GNU source tarballs unpack into a single `bash-5.3/` directory.
+    const entries = readdirSync(extractDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory());
+    const srcDir = entries.length === 1 ? join(extractDir, entries[0]!.name) : extractDir;
+
+    console.log(
+      '[build] Configuring bash (--without-bash-malloc, -arch arm64 -Os ' +
+      `-mmacosx-version-min=${SHIM_PINNED_MINOS}) …`,
+    );
+    // -mmacosx-version-min pins bash's minOS to the dylib floor; bash's
+    // Makefile propagates CFLAGS to the link line via BASE_LDFLAGS, so no
+    // separate LDFLAGS is needed.
+    execSync(
+      `./configure --without-bash-malloc CFLAGS="-arch arm64 -Os -mmacosx-version-min=${SHIM_PINNED_MINOS}"`,
+      { stdio: 'inherit', cwd: srcDir },
+    );
+    console.log('[build] Building bash (make -j) …');
+    execSync(`make -j`, { stdio: 'inherit', cwd: srcDir });
+
+    const builtBash = join(srcDir, 'bash');
+    if (!existsSync(builtBash)) {
+      throw new Error(`[build] bash binary not found at ${builtBash} after make.`);
+    }
+
+    // Ad-hoc sign so the binary loads under SIP-redirect into the audited shell
+    // path on Apple Silicon (same precedent as the dylib codesign above).
+    console.log('[build] Ad-hoc signing bash (codesign --force --sign -) …');
+    execSync(`codesign --force --sign - "${builtBash}"`, { stdio: 'inherit', cwd: srcDir });
+
+    copyFileSync(builtBash, dest);
+    chmodSync(dest, 0o755);
+
+    // Sanity-check the artifact is a THIN arm64 Mach-O (rejects arm64e, fat, or
+    // x86_64 — the whole point is no arm64e).
+    const archs = machoArchs(dest);
+    if (archs !== 'arm64') {
+      throw new Error(
+        `[build] images/bash-arm64 is not a thin arm64 Mach-O (lipo -archs = ${archs ?? 'unreadable'}).`,
+      );
+    }
+    // Fail closed if the built bash's minOS is not exactly the pin — same
+    // contract as the dylib (a higher minOS won't load on macos-14).
+    const builtMinOS = machoMinOS(dest);
+    if (builtMinOS !== SHIM_PINNED_MINOS) {
+      throw new Error(
+        `[build] images/bash-arm64 minOS is ${builtMinOS}, expected ${SHIM_PINNED_MINOS}. ` +
+        'Ensure -mmacosx-version-min reaches both the compile and link steps.',
+      );
+    }
+    console.log(
+      `[build] images/bash-arm64 built + signed + chmod 0o755 (minOS ${builtMinOS}).`,
+    );
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Depth-bounded search for a regular file named `name` under `root`.  Used to
+ * locate the `coreutils` binary inside the extracted uutils tarball without
+ * hardcoding its wrapper-directory layout.
+ */
+/**
+ * The lipo arch list of a Mach-O file (e.g. `"arm64"`, `"arm64e"`,
+ * `"arm64 arm64e"`), or null if the file is missing / not a Mach-O.  Used to
+ * assert the substitution binaries are THIN arm64 (no arm64e slice).
+ */
+function machoArchs(path: string): string | null {
+  try {
+    return execSync(`lipo -archs "${path}"`, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+function findFileNamed(root: string, name: string): string | null {
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  while (stack.length > 0) {
+    const { dir, depth } = stack.pop()!;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isFile() && entry.name === name) return full;
+      if (entry.isDirectory() && depth < 4) stack.push({ dir: full, depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
 function buildShim(): void {
   if (process.platform === 'darwin') {
-    console.warn(
-      '[build] WARNING: Running on macOS — skipping shim build (requires Linux toolchain).\n' +
-      '[build]          The .so is not needed for macOS development; build in CI or Linux.',
-    );
+    // macOS produces the native Mach-O shim for the bare backend.  The Linux
+    // `.so` cannot be cross-built from this toolchain (cargo would emit a
+    // Mach-O); --shim-arm64 (cargo-zigbuild) handles the Linux arm64 .so in CI.
+    buildShimMac();
     return;
   }
 
@@ -335,7 +758,29 @@ async function main(): Promise<void> {
   } else {
     buildShim();
   }
-  artifacts.push({ path: join(REPO_ROOT, 'images', 'libscriptjail.so') });
+  // On macOS buildShim produces the Mach-O dylib (bare backend); on Linux the
+  // ELF .so.  Report whichever one the host build produced.
+  artifacts.push({
+    path:
+      process.platform === 'darwin'
+        ? join(REPO_ROOT, 'images', 'libscriptjail-arm64.dylib')
+        : join(REPO_ROOT, 'images', 'libscriptjail.so'),
+  });
+
+  // Step 2c: macOS audit-shell binaries (coreutils + bash).  These live next
+  // to the dylib in images/ and the SIP redirect's SCRIPT_JAIL_SHELL_SHIM_DIR
+  // points at a dir holding exactly these two files.  Acquire them right after
+  // the dylib is built + signed (same --skip-shim gate; same host gate).
+  if (skipShim) {
+    console.log(
+      '[build] --skip-shim passed; skipping macOS coreutils/bash acquisition.',
+    );
+  } else if (process.platform === 'darwin') {
+    await fetchMacCoreutils();
+    await buildMacBash();
+    artifacts.push({ path: join(REPO_ROOT, 'images', 'coreutils-arm64') });
+    artifacts.push({ path: join(REPO_ROOT, 'images', 'bash-arm64') });
+  }
 
   // Step 2b: optional arm64 shim cross-compile.  Surfaces a clear error on
   // macOS (where cargo cannot produce a Linux .so) so dev hosts know the

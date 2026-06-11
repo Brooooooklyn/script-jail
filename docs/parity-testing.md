@@ -4,11 +4,19 @@ The parity workflow (`.github/workflows/parity-test.yml`) verifies that the
 `.script-jail.lock.yml` produced by:
 
 - **Linux** running the action backend on `ubuntu-24.04-arm`
-  (`backend: auto`, normally Docker on hosted runners), and
-- **macOS** running the CLI under real Virtualization.framework (arm64 guest)
+  (`backend: auto`, normally Docker on hosted runners) — generated fresh on
+  every run, and
+- **macOS/VZ** running the CLI under real Virtualization.framework (arm64
+  guest) — a **committed** baseline (`test/parity/macos-arm64-lockfile.yml`),
+  since nested VZ cannot boot in CI, and
+- **macOS-bare** running the CLI's `update --backend bare` natively on a hosted
+  `macos-14` runner (no VM) — generated fresh on every run
 
 are byte-equal — modulo the canonicalised volatile fields (`generated_at`,
-`manager_lockfile_sha256`) — for a pinned upstream fixture.
+`manager_lockfile_sha256`) — for a pinned upstream fixture. The fresh Linux
+lockfile is diffed against **both** macOS sides: against the committed VZ
+baseline (the `diff` job) and against the fresh macOS-bare lockfile (the
+`diff-macos-bare` job).
 
 The fixture lives in [`test/parity/fixture.yml`](../test/parity/fixture.yml)
 and pins [`vuejs/core`](https://github.com/vuejs/core) at a specific tag +
@@ -50,23 +58,31 @@ The fixture choice deliberately stresses the pieces most likely to diverge:
 ## Pipeline architecture
 
 ```
-                ┌──────────────────────────┐
-                │  resolve-fixture         │
-                │  (reads test/parity/...) │
-                └────┬─────────────────────┘
-                     │   repo + sha + tag + pm
-        ┌────────────┼──────────────────────┐
-        ▼            ▼                      ▼
-  linux-backend            committed macos-arm64-vz lockfile
-  (real action +           (generated locally on bare-metal
-   auto backend on          Apple Silicon; nested VZ cannot
-   ubuntu-24.04-arm)        run on GitHub-hosted macOS)
-        │                          │
-        └────────────┬─────────────┘
-                 ▼
-              diff
-   (parity-diff.ts → parity-report.md)
-   (fails when streams differ)
+                     ┌──────────────────────────┐
+                     │  resolve-fixture         │
+                     │  (reads test/parity/...) │
+                     └────┬─────────────────────┘
+                          │   repo + sha + tag + pm
+              ┌───────────┴────────────┐
+              ▼                        ▼
+        linux-backend             macos-bare
+        (real action +            (CLI update --backend
+         auto backend on           bare, NATIVE on a
+         ubuntu-24.04-arm)         hosted macos-14, no VM)
+              │   │                    │
+              │   └──────────┬─────────┘
+              │              ▼
+              │         diff-macos-bare
+              │   (linux vs fresh macos-bare,
+              │    both generated this run)
+              ▼
+            diff
+   (linux vs committed macos-arm64-vz
+    lockfile — generated locally on
+    bare-metal Apple Silicon; nested
+    VZ cannot run on GitHub-hosted macOS)
+   (both: parity-diff.ts → report.md;
+    fail when streams differ)
 ```
 
 Each platform job runs the same code path a real consumer would:
@@ -76,20 +92,45 @@ Each platform job runs the same code path a real consumer would:
   and running `node dist/main.cjs`. Hosted arm64 runners do not expose KVM, so
   `backend: auto` normally selects Docker after the Firecracker availability
   check fails.
-- **macOS** is committed rather than generated in CI. A maintainer runs the
+- **macOS/VZ** is committed rather than generated in CI. A maintainer runs the
   CLI's `update` subcommand locally on bare-metal Apple Silicon and commits
   `test/parity/macos-arm64-lockfile.yml`.
+- **macOS-bare** is **CI-native**: the `macos-bare` job runs on a hosted
+  `macos-14` runner and invokes the CLI's `update --backend bare` directly. The
+  bare backend needs no VM — it runs the install on the host under the Mach-O
+  shim via `DYLD_INSERT_LIBRARIES` — so it boots fine on a hosted runner, unlike
+  the VZ path, which cannot run in CI because GitHub-hosted macOS runners are
+  themselves virtualized and Apple's Virtualization.framework does not nest.
+  This is the first macOS parity gate generated fresh in CI on both sides.
 
-Both produce a `.script-jail.lock.yml`. The `diff` job downloads the fresh
-Linux lockfile, canonicalises the volatile fields on both sides, compares, and
-fails the workflow if any diff remains after the parity-only filters.
+All three produce a `.script-jail.lock.yml`. The `diff` job downloads the fresh
+Linux lockfile and diffs it against the committed VZ baseline; the
+`diff-macos-bare` job diffs the same fresh Linux lockfile against the fresh
+macOS-bare lockfile. Both jobs run `scripts/parity-diff.ts`, which canonicalises
+the volatile fields on both sides and reconciles the documented platform
+plumbing differences enumerated in [`docs/divergence.md`](./divergence.md)
+(injection/provisioning env, libSystem/CoreFoundation runtime probes, the SIP
+`<AUDIT_BLIND>` git framing, and the intrinsically platform-divergent package
+set). Either job fails the workflow if any diff remains after the parity-only
+filters.
 
 ## Interpreting the parity report
 
-`scripts/parity-diff.ts` emits a markdown report. Before comparing, it
-canonicalizes the volatile header fields and filters known parity-only
-host/VMM noise such as ambient CI env probes and the local VZ DNS resolver.
-It does not hide native executable divergence. Three cases:
+`scripts/parity-diff.ts` emits a markdown report. The comparison is
+**structural**: each lock is parsed, validated against a fully `.strict()` parity
+schema (`ParityLock`, built on `src/lock/schema.ts`), danger-walked, then the
+divergent packages are dropped and the parity-only noise filtered **on the parsed
+structure**, and the result is re-rendered through the canonical byte-stable
+serializer (`src/lock/render.ts`) before the two renders are diffed. It fails
+closed if either lock is malformed, carries an unknown field or top-level
+section, uses a YAML alias/anchor/merge key, or does not parse — the parser and
+the strip/filter operate on the same structure, so they cannot disagree. The
+volatile header fields (`generated_at`, `manager_lockfile_sha256`) are normalised
+before rendering; known parity-only host/VMM noise (ambient CI env probes, the
+local VZ DNS resolver) is filtered out. Those env/read/resolver waivers are
+global (ambient harness noise, read in every package); the benign-spawn waivers
+are scoped to the exact package they belong to, so an unrelated package cannot
+launder them. It does not hide native executable divergence. Four outcomes:
 
 ### ✅ Parity holds
 
@@ -121,6 +162,63 @@ Anything else is a bug. Common shapes:
   resolution desync. The Linux and macOS sides should both resolve arm64
   Linux optional packages now; check whether an input override, stale
   committed lockfile, or package-manager environment read changed the target.
+
+### 🚨 Danger — a blocking signal the gate refuses to launder
+
+The report carries a **danger table** (and the job log prints a `!! DANGER`
+block) for any signal that must never pass as parity even when the comparable
+text is byte-equal. There are four shapes:
+
+- **Escape hidden in an excluded package.** A suspicious signal inside one of the
+  intrinsically platform-divergent packages otherwise excluded from the byte
+  comparison (`@swc/core`, `puppeteer`, `unrs-resolver` — see
+  [`docs/divergence.md`](./divergence.md)). The exclusion is screened per side by
+  `collectDivergentDangers`: a non-events-file escaped write, a `<HIDDEN>` **or
+  credential-named** env read (matched by credential SHAPE, not a name list —
+  case-insensitive substrings `TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/
+  `AUTHORIZATION`/`PRIVATEKEY`/`BEARER`/… plus whole-token `AUTH`/`KEY`/`PAT`, so
+  `github_token`, `npm_config__authToken`, `NPM_AUTH`, `DOCKER_AUTH_CONFIG`,
+  `SERVICE_ACCOUNT_KEY`, `GITHUB_PAT` hit while the benign `npm_config_always_auth`,
+  `…UNAUTHORIZED`, `*_PATH`, `MONKEY` do not), a `<HIDDEN>`/sensitive file read
+  (case-insensitive, segment/suffix-aware — the default protected set
+  `.ssh`/`.aws`/`.npmrc`/`.gnupg`/… plus cloud-CLI / package-manager stores
+  `.config/gcloud`/`.azure`/`.kube`/`.git-credentials`/`.pypirc`/`.cargo/credentials`/
+  composer `auth.json`/NuGet config and key-file suffixes `.pem`/`.p12`/`.pfx`/`.key`),
+  a non-resolver or *succeeded* connect, any
+  `dlopen`/`audit_bypass`/`env_tamper`, or a spawn outside that package's benign
+  allowlist.
+- **One-sided divergent package or stage.** A divergent package present on only
+  one side, *or* present on both but with a one-sided / mismatched lifecycle stage
+  (`field: divergent_presence`). The block is excluded from the byte comparison,
+  so a one-sided absence — or a `lifecycle: {}` / wrong-stage block — would
+  otherwise pass silently; it is a resolution/producer desync and fails the gate,
+  naming the side (and stage) it is missing from.
+  - **Asymmetric validation (`--source-of-truth`).** Linux is the single source
+    of truth (the lockfile is *generated* there); macOS/Windows **validate** that
+    lockfile as a SUBSET. Under `--source-of-truth left` (Linux is `--left`), a
+    divergent package/stage present in the source-of-truth lock but **absent** on
+    the validated platform is **safe** — the validated platform legitimately did
+    *less* (e.g. `puppeteer`/`unrs-resolver` early-exit on Darwin, producing no
+    lifecycle block). The reverse — a divergent package present on the **validated**
+    side but absent from the source of truth — still **fails** (the validated
+    platform did something the trusted lockfile never recorded). The present side's
+    **content** is danger-screened in both modes, so this never launders an escape;
+    it only stops treating a smaller validated platform as a desync. Omit the flag
+    for symmetric comparison (a one-sided divergent package fails either way).
+- **Malformed / unknown shape.** A lock that fails the strict parity schema
+  (`field: schema`) — a non-array field, an unknown lifecycle field, an unknown
+  sibling next to `lifecycle`, or an unknown **top-level section**.
+- **Structural feature.** A lock that uses a YAML alias, anchor, merge key, a
+  non-string mapping key, `__proto__`, or a mapping key containing a control
+  character such as TAB (`field: structure`), or one that does not parse
+  (`field: yaml`). The canonical renderer never emits any of these, so a
+  conformant lock has none; the control-char rejection in particular keeps a key
+  from forging a package→stage presence composite.
+
+This is **never** routine noise — treat it as a real audit signal. Inspect the
+named package and side first; do not "fix" it by widening the benign allowlist
+unless you have confirmed the new spawn/read is genuinely part of that package's
+pinned-version install.
 
 ## Triggering the workflow
 

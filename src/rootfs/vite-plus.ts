@@ -20,7 +20,14 @@
 /** Architectures the rootfs is built for. */
 export type VitePlusArch = 'x64' | 'arm64';
 
-/** Pinned vite-plus CLI version (npm `@voidzero-dev/vite-plus-cli-linux-*`). */
+/**
+ * Host OS the vite-plus CLI binary targets.  `linux` is the rootfs/guest path
+ * (existing, byte-for-byte unchanged); `darwin` is the macOS-native bare
+ * backend, which provisions Node directly on the Mac (no VM).
+ */
+export type VitePlusOs = 'linux' | 'darwin';
+
+/** Pinned vite-plus CLI version (npm `@voidzero-dev/vite-plus-cli-*`). */
 export const VITE_PLUS_VERSION = '0.1.22';
 
 /**
@@ -30,7 +37,7 @@ export const VITE_PLUS_VERSION = '0.1.22';
 export const NODE_VERSION = '24.15.0';
 
 /**
- * SHA-256 of the per-arch vite-plus CLI npm tarball.  Verified in
+ * SHA-256 of the per-arch Linux vite-plus CLI npm tarball.  Verified in
  * Dockerfile.base after download.  Update together with VITE_PLUS_VERSION.
  */
 export const VITE_PLUS_SHA256: Readonly<Record<VitePlusArch, string>> = {
@@ -39,10 +46,29 @@ export const VITE_PLUS_SHA256: Readonly<Record<VitePlusArch, string>> = {
 };
 
 /**
- * npm registry tarball URL for the per-arch vite-plus CLI.  The package name
- * embeds the arch (`x64` / `arm64`); the tarball extracts to `package/vp`.
+ * SHA-256 of the per-arch macOS (darwin) vite-plus CLI npm tarball.  Verified
+ * by `src/cli/provision-node-mac.ts` after download (the macOS-native bare
+ * backend has no Dockerfile.base).  Update together with VITE_PLUS_VERSION.
+ *
+ * Unlike the Linux packages, the darwin package name carries NO `-gnu` suffix
+ * (`@voidzero-dev/vite-plus-cli-darwin-<arch>`).
  */
-export function vitePlusTarballUrl(arch: VitePlusArch): string {
-  const pkg = `@voidzero-dev/vite-plus-cli-linux-${arch}-gnu`;
-  return `https://registry.npmjs.org/${pkg}/-/vite-plus-cli-linux-${arch}-gnu-${VITE_PLUS_VERSION}.tgz`;
+export const VITE_PLUS_DARWIN_SHA256: Readonly<Record<VitePlusArch, string>> = {
+  arm64: '95ab62b3287e3761247b1cb5f9a0a5bd90d1b6f86cc79c8e777f00dbd0157eff',
+  x64:   '2399331bd59270ea5e01288ba2e6e50d91bbeff3f0e34cedea0e427c7da361ea',
+};
+
+/**
+ * npm registry tarball URL for the per-(os, arch) vite-plus CLI.  The package
+ * name embeds the OS + arch; the tarball extracts to `package/vp`.
+ *
+ * The `os` parameter DEFAULTS to `'linux'` so every existing rootfs/build
+ * caller is byte-for-byte unchanged.  Linux packages carry a `-gnu` suffix
+ * (`vite-plus-cli-linux-<arch>-gnu`); darwin packages do not
+ * (`vite-plus-cli-darwin-<arch>`).
+ */
+export function vitePlusTarballUrl(arch: VitePlusArch, os: VitePlusOs = 'linux'): string {
+  const slug = os === 'darwin' ? `darwin-${arch}` : `linux-${arch}-gnu`;
+  const pkg = `@voidzero-dev/vite-plus-cli-${slug}`;
+  return `https://registry.npmjs.org/${pkg}/-/vite-plus-cli-${slug}-${VITE_PLUS_VERSION}.tgz`;
 }

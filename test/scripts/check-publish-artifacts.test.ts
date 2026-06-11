@@ -70,6 +70,9 @@ interface ManifestEntries {
   darwinRootfs22Arm64: string;
   darwinRootfs24Arm64: string;
   darwinLibsoArm64: string;
+  darwinDylibArm64: string;
+  darwinCoreutilsArm64: string;
+  darwinBashArm64: string;
   vmlinuxVzX86_64: string;
   vmlinuxVzArm64: string;
   scriptJailVmArm64Darwin: string;
@@ -77,7 +80,7 @@ interface ManifestEntries {
   // `PLACEHOLDER_SHA256_` prefix at the START — a placeholder ref carries the
   // token inside its `@sha256:` digest position — so the script classifies
   // them via a substring check. All four refs participate in the same
-  // all-or-nothing placeholder/real classification as the 9 file SHAs.
+  // all-or-nothing placeholder/real classification as the 12 file SHAs.
   dockerX64Ubuntu22: string;
   dockerX64Ubuntu24: string;
   dockerArm64Ubuntu22: string;
@@ -90,6 +93,9 @@ const PLACEHOLDER_LINUX_LIBSO = 'PLACEHOLDER_SHA256_LINUX_LIBSCRIPTJAIL_SO';
 const PLACEHOLDER_DARWIN_ROOTFS_22_ARM64 = 'PLACEHOLDER_SHA256_DARWIN_ROOTFS_UBUNTU_22_04_ARM64';
 const PLACEHOLDER_DARWIN_ROOTFS_24_ARM64 = 'PLACEHOLDER_SHA256_DARWIN_ROOTFS_UBUNTU_24_04_ARM64';
 const PLACEHOLDER_DARWIN_LIBSO_ARM64 = 'PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_SO';
+const PLACEHOLDER_DARWIN_DYLIB_ARM64 = 'PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_DYLIB';
+const PLACEHOLDER_DARWIN_COREUTILS_ARM64 = 'PLACEHOLDER_SHA256_DARWIN_COREUTILS_ARM64';
+const PLACEHOLDER_DARWIN_BASH_ARM64 = 'PLACEHOLDER_SHA256_DARWIN_BASH_ARM64';
 const PLACEHOLDER_VMLINUX_VZ_X86_64 = 'PLACEHOLDER_SHA256_VMLINUX_VZ_X86_64';
 const PLACEHOLDER_VMLINUX_VZ_ARM64 = 'PLACEHOLDER_SHA256_VMLINUX_VZ_ARM64';
 const PLACEHOLDER_SJ_VM_ARM64_DARWIN = 'PLACEHOLDER_SHA256_SCRIPT_JAIL_VM_ARM64_DARWIN';
@@ -122,6 +128,9 @@ function allPlaceholders(): ManifestEntries {
     darwinRootfs22Arm64: PLACEHOLDER_DARWIN_ROOTFS_22_ARM64,
     darwinRootfs24Arm64: PLACEHOLDER_DARWIN_ROOTFS_24_ARM64,
     darwinLibsoArm64: PLACEHOLDER_DARWIN_LIBSO_ARM64,
+    darwinDylibArm64: PLACEHOLDER_DARWIN_DYLIB_ARM64,
+    darwinCoreutilsArm64: PLACEHOLDER_DARWIN_COREUTILS_ARM64,
+    darwinBashArm64: PLACEHOLDER_DARWIN_BASH_ARM64,
     vmlinuxVzX86_64: PLACEHOLDER_VMLINUX_VZ_X86_64,
     vmlinuxVzArm64: PLACEHOLDER_VMLINUX_VZ_ARM64,
     scriptJailVmArm64Darwin: PLACEHOLDER_SJ_VM_ARM64_DARWIN,
@@ -140,6 +149,9 @@ function promoteDarwinAndDockerToReal(entries: ManifestEntries): void {
   entries.darwinRootfs22Arm64 = 'a'.repeat(64);
   entries.darwinRootfs24Arm64 = 'b'.repeat(64);
   entries.darwinLibsoArm64 = 'c'.repeat(64);
+  entries.darwinDylibArm64 = 'a'.repeat(64);
+  entries.darwinCoreutilsArm64 = '9'.repeat(64);
+  entries.darwinBashArm64 = '8'.repeat(64);
   entries.vmlinuxVzX86_64 = 'd'.repeat(64);
   entries.vmlinuxVzArm64 = 'e'.repeat(64);
   entries.scriptJailVmArm64Darwin = 'f'.repeat(64);
@@ -167,6 +179,9 @@ function writeManifest(workspace: string, entries: ManifestEntries): string {
     `      'rootfs-ubuntu-22.04-arm64.ext4': '${entries.darwinRootfs22Arm64}',`,
     `      'rootfs-ubuntu-24.04-arm64.ext4': '${entries.darwinRootfs24Arm64}',`,
     `      'libscriptjail-arm64.so':         '${entries.darwinLibsoArm64}',`,
+    `      'libscriptjail-arm64.dylib':      '${entries.darwinDylibArm64}',`,
+    `      'coreutils-arm64':                '${entries.darwinCoreutilsArm64}',`,
+    `      'bash-arm64':                     '${entries.darwinBashArm64}',`,
     `      'vmlinux-vz-x86_64':              '${entries.vmlinuxVzX86_64}',`,
     `      'vmlinux-vz-arm64':               '${entries.vmlinuxVzArm64}',`,
     `      'script-jail-vm-arm64-darwin':    '${entries.scriptJailVmArm64Darwin}',`,
@@ -208,6 +223,9 @@ interface DarwinArtifactBytes {
   rootfs22Arm64: string;
   rootfs24Arm64: string;
   libsoArm64: string;
+  dylibArm64: string;
+  coreutilsArm64: string;
+  bashArm64: string;
   vmlinuxVzX86_64: string;
   vmlinuxVzArm64: string;
   scriptJailVmArm64Darwin: string;
@@ -261,6 +279,9 @@ interface FullArtifactsOutput {
     rootfs22Arm64: string;
     rootfs24Arm64: string;
     libsoArm64: string;
+    dylibArm64: string;
+    coreutilsArm64: string;
+    bashArm64: string;
     vmlinuxVzX86_64: string;
     vmlinuxVzArm64: string;
     scriptJailVmArm64Darwin: string;
@@ -283,6 +304,13 @@ function writeAllArtifacts(
     darwin.rootfs24Arm64,
   );
   writeFileSync(join(dir, 'images/libscriptjail-arm64.so'), darwin.libsoArm64);
+  // The dylib lands at the artifacts ROOT (next to script-jail-vm-arm64-darwin),
+  // NOT under images/ — mirroring the gate's ART_DARWIN_DYLIB_ARM64 location.
+  writeFileSync(join(dir, 'libscriptjail-arm64.dylib'), darwin.dylibArm64);
+  // coreutils-arm64 / bash-arm64 also land at the artifacts ROOT (plain-arm64
+  // SIP-substitution binaries), pinned by plain sha256 like the dylib.
+  writeFileSync(join(dir, 'coreutils-arm64'), darwin.coreutilsArm64);
+  writeFileSync(join(dir, 'bash-arm64'), darwin.bashArm64);
   writeFileSync(join(dir, 'images/vmlinux-vz-x86_64'), darwin.vmlinuxVzX86_64);
   writeFileSync(join(dir, 'images/vmlinux-vz-arm64'), darwin.vmlinuxVzArm64);
   writeFileSync(
@@ -296,6 +324,9 @@ function writeAllArtifacts(
       rootfs22Arm64: sha256(darwin.rootfs22Arm64),
       rootfs24Arm64: sha256(darwin.rootfs24Arm64),
       libsoArm64: sha256(darwin.libsoArm64),
+      dylibArm64: sha256(darwin.dylibArm64),
+      coreutilsArm64: sha256(darwin.coreutilsArm64),
+      bashArm64: sha256(darwin.bashArm64),
       vmlinuxVzX86_64: sha256(darwin.vmlinuxVzX86_64),
       vmlinuxVzArm64: sha256(darwin.vmlinuxVzArm64),
       scriptJailVmArm64Darwin: sha256(darwin.scriptJailVmArm64Darwin),
@@ -530,6 +561,9 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
       `      'rootfs-ubuntu-22.04-arm64.ext4': '${'a'.repeat(64)}',`,
       `      'rootfs-ubuntu-24.04-arm64.ext4': '${'b'.repeat(64)}',`,
       `      'libscriptjail-arm64.so':         '${'c'.repeat(64)}',`,
+      `      'libscriptjail-arm64.dylib':      '${'a'.repeat(64)}',`,
+      `      'coreutils-arm64':                '${'9'.repeat(64)}',`,
+      `      'bash-arm64':                     '${'8'.repeat(64)}',`,
       `      'vmlinux-vz-x86_64':              '${'d'.repeat(64)}',`,
       `      'vmlinux-vz-arm64':               '${'e'.repeat(64)}',`,
       `      'script-jail-vm-arm64-darwin':    '${'0'.repeat(64)}',`,
@@ -585,6 +619,9 @@ describe('scripts/check-publish-artifacts.sh — linux-only subset', () => {
       `      'rootfs-ubuntu-22.04-arm64.ext4': '${'a'.repeat(64)}',`,
       `      'rootfs-ubuntu-24.04-arm64.ext4': '${'b'.repeat(64)}',`,
       `      'libscriptjail-arm64.so':         '${'c'.repeat(64)}',`,
+      `      'libscriptjail-arm64.dylib':      '${'a'.repeat(64)}',`,
+      `      'coreutils-arm64':                '${'9'.repeat(64)}',`,
+      `      'bash-arm64':                     '${'8'.repeat(64)}',`,
       `      'vmlinux-vz-x86_64':              '${'d'.repeat(64)}',`,
       `      'vmlinux-vz-arm64':               '${'e'.repeat(64)}',`,
       `      'script-jail-vm-arm64-darwin':    '${'0'.repeat(64)}',`,
@@ -769,6 +806,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -781,6 +821,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
       darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
       darwinLibsoArm64: darwinShas.libsoArm64,
+      darwinDylibArm64: darwinShas.dylibArm64,
+      darwinCoreutilsArm64: darwinShas.coreutilsArm64,
+      darwinBashArm64: darwinShas.bashArm64,
       vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
       vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
       scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
@@ -818,6 +861,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -831,6 +877,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
       darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
       darwinLibsoArm64: darwinShas.libsoArm64,
+      darwinDylibArm64: darwinShas.dylibArm64,
+      darwinCoreutilsArm64: darwinShas.coreutilsArm64,
+      darwinBashArm64: darwinShas.bashArm64,
       vmlinuxVzX86_64: wrongKernel, // lie about kernel SHA
       vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
       scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
@@ -865,6 +914,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -881,6 +933,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       `      'rootfs-ubuntu-22.04-arm64.ext4': '${'a'.repeat(64)}',`,
       `      'rootfs-ubuntu-24.04-arm64.ext4': '${'b'.repeat(64)}',`,
       `      'libscriptjail-arm64.so':         '${'c'.repeat(64)}',`,
+      `      'libscriptjail-arm64.dylib':      '${'a'.repeat(64)}',`,
+      `      'coreutils-arm64':                '${'9'.repeat(64)}',`,
+      `      'bash-arm64':                     '${'8'.repeat(64)}',`,
       `      'vmlinux-vz-x86_64':              '${'d'.repeat(64)}',`,
       `      'vmlinux-vz-arm64':               '${'e'.repeat(64)}',`,
       `      'script-jail-vm-arm64-darwin':    '${'0'.repeat(64)}',`,
@@ -912,6 +967,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -922,6 +980,7 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/::warning::/);
     expect(r.stderr).toMatch(/linux\/libscriptjail\.so/);
+    expect(r.stderr).toMatch(/darwin\/libscriptjail-arm64\.dylib/);
     expect(r.stderr).toMatch(/darwin\/vmlinux-vz-x86_64/);
     expect(r.stderr).toMatch(/darwin\/script-jail-vm-arm64-darwin/);
   });
@@ -943,6 +1002,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -958,6 +1020,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       darwinRootfs22Arm64: PLACEHOLDER_DARWIN_ROOTFS_22_ARM64,
       darwinRootfs24Arm64: PLACEHOLDER_DARWIN_ROOTFS_24_ARM64,
       darwinLibsoArm64: PLACEHOLDER_DARWIN_LIBSO_ARM64,
+      darwinDylibArm64: PLACEHOLDER_DARWIN_DYLIB_ARM64,
+      darwinCoreutilsArm64: PLACEHOLDER_DARWIN_COREUTILS_ARM64,
+      darwinBashArm64: PLACEHOLDER_DARWIN_BASH_ARM64,
       vmlinuxVzX86_64: PLACEHOLDER_VMLINUX_VZ_X86_64,
       vmlinuxVzArm64: PLACEHOLDER_VMLINUX_VZ_ARM64,
       scriptJailVmArm64Darwin: PLACEHOLDER_SJ_VM_ARM64_DARWIN,
@@ -981,7 +1046,7 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
 
   it('rejects a manifest with real file SHAs but placeholder docker refs (mixed)', () => {
     // S4 regression: the gate's all-or-nothing classification now spans the 4
-    // dockerImages refs.  A backfill that pastes all 9 real file SHAs but
+    // dockerImages refs.  A backfill that pastes all 12 real file SHAs but
     // leaves the docker refs as `ghcr.io/...@sha256:PLACEHOLDER_SHA256_...`
     // placeholders must trip the mixed-manifest reject — NOT silently pass.
     const ws = makeWorkspace();
@@ -995,19 +1060,25 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
     };
     const { dir, linuxShas, darwinShas } = writeAllArtifacts(ws, linux, darwin);
     const entries: ManifestEntries = {
-      // All 9 file SHAs real (and matching the artifacts).
+      // All 12 file SHAs real (and matching the artifacts).
       linuxRootfs22: linuxShas.rootfs22,
       linuxRootfs24: linuxShas.rootfs24,
       linuxLibso: linuxShas.libso,
       darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
       darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
       darwinLibsoArm64: darwinShas.libsoArm64,
+      darwinDylibArm64: darwinShas.dylibArm64,
+      darwinCoreutilsArm64: darwinShas.coreutilsArm64,
+      darwinBashArm64: darwinShas.bashArm64,
       vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
       vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
       scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
@@ -1025,14 +1096,14 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
     const r = runScript(['--manifest', manifestPath, '--dir', dir]);
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/mixed with/);
-    // 9 real file SHAs + 4 placeholder docker refs.
+    // 12 real file SHAs + 4 placeholder docker refs.
     expect(r.stderr).toMatch(/4 placeholder entr/);
-    expect(r.stderr).toMatch(/9 real SHA/);
+    expect(r.stderr).toMatch(/12 real SHA/);
     expect(r.stdout).not.toMatch(/::warning::/);
   });
 
   it('takes the bootstrap path for an all-placeholder manifest including docker refs', () => {
-    // The all-placeholder case (9 file placeholders + 4 docker placeholders)
+    // The all-placeholder case (12 file placeholders + 4 docker placeholders)
     // must still take the documented bootstrap path — a warning + exit 0 — and
     // must NOT be flagged as mixed now that docker refs are classified.
     const ws = makeWorkspace();
@@ -1047,6 +1118,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -1061,7 +1135,7 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
   });
 
   it('does NOT reject an all-real manifest (files + docker) as mixed', () => {
-    // The inverse guard: all 9 file SHAs AND all 4 docker refs are real
+    // The inverse guard: all 12 file SHAs AND all 4 docker refs are real
     // (syntactically valid sha256 digests).  The gate must reach the normal
     // SHA-comparison path and pass — never the mixed reject.
     const ws = makeWorkspace();
@@ -1075,6 +1149,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -1087,6 +1164,9 @@ describe('scripts/check-publish-artifacts.sh — full platform set', () => {
       darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
       darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
       darwinLibsoArm64: darwinShas.libsoArm64,
+      darwinDylibArm64: darwinShas.dylibArm64,
+      darwinCoreutilsArm64: darwinShas.coreutilsArm64,
+      darwinBashArm64: darwinShas.bashArm64,
       vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
       vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
       scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,
@@ -1142,6 +1222,11 @@ describe('scripts/check-publish-artifacts.sh — binary-only (download-forever) 
       darwin.rootfs24Arm64,
     );
     writeFileSync(join(dir, 'images/libscriptjail-arm64.so'), darwin.libsoArm64);
+    // Dylib at the artifacts ROOT (mirrors the gate's ART_DARWIN_DYLIB_ARM64).
+    writeFileSync(join(dir, 'libscriptjail-arm64.dylib'), darwin.dylibArm64);
+    // coreutils-arm64 / bash-arm64 also at the artifacts ROOT, plain-sha pinned.
+    writeFileSync(join(dir, 'coreutils-arm64'), darwin.coreutilsArm64);
+    writeFileSync(join(dir, 'bash-arm64'), darwin.bashArm64);
     writeFileSync(join(dir, 'images/vmlinux-vz-x86_64'), darwin.vmlinuxVzX86_64);
     writeFileSync(join(dir, 'images/vmlinux-vz-arm64'), darwin.vmlinuxVzArm64);
     writeFileSync(
@@ -1159,6 +1244,9 @@ describe('scripts/check-publish-artifacts.sh — binary-only (download-forever) 
         rootfs22Arm64: sha256(darwin.rootfs22Arm64),
         rootfs24Arm64: sha256(darwin.rootfs24Arm64),
         libsoArm64: sha256(darwin.libsoArm64),
+        dylibArm64: sha256(darwin.dylibArm64),
+        coreutilsArm64: sha256(darwin.coreutilsArm64),
+        bashArm64: sha256(darwin.bashArm64),
         vmlinuxVzX86_64: sha256(darwin.vmlinuxVzX86_64),
         vmlinuxVzArm64: sha256(darwin.vmlinuxVzArm64),
         scriptJailVmArm64Darwin: sha256(darwin.scriptJailVmArm64Darwin),
@@ -1173,6 +1261,9 @@ describe('scripts/check-publish-artifacts.sh — binary-only (download-forever) 
       rootfs22Arm64: 'dr22a',
       rootfs24Arm64: 'dr24a',
       libsoArm64: 'dsoa',
+      dylibArm64: 'dyla',
+      coreutilsArm64: 'coreu',
+      bashArm64: 'basha',
       vmlinuxVzX86_64: 'kx86',
       vmlinuxVzArm64: 'karm',
       scriptJailVmArm64Darwin: 'sjvm',
@@ -1189,6 +1280,9 @@ describe('scripts/check-publish-artifacts.sh — binary-only (download-forever) 
       darwinRootfs22Arm64: darwinShas.rootfs22Arm64,
       darwinRootfs24Arm64: darwinShas.rootfs24Arm64,
       darwinLibsoArm64: darwinShas.libsoArm64,
+      darwinDylibArm64: darwinShas.dylibArm64,
+      darwinCoreutilsArm64: darwinShas.coreutilsArm64,
+      darwinBashArm64: darwinShas.bashArm64,
       vmlinuxVzX86_64: darwinShas.vmlinuxVzX86_64,
       vmlinuxVzArm64: darwinShas.vmlinuxVzArm64,
       scriptJailVmArm64Darwin: darwinShas.scriptJailVmArm64Darwin,

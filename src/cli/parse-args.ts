@@ -21,12 +21,23 @@ export type Subcommand = 'init' | 'update' | 'check';
 export type SpoofPlatform = 'linux' | 'darwin' | 'win32';
 export type SpoofArch = 'x64' | 'arm64';
 
+/**
+ * macOS audit backend selector (darwin-only).  `vz` boots the Linux guest
+ * inside Apple Virtualization.framework; `bare` runs the install natively on
+ * the Mac under the Mach-O shim (no VM).  Defaults to `null` here — the
+ * effective backend is resolved in `src/cli/index.ts` (darwin: `vz` on arm64,
+ * `bare` otherwise).  On Linux the flag is ignored (a warning is emitted).
+ */
+export type CliBackend = 'vz' | 'bare';
+
 export interface ParsedArgs {
   subcommand: Subcommand | null;
   configPath: string;
   lockPath: string;
   spoofPlatform: SpoofPlatform;
   spoofArch: SpoofArch;
+  /** Explicit `--backend` selection, or `null` when the user did not pass one. */
+  backend: CliBackend | null;
   help: boolean;
   version: boolean;
   errors: string[];
@@ -35,6 +46,7 @@ export interface ParsedArgs {
 const VALID_SUBCOMMANDS: ReadonlySet<Subcommand> = new Set<Subcommand>(['init', 'update', 'check']);
 const VALID_PLATFORMS: ReadonlySet<SpoofPlatform> = new Set<SpoofPlatform>(['linux', 'darwin', 'win32']);
 const VALID_ARCHES: ReadonlySet<SpoofArch> = new Set<SpoofArch>(['x64', 'arm64']);
+const VALID_CLI_BACKENDS: ReadonlySet<CliBackend> = new Set<CliBackend>(['vz', 'bare']);
 
 // ---------------------------------------------------------------------------
 // parseArgs
@@ -50,6 +62,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     // user did not pass --spoof-arch.  Keeping a concrete parser default
     // preserves the stable ParsedArgs shape.
     spoofArch: 'x64',
+    // `null` until the user passes --backend.  `src/cli/index.ts` resolves the
+    // effective backend per host (darwin: vz on arm64, bare otherwise).
+    backend: null,
     help: false,
     version: false,
     errors: [],
@@ -113,6 +128,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
         continue;
       }
       out.spoofArch = v as SpoofArch;
+      continue;
+    }
+    if (a === '--backend') {
+      const v = peekValue('backend', argv[i + 1]);
+      if (v === null) continue;
+      i++;
+      if (!VALID_CLI_BACKENDS.has(v as CliBackend)) {
+        out.errors.push(`--backend must be one of: vz, bare (got '${v}')`);
+        continue;
+      }
+      out.backend = v as CliBackend;
       continue;
     }
     if (a.startsWith('-')) {

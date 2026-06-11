@@ -6,6 +6,8 @@
 //   - kernelPath           — VZ-compatible kernel image.
 //   - rootfsPath           — Linux ext4 image keyed by Ubuntu major + arch.
 //   - libscriptjailSoPath  — LD_PRELOAD shim, ELF for the guest arch.
+//   - macShimDylibPath     — DYLD_INSERT_LIBRARIES shim, Mach-O for the macOS
+//                            bare backend (arm64 only; no VM/guest involved).
 //
 // Path resolution is intentionally PURE: this function never touches the
 // filesystem, throws no errors, and does not validate that the files exist.
@@ -23,6 +25,9 @@
 //     rootfs-ubuntu-<major>-arm64.ext4             (arm64 rootfs build)
 //     libscriptjail.so                             (existing x86_64 ELF)
 //     libscriptjail-arm64.so                       (cross-compiled in CI)
+//     libscriptjail-arm64.dylib                     (macOS-native Mach-O shim;
+//                                                   arm64-only, built + ad-hoc
+//                                                   signed on the macos leg)
 //
 // VZ does not require a fundamentally different rootfs from Firecracker —
 // the kernel/cmdline differ but the disk image is the same OS install.  So
@@ -75,13 +80,46 @@ export interface ResolvedArtifacts {
   compressedRootfsPath: string;
   /** Absolute path to the libscriptjail.so ELF for `hostArch`. */
   libscriptjailSoPath: string;
+  /**
+   * Absolute path to the macOS-native `libscriptjail-arm64.dylib` Mach-O shim,
+   * injected via `DYLD_INSERT_LIBRARIES` by the bare macOS backend.  This is a
+   * SEPARATE artifact from `libscriptjailSoPath` (the ELF baked into the Linux
+   * guest rootfs): the macOS bare backend runs no VM, so the dylib loads
+   * directly into the host install process.  arm64-only (see R10); the name
+   * has no x64 variant.  Callers on a non-macOS host can ignore it.
+   */
+  macShimDylibPath: string;
+  /**
+   * Absolute path to the bundled `coreutils-arm64` uutils multi-call binary
+   * (official prebuilt) that the macOS shell shim points `coreutils` at.  Like
+   * `macShimDylibPath`, this is arm64-only — the name has no x64 variant — and
+   * is resolved unconditionally (pure helper, no IO).  The macOS bare backend
+   * stages it (alongside `macBashPath`) into `SCRIPT_JAIL_SHELL_SHIM_DIR` under
+   * the fixed filename `coreutils`.  Callers on a non-macOS host can ignore it.
+   */
+  macCoreutilsPath: string;
+  /**
+   * Absolute path to the bundled `bash-arm64` binary (bash built from source,
+   * plain arm64, ad-hoc signed) that the macOS shell shim points `bash` at.
+   * arm64-only (no x64 variant) and resolved unconditionally (pure helper, no
+   * IO).  The macOS bare backend stages it (alongside `macCoreutilsPath`) into
+   * `SCRIPT_JAIL_SHELL_SHIM_DIR` under the fixed filename `bash`.  Callers on a
+   * non-macOS host can ignore it.
+   */
+  macBashPath: string;
 }
 
 /**
  * Which kind of artifact a `manifestKey()` lookup is asking about.  Mirrors
  * the `ResolvedArtifacts` fields.
  */
-export type ArtifactKind = 'kernel' | 'rootfs' | 'libscriptjail';
+export type ArtifactKind =
+  | 'kernel'
+  | 'rootfs'
+  | 'libscriptjail'
+  | 'macshim'
+  | 'maccoreutils'
+  | 'macbash';
 
 // ---------------------------------------------------------------------------
 // resolveArtifacts
@@ -137,7 +175,31 @@ export function resolveArtifacts(input: ArtifactInput): ResolvedArtifacts {
     hostArch === 'x64' ? 'libscriptjail.so' : 'libscriptjail-arm64.so',
   );
 
-  return { kernelPath, rootfsPath, compressedRootfsPath, libscriptjailSoPath };
+  // libscriptjail-arm64.dylib: the macOS-native Mach-O shim for the bare
+  // backend.  arm64-only (R10), so the name is fixed regardless of `hostArch` —
+  // a darwin-x64 host has no published dylib and must build from source.  The
+  // path is resolved unconditionally (pure helper, no IO); the macOS bare
+  // backend is the only caller that reads it.
+  const macShimDylibPath = join(imagesDir, 'libscriptjail-arm64.dylib');
+
+  // coreutils-arm64 / bash-arm64: the bundled binaries the macOS shell shim
+  // redirects to (uutils multi-call binary + bash built from source).  Both are
+  // arm64-only (R10), so the names are fixed regardless of `hostArch`, mirroring
+  // `macShimDylibPath`.  Resolved unconditionally (pure helper, no IO); the
+  // macOS bare backend stages them into `SCRIPT_JAIL_SHELL_SHIM_DIR` under the
+  // fixed filenames `coreutils` / `bash`.
+  const macCoreutilsPath = join(imagesDir, 'coreutils-arm64');
+  const macBashPath = join(imagesDir, 'bash-arm64');
+
+  return {
+    kernelPath,
+    rootfsPath,
+    compressedRootfsPath,
+    libscriptjailSoPath,
+    macShimDylibPath,
+    macCoreutilsPath,
+    macBashPath,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +326,24 @@ export function manifestKey(input: {
     return hostArch === 'arm64'
       ? `rootfs-ubuntu-${ubuntuMajor}-arm64.ext4`
       : `rootfs-ubuntu-${ubuntuMajor}.ext4`;
+  }
+  if (kind === 'macshim') {
+    // The macOS-native Mach-O shim is arm64-only (R10); the key has no x64
+    // variant, mirroring the single `libscriptjail-arm64.dylib` asset pinned
+    // under `expected.darwin` in src/action/artifact-manifest.ts.
+    return 'libscriptjail-arm64.dylib';
+  }
+  if (kind === 'maccoreutils') {
+    // The bundled uutils multi-call binary is arm64-only (R10); the key has no
+    // x64 variant, mirroring the single `coreutils-arm64` asset pinned under
+    // `expected.darwin` in src/action/artifact-manifest.ts.
+    return 'coreutils-arm64';
+  }
+  if (kind === 'macbash') {
+    // The bundled bash binary is arm64-only (R10); the key has no x64 variant,
+    // mirroring the single `bash-arm64` asset pinned under `expected.darwin` in
+    // src/action/artifact-manifest.ts.
+    return 'bash-arm64';
   }
   // kind === 'libscriptjail'
   return hostArch === 'arm64' ? 'libscriptjail-arm64.so' : 'libscriptjail.so';

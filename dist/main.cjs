@@ -27021,6 +27021,24 @@ var PINNED_MANIFEST = {
       "rootfs-ubuntu-22.04-arm64.ext4": "e29dd8113b08fdc81441d2be3709127bf2ccaeaba3798b103ce7a57abca5039d",
       "rootfs-ubuntu-24.04-arm64.ext4": "b45c85495f6537223d74e0903efe9d9148d38c4027f00fbe497b113680489eff",
       "libscriptjail-arm64.so": "31d98f738131a11f58cdf7b07d1576511b2fd3906d46937b953e7f4b4cab5ec3",
+      // macOS-native Mach-O shim for the bare backend (DYLD_INSERT_LIBRARIES).
+      // PLACEHOLDER until the first release-build.yml run that emits its SHA:
+      // the dylib is a NEW artifact with no producer-backed bytes yet.  This
+      // makes the manifest MIXED (real entries + this placeholder), so the
+      // publish-job gate (scripts/check-publish-artifacts.sh) will reject a
+      // release until this is backfilled from a producer run that built the
+      // dylib — exactly the all-or-nothing contract.  Paste the real SHA from
+      // the producer paste-block, then cut the tag.
+      "libscriptjail-arm64.dylib": "PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_DYLIB",
+      // Bare-backend SIP-substitution binaries (the shim redirects /bin/sh +
+      // coreutils to these plain-arm64 binaries, so no arm64e dylib is needed).
+      // coreutils-arm64 is the official uutils 0.4.0 prebuilt — a fixed upstream
+      // artifact with a stable BINARY sha, so it is pinned real now.  bash-arm64
+      // is built-from-source by the producer (not byte-reproducible across
+      // toolchains), so it is a PLACEHOLDER until a release-build.yml run emits
+      // its SHA — same backfill contract as the dylib above.
+      "coreutils-arm64": "8e8f38d9323135a19a73d617336fce85380f3c46fcb83d3ae3e031d1c0372f21",
+      "bash-arm64": "PLACEHOLDER_SHA256_DARWIN_BASH_ARM64",
       "vmlinux-vz-x86_64": "012e33842367483ffad908d878d5682fa891d2a4f476a229b631e16780404953",
       "vmlinux-vz-arm64": "4b42d3b912065a92a3816c788ed9c4dac92a12ece4c478c4fb1396c76cffd255",
       // No `script-jail-vm-x86_64-darwin` — see the file header for the
@@ -42814,7 +42832,18 @@ var SpawnEvent = external_exports.object({
   // 'eacces' = found but not executable
   result: external_exports.enum(["ok", "enoent", "eacces"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux for byte-stability). Carried from
+  // the Mach-O shim's exec event: `true` when the exec target resolved to a
+  // SIP-protected system binary (under /bin or /usr/bin) that sip_redirect could
+  // NOT redirect to a bundled substitute (e.g. find/sed/awk/grep/xargs/which/
+  // python3/git/perl/ruby). The real arm64e binary ran with DYLD stripped, so it
+  // and its descendants executed OUTSIDE the audit envelope. normalize.ts surfaces
+  // it as an `<AUDIT_BLIND>` prefix in spawn_attempts/spawn_blocked so the lock
+  // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
+  // benign find/sed use stays green; a reviewer just sees the marker). Omitted
+  // (never `false`) so existing/non-blind records stay byte-identical.
+  audit_blind: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -42885,7 +42914,30 @@ var ExecEvent = external_exports.object({
   // are built together but this gives us a safety net.
   result: external_exports.enum(["ok", "failed"]).default("ok"),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux). Set `true` by the Mach-O shim
+  // when `prog` resolved to a SIP-protected system binary under /bin or /usr/bin
+  // that sip_redirect left unchanged (no bundled substitute covers it), so the
+  // real arm64e image ran with DYLD_INSERT_LIBRARIES stripped — un-audited. The
+  // macOS guest dispatcher (phase-install-macos.ts) carries this onto the
+  // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
+  // blind shim records parse byte-identically (zod would otherwise drop it).
+  audit_blind: external_exports.boolean().optional(),
+  // macOS bare backend only (omitted on Linux). The FULL argv vector for the
+  // exec, serialized by the Mach-O shim's `append_argv_field` (capped/truncated
+  // deterministically). The macOS guest dispatcher synthesizes a spawn whose
+  // `argv` is this array (vs the single-element `[argv0 ?? prog]` fallback), so
+  // the rendered spawn_attempts command line matches Linux's full strace argv
+  // (e.g. `node postinstall.js` instead of just `node`). Optional so Linux
+  // records (no `argv` field) and pre-change shim builds still parse.
+  argv: external_exports.array(external_exports.string()).optional(),
+  // macOS bare backend only (omitted on Linux). On a FAILED exec the Mach-O shim
+  // records the errno as a short uppercase string (`ENOENT` / `EACCES` — the
+  // only two Linux's strace parser would surface). The macOS guest dispatcher
+  // maps it onto a `spawn` RawEvent with `result:'enoent'|'eacces'` so normalize
+  // renders `<ENOENT> <full argv>` in spawn_blocked (parity with Linux strace).
+  // Optional so Linux/successful records parse byte-identically.
+  exec_errno: external_exports.string().optional()
 });
 var EnvTamperEvent = external_exports.object({
   kind: external_exports.literal("env_tamper"),

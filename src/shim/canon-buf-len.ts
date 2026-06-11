@@ -25,6 +25,15 @@
 // truncates silently in that case), but it would re-introduce the silent-
 // truncation bug, so any change here MUST be mirrored in lib.rs and
 // vice-versa.
+//
+// macOS NOTE: the macOS Mach-O shim adds one more sticky var,
+// `SCRIPT_JAIL_SHELL_SHIM_DIR` (the re-signed shell/coreutils shim directory
+// consulted by `sip_redirect`).  It shares the SAME `CanonBuf` cap
+// (`CANON_BUF_LEN` = 1024 incl. NUL) — no new constant.  It is host-composed
+// (a filesystem path well under the cap), not user-controllable, so it does
+// NOT need the over-long-list rejection that `SCRIPT_JAIL_PROTECTED_ENV_NAMES`
+// gets; capturing it past the cap would only truncate the redirect dir (a
+// missing-redirect fail-safe), never leak a protected env name.
 export const CANON_PROTECTED_ENV_NAMES_MAX_LEN = 1023;
 
 // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list table

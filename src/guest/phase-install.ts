@@ -484,13 +484,13 @@ function pathBasename(pathLike: string): string {
   return slash === -1 ? value : value.slice(slash + 1);
 }
 
-function isNodeBasename(pathLike: string | undefined): boolean {
+export function isNodeBasename(pathLike: string | undefined): boolean {
   if (pathLike === undefined || pathLike.length === 0) return false;
   const base = pathBasename(pathLike);
   return base === 'node' || base === 'nodejs';
 }
 
-function isPackageManagerClientBasename(pathLike: string | undefined): boolean {
+export function isPackageManagerClientBasename(pathLike: string | undefined): boolean {
   if (pathLike === undefined || pathLike.length === 0) return false;
   const base = pathBasename(pathLike);
   return (
@@ -714,6 +714,13 @@ export async function runInstallPhase(
       return path.resolve(eventsFilePath);
     }
   })();
+  // Lexical-resolve companion of the events path.  `canonicalizeForEmit`
+  // resolves a successful absolute open with `path.resolve` (no symlink
+  // follow), so on a symlinked $TMPDIR the realpath form above and the
+  // resolved form can differ; comparing against BOTH ensures the shim's own
+  // events-file write is recognised either way.
+  const eventsFilePathResolved: string | null =
+    eventsFilePath === null ? null : path.resolve(eventsFilePath);
 
   // Audit-trust Finding (high, 2026-05-19): basename of the canonical
   // events file, used as a Layer-1 safety net for the cwd-relative
@@ -5678,6 +5685,43 @@ export async function runInstallPhase(
               pkg: result.pkg,
               lifecycle: result.lifecycle,
             });
+            continue;
+          }
+          // Drop env-spy's OWN append to the events file.  Every shim-loaded
+          // lifecycle process opens SCRIPT_JAIL_LOG_FILE BY PATH as its env_read
+          // sink (fd 3 is closed across the npm/pnpm/yarn `stdio:'inherit'`
+          // spawn, so the path is the only sink that survives) and re-opens it
+          // by path on EBADF as an anti-tamper measure (env-spy Audit-trust
+          // Finding 4).  That open lands under the watched $TMPDIR and would
+          // otherwise surface as an `escaped_writes` entry — audit
+          // infrastructure, not script behavior, and absent on macOS-bare (the
+          // shim's `path_is_audit_log` excludes it there).  Matched by EXACT
+          // full-path equality against our per-run-random events path
+          // (`events-<32-hex>.jsonl`), so a genuine escaped write to any OTHER
+          // $TMPDIR path is never dropped.
+          //
+          // KNOWN RESIDUAL (adversarial review round-10, finding F3): the events
+          // path is READABLE by package code — it is NOT a read-protected env
+          // name, so a package can obtain it via process.env / getenv /
+          // /proc/self/environ or by scanning $TMPDIR for `events-*.jsonl`.  A
+          // malicious SHIM-LOADED pid can therefore open this exact path, and its
+          // write is also dropped here.  This is not separately defensible:
+          // env-spy's own legitimate by-path (re)open is INDISTINGUISHABLE from a
+          // malicious one at the open() layer, so flagging "package opens of the
+          // log path" would false-flag env-spy's anti-tamper reopen and — because
+          // reopen count/timing differs per backend — flake the parity gate.  It
+          // is the SAME already-accepted trusted-pid residual documented above
+          // (see the `shimLoadedPids` caveat, ~L660): a shim-loaded pid is
+          // trusted w.r.t. the events file.  See docs/divergence.md.  (The
+          // earlier `parity-diff` waiver that absorbed a tokenized
+          // `$TMPDIR/<hash>/<hash>.jsonl` was forgeable and was removed in
+          // round 9; this exact-full-path producer drop is not.)
+          if (
+            rawEvent.kind === 'write' &&
+            eventsFilePathCanonical !== null &&
+            (canonical === eventsFilePathCanonical ||
+              canonical === eventsFilePathResolved)
+          ) {
             continue;
           }
           // Replace path with canonical absolute form.  Spread

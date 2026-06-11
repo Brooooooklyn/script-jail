@@ -96,5 +96,13 @@ export function detectHost(input: DetectHostInput = {}): DetectedHost {
     throw new NotMacOSError(platform.os);
   }
 
+  // `detectPlatform` now DETECTS darwin-x64 (returns it for the bare backend)
+  // instead of throwing.  This legacy shim models the macOS-VZ-only world, so
+  // it must keep throwing `UnsupportedDarwinArchError` for Intel macs to
+  // preserve its historical contract (callers branching on this class).
+  if (platform.arch === 'x64') {
+    throw new UnsupportedDarwinArchError();
+  }
+
   return { macosMajor: platform.macosMajor!, hostArch: platform.arch };
 }

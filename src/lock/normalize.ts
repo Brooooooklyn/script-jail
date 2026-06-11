@@ -18,6 +18,7 @@
 //   - Each list is deduped and sorted ascending.
 
 import type { AttributedEvent, LifecycleBlock, PackageBlock } from './schema.js';
+import { canonicalizePrivateRealpath } from './private-realpath.js';
 import { isCrossPackage, isInsidePkg, tokenize, type TokenizeRoots } from './tokenize.js';
 
 // Binaries whose absolute argv[0] paths are collapsed to the bare basename in
@@ -62,6 +63,61 @@ const SYSTEM_NOISE_PREFIXES = [
   '/opt',
 ];
 
+// macOS-only system noise prefixes, applied ONLY when ctx.os === 'darwin'.
+// These cover the dyld runtime, the system frameworks/dylibs a hardened-
+// runtime Node and the shell shims read at startup, and the dyld shared
+// cache — the macOS analog of /usr/lib + /etc/ld.so.* on Linux.  Gating on
+// os==='darwin' is a security boundary: a malicious *Linux* lockfile must
+// never be able to smuggle macOS-shaped paths (e.g. /System/... reads inside
+// a package dir) past a Linux audit gate, because the Linux side never emits
+// these prefixes and so should never drop on them.  The /usr/lib, /usr/share,
+// and /dev prefixes above already apply on both platforms (macOS ships
+// /usr/lib + /usr/share too), so they stay in the shared list.
+//
+// These are matched against the POST-/private-canonicalization path
+// (isSystemNoise runs on fsPath, which on darwin already had /private/var ->
+// /var etc. applied), so the dyld state store is listed as /var/db/dyld/, NOT
+// /private/var/db/dyld/.
+const SYSTEM_NOISE_PREFIXES_DARWIN = [
+  // System frameworks/dylibs and the protected system volume — the macOS
+  // analog of /lib + /lib64 on Linux.
+  '/System/',
+  // Apple-shipped frameworks, resource bundles, and the dyld closure caches
+  // a hardened-runtime Node and the re-signed shell shims read at startup.
+  // Root-level /Library only (NOT the per-user /Users/<u>/Library, which can
+  // hold real package writes); /Library/Caches/com.apple.dyld/ is a subset
+  // listed explicitly for documentation.
+  '/Library/',
+  '/Library/Caches/com.apple.dyld/',
+  // dyld launch-closure / shared-cache state under the private system store.
+  // Post-canon form of /private/var/db/dyld/.
+  '/var/db/dyld/',
+  // The dyld shared cache image directory (the OS-major leaf varies; the
+  // basename `dyld_shared_cache_*` is matched separately in isSystemNoise).
+  '/System/Library/dyld/',
+];
+
+// dyld shared cache files share this basename prefix regardless of the OS
+// major directory they live under, so a basename test is more robust than a
+// path prefix.  macOS-only.
+const DYLD_SHARED_CACHE_BASENAME = 'dyld_shared_cache_';
+
+// The macOS provisioned-node toolchain cache (the vite-plus-installed +
+// ad-hoc re-signed Node/corepack tree the bare backend runs the install
+// against).  It honors SCRIPT_JAIL_CACHE_DIR else os.tmpdir(), so its
+// absolute root is host-variable — but it always lives under a fixed
+// `script-jail-cache` directory segment (see src/cli/rootfs-cache.ts
+// defaultCacheDir).  A lifecycle `require()` of a stdlib module makes Node
+// read its own install tree here; that is toolchain infrastructure, not a
+// package escape — the macOS analog of the Linux /opt/vp noise prefix.
+// Because the root is variable we match a path SEGMENT rather than a fixed
+// startsWith() prefix (darwin-only, see isSystemNoise).
+const PROVISIONED_NODE_CACHE_SEGMENT = '/script-jail-cache/';
+
+// /private realpath canonicalization (macOS-only) lives in a shared helper so
+// normalize.ts and the protected-paths matcher collapse it identically — see
+// src/lock/private-realpath.ts for why both must agree.
+
 const NPM_DEBUG_LOG_BASENAME =
   /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(\d+)\.log$/;
 
@@ -69,13 +125,34 @@ export interface NormalizeContext {
   roots: TokenizeRoots;
   // pkg@version → installed path inside the VM (e.g. /work/node_modules/esbuild)
   pkgDirs: Map<string, string>;
+  // Host OS the audit ran on.  Defaults to 'linux' when omitted so every
+  // existing caller (the Linux Action guest, all unit/integration tests)
+  // produces byte-identical output.  Only 'darwin' enables the macOS-only
+  // system-noise prefixes and the /private realpath canonicalization; gating
+  // on the flag (not on path shape) is a security boundary — a malicious
+  // Linux lockfile must never be able to smuggle macOS-shaped paths past a
+  // Linux audit gate.
+  os?: 'linux' | 'darwin';
 }
 
 export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map<string, PackageBlock> {
   const out = new Map<string, PackageBlock>();
+  const os = ctx.os ?? 'linux';
 
   for (const ev of events) {
-    if (isSystemNoise(ev)) continue;
+    // For fs events, canonicalize the macOS /private realpath BEFORE both the
+    // system-noise check and tokenization, so the shared noise prefixes
+    // (/etc/resolv.conf, /dev/, /usr/...) match the canonical form a macOS
+    // shim reports (it resolves /etc -> /private/etc via F_GETPATH/realpath).
+    // Linux events are returned unchanged (os defaults to 'linux'), so Linux
+    // output stays byte-identical.
+    const fsPath =
+      (ev.raw.kind === 'read' || ev.raw.kind === 'write') && os === 'darwin'
+        ? canonicalizePrivateRealpath(ev.raw.path)
+        : ev.raw.kind === 'read' || ev.raw.kind === 'write'
+          ? ev.raw.path
+          : undefined;
+    if (isSystemNoise(ev, fsPath, os)) continue;
 
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
 
@@ -92,14 +169,16 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
 
     switch (ev.raw.kind) {
       case 'read': {
-        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
+        // fsPath is the /private-canonicalized path on darwin, ev.raw.path on
+        // linux (computed once at the top of the loop).
+        const tokenized = normalizeVolatilePath(tokenize(fsPath!, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package read
         const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
         block.external_reads.push(tagged);
         break;
       }
       case 'write': {
-        const tokenized = normalizeVolatilePath(tokenize(ev.raw.path, ctx.roots, pkgDir));
+        const tokenized = normalizeVolatilePath(tokenize(fsPath!, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package write
         // Both prefixes are independent: <HIDDEN> answers "was this a protected
         // path?"; <CROSS_PACKAGE> answers "did this write escape into another
@@ -137,8 +216,16 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
           return tokenized;
         });
         const cmd = tokenizedArgv.join(' ');
-        if (ev.raw.result === 'ok') block.spawn_attempts.push(cmd);
-        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${cmd}`);
+        // macOS bare backend: a SIP system binary the shim could not redirect ran
+        // un-instrumented (DYLD stripped), so its env/fs/exec/connect activity is
+        // invisible.  Surface it as an `<AUDIT_BLIND>` prefix so the lock diff
+        // exposes the un-audited subtree.  This is informational (it lands in
+        // spawn_attempts/spawn_blocked, NOT audit_bypass), so benign find/sed use
+        // stays green while a reviewer still sees which exec escaped the audit.
+        // The marker sits AFTER any result tag, e.g. `<ENOENT> <AUDIT_BLIND> …`.
+        const auditBlind = ev.raw.audit_blind === true ? '<AUDIT_BLIND> ' : '';
+        if (ev.raw.result === 'ok') block.spawn_attempts.push(`${auditBlind}${cmd}`);
+        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`);
         break;
       }
       case 'dlopen': {
@@ -378,8 +465,31 @@ function parseBlockedSpawn(entry: string): { command: string } | null {
   return { command: match[1]! };
 }
 
-function isSystemNoise(ev: AttributedEvent): boolean {
+function isSystemNoise(
+  ev: AttributedEvent,
+  fsPath: string | undefined,
+  os: 'linux' | 'darwin',
+): boolean {
   if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') return false;
-  const p = ev.raw.path;
-  return SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix));
+  // fsPath is always defined for read/write (computed by the caller): on
+  // darwin it is the /private-canonicalized path, on linux it is ev.raw.path.
+  const p = fsPath ?? ev.raw.path;
+  // Shared prefixes apply on BOTH platforms (macOS ships /usr/lib, /usr/share,
+  // /dev too) so Linux output stays byte-identical regardless of os.
+  if (SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix))) return true;
+  // macOS-only noise.  Gated on os==='darwin' so a Linux lockfile can never
+  // smuggle macOS-shaped paths (e.g. a /System/... write inside a package
+  // dir) past a Linux gate that would otherwise drop them.
+  if (os === 'darwin') {
+    if (SYSTEM_NOISE_PREFIXES_DARWIN.some((prefix) => p.startsWith(prefix))) return true;
+    // dyld shared cache image — basename test (its dir leaf varies by OS major).
+    if (basename(p).startsWith(DYLD_SHARED_CACHE_BASENAME)) return true;
+    // The provisioned-node toolchain cache — host-variable root, fixed segment.
+    if (p.includes(PROVISIONED_NODE_CACHE_SEGMENT)) return true;
+  }
+  return false;
+}
+
+function basename(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1);
 }

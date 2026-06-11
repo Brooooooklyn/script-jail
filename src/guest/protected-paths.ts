@@ -22,20 +22,41 @@ import micromatch from 'micromatch';
 import type { AttributedEvent, FsReadEvent, FsWriteEvent } from '../lock/schema.js';
 import type { TokenizeRoots } from '../lock/tokenize.js';
 import { tokenize } from '../lock/tokenize.js';
+import { canonicalizePrivateRealpath } from '../lock/private-realpath.js';
 
 export interface ProtectedPathsMatcherInput {
   /** Patterns from config.protected.files (e.g. ['~/.ssh/**', '$REPO/.env*']). */
   patterns: ReadonlyArray<string>;
   roots: TokenizeRoots;
+  /**
+   * Host OS the audit runs on.  On 'darwin' the matcher collapses the macOS
+   * `/private/{var,tmp,etc}` realpath prefix the Mach-O shim reports BEFORE
+   * matching, so it agrees with the non-/private `roots` (and with normalize's
+   * own /private canonicalization).  Defaults to 'linux' — a no-op — so the
+   * Linux pipeline is byte-identical and a hostile Linux lockfile can never
+   * trigger macOS path rewriting.
+   */
+  os?: 'linux' | 'darwin';
 }
 
 export class ProtectedPathsMatcher {
   private readonly tokenizedPatterns: string[];
   private readonly roots: TokenizeRoots;
+  private readonly os: 'linux' | 'darwin';
 
   constructor(input: ProtectedPathsMatcherInput) {
     this.roots = input.roots;
     this.tokenizedPatterns = input.patterns.map(normalizePattern);
+    this.os = input.os ?? 'linux';
+  }
+
+  /**
+   * Collapse the macOS /private realpath prefix when auditing on darwin so the
+   * raw shim path (/private/var/folders/.../node_modules/...) matches the
+   * non-/private `roots`.  No-op on linux.
+   */
+  private canon(rawPath: string): string {
+    return this.os === 'darwin' ? canonicalizePrivateRealpath(rawPath) : rawPath;
   }
 
   /**
@@ -50,7 +71,7 @@ export class ProtectedPathsMatcher {
    */
   isProtected(rawPath: string): boolean {
     if (this.tokenizedPatterns.length === 0) return false;
-    const tokenized = tokenize(rawPath, this.roots);
+    const tokenized = tokenize(this.canon(rawPath), this.roots);
     return micromatch.isMatch(tokenized, this.tokenizedPatterns, { dot: true });
   }
 
@@ -68,7 +89,8 @@ export class ProtectedPathsMatcher {
   isUnderNodeModules(rawPath: string): boolean {
     const nm = this.roots.nodeModules;
     if (nm.length === 0) return false;
-    return rawPath === nm || rawPath.startsWith(`${nm}/`);
+    const p = this.canon(rawPath);
+    return p === nm || p.startsWith(`${nm}/`);
   }
 }
 

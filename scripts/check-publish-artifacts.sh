@@ -27,7 +27,7 @@
 #   warning and proceed so the maintainer can copy the published SHAs into
 #   the manifest and cut the next tag.  Mixed manifests (some real, some
 #   placeholder) are treated as bugs and rejected.  The all-or-nothing
-#   classification spans BOTH the 9 file SHAs and the 4 Docker image refs:
+#   classification spans BOTH the 10 file SHAs and the 4 Docker image refs:
 #   pasting real file SHAs while leaving the Docker refs as placeholders (or
 #   vice versa) trips the mixed-manifest reject.
 #
@@ -347,6 +347,20 @@ fi
 if ! EXPECTED_DARWIN_LIBSO_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'libscriptjail-arm64.so')"; then
   exit 1
 fi
+# The macOS-native Mach-O shim (bare backend). Pinned by a PLAIN sha256 — like
+# the .so shims / kernels / Mach-O VZ helper, NOT the canonical rootfs hash.
+if ! EXPECTED_DARWIN_DYLIB_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'libscriptjail-arm64.dylib')"; then
+  exit 1
+fi
+# Bare-backend SIP-substitution binaries (plain arm64). Pinned by PLAIN sha256
+# like the dylib. coreutils-arm64 is the fixed uutils prebuilt's BINARY sha;
+# bash-arm64 is producer-built (placeholder until backfilled).
+if ! EXPECTED_DARWIN_COREUTILS_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'coreutils-arm64')"; then
+  exit 1
+fi
+if ! EXPECTED_DARWIN_BASH_ARM64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'bash-arm64')"; then
+  exit 1
+fi
 if ! EXPECTED_VMLINUX_VZ_X86_64="$(extract_from_block 'darwin' "$DARWIN_BLOCK" 'vmlinux-vz-x86_64')"; then
   exit 1
 fi
@@ -401,11 +415,12 @@ is_docker_placeholder() {
 
 PLACEHOLDER_COUNT=0
 REAL_COUNT=0
-# The 9 file SHAs use the prefix-anchored placeholder test.
+# The 12 file SHAs use the prefix-anchored placeholder test.
 for v in \
   "$EXPECTED_LINUX_ROOTFS_22" "$EXPECTED_LINUX_ROOTFS_24" "$EXPECTED_LINUX_LIBSO" \
   "$EXPECTED_DARWIN_ROOTFS_22_ARM64" "$EXPECTED_DARWIN_ROOTFS_24_ARM64" \
-  "$EXPECTED_DARWIN_LIBSO_ARM64" \
+  "$EXPECTED_DARWIN_LIBSO_ARM64" "$EXPECTED_DARWIN_DYLIB_ARM64" \
+  "$EXPECTED_DARWIN_COREUTILS_ARM64" "$EXPECTED_DARWIN_BASH_ARM64" \
   "$EXPECTED_VMLINUX_VZ_X86_64" "$EXPECTED_VMLINUX_VZ_ARM64" \
   "$EXPECTED_SJ_VM_ARM64_DARWIN"
 do
@@ -454,6 +469,12 @@ ART_DARWIN_LIBSO_ARM64="$DIR/images/libscriptjail-arm64.so"
 ART_VMLINUX_VZ_X86_64="$DIR/images/vmlinux-vz-x86_64"
 ART_VMLINUX_VZ_ARM64="$DIR/images/vmlinux-vz-arm64"
 ART_SJ_VM_ARM64_DARWIN="$DIR/script-jail-vm-arm64-darwin"
+# The macOS-native Mach-O shim is built on the macOS leg and downloaded to the
+# artifacts ROOT (next to script-jail-vm-arm64-darwin), NOT under images/.
+ART_DARWIN_DYLIB_ARM64="$DIR/libscriptjail-arm64.dylib"
+# Bare-backend SIP-substitution binaries, also at the artifacts ROOT.
+ART_DARWIN_COREUTILS_ARM64="$DIR/coreutils-arm64"
+ART_DARWIN_BASH_ARM64="$DIR/bash-arm64"
 
 # Artifacts must exist in BOTH modes — a missing file means the build job's
 # upload-artifact step is broken, not a bootstrap nuance.  Tests that only
@@ -484,6 +505,9 @@ if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
     "$ART_DARWIN_ROOTFS_22_ARM64"
     "$ART_DARWIN_ROOTFS_24_ARM64"
     "$ART_DARWIN_LIBSO_ARM64"
+    "$ART_DARWIN_DYLIB_ARM64"
+    "$ART_DARWIN_COREUTILS_ARM64"
+    "$ART_DARWIN_BASH_ARM64"
     "$ART_VMLINUX_VZ_X86_64"
     "$ART_VMLINUX_VZ_ARM64"
     "$ART_SJ_VM_ARM64_DARWIN"
@@ -537,6 +561,12 @@ if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
   COMPUTED_DARWIN_ROOTFS_22_ARM64="$(canonical_rootfs_hash "$ART_DARWIN_ROOTFS_22_ARM64")"
   COMPUTED_DARWIN_ROOTFS_24_ARM64="$(canonical_rootfs_hash "$ART_DARWIN_ROOTFS_24_ARM64")"
   COMPUTED_DARWIN_LIBSO_ARM64="$(sha_of "$ART_DARWIN_LIBSO_ARM64")"
+  # Plain sha256 — the dylib is not a rootfs ext4, so it has no time-masked
+  # canonical form to mask.
+  COMPUTED_DARWIN_DYLIB_ARM64="$(sha_of "$ART_DARWIN_DYLIB_ARM64")"
+  # Plain sha256 for the substitution binaries too.
+  COMPUTED_DARWIN_COREUTILS_ARM64="$(sha_of "$ART_DARWIN_COREUTILS_ARM64")"
+  COMPUTED_DARWIN_BASH_ARM64="$(sha_of "$ART_DARWIN_BASH_ARM64")"
   COMPUTED_VMLINUX_VZ_X86_64="$(sha_of "$ART_VMLINUX_VZ_X86_64")"
   COMPUTED_VMLINUX_VZ_ARM64="$(sha_of "$ART_VMLINUX_VZ_ARM64")"
   COMPUTED_SJ_VM_ARM64_DARWIN="$(sha_of "$ART_SJ_VM_ARM64_DARWIN")"
@@ -612,6 +642,9 @@ if [ "$ALL_PLACEHOLDERS" -eq 1 ]; then
     echo "  darwin/rootfs-ubuntu-22.04-arm64.ext4: $COMPUTED_DARWIN_ROOTFS_22_ARM64" >&2
     echo "  darwin/rootfs-ubuntu-24.04-arm64.ext4: $COMPUTED_DARWIN_ROOTFS_24_ARM64" >&2
     echo "  darwin/libscriptjail-arm64.so:         $COMPUTED_DARWIN_LIBSO_ARM64" >&2
+    echo "  darwin/libscriptjail-arm64.dylib:      $COMPUTED_DARWIN_DYLIB_ARM64" >&2
+    echo "  darwin/coreutils-arm64:                $COMPUTED_DARWIN_COREUTILS_ARM64" >&2
+    echo "  darwin/bash-arm64:                     $COMPUTED_DARWIN_BASH_ARM64" >&2
     echo "  darwin/vmlinux-vz-x86_64:              $COMPUTED_VMLINUX_VZ_X86_64" >&2
     echo "  darwin/vmlinux-vz-arm64:               $COMPUTED_VMLINUX_VZ_ARM64" >&2
     echo "  darwin/script-jail-vm-arm64-darwin:    $COMPUTED_SJ_VM_ARM64_DARWIN" >&2
@@ -645,6 +678,9 @@ if [ "$CHECK_DARWIN_ARTIFACTS" = "1" ]; then
   check "darwin/rootfs-ubuntu-22.04-arm64.ext4" "$EXPECTED_DARWIN_ROOTFS_22_ARM64" "$COMPUTED_DARWIN_ROOTFS_22_ARM64"
   check "darwin/rootfs-ubuntu-24.04-arm64.ext4" "$EXPECTED_DARWIN_ROOTFS_24_ARM64" "$COMPUTED_DARWIN_ROOTFS_24_ARM64"
   check "darwin/libscriptjail-arm64.so"         "$EXPECTED_DARWIN_LIBSO_ARM64"     "$COMPUTED_DARWIN_LIBSO_ARM64"
+  check "darwin/libscriptjail-arm64.dylib"      "$EXPECTED_DARWIN_DYLIB_ARM64"     "$COMPUTED_DARWIN_DYLIB_ARM64"
+  check "darwin/coreutils-arm64"                "$EXPECTED_DARWIN_COREUTILS_ARM64" "$COMPUTED_DARWIN_COREUTILS_ARM64"
+  check "darwin/bash-arm64"                     "$EXPECTED_DARWIN_BASH_ARM64"      "$COMPUTED_DARWIN_BASH_ARM64"
   check "darwin/vmlinux-vz-x86_64"              "$EXPECTED_VMLINUX_VZ_X86_64"      "$COMPUTED_VMLINUX_VZ_X86_64"
   check "darwin/vmlinux-vz-arm64"               "$EXPECTED_VMLINUX_VZ_ARM64"       "$COMPUTED_VMLINUX_VZ_ARM64"
   check "darwin/script-jail-vm-arm64-darwin"    "$EXPECTED_SJ_VM_ARM64_DARWIN"     "$COMPUTED_SJ_VM_ARM64_DARWIN"

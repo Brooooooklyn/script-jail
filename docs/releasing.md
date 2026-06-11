@@ -91,7 +91,7 @@ The producer builds every image asset exactly once:
    build both VZ vmlinux kernels, **push the 4 GHCR rootfs Docker images**, and
    upload the 8 binary image assets as the tag-suffixed artifact
    `release-assets-vX.Y.Z`. It then prints two paste-blocks to the job summary:
-   the **9 file SHAs** ("Artifact SHAs" — from the *Compute SHAs* step) and the
+   the **12 file SHAs** ("Artifact SHAs" — from the *Compute SHAs* step) and the
    **4 Docker digests** ("Docker image refs" — from the *Publish Docker rootfs
    images* step).
 
@@ -130,17 +130,17 @@ Paste the producer's values into `src/action/artifact-manifest.ts` and commit.
 > reproducible, so SHAs from an older run would not match the binaries the
 > release actually downloads, and the verify step would fail.
 
-1. **Paste the 9 file SHAs + 4 Docker digests.** Copy the **9 file SHAs**
-   (3 `expected.linux` + 6 `expected.darwin`) from the *Compute SHAs* paste-block
+1. **Paste the 12 file SHAs + 4 Docker digests.** Copy the **12 file SHAs**
+   (3 `expected.linux` + 9 `expected.darwin`) from the *Compute SHAs* paste-block
    and the **4 Docker digests** (2 `dockerImages.x64` + 2 `dockerImages.arm64`)
    from the *Docker image refs* paste-block of the LATEST producer run, replacing
    every `PLACEHOLDER_SHA256_*` token.
 2. **Set `tag` to `'vX.Y.Z'`** in the same file.
-3. **All-or-nothing across all 13 pinned entries.** A manifest with SOME real
+3. **All-or-nothing across all 16 pinned entries.** A manifest with SOME real
    values and SOME placeholders is a packaging bug and is rejected by
    `check-publish-artifacts.sh` (the mixed-manifest gate:
    `[ "$PLACEHOLDER_COUNT" -gt 0 ] && [ "$REAL_COUNT" -gt 0 ]` → `exit 1`). The
-   classification folds **all 13 pinned entries — the 9 file SHAs AND the 4
+   classification folds **all 16 pinned entries — the 12 file SHAs AND the 4
    Docker digests** — into one `PLACEHOLDER_COUNT` / `REAL_COUNT` tally, so
    pasting the real file SHAs while leaving the Docker refs as placeholders (or
    vice versa) trips the reject. Replace every placeholder, or none. (File SHAs

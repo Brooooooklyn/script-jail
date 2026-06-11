@@ -429,6 +429,50 @@ describe('agent main()', () => {
     expect(env['SCRIPT_JAIL_NODE_OPTIONS']).toContain('env-spy.cjs');
   });
 
+  it('macos-bare keeps native file/connect auditing off in Phase A and on in Phase B', async () => {
+    const { conn, hostSend } = makeConn();
+    const configPath = writeConfig(testDir, { spoof: { platform: 'darwin', arch: 'arm64' } });
+    const oldBackend = process.env['SCRIPT_JAIL_BACKEND'];
+    const oldAuditOps = process.env['SCRIPT_JAIL_MACOS_AUDIT_OPS'];
+    process.env['SCRIPT_JAIL_BACKEND'] = 'macos-bare';
+    process.env['SCRIPT_JAIL_MACOS_AUDIT_OPS'] = '1';
+
+    const fetchEnvs: Array<NodeJS.ProcessEnv> = [];
+    const installEnvs: Array<NodeJS.ProcessEnv> = [];
+    const spawner: Spawner = {
+      async spawn(_cmd, _args, opts) {
+        fetchEnvs.push(opts.env);
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    };
+    const strace: StraceRunner = {
+      async *run(_cmd, _args, opts) {
+        installEnvs.push(opts.env);
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op for this env-split test */ },
+      getRootPid() { return null; },
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
+    } finally {
+      if (oldBackend === undefined) delete process.env['SCRIPT_JAIL_BACKEND'];
+      else process.env['SCRIPT_JAIL_BACKEND'] = oldBackend;
+      if (oldAuditOps === undefined) delete process.env['SCRIPT_JAIL_MACOS_AUDIT_OPS'];
+      else process.env['SCRIPT_JAIL_MACOS_AUDIT_OPS'] = oldAuditOps;
+    }
+
+    expect(fetchEnvs).toHaveLength(1);
+    expect(installEnvs).toHaveLength(1);
+    expect(fetchEnvs[0]!['DYLD_INSERT_LIBRARIES']).toBe('/lib/libscriptjail.so');
+    expect(fetchEnvs[0]!['SCRIPT_JAIL_MACOS_AUDIT_OPS']).toBeUndefined();
+    expect(installEnvs[0]!['SCRIPT_JAIL_MACOS_AUDIT_OPS']).toBe('1');
+  });
+
   it('throws when config file does not exist', async () => {
     const { conn } = makeConn();
     await expect(
@@ -983,6 +1027,23 @@ describe('buildChildEnv protected-env-names length gate', () => {
     };
   }
 
+  it('strips ambient macOS-only SCRIPT_JAIL_MACOS_AUDIT_OPS (and unknown SCRIPT_JAIL_*) from the Linux child env', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv(
+      { SCRIPT_JAIL_MACOS_AUDIT_OPS: '1', SCRIPT_JAIL_BOGUS: 'x', PATH: '/usr/bin:/bin' },
+      makeConfig([]),
+      '/tmp/events.jsonl',
+    );
+    // Regression (Codex adversarial review): the macOS audit-ops gate must NOT
+    // be allow-listed in the shared lifecycle sanitizer.  On a Linux runner the
+    // ELF shim has no audit-ops gate, so an ambient SCRIPT_JAIL_MACOS_AUDIT_OPS
+    // must be STRIPPED from the audited child env — never ride through (which
+    // would break the "strip unknown SCRIPT_JAIL_*" invariant and risk a
+    // spurious env_read perturbing the byte-stable lock).
+    expect(env['SCRIPT_JAIL_MACOS_AUDIT_OPS']).toBeUndefined();
+    expect(env['SCRIPT_JAIL_BOGUS']).toBeUndefined();
+  });
+
   it('accepts a protect list that fits within the CanonBuf payload (<= 1023 bytes)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const { CANON_PROTECTED_ENV_NAMES_MAX_LEN, MAX_PROTECTED_ENV_NAMES } =
@@ -1348,6 +1409,57 @@ describe('buildChildEnv lifecycle env sanitization', () => {
     ]) {
       expect(env).not.toHaveProperty(name);
     }
+  });
+});
+
+describe('buildChildEnvMacos macOS sticky env contract', () => {
+  function makeConfig(workDir: string): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: [] },
+      spoof: { platform: 'darwin', arch: 'arm64' },
+      node_version: '24.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: workDir,
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('sets SCRIPT_JAIL_WORK_DIR to config.work_dir so the shim keeps node_modules/.bin audited', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+
+    const env = buildChildEnvMacos(
+      { PATH: '/usr/bin:/bin', SCRIPT_JAIL_SHELL_SHIM_DIR: '/fake/shims' },
+      makeConfig('/staged/repo/work'),
+      '/tmp/events.jsonl',
+    );
+
+    // Mirrors the SCRIPT_JAIL_SHELL_SHIM_DIR contract: the shim captures this at
+    // ctor into CANON_WORK_DIR (keep-root #6) so a top-level node_modules/.bin
+    // helper stays audited after a lifecycle chdir (the false-strip class).
+    expect(env['SCRIPT_JAIL_WORK_DIR']).toBe('/staged/repo/work');
+    expect(env['SCRIPT_JAIL_SHELL_SHIM_DIR']).toBe('/fake/shims');
+  });
+
+  it('keeps SCRIPT_JAIL_WORK_DIR on a lifecycle child (allow-listed, not sanitized away)', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+
+    // baseEnv carries an AMBIENT SCRIPT_JAIL_WORK_DIR; it must survive
+    // sanitizeLifecycleBaseEnv (allow-listed) and be re-asserted to config.work_dir.
+    const env = buildChildEnvMacos(
+      {
+        PATH: '/usr/bin:/bin',
+        SCRIPT_JAIL_WORK_DIR: '/ambient/work',
+        SCRIPT_JAIL_UNKNOWN_VAR: 'stripped',
+      },
+      makeConfig('/staged/repo/work'),
+      '/tmp/events.jsonl',
+    );
+
+    expect(env['SCRIPT_JAIL_WORK_DIR']).toBe('/staged/repo/work');
+    // Unknown SCRIPT_JAIL_* vars are still stripped (allow-list invariant intact).
+    expect(env).not.toHaveProperty('SCRIPT_JAIL_UNKNOWN_VAR');
   });
 });
 

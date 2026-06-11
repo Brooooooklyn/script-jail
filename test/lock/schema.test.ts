@@ -79,6 +79,19 @@ describe('schema', () => {
         expect((parsed.data as Record<string, unknown>)['hidden']).toBeUndefined();
       }
     });
+    it('parses the optional macOS audit_blind flag when true', () => {
+      const raw = { kind: 'spawn', argv: ['/usr/bin/find', '.'], result: 'ok', pid: 4, ts: 3, audit_blind: true };
+      const parsed = SpawnEvent.safeParse(raw);
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.audit_blind).toBe(true);
+    });
+    it('omits audit_blind when absent (byte-stable: never materialized as false)', () => {
+      const parsed = SpawnEvent.safeParse({ kind: 'spawn', argv: ['node'], result: 'ok', pid: 4, ts: 3 });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) {
+        expect((parsed.data as Record<string, unknown>)['audit_blind']).toBeUndefined();
+      }
+    });
   });
 
   describe('DlopenEvent', () => {

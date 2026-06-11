@@ -9,9 +9,27 @@ description      = "LD_PRELOAD shim that audits getenv / secure_getenv / __secur
 name        = "scriptjail"
 crate-type  = ["cdylib"]
 
+# macOS-only helper that prints a pid's parent pid via
+# proc_pidinfo(PROC_PIDTBSDINFO) for the guest's MacOSProcReader (no /proc on
+# macOS).  A standalone std binary — NOT the no_std cdylib — never injected
+# into an audited process.  Compiles to a no-op stub on non-macOS so the Linux
+# ELF cdylib build is unaffected.
+[[bin]]
+name = "sj-procinfo"
+path = "src/bin/procinfo.rs"
+
 [dependencies]
 libc = { version = "0.2", default-features = false }
 ctor = { version = "1.0", default-features = false, features = ["proc_macro"] }
+
+# `cc` is an UNCONDITIONAL build-dependency: a `cfg(target_os = "macos")`
+# build-dep resolves against the HOST, so on a Linux host `build.rs`'s
+# `cc::Build` reference fails to COMPILE (E0433) even though its runtime guard
+# would skip the macOS branch.  Declaring `cc` for every host keeps `build.rs`
+# portable; the runtime `CARGO_CFG_TARGET_OS` check in build.rs restricts the
+# actual C compilation of `open_variadic.c` to the macOS TARGET.
+[build-dependencies]
+cc = "1.2.63"
 
 # NOTE: `[profile.release]` for this crate lives in the workspace root
 # Cargo.toml (one level up).  Cargo ignores profile blocks in workspace

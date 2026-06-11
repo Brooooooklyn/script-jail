@@ -14,6 +14,8 @@ images/*.ext4.gz
 images/*.so
 images/*.dylib
 images/*.d
+images/coreutils-arm64
+images/bash-arm64
 bin/darwin-*/
 
 # Spurious ESM-flavoured action bundle.  action.yml uses dist/main.cjs; an

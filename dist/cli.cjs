@@ -7364,9 +7364,9 @@ __export(index_exports, {
   run: () => run
 });
 module.exports = __toCommonJS(index_exports);
-var import_node_fs19 = require("node:fs");
-var import_node_os8 = require("node:os");
-var import_node_path15 = require("node:path");
+var import_node_fs22 = require("node:fs");
+var import_node_os9 = require("node:os");
+var import_node_path17 = require("node:path");
 var import_node_url2 = require("node:url");
 
 // src/cli/detect-platform.ts
@@ -7430,7 +7430,7 @@ function detectPlatform(input = {}) {
       throw new UnsupportedMacOSError(macosMajor, MIN_MACOS_MAJOR);
     }
     if (arch === "x64") {
-      throw new UnsupportedDarwinArchError();
+      return { os: "darwin", arch: "x64", macosMajor };
     }
     if (arch !== "arm64") {
       throw new UnsupportedArchError(arch);
@@ -7766,6 +7766,7 @@ async function spawnVm(vmConfig, options = {}) {
 var VALID_SUBCOMMANDS = /* @__PURE__ */ new Set(["init", "update", "check"]);
 var VALID_PLATFORMS = /* @__PURE__ */ new Set(["linux", "darwin", "win32"]);
 var VALID_ARCHES = /* @__PURE__ */ new Set(["x64", "arm64"]);
+var VALID_CLI_BACKENDS = /* @__PURE__ */ new Set(["vz", "bare"]);
 function parseArgs(argv) {
   const out = {
     subcommand: null,
@@ -7776,6 +7777,9 @@ function parseArgs(argv) {
     // user did not pass --spoof-arch.  Keeping a concrete parser default
     // preserves the stable ParsedArgs shape.
     spoofArch: "x64",
+    // `null` until the user passes --backend.  `src/cli/index.ts` resolves the
+    // effective backend per host (darwin: vz on arm64, bare otherwise).
+    backend: null,
     help: false,
     version: false,
     errors: []
@@ -7832,6 +7836,17 @@ function parseArgs(argv) {
         continue;
       }
       out.spoofArch = v;
+      continue;
+    }
+    if (a === "--backend") {
+      const v = peekValue("backend", argv[i + 1]);
+      if (v === null) continue;
+      i++;
+      if (!VALID_CLI_BACKENDS.has(v)) {
+        out.errors.push(`--backend must be one of: vz, bare (got '${v}')`);
+        continue;
+      }
+      out.backend = v;
       continue;
     }
     if (a.startsWith("-")) {
@@ -7939,7 +7954,18 @@ function resolveArtifacts(input) {
     imagesDir,
     hostArch === "x64" ? "libscriptjail.so" : "libscriptjail-arm64.so"
   );
-  return { kernelPath, rootfsPath, compressedRootfsPath, libscriptjailSoPath };
+  const macShimDylibPath = (0, import_node_path3.join)(imagesDir, "libscriptjail-arm64.dylib");
+  const macCoreutilsPath = (0, import_node_path3.join)(imagesDir, "coreutils-arm64");
+  const macBashPath = (0, import_node_path3.join)(imagesDir, "bash-arm64");
+  return {
+    kernelPath,
+    rootfsPath,
+    compressedRootfsPath,
+    libscriptjailSoPath,
+    macShimDylibPath,
+    macCoreutilsPath,
+    macBashPath
+  };
 }
 var PlatformPackageMissingError = class extends Error {
   constructor(packageName) {
@@ -23356,7 +23382,18 @@ var SpawnEvent = external_exports.object({
   // 'eacces' = found but not executable
   result: external_exports.enum(["ok", "enoent", "eacces"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux for byte-stability). Carried from
+  // the Mach-O shim's exec event: `true` when the exec target resolved to a
+  // SIP-protected system binary (under /bin or /usr/bin) that sip_redirect could
+  // NOT redirect to a bundled substitute (e.g. find/sed/awk/grep/xargs/which/
+  // python3/git/perl/ruby). The real arm64e binary ran with DYLD stripped, so it
+  // and its descendants executed OUTSIDE the audit envelope. normalize.ts surfaces
+  // it as an `<AUDIT_BLIND>` prefix in spawn_attempts/spawn_blocked so the lock
+  // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
+  // benign find/sed use stays green; a reviewer just sees the marker). Omitted
+  // (never `false`) so existing/non-blind records stay byte-identical.
+  audit_blind: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -23427,7 +23464,30 @@ var ExecEvent = external_exports.object({
   // are built together but this gives us a safety net.
   result: external_exports.enum(["ok", "failed"]).default("ok"),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // macOS bare backend only (omitted on Linux). Set `true` by the Mach-O shim
+  // when `prog` resolved to a SIP-protected system binary under /bin or /usr/bin
+  // that sip_redirect left unchanged (no bundled substitute covers it), so the
+  // real arm64e image ran with DYLD_INSERT_LIBRARIES stripped — un-audited. The
+  // macOS guest dispatcher (phase-install-macos.ts) carries this onto the
+  // synthesized spawn event; see SpawnEvent.audit_blind. Optional so Linux/non-
+  // blind shim records parse byte-identically (zod would otherwise drop it).
+  audit_blind: external_exports.boolean().optional(),
+  // macOS bare backend only (omitted on Linux). The FULL argv vector for the
+  // exec, serialized by the Mach-O shim's `append_argv_field` (capped/truncated
+  // deterministically). The macOS guest dispatcher synthesizes a spawn whose
+  // `argv` is this array (vs the single-element `[argv0 ?? prog]` fallback), so
+  // the rendered spawn_attempts command line matches Linux's full strace argv
+  // (e.g. `node postinstall.js` instead of just `node`). Optional so Linux
+  // records (no `argv` field) and pre-change shim builds still parse.
+  argv: external_exports.array(external_exports.string()).optional(),
+  // macOS bare backend only (omitted on Linux). On a FAILED exec the Mach-O shim
+  // records the errno as a short uppercase string (`ENOENT` / `EACCES` — the
+  // only two Linux's strace parser would surface). The macOS guest dispatcher
+  // maps it onto a `spawn` RawEvent with `result:'enoent'|'eacces'` so normalize
+  // renders `<ENOENT> <full argv>` in spawn_blocked (parity with Linux strace).
+  // Optional so Linux/successful records parse byte-identically.
+  exec_errno: external_exports.string().optional()
 });
 var EnvTamperEvent = external_exports.object({
   kind: external_exports.literal("env_tamper"),
@@ -23997,6 +24057,24 @@ var PINNED_MANIFEST = {
       "rootfs-ubuntu-22.04-arm64.ext4": "e29dd8113b08fdc81441d2be3709127bf2ccaeaba3798b103ce7a57abca5039d",
       "rootfs-ubuntu-24.04-arm64.ext4": "b45c85495f6537223d74e0903efe9d9148d38c4027f00fbe497b113680489eff",
       "libscriptjail-arm64.so": "31d98f738131a11f58cdf7b07d1576511b2fd3906d46937b953e7f4b4cab5ec3",
+      // macOS-native Mach-O shim for the bare backend (DYLD_INSERT_LIBRARIES).
+      // PLACEHOLDER until the first release-build.yml run that emits its SHA:
+      // the dylib is a NEW artifact with no producer-backed bytes yet.  This
+      // makes the manifest MIXED (real entries + this placeholder), so the
+      // publish-job gate (scripts/check-publish-artifacts.sh) will reject a
+      // release until this is backfilled from a producer run that built the
+      // dylib — exactly the all-or-nothing contract.  Paste the real SHA from
+      // the producer paste-block, then cut the tag.
+      "libscriptjail-arm64.dylib": "PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_DYLIB",
+      // Bare-backend SIP-substitution binaries (the shim redirects /bin/sh +
+      // coreutils to these plain-arm64 binaries, so no arm64e dylib is needed).
+      // coreutils-arm64 is the official uutils 0.4.0 prebuilt — a fixed upstream
+      // artifact with a stable BINARY sha, so it is pinned real now.  bash-arm64
+      // is built-from-source by the producer (not byte-reproducible across
+      // toolchains), so it is a PLACEHOLDER until a release-build.yml run emits
+      // its SHA — same backfill contract as the dylib above.
+      "coreutils-arm64": "8e8f38d9323135a19a73d617336fce85380f3c46fcb83d3ae3e031d1c0372f21",
+      "bash-arm64": "PLACEHOLDER_SHA256_DARWIN_BASH_ARM64",
       "vmlinux-vz-x86_64": "012e33842367483ffad908d878d5682fa891d2a4f476a229b631e16780404953",
       "vmlinux-vz-arm64": "4b42d3b912065a92a3816c788ed9c4dac92a12ece4c478c4fb1396c76cffd255",
       // No `script-jail-vm-x86_64-darwin` — see the file header for the
@@ -24744,13 +24822,13 @@ function createFirecrackerBackend(deps) {
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
   const checkExists = deps.existsSync ?? import_node_fs16.existsSync;
-  const hostPlatform = deps.platform ?? import_node_process3.platform;
+  const hostPlatform2 = deps.platform ?? import_node_process3.platform;
   return {
     name: "firecracker",
     async run(ctx) {
       if (deps.skipAvailabilityCheck !== true) {
-        if (hostPlatform !== "linux") {
-          throw new BackendUnavailableError("firecracker", `requires Linux (detected ${hostPlatform})`);
+        if (hostPlatform2 !== "linux") {
+          throw new BackendUnavailableError("firecracker", `requires Linux (detected ${hostPlatform2})`);
         }
         if (!checkExists("/dev/kvm")) {
           throw new BackendUnavailableError("firecracker", "/dev/kvm is missing");
@@ -25106,14 +25184,14 @@ var import_node_fs18 = require("node:fs");
 var import_node_path14 = require("node:path");
 var import_node_process4 = require("node:process");
 function createBareBackend(deps = {}) {
-  const hostPlatform = deps.platform ?? import_node_process4.platform;
+  const hostPlatform2 = deps.platform ?? import_node_process4.platform;
   const env = deps.env ?? process.env;
   const doPreFetchArtifacts = deps.preFetchArtifacts ?? preFetchArtifacts;
   return {
     name: "bare",
     async run(ctx) {
-      if (hostPlatform !== "linux") {
-        throw new BackendUnavailableError("bare", `requires Linux (detected ${hostPlatform})`);
+      if (hostPlatform2 !== "linux") {
+        throw new BackendUnavailableError("bare", `requires Linux (detected ${hostPlatform2})`);
       }
       if (!commandSucceeds("strace", ["-V"], { env })) {
         throw new BackendUnavailableError("bare", "strace is not available");
@@ -25234,6 +25312,551 @@ async function runSelectedBackend(input) {
   );
 }
 
+// src/action/backend/mac-bare.ts
+var import_node_fs21 = require("node:fs");
+var import_node_path16 = require("node:path");
+var import_node_process5 = require("node:process");
+
+// src/cli/provision-node-mac.ts
+var import_node_child_process5 = require("node:child_process");
+var import_node_fs19 = require("node:fs");
+var import_node_os8 = require("node:os");
+var import_node_path15 = require("node:path");
+
+// src/rootfs/vite-plus.ts
+var VITE_PLUS_VERSION = "0.1.22";
+var NODE_VERSION = "24.15.0";
+var VITE_PLUS_DARWIN_SHA256 = {
+  arm64: "95ab62b3287e3761247b1cb5f9a0a5bd90d1b6f86cc79c8e777f00dbd0157eff",
+  x64: "2399331bd59270ea5e01288ba2e6e50d91bbeff3f0e34cedea0e427c7da361ea"
+};
+function vitePlusTarballUrl(arch, os = "linux") {
+  const slug = os === "darwin" ? `darwin-${arch}` : `linux-${arch}-gnu`;
+  const pkg = `@voidzero-dev/vite-plus-cli-${slug}`;
+  return `https://registry.npmjs.org/${pkg}/-/vite-plus-cli-${slug}-${VITE_PLUS_VERSION}.tgz`;
+}
+
+// src/cli/provision-node-mac.ts
+function defaultProvisionCacheDir(env = process.env) {
+  const override = env["SCRIPT_JAIL_CACHE_DIR"];
+  if (override !== void 0 && override !== "") return override;
+  return (0, import_node_path15.join)((0, import_node_os8.tmpdir)(), "script-jail-cache");
+}
+var SHELL_SHIM_BASH = "bash";
+var SHELL_SHIM_COREUTILS = "coreutils";
+async function provisionNodeMac(input) {
+  const doRunCommand = input.runCommand ?? runCommand;
+  const http = input.http ?? new NodeHttpClient();
+  const { arch, cacheDir } = input;
+  (0, import_node_fs19.mkdirSync)(cacheDir, { recursive: true });
+  const root = (0, import_node_path15.join)(
+    cacheDir,
+    "script-jail-node-mac",
+    `node-${NODE_VERSION}-${arch}-vp${VITE_PLUS_VERSION}`
+  );
+  const vpHome = (0, import_node_path15.join)(root, "vp-home");
+  const shellShimDir = (0, import_node_path15.join)(root, "shell-shim");
+  const markerPath = (0, import_node_path15.join)(root, "resign-marker.json");
+  const cached2 = readMarker(markerPath);
+  if (cached2 !== void 0) {
+    const nodePath2 = cached2.nodePath;
+    if ((0, import_node_fs19.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand)) {
+      (0, import_node_fs19.mkdirSync)(shellShimDir, { recursive: true });
+      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+      return {
+        nodeBinDir: cached2.nodeBinDir,
+        nodePath: nodePath2,
+        shellShimDir,
+        nodeVersion: NODE_VERSION,
+        preResignSha256: cached2.preResignSha256
+      };
+    }
+    (0, import_node_fs19.rmSync)(root, { recursive: true, force: true });
+  }
+  (0, import_node_fs19.rmSync)(root, { recursive: true, force: true });
+  (0, import_node_fs19.mkdirSync)(vpHome, { recursive: true });
+  (0, import_node_fs19.mkdirSync)(shellShimDir, { recursive: true });
+  const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand });
+  const vpEnv = {
+    ...process.env,
+    VP_HOME: vpHome,
+    COREPACK_HOME: (0, import_node_path15.join)(vpHome, "corepack"),
+    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+  };
+  doRunCommand(vpBin, ["env", "install", NODE_VERSION], { env: vpEnv });
+  const nodeBinDir = findNodeBinDir((0, import_node_path15.join)(vpHome, "js_runtime"));
+  if (nodeBinDir === null) {
+    throw new Error(
+      `script-jail: vp produced no Node toolchain under ${(0, import_node_path15.join)(vpHome, "js_runtime")} (vp env install ${NODE_VERSION} succeeded but no bin/node found).`
+    );
+  }
+  const nodePath = (0, import_node_path15.join)(nodeBinDir, "node");
+  const preResignSha256 = await sha256File2(nodePath);
+  const corepackPath = (0, import_node_path15.join)(nodeBinDir, "corepack");
+  doRunCommand(corepackPath, ["enable"], { env: { ...vpEnv, PATH: prependPath(nodeBinDir, vpEnv) } });
+  resignAdHoc(nodePath, doRunCommand);
+  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+  writeMarker(markerPath, {
+    version: RESIGN_MARKER_VERSION,
+    nodeBinDir,
+    nodePath,
+    preResignSha256
+  });
+  return {
+    nodeBinDir,
+    nodePath,
+    shellShimDir,
+    nodeVersion: NODE_VERSION,
+    preResignSha256
+  };
+}
+var RESIGN_MARKER_VERSION = 3;
+function readMarker(path) {
+  try {
+    const parsed = JSON.parse((0, import_node_fs19.readFileSync)(path, "utf8"));
+    const { version: version2, nodeBinDir, nodePath, preResignSha256 } = parsed;
+    if (version2 !== RESIGN_MARKER_VERSION || typeof nodeBinDir !== "string" || typeof nodePath !== "string" || typeof preResignSha256 !== "string") {
+      return void 0;
+    }
+    return { version: RESIGN_MARKER_VERSION, nodeBinDir, nodePath, preResignSha256 };
+  } catch {
+    return void 0;
+  }
+}
+function writeMarker(path, marker) {
+  (0, import_node_fs19.writeFileSync)(path, JSON.stringify(marker, null, 2) + "\n", "utf8");
+}
+async function fetchVpBinary(input) {
+  const { arch, root, http } = input;
+  const url2 = vitePlusTarballUrl(arch, "darwin");
+  const expectedSha = VITE_PLUS_DARWIN_SHA256[arch];
+  const tgzPath = (0, import_node_path15.join)(root, "vp.tgz");
+  const extractDir = (0, import_node_path15.join)(root, "vp-extract");
+  (0, import_node_fs19.mkdirSync)(extractDir, { recursive: true });
+  await http.download(url2, tgzPath, expectedSha);
+  input.runCommand("tar", ["-xzf", tgzPath, "-C", extractDir]);
+  const vpBin = (0, import_node_path15.join)(extractDir, "package", "vp");
+  if (!(0, import_node_fs19.existsSync)(vpBin)) {
+    throw new Error(
+      `script-jail: vp binary not found at ${vpBin} after extracting ${url2}.`
+    );
+  }
+  (0, import_node_fs19.chmodSync)(vpBin, 493);
+  return vpBin;
+}
+function findNodeBinDir(jsRuntimeDir) {
+  if (!(0, import_node_fs19.existsSync)(jsRuntimeDir)) return null;
+  const stack = [{ dir: jsRuntimeDir, depth: 0 }];
+  while (stack.length > 0) {
+    const { dir, depth } = stack.pop();
+    let entries;
+    try {
+      entries = (0, import_node_fs19.readdirSync)(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      const child = (0, import_node_path15.join)(dir, name);
+      let isDir;
+      try {
+        isDir = (0, import_node_fs19.statSync)(child).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+      if (name === "bin" && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(child, "node"))) {
+        return child;
+      }
+      if (depth < 4) stack.push({ dir: child, depth: depth + 1 });
+    }
+  }
+  return null;
+}
+function prependPath(dir, env) {
+  const existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  return `${dir}:${existing}`;
+}
+function resignAdHoc(binPath, doRunCommand, identifier) {
+  doRunCommand("codesign", ["--remove-signature", binPath]);
+  doRunCommand(
+    "codesign",
+    identifier === void 0 ? ["--force", "--sign", "-", binPath] : ["--force", "--sign", "-", "--identifier", identifier, binPath]
+  );
+  (0, import_node_child_process5.spawnSync)("xattr", ["-d", "com.apple.quarantine", binPath], { stdio: "ignore" });
+  doRunCommand("codesign", ["--verify", binPath]);
+}
+function codesignVerifies(binPath, doRunCommand) {
+  try {
+    doRunCommand("codesign", ["--verify", binPath]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand) {
+  materializeOne(macBashPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
+  materializeOne(macCoreutilsPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
+}
+function materializeOne(src, dest, doRunCommand) {
+  requireShimSource(src);
+  const tmp = (0, import_node_path15.join)((0, import_node_path15.dirname)(dest), `.${(0, import_node_path15.basename)(dest)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    (0, import_node_fs19.copyFileSync)(src, tmp);
+    (0, import_node_fs19.chmodSync)(tmp, 493);
+    resignAdHoc(tmp, doRunCommand, (0, import_node_path15.basename)(dest));
+    (0, import_node_fs19.renameSync)(tmp, dest);
+  } catch (err) {
+    (0, import_node_fs19.rmSync)(tmp, { force: true });
+    throw err;
+  }
+}
+function requireShimSource(src) {
+  if (!(0, import_node_fs19.existsSync)(src)) {
+    throw new Error(
+      `script-jail: bundled shell-shim binary not found at ${src}. Build it with \`pnpm build\` on an Apple Silicon mac (or fetch the release artifact).`
+    );
+  }
+}
+
+// src/rootfs/macho.ts
+var import_node_fs20 = require("node:fs");
+function readU32LE(buf, off) {
+  return (buf[off] | buf[off + 1] << 8 | buf[off + 2] << 16 | buf[off + 3] << 24) >>> 0;
+}
+function readU32BE(buf, off) {
+  return (buf[off] << 24 | buf[off + 1] << 16 | buf[off + 2] << 8 | buf[off + 3]) >>> 0;
+}
+var FAT_HEADER_SIZE = 8;
+var FAT_ARCH_SIZE = 20;
+var MH_MAGIC_64 = 4277009103;
+var FAT_MAGIC = 3405691582;
+var FAT_MAGIC_CIGAM = 3199925962;
+var MH_DYLIB = 6;
+var LC_SEGMENT_64 = 25;
+var CPU_TYPE_ARM64 = 16777228;
+var CPU_TYPE_X86_64 = 16777223;
+var MACHO64_HEADER_SIZE = 32;
+function expectedMachOCpuType(arch) {
+  return arch === "x64" ? CPU_TYPE_X86_64 : CPU_TYPE_ARM64;
+}
+function cpuTypeLabel(cpu) {
+  if (cpu === CPU_TYPE_ARM64) return "arm64 (CPU_TYPE_ARM64)";
+  if (cpu === CPU_TYPE_X86_64) return "x86-64 (CPU_TYPE_X86_64)";
+  return `cputype=0x${(cpu >>> 0).toString(16)}`;
+}
+function machoNameEquals(buf, off, width, name) {
+  for (let i = 0; i < width; i++) {
+    const c = buf[off + i] ?? 0;
+    const want = i < name.length ? name.charCodeAt(i) : 0;
+    if (c !== want) return false;
+    if (c === 0 && i >= name.length) return true;
+  }
+  return true;
+}
+function validateMachOShimFile(path, expectedCpuType) {
+  let fd;
+  try {
+    fd = (0, import_node_fs20.openSync)(path, "r");
+  } catch (err) {
+    return `cannot open: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  try {
+    let fileSize;
+    try {
+      fileSize = (0, import_node_fs20.statSync)(path).size;
+    } catch (err) {
+      return `cannot stat: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    const prelude = Buffer.alloc(FAT_HEADER_SIZE);
+    if ((0, import_node_fs20.readSync)(fd, prelude, 0, FAT_HEADER_SIZE, 0) < FAT_HEADER_SIZE) {
+      return `file too short (< ${FAT_HEADER_SIZE} bytes)`;
+    }
+    const magic = readU32LE(prelude, 0);
+    if (magic === FAT_MAGIC || magic === FAT_MAGIC_CIGAM) {
+      const nfat = readU32BE(prelude, 4);
+      if (nfat === 0 || nfat > 32) {
+        return `universal binary has implausible nfat_arch=${nfat}`;
+      }
+      const tableBytes = nfat * FAT_ARCH_SIZE;
+      const table = Buffer.alloc(tableBytes);
+      if ((0, import_node_fs20.readSync)(fd, table, 0, tableBytes, FAT_HEADER_SIZE) < tableBytes) {
+        return `short read of fat_arch table (need ${tableBytes} bytes)`;
+      }
+      for (let i = 0; i < nfat; i++) {
+        const e = i * FAT_ARCH_SIZE;
+        const cputype = readU32BE(table, e);
+        const offset = readU32BE(table, e + 8);
+        const size = readU32BE(table, e + 12);
+        if (cputype === expectedCpuType) {
+          if (offset + size > fileSize) {
+            return `fat slice for ${cpuTypeLabel(expectedCpuType)} runs past EOF (offset ${offset} + size ${size} > ${fileSize})`;
+          }
+          return validateThinMachOAt(fd, offset, offset + size, expectedCpuType);
+        }
+      }
+      return `universal binary has no slice for ${cpuTypeLabel(expectedCpuType)}`;
+    }
+    return validateThinMachOAt(fd, 0, fileSize, expectedCpuType);
+  } finally {
+    try {
+      (0, import_node_fs20.closeSync)(fd);
+    } catch {
+    }
+  }
+}
+function validateThinMachOAt(fd, base, limit, expectedCpuType) {
+  const hdr = Buffer.alloc(MACHO64_HEADER_SIZE);
+  const n = (0, import_node_fs20.readSync)(fd, hdr, 0, MACHO64_HEADER_SIZE, base);
+  if (n < MACHO64_HEADER_SIZE) {
+    return `header too short at offset ${base} (${n} bytes; need \u2265 ${MACHO64_HEADER_SIZE})`;
+  }
+  const magic = readU32LE(hdr, 0);
+  if (magic !== MH_MAGIC_64) {
+    if (magic === 1179403647) {
+      return "file is a Linux ELF object, not a macOS Mach-O dylib";
+    }
+    return `bad Mach-O magic at offset ${base}: expected 0x${MH_MAGIC_64.toString(16)}, got 0x${magic.toString(16)}`;
+  }
+  const cputype = readU32LE(hdr, 4);
+  if (cputype !== expectedCpuType) {
+    return `wrong architecture: got ${cpuTypeLabel(cputype)}, expected ${cpuTypeLabel(expectedCpuType)}`;
+  }
+  const filetype = readU32LE(hdr, 12);
+  if (filetype !== MH_DYLIB) {
+    return `unexpected filetype=0x${filetype.toString(16)} (expected 0x${MH_DYLIB.toString(16)} = MH_DYLIB)`;
+  }
+  const ncmds = readU32LE(hdr, 16);
+  const sizeofcmds = readU32LE(hdr, 20);
+  if (ncmds === 0 || sizeofcmds === 0) {
+    return "no load commands; not a loadable dylib";
+  }
+  if (base + MACHO64_HEADER_SIZE + sizeofcmds > limit) {
+    return `load-command region runs past slice end (header ${MACHO64_HEADER_SIZE} + sizeofcmds ${sizeofcmds} > slice ${limit - base})`;
+  }
+  const cmds = Buffer.alloc(sizeofcmds);
+  const m = (0, import_node_fs20.readSync)(fd, cmds, 0, sizeofcmds, base + MACHO64_HEADER_SIZE);
+  if (m < sizeofcmds) {
+    return `short read of load commands (got ${m}; need ${sizeofcmds})`;
+  }
+  let off = 0;
+  let sawInterpose = false;
+  for (let i = 0; i < ncmds; i++) {
+    if (off + 8 > sizeofcmds) {
+      return `load command ${i} runs past the command region (off=${off})`;
+    }
+    const cmd = readU32LE(cmds, off);
+    const cmdsize = readU32LE(cmds, off + 4);
+    if (cmdsize < 8 || off + cmdsize > sizeofcmds) {
+      return `load command ${i} has invalid cmdsize=${cmdsize} at off=${off}`;
+    }
+    if (cmd === LC_SEGMENT_64) {
+      const nsects = readU32LE(cmds, off + 64);
+      const sectsBase = off + 72;
+      for (let s = 0; s < nsects; s++) {
+        const secOff = sectsBase + s * 80;
+        if (secOff + 32 > off + cmdsize) break;
+        const sectnameOff = secOff;
+        const secSegnameOff = secOff + 16;
+        if (machoNameEquals(cmds, secSegnameOff, 16, "__DATA") && machoNameEquals(cmds, sectnameOff, 16, "__interpose")) {
+          sawInterpose = true;
+        }
+      }
+    }
+    off += cmdsize;
+  }
+  if (!sawInterpose) {
+    return "no __DATA,__interpose section; dyld has nothing to rebind (the dylib would load but intercept nothing)";
+  }
+  return null;
+}
+
+// src/action/backend/mac-bare.ts
+var MacBareUnavailableError = class extends Error {
+  constructor(message) {
+    super(`script-jail mac-bare: ${message}`);
+    this.name = "MacBareUnavailableError";
+  }
+};
+var MACOS_ORCHESTRATOR_ENV_ALLOWLIST = ["HOME", "TMPDIR"];
+function pickOrchestratorEnv(baseEnv) {
+  const out = {};
+  for (const name of MACOS_ORCHESTRATOR_ENV_ALLOWLIST) {
+    const value = baseEnv[name];
+    if (value !== void 0) out[name] = value;
+  }
+  return out;
+}
+function createMacBareExecute(deps) {
+  const platform5 = deps.platform ?? import_node_process5.platform;
+  const doExists = deps.existsSync ?? import_node_fs21.existsSync;
+  const doProvision = deps.provisionNodeMac ?? provisionNodeMac;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const doValidateShim = deps.validateMachOShimFile ?? validateMachOShimFile;
+  const baseEnv = deps.env ?? process.env;
+  return async function macBareExecute(input) {
+    if (platform5 !== "darwin") {
+      throw new MacBareUnavailableError(`requires macOS (detected ${platform5})`);
+    }
+    const runtime = resolveRuntimePaths2(deps.repoRoot, deps.imagesDir, doExists);
+    if (!doExists(runtime.nativePreloadPath)) {
+      throw new MacBareUnavailableError(
+        `Mach-O shim not found at ${runtime.nativePreloadPath}. Build it with \`pnpm build\` on an Apple Silicon mac (or fetch the release dylib).`
+      );
+    }
+    const shimError = doValidateShim(
+      runtime.nativePreloadPath,
+      expectedMachOCpuType(deps.arch)
+    );
+    if (shimError !== null) {
+      throw new MacBareUnavailableError(
+        `Mach-O shim at ${runtime.nativePreloadPath} is unusable: ${shimError}. Rebuild it with \`pnpm build\` on an Apple Silicon mac (or fetch the release dylib).`
+      );
+    }
+    const provisioned = await doProvision({
+      arch: deps.arch,
+      cacheDir: defaultProvisionCacheDir(baseEnv),
+      // The bundled plain-arm64 substitutes the shim's SIP redirect points at:
+      // staged as <shellShimDir>/bash and <shellShimDir>/coreutils.
+      macBashPath: runtime.bashPath,
+      macCoreutilsPath: runtime.coreutilsPath
+    });
+    if (!doExists(provisioned.nodePath)) {
+      throw new MacBareUnavailableError(
+        `re-signed node not found at ${provisioned.nodePath} after provisioning.`
+      );
+    }
+    const staged = stageRepoDirectory({
+      repoDir: input.repoDir,
+      parentDir: input.scratchDir,
+      extraRepoOverlayFiles: input.extraRepoOverlayFiles
+    });
+    const backendConfigPath = rewriteConfigWorkDir({
+      configPath: input.configPath,
+      outDir: input.scratchDir,
+      workDir: staged.path
+    });
+    try {
+      return await doRunAgentProcess({
+        cmd: provisioned.nodePath,
+        args: [runtime.agentPath],
+        env: {
+          ...pickOrchestratorEnv(baseEnv),
+          // Mirror init.sh / docker.ts: corepack must not prompt offline.
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+          PATH: prependPath2(provisioned.nodeBinDir, baseEnv),
+          SCRIPT_JAIL_CONNECTION: "stdio",
+          SCRIPT_JAIL_BACKEND: "macos-bare",
+          SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+          SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
+          SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
+          SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
+          SCRIPT_JAIL_SHELL_SHIM_DIR: provisioned.shellShimDir,
+          // The install/repo root (== the rewritten config work_dir, `staged.path`).
+          // The shim's `shim_init` captures it into CANON_WORK_DIR and uses it as
+          // is_external_system_tool keep-root #6 so the WHOLE install tree — incl.
+          // top-level node_modules/.bin helpers that are SIBLINGS of a lifecycle
+          // child's chdir'd cwd — stays audited (the top-level-.bin false-strip).
+          // Sticky + re-injected into every kept child, exactly like
+          // SCRIPT_JAIL_SHELL_SHIM_DIR.
+          SCRIPT_JAIL_WORK_DIR: staged.path
+          // NO SCRIPT_JAIL_PHASE_B_UNSHARE_NET: macOS has no network namespace
+          // to drop, and macOS-bare does NOT enforce offline.  It is OBSERVE-ONLY
+          // and stays ONLINE: net.rs forwards connect/connectx and records the
+          // TRUE result once SCRIPT_JAIL_MACOS_AUDIT_OPS is set (Phase B only);
+          // parity-diff reconciles the offline-Linux / online-macOS split by
+          // stripping the `<BLOCKED> ` prefix at diff time.  Audit-blind SIP
+          // children and raw syscalls egress unrecorded — Firecracker is the
+          // high-assurance backend (see docs/divergence.md).  So the host
+          // launcher sets no network env here.
+        },
+        label: "mac-bare",
+        ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}
+      });
+    } finally {
+      staged.cleanup();
+    }
+  };
+}
+function resolveRuntimePaths2(repoRoot, imagesDir, doExists) {
+  const roots = [
+    process.env["SCRIPT_JAIL_ACTION_ROOT"],
+    process.env["GITHUB_ACTION_PATH"],
+    repoRoot,
+    (0, import_node_path16.join)(repoRoot, ".."),
+    process.cwd()
+  ].filter((p) => typeof p === "string" && p.length > 0);
+  const agentPath = findFirst2(
+    [
+      ...roots.map((root) => (0, import_node_path16.join)(root, "guest-agent.cjs")),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "guest-agent.cjs"))
+    ],
+    "guest-agent.cjs",
+    doExists
+  );
+  const platformPreloadPath = findFirst2(
+    [
+      ...roots.map((root) => (0, import_node_path16.join)(root, "preloads", "platform-spoof.cjs")),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "preloads", "platform-spoof.cjs"))
+    ],
+    "platform-spoof.cjs",
+    doExists
+  );
+  const envSpyPreloadPath = findFirst2(
+    [
+      ...roots.map((root) => (0, import_node_path16.join)(root, "preloads", "env-spy.cjs")),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "preloads", "env-spy.cjs"))
+    ],
+    "env-spy.cjs",
+    doExists
+  );
+  const dylibName = "libscriptjail-arm64.dylib";
+  const nativePreloadPath = firstExistingOrDefault(
+    [
+      (0, import_node_path16.join)(imagesDir, dylibName),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "images", dylibName))
+    ],
+    doExists
+  );
+  const bashPath = firstExistingOrDefault(
+    [
+      (0, import_node_path16.join)(imagesDir, "bash-arm64"),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "bash-arm64"))
+    ],
+    doExists
+  );
+  const coreutilsPath = firstExistingOrDefault(
+    [
+      (0, import_node_path16.join)(imagesDir, "coreutils-arm64"),
+      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "coreutils-arm64"))
+    ],
+    doExists
+  );
+  return {
+    agentPath,
+    platformPreloadPath,
+    envSpyPreloadPath,
+    nativePreloadPath,
+    bashPath,
+    coreutilsPath
+  };
+}
+function findFirst2(candidates, label, doExists) {
+  for (const candidate of candidates) {
+    if (doExists(candidate)) return candidate;
+  }
+  throw new MacBareUnavailableError(`${label} was not found`);
+}
+function firstExistingOrDefault(candidates, doExists) {
+  for (const candidate of candidates) {
+    if (doExists(candidate)) return candidate;
+  }
+  return candidates[0];
+}
+function prependPath2(dir, env) {
+  const existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  return `${dir}:${existing}`;
+}
+
 // src/cli/index.ts
 var import_meta3 = {};
 var USAGE = `script-jail \u2014 Firecracker/VZ-sandboxed npm/pnpm/yarn lifecycle auditor.
@@ -25251,6 +25874,11 @@ Subcommands:
 Options:
   --config <path>        Path to .script-jail.yml (default: ./.script-jail.yml)
   --lock <path>          Path to .script-jail.lock.yml (default: ./.script-jail.lock.yml)
+  --backend <b>          macOS audit backend: vz | bare. vz boots the Linux guest
+                         inside Apple Virtualization.framework (arm64 only); bare
+                         runs the install natively on the Mac under the Mach-O
+                         shim (no VM). Default: vz on Apple Silicon, bare on Intel.
+                         Ignored on Linux (a warning is printed).
   --spoof-platform <p>   linux | darwin | win32 (default: linux)
   --spoof-arch <a>       x64 | arm64 (default: host arch)
   --help                 Print this help and exit.
@@ -25275,6 +25903,7 @@ async function run(deps = {}) {
   const doRunAudit = deps.runAudit ?? runAudit;
   const doResolvePlatformPackageDir = deps.resolvePlatformPackageDir ?? resolvePlatformPackageDir;
   const doRunSelectedBackend = deps.runSelectedBackend ?? runSelectedBackend;
+  const doCreateMacBareExecute = deps.createMacBareExecute ?? createMacBareExecute;
   const doDetectPlatform = deps.detectPlatform ?? (deps.detectHost !== void 0 ? (input) => {
     const host = deps.detectHost(input);
     return { os: "darwin", arch: host.hostArch, macosMajor: host.macosMajor };
@@ -25307,10 +25936,10 @@ async function run(deps = {}) {
     }
     throw err;
   }
-  const configPath = (0, import_node_path15.resolve)(cwd, args.configPath);
-  const lockPath = (0, import_node_path15.resolve)(cwd, args.lockPath);
+  const configPath = (0, import_node_path17.resolve)(cwd, args.configPath);
+  const lockPath = (0, import_node_path17.resolve)(cwd, args.lockPath);
   const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : platform5.arch;
-  const subcommand = args.subcommand ?? ((0, import_node_fs19.existsSync)(lockPath) ? "check" : "init");
+  const subcommand = args.subcommand ?? ((0, import_node_fs22.existsSync)(lockPath) ? "check" : "init");
   const mode = subcommand === "check" ? "check" : "update";
   let pm;
   try {
@@ -25333,7 +25962,7 @@ async function run(deps = {}) {
   try {
     packageImagesDir = doResolvePlatformPackageDir({
       packageName: platformPackageName(platform5),
-      devImagesDir: (0, import_node_path15.join)(repoRoot, "images")
+      devImagesDir: (0, import_node_path17.join)(repoRoot, "images")
     }).imagesDir;
   } catch (err) {
     if (err instanceof PlatformPackageMissingError) {
@@ -25344,6 +25973,9 @@ async function run(deps = {}) {
     throw err;
   }
   if (platform5.os === "linux") {
+    if (args.backend !== null) {
+      warn2(`--backend is darwin-only; ignoring '--backend ${args.backend}' on Linux.`);
+    }
     return runLinux({
       platform: platform5,
       packageImagesDir,
@@ -25362,6 +25994,32 @@ async function run(deps = {}) {
       doBuildArchFlagOverlay
     });
   }
+  const effectiveBackend = args.backend ?? (platform5.arch === "arm64" ? "vz" : "bare");
+  if (effectiveBackend === "vz" && platform5.arch === "x64") {
+    stderr.write(`script-jail: ${new UnsupportedDarwinArchError().message}
+`);
+    return 1;
+  }
+  if (effectiveBackend === "bare") {
+    return runMacBare({
+      platform: platform5,
+      packageImagesDir,
+      repoRoot,
+      cwd,
+      configPath,
+      lockPath,
+      mode,
+      pm,
+      spoofPlatform: args.spoofPlatform,
+      effectiveSpoofArch,
+      warn: warn2,
+      stdout,
+      stderr,
+      doRunAudit,
+      doBuildArchFlagOverlay,
+      doCreateMacBareExecute
+    });
+  }
   const artifacts = resolveArtifacts({
     imagesDir: packageImagesDir,
     hostArch: platform5.arch,
@@ -25374,7 +26032,7 @@ async function run(deps = {}) {
       compressedRootfsPath: artifacts.compressedRootfsPath
     });
   }
-  if (deps.makeOverlay === void 0 && !(0, import_node_fs19.existsSync)(baseRootfsPath)) {
+  if (deps.makeOverlay === void 0 && !(0, import_node_fs22.existsSync)(baseRootfsPath)) {
     const buildHint = platform5.arch === "arm64" ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64` : `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR}`;
     stderr.write(
       `script-jail: rootfs not found at ${artifacts.rootfsPath}. Run \`${buildHint}\` (or fetch the release artifact) to produce it.
@@ -25396,7 +26054,7 @@ async function run(deps = {}) {
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs
       // distinguish it from any real UDS.
-      vsockUdsPath: (0, import_node_path15.resolve)(overlay.workDir, "vsock.sock"),
+      vsockUdsPath: (0, import_node_path17.resolve)(overlay.workDir, "vsock.sock"),
       vsockPort: VSOCK_PORT2,
       vcpuCount: DEFAULT_VCPU_COUNT,
       memoryMb: DEFAULT_MEMORY_MB,
@@ -25435,7 +26093,7 @@ async function run(deps = {}) {
       // arch-flag sidecars (.yarnrc.yml / pm-flags.json) cannot pollute
       // the user's repo.  runAudit creates a private mkdtemp dir under
       // this parent and removes it in `finally` even on crash.
-      workDir: (0, import_node_os8.tmpdir)(),
+      workDir: (0, import_node_os9.tmpdir)(),
       launch,
       io: {
         warn: warn2,
@@ -25464,8 +26122,8 @@ async function run(deps = {}) {
 async function runLinux(input) {
   const { platform: platform5, stderr } = input;
   const arch = platform5.arch;
-  const imagesDir = process.env["SCRIPT_JAIL_CACHE_DIR"] ? (0, import_node_path15.join)(process.env["SCRIPT_JAIL_CACHE_DIR"], "script-jail-images") : (0, import_node_path15.join)((0, import_node_os8.tmpdir)(), "script-jail-images");
-  (0, import_node_fs19.mkdirSync)(imagesDir, { recursive: true });
+  const imagesDir = process.env["SCRIPT_JAIL_CACHE_DIR"] ? (0, import_node_path17.join)(process.env["SCRIPT_JAIL_CACHE_DIR"], "script-jail-images") : (0, import_node_path17.join)((0, import_node_os9.tmpdir)(), "script-jail-images");
+  (0, import_node_fs22.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
   const localPreFetch = createLocalPreFetchArtifacts({
     packageImagesDir: input.packageImagesDir,
@@ -25493,7 +26151,7 @@ async function runLinux(input) {
       },
       pm: input.pm,
       hostArch: arch,
-      workDir: (0, import_node_os8.tmpdir)(),
+      workDir: (0, import_node_os9.tmpdir)(),
       // Backend executor: runAudit prepares the common config/sidecars, then
       // hands control here to pick + run a Linux backend.  CRITICAL: no
       // `validateManifest` anywhere on this path.
@@ -25528,6 +26186,47 @@ async function runLinux(input) {
     throw err;
   }
 }
+async function runMacBare(input) {
+  const { platform: platform5, stderr } = input;
+  const execute = input.doCreateMacBareExecute({
+    imagesDir: input.packageImagesDir,
+    repoRoot: input.repoRoot,
+    arch: platform5.arch,
+    stderr
+  });
+  try {
+    const result = await input.doRunAudit({
+      repoDir: input.cwd,
+      configPath: input.configPath,
+      lockPath: input.lockPath,
+      mode: input.mode,
+      overrides: {
+        spoofPlatform: input.spoofPlatform,
+        spoofArch: input.effectiveSpoofArch
+      },
+      pm: input.pm,
+      hostArch: platform5.arch,
+      // os.tmpdir() — never `cwd` — so the rewritten config + sidecars cannot
+      // pollute the user's repo.  runAudit creates a private mkdtemp dir here.
+      workDir: (0, import_node_os9.tmpdir)(),
+      execute,
+      io: {
+        warn: input.warn,
+        stdout: input.stdout,
+        stderr
+      },
+      buildArchFlagOverlay: input.doBuildArchFlagOverlay
+    });
+    return result.exitCode;
+  } catch (err) {
+    if (err instanceof Error) {
+      stderr.write(`script-jail: ${err.message}
+`);
+      return 1;
+    }
+    throw err;
+  }
+}
 function resolveScriptJailRoot(cwd) {
   let here = "";
   try {
@@ -25543,18 +26242,18 @@ function resolveScriptJailRoot(cwd) {
   }
   if (here === "") return cwd;
   const candidates = [
-    (0, import_node_path15.resolve)((0, import_node_path15.dirname)((0, import_node_path15.dirname)(here))),
-    (0, import_node_path15.resolve)((0, import_node_path15.dirname)((0, import_node_path15.dirname)((0, import_node_path15.dirname)(here))))
+    (0, import_node_path17.resolve)((0, import_node_path17.dirname)((0, import_node_path17.dirname)(here))),
+    (0, import_node_path17.resolve)((0, import_node_path17.dirname)((0, import_node_path17.dirname)((0, import_node_path17.dirname)(here))))
   ];
   for (const c of candidates) {
-    if ((0, import_node_fs19.existsSync)((0, import_node_path15.join)(c, "package.json"))) return c;
+    if ((0, import_node_fs22.existsSync)((0, import_node_path17.join)(c, "package.json"))) return c;
   }
   return cwd;
 }
 function readPackageVersion(cwd) {
-  const packageJsonPath = (0, import_node_path15.join)(resolveScriptJailRoot(cwd), "package.json");
+  const packageJsonPath = (0, import_node_path17.join)(resolveScriptJailRoot(cwd), "package.json");
   try {
-    const pkg = JSON.parse(String((0, import_node_fs19.readFileSync)(packageJsonPath, "utf8")));
+    const pkg = JSON.parse(String((0, import_node_fs22.readFileSync)(packageJsonPath, "utf8")));
     if (typeof pkg["version"] === "string") return pkg["version"];
   } catch {
   }

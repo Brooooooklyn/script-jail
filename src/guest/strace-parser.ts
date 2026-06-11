@@ -729,14 +729,25 @@ function parseConnect(args: string[], retVal: RetVal, pid: number, ts: number): 
   const addr = parseConnectStruct(structToken);
   if (addr === null) return null;
 
-  // Success: retVal 0 → ok; any failure → blocked.
-  // EINPROGRESS is classified as blocked here even though the connect may
-  // eventually succeed; for phase-B audit purposes we only count connections
-  // that complete synchronously, which is operationally correct even if
-  // semantically imprecise (the caller would need SO_ERROR/getsockopt to
-  // confirm completion, which we do not trace in v1).
-  // TODO(v2): track SO_ERROR getsockopt results to resolve EINPROGRESS.
-  const result = retVal.isError ? 'blocked' : 'ok';
+  // retVal 0 → ok.  A non-blocking connect (how libuv — and thus ALL Node
+  // networking — issues connects) returns -1/EINPROGRESS while the SYN is
+  // already on the wire; EALREADY (a later connect on a still-pending non-
+  // blocking socket) and EISCONN (already connected) likewise mean egress
+  // HAPPENED.  For an exfil-detection audit those count as "ok" (the package
+  // DID reach out) — recording them "blocked" would log a successful reach-out
+  // as prevented, the wrong (unsafe) direction.  Only a genuine failure
+  // (refused / timed out / unreachable / denied) is "blocked".  This keeps the
+  // Linux and macOS-bare classifiers identical (src/shim/src/net.rs).
+  // (Round-12 finding F3.  Resolving the FINAL result of an in-flight connect
+  // would still need SO_ERROR/getsockopt — tracked as the v2 follow-up — but
+  // the egress-occurred default is correct for the audit either way.)
+  const result =
+    !retVal.isError ||
+    retVal.errno === 'EINPROGRESS' ||
+    retVal.errno === 'EALREADY' ||
+    retVal.errno === 'EISCONN'
+      ? 'ok'
+      : 'blocked';
 
   return [{ kind: 'connect', host: addr.host, port: addr.port, result, pid, ts }];
 }

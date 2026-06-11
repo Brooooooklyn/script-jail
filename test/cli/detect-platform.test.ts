@@ -56,17 +56,34 @@ describe('detectPlatform — darwin', () => {
       .toThrow(UnsupportedMacOSError);
   });
 
-  it('darwin/x64 (Intel mac) is rejected; message mentions darwin-x64 / VZ / not supported', () => {
-    try {
-      detectPlatform({ platform: 'darwin', release: '23.0.0', arch: 'x64' });
-      expect.fail('expected to throw');
-    } catch (err) {
-      expect(err).toBeInstanceOf(UnsupportedDarwinArchError);
-      const msg = (err as Error).message;
-      expect(msg).toContain('darwin-x64');
-      expect(msg).toMatch(/Virtualization\.framework|VZ/);
-      expect(msg).toMatch(/not supported/i);
-    }
+  it('darwin/x64 (Intel mac) is DETECTED, not rejected — bare backend builds the shim from source', () => {
+    // Behaviour change (Phase 5): detection is now backend-agnostic.  The bare
+    // macOS backend runs the install natively under the Mach-O shim (no VM), so
+    // an Intel mac CAN audit via `--backend bare`.  detectPlatform therefore
+    // RETURNS a darwin/x64 capability report rather than throwing.  The VZ-only
+    // arm64 gate (darwin + vz + x64 → UnsupportedDarwinArchError) moved into
+    // src/cli/index.ts; see the index.test.ts dispatch tests.
+    expect(detectPlatform({ platform: 'darwin', release: '23.0.0', arch: 'x64' }))
+      .toEqual({ os: 'darwin', arch: 'x64', macosMajor: 14 } satisfies DetectedPlatform);
+  });
+
+  it('darwin/x64 still honours the macOS-major floor (Darwin 22 → UnsupportedMacOSError)', () => {
+    // The macOS-version gate is shared across arches: an Intel mac on an
+    // unsupported macOS still throws before the arch branch is reached.
+    expect(() => detectPlatform({ platform: 'darwin', release: '22.0.0', arch: 'x64' }))
+      .toThrow(UnsupportedMacOSError);
+  });
+
+  it('darwin/ia32 (neither x64 nor arm64) throws UnsupportedArchError', () => {
+    expect(() => detectPlatform({ platform: 'darwin', release: '23.0.0', arch: 'ia32' }))
+      .toThrow(UnsupportedArchError);
+  });
+
+  it('UnsupportedDarwinArchError remains re-exported for the index.ts vz-gating path', () => {
+    // detectPlatform no longer throws it, but src/cli/index.ts does (darwin +
+    // vz + x64).  Keep the class resolvable so that gate can construct it.
+    expect(typeof UnsupportedDarwinArchError).toBe('function');
+    expect(new UnsupportedDarwinArchError().message).toMatch(/darwin-x64/);
   });
 });
 

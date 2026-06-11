@@ -12,7 +12,8 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
@@ -23,9 +24,12 @@ import { dirname, basename, join as joinPath } from 'node:path';
 
 import { Attribution } from './attribution.js';
 import { LinuxProcReader } from './proc-reader.js';
+import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
 import { runFetchPhase, type Spawner } from './phase-fetch.js';
 import { runInstallPhase, type LineSource, type StraceRunner } from './phase-install.js';
+import { runInstallPhaseMacos, macosManagerLaunch } from './phase-install-macos.js';
+import { MacOSInstallRunner } from './macos-install-runner.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
@@ -256,6 +260,32 @@ export class LinuxSpawner implements Spawner {
         resolve({ exitCode: code ?? 1, stdout, stderr });
       });
     });
+  }
+}
+
+/**
+ * macOS Phase-A (fetch) spawner.  Rewrites the bare `npm`/`pnpm`/`yarn` fetch
+ * command into the provisioned `<re-signed node> <cli.js>` / corepack launch
+ * (see `macosManagerLaunch`) so the first exec stays plain-arm64 and DYLD
+ * survives.  The bare bin would otherwise shebang through `/usr/bin/env` (SIP
+ * strips DYLD) or resolve to an arm64e ambient pm (dyld rejects our thin-arm64
+ * insert) — Phase A would either run un-instrumented or crash at launch.  This
+ * makes Phase A symmetric with the Phase-B `MacOSInstallRunner`, which already
+ * launches via the same node+cli form.  The actual child-process plumbing is
+ * delegated to `LinuxSpawner`; only the command is rewritten.  A non-manager
+ * `cmd` (none today on the fetch path) passes through unchanged.
+ */
+export class MacOSSpawner implements Spawner {
+  async spawn(
+    cmd: string,
+    args: string[],
+    opts: { env: NodeJS.ProcessEnv; cwd: string },
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    const launch =
+      cmd === 'npm' || cmd === 'pnpm' || cmd === 'yarn'
+        ? macosManagerLaunch(cmd, args)
+        : { cmd, args };
+    return new LinuxSpawner().spawn(launch.cmd, launch.args, opts);
   }
 }
 
@@ -1626,6 +1656,33 @@ const LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES = new Set([
   'SCRIPT_JAIL_PROTECTED_ENV_NAMES',
   'SCRIPT_JAIL_SPOOF_ARCH',
   'SCRIPT_JAIL_SPOOF_PLATFORM',
+  // macOS-bare only.  When set to '1', env-spy.cjs writes the
+  // node_startup_done JSONL marker DIRECTLY (the Mach-O shim may not load into
+  // a hardened node, so it cannot be relied on to fire the marker via setenv
+  // interception).  Allowed so descendants that re-require env-spy via the
+  // inherited NODE_OPTIONS see it.  No effect on Linux (the var is never set).
+  'SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL',
+  // macOS-bare only.  Directory of the materialized, re-signed /bin/sh,
+  // /bin/bash, and coreutils copies the shim's sip_redirect rewrites system
+  // binaries to (SIP strips DYLD_* for /bin and /usr/bin).  The shim captures
+  // it at ctor; allowed so descendants see the same sticky value.
+  'SCRIPT_JAIL_SHELL_SHIM_DIR',
+  // macOS-bare only.  The install/repo root (config.work_dir).  The shim
+  // captures it at ctor into CANON_WORK_DIR and uses it as is_external_system_tool
+  // keep-root #6 so the WHOLE install tree — incl. top-level node_modules/.bin
+  // helpers that are SIBLINGS of a lifecycle child's chdir'd cwd — stays audited
+  // (the top-level-.bin false-strip).  Allowed so descendants see the same sticky
+  // value; the shim re-injects it on every kept exec regardless.
+  'SCRIPT_JAIL_WORK_DIR',
+  // NOTE: SCRIPT_JAIL_MACOS_AUDIT_OPS is deliberately NOT allow-listed here.
+  // It is an internal per-phase control set solely by main() (deleted from the
+  // Phase-A fetch env, set to '1' on the Phase-B install env).  Allow-listing it
+  // would let an AMBIENT value survive sanitization into audited children —
+  // harmless-but-leaky on macOS and a real regression on Linux (the ELF .so has
+  // no audit-ops gate, yet the var would still ride into the Linux lifecycle env
+  // and break the "strip unknown SCRIPT_JAIL_* vars" invariant).  Keeping it off
+  // the list means an ambient value is always stripped; main() is the sole
+  // authority.  See the Phase A/B split in main().
 ]);
 
 const LIFECYCLE_HOST_NOISE_ENV_NAMES = new Set([
@@ -1864,6 +1921,125 @@ export function buildChildEnv(
     // do not recognise this key and ignore it, so setting it
     // unconditionally is safe across managers.
     npm_config_store_dir: `${config.work_dir}/.pnpm-store`,
+  };
+}
+
+/**
+ * macOS-bare variant of {@link buildChildEnv}.  Reuses ALL of the Linux
+ * builder's protected-env validation and caps (entry count, per-entry byte
+ * length, CanonBuf total), then re-targets the dynamic-linker injection from
+ * ELF `LD_PRELOAD` to dyld `DYLD_INSERT_LIBRARIES` (+ `DYLD_FORCE_FLAT_NAMESPACE`
+ * per the dyld interpose spike) and layers on the two macOS-only sticky vars.
+ *
+ * What changes vs Linux:
+ *   - `LD_PRELOAD` → `DYLD_INSERT_LIBRARIES` (the Mach-O shim's load var) +
+ *     `DYLD_FORCE_FLAT_NAMESPACE=1` (dyld two-level-namespace defeats
+ *     __interpose unless flat namespace is forced).
+ *   - `NODE_OPTIONS` `--require` preloads are KEPT verbatim: NODE_OPTIONS is
+ *     honored even when a hardened node strips DYLD_* at exec, so env-spy /
+ *     platform-spoof remain the in-node audit floor.
+ *   - `SCRIPT_JAIL_PRELOAD_PATH` already points at the native preload (the
+ *     dylib on macOS) via {@link buildChildEnv}'s `nativePreload`.
+ *   - `SCRIPT_JAIL_PHASE_B_UNSHARE_NET` is intentionally NOT set: the macOS
+ *     backend is observe-only and stays online.
+ *   - `SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL=1`: env-spy writes the
+ *     node_startup_done marker DIRECTLY (the dylib may not load into a hardened
+ *     node, so the shim's setenv-interception marker path cannot be relied on).
+ *   - `SCRIPT_JAIL_SHELL_SHIM_DIR` is threaded through (from `baseEnv`) so the
+ *     shim's sip_redirect can rewrite /bin/sh, /bin/bash, and coreutils to the
+ *     materialized re-signed copies (SIP strips DYLD_* for system binaries).
+ *   - `SCRIPT_JAIL_MACOS_AUDIT_OPS` is intentionally NOT set here.  main()
+ *     adds it only for Phase B so Phase A keeps env_read coverage without
+ *     native file/connect auditing.
+ *
+ * @internal Exported for unit tests and the macOS-bare main() path.
+ */
+export function buildChildEnvMacos(
+  baseEnv: NodeJS.ProcessEnv,
+  config: AgentConfig,
+  eventsFilePath: string,
+  preloadPaths?: AgentInput['preloadPaths'],
+): NodeJS.ProcessEnv {
+  // Reuse the Linux builder for all validation + the shared SCRIPT_JAIL_* /
+  // NODE_OPTIONS / npm_config_store_dir keys, then strip the ELF-only
+  // LD_PRELOAD and overlay the dyld + macOS-only keys.
+  const base = buildChildEnv(baseEnv, config, eventsFilePath, preloadPaths);
+  const { LD_PRELOAD: nativePreload, ...rest } = base;
+
+  const env: NodeJS.ProcessEnv = {
+    ...rest,
+    // dyld injection (vs ELF LD_PRELOAD).  Flat namespace is required for
+    // __interpose to take effect across images.
+    DYLD_INSERT_LIBRARIES: nativePreload,
+    DYLD_FORCE_FLAT_NAMESPACE: '1',
+    // env-spy writes the node_startup_done JSONL marker directly on macOS.
+    SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL: '1',
+  };
+
+  // Thread the shell-shim dir through when the backend provided it.  Pulled
+  // from baseEnv (the agent's own process.env) — sanitizeLifecycleBaseEnv
+  // already allows SCRIPT_JAIL_SHELL_SHIM_DIR through, so it is also present
+  // in `rest` when set; we re-assert it here for clarity and to centralise
+  // the macOS contract in one place.
+  const shellShimDir = baseEnv['SCRIPT_JAIL_SHELL_SHIM_DIR'];
+  if (shellShimDir !== undefined && shellShimDir.length > 0) {
+    env['SCRIPT_JAIL_SHELL_SHIM_DIR'] = shellShimDir;
+  }
+
+  // Pass the install/repo root down so the shim's `shim_init` captures it into
+  // CANON_WORK_DIR and `is_external_system_tool` keeps the WHOLE install tree —
+  // node_modules/<pkg> AND its SIBLING node_modules/.bin/<helper> — audited.
+  // Without this, a top-level `.bin` helper that runs after a lifecycle script
+  // `chdir`s into a package dir falls outside every other keep-root and would be
+  // FALSE-STRIPPED of DYLD, blinding it (and its subtree) and tripping a spurious
+  // parity GATE FAILURE vs Linux.  Sticky + re-injected by the shim (and audited
+  // as env_tamper if a script unsets it), exactly like SCRIPT_JAIL_SHELL_SHIM_DIR.
+  env['SCRIPT_JAIL_WORK_DIR'] = config.work_dir;
+
+  return env;
+}
+
+/**
+ * Tokenize roots for the macOS-bare backend (vs the fixed Linux microVM
+ * layout).  Derived from the host environment so the rendered lock tokenizes
+ * developer-machine paths into the SAME `$HOME` / `$TMPDIR` / `$CACHE` tokens
+ * the Linux lock uses (reconciled against any residual divergence at diff time,
+ * Phase 6):
+ *   - `home`:  `$HOME` (os.homedir()).
+ *   - `tmp`:   realpath of `$TMPDIR` (os.tmpdir()).  macOS hands out a per-user
+ *              `/var/folders/.../T` TMPDIR whose realpath lives under
+ *              `/private` — collapsing it here means tokenize sees the
+ *              canonical form regardless of how a script spells the temp path.
+ *   - `cache`: the macOS pnpm cache (`$HOME/Library/Caches/pnpm`).  The pnpm
+ *              content-addressed store tails are hashes that `collapseUnstable`
+ *              folds to `$CACHE/<hash>`, matching cross-OS.
+ *
+ * realpathSync may throw if `$TMPDIR` does not exist (it always does on a real
+ * Mac, but be defensive in test rigs); fall back to the raw value.
+ *
+ * @internal Exported for unit tests and the macOS-bare main() path.
+ */
+export function macosTokenizeRoots(workDir: string): {
+  repo: string;
+  nodeModules: string;
+  home: string;
+  tmp: string;
+  cache: string;
+} {
+  const home = homedir();
+  const rawTmp = tmpdir();
+  let tmp: string;
+  try {
+    tmp = realpathSync(rawTmp);
+  } catch {
+    tmp = rawTmp;
+  }
+  return {
+    repo: workDir,
+    nodeModules: `${workDir}/node_modules`,
+    home,
+    tmp,
+    cache: `${home}/Library/Caches/pnpm`,
   };
 }
 
@@ -2222,22 +2398,58 @@ export async function main(input: AgentInput): Promise<void> {
   }
   const eventsFilePath = eventsFile.path;
 
-  // 5. Build child environment
-  const childEnv = buildChildEnv(process.env, config, eventsFilePath, input.preloadPaths);
+  // macOS-bare detection.  The orchestrator runs on the Mac itself (no VM) and
+  // selects the native runner/proc-reader/env-builder/dispatcher.  Driven by
+  // the explicit backend marker the CLI's mac-bare backend sets, OR a darwin
+  // host fallback — but the darwin fallback applies ONLY when no runner was
+  // injected.  Existing Linux-contract unit tests inject `input.strace` (a fake
+  // that yields `source:'strace'` lines); on a darwin dev machine those must
+  // still route through the Linux dispatcher, not the shim-only macOS one which
+  // would fail-closed on a non-'shim' source.  Production macOS never injects a
+  // runner, so the fallback fires there.  Every macOS branch below is gated on
+  // this flag; Linux behaviour is byte-for-byte unchanged.
+  const isMacosBare =
+    process.env['SCRIPT_JAIL_BACKEND'] === 'macos-bare' ||
+    (process.platform === 'darwin' && input.strace === undefined);
 
-  // 6. Set up spawner (Phase A) and strace runner (Phase B)
-  const spawner: Spawner = input.spawner ?? new LinuxSpawner();
-  const straceRunner: StraceRunner = input.strace ?? new LinuxStraceRunner(undefined, eventsFile);
+  // 5. Build child environment.  macOS swaps LD_PRELOAD → DYLD_INSERT_LIBRARIES
+  //    (+ flat namespace), keeps NODE_OPTIONS preloads, adds the macOS-only
+  //    sticky vars, and does NOT set SCRIPT_JAIL_PHASE_B_UNSHARE_NET.
+  const childEnv = isMacosBare
+    ? buildChildEnvMacos(process.env, config, eventsFilePath, input.preloadPaths)
+    : buildChildEnv(process.env, config, eventsFilePath, input.preloadPaths);
+  const fetchEnv = isMacosBare ? { ...childEnv } : childEnv;
+  if (isMacosBare) {
+    delete fetchEnv['SCRIPT_JAIL_MACOS_AUDIT_OPS'];
+  }
+  const installEnv = isMacosBare
+    ? { ...childEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: '1' }
+    : childEnv;
 
-  // 7. Attribution (reads /proc; real ProcReader in production)
-  const attribution = new Attribution(new LinuxProcReader());
+  // 6. Set up spawner (Phase A) and install runner (Phase B).  On macOS the
+  //    runner spawns the install DIRECTLY (no strace/unshare) and the Mach-O
+  //    shim is the sole event source.
+  const spawner: Spawner =
+    input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
+  const straceRunner: StraceRunner =
+    input.strace ??
+    (isMacosBare
+      ? new MacOSInstallRunner(undefined, eventsFile)
+      : new LinuxStraceRunner(undefined, eventsFile));
+
+  // 7. Attribution.  Linux reads /proc; macOS has no /proc, so MacOSProcReader
+  //    returns null environ (attribution flows through the shim event seed) and
+  //    best-effort ppid via the sj-procinfo helper.
+  const attribution = new Attribution(
+    isMacosBare ? new MacOSProcReader() : new LinuxProcReader(),
+  );
 
   // 8. Phase A: fetch (network on, no strace)
   diag(input, `Phase A starting: ${manager} fetch in ${config.work_dir}`);
   const fetchResult = await runFetchPhase({
     manager,
     cwd: config.work_dir,
-    env: childEnv,
+    env: fetchEnv,
     spawner,
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
@@ -2269,6 +2481,14 @@ export async function main(input: AgentInput): Promise<void> {
 
   const phaseBUsesUnshareNet = process.env['SCRIPT_JAIL_PHASE_B_UNSHARE_NET'] === '1';
 
+  // macOS-bare is OBSERVE-ONLY and stays ONLINE (user decision 3): the Mach-O
+  // shim records connect() attempts but does not enforce offline.  There is
+  // also no eth0 to drop (no VM) and dropping the host's network would be
+  // hostile to the developer's machine.  So the eth0-drop + DNS-offline gate
+  // below is skipped on macOS — its `connect` events are recorded with their
+  // true online result and reconciled at diff time (Phase 6).
+  const skipOfflineEnforcement = phaseBUsesUnshareNet || isMacosBare;
+
   // 9b. Before verifying offline, drop the eth0 interface from inside the
   //     guest.  We use guest-side control because Firecracker's host-side
   //     rate-limiter API treats `size: 0` as "rate limiter disabled" (i.e.
@@ -2279,7 +2499,7 @@ export async function main(input: AgentInput): Promise<void> {
   //     Failure here (e.g. no eth0 interface on a Phase B-only test rig) is
   //     surfaced as a non-fatal error frame but we continue: the DNS probe
   //     immediately below is the real gate.
-  if (!phaseBUsesUnshareNet) {
+  if (!skipOfflineEnforcement) {
     try {
       if (input.dropEth0) {
         await input.dropEth0();
@@ -2304,7 +2524,7 @@ export async function main(input: AgentInput): Promise<void> {
   //     We `return` after `process.exit(1)` so tests that stub out
   //     `process.exit` don't fall through to Phase B; in production
   //     `process.exit` terminates the process and the return is unreached.
-  if (!phaseBUsesUnshareNet) {
+  if (!skipOfflineEnforcement) {
     const lookupFn: DnsLookupFn = input.dnsLookup ?? dnsLookup;
     const offline = await verifyOfflineWithTimeout(
       lookupFn,
@@ -2357,29 +2577,50 @@ export async function main(input: AgentInput): Promise<void> {
   // Tokenize roots used by BOTH the install-phase protected-paths matcher and
   // the post-phase normalize step. Defined once so both stages agree on what
   // `$HOME`, `$REPO`, etc. resolve to.
-  const roots = {
-    repo: config.work_dir,
-    nodeModules: `${config.work_dir}/node_modules`,
-    home: '/root',
-    tmp: '/tmp',
-    cache: '/root/.cache/pnpm',
-  };
+  //
+  // Linux uses the fixed microVM layout (/root, /tmp, /root/.cache/pnpm).
+  // macOS-bare runs on the developer's Mac, so the roots are derived from the
+  // host environment: $HOME, the realpath of $TMPDIR (macOS hands out a
+  // per-user /var/folders/... TMPDIR that is a symlink target under /private —
+  // realpath collapses it so tokenize sees the canonical form), and the macOS
+  // pnpm cache.  The /private realpath + cache canonicalization is reconciled
+  // against the Linux lock at diff time (Phase 6).
+  const roots = isMacosBare
+    ? macosTokenizeRoots(config.work_dir)
+    : {
+        repo: config.work_dir,
+        nodeModules: `${config.work_dir}/node_modules`,
+        home: '/root',
+        tmp: '/tmp',
+        cache: '/root/.cache/pnpm',
+      };
 
   const protectedPaths = new ProtectedPathsMatcher({
     patterns: config.protected.files,
     roots,
+    // macOS-bare shim paths come back /private-canonicalized (F_GETPATH); the
+    // matcher must collapse /private to match the non-/private `roots`, or the
+    // benign cross-package read suppression misfires and floods external_reads.
+    os: isMacosBare ? 'darwin' : 'linux',
   });
 
-  const installResult = await runInstallPhase({
+  const installInput = {
     manager,
     cwd: config.work_dir,
-    env: childEnv,
+    env: installEnv,
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
     straceBasePath: '/tmp/script-jail-strace/strace.out',
     protectedPaths,
-  });
+  };
+  // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux
+  // uses the full strace+shim dispatcher.  Both share PhaseInstallInput /
+  // PhaseInstallResult so the downstream exit-code / tamper / normalize logic
+  // below is identical.
+  const installResult = isMacosBare
+    ? await runInstallPhaseMacos(installInput)
+    : await runInstallPhase(installInput);
 
   // 11. Phase B exit-code handling.  A non-zero exit is the COMMON case for a
   //     real repo: Phase B runs dependency lifecycle scripts offline under
@@ -2484,7 +2725,16 @@ export async function main(input: AgentInput): Promise<void> {
   for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
 
   // 12. Normalize + render
-  const ctx: NormalizeContext = { roots, pkgDirs };
+  //
+  // On macOS-bare the normalize pass MUST run with `os: 'darwin'` so the
+  // darwin-only system-noise prefixes and the `/private` realpath
+  // canonicalization (Phase 6 reconciliation) actually fire.  Omitting it
+  // would silently leave the lock with raw `/System`, `/private/var`, … paths
+  // that never reconcile against the Linux-produced committed lock.  The Linux
+  // path keeps the default (`os` undefined → 'linux').
+  const ctx: NormalizeContext = isMacosBare
+    ? { roots, pkgDirs, os: 'darwin' }
+    : { roots, pkgDirs };
 
   let yaml: string;
   try {

@@ -18,6 +18,9 @@ describe('parseArgs — happy paths', () => {
       lockPath: '.script-jail.lock.yml',
       spoofPlatform: 'linux',
       spoofArch: 'x64',
+      // `--backend` defaults to null; src/cli/index.ts resolves the effective
+      // backend per host (darwin: vz on arm64, bare otherwise).
+      backend: null,
       help: false,
       version: false,
       errors: [],
@@ -66,6 +69,22 @@ describe('parseArgs — happy paths', () => {
     }
   });
 
+  it('--backend parses valid values (vz | bare); default is null', () => {
+    expect(parseArgs([]).backend).toBeNull();
+    for (const b of ['vz', 'bare'] as const) {
+      const out = parseArgs(['--backend', b]);
+      expect(out.backend).toBe(b);
+      expect(out.errors).toEqual([]);
+    }
+  });
+
+  it('--backend pairs with a subcommand without consuming it', () => {
+    const out = parseArgs(['check', '--backend', 'bare']);
+    expect(out.subcommand).toBe('check');
+    expect(out.backend).toBe('bare');
+    expect(out.errors).toEqual([]);
+  });
+
   it('-h is an alias for --help', () => {
     expect(parseArgs(['-h']).help).toBe(true);
     expect(parseArgs(['--help']).help).toBe(true);
@@ -101,6 +120,21 @@ describe('parseArgs — errors', () => {
     const out = parseArgs(['--spoof-arch', 'mips']);
     expect(out.errors).toHaveLength(1);
     expect(out.errors[0]).toMatch(/--spoof-arch must be one of/);
+  });
+
+  it('--backend with an invalid value errors (and leaves backend null)', () => {
+    const out = parseArgs(['--backend', 'firecracker']);
+    expect(out.errors).toHaveLength(1);
+    expect(out.errors[0]).toMatch(/--backend must be one of: vz, bare/);
+    expect(out.errors[0]).toMatch(/firecracker/);
+    expect(out.backend).toBeNull();
+  });
+
+  it('--backend without a value records a requires-a-value error', () => {
+    const out = parseArgs(['--backend']);
+    expect(out.errors).toHaveLength(1);
+    expect(out.errors[0]).toMatch(/--backend requires a value/);
+    expect(out.backend).toBeNull();
   });
 
   it('rejects an unknown flag', () => {
@@ -142,5 +176,14 @@ describe('parseArgs — multi-error accumulation', () => {
     expect(out.errors).toHaveLength(2);
     expect(out.errors[0]).toMatch(/unknown flag/);
     expect(out.errors[1]).toMatch(/--spoof-arch must be one of/);
+  });
+
+  it('accumulates an invalid --backend alongside a missing-value --config', () => {
+    const out = parseArgs(['--backend', 'docker', '--config']);
+    expect(out.errors).toHaveLength(2);
+    expect(out.errors[0]).toMatch(/--backend must be one of/);
+    expect(out.errors[1]).toMatch(/--config requires a value/);
+    // The invalid backend value must NOT be accepted.
+    expect(out.backend).toBeNull();
   });
 });
