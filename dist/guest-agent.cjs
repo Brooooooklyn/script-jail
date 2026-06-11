@@ -26204,6 +26204,21 @@ function isPackageManagerClientSpawn(rawEvent, line) {
   }
   return false;
 }
+var CLONE_UNTRACED_BIT = 8388608;
+function cloneFlagsHaveUntraced(line) {
+  const m = line.match(/flags=([A-Za-z0-9_|]+)/);
+  if (m === null) return false;
+  for (const tok of (m[1] ?? "").split("|")) {
+    if (tok === "CLONE_UNTRACED") return true;
+    let bits = null;
+    if (/^0[xX][0-9a-fA-F]+$/.test(tok)) bits = Number.parseInt(tok, 16);
+    else if (/^[0-9]+$/.test(tok)) bits = Number.parseInt(tok, 10);
+    if (bits !== null && Number.isFinite(bits) && (bits & CLONE_UNTRACED_BIT) !== 0) {
+      return true;
+    }
+  }
+  return false;
+}
 async function runInstallPhase(input) {
   const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
   const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
@@ -27064,6 +27079,11 @@ async function runInstallPhase(input) {
       const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
       if (cloneMatch !== null) {
         const syscallName = cloneMatch[1] ?? "";
+        if ((syscallName === "clone" || syscallName === "clone3") && cloneFlagsHaveUntraced(line)) {
+          setPhaseTamper(
+            `pid=${pid} issued ${syscallName} with CLONE_UNTRACED \u2014 the child escapes strace -ff and cannot be observed; audit capture cannot be trusted`
+          );
+        }
         const rcMatch = line.match(/\)\s*=\s*(-?\d+)\b/);
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
@@ -28555,6 +28575,16 @@ var MacOSInstallRunner = class {
           tamperRef: this._tamperRef
         } : {},
         exitPromise
+        // SECURITY (Codex 2026-06-12, round-2 finding 1): DELIBERATELY no
+        // exitStatusRef here.  The post-exit meta-gate freeze relies on the
+        // Linux `strace -ff` invariant that a NORMAL exit means the WHOLE traced
+        // tree has exited (no in-model writer left).  This macOS runner spawns
+        // the install command DIRECTLY and resolves exitPromise on that ONE
+        // process's close — a daemonised/backgrounded child can outlive a clean
+        // npm/pnpm exit and tamper with the events file.  Withholding
+        // exitStatusRef leaves the ctime/mtime meta gates ARMED post-exit on
+        // macOS (the absent-disposition fail-closed default), matching the
+        // shipped v0.2.0 behaviour (PR #10's freeze was never on macOS).
         // No root-pid seeding: getRootPid() is null on macOS by design.  We do
         // NOT install recordRootPid — the install root would otherwise be
         // mis-pinned to the first phantom per-pid file (there are none here).
@@ -29246,6 +29276,7 @@ async function* runStraceTailer(opts) {
   let ctimeAdvanceStablePolls = 0;
   let mtimeAdvanceStablePolls = 0;
   const META_ADVANCE_REQUIRED_POLLS = 3;
+  let childExited = false;
   function recordTamper(reason) {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -29299,7 +29330,7 @@ async function* runStraceTailer(opts) {
       return;
     }
     if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
-    if (lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
+    if (!childExited && lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
@@ -29310,7 +29341,7 @@ async function* runStraceTailer(opts) {
     } else {
       ctimeAdvanceStablePolls = 0;
     }
-    if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
+    if (!childExited && lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
       mtimeAdvanceStablePolls += 1;
       if (mtimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
@@ -29440,6 +29471,16 @@ async function* runStraceTailer(opts) {
     wake();
   }, pollIntervalMs);
   opts.exitPromise.then(async () => {
+    const exitStatus = opts.exitStatusRef;
+    if (exitStatus !== void 0) {
+      if (exitStatus.signal !== null || exitStatus.spawnError === true) {
+        recordTamper(
+          `strace terminated abnormally (signal=${exitStatus.signal ?? "<none>"}${exitStatus.spawnError === true ? ", spawn error" : ""}) \u2014 a killed or crashed tracer can leave a detached tracee alive; audit capture cannot be trusted`
+        );
+      } else {
+        childExited = true;
+      }
+    }
     const hardDeadline = Date.now() + settleHardCapMs;
     let quiet = 0;
     let prev = "";
@@ -29680,12 +29721,19 @@ var LinuxStraceRunner = class {
         this._rootPid = pid;
       }
     }
+    const exitStatus = {
+      code: null,
+      signal: null
+    };
     const exitPromise = new Promise((resolve2) => {
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
+        exitStatus.code = code;
+        exitStatus.signal = signal;
         this._exitCode = code ?? 1;
         resolve2();
       });
       child.on("error", () => {
+        exitStatus.spawnError = true;
         this._exitCode = 1;
         resolve2();
       });
@@ -29714,6 +29762,12 @@ var LinuxStraceRunner = class {
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
+        // Only this Linux `strace -ff` runner may pass exitStatusRef: strace
+        // exits ONLY after the WHOLE traced tree has exited, so a normal exit
+        // proves no in-model writer survives and the post-exit meta-gate freeze
+        // is sound.  The macOS direct-spawn runner has no such proof and MUST
+        // omit it — see StraceTailerOptions.exitStatusRef.
+        exitStatusRef: exitStatus,
         // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
         // fallback runs ONLY when the /proc-based deterministic
         // resolution was not attempted (i.e. child.pid was undefined,

@@ -6957,6 +6957,189 @@ describe('runInstallPhase', () => {
       expect(stale).toHaveLength(0);
     });
 
+    // 2026-06-12 SECURITY (Codex finding 2): a clone/clone3 carrying
+    // CLONE_UNTRACED spawns a child that `strace -ff` will NOT follow — it
+    // escapes observation and can outlive the traced tree, then tamper with the
+    // events file during the window the post-exit meta gates stop guarding once
+    // strace exits cleanly.  The dispatcher must fail closed (record a fatal
+    // tamper) the moment it parses such a clone, so main() refuses the lockfile.
+    it('clone with CLONE_UNTRACED fails closed (audit-integrity tamper)', async () => {
+      const proc = mockProcReader({
+        9101: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'untraced-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Seed the install-root cwd for pid 9101.
+        {
+          pid: 9101,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Clone an UNTRACED child — strace -ff cannot follow it.
+        {
+          pid: 9101,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_UNTRACED|CLONE_FS|SIGCHLD, child_tidptr=0x7f...) = 9102',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter } = makeEmitter();
+      const strace = cannedStraceRunner(records, 0, { rootPid: 9101 });
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(result.tamperReason).not.toBeNull();
+      expect(result.tamperReason).toMatch(/CLONE_UNTRACED|escapes strace/);
+      // Belt-and-braces: also surfaced through the runner contract.
+      expect(strace.recordedTamper()).not.toBeNull();
+    });
+
+    // clone3 renders flags INSIDE the struct literal; the same detector must fire.
+    it('clone3 with CLONE_UNTRACED fails closed (audit-integrity tamper)', async () => {
+      const proc = mockProcReader({
+        9201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'untraced-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 9201,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        {
+          pid: 9201,
+          line: 'clone3({flags=CLONE_VM|CLONE_UNTRACED, exit_signal=SIGCHLD, stack_size=0}, 88) = 9202',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter } = makeEmitter();
+      const strace = cannedStraceRunner(records, 0, { rootPid: 9201 });
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(result.tamperReason).not.toBeNull();
+      expect(result.tamperReason).toMatch(/CLONE_UNTRACED|escapes strace/);
+    });
+
+    // Round-2 finding 2: strace may render CLONE_UNTRACED as its NUMERIC bit
+    // (0x00800000) rather than the symbolic token — a token-only check would
+    // miss it and the security fail-closed would not fire. The detector decodes
+    // hex/decimal flag components and tests the bit.
+    it('clone with a NUMERIC CLONE_UNTRACED bit (flags=...|0x800000) fails closed', async () => {
+      const proc = mockProcReader({
+        9301: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'untraced-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 9301,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // CLONE_UNTRACED appears as its raw hex bit (strace did not symbolise it).
+        {
+          pid: 9301,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|0x800000|SIGCHLD, child_tidptr=0x7f...) = 9302',
+          source: 'strace',
+        },
+      ];
+      const { emitter } = makeEmitter();
+      const strace = cannedStraceRunner(records, 0, { rootPid: 9301 });
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(result.tamperReason).not.toBeNull();
+      expect(result.tamperReason).toMatch(/CLONE_UNTRACED|escapes strace/);
+    });
+
+    // Round-2 finding 3: strace can split a clone interrupted by a signal into a
+    // `clone(... <unfinished ...>` half (flags, NO return value) and a later
+    // `<... clone resumed> = <pid>` half (which does not match ^clone). An
+    // rc-gated detector misses both halves. The detector runs on the raw clone
+    // line BEFORE the rc gate, so the unfinished half (which carries the flags)
+    // still fails closed.
+    it('unfinished clone carrying CLONE_UNTRACED (no return value yet) fails closed', async () => {
+      const proc = mockProcReader({
+        9401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'untraced-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 9401,
+          line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+          source: 'strace',
+        },
+        // Flags on the unfinished half (no rc)...
+        {
+          pid: 9401,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_UNTRACED|SIGCHLD,  <unfinished ...>',
+          source: 'strace',
+        },
+        // ...pid on the resumed half (does not match ^clone; parser drops it).
+        {
+          pid: 9401,
+          line: '<... clone resumed>, child_tidptr=0x7f...) = 9402',
+          source: 'strace',
+        },
+      ];
+      const { emitter } = makeEmitter();
+      const strace = cannedStraceRunner(records, 0, { rootPid: 9401 });
+      const result = await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace,
+        attribution: new Attribution(proc),
+        emitter,
+      });
+
+      expect(result.tamperReason).not.toBeNull();
+      expect(result.tamperReason).toMatch(/CLONE_UNTRACED|escapes strace/);
+    });
+
     // Bug #3: CLONE_FILES makes parent and child share the fd table.
     // A dup2 in EITHER pid mutates the shared fd table; subsequent
     // openat(<fd>, "relative", ...) in the OTHER pid resolves through

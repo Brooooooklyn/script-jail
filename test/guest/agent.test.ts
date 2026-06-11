@@ -11,7 +11,8 @@ import { stringify } from 'yaml';
 import { createConnection } from 'node:net';
 
 import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer } from '../../src/guest/agent.js';
-import type { DnsLookupFn, SpawnResult } from '../../src/guest/agent.js';
+import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
+import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
 import type { StraceRunner } from '../../src/guest/phase-install.js';
 
@@ -2403,6 +2404,246 @@ describe('runStraceTailer', () => {
     expect(items.some((i) => i.line.includes('"name":"OK"'))).toBe(true);
   });
 
+  // 2026-06-11 regression: end-of-audit lazy ctime-finalize must NOT trip.
+  //
+  // Reproduces the CI parity-test false positive.  After the last legitimate
+  // append is consumed (eventsPos === size), the Ubuntu-22.04 microVM kernel
+  // finalizes the file's ctime a few hundred microseconds later with mtime and
+  // size UNCHANGED.  Once writes stop, that state (`ctime > lastConsumed &&
+  // size === eventsPos`) is PERMANENT and accumulates the 3-poll gate into a
+  // false "ctime advanced without new bytes" tamper.  A `chmod` bumps ctime only
+  // (mtime + size unchanged), faithfully simulating the finalize.
+  //
+  // The fix freezes the meta-advance gates once the traced tree has exited
+  // (childExited), so a finalize observed POST-exit is ignored.  Here the bump
+  // lands AFTER resolveExit and is then seen by several post-exit polls: the
+  // pre-fix code trips the ctime gate on them (red), the freeze ignores them
+  // (green).  The gate stays STRICT during the active phase — the utimes-restore
+  // and append-truncate tests below trip pre-exit — so in-model detection is
+  // unchanged.
+  it('does NOT record tamper on the end-of-audit lazy ctime-finalize (post-exit chmod, mtime+size flat)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      // Clean strace exit (code 0, no signal): the runner publishes this and the
+      // tailer engages the post-exit meta-gate freeze.  Without it the freeze
+      // stays OFF (fail-closed default) and this benign finalize would trip.
+      exitStatusRef: { code: 0, signal: null },
+      pollIntervalMs: 20,
+      drainMs: 30,
+      // Keep the post-exit settle loop polling long enough that several polls
+      // observe the permanent benign state (>> 3 × 20ms) before the tailer
+      // stops — so the pre-fix code has a clear window to (wrongly) trip.
+      settleQuietPasses: 8,
+      settleHardCapMs: 600,
+    });
+
+    // t=40: last legitimate event — consumed by an active-phase drain.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: traced tree exits (childExited).  t=140: bump ctime ONLY (mtime +
+    // size flat) AFTER exit, so the permanent finalize state is observed only by
+    // post-exit polls — which the freeze must ignore.
+    setTimeout(() => { resolveExit(); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
+    // The legitimate appended line must still be yielded.
+    expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
+  });
+
+  // 2026-06-12 SECURITY (Codex finding 1): the post-exit meta-gate freeze must
+  // engage ONLY on a CLEAN strace exit.  exitPromise resolves on ANY strace
+  // close — including a tracee (same UID) SIGKILLing its own tracer to detach
+  // and keep running.  If the freeze engaged on that, the survivor could
+  // append->truncate->utimes-restore (size===eventsPos, mtime pinned) entirely
+  // unobserved.  So an ABNORMAL strace termination (signal set, or non-zero
+  // code) is itself a fatal tamper — a killed/crashed tracer means the capture
+  // can no longer be trusted.  Here strace "exits" via SIGKILL with the events
+  // file left completely benign (only one legitimately-consumed line): the
+  // killed tracer ALONE must refuse the lockfile.
+  it('records a tamper reason when strace exits abnormally (killed tracer), even with a benign events file', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+    // The runner mutates this ref in strace's `close` handler BEFORE resolving
+    // exitPromise.  A tracee-driven SIGKILL surfaces as code=null, signal set.
+    const exitStatusRef: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null };
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      exitStatusRef,
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 2,
+      settleHardCapMs: 400,
+    });
+
+    // t=40: one legitimate event, consumed during the active phase — proves the
+    // file itself is untouched; ONLY the tracer's death drives the tamper.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: strace is SIGKILLed — publish the abnormal disposition, then resolve.
+    setTimeout(() => {
+      exitStatusRef.code = null;
+      exitStatusRef.signal = 'SIGKILL';
+      resolveExit();
+    }, 120);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/terminated abnormally|SIGKILL|killed or crashed tracer/);
+  });
+
+  // 2026-06-12 SECURITY (Codex finding 1, corollary): a NON-ZERO strace exit
+  // with NO signal is a legitimately-failing-but-audited install — `strace -f`
+  // propagates the tracee's exit code, and the whole tree still exited, so the
+  // freeze MUST engage and the benign end-of-audit ctime finalize must NOT trip.
+  // Treating a non-zero code as tamper would refuse a lockfile for every offline
+  // postinstall (see main()'s non-zero-Phase-B leniency at agent main() tests).
+  it('does NOT record tamper on a NORMAL non-zero strace exit + benign post-exit ctime finalize', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      // Normal exit, non-zero code (a failing install), NO signal → freeze engages.
+      exitStatusRef: { code: 1, signal: null },
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 8,
+      settleHardCapMs: 600,
+    });
+
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    setTimeout(() => { resolveExit(); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
+    expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
+  });
+
+  // 2026-06-12 SECURITY (Codex round-2 finding 1): the macOS bare runner spawns
+  // the install DIRECTLY (no `strace -ff` whole-tree wait), so it must NOT enable
+  // the freeze — it withholds exitStatusRef.  This pins the fail-closed default
+  // the macOS path relies on: with NO disposition the meta gates stay ARMED
+  // post-exit, so the benign end-of-audit ctime finalize that a clean Linux exit
+  // suppresses is instead CAUGHT (on macOS a daemonized survivor could be the
+  // cause, and we have no whole-tree-exit proof to rule that out).
+  it('keeps the meta gates ARMED post-exit when no exit disposition is supplied (macOS fail-closed default)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      // NO exitStatusRef → freeze must stay OFF (the macOS direct-spawn default).
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 8,
+      settleHardCapMs: 600,
+    });
+
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    setTimeout(() => { resolveExit(); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/ctime advanced|without new bytes/);
+  });
+
   it('records a tamper reason when the events file is truncated below the read position', async () => {
     const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, truncateSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
     const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
@@ -2975,5 +3216,91 @@ describe('readStraceChildPid', () => {
     const { readStraceChildPid } = await import('../../src/guest/agent.js');
     const result = readStraceChildPid(process.pid, 0);
     expect(result).toBeNull();
+  });
+});
+
+describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)', () => {
+  let macDir: string;
+
+  beforeEach(() => {
+    macDir = join(tmpdir(), `macos-runner-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(macDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(macDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  // The macOS bare runner spawns the install command DIRECTLY (no `strace -ff`
+  // whole-tree wait), so a normal child exit does NOT prove a daemonized
+  // descendant has exited.  It therefore MUST NOT pass exitStatusRef to
+  // runStraceTailer — leaving the post-exit ctime/mtime meta gates ARMED.  This
+  // is a SECURITY invariant (Codex round-2 finding 1): if a maintainer "fixed"
+  // the runner to pass a normal-exit disposition, the freeze would engage and a
+  // post-parent-exit survivor could tamper undetected.  This test fails if that
+  // regression is introduced: a benign post-exit ctime finalize MUST still be
+  // caught (gates armed), exactly because the runner withholds exitStatusRef.
+  it('does NOT freeze the meta gates post-exit (keeps them armed) on a normal child exit', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(macDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const eventsFile: EventsFile = {
+      path: eventsPath,
+      dirPath: macDir,
+      baseline: { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs },
+    };
+
+    // Fake child whose `close` we fire manually with a NORMAL (code 0, no signal)
+    // exit — the disposition that WOULD freeze the gates on the Linux runner.
+    let fireClose: ((code: number | null, signal: NodeJS.Signals | null) => void) | null = null;
+    const fakeChild = {
+      stderr: null as NodeJS.ReadableStream | null,
+      stdio: [null, null, null, null] as Array<NodeJS.ReadableStream | null | undefined>,
+      pid: undefined as number | undefined,
+      on(event: 'close' | 'error', listener: (...a: never[]) => void) {
+        if (event === 'close') fireClose = listener as unknown as typeof fireClose;
+        return this;
+      },
+    };
+    const fakeSpawn = (() => fakeChild) as unknown as SpawnImpl;
+
+    const runner = new MacOSInstallRunner(fakeSpawn, eventsFile);
+
+    // t=40: one legitimate event consumed during the active phase.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: child exits NORMALLY (code 0).  t=140: benign ctime finalize.
+    setTimeout(() => { fireClose?.(0, null); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    // Consume the runner's async iterable with a timeout guard.
+    await Promise.race([
+      (async () => {
+        for await (const _ of runner.run('node', [], {
+          env: {},
+          cwd: macDir,
+          basePath: join(macDir, 'strace.out'),
+        })) {
+          // drain
+        }
+      })(),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error('macOS runner timed out')), 4000)),
+    ]);
+
+    // Gates stayed ARMED → the post-exit ctime bump is caught.  If the runner
+    // ever (wrongly) passed a normal-exit exitStatusRef, the freeze would engage
+    // and this would be null.
+    expect(runner.getTamperReason()).not.toBeNull();
+    expect(runner.getTamperReason()).toMatch(/ctime advanced|without new bytes/);
   });
 });
