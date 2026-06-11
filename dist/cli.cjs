@@ -24046,50 +24046,44 @@ function firecrackerReleaseArch(arch) {
 var PINNED_MANIFEST = {
   repo: "Brooooooklyn/scriptjail",
   // update when forked
-  tag: "v0.1.1",
+  tag: "v0.2.0",
   expected: {
     linux: {
-      "rootfs-ubuntu-22.04.ext4": "f95caefaa1f4cfa09b54ba5ab48bbbb52f76742db38ceda1c7620bacc6dfbfc8",
-      "rootfs-ubuntu-24.04.ext4": "f301f1727e93ab4ccb5c6a31636d10674f60d0d9eaca942e72c28eacf357c167",
-      "libscriptjail.so": "5d7b8d1a584ad4fce4922a2c558eaab24f3f52fef93b30b12a154569adf19890"
+      "rootfs-ubuntu-22.04.ext4": "8a0a4c2060eac5d65d2ec73aac9082b9ada9481d0eca300f53aa0d6d8f00505e",
+      "rootfs-ubuntu-24.04.ext4": "daee13379e61b0ab9f70d1f315573dadf1292470b54a20aebb9c83a64df693d7",
+      "libscriptjail.so": "00ad21620189c80228d46ecf50009350906660ee0fd68e0f695108fdccd48251"
     },
     darwin: {
-      "rootfs-ubuntu-22.04-arm64.ext4": "e29dd8113b08fdc81441d2be3709127bf2ccaeaba3798b103ce7a57abca5039d",
-      "rootfs-ubuntu-24.04-arm64.ext4": "b45c85495f6537223d74e0903efe9d9148d38c4027f00fbe497b113680489eff",
-      "libscriptjail-arm64.so": "31d98f738131a11f58cdf7b07d1576511b2fd3906d46937b953e7f4b4cab5ec3",
-      // macOS-native Mach-O shim for the bare backend (DYLD_INSERT_LIBRARIES).
-      // PLACEHOLDER until the first release-build.yml run that emits its SHA:
-      // the dylib is a NEW artifact with no producer-backed bytes yet.  This
-      // makes the manifest MIXED (real entries + this placeholder), so the
-      // publish-job gate (scripts/check-publish-artifacts.sh) will reject a
-      // release until this is backfilled from a producer run that built the
-      // dylib — exactly the all-or-nothing contract.  Paste the real SHA from
-      // the producer paste-block, then cut the tag.
-      "libscriptjail-arm64.dylib": "PLACEHOLDER_SHA256_DARWIN_LIBSCRIPTJAIL_ARM64_DYLIB",
+      "rootfs-ubuntu-22.04-arm64.ext4": "8796fe96bb772b7c1b47928fc0256a5ecac309077b83d75f21e729b81c01087f",
+      "rootfs-ubuntu-24.04-arm64.ext4": "b5c5efb30073f9f56e9f5be7f743010841f17fb225faa4b9b6d8dd7f7c35fe86",
+      "libscriptjail-arm64.so": "865379b96a5b5b79af3d2e0c5125ee71a14340fadbba34fdcc318e2f734e9911",
+      // macOS-native Mach-O shim for the bare backend (DYLD_INSERT_LIBRARIES),
+      // ad-hoc signed in build-mac-bin; pinned by a plain sha256 of the signed
+      // dylib (backfilled from the v0.2.0 producer run 27341865124).
+      "libscriptjail-arm64.dylib": "9ed31f985f610a5c5466096c0eee42f5c985f02b24cde04591bba73a07e7e95b",
       // Bare-backend SIP-substitution binaries (the shim redirects /bin/sh +
       // coreutils to these plain-arm64 binaries, so no arm64e dylib is needed).
       // coreutils-arm64 is the official uutils 0.4.0 prebuilt — a fixed upstream
-      // artifact with a stable BINARY sha, so it is pinned real now.  bash-arm64
-      // is built-from-source by the producer (not byte-reproducible across
-      // toolchains), so it is a PLACEHOLDER until a release-build.yml run emits
-      // its SHA — same backfill contract as the dylib above.
+      // artifact with a stable BINARY sha (producer recomputed it to the same
+      // value).  bash-arm64 is built-from-source by the producer; pinned to the
+      // v0.2.0 producer run's signed binary.
       "coreutils-arm64": "8e8f38d9323135a19a73d617336fce85380f3c46fcb83d3ae3e031d1c0372f21",
-      "bash-arm64": "PLACEHOLDER_SHA256_DARWIN_BASH_ARM64",
-      "vmlinux-vz-x86_64": "012e33842367483ffad908d878d5682fa891d2a4f476a229b631e16780404953",
-      "vmlinux-vz-arm64": "4b42d3b912065a92a3816c788ed9c4dac92a12ece4c478c4fb1396c76cffd255",
+      "bash-arm64": "b067972c856c90d3147b179b4269db57bb78fc65f0e92c9b6f66efd505cec722",
+      "vmlinux-vz-x86_64": "81bb2b1ed63ff02844cc3b09e00de4c99d15f182ae5ca6411510e7f7b67c32a3",
+      "vmlinux-vz-arm64": "2131a7bd4a78a3541b04c624e4d137a0a050574e00d1578b2e76776d14b5f88a",
       // No `script-jail-vm-x86_64-darwin` — see the file header for the
       // Intel-macOS-runner deprecation note.
-      "script-jail-vm-arm64-darwin": "2fc6aefe66ae8275baa4c4d60efb14e18a5b07fbfe217920a84224fae09e281c"
+      "script-jail-vm-arm64-darwin": "961642267c02554a7a098273b915cf16a7c2f939d4caaf8aaea658e5cb1a69fe"
     }
   },
   dockerImages: {
     x64: {
-      "ubuntu-22.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04@sha256:4c29ddb7a81dfe5e2faa9ae24a4f40cb70d46cfc9e9024e9c7888b42b077163e",
-      "ubuntu-24.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:127c98bf505d5ed45c69612395b08f36a5e2d661f1d02e4cbdf38e72aa030c8f"
+      "ubuntu-22.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04@sha256:7d4a0e7fb69d6ccd66b7488d2eca1fd23a6d273c37ea8a3d5370ca02d515f483",
+      "ubuntu-24.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:07a73cccc09039be7384b62626d85b6d104cfa482101a65fa1d5a4221f9f9f30"
     },
     arm64: {
-      "ubuntu-22.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:9eb6a7084ce7b0ec321e81954f4e5dde588bcbfe116da82e798987b30a005cbe",
-      "ubuntu-24.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:25eff7b65351001691c9c8591695338bea23d7272181eda499c624abfb0fd971"
+      "ubuntu-22.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:2ed56076414f375fd002ba87ccfce2660f6306fc56128095cd2f534c2e6f3de5",
+      "ubuntu-24.04": "ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:9b0c8a93a878f5a69cba4b995c3f0b4688db5f1b6d9604e51b979efe67b2845f"
     }
   }
 };
