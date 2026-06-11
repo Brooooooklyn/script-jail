@@ -571,8 +571,30 @@ jobs:
           # no such copy because nothing was downloaded.)
           vp_version="$(sed -nE "s/^export const VITE_PLUS_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
           node_version="$(sed -nE "s/^export const NODE_VERSION = '([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          vp_sha_x64="$(sed -nE "s/^[[:space:]]*x64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
-          vp_sha_arm64="$(sed -nE "s/^[[:space:]]*arm64:[[:space:]]*'([^']+)'.*/\1/p" src/rootfs/vite-plus.ts)"
+
+          # Read the per-arch vp tarball SHA from the LINUX pin object only.
+          # vite-plus.ts now also exports VITE_PLUS_DARWIN_SHA256, which carries
+          # its OWN x64/arm64 keys — a bare `sed .../x64:/` would match BOTH the
+          # linux and darwin lines and emit a TWO-LINE value, so sha256sum -c
+          # would verify the linux tarball against the darwin hash and always
+          # fail.  Scope the read to the `VITE_PLUS_SHA256 { … }` block (same
+          # block-scoped `node -e` pattern used for UBUNTU_REF below); arch is
+          # passed via env, not interpolated, so quoting/injection is a non-issue.
+          read_vp_sha() {
+            SJ_ARCH="$1" node -e '
+              const fs = require("fs");
+              const src = fs.readFileSync("src/rootfs/vite-plus.ts", "utf8");
+              const block = src.match(/export const VITE_PLUS_SHA256[^{]*\{([\s\S]*?)\}/);
+              let out = "";
+              if (block) {
+                const m = block[1].match(new RegExp("\\b" + process.env.SJ_ARCH + "\\s*:\\s*[\"\x27]([^\"\x27]+)[\"\x27]"));
+                if (m) out = m[1];
+              }
+              process.stdout.write(out);
+            '
+          }
+          vp_sha_x64="$(read_vp_sha x64)"
+          vp_sha_arm64="$(read_vp_sha arm64)"
           owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/${owner_lc}/script-jail-rootfs"
           : > docker-image-refs.txt
