@@ -253,16 +253,28 @@ RUN mkdir -p /work /etc/script-jail /usr/local/lib/script-jail /usr/local/bin /o
 # NODE_VERSION is recorded at /etc/script-jail/node-version so init.sh can
 # run `vp env install "$(cat …)"` with an EXACT version — reproducibility is
 # load-bearing for the byte-stable lockfile (a bare major would drift).
+#
+# Fetch + verify is a SINGLE retry unit: a curl failure AND a sha256sum
+# mismatch both retry (deleting the partial file first), so a transient
+# HTTP-200-with-wrong-bytes response — a half-written object, a stale edge,
+# any successful-but-wrong content — does not abort the producer; only 8
+# consecutive fetch-or-verify failures do.  Single source (npmjs) by design:
+# the pinned ${VP_SHA256} is the trust anchor, so a mirror could not inject
+# bad bytes anyway, and the one historical "wrong bytes" report was actually a
+# build-arg parse bug (two-line VP_SHA256), not a CDN problem.
 RUN set -eu; \
     url="https://registry.npmjs.org/@voidzero-dev/vite-plus-cli-linux-${VP_ARCH}-gnu/-/vite-plus-cli-linux-${VP_ARCH}-gnu-${VP_VERSION}.tgz"; \
+    ok=0; \
     for attempt in 1 2 3 4 5 6 7 8; do \
-      if curl -fsSL --retry 5 -o /tmp/vp.tgz "$url"; then break; fi; \
-      if [ "$attempt" = "8" ]; then \
-        echo "vp download failed after 8 attempts: $url" >&2; exit 1; \
+      if curl -fsSL --retry 5 -o /tmp/vp.tgz "$url" \
+         && echo "${VP_SHA256}  /tmp/vp.tgz" | sha256sum -c -; then \
+        ok=1; break; \
       fi; \
-      echo "vp download attempt $attempt failed; retrying" >&2; sleep $((attempt * 5)); \
+      echo "vp fetch+verify attempt $attempt failed; retrying" >&2; \
+      rm -f /tmp/vp.tgz; \
+      sleep $((attempt * 5)); \
     done; \
-    echo "${VP_SHA256}  /tmp/vp.tgz" | sha256sum -c -; \
+    [ "$ok" = 1 ] || { echo "vp download+verify failed after 8 attempts: $url" >&2; exit 1; }; \
     tar -xzf /tmp/vp.tgz -C /tmp; \
     install -m 0755 /tmp/package/vp /usr/local/bin/vp; \
     rm -rf /tmp/vp.tgz /tmp/package; \
