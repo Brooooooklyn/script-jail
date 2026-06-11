@@ -26204,6 +26204,21 @@ function isPackageManagerClientSpawn(rawEvent, line) {
   }
   return false;
 }
+var CLONE_UNTRACED_BIT = 8388608;
+function cloneFlagsHaveUntraced(line) {
+  const m = line.match(/flags=([A-Za-z0-9_|]+)/);
+  if (m === null) return false;
+  for (const tok of (m[1] ?? "").split("|")) {
+    if (tok === "CLONE_UNTRACED") return true;
+    let bits = null;
+    if (/^0[xX][0-9a-fA-F]+$/.test(tok)) bits = Number.parseInt(tok, 16);
+    else if (/^[0-9]+$/.test(tok)) bits = Number.parseInt(tok, 10);
+    if (bits !== null && Number.isFinite(bits) && (bits & CLONE_UNTRACED_BIT) !== 0) {
+      return true;
+    }
+  }
+  return false;
+}
 async function runInstallPhase(input) {
   const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
   const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
@@ -27064,6 +27079,11 @@ async function runInstallPhase(input) {
       const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
       if (cloneMatch !== null) {
         const syscallName = cloneMatch[1] ?? "";
+        if ((syscallName === "clone" || syscallName === "clone3") && cloneFlagsHaveUntraced(line)) {
+          setPhaseTamper(
+            `pid=${pid} issued ${syscallName} with CLONE_UNTRACED \u2014 the child escapes strace -ff and cannot be observed; audit capture cannot be trusted`
+          );
+        }
         const rcMatch = line.match(/\)\s*=\s*(-?\d+)\b/);
         if (rcMatch !== null) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
@@ -27071,7 +27091,6 @@ async function runInstallPhase(input) {
             propagateNodeBootstrap(pid, childPid);
             let cloneFs = false;
             let cloneFiles = false;
-            let cloneUntraced = false;
             if (syscallName === "clone" || syscallName === "clone3") {
               const flagsMatch = line.match(/flags=([A-Z0-9_|]+)/);
               if (flagsMatch !== null) {
@@ -27079,14 +27098,8 @@ async function runInstallPhase(input) {
                 for (const tok of flagTokens) {
                   if (tok === "CLONE_FS") cloneFs = true;
                   else if (tok === "CLONE_FILES") cloneFiles = true;
-                  else if (tok === "CLONE_UNTRACED") cloneUntraced = true;
                 }
               }
-            }
-            if (cloneUntraced) {
-              setPhaseTamper(
-                `pid=${pid} created child pid=${childPid} with CLONE_UNTRACED \u2014 the child escapes strace -ff and cannot be observed; audit capture cannot be trusted`
-              );
             }
             const childCwdSnap = pendingCwdDetach.get(childPid);
             pendingCwdDetach.delete(childPid);
@@ -28518,19 +28531,12 @@ var MacOSInstallRunner = class {
       env: opts.env,
       stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
-    const exitStatus = {
-      code: null,
-      signal: null
-    };
     const exitPromise = new Promise((resolve2) => {
-      child.on("close", (code, signal) => {
-        exitStatus.code = code;
-        exitStatus.signal = signal;
+      child.on("close", (code) => {
         this._exitCode = code ?? 1;
         resolve2();
       });
       child.on("error", () => {
-        exitStatus.spawnError = true;
         this._exitCode = 1;
         resolve2();
       });
@@ -28568,8 +28574,17 @@ var MacOSInstallRunner = class {
           // alongside the dropped strace-derived detectors).
           tamperRef: this._tamperRef
         } : {},
-        exitPromise,
-        exitStatusRef: exitStatus
+        exitPromise
+        // SECURITY (Codex 2026-06-12, round-2 finding 1): DELIBERATELY no
+        // exitStatusRef here.  The post-exit meta-gate freeze relies on the
+        // Linux `strace -ff` invariant that a NORMAL exit means the WHOLE traced
+        // tree has exited (no in-model writer left).  This macOS runner spawns
+        // the install command DIRECTLY and resolves exitPromise on that ONE
+        // process's close — a daemonised/backgrounded child can outlive a clean
+        // npm/pnpm exit and tamper with the events file.  Withholding
+        // exitStatusRef leaves the ctime/mtime meta gates ARMED post-exit on
+        // macOS (the absent-disposition fail-closed default), matching the
+        // shipped v0.2.0 behaviour (PR #10's freeze was never on macOS).
         // No root-pid seeding: getRootPid() is null on macOS by design.  We do
         // NOT install recordRootPid — the install root would otherwise be
         // mis-pinned to the first phantom per-pid file (there are none here).

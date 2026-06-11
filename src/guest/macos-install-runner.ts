@@ -124,26 +124,9 @@ export class MacOSInstallRunner implements StraceRunner {
       stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
     });
 
-    // Capture the install command's exit disposition (code + signal) so the
-    // tailer can tell a CLEAN exit from an ABNORMAL termination.  Mutated BEFORE
-    // resolve() so exitPromise.then() observes it.  See
-    // StraceTailerOptions.exitStatusRef.
-    const exitStatus: { code: number | null; signal: NodeJS.Signals | null; spawnError?: boolean } = {
-      code: null,
-      signal: null,
-    };
     const exitPromise = new Promise<void>((resolve) => {
-      child.on('close', (code, signal) => {
-        exitStatus.code = code;
-        exitStatus.signal = signal;
-        this._exitCode = code ?? 1;
-        resolve();
-      });
-      child.on('error', () => {
-        exitStatus.spawnError = true;
-        this._exitCode = 1;
-        resolve();
-      });
+      child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });
+      child.on('error', () => { this._exitCode = 1; resolve(); });
     });
 
     // There are no per-pid strace files on macOS.  `runStraceTailer` still
@@ -190,7 +173,16 @@ export class MacOSInstallRunner implements StraceRunner {
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,
-        exitStatusRef: exitStatus,
+        // SECURITY (Codex 2026-06-12, round-2 finding 1): DELIBERATELY no
+        // exitStatusRef here.  The post-exit meta-gate freeze relies on the
+        // Linux `strace -ff` invariant that a NORMAL exit means the WHOLE traced
+        // tree has exited (no in-model writer left).  This macOS runner spawns
+        // the install command DIRECTLY and resolves exitPromise on that ONE
+        // process's close — a daemonised/backgrounded child can outlive a clean
+        // npm/pnpm exit and tamper with the events file.  Withholding
+        // exitStatusRef leaves the ctime/mtime meta gates ARMED post-exit on
+        // macOS (the absent-disposition fail-closed default), matching the
+        // shipped v0.2.0 behaviour (PR #10's freeze was never on macOS).
         // No root-pid seeding: getRootPid() is null on macOS by design.  We do
         // NOT install recordRootPid — the install root would otherwise be
         // mis-pinned to the first phantom per-pid file (there are none here).

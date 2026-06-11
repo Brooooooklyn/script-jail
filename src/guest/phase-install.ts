@@ -531,6 +531,33 @@ function isPackageManagerClientSpawn(rawEvent: RawEvent, line: string): boolean 
   return false;
 }
 
+/** CLONE_UNTRACED bit (linux/sched.h) — kernel-stable since 2.5.46. */
+const CLONE_UNTRACED_BIT = 0x0080_0000;
+
+/**
+ * True when a strace clone/clone3 line's `flags=` field carries CLONE_UNTRACED,
+ * via EITHER the symbolic token OR a numeric (hex/decimal) component whose
+ * CLONE_UNTRACED bit is set.  A token-only check would miss `flags=0x...`
+ * renderings (a security gate must not depend on strace symbolising the flag),
+ * so we also decode any numeric `|`-component and test the bit.  We widen the
+ * capture to `[A-Za-z0-9_|]+` (the cwd/fd loop's `[A-Z0-9_|]+` would truncate a
+ * lowercase-hex token like `0x800abc` at the first hex letter).
+ */
+function cloneFlagsHaveUntraced(line: string): boolean {
+  const m = line.match(/flags=([A-Za-z0-9_|]+)/);
+  if (m === null) return false;
+  for (const tok of (m[1] ?? '').split('|')) {
+    if (tok === 'CLONE_UNTRACED') return true;
+    let bits: number | null = null;
+    if (/^0[xX][0-9a-fA-F]+$/.test(tok)) bits = Number.parseInt(tok, 16);
+    else if (/^[0-9]+$/.test(tok)) bits = Number.parseInt(tok, 10);
+    if (bits !== null && Number.isFinite(bits) && (bits & CLONE_UNTRACED_BIT) !== 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
@@ -3227,6 +3254,36 @@ export async function runInstallPhase(
       const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
       if (cloneMatch !== null) {
         const syscallName = cloneMatch[1] ?? '';
+
+        // SECURITY (Codex 2026-06-12, finding 2): a clone/clone3 carrying
+        // CLONE_UNTRACED spawns a child the kernel will NOT let `strace -ff`
+        // auto-attach to ("a tracing process cannot force CLONE_PTRACE on this
+        // child").  That child escapes observation, can outlive the traced tree,
+        // and then tamper with the events file in the window the meta gates stop
+        // guarding once strace exits cleanly.  Fail closed.
+        //
+        // Checked HERE — on the raw clone line, BEFORE the rc/success gate below
+        // — for two reasons the round-2 review caught:
+        //   * unfinished/resumed split: strace can render the flags on a
+        //     `clone(... <unfinished ...>` half (no rc) and the pid on a later
+        //     `<... clone resumed> = <pid>` half (which does not match ^clone),
+        //     so an rc-gated check misses it (strace-parser drops both halves).
+        //   * numeric/hex flags: a `flags=0x...` value (a bit strace did not
+        //     symbolise) carries the CLONE_UNTRACED bit WITHOUT the literal
+        //     token, so a token-only check misses it.  cloneFlagsHaveUntraced
+        //     decodes hex/decimal components and tests the bit.
+        // A legitimate install NEVER issues CLONE_UNTRACED (glibc/Node never set
+        // it), so its mere presence — successful clone or not — is the signal.
+        if (
+          (syscallName === 'clone' || syscallName === 'clone3') &&
+          cloneFlagsHaveUntraced(line)
+        ) {
+          setPhaseTamper(
+            `pid=${pid} issued ${syscallName} with CLONE_UNTRACED — the child ` +
+              `escapes strace -ff and cannot be observed; audit capture cannot be trusted`,
+          );
+        }
+
         // Locate the trailing "= <rc>" and gate on success (positive rc).
         //
         // Codex follow-up (bug #4, high, 2026-05-19): the prior regex was
@@ -3261,7 +3318,6 @@ export async function runInstallPhase(
             // fork/vfork have no flags field.
             let cloneFs = false;
             let cloneFiles = false;
-            let cloneUntraced = false;
             if (syscallName === 'clone' || syscallName === 'clone3') {
               const flagsMatch = line.match(/flags=([A-Z0-9_|]+)/);
               if (flagsMatch !== null) {
@@ -3269,31 +3325,8 @@ export async function runInstallPhase(
                 for (const tok of flagTokens) {
                   if (tok === 'CLONE_FS') cloneFs = true;
                   else if (tok === 'CLONE_FILES') cloneFiles = true;
-                  else if (tok === 'CLONE_UNTRACED') cloneUntraced = true;
                 }
               }
-            }
-
-            // SECURITY (Codex 2026-06-12, finding 2): CLONE_UNTRACED tells the
-            // kernel that "a tracing process cannot force CLONE_PTRACE on this
-            // child" — i.e. `strace -ff` will NOT auto-attach to this descendant.
-            // Such a child escapes observation entirely and can outlive the
-            // traced tree, then tamper with the events file during the post-exit
-            // window the meta gates stop guarding once strace exits cleanly.
-            // That is a hard audit-integrity breach, so fail closed: refuse to
-            // emit a lockfile rather than ship one from an audit with a blind
-            // spot.  (Plain fork/vfork and double-fork/setsid are still followed
-            // by `-ff`; CLONE_UNTRACED is the specific ptrace-follow bypass.)
-            //
-            // A numeric `flags=0x...` rendering would slip this literal-token
-            // check — the same accepted parity limitation as CLONE_FS /
-            // CLONE_FILES above; strace symbolizes CLONE_* names by default.
-            if (cloneUntraced) {
-              setPhaseTamper(
-                `pid=${pid} created child pid=${childPid} with CLONE_UNTRACED — the ` +
-                  `child escapes strace -ff and cannot be observed; audit capture ` +
-                  `cannot be trusted`,
-              );
             }
 
             // --- cwd group: union if CLONE_FS, else copy. -----------

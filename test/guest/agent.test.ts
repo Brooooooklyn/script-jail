@@ -2591,6 +2591,58 @@ describe('runStraceTailer', () => {
     expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
   });
 
+  // 2026-06-12 SECURITY (Codex round-2 finding 1): the macOS bare runner spawns
+  // the install DIRECTLY (no `strace -ff` whole-tree wait), so it must NOT enable
+  // the freeze — it withholds exitStatusRef.  This pins the fail-closed default
+  // the macOS path relies on: with NO disposition the meta gates stay ARMED
+  // post-exit, so the benign end-of-audit ctime finalize that a clean Linux exit
+  // suppresses is instead CAUGHT (on macOS a daemonized survivor could be the
+  // cause, and we have no whole-tree-exit proof to rule that out).
+  it('keeps the meta gates ARMED post-exit when no exit disposition is supplied (macOS fail-closed default)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      // NO exitStatusRef → freeze must stay OFF (the macOS direct-spawn default).
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 8,
+      settleHardCapMs: 600,
+    });
+
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    setTimeout(() => { resolveExit(); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/ctime advanced|without new bytes/);
+  });
+
   it('records a tamper reason when the events file is truncated below the read position', async () => {
     const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, truncateSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
     const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
