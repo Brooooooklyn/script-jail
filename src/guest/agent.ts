@@ -397,9 +397,21 @@ export interface StraceTailerOptions {
    * ARMED (fail closed).  A non-zero exit code alone is NOT abnormal here: it is
    * the tracee's propagated status, and treating it as tamper would refuse a
    * lockfile for every offline/failing postinstall (see the non-zero-Phase-B
-   * leniency in main()).  When the disposition is absent (unit tests that don't
-   * model exit status) the relaxation also stays OFF: fail-closed by default.
-   * Production runners (Linux + macOS) ALWAYS populate this.
+   * leniency in main()).
+   *
+   * WHO MAY PASS THIS (security invariant — do NOT "fix" by widening): ONLY a
+   * runner whose exit signal proves the WHOLE descendant tree has exited may
+   * populate exitStatusRef, because the freeze trusts that proof.  That is the
+   * Linux {@link LinuxStraceRunner}, which runs `strace -ff` and resolves
+   * exitPromise only after the entire traced tree is gone.  The macOS
+   * {@link MacOSInstallRunner} spawns the install command DIRECTLY (no
+   * `strace -ff`) and resolves on that ONE process's close, so a normal exit
+   * does NOT prove a daemonized/backgrounded descendant has exited — it MUST
+   * NOT pass exitStatusRef.  When the disposition is absent (the macOS runner,
+   * and unit tests that don't model exit status) the relaxation stays OFF and
+   * the meta gates remain ARMED post-exit: fail-closed by default.  Passing a
+   * normal-exit disposition from a direct-spawn runner would reopen the
+   * post-exit survivor-tamper gap (Codex round-2 finding 1).
    */
   exitStatusRef?: { code: number | null; signal: NodeJS.Signals | null; spawnError?: boolean };
   /** Poll interval in ms for directory scan and file growth checks (default 50). */
@@ -1668,6 +1680,11 @@ export class LinuxStraceRunner implements StraceRunner {
           tamperRef: this._tamperRef,
         } : {}),
         exitPromise,
+        // Only this Linux `strace -ff` runner may pass exitStatusRef: strace
+        // exits ONLY after the WHOLE traced tree has exited, so a normal exit
+        // proves no in-model writer survives and the post-exit meta-gate freeze
+        // is sound.  The macOS direct-spawn runner has no such proof and MUST
+        // omit it — see StraceTailerOptions.exitStatusRef.
         exitStatusRef: exitStatus,
         // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
         // fallback runs ONLY when the /proc-based deterministic

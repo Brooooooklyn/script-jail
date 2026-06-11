@@ -29762,6 +29762,11 @@ var LinuxStraceRunner = class {
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
+        // Only this Linux `strace -ff` runner may pass exitStatusRef: strace
+        // exits ONLY after the WHOLE traced tree has exited, so a normal exit
+        // proves no in-model writer survives and the post-exit meta-gate freeze
+        // is sound.  The macOS direct-spawn runner has no such proof and MUST
+        // omit it — see StraceTailerOptions.exitStatusRef.
         exitStatusRef: exitStatus,
         // Codex follow-up (bug #3, high, 2026-05-19): the per-pid-file
         // fallback runs ONLY when the /proc-based deterministic

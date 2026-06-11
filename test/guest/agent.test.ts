@@ -11,7 +11,8 @@ import { stringify } from 'yaml';
 import { createConnection } from 'node:net';
 
 import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer } from '../../src/guest/agent.js';
-import type { DnsLookupFn, SpawnResult } from '../../src/guest/agent.js';
+import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
+import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
 import type { StraceRunner } from '../../src/guest/phase-install.js';
 
@@ -3215,5 +3216,91 @@ describe('readStraceChildPid', () => {
     const { readStraceChildPid } = await import('../../src/guest/agent.js');
     const result = readStraceChildPid(process.pid, 0);
     expect(result).toBeNull();
+  });
+});
+
+describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)', () => {
+  let macDir: string;
+
+  beforeEach(() => {
+    macDir = join(tmpdir(), `macos-runner-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(macDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(macDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  // The macOS bare runner spawns the install command DIRECTLY (no `strace -ff`
+  // whole-tree wait), so a normal child exit does NOT prove a daemonized
+  // descendant has exited.  It therefore MUST NOT pass exitStatusRef to
+  // runStraceTailer — leaving the post-exit ctime/mtime meta gates ARMED.  This
+  // is a SECURITY invariant (Codex round-2 finding 1): if a maintainer "fixed"
+  // the runner to pass a normal-exit disposition, the freeze would engage and a
+  // post-parent-exit survivor could tamper undetected.  This test fails if that
+  // regression is introduced: a benign post-exit ctime finalize MUST still be
+  // caught (gates armed), exactly because the runner withholds exitStatusRef.
+  it('does NOT freeze the meta gates post-exit (keeps them armed) on a normal child exit', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(macDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const eventsFile: EventsFile = {
+      path: eventsPath,
+      dirPath: macDir,
+      baseline: { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs },
+    };
+
+    // Fake child whose `close` we fire manually with a NORMAL (code 0, no signal)
+    // exit — the disposition that WOULD freeze the gates on the Linux runner.
+    let fireClose: ((code: number | null, signal: NodeJS.Signals | null) => void) | null = null;
+    const fakeChild = {
+      stderr: null as NodeJS.ReadableStream | null,
+      stdio: [null, null, null, null] as Array<NodeJS.ReadableStream | null | undefined>,
+      pid: undefined as number | undefined,
+      on(event: 'close' | 'error', listener: (...a: never[]) => void) {
+        if (event === 'close') fireClose = listener as unknown as typeof fireClose;
+        return this;
+      },
+    };
+    const fakeSpawn = (() => fakeChild) as unknown as SpawnImpl;
+
+    const runner = new MacOSInstallRunner(fakeSpawn, eventsFile);
+
+    // t=40: one legitimate event consumed during the active phase.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: child exits NORMALLY (code 0).  t=140: benign ctime finalize.
+    setTimeout(() => { fireClose?.(0, null); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    // Consume the runner's async iterable with a timeout guard.
+    await Promise.race([
+      (async () => {
+        for await (const _ of runner.run('node', [], {
+          env: {},
+          cwd: macDir,
+          basePath: join(macDir, 'strace.out'),
+        })) {
+          // drain
+        }
+      })(),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error('macOS runner timed out')), 4000)),
+    ]);
+
+    // Gates stayed ARMED → the post-exit ctime bump is caught.  If the runner
+    // ever (wrongly) passed a normal-exit exitStatusRef, the freeze would engage
+    // and this would be null.
+    expect(runner.getTamperReason()).not.toBeNull();
+    expect(runner.getTamperReason()).toMatch(/ctime advanced|without new bytes/);
   });
 });
