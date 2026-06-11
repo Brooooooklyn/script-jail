@@ -648,6 +648,26 @@ export async function* runStraceTailer(
   let ctimeAdvanceStablePolls = 0;
   let mtimeAdvanceStablePolls = 0;
   const META_ADVANCE_REQUIRED_POLLS = 3;
+  // 2026-06-11: freeze the two "advanced WITHOUT new bytes" meta gates once the
+  // traced process tree has exited.  Those gates are defense-in-depth against a
+  // LIVE attacker racing the polling window with an append->truncate(->utimes-
+  // restore) cycle that leaves `size === eventsPos`.  `strace -f` resolves
+  // exitPromise only AFTER the whole traced tree has exited, so once
+  // `childExited` is set no in-model process remains to perform that race.
+  // Meanwhile the Ubuntu-22.04 microVM kernel finalizes the ctime of the LAST
+  // byte-consuming write a few hundred microseconds AFTER readSync returns, with
+  // mtime + size unchanged; at END OF AUDIT (writes stopped, `size ===
+  // eventsPos` forever) that state is PERMANENT and would accumulate
+  // META_ADVANCE_REQUIRED_POLLS into a FALSE "advanced without new bytes" tamper
+  // that refuses a clean lockfile (observed flaking CI parity-test).  Freezing
+  // ONLY these two counters post-exit removes the false positive without
+  // weakening in-model detection: every other gate (size-grow drain, maxSeenSize
+  // shrink, mtime-regression, inode/rename watchers) stays active post-exit, and
+  // both gates stay fully strict for the ENTIRE active phase (the existing
+  // utimes-restore + append-truncate tests trip pre-exit).  The only relaxation
+  // is reachable solely by a process that outlived the tracer — outside the
+  // audit's threat model.
+  let childExited = false;
   function recordTamper(reason: string): void {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -750,7 +770,15 @@ export async function* runStraceTailer(
     // defence.  The mtime-regression check above remains the primary
     // signal; this gate stays defence-in-depth for the narrow case where
     // the attacker restores mtime to a value still ≥ maxObservedMtime.
+    //
+    // 2026-06-11: but at END OF AUDIT that "one-shot" settle becomes PERMANENT
+    // (no further writes refresh lastConsumedCtime), so N consecutive polls
+    // accumulate a FALSE positive.  Freeze this gate once `childExited` — past
+    // that point no in-model process is alive to race the window (see the
+    // childExited declaration); byte-adding tampers are still caught by the
+    // size-grow drain below.
     if (
+      !childExited &&
       lastConsumedCtime !== -1n &&
       ctimeBig > lastConsumedCtime &&
       sizeNum === eventsPos
@@ -772,8 +800,9 @@ export async function* runStraceTailer(
     // so the pre-existing test contract continues to hold.  Same lazy-stat
     // race as ctime above — gate on N consecutive polls so we tolerate the
     // kernel's brief mtime/size desync without weakening the steady-state
-    // tamper signal.
-    if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
+    // tamper signal.  Frozen post-exit for the same reason as the ctime gate
+    // (see the childExited declaration): no in-model writer remains.
+    if (!childExited && lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
       mtimeAdvanceStablePolls += 1;
       if (mtimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
@@ -1008,6 +1037,11 @@ export async function* runStraceTailer(
   // ---- wait for child exit, then drain -------------------------------------
 
   opts.exitPromise.then(async () => {
+    // Mark the traced tree exited so the two "advanced without new bytes" meta
+    // gates freeze (see the childExited declaration).  Set BEFORE the settle
+    // drains below so the kernel's permanent end-of-audit ctime finalize cannot
+    // accumulate a false positive while we tail out the remaining bytes.
+    childExited = true;
     // By the time exitPromise resolves, strace has already fclose()'d every
     // per-pid file: it exits only after the whole traced process tree has
     // exited, and the agent NEVER kills it (no SIGKILL/SIGTERM anywhere in

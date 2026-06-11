@@ -29246,6 +29246,7 @@ async function* runStraceTailer(opts) {
   let ctimeAdvanceStablePolls = 0;
   let mtimeAdvanceStablePolls = 0;
   const META_ADVANCE_REQUIRED_POLLS = 3;
+  let childExited = false;
   function recordTamper(reason) {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -29299,7 +29300,7 @@ async function* runStraceTailer(opts) {
       return;
     }
     if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
-    if (lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
+    if (!childExited && lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
@@ -29310,7 +29311,7 @@ async function* runStraceTailer(opts) {
     } else {
       ctimeAdvanceStablePolls = 0;
     }
-    if (lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
+    if (!childExited && lastMtime !== -1n && mtimeBig > lastMtime && sizeNum === eventsPos) {
       mtimeAdvanceStablePolls += 1;
       if (mtimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
@@ -29440,6 +29441,7 @@ async function* runStraceTailer(opts) {
     wake();
   }, pollIntervalMs);
   opts.exitPromise.then(async () => {
+    childExited = true;
     const hardDeadline = Date.now() + settleHardCapMs;
     let quiet = 0;
     let prev = "";

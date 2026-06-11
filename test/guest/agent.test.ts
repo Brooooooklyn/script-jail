@@ -2403,6 +2403,75 @@ describe('runStraceTailer', () => {
     expect(items.some((i) => i.line.includes('"name":"OK"'))).toBe(true);
   });
 
+  // 2026-06-11 regression: end-of-audit lazy ctime-finalize must NOT trip.
+  //
+  // Reproduces the CI parity-test false positive.  After the last legitimate
+  // append is consumed (eventsPos === size), the Ubuntu-22.04 microVM kernel
+  // finalizes the file's ctime a few hundred microseconds later with mtime and
+  // size UNCHANGED.  Once writes stop, that state (`ctime > lastConsumed &&
+  // size === eventsPos`) is PERMANENT and accumulates the 3-poll gate into a
+  // false "ctime advanced without new bytes" tamper.  A `chmod` bumps ctime only
+  // (mtime + size unchanged), faithfully simulating the finalize.
+  //
+  // The fix freezes the meta-advance gates once the traced tree has exited
+  // (childExited), so a finalize observed POST-exit is ignored.  Here the bump
+  // lands AFTER resolveExit and is then seen by several post-exit polls: the
+  // pre-fix code trips the ctime gate on them (red), the freeze ignores them
+  // (green).  The gate stays STRICT during the active phase — the utimes-restore
+  // and append-truncate tests below trip pre-exit — so in-model detection is
+  // unchanged.
+  it('does NOT record tamper on the end-of-audit lazy ctime-finalize (post-exit chmod, mtime+size flat)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      pollIntervalMs: 20,
+      drainMs: 30,
+      // Keep the post-exit settle loop polling long enough that several polls
+      // observe the permanent benign state (>> 3 × 20ms) before the tailer
+      // stops — so the pre-fix code has a clear window to (wrongly) trip.
+      settleQuietPasses: 8,
+      settleHardCapMs: 600,
+    });
+
+    // t=40: last legitimate event — consumed by an active-phase drain.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: traced tree exits (childExited).  t=140: bump ctime ONLY (mtime +
+    // size flat) AFTER exit, so the permanent finalize state is observed only by
+    // post-exit polls — which the freeze must ignore.
+    setTimeout(() => { resolveExit(); }, 120);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 140);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
+    // The legitimate appended line must still be yielded.
+    expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
+  });
+
   it('records a tamper reason when the events file is truncated below the read position', async () => {
     const { openSync: openSyncFn, fstatSync: fstatSyncFn, closeSync: closeSyncFn, truncateSync, writeFileSync: writeSyncFn, constants: fsConstants } = await import('node:fs');
     const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
