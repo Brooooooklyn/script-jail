@@ -221,6 +221,14 @@ describe('npmPackages (PKG-1)', () => {
       expect(pkg.packageJson.engines).toEqual({ node: '>=20.0.0' });
       expect(typeof pkg.packageJson.description).toBe('string');
       expect(pkg.packageJson.description.length).toBeGreaterThan(0);
+      // repository.url is REQUIRED for npm OIDC trusted publishing: the
+      // provenance bundle is validated against it and an empty value is
+      // rejected with E422.  Must point at the (renamed) repo so it matches
+      // the repository the release.yml OIDC token is issued for.
+      expect(pkg.packageJson.repository).toEqual({
+        type: 'git',
+        url: 'git+https://github.com/Brooooooklyn/script-jail.git',
+      });
     }
   });
 

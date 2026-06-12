@@ -84,6 +84,15 @@ function sharedPackageJson(version) {
     license: 'MIT',
     type: 'module',
     engines: { node: '>=20.0.0' },
+    // Required for npm OIDC trusted publishing: the provenance bundle is
+    // validated against repository.url, and an empty/missing value is rejected
+    // with E422 ("repository.url is '', expected to match ...").  Must match the
+    // repo the release.yml OIDC token is issued for (renamed scriptjail →
+    // script-jail).  Applied to ALL four packages.
+    repository: {
+      type: 'git',
+      url: 'git+https://github.com/Brooooooklyn/script-jail.git',
+    },
     publishConfig: { access: 'public' },
   };
 }
