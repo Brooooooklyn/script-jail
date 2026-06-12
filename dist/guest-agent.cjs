@@ -25439,7 +25439,12 @@ async function runFetchPhase(input) {
   });
   return {
     ok: result.exitCode === 0,
-    stderr: result.stderr
+    stderr: result.stderr,
+    // yarn Berry writes its progress AND its errors (YN0001 ENOSPC traces,
+    // resolution failures, …) to STDOUT; stderr is typically empty.  Return
+    // stdout too so the agent's Phase A failure dump can include it — an
+    // empty fatal message hides the actual cause (found dogfooding napi-rs).
+    stdout: result.stdout
   };
 }
 
@@ -25962,7 +25967,8 @@ function tokenize(rawPath, roots, currentPkgDir) {
     [roots.repo, "$REPO"],
     [roots.cache, "$CACHE"],
     [roots.home, "$HOME"],
-    [roots.tmp, "$TMPDIR"]
+    [roots.tmp, "$TMPDIR"],
+    roots.tmpLegacy !== void 0 ? [roots.tmpLegacy, "$TMPDIR"] : null
   ];
   const sorted = prefixes.filter((p) => p !== null).sort((a, b) => b[0].length - a[0].length);
   for (const [prefix, token] of sorted) {
@@ -30129,12 +30135,19 @@ async function main(input) {
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
   if (!fetchResult.ok) {
+    const stdoutTrimmed = fetchResult.stdout.trim();
+    const stdoutTail = stdoutTrimmed.length > 4e3 ? `\u2026${stdoutTrimmed.slice(-4e3)}` : stdoutTrimmed;
+    const fetchDetail = [
+      fetchResult.stderr.trim(),
+      stdoutTail === "" ? "" : `--- stdout (tail) ---
+${stdoutTail}`
+    ].filter((s) => s !== "").join("\n");
     process.stderr.write(
       `[agent] Phase A (fetch) failed:
-${fetchResult.stderr}
+${fetchDetail}
 `
     );
-    emitter.emitError(`Phase A (fetch) failed: ${fetchResult.stderr}`, true);
+    emitter.emitError(`Phase A (fetch) failed: ${fetchDetail}`, true);
     flushAndExit(input.connection.writable, 1);
     return;
   }
@@ -30203,11 +30216,13 @@ ${fetchResult.stderr}
       }
     }()
   );
+  const linuxTmp = (0, import_node_os.tmpdir)();
   const roots = isMacosBare ? macosTokenizeRoots(config2.work_dir) : {
     repo: config2.work_dir,
     nodeModules: `${config2.work_dir}/node_modules`,
     home: "/root",
-    tmp: "/tmp",
+    tmp: linuxTmp,
+    ...linuxTmp !== "/tmp" ? { tmpLegacy: "/tmp" } : {},
     cache: "/root/.cache/pnpm"
   };
   const protectedPaths = new ProtectedPathsMatcher({

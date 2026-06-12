@@ -2711,15 +2711,31 @@ export async function main(input: AgentInput): Promise<void> {
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
 
   if (!fetchResult.ok) {
+    // Build the failure detail from stderr AND a stdout tail: npm/pnpm put
+    // their errors on stderr, but yarn Berry writes everything — including
+    // YN0001 ENOSPC traces and resolution failures — to STDOUT with an empty
+    // stderr.  Without the stdout tail the fatal frame reads
+    // "Phase A (fetch) failed: " and the actual cause is invisible on the
+    // host (found dogfooding napi-rs).  Tail-capped so a megabyte of yarn
+    // progress output cannot bloat the vsock error frame.
+    const stdoutTrimmed = fetchResult.stdout.trim();
+    const stdoutTail =
+      stdoutTrimmed.length > 4000 ? `…${stdoutTrimmed.slice(-4000)}` : stdoutTrimmed;
+    const fetchDetail = [
+      fetchResult.stderr.trim(),
+      stdoutTail === '' ? '' : `--- stdout (tail) ---\n${stdoutTail}`,
+    ]
+      .filter((s) => s !== '')
+      .join('\n');
     // Also write to process.stderr so the npm error reaches ttyS0 (the
     // VM's serial console) — `LinuxSpawner` captures the child's stderr
     // into a string, so without this dump the only host-visible symptom
     // would be the eventual fatal error frame.  Useful when the frame
     // itself doesn't make it (e.g. before this flushAndExit was added).
     process.stderr.write(
-      `[agent] Phase A (fetch) failed:\n${fetchResult.stderr}\n`,
+      `[agent] Phase A (fetch) failed:\n${fetchDetail}\n`,
     );
-    emitter.emitError(`Phase A (fetch) failed: ${fetchResult.stderr}`, true);
+    emitter.emitError(`Phase A (fetch) failed: ${fetchDetail}`, true);
     flushAndExit(input.connection.writable, 1);
     return;
   }
@@ -2841,13 +2857,23 @@ export async function main(input: AgentInput): Promise<void> {
   // realpath collapses it so tokenize sees the canonical form), and the macOS
   // pnpm cache.  The /private realpath + cache canonicalization is reconciled
   // against the Linux lock at diff time (Phase 6).
+  // Linux `tmp` follows os.tmpdir(): init.sh exports TMPDIR=/scratch/tmp when
+  // the scratch disk is attached (yarn Berry's zip-conversion staging ENOSPCs
+  // the 64 MB /tmp tmpfs on real monorepos), and tmpdir() honours it.  The
+  // literal /tmp is kept as a second $TMPDIR alias (tmpLegacy) for tools that
+  // ignore TMPDIR — without it their writes would record as raw /tmp/<hash>
+  // paths and break determinism/parity.  Docker/bare set no TMPDIR, so
+  // tmpdir() is '/tmp' there and the alias is omitted — byte-identical to the
+  // previous hardcoded root.
+  const linuxTmp = tmpdir();
   const roots = isMacosBare
     ? macosTokenizeRoots(config.work_dir)
     : {
         repo: config.work_dir,
         nodeModules: `${config.work_dir}/node_modules`,
         home: '/root',
-        tmp: '/tmp',
+        tmp: linuxTmp,
+        ...(linuxTmp !== '/tmp' ? { tmpLegacy: '/tmp' } : {}),
         cache: '/root/.cache/pnpm',
       };
 
