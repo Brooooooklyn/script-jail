@@ -20,12 +20,12 @@ with a unified diff.
 
 ## Status
 
-Feature-complete pre-release. The Action, guest agent, backend abstraction,
-Docker fallback, bare Linux executor, macOS Virtualization.framework CLI path,
-lockfile renderer, and parity CI are implemented. The first public release
-still needs real artifact-manifest SHAs and GHCR image digests in
-`src/action/artifact-manifest.ts`; this repo's own CI uses
-`SCRIPT_JAIL_E2E_SELF_TEST=1` while those release artifacts are bootstrapped.
+Released. `script-jail` and its three platform packages are published to npm,
+and each GitHub release carries the full artifact set. The Action and CLI
+verify every downloaded rootfs, kernel, shim, and Docker image against the
+hash manifest committed in `src/action/artifact-manifest.ts` before use.
+Backends: Firecracker, Docker, and bare Linux in CI; a Virtualization.framework
+VM (`vz`) and a native no-VM `bare` backend on macOS.
 
 ## GitHub Action
 
@@ -99,7 +99,8 @@ that run without modifying the file on disk.
 
 The generated `.script-jail.lock.yml` is grouped by package identity and
 lifecycle stage. Empty lists are intentional: they keep the schema stable and
-make newly observed behavior obvious in diffs.
+make newly observed behavior obvious in diffs. Two extra lists, `audit_bypass`
+and `env_tamper`, appear only when populated — a clean run renders neither.
 
 ```yaml
 schema_version: 1
@@ -131,20 +132,26 @@ packages:
 
 ## macOS CLI
 
-On macOS 14 or newer, the CLI runs the same Linux guest agent through Apple's
-Virtualization.framework:
+On macOS 14 or newer, the CLI audits installs through one of two backends:
+
+- `vz` (default on Apple Silicon) — boots the same Linux guest agent in a
+  lightweight VM through Apple's Virtualization.framework.
+- `bare` — runs natively with a Mach-O `DYLD_INSERT_LIBRARIES` shim and bundled
+  bash/coreutils substitutes, no VM. Network activity is recorded but not
+  blocked on this backend; SIP-protected tools that cannot be instrumented are
+  marked `<AUDIT_BLIND>`.
 
 ```bash
-pnpm exec script-jail init     # create .script-jail.lock.yml
-pnpm exec script-jail update   # overwrite .script-jail.lock.yml
-pnpm exec script-jail check    # diff against the committed lockfile
+pnpm exec script-jail init                  # create .script-jail.lock.yml
+pnpm exec script-jail update                # overwrite .script-jail.lock.yml
+pnpm exec script-jail check                 # diff against the committed lockfile
+pnpm exec script-jail check --backend bare  # native audit, no VM
 ```
 
 When no subcommand is provided, the CLI defaults to `init` if the lockfile does
-not exist and `check` if it does. The macOS path requires the VZ helper binary,
-VZ kernel, per-arch rootfs, and `libscriptjail` release artifacts; in this repo
-checkout those are produced by the release/build workflows and resolved from
-`images/`.
+not exist and `check` if it does. The runtime artifacts (VZ helper, VZ kernel,
+rootfs, and the `.so`/`.dylib` shims) ship inside `@script-jail/darwin-arm64`;
+a repo checkout resolves them from `images/` instead.
 
 ## Installation and packaging
 
@@ -154,8 +161,9 @@ runtime artifacts. The platform-specific runtime payloads live in three
 optional dependency packages, one per supported host:
 
 - `@script-jail/darwin-arm64` — VZ helper (`script-jail-vm`), VZ kernel
-  (`vmlinux-vz-arm64`), `libscriptjail-arm64.so`, and a compressed Ubuntu 24.04
-  arm64 rootfs.
+  (`vmlinux-vz-arm64`), `libscriptjail-arm64.so`, a compressed Ubuntu 24.04
+  arm64 rootfs, and the bare-backend binaries (`libscriptjail-arm64.dylib`,
+  `bash-arm64`, `coreutils-arm64`).
 - `@script-jail/linux-x64` — `libscriptjail.so` and a compressed Ubuntu 24.04
   x64 rootfs.
 - `@script-jail/linux-arm64` — `libscriptjail-arm64.so` and a compressed Ubuntu
