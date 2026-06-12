@@ -57,13 +57,13 @@ export const PINNED_MANIFEST: ArtifactManifest = {
   tag: 'v0.2.2',
   expected: {
     linux: {
-      'rootfs-ubuntu-22.04.ext4': '808e10e569e3c0fc591ae90b30ef2c30131d936ac2f3da667c02bc4e82eb2f41',
-      'rootfs-ubuntu-24.04.ext4': '396309abe7ccb3918e552be8c29f3fe0a87aa7abfcdea41e6606180c8e31cfa0',
+      'rootfs-ubuntu-22.04.ext4': 'cf9d339ab6202e383225e719c1090e30792c6f167751fdcaf19db17993bd1651',
+      'rootfs-ubuntu-24.04.ext4': '48b3fd05662f5a7302d828b826b3576c056165a17dd6986b1af61a99bfbfdab4',
       'libscriptjail.so':         '00ad21620189c80228d46ecf50009350906660ee0fd68e0f695108fdccd48251',
     },
     darwin: {
-      'rootfs-ubuntu-22.04-arm64.ext4': '7299442055ff094ef56d0a44b4863da75bebd98389029e95d3fb2f5362a95077',
-      'rootfs-ubuntu-24.04-arm64.ext4': 'a9b482e5d08fa54be75cae32cd177b20fb4c54b8d7e979c60995efdcb880a8b7',
+      'rootfs-ubuntu-22.04-arm64.ext4': '5be4343a9a9c958b82f29cf117e7e49cf33fdd16f994067977a8052e62564cbb',
+      'rootfs-ubuntu-24.04-arm64.ext4': '41e063867ce775830915e8e5644b3b3e7190c3d2e38494775d32146ca0edc5c3',
       'libscriptjail-arm64.so':         '865379b96a5b5b79af3d2e0c5125ee71a14340fadbba34fdcc318e2f734e9911',
       // macOS-native Mach-O shim for the bare backend (DYLD_INSERT_LIBRARIES),
       // ad-hoc signed in build-mac-bin; pinned by a plain sha256 of the signed
