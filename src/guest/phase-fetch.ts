@@ -32,8 +32,9 @@
 //
 //   yarn: `yarn install --immutable --mode=skip-build`
 //     Fetches and links packages but skips lifecycle script execution.
-//     Phase B runs `yarn install --immutable --offline` which re-links and
-//     triggers scripts (or yarn rebuild if needed).
+//     Phase B runs `yarn install --immutable` (NOT `--offline` — that is a
+//     Yarn Classic flag Berry rejects) which re-links and runs the deferred
+//     build scripts against this cache, offline via the netns sever.
 //
 // Optional package-manager resolution hints:
 //   The normal same-arch parity path does not stage these files.  If a future

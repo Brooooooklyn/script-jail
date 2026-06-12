@@ -183,7 +183,7 @@ describe('runInstallPhase', () => {
       ]);
     });
 
-    it('yarn → yarn install --immutable --offline', async () => {
+    it('yarn → yarn install --immutable (NO --offline: Classic-only flag Berry rejects)', async () => {
       const calls: Array<{ cmd: string; args: string[] }> = [];
       const strace: StraceRunner = {
         async *run(cmd, args) { calls.push({ cmd, args }); },
@@ -202,7 +202,7 @@ describe('runInstallPhase', () => {
         emitter,
       });
       expect(calls[0]!.cmd).toBe('yarn');
-      expect(calls[0]!.args).toEqual(['install', '--immutable', '--offline']);
+      expect(calls[0]!.args).toEqual(['install', '--immutable']);
     });
 
     it('StraceRunner is called exactly once per runInstallPhase', async () => {

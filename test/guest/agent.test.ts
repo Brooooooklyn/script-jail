@@ -506,7 +506,7 @@ describe('agent main()', () => {
     await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
 
     expect(fetchCalls[0]).toContain('yarn install');
-    expect(installCalls[0]).toContain('yarn install --immutable --offline');
+    expect(installCalls[0]).toContain('yarn install --immutable');
   });
 
   it('fails closed when Phase B exits non-zero with no audit events', async () => {

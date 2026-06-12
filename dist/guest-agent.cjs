@@ -26100,7 +26100,10 @@ function normalizePattern(p) {
 var INSTALL_CMD = {
   npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
 };
 var NODE_STARTUP_DONE_STRACE_PATH = "/tmp/script-jail-node-startup-done";
 function parseShimLine(line) {
@@ -28113,7 +28116,12 @@ function parseMacosShimLine(line) {
 var INSTALL_CMD2 = {
   npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
+  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
+  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
+  // rationale.  The macOS-bare backend is observe-only and does not sever the
+  // network, but the cache Phase A populated still makes this a relink+build
+  // with no required registry traffic.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
 };
 var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
   "npm_package_name",
