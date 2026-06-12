@@ -10359,6 +10359,7 @@ __export(agent_exports, {
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
   readStraceChildPid: () => readStraceChildPid,
+  redactSensitive: () => redactSensitive,
   runStraceTailer: () => runStraceTailer,
   scratchBaseDir: () => scratchBaseDir
 });
@@ -30084,6 +30085,17 @@ function diag(input, msg) {
   else process.stderr.write(`[agent] ${msg}
 `);
 }
+function redactSensitive(text, protectedEnvNames, env = process.env) {
+  let out = text;
+  const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
+    (e) => typeof e.value === "string" && e.value.length >= 4
+  ).sort((a, b) => b.value.length - a.value.length);
+  for (const { name, value } of values) {
+    out = out.split(value).join(`<REDACTED:${name}>`);
+  }
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, "$1<REDACTED>").replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>");
+  return out;
+}
 async function main(input) {
   const configPath = input.configPath ?? "/etc/script-jail/config.yml";
   diag(input, `main(): configPath=${configPath}`);
@@ -30137,11 +30149,12 @@ async function main(input) {
   if (!fetchResult.ok) {
     const stdoutTrimmed = fetchResult.stdout.trim();
     const stdoutTail = stdoutTrimmed.length > 4e3 ? `\u2026${stdoutTrimmed.slice(-4e3)}` : stdoutTrimmed;
-    const fetchDetail = [
+    const fetchDetailRaw = [
       fetchResult.stderr.trim(),
       stdoutTail === "" ? "" : `--- stdout (tail) ---
 ${stdoutTail}`
     ].filter((s) => s !== "").join("\n");
+    const fetchDetail = redactSensitive(fetchDetailRaw, config2.protected.env);
     process.stderr.write(
       `[agent] Phase A (fetch) failed:
 ${fetchDetail}
@@ -30365,6 +30378,7 @@ if (isMain) {
   macosTokenizeRoots,
   main,
   readStraceChildPid,
+  redactSensitive,
   runStraceTailer,
   scratchBaseDir
 });

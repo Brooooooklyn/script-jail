@@ -223,19 +223,29 @@ else
 fi
 SCRATCH_BASE=/scratch
 
-# --- Guest-wide TMPDIR on the scratch disk ------------------------------------
+# --- Guest-wide TMPDIR on the REPO disk (NOT the audit scratch disk) -----------
 # yarn Berry's fetch step converts every downloaded tarball into a cache zip
 # via a staging file in os.tmpdir() (ZipFS convertToZipWorker).  On the 64 MB
 # /tmp tmpfs above, a real monorepo's parallel conversions ENOSPC partway
-# through Phase A (napi-rs: ~488 MiB of zips against 64 MB).  Point the WHOLE
-# guest — the agent and, by env inheritance, every Phase A/B child — at the
-# 4 GiB scratch disk instead.  Lockfile parity is preserved because the
-# agent's tokenize roots follow os.tmpdir() AND keep mapping the literal
-# /tmp prefix (for tools that ignore TMPDIR), so both render as $TMPDIR on
-# every backend (src/guest/agent.ts roots + src/lock/tokenize.ts tmpLegacy).
-mkdir -p "${SCRATCH_BASE}/tmp"
-chmod 1777 "${SCRATCH_BASE}/tmp"
-export TMPDIR="${SCRATCH_BASE}/tmp"
+# through Phase A (napi-rs: ~488 MiB of zips against 64 MB).
+#
+# TMPDIR points at the 4 GiB REPO disk (/work, mounted above), NOT the scratch
+# disk.  This is deliberate (Codex round-1 [high], 2026-06-12): the scratch
+# disk holds the AUDIT artifacts — the per-pid `strace -ff` logs and the events
+# JSONL — written only by the trusted agent/strace.  A lifecycle script honours
+# TMPDIR, so co-locating TMPDIR with the audit artifacts would let a malicious
+# script fill the disk and silently STARVE the strace/event writes (partial
+# capture presented as a clean lockfile).  /work is a SEPARATE filesystem that
+# already holds the install's own attacker-adjacent bulk (node_modules + the
+# YARN_*/npm cache redirects from buildChildEnv), so a TMPDIR fill there only
+# fails the install honestly with ENOSPC — it cannot touch the audit channel on
+# /scratch.  Lockfile parity is preserved: the agent's tmp tokenize root follows
+# os.tmpdir() (so /work/.sj-tmp renders $TMPDIR, longest-prefix beating $REPO)
+# and keeps the literal /tmp as a second $TMPDIR alias for tools that ignore
+# TMPDIR (src/guest/agent.ts roots + src/lock/tokenize.ts tmpLegacy).
+mkdir -p /work/.sj-tmp
+chmod 1777 /work/.sj-tmp
+export TMPDIR=/work/.sj-tmp
 
 # Copy the user's config from the repo disk into the rootfs's canonical
 # /etc/script-jail/config.yml so the agent can read it regardless of /work staying

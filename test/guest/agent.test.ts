@@ -1413,6 +1413,52 @@ describe('buildChildEnv lifecycle env sanitization', () => {
   });
 });
 
+describe('redactSensitive (Phase A failure dump)', () => {
+  it('masks protected env values read from the agent env', async () => {
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const env = { NPM_TOKEN: 'super-secret-token-value', GITHUB_TOKEN: 'ghp_abcd1234efgh' };
+    const out = redactSensitive(
+      'login failed for super-secret-token-value using ghp_abcd1234efgh',
+      ['NPM_TOKEN', 'GITHUB_TOKEN'],
+      env,
+    );
+    expect(out).toBe('login failed for <REDACTED:NPM_TOKEN> using <REDACTED:GITHUB_TOKEN>');
+    expect(out).not.toContain('super-secret-token-value');
+  });
+
+  it('skips short/empty protected values so it cannot blank out an ENOSPC trace', async () => {
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const out = redactSensitive('ENOSPC: no space left on device', ['CI'], { CI: '1' });
+    expect(out).toBe('ENOSPC: no space left on device');
+  });
+
+  it('redacts credential SHAPES not in the protected list', async () => {
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const out = redactSensitive(
+      [
+        'fetch https://alice:hunter2@npm.example.com/foo',
+        '//registry.npmjs.org/:_authToken=npmtok123abc',
+        'Authorization: Bearer eyJhbGciOi.payload.sig',
+        'token npm_0123456789012345678901234567890123456789',
+      ].join('\n'),
+      [],
+      {},
+    );
+    expect(out).not.toContain('hunter2');
+    expect(out).toContain('https://<REDACTED:URL-CREDENTIALS>@npm.example.com/foo');
+    expect(out).toContain('_authToken=<REDACTED>');
+    expect(out).toContain('Bearer <REDACTED>');
+    expect(out).toContain('<REDACTED:NPM-TOKEN>');
+    expect(out).not.toContain('npm_0123456789012345678901234567890123456789');
+  });
+
+  it('leaves benign output untouched', async () => {
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const msg = '➤ YN0001: │ Error: ENOSPC: no space left on device, write';
+    expect(redactSensitive(msg, ['NPM_TOKEN'], { NPM_TOKEN: 'x'.repeat(20) })).toBe(msg);
+  });
+});
+
 describe('buildChildEnv package-manager cache/store redirects', () => {
   // ENOSPC on large repos (found auditing a ~1000-package yarn-4 monorepo):
   // yarn berry's global folder defaults under $HOME (/root, a 16 MB tmpfs in
