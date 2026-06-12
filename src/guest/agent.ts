@@ -1370,7 +1370,7 @@ export interface SpawnResult {
 export type SpawnImpl = (
   cmd: string,
   args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: Array<string> },
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: Array<string | number> },
 ) => SpawnResult;
 
 /**
@@ -1446,48 +1446,63 @@ export function readStraceChildPid(
 }
 
 /**
- * Cap for the Phase-B install-stdout ring buffer kept by the install runners.
- * Chosen well above any plausible single diagnostic line / credential token.
+ * Default byte window read back from the Phase-B stdout capture FILE for the
+ * fail-closed diagnostic.  `main()` enlarges this to comfortably exceed the
+ * longest protected env value so the emit-time redactor always sees whole
+ * values (Codex round-3 [medium] #2).
  */
-const PHASE_B_STDOUT_TAIL_BYTES = 16384;
+export const PHASE_B_STDOUT_WINDOW_BYTES = 16384;
 
 /**
- * Attach a drained, bounded tail collector to a child's STDOUT stream.  The
- * 'data' listener keeps the stream flowing (so a verbose install cannot fill
- * the OS pipe buffer and deadlock the child), retaining only the last
- * {@link PHASE_B_STDOUT_TAIL_BYTES} bytes.  Returns a getter for the current
- * tail; a no-op (`() => ''`) when the stream is absent (test stubs that don't
- * pipe fd1).
+ * Open (truncating) the Phase-B stdout capture file and return its path plus a
+ * write fd to hand to the install child via `stdio[1]`.  Returns `null` when
+ * the file can't be created — capture is best-effort and never fatal.
  *
- * SECRET SAFETY: a `redact` function MUST be supplied in production.  The ring
- * buffer drops its FRONT once it exceeds the cap; a protected value straddling
- * that drop boundary would lose its prefix, and the agent's redactor matches
- * only COMPLETE values — so the retained suffix could leak (Codex round-2
- * [medium]).  We therefore redact the WHOLE buffer BEFORE every front-drop:
- * any complete value/credential-shape present at that moment is masked to a
- * fixed token, and the subsequent slice can only cut an already-masked token
- * (harmless).  A value is received contiguously and accumulates at the END of
- * the buffer, so it is never truncated mid-arrival before it is whole.  The
- * fail-closed emit path redacts again (idempotent) and caps to a short tail.
+ * WHY A FILE, NOT A PIPE (Codex round-3 [medium] #1): the install command's
+ * stdout is captured by redirecting fd1 to a regular file rather than a Node
+ * pipe.  A pipe makes the child's `close` event wait for stdout EOF, so a
+ * lifecycle descendant that escapes tracing (e.g. `CLONE_UNTRACED`, a path this
+ * repo models) and inherits fd1 could hold the audit open until an outer
+ * timeout.  A file fd carries no such EOF dependency: `close` fires on process
+ * exit + the (small, pre-existing) fd2/fd3 pipe drains, and we read the file's
+ * tail afterward.  It also can't deadlock on a full pipe buffer.
  */
-export function attachStdoutTailCollector(
-  stream: Readable | null | undefined,
-  redact?: (s: string) => string,
-): () => string {
-  if (!stream) return () => '';
-  let tail = '';
-  stream.on('data', (chunk: Buffer | string) => {
-    tail = tail + chunk.toString('utf8');
-    if (tail.length > PHASE_B_STDOUT_TAIL_BYTES) {
-      // Mask complete secrets BEFORE dropping the front (see SECRET SAFETY).
-      if (redact) tail = redact(tail);
-      tail = tail.slice(-PHASE_B_STDOUT_TAIL_BYTES);
-    }
-  });
-  // Swallow late errors on the captured stream (e.g. EPIPE on teardown) so an
-  // stdout-side hiccup never crashes the agent; the tail we have is best-effort.
-  stream.on('error', () => { /* best-effort capture */ });
-  return () => tail;
+export function openPhaseBStdoutCapture(
+  dir: string,
+): { fd: number; path: string } | null {
+  try {
+    const path = `${dir}/phase-b-stdout.log`;
+    const fd = openSync(path, 'w'); // O_WRONLY | O_CREAT | O_TRUNC
+    return { fd, path };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the last `maxBytes` of a file as UTF-8 (whole file when smaller), or
+ * `''` on any error.  Used to read the Phase-B stdout capture tail at emit
+ * time.  `maxBytes` is sized by `main()` to exceed the longest protected env
+ * value, so any value appearing in the returned window is present WHOLE and the
+ * downstream redactor can mask it (a value straddling the window's front is
+ * impossible because the window is wider than the longest protected value).
+ */
+export function readFileTail(path: string, maxBytes: number): string {
+  let fd = -1;
+  try {
+    fd = openSync(path, 'r');
+    const size = fstatSync(fd).size;
+    const start = size > maxBytes ? size - maxBytes : 0;
+    const len = size - start;
+    if (len <= 0) return '';
+    const buf = Buffer.allocUnsafe(len);
+    readSync(fd, buf, 0, len, start);
+    return buf.toString('utf8');
+  } catch {
+    return '';
+  } finally {
+    if (fd >= 0) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
 }
 
 export class LinuxStraceRunner implements StraceRunner {
@@ -1505,14 +1520,15 @@ export class LinuxStraceRunner implements StraceRunner {
   // until the first per-pid file is observed (and remains null if
   // strace failed to spawn).
   private _rootPid: number | null = null;
-  // Live getter over the bounded, drained tail of the install command's STDOUT
-  // (yarn Berry writes its setup/diagnostic errors here).  fd1 is wired as a
-  // pipe and a 'data' listener keeps it flowing so a verbose install cannot
-  // fill the pipe and deadlock; only the last PHASE_B_STDOUT_TAIL_BYTES are
-  // retained.  Wired in run(); read via getStdoutTail() and surfaced REDACTED
-  // on the Phase-B fail-closed path.  Defaults to the empty-tail getter so it
-  // is safe to call before/without a spawn.
-  private _stdoutTailGetter: () => string = () => '';
+  // Path of the install command's STDOUT capture FILE (yarn Berry writes its
+  // setup/diagnostic errors to stdout).  fd1 is redirected to this file in
+  // run(); getStdoutTail() reads its tail and main() surfaces it REDACTED on
+  // the Phase-B fail-closed path.  Null until run() opens it (or if the open
+  // failed — capture is best-effort).
+  private _stdoutCapturePath: string | null = null;
+  // Byte window read back from the capture file.  Sized by main() to exceed the
+  // longest protected env value so the emit-time redactor sees whole values.
+  private readonly _stdoutWindowBytes: number;
 
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
@@ -1524,19 +1540,14 @@ export class LinuxStraceRunner implements StraceRunner {
    *                   pre-set environment via the `opts.env` passed to
    *                   `run()`.
    */
-  // Redactor applied to the stdout ring buffer before each front-drop and
-  // again at emit time.  Injected from main() (where config.protected.env is
-  // known).  Undefined for test fakes / callers that don't capture stdout.
-  private readonly _redactStdout: ((s: string) => string) | undefined;
-
   constructor(
     spawnImpl?: SpawnImpl,
     eventsFile?: EventsFile | null,
-    redactStdout?: (s: string) => string,
+    stdoutWindowBytes: number = PHASE_B_STDOUT_WINDOW_BYTES,
   ) {
     this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
     this._eventsFile = eventsFile ?? null;
-    this._redactStdout = redactStdout;
+    this._stdoutWindowBytes = stdoutWindowBytes;
   }
 
   getExitCode(): number {
@@ -1572,7 +1583,9 @@ export class LinuxStraceRunner implements StraceRunner {
   }
 
   getStdoutTail(): string {
-    return this._stdoutTailGetter();
+    return this._stdoutCapturePath === null
+      ? ''
+      : readFileTail(this._stdoutCapturePath, this._stdoutWindowBytes);
   }
 
   async *run(
@@ -1689,27 +1702,31 @@ export class LinuxStraceRunner implements StraceRunner {
       ...commandArgs,
     ];
 
+    // Capture the install command's stdout into a FILE (not a pipe) so a
+    // tracing-escaped descendant holding fd1 cannot stall the child `close`
+    // event (Codex round-3 [medium] #1).  Best-effort: if the open fails,
+    // fd1 falls back to 'ignore' and the diagnostic is simply empty.  strace
+    // writes its traces to `-o` files and diagnostics to fd2, so the capture
+    // file carries the traced install command's stdout only.
+    const stdoutCapture = openPhaseBStdoutCapture(dirname(opts.basePath));
+    this._stdoutCapturePath = stdoutCapture?.path ?? null;
+
     const child = this._spawnImpl('strace', straceArgs, {
       cwd: opts.cwd,
       env: opts.env,
       // fd 0: stdin  → /dev/null
-      // fd 1: stdout → pipe  (the install command inherits strace's fd1; yarn
-      //                Berry writes its errors here — drained into a bounded
-      //                tail for the Phase-B fail-closed diagnostic)
+      // fd 1: stdout → capture FILE (install stdout) or 'ignore' if unavailable
       // fd 2: stderr → pipe  (strace diagnostics forwarded to process.stderr)
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+      stdio: ['ignore', stdoutCapture ? stdoutCapture.fd : 'ignore', 'pipe', 'pipe'],
     });
 
-    // Drain the install command's stdout into a bounded ring buffer.  MUST be
-    // attached before `yield*` below so the stream flows from the first byte —
-    // an unread 'pipe' fd1 would fill the OS pipe buffer and deadlock a verbose
-    // (1000-package) install.  strace writes its traces to `-o` files, not
-    // stdout, so fd1 carries the traced install command's stdout only.
-    this._stdoutTailGetter = attachStdoutTailCollector(
-      child.stdio[1] as Readable | null,
-      this._redactStdout,
-    );
+    // The child inherited its own copy of the capture fd; close the parent's
+    // copy so the only writer is the install tree.  (No effect on `close`:
+    // a file fd isn't a Node stream.)
+    if (stdoutCapture) {
+      try { closeSync(stdoutCapture.fd); } catch { /* already closed / harmless */ }
+    }
 
     // Codex follow-up (bug #1, high, 2026-05-19): deterministically capture
     // the install command's pid by reading `/proc/<strace_pid>/task/<strace_
@@ -2823,13 +2840,24 @@ export async function main(input: AgentInput): Promise<void> {
   //    shim is the sole event source.
   const spawner: Spawner =
     input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
+  // Size the Phase-B stdout read window to comfortably exceed the longest
+  // protected env value, so the emit-time redactor always sees whole values
+  // (a value can't straddle the window's front when the window is wider than
+  // the value — Codex round-3 [medium] #2).  4 KiB emit cap + longest value +
+  // 4 KiB slack.
+  const maxProtectedValueLen = config.protected.env.reduce((max, name) => {
+    const v = process.env[name];
+    return typeof v === 'string' && v.length > max ? v.length : max;
+  }, 0);
+  const stdoutWindowBytes = Math.max(
+    PHASE_B_STDOUT_WINDOW_BYTES,
+    4096 + maxProtectedValueLen + 4096,
+  );
   const straceRunner: StraceRunner =
     input.strace ??
     (isMacosBare
-      ? new MacOSInstallRunner(undefined, eventsFile)
-      : new LinuxStraceRunner(undefined, eventsFile, (s) =>
-          redactSensitive(s, config.protected.env),
-        ));
+      ? new MacOSInstallRunner(undefined, eventsFile, stdoutWindowBytes)
+      : new LinuxStraceRunner(undefined, eventsFile, stdoutWindowBytes));
 
   // 7. Attribution.  Linux reads /proc; macOS has no /proc, so MacOSProcReader
   //    returns null environ (attribution flows through the shim event seed) and
@@ -3110,13 +3138,14 @@ export async function main(input: AgentInput): Promise<void> {
       // resolution/scoped-registry errors) to stdout, NOT stderr — without
       // this the host saw only the generic message and the real cause was
       // invisible (the `--offline` bug took a container repro to diagnose).
-      // Redact the FULL captured buffer BEFORE tail-capping (the redactor masks
+      // Redact the FULL captured window BEFORE tail-capping (the redactor masks
       // only COMPLETE protected values, so slicing first could start the tail
       // inside a secret and leak the suffix — same ordering as Phase A,
       // agent.ts Codex round-2 [high]).  A mask token split by the cap is
-      // harmless.  Residual: a secret split at the ring buffer's FRONT (drop)
-      // boundary cannot be masked — accepted (Phase B is offline, so install
-      // stdout rarely carries credentials; see PHASE_B_STDOUT_TAIL_BYTES).
+      // harmless.  The capture window (getStdoutTail → readFileTail) is sized by
+      // main() to exceed the longest protected value, so any protected value in
+      // the window is present WHOLE and the redactor can mask it — no front-drop
+      // residual (Codex round-3 [medium] #2).
       const stdoutRedacted = redactSensitive(
         installResult.installStdoutTail,
         config.protected.env,
