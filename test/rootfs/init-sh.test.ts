@@ -40,9 +40,14 @@ describe('init.sh — CAP_SYS_ADMIN drop before repo-controlled code', () => {
     // The mountpoint-trust premise (/sjtmp cannot be umounted / bind-mounted
     // over by repo code) is only TRUE if no descendant can call mount(2). The
     // bounding-set drop is what enforces that for the whole uid-0 process tree.
+    // setpriv names caps WITHOUT the `cap_` prefix — `-sys_admin`, not
+    // `-cap_sys_admin` (which errors "unknown capability" and, being
+    // fail-closed, would abort every boot). Verified against ubuntu:24.04.
     expect(INIT_SH).toMatch(
-      /exec setpriv --bounding-set=-cap_sys_admin dumb-init \/sbin\/orchestrate/,
+      /exec setpriv --bounding-set=-sys_admin dumb-init \/sbin\/orchestrate/,
     );
+    // Guard against the prefixed spelling that util-linux rejects.
+    expect(INIT_SH).not.toMatch(/--bounding-set=-cap_sys_admin/);
   });
 
   it('fail-closes when setpriv is missing (never hands off without the drop)', () => {
@@ -60,7 +65,7 @@ describe('init.sh — CAP_SYS_ADMIN drop before repo-controlled code', () => {
     // sjtmp mount.
     const sjtmpMountIdx = INIT_SH.indexOf('mount "${SJTMP_DEV}" /sjtmp');
     const dropIdx = INIT_SH.indexOf(
-      'exec setpriv --bounding-set=-cap_sys_admin',
+      'exec setpriv --bounding-set=-sys_admin',
     );
     expect(sjtmpMountIdx).toBeGreaterThan(-1);
     expect(dropIdx).toBeGreaterThan(-1);

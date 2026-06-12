@@ -379,4 +379,9 @@ fi
 # for the startup ordering — start agent first, wait until its TCP listener
 # is bound, THEN start socat, so the AF_VSOCK port doesn't accept a host
 # connection before the agent's TCP target exists (see Task #14).
-exec setpriv --bounding-set=-cap_sys_admin dumb-init /sbin/orchestrate
+# NB: setpriv (util-linux/libcap-ng) names capabilities WITHOUT the `cap_`
+# prefix — `-sys_admin`, not `-cap_sys_admin` (that errors "unknown capability"
+# and, being fail-closed, would abort every boot).  Verified against
+# ubuntu:24.04: `-sys_admin` clears exactly CapBnd bit 21 and makes
+# mount(2)/umount(2) return EPERM.
+exec setpriv --bounding-set=-sys_admin dumb-init /sbin/orchestrate
