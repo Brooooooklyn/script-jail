@@ -1447,12 +1447,7 @@ export function readStraceChildPid(
 
 /**
  * Cap for the Phase-B install-stdout ring buffer kept by the install runners.
- * Chosen well above any plausible single diagnostic line / credential token so
- * a secret is overwhelmingly present whole when the agent redacts the tail; the
- * one residual is a secret split at the FRONT (drop) boundary of the ring,
- * which the agent's redactor cannot mask (it matches only complete values).
- * Phase B runs OFFLINE (no auth fetch), so secrets reaching install stdout are
- * already unlikely — this is defence-in-depth, not the primary protection.
+ * Chosen well above any plausible single diagnostic line / credential token.
  */
 const PHASE_B_STDOUT_TAIL_BYTES = 16384;
 
@@ -1461,17 +1456,31 @@ const PHASE_B_STDOUT_TAIL_BYTES = 16384;
  * 'data' listener keeps the stream flowing (so a verbose install cannot fill
  * the OS pipe buffer and deadlock the child), retaining only the last
  * {@link PHASE_B_STDOUT_TAIL_BYTES} bytes.  Returns a getter for the current
- * tail; no-op (returns `() => ''`) when the stream is absent (test stubs that
- * don't pipe fd1).
+ * tail; a no-op (`() => ''`) when the stream is absent (test stubs that don't
+ * pipe fd1).
+ *
+ * SECRET SAFETY: a `redact` function MUST be supplied in production.  The ring
+ * buffer drops its FRONT once it exceeds the cap; a protected value straddling
+ * that drop boundary would lose its prefix, and the agent's redactor matches
+ * only COMPLETE values — so the retained suffix could leak (Codex round-2
+ * [medium]).  We therefore redact the WHOLE buffer BEFORE every front-drop:
+ * any complete value/credential-shape present at that moment is masked to a
+ * fixed token, and the subsequent slice can only cut an already-masked token
+ * (harmless).  A value is received contiguously and accumulates at the END of
+ * the buffer, so it is never truncated mid-arrival before it is whole.  The
+ * fail-closed emit path redacts again (idempotent) and caps to a short tail.
  */
 export function attachStdoutTailCollector(
   stream: Readable | null | undefined,
+  redact?: (s: string) => string,
 ): () => string {
   if (!stream) return () => '';
   let tail = '';
   stream.on('data', (chunk: Buffer | string) => {
-    tail = (tail + chunk.toString('utf8'));
+    tail = tail + chunk.toString('utf8');
     if (tail.length > PHASE_B_STDOUT_TAIL_BYTES) {
+      // Mask complete secrets BEFORE dropping the front (see SECRET SAFETY).
+      if (redact) tail = redact(tail);
       tail = tail.slice(-PHASE_B_STDOUT_TAIL_BYTES);
     }
   });
@@ -1515,9 +1524,19 @@ export class LinuxStraceRunner implements StraceRunner {
    *                   pre-set environment via the `opts.env` passed to
    *                   `run()`.
    */
-  constructor(spawnImpl?: SpawnImpl, eventsFile?: EventsFile | null) {
+  // Redactor applied to the stdout ring buffer before each front-drop and
+  // again at emit time.  Injected from main() (where config.protected.env is
+  // known).  Undefined for test fakes / callers that don't capture stdout.
+  private readonly _redactStdout: ((s: string) => string) | undefined;
+
+  constructor(
+    spawnImpl?: SpawnImpl,
+    eventsFile?: EventsFile | null,
+    redactStdout?: (s: string) => string,
+  ) {
     this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
     this._eventsFile = eventsFile ?? null;
+    this._redactStdout = redactStdout;
   }
 
   getExitCode(): number {
@@ -1689,6 +1708,7 @@ export class LinuxStraceRunner implements StraceRunner {
     // stdout, so fd1 carries the traced install command's stdout only.
     this._stdoutTailGetter = attachStdoutTailCollector(
       child.stdio[1] as Readable | null,
+      this._redactStdout,
     );
 
     // Codex follow-up (bug #1, high, 2026-05-19): deterministically capture
@@ -2807,7 +2827,9 @@ export async function main(input: AgentInput): Promise<void> {
     input.strace ??
     (isMacosBare
       ? new MacOSInstallRunner(undefined, eventsFile)
-      : new LinuxStraceRunner(undefined, eventsFile));
+      : new LinuxStraceRunner(undefined, eventsFile, (s) =>
+          redactSensitive(s, config.protected.env),
+        ));
 
   // 7. Attribution.  Linux reads /proc; macOS has no /proc, so MacOSProcReader
   //    returns null environ (attribution flows through the shim event seed) and

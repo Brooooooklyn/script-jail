@@ -28548,6 +28548,14 @@ var MacOSInstallRunner = class {
   getRootPid() {
     return null;
   }
+  // macOS-bare spawns the install DIRECTLY (no strace tree-wait), and Phase B
+  // completion is gated on the child's `close` event.  Piping fd1 would tie
+  // that close to stdout EOF, so any lifecycle descendant that inherits fd1 and
+  // outlives the install root could stall the (observe-only) audit until an
+  // outer timeout.  We therefore leave fd1 = 'ignore' here and DO NOT capture a
+  // stdout tail on macOS — getStdoutTail() returns '' (the default getter).
+  // The Phase-B stdout diagnostic is a Linux-path feature, where strace already
+  // waits for the whole traced tree so the pipe EOF coincides with strace exit.
   getStdoutTail() {
     return this._stdoutTailGetter();
   }
@@ -28555,11 +28563,8 @@ var MacOSInstallRunner = class {
     const child = this._spawnImpl(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ["ignore", "pipe", "pipe", "pipe"]
+      stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
-    this._stdoutTailGetter = attachStdoutTailCollector(
-      child.stdio[1]
-    );
     const exitPromise = new Promise((resolve2) => {
       child.on("close", (code) => {
         this._exitCode = code ?? 1;
@@ -29668,12 +29673,13 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
   return null;
 }
 var PHASE_B_STDOUT_TAIL_BYTES = 16384;
-function attachStdoutTailCollector(stream) {
+function attachStdoutTailCollector(stream, redact) {
   if (!stream) return () => "";
   let tail = "";
   stream.on("data", (chunk) => {
     tail = tail + chunk.toString("utf8");
     if (tail.length > PHASE_B_STDOUT_TAIL_BYTES) {
+      if (redact) tail = redact(tail);
       tail = tail.slice(-PHASE_B_STDOUT_TAIL_BYTES);
     }
   });
@@ -29714,9 +29720,14 @@ var LinuxStraceRunner = class {
    *                   pre-set environment via the `opts.env` passed to
    *                   `run()`.
    */
-  constructor(spawnImpl, eventsFile) {
+  // Redactor applied to the stdout ring buffer before each front-drop and
+  // again at emit time.  Injected from main() (where config.protected.env is
+  // known).  Undefined for test fakes / callers that don't capture stdout.
+  _redactStdout;
+  constructor(spawnImpl, eventsFile, redactStdout) {
     this._spawnImpl = spawnImpl ?? import_node_child_process3.spawn;
     this._eventsFile = eventsFile ?? null;
+    this._redactStdout = redactStdout;
   }
   getExitCode() {
     return this._exitCode;
@@ -29773,7 +29784,8 @@ var LinuxStraceRunner = class {
       stdio: ["ignore", "pipe", "pipe", "pipe"]
     });
     this._stdoutTailGetter = attachStdoutTailCollector(
-      child.stdio[1]
+      child.stdio[1],
+      this._redactStdout
     );
     let rootPidDeterministicResolution = false;
     if (child.pid !== void 0) {
@@ -30185,7 +30197,11 @@ async function main(input) {
   }
   const installEnv = isMacosBare ? { ...childEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : childEnv;
   const spawner = input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
-  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(void 0, eventsFile));
+  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(
+    void 0,
+    eventsFile,
+    (s) => redactSensitive(s, config2.protected.env)
+  ));
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader()
   );

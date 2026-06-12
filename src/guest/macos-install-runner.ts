@@ -38,7 +38,6 @@ import { createInterface } from 'node:readline';
 import type { Readable } from 'node:stream';
 
 import {
-  attachStdoutTailCollector,
   runStraceTailer,
   type EventsFile,
   type SpawnImpl,
@@ -107,6 +106,14 @@ export class MacOSInstallRunner implements StraceRunner {
     return null;
   }
 
+  // macOS-bare spawns the install DIRECTLY (no strace tree-wait), and Phase B
+  // completion is gated on the child's `close` event.  Piping fd1 would tie
+  // that close to stdout EOF, so any lifecycle descendant that inherits fd1 and
+  // outlives the install root could stall the (observe-only) audit until an
+  // outer timeout.  We therefore leave fd1 = 'ignore' here and DO NOT capture a
+  // stdout tail on macOS — getStdoutTail() returns '' (the default getter).
+  // The Phase-B stdout diagnostic is a Linux-path feature, where strace already
+  // waits for the whole traced tree so the pipe EOF coincides with strace exit.
   getStdoutTail(): string {
     return this._stdoutTailGetter();
   }
@@ -122,9 +129,9 @@ export class MacOSInstallRunner implements StraceRunner {
     //
     // stdio:
     //   fd 0: stdin  → ignored
-    //   fd 1: stdout → pipe (the install command's stdout; yarn Berry writes
-    //                  its errors here — drained into a bounded tail for the
-    //                  Phase-B fail-closed diagnostic)
+    //   fd 1: stdout → ignored (see getStdoutTail() above: piping it here would
+    //                  tie Phase-B completion to stdout EOF on the direct-spawn
+    //                  path and risk a stall on a descendant that inherits fd1)
     //   fd 2: stderr → pipe (forwarded to process.stderr with a [macos] prefix)
     //   fd 3: pipe   → JSON channel for JS preloads that still write to fd 3
     //                  (env-spy's primary sink is the events file, but the
@@ -132,15 +139,8 @@ export class MacOSInstallRunner implements StraceRunner {
     const child = this._spawnImpl(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+      stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
     });
-
-    // Drain the install command's stdout into a bounded ring buffer.  Attached
-    // before `yield*` so the stream flows immediately — an unread 'pipe' fd1
-    // would fill the OS pipe buffer and deadlock a verbose install.
-    this._stdoutTailGetter = attachStdoutTailCollector(
-      child.stdio[1] as Readable | null,
-    );
 
     const exitPromise = new Promise<void>((resolve) => {
       child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });

@@ -10,7 +10,7 @@ import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer } from '../../src/guest/agent.js';
+import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, redactSensitive } from '../../src/guest/agent.js';
 import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
 import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
@@ -3804,5 +3804,53 @@ describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)
     // and this would be null.
     expect(runner.getTamperReason()).not.toBeNull();
     expect(runner.getTamperReason()).toMatch(/ctime advanced|without new bytes/);
+  });
+});
+
+describe('attachStdoutTailCollector (Phase B stdout tail)', () => {
+  // Build a stream where a protected value straddles the 16 KiB ring
+  // drop-boundary: its prefix sits before the boundary, its suffix inside the
+  // retained tail.  Without redact-before-truncate the suffix survives.
+  const SECRET = 'supersecretvalue1234';
+  const SUFFIX = SECRET.slice(-9); // 'value1234'
+  function feed(stream: PassThrough): void {
+    stream.write('p'.repeat(5000)); // prefix filler → secret lands ~offset 5000
+    stream.write(SECRET);
+    stream.write('q'.repeat(16374)); // pushes total past the cap, dropping the front
+    stream.end();
+  }
+
+  it('drains the stream and retains only a bounded tail', async () => {
+    const s = new PassThrough();
+    const get = attachStdoutTailCollector(s);
+    s.write('A'.repeat(20000));
+    s.write('TAIL_MARKER');
+    s.end();
+    await new Promise((r) => s.on('end', r));
+    const out = get();
+    expect(out.length).toBeLessThanOrEqual(16384);
+    expect(out).toContain('TAIL_MARKER');
+  });
+
+  it('WITHOUT a redactor, a boundary-straddling secret suffix leaks (shows the hazard)', async () => {
+    const s = new PassThrough();
+    const get = attachStdoutTailCollector(s); // no redact
+    feed(s);
+    await new Promise((r) => s.on('end', r));
+    // The prefix was dropped but the suffix landed inside the retained tail.
+    expect(get()).toContain(SUFFIX);
+  });
+
+  it('WITH a redactor, the secret is masked before the front-drop (round-2 [medium])', async () => {
+    const redact = (text: string) =>
+      redactSensitive(text, ['MY_TOKEN'], { MY_TOKEN: SECRET });
+    const s = new PassThrough();
+    const get = attachStdoutTailCollector(s, redact);
+    feed(s);
+    await new Promise((r) => s.on('end', r));
+    const out = get();
+    // Neither the full value nor its boundary suffix survives.
+    expect(out).not.toContain(SECRET);
+    expect(out).not.toContain(SUFFIX);
   });
 });
