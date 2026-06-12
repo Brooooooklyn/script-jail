@@ -29674,17 +29674,34 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
 var PHASE_B_STDOUT_TAIL_BYTES = 16384;
 function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAIL_BYTES) {
   if (!stream) return () => "";
+  const truncMarker = `
+<script-jail: stdout line over ${capBytes}B suppressed>
+`;
   let redactedTail = "";
   let pending = "";
+  let suppressing = false;
+  const capTail = (s) => {
+    const buf = Buffer.from(s, "utf8");
+    if (buf.length <= capBytes) return s;
+    let start = buf.length - capBytes;
+    while (start < buf.length && (buf[start] & 192) === 128) start++;
+    return buf.subarray(start).toString("utf8");
+  };
   const appendRedacted = (s) => {
-    redactedTail += s;
-    if (Buffer.byteLength(redactedTail, "utf8") > capBytes) {
-      const buf = Buffer.from(redactedTail, "utf8");
-      redactedTail = buf.subarray(buf.length - capBytes).toString("utf8");
-    }
+    redactedTail = capTail(redactedTail + s);
   };
   stream.on("data", (chunk) => {
     pending += chunk.toString("utf8");
+    if (suppressing) {
+      const nl2 = pending.indexOf("\n");
+      if (nl2 === -1) {
+        pending = "";
+        return;
+      }
+      appendRedacted(truncMarker);
+      suppressing = false;
+      pending = pending.slice(nl2 + 1);
+    }
     const nl = pending.lastIndexOf("\n");
     if (nl >= 0) {
       const complete = pending.slice(0, nl + 1);
@@ -29692,20 +29709,15 @@ function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAI
       appendRedacted(redact ? redact(complete) : complete);
     }
     if (Buffer.byteLength(pending, "utf8") > capBytes) {
-      appendRedacted(redact ? redact(pending) : pending);
       pending = "";
+      suppressing = true;
     }
   });
   stream.on("error", () => {
   });
   return () => {
-    const finalPending = pending ? redact ? redact(pending) : pending : "";
-    let out = redactedTail + finalPending;
-    if (Buffer.byteLength(out, "utf8") > capBytes) {
-      const buf = Buffer.from(out, "utf8");
-      out = buf.subarray(buf.length - capBytes).toString("utf8");
-    }
-    return out;
+    const finalPending = suppressing ? truncMarker : pending ? redact ? redact(pending) : pending : "";
+    return capTail(redactedTail + finalPending);
   };
 }
 var LinuxStraceRunner = class {

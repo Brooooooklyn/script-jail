@@ -3833,16 +3833,17 @@ describe('Phase B stdout capture (in-memory tail)', () => {
     expect(await feed(['hello ', 'world'], undefined, 16384)).toBe('hello world');
   });
 
-  it('retains only the last cap BYTES once exceeded', async () => {
-    const tail = await feed(['A'.repeat(1000), 'TAILMARK'], undefined, 8);
+  it('retains only the last cap BYTES of a COMPLETE line once exceeded', async () => {
+    // A terminated line is byte-capped by dropping its (already-safe) front.
+    const tail = await feed(['A'.repeat(1000) + 'ENDMARK\n'], undefined, 8);
     expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(8);
-    expect(tail).toBe('TAILMARK');
+    expect(tail).toContain('ENDMARK');
   });
 
-  it('caps in BYTES, not UTF-16 code units, for multibyte output (round-4)', async () => {
+  it('caps in BYTES, not UTF-16 code units, for multibyte complete lines (round-4)', async () => {
     // '€' is 3 UTF-8 bytes but 1 JS code unit.  A cap of 9 bytes must keep at
     // most 3 euro signs, regardless of .length.
-    const tail = await feed(['€'.repeat(100)], undefined, 9);
+    const tail = await feed(['€'.repeat(100) + '\n'], undefined, 9);
     expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(9);
   });
 
@@ -3895,6 +3896,59 @@ describe('Phase B stdout capture (in-memory tail)', () => {
       expect(tail).toContain('<REDACTED');
     });
   }
+
+  // Codex round-6 [high]: when the UNTERMINATED line itself exceeds the cap
+  // before any newline, we must NOT redact it (that re-introduces the round-5
+  // partial-match leak).  It is suppressed entirely and replaced by a marker.
+  it('suppresses (does not leak) an over-cap unterminated line split between prefix and suffix (round-6)', async () => {
+    const redact = (s: string) => redactSensitive(s, []);
+    const cap = 4096;
+    const tail = await feed(
+      [
+        'Authorization: Bearer TOKENPREFIX', // partial token, NO newline
+        'X'.repeat(cap + 100),                // pushes pending past cap → suppress
+        'TOKENSUFFIXZZ\n',                    // suffix + delimiter ends the line
+      ],
+      redact,
+      cap,
+    );
+    expect(tail).not.toContain('TOKENSUFFIXZZ'); // suffix never leaks
+    expect(tail).not.toContain('TOKENPREFIX');   // whole logical line suppressed
+    expect(tail).toContain('suppressed');        // truncation marker present
+  });
+
+  it('suppresses lone-\\r (CR-only) progress output carrying a split credential (round-6)', async () => {
+    const redact = (s: string) => redactSensitive(s, []);
+    const cap = 2048;
+    const tail = await feed(
+      [
+        'progress 0%\rprogress 50%\rAuthorization: Bearer CRSPLITPREFIX', // no \n — one logical line
+        'Y'.repeat(cap + 100),  // overflow before any \n → suppress
+        'CRSPLITSUFFIXZZ\n',
+      ],
+      redact,
+      cap,
+    );
+    expect(tail).not.toContain('CRSPLITSUFFIXZZ');
+    expect(tail).not.toContain('CRSPLITPREFIX');
+    expect(tail).toContain('suppressed');
+  });
+
+  it('resumes capturing complete lines after an over-cap line is suppressed', async () => {
+    const cap = 1024;
+    const tail = await feed(
+      [
+        'Z'.repeat(cap + 50), // over-cap unterminated → suppress
+        ' tail-of-huge-line\n', // ends the suppressed line
+        'NORMAL DIAGNOSTIC LINE\n', // must be captured after suppression ends
+      ],
+      undefined,
+      cap,
+    );
+    expect(tail).toContain('NORMAL DIAGNOSTIC LINE');
+    expect(tail).toContain('suppressed');
+    expect(tail).not.toContain('tail-of-huge-line'); // belonged to the suppressed line
+  });
 
   it('exposes a sane default byte cap', () => {
     expect(PHASE_B_STDOUT_TAIL_BYTES).toBeGreaterThanOrEqual(16384);
