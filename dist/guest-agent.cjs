@@ -29674,20 +29674,39 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
 var PHASE_B_STDOUT_TAIL_BYTES = 16384;
 function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAIL_BYTES) {
   if (!stream) return () => "";
-  let tail = "";
+  let redactedTail = "";
+  let pending = "";
+  const appendRedacted = (s) => {
+    redactedTail += s;
+    if (Buffer.byteLength(redactedTail, "utf8") > capBytes) {
+      const buf = Buffer.from(redactedTail, "utf8");
+      redactedTail = buf.subarray(buf.length - capBytes).toString("utf8");
+    }
+  };
   stream.on("data", (chunk) => {
-    tail = tail + chunk.toString("utf8");
-    if (Buffer.byteLength(tail, "utf8") > capBytes) {
-      if (redact) tail = redact(tail);
-      const buf = Buffer.from(tail, "utf8");
-      if (buf.length > capBytes) {
-        tail = buf.subarray(buf.length - capBytes).toString("utf8");
-      }
+    pending += chunk.toString("utf8");
+    const nl = pending.lastIndexOf("\n");
+    if (nl >= 0) {
+      const complete = pending.slice(0, nl + 1);
+      pending = pending.slice(nl + 1);
+      appendRedacted(redact ? redact(complete) : complete);
+    }
+    if (Buffer.byteLength(pending, "utf8") > capBytes) {
+      appendRedacted(redact ? redact(pending) : pending);
+      pending = "";
     }
   });
   stream.on("error", () => {
   });
-  return () => tail;
+  return () => {
+    const finalPending = pending ? redact ? redact(pending) : pending : "";
+    let out = redactedTail + finalPending;
+    if (Buffer.byteLength(out, "utf8") > capBytes) {
+      const buf = Buffer.from(out, "utf8");
+      out = buf.subarray(buf.length - capBytes).toString("utf8");
+    }
+    return out;
+  };
 }
 var LinuxStraceRunner = class {
   _exitCode = 0;

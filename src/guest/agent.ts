@@ -1475,19 +1475,34 @@ export const PHASE_B_STDOUT_TAIL_BYTES = 16384;
  * gated `close`.  A drained fd1 joins that pre-existing set; it degrades a
  * lingering-child case to the outer timeout (fail-closed), never a bypass.
  *
- * SECRET SAFETY: a `redact` function MUST be supplied in production.  The ring
- * drops its FRONT once it exceeds the cap; the agent's redactor matches only
- * COMPLETE values, so a value straddling that drop boundary would lose its
- * prefix and the surviving suffix could leak.  We therefore redact the WHOLE
- * buffer BEFORE every front-drop: any complete value/credential-shape present
- * is masked to a fixed token, and the subsequent byte-slice can only cut an
- * already-masked token (harmless).  A value arrives contiguously and
- * accumulates at the END of the buffer, so when the cap (BYTES) exceeds the
- * value's UTF-8 byte length it is whole — hence masked — before any drop can
- * reach it.  `main()` sizes the cap from the longest protected value's
- * `Buffer.byteLength`.  Residual: a layer-2 credential SHAPE longer than the
- * cap (≥16 KiB on one unbroken line) has no known length to size against and
- * could be split — accepted (Phase B is offline; such a token is implausible).
+ * SECRET SAFETY — LINE-BUFFERED redaction (Codex round-5 [medium]).  A naive
+ * "redact the whole live buffer on every front-drop" leaks credential SHAPES
+ * split across pipe chunks: `redactSensitive`'s shape regexes (e.g. `Bearer
+ * <8+ chars>`) match a PARTIAL token at the live end of the stream, masking the
+ * prefix; the next chunk appends the rest of the token now detached from its
+ * `Bearer ` prefix, so the final redaction can no longer match it and the
+ * suffix leaks.  The fix is to never finalize a match until a DELIMITER (a
+ * newline — install stdout is line-oriented and credentials live on a single
+ * line) has arrived:
+ *
+ *   - `pending` holds the raw bytes AFTER the last newline (an unterminated
+ *     line).  It is never redacted at the live end, so a half-arrived token is
+ *     never prematurely matched.
+ *   - When a newline arrives, the now-COMPLETE line(s) are redacted ATOMICALLY
+ *     (the whole token is present) and appended to `redactedTail`.
+ *   - `redactedTail` is byte-capped by dropping its FRONT; it holds only
+ *     already-redacted bytes, so a byte-slice can cut only an already-masked
+ *     token (harmless).  The 'data' listener keeps the pipe flowing (no
+ *     deadlock) and only complete lines are ever re-redacted (no quadratic
+ *     blow-up over the growing buffer).
+ *   - The getter finalizes `pending` (redacts the trailing partial line) and
+ *     byte-caps the combined result — idempotent, safe to call repeatedly.
+ *
+ * Residual: a credential inside a SINGLE unbroken line longer than `capBytes`
+ * (≥16 KiB) forces a mid-line flush and could split — accepted (Phase B is
+ * offline; a >16 KiB single-line token in install stdout is implausible).  A
+ * protected VALUE containing an embedded newline is likewise matched per-line —
+ * also accepted (env values rarely contain newlines).
  */
 export function attachStdoutTailCollector(
   stream: Readable | null | undefined,
@@ -1495,25 +1510,52 @@ export function attachStdoutTailCollector(
   capBytes: number = PHASE_B_STDOUT_TAIL_BYTES,
 ): () => string {
   if (!stream) return () => '';
-  let tail = '';
+  let redactedTail = ''; // redacted, byte-capped, COMPLETE lines
+  let pending = ''; // raw bytes after the last newline (not yet finalized)
+
+  // Append already-redacted text and byte-cap the retained tail by dropping its
+  // FRONT.  A multibyte char split at the new front decodes to U+FFFD, harmless
+  // because that region is already redacted / stale output.
+  const appendRedacted = (s: string): void => {
+    redactedTail += s;
+    if (Buffer.byteLength(redactedTail, 'utf8') > capBytes) {
+      const buf = Buffer.from(redactedTail, 'utf8');
+      redactedTail = buf.subarray(buf.length - capBytes).toString('utf8');
+    }
+  };
+
   stream.on('data', (chunk: Buffer | string) => {
-    tail = tail + chunk.toString('utf8');
-    if (Buffer.byteLength(tail, 'utf8') > capBytes) {
-      // Mask complete secrets BEFORE dropping the front (see SECRET SAFETY).
-      if (redact) tail = redact(tail);
-      // Byte-exact front-drop: keep the last `capBytes` UTF-8 bytes.  A
-      // multibyte char split at the new front decodes to a replacement char,
-      // which is harmless — that region is already redacted / stale output.
-      const buf = Buffer.from(tail, 'utf8');
-      if (buf.length > capBytes) {
-        tail = buf.subarray(buf.length - capBytes).toString('utf8');
-      }
+    pending += chunk.toString('utf8');
+    const nl = pending.lastIndexOf('\n');
+    if (nl >= 0) {
+      // Everything up to and including the last newline is complete line(s):
+      // redact atomically (the whole token is present) and retain.
+      const complete = pending.slice(0, nl + 1);
+      pending = pending.slice(nl + 1);
+      appendRedacted(redact ? redact(complete) : complete);
+    }
+    // Bound the unterminated trailing line so a no-newline flood can't grow
+    // memory without limit.  Flushing mid-line is the only split residual.
+    if (Buffer.byteLength(pending, 'utf8') > capBytes) {
+      appendRedacted(redact ? redact(pending) : pending);
+      pending = '';
     }
   });
   // Swallow late errors on the captured stream (e.g. EPIPE on teardown) so an
   // stdout-side hiccup never crashes the agent; the tail we have is best-effort.
   stream.on('error', () => { /* best-effort capture */ });
-  return () => tail;
+
+  return () => {
+    // Finalize the trailing partial line (newline never arrived) and byte-cap
+    // the combined result.  Non-mutating, so repeated calls are stable.
+    const finalPending = pending ? (redact ? redact(pending) : pending) : '';
+    let out = redactedTail + finalPending;
+    if (Buffer.byteLength(out, 'utf8') > capBytes) {
+      const buf = Buffer.from(out, 'utf8');
+      out = buf.subarray(buf.length - capBytes).toString('utf8');
+    }
+    return out;
+  };
 }
 
 export class LinuxStraceRunner implements StraceRunner {

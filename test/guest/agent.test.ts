@@ -3854,20 +3854,47 @@ describe('Phase B stdout capture (in-memory tail)', () => {
   });
 
   it('redacts a complete protected value BEFORE any front-drop reaches it', async () => {
-    // The value arrives whole and accumulates at the END; with a cap wider than
-    // the value (in bytes) the redactor masks it at drop time, so the surviving
-    // tail never leaks it even as later output pushes the front out (round-3
-    // [medium] #2 / round-4 byte-vs-char closure).
+    // The value arrives on a complete line and is masked atomically; the
+    // surviving tail never leaks it even as later output pushes the front out.
     const SECRET = 'supersecretvalue1234';
     const redact = (s: string) => redactSensitive(s, ['MY_TOKEN'], { MY_TOKEN: SECRET });
     const cap = 4096 + Buffer.byteLength(SECRET, 'utf8') + 4096;
     const tail = await feed(
-      ['lead ', SECRET, ' ', 'q'.repeat(50000)],
+      ['lead ', SECRET, '\n', 'q\n'.repeat(25000)],
       redact,
       cap,
     );
     expect(tail).not.toContain(SECRET);
   });
+
+  // Codex round-5 [medium]: a credential SHAPE split across pipe chunks must not
+  // leak its suffix.  This is the whole point of line-buffering — a partial
+  // token at the live end is NOT finalized (redacted) until its newline arrives,
+  // so the prefix can't be masked-and-detached from the suffix.  Each case ends
+  // in a unique leak-marker that must NOT survive; we force a front-drop (filler
+  // past the cap) BETWEEN the prefix chunk and the suffix chunk.
+  const shapeCases: Array<{ name: string; cred: string; leak: string }> = [
+    { name: 'Bearer token', cred: 'Authorization: Bearer TOKENPREFIX0123456789TOKENSUFFIXZZ', leak: 'TOKENSUFFIXZZ' },
+    { name: 'npm_ token', cred: '//registry.npmjs.org/:_authToken=npm_' + 'A'.repeat(30) + 'NPMSUFFIXZZ', leak: 'NPMSUFFIXZZ' },
+    { name: 'scheme creds', cred: 'proxy=https://user:PASSWORDSUFFIXZZ@proxy.internal:8080', leak: 'PASSWORDSUFFIXZZ' },
+  ];
+  for (const { name, cred, leak } of shapeCases) {
+    it(`does not leak a ${name} split across chunks with a front-drop between (round-5)`, async () => {
+      const redact = (s: string) => redactSensitive(s, []); // shape-only (layer 2)
+      const half = Math.floor(cred.length / 2);
+      const tail = await feed(
+        [
+          'noise line\n'.repeat(2000), // push the tail past the default cap
+          cred.slice(0, half),          // chunk ends MID-token, no newline
+          cred.slice(half) + '\n',      // remainder + delimiter → finalize now
+        ],
+        redact,
+        PHASE_B_STDOUT_TAIL_BYTES,
+      );
+      expect(tail).not.toContain(leak);
+      expect(tail).toContain('<REDACTED');
+    });
+  }
 
   it('exposes a sane default byte cap', () => {
     expect(PHASE_B_STDOUT_TAIL_BYTES).toBeGreaterThanOrEqual(16384);
