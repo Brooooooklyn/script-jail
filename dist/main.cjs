@@ -27144,6 +27144,12 @@ async function buildOverlayInto(workDir, input) {
     sizeMB: SCRATCH_DISK_MB,
     outPath: scratchDiskPath
   });
+  const sjtmpDiskPath = (0, import_node_path5.join)(workDir, "sjtmp.ext4");
+  await buildExt4Disk({
+    label: SJTMP_DISK_LABEL,
+    sizeMB: SJTMP_DISK_MB,
+    outPath: sjtmpDiskPath
+  });
   const cleanup = async () => {
     try {
       await (0, import_promises3.rm)(workDir, { recursive: true, force: true });
@@ -27151,7 +27157,7 @@ async function buildOverlayInto(workDir, input) {
       console.warn(`[overlay] cleanup warning: ${String(err)}`);
     }
   };
-  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, sjtmpDiskPath, workDir, cleanup };
 }
 function writeOverlayFile(root, relPath, content) {
   const parts = relPath.split("/").filter((part) => part.length > 0);
@@ -27238,6 +27244,8 @@ function resolveMkfsExt4() {
 var REPO_DISK_MIN_MB = 4096;
 var SCRATCH_DISK_LABEL = "scratch";
 var SCRATCH_DISK_MB = 4096;
+var SJTMP_DISK_LABEL = "sjtmp";
+var SJTMP_DISK_MB = 4096;
 function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
@@ -27272,6 +27280,7 @@ async function launchVm(input) {
     rootfsPath,
     repoDiskPath,
     scratchDiskPath,
+    sjtmpDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -27330,6 +27339,12 @@ async function launchVm(input) {
     await apiClient.put("/drives/scratch", {
       drive_id: "scratch",
       path_on_host: scratchDiskPath,
+      is_root_device: false,
+      is_read_only: false
+    });
+    await apiClient.put("/drives/sjtmp", {
+      drive_id: "sjtmp",
+      path_on_host: sjtmpDiskPath,
       is_root_device: false,
       is_read_only: false
     });
@@ -43527,6 +43542,9 @@ async function launchFirecracker(input) {
       // (mounted by label at /scratch) instead of the guest's 64 MB /tmp
       // tmpfs, which large installs overflow (ENOSPC).
       scratchDiskPath: input.overlay.scratchDiskPath,
+      // Dedicated tmp disk: TMPDIR=/sjtmp (mounted by label), off /work and
+      // the audit /scratch; mountpoint can't be symlink-redirected by repo code.
+      sjtmpDiskPath: input.overlay.sjtmpDiskPath,
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,

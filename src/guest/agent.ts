@@ -12,7 +12,7 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, lstatSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
@@ -2644,53 +2644,6 @@ export function redactSensitive(
   return out;
 }
 
-/**
- * Re-validate the repo-disk TMPDIR after Phase A (Codex round-3 [high],
- * 2026-06-12).  init.sh creates `/work/.sj-tmp` as a fresh real directory at
- * boot, but Phase A runs the package manager with REPO-CONTROLLED code — the
- * repo's own `yarnPath` bundle, pnpmfile, or Yarn plugins all execute during
- * `yarn install`/`pnpm install` even under `--mode=skip-build`/`--ignore-
- * scripts`.  Such code can `rm -rf /work/.sj-tmp` and recreate it as a symlink
- * to `/scratch` (→ starve the audit-artifact disk) or to `/work/node_modules`
- * (→ make repo/node_modules mutations spelled `/work/.sj-tmp/...` tokenize as
- * the benign `$TMPDIR`, hiding them from the audit).  The boot-time guard
- * cannot see that; so before Phase B (and before `fetch_done`) we re-assert
- * that TMPDIR is STILL a real, non-symlink directory whose realpath is itself.
- *
- * Returns null when safe; otherwise a reason string (caller fails closed).  No
- * recreate/recover — a TMPDIR that changed shape mid-audit is unambiguously
- * hostile (no benign tool symlinks its own tmp), so refusing the lockfile is
- * the correct response.
- *
- * @internal Exported for unit tests.
- */
-export function checkTmpdirUnderRepo(tmpDir: string, workDir: string): string | null {
-  // Only guard the VM-init repo-disk tmp scheme (`/work/.sj-tmp`).  Docker /
-  // bare-Linux set no TMPDIR (tmpdir() === '/tmp') and macOS-bare uses the
-  // host tmp — neither is under work_dir, so this is a no-op there and we never
-  // touch a system/host tmp.
-  if (!(tmpDir === `${workDir}/.sj-tmp` || tmpDir.startsWith(`${workDir}/.sj-tmp/`))) {
-    return null;
-  }
-  try {
-    const st = lstatSync(tmpDir);
-    if (st.isSymbolicLink()) {
-      return `TMPDIR ${tmpDir} is a symlink after Phase A (audit-evasion attempt)`;
-    }
-    if (!st.isDirectory()) {
-      return `TMPDIR ${tmpDir} is not a directory after Phase A`;
-    }
-    // realpath collapses any symlinked PARENT component too; if TMPDIR no
-    // longer resolves to itself, something redirected it.
-    if (realpathSync(tmpDir) !== tmpDir) {
-      return `TMPDIR ${tmpDir} resolves elsewhere after Phase A (${realpathSync(tmpDir)})`;
-    }
-  } catch (err) {
-    return `TMPDIR ${tmpDir} could not be validated after Phase A: ${String(err)}`;
-  }
-  return null;
-}
-
 export async function main(input: AgentInput): Promise<void> {
   const configPath = input.configPath ?? '/etc/script-jail/config.yml';
   diag(input, `main(): configPath=${configPath}`);
@@ -2851,19 +2804,13 @@ export async function main(input: AgentInput): Promise<void> {
     return;
   }
 
-  // Re-validate the repo-disk TMPDIR before Phase B.  Phase A ran repo-
-  // controlled code (yarnPath bundle / pnpmfile / plugins) that could have
-  // re-symlinked /work/.sj-tmp onto /scratch or node_modules to starve or hide
-  // the audit (Codex round-3 [high]).  Fail closed if it is no longer a real,
-  // self-resolving directory — no benign tool symlinks its own tmp.  No-op on
-  // docker/bare (/tmp) and macOS-bare (host tmp): neither is under work_dir.
-  const tmpdirTamper = checkTmpdirUnderRepo(tmpdir(), config.work_dir);
-  if (tmpdirTamper !== null) {
-    process.stderr.write(`[agent] ${tmpdirTamper}\n`);
-    emitter.emitError(`audit pipeline tampered with: ${tmpdirTamper}`, true);
-    flushAndExit(input.connection.writable, 1);
-    return;
-  }
+  // NOTE: no post-Phase-A TMPDIR re-validation needed.  On the VM backends
+  // TMPDIR is /sjtmp — a DEDICATED disk mounted at boot (init.sh), not a path
+  // under the repo disk.  A mountpoint cannot be symlink-swapped by Phase-A
+  // repo code (that would require `umount`, which no lifecycle child can do),
+  // and /sjtmp carries no committed repo content to subvert.  This structural
+  // property replaces the three rounds of point-in-time guards the old
+  // /work/.sj-tmp scheme needed (Codex rounds 1-4, 2026-06-12).
 
   emitter.emitHandshake('fetch_done');
 
@@ -2982,17 +2929,17 @@ export async function main(input: AgentInput): Promise<void> {
   // realpath collapses it so tokenize sees the canonical form), and the macOS
   // pnpm cache.  The /private realpath + cache canonicalization is reconciled
   // against the Linux lock at diff time (Phase 6).
-  // Linux `tmp` follows os.tmpdir(): init.sh exports TMPDIR=/work/.sj-tmp on
-  // the VM backends (yarn Berry's zip-conversion staging ENOSPCs the 64 MB
-  // /tmp tmpfs on real monorepos; /work/.sj-tmp is the 4 GiB repo disk, kept
-  // OFF the audit scratch disk — see init.sh), and tmpdir() honours it.  That
-  // path sits under $REPO (/work) but longest-prefix wins: /work/.sj-tmp is a
-  // longer prefix than /work, so its paths render $TMPDIR (with hash
-  // collapsing), not $REPO.  The literal /tmp is kept as a second $TMPDIR
-  // alias (tmpLegacy) for tools that ignore TMPDIR — without it their writes
-  // would record as raw /tmp/<hash> paths and break determinism/parity.
-  // Docker/bare set no TMPDIR, so tmpdir() is '/tmp' there and the alias is
-  // omitted — byte-identical to the previous hardcoded root.
+  // Linux `tmp` follows os.tmpdir(): init.sh exports TMPDIR=/sjtmp on the VM
+  // backends (yarn Berry's zip-conversion staging ENOSPCs the 64 MB /tmp tmpfs
+  // on real monorepos; /sjtmp is a DEDICATED 4 GiB disk, separate from both
+  // /work and the audit /scratch — see init.sh), and tmpdir() honours it.
+  // /sjtmp is not under $REPO (/work), so there is no prefix overlap to
+  // reason about — its paths render $TMPDIR (with hash collapsing) cleanly.
+  // The literal /tmp is kept as a second $TMPDIR alias (tmpLegacy) for tools
+  // that ignore TMPDIR — without it their writes would record as raw
+  // /tmp/<hash> paths and break determinism/parity.  Docker/bare set no
+  // TMPDIR, so tmpdir() is '/tmp' there and the alias is omitted —
+  // byte-identical to the previous hardcoded root.
   const linuxTmp = tmpdir();
   const roots = isMacosBare
     ? macosTokenizeRoots(config.work_dir)

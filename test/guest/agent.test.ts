@@ -1485,46 +1485,6 @@ describe('redactSensitive (Phase A failure dump)', () => {
   });
 });
 
-describe('checkTmpdirUnderRepo (post-Phase-A TMPDIR re-validation)', () => {
-  it('returns null for a real .sj-tmp directory under work_dir', async () => {
-    const { checkTmpdirUnderRepo } = await import('../../src/guest/agent.js');
-    const { mkdtempSync, mkdirSync } = await import('node:fs');
-    const work = mkdtempSync(join(tmpdir(), 'sj-work-'));
-    const tmp = join(work, '.sj-tmp');
-    mkdirSync(tmp);
-    // realpathSync collapses /var→/private/var on macOS, so compare against the
-    // realpath of work_dir (the agent passes config.work_dir, the same value).
-    const realWork = (await import('node:fs')).realpathSync(work);
-    expect(checkTmpdirUnderRepo(join(realWork, '.sj-tmp'), realWork)).toBeNull();
-  });
-
-  it('flags a .sj-tmp symlinked to a sibling (audit-evasion attempt)', async () => {
-    const { checkTmpdirUnderRepo } = await import('../../src/guest/agent.js');
-    const { mkdtempSync, mkdirSync, symlinkSync, realpathSync } = await import('node:fs');
-    const base = realpathSync(mkdtempSync(join(tmpdir(), 'sj-work-')));
-    const scratch = join(base, 'scratch');
-    mkdirSync(scratch);
-    const tmp = join(base, '.sj-tmp');
-    symlinkSync(scratch, tmp); // .sj-tmp -> ./scratch (stand-in for /scratch)
-    const reason = checkTmpdirUnderRepo(tmp, base);
-    expect(reason).not.toBeNull();
-    expect(reason).toMatch(/symlink|resolves elsewhere/);
-  });
-
-  it('flags a missing .sj-tmp after Phase A', async () => {
-    const { checkTmpdirUnderRepo } = await import('../../src/guest/agent.js');
-    const { mkdtempSync, realpathSync } = await import('node:fs');
-    const base = realpathSync(mkdtempSync(join(tmpdir(), 'sj-work-')));
-    expect(checkTmpdirUnderRepo(join(base, '.sj-tmp'), base)).not.toBeNull();
-  });
-
-  it('is a no-op for /tmp (docker/bare) and host tmp (macOS) — not under work_dir', async () => {
-    const { checkTmpdirUnderRepo } = await import('../../src/guest/agent.js');
-    expect(checkTmpdirUnderRepo('/tmp', '/work')).toBeNull();
-    expect(checkTmpdirUnderRepo('/var/folders/xy/T', '/work')).toBeNull();
-  });
-});
-
 describe('buildChildEnv package-manager cache/store redirects', () => {
   // ENOSPC on large repos (found auditing a ~1000-package yarn-4 monorepo):
   // yarn berry's global folder defaults under $HOME (/root, a 16 MB tmpfs in

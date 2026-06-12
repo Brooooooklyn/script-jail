@@ -10355,7 +10355,6 @@ __export(agent_exports, {
   StdioConnection: () => StdioConnection,
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
-  checkTmpdirUnderRepo: () => checkTmpdirUnderRepo,
   createEventsFile: () => createEventsFile,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
@@ -30097,26 +30096,6 @@ function redactSensitive(text, protectedEnvNames, env = process.env) {
   out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, "$1<REDACTED>").replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
   return out;
 }
-function checkTmpdirUnderRepo(tmpDir, workDir) {
-  if (!(tmpDir === `${workDir}/.sj-tmp` || tmpDir.startsWith(`${workDir}/.sj-tmp/`))) {
-    return null;
-  }
-  try {
-    const st = (0, import_node_fs3.lstatSync)(tmpDir);
-    if (st.isSymbolicLink()) {
-      return `TMPDIR ${tmpDir} is a symlink after Phase A (audit-evasion attempt)`;
-    }
-    if (!st.isDirectory()) {
-      return `TMPDIR ${tmpDir} is not a directory after Phase A`;
-    }
-    if ((0, import_node_fs3.realpathSync)(tmpDir) !== tmpDir) {
-      return `TMPDIR ${tmpDir} resolves elsewhere after Phase A (${(0, import_node_fs3.realpathSync)(tmpDir)})`;
-    }
-  } catch (err) {
-    return `TMPDIR ${tmpDir} could not be validated after Phase A: ${String(err)}`;
-  }
-  return null;
-}
 async function main(input) {
   const configPath = input.configPath ?? "/etc/script-jail/config.yml";
   diag(input, `main(): configPath=${configPath}`);
@@ -30182,14 +30161,6 @@ ${fetchDetail}
 `
     );
     emitter.emitError(`Phase A (fetch) failed: ${fetchDetail}`, true);
-    flushAndExit(input.connection.writable, 1);
-    return;
-  }
-  const tmpdirTamper = checkTmpdirUnderRepo((0, import_node_os.tmpdir)(), config2.work_dir);
-  if (tmpdirTamper !== null) {
-    process.stderr.write(`[agent] ${tmpdirTamper}
-`);
-    emitter.emitError(`audit pipeline tampered with: ${tmpdirTamper}`, true);
     flushAndExit(input.connection.writable, 1);
     return;
   }
@@ -30403,7 +30374,6 @@ if (isMain) {
   StdioConnection,
   buildChildEnv,
   buildChildEnvMacos,
-  checkTmpdirUnderRepo,
   createEventsFile,
   macosTokenizeRoots,
   main,

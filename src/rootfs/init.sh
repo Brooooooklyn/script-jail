@@ -223,44 +223,53 @@ else
 fi
 SCRATCH_BASE=/scratch
 
-# --- Guest-wide TMPDIR on the REPO disk (NOT the audit scratch disk) -----------
+# --- Guest-wide TMPDIR on a DEDICATED disk (not /work, not the audit /scratch) -
 # yarn Berry's fetch step converts every downloaded tarball into a cache zip
 # via a staging file in os.tmpdir() (ZipFS convertToZipWorker).  On the 64 MB
 # /tmp tmpfs above, a real monorepo's parallel conversions ENOSPC partway
 # through Phase A (napi-rs: ~488 MiB of zips against 64 MB).
 #
-# TMPDIR points at the 4 GiB REPO disk (/work, mounted above), NOT the scratch
-# disk.  This is deliberate (Codex round-1 [high], 2026-06-12): the scratch
-# disk holds the AUDIT artifacts — the per-pid `strace -ff` logs and the events
-# JSONL — written only by the trusted agent/strace.  A lifecycle script honours
-# TMPDIR, so co-locating TMPDIR with the audit artifacts would let a malicious
-# script fill the disk and silently STARVE the strace/event writes (partial
-# capture presented as a clean lockfile).  /work is a SEPARATE filesystem that
-# already holds the install's own attacker-adjacent bulk (node_modules + the
-# YARN_*/npm cache redirects from buildChildEnv), so a TMPDIR fill there only
-# fails the install honestly with ENOSPC — it cannot touch the audit channel on
-# /scratch.  Lockfile parity is preserved: the agent's tmp tokenize root follows
-# os.tmpdir() (so /work/.sj-tmp renders $TMPDIR, longest-prefix beating $REPO)
-# and keeps the literal /tmp as a second $TMPDIR alias for tools that ignore
-# TMPDIR (src/guest/agent.ts roots + src/lock/tokenize.ts tmpLegacy).
-# SYMLINK HARDENING (Codex round-2 [high], 2026-06-12): /work is built from
-# the USER repo, so a malicious repo can COMMIT `.sj-tmp` as a symlink — to
-# /scratch (re-co-locating TMPDIR with the audit artifacts → starvation) or to
-# /work/node_modules (so writes spelled `/work/.sj-tmp/...` resolve into real
-# repo content yet tokenize as $TMPDIR, hiding them from the audit).  `mkdir -p`
-# accepts a preexisting symlink-to-dir and `chmod` follows it.  So: unlink
-# whatever the repo shipped (rm of a symlink removes the LINK, never its
-# target), create a FRESH real directory, and fail closed if the result is not
-# a real, non-symlink directory.  (An active root lifecycle script can still
-# find /scratch via `mount` and is the pre-existing root-attacker residual; this
-# closes only the passive committed-symlink supply-chain vector.)
-rm -rf /work/.sj-tmp
-mkdir /work/.sj-tmp
-chmod 1777 /work/.sj-tmp
-if [ -L /work/.sj-tmp ] || [ ! -d /work/.sj-tmp ]; then
-  fatal "/work/.sj-tmp is not a real directory after creation (repo-shipped symlink?)"
+# TMPDIR points at a SEPARATE 4 GiB ext4 (label `sjtmp`, built per-run by
+# overlay.ts) mounted at /sjtmp — distinct from BOTH /work (the repo disk) and
+# /scratch (the audit disk).  Why a dedicated disk rather than the earlier
+# /work/.sj-tmp scheme (Codex rounds 1-4, 2026-06-12):
+#   * NOT /scratch: /scratch holds the AUDIT artifacts (per-pid `strace -ff`
+#     logs + the events JSONL, written only by the trusted agent/strace).  A
+#     lifecycle script honours TMPDIR, so co-locating would let a malicious
+#     script fill the disk and silently STARVE the audit writes (partial
+#     capture presented as a clean lockfile).
+#   * NOT /work: /work is built from the USER repo, so a committed `.sj-tmp`
+#     symlink — or a Phase-A `rm -rf && ln -s` from repo-controlled code (the
+#     yarnPath bundle / pnpmfile / Yarn plugins run during `yarn install`) —
+#     could redirect TMPDIR onto /scratch (starve) or /work/node_modules (so
+#     writes spelled `$TMPDIR/...` tokenize benignly yet land in real repo
+#     content, hiding them).  Three rounds of point-in-time guards could not
+#     close that TOCTOU because the trusted root itself was repo-mutable.
+# A MOUNTPOINT closes it structurally: /sjtmp cannot be symlink-swapped without
+# `umount` (which no lifecycle child can do), and it has no committed repo
+# content to subvert.  A TMPDIR fill on /sjtmp now only fails the install
+# honestly with ENOSPC — it touches neither the repo nor the audit channel.
+#
+# Lockfile parity is preserved: the agent's tmp tokenize root follows
+# os.tmpdir() (so /sjtmp renders $TMPDIR) and keeps the literal /tmp as a second
+# $TMPDIR alias for tools that ignore TMPDIR (src/guest/agent.ts roots +
+# src/lock/tokenize.ts tmpLegacy).
+#
+# Resolution mirrors the scratch lookup: by label via `blkid -L`, never by
+# /dev/vd* letter, with the same `if`-wrapping so `set -e` doesn't swallow the
+# diagnostic on the absent-device non-zero exit.  Fail closed when missing — a
+# silent /tmp fallback would reintroduce the ENOSPC truncation this disk
+# exists to prevent.  The Docker/bare backends never execute init.sh, so this
+# cannot affect them; their agent falls back to /tmp (no TMPDIR export).
+if SJTMP_DEV="$(blkid -L sjtmp)" && [ -n "${SJTMP_DEV}" ]; then
+  mkdir -p /sjtmp
+  mount "${SJTMP_DEV}" /sjtmp
+  chmod 1777 /sjtmp
+  export TMPDIR=/sjtmp
+  echo "[init] sjtmp disk mounted at /sjtmp (${SJTMP_DEV}); TMPDIR=/sjtmp"
+else
+  fatal "no block device with filesystem label 'sjtmp'"
 fi
-export TMPDIR=/work/.sj-tmp
 
 # Copy the user's config from the repo disk into the rootfs's canonical
 # /etc/script-jail/config.yml so the agent can read it regardless of /work staying

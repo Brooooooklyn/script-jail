@@ -232,6 +232,8 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       expect(result.repoDiskPath).toContain('repo.ext4');
       expect(existsSync(result.scratchDiskPath)).toBe(true);
       expect(result.scratchDiskPath).toContain('scratch.ext4');
+      expect(existsSync(result.sjtmpDiskPath)).toBe(true);
+      expect(result.sjtmpDiskPath).toContain('sjtmp.ext4');
       expect(result.workDir).toBeTruthy();
     } finally {
       await result.cleanup();
@@ -273,6 +275,40 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       const label = sb.subarray(0x78, 0x78 + 16);
       const labelStr = label.subarray(0, label.indexOf(0)).toString('utf8');
       expect(labelStr).toBe('scratch');
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('sjtmp.ext4 is an ext4 labeled exactly `sjtmp`, 4096 MiB logical', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+    });
+
+    try {
+      const { statSync } = await import('node:fs');
+      expect(statSync(result.sjtmpDiskPath).size).toBe(4096 * 1024 * 1024);
+
+      // Read the ext4 superblock and assert magic + the load-bearing label
+      // `sjtmp` (the guest mounts via `blkid -L sjtmp`).
+      const { openSync, readSync, closeSync } = await import('node:fs');
+      const sb = Buffer.alloc(1024);
+      const fd = openSync(result.sjtmpDiskPath, 'r');
+      try {
+        readSync(fd, sb, 0, 1024, 1024);
+      } finally {
+        closeSync(fd);
+      }
+      const magic = sb.readUInt16LE(0x38);
+      expect(magic.toString(16)).toBe('ef53');
+      const label = sb.subarray(0x78, 0x78 + 16);
+      const labelStr = label.subarray(0, label.indexOf(0)).toString('utf8');
+      expect(labelStr).toBe('sjtmp');
     } finally {
       await result.cleanup();
     }

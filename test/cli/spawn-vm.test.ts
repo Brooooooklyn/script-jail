@@ -186,6 +186,42 @@ describe('checkArtifacts', () => {
       }),
     ).not.toThrow();
   });
+
+  it('throws MacOSVmArtifactNotFoundError("sjtmp disk", …) when the sjtmp disk is missing', () => {
+    const kernel = join(scratch, 'kernel');
+    const rootfs = join(scratch, 'rootfs');
+    const scratchDisk = join(scratch, 'scratch.ext4');
+    writeFileSync(kernel, 'fake');
+    writeFileSync(rootfs, 'fake');
+    writeFileSync(scratchDisk, 'fake');
+    expect(() =>
+      checkArtifacts({
+        kernelPath: kernel,
+        rootfsDiskPath: rootfs,
+        scratchDiskPath: scratchDisk,
+        sjtmpDiskPath: join(scratch, 'no-sjtmp.ext4'),
+      }),
+    ).toThrow(/sjtmp disk not found/);
+  });
+
+  it('passes when the sjtmp disk exists', () => {
+    const kernel = join(scratch, 'kernel');
+    const rootfs = join(scratch, 'rootfs');
+    const scratchDisk = join(scratch, 'scratch.ext4');
+    const sjtmpDisk = join(scratch, 'sjtmp.ext4');
+    writeFileSync(kernel, 'fake');
+    writeFileSync(rootfs, 'fake');
+    writeFileSync(scratchDisk, 'fake');
+    writeFileSync(sjtmpDisk, 'fake');
+    expect(() =>
+      checkArtifacts({
+        kernelPath: kernel,
+        rootfsDiskPath: rootfs,
+        scratchDiskPath: scratchDisk,
+        sjtmpDiskPath: sjtmpDisk,
+      }),
+    ).not.toThrow();
+  });
 });
 
 describe('toJsonPayload', () => {
@@ -196,6 +232,7 @@ describe('toJsonPayload', () => {
       rootfsDiskPath: '/r',
       repoDiskPath: '/re',
       scratchDiskPath: '/sc',
+      sjtmpDiskPath: '/sj',
       vsockUdsPath: '/v',
       vsockPort: 10242,
       vcpuCount: 2,
@@ -213,6 +250,7 @@ describe('toJsonPayload', () => {
       rootfs_disk_path: '/r',
       repo_disk_path: '/re',
       scratch_disk_path: '/sc',
+      sjtmp_disk_path: '/sj',
       vsock_uds_path: '/v',
       vsock_port: 10242,
       vcpu_count: 2,
@@ -337,6 +375,7 @@ describe('spawnVm — preflights', () => {
       rootfsDiskPath: join(scratch, 'rootfs.ext4'),
       repoDiskPath: join(scratch, 'repo.ext4'),
       scratchDiskPath: join(scratch, 'scratch.ext4'),
+      sjtmpDiskPath: join(scratch, 'sjtmp.ext4'),
       vsockUdsPath: join(scratch, 'vsock.sock'),
       vsockPort: 10242,
       vcpuCount: 2,
@@ -366,6 +405,7 @@ describe('spawnVm — preflights', () => {
     writeFileSync(join(scratch, 'kernel'), 'fake');
     writeFileSync(join(scratch, 'rootfs.ext4'), 'fake');
     writeFileSync(join(scratch, 'scratch.ext4'), 'fake');
+    writeFileSync(join(scratch, 'sjtmp.ext4'), 'fake');
 
     const { run, calls } = fakeCodesign({ status: 0, stdout: '' });
     await expect(

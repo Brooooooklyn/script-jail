@@ -4,6 +4,7 @@
   "rootfs_disk_path": "test/fixtures/host-mac/missing-rootfs.img",
   "repo_disk_path": "test/fixtures/host-mac/missing-repo.img",
   "scratch_disk_path": "test/fixtures/host-mac/missing-scratch.img",
+  "sjtmp_disk_path": "test/fixtures/host-mac/missing-sjtmp.img",
   "vsock_uds_path": "/tmp/script-jail-vsock-smoke",
   "vsock_port": 10242,
   "vcpu_count": 2,

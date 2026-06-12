@@ -31,6 +31,7 @@ function makeOverlayResult(overrides?: Partial<OverlayResult>): OverlayResult {
     rootfsCopyPath: '/tmp/rootfs.ext4',
     repoDiskPath: '/tmp/repo.ext4',
     scratchDiskPath: '/tmp/scratch.ext4',
+    sjtmpDiskPath: '/tmp/sjtmp.ext4',
     workDir: '/tmp/work',
     cleanup: vi.fn(async () => {}),
     ...overrides,

@@ -80,6 +80,14 @@ export interface LaunchInput {
    * without it would boot a guest that refuses to run.
    */
   scratchDiskPath: string;
+  /**
+   * Per-run EMPTY ext4 (filesystem label `sjtmp`, built by overlay.ts) the
+   * guest mounts at /sjtmp and exports as TMPDIR.  A dedicated disk keeps a
+   * large install's tmp churn off both /work and the audit /scratch, and —
+   * being a mountpoint — closes the symlink-redirect TOCTOU the old repo-disk
+   * `/work/.sj-tmp` scheme had.  Required: init.sh fail-closes when absent.
+   */
+  sjtmpDiskPath: string;
   vcpu?: number | undefined;       // default 2
   memMB?: number | undefined;      // default 2048
   /** Guest CID for vsock (must be > 2; host CID is 2). */
@@ -144,6 +152,7 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     rootfsPath,
     repoDiskPath,
     scratchDiskPath,
+    sjtmpDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -244,6 +253,20 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     await apiClient.put('/drives/scratch', {
       drive_id: 'scratch',
       path_on_host: scratchDiskPath,
+      is_root_device: false,
+      is_read_only: false,
+    });
+
+    // 4d. sjtmp disk (required), attached after the scratch drive.  An EMPTY
+    //     ext4 (filesystem label `sjtmp`, built per-run by overlay.ts) the
+    //     guest mounts read-write — via `blkid -L sjtmp` — at /sjtmp and
+    //     exports as TMPDIR.  Dedicated tmp space keeps a large install's tmp
+    //     churn off both /work and the audit /scratch; as a mountpoint it
+    //     can't be symlink-redirected by Phase-A repo code.  init.sh
+    //     fail-closes when absent, so the PUT is unconditional.
+    await apiClient.put('/drives/sjtmp', {
+      drive_id: 'sjtmp',
+      path_on_host: sjtmpDiskPath,
       is_root_device: false,
       is_read_only: false,
     });
