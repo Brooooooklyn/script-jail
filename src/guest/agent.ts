@@ -1546,16 +1546,25 @@ export function attachStdoutTailCollector(
     pending += chunk.toString('utf8');
 
     // 1. If suppressing an over-cap unterminated line, skip to its terminating
-    //    newline (if any).  No newline yet → keep discarding (bound memory).
+    //    delimiter — the EARLIEST '\r' OR '\n'.  CR matters (Codex round-7
+    //    [medium]): package managers render progress with '\r' and may print
+    //    the real error after a '\r' BEFORE the first '\n'; ending suppression
+    //    only on '\n' would discard that error with the progress flood.  We
+    //    consume only through that earliest delimiter and feed the remainder
+    //    back through normal complete-line handling below, so the error line
+    //    (terminated by its own '\n') survives.  No delimiter yet → keep
+    //    discarding (bound memory).
     if (suppressing) {
-      const nl = pending.indexOf('\n');
-      if (nl === -1) {
+      const cr = pending.indexOf('\r');
+      const lf = pending.indexOf('\n');
+      const d = cr === -1 ? lf : lf === -1 ? cr : Math.min(cr, lf);
+      if (d === -1) {
         pending = '';
         return;
       }
       appendRedacted(truncMarker); // the suppressed logical line finally ended
       suppressing = false;
-      pending = pending.slice(nl + 1);
+      pending = pending.slice(d + 1);
     }
 
     // 2. Finalize all COMPLETE lines atomically (safe at any length — the token

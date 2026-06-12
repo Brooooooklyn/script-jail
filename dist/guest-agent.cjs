@@ -29693,14 +29693,16 @@ function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAI
   stream.on("data", (chunk) => {
     pending += chunk.toString("utf8");
     if (suppressing) {
-      const nl2 = pending.indexOf("\n");
-      if (nl2 === -1) {
+      const cr = pending.indexOf("\r");
+      const lf = pending.indexOf("\n");
+      const d = cr === -1 ? lf : lf === -1 ? cr : Math.min(cr, lf);
+      if (d === -1) {
         pending = "";
         return;
       }
       appendRedacted(truncMarker);
       suppressing = false;
-      pending = pending.slice(nl2 + 1);
+      pending = pending.slice(d + 1);
     }
     const nl = pending.lastIndexOf("\n");
     if (nl >= 0) {

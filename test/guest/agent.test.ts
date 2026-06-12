@@ -3950,6 +3950,26 @@ describe('Phase B stdout capture (in-memory tail)', () => {
     expect(tail).not.toContain('tail-of-huge-line'); // belonged to the suppressed line
   });
 
+  it('preserves a real error printed after CR progress, post-suppression (round-7)', async () => {
+    // CR-only progress overflows the cap → suppress; the actual error then
+    // arrives after a '\r' BEFORE any '\n'.  Suppression must end at that '\r'
+    // (not wait for '\n') so the error line — terminated by its own '\n' — is
+    // still captured, not discarded with the progress flood.
+    const cap = 64;
+    const tail = await feed(
+      [
+        'progress 0%\r',
+        'F'.repeat(cap + 50),                       // overflow → suppress
+        '\rYN0001: real yarn error details\n',      // \r ends suppression, then the error
+      ],
+      undefined,
+      cap,
+    );
+    expect(tail).toContain('YN0001: real yarn error details'); // actionable cause survives
+    expect(tail).toContain('suppressed');                       // marker for the dropped progress
+    expect(tail).not.toContain('FFF');                          // progress filler gone
+  });
+
   it('exposes a sane default byte cap', () => {
     expect(PHASE_B_STDOUT_TAIL_BYTES).toBeGreaterThanOrEqual(16384);
   });
