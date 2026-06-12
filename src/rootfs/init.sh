@@ -243,8 +243,23 @@ SCRATCH_BASE=/scratch
 # os.tmpdir() (so /work/.sj-tmp renders $TMPDIR, longest-prefix beating $REPO)
 # and keeps the literal /tmp as a second $TMPDIR alias for tools that ignore
 # TMPDIR (src/guest/agent.ts roots + src/lock/tokenize.ts tmpLegacy).
-mkdir -p /work/.sj-tmp
+# SYMLINK HARDENING (Codex round-2 [high], 2026-06-12): /work is built from
+# the USER repo, so a malicious repo can COMMIT `.sj-tmp` as a symlink — to
+# /scratch (re-co-locating TMPDIR with the audit artifacts → starvation) or to
+# /work/node_modules (so writes spelled `/work/.sj-tmp/...` resolve into real
+# repo content yet tokenize as $TMPDIR, hiding them from the audit).  `mkdir -p`
+# accepts a preexisting symlink-to-dir and `chmod` follows it.  So: unlink
+# whatever the repo shipped (rm of a symlink removes the LINK, never its
+# target), create a FRESH real directory, and fail closed if the result is not
+# a real, non-symlink directory.  (An active root lifecycle script can still
+# find /scratch via `mount` and is the pre-existing root-attacker residual; this
+# closes only the passive committed-symlink supply-chain vector.)
+rm -rf /work/.sj-tmp
+mkdir /work/.sj-tmp
 chmod 1777 /work/.sj-tmp
+if [ -L /work/.sj-tmp ] || [ ! -d /work/.sj-tmp ]; then
+  fatal "/work/.sj-tmp is not a real directory after creation (repo-shipped symlink?)"
+fi
 export TMPDIR=/work/.sj-tmp
 
 # Copy the user's config from the repo disk into the rootfs's canonical

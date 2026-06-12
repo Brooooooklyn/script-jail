@@ -2636,7 +2636,11 @@ export function redactSensitive(
     // Bearer <token>
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
     // npm automation/granular token literals (npm_… 36+ char)
-    .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>');
+    .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>')
+    // GitHub token literals (ghp_/gho_/ghs_/ghu_/ghr_ + 36+ char)
+    .replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, '<REDACTED:GH-TOKEN>')
+    // AWS access key id (AKIA/ASIA + 16 upper-alnum)
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '<REDACTED:AWS-KEY>');
   return out;
 }
 
@@ -2771,18 +2775,22 @@ export async function main(input: AgentInput): Promise<void> {
     // "Phase A (fetch) failed: " and the actual cause is invisible on the
     // host (found dogfooding napi-rs).  Tail-capped so a megabyte of yarn
     // progress output cannot bloat the vsock error frame.
-    const stdoutTrimmed = fetchResult.stdout.trim();
+    // Redact BEFORE tailing (Codex round-2 [high]): the value redactor only
+    // masks COMPLETE protected values, so slicing to the last 4 KB first could
+    // start the tail INSIDE a secret — the partial no longer matches and the
+    // suffix leaks.  Redact the full stdout/stderr (the secret is wholly
+    // present), THEN cap the already-masked text.  A mask token split by the
+    // cap is harmless (a truncated `<REDACTED:` leaks nothing).
+    const stderrRedacted = redactSensitive(fetchResult.stderr, config.protected.env).trim();
+    const stdoutRedacted = redactSensitive(fetchResult.stdout, config.protected.env).trim();
     const stdoutTail =
-      stdoutTrimmed.length > 4000 ? `…${stdoutTrimmed.slice(-4000)}` : stdoutTrimmed;
-    const fetchDetailRaw = [
-      fetchResult.stderr.trim(),
+      stdoutRedacted.length > 4000 ? `…${stdoutRedacted.slice(-4000)}` : stdoutRedacted;
+    const fetchDetail = [
+      stderrRedacted,
       stdoutTail === '' ? '' : `--- stdout (tail) ---\n${stdoutTail}`,
     ]
       .filter((s) => s !== '')
       .join('\n');
-    // Redact protected env values + credential shapes before this external
-    // tool output reaches the host log / vsock frame (Codex round-1 [medium]).
-    const fetchDetail = redactSensitive(fetchDetailRaw, config.protected.env);
     // Also write to process.stderr so the npm error reaches ttyS0 (the
     // VM's serial console) — `LinuxSpawner` captures the child's stderr
     // into a string, so without this dump the only host-visible symptom

@@ -30093,7 +30093,7 @@ function redactSensitive(text, protectedEnvNames, env = process.env) {
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);
   }
-  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, "$1<REDACTED>").replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>");
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, "$1<REDACTED>").replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
   return out;
 }
 async function main(input) {
@@ -30147,14 +30147,14 @@ async function main(input) {
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
   if (!fetchResult.ok) {
-    const stdoutTrimmed = fetchResult.stdout.trim();
-    const stdoutTail = stdoutTrimmed.length > 4e3 ? `\u2026${stdoutTrimmed.slice(-4e3)}` : stdoutTrimmed;
-    const fetchDetailRaw = [
-      fetchResult.stderr.trim(),
+    const stderrRedacted = redactSensitive(fetchResult.stderr, config2.protected.env).trim();
+    const stdoutRedacted = redactSensitive(fetchResult.stdout, config2.protected.env).trim();
+    const stdoutTail = stdoutRedacted.length > 4e3 ? `\u2026${stdoutRedacted.slice(-4e3)}` : stdoutRedacted;
+    const fetchDetail = [
+      stderrRedacted,
       stdoutTail === "" ? "" : `--- stdout (tail) ---
 ${stdoutTail}`
     ].filter((s) => s !== "").join("\n");
-    const fetchDetail = redactSensitive(fetchDetailRaw, config2.protected.env);
     process.stderr.write(
       `[agent] Phase A (fetch) failed:
 ${fetchDetail}
