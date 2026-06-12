@@ -1005,50 +1005,9 @@ export async function* runStraceTailer(
   // observe the now-discarded growth and flag tamper.
   let eventsWatcher: ReturnType<typeof fsWatch> | null = null;
   if (opts.eventsFilePath !== undefined && opts.eventsFilePath !== '') {
-    const eventsFilePath = opts.eventsFilePath; // narrowed for the closure below
     try {
-      eventsWatcher = fsWatch(eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = fsWatch(opts.eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
-        // INOTIFY-PROVEN ctime tamper (2026-06-12, Codex round-4 [high]).  An
-        // inotify 'change' fire means a real SYSCALL touched the events file.
-        // The deferred kernel ctime-finalize fires NO inotify event — verified
-        // empirically on overlay AND ext4: 'change' events track writes 1:1
-        // (changePerWrite ≈ 1.000) even when a poll observes a finalize
-        // overshoot (ext4 showed overshoots up to 5ms with zero extra 'change'
-        // events).  So a watcher fire that, AFTER draining any new bytes, leaves
-        // size === eventsPos with ctime advanced past the last consumed write is
-        // a metadata-only operation — truncate-back / utimes-restore / chmod —
-        // i.e. tamper.  The poll-based ctime gate below cannot tell that benign
-        // finalize from a syscall and so defers to the exit disposition (which
-        // VOIDS a benign end-of-audit finalize); THIS path fires immediately and
-        // disposition-INDEPENDENTLY, closing the append→truncate→utimes→exit-0
-        // hole where a same-UID script tampers then lets the install exit clean.
-        // No false positive: a legit append grows size (consumed → ctime ==
-        // lastConsumedCtime), and the events file's metadata is touched by
-        // nothing but the appending shim during a normal audit.
-        try {
-          const st = statSync(eventsFilePath, { bigint: true }) as unknown as { size: bigint; ctimeNs: bigint };
-          if (
-            // Gate on !childExited for the SAME reason the poll gate does (PR
-            // #10): a CLEAN whole-tree exit proves no in-model writer remains,
-            // so a post-exit inotify fire is trusted (and the end-of-audit
-            // tests' post-exit chmod must not trip).  An ABNORMAL / no-
-            // disposition exit leaves childExited false, so this stays ARMED
-            // post-exit and still catches a detached-survivor metadata op.
-            !childExited &&
-            Number(st.size) === eventsPos &&
-            lastConsumedCtime !== -1n &&
-            st.ctimeNs > lastConsumedCtime
-          ) {
-            recordTamper(
-              `events file ctime advanced without new bytes on inotify fire ` +
-                `(ctimeNs=${st.ctimeNs} > lastConsumed=${lastConsumedCtime}, size=${eventsPos}): ${eventsFilePath}`,
-            );
-          }
-        } catch {
-          // stat race (file vanished/rebound) — the inode/ENOENT gates in
-          // drainEventsFile() and the disposition-resolved poll gate cover it.
-        }
         wake();
       });
       // Inotify reports IN_DELETE_SELF / IN_MOVE_SELF as a watcher 'rename'
@@ -1184,6 +1143,34 @@ export async function* runStraceTailer(
         // not a live attacker (none can remain past a clean exit).  Void the
         // provisional verdict — this is what wins the pre-notification race the
         // `childExited` freeze alone loses.
+        //
+        // ACCEPTED RESIDUAL (Codex round-4 [high], 2026-06-12): voiding here
+        // also clears a REAL active-phase ctime-only tamper (truncate-back /
+        // utimes-restore / same-size in-place substitution) that a same-UID
+        // script performs and then lets the install exit 0.  This is a
+        // deliberate, irreducible tradeoff, not an oversight:
+        //   * {ctime advanced, size === eventsPos} is the EXACT signature of
+        //     the benign lazy finalize, so no stat/poll signal distinguishes it
+        //     from a tamper.  An inotify-fire-driven immediate gate was tried
+        //     to close this (the finalize was assumed inotify-silent); it
+        //     FALSE-POSITIVED on the real CI kernels (docker 24.04 host AND
+        //     firecracker 22.04 microVM — the finalize re-stats > the pre-
+        //     finalize watermark for benign writes), confirmed by CI and an
+        //     independent review.  There is no FP-free poll/inotify fix.
+        //   * The PRIMARY defense is intact and unaffected: the inotify-driven
+        //     drain + the size/maxSeenSize gates read the attacker's appended
+        //     bytes (recording the malicious line) UNLESS the attacker wins a
+        //     sub-millisecond cross-process race against the concurrently-
+        //     running tailer.  The ctime gate is only the defense-in-depth
+        //     backstop for that race-won case; this void narrows it to the
+        //     additional conjunction of {race won} AND {clean exit} AND {no
+        //     subsequent observed activity}.
+        //   * Same CLASS as PR #10's accepted post-exit-freeze residual: a root
+        //     attacker racing the tailer is outside the enforceable boundary.
+        // Keeping PR #10's strict active-phase immediate-fire instead would
+        // re-introduce the large-repo false positive this whole change exists
+        // to fix (legit installs of ~1000-pkg monorepos rejected as tampered) —
+        // a guaranteed, frequent failure traded for a tight, rare race.
         pendingCtimeTamper = null;
       }
     }

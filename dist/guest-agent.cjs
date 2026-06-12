@@ -29433,27 +29433,9 @@ async function* runStraceTailer(opts) {
   }
   let eventsWatcher = null;
   if (opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
-    const eventsFilePath = opts.eventsFilePath;
     try {
-      eventsWatcher = (0, import_node_fs3.watch)(eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = (0, import_node_fs3.watch)(opts.eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
-        try {
-          const st = (0, import_node_fs3.statSync)(eventsFilePath, { bigint: true });
-          if (
-            // Gate on !childExited for the SAME reason the poll gate does (PR
-            // #10): a CLEAN whole-tree exit proves no in-model writer remains,
-            // so a post-exit inotify fire is trusted (and the end-of-audit
-            // tests' post-exit chmod must not trip).  An ABNORMAL / no-
-            // disposition exit leaves childExited false, so this stays ARMED
-            // post-exit and still catches a detached-survivor metadata op.
-            !childExited && Number(st.size) === eventsPos && lastConsumedCtime !== -1n && st.ctimeNs > lastConsumedCtime
-          ) {
-            recordTamper(
-              `events file ctime advanced without new bytes on inotify fire (ctimeNs=${st.ctimeNs} > lastConsumed=${lastConsumedCtime}, size=${eventsPos}): ${eventsFilePath}`
-            );
-          }
-        } catch {
-        }
         wake();
       });
       eventsWatcher.on("error", () => {
