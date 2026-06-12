@@ -440,6 +440,19 @@ export interface StraceTailerOptions {
    */
   settleQuietPasses?: number;
   /**
+   * Settle window (ns) for the "ctime advanced without new bytes" gate
+   * (default 10ms).  The kernel finalizes the ctime of a consumed write
+   * slightly AFTER the consume-time stat observed it (sub-millisecond deltas
+   * measured in CI: 0.297ms and 0.649ms on the ubuntu-24.04 docker host
+   * kernel), so a ctime that lands within this window past
+   * `lastConsumedCtime` is treated as that lazy finalize, not tamper.  A
+   * real utimes-restore stamps ctime = NOW, which during any quiescent
+   * phase lands far beyond the window.  Tests override this to pin the
+   * exemption mechanism deterministically; see the gate comment in
+   * drainEventsFile for the residual-risk analysis.
+   */
+  ctimeSettleWindowNs?: bigint;
+  /**
    * Optional callback invoked once with the pid of the FIRST per-pid
    * strace output file discovered during tailing — i.e. the install
    * command's pid (strace's direct child).  Used by
@@ -489,6 +502,7 @@ export async function* runStraceTailer(
   const drainMs = opts.drainMs ?? 100;
   const settleHardCapMs = opts.settleHardCapMs ?? 2000;
   const settleQuietPasses = opts.settleQuietPasses ?? 2;
+  const ctimeSettleWindowNs = opts.ctimeSettleWindowNs ?? 10_000_000n; // 10ms
 
   // Bounded async sleep used by the post-exit settle loop.  `unref` so a
   // pending delay never by itself keeps the process alive.
@@ -811,16 +825,37 @@ export async function* runStraceTailer(
     // that point no in-model process is alive to race the window (see the
     // childExited declaration); byte-adding tampers are still caught by the
     // size-grow drain below.
+    //
+    // 2026-06-12: the 2026-05-19 premise ("the settle is one-shot") is WRONG
+    // for MID-RUN quiet gaps.  The lazy finalize is not transient — once the
+    // kernel settles ctime to a value > lastConsumedCtime, the suspicious
+    // state {ctime advanced, size === eventsPos} holds on EVERY poll until
+    // the next byte arrives.  Any ≥ N-poll gap between write bursts after a
+    // consume-stat that raced the finalize therefore accumulated a FALSE
+    // fatal long before exit (deterministic 2/2 on the docker parity job,
+    // ubuntu-24.04 host kernel; the childExited freeze above only covers the
+    // end-of-audit case).  Fix: bound the gate by ctime VALUE.  The finalize
+    // lands sub-millisecond past the consume-stat observation (measured CI
+    // deltas: 0.297ms, 0.649ms), while a real utimes-restore stamps ctime =
+    // NOW — during any quiescent phase that is far beyond a 10ms window.
+    // Residual: an attacker whose entire append→truncate→utimes sequence
+    // lands BOTH after the consume-stat AND within the window of the last
+    // consumed write's ctime (≤10ms minus the poll phase — empty whenever
+    // the poll lands >10ms after the write) evades THIS gate; the
+    // mtime-regression primary gate and the size/maxSeenSize gates are
+    // unaffected.  That sliver is strictly narrower than the pre-existing
+    // accepted residual (tamper absorbed into lastConsumedCtime when it
+    // precedes the consume-stat).
     if (
       !childExited &&
       lastConsumedCtime !== -1n &&
-      ctimeBig > lastConsumedCtime &&
+      ctimeBig > lastConsumedCtime + ctimeSettleWindowNs &&
       sizeNum === eventsPos
     ) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
-          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`,
+          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime} + settleWindow=${ctimeSettleWindowNs}ns, size=${sizeNum} == eventsPos): ${path}`,
         );
         return;
       }

@@ -29182,6 +29182,7 @@ async function* runStraceTailer(opts) {
   const drainMs = opts.drainMs ?? 100;
   const settleHardCapMs = opts.settleHardCapMs ?? 2e3;
   const settleQuietPasses = opts.settleQuietPasses ?? 2;
+  const ctimeSettleWindowNs = opts.ctimeSettleWindowNs ?? 10000000n;
   const delay = (ms) => new Promise((resolve2) => {
     const t = setTimeout(resolve2, ms);
     t.unref?.();
@@ -29331,11 +29332,11 @@ async function* runStraceTailer(opts) {
       return;
     }
     if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
-    if (!childExited && lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
+    if (!childExited && lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime + ctimeSettleWindowNs && sizeNum === eventsPos) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
         recordTamper(
-          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path3}`
+          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime} + settleWindow=${ctimeSettleWindowNs}ns, size=${sizeNum} == eventsPos): ${path3}`
         );
         return;
       }

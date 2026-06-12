@@ -2664,6 +2664,128 @@ describe('runStraceTailer', () => {
     expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
   });
 
+  // 2026-06-12: MID-RUN lazy ctime-finalize false positive (docker parity job,
+  // deterministic 2/2 on the ubuntu-24.04 host kernel).  The childExited freeze
+  // above only covers END-of-audit quiescence; the same finalize state
+  // ({ctime > lastConsumed, size === eventsPos}) is PERMANENT in any mid-run
+  // quiet gap too, so a ≥3-poll pause between write bursts accumulated a false
+  // fatal long before exit.  Fix: the gate is bounded by ctime VALUE — advances
+  // within `ctimeSettleWindowNs` past lastConsumedCtime are the kernel finalize
+  // (measured CI deltas: 0.297ms / 0.649ms), not tamper.  Real FS ops can't
+  // deterministically land within the 10ms default, so this test pins the
+  // exemption MECHANISM with an injected large window: a mid-run ctime-only
+  // bump (chmod; mtime + size flat) observed by many pre-exit polls must NOT
+  // trip when its value-delta is sub-window.  The companion test below pins
+  // that the default window stays STRICT for beyond-window advances.
+  it('does NOT record tamper on a mid-run sub-window ctime advance (lazy finalize, value-bounded gate)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      exitStatusRef: { code: 0, signal: null },
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 2,
+      settleHardCapMs: 400,
+      // Real-FS chmod lands ~80ms past the consumed write's ctime; a window
+      // larger than that classifies it as the lazy finalize.  The production
+      // default (10ms) cannot be exercised deterministically with real FS ops
+      // — the docker parity CI job covers the default against the real kernel.
+      ctimeSettleWindowNs: 60_000_000_000n,
+    });
+
+    // t=40: a legitimate event — consumed by an active-phase drain, which sets
+    // lastConsumedCtime from the consume-time stat.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: MID-RUN ctime-only bump (mtime + size flat) — the finalize shape.
+    // The traced tree is still running; pre-fix code accumulates 3 strikes by
+    // t≈180 and goes fatal.  The value-bounded gate must stay quiet.
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 120);
+    // t=320: exit AFTER the strikes would have fired — proves the WINDOW (not
+    // the post-exit freeze) is what suppressed the false positive.
+    setTimeout(() => { resolveExit(); }, 320);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
+    expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
+  });
+
+  // Companion strictness pin: with the DEFAULT 10ms window, a mid-run ctime
+  // advance whose value lands far beyond the window (chmod ~80ms past the
+  // consumed write) is still the utimes-restore signature and MUST trip — the
+  // settle exemption must not swallow real quiescent-phase tamper.
+  it('still records tamper on a mid-run ctime advance beyond the default settle window', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      exitStatusRef: { code: 0, signal: null },
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 2,
+      settleHardCapMs: 400,
+      // Default ctimeSettleWindowNs (10ms) — deliberately NOT overridden.
+    });
+
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: ctime-only bump ~80ms past the consumed write's ctime — beyond
+    // the 10ms window, mid-run, persisting across ≥3 polls before exit.
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 120);
+    setTimeout(() => { resolveExit(); }, 320);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/ctime advanced without new bytes/);
+  });
+
   // 2026-06-12 SECURITY (Codex finding 1): the post-exit meta-gate freeze must
   // engage ONLY on a CLEAN strace exit.  exitPromise resolves on ANY strace
   // close — including a tracee (same UID) SIGKILLing its own tracer to detach
