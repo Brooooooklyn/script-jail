@@ -3,14 +3,14 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { PassThrough } from 'node:stream';
-import { writeFileSync, mkdirSync, rmSync, appendFileSync, mkdtempSync, closeSync } from 'node:fs';
+import { writeFileSync, mkdirSync, rmSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, openPhaseBStdoutCapture, readFileTail, redactSensitive } from '../../src/guest/agent.js';
+import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, PHASE_B_STDOUT_TAIL_BYTES, redactSensitive } from '../../src/guest/agent.js';
 import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
 import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
@@ -3807,48 +3807,69 @@ describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)
   });
 });
 
-describe('Phase B stdout capture (file-based)', () => {
-  let dir: string;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'sj-stdout-')); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+describe('Phase B stdout capture (in-memory tail)', () => {
+  // Drain a PassThrough through the collector, then end it and let the
+  // 'data' listeners flush on the next tick before reading the tail.
+  async function feed(
+    chunks: Array<string | Buffer>,
+    redact: ((s: string) => string) | undefined,
+    capBytes?: number,
+  ): Promise<string> {
+    const stream = new PassThrough();
+    const getTail = attachStdoutTailCollector(stream, redact, capBytes);
+    for (const c of chunks) stream.write(c);
+    stream.end();
+    await new Promise<void>((r) => stream.on('end', () => r()));
+    await new Promise<void>((r) => setImmediate(r));
+    return getTail();
+  }
 
-  it('readFileTail returns the whole file when smaller than the window', () => {
-    const p = join(dir, 'f.log');
-    writeFileSync(p, 'hello world');
-    expect(readFileTail(p, 16384)).toBe('hello world');
+  it('returns "" when no stream is supplied (test stubs / no fd1)', () => {
+    expect(attachStdoutTailCollector(null, undefined)()).toBe('');
+    expect(attachStdoutTailCollector(undefined, (s) => s)()).toBe('');
   });
 
-  it('readFileTail returns only the last maxBytes when larger', () => {
-    const p = join(dir, 'f.log');
-    writeFileSync(p, 'A'.repeat(1000) + 'TAILMARK');
-    const out = readFileTail(p, 8);
-    expect(out.length).toBe(8);
-    expect(out).toBe('TAILMARK');
+  it('keeps the whole output when under the byte cap', async () => {
+    expect(await feed(['hello ', 'world'], undefined, 16384)).toBe('hello world');
   });
 
-  it('readFileTail returns "" for a missing file (best-effort, never throws)', () => {
-    expect(readFileTail(join(dir, 'nope.log'), 100)).toBe('');
+  it('retains only the last cap BYTES once exceeded', async () => {
+    const tail = await feed(['A'.repeat(1000), 'TAILMARK'], undefined, 8);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(8);
+    expect(tail).toBe('TAILMARK');
   });
 
-  it('openPhaseBStdoutCapture creates a writable capture file; null on a bad dir', () => {
-    const cap = openPhaseBStdoutCapture(dir);
-    expect(cap).not.toBeNull();
-    expect(cap!.path).toBe(join(dir, 'phase-b-stdout.log'));
-    closeSync(cap!.fd);
-    expect(openPhaseBStdoutCapture(join(dir, 'missing-subdir'))).toBeNull();
+  it('caps in BYTES, not UTF-16 code units, for multibyte output (round-4)', async () => {
+    // '€' is 3 UTF-8 bytes but 1 JS code unit.  A cap of 9 bytes must keep at
+    // most 3 euro signs, regardless of .length.
+    const tail = await feed(['€'.repeat(100)], undefined, 9);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(9);
   });
 
-  it('a window wider than the protected value keeps it WHOLE so redaction masks it (round-3 [medium] #2)', () => {
-    // No matter how much trailing output follows, main() sizes the read window
-    // to exceed the longest protected value, so the value is read whole and the
-    // emit-time redactor can mask it — it can never straddle the window front.
+  it('drains a verbose stream without deadlock and keeps the tail bounded', async () => {
+    const chunks = Array.from({ length: 200 }, (_, i) => `line ${i}\n`.repeat(50));
+    const tail = await feed(chunks, undefined, 1024);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(1024);
+    expect(tail).toContain('line 199'); // most-recent output survives
+  });
+
+  it('redacts a complete protected value BEFORE any front-drop reaches it', async () => {
+    // The value arrives whole and accumulates at the END; with a cap wider than
+    // the value (in bytes) the redactor masks it at drop time, so the surviving
+    // tail never leaks it even as later output pushes the front out (round-3
+    // [medium] #2 / round-4 byte-vs-char closure).
     const SECRET = 'supersecretvalue1234';
-    const p = join(dir, 'f.log');
-    writeFileSync(p, 'lead ' + SECRET + ' ' + 'q'.repeat(50000));
-    const window = 4096 + SECRET.length + 50000 + 4096;
-    const tail = readFileTail(p, window);
-    expect(tail).toContain(SECRET); // wholly present in the read window…
-    const redacted = redactSensitive(tail, ['MY_TOKEN'], { MY_TOKEN: SECRET });
-    expect(redacted).not.toContain(SECRET); // …so the redactor masks it
+    const redact = (s: string) => redactSensitive(s, ['MY_TOKEN'], { MY_TOKEN: SECRET });
+    const cap = 4096 + Buffer.byteLength(SECRET, 'utf8') + 4096;
+    const tail = await feed(
+      ['lead ', SECRET, ' ', 'q'.repeat(50000)],
+      redact,
+      cap,
+    );
+    expect(tail).not.toContain(SECRET);
+  });
+
+  it('exposes a sane default byte cap', () => {
+    expect(PHASE_B_STDOUT_TAIL_BYTES).toBeGreaterThanOrEqual(16384);
   });
 });

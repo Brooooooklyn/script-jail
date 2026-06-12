@@ -33,16 +33,12 @@
 // macOS-bare path (see agent.ts main()).
 
 import { spawn } from 'node:child_process';
-import { closeSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable } from 'node:stream';
 
 import {
-  openPhaseBStdoutCapture,
-  readFileTail,
   runStraceTailer,
-  PHASE_B_STDOUT_WINDOW_BYTES,
   type EventsFile,
   type SpawnImpl,
 } from './agent.js';
@@ -53,13 +49,6 @@ export class MacOSInstallRunner implements StraceRunner {
   private readonly _spawnImpl: SpawnImpl;
   private readonly _eventsFile: EventsFile | null;
   private readonly _tamperRef: { reason: string | null } = { reason: null };
-  // Path of the install command's STDOUT capture FILE (yarn Berry writes its
-  // errors to stdout).  Captured to a file rather than a pipe so a surviving
-  // descendant holding fd1 can't stall the child `close` event — see
-  // LinuxStraceRunner / openPhaseBStdoutCapture.  Surfaced REDACTED on the
-  // Phase-B fail-closed path by main().  Null until run() opens it.
-  private _stdoutCapturePath: string | null = null;
-  private readonly _stdoutWindowBytes: number;
 
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through to
@@ -69,18 +58,10 @@ export class MacOSInstallRunner implements StraceRunner {
    *                   `null`, the runner does not tail a shared events file
    *                   (used by tests that supply a pre-set environment via the
    *                   `opts.env` passed to `run()`).
-   * @param stdoutWindowBytes  Byte window read back from the stdout capture
-   *                   file; sized by main() to exceed the longest protected
-   *                   env value.
    */
-  constructor(
-    spawnImpl?: SpawnImpl,
-    eventsFile?: EventsFile | null,
-    stdoutWindowBytes: number = PHASE_B_STDOUT_WINDOW_BYTES,
-  ) {
+  constructor(spawnImpl?: SpawnImpl, eventsFile?: EventsFile | null) {
     this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
     this._eventsFile = eventsFile ?? null;
-    this._stdoutWindowBytes = stdoutWindowBytes;
   }
 
   getExitCode(): number {
@@ -121,10 +102,18 @@ export class MacOSInstallRunner implements StraceRunner {
     return null;
   }
 
+  /**
+   * macOS-bare DELIBERATELY does not capture Phase-B install stdout (returns
+   * ''), unlike the Linux runner.  The macOS runner spawns the install command
+   * DIRECTLY (no strace intermediary), so wiring fd1 to a pipe ties the child
+   * `close` event tightly to the install tree's stdout EOF — Codex round-2
+   * [medium] #1 showed this can hang the macOS path when a child lingers on
+   * fd1.  macOS is observe-only and already forwards the install's STDERR to
+   * the console (see run()), where its diagnostics land; the stdout tail is a
+   * Linux-only fail-closed nicety.
+   */
   getStdoutTail(): string {
-    return this._stdoutCapturePath === null
-      ? ''
-      : readFileTail(this._stdoutCapturePath, this._stdoutWindowBytes);
+    return '';
   }
 
   async *run(
@@ -136,17 +125,16 @@ export class MacOSInstallRunner implements StraceRunner {
     // Mach-O shim (DYLD_INSERT_LIBRARIES, set by buildChildEnvMacos) is the
     // sole event source; it writes JSONL into SCRIPT_JAIL_LOG_FILE.
     //
-    // Capture the install command's stdout into a FILE (yarn Berry writes its
-    // errors to stdout).  A file — not a pipe — so a lifecycle descendant that
-    // inherits fd1 and outlives the install root cannot stall the child `close`
-    // event on the direct-spawn path (Codex round-3 [medium] #1).  Best-effort:
-    // falls back to 'ignore' if the open fails.
-    const stdoutCapture = openPhaseBStdoutCapture(dirname(opts.basePath));
-    this._stdoutCapturePath = stdoutCapture?.path ?? null;
-
     // stdio:
     //   fd 0: stdin  → ignored
-    //   fd 1: stdout → capture FILE (install stdout) or 'ignore' if unavailable
+    //   fd 1: stdout → 'ignore'.  DELIBERATELY not captured on macOS: the
+    //                  install is spawned DIRECTLY (no strace intermediary), so
+    //                  wiring fd1 to a pipe ties the child `close` event to the
+    //                  install tree's stdout EOF and can hang a lingering-child
+    //                  case (Codex round-2 [medium] #1).  getStdoutTail()
+    //                  returns ''; macOS surfaces its diagnostics via STDERR
+    //                  (forwarded below).  The stdout tail is a Linux-only
+    //                  fail-closed nicety (see LinuxStraceRunner).
     //   fd 2: stderr → pipe (forwarded to process.stderr with a [macos] prefix)
     //   fd 3: pipe   → JSON channel for JS preloads that still write to fd 3
     //                  (env-spy's primary sink is the events file, but the
@@ -154,13 +142,8 @@ export class MacOSInstallRunner implements StraceRunner {
     const child = this._spawnImpl(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ['ignore', stdoutCapture ? stdoutCapture.fd : 'ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
     });
-
-    // Close the parent's copy of the capture fd; the install tree keeps its own.
-    if (stdoutCapture) {
-      try { closeSync(stdoutCapture.fd); } catch { /* harmless */ }
-    }
 
     const exitPromise = new Promise<void>((resolve) => {
       child.on('close', (code) => { this._exitCode = code ?? 1; resolve(); });

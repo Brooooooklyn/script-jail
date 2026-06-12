@@ -10351,23 +10351,22 @@ __export(agent_exports, {
   LinuxVsockConnection: () => LinuxVsockConnection,
   MacOSSpawner: () => MacOSSpawner,
   MemoryConnection: () => MemoryConnection,
-  PHASE_B_STDOUT_WINDOW_BYTES: () => PHASE_B_STDOUT_WINDOW_BYTES,
+  PHASE_B_STDOUT_TAIL_BYTES: () => PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough: () => import_node_stream.PassThrough,
   StdioConnection: () => StdioConnection,
+  attachStdoutTailCollector: () => attachStdoutTailCollector,
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
   createEventsFile: () => createEventsFile,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
-  openPhaseBStdoutCapture: () => openPhaseBStdoutCapture,
-  readFileTail: () => readFileTail,
   readStraceChildPid: () => readStraceChildPid,
   redactSensitive: () => redactSensitive,
   runStraceTailer: () => runStraceTailer,
   scratchBaseDir: () => scratchBaseDir
 });
 module.exports = __toCommonJS(agent_exports);
-var import_node_fs4 = require("node:fs");
+var import_node_fs3 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_readline2 = require("node:readline");
 var import_node_net = require("node:net");
@@ -28492,7 +28491,6 @@ async function runInstallPhaseMacos(input) {
 
 // src/guest/macos-install-runner.ts
 var import_node_child_process2 = require("node:child_process");
-var import_node_fs2 = require("node:fs");
 var import_node_path2 = require("node:path");
 var import_node_readline = require("node:readline");
 var MacOSInstallRunner = class {
@@ -28500,13 +28498,6 @@ var MacOSInstallRunner = class {
   _spawnImpl;
   _eventsFile;
   _tamperRef = { reason: null };
-  // Path of the install command's STDOUT capture FILE (yarn Berry writes its
-  // errors to stdout).  Captured to a file rather than a pipe so a surviving
-  // descendant holding fd1 can't stall the child `close` event — see
-  // LinuxStraceRunner / openPhaseBStdoutCapture.  Surfaced REDACTED on the
-  // Phase-B fail-closed path by main().  Null until run() opens it.
-  _stdoutCapturePath = null;
-  _stdoutWindowBytes;
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through to
    *                   `node:child_process.spawn`.
@@ -28515,14 +28506,10 @@ var MacOSInstallRunner = class {
    *                   `null`, the runner does not tail a shared events file
    *                   (used by tests that supply a pre-set environment via the
    *                   `opts.env` passed to `run()`).
-   * @param stdoutWindowBytes  Byte window read back from the stdout capture
-   *                   file; sized by main() to exceed the longest protected
-   *                   env value.
    */
-  constructor(spawnImpl, eventsFile, stdoutWindowBytes = PHASE_B_STDOUT_WINDOW_BYTES) {
+  constructor(spawnImpl, eventsFile) {
     this._spawnImpl = spawnImpl ?? import_node_child_process2.spawn;
     this._eventsFile = eventsFile ?? null;
-    this._stdoutWindowBytes = stdoutWindowBytes;
   }
   getExitCode() {
     return this._exitCode;
@@ -28558,23 +28545,25 @@ var MacOSInstallRunner = class {
   getRootPid() {
     return null;
   }
+  /**
+   * macOS-bare DELIBERATELY does not capture Phase-B install stdout (returns
+   * ''), unlike the Linux runner.  The macOS runner spawns the install command
+   * DIRECTLY (no strace intermediary), so wiring fd1 to a pipe ties the child
+   * `close` event tightly to the install tree's stdout EOF — Codex round-2
+   * [medium] #1 showed this can hang the macOS path when a child lingers on
+   * fd1.  macOS is observe-only and already forwards the install's STDERR to
+   * the console (see run()), where its diagnostics land; the stdout tail is a
+   * Linux-only fail-closed nicety.
+   */
   getStdoutTail() {
-    return this._stdoutCapturePath === null ? "" : readFileTail(this._stdoutCapturePath, this._stdoutWindowBytes);
+    return "";
   }
   async *run(cmd, args, opts) {
-    const stdoutCapture = openPhaseBStdoutCapture((0, import_node_path2.dirname)(opts.basePath));
-    this._stdoutCapturePath = stdoutCapture?.path ?? null;
     const child = this._spawnImpl(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ["ignore", stdoutCapture ? stdoutCapture.fd : "ignore", "pipe", "pipe"]
+      stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
-    if (stdoutCapture) {
-      try {
-        (0, import_node_fs2.closeSync)(stdoutCapture.fd);
-      } catch {
-      }
-    }
     const exitPromise = new Promise((resolve2) => {
       child.on("close", (code) => {
         this._exitCode = code ?? 1;
@@ -28968,13 +28957,13 @@ function renderBlock(block) {
 }
 
 // src/guest/discover-pkg-dirs.ts
-var import_node_fs3 = require("node:fs");
+var import_node_fs2 = require("node:fs");
 var import_node_path3 = require("node:path");
 function discoverPkgDirs(nodeModulesDir) {
   const result = /* @__PURE__ */ new Map();
   let entries;
   try {
-    entries = (0, import_node_fs3.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
+    entries = (0, import_node_fs2.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return result;
   }
@@ -28984,7 +28973,7 @@ function discoverPkgDirs(nodeModulesDir) {
     if (entry.name.startsWith("@")) {
       let scopeEntries;
       try {
-        scopeEntries = (0, import_node_fs3.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
+        scopeEntries = (0, import_node_fs2.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
       } catch {
         continue;
       }
@@ -29005,7 +28994,7 @@ function discoverPkgDirs(nodeModulesDir) {
 function scanPnpmVirtualStore(pnpmDir, result) {
   let flatEntries;
   try {
-    flatEntries = (0, import_node_fs3.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
+    flatEntries = (0, import_node_fs2.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return;
   }
@@ -29014,7 +29003,7 @@ function scanPnpmVirtualStore(pnpmDir, result) {
     const innerNm = (0, import_node_path3.join)(pnpmDir, flat.name, "node_modules");
     let innerEntries;
     try {
-      innerEntries = (0, import_node_fs3.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
+      innerEntries = (0, import_node_fs2.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
     } catch {
       continue;
     }
@@ -29025,7 +29014,7 @@ function scanPnpmVirtualStore(pnpmDir, result) {
         const scopeDir = (0, import_node_path3.join)(innerNm, inner.name);
         let scopeEntries;
         try {
-          scopeEntries = (0, import_node_fs3.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
+          scopeEntries = (0, import_node_fs2.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
         } catch {
           continue;
         }
@@ -29044,7 +29033,7 @@ function readAndRegister(pkgPath, result) {
   const manifestPath = (0, import_node_path3.join)(pkgPath, "package.json");
   let raw;
   try {
-    raw = (0, import_node_fs3.readFileSync)(manifestPath, "utf8");
+    raw = (0, import_node_fs2.readFileSync)(manifestPath, "utf8");
   } catch (err) {
     if (err.code !== "ENOENT") {
       process.stderr.write(
@@ -29260,7 +29249,7 @@ async function* runStraceTailer(opts) {
     const pos = filePos.get(name) ?? 0;
     let size = 0;
     try {
-      size = (0, import_node_fs4.statSync)(fullPath).size;
+      size = (0, import_node_fs3.statSync)(fullPath).size;
     } catch {
       return;
     }
@@ -29270,18 +29259,18 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs4.openSync)(fullPath, "r");
-      bytesRead = (0, import_node_fs4.readSync)(fd, buf, 0, toRead, pos);
+      fd = (0, import_node_fs3.openSync)(fullPath, "r");
+      bytesRead = (0, import_node_fs3.readSync)(fd, buf, 0, toRead, pos);
     } catch {
       if (fd >= 0) {
         try {
-          (0, import_node_fs4.closeSync)(fd);
+          (0, import_node_fs3.closeSync)(fd);
         } catch {
         }
       }
       return;
     }
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs3.closeSync)(fd);
     filePos.set(name, pos + bytesRead);
     const chunk = (fileBuf.get(name) ?? "") + buf.slice(0, bytesRead).toString("utf8");
     const newlineIdx = chunk.lastIndexOf("\n");
@@ -29302,7 +29291,7 @@ async function* runStraceTailer(opts) {
   function pollDir() {
     let entries;
     try {
-      entries = (0, import_node_fs4.readdirSync)(opts.watchDir);
+      entries = (0, import_node_fs3.readdirSync)(opts.watchDir);
     } catch {
       return;
     }
@@ -29332,7 +29321,7 @@ async function* runStraceTailer(opts) {
     if (path3 === void 0 || path3 === "") return;
     let stat;
     try {
-      stat = (0, import_node_fs4.statSync)(path3, { bigint: true });
+      stat = (0, import_node_fs3.statSync)(path3, { bigint: true });
     } catch (err) {
       const code = err.code;
       if (code === "ENOENT") {
@@ -29404,22 +29393,22 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs4.openSync)(path3, "r");
+      fd = (0, import_node_fs3.openSync)(path3, "r");
       if (baseline !== void 0) {
-        const fdStat = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
+        const fdStat = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
         if (fdStat.ino !== baseline.ino || fdStat.dev !== baseline.dev) {
-          (0, import_node_fs4.closeSync)(fd);
+          (0, import_node_fs3.closeSync)(fd);
           recordTamper(
             `events file fd-stat mismatch on open (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${fdStat.dev} ino=${fdStat.ino}): ${path3}`
           );
           return;
         }
       }
-      bytesRead = (0, import_node_fs4.readSync)(fd, buf, 0, toRead, eventsPos);
+      bytesRead = (0, import_node_fs3.readSync)(fd, buf, 0, toRead, eventsPos);
     } catch (err) {
       if (fd >= 0) {
         try {
-          (0, import_node_fs4.closeSync)(fd);
+          (0, import_node_fs3.closeSync)(fd);
         } catch {
         }
       }
@@ -29429,7 +29418,7 @@ async function* runStraceTailer(opts) {
       }
       return;
     }
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs3.closeSync)(fd);
     eventsPos += bytesRead;
     lastConsumedCtime = ctimeBig;
     const chunk = eventsBuf + buf.slice(0, bytesRead).toString("utf8");
@@ -29465,7 +29454,7 @@ async function* runStraceTailer(opts) {
   }
   let watcher = null;
   try {
-    watcher = (0, import_node_fs4.watch)(opts.watchDir, (_event, _filename) => {
+    watcher = (0, import_node_fs3.watch)(opts.watchDir, (_event, _filename) => {
       drainEventsFile();
       pollDir();
       wake();
@@ -29477,7 +29466,7 @@ async function* runStraceTailer(opts) {
   let eventsWatcher = null;
   if (opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     try {
-      eventsWatcher = (0, import_node_fs4.watch)(opts.eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = (0, import_node_fs3.watch)(opts.eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
         wake();
       });
@@ -29490,7 +29479,7 @@ async function* runStraceTailer(opts) {
   if (opts.eventsDirPath !== void 0 && opts.eventsDirPath !== "" && opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     const expectedBasename = opts.eventsFileBasename ?? opts.eventsFilePath.slice(opts.eventsFilePath.lastIndexOf("/") + 1);
     try {
-      eventsDirWatcher = (0, import_node_fs4.watch)(
+      eventsDirWatcher = (0, import_node_fs3.watch)(
         opts.eventsDirPath,
         { persistent: false },
         (event, filename) => {
@@ -29657,7 +29646,7 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
     if (Date.now() - start >= deadlineMs) break;
     let raw;
     try {
-      raw = (0, import_node_fs4.readFileSync)(
+      raw = (0, import_node_fs3.readFileSync)(
         `/proc/${stracePid}/task/${stracePid}/children`,
         "utf8"
       ).trim();
@@ -29682,37 +29671,23 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
   }
   return null;
 }
-var PHASE_B_STDOUT_WINDOW_BYTES = 16384;
-function openPhaseBStdoutCapture(dir) {
-  try {
-    const path3 = `${dir}/phase-b-stdout.log`;
-    const fd = (0, import_node_fs4.openSync)(path3, "w");
-    return { fd, path: path3 };
-  } catch {
-    return null;
-  }
-}
-function readFileTail(path3, maxBytes) {
-  let fd = -1;
-  try {
-    fd = (0, import_node_fs4.openSync)(path3, "r");
-    const size = (0, import_node_fs4.fstatSync)(fd).size;
-    const start = size > maxBytes ? size - maxBytes : 0;
-    const len = size - start;
-    if (len <= 0) return "";
-    const buf = Buffer.allocUnsafe(len);
-    (0, import_node_fs4.readSync)(fd, buf, 0, len, start);
-    return buf.toString("utf8");
-  } catch {
-    return "";
-  } finally {
-    if (fd >= 0) {
-      try {
-        (0, import_node_fs4.closeSync)(fd);
-      } catch {
+var PHASE_B_STDOUT_TAIL_BYTES = 16384;
+function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAIL_BYTES) {
+  if (!stream) return () => "";
+  let tail = "";
+  stream.on("data", (chunk) => {
+    tail = tail + chunk.toString("utf8");
+    if (Buffer.byteLength(tail, "utf8") > capBytes) {
+      if (redact) tail = redact(tail);
+      const buf = Buffer.from(tail, "utf8");
+      if (buf.length > capBytes) {
+        tail = buf.subarray(buf.length - capBytes).toString("utf8");
       }
     }
-  }
+  });
+  stream.on("error", () => {
+  });
+  return () => tail;
 }
 var LinuxStraceRunner = class {
   _exitCode = 0;
@@ -29729,15 +29704,22 @@ var LinuxStraceRunner = class {
   // until the first per-pid file is observed (and remains null if
   // strace failed to spawn).
   _rootPid = null;
-  // Path of the install command's STDOUT capture FILE (yarn Berry writes its
-  // setup/diagnostic errors to stdout).  fd1 is redirected to this file in
-  // run(); getStdoutTail() reads its tail and main() surfaces it REDACTED on
-  // the Phase-B fail-closed path.  Null until run() opens it (or if the open
-  // failed — capture is best-effort).
-  _stdoutCapturePath = null;
-  // Byte window read back from the capture file.  Sized by main() to exceed the
-  // longest protected env value so the emit-time redactor sees whole values.
-  _stdoutWindowBytes;
+  // Live getter over the drained, byte-bounded in-memory tail of the install
+  // command's STDOUT (yarn Berry writes its setup/diagnostic errors here).  fd1
+  // is wired as a pipe and a 'data' listener keeps it flowing so a verbose
+  // install cannot fill the pipe and deadlock; only the last cap BYTES are
+  // retained, redacted before each front-drop.  Wired in run(); read via
+  // getStdoutTail() and surfaced REDACTED on the Phase-B fail-closed path.
+  // Defaults to the empty-tail getter so it is safe to call before/without a
+  // spawn.  Nothing touches disk (Codex round-4 [high]).
+  _stdoutTailGetter = () => "";
+  // Redactor applied to the stdout tail before each front-drop and again at
+  // emit time.  Injected from main() (where config.protected.env is known).
+  // Undefined for test fakes / callers that don't capture stdout.
+  _redactStdout;
+  // Byte cap for the in-memory tail.  Sized by main() to exceed the longest
+  // protected env value (in UTF-8 bytes) so the redactor sees whole values.
+  _stdoutTailBytes;
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
    *                   to `node:child_process.spawn`.
@@ -29747,11 +29729,15 @@ var LinuxStraceRunner = class {
    *                   shared events file — used by tests that supply a
    *                   pre-set environment via the `opts.env` passed to
    *                   `run()`.
+   * @param redactStdout Redactor for the stdout tail (masks complete protected
+   *                   values + credential shapes).  Undefined for test fakes.
+   * @param stdoutTailBytes Byte cap for the in-memory stdout tail.
    */
-  constructor(spawnImpl, eventsFile, stdoutWindowBytes = PHASE_B_STDOUT_WINDOW_BYTES) {
+  constructor(spawnImpl, eventsFile, redactStdout, stdoutTailBytes = PHASE_B_STDOUT_TAIL_BYTES) {
     this._spawnImpl = spawnImpl ?? import_node_child_process3.spawn;
     this._eventsFile = eventsFile ?? null;
-    this._stdoutWindowBytes = stdoutWindowBytes;
+    this._redactStdout = redactStdout;
+    this._stdoutTailBytes = stdoutTailBytes;
   }
   getExitCode() {
     return this._exitCode;
@@ -29782,7 +29768,7 @@ var LinuxStraceRunner = class {
     return this._rootPid;
   }
   getStdoutTail() {
-    return this._stdoutCapturePath === null ? "" : readFileTail(this._stdoutCapturePath, this._stdoutWindowBytes);
+    return this._stdoutTailGetter();
   }
   async *run(cmd, args, opts) {
     const commandArgs = process.env["SCRIPT_JAIL_PHASE_B_UNSHARE_NET"] === "1" ? ["unshare", "-n", "--", cmd, ...args] : [cmd, ...args];
@@ -29796,23 +29782,23 @@ var LinuxStraceRunner = class {
       opts.basePath,
       ...commandArgs
     ];
-    const stdoutCapture = openPhaseBStdoutCapture((0, import_node_path4.dirname)(opts.basePath));
-    this._stdoutCapturePath = stdoutCapture?.path ?? null;
     const child = this._spawnImpl("strace", straceArgs, {
       cwd: opts.cwd,
       env: opts.env,
       // fd 0: stdin  → /dev/null
-      // fd 1: stdout → capture FILE (install stdout) or 'ignore' if unavailable
+      // fd 1: stdout → pipe  (the install command inherits strace's fd1; yarn
+      //                Berry writes its errors here — drained into a byte-
+      //                bounded in-memory tail for the Phase-B fail-closed
+      //                diagnostic)
       // fd 2: stderr → pipe  (strace diagnostics forwarded to process.stderr)
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
-      stdio: ["ignore", stdoutCapture ? stdoutCapture.fd : "ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe", "pipe"]
     });
-    if (stdoutCapture) {
-      try {
-        (0, import_node_fs4.closeSync)(stdoutCapture.fd);
-      } catch {
-      }
-    }
+    this._stdoutTailGetter = attachStdoutTailCollector(
+      child.stdio[1],
+      this._redactStdout,
+      this._stdoutTailBytes
+    );
     let rootPidDeterministicResolution = false;
     if (child.pid !== void 0) {
       rootPidDeterministicResolution = true;
@@ -29894,8 +29880,8 @@ var LinuxStraceRunner = class {
   }
 };
 function detectManager(cwd) {
-  if ((0, import_node_fs4.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
-  if ((0, import_node_fs4.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
+  if ((0, import_node_fs3.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
+  if ((0, import_node_fs3.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
   return "npm";
 }
 async function waitForGo(readable) {
@@ -30098,7 +30084,7 @@ function macosTokenizeRoots(workDir) {
   const rawTmp = (0, import_node_os.tmpdir)();
   let tmp;
   try {
-    tmp = (0, import_node_fs4.realpathSync)(rawTmp);
+    tmp = (0, import_node_fs3.realpathSync)(rawTmp);
   } catch {
     tmp = rawTmp;
   }
@@ -30116,21 +30102,21 @@ function scratchBaseDir(env = process.env) {
 }
 function createEventsFile(parentDir = scratchBaseDir()) {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
-  const dirPath = (0, import_node_fs4.mkdtempSync)((0, import_node_path4.join)(parentDir, `script-jail-events-${tag}-`));
-  (0, import_node_fs4.chmodSync)(dirPath, 448);
+  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path4.join)(parentDir, `script-jail-events-${tag}-`));
+  (0, import_node_fs3.chmodSync)(dirPath, 448);
   const path3 = (0, import_node_path4.join)(dirPath, `events-${tag}.jsonl`);
-  const fd = (0, import_node_fs4.openSync)(
+  const fd = (0, import_node_fs3.openSync)(
     path3,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition
-    import_node_fs4.constants.O_RDWR | import_node_fs4.constants.O_CREAT | import_node_fs4.constants.O_EXCL | import_node_fs4.constants.O_NOFOLLOW,
+    import_node_fs3.constants.O_RDWR | import_node_fs3.constants.O_CREAT | import_node_fs3.constants.O_EXCL | import_node_fs3.constants.O_NOFOLLOW,
     384
   );
   let baseline;
   try {
-    const s = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
+    const s = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
     baseline = { ino: s.ino, dev: s.dev, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
   } finally {
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs3.closeSync)(fd);
   }
   return { path: path3, dirPath, baseline };
 }
@@ -30190,7 +30176,7 @@ async function main(input) {
   diag(input, `main(): configPath=${configPath}`);
   let rawConfig;
   try {
-    const text = (0, import_node_fs4.readFileSync)(configPath, "utf8");
+    const text = (0, import_node_fs3.readFileSync)(configPath, "utf8");
     rawConfig = (0, import_yaml2.parse)(text);
   } catch (err) {
     throw new Error(`script-jail agent: failed to read config at ${configPath}: ${String(err)}`);
@@ -30223,15 +30209,22 @@ async function main(input) {
   }
   const installEnv = isMacosBare ? { ...childEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : childEnv;
   const spawner = input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
-  const maxProtectedValueLen = config2.protected.env.reduce((max, name) => {
+  const maxProtectedValueBytes = config2.protected.env.reduce((max, name) => {
     const v = process.env[name];
-    return typeof v === "string" && v.length > max ? v.length : max;
+    if (typeof v !== "string") return max;
+    const n = Buffer.byteLength(v, "utf8");
+    return n > max ? n : max;
   }, 0);
-  const stdoutWindowBytes = Math.max(
-    PHASE_B_STDOUT_WINDOW_BYTES,
-    4096 + maxProtectedValueLen + 4096
+  const stdoutTailBytes = Math.max(
+    PHASE_B_STDOUT_TAIL_BYTES,
+    4096 + maxProtectedValueBytes + 4096
   );
-  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile, stdoutWindowBytes) : new LinuxStraceRunner(void 0, eventsFile, stdoutWindowBytes));
+  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(
+    void 0,
+    eventsFile,
+    (s) => redactSensitive(s, config2.protected.env),
+    stdoutTailBytes
+  ));
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader()
   );
@@ -30345,7 +30338,7 @@ ${fetchDetail}
   });
   const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
   try {
-    (0, import_node_fs4.mkdirSync)(straceBaseDir, { recursive: true });
+    (0, import_node_fs3.mkdirSync)(straceBaseDir, { recursive: true });
   } catch {
   }
   const installInput = {
@@ -30415,7 +30408,7 @@ ${stdoutTail}`;
     let sha256 = config2.manager_lockfile_sha256;
     if (!sha256 && config2.lockfile_path) {
       try {
-        const lockfileContent = (0, import_node_fs4.readFileSync)(config2.lockfile_path);
+        const lockfileContent = (0, import_node_fs3.readFileSync)(config2.lockfile_path);
         sha256 = (0, import_node_crypto.createHash)("sha256").update(lockfileContent).digest("hex");
       } catch {
         sha256 = "";
@@ -30481,16 +30474,15 @@ if (isMain) {
   LinuxVsockConnection,
   MacOSSpawner,
   MemoryConnection,
-  PHASE_B_STDOUT_WINDOW_BYTES,
+  PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough,
   StdioConnection,
+  attachStdoutTailCollector,
   buildChildEnv,
   buildChildEnvMacos,
   createEventsFile,
   macosTokenizeRoots,
   main,
-  openPhaseBStdoutCapture,
-  readFileTail,
   readStraceChildPid,
   redactSensitive,
   runStraceTailer,
