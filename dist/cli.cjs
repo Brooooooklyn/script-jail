@@ -8201,15 +8201,21 @@ var import_node_os4 = require("node:os");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
-  const {
-    baseRootfsPath,
-    repoSrcPath,
-    configPath,
-    workDir: maybeWorkDir,
-    extraRepoOverlayFiles
-  } = input;
-  const workDir = maybeWorkDir ?? (0, import_node_fs6.mkdtempSync)((0, import_node_path6.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
+  const workDir = input.workDir ?? (0, import_node_fs6.mkdtempSync)((0, import_node_path6.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
   (0, import_node_fs6.mkdirSync)(workDir, { recursive: true });
+  try {
+    return await buildOverlayInto(workDir, input);
+  } catch (err) {
+    try {
+      await (0, import_promises.rm)(workDir, { recursive: true, force: true });
+    } catch (rmErr) {
+      console.warn(`[overlay] partial-build cleanup warning: ${String(rmErr)}`);
+    }
+    throw err;
+  }
+}
+async function buildOverlayInto(workDir, input) {
+  const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
   const rootfsCopyPath = (0, import_node_path6.join)(workDir, "rootfs.ext4");
   copyRootfs(baseRootfsPath, rootfsCopyPath);
   const repoStageDir = (0, import_node_path6.join)(workDir, "repo-stage");
@@ -24389,14 +24395,12 @@ async function launchVm(input) {
         is_read_only: false
       });
     }
-    if (scratchDiskPath !== void 0) {
-      await apiClient.put("/drives/scratch", {
-        drive_id: "scratch",
-        path_on_host: scratchDiskPath,
-        is_root_device: false,
-        is_read_only: false
-      });
-    }
+    await apiClient.put("/drives/scratch", {
+      drive_id: "scratch",
+      path_on_host: scratchDiskPath,
+      is_root_device: false,
+      is_read_only: false
+    });
     await apiClient.put("/machine-config", {
       vcpu_count: vcpu,
       mem_size_mib: memMB

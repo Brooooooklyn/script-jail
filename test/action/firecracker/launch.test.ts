@@ -79,6 +79,10 @@ function makeInput(
     firecrackerPath: '/usr/bin/firecracker',
     vmlinuxPath: '/images/vmlinux',
     rootfsPath: '/run/rootfs.ext4',
+    // Required since the round-1 review hardening: the guest's init.sh
+    // fail-closes when the scratch device is absent, so every launch must
+    // attach it.
+    scratchDiskPath: '/run/scratch.ext4',
     vsockCid: 100,
     vsockUdsPath: '/tmp/vsock.sock',
     enableNetwork: false,
@@ -292,14 +296,21 @@ describe('launchVm', () => {
     expect(scratchIdx).toBeGreaterThan(repoIdx);
   });
 
-  it('does NOT send /drives/scratch when scratchDiskPath is not provided', async () => {
+  it('ALWAYS sends /drives/scratch (required — init.sh fail-closes without it)', async () => {
     const { client, calls } = makeFakeApiClient();
     const { spawner } = makeFakeSpawner();
 
-    await launchVm(makeInput({ apiClient: client, spawner, scratchDiskPath: undefined }));
+    // No scratch override — the default input's scratch disk must be PUT
+    // unconditionally.  A launch without the drive would boot a guest whose
+    // init.sh fatals on the missing `scratch` label.
+    await launchVm(makeInput({ apiClient: client, spawner }));
 
     const scratchDrive = calls.find((c) => c.path === '/drives/scratch');
-    expect(scratchDrive).toBeUndefined();
+    expect(scratchDrive).toBeDefined();
+    const body = scratchDrive!.body as Record<string, unknown>;
+    expect(body['drive_id']).toBe('scratch');
+    expect(body['path_on_host']).toBe('/run/scratch.ext4');
+    expect(body['is_read_only']).toBe(false);
   });
 
   it('uses the custom bootArgs when provided', async () => {
@@ -325,6 +336,7 @@ describe('launchVm', () => {
         firecrackerPath: '/usr/bin/firecracker',
         vmlinuxPath: '/images/vmlinux',
         rootfsPath: '/run/rootfs.ext4',
+        scratchDiskPath: '/run/scratch.ext4',
         vsockCid: 100,
         vsockUdsPath: '/tmp/vsock.sock',
         enableNetwork: false,

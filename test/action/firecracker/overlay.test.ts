@@ -72,6 +72,33 @@ function fakeConfig(dir: string): string {
 // a stubbed mkfs.ext4 requires > 50 lines of mock infrastructure.  Leave as
 // is until a dedicated ext4-mock helper is available.
 
+describe('makeOverlay — partial-build failure removes the workDir', () => {
+  it('removes a populated workDir when a build step throws mid-flight', async () => {
+    // The escaping extraRepoOverlayFiles entry throws AFTER the rootfs copy
+    // and repo staging have populated the workDir (and before any mkfs, so
+    // this runs on every platform).  Without the try/catch in makeOverlay
+    // the caller never receives cleanup() and the populated tree leaks
+    // (round-1 review, medium finding).
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+    const workDir = mkdtempSync(join(tmpdir(), 'script-jail-partial-build-'));
+
+    await expect(
+      makeOverlay({
+        baseRootfsPath,
+        repoSrcPath: repoDir,
+        configPath,
+        workDir,
+        extraRepoOverlayFiles: [{ relPath: '../escape.txt', content: 'x' }],
+      }),
+    ).rejects.toThrow(/escapes the repo stage dir|not a safe relative path/);
+
+    // The whole workDir — including the already-copied rootfs and staged
+    // repo — must be gone.
+    expect(existsSync(workDir)).toBe(false);
+  });
+});
+
 describe('makeOverlay — staging (no ext4 build)', () => {
   it('copies the base rootfs to rootfsCopyPath', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);

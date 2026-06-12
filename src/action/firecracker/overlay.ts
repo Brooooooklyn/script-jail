@@ -116,17 +116,35 @@ export interface OverlayResult {
 // ---------------------------------------------------------------------------
 
 export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
-  const {
-    baseRootfsPath,
-    repoSrcPath,
-    configPath,
-    workDir: maybeWorkDir,
-    extraRepoOverlayFiles,
-  } = input;
-
   // 1. Create per-run work dir if not supplied.
-  const workDir = maybeWorkDir ?? mkdtempSync(join(tmpdir(), 'script-jail-run-'));
+  const workDir = input.workDir ?? mkdtempSync(join(tmpdir(), 'script-jail-run-'));
   mkdirSync(workDir, { recursive: true });
+
+  // Everything below populates workDir.  If any build step throws after this
+  // point (rootfs copy, repo staging, repo/scratch mkfs), the caller never
+  // receives the `cleanup` closure and could not remove the partially built
+  // tree — which by then can hold a full rootfs copy plus a multi-GB-logical
+  // repo image (Codex review 2026-06-12, round-1 medium finding).  Remove the
+  // workDir ourselves before rethrowing; mirror cleanup()'s never-throw rule
+  // so the removal failure can't mask the original error.
+  try {
+    return await buildOverlayInto(workDir, input);
+  } catch (err) {
+    try {
+      await rm(workDir, { recursive: true, force: true });
+    } catch (rmErr) {
+      console.warn(`[overlay] partial-build cleanup warning: ${String(rmErr)}`);
+    }
+    throw err;
+  }
+}
+
+/** Body of {@link makeOverlay}: builds all three images inside `workDir`. */
+async function buildOverlayInto(
+  workDir: string,
+  input: OverlayInput,
+): Promise<OverlayResult> {
+  const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
 
   // 2. Copy the base rootfs (CoW where supported, plain copy otherwise).
   const rootfsCopyPath = join(workDir, 'rootfs.ext4');

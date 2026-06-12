@@ -184,7 +184,7 @@ else
   fatal "no block device with filesystem label 'repo'"
 fi
 
-# --- Scratch disk (filesystem label `scratch`, OPTIONAL) ----------------------
+# --- Scratch disk (filesystem label `scratch`, REQUIRED) ----------------------
 # VM backends (Firecracker, Apple VZ) attach a third virtio drive labelled
 # `scratch` (empty ext4, 4096 MiB) for the agent's bulk audit artifacts: the
 # per-pid `strace -ff` logs and the audit-events JSONL.  Both historically
@@ -192,33 +192,36 @@ fi
 # partway through Phase B — a ~1000-package yarn-berry monorepo produces
 # hundreds of MB of strace text alone), truncating the audit.
 #
-# The drive is OPTIONAL for forward/backward compatibility: older hosts (and
-# the Docker/bare backends, which have no block-device contract) do not attach
-# it.  Resolution mirrors the repo-disk lookup: by label via `blkid -L`, never
-# by /dev/vd* letter, and the same `if`-wrapping keeps `set -e` from aborting
-# on the absent-device non-zero exit.  When absent we degrade silently to
-# /tmp — small repos keep working without a lockstep host upgrade.
+# The drive is REQUIRED, exactly like the repo disk above: this init.sh only
+# runs inside a VM, and the host that boots this rootfs ships in lock-step
+# with it (the action/CLI pins the rootfs by manifest SHA from its own
+# release, and every VM launcher in that release attaches the scratch
+# drive).  A missing or unmountable scratch device therefore always means a
+# bug — and silently degrading to /tmp would reintroduce the exact silent
+# ENOSPC truncation this disk exists to prevent (Codex review 2026-06-12,
+# round-1 high finding).  The Docker/bare backends never execute init.sh, so
+# fail-closed here cannot affect them; their agent falls back to /tmp via the
+# unset SCRIPT_JAIL_SCRATCH_DIR.
 #
-# When mounted, SCRIPT_JAIL_SCRATCH_DIR tells the agent (src/guest/agent.ts,
+# Resolution mirrors the repo-disk lookup: by label via `blkid -L`, never by
+# /dev/vd* letter, with the same `if`-wrapping so `set -e` doesn't swallow
+# the diagnostic on the absent-device non-zero exit.
+#
+# SCRIPT_JAIL_SCRATCH_DIR tells the agent (src/guest/agent.ts,
 # scratchBaseDir()) where to put the events file + strace logs.  The variable
 # is agent-internal: it is deliberately NOT in the agent's
 # LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES allow-list, so it is stripped from
 # every audited lifecycle child's env — backends with and without the scratch
 # disk present byte-identical child environments.
-SCRATCH_BASE=/tmp
 if SCRATCH_DEV="$(blkid -L scratch)" && [ -n "${SCRATCH_DEV}" ]; then
   mkdir -p /scratch
-  if mount "${SCRATCH_DEV}" /scratch; then
-    SCRATCH_BASE=/scratch
-    export SCRIPT_JAIL_SCRATCH_DIR=/scratch
-    echo "[init] scratch disk mounted at /scratch (${SCRATCH_DEV})"
-  else
-    # A present-but-unmountable scratch disk degrades to /tmp rather than
-    # failing the audit: the fallback only risks ENOSPC on large repos,
-    # while a fatal here would brick every run over a transient disk issue.
-    echo "[init] WARN: scratch device ${SCRATCH_DEV} found but mount failed; using /tmp" >&2
-  fi
+  mount "${SCRATCH_DEV}" /scratch
+  export SCRIPT_JAIL_SCRATCH_DIR=/scratch
+  echo "[init] scratch disk mounted at /scratch (${SCRATCH_DEV})"
+else
+  fatal "no block device with filesystem label 'scratch'"
 fi
+SCRATCH_BASE=/scratch
 
 # Copy the user's config from the repo disk into the rootfs's canonical
 # /etc/script-jail/config.yml so the agent can read it regardless of /work staying
