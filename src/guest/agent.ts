@@ -1005,9 +1005,50 @@ export async function* runStraceTailer(
   // observe the now-discarded growth and flag tamper.
   let eventsWatcher: ReturnType<typeof fsWatch> | null = null;
   if (opts.eventsFilePath !== undefined && opts.eventsFilePath !== '') {
+    const eventsFilePath = opts.eventsFilePath; // narrowed for the closure below
     try {
-      eventsWatcher = fsWatch(opts.eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = fsWatch(eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
+        // INOTIFY-PROVEN ctime tamper (2026-06-12, Codex round-4 [high]).  An
+        // inotify 'change' fire means a real SYSCALL touched the events file.
+        // The deferred kernel ctime-finalize fires NO inotify event — verified
+        // empirically on overlay AND ext4: 'change' events track writes 1:1
+        // (changePerWrite ≈ 1.000) even when a poll observes a finalize
+        // overshoot (ext4 showed overshoots up to 5ms with zero extra 'change'
+        // events).  So a watcher fire that, AFTER draining any new bytes, leaves
+        // size === eventsPos with ctime advanced past the last consumed write is
+        // a metadata-only operation — truncate-back / utimes-restore / chmod —
+        // i.e. tamper.  The poll-based ctime gate below cannot tell that benign
+        // finalize from a syscall and so defers to the exit disposition (which
+        // VOIDS a benign end-of-audit finalize); THIS path fires immediately and
+        // disposition-INDEPENDENTLY, closing the append→truncate→utimes→exit-0
+        // hole where a same-UID script tampers then lets the install exit clean.
+        // No false positive: a legit append grows size (consumed → ctime ==
+        // lastConsumedCtime), and the events file's metadata is touched by
+        // nothing but the appending shim during a normal audit.
+        try {
+          const st = statSync(eventsFilePath, { bigint: true }) as unknown as { size: bigint; ctimeNs: bigint };
+          if (
+            // Gate on !childExited for the SAME reason the poll gate does (PR
+            // #10): a CLEAN whole-tree exit proves no in-model writer remains,
+            // so a post-exit inotify fire is trusted (and the end-of-audit
+            // tests' post-exit chmod must not trip).  An ABNORMAL / no-
+            // disposition exit leaves childExited false, so this stays ARMED
+            // post-exit and still catches a detached-survivor metadata op.
+            !childExited &&
+            Number(st.size) === eventsPos &&
+            lastConsumedCtime !== -1n &&
+            st.ctimeNs > lastConsumedCtime
+          ) {
+            recordTamper(
+              `events file ctime advanced without new bytes on inotify fire ` +
+                `(ctimeNs=${st.ctimeNs} > lastConsumed=${lastConsumedCtime}, size=${eventsPos}): ${eventsFilePath}`,
+            );
+          }
+        } catch {
+          // stat race (file vanished/rebound) — the inode/ENOENT gates in
+          // drainEventsFile() and the disposition-resolved poll gate cover it.
+        }
         wake();
       });
       // Inotify reports IN_DELETE_SELF / IN_MOVE_SELF as a watcher 'rename'
@@ -2050,8 +2091,40 @@ export function buildChildEnv(
     );
   }
 
+  // Redirect the bulk install cache/store off the small rootfs (and the 16 MB
+  // /root tmpfs) onto the repo overlay disk — but INJECT ONLY the knob the
+  // DETECTED manager actually consumes.  Setting a foreign manager's env knob
+  // is a no-op for the install, but env-spy records ANY enumerated key as an
+  // `env_read`, so an unconditionally-set `YARN_*` would surface in a pnpm
+  // (or npm) lockfile as noise AND break cross-backend parity for fixtures of
+  // a different manager.  Keying on the resolved manager keeps each lockfile
+  // to exactly the redirect that ran.  Per-key rationale:
+  //   pnpm → npm_config_store_dir : pnpm's content-addressed store (the knob
+  //     pnpm reads; npm/yarn ignore it).  Without it a large dep graph
+  //     overruns the rootfs partway through `pnpm fetch`.
+  //   yarn → YARN_GLOBAL_FOLDER + YARN_CACHE_FOLDER : berry rewrites
+  //     cacheFolder to `${globalFolder}/cache` under enableGlobalCache (the
+  //     env source beats repo .yarnrc.yml); YARN_CACHE_FOLDER also covers
+  //     classic 1.x and `enableGlobalCache:false` berry.  Without these the
+  //     cache defaults under $HOME/.yarn on the /root tmpfs → ENOSPC on a
+  //     ~1000-package yarn-4 monorepo.
+  //   npm  → npm_config_cache : moves the ~/.npm cacache tree off /root.
+  // All tokenize under the same `$REPO/...` longest-prefix bucket as the
+  // established `$REPO/.pnpm-store` (src/lock/tokenize.ts).
+  const resolvedManager = config.manager ?? detectManager(config.work_dir);
+  const cacheRedirectEnv: Record<string, string> =
+    resolvedManager === 'pnpm'
+      ? { npm_config_store_dir: `${config.work_dir}/.pnpm-store` }
+      : resolvedManager === 'yarn'
+        ? {
+            YARN_GLOBAL_FOLDER: `${config.work_dir}/.yarn-global`,
+            YARN_CACHE_FOLDER: `${config.work_dir}/.yarn-cache`,
+          }
+        : { npm_config_cache: `${config.work_dir}/.npm-cache` };
+
   return {
     ...inheritedEnv,
+    ...cacheRedirectEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -2081,62 +2154,8 @@ export function buildChildEnv(
       ...(inheritedEnv['NODE_OPTIONS'] ? [inheritedEnv['NODE_OPTIONS']] : []),
       ...requireFlags,
     ].join(' '),
-
-    // Redirect pnpm's content-addressed store off the rootfs (sized
-    // ~512 MB and shared with `/lib`, `/usr`, `/root`, etc.) onto the
-    // repo overlay disk (~4 GB, see src/action/firecracker/overlay.ts:
-    // REPO_DISK_MIN_MB).  Without this, a real-world monorepo (e.g.
-    // vuejs/core's ~500 MB dep graph) overruns the rootfs partway
-    // through `pnpm fetch` — Phase A reports `ok=true` but the store
-    // is incomplete, Phase B's `pnpm install --offline` then links
-    // only what's present and emits a truncated lockfile.
-    //
-    // `npm_config_store_dir` is the documented pnpm env knob for
-    // store location (pnpm reads npm-style env vars).  npm and yarn
-    // do not recognise this key and ignore it, so setting it
-    // unconditionally is safe across managers.
-    npm_config_store_dir: `${config.work_dir}/.pnpm-store`,
-
-    // Redirect yarn's and npm's caches onto the repo disk for the same
-    // reason as the pnpm store above.  Without these, yarn berry's global
-    // folder defaults under $HOME (`~/.yarn/berry`) and npm's cache lands
-    // at `~/.npm` — both on the guest's /root, a 16 MB tmpfs
-    // (src/rootfs/init.sh), with the 1 GB rootfs ext4 right behind it.
-    // A real dependency graph overflows either one with ENOSPC partway
-    // through Phase A (found auditing a ~1000-package yarn-4 monorepo).
-    //
-    // YARN_GLOBAL_FOLDER — yarn berry only (classic 1.x ignores it).
-    // Berry maps every config setting to a `YARN_<SNAKE_CASE>` env var and
-    // applies the `<environment>` source BEFORE yarnrc files with
-    // first-source-wins (Configuration.use skips keys whose source is
-    // already set), so this beats a repo's own .yarnrc.yml.  Yarn 4
-    // defaults `enableGlobalCache: true` and then INTERNALLY rewrites
-    // `cacheFolder` to `${globalFolder}/cache` (Configuration.find), so the
-    // bulk download cache lands at `${work_dir}/.yarn-global/cache`
-    // regardless of any cacheFolder / YARN_CACHE_FOLDER value.  Berry's
-    // install-state stays project-relative (./.yarn/install-state.gz),
-    // already on the repo disk.
-    //
-    // YARN_CACHE_FOLDER — yarn classic's cache-folder AND berry's
-    // cacheFolder.  Covers (a) yarn 1.x, which ignores YARN_GLOBAL_FOLDER,
-    // and (b) berry repos that opt out via `enableGlobalCache: false` —
-    // there the env-provided cacheFolder wins over the rc value, and
-    // berry's optional offline mirror is `${globalFolder}/cache`, also on
-    // the repo disk.  Either way every yarn cache write lands under
-    // `${config.work_dir}`, never on the /root tmpfs.
-    //
-    // npm_config_cache — npm's `cache` key (env beats .npmrc), moving the
-    // ~/.npm cacache tree onto the repo disk.  pnpm does NOT consult npm's
-    // `cache` key (its setting is `cache-dir` / npm_config_cache_dir,
-    // defaulting to the XDG cache dir), so this cannot disturb the
-    // .pnpm-store redirect above; yarn does not read it either.
-    //
-    // All three tokenize as `$REPO/.yarn-global`, `$REPO/.yarn-cache`, and
-    // `$REPO/.npm-cache` — the same longest-prefix bucket as the
-    // established `$REPO/.pnpm-store` (src/lock/tokenize.ts).
-    YARN_GLOBAL_FOLDER: `${config.work_dir}/.yarn-global`,
-    YARN_CACHE_FOLDER: `${config.work_dir}/.yarn-cache`,
-    npm_config_cache: `${config.work_dir}/.npm-cache`,
+    // The manager-specific cache/store redirect is spread in above via
+    // `...cacheRedirectEnv` (see the rationale where it is built).
   };
 }
 

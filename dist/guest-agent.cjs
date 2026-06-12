@@ -29433,9 +29433,27 @@ async function* runStraceTailer(opts) {
   }
   let eventsWatcher = null;
   if (opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
+    const eventsFilePath = opts.eventsFilePath;
     try {
-      eventsWatcher = (0, import_node_fs3.watch)(opts.eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = (0, import_node_fs3.watch)(eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
+        try {
+          const st = (0, import_node_fs3.statSync)(eventsFilePath, { bigint: true });
+          if (
+            // Gate on !childExited for the SAME reason the poll gate does (PR
+            // #10): a CLEAN whole-tree exit proves no in-model writer remains,
+            // so a post-exit inotify fire is trusted (and the end-of-audit
+            // tests' post-exit chmod must not trip).  An ABNORMAL / no-
+            // disposition exit leaves childExited false, so this stays ARMED
+            // post-exit and still catches a detached-survivor metadata op.
+            !childExited && Number(st.size) === eventsPos && lastConsumedCtime !== -1n && st.ctimeNs > lastConsumedCtime
+          ) {
+            recordTamper(
+              `events file ctime advanced without new bytes on inotify fire (ctimeNs=${st.ctimeNs} > lastConsumed=${lastConsumedCtime}, size=${eventsPos}): ${eventsFilePath}`
+            );
+          }
+        } catch {
+        }
         wake();
       });
       eventsWatcher.on("error", () => {
@@ -29937,8 +29955,14 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
       `SCRIPT_JAIL_PROTECTED_ENV_NAMES is ${protectedNamesByteLen} bytes (comma-joined from ${config2.protected.env.length} entries); the LD_PRELOAD shim's CanonBuf can hold at most ${CANON_PROTECTED_ENV_NAMES_MAX_LEN} bytes before silently truncating the suffix and leaking the dropped names unannotated.  Reduce the \`protected.env\` list in .script-jail.yml (or split secrets across multiple runs).`
     );
   }
+  const resolvedManager = config2.manager ?? detectManager(config2.work_dir);
+  const cacheRedirectEnv = resolvedManager === "pnpm" ? { npm_config_store_dir: `${config2.work_dir}/.pnpm-store` } : resolvedManager === "yarn" ? {
+    YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
+    YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`
+  } : { npm_config_cache: `${config2.work_dir}/.npm-cache` };
   return {
     ...inheritedEnv,
+    ...cacheRedirectEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -29967,61 +29991,9 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     NODE_OPTIONS: [
       ...inheritedEnv["NODE_OPTIONS"] ? [inheritedEnv["NODE_OPTIONS"]] : [],
       ...requireFlags
-    ].join(" "),
-    // Redirect pnpm's content-addressed store off the rootfs (sized
-    // ~512 MB and shared with `/lib`, `/usr`, `/root`, etc.) onto the
-    // repo overlay disk (~4 GB, see src/action/firecracker/overlay.ts:
-    // REPO_DISK_MIN_MB).  Without this, a real-world monorepo (e.g.
-    // vuejs/core's ~500 MB dep graph) overruns the rootfs partway
-    // through `pnpm fetch` — Phase A reports `ok=true` but the store
-    // is incomplete, Phase B's `pnpm install --offline` then links
-    // only what's present and emits a truncated lockfile.
-    //
-    // `npm_config_store_dir` is the documented pnpm env knob for
-    // store location (pnpm reads npm-style env vars).  npm and yarn
-    // do not recognise this key and ignore it, so setting it
-    // unconditionally is safe across managers.
-    npm_config_store_dir: `${config2.work_dir}/.pnpm-store`,
-    // Redirect yarn's and npm's caches onto the repo disk for the same
-    // reason as the pnpm store above.  Without these, yarn berry's global
-    // folder defaults under $HOME (`~/.yarn/berry`) and npm's cache lands
-    // at `~/.npm` — both on the guest's /root, a 16 MB tmpfs
-    // (src/rootfs/init.sh), with the 1 GB rootfs ext4 right behind it.
-    // A real dependency graph overflows either one with ENOSPC partway
-    // through Phase A (found auditing a ~1000-package yarn-4 monorepo).
-    //
-    // YARN_GLOBAL_FOLDER — yarn berry only (classic 1.x ignores it).
-    // Berry maps every config setting to a `YARN_<SNAKE_CASE>` env var and
-    // applies the `<environment>` source BEFORE yarnrc files with
-    // first-source-wins (Configuration.use skips keys whose source is
-    // already set), so this beats a repo's own .yarnrc.yml.  Yarn 4
-    // defaults `enableGlobalCache: true` and then INTERNALLY rewrites
-    // `cacheFolder` to `${globalFolder}/cache` (Configuration.find), so the
-    // bulk download cache lands at `${work_dir}/.yarn-global/cache`
-    // regardless of any cacheFolder / YARN_CACHE_FOLDER value.  Berry's
-    // install-state stays project-relative (./.yarn/install-state.gz),
-    // already on the repo disk.
-    //
-    // YARN_CACHE_FOLDER — yarn classic's cache-folder AND berry's
-    // cacheFolder.  Covers (a) yarn 1.x, which ignores YARN_GLOBAL_FOLDER,
-    // and (b) berry repos that opt out via `enableGlobalCache: false` —
-    // there the env-provided cacheFolder wins over the rc value, and
-    // berry's optional offline mirror is `${globalFolder}/cache`, also on
-    // the repo disk.  Either way every yarn cache write lands under
-    // `${config.work_dir}`, never on the /root tmpfs.
-    //
-    // npm_config_cache — npm's `cache` key (env beats .npmrc), moving the
-    // ~/.npm cacache tree onto the repo disk.  pnpm does NOT consult npm's
-    // `cache` key (its setting is `cache-dir` / npm_config_cache_dir,
-    // defaulting to the XDG cache dir), so this cannot disturb the
-    // .pnpm-store redirect above; yarn does not read it either.
-    //
-    // All three tokenize as `$REPO/.yarn-global`, `$REPO/.yarn-cache`, and
-    // `$REPO/.npm-cache` — the same longest-prefix bucket as the
-    // established `$REPO/.pnpm-store` (src/lock/tokenize.ts).
-    YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
-    YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`,
-    npm_config_cache: `${config2.work_dir}/.npm-cache`
+    ].join(" ")
+    // The manager-specific cache/store redirect is spread in above via
+    // `...cacheRedirectEnv` (see the rationale where it is built).
   };
 }
 function buildChildEnvMacos(baseEnv, config2, eventsFilePath, preloadPaths) {
