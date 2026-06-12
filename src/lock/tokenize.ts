@@ -20,7 +20,16 @@ export interface TokenizeRoots {
   repo: string; // absolute path of the repo bind-mount inside the VM, e.g. "/work"
   nodeModules: string; // typically `${repo}/node_modules`
   home: string; // e.g. "/root"
-  tmp: string; // e.g. "/tmp"
+  tmp: string; // e.g. "/tmp" — follows os.tmpdir(), i.e. the scratch tmp when init.sh redirects TMPDIR
+  /**
+   * Optional SECOND prefix that also renders as `$TMPDIR`.  When the guest's
+   * init.sh points TMPDIR at the scratch disk (`/scratch/tmp`), `tmp` above
+   * follows it via os.tmpdir() — but tools that ignore TMPDIR still write to
+   * the literal `/tmp` tmpfs.  Without this alias those writes would surface
+   * as raw `/tmp/...` paths (with uncollapsed hash names), breaking both
+   * determinism and cross-backend parity.  Leave unset when `tmp` IS `/tmp`.
+   */
+  tmpLegacy?: string;
   cache: string; // per-manager, e.g. "/root/.local/share/pnpm/store"
 }
 
@@ -40,6 +49,7 @@ export function tokenize(rawPath: string, roots: TokenizeRoots, currentPkgDir?: 
     [roots.cache, '$CACHE'],
     [roots.home, '$HOME'],
     [roots.tmp, '$TMPDIR'],
+    roots.tmpLegacy !== undefined ? [roots.tmpLegacy, '$TMPDIR'] : null,
   ];
   // Sort by prefix length descending so $PKG beats $NODE_MODULES beats $REPO.
   const sorted = prefixes

@@ -2587,6 +2587,59 @@ function diag(input: AgentInput, msg: string): void {
   else process.stderr.write(`[agent] ${msg}\n`);
 }
 
+/**
+ * Redact secrets from package-manager output before it is surfaced to the host
+ * (Phase A failure dump).  Defence in depth (Codex round-1 [medium], 2026-06-12):
+ * the failure detail tails the install tool's STDOUT, which is repo-controlled
+ * (yarn plugins, lifecycle banners, `.yarnrc.yml`/`.npmrc` echoes) and runs in a
+ * process that inherits the audit env — so it could print a token or a
+ * credentialed registry URL right before failing, republishing it into the
+ * host's CI logs and the vsock error frame.
+ *
+ * Two redaction layers:
+ *   1. VALUE-based: every protected env var's actual value (read from the
+ *      agent's own process.env, which still holds the real secrets — the shim
+ *      only hides them from the lifecycle CHILDREN) is masked wherever it
+ *      appears.  This is exact and catches secrets echoed verbatim.
+ *   2. PATTERN-based: credential shapes that may NOT be in the protected list —
+ *      `user:pass@host` URL userinfo, npm `_authToken`/`_auth`/`_password`
+ *      rc lines, and `Bearer <token>` headers.
+ *
+ * Short/empty values are skipped (layer 1) so a protected var set to e.g. "1"
+ * does not blank out every digit of an ENOSPC trace.
+ *
+ * @internal Exported for unit tests.
+ */
+export function redactSensitive(
+  text: string,
+  protectedEnvNames: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  let out = text;
+  // Layer 1 — exact protected values.  Sort longest-first so a value that is a
+  // substring of another is not partially pre-masked.
+  const values = protectedEnvNames
+    .map((name) => ({ name, value: env[name] }))
+    .filter((e): e is { name: string; value: string } =>
+      typeof e.value === 'string' && e.value.length >= 4,
+    )
+    .sort((a, b) => b.value.length - a.value.length);
+  for (const { name, value } of values) {
+    out = out.split(value).join(`<REDACTED:${name}>`);
+  }
+  // Layer 2 — credential SHAPES regardless of the protected list.
+  out = out
+    // scheme://user:pass@host  → keep scheme + host, drop userinfo
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
+    // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
+    .replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, '$1<REDACTED>')
+    // Bearer <token>
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
+    // npm automation/granular token literals (npm_… 36+ char)
+    .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>');
+  return out;
+}
+
 export async function main(input: AgentInput): Promise<void> {
   const configPath = input.configPath ?? '/etc/script-jail/config.yml';
   diag(input, `main(): configPath=${configPath}`);
@@ -2711,15 +2764,34 @@ export async function main(input: AgentInput): Promise<void> {
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
 
   if (!fetchResult.ok) {
+    // Build the failure detail from stderr AND a stdout tail: npm/pnpm put
+    // their errors on stderr, but yarn Berry writes everything — including
+    // YN0001 ENOSPC traces and resolution failures — to STDOUT with an empty
+    // stderr.  Without the stdout tail the fatal frame reads
+    // "Phase A (fetch) failed: " and the actual cause is invisible on the
+    // host (found dogfooding napi-rs).  Tail-capped so a megabyte of yarn
+    // progress output cannot bloat the vsock error frame.
+    const stdoutTrimmed = fetchResult.stdout.trim();
+    const stdoutTail =
+      stdoutTrimmed.length > 4000 ? `…${stdoutTrimmed.slice(-4000)}` : stdoutTrimmed;
+    const fetchDetailRaw = [
+      fetchResult.stderr.trim(),
+      stdoutTail === '' ? '' : `--- stdout (tail) ---\n${stdoutTail}`,
+    ]
+      .filter((s) => s !== '')
+      .join('\n');
+    // Redact protected env values + credential shapes before this external
+    // tool output reaches the host log / vsock frame (Codex round-1 [medium]).
+    const fetchDetail = redactSensitive(fetchDetailRaw, config.protected.env);
     // Also write to process.stderr so the npm error reaches ttyS0 (the
     // VM's serial console) — `LinuxSpawner` captures the child's stderr
     // into a string, so without this dump the only host-visible symptom
     // would be the eventual fatal error frame.  Useful when the frame
     // itself doesn't make it (e.g. before this flushAndExit was added).
     process.stderr.write(
-      `[agent] Phase A (fetch) failed:\n${fetchResult.stderr}\n`,
+      `[agent] Phase A (fetch) failed:\n${fetchDetail}\n`,
     );
-    emitter.emitError(`Phase A (fetch) failed: ${fetchResult.stderr}`, true);
+    emitter.emitError(`Phase A (fetch) failed: ${fetchDetail}`, true);
     flushAndExit(input.connection.writable, 1);
     return;
   }
@@ -2841,13 +2913,26 @@ export async function main(input: AgentInput): Promise<void> {
   // realpath collapses it so tokenize sees the canonical form), and the macOS
   // pnpm cache.  The /private realpath + cache canonicalization is reconciled
   // against the Linux lock at diff time (Phase 6).
+  // Linux `tmp` follows os.tmpdir(): init.sh exports TMPDIR=/work/.sj-tmp on
+  // the VM backends (yarn Berry's zip-conversion staging ENOSPCs the 64 MB
+  // /tmp tmpfs on real monorepos; /work/.sj-tmp is the 4 GiB repo disk, kept
+  // OFF the audit scratch disk — see init.sh), and tmpdir() honours it.  That
+  // path sits under $REPO (/work) but longest-prefix wins: /work/.sj-tmp is a
+  // longer prefix than /work, so its paths render $TMPDIR (with hash
+  // collapsing), not $REPO.  The literal /tmp is kept as a second $TMPDIR
+  // alias (tmpLegacy) for tools that ignore TMPDIR — without it their writes
+  // would record as raw /tmp/<hash> paths and break determinism/parity.
+  // Docker/bare set no TMPDIR, so tmpdir() is '/tmp' there and the alias is
+  // omitted — byte-identical to the previous hardcoded root.
+  const linuxTmp = tmpdir();
   const roots = isMacosBare
     ? macosTokenizeRoots(config.work_dir)
     : {
         repo: config.work_dir,
         nodeModules: `${config.work_dir}/node_modules`,
         home: '/root',
-        tmp: '/tmp',
+        tmp: linuxTmp,
+        ...(linuxTmp !== '/tmp' ? { tmpLegacy: '/tmp' } : {}),
         cache: '/root/.cache/pnpm',
       };
 

@@ -99,7 +99,7 @@ const FETCH_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }
 
 export async function runFetchPhase(
   input: PhaseFetchInput,
-): Promise<{ ok: boolean; stderr: string }> {
+): Promise<{ ok: boolean; stderr: string; stdout: string }> {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
 
   // npm: append pm-flags.json extras (`--cpu/--os/--libc`) to `npm ci`.
@@ -144,5 +144,10 @@ export async function runFetchPhase(
   return {
     ok: result.exitCode === 0,
     stderr: result.stderr,
+    // yarn Berry writes its progress AND its errors (YN0001 ENOSPC traces,
+    // resolution failures, …) to STDOUT; stderr is typically empty.  Return
+    // stdout too so the agent's Phase A failure dump can include it — an
+    // empty fatal message hides the actual cause (found dogfooding napi-rs).
+    stdout: result.stdout,
   };
 }

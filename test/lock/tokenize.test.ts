@@ -48,6 +48,42 @@ describe('tokenize', () => {
       expect(result).toContain('$TMPDIR');
     });
 
+    // init.sh points TMPDIR at the scratch disk inside the VM backends, so the
+    // primary tmp root follows os.tmpdir() (/scratch/tmp) while the literal
+    // /tmp tmpfs stays reachable for tools that ignore TMPDIR.  BOTH must
+    // render as $TMPDIR — with hash collapsing — or scratch-tmp writes would
+    // leak raw nondeterministic paths into the lockfile.
+    describe('tmpLegacy alias (TMPDIR on the scratch disk)', () => {
+      const scratchRoots: TokenizeRoots = {
+        ...roots,
+        tmp: '/scratch/tmp',
+        tmpLegacy: '/tmp',
+      };
+
+      it('maps the redirected tmp root to $TMPDIR with collapsing', () => {
+        // `xfs-<32hex>` matches HASH_PATTERN as one [A-Za-z0-9_-]{16,} run
+        // (the hyphen is in the class), so the whole segment collapses.
+        const result = tokenize('/scratch/tmp/xfs-a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/archive.zip', scratchRoots);
+        expect(result).toBe('$TMPDIR/<hash>/archive.zip');
+      });
+
+      it('maps the literal /tmp to $TMPDIR too (tools that ignore TMPDIR)', () => {
+        const result = tokenize('/tmp/npm-abc123/build.log', scratchRoots);
+        expect(result).toContain('$TMPDIR');
+        expect(result).not.toContain('/tmp');
+      });
+
+      it('does not let /scratch siblings outside tmp match', () => {
+        const result = tokenize('/scratch/script-jail-strace/strace.out.123', scratchRoots);
+        expect(result).toBe('/scratch/script-jail-strace/strace.out.123');
+      });
+
+      it('bare alias prefix tokenizes exactly like the primary', () => {
+        expect(tokenize('/tmp', scratchRoots)).toBe('$TMPDIR');
+        expect(tokenize('/scratch/tmp', scratchRoots)).toBe('$TMPDIR');
+      });
+    });
+
     it('leaves an unmatched absolute path unmodified (modulo hash collapsing)', () => {
       const result = tokenize('/usr/bin/node', roots, pkgDir);
       expect(result).toBe('/usr/bin/node');

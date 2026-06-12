@@ -93,6 +93,26 @@ describe('runFetchPhase', () => {
       const result = await runFetchPhase({ manager: 'yarn', cwd: '/work', env: BASE_ENV, spawner });
       expect(result.ok).toBe(false);
     });
+
+    // yarn Berry writes errors (YN0001 ENOSPC traces, resolution failures) to
+    // STDOUT with an empty stderr — the agent's failure dump needs stdout to
+    // show the actual cause (found dogfooding napi-rs: the fatal frame read
+    // "Phase A (fetch) failed: " with no detail at all).
+    it('returns stdout so a stdout-only yarn failure is diagnosable', async () => {
+      const spawner: Spawner = {
+        async spawn() {
+          return {
+            exitCode: 1,
+            stdout: '➤ YN0001: │ Error: ENOSPC: no space left on device, write',
+            stderr: '',
+          };
+        },
+      };
+      const result = await runFetchPhase({ manager: 'yarn', cwd: '/work', env: BASE_ENV, spawner });
+      expect(result.ok).toBe(false);
+      expect(result.stderr).toBe('');
+      expect(result.stdout).toContain('ENOSPC');
+    });
   });
 
   describe('env passthrough', () => {
