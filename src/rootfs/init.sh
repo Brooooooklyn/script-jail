@@ -374,14 +374,40 @@ if ! command -v setpriv >/dev/null 2>&1; then
   fatal "setpriv (util-linux) not found; refusing to hand off without dropping CAP_SYS_ADMIN"
 fi
 
+# Dropping CAP_SYS_ADMIN blocks mount(2)/umount(2) for the uid-0 process tree —
+# but on a kernel with CONFIG_USER_NS=y (our VZ kernels are built that way, and
+# the Firecracker kernel ships it too) repo code can `unshare(CLONE_NEWUSER|
+# CLONE_NEWNS)` to gain CAP_SYS_ADMIN INSIDE a fresh namespace and `mount --bind`
+# /scratch or /work/node_modules over /sjtmp there.  Bind mounts share the
+# underlying superblock, so that namespace-local redirect still starves the
+# audit (/scratch) or hides repo writes behind the benign $TMPDIR token —
+# verified to survive a bare CAP_SYS_ADMIN drop (Codex round-7, 2026-06-12).
+# Clamp new user-namespace creation to zero, for BOTH backends, independent of
+# kernel config.  Done while still fully privileged; the matching
+# CAP_SYS_RESOURCE drop at the handoff below stops any descendant from raising
+# the limit back (a uid-0 child WITH cap_sys_resource can rewrite this knob).
+# If the knob is absent the kernel has no user-namespace support, so the escape
+# is already impossible — absence is safe, not fatal.
+USERNS_MAX=/proc/sys/user/max_user_namespaces
+if [ -e "${USERNS_MAX}" ]; then
+  echo 0 > "${USERNS_MAX}" || fatal "could not clamp ${USERNS_MAX}"
+  if [ "$(cat "${USERNS_MAX}")" != "0" ]; then
+    fatal "failed to set ${USERNS_MAX}=0 (user namespaces still creatable)"
+  fi
+  echo "[init] user namespaces clamped (max_user_namespaces=0)"
+fi
+
 # Hand off to the orchestrator under dumb-init.  dumb-init becomes PID 1 and
 # reaps the two children (the agent and socat); orchestrate.sh is responsible
 # for the startup ordering — start agent first, wait until its TCP listener
 # is bound, THEN start socat, so the AF_VSOCK port doesn't accept a host
 # connection before the agent's TCP target exists (see Task #14).
+# Drop CAP_SYS_ADMIN (blocks mount/umount) AND CAP_SYS_RESOURCE (so the
+# max_user_namespaces clamp above cannot be raised back by a uid-0 descendant).
 # NB: setpriv (util-linux/libcap-ng) names capabilities WITHOUT the `cap_`
-# prefix — `-sys_admin`, not `-cap_sys_admin` (that errors "unknown capability"
-# and, being fail-closed, would abort every boot).  Verified against
-# ubuntu:24.04: `-sys_admin` clears exactly CapBnd bit 21 and makes
-# mount(2)/umount(2) return EPERM.
-exec setpriv --bounding-set=-sys_admin dumb-init /sbin/orchestrate
+# prefix — `-sys_admin,-sys_resource`, not `-cap_*` (that errors "unknown
+# capability" and, being fail-closed, would abort every boot).  Verified against
+# ubuntu:24.04: this clears exactly CapBnd/CapEff bits 21+24, retains
+# CAP_SYS_PTRACE for strace, and makes mount/umount, `unshare -Urm`, and
+# rewriting the userns clamp all fail.
+exec setpriv --bounding-set=-sys_admin,-sys_resource dumb-init /sbin/orchestrate

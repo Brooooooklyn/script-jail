@@ -42,12 +42,24 @@ describe('init.sh — CAP_SYS_ADMIN drop before repo-controlled code', () => {
     // bounding-set drop is what enforces that for the whole uid-0 process tree.
     // setpriv names caps WITHOUT the `cap_` prefix — `-sys_admin`, not
     // `-cap_sys_admin` (which errors "unknown capability" and, being
-    // fail-closed, would abort every boot). Verified against ubuntu:24.04.
+    // fail-closed, would abort every boot). CAP_SYS_RESOURCE is dropped too so
+    // a uid-0 child can't raise the userns clamp back. Verified ubuntu:24.04.
     expect(INIT_SH).toMatch(
-      /exec setpriv --bounding-set=-sys_admin dumb-init \/sbin\/orchestrate/,
+      /exec setpriv --bounding-set=-sys_admin,-sys_resource dumb-init \/sbin\/orchestrate/,
     );
     // Guard against the prefixed spelling that util-linux rejects.
-    expect(INIT_SH).not.toMatch(/--bounding-set=-cap_sys_admin/);
+    expect(INIT_SH).not.toMatch(/--bounding-set=-cap_/);
+  });
+
+  it('clamps user namespaces to zero so the cap drop cannot be escaped via unshare', () => {
+    // CONFIG_USER_NS=y kernels let repo code unshare(CLONE_NEWUSER|CLONE_NEWNS)
+    // to regain CAP_SYS_ADMIN in a fresh namespace and bind-mount over /sjtmp.
+    // The clamp closes that for both backends regardless of kernel config.
+    expect(INIT_SH).toMatch(/max_user_namespaces/);
+    expect(INIT_SH).toMatch(/echo 0 > "\$\{USERNS_MAX\}"/);
+    // Fail-closed if the clamp can't be applied (but absent knob = no userns
+    // support = already safe, so that branch is skipped, not fatal).
+    expect(INIT_SH).toMatch(/user namespaces still creatable/);
   });
 
   it('fail-closes when setpriv is missing (never hands off without the drop)', () => {
@@ -65,7 +77,7 @@ describe('init.sh — CAP_SYS_ADMIN drop before repo-controlled code', () => {
     // sjtmp mount.
     const sjtmpMountIdx = INIT_SH.indexOf('mount "${SJTMP_DEV}" /sjtmp');
     const dropIdx = INIT_SH.indexOf(
-      'exec setpriv --bounding-set=-sys_admin',
+      'exec setpriv --bounding-set=-sys_admin,-sys_resource',
     );
     expect(sjtmpMountIdx).toBeGreaterThan(-1);
     expect(dropIdx).toBeGreaterThan(-1);
