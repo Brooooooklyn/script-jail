@@ -84,8 +84,10 @@ export interface LaunchInput {
    * Per-run EMPTY ext4 (filesystem label `sjtmp`, built by overlay.ts) the
    * guest mounts at /sjtmp and exports as TMPDIR.  A dedicated disk keeps a
    * large install's tmp churn off both /work and the audit /scratch, and —
-   * being a mountpoint — closes the symlink-redirect TOCTOU the old repo-disk
-   * `/work/.sj-tmp` scheme had.  Required: init.sh fail-closes when absent.
+   * being a mountpoint whose umount is blocked (init.sh drops CAP_SYS_ADMIN
+   * before any repo code runs) — closes the symlink-redirect TOCTOU the old
+   * repo-disk `/work/.sj-tmp` scheme had.  Required: init.sh fail-closes when
+   * absent.
    */
   sjtmpDiskPath: string;
   vcpu?: number | undefined;       // default 2

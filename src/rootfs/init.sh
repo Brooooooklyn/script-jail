@@ -246,8 +246,11 @@ SCRATCH_BASE=/scratch
 #     content, hiding them).  Three rounds of point-in-time guards could not
 #     close that TOCTOU because the trusted root itself was repo-mutable.
 # A MOUNTPOINT closes it structurally: /sjtmp cannot be symlink-swapped without
-# `umount` (which no lifecycle child can do), and it has no committed repo
-# content to subvert.  A TMPDIR fill on /sjtmp now only fails the install
+# `umount`, and it has no committed repo content to subvert.  We make "no
+# lifecycle child can umount" actually TRUE by dropping CAP_SYS_ADMIN from the
+# bounding set before the agent hands off (see the setpriv exec at the end of
+# this file) — so neither Phase-A nor Phase-B repo code can umount /sjtmp or
+# `mount --bind` over it.  A TMPDIR fill on /sjtmp now only fails the install
 # honestly with ENOSPC — it touches neither the repo nor the audit channel.
 #
 # Lockfile parity is preserved: the agent's tmp tokenize root follows
@@ -341,9 +344,39 @@ corepack enable
 # src/guest/agent.ts main().
 mkdir -p "${SCRATCH_BASE}/script-jail-strace"
 
+# --- Drop CAP_SYS_ADMIN before any repo-influenced code runs -----------------
+# Everything past this exec — the agent, strace, and (load-bearing) the
+# package-manager processes that execute REPO-CONTROLLED code (a repo's
+# `yarnPath` bundle, `.pnpmfile.cjs`, Yarn plugins, and lifecycle scripts) —
+# runs as root in this microVM.  A root process holding CAP_SYS_ADMIN can
+# mount(2)/umount(2); without dropping it, a malicious Phase-A/Phase-B script
+# could `umount /sjtmp` and then `mount --bind /scratch /sjtmp` (→ co-locate
+# TMPDIR with the audit artifacts and STARVE the strace/event writes) or
+# `mount --bind /work/node_modules /sjtmp` (→ make repo/node_modules mutations
+# spelled `$TMPDIR/...` tokenize as the benign `$TMPDIR`, HIDING them from the
+# audit).  That bind/umount vector is exactly what the dedicated `/sjtmp`
+# mountpoint is meant to be immune to — but a mountpoint only resists redirect
+# while no one can call umount.  So we make that true: drop CAP_SYS_ADMIN from
+# the BOUNDING set here.  The bounding set is inherited by every descendant and
+# can never be re-raised, and for a uid-0 process tree a root execve's permitted
+# set is capped by the bounding set (capabilities(7)) — so the agent and ALL
+# package-manager children lose CAP_SYS_ADMIN from their effective set and
+# mount/umount return EPERM.  Every legitimate mount (/work, /scratch, /sjtmp,
+# proc/sys) is already established above, and nothing downstream mounts, so this
+# is safe.  CAP_SYS_PTRACE is left in place for strace -ff.  (Docker/bare
+# backends never run init.sh; their isolation boundary is the container/host,
+# and they use /tmp, not /sjtmp.)
+#
+# Fail closed if the tool is missing: silently skipping the drop would ship the
+# false "mountpoint cannot be redirected" premise.  `blkid` (util-linux) is used
+# above, so setpriv (also util-linux) is present in a well-formed rootfs.
+if ! command -v setpriv >/dev/null 2>&1; then
+  fatal "setpriv (util-linux) not found; refusing to hand off without dropping CAP_SYS_ADMIN"
+fi
+
 # Hand off to the orchestrator under dumb-init.  dumb-init becomes PID 1 and
 # reaps the two children (the agent and socat); orchestrate.sh is responsible
 # for the startup ordering — start agent first, wait until its TCP listener
 # is bound, THEN start socat, so the AF_VSOCK port doesn't accept a host
 # connection before the agent's TCP target exists (see Task #14).
-exec dumb-init /sbin/orchestrate
+exec setpriv --bounding-set=-cap_sys_admin dumb-init /sbin/orchestrate

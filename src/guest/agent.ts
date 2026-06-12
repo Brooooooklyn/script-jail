@@ -2806,11 +2806,13 @@ export async function main(input: AgentInput): Promise<void> {
 
   // NOTE: no post-Phase-A TMPDIR re-validation needed.  On the VM backends
   // TMPDIR is /sjtmp — a DEDICATED disk mounted at boot (init.sh), not a path
-  // under the repo disk.  A mountpoint cannot be symlink-swapped by Phase-A
-  // repo code (that would require `umount`, which no lifecycle child can do),
-  // and /sjtmp carries no committed repo content to subvert.  This structural
-  // property replaces the three rounds of point-in-time guards the old
-  // /work/.sj-tmp scheme needed (Codex rounds 1-4, 2026-06-12).
+  // under the repo disk.  A mountpoint cannot be symlink-swapped without
+  // umount, and init.sh drops CAP_SYS_ADMIN from the bounding set before this
+  // agent (and therefore every Phase-A/Phase-B package-manager child) starts,
+  // so repo code cannot umount /sjtmp or `mount --bind` over it (EPERM).
+  // /sjtmp also carries no committed repo content to subvert.  Together these
+  // replace the three rounds of point-in-time guards the old /work/.sj-tmp
+  // scheme needed (Codex rounds 1-5, 2026-06-12).
 
   emitter.emitHandshake('fetch_done');
 

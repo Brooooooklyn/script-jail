@@ -110,8 +110,10 @@ export interface OverlayResult {
    * the guest mounts read-write at /sjtmp and exports as TMPDIR.  A dedicated
    * disk (not /work, not /scratch): yarn Berry's tarball→zip staging needs
    * gigabytes of tmp on large monorepos, and a MOUNTPOINT cannot be symlink-
-   * swapped by a Phase-A lifecycle script (closing the TOCTOU that the old
-   * `/work/.sj-tmp` repo-disk scheme could not).
+   * swapped by a Phase-A lifecycle script — init.sh drops CAP_SYS_ADMIN before
+   * any repo code runs, so umount/`mount --bind` over /sjtmp return EPERM
+   * (closing the TOCTOU that the old `/work/.sj-tmp` repo-disk scheme could
+   * not).
    */
   sjtmpDiskPath: string;
   /** The working directory (contains all ext4 images). */
