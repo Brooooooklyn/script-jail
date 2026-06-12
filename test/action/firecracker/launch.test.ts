@@ -83,6 +83,9 @@ function makeInput(
     // fail-closes when the scratch device is absent, so every launch must
     // attach it.
     scratchDiskPath: '/run/scratch.ext4',
+    // Required like scratch: init.sh fail-closes when the sjtmp device is
+    // absent (TMPDIR=/sjtmp), so every launch must attach it.
+    sjtmpDiskPath: '/run/sjtmp.ext4',
     vsockCid: 100,
     vsockUdsPath: '/tmp/vsock.sock',
     enableNetwork: false,
@@ -296,6 +299,49 @@ describe('launchVm', () => {
     expect(scratchIdx).toBeGreaterThan(repoIdx);
   });
 
+  it('sends PUT /drives/sjtmp (rw) after /drives/scratch', async () => {
+    const { client, calls } = makeFakeApiClient();
+    const { spawner } = makeFakeSpawner();
+
+    await launchVm(makeInput({
+      apiClient: client,
+      spawner,
+      scratchDiskPath: '/run/scratch.ext4',
+      sjtmpDiskPath: '/run/sjtmp.ext4',
+    }));
+
+    const sjtmpDrive = calls.find((c) => c.path === '/drives/sjtmp');
+    expect(sjtmpDrive).toBeDefined();
+    expect(sjtmpDrive!.method).toBe('PUT');
+    const body = sjtmpDrive!.body as Record<string, unknown>;
+    expect(body['drive_id']).toBe('sjtmp');
+    expect(body['path_on_host']).toBe('/run/sjtmp.ext4');
+    expect(body['is_root_device']).toBe(false);
+    // TMPDIR=/sjtmp — the install writes here, so it MUST be writable.
+    expect(body['is_read_only']).toBe(false);
+
+    // Attach order: scratch → sjtmp (sjtmp last).
+    const paths = calls.map((c) => c.path);
+    const scratchIdx = paths.indexOf('/drives/scratch');
+    const sjtmpIdx = paths.indexOf('/drives/sjtmp');
+    expect(scratchIdx).toBeGreaterThanOrEqual(0);
+    expect(sjtmpIdx).toBeGreaterThan(scratchIdx);
+  });
+
+  it('ALWAYS sends /drives/sjtmp (required — init.sh fail-closes without it)', async () => {
+    const { client, calls } = makeFakeApiClient();
+    const { spawner } = makeFakeSpawner();
+
+    await launchVm(makeInput({ apiClient: client, spawner }));
+
+    const sjtmpDrive = calls.find((c) => c.path === '/drives/sjtmp');
+    expect(sjtmpDrive).toBeDefined();
+    const body = sjtmpDrive!.body as Record<string, unknown>;
+    expect(body['drive_id']).toBe('sjtmp');
+    expect(body['path_on_host']).toBe('/run/sjtmp.ext4');
+    expect(body['is_read_only']).toBe(false);
+  });
+
   it('ALWAYS sends /drives/scratch (required — init.sh fail-closes without it)', async () => {
     const { client, calls } = makeFakeApiClient();
     const { spawner } = makeFakeSpawner();
@@ -337,6 +383,7 @@ describe('launchVm', () => {
         vmlinuxPath: '/images/vmlinux',
         rootfsPath: '/run/rootfs.ext4',
         scratchDiskPath: '/run/scratch.ext4',
+        sjtmpDiskPath: '/run/sjtmp.ext4',
         vsockCid: 100,
         vsockUdsPath: '/tmp/vsock.sock',
         enableNetwork: false,

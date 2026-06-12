@@ -165,6 +165,9 @@ async function launchFirecracker(input: {
       // (mounted by label at /scratch) instead of the guest's 64 MB /tmp
       // tmpfs, which large installs overflow (ENOSPC).
       scratchDiskPath: input.overlay.scratchDiskPath,
+      // Dedicated tmp disk: TMPDIR=/sjtmp (mounted by label), off /work and
+      // the audit /scratch; mountpoint can't be symlink-redirected by repo code.
+      sjtmpDiskPath: input.overlay.sjtmpDiskPath,
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,

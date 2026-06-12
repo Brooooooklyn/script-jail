@@ -61,6 +61,7 @@ function stubOverlay(workDir: string, capture?: {
       rootfsCopyPath: join(workDir, 'rootfs.ext4'),
       repoDiskPath: join(workDir, 'repo.ext4'),
       scratchDiskPath: join(workDir, 'scratch.ext4'),
+      sjtmpDiskPath: join(workDir, 'sjtmp.ext4'),
       workDir,
       cleanup: async () => {
         if (capture !== undefined) capture.cleanups++;

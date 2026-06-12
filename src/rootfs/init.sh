@@ -223,29 +223,56 @@ else
 fi
 SCRATCH_BASE=/scratch
 
-# --- Guest-wide TMPDIR on the REPO disk (NOT the audit scratch disk) -----------
+# --- Guest-wide TMPDIR on a DEDICATED disk (not /work, not the audit /scratch) -
 # yarn Berry's fetch step converts every downloaded tarball into a cache zip
 # via a staging file in os.tmpdir() (ZipFS convertToZipWorker).  On the 64 MB
 # /tmp tmpfs above, a real monorepo's parallel conversions ENOSPC partway
 # through Phase A (napi-rs: ~488 MiB of zips against 64 MB).
 #
-# TMPDIR points at the 4 GiB REPO disk (/work, mounted above), NOT the scratch
-# disk.  This is deliberate (Codex round-1 [high], 2026-06-12): the scratch
-# disk holds the AUDIT artifacts — the per-pid `strace -ff` logs and the events
-# JSONL — written only by the trusted agent/strace.  A lifecycle script honours
-# TMPDIR, so co-locating TMPDIR with the audit artifacts would let a malicious
-# script fill the disk and silently STARVE the strace/event writes (partial
-# capture presented as a clean lockfile).  /work is a SEPARATE filesystem that
-# already holds the install's own attacker-adjacent bulk (node_modules + the
-# YARN_*/npm cache redirects from buildChildEnv), so a TMPDIR fill there only
-# fails the install honestly with ENOSPC — it cannot touch the audit channel on
-# /scratch.  Lockfile parity is preserved: the agent's tmp tokenize root follows
-# os.tmpdir() (so /work/.sj-tmp renders $TMPDIR, longest-prefix beating $REPO)
-# and keeps the literal /tmp as a second $TMPDIR alias for tools that ignore
-# TMPDIR (src/guest/agent.ts roots + src/lock/tokenize.ts tmpLegacy).
-mkdir -p /work/.sj-tmp
-chmod 1777 /work/.sj-tmp
-export TMPDIR=/work/.sj-tmp
+# TMPDIR points at a SEPARATE 4 GiB ext4 (label `sjtmp`, built per-run by
+# overlay.ts) mounted at /sjtmp — distinct from BOTH /work (the repo disk) and
+# /scratch (the audit disk).  Why a dedicated disk rather than the earlier
+# /work/.sj-tmp scheme (Codex rounds 1-4, 2026-06-12):
+#   * NOT /scratch: /scratch holds the AUDIT artifacts (per-pid `strace -ff`
+#     logs + the events JSONL, written only by the trusted agent/strace).  A
+#     lifecycle script honours TMPDIR, so co-locating would let a malicious
+#     script fill the disk and silently STARVE the audit writes (partial
+#     capture presented as a clean lockfile).
+#   * NOT /work: /work is built from the USER repo, so a committed `.sj-tmp`
+#     symlink — or a Phase-A `rm -rf && ln -s` from repo-controlled code (the
+#     yarnPath bundle / pnpmfile / Yarn plugins run during `yarn install`) —
+#     could redirect TMPDIR onto /scratch (starve) or /work/node_modules (so
+#     writes spelled `$TMPDIR/...` tokenize benignly yet land in real repo
+#     content, hiding them).  Three rounds of point-in-time guards could not
+#     close that TOCTOU because the trusted root itself was repo-mutable.
+# A MOUNTPOINT closes it structurally: /sjtmp cannot be symlink-swapped without
+# `umount`, and it has no committed repo content to subvert.  We make "no
+# lifecycle child can umount" actually TRUE by dropping CAP_SYS_ADMIN from the
+# bounding set before the agent hands off (see the setpriv exec at the end of
+# this file) — so neither Phase-A nor Phase-B repo code can umount /sjtmp or
+# `mount --bind` over it.  A TMPDIR fill on /sjtmp now only fails the install
+# honestly with ENOSPC — it touches neither the repo nor the audit channel.
+#
+# Lockfile parity is preserved: the agent's tmp tokenize root follows
+# os.tmpdir() (so /sjtmp renders $TMPDIR) and keeps the literal /tmp as a second
+# $TMPDIR alias for tools that ignore TMPDIR (src/guest/agent.ts roots +
+# src/lock/tokenize.ts tmpLegacy).
+#
+# Resolution mirrors the scratch lookup: by label via `blkid -L`, never by
+# /dev/vd* letter, with the same `if`-wrapping so `set -e` doesn't swallow the
+# diagnostic on the absent-device non-zero exit.  Fail closed when missing — a
+# silent /tmp fallback would reintroduce the ENOSPC truncation this disk
+# exists to prevent.  The Docker/bare backends never execute init.sh, so this
+# cannot affect them; their agent falls back to /tmp (no TMPDIR export).
+if SJTMP_DEV="$(blkid -L sjtmp)" && [ -n "${SJTMP_DEV}" ]; then
+  mkdir -p /sjtmp
+  mount "${SJTMP_DEV}" /sjtmp
+  chmod 1777 /sjtmp
+  export TMPDIR=/sjtmp
+  echo "[init] sjtmp disk mounted at /sjtmp (${SJTMP_DEV}); TMPDIR=/sjtmp"
+else
+  fatal "no block device with filesystem label 'sjtmp'"
+fi
 
 # Copy the user's config from the repo disk into the rootfs's canonical
 # /etc/script-jail/config.yml so the agent can read it regardless of /work staying
@@ -317,9 +344,70 @@ corepack enable
 # src/guest/agent.ts main().
 mkdir -p "${SCRATCH_BASE}/script-jail-strace"
 
+# --- Drop CAP_SYS_ADMIN before any repo-influenced code runs -----------------
+# Everything past this exec — the agent, strace, and (load-bearing) the
+# package-manager processes that execute REPO-CONTROLLED code (a repo's
+# `yarnPath` bundle, `.pnpmfile.cjs`, Yarn plugins, and lifecycle scripts) —
+# runs as root in this microVM.  A root process holding CAP_SYS_ADMIN can
+# mount(2)/umount(2); without dropping it, a malicious Phase-A/Phase-B script
+# could `umount /sjtmp` and then `mount --bind /scratch /sjtmp` (→ co-locate
+# TMPDIR with the audit artifacts and STARVE the strace/event writes) or
+# `mount --bind /work/node_modules /sjtmp` (→ make repo/node_modules mutations
+# spelled `$TMPDIR/...` tokenize as the benign `$TMPDIR`, HIDING them from the
+# audit).  That bind/umount vector is exactly what the dedicated `/sjtmp`
+# mountpoint is meant to be immune to — but a mountpoint only resists redirect
+# while no one can call umount.  So we make that true: drop CAP_SYS_ADMIN from
+# the BOUNDING set here.  The bounding set is inherited by every descendant and
+# can never be re-raised, and for a uid-0 process tree a root execve's permitted
+# set is capped by the bounding set (capabilities(7)) — so the agent and ALL
+# package-manager children lose CAP_SYS_ADMIN from their effective set and
+# mount/umount return EPERM.  Every legitimate mount (/work, /scratch, /sjtmp,
+# proc/sys) is already established above, and nothing downstream mounts, so this
+# is safe.  CAP_SYS_PTRACE is left in place for strace -ff.  (Docker/bare
+# backends never run init.sh; their isolation boundary is the container/host,
+# and they use /tmp, not /sjtmp.)
+#
+# Fail closed if the tool is missing: silently skipping the drop would ship the
+# false "mountpoint cannot be redirected" premise.  `blkid` (util-linux) is used
+# above, so setpriv (also util-linux) is present in a well-formed rootfs.
+if ! command -v setpriv >/dev/null 2>&1; then
+  fatal "setpriv (util-linux) not found; refusing to hand off without dropping CAP_SYS_ADMIN"
+fi
+
+# Dropping CAP_SYS_ADMIN blocks mount(2)/umount(2) for the uid-0 process tree —
+# but on a kernel with CONFIG_USER_NS=y (our VZ kernels are built that way, and
+# the Firecracker kernel ships it too) repo code can `unshare(CLONE_NEWUSER|
+# CLONE_NEWNS)` to gain CAP_SYS_ADMIN INSIDE a fresh namespace and `mount --bind`
+# /scratch or /work/node_modules over /sjtmp there.  Bind mounts share the
+# underlying superblock, so that namespace-local redirect still starves the
+# audit (/scratch) or hides repo writes behind the benign $TMPDIR token —
+# verified to survive a bare CAP_SYS_ADMIN drop (Codex round-7, 2026-06-12).
+# Clamp new user-namespace creation to zero, for BOTH backends, independent of
+# kernel config.  Done while still fully privileged; the matching
+# CAP_SYS_RESOURCE drop at the handoff below stops any descendant from raising
+# the limit back (a uid-0 child WITH cap_sys_resource can rewrite this knob).
+# If the knob is absent the kernel has no user-namespace support, so the escape
+# is already impossible — absence is safe, not fatal.
+USERNS_MAX=/proc/sys/user/max_user_namespaces
+if [ -e "${USERNS_MAX}" ]; then
+  echo 0 > "${USERNS_MAX}" || fatal "could not clamp ${USERNS_MAX}"
+  if [ "$(cat "${USERNS_MAX}")" != "0" ]; then
+    fatal "failed to set ${USERNS_MAX}=0 (user namespaces still creatable)"
+  fi
+  echo "[init] user namespaces clamped (max_user_namespaces=0)"
+fi
+
 # Hand off to the orchestrator under dumb-init.  dumb-init becomes PID 1 and
 # reaps the two children (the agent and socat); orchestrate.sh is responsible
 # for the startup ordering — start agent first, wait until its TCP listener
 # is bound, THEN start socat, so the AF_VSOCK port doesn't accept a host
 # connection before the agent's TCP target exists (see Task #14).
-exec dumb-init /sbin/orchestrate
+# Drop CAP_SYS_ADMIN (blocks mount/umount) AND CAP_SYS_RESOURCE (so the
+# max_user_namespaces clamp above cannot be raised back by a uid-0 descendant).
+# NB: setpriv (util-linux/libcap-ng) names capabilities WITHOUT the `cap_`
+# prefix — `-sys_admin,-sys_resource`, not `-cap_*` (that errors "unknown
+# capability" and, being fail-closed, would abort every boot).  Verified against
+# ubuntu:24.04: this clears exactly CapBnd/CapEff bits 21+24, retains
+# CAP_SYS_PTRACE for strace, and makes mount/umount, `unshare -Urm`, and
+# rewriting the userns clamp all fail.
+exec setpriv --bounding-set=-sys_admin,-sys_resource dumb-init /sbin/orchestrate

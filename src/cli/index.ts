@@ -465,6 +465,9 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       // Empty per-run ext4 (label `scratch`) for strace/event spill; the
       // helper attaches it after the repo disk, mirroring repo_disk_path.
       scratchDiskPath: overlay.scratchDiskPath,
+      // Empty per-run ext4 (label `sjtmp`) mounted at /sjtmp as TMPDIR; the
+      // helper attaches it after the scratch disk, mirroring scratch_disk_path.
+      sjtmpDiskPath: overlay.sjtmpDiskPath,
       // VZ does not consume a UDS path (the listener lives in-process) but
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs

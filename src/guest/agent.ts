@@ -2636,7 +2636,11 @@ export function redactSensitive(
     // Bearer <token>
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
     // npm automation/granular token literals (npm_… 36+ char)
-    .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>');
+    .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>')
+    // GitHub token literals (ghp_/gho_/ghs_/ghu_/ghr_ + 36+ char)
+    .replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, '<REDACTED:GH-TOKEN>')
+    // AWS access key id (AKIA/ASIA + 16 upper-alnum)
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '<REDACTED:AWS-KEY>');
   return out;
 }
 
@@ -2771,18 +2775,22 @@ export async function main(input: AgentInput): Promise<void> {
     // "Phase A (fetch) failed: " and the actual cause is invisible on the
     // host (found dogfooding napi-rs).  Tail-capped so a megabyte of yarn
     // progress output cannot bloat the vsock error frame.
-    const stdoutTrimmed = fetchResult.stdout.trim();
+    // Redact BEFORE tailing (Codex round-2 [high]): the value redactor only
+    // masks COMPLETE protected values, so slicing to the last 4 KB first could
+    // start the tail INSIDE a secret — the partial no longer matches and the
+    // suffix leaks.  Redact the full stdout/stderr (the secret is wholly
+    // present), THEN cap the already-masked text.  A mask token split by the
+    // cap is harmless (a truncated `<REDACTED:` leaks nothing).
+    const stderrRedacted = redactSensitive(fetchResult.stderr, config.protected.env).trim();
+    const stdoutRedacted = redactSensitive(fetchResult.stdout, config.protected.env).trim();
     const stdoutTail =
-      stdoutTrimmed.length > 4000 ? `…${stdoutTrimmed.slice(-4000)}` : stdoutTrimmed;
-    const fetchDetailRaw = [
-      fetchResult.stderr.trim(),
+      stdoutRedacted.length > 4000 ? `…${stdoutRedacted.slice(-4000)}` : stdoutRedacted;
+    const fetchDetail = [
+      stderrRedacted,
       stdoutTail === '' ? '' : `--- stdout (tail) ---\n${stdoutTail}`,
     ]
       .filter((s) => s !== '')
       .join('\n');
-    // Redact protected env values + credential shapes before this external
-    // tool output reaches the host log / vsock frame (Codex round-1 [medium]).
-    const fetchDetail = redactSensitive(fetchDetailRaw, config.protected.env);
     // Also write to process.stderr so the npm error reaches ttyS0 (the
     // VM's serial console) — `LinuxSpawner` captures the child's stderr
     // into a string, so without this dump the only host-visible symptom
@@ -2795,6 +2803,19 @@ export async function main(input: AgentInput): Promise<void> {
     flushAndExit(input.connection.writable, 1);
     return;
   }
+
+  // NOTE: no post-Phase-A TMPDIR re-validation needed.  On the VM backends
+  // TMPDIR is /sjtmp — a DEDICATED disk mounted at boot (init.sh), not a path
+  // under the repo disk.  A mountpoint cannot be symlink-swapped without
+  // umount, and init.sh drops CAP_SYS_ADMIN + CAP_SYS_RESOURCE from the bounding
+  // set AND clamps max_user_namespaces=0 before this agent (and therefore every
+  // Phase-A/Phase-B package-manager child) starts — so repo code can neither
+  // umount/`mount --bind` over /sjtmp directly (EPERM) nor regain mount
+  // authority inside a fresh user+mount namespace (creation blocked, and the
+  // clamp can't be raised without CAP_SYS_RESOURCE).  /sjtmp also carries no
+  // committed repo content to subvert.  Together these replace the three rounds
+  // of point-in-time guards the old /work/.sj-tmp scheme needed (Codex rounds
+  // 1-7, 2026-06-12).
 
   emitter.emitHandshake('fetch_done');
 
@@ -2913,17 +2934,17 @@ export async function main(input: AgentInput): Promise<void> {
   // realpath collapses it so tokenize sees the canonical form), and the macOS
   // pnpm cache.  The /private realpath + cache canonicalization is reconciled
   // against the Linux lock at diff time (Phase 6).
-  // Linux `tmp` follows os.tmpdir(): init.sh exports TMPDIR=/work/.sj-tmp on
-  // the VM backends (yarn Berry's zip-conversion staging ENOSPCs the 64 MB
-  // /tmp tmpfs on real monorepos; /work/.sj-tmp is the 4 GiB repo disk, kept
-  // OFF the audit scratch disk — see init.sh), and tmpdir() honours it.  That
-  // path sits under $REPO (/work) but longest-prefix wins: /work/.sj-tmp is a
-  // longer prefix than /work, so its paths render $TMPDIR (with hash
-  // collapsing), not $REPO.  The literal /tmp is kept as a second $TMPDIR
-  // alias (tmpLegacy) for tools that ignore TMPDIR — without it their writes
-  // would record as raw /tmp/<hash> paths and break determinism/parity.
-  // Docker/bare set no TMPDIR, so tmpdir() is '/tmp' there and the alias is
-  // omitted — byte-identical to the previous hardcoded root.
+  // Linux `tmp` follows os.tmpdir(): init.sh exports TMPDIR=/sjtmp on the VM
+  // backends (yarn Berry's zip-conversion staging ENOSPCs the 64 MB /tmp tmpfs
+  // on real monorepos; /sjtmp is a DEDICATED 4 GiB disk, separate from both
+  // /work and the audit /scratch — see init.sh), and tmpdir() honours it.
+  // /sjtmp is not under $REPO (/work), so there is no prefix overlap to
+  // reason about — its paths render $TMPDIR (with hash collapsing) cleanly.
+  // The literal /tmp is kept as a second $TMPDIR alias (tmpLegacy) for tools
+  // that ignore TMPDIR — without it their writes would record as raw
+  // /tmp/<hash> paths and break determinism/parity.  Docker/bare set no
+  // TMPDIR, so tmpdir() is '/tmp' there and the alias is omitted —
+  // byte-identical to the previous hardcoded root.
   const linuxTmp = tmpdir();
   const roots = isMacosBare
     ? macosTokenizeRoots(config.work_dir)

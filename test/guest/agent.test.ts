@@ -1457,6 +1457,32 @@ describe('redactSensitive (Phase A failure dump)', () => {
     const msg = '➤ YN0001: │ Error: ENOSPC: no space left on device, write';
     expect(redactSensitive(msg, ['NPM_TOKEN'], { NPM_TOKEN: 'x'.repeat(20) })).toBe(msg);
   });
+
+  it('redacts GitHub + AWS key shapes (defense-in-depth, not in protected list)', async () => {
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const out = redactSensitive(
+      'ghp_0123456789abcdefghijklmnopqrstuvwxyzAB and AKIAIOSFODNN7EXAMPLE',
+      [],
+      {},
+    );
+    expect(out).toContain('<REDACTED:GH-TOKEN>');
+    expect(out).toContain('<REDACTED:AWS-KEY>');
+    expect(out).not.toContain('ghp_0123456789');
+    expect(out).not.toContain('AKIAIOSFODNN7EXAMPLE');
+  });
+
+  // Codex round-2 [high]: a secret must be masked when redaction runs on the
+  // FULL output, so a later tail-cap that starts inside the (now-masked) region
+  // cannot leak a suffix.  The agent slices stdoutRedacted (post-redact), never
+  // the raw stdout — this asserts the value is gone from the full redaction.
+  it('masks a secret surrounded by padding longer than the tail cap', async () => {
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const secret = 'tok_' + 'Z'.repeat(40);
+    const padded = 'A'.repeat(5000) + secret + 'B'.repeat(50);
+    const out = redactSensitive(padded, ['NPM_TOKEN'], { NPM_TOKEN: secret });
+    expect(out).not.toContain(secret);
+    expect(out.slice(-4000)).not.toContain('ZZZZ');
+  });
 });
 
 describe('buildChildEnv package-manager cache/store redirects', () => {

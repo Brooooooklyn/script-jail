@@ -30,6 +30,12 @@ pub struct VmConfig {
     /// guest's small /tmp tmpfs.  Required — the Node CLI always supplies
     /// it, exactly like `repo_disk_path`.
     pub scratch_disk_path: PathBuf,
+    /// sjtmp ext4 the guest mounts at `/sjtmp` and exports as TMPDIR.  A
+    /// dedicated disk keeps a large install's tmp churn off both `/work` and
+    /// the audit `/scratch`; as a mountpoint it can't be symlink-redirected by
+    /// Phase-A repo code.  Required — the Node CLI always supplies it, exactly
+    /// like `scratch_disk_path`.
+    pub sjtmp_disk_path: PathBuf,
     /// Reserved for parity with the Linux runner (src/action/firecracker/vsock.ts).
     /// VZ does not consume a host UDS path — the listener lives in-process —
     /// but the field travels with the config so consumers don't have to
@@ -150,6 +156,7 @@ mod tests {
               "rootfs_disk_path": "/tmp/rootfs.img",
               "repo_disk_path": "/tmp/repo.img",
               "scratch_disk_path": "/tmp/scratch.img",
+              "sjtmp_disk_path": "/tmp/sjtmp.img",
               "vsock_uds_path": "/tmp/vsock",
               "vsock_port": 10242,
               "vcpu_count": 2,
@@ -166,6 +173,7 @@ mod tests {
         let cfg_path = tmp_file("config-ok.json", &base_json(&kernel));
         let cfg = parse(&cfg_path).expect("config should parse");
         assert_eq!(cfg.scratch_disk_path, PathBuf::from("/tmp/scratch.img"));
+        assert_eq!(cfg.sjtmp_disk_path, PathBuf::from("/tmp/sjtmp.img"));
         assert_eq!(cfg.vcpu_count, 2);
         assert_eq!(cfg.memory_mb, 2048);
         assert_eq!(cfg.vsock_port, 10242);
@@ -198,6 +206,23 @@ mod tests {
             ConfigError::Parse(e) => {
                 let msg = e.to_string();
                 assert!(msg.contains("scratch_disk_path"), "got: {msg}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_config_without_sjtmp_disk_path() {
+        // `sjtmp_disk_path` is required, exactly like `scratch_disk_path`:
+        // serde rejects the document at parse time with a missing-field error.
+        let kernel = touch("kernel-no-sjtmp.bin");
+        let body = base_json(&kernel).replace("\"sjtmp_disk_path\": \"/tmp/sjtmp.img\",", "");
+        let cfg_path = tmp_file("config-no-sjtmp.json", &body);
+        let err = parse(&cfg_path).expect_err("missing sjtmp_disk_path");
+        match err {
+            ConfigError::Parse(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("sjtmp_disk_path"), "got: {msg}");
             }
             other => panic!("expected Parse, got {other:?}"),
         }

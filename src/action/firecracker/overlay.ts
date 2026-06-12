@@ -105,6 +105,17 @@ export interface OverlayResult {
    * the guest mounts read-write for strace logs + the events JSONL.
    */
   scratchDiskPath: string;
+  /**
+   * EMPTY per-run ext4 (filesystem label `sjtmp`, 4096 MiB logical, sparse)
+   * the guest mounts read-write at /sjtmp and exports as TMPDIR.  A dedicated
+   * disk (not /work, not /scratch): yarn Berry's tarball→zip staging needs
+   * gigabytes of tmp on large monorepos, and a MOUNTPOINT cannot be symlink-
+   * swapped by a Phase-A lifecycle script — init.sh drops CAP_SYS_ADMIN before
+   * any repo code runs, so umount/`mount --bind` over /sjtmp return EPERM
+   * (closing the TOCTOU that the old `/work/.sj-tmp` repo-disk scheme could
+   * not).
+   */
+  sjtmpDiskPath: string;
   /** The working directory (contains all ext4 images). */
   workDir: string;
   /** Removes the entire workDir tree.  Never throws. */
@@ -209,6 +220,18 @@ async function buildOverlayInto(
     outPath: scratchDiskPath,
   });
 
+  // 6. Build the EMPTY sjtmp disk ext4.  Dedicated TMPDIR space: a separate
+  //    filesystem from /work (repo) and /scratch (audit), so a large-repo
+  //    install's tmp churn can't ENOSPC either, and — being a MOUNTPOINT —
+  //    cannot be symlink-redirected by Phase-A repo code.  Guest resolves it
+  //    via `blkid -L sjtmp`, so the label must be exactly `sjtmp`.
+  const sjtmpDiskPath = join(workDir, 'sjtmp.ext4');
+  await buildExt4Disk({
+    label: SJTMP_DISK_LABEL,
+    sizeMB: SJTMP_DISK_MB,
+    outPath: sjtmpDiskPath,
+  });
+
   const cleanup = async (): Promise<void> => {
     try {
       await rm(workDir, { recursive: true, force: true });
@@ -217,7 +240,7 @@ async function buildOverlayInto(
     }
   };
 
-  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, sjtmpDiskPath, workDir, cleanup };
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +414,21 @@ const SCRATCH_DISK_LABEL = 'scratch';
  * host, so the actual footprint is just ext4 metadata.
  */
 const SCRATCH_DISK_MB = 4096;
+
+/**
+ * Filesystem label of the sjtmp disk.  LOAD-BEARING: the guest resolves the
+ * device via `blkid -L sjtmp` and mounts it at /sjtmp (exported as TMPDIR) —
+ * change it and the guest fails closed at boot (init.sh).
+ */
+const SJTMP_DISK_LABEL = 'sjtmp';
+
+/**
+ * Logical size of the empty sjtmp disk (MiB).  Sized so a large monorepo's
+ * package-manager tmp churn (yarn Berry stages every tarball→zip conversion
+ * in TMPDIR — ~488 MiB for napi-rs) fits comfortably; sparse on the host, so
+ * the actual footprint is just ext4 metadata.
+ */
+const SJTMP_DISK_MB = 4096;
 
 /**
  * Recursively sum the size of files under `dir` and return a size in MB

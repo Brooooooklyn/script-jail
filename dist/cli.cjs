@@ -7647,6 +7647,9 @@ function checkArtifacts(cfg) {
   if (cfg.scratchDiskPath !== void 0 && cfg.scratchDiskPath !== "" && !(0, import_node_fs.existsSync)(cfg.scratchDiskPath)) {
     throw new MacOSVmArtifactNotFoundError("scratch disk", cfg.scratchDiskPath);
   }
+  if (cfg.sjtmpDiskPath !== void 0 && cfg.sjtmpDiskPath !== "" && !(0, import_node_fs.existsSync)(cfg.sjtmpDiskPath)) {
+    throw new MacOSVmArtifactNotFoundError("sjtmp disk", cfg.sjtmpDiskPath);
+  }
   if (cfg.libscriptjailSoPath !== void 0 && cfg.libscriptjailSoPath !== "" && !(0, import_node_fs.existsSync)(cfg.libscriptjailSoPath)) {
     throw new MacOSVmArtifactNotFoundError("libscriptjail.so", cfg.libscriptjailSoPath);
   }
@@ -7676,6 +7679,7 @@ function toJsonPayload(cfg) {
     rootfs_disk_path: cfg.rootfsDiskPath,
     repo_disk_path: cfg.repoDiskPath,
     scratch_disk_path: cfg.scratchDiskPath,
+    sjtmp_disk_path: cfg.sjtmpDiskPath,
     vsock_uds_path: cfg.vsockUdsPath,
     vsock_port: cfg.vsockPort,
     vcpu_count: cfg.vcpuCount,
@@ -7705,7 +7709,8 @@ async function spawnVm(vmConfig, options = {}) {
   checkArtifacts({
     kernelPath: vmConfig.kernelPath,
     rootfsDiskPath: vmConfig.rootfsDiskPath,
-    scratchDiskPath: vmConfig.scratchDiskPath
+    scratchDiskPath: vmConfig.scratchDiskPath,
+    sjtmpDiskPath: vmConfig.sjtmpDiskPath
   });
   assertVmHelperEntitlement(binary, options.codesignRunner);
   const tmpDir = (0, import_node_fs.mkdtempSync)((0, import_node_path.join)((0, import_node_os2.tmpdir)(), "script-jail-vm-"));
@@ -8249,6 +8254,12 @@ async function buildOverlayInto(workDir, input) {
     sizeMB: SCRATCH_DISK_MB,
     outPath: scratchDiskPath
   });
+  const sjtmpDiskPath = (0, import_node_path6.join)(workDir, "sjtmp.ext4");
+  await buildExt4Disk({
+    label: SJTMP_DISK_LABEL,
+    sizeMB: SJTMP_DISK_MB,
+    outPath: sjtmpDiskPath
+  });
   const cleanup = async () => {
     try {
       await (0, import_promises.rm)(workDir, { recursive: true, force: true });
@@ -8256,7 +8267,7 @@ async function buildOverlayInto(workDir, input) {
       console.warn(`[overlay] cleanup warning: ${String(err)}`);
     }
   };
-  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, sjtmpDiskPath, workDir, cleanup };
 }
 function writeOverlayFile(root, relPath, content) {
   const parts = relPath.split("/").filter((part) => part.length > 0);
@@ -8343,6 +8354,8 @@ function resolveMkfsExt4() {
 var REPO_DISK_MIN_MB = 4096;
 var SCRATCH_DISK_LABEL = "scratch";
 var SCRATCH_DISK_MB = 4096;
+var SJTMP_DISK_LABEL = "sjtmp";
+var SJTMP_DISK_MB = 4096;
 function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
@@ -24340,6 +24353,7 @@ async function launchVm(input) {
     rootfsPath,
     repoDiskPath,
     scratchDiskPath,
+    sjtmpDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -24398,6 +24412,12 @@ async function launchVm(input) {
     await apiClient.put("/drives/scratch", {
       drive_id: "scratch",
       path_on_host: scratchDiskPath,
+      is_root_device: false,
+      is_read_only: false
+    });
+    await apiClient.put("/drives/sjtmp", {
+      drive_id: "sjtmp",
+      path_on_host: sjtmpDiskPath,
       is_root_device: false,
       is_read_only: false
     });
@@ -24961,6 +24981,9 @@ async function launchFirecracker(input) {
       // (mounted by label at /scratch) instead of the guest's 64 MB /tmp
       // tmpfs, which large installs overflow (ENOSPC).
       scratchDiskPath: input.overlay.scratchDiskPath,
+      // Dedicated tmp disk: TMPDIR=/sjtmp (mounted by label), off /work and
+      // the audit /scratch; mountpoint can't be symlink-redirected by repo code.
+      sjtmpDiskPath: input.overlay.sjtmpDiskPath,
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,
@@ -26113,6 +26136,9 @@ async function run(deps = {}) {
       // Empty per-run ext4 (label `scratch`) for strace/event spill; the
       // helper attaches it after the repo disk, mirroring repo_disk_path.
       scratchDiskPath: overlay.scratchDiskPath,
+      // Empty per-run ext4 (label `sjtmp`) mounted at /sjtmp as TMPDIR; the
+      // helper attaches it after the scratch disk, mirroring scratch_disk_path.
+      sjtmpDiskPath: overlay.sjtmpDiskPath,
       // VZ does not consume a UDS path (the listener lives in-process) but
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs

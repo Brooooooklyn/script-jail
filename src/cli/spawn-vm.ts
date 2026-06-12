@@ -68,6 +68,14 @@ export interface VmConfig {
    */
   scratchDiskPath: string;
   /**
+   * Per-run EMPTY sjtmp ext4 (output of `makeOverlay()`; filesystem label
+   * `sjtmp`).  The guest mounts it read-write — via `blkid -L sjtmp` — at
+   * /sjtmp and exports as TMPDIR.  A dedicated disk keeps tmp churn off /work
+   * and the audit /scratch; as a mountpoint it can't be symlink-redirected.
+   * Semantics mirror `scratchDiskPath`.
+   */
+  sjtmpDiskPath: string;
+  /**
    * vsock UDS path.  Kept in the payload for parity with the Linux runner
    * (where the listener IS a UDS); on macOS the helper's listener lives
    * in-process so this is unused but still validated by `config.rs`.
@@ -292,6 +300,8 @@ export function checkArtifacts(cfg: {
   rootfsDiskPath: string;
   /** Per-run scratch ext4 (built by makeOverlay).  Checked when provided. */
   scratchDiskPath?: string;
+  /** Per-run sjtmp ext4 (built by makeOverlay).  Checked when provided. */
+  sjtmpDiskPath?: string;
   libscriptjailSoPath?: string;
 }): void {
   if (!existsSync(cfg.kernelPath)) {
@@ -306,6 +316,13 @@ export function checkArtifacts(cfg: {
     !existsSync(cfg.scratchDiskPath)
   ) {
     throw new MacOSVmArtifactNotFoundError('scratch disk', cfg.scratchDiskPath);
+  }
+  if (
+    cfg.sjtmpDiskPath !== undefined &&
+    cfg.sjtmpDiskPath !== '' &&
+    !existsSync(cfg.sjtmpDiskPath)
+  ) {
+    throw new MacOSVmArtifactNotFoundError('sjtmp disk', cfg.sjtmpDiskPath);
   }
   if (
     cfg.libscriptjailSoPath !== undefined &&
@@ -384,6 +401,7 @@ interface VmConfigJson {
   rootfs_disk_path: string;
   repo_disk_path: string;
   scratch_disk_path: string;
+  sjtmp_disk_path: string;
   vsock_uds_path: string;
   vsock_port: number;
   vcpu_count: number;
@@ -399,6 +417,7 @@ export function toJsonPayload(cfg: VmConfig): VmConfigJson {
     rootfs_disk_path: cfg.rootfsDiskPath,
     repo_disk_path: cfg.repoDiskPath,
     scratch_disk_path: cfg.scratchDiskPath,
+    sjtmp_disk_path: cfg.sjtmpDiskPath,
     vsock_uds_path: cfg.vsockUdsPath,
     vsock_port: cfg.vsockPort,
     vcpu_count: cfg.vcpuCount,
@@ -487,6 +506,7 @@ export async function spawnVm(
     kernelPath: vmConfig.kernelPath,
     rootfsDiskPath: vmConfig.rootfsDiskPath,
     scratchDiskPath: vmConfig.scratchDiskPath,
+    sjtmpDiskPath: vmConfig.sjtmpDiskPath,
   });
 
   // Pre-flight: the helper must be signed WITH the VZ entitlement, or every
