@@ -1,10 +1,10 @@
 // script-jail — src/action/firecracker/overlay.ts
 //
-// Builds a per-run rootfs overlay plus a side disk for the VM.
+// Builds a per-run rootfs overlay plus side disks for the VM.
 //
-// Design: TWO-DISK APPROACH
-// ──────────────────────────
-// Rather than mounting and mutating the base ext4 in-place we use two
+// Design: THREE-DISK APPROACH
+// ───────────────────────────
+// Rather than mounting and mutating the base ext4 in-place we use three
 // separate ext4 images:
 //
 //   1. rootfs.ext4    — a copy of the base image (CoW with `cp --reflink=auto`
@@ -20,14 +20,21 @@
 //                       predictable (same size every run) and avoids needing
 //                       `mount`/`umount` root privileges on the host.
 //
+//   3. scratch.ext4   — an EMPTY ext4 (filesystem label `scratch`) the guest
+//                       mounts read-write for audit by-products: strace -ff
+//                       logs and the events JSONL.  Large repos overflow the
+//                       guest's 64 MB /tmp tmpfs (→ ENOSPC mid-audit); this
+//                       disk gives those files a 4 GiB logical home.  Sparse,
+//                       so the host-side footprint is metadata only.
+//
 // The Node toolchain is NOT shipped as a side disk: the rootfs bakes the
 // standalone `vp` binary and init.sh runs `vp env install` at guest boot
 // (Phase A, network on) to download a real Linux Node toolchain.
 //
-// The repo disk is created with `mkfs.ext4 -d <dir>` on Linux or via a
-// Docker helper on macOS (same pattern as rootfs/build.ts).  On macOS the
-// test suite skips filesystem-level assertions and only verifies the
-// file-staging logic.
+// The side disks are created with `mkfs.ext4` (`-d <dir>` seeds the repo
+// disk; the scratch disk gets no seed) on Linux or via a Docker helper on
+// macOS (same pattern as rootfs/build.ts).  On macOS the test suite skips
+// filesystem-level assertions and only verifies the file-staging logic.
 //
 // Cleanup contract: `overlay.cleanup()` removes the entire `workDir`.  The
 // caller MUST invoke it (via teardown.ts) whether the VM run succeeds or fails.
@@ -36,6 +43,10 @@
 //   1. Disk with filesystem label `repo` (resolved via `blkid -L repo`)
 //      → mounted read-only at /work.
 //   2. /work/etc/script-jail/config.yml → copied into /etc/script-jail/config.yml.
+//   3. Disk with filesystem label `scratch` (resolved via `blkid -L scratch`)
+//      → mounted read-write for strace/event spill.  The label string is
+//      load-bearing: the guest finds the disk ONLY by label, never by device
+//      name, so it must be exactly `scratch`.
 
 import {
   cpSync,
@@ -89,6 +100,11 @@ export interface OverlayResult {
   rootfsCopyPath: string;
   /** Small ext4 containing the user's repo + script-jail config, mounted at /work. */
   repoDiskPath: string;
+  /**
+   * EMPTY per-run ext4 (filesystem label `scratch`, 4096 MiB logical, sparse)
+   * the guest mounts read-write for strace logs + the events JSONL.
+   */
+  scratchDiskPath: string;
   /** The working directory (contains all ext4 images). */
   workDir: string;
   /** Removes the entire workDir tree.  Never throws. */
@@ -100,17 +116,35 @@ export interface OverlayResult {
 // ---------------------------------------------------------------------------
 
 export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
-  const {
-    baseRootfsPath,
-    repoSrcPath,
-    configPath,
-    workDir: maybeWorkDir,
-    extraRepoOverlayFiles,
-  } = input;
-
   // 1. Create per-run work dir if not supplied.
-  const workDir = maybeWorkDir ?? mkdtempSync(join(tmpdir(), 'script-jail-run-'));
+  const workDir = input.workDir ?? mkdtempSync(join(tmpdir(), 'script-jail-run-'));
   mkdirSync(workDir, { recursive: true });
+
+  // Everything below populates workDir.  If any build step throws after this
+  // point (rootfs copy, repo staging, repo/scratch mkfs), the caller never
+  // receives the `cleanup` closure and could not remove the partially built
+  // tree — which by then can hold a full rootfs copy plus a multi-GB-logical
+  // repo image (Codex review 2026-06-12, round-1 medium finding).  Remove the
+  // workDir ourselves before rethrowing; mirror cleanup()'s never-throw rule
+  // so the removal failure can't mask the original error.
+  try {
+    return await buildOverlayInto(workDir, input);
+  } catch (err) {
+    try {
+      await rm(workDir, { recursive: true, force: true });
+    } catch (rmErr) {
+      console.warn(`[overlay] partial-build cleanup warning: ${String(rmErr)}`);
+    }
+    throw err;
+  }
+}
+
+/** Body of {@link makeOverlay}: builds all three images inside `workDir`. */
+async function buildOverlayInto(
+  workDir: string,
+  input: OverlayInput,
+): Promise<OverlayResult> {
+  const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
 
   // 2. Copy the base rootfs (CoW where supported, plain copy otherwise).
   const rootfsCopyPath = join(workDir, 'rootfs.ext4');
@@ -158,7 +192,22 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
 
   // 4. Build the repo disk ext4.
   const repoDiskPath = join(workDir, 'repo.ext4');
-  await buildRepoDisk(repoStageDir, repoDiskPath);
+  await buildExt4Disk({
+    srcDir: repoStageDir,
+    label: 'repo',
+    sizeMB: estimateDiskSizeMB(repoStageDir),
+    outPath: repoDiskPath,
+  });
+
+  // 5. Build the EMPTY scratch disk ext4.  Same creation mechanism as
+  //    repo.ext4, just no content seed.  The guest resolves it via
+  //    `blkid -L scratch`, so the label must be exactly `scratch`.
+  const scratchDiskPath = join(workDir, 'scratch.ext4');
+  await buildExt4Disk({
+    label: SCRATCH_DISK_LABEL,
+    sizeMB: SCRATCH_DISK_MB,
+    outPath: scratchDiskPath,
+  });
 
   const cleanup = async (): Promise<void> => {
     try {
@@ -168,7 +217,7 @@ export async function makeOverlay(input: OverlayInput): Promise<OverlayResult> {
     }
   };
 
-  return { rootfsCopyPath, repoDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, workDir, cleanup };
 }
 
 // ---------------------------------------------------------------------------
@@ -222,23 +271,33 @@ function copyRootfs(src: string, dest: string): void {
 }
 
 /**
- * Build a small ext4 image from `srcDir` content.
+ * Build a small ext4 image, optionally seeded from `srcDir` content.
  *
- * On Linux: `mkfs.ext4 -d <srcDir>` (no mount required, no root).
+ * On Linux: `mkfs.ext4 [-d <srcDir>]` (no mount required, no root).  mke2fs
+ * creates the output file itself when an explicit size is given, so an
+ * EMPTY disk (no `srcDir`) needs no pre-allocation step.
  * On macOS: prefer native `mkfs.ext4` from homebrew's `e2fsprogs` (keg-only,
  * located under `$(brew --prefix e2fsprogs)/sbin`); fall back to a Docker
  * Alpine helper if e2fsprogs isn't installed.  Docker is no longer
  * pre-installed on GitHub-hosted macOS runners, so CI relies on the native
  * path.
  *
- * Size is estimated at max(REPO_DISK_MIN_MB, 2× the source dir size). The
- * floor (4 GB) gives the guest enough headroom to run `pnpm install` /
- * `npm install` against real-world monorepos (e.g. vuejs/core's ~500 MB
- * dependency graph) without ENOSPC inside the VM. The image is sparse, so
- * the actual host disk footprint is just `metadata + content` — not 4 GB.
+ * The image is sparse, so the actual host disk footprint is just
+ * `metadata + content` — not the full logical `sizeMB`.
  */
-async function buildRepoDisk(srcDir: string, outPath: string): Promise<void> {
-  const sizeMB = estimateDiskSizeMB(srcDir);
+async function buildExt4Disk(opts: {
+  /**
+   * Directory whose content seeds the image (`mkfs.ext4 -d`).  Omit to
+   * produce an empty filesystem (scratch disk).
+   */
+  srcDir?: string;
+  /** Filesystem label (`mkfs.ext4 -L`).  The guest mounts by label. */
+  label: string;
+  /** Logical image size in MiB. */
+  sizeMB: number;
+  outPath: string;
+}): Promise<void> {
+  const { srcDir, label, sizeMB, outPath } = opts;
   const sizeSpec = `${sizeMB}M`;
 
   const mkfs = resolveMkfsExt4();
@@ -246,8 +305,8 @@ async function buildRepoDisk(srcDir: string, outPath: string): Promise<void> {
     const result = spawnSync(
       mkfs,
       [
-        '-d', srcDir,
-        '-L', 'repo',
+        ...(srcDir !== undefined ? ['-d', srcDir] : []),
+        '-L', label,
         '-O', '^has_journal',
         '-m', '0',
         outPath,
@@ -257,7 +316,7 @@ async function buildRepoDisk(srcDir: string, outPath: string): Promise<void> {
     );
     if (result.status !== 0) {
       throw new Error(
-        `mkfs.ext4 for repo disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
+        `mkfs.ext4 for ${label} disk failed (exit ${result.status ?? 'unknown'}, signal ${result.signal ?? 'none'})`,
       );
     }
     return;
@@ -267,14 +326,16 @@ async function buildRepoDisk(srcDir: string, outPath: string): Promise<void> {
   // is not installed; on CI we install it explicitly so this branch is dead.
   const outDir = join(outPath, '..');
   const imageName = basename(outPath);
+  const srcMount = srcDir !== undefined ? `-v "${srcDir}:/work:ro" ` : '';
+  const seedFlag = srcDir !== undefined ? '-d /work ' : '';
   execSync(
     `docker run --rm ` +
-    `-v "${srcDir}:/work:ro" ` +
+    srcMount +
     `-v "${outDir}:/out" ` +
     `alpine:latest ` +
     `sh -c ` +
     `"apk add --no-cache e2fsprogs && ` +
-    ` mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
+    ` mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
     { stdio: 'inherit' },
   );
 }
@@ -317,7 +378,24 @@ function resolveMkfsExt4(): string | null {
  */
 const REPO_DISK_MIN_MB = 4096;
 
-/** Recursively sum the size of files under `dir` and return a size in MB. */
+/**
+ * Filesystem label of the scratch disk.  LOAD-BEARING: the guest resolves the
+ * device via `blkid -L scratch` — change it and the guest silently loses its
+ * strace/event spill space.
+ */
+const SCRATCH_DISK_LABEL = 'scratch';
+
+/**
+ * Logical size of the empty scratch disk (MiB).  Sized so strace -ff logs and
+ * the events JSONL of large monorepo installs fit comfortably; sparse on the
+ * host, so the actual footprint is just ext4 metadata.
+ */
+const SCRATCH_DISK_MB = 4096;
+
+/**
+ * Recursively sum the size of files under `dir` and return a size in MB
+ * (`max(REPO_DISK_MIN_MB, 2× content)` — headroom for node_modules writes).
+ */
 function estimateDiskSizeMB(dir: string): number {
   let totalBytes = 0;
 

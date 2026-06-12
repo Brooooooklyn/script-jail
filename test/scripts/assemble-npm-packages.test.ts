@@ -330,5 +330,9 @@ describe('assemble-npm-packages.mjs (PKG-3)', () => {
         `assert-npm-packlist for ${pkg.name}: ${result.stdout}${result.stderr}`,
       ).toBe(0);
     }
-  });
+    // This case forks the assemble script plus one packlist-verifier child per
+    // npm package (5 short-lived Node processes doing real fs work).  Under CI
+    // load that overshoots vitest's 5s default — it timed out on one matrix leg
+    // while passing on the others.  Give it a budget matched to the spawn count.
+  }, 30_000);
 });

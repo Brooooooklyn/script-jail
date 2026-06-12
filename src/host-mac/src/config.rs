@@ -25,6 +25,11 @@ pub struct VmConfig {
     pub kernel_cmdline: String,
     pub rootfs_disk_path: PathBuf,
     pub repo_disk_path: PathBuf,
+    /// Scratch ext4 the guest mounts at `/scratch` for audit artifacts
+    /// (strace logs, events JSONL).  Keeps large-repo runs from filling the
+    /// guest's small /tmp tmpfs.  Required — the Node CLI always supplies
+    /// it, exactly like `repo_disk_path`.
+    pub scratch_disk_path: PathBuf,
     /// Reserved for parity with the Linux runner (src/action/firecracker/vsock.ts).
     /// VZ does not consume a host UDS path — the listener lives in-process —
     /// but the field travels with the config so consumers don't have to
@@ -144,6 +149,7 @@ mod tests {
               "kernel_cmdline": "console=hvc0",
               "rootfs_disk_path": "/tmp/rootfs.img",
               "repo_disk_path": "/tmp/repo.img",
+              "scratch_disk_path": "/tmp/scratch.img",
               "vsock_uds_path": "/tmp/vsock",
               "vsock_port": 10242,
               "vcpu_count": 2,
@@ -159,6 +165,7 @@ mod tests {
         let kernel = touch("kernel-ok.bin");
         let cfg_path = tmp_file("config-ok.json", &base_json(&kernel));
         let cfg = parse(&cfg_path).expect("config should parse");
+        assert_eq!(cfg.scratch_disk_path, PathBuf::from("/tmp/scratch.img"));
         assert_eq!(cfg.vcpu_count, 2);
         assert_eq!(cfg.memory_mb, 2048);
         assert_eq!(cfg.vsock_port, 10242);
@@ -176,6 +183,41 @@ mod tests {
         let cfg_path = tmp_file("config-malformed.json", "{ not json");
         let err = parse(&cfg_path).expect_err("malformed json");
         assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_rejects_config_without_scratch_disk_path() {
+        // `scratch_disk_path` is required, exactly like `repo_disk_path`:
+        // serde rejects the document at parse time with a missing-field
+        // error naming the field.
+        let kernel = touch("kernel-no-scratch.bin");
+        let body = base_json(&kernel).replace("\"scratch_disk_path\": \"/tmp/scratch.img\",", "");
+        let cfg_path = tmp_file("config-no-scratch.json", &body);
+        let err = parse(&cfg_path).expect_err("missing scratch_disk_path");
+        match err {
+            ConfigError::Parse(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("scratch_disk_path"), "got: {msg}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_config_without_repo_disk_path() {
+        // Companion to the scratch test above: documents that the new field
+        // fails the same way the existing required disk field does.
+        let kernel = touch("kernel-no-repo.bin");
+        let body = base_json(&kernel).replace("\"repo_disk_path\": \"/tmp/repo.img\",", "");
+        let cfg_path = tmp_file("config-no-repo.json", &body);
+        let err = parse(&cfg_path).expect_err("missing repo_disk_path");
+        match err {
+            ConfigError::Parse(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("repo_disk_path"), "got: {msg}");
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 
     #[test]

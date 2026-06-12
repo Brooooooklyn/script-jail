@@ -1413,6 +1413,227 @@ describe('buildChildEnv lifecycle env sanitization', () => {
   });
 });
 
+describe('buildChildEnv package-manager cache/store redirects', () => {
+  // ENOSPC on large repos (found auditing a ~1000-package yarn-4 monorepo):
+  // yarn berry's global folder defaults under $HOME (/root, a 16 MB tmpfs in
+  // the microVM) and npm's cache lands at ~/.npm on the same tmpfs.  All
+  // package-manager bulk caches must be pinned onto the repo disk
+  // (config.work_dir, ~4 GB) the same way the pnpm store already is.
+  function makeConfig(
+    workDir: string,
+    manager?: 'npm' | 'pnpm' | 'yarn',
+  ): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: [] },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: workDir,
+      log_fd: 3,
+      pkg_dirs: {},
+      ...(manager !== undefined ? { manager } : {}),
+    };
+  }
+
+  // The bulk cache/store redirect is INJECTED ONLY for the detected manager:
+  // setting a foreign manager's knob is a no-op for the install but env-spy
+  // records any enumerated key, so an unconditional YARN_* would pollute a
+  // pnpm/npm lockfile and break cross-backend parity for a fixture of another
+  // manager.  Each manager therefore carries EXACTLY its own redirect.
+  it('pnpm: pins only npm_config_store_dir under work_dir; no yarn/npm knobs', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({}, makeConfig('/work', 'pnpm'), '/tmp/events.jsonl');
+
+    expect(env['npm_config_store_dir']).toBe('/work/.pnpm-store');
+    expect(env['YARN_GLOBAL_FOLDER']).toBeUndefined();
+    expect(env['YARN_CACHE_FOLDER']).toBeUndefined();
+    expect(env['npm_config_cache']).toBeUndefined();
+  });
+
+  it('yarn: pins only YARN_GLOBAL_FOLDER + YARN_CACHE_FOLDER; no pnpm/npm knobs', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({}, makeConfig('/work', 'yarn'), '/tmp/events.jsonl');
+
+    // berry: enableGlobalCache=true → ${globalFolder}/cache regardless of
+    // cacheFolder; YARN_CACHE_FOLDER also covers classic 1.x / enableGlobalCache=false.
+    expect(env['YARN_GLOBAL_FOLDER']).toBe('/work/.yarn-global');
+    expect(env['YARN_CACHE_FOLDER']).toBe('/work/.yarn-cache');
+    expect(env['npm_config_store_dir']).toBeUndefined();
+    expect(env['npm_config_cache']).toBeUndefined();
+  });
+
+  it('npm: pins only npm_config_cache; no pnpm/yarn knobs', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({}, makeConfig('/work', 'npm'), '/tmp/events.jsonl');
+
+    expect(env['npm_config_cache']).toBe('/work/.npm-cache');
+    expect(env['npm_config_store_dir']).toBeUndefined();
+    expect(env['YARN_GLOBAL_FOLDER']).toBeUndefined();
+    expect(env['YARN_CACHE_FOLDER']).toBeUndefined();
+  });
+
+  it('keeps the redirect relative to a non-default work_dir (yarn)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({}, makeConfig('/staged/repo', 'yarn'), '/tmp/events.jsonl');
+
+    expect(env['YARN_GLOBAL_FOLDER']).toBe('/staged/repo/.yarn-global');
+    expect(env['YARN_CACHE_FOLDER']).toBe('/staged/repo/.yarn-cache');
+  });
+
+  it('falls back to npm_config_cache when no manager is set and no lockfile is present', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // makeConfig omits `manager`; /work has no lockfile, so detectManager → 'npm'.
+    const env = buildChildEnv({}, makeConfig('/work'), '/tmp/events.jsonl');
+
+    expect(env['npm_config_cache']).toBe('/work/.npm-cache');
+    expect(env['npm_config_store_dir']).toBeUndefined();
+    expect(env['YARN_GLOBAL_FOLDER']).toBeUndefined();
+  });
+
+  it('macOS child env carries the same manager-conditional redirect (parity: $REPO/... tokens)', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+    const env = buildChildEnvMacos({}, makeConfig('/work', 'yarn'), '/tmp/events.jsonl');
+
+    expect(env['YARN_GLOBAL_FOLDER']).toBe('/work/.yarn-global');
+    expect(env['YARN_CACHE_FOLDER']).toBe('/work/.yarn-cache');
+    expect(env['npm_config_store_dir']).toBeUndefined();
+    expect(env['npm_config_cache']).toBeUndefined();
+  });
+
+  it('strips an ambient SCRIPT_JAIL_SCRATCH_DIR from the lifecycle child env', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // init.sh exports SCRIPT_JAIL_SCRATCH_DIR for the AGENT only — it is an
+    // internal artifact-placement knob, deliberately not allow-listed in
+    // LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES, so backends with and without
+    // the scratch disk present byte-identical child environments.
+    const env = buildChildEnv(
+      { SCRIPT_JAIL_SCRATCH_DIR: '/scratch', PATH: '/usr/bin' },
+      makeConfig('/work'),
+      '/tmp/events.jsonl',
+    );
+    expect(env).not.toHaveProperty('SCRIPT_JAIL_SCRATCH_DIR');
+  });
+});
+
+describe('scratchBaseDir + scratch-disk artifact placement', () => {
+  // The VM backends attach a `scratch`-labelled 4 GiB disk that init.sh
+  // mounts at /scratch (exporting SCRIPT_JAIL_SCRATCH_DIR) so the per-pid
+  // strace logs and the events JSONL stop overflowing the 64 MB /tmp tmpfs.
+  // Docker/bare/macOS never set the var → everything stays under /tmp.
+
+  const ENV_NAME = 'SCRIPT_JAIL_SCRATCH_DIR';
+  let savedEnv: string | undefined;
+
+  beforeEach(() => {
+    savedEnv = process.env[ENV_NAME];
+    delete process.env[ENV_NAME];
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV_NAME];
+    else process.env[ENV_NAME] = savedEnv;
+  });
+
+  it('scratchBaseDir falls back to /tmp when the env var is unset', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir({})).toBe('/tmp');
+  });
+
+  it('scratchBaseDir treats an empty value as unset (no relative artifact paths)', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir({ [ENV_NAME]: '' })).toBe('/tmp');
+  });
+
+  it('scratchBaseDir returns the env-provided directory when set', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir({ [ENV_NAME]: '/scratch' })).toBe('/scratch');
+  });
+
+  it('scratchBaseDir reads process.env by default, at call time', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir()).toBe('/tmp');
+    process.env[ENV_NAME] = '/scratch';
+    expect(scratchBaseDir()).toBe('/scratch');
+  });
+
+  it('createEventsFile creates the events dir under SCRIPT_JAIL_SCRATCH_DIR when set', async () => {
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    // testDir stands in for the mounted /scratch — created by the
+    // file-level beforeEach, removed by its afterEach.
+    process.env[ENV_NAME] = testDir;
+
+    const eventsFile = createEventsFile();
+    expect(eventsFile.dirPath.startsWith(join(testDir, 'script-jail-events-'))).toBe(true);
+    expect(eventsFile.path.startsWith(eventsFile.dirPath)).toBe(true);
+    // The handle contract is unchanged: fresh inode baseline captured.
+    expect(eventsFile.baseline.ino).toBeGreaterThan(0n);
+  });
+
+  it('createEventsFile falls back to /tmp when the env var is unset', async () => {
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+
+    const eventsFile = createEventsFile();
+    try {
+      expect(eventsFile.dirPath.startsWith('/tmp/script-jail-events-')).toBe(true);
+    } finally {
+      rmSync(eventsFile.dirPath, { recursive: true, force: true });
+    }
+  });
+
+  it('an explicit parentDir argument still wins over the env var (test seam)', async () => {
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    process.env[ENV_NAME] = '/nonexistent-scratch-mount';
+
+    const eventsFile = createEventsFile(testDir);
+    expect(eventsFile.dirPath.startsWith(join(testDir, 'script-jail-events-'))).toBe(true);
+  });
+
+  it('main() points the strace runner basePath at the scratch dir when set, /tmp when not', async () => {
+    // Capture opts.basePath from a contract-conforming fake runner — the
+    // same seam trackingStrace uses, extended with the third run() arg.
+    function basePathCapturingStrace(): { strace: StraceRunner; basePaths: string[] } {
+      const basePaths: string[] = [];
+      return {
+        basePaths,
+        strace: {
+          async *run(_cmd, _args, opts) {
+            basePaths.push(opts.basePath);
+          },
+          getExitCode() { return 0; },
+          getTamperReason() { return null; },
+          recordTamper(_reason: string) { /* no-op for test fakes */ },
+          getRootPid() { return null; },
+        },
+      };
+    }
+
+    // Unset → the historical /tmp path (Docker/bare backends).
+    {
+      const { conn, hostSend } = makeConn();
+      const configPath = writeConfig(testDir);
+      const { strace, basePaths } = basePathCapturingStrace();
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace, dnsLookup: offlineLookup });
+      expect(basePaths).toEqual(['/tmp/script-jail-strace/strace.out']);
+    }
+
+    // Set → the scratch-disk path (Firecracker/VZ with the scratch drive).
+    // testDir stands in for the mounted /scratch: main() also creates the
+    // events file under the scratch base, so the dir must really exist or
+    // createEventsFile fails closed before Phase B ever runs.
+    {
+      process.env[ENV_NAME] = testDir;
+      const { conn, hostSend } = makeConn();
+      const configPath = writeConfig(testDir);
+      const { strace, basePaths } = basePathCapturingStrace();
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace, dnsLookup: offlineLookup });
+      expect(basePaths).toEqual([`${testDir}/script-jail-strace/strace.out`]);
+    }
+  });
+});
+
 describe('buildChildEnvMacos macOS sticky env contract', () => {
   function makeConfig(workDir: string): import('../../src/guest/agent.js').AgentConfig {
     return {
@@ -2475,6 +2696,144 @@ describe('runStraceTailer', () => {
     expect(tamperRef.reason).toBeNull();
     // The legitimate appended line must still be yielded.
     expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
+  });
+
+  // 2026-06-12: PRE-NOTIFICATION RACE — the docker parity job's deterministic
+  // false positive.  `strace -ff` exits only after the WHOLE traced tree exits;
+  // on a large repo many children finish WITHOUT writing events, so strace
+  // lingers >> 3 × pollIntervalMs after the LAST events byte was consumed.  The
+  // kernel finalizes that write's ctime immediately, so {ctime advanced, size
+  // === eventsPos} is PERMANENT and the gate accumulates its full strike count
+  // BEFORE exitPromise resolves and flips `childExited` — the freeze loses the
+  // race.  A value window was tried and rejected as attacker-forgeable; the fix
+  // records the suspicion PROVISIONALLY and lets the CLEAN exit disposition VOID
+  // it.  Here the ctime-only bump (chmod; mtime + size flat) lands at t=120
+  // while the tracer is still "running", strikes fire at t≈180, and the clean
+  // exit arrives only at t=320 — so the strikes are accumulated, the
+  // provisional verdict is set, and the clean disposition must retroactively
+  // VOID it.  (Contrast the end-of-audit chmod test above, where the bump lands
+  // AFTER the clean exit, so `childExited` is already set and the gate never
+  // accumulates — a different path.)
+  //
+  // NOTE (2026-06-12): an inotify-fire-driven immediate-tamper path was tried
+  // here to close the round-4 [high] (a clean exit voiding a real end-of-audit
+  // tamper).  It FALSE-POSITIVED on the real CI kernels (docker 24.04 host AND
+  // firecracker 22.04 microVM): the lazy ctime finalize is NOT inotify-silent
+  // there — a benign write's watcher fire re-stats AFTER the finalize and sees
+  // ctime > the pre-finalize lastConsumedCtime with size === eventsPos, which is
+  // indistinguishable from a truncate/utimes tamper.  Reverted.  The clean-exit
+  // void residual (end-of-audit in-place substitution on a clean exit, winning
+  // the sub-ms race vs the inotify+poll drain) is an ACCEPTED irreducible
+  // residual — see docs/divergence.md and the agent.ts disposition gate.
+  it('voids a ctime finalize whose strikes accumulated BEFORE the clean exit disposition (pre-notification race)', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+    // Disposition is published in strace's `close` handler BEFORE exitPromise
+    // resolves — a CLEAN whole-tree exit (code 0, no signal).
+    const exitStatusRef: { code: number | null; signal: NodeJS.Signals | null } = { code: 0, signal: null };
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      exitStatusRef,
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 2,
+      settleHardCapMs: 400,
+    });
+
+    // t=40: a legitimate event — consumed by an active-phase drain, which sets
+    // lastConsumedCtime from the consume-time stat.
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    // t=120: MID-RUN ctime-only bump (mtime + size flat) — the finalize shape.
+    // The tracer is still "running" (childExited false), so the gate ACCUMULATES
+    // strikes and sets the provisional verdict at t≈180.
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 120);
+    // t=320: the CLEAN whole-tree exit finally lands — long after the strikes
+    // fired.  It must retroactively VOID the provisional verdict.
+    setTimeout(() => { resolveExit(); }, 320);
+
+    const items = await collect(tailer, 4000);
+    expect(tamperRef.reason).toBeNull();
+    expect(items.some((i) => i.line.includes('"name":"LAST"'))).toBe(true);
+  });
+
+  // Companion: the provisional verdict is VOIDED only by a CLEAN exit.  Same
+  // pre-exit-accumulated finalize shape, but the tracer dies ABNORMALLY (a
+  // killed tracer can leave a detached survivor), so the suspicion is PROMOTED
+  // to a real tamper — never silently dropped.
+  it('promotes a pre-exit ctime finalize to tamper when the exit is abnormal', async () => {
+    const {
+      openSync: openSyncFn,
+      fstatSync: fstatSyncFn,
+      closeSync: closeSyncFn,
+      appendFileSync: appendSyncFn,
+      chmodSync,
+      constants: fsConstants,
+    } = await import('node:fs');
+    const eventsPath = join(tailerDir, 'script-jail-events.jsonl');
+    const fd = openSyncFn(eventsPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    const stat = fstatSyncFn(fd, { bigint: true });
+    closeSyncFn(fd);
+    const baseline = { ino: stat.ino, dev: stat.dev, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+    const tamperRef: { reason: string | null } = { reason: null };
+
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((r) => { resolveExit = r; });
+    const exitStatusRef: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null };
+
+    const tailer = runStraceTailer({
+      watchDir: tailerDir,
+      basePrefix: 'strace.out',
+      fd3Stream: null,
+      eventsFilePath: eventsPath,
+      eventsBaseline: baseline,
+      tamperRef,
+      exitPromise,
+      exitStatusRef,
+      pollIntervalMs: 20,
+      drainMs: 30,
+      settleQuietPasses: 2,
+      settleHardCapMs: 400,
+    });
+
+    setTimeout(() => {
+      appendSyncFn(eventsPath, '{"kind":"env_read","name":"LAST","pid":1,"ts":0,"hidden":false}\n', 'utf8');
+    }, 40);
+    setTimeout(() => { chmodSync(eventsPath, 0o600); }, 120);
+    // t=320: ABNORMAL termination (SIGKILL) — publish the abnormal disposition,
+    // then resolve.  The provisional ctime verdict must NOT be voided.
+    setTimeout(() => {
+      exitStatusRef.code = null;
+      exitStatusRef.signal = 'SIGKILL';
+      resolveExit();
+    }, 320);
+
+    await collect(tailer, 4000);
+    expect(tamperRef.reason).not.toBeNull();
+    expect(tamperRef.reason).toMatch(/ctime advanced without new bytes|terminated abnormally|SIGKILL|killed or crashed tracer/);
   });
 
   // 2026-06-12 SECURITY (Codex finding 1): the post-exit meta-gate freeze must

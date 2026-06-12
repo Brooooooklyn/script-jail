@@ -129,6 +129,36 @@ describe('tokenize', () => {
     });
   });
 
+  describe('redirected package-manager store/cache dirs (under work_dir)', () => {
+    // buildChildEnv pins every package-manager bulk store/cache onto the
+    // repo disk: npm_config_store_dir=/work/.pnpm-store (pnpm, the original
+    // precedent), YARN_GLOBAL_FOLDER=/work/.yarn-global,
+    // YARN_CACHE_FOLDER=/work/.yarn-cache, npm_config_cache=/work/.npm-cache.
+    // Longest-prefix-wins puts all of them in the $REPO bucket (roots.cache
+    // only covers the per-manager default cache root under $HOME), with NO
+    // hash collapsing — same treatment across all four, so yarn/npm stay
+    // consistent with the established $REPO/.pnpm-store rendering.
+    it('tokenizes /work/.pnpm-store under $REPO (existing pnpm precedent)', () => {
+      const result = tokenize('/work/.pnpm-store/v10/files/ab/cdef', roots, pkgDir);
+      expect(result).toBe('$REPO/.pnpm-store/v10/files/ab/cdef');
+    });
+
+    it('tokenizes /work/.yarn-global under $REPO (yarn berry global folder)', () => {
+      const result = tokenize('/work/.yarn-global/cache/lodash-npm-4.17.21-abc.zip', roots, pkgDir);
+      expect(result).toBe('$REPO/.yarn-global/cache/lodash-npm-4.17.21-abc.zip');
+    });
+
+    it('tokenizes /work/.yarn-cache under $REPO (yarn classic cache-folder)', () => {
+      const result = tokenize('/work/.yarn-cache/v6/npm-debug-4.3.4/package.json', roots, pkgDir);
+      expect(result).toBe('$REPO/.yarn-cache/v6/npm-debug-4.3.4/package.json');
+    });
+
+    it('tokenizes /work/.npm-cache under $REPO (npm cacache tree)', () => {
+      const result = tokenize('/work/.npm-cache/_cacache/index-v5/00/aa', roots, pkgDir);
+      expect(result).toBe('$REPO/.npm-cache/_cacache/index-v5/00/aa');
+    });
+  });
+
   describe('no currentPkgDir', () => {
     it('falls back to $NODE_MODULES without currentPkgDir', () => {
       const result = tokenize('/work/node_modules/debug/index.js', roots);

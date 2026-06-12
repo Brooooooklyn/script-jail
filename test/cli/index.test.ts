@@ -56,6 +56,7 @@ function fakeOverlay(workDir: string) {
   return {
     rootfsCopyPath: join(workDir, 'rootfs.ext4'),
     repoDiskPath: join(workDir, 'repo.ext4'),
+    scratchDiskPath: join(workDir, 'scratch.ext4'),
     workDir,
     cleanup: async () => { /* no-op */ },
   };

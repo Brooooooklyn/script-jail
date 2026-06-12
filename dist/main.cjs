@@ -27096,15 +27096,21 @@ var import_node_os2 = require("node:os");
 var import_node_child_process = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
-  const {
-    baseRootfsPath,
-    repoSrcPath,
-    configPath,
-    workDir: maybeWorkDir,
-    extraRepoOverlayFiles
-  } = input;
-  const workDir = maybeWorkDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path5.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
+  const workDir = input.workDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path5.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
   (0, import_node_fs7.mkdirSync)(workDir, { recursive: true });
+  try {
+    return await buildOverlayInto(workDir, input);
+  } catch (err) {
+    try {
+      await (0, import_promises3.rm)(workDir, { recursive: true, force: true });
+    } catch (rmErr) {
+      console.warn(`[overlay] partial-build cleanup warning: ${String(rmErr)}`);
+    }
+    throw err;
+  }
+}
+async function buildOverlayInto(workDir, input) {
+  const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
   const rootfsCopyPath = (0, import_node_path5.join)(workDir, "rootfs.ext4");
   copyRootfs(baseRootfsPath, rootfsCopyPath);
   const repoStageDir = (0, import_node_path5.join)(workDir, "repo-stage");
@@ -27126,7 +27132,18 @@ async function makeOverlay(input) {
     }
   }
   const repoDiskPath = (0, import_node_path5.join)(workDir, "repo.ext4");
-  await buildRepoDisk(repoStageDir, repoDiskPath);
+  await buildExt4Disk({
+    srcDir: repoStageDir,
+    label: "repo",
+    sizeMB: estimateDiskSizeMB(repoStageDir),
+    outPath: repoDiskPath
+  });
+  const scratchDiskPath = (0, import_node_path5.join)(workDir, "scratch.ext4");
+  await buildExt4Disk({
+    label: SCRATCH_DISK_LABEL,
+    sizeMB: SCRATCH_DISK_MB,
+    outPath: scratchDiskPath
+  });
   const cleanup = async () => {
     try {
       await (0, import_promises3.rm)(workDir, { recursive: true, force: true });
@@ -27134,7 +27151,7 @@ async function makeOverlay(input) {
       console.warn(`[overlay] cleanup warning: ${String(err)}`);
     }
   };
-  return { rootfsCopyPath, repoDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, workDir, cleanup };
 }
 function writeOverlayFile(root, relPath, content) {
   const parts = relPath.split("/").filter((part) => part.length > 0);
@@ -27169,18 +27186,17 @@ function copyRootfs(src, dest) {
   }
   (0, import_node_fs7.cpSync)(src, dest);
 }
-async function buildRepoDisk(srcDir, outPath) {
-  const sizeMB = estimateDiskSizeMB(srcDir);
+async function buildExt4Disk(opts) {
+  const { srcDir, label, sizeMB, outPath } = opts;
   const sizeSpec = `${sizeMB}M`;
   const mkfs = resolveMkfsExt4();
   if (mkfs !== null) {
     const result = (0, import_node_child_process.spawnSync)(
       mkfs,
       [
-        "-d",
-        srcDir,
+        ...srcDir !== void 0 ? ["-d", srcDir] : [],
         "-L",
-        "repo",
+        label,
         "-O",
         "^has_journal",
         "-m",
@@ -27192,15 +27208,17 @@ async function buildRepoDisk(srcDir, outPath) {
     );
     if (result.status !== 0) {
       throw new Error(
-        `mkfs.ext4 for repo disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
+        `mkfs.ext4 for ${label} disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
       );
     }
     return;
   }
   const outDir = (0, import_node_path5.join)(outPath, "..");
   const imageName = (0, import_node_path5.basename)(outPath);
+  const srcMount = srcDir !== void 0 ? `-v "${srcDir}:/work:ro" ` : "";
+  const seedFlag = srcDir !== void 0 ? "-d /work " : "";
   (0, import_node_child_process.execSync)(
-    `docker run --rm -v "${srcDir}:/work:ro" -v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
+    `docker run --rm ` + srcMount + `-v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
     { stdio: "inherit" }
   );
 }
@@ -27218,6 +27236,8 @@ function resolveMkfsExt4() {
   return null;
 }
 var REPO_DISK_MIN_MB = 4096;
+var SCRATCH_DISK_LABEL = "scratch";
+var SCRATCH_DISK_MB = 4096;
 function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
@@ -27251,6 +27271,7 @@ async function launchVm(input) {
     vmlinuxPath,
     rootfsPath,
     repoDiskPath,
+    scratchDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -27306,6 +27327,12 @@ async function launchVm(input) {
         is_read_only: false
       });
     }
+    await apiClient.put("/drives/scratch", {
+      drive_id: "scratch",
+      path_on_host: scratchDiskPath,
+      is_root_device: false,
+      is_read_only: false
+    });
     await apiClient.put("/machine-config", {
       vcpu_count: vcpu,
       mem_size_mib: memMB
@@ -43496,6 +43523,10 @@ async function launchFirecracker(input) {
       vmlinuxPath: input.binaries.vmlinuxPath,
       rootfsPath: input.overlay.rootfsCopyPath,
       repoDiskPath: input.overlay.repoDiskPath,
+      // Audit scratch disk: strace -ff logs + the events JSONL live here
+      // (mounted by label at /scratch) instead of the guest's 64 MB /tmp
+      // tmpfs, which large installs overflow (ENOSPC).
+      scratchDiskPath: input.overlay.scratchDiskPath,
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,

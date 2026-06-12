@@ -12,7 +12,7 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
@@ -702,6 +702,16 @@ export async function* runStraceTailer(
   // is reachable solely by a process that outlived the tracer — outside the
   // audit's threat model.
   let childExited = false;
+  // Provisional "ctime advanced without new bytes" verdict (2026-06-12).  The
+  // end-of-audit lazy ctime finalize accumulates this gate's strikes BEFORE the
+  // clean-exit disposition can flip `childExited` (a >150ms race on large
+  // repos), so the ctime gate writes its suspicion HERE instead of firing the
+  // fatal directly.  The exitPromise handler VOIDS it on a clean whole-tree
+  // exit (benign finalize) and PROMOTES it (via recordTamper) after the settle
+  // loop on an abnormal exit or when no disposition is supplied (macOS / unit
+  // tests — fail-closed).  The mtime-advance gate keeps firing synchronously:
+  // mtime is stamped at write time and does not exhibit the lazy finalize.
+  let pendingCtimeTamper: string | null = null;
   function recordTamper(reason: string): void {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -811,6 +821,30 @@ export async function* runStraceTailer(
     // that point no in-model process is alive to race the window (see the
     // childExited declaration); byte-adding tampers are still caught by the
     // size-grow drain below.
+    //
+    // 2026-06-12: the childExited freeze loses a RACE.  `strace -ff` exits only
+    // after the WHOLE traced tree exits; on a large repo many children finish
+    // WITHOUT writing events, so strace lingers >> META_ADVANCE_REQUIRED_POLLS ×
+    // pollIntervalMs (≥150ms) AFTER the last events byte was consumed.  The
+    // kernel finalizes that last write's ctime almost immediately, so the
+    // suspicious state {ctime advanced, size === eventsPos} is PERMANENT and
+    // accumulates the full strike count BEFORE exitPromise resolves and flips
+    // `childExited` (deterministic 2/2 on the docker parity job, ubuntu-24.04
+    // host kernel).  A value window was tried and rejected: a pure ctime-delta
+    // tolerance is attacker-forgeable (a same-UID script can append→truncate→
+    // utimes-restore within the window after observing a consume).
+    //
+    // Fix: do NOT fire the fatal synchronously here.  Record the suspicion
+    // PROVISIONALLY in `pendingCtimeTamper` and resolve it against the strace
+    // EXIT DISPOSITION — a signal the attacker cannot forge.  On a CLEAN whole-
+    // tree exit (exit(), signal === null) the lingering finalize is benign and
+    // the provisional verdict is VOIDED (see the exitPromise handler).  On an
+    // ABNORMAL exit (killed/crashed tracer → possible detached survivor) or
+    // with NO disposition at all (the macOS direct-spawn runner — fail-closed,
+    // armed-forever) the provisional verdict is PROMOTED to a real tamper after
+    // the settle loop.  No value window, so the steady-state gate stays strict:
+    // every byte-adding tamper is still caught by the size-grow drain below and
+    // the maxSeenSize / mtime-regression gates, which fire unconditionally.
     if (
       !childExited &&
       lastConsumedCtime !== -1n &&
@@ -819,9 +853,8 @@ export async function* runStraceTailer(
     ) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
-        recordTamper(
-          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`,
-        );
+        pendingCtimeTamper =
+          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`;
         return;
       }
     } else {
@@ -1105,6 +1138,40 @@ export async function* runStraceTailer(
         );
       } else {
         childExited = true;
+        // Clean whole-tree exit: any ctime advance the gate flagged while we
+        // waited out the tracer was the kernel's benign end-of-audit finalize,
+        // not a live attacker (none can remain past a clean exit).  Void the
+        // provisional verdict — this is what wins the pre-notification race the
+        // `childExited` freeze alone loses.
+        //
+        // ACCEPTED RESIDUAL (Codex round-4 [high], 2026-06-12): voiding here
+        // also clears a REAL active-phase ctime-only tamper (truncate-back /
+        // utimes-restore / same-size in-place substitution) that a same-UID
+        // script performs and then lets the install exit 0.  This is a
+        // deliberate, irreducible tradeoff, not an oversight:
+        //   * {ctime advanced, size === eventsPos} is the EXACT signature of
+        //     the benign lazy finalize, so no stat/poll signal distinguishes it
+        //     from a tamper.  An inotify-fire-driven immediate gate was tried
+        //     to close this (the finalize was assumed inotify-silent); it
+        //     FALSE-POSITIVED on the real CI kernels (docker 24.04 host AND
+        //     firecracker 22.04 microVM — the finalize re-stats > the pre-
+        //     finalize watermark for benign writes), confirmed by CI and an
+        //     independent review.  There is no FP-free poll/inotify fix.
+        //   * The PRIMARY defense is intact and unaffected: the inotify-driven
+        //     drain + the size/maxSeenSize gates read the attacker's appended
+        //     bytes (recording the malicious line) UNLESS the attacker wins a
+        //     sub-millisecond cross-process race against the concurrently-
+        //     running tailer.  The ctime gate is only the defense-in-depth
+        //     backstop for that race-won case; this void narrows it to the
+        //     additional conjunction of {race won} AND {clean exit} AND {no
+        //     subsequent observed activity}.
+        //   * Same CLASS as PR #10's accepted post-exit-freeze residual: a root
+        //     attacker racing the tailer is outside the enforceable boundary.
+        // Keeping PR #10's strict active-phase immediate-fire instead would
+        // re-introduce the large-repo false positive this whole change exists
+        // to fix (legit installs of ~1000-pkg monorepos rejected as tampered) —
+        // a guaranteed, frequent failure traded for a tight, rare race.
+        pendingCtimeTamper = null;
       }
     }
     // By the time exitPromise resolves, strace has already fclose()'d every
@@ -1160,6 +1227,14 @@ export async function* runStraceTailer(
       prev = cur;
       if (Date.now() >= hardDeadline) break; // safety net — never hang
       await delay(pollIntervalMs);
+    }
+    // Resolve any provisional ctime verdict.  A clean whole-tree exit already
+    // set `childExited` and voided it above; reaching here with it still set
+    // means the exit was ABNORMAL (killed/crashed tracer — possible detached
+    // survivor) or NO disposition was supplied (macOS direct-spawn runner, or a
+    // unit test) — both fail-closed, so PROMOTE the suspicion to a real tamper.
+    if (pendingCtimeTamper !== null && !childExited) {
+      recordTamper(pendingCtimeTamper);
     }
     if (quiet < settleQuietPasses) {
       // Cap hit before quiescence.  FAIL CLOSED: this is a security audit
@@ -2003,8 +2078,40 @@ export function buildChildEnv(
     );
   }
 
+  // Redirect the bulk install cache/store off the small rootfs (and the 16 MB
+  // /root tmpfs) onto the repo overlay disk — but INJECT ONLY the knob the
+  // DETECTED manager actually consumes.  Setting a foreign manager's env knob
+  // is a no-op for the install, but env-spy records ANY enumerated key as an
+  // `env_read`, so an unconditionally-set `YARN_*` would surface in a pnpm
+  // (or npm) lockfile as noise AND break cross-backend parity for fixtures of
+  // a different manager.  Keying on the resolved manager keeps each lockfile
+  // to exactly the redirect that ran.  Per-key rationale:
+  //   pnpm → npm_config_store_dir : pnpm's content-addressed store (the knob
+  //     pnpm reads; npm/yarn ignore it).  Without it a large dep graph
+  //     overruns the rootfs partway through `pnpm fetch`.
+  //   yarn → YARN_GLOBAL_FOLDER + YARN_CACHE_FOLDER : berry rewrites
+  //     cacheFolder to `${globalFolder}/cache` under enableGlobalCache (the
+  //     env source beats repo .yarnrc.yml); YARN_CACHE_FOLDER also covers
+  //     classic 1.x and `enableGlobalCache:false` berry.  Without these the
+  //     cache defaults under $HOME/.yarn on the /root tmpfs → ENOSPC on a
+  //     ~1000-package yarn-4 monorepo.
+  //   npm  → npm_config_cache : moves the ~/.npm cacache tree off /root.
+  // All tokenize under the same `$REPO/...` longest-prefix bucket as the
+  // established `$REPO/.pnpm-store` (src/lock/tokenize.ts).
+  const resolvedManager = config.manager ?? detectManager(config.work_dir);
+  const cacheRedirectEnv: Record<string, string> =
+    resolvedManager === 'pnpm'
+      ? { npm_config_store_dir: `${config.work_dir}/.pnpm-store` }
+      : resolvedManager === 'yarn'
+        ? {
+            YARN_GLOBAL_FOLDER: `${config.work_dir}/.yarn-global`,
+            YARN_CACHE_FOLDER: `${config.work_dir}/.yarn-cache`,
+          }
+        : { npm_config_cache: `${config.work_dir}/.npm-cache` };
+
   return {
     ...inheritedEnv,
+    ...cacheRedirectEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -2034,21 +2141,8 @@ export function buildChildEnv(
       ...(inheritedEnv['NODE_OPTIONS'] ? [inheritedEnv['NODE_OPTIONS']] : []),
       ...requireFlags,
     ].join(' '),
-
-    // Redirect pnpm's content-addressed store off the rootfs (sized
-    // ~512 MB and shared with `/lib`, `/usr`, `/root`, etc.) onto the
-    // repo overlay disk (~4 GB, see src/action/firecracker/overlay.ts:
-    // REPO_DISK_MIN_MB).  Without this, a real-world monorepo (e.g.
-    // vuejs/core's ~500 MB dep graph) overruns the rootfs partway
-    // through `pnpm fetch` — Phase A reports `ok=true` but the store
-    // is incomplete, Phase B's `pnpm install --offline` then links
-    // only what's present and emits a truncated lockfile.
-    //
-    // `npm_config_store_dir` is the documented pnpm env knob for
-    // store location (pnpm reads npm-style env vars).  npm and yarn
-    // do not recognise this key and ignore it, so setting it
-    // unconditionally is safe across managers.
-    npm_config_store_dir: `${config.work_dir}/.pnpm-store`,
+    // The manager-specific cache/store redirect is spread in above via
+    // `...cacheRedirectEnv` (see the rationale where it is built).
   };
 }
 
@@ -2219,12 +2313,44 @@ export interface EventsFile {
 }
 
 /**
+ * Base directory for the agent's bulk audit artifacts: the audit-events
+ * JSONL ({@link createEventsFile}) and the per-pid `strace -ff` logs (the
+ * `straceBasePath` wiring in `main()`).
+ *
+ * On the VM backends (Firecracker, Apple VZ) the host attaches a third
+ * virtio drive labelled `scratch` (4096 MiB ext4); src/rootfs/init.sh mounts
+ * it at /scratch and exports `SCRIPT_JAIL_SCRATCH_DIR=/scratch` before
+ * exec'ing the orchestrator.  Both artifact classes used to live on the
+ * guest's 64 MB /tmp tmpfs, which a large repo overflows (ENOSPC) —
+ * a ~1000-package yarn-berry monorepo produces hundreds of MB of strace
+ * text alone, and the events JSONL grows with it.
+ *
+ * When the variable is unset (Docker/bare backends, macOS-bare, older hosts
+ * without the scratch-disk contract, unit tests) we fall back to `/tmp` —
+ * byte-for-byte the previous behaviour.  An empty value is treated as unset
+ * so a degenerate `SCRIPT_JAIL_SCRATCH_DIR=` cannot produce relative
+ * artifact paths.
+ *
+ * Resolved at CALL time (not import time) so init.sh's export is the only
+ * production sequencing requirement and tests can flip the env per-case.
+ *
+ * @internal Exported for unit tests; production callers are
+ * {@link createEventsFile}'s default parameter and `main()`.
+ */
+export function scratchBaseDir(env: NodeJS.ProcessEnv = process.env): string {
+  const dir = env['SCRIPT_JAIL_SCRATCH_DIR'];
+  return dir !== undefined && dir !== '' ? dir : '/tmp';
+}
+
+/**
  * Create the per-VM events file under a fresh 0700 tmpdir and return its
  * handle.  Called by `main()` BEFORE strace launches so the path is set in
  * `SCRIPT_JAIL_LOG_FILE` (via `buildChildEnv`) and the baseline can be
  * compared on every drain cycle.
  *
  * Implementation notes:
+ *   - `parentDir` defaults to {@link scratchBaseDir}: the scratch disk when
+ *     the host attached one (SCRIPT_JAIL_SCRATCH_DIR), else `/tmp`.
  *   - `mkdtempSync` returns a path with mode 0700 by default.
  *   - The file is opened with O_RDWR|O_CREAT|O_EXCL so we know we hold the
  *     fresh inode; if the path somehow already exists (it shouldn't, mkdtemp
@@ -2232,7 +2358,7 @@ export interface EventsFile {
  *   - fstat-on-fd captures dev+ino atomically with the create; nothing can
  *     race the create-then-stat pair.
  */
-export function createEventsFile(parentDir: string = '/tmp'): EventsFile {
+export function createEventsFile(parentDir: string = scratchBaseDir()): EventsFile {
   // Audit-trust Finding (medium, 2026-05-19): the events file basename
   // must NOT be a generic name like `events.jsonl`.  The Layer-1
   // basename safety net in `phase-install.ts` flags any non-shim-loaded
@@ -2365,7 +2491,9 @@ export interface AgentInput {
   diag?: (msg: string) => void;
   /**
    * Injection seam for {@link createEventsFile}.  Production uses the
-   * default (mkdtemp + open with O_EXCL|O_NOFOLLOW under `/tmp`).  Tests
+   * default (mkdtemp + open with O_EXCL|O_NOFOLLOW under
+   * {@link scratchBaseDir} — the scratch disk when attached, else `/tmp`).
+   * Tests
    * inject a fake to simulate the file-create failure path (e.g.
    * EMFILE / EACCES / EEXIST race) without arranging a read-only /tmp,
    * and to assert the agent fails closed instead of silently falling
@@ -2732,6 +2860,20 @@ export async function main(input: AgentInput): Promise<void> {
     os: isMacosBare ? 'darwin' : 'linux',
   });
 
+  // Best-effort create of the strace output dir.  init.sh (VM) and the Docker
+  // backend normally pre-create it, but the bare Linux backend has no init
+  // step, and the agent agreeing with init.sh on the scratch-vs-/tmp base is
+  // now load-bearing — so make the agent self-sufficient.  Failure is left to
+  // the existing fail-closed path: strace cannot open its `-o` files, Phase B
+  // exits non-zero with zero events, and main() refuses to emit a lockfile.
+  const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
+  try {
+    mkdirSync(straceBaseDir, { recursive: true });
+  } catch {
+    // EEXIST cannot happen (recursive: true); EROFS/EACCES fall through to
+    // the strace spawn failure described above.
+  }
+
   const installInput = {
     manager,
     cwd: config.work_dir,
@@ -2739,7 +2881,13 @@ export async function main(input: AgentInput): Promise<void> {
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
-    straceBasePath: '/tmp/script-jail-strace/strace.out',
+    // Scratch disk when SCRIPT_JAIL_SCRATCH_DIR is set (VM backends — init.sh
+    // mounts the `scratch`-labelled drive and creates <base>/script-jail-strace
+    // there), /tmp otherwise (the Docker backend creates /tmp/script-jail-strace
+    // itself; macOS-bare never sets the var and uses the path only as the
+    // tailer's always-empty watchDir).  Per-pid `strace -ff` logs for a large
+    // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
+    straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
   };
   // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux

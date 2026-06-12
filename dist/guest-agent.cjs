@@ -10359,7 +10359,8 @@ __export(agent_exports, {
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
   readStraceChildPid: () => readStraceChildPid,
-  runStraceTailer: () => runStraceTailer
+  runStraceTailer: () => runStraceTailer,
+  scratchBaseDir: () => scratchBaseDir
 });
 module.exports = __toCommonJS(agent_exports);
 var import_node_fs3 = require("node:fs");
@@ -29277,6 +29278,7 @@ async function* runStraceTailer(opts) {
   let mtimeAdvanceStablePolls = 0;
   const META_ADVANCE_REQUIRED_POLLS = 3;
   let childExited = false;
+  let pendingCtimeTamper = null;
   function recordTamper(reason) {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -29333,9 +29335,7 @@ async function* runStraceTailer(opts) {
     if (!childExited && lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
-        recordTamper(
-          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path3}`
-        );
+        pendingCtimeTamper = `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path3}`;
         return;
       }
     } else {
@@ -29479,6 +29479,7 @@ async function* runStraceTailer(opts) {
         );
       } else {
         childExited = true;
+        pendingCtimeTamper = null;
       }
     }
     const hardDeadline = Date.now() + settleHardCapMs;
@@ -29504,6 +29505,9 @@ async function* runStraceTailer(opts) {
       prev = cur;
       if (Date.now() >= hardDeadline) break;
       await delay(pollIntervalMs);
+    }
+    if (pendingCtimeTamper !== null && !childExited) {
+      recordTamper(pendingCtimeTamper);
     }
     if (quiet < settleQuietPasses) {
       recordTamper(
@@ -29933,8 +29937,14 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
       `SCRIPT_JAIL_PROTECTED_ENV_NAMES is ${protectedNamesByteLen} bytes (comma-joined from ${config2.protected.env.length} entries); the LD_PRELOAD shim's CanonBuf can hold at most ${CANON_PROTECTED_ENV_NAMES_MAX_LEN} bytes before silently truncating the suffix and leaking the dropped names unannotated.  Reduce the \`protected.env\` list in .script-jail.yml (or split secrets across multiple runs).`
     );
   }
+  const resolvedManager = config2.manager ?? detectManager(config2.work_dir);
+  const cacheRedirectEnv = resolvedManager === "pnpm" ? { npm_config_store_dir: `${config2.work_dir}/.pnpm-store` } : resolvedManager === "yarn" ? {
+    YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
+    YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`
+  } : { npm_config_cache: `${config2.work_dir}/.npm-cache` };
   return {
     ...inheritedEnv,
+    ...cacheRedirectEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -29963,21 +29973,9 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     NODE_OPTIONS: [
       ...inheritedEnv["NODE_OPTIONS"] ? [inheritedEnv["NODE_OPTIONS"]] : [],
       ...requireFlags
-    ].join(" "),
-    // Redirect pnpm's content-addressed store off the rootfs (sized
-    // ~512 MB and shared with `/lib`, `/usr`, `/root`, etc.) onto the
-    // repo overlay disk (~4 GB, see src/action/firecracker/overlay.ts:
-    // REPO_DISK_MIN_MB).  Without this, a real-world monorepo (e.g.
-    // vuejs/core's ~500 MB dep graph) overruns the rootfs partway
-    // through `pnpm fetch` — Phase A reports `ok=true` but the store
-    // is incomplete, Phase B's `pnpm install --offline` then links
-    // only what's present and emits a truncated lockfile.
-    //
-    // `npm_config_store_dir` is the documented pnpm env knob for
-    // store location (pnpm reads npm-style env vars).  npm and yarn
-    // do not recognise this key and ignore it, so setting it
-    // unconditionally is safe across managers.
-    npm_config_store_dir: `${config2.work_dir}/.pnpm-store`
+    ].join(" ")
+    // The manager-specific cache/store redirect is spread in above via
+    // `...cacheRedirectEnv` (see the rationale where it is built).
   };
 }
 function buildChildEnvMacos(baseEnv, config2, eventsFilePath, preloadPaths) {
@@ -30016,7 +30014,11 @@ function macosTokenizeRoots(workDir) {
     cache: `${home}/Library/Caches/pnpm`
   };
 }
-function createEventsFile(parentDir = "/tmp") {
+function scratchBaseDir(env = process.env) {
+  const dir = env["SCRIPT_JAIL_SCRATCH_DIR"];
+  return dir !== void 0 && dir !== "" ? dir : "/tmp";
+}
+function createEventsFile(parentDir = scratchBaseDir()) {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
   const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path4.join)(parentDir, `script-jail-events-${tag}-`));
   (0, import_node_fs3.chmodSync)(dirPath, 448);
@@ -30216,6 +30218,11 @@ ${fetchResult.stderr}
     // benign cross-package read suppression misfires and floods external_reads.
     os: isMacosBare ? "darwin" : "linux"
   });
+  const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
+  try {
+    (0, import_node_fs3.mkdirSync)(straceBaseDir, { recursive: true });
+  } catch {
+  }
   const installInput = {
     manager,
     cwd: config2.work_dir,
@@ -30223,7 +30230,13 @@ ${fetchResult.stderr}
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
-    straceBasePath: "/tmp/script-jail-strace/strace.out",
+    // Scratch disk when SCRIPT_JAIL_SCRATCH_DIR is set (VM backends — init.sh
+    // mounts the `scratch`-labelled drive and creates <base>/script-jail-strace
+    // there), /tmp otherwise (the Docker backend creates /tmp/script-jail-strace
+    // itself; macOS-bare never sets the var and uses the path only as the
+    // tailer's always-empty watchDir).  Per-pid `strace -ff` logs for a large
+    // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
+    straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths
   };
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
@@ -30337,7 +30350,8 @@ if (isMain) {
   macosTokenizeRoots,
   main,
   readStraceChildPid,
-  runStraceTailer
+  runStraceTailer,
+  scratchBaseDir
 });
 /*! Bundled license information:
 

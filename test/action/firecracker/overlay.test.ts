@@ -72,6 +72,33 @@ function fakeConfig(dir: string): string {
 // a stubbed mkfs.ext4 requires > 50 lines of mock infrastructure.  Leave as
 // is until a dedicated ext4-mock helper is available.
 
+describe('makeOverlay — partial-build failure removes the workDir', () => {
+  it('removes a populated workDir when a build step throws mid-flight', async () => {
+    // The escaping extraRepoOverlayFiles entry throws AFTER the rootfs copy
+    // and repo staging have populated the workDir (and before any mkfs, so
+    // this runs on every platform).  Without the try/catch in makeOverlay
+    // the caller never receives cleanup() and the populated tree leaks
+    // (round-1 review, medium finding).
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+    const workDir = mkdtempSync(join(tmpdir(), 'script-jail-partial-build-'));
+
+    await expect(
+      makeOverlay({
+        baseRootfsPath,
+        repoSrcPath: repoDir,
+        configPath,
+        workDir,
+        extraRepoOverlayFiles: [{ relPath: '../escape.txt', content: 'x' }],
+      }),
+    ).rejects.toThrow(/escapes the repo stage dir|not a safe relative path/);
+
+    // The whole workDir — including the already-copied rootfs and staged
+    // repo — must be gone.
+    expect(existsSync(workDir)).toBe(false);
+  });
+});
+
 describe('makeOverlay — staging (no ext4 build)', () => {
   it('copies the base rootfs to rootfsCopyPath', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);
@@ -188,7 +215,7 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
     }
   });
 
-  it('returns correct paths for rootfsCopyPath and repoDiskPath', async () => {
+  it('returns correct paths for rootfsCopyPath, repoDiskPath and scratchDiskPath', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);
     const configPath = fakeConfig(testDir);
 
@@ -203,7 +230,49 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       expect(result.rootfsCopyPath).toContain('rootfs.ext4');
       expect(existsSync(result.repoDiskPath)).toBe(true);
       expect(result.repoDiskPath).toContain('repo.ext4');
+      expect(existsSync(result.scratchDiskPath)).toBe(true);
+      expect(result.scratchDiskPath).toContain('scratch.ext4');
       expect(result.workDir).toBeTruthy();
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('scratch.ext4 is an ext4 labeled exactly `scratch`, 4096 MiB logical', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+    });
+
+    try {
+      // Logical size: exactly 4096 MiB.  (Sparse on the host, so allocated
+      // blocks are far fewer — we only assert the logical length.)
+      const { statSync } = await import('node:fs');
+      expect(statSync(result.scratchDiskPath).size).toBe(4096 * 1024 * 1024);
+
+      // Read the ext4 superblock (at byte offset 1024) and assert:
+      //   - s_magic   (offset 0x38, little-endian) == 0xEF53  → it IS ext-family
+      //   - s_volume_name (offset 0x78, 16 bytes)  == 'scratch' → label is
+      //     load-bearing: the guest mounts via `blkid -L scratch`.
+      // Positioned read — readFileSync would pull the whole 4 GiB logical
+      // image into memory.
+      const { openSync, readSync, closeSync } = await import('node:fs');
+      const sb = Buffer.alloc(1024);
+      const fd = openSync(result.scratchDiskPath, 'r');
+      try {
+        readSync(fd, sb, 0, 1024, 1024);
+      } finally {
+        closeSync(fd);
+      }
+      const magic = sb.readUInt16LE(0x38);
+      expect(magic.toString(16)).toBe('ef53');
+      const label = sb.subarray(0x78, 0x78 + 16);
+      const labelStr = label.subarray(0, label.indexOf(0)).toString('utf8');
+      expect(labelStr).toBe('scratch');
     } finally {
       await result.cleanup();
     }

@@ -462,6 +462,9 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       kernelCmdline: `${DEFAULT_KERNEL_CMDLINE} sj_epoch=${Math.floor(Date.now() / 1000)}`,
       rootfsDiskPath: overlay.rootfsCopyPath,
       repoDiskPath: overlay.repoDiskPath,
+      // Empty per-run ext4 (label `scratch`) for strace/event spill; the
+      // helper attaches it after the repo disk, mirroring repo_disk_path.
+      scratchDiskPath: overlay.scratchDiskPath,
       // VZ does not consume a UDS path (the listener lives in-process) but
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs

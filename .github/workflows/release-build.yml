@@ -116,6 +116,44 @@ jobs:
             exit 1
           fi
 
+      # Entitlement-sign + verify the VZ helper.  Virtualization.framework
+      # refuses to boot a VM unless the calling binary carries the
+      # `com.apple.security.virtualization` entitlement; a plain `cargo build`
+      # leaves only the linker's adhoc signature with NO entitlements, so every
+      # helper published from v0.1.0 through v0.2.1 failed VZ boot with
+      # "doesn't have the com.apple.security.virtualization entitlement".  The
+      # plist lives in-repo at src/host-mac/script-jail-vm.entitlements.
+      # Ad-hoc signing is deterministic for fixed input bytes + filename
+      # (bash-arm64 below stayed byte-identical across producer reruns), so the
+      # post-sign SHA the manifest pins stays reproducible.  Signing happens
+      # HERE — after the arch/minOS gates (which signing does not alter) and
+      # before the `Stage binaries` cp — so the staged/uploaded copy that the
+      # `build` job's `Compute SHAs` step hashes is the SIGNED helper, mirroring
+      # the dylib's post-sign-SHA rule below, and so the embedded signing
+      # Identifier (derived from the filename) matches a local
+      # `cargo build -p script-jail-host-mac` + manual codesign of
+      # target/release/script-jail-vm.
+      - name: Entitlement-sign + verify VZ helper
+        run: |
+          set -euo pipefail
+          HELPER=target/release/script-jail-vm
+          codesign --force --sign - \
+            --entitlements src/host-mac/script-jail-vm.entitlements \
+            "$HELPER"
+          codesign --verify --verbose "$HELPER"
+          # HARD GATE: assert the signed binary actually carries the
+          # entitlement.  codesign -d prints the entitlements dict on stdout
+          # and the `Executable=` header on stderr; capture BOTH so a stream
+          # shuffle across macOS releases can't silently green the gate, and
+          # grep the captured variable via herestring (no pipe) so pipefail
+          # can't trip on an early-exit grep.
+          ENTS="$(codesign -d --entitlements - "$HELPER" 2>&1)"
+          if ! grep -q 'com.apple.security.virtualization' <<<"$ENTS"; then
+            echo "::error::script-jail-vm is signed but does not carry the com.apple.security.virtualization entitlement — VZ would refuse to boot every helper published from this run" >&2
+            printf 'codesign -d --entitlements - output was:\n%s\n' "$ENTS" >&2
+            exit 1
+          fi
+
       # Build the macOS-native shim cdylib.  Mirrors scripts/build.ts
       # `buildShimMac`: explicit `--target aarch64-apple-darwin` (the runner's
       # host target, already installed) so the output path is deterministic.

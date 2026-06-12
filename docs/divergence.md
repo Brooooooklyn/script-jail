@@ -422,6 +422,32 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
     pid can write forged JSONL regardless; the forgery detector only backstops
     NON-shim-loaded writers). Firecracker's strace-sourced event stream is not
     user-space-writable and does not share this channel.
+  - **Clean-exit void of an active-phase ctime-only events-file tamper (accepted
+    irreducible residual; Codex round-4 [high], 2026-06-12).** The tailer's
+    "events file ctime advanced without new bytes" gate (`runStraceTailer` in
+    `src/guest/agent.ts`) is the backstop for a same-UID script doing a metadata-
+    only mutation — truncate-back, `utimes`-restore, or a same-size in-place
+    substitution — that leaves `size === eventsPos` so the size/maxSeenSize gates
+    do not see it. On a **large** repo `strace -ff` lingers >150ms past the last
+    events byte, and the kernel's **lazy ctime finalize** of the last legit write
+    produces the EXACT `{ctime advanced, size === eventsPos}` shape — so the gate
+    cannot fire immediately without a guaranteed false positive (it rejected legit
+    installs of ~1000-package monorepos, the v0.2.2 blocker). The gate therefore
+    records the suspicion **provisionally** and resolves it against the strace
+    **exit disposition**: a CLEAN whole-tree exit (no survivor can remain) VOIDs
+    it as the benign finalize; an ABNORMAL exit or absent disposition (macOS /
+    unit) PROMOTES it to a fatal tamper. The residual: a real ctime-only tamper
+    that the attacker performs and then lets the install exit 0 is **also** voided.
+    This is irreducible — `{ctime↑, size flat}` is indistinguishable from the
+    finalize by any stat/poll/inotify signal (an inotify-fire immediate gate was
+    tried and FALSE-POSITIVED on the real CI kernels, confirmed by CI and an
+    independent review). The **primary** defense is unaffected: the inotify-driven
+    drain reads the attacker's appended bytes (recording the forged line) unless
+    they win a sub-millisecond cross-process race against the concurrently-running
+    tailer; the void only narrows the ctime backstop to {race won} AND {clean
+    exit} AND {no later observed activity} — the **same class** as PR #10's
+    accepted post-exit-freeze residual (a root attacker racing the tailer is
+    outside the enforceable boundary).
   Any finding **fails the gate** even when the
   comparable text is byte-equal, so the exclusion can never launder a real
   escape. The exclusion is also **symmetric down to the lifecycle stage**: a
