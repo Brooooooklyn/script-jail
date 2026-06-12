@@ -12,7 +12,7 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
@@ -2049,6 +2049,47 @@ export function buildChildEnv(
     // do not recognise this key and ignore it, so setting it
     // unconditionally is safe across managers.
     npm_config_store_dir: `${config.work_dir}/.pnpm-store`,
+
+    // Redirect yarn's and npm's caches onto the repo disk for the same
+    // reason as the pnpm store above.  Without these, yarn berry's global
+    // folder defaults under $HOME (`~/.yarn/berry`) and npm's cache lands
+    // at `~/.npm` — both on the guest's /root, a 16 MB tmpfs
+    // (src/rootfs/init.sh), with the 1 GB rootfs ext4 right behind it.
+    // A real dependency graph overflows either one with ENOSPC partway
+    // through Phase A (found auditing a ~1000-package yarn-4 monorepo).
+    //
+    // YARN_GLOBAL_FOLDER — yarn berry only (classic 1.x ignores it).
+    // Berry maps every config setting to a `YARN_<SNAKE_CASE>` env var and
+    // applies the `<environment>` source BEFORE yarnrc files with
+    // first-source-wins (Configuration.use skips keys whose source is
+    // already set), so this beats a repo's own .yarnrc.yml.  Yarn 4
+    // defaults `enableGlobalCache: true` and then INTERNALLY rewrites
+    // `cacheFolder` to `${globalFolder}/cache` (Configuration.find), so the
+    // bulk download cache lands at `${work_dir}/.yarn-global/cache`
+    // regardless of any cacheFolder / YARN_CACHE_FOLDER value.  Berry's
+    // install-state stays project-relative (./.yarn/install-state.gz),
+    // already on the repo disk.
+    //
+    // YARN_CACHE_FOLDER — yarn classic's cache-folder AND berry's
+    // cacheFolder.  Covers (a) yarn 1.x, which ignores YARN_GLOBAL_FOLDER,
+    // and (b) berry repos that opt out via `enableGlobalCache: false` —
+    // there the env-provided cacheFolder wins over the rc value, and
+    // berry's optional offline mirror is `${globalFolder}/cache`, also on
+    // the repo disk.  Either way every yarn cache write lands under
+    // `${config.work_dir}`, never on the /root tmpfs.
+    //
+    // npm_config_cache — npm's `cache` key (env beats .npmrc), moving the
+    // ~/.npm cacache tree onto the repo disk.  pnpm does NOT consult npm's
+    // `cache` key (its setting is `cache-dir` / npm_config_cache_dir,
+    // defaulting to the XDG cache dir), so this cannot disturb the
+    // .pnpm-store redirect above; yarn does not read it either.
+    //
+    // All three tokenize as `$REPO/.yarn-global`, `$REPO/.yarn-cache`, and
+    // `$REPO/.npm-cache` — the same longest-prefix bucket as the
+    // established `$REPO/.pnpm-store` (src/lock/tokenize.ts).
+    YARN_GLOBAL_FOLDER: `${config.work_dir}/.yarn-global`,
+    YARN_CACHE_FOLDER: `${config.work_dir}/.yarn-cache`,
+    npm_config_cache: `${config.work_dir}/.npm-cache`,
   };
 }
 
@@ -2219,12 +2260,44 @@ export interface EventsFile {
 }
 
 /**
+ * Base directory for the agent's bulk audit artifacts: the audit-events
+ * JSONL ({@link createEventsFile}) and the per-pid `strace -ff` logs (the
+ * `straceBasePath` wiring in `main()`).
+ *
+ * On the VM backends (Firecracker, Apple VZ) the host attaches a third
+ * virtio drive labelled `scratch` (4096 MiB ext4); src/rootfs/init.sh mounts
+ * it at /scratch and exports `SCRIPT_JAIL_SCRATCH_DIR=/scratch` before
+ * exec'ing the orchestrator.  Both artifact classes used to live on the
+ * guest's 64 MB /tmp tmpfs, which a large repo overflows (ENOSPC) —
+ * a ~1000-package yarn-berry monorepo produces hundreds of MB of strace
+ * text alone, and the events JSONL grows with it.
+ *
+ * When the variable is unset (Docker/bare backends, macOS-bare, older hosts
+ * without the scratch-disk contract, unit tests) we fall back to `/tmp` —
+ * byte-for-byte the previous behaviour.  An empty value is treated as unset
+ * so a degenerate `SCRIPT_JAIL_SCRATCH_DIR=` cannot produce relative
+ * artifact paths.
+ *
+ * Resolved at CALL time (not import time) so init.sh's export is the only
+ * production sequencing requirement and tests can flip the env per-case.
+ *
+ * @internal Exported for unit tests; production callers are
+ * {@link createEventsFile}'s default parameter and `main()`.
+ */
+export function scratchBaseDir(env: NodeJS.ProcessEnv = process.env): string {
+  const dir = env['SCRIPT_JAIL_SCRATCH_DIR'];
+  return dir !== undefined && dir !== '' ? dir : '/tmp';
+}
+
+/**
  * Create the per-VM events file under a fresh 0700 tmpdir and return its
  * handle.  Called by `main()` BEFORE strace launches so the path is set in
  * `SCRIPT_JAIL_LOG_FILE` (via `buildChildEnv`) and the baseline can be
  * compared on every drain cycle.
  *
  * Implementation notes:
+ *   - `parentDir` defaults to {@link scratchBaseDir}: the scratch disk when
+ *     the host attached one (SCRIPT_JAIL_SCRATCH_DIR), else `/tmp`.
  *   - `mkdtempSync` returns a path with mode 0700 by default.
  *   - The file is opened with O_RDWR|O_CREAT|O_EXCL so we know we hold the
  *     fresh inode; if the path somehow already exists (it shouldn't, mkdtemp
@@ -2232,7 +2305,7 @@ export interface EventsFile {
  *   - fstat-on-fd captures dev+ino atomically with the create; nothing can
  *     race the create-then-stat pair.
  */
-export function createEventsFile(parentDir: string = '/tmp'): EventsFile {
+export function createEventsFile(parentDir: string = scratchBaseDir()): EventsFile {
   // Audit-trust Finding (medium, 2026-05-19): the events file basename
   // must NOT be a generic name like `events.jsonl`.  The Layer-1
   // basename safety net in `phase-install.ts` flags any non-shim-loaded
@@ -2365,7 +2438,9 @@ export interface AgentInput {
   diag?: (msg: string) => void;
   /**
    * Injection seam for {@link createEventsFile}.  Production uses the
-   * default (mkdtemp + open with O_EXCL|O_NOFOLLOW under `/tmp`).  Tests
+   * default (mkdtemp + open with O_EXCL|O_NOFOLLOW under
+   * {@link scratchBaseDir} — the scratch disk when attached, else `/tmp`).
+   * Tests
    * inject a fake to simulate the file-create failure path (e.g.
    * EMFILE / EACCES / EEXIST race) without arranging a read-only /tmp,
    * and to assert the agent fails closed instead of silently falling
@@ -2732,6 +2807,20 @@ export async function main(input: AgentInput): Promise<void> {
     os: isMacosBare ? 'darwin' : 'linux',
   });
 
+  // Best-effort create of the strace output dir.  init.sh (VM) and the Docker
+  // backend normally pre-create it, but the bare Linux backend has no init
+  // step, and the agent agreeing with init.sh on the scratch-vs-/tmp base is
+  // now load-bearing — so make the agent self-sufficient.  Failure is left to
+  // the existing fail-closed path: strace cannot open its `-o` files, Phase B
+  // exits non-zero with zero events, and main() refuses to emit a lockfile.
+  const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
+  try {
+    mkdirSync(straceBaseDir, { recursive: true });
+  } catch {
+    // EEXIST cannot happen (recursive: true); EROFS/EACCES fall through to
+    // the strace spawn failure described above.
+  }
+
   const installInput = {
     manager,
     cwd: config.work_dir,
@@ -2739,7 +2828,13 @@ export async function main(input: AgentInput): Promise<void> {
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
-    straceBasePath: '/tmp/script-jail-strace/strace.out',
+    // Scratch disk when SCRIPT_JAIL_SCRATCH_DIR is set (VM backends — init.sh
+    // mounts the `scratch`-labelled drive and creates <base>/script-jail-strace
+    // there), /tmp otherwise (the Docker backend creates /tmp/script-jail-strace
+    // itself; macOS-bare never sets the var and uses the path only as the
+    // tailer's always-empty watchDir).  Per-pid `strace -ff` logs for a large
+    // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
+    straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
   };
   // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux

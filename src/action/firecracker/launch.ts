@@ -11,7 +11,7 @@
 //   1. Spawn firecracker subprocess with --api-sock.
 //   2. Poll for the Unix socket to appear (up to 5 s).
 //   3. PUT /boot-source
-//   4. PUT /drives/rootfs
+//   4. PUT /drives/rootfs (+ optional /drives/repo and /drives/scratch)
 //   5. PUT /machine-config
 //   6. (optional) set up tap + PUT /network-interfaces/eth0
 //   7. PUT /vsock
@@ -69,6 +69,14 @@ export interface LaunchInput {
   rootfsPath: string;
   /** Optional second disk (repo). If provided, added as drive id "repo". */
   repoDiskPath?: string | undefined;
+  /**
+   * Optional third disk (scratch).  If provided, added as drive id "scratch"
+   * (read-write, attached after the repo drive).  An EMPTY ext4 with
+   * filesystem label `scratch` (built by overlay.ts) that the guest mounts
+   * via `blkid -L scratch` for strace logs + the events JSONL, keeping them
+   * off the guest's 64 MB /tmp tmpfs.
+   */
+  scratchDiskPath?: string | undefined;
   vcpu?: number | undefined;       // default 2
   memMB?: number | undefined;      // default 2048
   /** Guest CID for vsock (must be > 2; host CID is 2). */
@@ -132,6 +140,7 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     vmlinuxPath,
     rootfsPath,
     repoDiskPath,
+    scratchDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -216,6 +225,21 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
       await apiClient.put('/drives/repo', {
         drive_id: 'repo',
         path_on_host: repoDiskPath,
+        is_root_device: false,
+        is_read_only: false,
+      });
+    }
+
+    // 4c. Optional scratch disk, attached after the repo drive.  An EMPTY
+    //     ext4 (filesystem label `scratch`, built per-run by overlay.ts)
+    //     the guest mounts read-write — via `blkid -L scratch` — for audit
+    //     by-products: strace -ff logs and the events JSONL.  Keeping those
+    //     off the guest's 64 MB /tmp tmpfs prevents ENOSPC on large repos.
+    //     Read-WRITE for the same reason as the repo drive above.
+    if (scratchDiskPath !== undefined) {
+      await apiClient.put('/drives/scratch', {
+        drive_id: 'scratch',
+        path_on_host: scratchDiskPath,
         is_root_device: false,
         is_read_only: false,
       });

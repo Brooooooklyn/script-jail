@@ -184,6 +184,42 @@ else
   fatal "no block device with filesystem label 'repo'"
 fi
 
+# --- Scratch disk (filesystem label `scratch`, OPTIONAL) ----------------------
+# VM backends (Firecracker, Apple VZ) attach a third virtio drive labelled
+# `scratch` (empty ext4, 4096 MiB) for the agent's bulk audit artifacts: the
+# per-pid `strace -ff` logs and the audit-events JSONL.  Both historically
+# lived on the 64 MB /tmp tmpfs above, which a large repo overflows (ENOSPC
+# partway through Phase B — a ~1000-package yarn-berry monorepo produces
+# hundreds of MB of strace text alone), truncating the audit.
+#
+# The drive is OPTIONAL for forward/backward compatibility: older hosts (and
+# the Docker/bare backends, which have no block-device contract) do not attach
+# it.  Resolution mirrors the repo-disk lookup: by label via `blkid -L`, never
+# by /dev/vd* letter, and the same `if`-wrapping keeps `set -e` from aborting
+# on the absent-device non-zero exit.  When absent we degrade silently to
+# /tmp — small repos keep working without a lockstep host upgrade.
+#
+# When mounted, SCRIPT_JAIL_SCRATCH_DIR tells the agent (src/guest/agent.ts,
+# scratchBaseDir()) where to put the events file + strace logs.  The variable
+# is agent-internal: it is deliberately NOT in the agent's
+# LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES allow-list, so it is stripped from
+# every audited lifecycle child's env — backends with and without the scratch
+# disk present byte-identical child environments.
+SCRATCH_BASE=/tmp
+if SCRATCH_DEV="$(blkid -L scratch)" && [ -n "${SCRATCH_DEV}" ]; then
+  mkdir -p /scratch
+  if mount "${SCRATCH_DEV}" /scratch; then
+    SCRATCH_BASE=/scratch
+    export SCRIPT_JAIL_SCRATCH_DIR=/scratch
+    echo "[init] scratch disk mounted at /scratch (${SCRATCH_DEV})"
+  else
+    # A present-but-unmountable scratch disk degrades to /tmp rather than
+    # failing the audit: the fallback only risks ENOSPC on large repos,
+    # while a fatal here would brick every run over a transient disk issue.
+    echo "[init] WARN: scratch device ${SCRATCH_DEV} found but mount failed; using /tmp" >&2
+  fi
+fi
+
 # Copy the user's config from the repo disk into the rootfs's canonical
 # /etc/script-jail/config.yml so the agent can read it regardless of /work staying
 # mounted.  overlay.ts stages the config at /work/etc/script-jail/config.yml.
@@ -248,8 +284,11 @@ export PATH="${NODE_BIN}:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 # to the version pinned by each repo's `packageManager` field.
 corepack enable
 
-# Strace output directory used by phase B.
-mkdir -p /tmp/script-jail-strace
+# Strace output directory used by phase B — on the scratch disk when the host
+# attached one (see the scratch block above), else the /tmp tmpfs fallback.
+# Must match the agent's `${scratchBaseDir()}/script-jail-strace` wiring in
+# src/guest/agent.ts main().
+mkdir -p "${SCRATCH_BASE}/script-jail-strace"
 
 # Hand off to the orchestrator under dumb-init.  dumb-init becomes PID 1 and
 # reaps the two children (the agent and socat); orchestrate.sh is responsible

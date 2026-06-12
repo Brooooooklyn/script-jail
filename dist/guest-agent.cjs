@@ -10359,7 +10359,8 @@ __export(agent_exports, {
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
   readStraceChildPid: () => readStraceChildPid,
-  runStraceTailer: () => runStraceTailer
+  runStraceTailer: () => runStraceTailer,
+  scratchBaseDir: () => scratchBaseDir
 });
 module.exports = __toCommonJS(agent_exports);
 var import_node_fs3 = require("node:fs");
@@ -29977,7 +29978,47 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     // store location (pnpm reads npm-style env vars).  npm and yarn
     // do not recognise this key and ignore it, so setting it
     // unconditionally is safe across managers.
-    npm_config_store_dir: `${config2.work_dir}/.pnpm-store`
+    npm_config_store_dir: `${config2.work_dir}/.pnpm-store`,
+    // Redirect yarn's and npm's caches onto the repo disk for the same
+    // reason as the pnpm store above.  Without these, yarn berry's global
+    // folder defaults under $HOME (`~/.yarn/berry`) and npm's cache lands
+    // at `~/.npm` — both on the guest's /root, a 16 MB tmpfs
+    // (src/rootfs/init.sh), with the 1 GB rootfs ext4 right behind it.
+    // A real dependency graph overflows either one with ENOSPC partway
+    // through Phase A (found auditing a ~1000-package yarn-4 monorepo).
+    //
+    // YARN_GLOBAL_FOLDER — yarn berry only (classic 1.x ignores it).
+    // Berry maps every config setting to a `YARN_<SNAKE_CASE>` env var and
+    // applies the `<environment>` source BEFORE yarnrc files with
+    // first-source-wins (Configuration.use skips keys whose source is
+    // already set), so this beats a repo's own .yarnrc.yml.  Yarn 4
+    // defaults `enableGlobalCache: true` and then INTERNALLY rewrites
+    // `cacheFolder` to `${globalFolder}/cache` (Configuration.find), so the
+    // bulk download cache lands at `${work_dir}/.yarn-global/cache`
+    // regardless of any cacheFolder / YARN_CACHE_FOLDER value.  Berry's
+    // install-state stays project-relative (./.yarn/install-state.gz),
+    // already on the repo disk.
+    //
+    // YARN_CACHE_FOLDER — yarn classic's cache-folder AND berry's
+    // cacheFolder.  Covers (a) yarn 1.x, which ignores YARN_GLOBAL_FOLDER,
+    // and (b) berry repos that opt out via `enableGlobalCache: false` —
+    // there the env-provided cacheFolder wins over the rc value, and
+    // berry's optional offline mirror is `${globalFolder}/cache`, also on
+    // the repo disk.  Either way every yarn cache write lands under
+    // `${config.work_dir}`, never on the /root tmpfs.
+    //
+    // npm_config_cache — npm's `cache` key (env beats .npmrc), moving the
+    // ~/.npm cacache tree onto the repo disk.  pnpm does NOT consult npm's
+    // `cache` key (its setting is `cache-dir` / npm_config_cache_dir,
+    // defaulting to the XDG cache dir), so this cannot disturb the
+    // .pnpm-store redirect above; yarn does not read it either.
+    //
+    // All three tokenize as `$REPO/.yarn-global`, `$REPO/.yarn-cache`, and
+    // `$REPO/.npm-cache` — the same longest-prefix bucket as the
+    // established `$REPO/.pnpm-store` (src/lock/tokenize.ts).
+    YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
+    YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`,
+    npm_config_cache: `${config2.work_dir}/.npm-cache`
   };
 }
 function buildChildEnvMacos(baseEnv, config2, eventsFilePath, preloadPaths) {
@@ -30016,7 +30057,11 @@ function macosTokenizeRoots(workDir) {
     cache: `${home}/Library/Caches/pnpm`
   };
 }
-function createEventsFile(parentDir = "/tmp") {
+function scratchBaseDir(env = process.env) {
+  const dir = env["SCRIPT_JAIL_SCRATCH_DIR"];
+  return dir !== void 0 && dir !== "" ? dir : "/tmp";
+}
+function createEventsFile(parentDir = scratchBaseDir()) {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
   const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path4.join)(parentDir, `script-jail-events-${tag}-`));
   (0, import_node_fs3.chmodSync)(dirPath, 448);
@@ -30216,6 +30261,11 @@ ${fetchResult.stderr}
     // benign cross-package read suppression misfires and floods external_reads.
     os: isMacosBare ? "darwin" : "linux"
   });
+  const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
+  try {
+    (0, import_node_fs3.mkdirSync)(straceBaseDir, { recursive: true });
+  } catch {
+  }
   const installInput = {
     manager,
     cwd: config2.work_dir,
@@ -30223,7 +30273,13 @@ ${fetchResult.stderr}
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
-    straceBasePath: "/tmp/script-jail-strace/strace.out",
+    // Scratch disk when SCRIPT_JAIL_SCRATCH_DIR is set (VM backends — init.sh
+    // mounts the `scratch`-labelled drive and creates <base>/script-jail-strace
+    // there), /tmp otherwise (the Docker backend creates /tmp/script-jail-strace
+    // itself; macOS-bare never sets the var and uses the path only as the
+    // tailer's always-empty watchDir).  Per-pid `strace -ff` logs for a large
+    // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
+    straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths
   };
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
@@ -30337,7 +30393,8 @@ if (isMain) {
   macosTokenizeRoots,
   main,
   readStraceChildPid,
-  runStraceTailer
+  runStraceTailer,
+  scratchBaseDir
 });
 /*! Bundled license information:
 

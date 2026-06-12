@@ -161,6 +161,10 @@ async function launchFirecracker(input: {
       vmlinuxPath: input.binaries.vmlinuxPath,
       rootfsPath: input.overlay.rootfsCopyPath,
       repoDiskPath: input.overlay.repoDiskPath,
+      // Audit scratch disk: strace -ff logs + the events JSONL live here
+      // (mounted by label at /scratch) instead of the guest's 64 MB /tmp
+      // tmpfs, which large installs overflow (ENOSPC).
+      scratchDiskPath: input.overlay.scratchDiskPath,
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,

@@ -84,8 +84,12 @@ explicitly — `github.ref_name` is the dispatched *branch*, not a `v*.*.*` tag.
 The producer builds every image asset exactly once:
 
 1. **`build-mac-bin`** (macOS Apple-Silicon runner) — cross-build the Darwin
-   arm64 `script-jail-vm` Mach-O helper and upload it as the tag-suffixed
-   artifact `mac-bin-vX.Y.Z`. (It cannot be built on a Linux runner.)
+   arm64 `script-jail-vm` Mach-O helper, ad-hoc sign it with the
+   `com.apple.security.virtualization` entitlement
+   (`src/host-mac/script-jail-vm.entitlements` — VZ refuses to boot without
+   it; the gate fails the job if the signed binary lacks it), and upload it as
+   the tag-suffixed artifact `mac-bin-vX.Y.Z`. (It cannot be built on a Linux
+   runner.)
 2. **`build`** (Linux runner) — install / bundle, build both x64 + arm64 rootfs
    ext4s for each Ubuntu major, build the x64 + cross-compiled arm64 Rust shims,
    build both VZ vmlinux kernels, **push the 4 GHCR rootfs Docker images**, and

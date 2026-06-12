@@ -3,9 +3,13 @@
 // Pure builders for VZVirtioBlockDeviceConfiguration.  Each call wires a
 // VZDiskImageStorageDeviceAttachment to a fresh Virtio block device.
 //
-// Two of these are attached to the VM in src/host-mac/src/vm.rs:
+// Three of these are attached to the VM in src/host-mac/src/vm.rs, in this
+// order (the guest names virtio disks by attachment order, so it matters):
 //   - rootfs  (rw)  — ubuntu ext4 image, mounted as `/` in the guest.
 //   - repo    (rw)  — host repo bind-mounted at `/work` in the guest.
+//   - scratch (rw)  — ext4 image mounted at `/scratch` in the guest for
+//                     audit artifacts (strace logs, events JSONL), keeping
+//                     them off the guest's small /tmp tmpfs.
 //
 // The test in vm.rs verifies that the assembly compiles and the API contracts
 // hold; real boot coverage is artifact-gated.

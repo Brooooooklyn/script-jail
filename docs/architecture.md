@@ -210,10 +210,18 @@ pipeline.
 
 ## Rootfs
 
-Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` (Firecracker) or Docker backend bootstrap runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Firecracker mounts two virtio drives at boot:
+Built per Ubuntu runner image (`ubuntu-22.04`, `ubuntu-24.04`) and arch by `src/rootfs/build.ts`. The image is minimal: no `gcc`, no `python`, no `$HOME` contents, no credentials. It bakes the standalone `vp` (vite-plus) binary; the guest's `init.sh` (Firecracker) or Docker backend bootstrap runs `vp env install <pinned version>` during Phase A to download a real Linux Node toolchain into `/opt/vp`, then `corepack enable` for `pnpm`/`yarn`. Firecracker (and the macOS VZ helper) mounts three virtio drives at boot:
 
 1. The rootfs itself.
-2. An ext4 overlay holding the consumer repo + caches at `/work`.
+2. An ext4 overlay holding the consumer repo + package-manager caches at
+   `/work` (the pnpm store, yarn global folder, and npm cache are all
+   redirected here — the rootfs and the tmpfs mounts are far too small for a
+   real dependency graph).
+3. An empty ext4 scratch disk (label `scratch`) mounted at `/scratch` for
+   audit artifacts: the per-pid `strace -ff` logs and the events JSONL. These
+   previously lived on the 64 MB `/tmp` tmpfs, which large installs overflow.
+   When the disk is absent (Docker / bare backends), the guest agent falls
+   back to `/tmp` via `SCRIPT_JAIL_SCRATCH_DIR`.
 
 There is no host-Node drive: the toolchain is provisioned at runtime, so a macOS host (whose own `node` is a Mach-O binary) can still produce a Linux-guest lockfile. The exact Node version is pinned in `src/rootfs/vite-plus.ts` for byte-stable cross-host parity.
 

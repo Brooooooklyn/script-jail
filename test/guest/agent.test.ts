@@ -1413,6 +1413,193 @@ describe('buildChildEnv lifecycle env sanitization', () => {
   });
 });
 
+describe('buildChildEnv package-manager cache/store redirects', () => {
+  // ENOSPC on large repos (found auditing a ~1000-package yarn-4 monorepo):
+  // yarn berry's global folder defaults under $HOME (/root, a 16 MB tmpfs in
+  // the microVM) and npm's cache lands at ~/.npm on the same tmpfs.  All
+  // package-manager bulk caches must be pinned onto the repo disk
+  // (config.work_dir, ~4 GB) the same way the pnpm store already is.
+  function makeConfig(workDir: string): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: [] },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: workDir,
+      log_fd: 3,
+      pkg_dirs: {},
+    };
+  }
+
+  it('pins the pnpm store and the yarn/npm caches under work_dir (the repo disk)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({}, makeConfig('/work'), '/tmp/events.jsonl');
+
+    // Existing pnpm precedent (store off the rootfs)…
+    expect(env['npm_config_store_dir']).toBe('/work/.pnpm-store');
+    // …mirrored for yarn berry (globalFolder: enableGlobalCache=true makes
+    // berry use ${globalFolder}/cache regardless of cacheFolder)…
+    expect(env['YARN_GLOBAL_FOLDER']).toBe('/work/.yarn-global');
+    // …yarn classic / berry-with-enableGlobalCache=false (cacheFolder)…
+    expect(env['YARN_CACHE_FOLDER']).toBe('/work/.yarn-cache');
+    // …and npm's cacache tree (env beats any repo .npmrc).
+    expect(env['npm_config_cache']).toBe('/work/.npm-cache');
+  });
+
+  it('keeps the redirects relative to a non-default work_dir', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({}, makeConfig('/staged/repo'), '/tmp/events.jsonl');
+
+    expect(env['npm_config_store_dir']).toBe('/staged/repo/.pnpm-store');
+    expect(env['YARN_GLOBAL_FOLDER']).toBe('/staged/repo/.yarn-global');
+    expect(env['YARN_CACHE_FOLDER']).toBe('/staged/repo/.yarn-cache');
+    expect(env['npm_config_cache']).toBe('/staged/repo/.npm-cache');
+  });
+
+  it('macOS child env carries the same redirects (parity: $REPO/... tokens on both backends)', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+    const env = buildChildEnvMacos({}, makeConfig('/work'), '/tmp/events.jsonl');
+
+    expect(env['npm_config_store_dir']).toBe('/work/.pnpm-store');
+    expect(env['YARN_GLOBAL_FOLDER']).toBe('/work/.yarn-global');
+    expect(env['YARN_CACHE_FOLDER']).toBe('/work/.yarn-cache');
+    expect(env['npm_config_cache']).toBe('/work/.npm-cache');
+  });
+
+  it('strips an ambient SCRIPT_JAIL_SCRATCH_DIR from the lifecycle child env', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // init.sh exports SCRIPT_JAIL_SCRATCH_DIR for the AGENT only — it is an
+    // internal artifact-placement knob, deliberately not allow-listed in
+    // LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES, so backends with and without
+    // the scratch disk present byte-identical child environments.
+    const env = buildChildEnv(
+      { SCRIPT_JAIL_SCRATCH_DIR: '/scratch', PATH: '/usr/bin' },
+      makeConfig('/work'),
+      '/tmp/events.jsonl',
+    );
+    expect(env).not.toHaveProperty('SCRIPT_JAIL_SCRATCH_DIR');
+  });
+});
+
+describe('scratchBaseDir + scratch-disk artifact placement', () => {
+  // The VM backends attach a `scratch`-labelled 4 GiB disk that init.sh
+  // mounts at /scratch (exporting SCRIPT_JAIL_SCRATCH_DIR) so the per-pid
+  // strace logs and the events JSONL stop overflowing the 64 MB /tmp tmpfs.
+  // Docker/bare/macOS never set the var → everything stays under /tmp.
+
+  const ENV_NAME = 'SCRIPT_JAIL_SCRATCH_DIR';
+  let savedEnv: string | undefined;
+
+  beforeEach(() => {
+    savedEnv = process.env[ENV_NAME];
+    delete process.env[ENV_NAME];
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV_NAME];
+    else process.env[ENV_NAME] = savedEnv;
+  });
+
+  it('scratchBaseDir falls back to /tmp when the env var is unset', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir({})).toBe('/tmp');
+  });
+
+  it('scratchBaseDir treats an empty value as unset (no relative artifact paths)', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir({ [ENV_NAME]: '' })).toBe('/tmp');
+  });
+
+  it('scratchBaseDir returns the env-provided directory when set', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir({ [ENV_NAME]: '/scratch' })).toBe('/scratch');
+  });
+
+  it('scratchBaseDir reads process.env by default, at call time', async () => {
+    const { scratchBaseDir } = await import('../../src/guest/agent.js');
+    expect(scratchBaseDir()).toBe('/tmp');
+    process.env[ENV_NAME] = '/scratch';
+    expect(scratchBaseDir()).toBe('/scratch');
+  });
+
+  it('createEventsFile creates the events dir under SCRIPT_JAIL_SCRATCH_DIR when set', async () => {
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    // testDir stands in for the mounted /scratch — created by the
+    // file-level beforeEach, removed by its afterEach.
+    process.env[ENV_NAME] = testDir;
+
+    const eventsFile = createEventsFile();
+    expect(eventsFile.dirPath.startsWith(join(testDir, 'script-jail-events-'))).toBe(true);
+    expect(eventsFile.path.startsWith(eventsFile.dirPath)).toBe(true);
+    // The handle contract is unchanged: fresh inode baseline captured.
+    expect(eventsFile.baseline.ino).toBeGreaterThan(0n);
+  });
+
+  it('createEventsFile falls back to /tmp when the env var is unset', async () => {
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+
+    const eventsFile = createEventsFile();
+    try {
+      expect(eventsFile.dirPath.startsWith('/tmp/script-jail-events-')).toBe(true);
+    } finally {
+      rmSync(eventsFile.dirPath, { recursive: true, force: true });
+    }
+  });
+
+  it('an explicit parentDir argument still wins over the env var (test seam)', async () => {
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    process.env[ENV_NAME] = '/nonexistent-scratch-mount';
+
+    const eventsFile = createEventsFile(testDir);
+    expect(eventsFile.dirPath.startsWith(join(testDir, 'script-jail-events-'))).toBe(true);
+  });
+
+  it('main() points the strace runner basePath at the scratch dir when set, /tmp when not', async () => {
+    // Capture opts.basePath from a contract-conforming fake runner — the
+    // same seam trackingStrace uses, extended with the third run() arg.
+    function basePathCapturingStrace(): { strace: StraceRunner; basePaths: string[] } {
+      const basePaths: string[] = [];
+      return {
+        basePaths,
+        strace: {
+          async *run(_cmd, _args, opts) {
+            basePaths.push(opts.basePath);
+          },
+          getExitCode() { return 0; },
+          getTamperReason() { return null; },
+          recordTamper(_reason: string) { /* no-op for test fakes */ },
+          getRootPid() { return null; },
+        },
+      };
+    }
+
+    // Unset → the historical /tmp path (Docker/bare backends).
+    {
+      const { conn, hostSend } = makeConn();
+      const configPath = writeConfig(testDir);
+      const { strace, basePaths } = basePathCapturingStrace();
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace, dnsLookup: offlineLookup });
+      expect(basePaths).toEqual(['/tmp/script-jail-strace/strace.out']);
+    }
+
+    // Set → the scratch-disk path (Firecracker/VZ with the scratch drive).
+    // testDir stands in for the mounted /scratch: main() also creates the
+    // events file under the scratch base, so the dir must really exist or
+    // createEventsFile fails closed before Phase B ever runs.
+    {
+      process.env[ENV_NAME] = testDir;
+      const { conn, hostSend } = makeConn();
+      const configPath = writeConfig(testDir);
+      const { strace, basePaths } = basePathCapturingStrace();
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({ configPath, connection: conn, spawner: mockSpawner().spawner, strace, dnsLookup: offlineLookup });
+      expect(basePaths).toEqual([`${testDir}/script-jail-strace/strace.out`]);
+    }
+  });
+});
+
 describe('buildChildEnvMacos macOS sticky env contract', () => {
   function makeConfig(workDir: string): import('../../src/guest/agent.js').AgentConfig {
     return {

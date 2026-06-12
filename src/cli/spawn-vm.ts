@@ -24,8 +24,13 @@
 // All checked paths are listed before raising — the error message names every
 // one we tried so a dev who forgot to `cargo build` (or a user whose platform
 // package failed to install) knows where the binary is expected to live.
+//
+// Pre-spawn preflights: host-side artifact existence (`checkArtifacts`) and
+// the VZ codesign entitlement (`assertVmHelperEntitlement` — a binary signed
+// without `com.apple.security.virtualization` cannot boot VZ VMs and would
+// only surface a cryptic runtime error).
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -55,6 +60,13 @@ export interface VmConfig {
   rootfsDiskPath: string;
   /** Per-run repo ext4 (output of `makeOverlay()`). */
   repoDiskPath: string;
+  /**
+   * Per-run EMPTY scratch ext4 (output of `makeOverlay()`; filesystem label
+   * `scratch`).  The guest mounts it read-write — via `blkid -L scratch` —
+   * for strace logs + the events JSONL so large repos don't ENOSPC the
+   * guest's 64 MB /tmp tmpfs.  Semantics mirror `repoDiskPath`.
+   */
+  scratchDiskPath: string;
   /**
    * vsock UDS path.  Kept in the payload for parity with the Linux runner
    * (where the listener IS a UDS); on macOS the helper's listener lives
@@ -127,6 +139,25 @@ export class MacOSVmArtifactNotFoundError extends Error {
         'Run `pnpm build` for local artifacts or fetch the matching release artifact.',
     );
     this.name = 'MacOSVmArtifactNotFoundError';
+  }
+}
+
+/**
+ * The helper binary is signed WITHOUT the `com.apple.security.virtualization`
+ * entitlement, so Virtualization.framework will refuse to boot any VM — with
+ * a cryptic runtime error, not a clear diagnostic.  Caught pre-spawn by
+ * `assertVmHelperEntitlement`.
+ */
+export class MacOSVmEntitlementError extends Error {
+  constructor(public readonly binaryPath: string) {
+    super(
+      `script-jail-vm at ${binaryPath} is missing the ` +
+        `'${VZ_ENTITLEMENT}' entitlement, so it cannot boot ` +
+        'Virtualization.framework VMs (VZ would fail with a cryptic boot error). ' +
+        'For dev builds, re-sign it with:\n' +
+        `  codesign --force --sign - --entitlements src/host-mac/script-jail-vm.entitlements ${binaryPath}`,
+    );
+    this.name = 'MacOSVmEntitlementError';
   }
 }
 
@@ -259,6 +290,8 @@ export function resolveScriptJailVmBinary(opts?: {
 export function checkArtifacts(cfg: {
   kernelPath: string;
   rootfsDiskPath: string;
+  /** Per-run scratch ext4 (built by makeOverlay).  Checked when provided. */
+  scratchDiskPath?: string;
   libscriptjailSoPath?: string;
 }): void {
   if (!existsSync(cfg.kernelPath)) {
@@ -268,12 +301,75 @@ export function checkArtifacts(cfg: {
     throw new MacOSVmArtifactNotFoundError('rootfs', cfg.rootfsDiskPath);
   }
   if (
+    cfg.scratchDiskPath !== undefined &&
+    cfg.scratchDiskPath !== '' &&
+    !existsSync(cfg.scratchDiskPath)
+  ) {
+    throw new MacOSVmArtifactNotFoundError('scratch disk', cfg.scratchDiskPath);
+  }
+  if (
     cfg.libscriptjailSoPath !== undefined &&
     cfg.libscriptjailSoPath !== '' &&
     !existsSync(cfg.libscriptjailSoPath)
   ) {
     throw new MacOSVmArtifactNotFoundError('libscriptjail.so', cfg.libscriptjailSoPath);
   }
+}
+
+// ---------------------------------------------------------------------------
+// VZ entitlement preflight
+// ---------------------------------------------------------------------------
+
+/** Entitlement Virtualization.framework requires of any VM-booting process. */
+export const VZ_ENTITLEMENT = 'com.apple.security.virtualization';
+
+/**
+ * Injectable `codesign` runner (test seam).  Mirrors the slice of
+ * `spawnSync`'s return shape the entitlement check consumes.
+ */
+export type CodesignRunner = (args: ReadonlyArray<string>) => {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  /** Set when the codesign binary itself could not be executed (ENOENT…). */
+  error?: Error | undefined;
+};
+
+const defaultCodesignRunner: CodesignRunner = (args) => {
+  const result = spawnSync('codesign', [...args], { encoding: 'utf8' });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    error: result.error,
+  };
+};
+
+/**
+ * Verify the helper binary carries the `com.apple.security.virtualization`
+ * entitlement BEFORE spawning it.  Without it VZ refuses to boot with a
+ * cryptic runtime error; this preflight converts that into a clear, typed
+ * `MacOSVmEntitlementError` with a re-sign remediation.
+ *
+ * We run `codesign -d --entitlements - <binary>` synchronously (cheap, local)
+ * and substring-match the entitlement id: the key name appears literally in
+ * BOTH output formats codesign has shipped (XML on macOS ≤12, DER-decoded
+ * text on macOS ≥13).  An unsigned binary prints nothing and exits non-zero
+ * — also (correctly) classified as missing.
+ *
+ * Degrades gracefully: when codesign itself cannot be executed (e.g. not on
+ * macOS, or Xcode CLTs absent) the check is SKIPPED, never fatal — the VZ
+ * boot error path still exists as the backstop.
+ */
+export function assertVmHelperEntitlement(
+  binaryPath: string,
+  run?: CodesignRunner,
+): void {
+  const doRun = run ?? defaultCodesignRunner;
+  const result = doRun(['-d', '--entitlements', '-', binaryPath]);
+  if (result.error !== undefined) return; // codesign unavailable → skip check
+  if (`${result.stdout}\n${result.stderr}`.includes(VZ_ENTITLEMENT)) return;
+  throw new MacOSVmEntitlementError(binaryPath);
 }
 
 /**
@@ -287,6 +383,7 @@ interface VmConfigJson {
   kernel_cmdline: string;
   rootfs_disk_path: string;
   repo_disk_path: string;
+  scratch_disk_path: string;
   vsock_uds_path: string;
   vsock_port: number;
   vcpu_count: number;
@@ -301,6 +398,7 @@ export function toJsonPayload(cfg: VmConfig): VmConfigJson {
     kernel_cmdline: cfg.kernelCmdline,
     rootfs_disk_path: cfg.rootfsDiskPath,
     repo_disk_path: cfg.repoDiskPath,
+    scratch_disk_path: cfg.scratchDiskPath,
     vsock_uds_path: cfg.vsockUdsPath,
     vsock_port: cfg.vsockPort,
     vcpu_count: cfg.vcpuCount,
@@ -354,6 +452,11 @@ export interface SpawnVmOptions {
    * Forwarded to `resolveScriptJailVmBinary`.  Ignored when `binary` is set.
    */
   repoRoot?: string;
+  /**
+   * Override the `codesign` runner used by the VZ-entitlement preflight
+   * (test seam).  Defaults to a synchronous `spawnSync('codesign', …)`.
+   */
+  codesignRunner?: CodesignRunner;
 }
 
 /**
@@ -383,7 +486,13 @@ export async function spawnVm(
   checkArtifacts({
     kernelPath: vmConfig.kernelPath,
     rootfsDiskPath: vmConfig.rootfsDiskPath,
+    scratchDiskPath: vmConfig.scratchDiskPath,
   });
+
+  // Pre-flight: the helper must be signed WITH the VZ entitlement, or every
+  // boot fails with a cryptic Virtualization.framework error.  Throws a typed
+  // MacOSVmEntitlementError (with re-sign remediation) before any spawn.
+  assertVmHelperEntitlement(binary, options.codesignRunner);
 
   // Write the JSON config to a per-run temp file.  We use a mkdtemp dir so
   // the path is unique per invocation and we can rm -rf at the end without

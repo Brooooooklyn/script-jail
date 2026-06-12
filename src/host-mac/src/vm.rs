@@ -206,6 +206,7 @@ pub fn build_config(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfigura
     for (label, path) in [
         ("rootfs_disk_path", &cfg.rootfs_disk_path),
         ("repo_disk_path", &cfg.repo_disk_path),
+        ("scratch_disk_path", &cfg.scratch_disk_path),
     ] {
         if !path.exists() {
             return Err(VmError::FileNotFound(format!(
@@ -246,9 +247,13 @@ pub fn build_config(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfigura
     unsafe { config.setCPUCount(cfg.vcpu_count as usize) };
     unsafe { config.setMemorySize(cfg.memory_mb * 1024 * 1024) };
 
-    // Storage devices: rootfs (rw), repo (rw).
+    // Storage devices: rootfs (rw), repo (rw), scratch (rw).  Attachment
+    // order is load-bearing: the guest names virtio disks /dev/vda, /dev/vdb,
+    // /dev/vdc in attachment order, so scratch must stay LAST to keep the
+    // existing rootfs/repo device names stable.
     let rootfs = disks::make_block_device(&cfg.rootfs_disk_path, false)?;
     let repo = disks::make_block_device(&cfg.repo_disk_path, false)?;
+    let scratch = disks::make_block_device(&cfg.scratch_disk_path, false)?;
     // Best-effort identifier assignment — failure here is non-fatal (VZ
     // accepts an empty identifier), but the guest's by-id symlinks are
     // nicer when these are present.  Surface failures via stderr so a
@@ -257,7 +262,11 @@ pub fn build_config(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfigura
     //
     // VZ caps virtio block-device identifiers at 20 bytes, so keep these
     // short.
-    for (device, ident) in [(&rootfs, "script-jail-rootfs"), (&repo, "script-jail-repo")] {
+    for (device, ident) in [
+        (&rootfs, "script-jail-rootfs"),
+        (&repo, "script-jail-repo"),
+        (&scratch, "script-jail-scratch"),
+    ] {
         if let Err(err) = disks::set_identifier(device, ident) {
             eprintln!("script-jail-vm: warning: set_identifier({ident}) failed: {err}");
         }
@@ -270,6 +279,7 @@ pub fn build_config(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfigura
         NSArray::from_retained_slice(&[
             Retained::cast_unchecked::<VZStorageDeviceConfiguration>(rootfs),
             Retained::cast_unchecked::<VZStorageDeviceConfiguration>(repo),
+            Retained::cast_unchecked::<VZStorageDeviceConfiguration>(scratch),
         ])
     };
     unsafe { config.setStorageDevices(&storage_devices) };
@@ -530,6 +540,7 @@ mod tests {
             kernel_cmdline: "console=hvc0".into(),
             rootfs_disk_path: rootfs.to_path_buf(),
             repo_disk_path: rootfs.to_path_buf(),
+            scratch_disk_path: rootfs.to_path_buf(),
             vsock_uds_path: "/tmp/script-jail-vsock".into(),
             vsock_port: 10242,
             vcpu_count: 2,
@@ -560,6 +571,20 @@ mod tests {
         match build_config(&cfg) {
             Err(VmError::FileNotFound(msg)) => {
                 assert!(msg.contains("repo_disk_path"), "got: {msg}");
+            }
+            other => panic!("expected FileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_config_errors_on_missing_scratch_disk() {
+        let kernel = tmp("vm-kernel-missing-scratch");
+        let rootfs = tmp("vm-rootfs-missing-scratch");
+        let mut cfg = base_cfg(&kernel, &rootfs);
+        cfg.scratch_disk_path = "/no/such/scratch.img".into();
+        match build_config(&cfg) {
+            Err(VmError::FileNotFound(msg)) => {
+                assert!(msg.contains("scratch_disk_path"), "got: {msg}");
             }
             other => panic!("expected FileNotFound, got {other:?}"),
         }

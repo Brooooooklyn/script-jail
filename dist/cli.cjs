@@ -7558,6 +7558,17 @@ var MacOSVmArtifactNotFoundError = class extends Error {
   artifact;
   path;
 };
+var MacOSVmEntitlementError = class extends Error {
+  constructor(binaryPath) {
+    super(
+      `script-jail-vm at ${binaryPath} is missing the '${VZ_ENTITLEMENT}' entitlement, so it cannot boot Virtualization.framework VMs (VZ would fail with a cryptic boot error). For dev builds, re-sign it with:
+  codesign --force --sign - --entitlements src/host-mac/script-jail-vm.entitlements ${binaryPath}`
+    );
+    this.binaryPath = binaryPath;
+    this.name = "MacOSVmEntitlementError";
+  }
+  binaryPath;
+};
 var MacOSVmConfigError = class extends Error {
   constructor(stderrTail) {
     super(
@@ -7633,9 +7644,30 @@ function checkArtifacts(cfg) {
   if (!(0, import_node_fs.existsSync)(cfg.rootfsDiskPath)) {
     throw new MacOSVmArtifactNotFoundError("rootfs", cfg.rootfsDiskPath);
   }
+  if (cfg.scratchDiskPath !== void 0 && cfg.scratchDiskPath !== "" && !(0, import_node_fs.existsSync)(cfg.scratchDiskPath)) {
+    throw new MacOSVmArtifactNotFoundError("scratch disk", cfg.scratchDiskPath);
+  }
   if (cfg.libscriptjailSoPath !== void 0 && cfg.libscriptjailSoPath !== "" && !(0, import_node_fs.existsSync)(cfg.libscriptjailSoPath)) {
     throw new MacOSVmArtifactNotFoundError("libscriptjail.so", cfg.libscriptjailSoPath);
   }
+}
+var VZ_ENTITLEMENT = "com.apple.security.virtualization";
+var defaultCodesignRunner = (args) => {
+  const result = (0, import_node_child_process.spawnSync)("codesign", [...args], { encoding: "utf8" });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error
+  };
+};
+function assertVmHelperEntitlement(binaryPath, run2) {
+  const doRun = run2 ?? defaultCodesignRunner;
+  const result = doRun(["-d", "--entitlements", "-", binaryPath]);
+  if (result.error !== void 0) return;
+  if (`${result.stdout}
+${result.stderr}`.includes(VZ_ENTITLEMENT)) return;
+  throw new MacOSVmEntitlementError(binaryPath);
 }
 function toJsonPayload(cfg) {
   return {
@@ -7643,6 +7675,7 @@ function toJsonPayload(cfg) {
     kernel_cmdline: cfg.kernelCmdline,
     rootfs_disk_path: cfg.rootfsDiskPath,
     repo_disk_path: cfg.repoDiskPath,
+    scratch_disk_path: cfg.scratchDiskPath,
     vsock_uds_path: cfg.vsockUdsPath,
     vsock_port: cfg.vsockPort,
     vcpu_count: cfg.vcpuCount,
@@ -7671,8 +7704,10 @@ async function spawnVm(vmConfig, options = {}) {
   const stderrSink = options.stderr ?? process.stderr;
   checkArtifacts({
     kernelPath: vmConfig.kernelPath,
-    rootfsDiskPath: vmConfig.rootfsDiskPath
+    rootfsDiskPath: vmConfig.rootfsDiskPath,
+    scratchDiskPath: vmConfig.scratchDiskPath
   });
+  assertVmHelperEntitlement(binary, options.codesignRunner);
   const tmpDir = (0, import_node_fs.mkdtempSync)((0, import_node_path.join)((0, import_node_os2.tmpdir)(), "script-jail-vm-"));
   const configJsonPath = (0, import_node_path.join)(tmpDir, "config.json");
   (0, import_node_fs.writeFileSync)(configJsonPath, JSON.stringify(toJsonPayload(vmConfig), null, 2), "utf8");
@@ -8196,7 +8231,18 @@ async function makeOverlay(input) {
     }
   }
   const repoDiskPath = (0, import_node_path6.join)(workDir, "repo.ext4");
-  await buildRepoDisk(repoStageDir, repoDiskPath);
+  await buildExt4Disk({
+    srcDir: repoStageDir,
+    label: "repo",
+    sizeMB: estimateDiskSizeMB(repoStageDir),
+    outPath: repoDiskPath
+  });
+  const scratchDiskPath = (0, import_node_path6.join)(workDir, "scratch.ext4");
+  await buildExt4Disk({
+    label: SCRATCH_DISK_LABEL,
+    sizeMB: SCRATCH_DISK_MB,
+    outPath: scratchDiskPath
+  });
   const cleanup = async () => {
     try {
       await (0, import_promises.rm)(workDir, { recursive: true, force: true });
@@ -8204,7 +8250,7 @@ async function makeOverlay(input) {
       console.warn(`[overlay] cleanup warning: ${String(err)}`);
     }
   };
-  return { rootfsCopyPath, repoDiskPath, workDir, cleanup };
+  return { rootfsCopyPath, repoDiskPath, scratchDiskPath, workDir, cleanup };
 }
 function writeOverlayFile(root, relPath, content) {
   const parts = relPath.split("/").filter((part) => part.length > 0);
@@ -8239,18 +8285,17 @@ function copyRootfs(src, dest) {
   }
   (0, import_node_fs6.cpSync)(src, dest);
 }
-async function buildRepoDisk(srcDir, outPath) {
-  const sizeMB = estimateDiskSizeMB(srcDir);
+async function buildExt4Disk(opts) {
+  const { srcDir, label, sizeMB, outPath } = opts;
   const sizeSpec = `${sizeMB}M`;
   const mkfs = resolveMkfsExt4();
   if (mkfs !== null) {
     const result = (0, import_node_child_process2.spawnSync)(
       mkfs,
       [
-        "-d",
-        srcDir,
+        ...srcDir !== void 0 ? ["-d", srcDir] : [],
         "-L",
-        "repo",
+        label,
         "-O",
         "^has_journal",
         "-m",
@@ -8262,15 +8307,17 @@ async function buildRepoDisk(srcDir, outPath) {
     );
     if (result.status !== 0) {
       throw new Error(
-        `mkfs.ext4 for repo disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
+        `mkfs.ext4 for ${label} disk failed (exit ${result.status ?? "unknown"}, signal ${result.signal ?? "none"})`
       );
     }
     return;
   }
   const outDir = (0, import_node_path6.join)(outPath, "..");
   const imageName = (0, import_node_path6.basename)(outPath);
+  const srcMount = srcDir !== void 0 ? `-v "${srcDir}:/work:ro" ` : "";
+  const seedFlag = srcDir !== void 0 ? "-d /work " : "";
   (0, import_node_child_process2.execSync)(
-    `docker run --rm -v "${srcDir}:/work:ro" -v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 -d /work -L repo -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
+    `docker run --rm ` + srcMount + `-v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
     { stdio: "inherit" }
   );
 }
@@ -8288,6 +8335,8 @@ function resolveMkfsExt4() {
   return null;
 }
 var REPO_DISK_MIN_MB = 4096;
+var SCRATCH_DISK_LABEL = "scratch";
+var SCRATCH_DISK_MB = 4096;
 function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
@@ -24284,6 +24333,7 @@ async function launchVm(input) {
     vmlinuxPath,
     rootfsPath,
     repoDiskPath,
+    scratchDiskPath,
     vcpu = 2,
     memMB = 2048,
     vsockCid,
@@ -24335,6 +24385,14 @@ async function launchVm(input) {
       await apiClient.put("/drives/repo", {
         drive_id: "repo",
         path_on_host: repoDiskPath,
+        is_root_device: false,
+        is_read_only: false
+      });
+    }
+    if (scratchDiskPath !== void 0) {
+      await apiClient.put("/drives/scratch", {
+        drive_id: "scratch",
+        path_on_host: scratchDiskPath,
         is_root_device: false,
         is_read_only: false
       });
@@ -24895,6 +24953,10 @@ async function launchFirecracker(input) {
       vmlinuxPath: input.binaries.vmlinuxPath,
       rootfsPath: input.overlay.rootfsCopyPath,
       repoDiskPath: input.overlay.repoDiskPath,
+      // Audit scratch disk: strace -ff logs + the events JSONL live here
+      // (mounted by label at /scratch) instead of the guest's 64 MB /tmp
+      // tmpfs, which large installs overflow (ENOSPC).
+      scratchDiskPath: input.overlay.scratchDiskPath,
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,
@@ -26044,6 +26106,9 @@ async function run(deps = {}) {
       kernelCmdline: `${DEFAULT_KERNEL_CMDLINE} sj_epoch=${Math.floor(Date.now() / 1e3)}`,
       rootfsDiskPath: overlay.rootfsCopyPath,
       repoDiskPath: overlay.repoDiskPath,
+      // Empty per-run ext4 (label `scratch`) for strace/event spill; the
+      // helper attaches it after the repo disk, mirroring repo_disk_path.
+      scratchDiskPath: overlay.scratchDiskPath,
       // VZ does not consume a UDS path (the listener lives in-process) but
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs
