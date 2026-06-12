@@ -118,6 +118,24 @@ function emptyStrace(exitCode = 0): StraceRunner {
 }
 
 /**
+ * Like {@link emptyStrace} (zero events, supplied exit code) but ALSO exposes a
+ * captured install-stdout tail via the optional `getStdoutTail()` contract.
+ * Exercises the Phase-B fail-closed diagnostic: yarn Berry writes its setup
+ * errors to stdout, and `main()` must surface a REDACTED tail on the fatal
+ * frame so the real cause isn't invisible.
+ */
+function emptyStraceWithStdout(exitCode: number, stdoutTail: string): StraceRunner {
+  return {
+    async *run() { /* zero events */ },
+    getExitCode() { return exitCode; },
+    getTamperReason() { return null; },
+    recordTamper(_reason: string) { /* no-op for test fakes */ },
+    getRootPid() { return null; },
+    getStdoutTail() { return stdoutTail; },
+  };
+}
+
+/**
  * A StraceRunner that yields ONE event-producing strace line — so
  * `runInstallPhase` reports `eventCount > 0` — and exits with the supplied
  * code.  Used to exercise the "Phase B failed but the audit DID observe a
@@ -546,6 +564,59 @@ describe('agent main()', () => {
 
     const errFrame = frames.find((f) => f['kind'] === 'error');
     expect(errFrame?.['fatal']).toBe(true);
+  });
+
+  it('Phase B zero-event fail-closed surfaces a REDACTED install-stdout tail', async () => {
+    // yarn Berry writes setup errors (Usage Errors, YN0028, resolution
+    // failures) to STDOUT, not stderr.  When Phase B fails before any
+    // lifecycle script runs (zero events) the fatal frame MUST include a tail
+    // of that stdout so the cause is diagnosable — but with credential shapes
+    // masked (it is raw, repo-controlled text).  Regression guard for the
+    // `--offline` class of failures that previously surfaced as a useless
+    // "produced no audit events" with no cause.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir);
+
+    // A realistic yarn-stdout failure mixed with a credential SHAPE (layer-2
+    // redaction fires without needing a process.env value).
+    const secret = 'npm_' + 'A'.repeat(36);
+    const stdoutTail =
+      'Unknown Syntax Error: Unsupported option name ("--offline").\n' +
+      `  resolving from //registry.example.com/:_authToken=${secret}\n`;
+
+    const origExit = process.exit.bind(process);
+    // @ts-expect-error — patching process.exit for test
+    process.exit = () => { /* no-op */ };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: emptyStraceWithStdout(1, stdoutTail),
+        dnsLookup: offlineLookup,
+      });
+    } finally {
+      process.exit = origExit;
+    }
+
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const errFrame = frames.find((f) => f['kind'] === 'error');
+    expect(errFrame?.['fatal']).toBe(true);
+    const msg = String(errFrame?.['message'] ?? '');
+    // The real cause is now visible…
+    expect(msg).toContain('install stdout (tail)');
+    expect(msg).toContain('Unknown Syntax Error');
+    // …but the credential shape is masked, not leaked verbatim.
+    expect(msg).not.toContain(secret);
+    // …and no final lockfile / install_done was emitted (still fail-closed).
+    expect(frames.map((f) => f['kind'])).not.toContain('final');
   });
 
   it('still emits install_done and the final lockfile when Phase B exits non-zero but audited scripts', async () => {

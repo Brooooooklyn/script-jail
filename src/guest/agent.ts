@@ -1445,6 +1445,42 @@ export function readStraceChildPid(
   return null;
 }
 
+/**
+ * Cap for the Phase-B install-stdout ring buffer kept by the install runners.
+ * Chosen well above any plausible single diagnostic line / credential token so
+ * a secret is overwhelmingly present whole when the agent redacts the tail; the
+ * one residual is a secret split at the FRONT (drop) boundary of the ring,
+ * which the agent's redactor cannot mask (it matches only complete values).
+ * Phase B runs OFFLINE (no auth fetch), so secrets reaching install stdout are
+ * already unlikely — this is defence-in-depth, not the primary protection.
+ */
+const PHASE_B_STDOUT_TAIL_BYTES = 16384;
+
+/**
+ * Attach a drained, bounded tail collector to a child's STDOUT stream.  The
+ * 'data' listener keeps the stream flowing (so a verbose install cannot fill
+ * the OS pipe buffer and deadlock the child), retaining only the last
+ * {@link PHASE_B_STDOUT_TAIL_BYTES} bytes.  Returns a getter for the current
+ * tail; no-op (returns `() => ''`) when the stream is absent (test stubs that
+ * don't pipe fd1).
+ */
+export function attachStdoutTailCollector(
+  stream: Readable | null | undefined,
+): () => string {
+  if (!stream) return () => '';
+  let tail = '';
+  stream.on('data', (chunk: Buffer | string) => {
+    tail = (tail + chunk.toString('utf8'));
+    if (tail.length > PHASE_B_STDOUT_TAIL_BYTES) {
+      tail = tail.slice(-PHASE_B_STDOUT_TAIL_BYTES);
+    }
+  });
+  // Swallow late errors on the captured stream (e.g. EPIPE on teardown) so an
+  // stdout-side hiccup never crashes the agent; the tail we have is best-effort.
+  stream.on('error', () => { /* best-effort capture */ });
+  return () => tail;
+}
+
 export class LinuxStraceRunner implements StraceRunner {
   private _exitCode = 0;
   private readonly _spawnImpl: SpawnImpl;
@@ -1460,6 +1496,14 @@ export class LinuxStraceRunner implements StraceRunner {
   // until the first per-pid file is observed (and remains null if
   // strace failed to spawn).
   private _rootPid: number | null = null;
+  // Live getter over the bounded, drained tail of the install command's STDOUT
+  // (yarn Berry writes its setup/diagnostic errors here).  fd1 is wired as a
+  // pipe and a 'data' listener keeps it flowing so a verbose install cannot
+  // fill the pipe and deadlock; only the last PHASE_B_STDOUT_TAIL_BYTES are
+  // retained.  Wired in run(); read via getStdoutTail() and surfaced REDACTED
+  // on the Phase-B fail-closed path.  Defaults to the empty-tail getter so it
+  // is safe to call before/without a spawn.
+  private _stdoutTailGetter: () => string = () => '';
 
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
@@ -1506,6 +1550,10 @@ export class LinuxStraceRunner implements StraceRunner {
 
   getRootPid(): number | null {
     return this._rootPid;
+  }
+
+  getStdoutTail(): string {
+    return this._stdoutTailGetter();
   }
 
   async *run(
@@ -1626,11 +1674,22 @@ export class LinuxStraceRunner implements StraceRunner {
       cwd: opts.cwd,
       env: opts.env,
       // fd 0: stdin  → /dev/null
-      // fd 1: stdout → ignored
+      // fd 1: stdout → pipe  (the install command inherits strace's fd1; yarn
+      //                Berry writes its errors here — drained into a bounded
+      //                tail for the Phase-B fail-closed diagnostic)
       // fd 2: stderr → pipe  (strace diagnostics forwarded to process.stderr)
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
-      stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
     });
+
+    // Drain the install command's stdout into a bounded ring buffer.  MUST be
+    // attached before `yield*` below so the stream flows from the first byte —
+    // an unread 'pipe' fd1 would fill the OS pipe buffer and deadlock a verbose
+    // (1000-package) install.  strace writes its traces to `-o` files, not
+    // stdout, so fd1 carries the traced install command's stdout only.
+    this._stdoutTailGetter = attachStdoutTailCollector(
+      child.stdio[1] as Readable | null,
+    );
 
     // Codex follow-up (bug #1, high, 2026-05-19): deterministically capture
     // the install command's pid by reading `/proc/<strace_pid>/task/<strace_
@@ -3024,10 +3083,42 @@ export async function main(input: AgentInput): Promise<void> {
   //     that is a genuinely clean repo with no escaping behaviour.)
   if (installResult.exitCode !== 0) {
     if (installResult.eventCount === 0) {
+      // Append a REDACTED tail of the install command's stdout.  yarn Berry
+      // writes its setup failures (Usage Errors, YN0028 immutable rejections,
+      // resolution/scoped-registry errors) to stdout, NOT stderr — without
+      // this the host saw only the generic message and the real cause was
+      // invisible (the `--offline` bug took a container repro to diagnose).
+      // Redact the FULL captured buffer BEFORE tail-capping (the redactor masks
+      // only COMPLETE protected values, so slicing first could start the tail
+      // inside a secret and leak the suffix — same ordering as Phase A,
+      // agent.ts Codex round-2 [high]).  A mask token split by the cap is
+      // harmless.  Residual: a secret split at the ring buffer's FRONT (drop)
+      // boundary cannot be masked — accepted (Phase B is offline, so install
+      // stdout rarely carries credentials; see PHASE_B_STDOUT_TAIL_BYTES).
+      const stdoutRedacted = redactSensitive(
+        installResult.installStdoutTail,
+        config.protected.env,
+      ).trim();
+      const stdoutTail =
+        stdoutRedacted.length > 4000
+          ? `…${stdoutRedacted.slice(-4000)}`
+          : stdoutRedacted;
+      const detail =
+        stdoutTail === ''
+          ? ''
+          : `\n--- install stdout (tail) ---\n${stdoutTail}`;
+      // Also dump to the serial console (mirror Phase A), in case the error
+      // frame itself doesn't reach the host.
+      if (detail !== '') {
+        process.stderr.write(
+          `[agent] Phase B (install) failed (exit ${installResult.exitCode}):${detail}\n`,
+        );
+      }
       emitter.emitError(
         `Phase B (install) failed with exit code ${installResult.exitCode} ` +
           'and produced no audit events — the install never ran a lifecycle ' +
-          'script under audit. Refusing to emit a lockfile that observed nothing.',
+          'script under audit. Refusing to emit a lockfile that observed nothing.' +
+          detail,
         true,
       );
       flushAndExit(input.connection.writable, 1);

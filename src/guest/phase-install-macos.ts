@@ -731,5 +731,6 @@ export async function runInstallPhaseMacos(
     exitCode: input.strace.getExitCode(),
     eventCount,
     tamperReason: phaseTamperReason,
+    installStdoutTail: input.strace.getStdoutTail?.() ?? '',
   };
 }

@@ -10353,6 +10353,7 @@ __export(agent_exports, {
   MemoryConnection: () => MemoryConnection,
   PassThrough: () => import_node_stream.PassThrough,
   StdioConnection: () => StdioConnection,
+  attachStdoutTailCollector: () => attachStdoutTailCollector,
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
   createEventsFile: () => createEventsFile,
@@ -28086,7 +28087,8 @@ async function runInstallPhase(input) {
     });
   }
   const exitCode = input.strace.getExitCode();
-  return { exitCode, eventCount, tamperReason: phaseTamperReason };
+  const installStdoutTail = input.strace.getStdoutTail?.() ?? "";
+  return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
 }
 
 // src/guest/phase-install-macos.ts
@@ -28481,7 +28483,8 @@ async function runInstallPhaseMacos(input) {
   return {
     exitCode: input.strace.getExitCode(),
     eventCount,
-    tamperReason: phaseTamperReason
+    tamperReason: phaseTamperReason,
+    installStdoutTail: input.strace.getStdoutTail?.() ?? ""
   };
 }
 
@@ -28494,6 +28497,10 @@ var MacOSInstallRunner = class {
   _spawnImpl;
   _eventsFile;
   _tamperRef = { reason: null };
+  // Live getter over the bounded, drained tail of the install command's STDOUT
+  // (yarn Berry writes its errors here).  See LinuxStraceRunner for the full
+  // rationale; surfaced REDACTED on the Phase-B fail-closed path.
+  _stdoutTailGetter = () => "";
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through to
    *                   `node:child_process.spawn`.
@@ -28541,12 +28548,18 @@ var MacOSInstallRunner = class {
   getRootPid() {
     return null;
   }
+  getStdoutTail() {
+    return this._stdoutTailGetter();
+  }
   async *run(cmd, args, opts) {
     const child = this._spawnImpl(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      stdio: ["ignore", "ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe", "pipe"]
     });
+    this._stdoutTailGetter = attachStdoutTailCollector(
+      child.stdio[1]
+    );
     const exitPromise = new Promise((resolve2) => {
       child.on("close", (code) => {
         this._exitCode = code ?? 1;
@@ -29654,6 +29667,20 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
   }
   return null;
 }
+var PHASE_B_STDOUT_TAIL_BYTES = 16384;
+function attachStdoutTailCollector(stream) {
+  if (!stream) return () => "";
+  let tail = "";
+  stream.on("data", (chunk) => {
+    tail = tail + chunk.toString("utf8");
+    if (tail.length > PHASE_B_STDOUT_TAIL_BYTES) {
+      tail = tail.slice(-PHASE_B_STDOUT_TAIL_BYTES);
+    }
+  });
+  stream.on("error", () => {
+  });
+  return () => tail;
+}
 var LinuxStraceRunner = class {
   _exitCode = 0;
   _spawnImpl;
@@ -29669,6 +29696,14 @@ var LinuxStraceRunner = class {
   // until the first per-pid file is observed (and remains null if
   // strace failed to spawn).
   _rootPid = null;
+  // Live getter over the bounded, drained tail of the install command's STDOUT
+  // (yarn Berry writes its setup/diagnostic errors here).  fd1 is wired as a
+  // pipe and a 'data' listener keeps it flowing so a verbose install cannot
+  // fill the pipe and deadlock; only the last PHASE_B_STDOUT_TAIL_BYTES are
+  // retained.  Wired in run(); read via getStdoutTail() and surfaced REDACTED
+  // on the Phase-B fail-closed path.  Defaults to the empty-tail getter so it
+  // is safe to call before/without a spawn.
+  _stdoutTailGetter = () => "";
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
    *                   to `node:child_process.spawn`.
@@ -29711,6 +29746,9 @@ var LinuxStraceRunner = class {
   getRootPid() {
     return this._rootPid;
   }
+  getStdoutTail() {
+    return this._stdoutTailGetter();
+  }
   async *run(cmd, args, opts) {
     const commandArgs = process.env["SCRIPT_JAIL_PHASE_B_UNSHARE_NET"] === "1" ? ["unshare", "-n", "--", cmd, ...args] : [cmd, ...args];
     const straceArgs = [
@@ -29727,11 +29765,16 @@ var LinuxStraceRunner = class {
       cwd: opts.cwd,
       env: opts.env,
       // fd 0: stdin  → /dev/null
-      // fd 1: stdout → ignored
+      // fd 1: stdout → pipe  (the install command inherits strace's fd1; yarn
+      //                Berry writes its errors here — drained into a bounded
+      //                tail for the Phase-B fail-closed diagnostic)
       // fd 2: stderr → pipe  (strace diagnostics forwarded to process.stderr)
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
-      stdio: ["ignore", "ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe", "pipe"]
     });
+    this._stdoutTailGetter = attachStdoutTailCollector(
+      child.stdio[1]
+    );
     let rootPidDeterministicResolution = false;
     if (child.pid !== void 0) {
       rootPidDeterministicResolution = true;
@@ -30278,8 +30321,22 @@ ${fetchDetail}
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
     if (installResult.eventCount === 0) {
+      const stdoutRedacted = redactSensitive(
+        installResult.installStdoutTail,
+        config2.protected.env
+      ).trim();
+      const stdoutTail = stdoutRedacted.length > 4e3 ? `\u2026${stdoutRedacted.slice(-4e3)}` : stdoutRedacted;
+      const detail = stdoutTail === "" ? "" : `
+--- install stdout (tail) ---
+${stdoutTail}`;
+      if (detail !== "") {
+        process.stderr.write(
+          `[agent] Phase B (install) failed (exit ${installResult.exitCode}):${detail}
+`
+        );
+      }
       emitter.emitError(
-        `Phase B (install) failed with exit code ${installResult.exitCode} and produced no audit events \u2014 the install never ran a lifecycle script under audit. Refusing to emit a lockfile that observed nothing.`,
+        `Phase B (install) failed with exit code ${installResult.exitCode} and produced no audit events \u2014 the install never ran a lifecycle script under audit. Refusing to emit a lockfile that observed nothing.` + detail,
         true
       );
       flushAndExit(input.connection.writable, 1);
@@ -30380,6 +30437,7 @@ if (isMain) {
   MemoryConnection,
   PassThrough,
   StdioConnection,
+  attachStdoutTailCollector,
   buildChildEnv,
   buildChildEnvMacos,
   createEventsFile,

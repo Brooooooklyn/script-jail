@@ -203,6 +203,29 @@ export interface StraceRunner {
    * this is the install command's pid.
    */
   getRootPid(): number | null;
+
+  /**
+   * Returns a bounded, drained tail (last few KB) of the install command's
+   * STDOUT, or `''` if none was captured.  Optional — fake runners that don't
+   * spawn a real child may omit it (callers use `getStdoutTail?.() ?? ''`).
+   *
+   * Why this exists: yarn Berry writes its setup/diagnostic output (resolution
+   * failures, `--immutable` YN0028 rejections, "Unknown Syntax Error" usage
+   * errors, scoped-registry resolution failures) to STDOUT, not stderr.  Phase
+   * B previously discarded fd1 entirely (`stdio: ['ignore','ignore',...]`), so
+   * a Phase-B install that failed BEFORE running any lifecycle script
+   * surfaced only as the generic "produced no audit events" fatal frame with
+   * the real cause invisible on the host — found dogfooding napi-rs (the
+   * `--offline` Usage Error), and the diagnostic blind spot that made it
+   * expensive to triage.  The production runners now drain fd1 into a bounded
+   * ring buffer so `main()` can append a REDACTED tail to the fatal Phase-B
+   * frame.  The buffer is drained continuously so a verbose 1000-package
+   * install cannot fill the pipe and deadlock the install.
+   *
+   * Only meaningful after the async iterable from `run()` has been fully
+   * consumed (the child has exited).
+   */
+  getStdoutTail?(): string;
 }
 
 export interface PhaseInstallInput {
@@ -253,6 +276,14 @@ export interface PhaseInstallResult {
    * checks are defence-in-depth: each may catch tampering the other misses.
    */
   tamperReason: string | null;
+  /**
+   * Bounded, drained tail of the install command's STDOUT (yarn Berry writes
+   * its errors here), copied from the runner's {@link StraceRunner.getStdoutTail}.
+   * `''` when the runner did not capture stdout.  The agent's Phase-B
+   * fail-closed path REDACTS this before surfacing it (it is raw,
+   * repo-controlled text).  See the rationale on `getStdoutTail`.
+   */
+  installStdoutTail: string;
 }
 
 const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
@@ -5970,5 +6001,9 @@ export async function runInstallPhase(
 
   // Exit code is owned by the StraceRunner (it ran the only install process).
   const exitCode = input.strace.getExitCode();
-  return { exitCode, eventCount, tamperReason: phaseTamperReason };
+  // Bounded stdout tail (yarn Berry writes errors here).  Optional on the
+  // runner contract — fake runners omit it.  Surfaced REDACTED by main()'s
+  // Phase-B fail-closed path.
+  const installStdoutTail = input.strace.getStdoutTail?.() ?? '';
+  return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
 }
