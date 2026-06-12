@@ -29182,7 +29182,6 @@ async function* runStraceTailer(opts) {
   const drainMs = opts.drainMs ?? 100;
   const settleHardCapMs = opts.settleHardCapMs ?? 2e3;
   const settleQuietPasses = opts.settleQuietPasses ?? 2;
-  const ctimeSettleWindowNs = opts.ctimeSettleWindowNs ?? 10000000n;
   const delay = (ms) => new Promise((resolve2) => {
     const t = setTimeout(resolve2, ms);
     t.unref?.();
@@ -29279,6 +29278,7 @@ async function* runStraceTailer(opts) {
   let mtimeAdvanceStablePolls = 0;
   const META_ADVANCE_REQUIRED_POLLS = 3;
   let childExited = false;
+  let pendingCtimeTamper = null;
   function recordTamper(reason) {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -29332,12 +29332,10 @@ async function* runStraceTailer(opts) {
       return;
     }
     if (mtimeBig > maxObservedMtime) maxObservedMtime = mtimeBig;
-    if (!childExited && lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime + ctimeSettleWindowNs && sizeNum === eventsPos) {
+    if (!childExited && lastConsumedCtime !== -1n && ctimeBig > lastConsumedCtime && sizeNum === eventsPos) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
-        recordTamper(
-          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime} + settleWindow=${ctimeSettleWindowNs}ns, size=${sizeNum} == eventsPos): ${path3}`
-        );
+        pendingCtimeTamper = `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path3}`;
         return;
       }
     } else {
@@ -29481,6 +29479,7 @@ async function* runStraceTailer(opts) {
         );
       } else {
         childExited = true;
+        pendingCtimeTamper = null;
       }
     }
     const hardDeadline = Date.now() + settleHardCapMs;
@@ -29506,6 +29505,9 @@ async function* runStraceTailer(opts) {
       prev = cur;
       if (Date.now() >= hardDeadline) break;
       await delay(pollIntervalMs);
+    }
+    if (pendingCtimeTamper !== null && !childExited) {
+      recordTamper(pendingCtimeTamper);
     }
     if (quiet < settleQuietPasses) {
       recordTamper(

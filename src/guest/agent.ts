@@ -440,19 +440,6 @@ export interface StraceTailerOptions {
    */
   settleQuietPasses?: number;
   /**
-   * Settle window (ns) for the "ctime advanced without new bytes" gate
-   * (default 10ms).  The kernel finalizes the ctime of a consumed write
-   * slightly AFTER the consume-time stat observed it (sub-millisecond deltas
-   * measured in CI: 0.297ms and 0.649ms on the ubuntu-24.04 docker host
-   * kernel), so a ctime that lands within this window past
-   * `lastConsumedCtime` is treated as that lazy finalize, not tamper.  A
-   * real utimes-restore stamps ctime = NOW, which during any quiescent
-   * phase lands far beyond the window.  Tests override this to pin the
-   * exemption mechanism deterministically; see the gate comment in
-   * drainEventsFile for the residual-risk analysis.
-   */
-  ctimeSettleWindowNs?: bigint;
-  /**
    * Optional callback invoked once with the pid of the FIRST per-pid
    * strace output file discovered during tailing — i.e. the install
    * command's pid (strace's direct child).  Used by
@@ -502,7 +489,6 @@ export async function* runStraceTailer(
   const drainMs = opts.drainMs ?? 100;
   const settleHardCapMs = opts.settleHardCapMs ?? 2000;
   const settleQuietPasses = opts.settleQuietPasses ?? 2;
-  const ctimeSettleWindowNs = opts.ctimeSettleWindowNs ?? 10_000_000n; // 10ms
 
   // Bounded async sleep used by the post-exit settle loop.  `unref` so a
   // pending delay never by itself keeps the process alive.
@@ -716,6 +702,16 @@ export async function* runStraceTailer(
   // is reachable solely by a process that outlived the tracer — outside the
   // audit's threat model.
   let childExited = false;
+  // Provisional "ctime advanced without new bytes" verdict (2026-06-12).  The
+  // end-of-audit lazy ctime finalize accumulates this gate's strikes BEFORE the
+  // clean-exit disposition can flip `childExited` (a >150ms race on large
+  // repos), so the ctime gate writes its suspicion HERE instead of firing the
+  // fatal directly.  The exitPromise handler VOIDS it on a clean whole-tree
+  // exit (benign finalize) and PROMOTES it (via recordTamper) after the settle
+  // loop on an abnormal exit or when no disposition is supplied (macOS / unit
+  // tests — fail-closed).  The mtime-advance gate keeps firing synchronously:
+  // mtime is stamped at write time and does not exhibit the lazy finalize.
+  let pendingCtimeTamper: string | null = null;
   function recordTamper(reason: string): void {
     if (opts.tamperRef && opts.tamperRef.reason === null) {
       opts.tamperRef.reason = reason;
@@ -826,37 +822,39 @@ export async function* runStraceTailer(
     // childExited declaration); byte-adding tampers are still caught by the
     // size-grow drain below.
     //
-    // 2026-06-12: the 2026-05-19 premise ("the settle is one-shot") is WRONG
-    // for MID-RUN quiet gaps.  The lazy finalize is not transient — once the
-    // kernel settles ctime to a value > lastConsumedCtime, the suspicious
-    // state {ctime advanced, size === eventsPos} holds on EVERY poll until
-    // the next byte arrives.  Any ≥ N-poll gap between write bursts after a
-    // consume-stat that raced the finalize therefore accumulated a FALSE
-    // fatal long before exit (deterministic 2/2 on the docker parity job,
-    // ubuntu-24.04 host kernel; the childExited freeze above only covers the
-    // end-of-audit case).  Fix: bound the gate by ctime VALUE.  The finalize
-    // lands sub-millisecond past the consume-stat observation (measured CI
-    // deltas: 0.297ms, 0.649ms), while a real utimes-restore stamps ctime =
-    // NOW — during any quiescent phase that is far beyond a 10ms window.
-    // Residual: an attacker whose entire append→truncate→utimes sequence
-    // lands BOTH after the consume-stat AND within the window of the last
-    // consumed write's ctime (≤10ms minus the poll phase — empty whenever
-    // the poll lands >10ms after the write) evades THIS gate; the
-    // mtime-regression primary gate and the size/maxSeenSize gates are
-    // unaffected.  That sliver is strictly narrower than the pre-existing
-    // accepted residual (tamper absorbed into lastConsumedCtime when it
-    // precedes the consume-stat).
+    // 2026-06-12: the childExited freeze loses a RACE.  `strace -ff` exits only
+    // after the WHOLE traced tree exits; on a large repo many children finish
+    // WITHOUT writing events, so strace lingers >> META_ADVANCE_REQUIRED_POLLS ×
+    // pollIntervalMs (≥150ms) AFTER the last events byte was consumed.  The
+    // kernel finalizes that last write's ctime almost immediately, so the
+    // suspicious state {ctime advanced, size === eventsPos} is PERMANENT and
+    // accumulates the full strike count BEFORE exitPromise resolves and flips
+    // `childExited` (deterministic 2/2 on the docker parity job, ubuntu-24.04
+    // host kernel).  A value window was tried and rejected: a pure ctime-delta
+    // tolerance is attacker-forgeable (a same-UID script can append→truncate→
+    // utimes-restore within the window after observing a consume).
+    //
+    // Fix: do NOT fire the fatal synchronously here.  Record the suspicion
+    // PROVISIONALLY in `pendingCtimeTamper` and resolve it against the strace
+    // EXIT DISPOSITION — a signal the attacker cannot forge.  On a CLEAN whole-
+    // tree exit (exit(), signal === null) the lingering finalize is benign and
+    // the provisional verdict is VOIDED (see the exitPromise handler).  On an
+    // ABNORMAL exit (killed/crashed tracer → possible detached survivor) or
+    // with NO disposition at all (the macOS direct-spawn runner — fail-closed,
+    // armed-forever) the provisional verdict is PROMOTED to a real tamper after
+    // the settle loop.  No value window, so the steady-state gate stays strict:
+    // every byte-adding tamper is still caught by the size-grow drain below and
+    // the maxSeenSize / mtime-regression gates, which fire unconditionally.
     if (
       !childExited &&
       lastConsumedCtime !== -1n &&
-      ctimeBig > lastConsumedCtime + ctimeSettleWindowNs &&
+      ctimeBig > lastConsumedCtime &&
       sizeNum === eventsPos
     ) {
       ctimeAdvanceStablePolls += 1;
       if (ctimeAdvanceStablePolls >= META_ADVANCE_REQUIRED_POLLS) {
-        recordTamper(
-          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime} + settleWindow=${ctimeSettleWindowNs}ns, size=${sizeNum} == eventsPos): ${path}`,
-        );
+        pendingCtimeTamper =
+          `events file ctime advanced without new bytes (ctimeNs=${ctimeBig} > lastConsumed=${lastConsumedCtime}, size=${sizeNum} == eventsPos): ${path}`;
         return;
       }
     } else {
@@ -1140,6 +1138,12 @@ export async function* runStraceTailer(
         );
       } else {
         childExited = true;
+        // Clean whole-tree exit: any ctime advance the gate flagged while we
+        // waited out the tracer was the kernel's benign end-of-audit finalize,
+        // not a live attacker (none can remain past a clean exit).  Void the
+        // provisional verdict — this is what wins the pre-notification race the
+        // `childExited` freeze alone loses.
+        pendingCtimeTamper = null;
       }
     }
     // By the time exitPromise resolves, strace has already fclose()'d every
@@ -1195,6 +1199,14 @@ export async function* runStraceTailer(
       prev = cur;
       if (Date.now() >= hardDeadline) break; // safety net — never hang
       await delay(pollIntervalMs);
+    }
+    // Resolve any provisional ctime verdict.  A clean whole-tree exit already
+    // set `childExited` and voided it above; reaching here with it still set
+    // means the exit was ABNORMAL (killed/crashed tracer — possible detached
+    // survivor) or NO disposition was supplied (macOS direct-spawn runner, or a
+    // unit test) — both fail-closed, so PROMOTE the suspicion to a real tamper.
+    if (pendingCtimeTamper !== null && !childExited) {
+      recordTamper(pendingCtimeTamper);
     }
     if (quiet < settleQuietPasses) {
       // Cap hit before quiescence.  FAIL CLOSED: this is a security audit
