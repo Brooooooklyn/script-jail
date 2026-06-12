@@ -75,6 +75,17 @@ describe('main package.json (PKG-4)', () => {
     expect(pkg).not.toHaveProperty('optionalDependencies');
   });
 
+  it('declares repository.url (required for npm OIDC trusted-publish provenance)', () => {
+    // buildMainManifest spreads the root package.json into the published main
+    // manifest; an empty/missing repository.url is rejected by npm provenance
+    // with E422 (the v0.2.3 main-package publish failed exactly here). Must
+    // match the repo the release.yml OIDC token is issued for.
+    expect(pkg.repository).toEqual({
+      type: 'git',
+      url: 'git+https://github.com/Brooooooklyn/script-jail.git',
+    });
+  });
+
   it('bin.script-jail points at dist/cli.cjs', () => {
     const bin = pkg.bin as Record<string, string>;
     expect(bin['script-jail']).toBe('dist/cli.cjs');

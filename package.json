@@ -55,5 +55,9 @@
     "oxnode": "0.0.34",
     "typescript": "6.0.3",
     "vitest": "4.1.6"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Brooooooklyn/script-jail.git"
   }
 }
