@@ -10351,8 +10351,11 @@ __export(agent_exports, {
   LinuxVsockConnection: () => LinuxVsockConnection,
   MacOSSpawner: () => MacOSSpawner,
   MemoryConnection: () => MemoryConnection,
+  PHASE_B_STDOUT_PENDING_MAX_BYTES: () => PHASE_B_STDOUT_PENDING_MAX_BYTES,
+  PHASE_B_STDOUT_TAIL_BYTES: () => PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough: () => import_node_stream.PassThrough,
   StdioConnection: () => StdioConnection,
+  attachStdoutTailCollector: () => attachStdoutTailCollector,
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
   createEventsFile: () => createEventsFile,
@@ -10370,6 +10373,7 @@ var import_node_readline2 = require("node:readline");
 var import_node_net = require("node:net");
 var import_node_dns = require("node:dns");
 var import_node_stream = require("node:stream");
+var import_node_string_decoder = require("node:string_decoder");
 var import_yaml2 = __toESM(require_dist(), 1);
 
 // node_modules/.pnpm/zod@4.4.3/node_modules/zod/v4/classic/external.js
@@ -26100,7 +26104,10 @@ function normalizePattern(p) {
 var INSTALL_CMD = {
   npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
 };
 var NODE_STARTUP_DONE_STRACE_PATH = "/tmp/script-jail-node-startup-done";
 function parseShimLine(line) {
@@ -28083,7 +28090,8 @@ async function runInstallPhase(input) {
     });
   }
   const exitCode = input.strace.getExitCode();
-  return { exitCode, eventCount, tamperReason: phaseTamperReason };
+  const installStdoutTail = input.strace.getStdoutTail?.() ?? "";
+  return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
 }
 
 // src/guest/phase-install-macos.ts
@@ -28113,7 +28121,12 @@ function parseMacosShimLine(line) {
 var INSTALL_CMD2 = {
   npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  yarn: { cmd: "yarn", args: ["install", "--immutable", "--offline"] }
+  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
+  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
+  // rationale.  The macOS-bare backend is observe-only and does not sever the
+  // network, but the cache Phase A populated still makes this a relink+build
+  // with no required registry traffic.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
 };
 var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
   "npm_package_name",
@@ -28473,7 +28486,8 @@ async function runInstallPhaseMacos(input) {
   return {
     exitCode: input.strace.getExitCode(),
     eventCount,
-    tamperReason: phaseTamperReason
+    tamperReason: phaseTamperReason,
+    installStdoutTail: input.strace.getStdoutTail?.() ?? ""
   };
 }
 
@@ -28532,6 +28546,19 @@ var MacOSInstallRunner = class {
    */
   getRootPid() {
     return null;
+  }
+  /**
+   * macOS-bare DELIBERATELY does not capture Phase-B install stdout (returns
+   * ''), unlike the Linux runner.  The macOS runner spawns the install command
+   * DIRECTLY (no strace intermediary), so wiring fd1 to a pipe ties the child
+   * `close` event tightly to the install tree's stdout EOF — Codex round-2
+   * [medium] #1 showed this can hang the macOS path when a child lingers on
+   * fd1.  macOS is observe-only and already forwards the install's STDERR to
+   * the console (see run()), where its diagnostics land; the stdout tail is a
+   * Linux-only fail-closed nicety.
+   */
+  getStdoutTail() {
+    return "";
   }
   async *run(cmd, args, opts) {
     const child = this._spawnImpl(cmd, args, {
@@ -29646,6 +29673,70 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
   }
   return null;
 }
+var PHASE_B_STDOUT_TAIL_BYTES = 16384;
+var PHASE_B_STDOUT_PENDING_MAX_BYTES = 1048576;
+function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAIL_BYTES, pendingMaxBytes = PHASE_B_STDOUT_PENDING_MAX_BYTES) {
+  if (!stream) return () => "";
+  const pendingMax = Math.max(pendingMaxBytes, capBytes);
+  const truncMarker = `
+<script-jail: stdout capture stopped \u2014 unterminated line over ${pendingMax}B (possible split secret); tail suppressed>
+`;
+  const decoder = new import_node_string_decoder.StringDecoder("utf8");
+  let redactedTail = "";
+  let pending = "";
+  let pendingBytes = 0;
+  let poisoned = false;
+  const capTail = (s) => {
+    const buf = Buffer.from(s, "utf8");
+    if (buf.length <= capBytes) return s;
+    let start = buf.length - capBytes;
+    while (start < buf.length && (buf[start] & 192) === 128) start++;
+    return buf.subarray(start).toString("utf8");
+  };
+  const appendRedacted = (s) => {
+    redactedTail = capTail(redactedTail + s);
+  };
+  const poison = () => {
+    appendRedacted(truncMarker);
+    poisoned = true;
+    pending = "";
+    pendingBytes = 0;
+  };
+  const drainCompleteLines = () => {
+    let nl;
+    while ((nl = pending.indexOf("\n")) !== -1) {
+      const line = pending.slice(0, nl + 1);
+      pending = pending.slice(nl + 1);
+      appendRedacted(redact ? redact(line) : line);
+    }
+    pendingBytes = Buffer.byteLength(pending, "utf8");
+  };
+  stream.on("data", (chunk) => {
+    if (poisoned) return;
+    const decoded = decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"));
+    if (decoded.length === 0) return;
+    pending += decoded;
+    if (decoded.indexOf("\n") !== -1) {
+      drainCompleteLines();
+    } else {
+      pendingBytes += Buffer.byteLength(decoded, "utf8");
+    }
+    if (pendingBytes > pendingMax) {
+      poison();
+    }
+  });
+  stream.on("end", () => {
+    if (poisoned) return;
+    pending += decoder.end();
+    drainCompleteLines();
+  });
+  stream.on("error", () => {
+  });
+  return () => {
+    const finalPending = poisoned ? "" : pending ? redact ? redact(pending) : pending : "";
+    return capTail(redactedTail + finalPending);
+  };
+}
 var LinuxStraceRunner = class {
   _exitCode = 0;
   _spawnImpl;
@@ -29661,6 +29752,22 @@ var LinuxStraceRunner = class {
   // until the first per-pid file is observed (and remains null if
   // strace failed to spawn).
   _rootPid = null;
+  // Live getter over the drained, byte-bounded in-memory tail of the install
+  // command's STDOUT (yarn Berry writes its setup/diagnostic errors here).  fd1
+  // is wired as a pipe and a 'data' listener keeps it flowing so a verbose
+  // install cannot fill the pipe and deadlock; only the last cap BYTES are
+  // retained, redacted before each front-drop.  Wired in run(); read via
+  // getStdoutTail() and surfaced REDACTED on the Phase-B fail-closed path.
+  // Defaults to the empty-tail getter so it is safe to call before/without a
+  // spawn.  Nothing touches disk (Codex round-4 [high]).
+  _stdoutTailGetter = () => "";
+  // Redactor applied to the stdout tail before each front-drop and again at
+  // emit time.  Injected from main() (where config.protected.env is known).
+  // Undefined for test fakes / callers that don't capture stdout.
+  _redactStdout;
+  // Byte cap for the in-memory tail.  Sized by main() to exceed the longest
+  // protected env value (in UTF-8 bytes) so the redactor sees whole values.
+  _stdoutTailBytes;
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
    *                   to `node:child_process.spawn`.
@@ -29670,10 +29777,15 @@ var LinuxStraceRunner = class {
    *                   shared events file — used by tests that supply a
    *                   pre-set environment via the `opts.env` passed to
    *                   `run()`.
+   * @param redactStdout Redactor for the stdout tail (masks complete protected
+   *                   values + credential shapes).  Undefined for test fakes.
+   * @param stdoutTailBytes Byte cap for the in-memory stdout tail.
    */
-  constructor(spawnImpl, eventsFile) {
+  constructor(spawnImpl, eventsFile, redactStdout, stdoutTailBytes = PHASE_B_STDOUT_TAIL_BYTES) {
     this._spawnImpl = spawnImpl ?? import_node_child_process3.spawn;
     this._eventsFile = eventsFile ?? null;
+    this._redactStdout = redactStdout;
+    this._stdoutTailBytes = stdoutTailBytes;
   }
   getExitCode() {
     return this._exitCode;
@@ -29703,6 +29815,9 @@ var LinuxStraceRunner = class {
   getRootPid() {
     return this._rootPid;
   }
+  getStdoutTail() {
+    return this._stdoutTailGetter();
+  }
   async *run(cmd, args, opts) {
     const commandArgs = process.env["SCRIPT_JAIL_PHASE_B_UNSHARE_NET"] === "1" ? ["unshare", "-n", "--", cmd, ...args] : [cmd, ...args];
     const straceArgs = [
@@ -29719,11 +29834,19 @@ var LinuxStraceRunner = class {
       cwd: opts.cwd,
       env: opts.env,
       // fd 0: stdin  → /dev/null
-      // fd 1: stdout → ignored
+      // fd 1: stdout → pipe  (the install command inherits strace's fd1; yarn
+      //                Berry writes its errors here — drained into a byte-
+      //                bounded in-memory tail for the Phase-B fail-closed
+      //                diagnostic)
       // fd 2: stderr → pipe  (strace diagnostics forwarded to process.stderr)
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
-      stdio: ["ignore", "ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe", "pipe"]
     });
+    this._stdoutTailGetter = attachStdoutTailCollector(
+      child.stdio[1],
+      this._redactStdout,
+      this._stdoutTailBytes
+    );
     let rootPidDeterministicResolution = false;
     if (child.pid !== void 0) {
       rootPidDeterministicResolution = true;
@@ -30093,7 +30216,7 @@ function redactSensitive(text, protectedEnvNames, env = process.env) {
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);
   }
-  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, "$1<REDACTED>").replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
   return out;
 }
 async function main(input) {
@@ -30134,7 +30257,22 @@ async function main(input) {
   }
   const installEnv = isMacosBare ? { ...childEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : childEnv;
   const spawner = input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
-  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(void 0, eventsFile));
+  const maxProtectedValueBytes = config2.protected.env.reduce((max, name) => {
+    const v = process.env[name];
+    if (typeof v !== "string") return max;
+    const n = Buffer.byteLength(v, "utf8");
+    return n > max ? n : max;
+  }, 0);
+  const stdoutTailBytes = Math.max(
+    PHASE_B_STDOUT_TAIL_BYTES,
+    4096 + maxProtectedValueBytes + 4096
+  );
+  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(
+    void 0,
+    eventsFile,
+    (s) => redactSensitive(s, config2.protected.env),
+    stdoutTailBytes
+  ));
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader()
   );
@@ -30270,8 +30408,22 @@ ${fetchDetail}
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
     if (installResult.eventCount === 0) {
+      const stdoutRedacted = redactSensitive(
+        installResult.installStdoutTail,
+        config2.protected.env
+      ).trim();
+      const stdoutTail = stdoutRedacted.length > 4e3 ? `\u2026${stdoutRedacted.slice(-4e3)}` : stdoutRedacted;
+      const detail = stdoutTail === "" ? "" : `
+--- install stdout (tail) ---
+${stdoutTail}`;
+      if (detail !== "") {
+        process.stderr.write(
+          `[agent] Phase B (install) failed (exit ${installResult.exitCode}):${detail}
+`
+        );
+      }
       emitter.emitError(
-        `Phase B (install) failed with exit code ${installResult.exitCode} and produced no audit events \u2014 the install never ran a lifecycle script under audit. Refusing to emit a lockfile that observed nothing.`,
+        `Phase B (install) failed with exit code ${installResult.exitCode} and produced no audit events \u2014 the install never ran a lifecycle script under audit. Refusing to emit a lockfile that observed nothing.` + detail,
         true
       );
       flushAndExit(input.connection.writable, 1);
@@ -30370,8 +30522,11 @@ if (isMain) {
   LinuxVsockConnection,
   MacOSSpawner,
   MemoryConnection,
+  PHASE_B_STDOUT_PENDING_MAX_BYTES,
+  PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough,
   StdioConnection,
+  attachStdoutTailCollector,
   buildChildEnv,
   buildChildEnvMacos,
   createEventsFile,

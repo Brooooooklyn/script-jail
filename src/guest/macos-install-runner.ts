@@ -102,6 +102,20 @@ export class MacOSInstallRunner implements StraceRunner {
     return null;
   }
 
+  /**
+   * macOS-bare DELIBERATELY does not capture Phase-B install stdout (returns
+   * ''), unlike the Linux runner.  The macOS runner spawns the install command
+   * DIRECTLY (no strace intermediary), so wiring fd1 to a pipe ties the child
+   * `close` event tightly to the install tree's stdout EOF — Codex round-2
+   * [medium] #1 showed this can hang the macOS path when a child lingers on
+   * fd1.  macOS is observe-only and already forwards the install's STDERR to
+   * the console (see run()), where its diagnostics land; the stdout tail is a
+   * Linux-only fail-closed nicety.
+   */
+  getStdoutTail(): string {
+    return '';
+  }
+
   async *run(
     cmd: string,
     args: string[],
@@ -113,7 +127,14 @@ export class MacOSInstallRunner implements StraceRunner {
     //
     // stdio:
     //   fd 0: stdin  → ignored
-    //   fd 1: stdout → ignored
+    //   fd 1: stdout → 'ignore'.  DELIBERATELY not captured on macOS: the
+    //                  install is spawned DIRECTLY (no strace intermediary), so
+    //                  wiring fd1 to a pipe ties the child `close` event to the
+    //                  install tree's stdout EOF and can hang a lingering-child
+    //                  case (Codex round-2 [medium] #1).  getStdoutTail()
+    //                  returns ''; macOS surfaces its diagnostics via STDERR
+    //                  (forwarded below).  The stdout tail is a Linux-only
+    //                  fail-closed nicety (see LinuxStraceRunner).
     //   fd 2: stderr → pipe (forwarded to process.stderr with a [macos] prefix)
     //   fd 3: pipe   → JSON channel for JS preloads that still write to fd 3
     //                  (env-spy's primary sink is the events file, but the

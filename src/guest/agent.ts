@@ -18,6 +18,7 @@ import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
 import { PassThrough, Writable, type Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
@@ -1445,6 +1446,203 @@ export function readStraceChildPid(
   return null;
 }
 
+/**
+ * Default BYTE cap for the RETAINED Phase-B install-stdout tail.  `main()`
+ * enlarges this to comfortably exceed the longest protected env value (measured
+ * in UTF-8 bytes) so a value echoed on one line fits whole before any front
+ * drop.  Chosen well above any plausible single diagnostic line / credential.
+ */
+export const PHASE_B_STDOUT_TAIL_BYTES = 16384;
+
+/**
+ * Max bytes buffered for a SINGLE unterminated line before the collector gives
+ * up and sticky-poisons.  Decoupled from {@link PHASE_B_STDOUT_TAIL_BYTES} so a
+ * long but COMPLETE diagnostic line (Codex round-9 [medium]: real Yarn
+ * `install --immutable` emitted a ~19 KB lockfile-descriptor line before its
+ * `YN0028` explanation) is buffered, redacted WHOLE, and retained — rather than
+ * poisoning and dropping the actionable error that follows.  Only a line that
+ * never terminates within this bound is pathological enough to poison.
+ */
+export const PHASE_B_STDOUT_PENDING_MAX_BYTES = 1_048_576; // 1 MiB
+
+/**
+ * Attach a drained, byte-bounded tail collector to a child's STDOUT stream and
+ * return a getter for the current (redacted-at-drop) tail; a no-op (`() => ''`)
+ * when the stream is absent (test stubs / runners that don't pipe fd1).
+ *
+ * WHY IN-MEMORY, NOT A FILE (Codex round-4 [high] x2): an on-disk capture file
+ * is unbounded (a verbose/malicious lifecycle script can fill the scratch disk
+ * → ENOSPC) and persists secrets at rest in a predictable, cross-run-shared,
+ * symlink-followable path.  A drained in-memory ring sidesteps both: it is hard
+ * byte-capped and nothing touches disk.  The 'data' listener keeps the pipe
+ * flowing so a verbose (1000-package) install cannot fill the OS pipe buffer
+ * and deadlock the child.
+ *
+ * CLOSE-WAIT NOTE (Codex round-4 [high] #1, accepted): fd1-as-pipe makes the
+ * child `close` event wait for stdout EOF.  This is NOT a new stall vector —
+ * fd2 (strace diagnostics) and fd3 (the LD_PRELOAD JSONL channel, which MUST be
+ * a live pipe) have been pipes since before this work shipped (v0.2.3), so a
+ * daemonized/tracing-escaped descendant holding any inherited stdio already
+ * gated `close`.  A drained fd1 joins that pre-existing set; it degrades a
+ * lingering-child case to the outer timeout (fail-closed), never a bypass.
+ *
+ * SECRET SAFETY — PER-LINE redaction (line-local shapes + stateful decode).
+ * Credentials in install stdout live on a single line, and `redactSensitive`
+ * masks only a COMPLETE match (a known value, or a shape like `Bearer <token>`,
+ * which is LINE-LOCAL by contract — see redactSensitive).  Failure modes closed:
+ *
+ *   (A) live-end partial match (Codex round-5): redacting an UNTERMINATED line
+ *       lets a shape match a half-arrived token's prefix; the suffix then
+ *       arrives detached and can't be re-matched.  → We NEVER redact the
+ *       unterminated trailing `pending`; a line is redacted only once it is
+ *       COMPLETE (its '\n' arrived), so the whole token is present.
+ *   (B) split-by-front-drop / resume re-anchor (Codex round-6/8): any
+ *       "suppress the over-cap line then RESUME" scheme leaks — a detached
+ *       suffix re-anchors as a fresh complete line after the resume point, on
+ *       ANY delimiter or write-split.  → For the unterminated case we NEVER
+ *       resume (see below).
+ *   (C) chunk-split multibyte corruption (Codex round-9 [high] #2): decoding
+ *       each pipe chunk independently with toString('utf8') turns a codepoint
+ *       split across a chunk boundary into U+FFFD, so the layer-1 exact-value
+ *       redactor no longer matches and an ASCII suffix leaks.  → A stateful
+ *       `StringDecoder` buffers an incomplete trailing sequence across chunks.
+ *   (D) newline-spanning shape (Codex round-9 [high] #1): a shape regex with
+ *       `\s` would match `Bearer\n<token>` under a whole-buffer pass but be
+ *       MISSED per-line.  → redactSensitive's shapes are LINE-LOCAL, so per-line
+ *       redaction is COMPLETE: no shape spans a '\n'.
+ *
+ * The invariant: EVERY byte committed to `redactedTail` belongs to a COMPLETE
+ * logical line that was redacted WHILE WHOLE (marker + secret co-resident → both
+ * masked, and — shapes being line-local — completely so).  A complete line is
+ * therefore safe to retain at ANY length: redaction masks every known secret in
+ * it BEFORE the byte-cap front-drop, so the front-drop only ever cuts
+ * already-masked / non-secret bytes.  A long-but-complete diagnostic line
+ * (Codex round-9 [medium]: real Yarn `--immutable` emits a ~19 KB lockfile line
+ * before its `YN0028` explanation) is buffered up to `pendingMaxBytes`, redacted
+ * whole, and retained — the error that follows is NOT dropped.
+ *
+ * The ONLY poison case is the genuinely-unhandleable one: a single UNTERMINATED
+ * line that never terminates within `pendingMaxBytes`.  We can neither redact it
+ * (failure A) nor resume past it (failure B), so we sticky-poison: emit one
+ * marker, surface nothing further.  Phase B is OFFLINE (no exfil channel needs
+ * the error text live), so this costs only diagnosability, never audit
+ * correctness.  Accepted residuals: (1) a single >pendingMaxBytes line with no
+ * newline poisons (pathological/adversarial — real tools terminate lines);
+ * (2) a protected VALUE or a credential split across a '\n' by adversarial
+ * output is matched per-line only (the PM does not split credentials across
+ * lines, and this tail is reached only on the zero-event fail-closed path, not
+ * from an audited lifecycle script).  macOS-bare is unaffected (captures no
+ * stdout; getStdoutTail() returns '').  O(n): each byte scanned once for '\n',
+ * each line redacted once.
+ */
+export function attachStdoutTailCollector(
+  stream: Readable | null | undefined,
+  redact: ((s: string) => string) | undefined,
+  capBytes: number = PHASE_B_STDOUT_TAIL_BYTES,
+  pendingMaxBytes: number = PHASE_B_STDOUT_PENDING_MAX_BYTES,
+): () => string {
+  if (!stream) return () => '';
+  // pendingMaxBytes must be ≥ capBytes (a complete line up to it is redacted then
+  // front-dropped into the capBytes tail).
+  const pendingMax = Math.max(pendingMaxBytes, capBytes);
+  const truncMarker = `\n<script-jail: stdout capture stopped — unterminated line over ${pendingMax}B (possible split secret); tail suppressed>\n`;
+  const decoder = new StringDecoder('utf8'); // stateful: buffers incomplete multibyte across chunks (C)
+  let redactedTail = ''; // committed: each constituent line was redacted WHOLE
+  let pending = ''; // decoded bytes after the last newline (the unterminated trailing line)
+  let pendingBytes = 0; // running UTF-8 byte length of `pending`, kept O(1) per data event
+  let poisoned = false; // sticky: set only when an unterminated line exceeds pendingMax
+
+  // Return the longest suffix of `s` whose UTF-8 byte length is ≤ capBytes,
+  // cut on a CHARACTER boundary.  Slicing the raw byte buffer mid-codepoint
+  // would decode the partial bytes to U+FFFD (3 bytes each), which can re-encode
+  // LARGER than capBytes — so advance the start past any continuation bytes
+  // (0x80–0xBF) to the next lead byte.  The dropped front is stale/redacted
+  // output (earlier whole-redacted lines), so dropping a few extra bytes is fine.
+  const capTail = (s: string): string => {
+    const buf = Buffer.from(s, 'utf8');
+    if (buf.length <= capBytes) return s;
+    let start = buf.length - capBytes;
+    while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++;
+    return buf.subarray(start).toString('utf8');
+  };
+
+  // Append already-redacted text and byte-cap the retained tail by dropping its
+  // (already-safe) FRONT.
+  const appendRedacted = (s: string): void => {
+    redactedTail = capTail(redactedTail + s);
+  };
+
+  // Sticky-poisoned terminal state: emit the marker once, surface nothing more.
+  const poison = (): void => {
+    appendRedacted(truncMarker);
+    poisoned = true;
+    pending = '';
+    pendingBytes = 0;
+  };
+
+  // Drain all COMPLETE lines from `pending`, redacting each WHOLE.  Resets
+  // `pendingBytes` to the residual tail's byte length — that tail is whatever
+  // followed the LAST newline, so it is bounded by the chunk that carried the
+  // newline (post-drain `pending` never holds a '\n'), keeping this cheap.
+  const drainCompleteLines = (): void => {
+    let nl: number;
+    while ((nl = pending.indexOf('\n')) !== -1) {
+      const line = pending.slice(0, nl + 1); // includes its '\n'
+      pending = pending.slice(nl + 1);
+      appendRedacted(redact ? redact(line) : line);
+    }
+    pendingBytes = Buffer.byteLength(pending, 'utf8');
+  };
+
+  stream.on('data', (chunk: Buffer | string) => {
+    if (poisoned) return; // sticky
+    // Stateful decode: an incomplete multibyte sequence at the chunk boundary is
+    // held by the decoder and completed by the next chunk (failure mode C).
+    const decoded = decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
+    if (decoded.length === 0) return; // only a partial codepoint arrived; nothing to do
+    pending += decoded;
+    // A newline can ONLY appear in the freshly-decoded bytes — post-drain
+    // `pending` never retains one — so scan/drain only when this chunk actually
+    // carries a '\n'.  Otherwise just advance the byte counter.  This keeps the
+    // no-newline path O(1) per event instead of O(pending): a byte-at-a-time
+    // unterminated stream up to pendingMax stays linear, never quadratic.
+    if (decoded.indexOf('\n') !== -1) {
+      drainCompleteLines(); // recomputes pendingBytes for the residual tail
+    } else {
+      pendingBytes += Buffer.byteLength(decoded, 'utf8');
+    }
+    // The trailing UNTERMINATED line is never redacted at the live end (A).  We
+    // buffer it up to pendingMax so a long-but-complete diagnostic line is kept;
+    // only a line that never terminates within that bound poisons (B).
+    if (pendingBytes > pendingMax) {
+      poison();
+    }
+  });
+  // Flush any byte held by the decoder at EOF, then drain a final complete line.
+  stream.on('end', () => {
+    if (poisoned) return;
+    pending += decoder.end();
+    drainCompleteLines();
+  });
+  // Swallow late errors on the captured stream (e.g. EPIPE on teardown) so an
+  // stdout-side hiccup never crashes the agent; the tail we have is best-effort.
+  stream.on('error', () => { /* best-effort capture */ });
+
+  return () => {
+    // Finalize: when poisoned, surface only what was committed before the
+    // overflow (the marker is already in redactedTail).  Otherwise the trailing
+    // partial line (≤pendingMax) is redacted ONCE at true EOF — no later suffix
+    // can arrive, so masking what's present cannot orphan anything.  Non-mutating
+    // so repeated calls are stable.
+    const finalPending = poisoned
+      ? ''
+      : pending
+        ? (redact ? redact(pending) : pending)
+        : '';
+    return capTail(redactedTail + finalPending);
+  };
+}
+
 export class LinuxStraceRunner implements StraceRunner {
   private _exitCode = 0;
   private readonly _spawnImpl: SpawnImpl;
@@ -1460,6 +1658,22 @@ export class LinuxStraceRunner implements StraceRunner {
   // until the first per-pid file is observed (and remains null if
   // strace failed to spawn).
   private _rootPid: number | null = null;
+  // Live getter over the drained, byte-bounded in-memory tail of the install
+  // command's STDOUT (yarn Berry writes its setup/diagnostic errors here).  fd1
+  // is wired as a pipe and a 'data' listener keeps it flowing so a verbose
+  // install cannot fill the pipe and deadlock; only the last cap BYTES are
+  // retained, redacted before each front-drop.  Wired in run(); read via
+  // getStdoutTail() and surfaced REDACTED on the Phase-B fail-closed path.
+  // Defaults to the empty-tail getter so it is safe to call before/without a
+  // spawn.  Nothing touches disk (Codex round-4 [high]).
+  private _stdoutTailGetter: () => string = () => '';
+  // Redactor applied to the stdout tail before each front-drop and again at
+  // emit time.  Injected from main() (where config.protected.env is known).
+  // Undefined for test fakes / callers that don't capture stdout.
+  private readonly _redactStdout: ((s: string) => string) | undefined;
+  // Byte cap for the in-memory tail.  Sized by main() to exceed the longest
+  // protected env value (in UTF-8 bytes) so the redactor sees whole values.
+  private readonly _stdoutTailBytes: number;
 
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through
@@ -1470,10 +1684,20 @@ export class LinuxStraceRunner implements StraceRunner {
    *                   shared events file — used by tests that supply a
    *                   pre-set environment via the `opts.env` passed to
    *                   `run()`.
+   * @param redactStdout Redactor for the stdout tail (masks complete protected
+   *                   values + credential shapes).  Undefined for test fakes.
+   * @param stdoutTailBytes Byte cap for the in-memory stdout tail.
    */
-  constructor(spawnImpl?: SpawnImpl, eventsFile?: EventsFile | null) {
+  constructor(
+    spawnImpl?: SpawnImpl,
+    eventsFile?: EventsFile | null,
+    redactStdout?: (s: string) => string,
+    stdoutTailBytes: number = PHASE_B_STDOUT_TAIL_BYTES,
+  ) {
     this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
     this._eventsFile = eventsFile ?? null;
+    this._redactStdout = redactStdout;
+    this._stdoutTailBytes = stdoutTailBytes;
   }
 
   getExitCode(): number {
@@ -1506,6 +1730,10 @@ export class LinuxStraceRunner implements StraceRunner {
 
   getRootPid(): number | null {
     return this._rootPid;
+  }
+
+  getStdoutTail(): string {
+    return this._stdoutTailGetter();
   }
 
   async *run(
@@ -1626,11 +1854,26 @@ export class LinuxStraceRunner implements StraceRunner {
       cwd: opts.cwd,
       env: opts.env,
       // fd 0: stdin  → /dev/null
-      // fd 1: stdout → ignored
+      // fd 1: stdout → pipe  (the install command inherits strace's fd1; yarn
+      //                Berry writes its errors here — drained into a byte-
+      //                bounded in-memory tail for the Phase-B fail-closed
+      //                diagnostic)
       // fd 2: stderr → pipe  (strace diagnostics forwarded to process.stderr)
       // fd 3: pipe   → LD_PRELOAD JSONL (env_read / dlopen events)
-      stdio: ['ignore', 'ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
     });
+
+    // Drain the install command's stdout into a byte-bounded in-memory ring.
+    // MUST be attached before `yield*` below so the stream flows from the first
+    // byte — an unread 'pipe' fd1 would fill the OS pipe buffer and deadlock a
+    // verbose (1000-package) install.  strace writes its traces to `-o` files,
+    // not stdout, so fd1 carries the traced install command's stdout only.
+    // Nothing touches disk (Codex round-4 [high]: no unbounded/persistent file).
+    this._stdoutTailGetter = attachStdoutTailCollector(
+      child.stdio[1] as Readable | null,
+      this._redactStdout,
+      this._stdoutTailBytes,
+    );
 
     // Codex follow-up (bug #1, high, 2026-05-19): deterministically capture
     // the install command's pid by reading `/proc/<strace_pid>/task/<strace_
@@ -2628,13 +2871,26 @@ export function redactSensitive(
     out = out.split(value).join(`<REDACTED:${name}>`);
   }
   // Layer 2 — credential SHAPES regardless of the protected list.
+  //
+  // LINE-LOCAL CONTRACT (Codex round-9 [high] #1): every shape below matches
+  // WITHIN A SINGLE LINE — none may span a newline.  The Phase-B stdout
+  // collector redacts per complete line (see attachStdoutTailCollector); a shape
+  // whose marker and token straddle a '\n' would be masked by a whole-buffer
+  // pass but MISSED per-line, and once the marker is front-dropped the surviving
+  // token would leak.  Aligning the regexes to be line-local makes per-line
+  // redaction COMPLETE for shapes: the inter-token whitespace classes use
+  // `[^\S\n]` (whitespace except newline), and every token/value class already
+  // excludes whitespace.  Real credentials are single-line, so this loses no
+  // genuine coverage — a `Bearer` with its token on the NEXT line is, by this
+  // contract, not a credential (its token, if itself a known shape or a layer-1
+  // value, is still caught on its own line).
   out = out
     // scheme://user:pass@host  → keep scheme + host, drop userinfo
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
     // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
-    .replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, '$1<REDACTED>')
+    .replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, '$1<REDACTED>')
     // Bearer <token>
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
+    .replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
     // npm automation/granular token literals (npm_… 36+ char)
     .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>')
     // GitHub token literals (ghp_/gho_/ghs_/ghu_/ghr_ + 36+ char)
@@ -2744,11 +3000,32 @@ export async function main(input: AgentInput): Promise<void> {
   //    shim is the sole event source.
   const spawner: Spawner =
     input.spawner ?? (isMacosBare ? new MacOSSpawner() : new LinuxSpawner());
+  // Size the Phase-B stdout tail cap (BYTES) to comfortably exceed the longest
+  // protected env value, so the redactor always masks whole values before any
+  // front-drop (a value can't straddle the cap's front when the cap is wider
+  // than the value — Codex round-3 [medium] #2 / round-4 byte-vs-char).  Use
+  // Buffer.byteLength (UTF-8 bytes), since the collector caps in bytes.  4 KiB
+  // emit cap + longest value + 4 KiB slack.
+  const maxProtectedValueBytes = config.protected.env.reduce((max, name) => {
+    const v = process.env[name];
+    if (typeof v !== 'string') return max;
+    const n = Buffer.byteLength(v, 'utf8');
+    return n > max ? n : max;
+  }, 0);
+  const stdoutTailBytes = Math.max(
+    PHASE_B_STDOUT_TAIL_BYTES,
+    4096 + maxProtectedValueBytes + 4096,
+  );
   const straceRunner: StraceRunner =
     input.strace ??
     (isMacosBare
       ? new MacOSInstallRunner(undefined, eventsFile)
-      : new LinuxStraceRunner(undefined, eventsFile));
+      : new LinuxStraceRunner(
+          undefined,
+          eventsFile,
+          (s) => redactSensitive(s, config.protected.env),
+          stdoutTailBytes,
+        ));
 
   // 7. Attribution.  Linux reads /proc; macOS has no /proc, so MacOSProcReader
   //    returns null environ (attribution flows through the shim event seed) and
@@ -3024,10 +3301,44 @@ export async function main(input: AgentInput): Promise<void> {
   //     that is a genuinely clean repo with no escaping behaviour.)
   if (installResult.exitCode !== 0) {
     if (installResult.eventCount === 0) {
+      // Append a REDACTED tail of the install command's stdout.  yarn Berry
+      // writes its setup failures (Usage Errors, YN0028 immutable rejections,
+      // resolution/scoped-registry errors) to stdout, NOT stderr — without
+      // this the host saw only the generic message and the real cause was
+      // invisible (the `--offline` bug took a container repro to diagnose).
+      // Redact the FULL captured tail BEFORE tail-capping (the redactor masks
+      // only COMPLETE protected values, so slicing first could start the tail
+      // inside a secret and leak the suffix — same ordering as Phase A,
+      // agent.ts Codex round-2 [high]).  A mask token split by the cap is
+      // harmless.  The in-memory tail (getStdoutTail → attachStdoutTailCollector)
+      // is byte-capped by main() to exceed the longest protected value's UTF-8
+      // byte length, so any protected value is whole — hence already masked at
+      // drop time — before any front-drop reaches it (Codex round-3 [medium] #2
+      // / round-4 byte-vs-char).  This redact is idempotent over those masks.
+      const stdoutRedacted = redactSensitive(
+        installResult.installStdoutTail,
+        config.protected.env,
+      ).trim();
+      const stdoutTail =
+        stdoutRedacted.length > 4000
+          ? `…${stdoutRedacted.slice(-4000)}`
+          : stdoutRedacted;
+      const detail =
+        stdoutTail === ''
+          ? ''
+          : `\n--- install stdout (tail) ---\n${stdoutTail}`;
+      // Also dump to the serial console (mirror Phase A), in case the error
+      // frame itself doesn't reach the host.
+      if (detail !== '') {
+        process.stderr.write(
+          `[agent] Phase B (install) failed (exit ${installResult.exitCode}):${detail}\n`,
+        );
+      }
       emitter.emitError(
         `Phase B (install) failed with exit code ${installResult.exitCode} ` +
           'and produced no audit events — the install never ran a lifecycle ' +
-          'script under audit. Refusing to emit a lockfile that observed nothing.',
+          'script under audit. Refusing to emit a lockfile that observed nothing.' +
+          detail,
         true,
       );
       flushAndExit(input.connection.writable, 1);

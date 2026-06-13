@@ -98,7 +98,12 @@ function parseMacosShimLine(line: string): MacosShimLineEvent {
 const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
   npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
   pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
-  yarn: { cmd: 'yarn', args: ['install', '--immutable', '--offline'] },
+  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
+  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
+  // rationale.  The macOS-bare backend is observe-only and does not sever the
+  // network, but the cache Phase A populated still makes this a relink+build
+  // with no required registry traffic.
+  yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
 };
 
 // env-spy.cjs stamps its `node_startup_done` JSONL marker by reading these three
@@ -726,5 +731,6 @@ export async function runInstallPhaseMacos(
     exitCode: input.strace.getExitCode(),
     eventCount,
     tamperReason: phaseTamperReason,
+    installStdoutTail: input.strace.getStdoutTail?.() ?? '',
   };
 }

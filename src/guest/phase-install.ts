@@ -21,8 +21,20 @@
 //     strace.  Like `npm rebuild`, this rebuilds DEPENDENCIES only and
 //     respects pnpm 10's `onlyBuiltDependencies`/`allowBuilds` allowlist —
 //     i.e. it audits exactly the scripts a real `pnpm install` would run.
-//   yarn: `yarn install --immutable --offline`
-//     Re-links packages and runs scripts without touching the registry.
+//   yarn: `yarn install --immutable`
+//     Re-links packages and runs the build scripts Phase A's `--mode=skip-build`
+//     deferred, against the cache Phase A populated under YARN_GLOBAL_FOLDER on
+//     the repo disk.  Yarn Berry has NO `--offline` install flag — that is a
+//     Yarn *Classic* (1.x) flag, and Berry rejects it with a fatal
+//     "Unknown Syntax Error: Unsupported option name (--offline)" BEFORE
+//     running anything (exit 1, zero events → the agent fail-closes for EVERY
+//     Berry repo; found dogfooding napi-rs).  Offline is enforced structurally
+//     instead: Phase B runs inside the severed network namespace
+//     (SCRIPT_JAIL_PHASE_B_UNSHARE_NET), and the cache is already complete, so
+//     `yarn install --immutable` makes zero network calls (verified: the Fetch
+//     step completes in <1s against a routeless netns).  `--immutable` is kept
+//     for parity with Phase A and as a tamper signal — a lockfile that would
+//     change here aborts the install.
 //
 // ARCHITECTURE: StraceRunner is the *sole* owner of the install child process.
 // There is no separate Spawner call in Phase B — doing so would start the
@@ -191,6 +203,29 @@ export interface StraceRunner {
    * this is the install command's pid.
    */
   getRootPid(): number | null;
+
+  /**
+   * Returns a bounded, drained tail (last few KB) of the install command's
+   * STDOUT, or `''` if none was captured.  Optional — fake runners that don't
+   * spawn a real child may omit it (callers use `getStdoutTail?.() ?? ''`).
+   *
+   * Why this exists: yarn Berry writes its setup/diagnostic output (resolution
+   * failures, `--immutable` YN0028 rejections, "Unknown Syntax Error" usage
+   * errors, scoped-registry resolution failures) to STDOUT, not stderr.  Phase
+   * B previously discarded fd1 entirely (`stdio: ['ignore','ignore',...]`), so
+   * a Phase-B install that failed BEFORE running any lifecycle script
+   * surfaced only as the generic "produced no audit events" fatal frame with
+   * the real cause invisible on the host — found dogfooding napi-rs (the
+   * `--offline` Usage Error), and the diagnostic blind spot that made it
+   * expensive to triage.  The production runners now drain fd1 into a bounded
+   * ring buffer so `main()` can append a REDACTED tail to the fatal Phase-B
+   * frame.  The buffer is drained continuously so a verbose 1000-package
+   * install cannot fill the pipe and deadlock the install.
+   *
+   * Only meaningful after the async iterable from `run()` has been fully
+   * consumed (the child has exited).
+   */
+  getStdoutTail?(): string;
 }
 
 export interface PhaseInstallInput {
@@ -241,12 +276,23 @@ export interface PhaseInstallResult {
    * checks are defence-in-depth: each may catch tampering the other misses.
    */
   tamperReason: string | null;
+  /**
+   * Bounded, drained tail of the install command's STDOUT (yarn Berry writes
+   * its errors here), copied from the runner's {@link StraceRunner.getStdoutTail}.
+   * `''` when the runner did not capture stdout.  The agent's Phase-B
+   * fail-closed path REDACTS this before surfacing it (it is raw,
+   * repo-controlled text).  See the rationale on `getStdoutTail`.
+   */
+  installStdoutTail: string;
 }
 
 const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
   npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
   pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
-  yarn: { cmd: 'yarn', args: ['install', '--immutable', '--offline'] },
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
 };
 
 // LOAD-BEARING: env-spy.cjs opens this exact path after installing the
@@ -5955,5 +6001,9 @@ export async function runInstallPhase(
 
   // Exit code is owned by the StraceRunner (it ran the only install process).
   const exitCode = input.strace.getExitCode();
-  return { exitCode, eventCount, tamperReason: phaseTamperReason };
+  // Bounded stdout tail (yarn Berry writes errors here).  Optional on the
+  // runner contract — fake runners omit it.  Surfaced REDACTED by main()'s
+  // Phase-B fail-closed path.
+  const installStdoutTail = input.strace.getStdoutTail?.() ?? '';
+  return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
 }

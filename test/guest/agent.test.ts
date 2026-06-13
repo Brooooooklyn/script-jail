@@ -10,7 +10,7 @@ import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer } from '../../src/guest/agent.js';
+import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, PHASE_B_STDOUT_TAIL_BYTES, PHASE_B_STDOUT_PENDING_MAX_BYTES, redactSensitive } from '../../src/guest/agent.js';
 import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
 import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
@@ -114,6 +114,24 @@ function emptyStrace(exitCode = 0): StraceRunner {
     getTamperReason() { return null; },
     recordTamper(_reason: string) { /* no-op for test fakes */ },
     getRootPid() { return null; },
+  };
+}
+
+/**
+ * Like {@link emptyStrace} (zero events, supplied exit code) but ALSO exposes a
+ * captured install-stdout tail via the optional `getStdoutTail()` contract.
+ * Exercises the Phase-B fail-closed diagnostic: yarn Berry writes its setup
+ * errors to stdout, and `main()` must surface a REDACTED tail on the fatal
+ * frame so the real cause isn't invisible.
+ */
+function emptyStraceWithStdout(exitCode: number, stdoutTail: string): StraceRunner {
+  return {
+    async *run() { /* zero events */ },
+    getExitCode() { return exitCode; },
+    getTamperReason() { return null; },
+    recordTamper(_reason: string) { /* no-op for test fakes */ },
+    getRootPid() { return null; },
+    getStdoutTail() { return stdoutTail; },
   };
 }
 
@@ -506,7 +524,7 @@ describe('agent main()', () => {
     await main({ configPath, connection: conn, spawner, strace, dnsLookup: offlineLookup });
 
     expect(fetchCalls[0]).toContain('yarn install');
-    expect(installCalls[0]).toContain('yarn install --immutable --offline');
+    expect(installCalls[0]).toContain('yarn install --immutable');
   });
 
   it('fails closed when Phase B exits non-zero with no audit events', async () => {
@@ -546,6 +564,59 @@ describe('agent main()', () => {
 
     const errFrame = frames.find((f) => f['kind'] === 'error');
     expect(errFrame?.['fatal']).toBe(true);
+  });
+
+  it('Phase B zero-event fail-closed surfaces a REDACTED install-stdout tail', async () => {
+    // yarn Berry writes setup errors (Usage Errors, YN0028, resolution
+    // failures) to STDOUT, not stderr.  When Phase B fails before any
+    // lifecycle script runs (zero events) the fatal frame MUST include a tail
+    // of that stdout so the cause is diagnosable — but with credential shapes
+    // masked (it is raw, repo-controlled text).  Regression guard for the
+    // `--offline` class of failures that previously surfaced as a useless
+    // "produced no audit events" with no cause.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir);
+
+    // A realistic yarn-stdout failure mixed with a credential SHAPE (layer-2
+    // redaction fires without needing a process.env value).
+    const secret = 'npm_' + 'A'.repeat(36);
+    const stdoutTail =
+      'Unknown Syntax Error: Unsupported option name ("--offline").\n' +
+      `  resolving from //registry.example.com/:_authToken=${secret}\n`;
+
+    const origExit = process.exit.bind(process);
+    // @ts-expect-error — patching process.exit for test
+    process.exit = () => { /* no-op */ };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: emptyStraceWithStdout(1, stdoutTail),
+        dnsLookup: offlineLookup,
+      });
+    } finally {
+      process.exit = origExit;
+    }
+
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const errFrame = frames.find((f) => f['kind'] === 'error');
+    expect(errFrame?.['fatal']).toBe(true);
+    const msg = String(errFrame?.['message'] ?? '');
+    // The real cause is now visible…
+    expect(msg).toContain('install stdout (tail)');
+    expect(msg).toContain('Unknown Syntax Error');
+    // …but the credential shape is masked, not leaked verbatim.
+    expect(msg).not.toContain(secret);
+    // …and no final lockfile / install_done was emitted (still fail-closed).
+    expect(frames.map((f) => f['kind'])).not.toContain('final');
   });
 
   it('still emits install_done and the final lockfile when Phase B exits non-zero but audited scripts', async () => {
@@ -3733,5 +3804,226 @@ describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)
     // and this would be null.
     expect(runner.getTamperReason()).not.toBeNull();
     expect(runner.getTamperReason()).toMatch(/ctime advanced|without new bytes/);
+  });
+});
+
+describe('Phase B stdout capture (in-memory tail)', () => {
+  // Drain a PassThrough through the collector, then end it and let the
+  // 'data'/'end' listeners flush on the next tick before reading the tail.
+  async function feed(
+    chunks: Array<string | Buffer>,
+    redact: ((s: string) => string) | undefined,
+    capBytes?: number,
+    pendingMaxBytes?: number,
+  ): Promise<string> {
+    const stream = new PassThrough();
+    const getTail = attachStdoutTailCollector(stream, redact, capBytes, pendingMaxBytes);
+    for (const c of chunks) stream.write(c);
+    stream.end();
+    await new Promise<void>((r) => stream.on('end', () => r()));
+    await new Promise<void>((r) => setImmediate(r));
+    return getTail();
+  }
+
+  // Feed Buffer chunks as SEPARATE 'data' events (a setImmediate between writes)
+  // so a multibyte codepoint split across chunk boundaries actually exercises
+  // the stateful decoder (PassThrough may otherwise coalesce back-to-back writes).
+  async function feedBuffersSeparated(
+    buffers: Array<Buffer>,
+    redact: ((s: string) => string) | undefined,
+    capBytes?: number,
+  ): Promise<string> {
+    const stream = new PassThrough();
+    const getTail = attachStdoutTailCollector(stream, redact, capBytes);
+    for (const b of buffers) {
+      stream.write(b);
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    stream.end();
+    await new Promise<void>((r) => stream.on('end', () => r()));
+    await new Promise<void>((r) => setImmediate(r));
+    return getTail();
+  }
+
+  it('returns "" when no stream is supplied (test stubs / no fd1)', () => {
+    expect(attachStdoutTailCollector(null, undefined)()).toBe('');
+    expect(attachStdoutTailCollector(undefined, (s) => s)()).toBe('');
+  });
+
+  it('keeps the whole output when under the byte cap', async () => {
+    expect(await feed(['hello ', 'world'], undefined, 16384)).toBe('hello world');
+  });
+
+  it('drains a verbose stream without deadlock and keeps the tail bounded', async () => {
+    const chunks = Array.from({ length: 200 }, (_, i) => `line ${i}\n`.repeat(50));
+    const tail = await feed(chunks, undefined, 1024);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(1024);
+    expect(tail).toContain('line 199'); // most-recent output survives
+  });
+
+  // ── LEAK GATE ────────────────────────────────────────────────────────────
+  // O9 invariant: a line is redacted only once COMPLETE (its '\n' arrived), so
+  // the whole token is present; shapes are LINE-LOCAL so per-line redaction is
+  // complete; a complete line is safe to retain at any length (redaction masks
+  // every secret BEFORE the front-drop). The r5..r8 "overflow split" leak is
+  // structurally impossible: a REAL credential on a (re-assembled) complete line
+  // is masked whole; the only drop is an unterminated >pendingMax line (poison).
+  it('LEAK GATE: a real Bearer token whose token chars exceed the cap is masked whole', async () => {
+    const cap = 4096;
+    const redact = (s: string) => redactSensitive(s, []); // shape-only
+    // One complete line, token >cap — kept (not poisoned) and masked whole.
+    const tail = await feed(['Authorization: Bearer ' + 'A'.repeat(cap + 1000) + '\n'], redact, cap);
+    expect(tail).not.toMatch(/A{50}/); // the token is gone
+    expect(tail).toContain('<REDACTED');
+  });
+
+  const realShape: Array<{ name: string; line: string; secretRe: RegExp }> = [
+    { name: 'Bearer', line: 'Authorization: Bearer ABCDEFGH01234567890123456789\n', secretRe: /ABCDEFGH0123/ },
+    { name: '_authToken', line: '//registry/:_authToken=npmTokenABCDEFGH01234567\n', secretRe: /npmTokenABCDEF/ },
+    { name: 'url user:pass@', line: 'proxy=https://user:PASSWORDABCDEFGH@host:8080\n', secretRe: /PASSWORDABCDEF/ },
+  ];
+  for (const { name, line, secretRe } of realShape) {
+    it(`LEAK GATE: real ${name} credential split ACROSS CHUNKS reunites on its line and is masked`, async () => {
+      const redact = (s: string) => redactSensitive(s, []);
+      const mid = Math.floor(line.length / 2);
+      // Push the cap first with newline-terminated noise, then split the
+      // credential line across two chunks (no delimiter between).
+      const tail = await feed(
+        ['noise\n'.repeat(2000), line.slice(0, mid), line.slice(mid)],
+        redact,
+        PHASE_B_STDOUT_TAIL_BYTES,
+      );
+      expect(tail).not.toMatch(secretRe);
+      expect(tail).toContain('<REDACTED');
+    });
+  }
+
+  it('LEAK GATE: a layer-1 exact value is masked wherever it lands on a complete line (after huge prefix + CR)', async () => {
+    const cap = 4096;
+    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'SECRETVAL1234567890' });
+    // The value sits after a >cap prefix and a bare CR, all on ONE complete line.
+    const tail = await feed(['junk ' + 'Q'.repeat(cap + 1000) + '\rSECRETVAL1234567890\n'], redact, cap);
+    expect(tail).not.toContain('SECRETVAL1234567890');
+  });
+
+  it('LEAK GATE: a layer-1 value split ACROSS CHUNKS within a line is masked', async () => {
+    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'SECRETVAL123' });
+    const tail = await feed(['env: secret=SECRET', 'VAL123 done\n'], redact, 4096);
+    expect(tail).not.toContain('SECRETVAL123');
+    expect(tail).toContain('<REDACTED');
+  });
+
+  // ── FINDING 1: line-local shape contract (Codex round-9 [high] #1) ─────────
+  it('line-local contract: a same-line shape is masked; a shape spanning a newline is NOT (documented)', async () => {
+    const redact = (s: string) => redactSensitive(s, []);
+    expect(await feed(['Authorization: Bearer TOKEN0123456789\n'], redact, 4096)).toContain('<REDACTED');
+    // Bearer marker and token on SEPARATE lines: by the line-local contract this
+    // is not a credential, so the token is not shape-masked.
+    const cross = await feed(['Authorization: Bearer\n', 'TOKEN0123456789\n'], redact, 4096);
+    expect(cross).toContain('TOKEN0123456789');
+  });
+
+  it('line-local contract: a real protected VALUE on the token line is still masked even when the shape spans a newline', async () => {
+    // Defense in depth: even if a shape regex would not span the newline, a
+    // registered env value on the second line is caught by layer-1.
+    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'TOKEN0123456789' });
+    const tail = await feed(['Authorization: Bearer\n', 'TOKEN0123456789\n'], redact, 4096);
+    expect(tail).not.toContain('TOKEN0123456789');
+  });
+
+  // ── FINDING 2: stateful UTF-8 decode across chunk boundaries (round-9 #2) ───
+  it('multibyte protected value split mid-codepoint across chunks is still masked', async () => {
+    const VALUE = 'tokéSECRETTAIL1234'; // é = 0xC3 0xA9
+    const redact = (s: string) => redactSensitive(s, ['V'], { V: VALUE });
+    const full = Buffer.from('value=' + VALUE + '\n', 'utf8');
+    const splitAt = Buffer.byteLength('value=tok', 'utf8') + 1; // AFTER the first byte of é
+    const tail = await feedBuffersSeparated(
+      [full.subarray(0, splitAt), full.subarray(splitAt)],
+      redact,
+      4096,
+    );
+    expect(tail).not.toContain('SECRETTAIL1234'); // value reassembled then masked
+    expect(tail).toContain('<REDACTED');
+  });
+
+  // ── FINDING 3: keep long-but-complete diagnostic lines (round-9 [medium]) ───
+  it('keeps a long (>cap) COMPLETE line and the YN0028 error that follows', async () => {
+    const cap = 4096;
+    const longLine = 'lockfile descriptor ' + 'D'.repeat(19000) + '\n'; // ~19 KB, like real Yarn
+    const tail = await feed(
+      [longLine, 'YN0028: The lockfile would have been modified by this install.\n'],
+      undefined,
+      cap,
+    );
+    expect(tail).toContain('YN0028: The lockfile would have been modified'); // NOT dropped
+    expect(tail).not.toContain('stdout capture stopped'); // no poison for a complete line
+  });
+
+  // ── POISON: only an unterminated line over pendingMax ──────────────────────
+  it('poisons (sticky) only an UNTERMINATED line exceeding pendingMax; drops nothing before it', async () => {
+    const cap = 1024;
+    const pendingMax = 4096;
+    const tail = await feed(
+      ['real error line\n', 'Z'.repeat(pendingMax + 100) /* no newline, > pendingMax */, 'later\n'],
+      undefined,
+      cap,
+      pendingMax,
+    );
+    expect(tail).toContain('real error line'); // pre-overflow retained
+    expect(tail).toContain('stdout capture stopped'); // marker
+    expect(tail).not.toContain('later'); // sticky: post-overflow dropped
+    expect((tail.match(/stdout capture stopped/g) || []).length).toBe(1); // exactly one marker
+  });
+
+  // Byte-at-a-time UNTERMINATED stream: exercises the O(1) incremental
+  // pendingBytes counter (no per-event O(pending) re-measure / newline scan).
+  // Under pendingMax it is retained whole; over it, it poisons — same outcome
+  // as a single big chunk, but reached one byte per 'data' event.
+  it('byte-at-a-time unterminated input: retained under pendingMax, poisoned over it', async () => {
+    // effective pendingMax = max(pendingMaxArg, capBytes); keep cap below it.
+    const cap = 2048;
+    const pendingMax = 3000;
+    const under = 'a'.repeat(2000); // < pendingMax and < cap → fully retained
+    const kept = await feed(under.split(''), undefined, cap, pendingMax);
+    expect(kept).toBe(under); // every single-byte chunk accumulated, none lost
+
+    const over = 'b'.repeat(4000); // > pendingMax, no newline
+    const poisoned = await feed(over.split(''), undefined, cap, pendingMax);
+    expect(poisoned).toContain('stdout capture stopped');
+    expect((poisoned.match(/stdout capture stopped/g) || []).length).toBe(1);
+  });
+
+  // ── CORRECTNESS / EDGES ──────────────────────────────────────────────────
+  it('front-drop never strands a secret across many redacted lines', async () => {
+    const cap = 2048;
+    const redact = (s: string) => redactSensitive(s, []);
+    const lines: Array<string> = [];
+    for (let i = 0; i < 200; i++) lines.push(`//r${i}/:_authToken=npm_${'A'.repeat(36)}${i}\n`);
+    const tail = await feed(lines, redact, cap);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(cap);
+    expect(tail).not.toMatch(/_authToken=npm_A/); // every token masked, none stranded
+    expect(tail).toContain('<REDACTED');
+  });
+
+  it('multibyte complete line under cap kept on a char boundary', async () => {
+    const tail = await feed(['€'.repeat(3) + '\n'], undefined, 16);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(16);
+    expect(tail).toContain('€');
+  });
+
+  it('idempotent getter: repeated calls are stable', async () => {
+    const stream = new PassThrough();
+    const get = attachStdoutTailCollector(stream, undefined, 4096);
+    stream.write('hi\n');
+    stream.end();
+    await new Promise<void>((r) => stream.on('end', () => r()));
+    await new Promise<void>((r) => setImmediate(r));
+    expect(get()).toBe(get());
+    expect(get()).toBe('hi\n');
+  });
+
+  it('exposes sane default byte caps', () => {
+    expect(PHASE_B_STDOUT_TAIL_BYTES).toBeGreaterThanOrEqual(16384);
+    expect(PHASE_B_STDOUT_PENDING_MAX_BYTES).toBeGreaterThan(PHASE_B_STDOUT_TAIL_BYTES);
   });
 });
