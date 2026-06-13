@@ -1475,41 +1475,52 @@ export const PHASE_B_STDOUT_TAIL_BYTES = 16384;
  * gated `close`.  A drained fd1 joins that pre-existing set; it degrades a
  * lingering-child case to the outer timeout (fail-closed), never a bypass.
  *
- * SECRET SAFETY — LINE-BUFFERED redaction (Codex round-5 [medium]).  A naive
- * "redact the whole live buffer on every front-drop" leaks credential SHAPES
- * split across pipe chunks: `redactSensitive`'s shape regexes (e.g. `Bearer
- * <8+ chars>`) match a PARTIAL token at the live end of the stream, masking the
- * prefix; the next chunk appends the rest of the token now detached from its
- * `Bearer ` prefix, so the final redaction can no longer match it and the
- * suffix leaks.  The fix is to never finalize a match until a DELIMITER (a
- * newline — install stdout is line-oriented and credentials live on a single
- * line) has arrived:
+ * SECRET SAFETY — PER-LINE redaction + STICKY OVER-CAP POISON.  Credentials in
+ * install stdout live on a single line, and `redactSensitive` masks only a
+ * COMPLETE match (a known value, or a shape like `Bearer <8+ chars>`).  Two
+ * failure modes must be closed:
  *
- *   - `pending` holds the raw bytes AFTER the last newline (an unterminated
- *     line).  It is never redacted at the live end, so a half-arrived token is
- *     never prematurely matched.
- *   - When a newline arrives, the now-COMPLETE line(s) are redacted ATOMICALLY
- *     (the whole token is present) and appended to `redactedTail`.  A complete
- *     line is safe to redact at ANY length — its token is whole — so only the
- *     unterminated trailing line needs special care.
- *   - `redactedTail` is byte-capped by dropping its FRONT; it holds only
- *     already-redacted bytes, so a byte-slice can cut only an already-masked
- *     token (harmless).  The 'data' listener keeps the pipe flowing (no
- *     deadlock) and only complete lines are ever redacted (no quadratic
- *     blow-up over the growing buffer).
- *   - The getter finalizes `pending` (redacts the trailing partial line) and
- *     byte-caps the combined result — idempotent, safe to call repeatedly.
+ *   (A) live-end partial match (Codex round-5): redacting an UNTERMINATED line
+ *       lets a shape regex match a half-arrived token's prefix; the suffix then
+ *       arrives detached and the final redaction can't re-match it.
+ *   (B) split-by-front-drop (Codex round-6/8): if a credential's marker and its
+ *       secret straddle the ~capBytes byte-cap boundary, the front-drop severs
+ *       them; whichever side survives is unmaskable.
  *
- * OVER-CAP UNTERMINATED LINE (Codex round-6 [high]): if the trailing line grows
- * past `capBytes` before any newline (a no-LF flood, or yarn/npm lone-`\r`
- * progress rendering, which has no `\n` until it finishes), we MUST NOT redact
- * it — that would re-introduce the round-5 leak (a partial `Bearer <8+ chars>`
- * masked at the live end, its suffix arriving later detached from `Bearer `).
- * Instead we SUPPRESS the whole logical line: discard its bytes and emit a fixed
- * truncation marker once the next newline (or EOF) arrives.  Suppressing is
- * strictly fail-safe — we drop a diagnostic line rather than risk leaking a
- * credential fragment.  Residual: a protected VALUE containing an embedded
- * newline is matched per-line (env values rarely contain one) — accepted.
+ * A long arc of "suppress the over-cap line, then RESUME capturing" designs
+ * (rounds 6–8) all leaked: a detached suffix can always be re-delivered as a
+ * fresh-looking COMPLETE line after the resume point (on ANY delimiter — bare
+ * `\r`, `\n`, `\r\n`, or an adversarial write-split), where it re-anchors with
+ * no marker context and surfaces.  Empirically EVERY resume variant (incl. the
+ * shipped LF-and-CR exit) leaks Bearer / `_authToken=` / `npm_` / URL-userinfo /
+ * AWS-key shapes AND layer-1 exact values.  For a BOUNDED-memory collector the
+ * ONLY leak-proof rule is: never resume.
+ *
+ * The invariant (simple, hence airtight): EVERY byte ever committed to
+ * `redactedTail` belongs to a COMPLETE logical line whose own UTF-8 length is
+ * ≤ capBytes and which was redacted WHILE WHOLE (marker + secret co-resident in
+ * one redact() call → both masked).  The instant ANY single logical line —
+ * complete or the unterminated trailing one — exceeds capBytes (the only
+ * situation in which a front-drop or a resume could sever a marker from its
+ * secret), the collector goes STICKY-poisoned: it emits one fixed marker and
+ * surfaces NOTHING further.  Consequences:
+ *   - (A) closed: the unterminated `pending` is never redacted at the live end.
+ *   - (B) closed: a retained line is ≤ capBytes, so the front-drop over the
+ *     accumulated tail only ever cuts EARLIER, already-masked lines — it can
+ *     never strand a marker from its own line's secret.
+ *   - No resume path ⇒ no re-anchor ⇒ delimiter-agnostic (CR/LF/CRLF/none, any
+ *     write-split).  O(n): each byte is scanned once for '\n'; each line is
+ *     redacted exactly once (no quadratic re-redaction of a growing buffer).
+ *
+ * Phase B is OFFLINE (no exfil channel needs the error text live), so dropping
+ * post-overflow diagnostics costs only diagnosability, never audit correctness.
+ * Accepted residuals: (1) all stdout AFTER the first over-cap line is dropped —
+ * the provably-minimal price of leak-proofness; real npm/pnpm/yarn print their
+ * `\n`-terminated error and exit, and lines BEFORE the flood are retained, so a
+ * lone >capBytes-with-no-newline line is itself pathological/adversarial output.
+ * (2) a protected VALUE containing an embedded newline is matched per-line (env
+ * values rarely contain one).  macOS-bare is unaffected (it captures no stdout;
+ * getStdoutTail() returns '').
  */
 export function attachStdoutTailCollector(
   stream: Readable | null | undefined,
@@ -1517,17 +1528,17 @@ export function attachStdoutTailCollector(
   capBytes: number = PHASE_B_STDOUT_TAIL_BYTES,
 ): () => string {
   if (!stream) return () => '';
-  const truncMarker = `\n<script-jail: stdout line over ${capBytes}B suppressed>\n`;
-  let redactedTail = ''; // redacted, byte-capped, COMPLETE lines
-  let pending = ''; // raw bytes after the last newline (only when NOT suppressing)
-  let suppressing = false; // discarding an over-cap unterminated line until its \n
+  const truncMarker = `\n<script-jail: stdout capture stopped — line over ${capBytes}B (possible split secret); tail suppressed>\n`;
+  let redactedTail = ''; // committed: each constituent line was ≤cap and redacted WHOLE
+  let pending = ''; // raw bytes after the last newline (the unterminated trailing line)
+  let poisoned = false; // sticky: once any single line exceeds cap, surface nothing further
 
   // Return the longest suffix of `s` whose UTF-8 byte length is ≤ capBytes,
   // cut on a CHARACTER boundary.  Slicing the raw byte buffer mid-codepoint
   // would decode the partial bytes to U+FFFD (3 bytes each), which can re-encode
   // LARGER than capBytes — so advance the start past any continuation bytes
   // (0x80–0xBF) to the next lead byte.  The dropped front is stale/redacted
-  // output, so dropping a few extra bytes is harmless.
+  // output (earlier whole-redacted lines), so dropping a few extra bytes is fine.
   const capTail = (s: string): string => {
     const buf = Buffer.from(s, 'utf8');
     if (buf.length <= capBytes) return s;
@@ -1542,46 +1553,39 @@ export function attachStdoutTailCollector(
     redactedTail = capTail(redactedTail + s);
   };
 
+  // Enter the sticky-poisoned terminal state: emit the marker once, drop the
+  // unterminated remainder, surface nothing further.
+  const poison = (): void => {
+    appendRedacted(truncMarker);
+    poisoned = true;
+    pending = '';
+  };
+
   stream.on('data', (chunk: Buffer | string) => {
+    if (poisoned) return; // sticky: capture nothing after the first over-cap line
     pending += chunk.toString('utf8');
 
-    // 1. If suppressing an over-cap unterminated line, skip to its terminating
-    //    delimiter — the EARLIEST '\r' OR '\n'.  CR matters (Codex round-7
-    //    [medium]): package managers render progress with '\r' and may print
-    //    the real error after a '\r' BEFORE the first '\n'; ending suppression
-    //    only on '\n' would discard that error with the progress flood.  We
-    //    consume only through that earliest delimiter and feed the remainder
-    //    back through normal complete-line handling below, so the error line
-    //    (terminated by its own '\n') survives.  No delimiter yet → keep
-    //    discarding (bound memory).
-    if (suppressing) {
-      const cr = pending.indexOf('\r');
-      const lf = pending.indexOf('\n');
-      const d = cr === -1 ? lf : lf === -1 ? cr : Math.min(cr, lf);
-      if (d === -1) {
-        pending = '';
+    // Process COMPLETE lines ONE AT A TIME.  Each is redacted WHOLE (so a
+    // credential's marker and secret are masked together), then byte-capped.
+    let nl: number;
+    while ((nl = pending.indexOf('\n')) !== -1) {
+      const line = pending.slice(0, nl + 1); // includes its '\n'
+      if (Buffer.byteLength(line, 'utf8') > capBytes) {
+        // A single complete line itself exceeds the cap: a front-drop could
+        // sever a marker from its secret WITHIN this one line.  Poison rather
+        // than risk it (a >capBytes single line is pathological output).
+        poison();
         return;
       }
-      appendRedacted(truncMarker); // the suppressed logical line finally ended
-      suppressing = false;
-      pending = pending.slice(d + 1);
-    }
-
-    // 2. Finalize all COMPLETE lines atomically (safe at any length — the token
-    //    is whole because the newline arrived).
-    const nl = pending.lastIndexOf('\n');
-    if (nl >= 0) {
-      const complete = pending.slice(0, nl + 1);
       pending = pending.slice(nl + 1);
-      appendRedacted(redact ? redact(complete) : complete);
+      appendRedacted(redact ? redact(line) : line);
     }
 
-    // 3. The trailing UNTERMINATED line must never be redacted at the live end.
-    //    If it alone exceeds the cap, SUPPRESS it — discarding is fail-safe;
-    //    redacting a partial token here is exactly the round-5/6 leak.
+    // The trailing UNTERMINATED line is never redacted at the live end (failure
+    // mode A).  If it alone exceeds the cap, poison (failure mode B): we can
+    // neither redact it safely nor resume past it without a re-anchor leak.
     if (Buffer.byteLength(pending, 'utf8') > capBytes) {
-      pending = '';
-      suppressing = true;
+      poison();
     }
   });
   // Swallow late errors on the captured stream (e.g. EPIPE on teardown) so an
@@ -1589,12 +1593,13 @@ export function attachStdoutTailCollector(
   stream.on('error', () => { /* best-effort capture */ });
 
   return () => {
-    // Finalize: a trailing partial line is redacted ONCE (true EOF — no later
-    // suffix can arrive, so masking what's present cannot orphan anything).  If
-    // we're mid-suppression at EOF, emit only the marker.  Non-mutating, so
-    // repeated calls are stable.
-    const finalPending = suppressing
-      ? truncMarker
+    // Finalize: when poisoned, surface only what was committed before the
+    // overflow (the marker is already in redactedTail).  Otherwise the trailing
+    // partial line (≤cap, since an over-cap one would have poisoned) is redacted
+    // ONCE at true EOF — no later suffix can arrive, so masking what's present
+    // cannot orphan anything.  Non-mutating, so repeated calls are stable.
+    const finalPending = poisoned
+      ? ''
       : pending
         ? (redact ? redact(pending) : pending)
         : '';

@@ -29675,11 +29675,11 @@ var PHASE_B_STDOUT_TAIL_BYTES = 16384;
 function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAIL_BYTES) {
   if (!stream) return () => "";
   const truncMarker = `
-<script-jail: stdout line over ${capBytes}B suppressed>
+<script-jail: stdout capture stopped \u2014 line over ${capBytes}B (possible split secret); tail suppressed>
 `;
   let redactedTail = "";
   let pending = "";
-  let suppressing = false;
+  let poisoned = false;
   const capTail = (s) => {
     const buf = Buffer.from(s, "utf8");
     if (buf.length <= capBytes) return s;
@@ -29690,35 +29690,32 @@ function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAI
   const appendRedacted = (s) => {
     redactedTail = capTail(redactedTail + s);
   };
+  const poison = () => {
+    appendRedacted(truncMarker);
+    poisoned = true;
+    pending = "";
+  };
   stream.on("data", (chunk) => {
+    if (poisoned) return;
     pending += chunk.toString("utf8");
-    if (suppressing) {
-      const cr = pending.indexOf("\r");
-      const lf = pending.indexOf("\n");
-      const d = cr === -1 ? lf : lf === -1 ? cr : Math.min(cr, lf);
-      if (d === -1) {
-        pending = "";
+    let nl;
+    while ((nl = pending.indexOf("\n")) !== -1) {
+      const line = pending.slice(0, nl + 1);
+      if (Buffer.byteLength(line, "utf8") > capBytes) {
+        poison();
         return;
       }
-      appendRedacted(truncMarker);
-      suppressing = false;
-      pending = pending.slice(d + 1);
-    }
-    const nl = pending.lastIndexOf("\n");
-    if (nl >= 0) {
-      const complete = pending.slice(0, nl + 1);
       pending = pending.slice(nl + 1);
-      appendRedacted(redact ? redact(complete) : complete);
+      appendRedacted(redact ? redact(line) : line);
     }
     if (Buffer.byteLength(pending, "utf8") > capBytes) {
-      pending = "";
-      suppressing = true;
+      poison();
     }
   });
   stream.on("error", () => {
   });
   return () => {
-    const finalPending = suppressing ? truncMarker : pending ? redact ? redact(pending) : pending : "";
+    const finalPending = poisoned ? "" : pending ? redact ? redact(pending) : pending : "";
     return capTail(redactedTail + finalPending);
   };
 }
