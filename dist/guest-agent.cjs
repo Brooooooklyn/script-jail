@@ -10351,6 +10351,7 @@ __export(agent_exports, {
   LinuxVsockConnection: () => LinuxVsockConnection,
   MacOSSpawner: () => MacOSSpawner,
   MemoryConnection: () => MemoryConnection,
+  PHASE_B_STDOUT_PENDING_MAX_BYTES: () => PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES: () => PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough: () => import_node_stream.PassThrough,
   StdioConnection: () => StdioConnection,
@@ -10372,6 +10373,7 @@ var import_node_readline2 = require("node:readline");
 var import_node_net = require("node:net");
 var import_node_dns = require("node:dns");
 var import_node_stream = require("node:stream");
+var import_node_string_decoder = require("node:string_decoder");
 var import_yaml2 = __toESM(require_dist(), 1);
 
 // node_modules/.pnpm/zod@4.4.3/node_modules/zod/v4/classic/external.js
@@ -29672,11 +29674,14 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
   return null;
 }
 var PHASE_B_STDOUT_TAIL_BYTES = 16384;
-function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAIL_BYTES) {
+var PHASE_B_STDOUT_PENDING_MAX_BYTES = 1048576;
+function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAIL_BYTES, pendingMaxBytes = PHASE_B_STDOUT_PENDING_MAX_BYTES) {
   if (!stream) return () => "";
+  const pendingMax = Math.max(pendingMaxBytes, capBytes);
   const truncMarker = `
-<script-jail: stdout capture stopped \u2014 line over ${capBytes}B (possible split secret); tail suppressed>
+<script-jail: stdout capture stopped \u2014 unterminated line over ${pendingMax}B (possible split secret); tail suppressed>
 `;
+  const decoder = new import_node_string_decoder.StringDecoder("utf8");
   let redactedTail = "";
   let pending = "";
   let poisoned = false;
@@ -29695,22 +29700,26 @@ function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAI
     poisoned = true;
     pending = "";
   };
-  stream.on("data", (chunk) => {
-    if (poisoned) return;
-    pending += chunk.toString("utf8");
+  const drainCompleteLines = () => {
     let nl;
     while ((nl = pending.indexOf("\n")) !== -1) {
       const line = pending.slice(0, nl + 1);
-      if (Buffer.byteLength(line, "utf8") > capBytes) {
-        poison();
-        return;
-      }
       pending = pending.slice(nl + 1);
       appendRedacted(redact ? redact(line) : line);
     }
-    if (Buffer.byteLength(pending, "utf8") > capBytes) {
+  };
+  stream.on("data", (chunk) => {
+    if (poisoned) return;
+    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"));
+    drainCompleteLines();
+    if (Buffer.byteLength(pending, "utf8") > pendingMax) {
       poison();
     }
+  });
+  stream.on("end", () => {
+    if (poisoned) return;
+    pending += decoder.end();
+    drainCompleteLines();
   });
   stream.on("error", () => {
   });
@@ -30198,7 +30207,7 @@ function redactSensitive(text, protectedEnvNames, env = process.env) {
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);
   }
-  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, "$1<REDACTED>").replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
   return out;
 }
 async function main(input) {
@@ -30504,6 +30513,7 @@ if (isMain) {
   LinuxVsockConnection,
   MacOSSpawner,
   MemoryConnection,
+  PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough,
   StdioConnection,

@@ -18,6 +18,7 @@ import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
 import { PassThrough, Writable, type Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
@@ -1446,13 +1447,23 @@ export function readStraceChildPid(
 }
 
 /**
- * Default BYTE cap for the Phase-B install-stdout in-memory tail.  `main()`
+ * Default BYTE cap for the RETAINED Phase-B install-stdout tail.  `main()`
  * enlarges this to comfortably exceed the longest protected env value (measured
- * in UTF-8 bytes) so the redactor always sees whole values before any front
- * drop (Codex round-3 [medium] #2 / round-4 [medium] byte-vs-char).  Chosen
- * well above any plausible single diagnostic line / credential token.
+ * in UTF-8 bytes) so a value echoed on one line fits whole before any front
+ * drop.  Chosen well above any plausible single diagnostic line / credential.
  */
 export const PHASE_B_STDOUT_TAIL_BYTES = 16384;
+
+/**
+ * Max bytes buffered for a SINGLE unterminated line before the collector gives
+ * up and sticky-poisons.  Decoupled from {@link PHASE_B_STDOUT_TAIL_BYTES} so a
+ * long but COMPLETE diagnostic line (Codex round-9 [medium]: real Yarn
+ * `install --immutable` emitted a ~19 KB lockfile-descriptor line before its
+ * `YN0028` explanation) is buffered, redacted WHOLE, and retained — rather than
+ * poisoning and dropping the actionable error that follows.  Only a line that
+ * never terminates within this bound is pathological enough to poison.
+ */
+export const PHASE_B_STDOUT_PENDING_MAX_BYTES = 1_048_576; // 1 MiB
 
 /**
  * Attach a drained, byte-bounded tail collector to a child's STDOUT stream and
@@ -1475,63 +1486,70 @@ export const PHASE_B_STDOUT_TAIL_BYTES = 16384;
  * gated `close`.  A drained fd1 joins that pre-existing set; it degrades a
  * lingering-child case to the outer timeout (fail-closed), never a bypass.
  *
- * SECRET SAFETY — PER-LINE redaction + STICKY OVER-CAP POISON.  Credentials in
- * install stdout live on a single line, and `redactSensitive` masks only a
- * COMPLETE match (a known value, or a shape like `Bearer <8+ chars>`).  Two
- * failure modes must be closed:
+ * SECRET SAFETY — PER-LINE redaction (line-local shapes + stateful decode).
+ * Credentials in install stdout live on a single line, and `redactSensitive`
+ * masks only a COMPLETE match (a known value, or a shape like `Bearer <token>`,
+ * which is LINE-LOCAL by contract — see redactSensitive).  Failure modes closed:
  *
  *   (A) live-end partial match (Codex round-5): redacting an UNTERMINATED line
- *       lets a shape regex match a half-arrived token's prefix; the suffix then
- *       arrives detached and the final redaction can't re-match it.
- *   (B) split-by-front-drop (Codex round-6/8): if a credential's marker and its
- *       secret straddle the ~capBytes byte-cap boundary, the front-drop severs
- *       them; whichever side survives is unmaskable.
+ *       lets a shape match a half-arrived token's prefix; the suffix then
+ *       arrives detached and can't be re-matched.  → We NEVER redact the
+ *       unterminated trailing `pending`; a line is redacted only once it is
+ *       COMPLETE (its '\n' arrived), so the whole token is present.
+ *   (B) split-by-front-drop / resume re-anchor (Codex round-6/8): any
+ *       "suppress the over-cap line then RESUME" scheme leaks — a detached
+ *       suffix re-anchors as a fresh complete line after the resume point, on
+ *       ANY delimiter or write-split.  → For the unterminated case we NEVER
+ *       resume (see below).
+ *   (C) chunk-split multibyte corruption (Codex round-9 [high] #2): decoding
+ *       each pipe chunk independently with toString('utf8') turns a codepoint
+ *       split across a chunk boundary into U+FFFD, so the layer-1 exact-value
+ *       redactor no longer matches and an ASCII suffix leaks.  → A stateful
+ *       `StringDecoder` buffers an incomplete trailing sequence across chunks.
+ *   (D) newline-spanning shape (Codex round-9 [high] #1): a shape regex with
+ *       `\s` would match `Bearer\n<token>` under a whole-buffer pass but be
+ *       MISSED per-line.  → redactSensitive's shapes are LINE-LOCAL, so per-line
+ *       redaction is COMPLETE: no shape spans a '\n'.
  *
- * A long arc of "suppress the over-cap line, then RESUME capturing" designs
- * (rounds 6–8) all leaked: a detached suffix can always be re-delivered as a
- * fresh-looking COMPLETE line after the resume point (on ANY delimiter — bare
- * `\r`, `\n`, `\r\n`, or an adversarial write-split), where it re-anchors with
- * no marker context and surfaces.  Empirically EVERY resume variant (incl. the
- * shipped LF-and-CR exit) leaks Bearer / `_authToken=` / `npm_` / URL-userinfo /
- * AWS-key shapes AND layer-1 exact values.  For a BOUNDED-memory collector the
- * ONLY leak-proof rule is: never resume.
+ * The invariant: EVERY byte committed to `redactedTail` belongs to a COMPLETE
+ * logical line that was redacted WHILE WHOLE (marker + secret co-resident → both
+ * masked, and — shapes being line-local — completely so).  A complete line is
+ * therefore safe to retain at ANY length: redaction masks every known secret in
+ * it BEFORE the byte-cap front-drop, so the front-drop only ever cuts
+ * already-masked / non-secret bytes.  A long-but-complete diagnostic line
+ * (Codex round-9 [medium]: real Yarn `--immutable` emits a ~19 KB lockfile line
+ * before its `YN0028` explanation) is buffered up to `pendingMaxBytes`, redacted
+ * whole, and retained — the error that follows is NOT dropped.
  *
- * The invariant (simple, hence airtight): EVERY byte ever committed to
- * `redactedTail` belongs to a COMPLETE logical line whose own UTF-8 length is
- * ≤ capBytes and which was redacted WHILE WHOLE (marker + secret co-resident in
- * one redact() call → both masked).  The instant ANY single logical line —
- * complete or the unterminated trailing one — exceeds capBytes (the only
- * situation in which a front-drop or a resume could sever a marker from its
- * secret), the collector goes STICKY-poisoned: it emits one fixed marker and
- * surfaces NOTHING further.  Consequences:
- *   - (A) closed: the unterminated `pending` is never redacted at the live end.
- *   - (B) closed: a retained line is ≤ capBytes, so the front-drop over the
- *     accumulated tail only ever cuts EARLIER, already-masked lines — it can
- *     never strand a marker from its own line's secret.
- *   - No resume path ⇒ no re-anchor ⇒ delimiter-agnostic (CR/LF/CRLF/none, any
- *     write-split).  O(n): each byte is scanned once for '\n'; each line is
- *     redacted exactly once (no quadratic re-redaction of a growing buffer).
- *
- * Phase B is OFFLINE (no exfil channel needs the error text live), so dropping
- * post-overflow diagnostics costs only diagnosability, never audit correctness.
- * Accepted residuals: (1) all stdout AFTER the first over-cap line is dropped —
- * the provably-minimal price of leak-proofness; real npm/pnpm/yarn print their
- * `\n`-terminated error and exit, and lines BEFORE the flood are retained, so a
- * lone >capBytes-with-no-newline line is itself pathological/adversarial output.
- * (2) a protected VALUE containing an embedded newline is matched per-line (env
- * values rarely contain one).  macOS-bare is unaffected (it captures no stdout;
- * getStdoutTail() returns '').
+ * The ONLY poison case is the genuinely-unhandleable one: a single UNTERMINATED
+ * line that never terminates within `pendingMaxBytes`.  We can neither redact it
+ * (failure A) nor resume past it (failure B), so we sticky-poison: emit one
+ * marker, surface nothing further.  Phase B is OFFLINE (no exfil channel needs
+ * the error text live), so this costs only diagnosability, never audit
+ * correctness.  Accepted residuals: (1) a single >pendingMaxBytes line with no
+ * newline poisons (pathological/adversarial — real tools terminate lines);
+ * (2) a protected VALUE or a credential split across a '\n' by adversarial
+ * output is matched per-line only (the PM does not split credentials across
+ * lines, and this tail is reached only on the zero-event fail-closed path, not
+ * from an audited lifecycle script).  macOS-bare is unaffected (captures no
+ * stdout; getStdoutTail() returns '').  O(n): each byte scanned once for '\n',
+ * each line redacted once.
  */
 export function attachStdoutTailCollector(
   stream: Readable | null | undefined,
   redact: ((s: string) => string) | undefined,
   capBytes: number = PHASE_B_STDOUT_TAIL_BYTES,
+  pendingMaxBytes: number = PHASE_B_STDOUT_PENDING_MAX_BYTES,
 ): () => string {
   if (!stream) return () => '';
-  const truncMarker = `\n<script-jail: stdout capture stopped — line over ${capBytes}B (possible split secret); tail suppressed>\n`;
-  let redactedTail = ''; // committed: each constituent line was ≤cap and redacted WHOLE
-  let pending = ''; // raw bytes after the last newline (the unterminated trailing line)
-  let poisoned = false; // sticky: once any single line exceeds cap, surface nothing further
+  // pendingMaxBytes must be ≥ capBytes (a complete line up to it is redacted then
+  // front-dropped into the capBytes tail).
+  const pendingMax = Math.max(pendingMaxBytes, capBytes);
+  const truncMarker = `\n<script-jail: stdout capture stopped — unterminated line over ${pendingMax}B (possible split secret); tail suppressed>\n`;
+  const decoder = new StringDecoder('utf8'); // stateful: buffers incomplete multibyte across chunks (C)
+  let redactedTail = ''; // committed: each constituent line was redacted WHOLE
+  let pending = ''; // decoded bytes after the last newline (the unterminated trailing line)
+  let poisoned = false; // sticky: set only when an unterminated line exceeds pendingMax
 
   // Return the longest suffix of `s` whose UTF-8 byte length is ≤ capBytes,
   // cut on a CHARACTER boundary.  Slicing the raw byte buffer mid-codepoint
@@ -1553,40 +1571,41 @@ export function attachStdoutTailCollector(
     redactedTail = capTail(redactedTail + s);
   };
 
-  // Enter the sticky-poisoned terminal state: emit the marker once, drop the
-  // unterminated remainder, surface nothing further.
+  // Sticky-poisoned terminal state: emit the marker once, surface nothing more.
   const poison = (): void => {
     appendRedacted(truncMarker);
     poisoned = true;
     pending = '';
   };
 
-  stream.on('data', (chunk: Buffer | string) => {
-    if (poisoned) return; // sticky: capture nothing after the first over-cap line
-    pending += chunk.toString('utf8');
-
-    // Process COMPLETE lines ONE AT A TIME.  Each is redacted WHOLE (so a
-    // credential's marker and secret are masked together), then byte-capped.
+  // Drain all COMPLETE lines from `pending`, redacting each WHOLE.
+  const drainCompleteLines = (): void => {
     let nl: number;
     while ((nl = pending.indexOf('\n')) !== -1) {
       const line = pending.slice(0, nl + 1); // includes its '\n'
-      if (Buffer.byteLength(line, 'utf8') > capBytes) {
-        // A single complete line itself exceeds the cap: a front-drop could
-        // sever a marker from its secret WITHIN this one line.  Poison rather
-        // than risk it (a >capBytes single line is pathological output).
-        poison();
-        return;
-      }
       pending = pending.slice(nl + 1);
       appendRedacted(redact ? redact(line) : line);
     }
+  };
 
-    // The trailing UNTERMINATED line is never redacted at the live end (failure
-    // mode A).  If it alone exceeds the cap, poison (failure mode B): we can
-    // neither redact it safely nor resume past it without a re-anchor leak.
-    if (Buffer.byteLength(pending, 'utf8') > capBytes) {
+  stream.on('data', (chunk: Buffer | string) => {
+    if (poisoned) return; // sticky
+    // Stateful decode: an incomplete multibyte sequence at the chunk boundary is
+    // held by the decoder and completed by the next chunk (failure mode C).
+    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
+    drainCompleteLines();
+    // The trailing UNTERMINATED line is never redacted at the live end (A).  We
+    // buffer it up to pendingMax so a long-but-complete diagnostic line is kept;
+    // only a line that never terminates within that bound poisons (B).
+    if (Buffer.byteLength(pending, 'utf8') > pendingMax) {
       poison();
     }
+  });
+  // Flush any byte held by the decoder at EOF, then drain a final complete line.
+  stream.on('end', () => {
+    if (poisoned) return;
+    pending += decoder.end();
+    drainCompleteLines();
   });
   // Swallow late errors on the captured stream (e.g. EPIPE on teardown) so an
   // stdout-side hiccup never crashes the agent; the tail we have is best-effort.
@@ -1595,9 +1614,9 @@ export function attachStdoutTailCollector(
   return () => {
     // Finalize: when poisoned, surface only what was committed before the
     // overflow (the marker is already in redactedTail).  Otherwise the trailing
-    // partial line (≤cap, since an over-cap one would have poisoned) is redacted
-    // ONCE at true EOF — no later suffix can arrive, so masking what's present
-    // cannot orphan anything.  Non-mutating, so repeated calls are stable.
+    // partial line (≤pendingMax) is redacted ONCE at true EOF — no later suffix
+    // can arrive, so masking what's present cannot orphan anything.  Non-mutating
+    // so repeated calls are stable.
     const finalPending = poisoned
       ? ''
       : pending
@@ -2835,13 +2854,26 @@ export function redactSensitive(
     out = out.split(value).join(`<REDACTED:${name}>`);
   }
   // Layer 2 — credential SHAPES regardless of the protected list.
+  //
+  // LINE-LOCAL CONTRACT (Codex round-9 [high] #1): every shape below matches
+  // WITHIN A SINGLE LINE — none may span a newline.  The Phase-B stdout
+  // collector redacts per complete line (see attachStdoutTailCollector); a shape
+  // whose marker and token straddle a '\n' would be masked by a whole-buffer
+  // pass but MISSED per-line, and once the marker is front-dropped the surviving
+  // token would leak.  Aligning the regexes to be line-local makes per-line
+  // redaction COMPLETE for shapes: the inter-token whitespace classes use
+  // `[^\S\n]` (whitespace except newline), and every token/value class already
+  // excludes whitespace.  Real credentials are single-line, so this loses no
+  // genuine coverage — a `Bearer` with its token on the NEXT line is, by this
+  // contract, not a credential (its token, if itself a known shape or a layer-1
+  // value, is still caught on its own line).
   out = out
     // scheme://user:pass@host  → keep scheme + host, drop userinfo
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
     // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
-    .replace(/((?:_authToken|_auth|_password)\s*=\s*)\S+/gi, '$1<REDACTED>')
+    .replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, '$1<REDACTED>')
     // Bearer <token>
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
+    .replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
     // npm automation/granular token literals (npm_… 36+ char)
     .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>')
     // GitHub token literals (ghp_/gho_/ghs_/ghu_/ghr_ + 36+ char)

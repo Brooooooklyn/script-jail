@@ -10,7 +10,7 @@ import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, PHASE_B_STDOUT_TAIL_BYTES, redactSensitive } from '../../src/guest/agent.js';
+import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, PHASE_B_STDOUT_TAIL_BYTES, PHASE_B_STDOUT_PENDING_MAX_BYTES, redactSensitive } from '../../src/guest/agent.js';
 import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
 import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
@@ -3809,15 +3809,36 @@ describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)
 
 describe('Phase B stdout capture (in-memory tail)', () => {
   // Drain a PassThrough through the collector, then end it and let the
-  // 'data' listeners flush on the next tick before reading the tail.
+  // 'data'/'end' listeners flush on the next tick before reading the tail.
   async function feed(
     chunks: Array<string | Buffer>,
+    redact: ((s: string) => string) | undefined,
+    capBytes?: number,
+    pendingMaxBytes?: number,
+  ): Promise<string> {
+    const stream = new PassThrough();
+    const getTail = attachStdoutTailCollector(stream, redact, capBytes, pendingMaxBytes);
+    for (const c of chunks) stream.write(c);
+    stream.end();
+    await new Promise<void>((r) => stream.on('end', () => r()));
+    await new Promise<void>((r) => setImmediate(r));
+    return getTail();
+  }
+
+  // Feed Buffer chunks as SEPARATE 'data' events (a setImmediate between writes)
+  // so a multibyte codepoint split across chunk boundaries actually exercises
+  // the stateful decoder (PassThrough may otherwise coalesce back-to-back writes).
+  async function feedBuffersSeparated(
+    buffers: Array<Buffer>,
     redact: ((s: string) => string) | undefined,
     capBytes?: number,
   ): Promise<string> {
     const stream = new PassThrough();
     const getTail = attachStdoutTailCollector(stream, redact, capBytes);
-    for (const c of chunks) stream.write(c);
+    for (const b of buffers) {
+      stream.write(b);
+      await new Promise<void>((r) => setImmediate(r));
+    }
     stream.end();
     await new Promise<void>((r) => stream.on('end', () => r()));
     await new Promise<void>((r) => setImmediate(r));
@@ -3840,108 +3861,121 @@ describe('Phase B stdout capture (in-memory tail)', () => {
     expect(tail).toContain('line 199'); // most-recent output survives
   });
 
-  it('redacts a complete protected value on its line; later output never resurfaces it', async () => {
-    const SECRET = 'supersecretvalue1234';
-    const redact = (s: string) => redactSensitive(s, ['MY_TOKEN'], { MY_TOKEN: SECRET });
-    const cap = 4096 + Buffer.byteLength(SECRET, 'utf8') + 4096;
-    const tail = await feed(['lead ', SECRET, '\n', 'q\n'.repeat(2000)], redact, cap);
-    expect(tail).not.toContain(SECRET);
+  // ── LEAK GATE ────────────────────────────────────────────────────────────
+  // O9 invariant: a line is redacted only once COMPLETE (its '\n' arrived), so
+  // the whole token is present; shapes are LINE-LOCAL so per-line redaction is
+  // complete; a complete line is safe to retain at any length (redaction masks
+  // every secret BEFORE the front-drop). The r5..r8 "overflow split" leak is
+  // structurally impossible: a REAL credential on a (re-assembled) complete line
+  // is masked whole; the only drop is an unterminated >pendingMax line (poison).
+  it('LEAK GATE: a real Bearer token whose token chars exceed the cap is masked whole', async () => {
+    const cap = 4096;
+    const redact = (s: string) => redactSensitive(s, []); // shape-only
+    // One complete line, token >cap — kept (not poisoned) and masked whole.
+    const tail = await feed(['Authorization: Bearer ' + 'A'.repeat(cap + 1000) + '\n'], redact, cap);
+    expect(tail).not.toMatch(/A{50}/); // the token is gone
+    expect(tail).toContain('<REDACTED');
   });
 
-  // ── LEAK GATE ────────────────────────────────────────────────────────────
-  // O8 invariant: every retained byte is from a COMPLETE line ≤cap redacted
-  // WHOLE; the instant any single logical line exceeds cap → sticky poison
-  // (surface nothing further). No resume path ⇒ a detached suffix can never
-  // re-anchor as fresh content, on ANY delimiter or write-split. These were the
-  // chunk shapes that defeated every round-5..8 suppress-then-resume variant
-  // (and that the shipped LF+CR-exit code leaks on — verified against the bundle).
-  const shapeLeak: Array<{ name: string; marker: string; secret: string }> = [
-    { name: 'Bearer', marker: 'Authorization: Bearer TOKENPREFIX', secret: 'TOKENSUFFIXZZ' },
-    { name: '_authToken=npm_', marker: '//r/:_authToken=npm_AAAA', secret: 'NPMSUFFIXLEAK' },
-    { name: 'scheme user:pass@', marker: 'proxy=https://user:PASSWORD', secret: 'PASSLEAK' },
+  const realShape: Array<{ name: string; line: string; secretRe: RegExp }> = [
+    { name: 'Bearer', line: 'Authorization: Bearer ABCDEFGH01234567890123456789\n', secretRe: /ABCDEFGH0123/ },
+    { name: '_authToken', line: '//registry/:_authToken=npmTokenABCDEFGH01234567\n', secretRe: /npmTokenABCDEF/ },
+    { name: 'url user:pass@', line: 'proxy=https://user:PASSWORDABCDEFGH@host:8080\n', secretRe: /PASSWORDABCDEF/ },
   ];
-  for (const { name, marker, secret } of shapeLeak) {
-    const cap = 4096;
-    const flood = 'X'.repeat(cap + 100);
-    const redact = (s: string) => redactSensitive(s, []); // shape-only (layer 2)
-    const variants: Array<{ d: string; chunks: Array<string> }> = [
-      { d: 'bare-CR', chunks: [marker, flood, `\r${secret}\n`] },
-      { d: 'plain-LF', chunks: [marker, flood, `\n${secret}\n`] },
-      { d: 'CRLF', chunks: [marker, flood, `\r\n${secret}\n`] },
-      { d: 'same-chunk flood+LF+suffix', chunks: [marker, `${flood}\n${secret}\nMORE\n`] },
-      { d: 'adversarial split flood|LF|suffix', chunks: [marker + flood, '\n', `${secret}\n`] },
-      { d: 'adversarial split flood|CR+suffix', chunks: [marker + flood, `\r${secret}\n`] },
-    ];
-    for (const { d, chunks } of variants) {
-      it(`LEAK GATE: ${name} split at overflow (${d}) never surfaces`, async () => {
-        const tail = await feed(chunks, redact, cap);
-        expect(tail).not.toContain(secret);
-      });
-    }
+  for (const { name, line, secretRe } of realShape) {
+    it(`LEAK GATE: real ${name} credential split ACROSS CHUNKS reunites on its line and is masked`, async () => {
+      const redact = (s: string) => redactSensitive(s, []);
+      const mid = Math.floor(line.length / 2);
+      // Push the cap first with newline-terminated noise, then split the
+      // credential line across two chunks (no delimiter between).
+      const tail = await feed(
+        ['noise\n'.repeat(2000), line.slice(0, mid), line.slice(mid)],
+        redact,
+        PHASE_B_STDOUT_TAIL_BYTES,
+      );
+      expect(tail).not.toMatch(secretRe);
+      expect(tail).toContain('<REDACTED');
+    });
   }
 
-  it('LEAK GATE: layer-1 exact protected value straddling the overflow never surfaces', async () => {
+  it('LEAK GATE: a layer-1 exact value is masked wherever it lands on a complete line (after huge prefix + CR)', async () => {
     const cap = 4096;
-    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'ABCDEFG-1234567890' });
-    const tail = await feed(['echo ABCDEFG', 'X'.repeat(cap + 100), '\r\n-1234567890\n'], redact, cap);
-    expect(tail).not.toContain('-1234567890');
+    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'SECRETVAL1234567890' });
+    // The value sits after a >cap prefix and a bare CR, all on ONE complete line.
+    const tail = await feed(['junk ' + 'Q'.repeat(cap + 1000) + '\rSECRETVAL1234567890\n'], redact, cap);
+    expect(tail).not.toContain('SECRETVAL1234567890');
   });
 
-  it('LEAK GATE: a contiguous over-cap COMPLETE line whose tail is the secret never surfaces', async () => {
-    const cap = 4096;
-    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'CONTIGTAILZZ' });
-    // One complete line, raw length > cap, secret value at the very end.
-    const tail = await feed(['junk:' + 'Q'.repeat(cap + 100) + 'CONTIGTAILZZ\n'], redact, cap);
-    expect(tail).not.toContain('CONTIGTAILZZ');
-  });
-
-  // ── AVAILABILITY ─────────────────────────────────────────────────────────
-  it('masks a real shape on its OWN complete line in the same chunk (not over-poisoned)', async () => {
-    const cap = 4096;
-    const redact = (s: string) => redactSensitive(s, []);
-    const tail = await feed(
-      ['Authorization: Bearer TOKENPREFIX', 'X'.repeat(cap + 100) + '\n'],
-      redact,
-      cap,
-    );
-    // The over-cap unterminated blob poisons, but a legitimate masked line that
-    // arrives BEFORE the overflow on its own '\n' is retained & masked elsewhere;
-    // here we assert the poison marker is present and no raw token leaks.
-    expect(tail).toContain('suppressed');
-  });
-
-  it('retains an error line printed BEFORE the over-cap flood', async () => {
-    const cap = 4096;
-    const tail = await feed(['YN0028 immutable rejection\n', 'Z'.repeat(cap + 50)], undefined, cap);
-    expect(tail).toContain('YN0028 immutable rejection');
-    expect(tail).toContain('suppressed');
-  });
-
-  it('round-5 cross-chunk split whose WHOLE token is <cap reunites on its line and is masked', async () => {
-    const redact = (s: string) => redactSensitive(s, []);
-    const tail = await feed(
-      ['noise\n'.repeat(2000), 'Authorization: Bearer ', 'realtoken12345\n'],
-      redact,
-      PHASE_B_STDOUT_TAIL_BYTES,
-    );
+  it('LEAK GATE: a layer-1 value split ACROSS CHUNKS within a line is masked', async () => {
+    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'SECRETVAL123' });
+    const tail = await feed(['env: secret=SECRET', 'VAL123 done\n'], redact, 4096);
+    expect(tail).not.toContain('SECRETVAL123');
     expect(tail).toContain('<REDACTED');
-    expect(tail).not.toContain('realtoken12345');
   });
 
-  // ── CORRECTNESS / EDGES ──────────────────────────────────────────────────
-  it('sticky poison: emits the marker once and drops ALL post-overflow lines', async () => {
+  // ── FINDING 1: line-local shape contract (Codex round-9 [high] #1) ─────────
+  it('line-local contract: a same-line shape is masked; a shape spanning a newline is NOT (documented)', async () => {
+    const redact = (s: string) => redactSensitive(s, []);
+    expect(await feed(['Authorization: Bearer TOKEN0123456789\n'], redact, 4096)).toContain('<REDACTED');
+    // Bearer marker and token on SEPARATE lines: by the line-local contract this
+    // is not a credential, so the token is not shape-masked.
+    const cross = await feed(['Authorization: Bearer\n', 'TOKEN0123456789\n'], redact, 4096);
+    expect(cross).toContain('TOKEN0123456789');
+  });
+
+  it('line-local contract: a real protected VALUE on the token line is still masked even when the shape spans a newline', async () => {
+    // Defense in depth: even if a shape regex would not span the newline, a
+    // registered env value on the second line is caught by layer-1.
+    const redact = (s: string) => redactSensitive(s, ['TOK'], { TOK: 'TOKEN0123456789' });
+    const tail = await feed(['Authorization: Bearer\n', 'TOKEN0123456789\n'], redact, 4096);
+    expect(tail).not.toContain('TOKEN0123456789');
+  });
+
+  // ── FINDING 2: stateful UTF-8 decode across chunk boundaries (round-9 #2) ───
+  it('multibyte protected value split mid-codepoint across chunks is still masked', async () => {
+    const VALUE = 'tokéSECRETTAIL1234'; // é = 0xC3 0xA9
+    const redact = (s: string) => redactSensitive(s, ['V'], { V: VALUE });
+    const full = Buffer.from('value=' + VALUE + '\n', 'utf8');
+    const splitAt = Buffer.byteLength('value=tok', 'utf8') + 1; // AFTER the first byte of é
+    const tail = await feedBuffersSeparated(
+      [full.subarray(0, splitAt), full.subarray(splitAt)],
+      redact,
+      4096,
+    );
+    expect(tail).not.toContain('SECRETTAIL1234'); // value reassembled then masked
+    expect(tail).toContain('<REDACTED');
+  });
+
+  // ── FINDING 3: keep long-but-complete diagnostic lines (round-9 [medium]) ───
+  it('keeps a long (>cap) COMPLETE line and the YN0028 error that follows', async () => {
     const cap = 4096;
+    const longLine = 'lockfile descriptor ' + 'D'.repeat(19000) + '\n'; // ~19 KB, like real Yarn
     const tail = await feed(
-      ['ok line 1\n', 'ok line 2\n', 'Z'.repeat(cap + 50) + '\n', 'ok line 3\n'],
+      [longLine, 'YN0028: The lockfile would have been modified by this install.\n'],
       undefined,
       cap,
     );
-    expect(tail).toContain('ok line 2'); // pre-overflow retained
-    expect(tail).toContain('suppressed'); // marker
-    expect(tail).not.toContain('ok line 3'); // post-overflow dropped (sticky)
+    expect(tail).toContain('YN0028: The lockfile would have been modified'); // NOT dropped
+    expect(tail).not.toContain('stdout capture stopped'); // no poison for a complete line
+  });
+
+  // ── POISON: only an unterminated line over pendingMax ──────────────────────
+  it('poisons (sticky) only an UNTERMINATED line exceeding pendingMax; drops nothing before it', async () => {
+    const cap = 1024;
+    const pendingMax = 4096;
+    const tail = await feed(
+      ['real error line\n', 'Z'.repeat(pendingMax + 100) /* no newline, > pendingMax */, 'later\n'],
+      undefined,
+      cap,
+      pendingMax,
+    );
+    expect(tail).toContain('real error line'); // pre-overflow retained
+    expect(tail).toContain('stdout capture stopped'); // marker
+    expect(tail).not.toContain('later'); // sticky: post-overflow dropped
     expect((tail.match(/stdout capture stopped/g) || []).length).toBe(1); // exactly one marker
   });
 
+  // ── CORRECTNESS / EDGES ──────────────────────────────────────────────────
   it('front-drop never strands a secret across many redacted lines', async () => {
     const cap = 2048;
     const redact = (s: string) => redactSensitive(s, []);
@@ -3953,11 +3987,10 @@ describe('Phase B stdout capture (in-memory tail)', () => {
     expect(tail).toContain('<REDACTED');
   });
 
-  it('multibyte: complete line under cap kept on a char boundary; over-cap flood poisons cleanly', async () => {
-    const under = await feed(['€'.repeat(3) + '\n'], undefined, 16);
-    expect(Buffer.byteLength(under, 'utf8')).toBeLessThanOrEqual(16);
-    const over = await feed(['€'.repeat(100)], undefined, 9); // unterminated over-cap → poison
-    expect(Buffer.byteLength(over, 'utf8')).toBeLessThanOrEqual(9);
+  it('multibyte complete line under cap kept on a char boundary', async () => {
+    const tail = await feed(['€'.repeat(3) + '\n'], undefined, 16);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(16);
+    expect(tail).toContain('€');
   });
 
   it('idempotent getter: repeated calls are stable', async () => {
@@ -3971,7 +4004,8 @@ describe('Phase B stdout capture (in-memory tail)', () => {
     expect(get()).toBe('hi\n');
   });
 
-  it('exposes a sane default byte cap', () => {
+  it('exposes sane default byte caps', () => {
     expect(PHASE_B_STDOUT_TAIL_BYTES).toBeGreaterThanOrEqual(16384);
+    expect(PHASE_B_STDOUT_PENDING_MAX_BYTES).toBeGreaterThan(PHASE_B_STDOUT_TAIL_BYTES);
   });
 });
