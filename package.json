@@ -1,6 +1,6 @@
 {
   "name": "script-jail",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Backend-isolated install auditor for npm/pnpm/yarn lifecycle scripts.",
   "type": "module",
   "license": "MIT",
