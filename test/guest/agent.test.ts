@@ -3975,6 +3975,24 @@ describe('Phase B stdout capture (in-memory tail)', () => {
     expect((tail.match(/stdout capture stopped/g) || []).length).toBe(1); // exactly one marker
   });
 
+  // Byte-at-a-time UNTERMINATED stream: exercises the O(1) incremental
+  // pendingBytes counter (no per-event O(pending) re-measure / newline scan).
+  // Under pendingMax it is retained whole; over it, it poisons — same outcome
+  // as a single big chunk, but reached one byte per 'data' event.
+  it('byte-at-a-time unterminated input: retained under pendingMax, poisoned over it', async () => {
+    // effective pendingMax = max(pendingMaxArg, capBytes); keep cap below it.
+    const cap = 2048;
+    const pendingMax = 3000;
+    const under = 'a'.repeat(2000); // < pendingMax and < cap → fully retained
+    const kept = await feed(under.split(''), undefined, cap, pendingMax);
+    expect(kept).toBe(under); // every single-byte chunk accumulated, none lost
+
+    const over = 'b'.repeat(4000); // > pendingMax, no newline
+    const poisoned = await feed(over.split(''), undefined, cap, pendingMax);
+    expect(poisoned).toContain('stdout capture stopped');
+    expect((poisoned.match(/stdout capture stopped/g) || []).length).toBe(1);
+  });
+
   // ── CORRECTNESS / EDGES ──────────────────────────────────────────────────
   it('front-drop never strands a secret across many redacted lines', async () => {
     const cap = 2048;

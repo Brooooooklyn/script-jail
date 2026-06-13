@@ -29684,6 +29684,7 @@ function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAI
   const decoder = new import_node_string_decoder.StringDecoder("utf8");
   let redactedTail = "";
   let pending = "";
+  let pendingBytes = 0;
   let poisoned = false;
   const capTail = (s) => {
     const buf = Buffer.from(s, "utf8");
@@ -29699,6 +29700,7 @@ function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAI
     appendRedacted(truncMarker);
     poisoned = true;
     pending = "";
+    pendingBytes = 0;
   };
   const drainCompleteLines = () => {
     let nl;
@@ -29707,12 +29709,19 @@ function attachStdoutTailCollector(stream, redact, capBytes = PHASE_B_STDOUT_TAI
       pending = pending.slice(nl + 1);
       appendRedacted(redact ? redact(line) : line);
     }
+    pendingBytes = Buffer.byteLength(pending, "utf8");
   };
   stream.on("data", (chunk) => {
     if (poisoned) return;
-    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"));
-    drainCompleteLines();
-    if (Buffer.byteLength(pending, "utf8") > pendingMax) {
+    const decoded = decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"));
+    if (decoded.length === 0) return;
+    pending += decoded;
+    if (decoded.indexOf("\n") !== -1) {
+      drainCompleteLines();
+    } else {
+      pendingBytes += Buffer.byteLength(decoded, "utf8");
+    }
+    if (pendingBytes > pendingMax) {
       poison();
     }
   });

@@ -1549,6 +1549,7 @@ export function attachStdoutTailCollector(
   const decoder = new StringDecoder('utf8'); // stateful: buffers incomplete multibyte across chunks (C)
   let redactedTail = ''; // committed: each constituent line was redacted WHOLE
   let pending = ''; // decoded bytes after the last newline (the unterminated trailing line)
+  let pendingBytes = 0; // running UTF-8 byte length of `pending`, kept O(1) per data event
   let poisoned = false; // sticky: set only when an unterminated line exceeds pendingMax
 
   // Return the longest suffix of `s` whose UTF-8 byte length is ≤ capBytes,
@@ -1576,9 +1577,13 @@ export function attachStdoutTailCollector(
     appendRedacted(truncMarker);
     poisoned = true;
     pending = '';
+    pendingBytes = 0;
   };
 
-  // Drain all COMPLETE lines from `pending`, redacting each WHOLE.
+  // Drain all COMPLETE lines from `pending`, redacting each WHOLE.  Resets
+  // `pendingBytes` to the residual tail's byte length — that tail is whatever
+  // followed the LAST newline, so it is bounded by the chunk that carried the
+  // newline (post-drain `pending` never holds a '\n'), keeping this cheap.
   const drainCompleteLines = (): void => {
     let nl: number;
     while ((nl = pending.indexOf('\n')) !== -1) {
@@ -1586,18 +1591,30 @@ export function attachStdoutTailCollector(
       pending = pending.slice(nl + 1);
       appendRedacted(redact ? redact(line) : line);
     }
+    pendingBytes = Buffer.byteLength(pending, 'utf8');
   };
 
   stream.on('data', (chunk: Buffer | string) => {
     if (poisoned) return; // sticky
     // Stateful decode: an incomplete multibyte sequence at the chunk boundary is
     // held by the decoder and completed by the next chunk (failure mode C).
-    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
-    drainCompleteLines();
+    const decoded = decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
+    if (decoded.length === 0) return; // only a partial codepoint arrived; nothing to do
+    pending += decoded;
+    // A newline can ONLY appear in the freshly-decoded bytes — post-drain
+    // `pending` never retains one — so scan/drain only when this chunk actually
+    // carries a '\n'.  Otherwise just advance the byte counter.  This keeps the
+    // no-newline path O(1) per event instead of O(pending): a byte-at-a-time
+    // unterminated stream up to pendingMax stays linear, never quadratic.
+    if (decoded.indexOf('\n') !== -1) {
+      drainCompleteLines(); // recomputes pendingBytes for the residual tail
+    } else {
+      pendingBytes += Buffer.byteLength(decoded, 'utf8');
+    }
     // The trailing UNTERMINATED line is never redacted at the live end (A).  We
     // buffer it up to pendingMax so a long-but-complete diagnostic line is kept;
     // only a line that never terminates within that bound poisons (B).
-    if (Buffer.byteLength(pending, 'utf8') > pendingMax) {
+    if (pendingBytes > pendingMax) {
       poison();
     }
   });
