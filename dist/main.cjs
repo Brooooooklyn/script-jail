@@ -26640,6 +26640,15 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   }
   return out;
 }
+function deriveSensitiveValues(args) {
+  const values = [];
+  for (const t of args) {
+    values.push(t);
+    const eq = t.indexOf("=");
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}
 
 // src/action/host-install.ts
 var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
@@ -26687,15 +26696,6 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = captureSpawn) {
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
   runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io, safeDisplayArgs, onOutput);
-}
-function deriveSensitiveValues(kept) {
-  const values = [];
-  for (const t of kept) {
-    values.push(t);
-    const eq = t.indexOf("=");
-    if (eq >= 0) values.push(t.slice(eq + 1));
-  }
-  return values;
 }
 function redactCaptured(text, sensitive) {
   let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");

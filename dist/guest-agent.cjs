@@ -25221,6 +25221,24 @@ var Attribution = class {
 function redactCredentialShapes(text) {
   return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
 }
+function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
+  const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
+  let out = text;
+  const replacement = `<${label}>`;
+  for (const value of unique) {
+    out = out.split(value).join(replacement);
+  }
+  return out;
+}
+function deriveSensitiveValues(args) {
+  const values = [];
+  for (const t of args) {
+    values.push(t);
+    const eq = t.indexOf("=");
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}
 
 // src/guest/proc-reader.ts
 var import_node_fs = require("node:fs");
@@ -25535,7 +25553,15 @@ async function runFetchPhase(input) {
     // resolution failures, …) to STDOUT; stderr is typically empty.  Return
     // stdout too so the agent's Phase A failure dump can include it — an
     // empty fatal message hides the actual cause (found dogfooding napi-rs).
-    stdout: result.stdout
+    stdout: result.stdout,
+    // Surface the (already re-sanitized) developer install args spliced into
+    // the fetch argv above.  On the Phase-A FAILURE path the agent masks these
+    // exact values out of the redacted detail BEFORE it reaches either sink
+    // (serial console + fatal frame) — a PM error like
+    // `npm warn invalid config registry="SECRET"` echoes a user-arg value that
+    // matches no credential SHAPE and no protected-ENV value, so without this
+    // it would leak to the public Actions log (adversarial-review round-7).
+    userInstallArgs
   };
 }
 
@@ -30479,8 +30505,10 @@ async function main(input) {
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
   if (!fetchResult.ok) {
-    const stderrRedacted = redactSensitive(fetchResult.stderr, config2.protected.env).trim();
-    const stdoutRedacted = redactSensitive(fetchResult.stdout, config2.protected.env).trim();
+    const userArgValues = deriveSensitiveValues(fetchResult.userInstallArgs);
+    const maskUserArgs = (text) => maskExactValues(text, userArgValues, "REDACTED:USER-ARG");
+    const stderrRedacted = redactSensitive(maskUserArgs(fetchResult.stderr), config2.protected.env).trim();
+    const stdoutRedacted = redactSensitive(maskUserArgs(fetchResult.stdout), config2.protected.env).trim();
     const stdoutTail = stdoutRedacted.length > 4e3 ? `\u2026${stdoutRedacted.slice(-4e3)}` : stdoutRedacted;
     const fetchDetail = [
       stderrRedacted,

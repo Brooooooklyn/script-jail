@@ -619,6 +619,123 @@ describe('agent main()', () => {
     expect(frames.map((f) => f['kind'])).not.toContain('final');
   });
 
+  // ---------------------------------------------------------------------------
+  // Phase-A FAILURE redaction — developer install `args` value masking.
+  //
+  // adversarial-review round-7 [high]: the drop-in install threads developer
+  // `args` into the SANDBOX Phase-A fetch via the pm-flags `user_install_args`
+  // channel.  On the fetch-FAILURE path the agent redacts the PM stderr/stdout
+  // with `redactSensitive` (protected-ENV values + credential SHAPES) ONLY —
+  // which does NOT mask a user-arg value like `SECRET_TOKEN` echoed by
+  // `npm warn invalid config registry="SECRET_TOKEN"`.  That value matched no
+  // shape and no protected env, so it leaked to the public Actions log via BOTH
+  // sinks (serial-console `process.stderr.write` + the fatal vsock error frame).
+  // The fix masks the known exact user-arg values FIRST.
+  // ---------------------------------------------------------------------------
+  describe('Phase-A fetch-failure redacts developer install args', () => {
+    /** Fail-spawner: Phase A fetch exits non-zero with a chosen stderr/stdout. */
+    function failingFetchSpawner(stderr: string, stdout = ''): Spawner {
+      return {
+        async spawn() {
+          return { exitCode: 1, stdout, stderr };
+        },
+      };
+    }
+
+    /**
+     * Drive main() to the Phase-A failure site with `userArgs` staged in a
+     * pm-flags.json (npm consumes user_install_args).  Captures BOTH sinks:
+     * the fatal error frame's message and everything written to process.stderr.
+     */
+    async function runPhaseAFailure(
+      userArgs: string[],
+      stderr: string,
+      stdout = '',
+    ): Promise<{ frameMsg: string; serial: string }> {
+      const { conn, getOutput } = makeConn();
+      const configPath = writeConfig(testDir);
+
+      // Stage user_install_args; the agent points runFetchPhase at this copy
+      // via SCRIPT_JAIL_PM_FLAGS_PATH (the non-Firecracker staged-copy path).
+      const pmFlagsPath = join(testDir, 'pm-flags.json');
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: [], user_install_args: userArgs }),
+      );
+
+      const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
+      process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = pmFlagsPath;
+
+      // Capture the serial-console sink (process.stderr.write).
+      let serial = '';
+      const origWrite = process.stderr.write.bind(process.stderr);
+      const stderrSpy = (chunk: string | Uint8Array): boolean => {
+        serial += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+        return true;
+      };
+      process.stderr.write = stderrSpy as typeof process.stderr.write;
+
+      const origExit = process.exit.bind(process);
+      // @ts-expect-error — patching process.exit for test
+      process.exit = () => { /* no-op */ };
+
+      try {
+        await main({
+          configPath,
+          connection: conn,
+          spawner: failingFetchSpawner(stderr, stdout),
+          strace: emptyStrace(), // never reached — Phase A fails first
+          dnsLookup: offlineLookup,
+        });
+      } finally {
+        process.exit = origExit;
+        process.stderr.write = origWrite;
+        if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
+        else process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = oldPmFlags;
+      }
+
+      const frames = getOutput()
+        .split('\n')
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const errFrame = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+      return { frameMsg: String(errFrame?.['message'] ?? ''), serial };
+    }
+
+    it('masks an `--registry=SECRET_TOKEN` value echoed by the PM (=-form)', async () => {
+      const { frameMsg, serial } = await runPhaseAFailure(
+        ['--registry=SECRET_TOKEN'],
+        'npm warn invalid config registry="SECRET_TOKEN" set in command line options\n',
+      );
+      // BOTH sinks must be scrubbed and BOTH must carry the mask token.
+      expect(frameMsg).not.toContain('SECRET_TOKEN');
+      expect(serial).not.toContain('SECRET_TOKEN');
+      expect(frameMsg).toContain('<REDACTED:USER-ARG>');
+      expect(serial).toContain('<REDACTED:USER-ARG>');
+    });
+
+    it('masks a split-pair `--registry SECRET_TOKEN` value (whole-token, len>=4)', async () => {
+      const { frameMsg, serial } = await runPhaseAFailure(
+        ['--registry', 'SECRET_TOKEN'],
+        'npm error could not resolve registry SECRET_TOKEN offline\n',
+      );
+      expect(frameMsg).not.toContain('SECRET_TOKEN');
+      expect(serial).not.toContain('SECRET_TOKEN');
+      expect(frameMsg).toContain('<REDACTED:USER-ARG>');
+      expect(serial).toContain('<REDACTED:USER-ARG>');
+    });
+
+    it('leaves a no-user-args Phase-A failure byte-identical (deriveSensitiveValues([]) is identity)', async () => {
+      const stderr = '➤ YN0001: │ Error: ENOSPC: no space left on device, write\n';
+      const { frameMsg, serial } = await runPhaseAFailure([], stderr);
+      // No mask token injected; the (trimmed) PM error survives verbatim.
+      expect(frameMsg).not.toContain('<REDACTED:USER-ARG>');
+      expect(serial).not.toContain('<REDACTED:USER-ARG>');
+      expect(frameMsg).toContain('ENOSPC: no space left on device');
+      expect(serial).toContain('ENOSPC: no space left on device');
+    });
+  });
+
   it('still emits install_done and the final lockfile when Phase B exits non-zero but audited scripts', async () => {
     // A non-zero Phase B exit WITH collected events means a dependency
     // lifecycle script ran and failed under audit (e.g. an offline

@@ -98,7 +98,7 @@ export interface PhaseFetchInput {
 
 export async function runFetchPhase(
   input: PhaseFetchInput,
-): Promise<{ ok: boolean; stderr: string; stdout: string }> {
+): Promise<{ ok: boolean; stderr: string; stdout: string; userInstallArgs: string[] }> {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
 
   // pm-flags.json carries two distinct channels (load-pm-flags.ts):
@@ -155,5 +155,13 @@ export async function runFetchPhase(
     // stdout too so the agent's Phase A failure dump can include it — an
     // empty fatal message hides the actual cause (found dogfooding napi-rs).
     stdout: result.stdout,
+    // Surface the (already re-sanitized) developer install args spliced into
+    // the fetch argv above.  On the Phase-A FAILURE path the agent masks these
+    // exact values out of the redacted detail BEFORE it reaches either sink
+    // (serial console + fatal frame) — a PM error like
+    // `npm warn invalid config registry="SECRET"` echoes a user-arg value that
+    // matches no credential SHAPE and no protected-ENV value, so without this
+    // it would leak to the public Actions log (adversarial-review round-7).
+    userInstallArgs,
   };
 }

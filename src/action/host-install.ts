@@ -32,7 +32,7 @@ import {
   sanitizeInstallArgs,
   type Manager,
 } from '../shared/pm-commands.js';
-import { maskExactValues, redactCredentialShapes } from '../shared/redact.js';
+import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
 
 /** Minimal sink so the module is testable without touching the real streams. */
 export interface HostInstallIo {
@@ -156,28 +156,6 @@ export function hostInstallNoScripts(
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
   runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
-}
-
-/**
- * Derive the exact literal values that must be masked out of part-1's captured
- * PM output.  For each KEPT user token `t`:
- *   * push `t` itself (the whole token — airtight literal match), and
- *   * if `t` contains `=`, push the value substring after the first `=` — this
- *     catches a PM that REFORMATS `--registry=SECRET` into `registry="SECRET"`;
- *     the value `SECRET` still appears verbatim inside the reformatted echo.
- * `maskExactValues` applies the `minLen >= 4` filter, so a short non-secret
- * value like `dev` (from `--omit=dev`) is NOT masked — only the whole
- * `--omit=dev` token is — which avoids mangling unrelated words (e.g.
- * "devDependencies") in the PM output.  Nothing else is pushed.
- */
-function deriveSensitiveValues(kept: readonly string[]): string[] {
-  const values: string[] = [];
-  for (const t of kept) {
-    values.push(t);
-    const eq = t.indexOf('=');
-    if (eq >= 0) values.push(t.slice(eq + 1));
-  }
-  return values;
 }
 
 /** Mask user-arg values first (exact), then catch credential SHAPES. */

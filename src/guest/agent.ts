@@ -24,7 +24,7 @@ import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
 
 import { Attribution, buildRootPkgKeys } from './attribution.js';
-import { redactCredentialShapes } from '../shared/redact.js';
+import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
@@ -3116,8 +3116,21 @@ export async function main(input: AgentInput): Promise<void> {
     // suffix leaks.  Redact the full stdout/stderr (the secret is wholly
     // present), THEN cap the already-masked text.  A mask token split by the
     // cap is harmless (a truncated `<REDACTED:` leaks nothing).
-    const stderrRedacted = redactSensitive(fetchResult.stderr, config.protected.env).trim();
-    const stdoutRedacted = redactSensitive(fetchResult.stdout, config.protected.env).trim();
+    // Developer install `args` are spliced into the Phase-A fetch argv only
+    // (runFetchPhase surfaces the already-re-sanitized set).  A PM error such as
+    // `npm warn invalid config registry="SECRET"` echoes a user-arg VALUE that
+    // matches NO credential SHAPE and is NOT a protected-ENV value — so
+    // `redactSensitive` alone would let it leak to the public Actions log
+    // (adversarial-review round-7 [high]).  Mask the KNOWN exact user-arg values
+    // FIRST (→ <REDACTED:USER-ARG>), THEN run the existing protected-env + shape
+    // redactor.  Empty userInstallArgs ⇒ deriveSensitiveValues([]) ⇒ identity,
+    // so the no-user-args failure dump stays byte-identical.  This single masked
+    // `fetchDetail` feeds BOTH sinks below (serial console + fatal frame).
+    const userArgValues = deriveSensitiveValues(fetchResult.userInstallArgs);
+    const maskUserArgs = (text: string): string =>
+      maskExactValues(text, userArgValues, 'REDACTED:USER-ARG');
+    const stderrRedacted = redactSensitive(maskUserArgs(fetchResult.stderr), config.protected.env).trim();
+    const stdoutRedacted = redactSensitive(maskUserArgs(fetchResult.stdout), config.protected.env).trim();
     const stdoutTail =
       stdoutRedacted.length > 4000 ? `…${stdoutRedacted.slice(-4000)}` : stdoutRedacted;
     const fetchDetail = [

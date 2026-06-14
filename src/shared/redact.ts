@@ -87,3 +87,31 @@ export function maskExactValues(
   }
   return out;
 }
+
+/**
+ * Derive the exact literal values that must be masked out of captured
+ * package-manager output that took developer-supplied install `args`.  For each
+ * KEPT (already sanitized) token `t`:
+ *   * push `t` itself (the whole token — airtight literal match), and
+ *   * if `t` contains `=`, push the value substring after the first `=` — this
+ *     catches a PM that REFORMATS `--registry=SECRET` into `registry="SECRET"`;
+ *     the value `SECRET` still appears verbatim inside the reformatted echo.
+ * `maskExactValues` applies the `minLen >= 4` filter, so a short non-secret
+ * value like `dev` (from `--omit=dev`) is NOT masked — only the whole
+ * `--omit=dev` token is — which avoids mangling unrelated words (e.g.
+ * "devDependencies") in the PM output.  Nothing else is pushed.
+ *
+ * Single-sourced here (was a local helper in src/action/host-install.ts) so the
+ * host part-1 capture path AND the guest Phase-A failure dump derive the
+ * IDENTICAL value set — the same single-source precedent as the redactors
+ * above.
+ */
+export function deriveSensitiveValues(args: readonly string[]): string[] {
+  const values: string[] = [];
+  for (const t of args) {
+    values.push(t);
+    const eq = t.indexOf('=');
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}

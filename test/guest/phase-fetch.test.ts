@@ -332,6 +332,34 @@ describe('runFetchPhase', () => {
         '--prod', '--store-dir=/work/.pnpm-store',
       ]);
     });
+
+    // The agent's Phase-A FAILURE path masks the exact user-arg VALUES out of
+    // the redacted PM output before it reaches the host (serial console + fatal
+    // frame).  Those values are not in scope at the agent's failure site —
+    // runFetchPhase loads + re-sanitizes them — so it MUST surface them in its
+    // return object for the agent to derive the mask set (adversarial-review
+    // round-7 [high]).  Assert the loaded re-sanitized args are returned.
+    it('returns the re-sanitized userInstallArgs it loaded (for the failure-dump mask)', async () => {
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: [], user_install_args: ['--registry=SECRET_TOKEN'] }),
+      );
+      const { spawner } = mockSpawner();
+      const result = await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(result.userInstallArgs).toEqual(['--registry=SECRET_TOKEN']);
+    });
+
+    it('returns an empty userInstallArgs array when none are staged', async () => {
+      const { spawner } = mockSpawner();
+      const result = await runFetchPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        spawner,
+        pmFlagsPath: join(testDir, 'absent.json'),
+      });
+      expect(result.userInstallArgs).toEqual([]);
+    });
   });
 
   // -------------------------------------------------------------------------
