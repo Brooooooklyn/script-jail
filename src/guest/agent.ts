@@ -23,7 +23,7 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
 
-import { Attribution } from './attribution.js';
+import { Attribution, buildRootPkgKeys } from './attribution.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
@@ -3254,26 +3254,19 @@ export async function main(input: AgentInput): Promise<void> {
   // counts as the root project.  The ROOT project is not in node_modules, so
   // discoverPkgDirs never maps it; its lifecycle events attribute to
   // `<rootName>@<rootVersion>` (or bare `<rootName>` when npm sets no version).
-  // Keys MUST match attribution's buildPkg().  Missing/invalid root package.json
-  // → empty set (unchanged semantics: no root lifecycle events to surface).
+  // Keys MUST match attribution's buildPkg() — use buildRootPkgKeys() as the
+  // single source of truth.  Missing/invalid root package.json → empty set
+  // (unchanged semantics: no root lifecycle events to surface).
   //
   // `canonicalRootKey` is the SINGLE key the prepare pass forces every event
   // onto (see the prepare-pass wrapping emitter below).  It is guaranteed to be
-  // a member of `rootPkgKeys`: version present → `<name>@<version>`, else the
-  // bare name, else null (degenerate no-root edge — nothing to force onto).
-  const rootPkgKeys = new Set<string>();
+  // a member of `rootPkgKeys`: version present (even '') → `<name>@<version>`,
+  // else the bare name, else null (degenerate no-root edge — nothing to force onto).
+  let rootPkgKeys = new Set<string>();
   let canonicalRootKey: string | null = null;
   try {
     const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as { name?: unknown; version?: unknown };
-    if (typeof rootManifest.name === 'string' && rootManifest.name.length > 0) {
-      rootPkgKeys.add(rootManifest.name);
-      if (typeof rootManifest.version === 'string' && rootManifest.version.length > 0) {
-        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
-        canonicalRootKey = `${rootManifest.name}@${rootManifest.version}`;
-      } else {
-        canonicalRootKey = rootManifest.name;
-      }
-    }
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
   } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
 
   // Wrap the emitter to also collect events for normalize.

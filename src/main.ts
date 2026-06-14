@@ -44,6 +44,7 @@ import { createDockerBackend } from './action/backend/docker.js';
 import { createBareBackend } from './action/backend/bare.js';
 import { runSelectedBackend } from './action/backend/select.js';
 import type { BackendMap } from './action/backend/select.js';
+import { buildRootPkgKeys } from './guest/attribution.js';
 
 // ---------------------------------------------------------------------------
 // Pinned versions
@@ -307,18 +308,15 @@ export async function main(deps: MainDeps = {}): Promise<void> {
         // so formatEgressWarning can tell whether a `prepare` egress entry is
         // the ROOT's.  The host rebuild does NOT run root `prepare` for
         // npm/yarn, so that egress is audited-only there; pnpm's
-        // `rebuild --pending` does run it.  Mirrors the guest's rootPkgKeys.
-        const rootPackageIds = new Set<string>();
+        // `rebuild --pending` does run it.  Uses buildRootPkgKeys() — the same
+        // single source of truth as the guest's rootPkgKeys — to guarantee the
+        // two sides stay in sync (including the empty-version '' edge case).
+        let rootPackageIds = new Set<string>();
         try {
           const rootManifest = JSON.parse(
             readFileSync(join(repoDir, 'package.json'), 'utf8'),
           ) as { name?: unknown; version?: unknown };
-          if (typeof rootManifest.name === 'string' && rootManifest.name.length > 0) {
-            rootPackageIds.add(rootManifest.name);
-            if (typeof rootManifest.version === 'string' && rootManifest.version.length > 0) {
-              rootPackageIds.add(`${rootManifest.name}@${rootManifest.version}`);
-            }
-          }
+          ({ keys: rootPackageIds } = buildRootPkgKeys(rootManifest));
         } catch {
           /* missing/invalid root package.json → empty set (no entry is root) */
         }
