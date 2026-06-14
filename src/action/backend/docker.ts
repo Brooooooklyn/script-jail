@@ -81,6 +81,13 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
           'mkdir -p /tmp/script-jail-strace',
           'export SCRIPT_JAIL_CONNECTION=stdio',
           'export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml',
+          // The host-owned pm-flags sidecar is staged in the repo tree at
+          // /work/etc/script-jail/pm-flags.json (Docker does not copy it into
+          // /etc the way Firecracker's init does).  Point the guest at it so
+          // the sandbox fetch applies the SAME install args as the host part-1
+          // install — without it, Docker audits a different arg set than the
+          // host installs.  loadPmFlags re-sanitizes the file before use.
+          'export SCRIPT_JAIL_PM_FLAGS_PATH=/work/etc/script-jail/pm-flags.json',
           'exec node /usr/local/lib/script-jail/guest-agent.cjs',
         ].join('; ');
 

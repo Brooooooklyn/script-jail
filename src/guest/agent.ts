@@ -23,7 +23,8 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
 
-import { Attribution } from './attribution.js';
+import { Attribution, buildRootPkgKeys } from './attribution.js';
+import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
@@ -2697,6 +2698,26 @@ export interface AgentInput {
   /** Used for Phase B (install under strace). Defaults to LinuxStraceRunner. */
   strace?: StraceRunner;
   /**
+   * Optional runner for the SECOND Phase-B pass that audits the ROOT project's
+   * `prepare` script (npm `rebuild --foreground-scripts` / yarn `install
+   * --immutable` do NOT run a root `prepare`, so it would otherwise never be
+   * audited).  Production leaves this undefined and the agent constructs a
+   * fresh runner over a SEPARATE events file.  TEST SEAM: when `strace` is
+   * injected (tests) the prepare pass is SKIPPED unless `prepareStrace` is ALSO
+   * injected — keeping every existing test (which injects only `strace`)
+   * byte-for-byte unaffected.
+   */
+  prepareStrace?: StraceRunner;
+  /**
+   * TEST-ONLY seam.  Forces the prepare pass to run even when `strace` is
+   * injected and `prepareStrace` is NOT — i.e. it drives the agent down the
+   * "build my own prepare runner / events file" branch with an injected main
+   * runner, so the fail-closed path (prepare events-file creation failure ⇒
+   * fatal, no lockfile) can be exercised without a real strace.  Never set in
+   * production (the `strace === undefined` branch covers it there).
+   */
+  forcePreparePass?: boolean;
+  /**
    * Override for the running Node's version string.  Defaults to
    * `process.version` (e.g. "v20.11.0").  The leading "v" is stripped before
    * being written into the rendered lockfile so the field contains a plain
@@ -2831,6 +2852,56 @@ function diag(input: AgentInput, msg: string): void {
 }
 
 /**
+ * Resolve the command for the second Phase-B pass that audits the ROOT
+ * project's `prepare` lifecycle script.
+ *
+ * Why this pass exists: the main Phase-B install command for npm
+ * (`npm rebuild --foreground-scripts`) and yarn-berry (`yarn install
+ * --immutable`) does NOT run the ROOT project's `prepare` script — only
+ * dependencies' lifecycle scripts.  A malicious root `prepare` would therefore
+ * escape the audit (and the diff gate) entirely.  pnpm's `pnpm rebuild
+ * --pending` DOES run the root `prepare` (confirmed), so pnpm needs no second
+ * pass → returns `null`.
+ *
+ * Per manager:
+ *   - npm  → `npm run prepare --if-present --foreground-scripts`.  `--if-present`
+ *            makes it a clean exit-0 no-op when no `prepare` script exists, so we
+ *            don't need to read package.json first.
+ *   - yarn → yarn-berry has NO `--if-present`; `yarn run prepare` exits 1 when
+ *            there is no `prepare` script, which would be a wasted (and
+ *            confusingly nonzero) pass.  So we READ `${cwd}/package.json` and
+ *            only return a command when `scripts.prepare` is a non-empty string.
+ *            Any read/parse error → `null` (skip).
+ *   - pnpm → `null` (already covered by `pnpm rebuild --pending`).
+ *
+ * Returns `null` when no prepare pass should run.
+ */
+export function resolvePrepareCommand(
+  manager: 'npm' | 'pnpm' | 'yarn',
+  cwd: string,
+): { cmd: string; args: string[] } | null {
+  if (manager === 'npm') {
+    return { cmd: 'npm', args: ['run', 'prepare', '--if-present', '--foreground-scripts'] };
+  }
+  if (manager === 'yarn') {
+    try {
+      const pkgRaw = readFileSync(joinPath(cwd, 'package.json'), 'utf8');
+      const pkg = JSON.parse(pkgRaw) as { scripts?: Record<string, unknown> };
+      const prepare = pkg.scripts?.['prepare'];
+      if (typeof prepare === 'string' && prepare.length > 0) {
+        return { cmd: 'yarn', args: ['run', 'prepare'] };
+      }
+    } catch {
+      // No package.json, unreadable, or malformed JSON → skip the prepare pass.
+      return null;
+    }
+    return null;
+  }
+  // pnpm: `pnpm rebuild --pending` already runs the root prepare.
+  return null;
+}
+
+/**
  * Redact secrets from package-manager output before it is surfaced to the host
  * (Phase A failure dump).  Defence in depth (Codex round-1 [medium], 2026-06-12):
  * the failure detail tails the install tool's STDOUT, which is repo-controlled
@@ -2870,33 +2941,11 @@ export function redactSensitive(
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);
   }
-  // Layer 2 — credential SHAPES regardless of the protected list.
-  //
-  // LINE-LOCAL CONTRACT (Codex round-9 [high] #1): every shape below matches
-  // WITHIN A SINGLE LINE — none may span a newline.  The Phase-B stdout
-  // collector redacts per complete line (see attachStdoutTailCollector); a shape
-  // whose marker and token straddle a '\n' would be masked by a whole-buffer
-  // pass but MISSED per-line, and once the marker is front-dropped the surviving
-  // token would leak.  Aligning the regexes to be line-local makes per-line
-  // redaction COMPLETE for shapes: the inter-token whitespace classes use
-  // `[^\S\n]` (whitespace except newline), and every token/value class already
-  // excludes whitespace.  Real credentials are single-line, so this loses no
-  // genuine coverage — a `Bearer` with its token on the NEXT line is, by this
-  // contract, not a credential (its token, if itself a known shape or a layer-1
-  // value, is still caught on its own line).
-  out = out
-    // scheme://user:pass@host  → keep scheme + host, drop userinfo
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
-    // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
-    .replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, '$1<REDACTED>')
-    // Bearer <token>
-    .replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
-    // npm automation/granular token literals (npm_… 36+ char)
-    .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>')
-    // GitHub token literals (ghp_/gho_/ghs_/ghu_/ghr_ + 36+ char)
-    .replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, '<REDACTED:GH-TOKEN>')
-    // AWS access key id (AKIA/ASIA + 16 upper-alnum)
-    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '<REDACTED:AWS-KEY>');
+  // Layer 2 — credential SHAPES regardless of the protected list.  Relocated
+  // verbatim into the shared single-source redactor (see src/shared/redact.ts)
+  // so the host part-1 capture path applies the IDENTICAL shape chain.  The
+  // LINE-LOCAL CONTRACT (Codex round-9 [high] #1) is documented there.
+  out = redactCredentialShapes(out);
   return out;
 }
 
@@ -3041,6 +3090,15 @@ export async function main(input: AgentInput): Promise<void> {
     cwd: config.work_dir,
     env: fetchEnv,
     spawner,
+    // Backends that cannot land the host-owned pm-flags sidecar at the default
+    // absolute `/etc/script-jail/pm-flags.json` (Docker, bare, macOS-bare —
+    // only Firecracker's init copies it into /etc) point us at the staged copy
+    // via this env var.  Unset on Firecracker → loadPmFlags() reads the /etc
+    // default.  loadPmFlags re-sanitizes whatever it reads, so this is safe
+    // even though the staged copy lives in the repo-controlled namespace.
+    ...(process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] !== undefined
+      ? { pmFlagsPath: process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] }
+      : {}),
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
 
@@ -3058,8 +3116,21 @@ export async function main(input: AgentInput): Promise<void> {
     // suffix leaks.  Redact the full stdout/stderr (the secret is wholly
     // present), THEN cap the already-masked text.  A mask token split by the
     // cap is harmless (a truncated `<REDACTED:` leaks nothing).
-    const stderrRedacted = redactSensitive(fetchResult.stderr, config.protected.env).trim();
-    const stdoutRedacted = redactSensitive(fetchResult.stdout, config.protected.env).trim();
+    // Developer install `args` are spliced into the Phase-A fetch argv only
+    // (runFetchPhase surfaces the already-re-sanitized set).  A PM error such as
+    // `npm warn invalid config registry="SECRET"` echoes a user-arg VALUE that
+    // matches NO credential SHAPE and is NOT a protected-ENV value — so
+    // `redactSensitive` alone would let it leak to the public Actions log
+    // (adversarial-review round-7 [high]).  Mask the KNOWN exact user-arg values
+    // FIRST (→ <REDACTED:USER-ARG>), THEN run the existing protected-env + shape
+    // redactor.  Empty userInstallArgs ⇒ deriveSensitiveValues([]) ⇒ identity,
+    // so the no-user-args failure dump stays byte-identical.  This single masked
+    // `fetchDetail` feeds BOTH sinks below (serial console + fatal frame).
+    const userArgValues = deriveSensitiveValues(fetchResult.userInstallArgs);
+    const maskUserArgs = (text: string): string =>
+      maskExactValues(text, userArgValues, 'REDACTED:USER-ARG');
+    const stderrRedacted = redactSensitive(maskUserArgs(fetchResult.stderr), config.protected.env).trim();
+    const stdoutRedacted = redactSensitive(maskUserArgs(fetchResult.stdout), config.protected.env).trim();
     const stdoutTail =
       stdoutRedacted.length > 4000 ? `…${stdoutRedacted.slice(-4000)}` : stdoutRedacted;
     const fetchDetail = [
@@ -3170,6 +3241,26 @@ export async function main(input: AgentInput): Promise<void> {
   // 10. Phase B: install (network off, under strace, StraceRunner owns the process)
   const collectedEvents: import('../lock/schema.js').AttributedEvent[] = [];
 
+  // ROOT package keys, computed ONCE here so BOTH Phase-B passes (main install
+  // and the root-prepare pass) and the post-phase normalize all agree on what
+  // counts as the root project.  The ROOT project is not in node_modules, so
+  // discoverPkgDirs never maps it; its lifecycle events attribute to
+  // `<rootName>@<rootVersion>` (or bare `<rootName>` when npm sets no version).
+  // Keys MUST match attribution's buildPkg() — use buildRootPkgKeys() as the
+  // single source of truth.  Missing/invalid root package.json → empty set
+  // (unchanged semantics: no root lifecycle events to surface).
+  //
+  // `canonicalRootKey` is the SINGLE key the prepare pass forces every event
+  // onto (see the prepare-pass wrapping emitter below).  It is guaranteed to be
+  // a member of `rootPkgKeys`: version present (even '') → `<name>@<version>`,
+  // else the bare name, else null (degenerate no-root edge — nothing to force onto).
+  let rootPkgKeys = new Set<string>();
+  let canonicalRootKey: string | null = null;
+  try {
+    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as { name?: unknown; version?: unknown };
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+  } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+
   // Wrap the emitter to also collect events for normalize.
   const collectingEmitter = new Emitter(
     new (class extends Writable {
@@ -3272,6 +3363,7 @@ export async function main(input: AgentInput): Promise<void> {
     // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
     straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
+    rootPkgKeys,
   };
   // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux
   // uses the full strace+shim dispatcher.  Both share PhaseInstallInput /
@@ -3352,6 +3444,235 @@ export async function main(input: AgentInput): Promise<void> {
     );
   }
 
+  // 11a. PREPARE PASS.  The main Phase-B install (`npm rebuild
+  //      --foreground-scripts` / `yarn install --immutable`) does NOT run the
+  //      ROOT project's `prepare` script — only dependencies' lifecycle
+  //      scripts.  A malicious root `prepare` would otherwise escape the audit
+  //      entirely.  pnpm's `pnpm rebuild --pending` DOES run the root prepare,
+  //      so resolvePrepareCommand returns null for it (pass skipped).
+  //
+  //      This is a SECOND `runInstallPhase`/`runInstallPhaseMacos` pass — we
+  //      reuse the whole security-critical dispatch loop (per-pid bypass
+  //      detection, events-file forgery, synthesis) verbatim via the
+  //      `commandOverride` seam rather than duplicating it.  Its events land
+  //      in the SAME `collectingEmitter` → `collectedEvents` → the lockfile,
+  //      and its tamper signal is MERGED into installResult below so the
+  //      tamper gate at 11b still fails closed on a tampering prepare.
+  //
+  //      The pass needs its OWN events file: a fresh runner over the SHARED
+  //      main events file would re-read from offset 0 and DOUBLE-EMIT every
+  //      main event.
+  //
+  //      TEST SEAM: when `input.strace` was injected (tests) we only run the
+  //      prepare pass if `input.prepareStrace` was ALSO injected.  Every
+  //      existing test injects only `input.strace`, so this keeps them
+  //      byte-for-byte unaffected (no prepare pass, no golden drift).
+  const prepareCommand = resolvePrepareCommand(manager, config.work_dir);
+  // Run the prepare pass when a command is resolved AND we have (or can build)
+  // a runner.  TEST SEAM: the existing suite injects only `input.strace`; those
+  // tests must neither run a prepare pass NOR fail closed, so we run only when a
+  // prepare runner was injected (`input.prepareStrace`), or we are in production
+  // (`input.strace === undefined`), or a test explicitly opts in
+  // (`input.forcePreparePass`, used purely to exercise the fail-closed path).
+  if (
+    prepareCommand !== null &&
+    (input.prepareStrace !== undefined ||
+      input.strace === undefined ||
+      input.forcePreparePass === true)
+  ) {
+    diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(' ')}`);
+    // Obtain the prepare runner and its audit sink.  An injected runner owns
+    // its own sink; otherwise build a fresh runner over a SEPARATE events file
+    // — a fresh runner over the SHARED main events file would re-read from
+    // offset 0 and DOUBLE-EMIT every main event.
+    let prepareRunner: StraceRunner;
+    let prepareEventsFilePath = eventsFilePath;
+    if (input.prepareStrace !== undefined) {
+      prepareRunner = input.prepareStrace;
+    } else {
+      // FAIL CLOSED when the prepare events file cannot be created.  Silently
+      // skipping (the earlier draft) would render a final lock with the root
+      // `prepare` UNAUDITED, yet `check` mode could still return `trusted` if
+      // that lock matched a committed one produced under the same degraded
+      // condition (Codex review #2).  Same fatal posture as the MAIN events
+      // file (section 4): an unaudited lifecycle stage must never ship.
+      let pf: EventsFile;
+      try {
+        pf = makeEventsFile();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        emitter.emitError(
+          'script-jail agent: failed to create the audit-events file for the ' +
+            `root-prepare pass — ${reason}. Refusing to emit a lockfile: the ` +
+            'root `prepare` script would otherwise run UNAUDITED and a clean ' +
+            'diff against it would be untrustworthy.',
+          true,
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+      prepareEventsFilePath = pf.path;
+      prepareRunner = isMacosBare
+        ? new MacOSInstallRunner(undefined, pf)
+        : new LinuxStraceRunner(
+            undefined,
+            pf,
+            (s) => redactSensitive(s, config.protected.env),
+            stdoutTailBytes,
+          );
+    }
+    // Point the prepare child's audit sink at the events file the runner uses.
+    const prepareChildEnv = isMacosBare
+      ? buildChildEnvMacos(process.env, config, prepareEventsFilePath, input.preloadPaths)
+      : buildChildEnv(process.env, config, prepareEventsFilePath, input.preloadPaths);
+    const prepareEnv = isMacosBare
+      ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: '1' }
+      : prepareChildEnv;
+    // FORCE-ATTRIBUTION emitter, used ONLY for the prepare pass.  This pass runs
+    // `<manager> run prepare`, so ONLY the root's `prepare` executes — EVERY
+    // event it produces genuinely belongs to the root's prepare, by
+    // construction.  A malicious dependency cannot inject itself into this pass,
+    // so this is bulletproof regardless of any forged `npm_package_name` /
+    // lifecycle env.  We override attribution here at the emitter boundary —
+    // the only place where "this came from the prepare pass" is still known;
+    // once events land in the shared `collectedEvents` the pass identity is
+    // lost.  This makes root identity NON-FORGEABLE for the prepare pass,
+    // independent of the Linux process-tree anchoring.
+    //
+    // Mirrors `collectingEmitter` EXACTLY for non-event frames
+    // (handshake/error/final/etc. pass through unchanged); only `kind:'event'`
+    // frames are rewritten: pkg → canonicalRootKey, lifecycle → 'prepare', and
+    // fs read/write events get `root_anchored = true` (non-fs raw is untouched;
+    // normalize only consults root_anchored for read/write).  The FORCED frame
+    // is what we push into the SHARED `collectedEvents` AND re-emit to the host
+    // stream, so the two stay consistent.
+    const preparingEmitter = new Emitter(
+      new (class extends Writable {
+        override _write(chunk: Buffer, _enc: string, cb: () => void): void {
+          const line = chunk.toString();
+          let frame: Record<string, unknown>;
+          try {
+            frame = JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            // Malformed line from a trusted internal writer — skip silently.
+            cb();
+            return;
+          }
+          if (frame['kind'] === 'event') {
+            const raw = frame['raw'] as import('../lock/schema.js').RawEvent;
+            // Force attribution: this pass runs only the root's prepare.
+            const forcedPkg = canonicalRootKey ?? (frame['pkg'] as string);
+            const forcedLifecycle: import('../lock/schema.js').LifecycleStage = 'prepare';
+            // Only stamp the non-forgeable root anchor when we actually have a
+            // parseable root manifest (canonicalRootKey).  With no root manifest
+            // `forcedPkg` falls back to the frame's own (dep) label, which is NOT
+            // the root — stamping root_anchored there would forge the very signal
+            // normalize relies on.  Inert today (the prepare pass only runs with a
+            // root manifest) but makes the intent explicit.
+            if ((raw.kind === 'read' || raw.kind === 'write') && canonicalRootKey !== null) {
+              raw.root_anchored = true;
+            }
+            const forcedFrame = {
+              ...frame,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+              raw,
+            };
+            const forcedLine = `${JSON.stringify(forcedFrame)}\n`;
+            // Re-emit the FORCED frame to the real emitter (host stream stays
+            // consistent with what normalize sees).
+            input.connection.writable.write(forcedLine);
+            // Collect the FORCED event for normalize.
+            collectedEvents.push({
+              raw,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+            });
+          } else {
+            input.connection.writable.write(line);
+          }
+          cb();
+        }
+      })()
+    );
+    const prepareInput = {
+      manager,
+      cwd: config.work_dir,
+      env: prepareEnv,
+      strace: prepareRunner,
+      attribution,
+      emitter: preparingEmitter,
+      // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
+      // the main install's files on the scratch disk.
+      straceBasePath: `${straceBaseDir}/strace-prepare.out`,
+      protectedPaths,
+      rootPkgKeys,
+      commandOverride: prepareCommand,
+    };
+    const prepareResult = isMacosBare
+      ? await runInstallPhaseMacos(prepareInput)
+      : await runInstallPhase(prepareInput);
+    diag(
+      input,
+      `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`,
+    );
+    // MERGE.  Mirrors the main-path fail-closed gate (~3402-3452):
+    //
+    //   - prepareResult.exitCode !== 0 && prepareResult.eventCount === 0:
+    //     FATAL.  The prepare script is KNOWN to exist (we only reach this
+    //     branch when prepareCommand !== null), so a traced run must produce
+    //     at least some events (node/sh startup emits fs reads).  Zero events
+    //     with a nonzero exit means strace could not attach or the PM aborted
+    //     before spawning the prepare script — i.e. the root `prepare` ran
+    //     UNAUDITED.  A clean diff against the resulting lockfile would be
+    //     untrustworthy.  Fail closed, exactly mirroring the main path.
+    //
+    //   - prepareResult.exitCode !== 0 && prepareResult.eventCount > 0:
+    //     Non-fatal.  Audit data exists (prepare failed offline but was
+    //     traced).  Fold counts/tamper and continue — same as the main path's
+    //     non-fatal nonzero handling.
+    //
+    //   - prepareResult.exitCode === 0: unchanged (fold counts/tamper).
+    //
+    // TWO tamper sources for the non-fatal paths, exactly mirroring what 11b
+    // does for the MAIN runner
+    // (`installResult.tamperReason ?? straceRunner.getTamperReason()`):
+    //   - `prepareResult.tamperReason` — the prepare DISPATCHER's owned reason
+    //     (shim-channel parse failure / bad LineSource).
+    //   - `prepareRunner.getTamperReason()` — the prepare RUNNER's events-file
+    //     tamper (unlink / inode-swap / mtime regression on the prepare events
+    //     file).  Critically, 11b only consults the MAIN `straceRunner`, never
+    //     the prepare runner — so without folding it in here a file-tamper on
+    //     the prepare pass's own events file would NOT fail closed.  First-
+    //     non-null wins (preserve the earliest, most specific reason).
+    if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) ` +
+          'and produced no audit events — the root `prepare` script likely ran ' +
+          'untraced (strace could not attach) or the package manager aborted ' +
+          'before spawning it. Refusing to emit a lockfile: the root `prepare` ' +
+          'would be unaudited and a clean diff against it would be untrustworthy.',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    if (prepareResult.exitCode !== 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) — ` +
+          'the root `prepare` script failed under audit. This is recorded in the ' +
+          'lockfile, not treated as a fatal error.',
+        false,
+      );
+    }
+    installResult.eventCount += prepareResult.eventCount;
+    const prepareTamper =
+      prepareResult.tamperReason ?? prepareRunner.getTamperReason();
+    if (installResult.tamperReason === null) {
+      installResult.tamperReason = prepareTamper;
+    }
+  }
+
   // 11b. Events-file tamper check (Findings A + B): the tailer baseline-
   //      stats the SCRIPT_JAIL_LOG_FILE path on every drain cycle and records
   //      any anomaly (unlink, inode mismatch, truncate, EACCES, parent-dir
@@ -3417,6 +3738,21 @@ export async function main(input: AgentInput): Promise<void> {
   const pkgDirs = new Map<string, string>(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
 
+  // The ROOT project is not in node_modules, so discoverPkgDirs never maps it.
+  // Its lifecycle events attribute to `<rootName>@<rootVersion>` (or bare
+  // `<rootName>` when npm sets no version): root pre/install/postinstall from
+  // the MAIN install pass, and root `prepare` from the prepare pass.  We do NOT
+  // register the root as a pkgDir — mapping it to work_dir would make the WHOLE
+  // repo $PKG, dropping every root write into the repo as intra-package (hiding
+  // the audited behaviour) and letting a dependency forge `npm_package_name=
+  // <root>` to write anywhere under the repo with the write silently dropped
+  // (Codex review #1).  Instead we pass the root keys to normalize as
+  // `rootPkgKeys`, which tokenizes the root's fs events against $REPO/
+  // $NODE_MODULES and SURFACES them (external_reads / escaped_writes) instead of
+  // throwing on the missing pkgDir.  Keys MUST match attribution's buildPkg().
+  // `rootPkgKeys` is computed ONCE before the Phase-B passes (section 10) and
+  // threaded into both — we reuse the SAME set here.
+
   // 12. Normalize + render
   //
   // On macOS-bare the normalize pass MUST run with `os: 'darwin'` so the
@@ -3426,8 +3762,8 @@ export async function main(input: AgentInput): Promise<void> {
   // that never reconcile against the Linux-produced committed lock.  The Linux
   // path keeps the default (`os` undefined → 'linux').
   const ctx: NormalizeContext = isMacosBare
-    ? { roots, pkgDirs, os: 'darwin' }
-    : { roots, pkgDirs };
+    ? { roots, pkgDirs, rootPkgKeys, os: 'darwin' }
+    : { roots, pkgDirs, rootPkgKeys };
 
   let yaml: string;
   try {

@@ -418,6 +418,125 @@ describe('normalize', () => {
     });
   });
 
+  // Root-project prepare pass: the ROOT project is not in node_modules, so
+  // discoverPkgDirs never maps it. The guest agent registers it in pkgDirs
+  // mapping the root key -> work_dir (== roots.repo). Once registered, a root
+  // fs event MUST NOT throw, and:
+  //   - a write INTO the repo tokenizes to $PKG and DROPS as intra-package
+  //     (build output is benign), and
+  //   - a read OUTSIDE the repo SURFACES under external_reads.
+  // This is the regression for the SHIPPING BLOCKER: a build `prepare` writing
+  // dist/ used to crash normalize() with `pkgDirs missing entry for <root>`.
+  describe('root-project events (rootPkgKeys → surfaced, never dropped)', () => {
+    const rootKey = 'runs-root-prepare@1.0.0';
+    // The agent passes the root key(s) via rootPkgKeys and gives the root NO
+    // pkgDir.  SECURITY-CRITICAL (Codex review #1): mapping the root to work_dir
+    // would make the whole repo $PKG, dropping every root write into the repo as
+    // "intra-package" — which a dependency could exploit by forging
+    // npm_package_name=<root> to hide a write anywhere under /work.  Instead the
+    // root's fs events tokenize against $REPO/$NODE_MODULES and SURFACE
+    // (external_reads / escaped_writes), so real OR forged, they always show.
+    const rootCtx: NormalizeContext = {
+      roots,
+      pkgDirs: new Map(),
+      rootPkgKeys: new Set([rootKey]),
+    };
+
+    // GENUINE root events carry the non-forgeable `root_anchored: true` verdict
+    // (Linux dispatcher derives it from the process tree; the prepare pass forces
+    // it true).  Only such events surface as the un-prefixed `$REPO/...`.
+    function rootRead(path: string, hidden = false): AttributedEvent {
+      return {
+        raw: { kind: 'read', path, pid: 1, ts: 0, hidden, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'prepare',
+      };
+    }
+    function rootWrite(path: string, hidden = false): AttributedEvent {
+      return {
+        raw: { kind: 'write', path, pid: 1, ts: 0, hidden, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'prepare',
+      };
+    }
+    // FORGED root events: the pkg CLAIMS the root key (forgeable npm_package_name)
+    // but `root_anchored` is absent — the non-forgeable verdict says "not the
+    // genuine root".  These must surface with the `<FORGED_ROOT> ` prefix.
+    function forgedRead(path: string, hidden = false): AttributedEvent {
+      return { raw: { kind: 'read', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'prepare' };
+    }
+    function forgedWrite(path: string, hidden = false): AttributedEvent {
+      return { raw: { kind: 'write', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'prepare' };
+    }
+
+    it('does NOT throw for a root-pkg fs event when listed in rootPkgKeys', () => {
+      const events = [rootWrite('/work/dist/index.js'), rootRead('/etc/hostname')];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    it('STILL throws for a non-root pkg with no pkgDir (forged/unknown attribution fails closed)', () => {
+      const events = [rootWrite('/work/dist/index.js')];
+      const notRoot: NormalizeContext = { roots, pkgDirs: new Map(), rootPkgKeys: new Set(['other@9.9.9']) };
+      // The pkg does NOT claim root (not in rootPkgKeys) and has no pkgDir.
+      expect(() => normalize(events, notRoot)).toThrow(/pkgDirs missing entry/);
+    });
+
+    it('SURFACES an intra-repo root write as $REPO/... (closes the forged-root hide hole)', () => {
+      const events = [rootWrite('/work/prepare-built.txt')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.escaped_writes).toEqual(['$REPO/prepare-built.txt']);
+    });
+
+    it('SURFACES an escaping root read under external_reads', () => {
+      const events = [rootRead('/etc/hostname')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      // /etc/hostname is NOT a system-noise prefix (unlike /etc/hosts), so it
+      // survives to external_reads.
+      expect(block?.external_reads).toEqual(['/etc/hostname']);
+    });
+
+    it('classifies both in one pass: repo write AND escaping read both surfaced', () => {
+      const events = [rootWrite('/work/prepare-built.txt'), rootRead('/etc/hostname')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.escaped_writes).toEqual(['$REPO/prepare-built.txt']);
+      expect(block?.external_reads).toEqual(['/etc/hostname']);
+    });
+
+    it('PREFIXES a FORGED-root write with <FORGED_ROOT> (root_anchored absent → not dropped, not thrown)', () => {
+      const events = [forgedWrite('/work/prepare-built.txt')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      // Surfaces (fail-loud), distinct from the genuine `$REPO/...` string.
+      expect(block?.escaped_writes).toEqual(['<FORGED_ROOT> $REPO/prepare-built.txt']);
+    });
+
+    it('PREFIXES a FORGED-root read with <FORGED_ROOT> (root_anchored absent → surfaces)', () => {
+      const events = [forgedRead('/etc/hostname')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.external_reads).toEqual(['<FORGED_ROOT> /etc/hostname']);
+    });
+
+    it('does NOT throw for a FORGED-root fs event (avoids dependency-triggered DoS)', () => {
+      const events = [forgedWrite('/work/anywhere.js'), forgedRead('/etc/hostname')];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    // SECURITY CRUX (non-collapse): a genuine root write and a forged write to
+    // the SAME path must BOTH appear.  Without the `<FORGED_ROOT> ` prefix the
+    // two identical `$REPO/dist/index.js` strings would dedupe-collapse to one
+    // in sortAndDedupe — hiding the forgery behind the legitimate write.
+    it('does NOT dedupe-collapse a forged write onto an identical genuine root write', () => {
+      const events = [
+        rootWrite('/work/dist/index.js'), // genuine (root_anchored: true)
+        forgedWrite('/work/dist/index.js'), // forged (same path, root_anchored absent)
+      ];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.escaped_writes).toEqual([
+        '$REPO/dist/index.js',
+        '<FORGED_ROOT> $REPO/dist/index.js',
+      ]);
+    });
+  });
+
   // Imp 4: argv[0] must be tokenized when absolute, and well-known binary paths
   // must be collapsed to their basename for byte-stability across rootfs variants.
   describe('spawn argv[0] tokenization (Imp 4)', () => {

@@ -10363,6 +10363,7 @@ __export(agent_exports, {
   main: () => main,
   readStraceChildPid: () => readStraceChildPid,
   redactSensitive: () => redactSensitive,
+  resolvePrepareCommand: () => resolvePrepareCommand,
   runStraceTailer: () => runStraceTailer,
   scratchBaseDir: () => scratchBaseDir
 });
@@ -24903,7 +24904,8 @@ var FsReadEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -24913,7 +24915,8 @@ var FsWriteEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
@@ -25112,6 +25115,19 @@ function isCanonicalStage(s) {
 function buildPkg(name, version2) {
   return version2 !== void 0 ? `${name}@${version2}` : name;
 }
+function buildRootPkgKeys(manifest) {
+  const keys = /* @__PURE__ */ new Set();
+  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+    return { keys, canonical: null };
+  }
+  const name = manifest.name;
+  keys.add(name);
+  if (typeof manifest.version === "string") {
+    keys.add(`${name}@${manifest.version}`);
+    return { keys, canonical: `${name}@${manifest.version}` };
+  }
+  return { keys, canonical: name };
+}
 function attributionFromEnvVars(name, version2, event) {
   if (name !== void 0 && name.length > 0 && event !== void 0 && isCanonicalStage(event)) {
     return { pkg: buildPkg(name, version2), lifecycle: event };
@@ -25175,8 +25191,8 @@ var Attribution = class {
   }
   _walk(startPid) {
     let current = startPid;
-    const MAX_DEPTH = 1024;
-    for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    const MAX_DEPTH2 = 1024;
+    for (let depth = 0; depth < MAX_DEPTH2; depth++) {
       if (current === 0 || current === 1) {
         return null;
       }
@@ -25200,6 +25216,29 @@ var Attribution = class {
     return null;
   }
 };
+
+// src/shared/redact.ts
+function redactCredentialShapes(text) {
+  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+}
+function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
+  const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
+  let out = text;
+  const replacement = `<${label}>`;
+  for (const value of unique) {
+    out = out.split(value).join(replacement);
+  }
+  return out;
+}
+function deriveSensitiveValues(args) {
+  const values = [];
+  for (const t of args) {
+    values.push(t);
+    const eq = t.indexOf("=");
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}
 
 // src/guest/proc-reader.ts
 var import_node_fs = require("node:fs");
@@ -25355,6 +25394,73 @@ var Emitter = class {
   }
 };
 
+// src/shared/pm-commands.ts
+var FETCH_CMD = {
+  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
+  pnpm: {
+    cmd: "pnpm",
+    args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"]
+  },
+  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
+};
+var INSTALL_CMD = {
+  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
+  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events). Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
+};
+function pnpmStoreDirArg(pm, cwd) {
+  return pm === "pnpm" ? [`--store-dir=${cwd}/.pnpm-store`] : [];
+}
+function isBareFlag(token) {
+  return !token.includes("=");
+}
+function canonicalFlagKey(token) {
+  if (token.length === 0 || token[0] !== "-") return null;
+  let i = 0;
+  while (i < token.length && token[i] === "-") i += 1;
+  let body = token.slice(i);
+  const eq = body.indexOf("=");
+  if (eq !== -1) body = body.slice(0, eq);
+  body = body.toLowerCase();
+  if (body.startsWith("no-")) body = body.slice("no-".length);
+  if (body.startsWith("config.")) body = body.slice("config.".length);
+  let key = "";
+  for (const ch of body) {
+    if (ch !== "-" && ch !== "_" && ch !== ".") key += ch;
+  }
+  return key;
+}
+function isForbiddenFlag(token) {
+  const key = canonicalFlagKey(token);
+  if (key === null || key.length === 0) return false;
+  if (key.length >= 2 && "ignorescripts".startsWith(key)) return true;
+  if (key === "mode") return true;
+  return false;
+}
+function sanitizeInstallArgs(args) {
+  const kept = [];
+  const dropped = [];
+  const droppedKeys = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (isForbiddenFlag(a)) {
+      dropped.push(a);
+      const rawKey = canonicalFlagKey(a) ?? "unknown";
+      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : rawKey;
+      droppedKeys.push(`--${displayKey}`);
+      if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        dropped.push(args[++i]);
+      }
+      continue;
+    }
+    kept.push(a);
+  }
+  return { kept, dropped, droppedKeys };
+}
+
 // src/guest/apply-pnpm-arch.ts
 var fs = __toESM(require("node:fs"), 1);
 var path = __toESM(require("node:path"), 1);
@@ -25403,41 +25509,39 @@ function applyPnpmArchOverlay(input) {
 // src/guest/load-pm-flags.ts
 var fs2 = __toESM(require("node:fs"), 1);
 var PmFlagsSchema = external_exports.object({
-  extra_install_args: external_exports.array(external_exports.string())
+  extra_install_args: external_exports.array(external_exports.string()),
+  user_install_args: external_exports.array(external_exports.string()).optional()
 });
 var PM_FLAGS_PATH = "/etc/script-jail/pm-flags.json";
 function loadPmFlags(filePath = PM_FLAGS_PATH) {
   try {
     const raw = fs2.readFileSync(filePath, "utf8");
     const parsed = PmFlagsSchema.safeParse(JSON.parse(raw));
-    if (!parsed.success) return { extraInstallArgs: [] };
-    return { extraInstallArgs: parsed.data.extra_install_args };
+    if (!parsed.success) return { extraInstallArgs: [], userInstallArgs: [] };
+    return {
+      extraInstallArgs: sanitizeInstallArgs(parsed.data.extra_install_args).kept,
+      userInstallArgs: sanitizeInstallArgs(parsed.data.user_install_args ?? []).kept
+    };
   } catch {
-    return { extraInstallArgs: [] };
+    return { extraInstallArgs: [], userInstallArgs: [] };
   }
 }
 
 // src/guest/phase-fetch.ts
-var FETCH_CMD = {
-  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"] },
-  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
-};
 async function runFetchPhase(input) {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
+  const { extraInstallArgs, userInstallArgs } = loadPmFlags(input.pmFlagsPath);
   let args = baseArgs;
-  if (input.manager === "npm") {
-    const { extraInstallArgs } = loadPmFlags(input.pmFlagsPath);
-    if (extraInstallArgs.length > 0) {
-      args = [...baseArgs, ...extraInstallArgs];
-    }
+  if (input.manager === "npm" && extraInstallArgs.length > 0) {
+    args = [...args, ...extraInstallArgs];
+  }
+  if (userInstallArgs.length > 0) {
+    args = [...args, ...userInstallArgs];
   }
   if (input.manager === "pnpm") {
     applyPnpmArchOverlay({ cwd: input.cwd, ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {} });
   }
-  if (input.manager === "pnpm") {
-    args = [...args, `--store-dir=${input.cwd}/.pnpm-store`];
-  }
+  args = [...args, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const result = await input.spawner.spawn(cmd, args, {
     env: input.env,
     cwd: input.cwd
@@ -25449,7 +25553,15 @@ async function runFetchPhase(input) {
     // resolution failures, …) to STDOUT; stderr is typically empty.  Return
     // stdout too so the agent's Phase A failure dump can include it — an
     // empty fatal message hides the actual cause (found dogfooding napi-rs).
-    stdout: result.stdout
+    stdout: result.stdout,
+    // Surface the (already re-sanitized) developer install args spliced into
+    // the fetch argv above.  On the Phase-A FAILURE path the agent masks these
+    // exact values out of the redacted detail BEFORE it reaches either sink
+    // (serial console + fatal frame) — a PM error like
+    // `npm warn invalid config registry="SECRET"` echoes a user-arg value that
+    // matches no credential SHAPE and no protected-ENV value, so without this
+    // it would leak to the public Actions log (adversarial-review round-7).
+    userInstallArgs
   };
 }
 
@@ -26100,15 +26212,35 @@ function normalizePattern(p) {
   return p;
 }
 
+// src/guest/root-anchor.ts
+var MAX_DEPTH = 1024;
+function isRepoRootAnchored(input) {
+  const { childParent, execCwd, workDir, rootPid } = input;
+  let cur = input.pid;
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    if (cur === rootPid) {
+      return true;
+    }
+    if (input.cwdUnknown(cur)) {
+      return false;
+    }
+    const ec = execCwd.get(cur);
+    if (ec === null) {
+      return false;
+    }
+    if (ec !== void 0 && ec !== workDir) {
+      return false;
+    }
+    const parent = childParent.get(cur);
+    if (parent === void 0) {
+      return false;
+    }
+    cur = parent;
+  }
+  return false;
+}
+
 // src/guest/phase-install.ts
-var INSTALL_CMD = {
-  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
-  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
-  // sever; the cache Phase A populated makes this a zero-network relink+build.
-  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
-};
 var NODE_STARTUP_DONE_STRACE_PATH = "/tmp/script-jail-node-startup-done";
 function parseShimLine(line) {
   try {
@@ -26235,8 +26367,8 @@ function cloneFlagsHaveUntraced(line) {
   return false;
 }
 async function runInstallPhase(input) {
-  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
-  const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
+  const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
+  const args = [...baseArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -26248,11 +26380,19 @@ async function runInstallPhase(input) {
     if (phaseTamperReason === null) phaseTamperReason = reason;
     input.strace.recordTamper(reason);
   };
-  const emit = (ev) => {
+  const emitFinal = (ev) => {
     const filtered = applyProtectedPathsPolicy(ev, matcher);
     if (filtered === null) return;
     input.emitter.emitEvent(filtered);
     eventCount++;
+  };
+  const deferredRootFsEvents = [];
+  const emit = (ev) => {
+    if (input.rootPkgKeys !== void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write") && input.rootPkgKeys.has(ev.pkg) && ev.raw.root_anchored === void 0) {
+      deferredRootFsEvents.push(ev);
+      return;
+    }
+    emitFinal(ev);
   };
   const straceExecsByPid = /* @__PURE__ */ new Map();
   const shimExecCountByPid = /* @__PURE__ */ new Map();
@@ -26681,6 +26821,9 @@ async function runInstallPhase(input) {
   const dirfdTable = /* @__PURE__ */ new Map();
   const fdKey = (pid, fd) => `${rootedFd(pid)}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
+  const childParent = /* @__PURE__ */ new Map();
+  const execCwd = /* @__PURE__ */ new Map();
+  const pendingExecCwd = /* @__PURE__ */ new Set();
   const pidCwdUnknown = /* @__PURE__ */ new Set();
   function cwdGet(pid) {
     return pidCwd.get(rootedCwd(pid));
@@ -26699,6 +26842,22 @@ async function runInstallPhase(input) {
   }
   function cwdUnknownDelete(pid) {
     pidCwdUnknown.delete(rootedCwd(pid));
+  }
+  function rootAnchored(pid) {
+    const rootPid = installRootPid;
+    if (rootPid === null) return false;
+    return isRepoRootAnchored({
+      pid,
+      childParent,
+      execCwd,
+      // Group-aware: `pidCwdUnknown` is keyed by cwd-group root (CLONE_FS), so
+      // querying the raw pid would miss a pid marked unknown via a sibling.
+      // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
+      // walker's fail-closed disqualifier sees the real unknown state.
+      cwdUnknown: cwdUnknownHas,
+      workDir: path2.resolve(input.cwd),
+      rootPid
+    });
   }
   const dirfdStateUnknown = /* @__PURE__ */ new Set();
   function fdUnknownHas(pid) {
@@ -26975,6 +27134,7 @@ async function runInstallPhase(input) {
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path2.resolve(input.cwd));
+        execCwd.set(pid, path2.resolve(input.cwd));
       }
     }
     if (source === "shim") {
@@ -27104,6 +27264,7 @@ async function runInstallPhase(input) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
           if (Number.isFinite(childPid) && childPid > 0) {
             propagateNodeBootstrap(pid, childPid);
+            childParent.set(childPid, pid);
             let cloneFs = false;
             let cloneFiles = false;
             if (syscallName === "clone" || syscallName === "clone3") {
@@ -27164,6 +27325,13 @@ async function runInstallPhase(input) {
               } else if (parentCwd !== void 0 && currentChildCwd === void 0) {
                 cwdSet(childPid, parentCwd);
               }
+            }
+            if (pendingExecCwd.has(childPid)) {
+              execCwd.set(
+                childPid,
+                cwdUnknownHas(childPid) ? null : cwdGet(childPid) ?? null
+              );
+              pendingExecCwd.delete(childPid);
             }
             if (cloneFiles && !childHadPendingFdDetach) {
               unionFd(pid, childPid);
@@ -27812,6 +27980,18 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          if (!execCwd.has(rawEvent.pid)) {
+            if (cwdUnknownHas(rawEvent.pid)) {
+              execCwd.set(rawEvent.pid, null);
+            } else {
+              const cwd = cwdGet(rawEvent.pid);
+              if (cwd !== void 0) {
+                execCwd.set(rawEvent.pid, cwd);
+              } else {
+                pendingExecCwd.add(rawEvent.pid);
+              }
+            }
+          }
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
           packageManagerClientPids.delete(rawEvent.pid);
@@ -27991,7 +28171,10 @@ async function runInstallPhase(input) {
           if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
             continue;
           }
-          const resolved = rawEvent.kind === "read" ? { ...rawEvent, path: canonical } : { ...rawEvent, path: canonical };
+          const resolved = {
+            ...rawEvent,
+            path: canonical
+          };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
@@ -28089,6 +28272,19 @@ async function runInstallPhase(input) {
       lifecycle: sample.lifecycle
     });
   }
+  for (const pid of pendingExecCwd) execCwd.set(pid, null);
+  pendingExecCwd.clear();
+  for (const ev of deferredRootFsEvents) {
+    if (ev.raw.kind !== "read" && ev.raw.kind !== "write") {
+      emitFinal(ev);
+      continue;
+    }
+    emitFinal({
+      ...ev,
+      raw: { ...ev.raw, root_anchored: rootAnchored(ev.raw.pid) }
+    });
+  }
+  deferredRootFsEvents.length = 0;
   const exitCode = input.strace.getExitCode();
   const installStdoutTail = input.strace.getStdoutTail?.() ?? "";
   return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
@@ -28118,16 +28314,6 @@ function parseMacosShimLine(line) {
   }
   return parseShimLine(line);
 }
-var INSTALL_CMD2 = {
-  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
-  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
-  // rationale.  The macOS-bare backend is observe-only and does not sever the
-  // network, but the cache Phase A populated still makes this a relink+build
-  // with no required registry traffic.
-  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
-};
 var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
   "npm_package_name",
   "npm_package_version",
@@ -28143,8 +28329,11 @@ function macosManagerLaunch(manager, subArgs) {
   const corepackCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
   return { cmd: node, args: [corepackCli, manager, ...subArgs] };
 }
-function buildMacosInstallCommand(manager, cwd) {
-  const base = INSTALL_CMD2[manager];
+function buildMacosInstallCommand(manager, cwd, commandOverride) {
+  if (commandOverride !== void 0) {
+    return macosManagerLaunch(manager, commandOverride.args);
+  }
+  const base = INSTALL_CMD[manager];
   const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
   return macosManagerLaunch(manager, managerArgs);
 }
@@ -28155,7 +28344,7 @@ function pathBasename2(pathLike) {
   return slash === -1 ? value : value.slice(slash + 1);
 }
 async function runInstallPhaseMacos(input) {
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
+  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd, input.commandOverride);
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -28463,8 +28652,10 @@ async function runInstallPhaseMacos(input) {
     }
     const attribution = freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
     if (attribution === null) continue;
+    const isRootAttributedFsEvent = (shimEvent.kind === "read" || shimEvent.kind === "write") && input.rootPkgKeys?.has(attribution.pkg) === true;
+    const raw = isRootAttributedFsEvent ? { ...shimEvent, root_anchored: true } : shimEvent;
     const attributed = {
-      raw: shimEvent,
+      raw,
       pkg: attribution.pkg,
       lifecycle: attribution.lifecycle
     };
@@ -28698,18 +28889,21 @@ function normalize(events, ctx) {
     const fsPath = (ev.raw.kind === "read" || ev.raw.kind === "write") && os === "darwin" ? canonicalizePrivateRealpath(ev.raw.path) : ev.raw.kind === "read" || ev.raw.kind === "write" ? ev.raw.path : void 0;
     if (isSystemNoise(ev, fsPath, os)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
-    if (pkgDir === void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
+    const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
+    const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write") && ev.raw.root_anchored !== true;
+    if (pkgDir === void 0 && !claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`
       );
     }
+    const forgedPrefix = isForgedRoot ? "<FORGED_ROOT> " : "";
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
     switch (ev.raw.kind) {
       case "read": {
         const tokenized = normalizeVolatilePath(tokenize(fsPath, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
-        const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
-        block.external_reads.push(tagged);
+        const hiddenTag = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
+        block.external_reads.push(`${forgedPrefix}${hiddenTag}`);
         break;
       }
       case "write": {
@@ -28717,7 +28911,7 @@ function normalize(events, ctx) {
         if (isInsidePkg(tokenized)) continue;
         const hiddenPrefix = ev.raw.hidden ? "<HIDDEN> " : "";
         const crossPrefix = isCrossPackage(tokenized) ? "<CROSS_PACKAGE> " : "";
-        block.escaped_writes.push(`${hiddenPrefix}${crossPrefix}${tokenized}`);
+        block.escaped_writes.push(`${forgedPrefix}${hiddenPrefix}${crossPrefix}${tokenized}`);
         break;
       }
       case "env_read": {
@@ -30208,6 +30402,25 @@ function diag(input, msg) {
   else process.stderr.write(`[agent] ${msg}
 `);
 }
+function resolvePrepareCommand(manager, cwd) {
+  if (manager === "npm") {
+    return { cmd: "npm", args: ["run", "prepare", "--if-present", "--foreground-scripts"] };
+  }
+  if (manager === "yarn") {
+    try {
+      const pkgRaw = (0, import_node_fs3.readFileSync)((0, import_node_path4.join)(cwd, "package.json"), "utf8");
+      const pkg = JSON.parse(pkgRaw);
+      const prepare = pkg.scripts?.["prepare"];
+      if (typeof prepare === "string" && prepare.length > 0) {
+        return { cmd: "yarn", args: ["run", "prepare"] };
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+  return null;
+}
 function redactSensitive(text, protectedEnvNames, env = process.env) {
   let out = text;
   const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
@@ -30216,7 +30429,7 @@ function redactSensitive(text, protectedEnvNames, env = process.env) {
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);
   }
-  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+  out = redactCredentialShapes(out);
   return out;
 }
 async function main(input) {
@@ -30281,12 +30494,21 @@ async function main(input) {
     manager,
     cwd: config2.work_dir,
     env: fetchEnv,
-    spawner
+    spawner,
+    // Backends that cannot land the host-owned pm-flags sidecar at the default
+    // absolute `/etc/script-jail/pm-flags.json` (Docker, bare, macOS-bare —
+    // only Firecracker's init copies it into /etc) point us at the staged copy
+    // via this env var.  Unset on Firecracker → loadPmFlags() reads the /etc
+    // default.  loadPmFlags re-sanitizes whatever it reads, so this is safe
+    // even though the staged copy lives in the repo-controlled namespace.
+    ...process.env["SCRIPT_JAIL_PM_FLAGS_PATH"] !== void 0 ? { pmFlagsPath: process.env["SCRIPT_JAIL_PM_FLAGS_PATH"] } : {}
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
   if (!fetchResult.ok) {
-    const stderrRedacted = redactSensitive(fetchResult.stderr, config2.protected.env).trim();
-    const stdoutRedacted = redactSensitive(fetchResult.stdout, config2.protected.env).trim();
+    const userArgValues = deriveSensitiveValues(fetchResult.userInstallArgs);
+    const maskUserArgs = (text) => maskExactValues(text, userArgValues, "REDACTED:USER-ARG");
+    const stderrRedacted = redactSensitive(maskUserArgs(fetchResult.stderr), config2.protected.env).trim();
+    const stdoutRedacted = redactSensitive(maskUserArgs(fetchResult.stdout), config2.protected.env).trim();
     const stdoutTail = stdoutRedacted.length > 4e3 ? `\u2026${stdoutRedacted.slice(-4e3)}` : stdoutRedacted;
     const fetchDetail = [
       stderrRedacted,
@@ -30342,6 +30564,13 @@ ${fetchDetail}
     }
   }
   const collectedEvents = [];
+  let rootPkgKeys = /* @__PURE__ */ new Set();
+  let canonicalRootKey = null;
+  try {
+    const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+  } catch {
+  }
   const collectingEmitter = new Emitter(
     new class extends import_node_stream.Writable {
       _write(chunk, _enc, cb) {
@@ -30403,7 +30632,8 @@ ${fetchDetail}
     // tailer's always-empty watchDir).  Per-pid `strace -ff` logs for a large
     // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
     straceBasePath: `${straceBaseDir}/strace.out`,
-    protectedPaths
+    protectedPaths,
+    rootPkgKeys
   };
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
@@ -30434,6 +30664,114 @@ ${stdoutTail}`;
       false
     );
   }
+  const prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
+  if (prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true)) {
+    diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
+    let prepareRunner;
+    let prepareEventsFilePath = eventsFilePath;
+    if (input.prepareStrace !== void 0) {
+      prepareRunner = input.prepareStrace;
+    } else {
+      let pf;
+      try {
+        pf = makeEventsFile();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        emitter.emitError(
+          `script-jail agent: failed to create the audit-events file for the root-prepare pass \u2014 ${reason}. Refusing to emit a lockfile: the root \`prepare\` script would otherwise run UNAUDITED and a clean diff against it would be untrustworthy.`,
+          true
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+      prepareEventsFilePath = pf.path;
+      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf) : new LinuxStraceRunner(
+        void 0,
+        pf,
+        (s) => redactSensitive(s, config2.protected.env),
+        stdoutTailBytes
+      );
+    }
+    const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
+    const prepareEnv = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
+    const preparingEmitter = new Emitter(
+      new class extends import_node_stream.Writable {
+        _write(chunk, _enc, cb) {
+          const line = chunk.toString();
+          let frame;
+          try {
+            frame = JSON.parse(line);
+          } catch {
+            cb();
+            return;
+          }
+          if (frame["kind"] === "event") {
+            const raw = frame["raw"];
+            const forcedPkg = canonicalRootKey ?? frame["pkg"];
+            const forcedLifecycle = "prepare";
+            if ((raw.kind === "read" || raw.kind === "write") && canonicalRootKey !== null) {
+              raw.root_anchored = true;
+            }
+            const forcedFrame = {
+              ...frame,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+              raw
+            };
+            const forcedLine = `${JSON.stringify(forcedFrame)}
+`;
+            input.connection.writable.write(forcedLine);
+            collectedEvents.push({
+              raw,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle
+            });
+          } else {
+            input.connection.writable.write(line);
+          }
+          cb();
+        }
+      }()
+    );
+    const prepareInput = {
+      manager,
+      cwd: config2.work_dir,
+      env: prepareEnv,
+      strace: prepareRunner,
+      attribution,
+      emitter: preparingEmitter,
+      // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
+      // the main install's files on the scratch disk.
+      straceBasePath: `${straceBaseDir}/strace-prepare.out`,
+      protectedPaths,
+      rootPkgKeys,
+      commandOverride: prepareCommand
+    };
+    const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
+    diag(
+      input,
+      `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
+    );
+    if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) and produced no audit events \u2014 the root \`prepare\` script likely ran untraced (strace could not attach) or the package manager aborted before spawning it. Refusing to emit a lockfile: the root \`prepare\` would be unaudited and a clean diff against it would be untrustworthy.`,
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    if (prepareResult.exitCode !== 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) \u2014 the root \`prepare\` script failed under audit. This is recorded in the lockfile, not treated as a fatal error.`,
+        false
+      );
+    }
+    installResult.eventCount += prepareResult.eventCount;
+    const prepareTamper = prepareResult.tamperReason ?? prepareRunner.getTamperReason();
+    if (installResult.tamperReason === null) {
+      installResult.tamperReason = prepareTamper;
+    }
+  }
   const tamperReason = installResult.tamperReason ?? straceRunner.getTamperReason();
   if (tamperReason !== null) {
     emitter.emitError(
@@ -30449,7 +30787,7 @@ ${stdoutTail}`;
   diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
   const pkgDirs = new Map(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
-  const ctx = isMacosBare ? { roots, pkgDirs, os: "darwin" } : { roots, pkgDirs };
+  const ctx = isMacosBare ? { roots, pkgDirs, rootPkgKeys, os: "darwin" } : { roots, pkgDirs, rootPkgKeys };
   let yaml;
   try {
     const packages = normalize(collectedEvents, ctx);
@@ -30534,6 +30872,7 @@ if (isMain) {
   main,
   readStraceChildPid,
   redactSensitive,
+  resolvePrepareCommand,
   runStraceTailer,
   scratchBaseDir
 });

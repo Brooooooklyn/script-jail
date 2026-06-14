@@ -115,6 +115,8 @@ export interface RunMainInput {
     spoofPlatform?: 'linux' | 'darwin' | 'win32';
     spoofArch?: 'x64' | 'arm64';
     cacheFirecracker?: boolean;
+    install?: boolean;
+    args?: string;
   };
   /** Deps from fakeVmFactory().deps — call sites typically pass exactly this. */
   deps: MainDeps;
@@ -604,6 +606,16 @@ export async function runMain(input: RunMainInput): Promise<RunMainResult> {
     process.env['INPUT_CACHE-FIRECRACKER'] = String(input.inputs.cacheFirecracker);
   } else {
     delete process.env['INPUT_CACHE-FIRECRACKER'];
+  }
+  if (input.inputs.install !== undefined) {
+    process.env['INPUT_INSTALL'] = String(input.inputs.install);
+  } else {
+    delete process.env['INPUT_INSTALL'];
+  }
+  if (input.inputs.args !== undefined) {
+    process.env['INPUT_ARGS'] = input.inputs.args;
+  } else {
+    delete process.env['INPUT_ARGS'];
   }
 
   // detectRunnerImage requires ImageOS or a parseable /etc/os-release.  On

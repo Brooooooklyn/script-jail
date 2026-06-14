@@ -35,6 +35,7 @@
 import { join, dirname } from 'node:path';
 
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
+import { INSTALL_CMD } from '../shared/pm-commands.js';
 import type { AttributionResult } from './attribution.js';
 import {
   parseShimLine,
@@ -95,16 +96,10 @@ function parseMacosShimLine(line: string): MacosShimLineEvent {
   return parseShimLine(line);
 }
 
-const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
-  npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
-  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
-  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
-  // rationale.  The macOS-bare backend is observe-only and does not sever the
-  // network, but the cache Phase A populated still makes this a relink+build
-  // with no required registry traffic.
-  yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
-};
+// INSTALL_CMD is imported from ../shared/pm-commands.ts (shared with Linux
+// Phase B and the host drop-in install). The macOS-bare backend is observe-only
+// and does not sever the network, but the cache Phase A populated still makes
+// the relink+build run with no required registry traffic.
 
 // env-spy.cjs stamps its `node_startup_done` JSONL marker by reading these three
 // npm lifecycle fields off `process.env` (signalNodeStartupDone, env-spy.cjs
@@ -176,11 +171,24 @@ export function macosManagerLaunch(
  * Build the Phase-B install command for macOS — `macosManagerLaunch` with the
  * Phase-B subcommand (`rebuild`/`install`) and pnpm's repo-disk store-dir pin
  * (IDENTICAL store-dir value to the one the fetch phase splices).
+ *
+ * When `commandOverride` is supplied (the agent's prepare-only second pass —
+ * e.g. `{cmd:'npm', args:['run','prepare',…]}`), we route the OVERRIDE'S ARGS
+ * through `macosManagerLaunch` exactly the same way: the override's `cmd`
+ * (`npm`/`yarn`) is intentionally discarded — `macosManagerLaunch` always
+ * launches via the provisioned, re-signed `process.execPath` + the manager's
+ * JS entry so DYLD_INSERT_LIBRARIES survives the first exec.  No pnpm
+ * store-dir splice is added for an override (prepare passes are npm/yarn only;
+ * the resolver returns null for pnpm).
  */
 function buildMacosInstallCommand(
   manager: 'npm' | 'pnpm' | 'yarn',
   cwd: string,
+  commandOverride?: { cmd: string; args: string[] },
 ): { cmd: string; args: string[] } {
+  if (commandOverride !== undefined) {
+    return macosManagerLaunch(manager, commandOverride.args);
+  }
   const base = INSTALL_CMD[manager];
   const managerArgs =
     manager === 'pnpm' ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
@@ -201,7 +209,7 @@ export async function runInstallPhaseMacos(
   // Launch as `<re-signed node> <manager-cli.js> …` so DYLD survives the first
   // exec (see buildMacosInstallCommand).  pnpm's store-dir pin is folded in
   // there, IDENTICAL to the value the fetch phase splices.
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
+  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd, input.commandOverride);
   // No per-pid strace files on macOS; the basePath still gives runStraceTailer
   // a watchDir.  Default to a macOS tmp path when the caller didn't supply one.
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
@@ -693,8 +701,27 @@ export async function runInstallPhaseMacos(
       snapshotAttribution(shimEvent.pid);
     if (attribution === null) continue;
 
+    // Repo-root anchoring (read/write only): when this fs event attributes to a
+    // root-project package key we stamp `root_anchored` so normalize.ts can tell
+    // a genuine root event from a dependency forging `npm_package_name=<root>`.
+    // macOS-bare is OBSERVE-ONLY and has no strace process-tree / exec-cwd
+    // machinery (see this file's header — the union-find group model, per-pid
+    // cwd table, and the prepare-pass attribution all live on the Linux path),
+    // so we cannot compute the non-forgeable verdict here; root identity is
+    // env-trusted and we default to `root_anchored: true` (a documented
+    // residual). The Linux/Firecracker backend computes the real value via
+    // isRepoRootAnchored() and remains the enforcement boundary. The field is
+    // OMITTED entirely (never set to false) on non-root events so frames stay
+    // byte-identical → zero behavior change while `rootPkgKeys` is undefined.
+    const isRootAttributedFsEvent =
+      (shimEvent.kind === 'read' || shimEvent.kind === 'write') &&
+      input.rootPkgKeys?.has(attribution.pkg) === true;
+    const raw: RawEvent = isRootAttributedFsEvent
+      ? { ...shimEvent, root_anchored: true }
+      : shimEvent;
+
     const attributed: AttributedEvent = {
-      raw: shimEvent,
+      raw,
       pkg: attribution.pkg,
       lifecycle: attribution.lifecycle,
     };

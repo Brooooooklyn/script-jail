@@ -51,6 +51,8 @@ import type { Attribution, AttributionResult } from './attribution.js';
 import { attributionFromEnvVars } from './attribution.js';
 import { parseStraceLine, unescapeStraceString } from './strace-parser.js';
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
+import { isRepoRootAnchored } from './root-anchor.js';
+import { INSTALL_CMD, pnpmStoreDirArg } from '../shared/pm-commands.js';
 import {
   ExecEvent,
   EnvTamperEvent,
@@ -249,6 +251,30 @@ export interface PhaseInstallInput {
    * behaviour from the policy filter.
    */
   protectedPaths?: ProtectedPathsMatcher;
+  /**
+   * Optional override for the traced command.  When omitted, the phase traces
+   * `INSTALL_CMD[manager]` (the canonical Phase-B install).  The agent supplies
+   * this for the second, prepare-only audit pass (`npm run prepare …` /
+   * `yarn run prepare`) — npm's `rebuild --foreground-scripts` and yarn's
+   * `install --immutable` do NOT run the ROOT project's `prepare` script, so a
+   * malicious root `prepare` would otherwise never be audited.  Everything else
+   * about the dispatch (the security loop, synthesis, pnpm store-dir splice) is
+   * IDENTICAL — only the command/args at the head of the trace change.
+   */
+  commandOverride?: { cmd: string; args: string[] };
+  /**
+   * The set of root-project package keys (bare `name` AND `name@version`).
+   * When an fs read/write event attributes to one of these keys, the
+   * dispatcher tags the emitted raw event with the NON-forgeable
+   * `root_anchored` signal (computed from the kernel process tree + per-pid
+   * exec-cwd via {@link isRepoRootAnchored}), so `normalize.ts` can later
+   * distinguish a genuine root event from one a dependency forged by setting
+   * `npm_package_name=<root>`.
+   *
+   * Optional: when undefined (the current caller state — the agent populates
+   * it in a later task) NOTHING is tagged → zero behavior change.
+   */
+  rootPkgKeys?: ReadonlySet<string>;
 }
 
 export interface PhaseInstallResult {
@@ -286,14 +312,9 @@ export interface PhaseInstallResult {
   installStdoutTail: string;
 }
 
-const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
-  npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
-  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
-  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
-  // sever; the cache Phase A populated makes this a zero-network relink+build.
-  yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
-};
+// INSTALL_CMD lives in ../shared/pm-commands.ts so the host drop-in install
+// (src/action/host-install.ts part-2) uses the byte-identical command. The
+// per-flag rationale (incl. why Berry has no `--offline`) is in the file header.
 
 // LOAD-BEARING: env-spy.cjs opens this exact path after installing the
 // process.env Proxy. The open is expected to fail with ENOENT; its only job is
@@ -607,19 +628,17 @@ function cloneFlagsHaveUntraced(line: string): boolean {
 export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
-  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
+  const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
   // pm-flags.json extras are spliced into Phase A (fetch/resolve), not here —
   // dependency resolution is already done by the time Phase B runs.
 
   // For pnpm: pin the store-dir to the repo overlay disk — IDENTICAL to
-  // the value spliced in phase-fetch.ts.  `pnpm rebuild` operates on the
-  // node_modules tree Phase A materialised, but still resolves store
-  // config; a mismatched --store-dir would point pnpm at an empty store
-  // on the cramped rootfs ext4.  Keep both phases in lockstep via
-  // `input.cwd`.
-  const args = input.manager === 'pnpm'
-    ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`]
-    : baseArgs;
+  // the value spliced in phase-fetch.ts (and the host install).  `pnpm
+  // rebuild` operates on the node_modules tree Phase A materialised, but
+  // still resolves store config; a mismatched --store-dir would point pnpm
+  // at an empty store on the cramped rootfs ext4.  The shared pnpmStoreDirArg
+  // helper keeps all three call sites in lockstep via `input.cwd`.
+  const args = [...baseArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`
@@ -652,11 +671,41 @@ export async function runInstallPhase(
     input.strace.recordTamper(reason);
   };
 
-  const emit = (ev: AttributedEvent): void => {
+  const emitFinal = (ev: AttributedEvent): void => {
     const filtered = applyProtectedPathsPolicy(ev, matcher);
     if (filtered === null) return;
     input.emitter.emitEvent(filtered);
     eventCount++;
+  };
+
+  // Determinism (Fix #2, adversarial-review [medium], 2026-06-14): the
+  // `root_anchored` verdict walks the kernel process tree (childParent +
+  // execCwd), which is built up incrementally as `strace -ff` per-pid files
+  // drain in NONDETERMINISTIC order. A root child's exec/write can be processed
+  // BEFORE its parent's clone edge, so a verdict computed AT EMIT TIME would
+  // see an incomplete tree and fail closed → `<FORGED_ROOT>` in one run and a
+  // genuine root path in another → committed-lock drift / flaky `check` CI.
+  //
+  // Fix: DEFER root-attributed fs read/write events until the whole tree has
+  // drained, then stamp `root_anchored` against the COMPLETE maps. `emit` is
+  // the single chokepoint every event flows through (including node-bootstrap
+  // candidate replays via `flushAllNodeBootstrapCandidates`, which re-enter
+  // here), so capturing here catches them all. Non-root and non-fs events are
+  // emitted immediately (unchanged). Events that already carry an explicit
+  // `root_anchored` (none produced in this file today) are NOT re-deferred —
+  // their verdict is final.
+  const deferredRootFsEvents: AttributedEvent[] = [];
+  const emit = (ev: AttributedEvent): void => {
+    if (
+      input.rootPkgKeys !== undefined &&
+      (ev.raw.kind === 'read' || ev.raw.kind === 'write') &&
+      input.rootPkgKeys.has(ev.pkg) &&
+      ev.raw.root_anchored === undefined
+    ) {
+      deferredRootFsEvents.push(ev);
+      return;
+    }
+    emitFinal(ev);
   };
 
   // Audit-trust Finding 1 (2026-05-18): cross-check strace execve against
@@ -1967,6 +2016,30 @@ export async function runInstallPhase(
   // the key is always a group root.
   const pidCwd = new Map<number, string>();
 
+  // Repo-root anchoring state (non-forgeable). Consumed only by the
+  // `rootAnchored` helper near the emit site to tag root-attributed fs
+  // events. These are RAW pid maps (NOT cwd-group keyed) because the
+  // process-tree walk in `isRepoRootAnchored` is over real pids:
+  //   - childParent: kernel-observed clone/fork/vfork edge, child -> parent.
+  //   - execCwd: resolved cwd snapshotted at a pid's FIRST execve. A string is
+  //     the cwd at exec time; `null` means the pid exec'd but its cwd was
+  //     unresolvable (fail closed); an absent key means the pid never exec'd
+  //     (forked but ran the parent's program, inheriting its identity).
+  const childParent = new Map<number, number>();
+  const execCwd = new Map<number, string | null>();
+  // Determinism (Fix #2, adversarial-review [medium], 2026-06-14): pids that
+  // exec'd BEFORE their parent's clone line had drained. At exec time such a
+  // pid's cwd is NOT-YET-KNOWN (not provably unknown, and clone hasn't yet
+  // propagated the inherited cwd), so we cannot snapshot a trustworthy
+  // exec-cwd. Recording `null` permanently here would fail-closed a genuine
+  // root child forever once the clone arrives. Instead we DEFER: park the pid
+  // here and reconcile `execCwd[pid]` in the clone handler once the inherited
+  // cwd has propagated (union or copy branch). Any pid still parked at
+  // end-of-drain (its clone never arrived) is finalized to `null` (fail
+  // closed). See the clone-handler reconcile (~L3690) and the end-of-drain
+  // flush (~L6110).
+  const pendingExecCwd = new Set<number>();
+
   // Audit-trust Finding (high, 2026-05-19, codex follow-up): set of pids
   // whose cwd state we OBSERVED a mutation event for but COULD NOT
   // resolve.  Membership in this set is "sticky": once a pid lands
@@ -2014,6 +2087,41 @@ export async function runInstallPhase(
   }
   function cwdUnknownDelete(pid: number): void {
     pidCwdUnknown.delete(rootedCwd(pid));
+  }
+
+  // Repo-root anchoring verdict for `pid`. Non-forgeable: walks pid -> parent
+  // up to the traced PM root via `childParent`, failing closed unless every
+  // ancestor either never exec'd or exec'd at the repo root (see
+  // `isRepoRootAnchored`). Recomputed per event — pid reuse across the install
+  // would make a cached value stale, the walk is short, and fs events are few.
+  function rootAnchored(pid: number): boolean {
+    const rootPid = installRootPid; // number | null
+    // No traced root pid (production CASE B in agent.ts: strace spawned but
+    // readStraceChildPid returned null — deadline/ambiguous/proc-unavailable —
+    // so _rootPid was left null and the per-pid-file fallback was disabled).
+    // We cannot prove repo-root anchoring without the process-tree signal, so
+    // we FAIL CLOSED: return false → normalize.ts prefixes the event with
+    // `<FORGED_ROOT>`, which is fail-loud and visible to reviewers.
+    //
+    // NOTE: returning `true` unconditionally when rootPid is null is reserved
+    // exclusively for the observe-only macOS-bare path
+    // (src/guest/phase-install-macos.ts).  This file is the Linux dispatcher
+    // used by ALL enforcing backends (Firecracker, Docker, bare Linux); it
+    // must never trust env attribution without a corroborating process-tree
+    // signal.
+    if (rootPid === null) return false;
+    return isRepoRootAnchored({
+      pid,
+      childParent,
+      execCwd,
+      // Group-aware: `pidCwdUnknown` is keyed by cwd-group root (CLONE_FS), so
+      // querying the raw pid would miss a pid marked unknown via a sibling.
+      // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
+      // walker's fail-closed disqualifier sees the real unknown state.
+      cwdUnknown: cwdUnknownHas,
+      workDir: path.resolve(input.cwd),
+      rootPid,
+    });
   }
 
   // Audit-trust Finding (high, 2026-05-19, codex follow-up #2): set of
@@ -2776,6 +2884,11 @@ export async function runInstallPhase(
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path.resolve(input.cwd));
+        // Anchor the PM root's exec-cwd at the repo root. The trusted root pid
+        // IS the anchor in `isRepoRootAnchored`, but seeding execCwd here keeps
+        // the map self-consistent for any future use and makes the root's
+        // exec-cwd explicit rather than absent.
+        execCwd.set(pid, path.resolve(input.cwd));
       }
     }
 
@@ -3355,6 +3468,10 @@ export async function runInstallPhase(
           const childPid = parseInt(rcMatch[1] ?? '', 10);
           if (Number.isFinite(childPid) && childPid > 0) {
             propagateNodeBootstrap(pid, childPid);
+            // Record the kernel-observed parent edge for repo-root anchoring.
+            // `pid` is the PARENT (the per-pid strace file owner that issued
+            // the clone/fork/vfork); `childPid` is the new child. Unconditional.
+            childParent.set(childPid, pid);
 
             // Extract the clone-flag identifier list.  For `clone(...)`
             // strace renders `flags=CLONE_VM|CLONE_FS|...`; for
@@ -3609,6 +3726,30 @@ export async function runInstallPhase(
               // else: parent has no known cwd; OR child has its own
               // post-detach cwd that we leave alone (private mutation
               // semantic per kernel detach).
+            }
+
+            // Determinism reconcile (Fix #2, [medium], 2026-06-14): if
+            // `childPid` exec'd BEFORE this clone line drained, its exec-cwd
+            // snapshot was deferred (`pendingExecCwd`) because the inherited
+            // cwd had not yet propagated. We are now PAST the cwd union/copy
+            // block above, so `cwdGet(childPid)`/`cwdUnknownHas(childPid)`
+            // reflect the FINAL propagated state for both branches:
+            //   - union (CLONE_FS): `unionCwd(pid, childPid)` merged the child
+            //     into the parent's cwd group, so `cwdGet(childPid)` resolves
+            //     through the shared root to the inherited cwd.
+            //   - copy: the parent's cwd was seeded into the child's private
+            //     group (or the group was tainted unknown on disagreement).
+            // The cwd that just propagated IS the exec-time cwd: clone sets the
+            // child's cwd from the parent at fork, and execve preserves cwd, so
+            // the cwd the child held when it exec'd equals the inherited one. If
+            // reconciliation tainted the group unknown, `cwdUnknownHas` is now
+            // true → snapshot `null` (fail closed).
+            if (pendingExecCwd.has(childPid)) {
+              execCwd.set(
+                childPid,
+                cwdUnknownHas(childPid) ? null : (cwdGet(childPid) ?? null),
+              );
+              pendingExecCwd.delete(childPid);
             }
 
             // --- fd group: union if CLONE_FILES, else copy. ---------
@@ -5239,6 +5380,39 @@ export async function runInstallPhase(
         // survives execve (per execve(2)), so the attacker's
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
+          // Repo-root anchoring: snapshot the pid's cwd at its FIRST execve
+          // only (later re-execs keep the first snapshot). The PM sets a
+          // lifecycle script's cwd to the package dir BEFORE the exec, so this
+          // kernel-observed value cannot be laundered by a later chdir.
+          // `cwdGet` returns `string | undefined`; `?? null` records "exec'd
+          // but cwd unknown" as null (a fail-closed signal for the walker).
+          //
+          // The cwdUnknown bit DOMINATES the cwdGet lookup (same invariant as
+          // canonicalizeForEmit, see bug #2 around line ~2196): after `unionCwd`
+          // reconciles a CLONE_FS group it can mark the group unknown while
+          // leaving a STALE non-null value in pidCwd. Snapshotting that stale
+          // value would let a provably-unknown pid be recorded as a workDir
+          // string and pass the root-anchor walk — a fail-closed bypass. So if
+          // the cwd is provably unknown at capture time, record `null`.
+          if (!execCwd.has(rawEvent.pid)) {
+            if (cwdUnknownHas(rawEvent.pid)) {
+              // Provably unknown (a CLONE_FS sibling tainted the group, or an
+              // unresolved relative chdir) → fail closed with `null`.
+              execCwd.set(rawEvent.pid, null);
+            } else {
+              const cwd = cwdGet(rawEvent.pid);
+              if (cwd !== undefined) {
+                // Known: snapshot the exec-time cwd (PM-set, non-forgeable).
+                execCwd.set(rawEvent.pid, cwd);
+              } else {
+                // NOT-YET-KNOWN: this pid exec'd before its parent's clone line
+                // drained, so the inherited cwd hasn't propagated. Defer the
+                // snapshot to the clone-handler reconcile rather than recording
+                // a permanent (and wrong) `null`. See `pendingExecCwd`.
+                pendingExecCwd.add(rawEvent.pid);
+              }
+            }
+          }
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
           packageManagerClientPids.delete(rawEvent.pid);
@@ -5831,10 +6005,21 @@ export async function runInstallPhase(
           // preserves discriminant + all transport fields; TS
           // narrows on the literal `kind` so the spread keeps the
           // read/write discriminated-union shape.
-          const resolved: RawEvent =
-            rawEvent.kind === 'read'
-              ? { ...rawEvent, path: canonical }
-              : { ...rawEvent, path: canonical };
+          //
+          // Repo-root anchoring: the non-forgeable `root_anchored` verdict is
+          // NO LONGER stamped here. Computing it at emit time walks an
+          // INCOMPLETE process tree (strace -ff drains per-pid files in
+          // nondeterministic order), so a root child whose clone edge hasn't
+          // drained yet would fail closed → nondeterministic `<FORGED_ROOT>`
+          // and committed-lock drift (Fix #2, [medium], 2026-06-14). Instead,
+          // `emit` DEFERS root-attributed fs read/write events and the
+          // end-of-drain flush stamps `root_anchored` against the COMPLETE
+          // childParent/execCwd maps. Non-root events are unchanged (the field
+          // stays OMITTED entirely so existing frames are byte-identical).
+          const resolved: RawEvent = {
+            ...rawEvent,
+            path: canonical,
+          };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
@@ -5998,6 +6183,37 @@ export async function runInstallPhase(
       lifecycle: sample.lifecycle,
     });
   }
+
+  // Determinism (Fix #2, [medium], 2026-06-14): stamp + flush the deferred
+  // root-attributed fs events. We run this AFTER:
+  //   - the main drain loop and `flushAllNodeBootstrapCandidates()` (so any
+  //     node-bootstrap candidate replays have re-entered `emit` and landed in
+  //     `deferredRootFsEvents`), and
+  //   - the strace-vs-shim bypass synthesis (those emit `exec` events, never
+  //     read/write, so they are never deferred — emitting them first keeps
+  //     their relative order unchanged).
+  // At this point the childParent/execCwd maps are COMPLETE, so `rootAnchored`
+  // computes a deterministic verdict regardless of strace -ff drain order.
+  //
+  // Any pid still parked in `pendingExecCwd` here exec'd not-yet-known and its
+  // clone line NEVER drained → its cwd is unprovable → finalize to `null`
+  // (fail closed) so the walk disqualifies it.
+  for (const pid of pendingExecCwd) execCwd.set(pid, null);
+  pendingExecCwd.clear();
+  for (const ev of deferredRootFsEvents) {
+    // `deferredRootFsEvents` only ever holds read/write events (the `emit`
+    // filter guarantees it); narrow on `kind` so TS keeps the discriminated
+    // read/write shape when we attach `root_anchored`.
+    if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') {
+      emitFinal(ev);
+      continue;
+    }
+    emitFinal({
+      ...ev,
+      raw: { ...ev.raw, root_anchored: rootAnchored(ev.raw.pid) },
+    });
+  }
+  deferredRootFsEvents.length = 0;
 
   // Exit code is owned by the StraceRunner (it ran the only install process).
   const exitCode = input.strace.getExitCode();

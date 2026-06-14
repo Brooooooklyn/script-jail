@@ -17,6 +17,8 @@
 
 import { isAbsolute, join, resolve } from 'node:path';
 
+import { splitInstallArgs } from '../shared/pm-commands.js';
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -38,6 +40,20 @@ export interface ActionInputs {
   backend: Backend;
   /** Whether to enable runner caching of the Firecracker bits. */
   cacheFirecracker: boolean;
+  /**
+   * Extra package-manager install args (e.g. `-D`, `--prod`, `--omit=dev`),
+   * split from the single `args` input string into an argv array.  Applied
+   * IDENTICALLY to the sandbox audit fetch and the host drop-in install (so the
+   * byte-stable lock does not drift).  Empty when the input is unset.
+   */
+  args: string[];
+  /**
+   * Drop-in install opt-in.  When true the action ALSO installs dependencies on
+   * the runner: package-manager install with lifecycle scripts disabled, then —
+   * only if the sandbox audit matches the committed lock — runs the lifecycle
+   * scripts on the host.  Default false (audit only, the historic behaviour).
+   */
+  install: boolean;
 }
 
 export interface ParseInput {
@@ -138,6 +154,27 @@ export function parseInputs(input: ParseInput): ActionInputs {
     );
   }
 
+  // ---- args -----------------------------------------------------------------
+  // Split the single `args` input string into an argv array here — the single
+  // typed boundary.  Everything downstream consumes string[] and the package
+  // manager is spawned with these as discrete argv items (NEVER through a
+  // shell), so the split is the only place raw user text is tokenised.
+  const args = splitInstallArgs(getInput('args') ?? '');
+
+  // ---- install --------------------------------------------------------------
+  // String-boolean like cache-firecracker, but defaults FALSE: the drop-in
+  // install is strictly opt-in so existing audit-only consumers are unchanged.
+  const installStr = (getInput('install') ?? '').trim();
+  let install: boolean;
+  if (installStr === '' || installStr === 'false') install = false;
+  else if (installStr === 'true') install = true;
+  else {
+    throw new Error(
+      `script-jail: invalid value for input "install": "${installStr}". ` +
+      `Expected "true" or "false".`,
+    );
+  }
+
   // ---- path resolution ------------------------------------------------------
   const configRel = rawConfig.trim() === '' ? '.script-jail.yml' : rawConfig.trim();
   const lockRel = rawLock.trim() === '' ? '.script-jail.lock.yml' : rawLock.trim();
@@ -150,6 +187,8 @@ export function parseInputs(input: ParseInput): ActionInputs {
     spoofArch: archStr,
     backend: backendStr,
     cacheFirecracker,
+    args,
+    install,
   };
 }
 

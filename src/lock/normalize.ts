@@ -125,6 +125,19 @@ export interface NormalizeContext {
   roots: TokenizeRoots;
   // pkg@version → installed path inside the VM (e.g. /work/node_modules/esbuild)
   pkgDirs: Map<string, string>;
+  // Keys (name AND name@version) identifying the ROOT project, which has no
+  // node_modules dir.  Its lifecycle events (root pre/install/postinstall from
+  // the main install pass; root `prepare` from the prepare pass) attribute to
+  // these keys.  We deliberately give the root NO pkgDir: mapping it to the
+  // repo root would treat the WHOLE repo as $PKG, so every root write into the
+  // repo would drop as "intra-package" — hiding the build/escape behaviour we
+  // audit, and letting a dependency FORGE `npm_package_name=<root>` to write
+  // anywhere under the repo with the write silently dropped.  Instead, listing
+  // the root here makes normalize SURFACE the root's fs events (external_reads /
+  // escaped_writes) rather than throw on the missing pkgDir — visible in the
+  // lock, diffable, forgery-safe.  Omitted/empty ⇒ no root events to surface
+  // (byte-identical to the pre-feature behaviour for every existing caller).
+  rootPkgKeys?: Set<string>;
   // Host OS the audit ran on.  Defaults to 'linux' when omitted so every
   // existing caller (the Linux Action guest, all unit/integration tests)
   // produces byte-identical output.  Only 'darwin' enables the macOS-only
@@ -156,14 +169,55 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
 
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
 
+    // Genuine-vs-forged ROOT attribution.
+    //
+    // `npm_package_name` (which drives `ev.pkg`) is FORGEABLE: any dependency
+    // can export `npm_package_name=<root>` to make its own fs events attribute
+    // to the root project's key.  The root has no pkgDir (it is not under
+    // node_modules), so a root-claimed event tokenizes against $REPO/
+    // $NODE_MODULES (no $PKG) and SURFACES as external_reads / escaped_writes —
+    // which is exactly what we want for the *genuine* root, but would let a
+    // forging dependency (a) write anywhere under the repo and have it surface
+    // under the root, then (b) if the path matches a real root write,
+    // dedupe-collapse away (hidden) downstream in sortAndDedupe.
+    //
+    // `root_anchored` closes that hole.  It is a NON-forgeable verdict the
+    // producer stamps on root-attributed fs events: the Linux dispatcher
+    // derives it from the kernel process tree + per-pid exec-cwd (genuine root
+    // → true; a dep forging the root label → false), macOS-bare defaults it
+    // true (observe-only), and the prepare pass forces it true (that pass runs
+    // ONLY the root's prepare).  It is consumed here and NEVER rendered.
+    //
+    //   - claimsRoot && root_anchored === true  → GENUINE root: surface as
+    //     `$REPO/...` exactly as before.
+    //   - claimsRoot && root_anchored !== true  → FORGED root: still surface
+    //     (never drop, never throw — dropping would be a dependency-triggered
+    //     DoS/hide, throwing would crash the whole audit), but prefix with
+    //     `<FORGED_ROOT> ` so it is a DISTINCT string that can never
+    //     dedupe-collapse with a genuine root entry and is fail-loud for review.
+    const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
+    // `root_anchored` lives only on the read/write members of the RawEvent union;
+    // the inline `kind` test narrows the union so TS can read the field.
+    const isForgedRoot =
+      claimsRoot &&
+      (ev.raw.kind === 'read' || ev.raw.kind === 'write') &&
+      ev.raw.root_anchored !== true;
+
     // For fs events (read/write) a missing pkgDirs entry is an error: without
     // pkgDir the $PKG token can never form, so intra-package reads would
-    // silently leak into external_reads — the opposite of what we want.
-    if (pkgDir === undefined && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
+    // silently leak into external_reads — the opposite of what we want.  A pkg
+    // that CLAIMS root (genuine or forged) is the one legitimate no-pkgDir case
+    // (handled above/below); everything else with no pkgDir is an unknown/forged
+    // NON-root attribution and we fail closed.
+    if (pkgDir === undefined && !claimsRoot && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`,
       );
     }
+
+    // Outermost prefix for a forged-root fs event.  Empty for genuine root and
+    // every non-root pkg, so their output is byte-identical to before.
+    const forgedPrefix = isForgedRoot ? '<FORGED_ROOT> ' : '';
 
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
 
@@ -173,8 +227,9 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // linux (computed once at the top of the loop).
         const tokenized = normalizeVolatilePath(tokenize(fsPath!, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package read
-        const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
-        block.external_reads.push(tagged);
+        const hiddenTag = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
+        // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
+        block.external_reads.push(`${forgedPrefix}${hiddenTag}`);
         break;
       }
       case 'write': {
@@ -185,7 +240,8 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // package's directory?". An auditor needs both signals.
         const hiddenPrefix = ev.raw.hidden ? '<HIDDEN> ' : '';
         const crossPrefix = isCrossPackage(tokenized) ? '<CROSS_PACKAGE> ' : '';
-        block.escaped_writes.push(`${hiddenPrefix}${crossPrefix}${tokenized}`);
+        // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
+        block.escaped_writes.push(`${forgedPrefix}${hiddenPrefix}${crossPrefix}${tokenized}`);
         break;
       }
       case 'env_read': {

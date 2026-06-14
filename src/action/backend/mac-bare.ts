@@ -217,6 +217,11 @@ export function createMacBareExecute(
           SCRIPT_JAIL_CONNECTION: 'stdio',
           SCRIPT_JAIL_BACKEND: 'macos-bare',
           SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+          // macOS-bare runs the agent directly on the host (no container /etc),
+          // so the host-owned pm-flags sidecar lives in the staged repo tree.
+          // Point the guest at it so the sandbox fetch applies the SAME install
+          // args as the host part-1 install.  loadPmFlags re-sanitizes it.
+          SCRIPT_JAIL_PM_FLAGS_PATH: join(staged.path, 'etc/script-jail/pm-flags.json'),
           SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,

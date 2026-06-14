@@ -26,6 +26,7 @@ import { createTwoFilesPatch, structuredPatch } from 'diff';
 import { parse as parseYaml } from 'yaml';
 
 import { Lock } from '../lock/schema.js';
+import type { Manager } from '../shared/pm-commands.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -251,6 +252,167 @@ export function formatAuditBypassError(entries: AuditBypassEntry[]): string {
     ']' +
     more
   );
+}
+
+// ---------------------------------------------------------------------------
+// network egress surfacing (drop-in install part-2)
+// ---------------------------------------------------------------------------
+
+/**
+ * One recorded `network_attempts` entry surfaced from a lockfile, carrying its
+ * package id and lifecycle stage.  The `entry` string is the rendered form,
+ * e.g. `<BLOCKED> connect 198.51.100.7:443`.
+ */
+export interface NetworkAttemptEntry {
+  packageId: string;
+  stage: string;
+  entry: string;
+}
+
+/**
+ * Scan a lockfile (YAML text) for every non-empty `network_attempts` array
+ * under `packages.<pkg>.lifecycle.<stage>`.  Same defensive shape-walk as
+ * {@link findAuditBypass} (strict schema parse first, hand-walk fallback).
+ *
+ * Used by the drop-in install (`install: true`): part 2 runs lifecycle scripts
+ * ONLINE on the host, so any egress the OFFLINE audit recorded (as `<BLOCKED>`)
+ * WILL succeed there.  Surfacing these before part 2 keeps that egress from
+ * being silent.  NOTE: the recorded host is the resolved IP the sandbox saw
+ * (strace parses `connect()` sockaddrs, never DNS names), and the online host
+ * may resolve a different address — so this is a directional heads-up, not an
+ * exact preview.
+ */
+export function collectNetworkAttempts(generated: string): NetworkAttemptEntry[] {
+  let doc: unknown;
+  try {
+    doc = parseYaml(generated);
+  } catch {
+    return [];
+  }
+  if (doc === null || typeof doc !== 'object') return [];
+
+  const parsed = Lock.safeParse(doc);
+  const packagesRaw = parsed.success
+    ? parsed.data.packages
+    : (doc as { packages?: unknown }).packages;
+  if (
+    packagesRaw === undefined ||
+    packagesRaw === null ||
+    typeof packagesRaw !== 'object'
+  ) {
+    return [];
+  }
+
+  const out: NetworkAttemptEntry[] = [];
+  for (const [packageId, pkgRaw] of Object.entries(
+    packagesRaw as Record<string, unknown>,
+  )) {
+    if (pkgRaw === null || typeof pkgRaw !== 'object') continue;
+    const lifecycleRaw = (pkgRaw as { lifecycle?: unknown }).lifecycle;
+    if (
+      lifecycleRaw === null ||
+      lifecycleRaw === undefined ||
+      typeof lifecycleRaw !== 'object'
+    ) {
+      continue;
+    }
+    for (const [stage, blockRaw] of Object.entries(
+      lifecycleRaw as Record<string, unknown>,
+    )) {
+      if (blockRaw === null || typeof blockRaw !== 'object') continue;
+      const na = (blockRaw as { network_attempts?: unknown }).network_attempts;
+      if (!Array.isArray(na)) continue;
+      for (const entry of na) {
+        if (typeof entry === 'string' && entry.length > 0) {
+          out.push({ packageId, stage, entry });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Build the two-part egress heads-up for drop-in install part 2.
+ *
+ *   `summary` — one line, emitted as a `::warning::` annotation (GH Actions
+ *               annotations are single-line, so the per-package list cannot
+ *               live here).
+ *   `detail`  — the per-package list + a review pointer, written to stdout as
+ *               plain lines so the full block is readable in the job log.
+ *
+ * The IP caveat is folded into `summary` so the annotation itself carries it.
+ *
+ * Not every audited egress entry actually runs on the host.  Part 2 invokes
+ * `INSTALL_CMD[pm]`, and the host rebuild's coverage of the ROOT project's
+ * `prepare` script differs by manager:
+ *   * npm  (`npm rebuild --foreground-scripts`) — does NOT run root `prepare`.
+ *   * yarn (`yarn install --immutable`)          — does NOT run root `prepare`.
+ *   * pnpm (`pnpm rebuild --pending`)             — DOES run root `prepare`.
+ * The sandbox always audits root `prepare` via a dedicated prepare pass, so for
+ * npm/yarn that recorded root-prepare egress is listed in the lock yet will NOT
+ * fire on the host.  Surfacing it as "WILL now succeed" would over-claim, so we
+ * partition such entries out and label them as audited-only.
+ */
+export function formatEgressWarning(
+  entries: NetworkAttemptEntry[],
+  opts: { manager: Manager; rootPackageIds: ReadonlySet<string> },
+): {
+  summary: string;
+  detail: string;
+} {
+  const MAX = 20;
+
+  // Partition: root `prepare` egress that the host rebuild will NOT run goes to
+  // `auditedOnly` (npm/yarn only); everything else is `hostBound` and genuinely
+  // runs online during part 2.  Input order is preserved on both sides, keeping
+  // the rendered output deterministic.
+  const auditedOnly: NetworkAttemptEntry[] = [];
+  const hostBound: NetworkAttemptEntry[] = [];
+  for (const e of entries) {
+    if (
+      e.stage === 'prepare' &&
+      opts.manager !== 'pnpm' &&
+      opts.rootPackageIds.has(e.packageId)
+    ) {
+      auditedOnly.push(e);
+    } else {
+      hostBound.push(e);
+    }
+  }
+
+  const summary =
+    hostBound.length > 0
+      ? `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. ` +
+        `The offline audit recorded ${hostBound.length} network egress attempt(s) that ` +
+        `WILL now succeed (listed below). IPs are offline-audit values — the host ` +
+        `may resolve different addresses; review the committed lock before trusting this install.`
+      : // No host-bound egress: only audited-only root `prepare` entries remain.
+        // Do NOT claim host egress — the root `prepare` was audited in the
+        // sandbox and the host rebuild (npm/yarn) does not run it.
+        `script-jail install: part 2 runs lifecycle scripts on the host; the root ` +
+        `\`prepare\` egress below was audited in the sandbox and will NOT run on the host.`;
+
+  const lines = hostBound.slice(0, MAX).map((e) => {
+    return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+  });
+  if (hostBound.length > MAX) {
+    lines.push(`  (+${hostBound.length - MAX} more — see the committed lock)`);
+  }
+
+  if (auditedOnly.length > 0) {
+    lines.push('  audited in the sandbox; NOT run on the host (root `prepare`):');
+    const auditedLines = auditedOnly.slice(0, MAX).map((e) => {
+      return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+    });
+    lines.push(...auditedLines);
+    if (auditedOnly.length > MAX) {
+      lines.push(`  (+${auditedOnly.length - MAX} more — see the committed lock)`);
+    }
+  }
+
+  const detail = `${lines.join('\n')}\n`;
+  return { summary, detail };
 }
 
 // ---------------------------------------------------------------------------

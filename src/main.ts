@@ -17,11 +17,12 @@
 // independently unit-tested.
 
 import { setOutput } from '@actions/core';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
+import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
@@ -37,11 +38,13 @@ import { launchVm } from './action/firecracker/launch.js';
 import { openVsockSession } from './action/firecracker/vsock.js';
 import { teardown } from './action/firecracker/teardown.js';
 import { runAudit } from './shared/run-audit.js';
+import { collectNetworkAttempts, formatEgressWarning } from './action/diff.js';
 import { createFirecrackerBackend } from './action/backend/firecracker.js';
 import { createDockerBackend } from './action/backend/docker.js';
 import { createBareBackend } from './action/backend/bare.js';
 import { runSelectedBackend } from './action/backend/select.js';
 import type { BackendMap } from './action/backend/select.js';
+import { buildRootPkgKeys } from './guest/attribution.js';
 
 // ---------------------------------------------------------------------------
 // Pinned versions
@@ -62,6 +65,9 @@ export interface MainDeps {
   openVsockSession?: typeof openVsockSession;
   teardown?: typeof teardown;
   exitProcess?: (code: number) => never;
+  /** Host drop-in install seams — injectable so tests need not spawn a real PM. */
+  hostInstallNoScripts?: typeof hostInstallNoScripts;
+  hostRunScripts?: typeof hostRunScripts;
 }
 
 export async function main(deps: MainDeps = {}): Promise<void> {
@@ -76,6 +82,8 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     openVsockSession: doOpenVsockSession = openVsockSession,
     teardown: doTeardown = teardown,
     exitProcess = process.exit as (code: number) => never,
+    hostInstallNoScripts: doHostInstallNoScripts = hostInstallNoScripts,
+    hostRunScripts: doHostRunScripts = hostRunScripts,
   } = deps;
 
   // ---------------------------------------------------------------------
@@ -155,6 +163,35 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     throw err;
   }
 
+  // --- Drop-in install: fail-closed preconditions --------------------------
+  // When `install: true` the action ALSO installs deps on the runner, but BOTH
+  // host halves run AFTER the audit (below), never here: part 1 must not
+  // populate node_modules before the backend stages its copy of the repo, or
+  // the freshly built tree (esp. pnpm's external-store symlinks) gets copied
+  // into the sandbox and diverges the audit.  Here we only enforce the
+  // preconditions that must fail BEFORE spending an audit: install needs a
+  // committed lock to gate against, and must run in `check` (update regenerates
+  // the lock and skips the audit-bypass scan, so there would be no fail-closed
+  // signal to run lifecycle scripts against).
+  if (inputs.install) {
+    if (inputs.mode === 'update') {
+      process.stdout.write(
+        '::error::script-jail: `install: true` requires `mode: check`. ' +
+          'Update mode regenerates the lock and skips the audit-bypass gate, so there is no ' +
+          'fail-closed signal to run lifecycle scripts against. Generate the lock with ' +
+          '`mode: update` (install off), commit it, then enable `install` with `mode: check`.\n',
+      );
+      exitProcess(1);
+    }
+    if (!existsSync(inputs.lockPath)) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires a committed lock at ${inputs.lockPath}. ` +
+          'Generate one with `mode: update` (install off), commit it, then enable `install`.\n',
+      );
+      exitProcess(1);
+    }
+  }
+
   // --- Detect runner image -------------------------------------------------
   const runnerImage = detectRunnerImage();
 
@@ -209,6 +246,9 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     },
     pm: pm.manager,
     hostArch: actionHostArch,
+    // Developer install args reach the sandbox fetch (so the audited tree
+    // matches what part 1 installed on the host).
+    args: inputs.args,
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,
@@ -239,6 +279,57 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       },
     },
   });
+
+  // --- Drop-in install: part 1 (host no-scripts) + part 2 (run scripts) ----
+  // Both host halves run AFTER the audit so the freshly built node_modules is
+  // never staged into the sandbox copy (which would diverge the audit — pnpm's
+  // external-store symlinks in particular).  Part 1 (lifecycle scripts
+  // disabled) is always safe and runs even on drift, so the safe no-scripts
+  // tree is left on the runner.  Part 2 (run the deferred scripts) is gated
+  // STRICTLY on a clean audit (`trusted` ⇔ check-mode, lock matched, no
+  // audit-bypass entry); on drift/bypass it is skipped, the safe tree stays in
+  // place, and the job fails via the non-zero exit below.  Part 2 runs the
+  // scripts ONLINE on the runner (no netns sever) — trust derives from the
+  // reviewed, matched lock.
+  if (inputs.install) {
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn });
+    if (result.trusted) {
+      // Surface the egress from the GENERATED lock runAudit just produced — it
+      // is guaranteed well-formed (the guest rendered it) and, on a trusted
+      // check, semantically equals the committed lock.  Re-reading the
+      // committed file would risk a parse failure (it can be malformed in a
+      // canonicalized volatile field yet still diff-match), silently dropping
+      // the warning while part 2 still runs scripts online.  Phase B was
+      // offline so these connects were recorded `<BLOCKED>`, but part 2 runs
+      // ONLINE — they WILL succeed.
+      const egress = collectNetworkAttempts(result.generatedLock ?? '');
+      if (egress.length > 0) {
+        // Build the root-project package ids (bare `name` AND `name@version`)
+        // so formatEgressWarning can tell whether a `prepare` egress entry is
+        // the ROOT's.  The host rebuild does NOT run root `prepare` for
+        // npm/yarn, so that egress is audited-only there; pnpm's
+        // `rebuild --pending` does run it.  Uses buildRootPkgKeys() — the same
+        // single source of truth as the guest's rootPkgKeys — to guarantee the
+        // two sides stay in sync (including the empty-version '' edge case).
+        let rootPackageIds = new Set<string>();
+        try {
+          const rootManifest = JSON.parse(
+            readFileSync(join(repoDir, 'package.json'), 'utf8'),
+          ) as { name?: unknown; version?: unknown };
+          ({ keys: rootPackageIds } = buildRootPkgKeys(rootManifest));
+        } catch {
+          /* missing/invalid root package.json → empty set (no entry is root) */
+        }
+        const { summary, detail } = formatEgressWarning(egress, {
+          manager: pm.manager,
+          rootPackageIds,
+        });
+        warn(summary);
+        process.stdout.write(detail);
+      }
+      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn });
+    }
+  }
 
   // Preserve the existing semantics: in `update` mode runAudit returns
   // exitCode 0 and main historically fell through to `return` rather than

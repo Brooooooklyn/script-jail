@@ -13,6 +13,8 @@
 //   - Errors are accumulated (not thrown) so the CLI can print every problem
 //     before exiting, which is friendlier than failing on the first bad arg.
 
+import { splitInstallArgs } from '../shared/pm-commands.js';
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -38,6 +40,12 @@ export interface ParsedArgs {
   spoofArch: SpoofArch;
   /** Explicit `--backend` selection, or `null` when the user did not pass one. */
   backend: CliBackend | null;
+  /**
+   * Extra package-manager install args (the `--args` flag), split into an argv
+   * array.  Threaded into the audit fetch so a locally-generated lock matches a
+   * CI run that uses the same action `args`.  Empty when `--args` is omitted.
+   */
+  args: string[];
   help: boolean;
   version: boolean;
   errors: string[];
@@ -65,6 +73,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     // `null` until the user passes --backend.  `src/cli/index.ts` resolves the
     // effective backend per host (darwin: vz on arm64, bare otherwise).
     backend: null,
+    args: [],
     help: false,
     version: false,
     errors: [],
@@ -139,6 +148,24 @@ export function parseArgs(argv: string[]): ParsedArgs {
         continue;
       }
       out.backend = v as CliBackend;
+      continue;
+    }
+    // `--args` takes a single (usually quoted) string whose VALUE legitimately
+    // starts with `-` (e.g. `--args "-D --omit=dev"`), so it cannot use
+    // peekValue (which rejects dash-leading values).  Accept both the joined
+    // `--args=...` form and `--args <value>` (consuming the next token as-is).
+    if (a.startsWith('--args=')) {
+      out.args = splitInstallArgs(a.slice('--args='.length));
+      continue;
+    }
+    if (a === '--args') {
+      const next = argv[i + 1];
+      if (next === undefined) {
+        out.errors.push('--args requires a value');
+        continue;
+      }
+      i++;
+      out.args = splitInstallArgs(next);
       continue;
     }
     if (a.startsWith('-')) {

@@ -7802,6 +7802,84 @@ async function spawnVm(vmConfig, options = {}) {
   }
 }
 
+// src/shared/pm-commands.ts
+function isBareFlag(token) {
+  return !token.includes("=");
+}
+function canonicalFlagKey(token) {
+  if (token.length === 0 || token[0] !== "-") return null;
+  let i = 0;
+  while (i < token.length && token[i] === "-") i += 1;
+  let body = token.slice(i);
+  const eq = body.indexOf("=");
+  if (eq !== -1) body = body.slice(0, eq);
+  body = body.toLowerCase();
+  if (body.startsWith("no-")) body = body.slice("no-".length);
+  if (body.startsWith("config.")) body = body.slice("config.".length);
+  let key = "";
+  for (const ch of body) {
+    if (ch !== "-" && ch !== "_" && ch !== ".") key += ch;
+  }
+  return key;
+}
+function isForbiddenFlag(token) {
+  const key = canonicalFlagKey(token);
+  if (key === null || key.length === 0) return false;
+  if (key.length >= 2 && "ignorescripts".startsWith(key)) return true;
+  if (key === "mode") return true;
+  return false;
+}
+function sanitizeInstallArgs(args) {
+  const kept = [];
+  const dropped = [];
+  const droppedKeys = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (isForbiddenFlag(a)) {
+      dropped.push(a);
+      const rawKey = canonicalFlagKey(a) ?? "unknown";
+      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : rawKey;
+      droppedKeys.push(`--${displayKey}`);
+      if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        dropped.push(args[++i]);
+      }
+      continue;
+    }
+    kept.push(a);
+  }
+  return { kept, dropped, droppedKeys };
+}
+function splitInstallArgs(raw) {
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let started = false;
+  for (const ch of raw) {
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === " " || ch === "	" || ch === "\n" || ch === "\r") {
+      if (started) {
+        out.push(cur);
+        cur = "";
+        started = false;
+      }
+      continue;
+    }
+    cur += ch;
+    started = true;
+  }
+  if (started) out.push(cur);
+  return out;
+}
+
 // src/cli/parse-args.ts
 var VALID_SUBCOMMANDS = /* @__PURE__ */ new Set(["init", "update", "check"]);
 var VALID_PLATFORMS = /* @__PURE__ */ new Set(["linux", "darwin", "win32"]);
@@ -7820,6 +7898,7 @@ function parseArgs(argv) {
     // `null` until the user passes --backend.  `src/cli/index.ts` resolves the
     // effective backend per host (darwin: vz on arm64, bare otherwise).
     backend: null,
+    args: [],
     help: false,
     version: false,
     errors: []
@@ -7887,6 +7966,20 @@ function parseArgs(argv) {
         continue;
       }
       out.backend = v;
+      continue;
+    }
+    if (a.startsWith("--args=")) {
+      out.args = splitInstallArgs(a.slice("--args=".length));
+      continue;
+    }
+    if (a === "--args") {
+      const next = argv[i + 1];
+      if (next === void 0) {
+        out.errors.push("--args requires a value");
+        continue;
+      }
+      i++;
+      out.args = splitInstallArgs(next);
       continue;
     }
     if (a.startsWith("-")) {
@@ -23422,7 +23515,8 @@ var FsReadEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -23432,7 +23526,8 @@ var FsWriteEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
@@ -23791,6 +23886,12 @@ async function runAudit(input) {
   let result;
   let overlay = null;
   try {
+    const userInstallArgs = sanitizeInstallArgs(input.args ?? []).kept;
+    const archPmFlags = archOverlay.pmFlagsJson;
+    const pmFlagsJson = {
+      extra_install_args: archPmFlags?.extra_install_args ?? [],
+      ...userInstallArgs.length > 0 ? { user_install_args: userInstallArgs } : {}
+    };
     const effectiveConfig = buildEffectiveConfig({
       userConfigPath: input.configPath,
       overrides: {
@@ -23802,7 +23903,7 @@ async function runAudit(input) {
       },
       workDir: scratchDir,
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
-      ...archOverlay.pmFlagsJson !== void 0 ? { pmFlagsJson: archOverlay.pmFlagsJson } : {},
+      pmFlagsJson,
       ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}
     });
     const extraRepoOverlayFiles = [];
@@ -23869,7 +23970,7 @@ async function runAudit(input) {
     );
     input.io.setOutput?.("lockfile", input.lockPath);
     input.io.setOutput?.("diff", "");
-    return { exitCode: 0 };
+    return { exitCode: 0, trusted: false };
   }
   const committed = (0, import_node_fs8.existsSync)(input.lockPath) ? (0, import_node_fs8.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
@@ -23894,9 +23995,9 @@ async function runAudit(input) {
     input.io.stderr.write(`${msg}
 `);
     input.io.emitAuditBypassAnnotation?.(lockLabel, msg);
-    return { exitCode: 1 };
+    return { exitCode: 1, trusted: false };
   }
-  return { exitCode: diff.match ? 0 : 1 };
+  return { exitCode: diff.match ? 0 : 1, trusted: diff.match, generatedLock: result.finalYaml };
 }
 function relativeForDisplay(absPath, repoDir) {
   const rel = (0, import_node_path8.relative)(repoDir, absPath);
@@ -25143,6 +25244,13 @@ function createDockerBackend(deps = {}) {
           "mkdir -p /tmp/script-jail-strace",
           "export SCRIPT_JAIL_CONNECTION=stdio",
           "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
+          // The host-owned pm-flags sidecar is staged in the repo tree at
+          // /work/etc/script-jail/pm-flags.json (Docker does not copy it into
+          // /etc the way Firecracker's init does).  Point the guest at it so
+          // the sandbox fetch applies the SAME install args as the host part-1
+          // install — without it, Docker audits a different arg set than the
+          // host installs.  loadPmFlags re-sanitizes the file before use.
+          "export SCRIPT_JAIL_PM_FLAGS_PATH=/work/etc/script-jail/pm-flags.json",
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
         return await runAgentProcess({
@@ -25311,6 +25419,12 @@ function createBareBackend(deps = {}) {
             ...env,
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+            // Bare mode runs the agent directly on the host (no container /etc),
+            // so the host-owned pm-flags sidecar lives in the staged repo tree.
+            // Point the guest at it so the sandbox fetch applies the SAME
+            // install args as the host part-1 install.  loadPmFlags
+            // re-sanitizes the file before use.
+            SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path14.join)(staged.path, "etc/script-jail/pm-flags.json"),
             SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
             SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
             SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -25830,6 +25944,11 @@ function createMacBareExecute(deps) {
           SCRIPT_JAIL_CONNECTION: "stdio",
           SCRIPT_JAIL_BACKEND: "macos-bare",
           SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+          // macOS-bare runs the agent directly on the host (no container /etc),
+          // so the host-owned pm-flags sidecar lives in the staged repo tree.
+          // Point the guest at it so the sandbox fetch applies the SAME install
+          // args as the host part-1 install.  loadPmFlags re-sanitizes it.
+          SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path16.join)(staged.path, "etc/script-jail/pm-flags.json"),
           SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -26067,6 +26186,7 @@ async function run(deps = {}) {
       lockPath,
       mode,
       pm,
+      args: args.args,
       spoofPlatform: args.spoofPlatform,
       effectiveSpoofArch,
       warn: warn2,
@@ -26093,6 +26213,7 @@ async function run(deps = {}) {
       lockPath,
       mode,
       pm,
+      args: args.args,
       spoofPlatform: args.spoofPlatform,
       effectiveSpoofArch,
       warn: warn2,
@@ -26173,6 +26294,9 @@ async function run(deps = {}) {
         spoofArch: effectiveSpoofArch
       },
       pm,
+      // Developer install args (the `--args` flag) reach the audit fetch so a
+      // locally-generated lock matches a CI run using the same action `args`.
+      args: args.args,
       // hostArch comes from the injected detectPlatform (NOT re-derived from
       // process.arch) so unit tests can exercise the arm64 codepath from
       // an x64 dev box without monkey-patching process.arch.
@@ -26239,6 +26363,7 @@ async function runLinux(input) {
         spoofArch: input.effectiveSpoofArch
       },
       pm: input.pm,
+      args: input.args,
       hostArch: arch,
       workDir: (0, import_node_os9.tmpdir)(),
       // Backend executor: runAudit prepares the common config/sidecars, then
@@ -26294,6 +26419,7 @@ async function runMacBare(input) {
         spoofArch: input.effectiveSpoofArch
       },
       pm: input.pm,
+      args: input.args,
       hostArch: platform5.arch,
       // os.tmpdir() — never `cwd` — so the rewritten config + sidecars cannot
       // pollute the user's repo.  runAudit creates a private mkdtemp dir here.

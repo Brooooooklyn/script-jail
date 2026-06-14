@@ -225,6 +225,59 @@ describe('runInstallPhase', () => {
       });
       expect(callCount).toBe(1);
     });
+
+    it('commandOverride is honored: traces the override cmd/args, NOT INSTALL_CMD', async () => {
+      // The agent's root-prepare pass supplies a commandOverride so the SAME
+      // dispatch loop traces `npm run prepare …` instead of `npm rebuild …`.
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const strace: StraceRunner = {
+        async *run(cmd, args) { calls.push({ cmd, args }); },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(mockProcReader({})),
+        emitter,
+        commandOverride: { cmd: 'npm', args: ['run', 'prepare', '--if-present', '--foreground-scripts'] },
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.cmd).toBe('npm');
+      expect(calls[0]!.args).toEqual(['run', 'prepare', '--if-present', '--foreground-scripts']);
+      // Crucially NOT the install command.
+      expect(calls[0]!.args).not.toEqual(['rebuild', '--foreground-scripts']);
+    });
+
+    it('commandOverride still splices the pnpm store-dir (manager-keyed, not command-keyed)', async () => {
+      // pnpmStoreDirArg keys off `manager`, so even an override gets the pin
+      // when manager==='pnpm'. The resolver never returns a pnpm override in
+      // production, but the dispatch contract must stay consistent.
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const strace: StraceRunner = {
+        async *run(cmd, args) { calls.push({ cmd, args }); },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter } = makeEmitter();
+      await runInstallPhase({
+        manager: 'pnpm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(mockProcReader({})),
+        emitter,
+        commandOverride: { cmd: 'pnpm', args: ['run', 'prepare'] },
+      });
+      expect(calls[0]!.args).toEqual(['run', 'prepare', '--store-dir=/work/.pnpm-store']);
+    });
   });
 
   describe('strace line processing', () => {
@@ -8149,6 +8202,71 @@ describe('runInstallPhase', () => {
       expect(unresolved.length).toBeGreaterThanOrEqual(1);
     });
 
+    // Security regression: null rootPid MUST fail closed on root-attributed
+    // fs events (adversarial-review finding [high], 2026-06-14).
+    //
+    // When the Linux dispatcher's getRootPid() returns null (production CASE B
+    // in agent.ts: strace spawned but readStraceChildPid timed out / /proc
+    // unavailable), rootAnchored() previously returned `true` — FAIL OPEN.
+    // A dependency forging `npm_package_name=<root>` in that degraded run
+    // would get root_anchored:true, making its repo write look genuine.
+    //
+    // Post-fix: null rootPid → root_anchored:false (FAIL CLOSED).
+    // normalize.ts treats root_anchored !== true as <FORGED_ROOT>, which is
+    // fail-loud and unambiguous. The unconditional-true path is reserved for
+    // the observe-only macOS-bare file (phase-install-macos.ts) only.
+    it('null rootPid fails closed: root-attributed fs write gets root_anchored:false (not true)', async () => {
+      // Root project environment: the forging dep or degraded-production root
+      // runs under these env vars, claimed via npm_package_name.
+      const rootPkgName = 'my-root-app';
+      const rootPkgVersion = '2.0.0';
+      const rootPkgKey = `${rootPkgName}@${rootPkgVersion}`;
+      const proc = mockProcReader({
+        8350: {
+          ppid: 1,
+          env: {
+            npm_package_name: rootPkgName,
+            npm_package_version: rootPkgVersion,
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Absolute open inside the repo cwd — this is the forged/degraded
+        // root write that must NOT get root_anchored:true.
+        {
+          pid: 8350,
+          line: 'openat(AT_FDCWD, "/work/dist/output.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        // rootPid explicitly null — mirrors CASE B: strace spawned but
+        // readStraceChildPid returned null (deadline/proc-unavailable).
+        // Pre-fix: rootAnchored() returned true  → FAIL OPEN (bug).
+        // Post-fix: rootAnchored() returns false → FAIL CLOSED (correct).
+        strace: cannedStraceRunner(records, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The write event must have been emitted (pkg matches rootPkgKey).
+      const writeEvent = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'write' && r['path'] === '/work/dist/output.js';
+      });
+      expect(writeEvent).toBeDefined();
+      // root_anchored MUST be false (fail closed), NOT true (fail open).
+      // A true here would mean normalize sees this as a genuine root write,
+      // laundering a potential forgery as $REPO/dist/output.js.
+      expect((writeEvent!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+
     // Bug #4 — clone3 return-value parsing anchored on the closing `)`.
     //  Real-shape clone3 lines contain numeric struct fields BEFORE the
     //  trailing rc (`stack_size=0`, `exit_signal=17`).  Pre-fix the rc
@@ -8239,6 +8357,160 @@ describe('runInstallPhase', () => {
       // Post-fix anchored regex.
       const post = line.match(/\)\s*=\s*(-?\d+)\b/);
       expect(post?.[1]).toBe('12345');
+    });
+  });
+
+  // =====================================================================
+  // Fix #2 (adversarial-review [medium], 2026-06-14) — deterministic
+  // root_anchored verdict + deferred exec-cwd reconcile.
+  //
+  // `strace -ff` writes one file per pid and the tailer drains them in
+  // NONDETERMINISTIC order, so a root child's exec+write can be processed
+  // BEFORE the parent's clone line.  Two coupled defects:
+  //   (A) the exec-cwd snapshot recorded `null` permanently when the clone
+  //       had not yet propagated the inherited cwd (not-yet-known confused
+  //       with provably-unknown), and
+  //   (B) the root_anchored verdict was computed AT EMIT TIME against an
+  //       incomplete process tree.
+  // Combined, the SAME genuine root write surfaced as genuine in one run and
+  // `<FORGED_ROOT>` in another → committed-lock drift / flaky `check` CI.
+  //
+  // Fix: defer the exec-cwd snapshot until the clone edge arrives, and defer
+  // the root_anchored verdict to end-of-drain when the tree is complete.
+  // These tests prove the verdict is now ORDER-INDEPENDENT.
+  // =====================================================================
+  describe('Fix #2 — deterministic root_anchored across strace drain order', () => {
+    const rootPkgName = 'det-root-app';
+    const rootPkgVersion = '3.1.0';
+    const rootPkgKey = `${rootPkgName}@${rootPkgVersion}`;
+    const ROOT_PID = 4100;
+    const CHILD_PID = 4200;
+    const rootEnv = {
+      npm_package_name: rootPkgName,
+      npm_package_version: rootPkgVersion,
+      npm_lifecycle_event: 'postinstall',
+    };
+
+    // Records for a GENUINE root child: cloned from the root PM pid, exec'd
+    // at the repo root (/work), wrote /work/dist/x.js.  `childFirst` controls
+    // whether the child's exec+write drain BEFORE the parent's clone line.
+    const childRecords = [
+      // Child execs at /work.  When drained before the clone, its exec-cwd is
+      // NOT-YET-KNOWN (clone hasn't propagated /work yet) → deferred snapshot.
+      // /bin/sh is neither `node` nor a PM client, so it does not trigger any
+      // node-bootstrap special handling.
+      {
+        pid: CHILD_PID,
+        line: 'execve("/bin/sh", ["sh", "build.sh"], 0x7ffd) = 0',
+        source: 'strace' as const,
+      },
+      // Child writes a genuine root build artifact (absolute path inside the
+      // repo).  Attributes to the root pkg via the child's npm_* env.
+      {
+        pid: CHILD_PID,
+        line: 'openat(AT_FDCWD, "/work/dist/x.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 5',
+        source: 'strace' as const,
+      },
+    ];
+    // The root PM clone line.  CLONE_FS so the child inherits /work via the
+    // shared cwd group.  Processing this record also seeds the root pid's cwd
+    // (= /work) at the top of the dispatcher loop.
+    const cloneRecord = {
+      pid: ROOT_PID,
+      line: `clone(child_stack=0, flags=CLONE_VM|CLONE_FS|SIGCHLD) = ${CHILD_PID}`,
+      source: 'strace' as const,
+    };
+
+    function rootWrites(lines: string[]): Record<string, unknown>[] {
+      return lines
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .filter((e) => {
+          const r = e['raw'] as Record<string, unknown>;
+          return r['kind'] === 'write' && r['path'] === '/work/dist/x.js';
+        });
+    }
+
+    function findRootWrite(lines: string[]): Record<string, unknown> | undefined {
+      return rootWrites(lines)[0];
+    }
+
+    async function runOrder(
+      records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }>,
+    ): Promise<string[]> {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: rootEnv },
+        [CHILD_PID]: { ppid: ROOT_PID, env: rootEnv },
+      });
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      return lines;
+    }
+
+    it('child drains BEFORE parent clone: genuine root write is root_anchored:true', async () => {
+      // The defect order: child exec + write FIRST, then the parent clone.
+      // Pre-fix: exec-cwd snapshotted `null` (not-yet-known) AND the verdict
+      // was computed at emit time against a tree missing the clone edge →
+      // root_anchored:false (<FORGED_ROOT>).  Post-fix: deferred snapshot is
+      // reconciled at the clone, verdict computed at end-of-drain → true.
+      const lines = await runOrder([...childRecords, cloneRecord]);
+      const writes = rootWrites(lines);
+      // Emitted exactly once (no double-emit, no drop).
+      expect(writes).toHaveLength(1);
+      expect((writes[0]!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    it('parent clone drains BEFORE child (mirror order): same verdict root_anchored:true', async () => {
+      // The benign order: clone first (propagates /work), then child exec +
+      // write.  Must yield the SAME verdict as the defect order → proves the
+      // verdict is order-independent (the determinism guarantee).
+      const lines = await runOrder([cloneRecord, ...childRecords]);
+      const writes = rootWrites(lines);
+      expect(writes).toHaveLength(1);
+      expect((writes[0]!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    it('pendingExecCwd leftover (clone never drains) fails closed: root_anchored:false', async () => {
+      // Child execs not-yet-known and its clone line NEVER arrives, so the
+      // child stays parked in `pendingExecCwd` to end-of-drain.  The flush
+      // finalizes it to `null` (unprovable cwd) and `childParent` has no edge
+      // to the root → the walk fails closed.  The write still emits (pkg
+      // matches rootPkgKey) but with root_anchored:false.
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: rootEnv },
+        [CHILD_PID]: { ppid: ROOT_PID, env: rootEnv },
+      });
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        // No clone record at all → CHILD_PID's exec-cwd is never reconciled
+        // and no parent edge is recorded.  ROOT_PID appears via a no-op read
+        // so the root is still seeded (cwd = /work) — proving the child fails
+        // closed on its OWN unprovable lineage, not on a missing root seed.
+        strace: cannedStraceRunner(
+          [
+            { pid: ROOT_PID, line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3', source: 'strace' },
+            ...childRecords,
+          ],
+          0,
+          { rootPid: ROOT_PID },
+        ),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      const write = findRootWrite(lines);
+      expect(write).toBeDefined();
+      expect((write!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
     });
   });
 
@@ -16071,7 +16343,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       // Read a path that doesn't exist.
-      expect(loadPmFlags(join(testDir, 'absent.json'))).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(join(testDir, 'absent.json'))).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16079,7 +16351,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['--cpu=x64', '--os=linux'] }));
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--cpu=x64', '--os=linux'] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--cpu=x64', '--os=linux'], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16087,7 +16359,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, 'not json');
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16095,7 +16367,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, JSON.stringify({ other_field: 'oops' }));
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16103,7 +16375,29 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['ok', 42] }));
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
+    } finally { teardown(); }
+  });
+
+  it('parses user_install_args alongside extra_install_args', () => {
+    setup();
+    try {
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: ['--cpu=x64'], user_install_args: ['-D', '--omit=dev'] }),
+      );
+      expect(loadPmFlags(pmFlagsPath)).toEqual({
+        extraInstallArgs: ['--cpu=x64'],
+        userInstallArgs: ['-D', '--omit=dev'],
+      });
+    } finally { teardown(); }
+  });
+
+  it('defaults user_install_args to [] when only extra_install_args is present', () => {
+    setup();
+    try {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['--os=linux'] }));
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--os=linux'], userInstallArgs: [] });
     } finally { teardown(); }
   });
 });

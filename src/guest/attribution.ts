@@ -65,6 +65,52 @@ function buildPkg(name: string, version: string | undefined): string {
 }
 
 /**
+ * Build the complete set of root-package identity keys from a parsed
+ * root `package.json` manifest, and the canonical key to use when
+ * force-attributing events to the root.
+ *
+ * Rules mirror `buildPkg` exactly:
+ *   - Bare `name` is ALWAYS added (covers the "version field absent →
+ *     npm sets no npm_package_version → attribution yields bare name" case).
+ *   - `name@version` is added whenever `version` is a string — INCLUDING
+ *     the empty string `''` — because npm/pnpm set `npm_package_version=`
+ *     (empty) when `package.json` has `"version": ""`, which makes
+ *     `buildPkg` produce `name@` (NOT the bare `name`).  Gating on
+ *     `version.length > 0` would diverge from `buildPkg` for that case,
+ *     causing a root fs event with `pkg='name@'` to go unrecognised and
+ *     `normalize` to throw `pkgDirs missing entry`.
+ *
+ * Returns `{ keys: Set<string>, canonical: string | null }` where:
+ *   - `keys` is the set of all pkg strings that could be emitted by
+ *     attribution for a root event.
+ *   - `canonical` is the single key used to force-attribute root events
+ *     (the most-specific one: `name@version` when version is a string,
+ *     else `name`).  `null` only when `name` is missing/invalid.
+ *
+ * Used by both `src/guest/agent.ts` (guest side) and `src/main.ts`
+ * (host side) to avoid duplicating this logic — divergence was the
+ * original bug.
+ */
+export function buildRootPkgKeys(manifest: { name?: unknown; version?: unknown }): {
+  keys: Set<string>;
+  canonical: string | null;
+} {
+  const keys = new Set<string>();
+  if (typeof manifest.name !== 'string' || manifest.name.length === 0) {
+    return { keys, canonical: null };
+  }
+  const name = manifest.name;
+  keys.add(name);
+  if (typeof manifest.version === 'string') {
+    // version is present (even if empty ''): mirrors buildPkg → `name@version`
+    keys.add(`${name}@${manifest.version}`);
+    return { keys, canonical: `${name}@${manifest.version}` };
+  }
+  // version field absent → canonical is bare name
+  return { keys, canonical: name };
+}
+
+/**
  * Compose an {@link AttributionResult} from raw npm lifecycle env vars, applying
  * the SAME match rules as the /proc walk: `npm_package_name` must be non-empty
  * AND `npm_lifecycle_event` must be one of the canonical {@link LifecycleStage}

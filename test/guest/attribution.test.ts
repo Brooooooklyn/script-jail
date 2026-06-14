@@ -3,7 +3,7 @@
 // All tests use a synthetic in-memory ProcReader — no /proc I/O.
 
 import { describe, it, expect } from 'vitest';
-import { Attribution } from '../../src/guest/attribution.js';
+import { Attribution, buildRootPkgKeys } from '../../src/guest/attribution.js';
 import type { ProcReader, AttributionResult } from '../../src/guest/attribution.js';
 
 // ---------------------------------------------------------------------------
@@ -374,6 +374,64 @@ describe('Attribution', () => {
       pkg: 'victim-pkg@9.9.9',
       lifecycle: 'postinstall',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildRootPkgKeys — mirrors buildPkg exactly (single source of truth)
+// ---------------------------------------------------------------------------
+
+describe('buildRootPkgKeys', () => {
+  // Normal version: both bare name and name@version in keys; canonical = name@version
+  it('normal version → keys contain name and name@version; canonical = name@version', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 'x', version: '1.0.0' });
+    expect([...keys].sort()).toEqual(['x', 'x@1.0.0']);
+    expect(canonical).toBe('x@1.0.0');
+  });
+
+  // EMPTY-STRING version: this is the bug case — npm sets npm_package_version='' so
+  // attribution produces pkg 'x@', NOT 'x'.  Keys must include 'x@'.
+  it('empty-string version → keys contain BOTH bare name AND name@ (mirrors buildPkg)', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 'x', version: '' });
+    expect(keys.has('x')).toBe(true);
+    expect(keys.has('x@')).toBe(true);   // critical: NOT skipped by length > 0
+    expect(canonical).toBe('x@');
+  });
+
+  // Scoped package with empty version
+  it('scoped package with empty-string version → keys contain @scope/y and @scope/y@', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: '@scope/y', version: '' });
+    expect(keys.has('@scope/y')).toBe(true);
+    expect(keys.has('@scope/y@')).toBe(true);
+    expect(canonical).toBe('@scope/y@');
+  });
+
+  // Missing version field: canonical is bare name only
+  it('missing version field → keys contain only bare name; canonical = name', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 'x' });
+    expect([...keys]).toEqual(['x']);
+    expect(canonical).toBe('x');
+  });
+
+  // Missing name → empty keys, null canonical
+  it('missing name → empty keys, null canonical', () => {
+    const { keys, canonical } = buildRootPkgKeys({});
+    expect(keys.size).toBe(0);
+    expect(canonical).toBeNull();
+  });
+
+  // Empty-string name → empty keys, null canonical
+  it('empty-string name → empty keys, null canonical', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: '' });
+    expect(keys.size).toBe(0);
+    expect(canonical).toBeNull();
+  });
+
+  // Non-string name → empty keys, null canonical
+  it('non-string name → empty keys, null canonical', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 42 });
+    expect(keys.size).toBe(0);
+    expect(canonical).toBeNull();
   });
 });
 

@@ -70,12 +70,15 @@ export interface BuildEffectiveConfigInput {
   yarnrcOverlay?: string;
   /**
    * Optional `etc/script-jail/pm-flags.json` payload.  Read by the guest
-   * (`src/guest/phase-fetch.ts`) which appends `extra_install_args` to npm's
-   * `ci` invocation.  npm only — pnpm does not accept these CLI flags.
+   * (`src/guest/phase-fetch.ts`).  Two channels:
+   *   * `extra_install_args` — npm-only arch hints (`--cpu/--os/--libc`),
+   *     appended to `npm ci` only (pnpm/yarn reject these CLI flags).
+   *   * `user_install_args`  — developer install flags (the action `args`
+   *     input), appended to ALL THREE managers' fetch command.
    * Written verbatim (after JSON.stringify) to
    * `<workDir>/etc/script-jail/pm-flags.json`.
    */
-  pmFlagsJson?: { extra_install_args: string[] };
+  pmFlagsJson?: { extra_install_args: string[]; user_install_args?: string[] };
   /**
    * Optional `etc/script-jail/pnpm-arch.json` content.  Provided by the
    * Optional pnpm `supportedArchitectures` override.  The guest

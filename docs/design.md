@@ -145,6 +145,136 @@ Phase B starts after fetch. The network is disabled, `strace` is attached, and
 the lifecycle rebuild/install command runs. Only Phase B events enter the
 lockfile.
 
+### Drop-in Install Trust Model (`install: true`)
+
+By default the host runner never receives a `node_modules` — the install runs on
+a throwaway copy inside the backend and only the lockfile YAML crosses back. The
+opt-in `install: true` mode turns the Action into a drop-in install replacement
+by reusing the SAME two-phase split on the host:
+
+1. **Host part 1** — the package manager installs with `--ignore-scripts`
+   (`--mode=skip-build` for yarn). No third-party code runs; the real
+   `node_modules` is populated safely.
+2. **Sandbox audit** — unchanged. The lockfile is diffed against the committed
+   `.script-jail.lock.yml` and the audit-bypass gate fires.
+3. **Host part 2** — the deferred lifecycle scripts run on the host, but ONLY
+   when the audit is *trusted*: `mode === 'check'` ∧ the lock matched ∧ no
+   audit-bypass entry. On drift or bypass the scripts never run; the safe
+   no-scripts tree is left in place and the job fails.
+
+The command shapes for both host halves are the single source of truth in
+`src/shared/pm-commands.ts`, shared with the guest phases so the host install is
+byte-identical to what the sandbox audited. The trust signal is surfaced from
+`runAudit` as `{ exitCode, trusted }`; `main.ts` gates part 2 on `trusted`.
+
+**Accepted residual — host part 2 runs online.** Real lifecycle scripts
+(`prebuild-install`, `node-pre-gyp`) fetch prebuilt binaries, so part 2 cannot
+run inside an offline network namespace on a generic runner. Consequence: a
+`connect` the sandbox recorded as `<BLOCKED>` (Phase B is offline) WILL succeed
+when the same script runs on the host. Trust therefore derives from the committed
+lock being **human-reviewed**, not from host isolation — a matching audit means
+"behaviour is unchanged from the reviewed lock," not "safe to run with the
+network on." This is strictly safer than an unaudited install step (which runs
+the same scripts online with zero recording) but weaker than the audit-only mode,
+where every script stays inside the sandbox. `install` requires a committed lock
+and is rejected in `update` mode (which regenerates the lock and skips the
+bypass scan, leaving no fail-closed gate). See also the [README drop-in install
+section](../README.md#drop-in-install).
+
+To keep that online egress from being silent, part 2 first scans the matched
+lock (`collectNetworkAttempts`) and, if any `network_attempts` are recorded,
+emits a `::warning::` with the count plus a per-package list before running the
+scripts. The recorded destination is the resolved **IP:port** the offline audit
+captured — `strace` parses the `connect()` sockaddr, never a DNS name — so the
+warning notes the host may resolve a different address. It is a directional
+heads-up that egress *will* happen, not an exact preview of where.
+
+The warning is **scoped to what host part 2 actually runs** (`formatEgressWarning`
+in `src/action/diff.ts`). Not every audited egress entry fires on the host: the
+sandbox always audits the root `prepare` in a dedicated pass (below), but host
+part 2 invokes `INSTALL_CMD[pm]`, whose coverage of the root `prepare` differs by
+manager — npm (`rebuild --foreground-scripts`) and yarn (`install --immutable`)
+do **not** run it, pnpm (`rebuild --pending`) **does**. So for npm/yarn, egress
+entries whose `(stage === 'prepare', packageId ∈ rootPackageIds)` are partitioned
+out of the host-bound "WILL now succeed" list and shown instead in a separate
+"audited in the sandbox; NOT run on the host (root `prepare`)" block. For pnpm
+those entries stay host-bound. Surfacing an audited-but-not-run connect as "WILL
+now succeed" would over-claim; the partition keeps the warning honest about what
+the runner will actually reach.
+
+**Accepted residual — the root `prepare` is audited but not run on the host.**
+The sandbox runs a dedicated second audited pass for the *root* project's
+`prepare` script (`npm rebuild --foreground-scripts` and yarn-berry
+`install --immutable` never run a root `prepare`), so its reads/writes/egress
+*are* recorded in the lock. But host part 2 runs only `INSTALL_CMD[pm]`
+(`npm rebuild` / `pnpm rebuild --pending` / `yarn install --immutable`) — it
+does **not** run the root `prepare`. The asymmetry is deliberate: the host drop-in
+install is for consuming a project's dependencies safely, not for building the
+project itself. Two consequences follow:
+
+- For a project whose root `prepare` generates build output (e.g. compiling
+  `dist/`), `install: true` does **not** produce that output on the host — it is
+  **not** a full `npm install` / `yarn install` for the root package. Run your
+  build step separately after the Action.
+- The egress warning above may list `network_attempts` that came from the
+  root-`prepare` audit pass. For npm/yarn those connects will **not** fire during
+  host part 2, because the root `prepare` does not run there, so they are shown in
+  the warning's separate audited-only block (above); for pnpm they stay
+  host-bound. The warning still surfaces them for review (they describe behaviour
+  the lock captured) either way.
+
+**Non-forgeable root identity (`root_anchored`).** The root project's events are
+privileged: it is not under `node_modules`, so a root-attributed fs event has no
+`$PKG` token and surfaces as `$REPO/...` in `external_reads`/`escaped_writes`.
+But attribution derives the package label from the **forgeable** `npm_package_name`
+the observed process exported, so a malicious dependency could spawn a child with
+`npm_package_name=<root-project-name>` and launder its own repo writes under the
+root's identity — and, if a forged write matched a genuine root write, dedupe them
+away so the escape disappears entirely. Env is therefore insufficient to decide
+root identity.
+
+The fix is a non-forgeable verdict, `root_anchored`, that the producer stamps on
+every root-attributed fs read/write (consumed in `src/lock/normalize.ts`, never
+rendered):
+
+- **Linux/Firecracker (the enforcement boundary)** computes it from a signal a
+  lifecycle script cannot rewrite after the fact: the kernel-observed process tree
+  (`clone`/`fork`/`vfork` edges) plus the cwd each process had at its **first
+  `execve`**. The package manager sets a lifecycle script's cwd to the package dir
+  *before* the script can run, and the value is snapshotted at exec time, so a
+  later `chdir(workDir)` cannot launder it. `isRepoRootAnchored`
+  (`src/guest/root-anchor.ts`) walks an event's pid up the parent chain to the
+  package-manager root: the event is anchored **iff** every hop either never
+  exec'd (inherits its parent's identity) or exec'd at the repo root, with no
+  ancestor that exec'd in a dependency directory. It is a **pure, fail-closed**
+  walk — an unresolvable cwd, a broken lineage, or a depth-bound overrun all
+  return `false`.
+- **The dedicated root-`prepare` pass is bulletproof by construction.** That pass
+  runs `<manager> run prepare` and nothing else, so *every* event it produces
+  genuinely belongs to the root's prepare regardless of any forged env. A
+  force-attribution emitter (in `src/guest/agent.ts`) rewrites each event in the
+  pass onto the canonical root key with `root_anchored = true` at the emitter
+  boundary — the only point where "this came from the prepare pass" is still
+  known. No untrusted actor can be in that pass, so it needs no process-tree walk.
+- **macOS-bare defaults it `true`** (observe-only; see `docs/divergence.md`). It
+  has no strace process-tree / exec-cwd machinery, so root identity there is
+  env-trusted — a documented residual, with Firecracker as the enforcement
+  boundary.
+
+`normalize.ts` then surfaces the three cases distinctly:
+
+| Event | `root_anchored` | Renders as |
+| --- | --- | --- |
+| genuine root | `true` | `$REPO/...` (exactly as before) |
+| forged root (claims root, not anchored) | `!== true` | `<FORGED_ROOT> $REPO/...` (outermost prefix) |
+| non-root with no package dir | n/a | throws (fail closed) |
+
+A forged-root event is **never dropped and never throws** — dropping would be a
+dependency-triggered hide, throwing would crash the whole audit. The
+`<FORGED_ROOT> ` prefix makes it a distinct string that can never dedupe-collapse
+with a genuine root entry, so a laundering attempt is fail-loud for the reviewer.
+Genuine root output is byte-identical to before the change.
+
 ### Layered Observation
 
 No single layer sees everything:

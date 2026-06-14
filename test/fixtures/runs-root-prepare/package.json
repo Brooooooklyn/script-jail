@@ -1,0 +1,10 @@
+{
+  "name": "runs-root-prepare",
+  "version": "1.0.0",
+  "description": "Shape fixture: the ROOT project ships a `prepare` script that (a) WRITES build output inside the repo (SURFACES as $REPO/prepare-built.txt in escaped_writes), (b) READS a path outside the repo (/etc/hostname -> external_reads), and (c) reads a protected env var (NPM_TOKEN). `npm rebuild --foreground-scripts` / `yarn install --immutable` do NOT run a root `prepare`, so the guest agent runs a SECOND audited pass (`npm run prepare --if-present --foreground-scripts`) to capture it. The root project is not in node_modules, so the agent passes its key via rootPkgKeys (NOT a /work pkgDir) so normalize SURFACES the root fs events instead of throwing or dropping them as $PKG -- forgery-safe (Codex review #1). The `postinstall` gives the main install pass an observable event too.",
+  "private": true,
+  "scripts": {
+    "prepare": "node prepare.js",
+    "postinstall": "node postinstall.js"
+  }
+}
