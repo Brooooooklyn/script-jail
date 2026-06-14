@@ -111,13 +111,23 @@ Then your build steps can use `node_modules` directly — no second `install` st
   would re-enable scripts in step 1 (`--no-ignore-scripts`, yarn `--mode`, …) are
   dropped with a warning.
 - The Action **audits** your root project's `prepare` script in the sandbox but
-  does **not run it on the runner** in step 3 (it runs only `rebuild`/`install
-  --immutable`, which never invoke a root `prepare`). So `install: true` is a
-  drop-in replacement for installing your **dependencies**, not a full build of
-  your **own** package: if your root `prepare` generates build output (compiling
+  does **not run it on the runner** in step 3 for npm/yarn (they run only
+  `rebuild`/`install --immutable`, which never invoke a root `prepare`; pnpm
+  `rebuild --pending` does). So for npm/yarn `install: true` is a drop-in
+  replacement for installing your **dependencies**, not a full build of your
+  **own** package: if your root `prepare` generates build output (compiling
   `dist/`, etc.), run your build step separately afterwards. Any
-  `network_attempts` the warning lists that originate from the root `prepare`
-  pass will **not** fire on the runner.
+  `network_attempts` the egress warning attributes to the root `prepare` pass
+  are shown as **audited in the sandbox, not run on the host** (npm/yarn),
+  rather than as host-bound egress.
+- **Root identity is non-forgeable.** Your root project's events surface in the
+  lock as `$REPO/...`. On the enforcing Linux/Firecracker backend the root is
+  identified from the kernel process tree plus each process's working directory
+  at exec time — **not** from env — so a dependency cannot forge
+  `npm_package_name=<your-project>` to launder its own repo writes under your
+  root. A write that *claims* to be the root but is not anchored to it surfaces
+  distinctly with a `<FORGED_ROOT> ` prefix in `external_reads`/`escaped_writes`
+  (fail-loud, never hidden), so review catches it.
 
 > **Security note.** Step 3 runs the lifecycle scripts **on the runner with the
 > network on** (real postinstalls fetch prebuilt binaries, so this is
@@ -131,10 +141,13 @@ Then your build steps can use `node_modules` directly — no second `install` st
 >
 > Before step 3 runs, if the matched lock recorded any `network_attempts`, the
 > action emits a `::warning::` naming the count and the destinations those
-> scripts will now reach online. The destinations are the **IP:port** the
-> offline audit observed (`connect()` carries a resolved address, not a DNS
-> name), so a fresh online resolve may hit a different address — treat the list
-> as a heads-up, not an exact preview.
+> scripts will now reach online. Egress the root `prepare` pass recorded is
+> listed in a **separate "audited in the sandbox; NOT run on the host"** block
+> for npm/yarn (their step 3 never runs the root `prepare`); for pnpm it stays
+> in the host-bound list. The destinations are the **IP:port** the offline audit
+> observed (`connect()` carries a resolved address, not a DNS name), so a fresh
+> online resolve may hit a different address — treat the list as a heads-up, not
+> an exact preview.
 
 ## Configuration
 

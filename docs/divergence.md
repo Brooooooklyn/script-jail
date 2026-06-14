@@ -656,6 +656,26 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   blanket-canonicalize spawn results to attempt-only: that would erase the
   Linux signal that an exec was blocked.
 
+- **Root identity is env-trusted on macOS-bare (`root_anchored` defaulted
+  `true`).** The root project's fs events surface as `$REPO/...`, and a dependency
+  forging `npm_package_name=<root>` to launder its repo writes under the root is
+  caught on Linux/Firecracker by the non-forgeable `root_anchored` verdict, which
+  is computed from the kernel process tree + per-pid exec-cwd
+  (`isRepoRootAnchored`; see `docs/design.md` "Non-forgeable root identity").
+  macOS-bare is **observe-only** and has no `strace` process-tree / exec-cwd
+  machinery, so it cannot compute that verdict and **defaults
+  `root_anchored: true`** on every root-attributed fs event
+  (`src/guest/phase-install-macos.ts`). Consequence for divergence: a **forged**
+  attack payload could render differently across backends — Linux marks the
+  laundered write `<FORGED_ROOT> $REPO/...`, macOS-bare treats it as a genuine
+  `$REPO/...` — so the two locks diverge on that line for a *malicious* fixture.
+  **Benign/parity fixtures are unaffected:** a genuine root event anchors `true`
+  on both backends and renders identically. The dedicated root-`prepare` pass also
+  force-attributes `root_anchored: true` on both backends (it runs only the root's
+  prepare, by construction). As with the other macOS-bare residuals,
+  **Firecracker is the enforcement boundary**; the env-trusted default is a known
+  no-strace fidelity gap, not a parity bug.
+
 - **Dropped `audit_bypass` detectors.** Three `audit_bypass` event kinds are
   **strace-derived** and have no macOS equivalent, because there is no kernel
   syscall channel to cross-check the libc-level shim against:
