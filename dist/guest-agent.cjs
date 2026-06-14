@@ -30715,6 +30715,20 @@ ${stdoutTail}`;
       input,
       `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
     );
+    if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) and produced no audit events \u2014 the root \`prepare\` script likely ran untraced (strace could not attach) or the package manager aborted before spawning it. Refusing to emit a lockfile: the root \`prepare\` would be unaudited and a clean diff against it would be untrustworthy.`,
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    if (prepareResult.exitCode !== 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) \u2014 the root \`prepare\` script failed under audit. This is recorded in the lockfile, not treated as a fatal error.`,
+        false
+      );
+    }
     installResult.eventCount += prepareResult.eventCount;
     const prepareTamper = prepareResult.tamperReason ?? prepareRunner.getTamperReason();
     if (installResult.tamperReason === null) {

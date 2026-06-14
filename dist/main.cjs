@@ -26635,8 +26635,12 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = defaultSpawn) {
   }
   const base = FETCH_CMD[pm];
   const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir)];
-  io.stdout.write(`[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${finalArgs.join(" ")}
-`);
+  const safeArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir)];
+  const userArgSuffix = kept.length > 0 ? ` (+${kept.length} user install arg${kept.length === 1 ? "" : "s"}, not shown)` : "";
+  io.stdout.write(
+    `[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${safeArgs.join(" ")}${userArgSuffix}
+`
+  );
   runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io);
 }
 function hostRunScripts(pm, repoDir, io, spawn2 = defaultSpawn) {
