@@ -24,6 +24,8 @@
 //     derives from the reviewed lock, not from host isolation.  See docs.
 
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { delimiter, isAbsolute, join } from 'node:path';
 
 import {
   FETCH_CMD,
@@ -33,6 +35,65 @@ import {
   type Manager,
 } from '../shared/pm-commands.js';
 import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
+
+// ---------------------------------------------------------------------------
+// SECURITY: pin npm's `git` config to the trusted runner git
+// ---------------------------------------------------------------------------
+//
+// npm's `git` CONFIG selects the git BINARY npm invokes for git operations
+// (clone / ls-remote) and is read from the project `.npmrc` in repoDir.  When
+// the lockfile carries a NON-GitHub git dependency (git+https://gitlab.com/…,
+// git+ssh://, git+file://; GitHub deps use the codeload HTTPS tarball and never
+// trigger git), `npm ci --ignore-scripts` INVOKES that configured git to fetch
+// the dep.  `--ignore-scripts` does NOT prevent this — it disables lifecycle
+// SCRIPTS, which is orthogonal to which git binary runs.  So a PR that commits
+// `.npmrc` with `git=./evil` + a non-GitHub git dep would execute `./evil` on
+// the runner during the pre-trust host part-1, BEFORE the trust gate.
+//
+// npm config precedence: an `npm_config_git` ENV var BEATS the project
+// `.npmrc`, so injecting it into the child env defeats the override.  We
+// resolve the ABSOLUTE path of the trusted runner git ONCE (an absolute path so
+// a repo-placed `./git` in cwd cannot shadow a bare `git`).  If it can't be
+// resolved we fall back to the bare literal `git` — still a value that
+// OVERRIDES (and thus defeats) the repo `.npmrc git=` entry; npm then resolves
+// it via PATH like any other command.  npm-specific but harmless for
+// pnpm/yarn (they ignore `npm_config_git`).
+let RESOLVED_TRUSTED_GIT: string | undefined;
+function trustedGitPath(): string {
+  if (RESOLVED_TRUSTED_GIT !== undefined) return RESOLVED_TRUSTED_GIT;
+  RESOLVED_TRUSTED_GIT = resolveGitFromPath() ?? 'git';
+  return RESOLVED_TRUSTED_GIT;
+}
+
+/**
+ * Scan `process.env.PATH` for the first executable named `git`/`git.exe` and
+ * return its ABSOLUTE path.  Returns `undefined` when none is found (caller
+ * falls back to the bare literal, which still overrides the repo `.npmrc`).
+ */
+function resolveGitFromPath(): string | undefined {
+  const pathVar = process.env['PATH'];
+  if (pathVar === undefined || pathVar === '') return undefined;
+  const names = process.platform === 'win32' ? ['git.exe', 'git.cmd', 'git'] : ['git'];
+  for (const dir of pathVar.split(delimiter)) {
+    if (dir === '') continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      // Only accept an ABSOLUTE candidate so a relative PATH entry (e.g. `.`)
+      // can't point npm at a repo-placed shadow binary.
+      if (isAbsolute(candidate) && existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Child env for the host PM spawns: the inherited environment plus the
+ * `npm_config_git` pin (see the security note above).  MERGES over
+ * `process.env` so PATH / HOME / registry auth are preserved.
+ */
+function hostInstallEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, npm_config_git: trustedGitPath() };
+}
 
 /** Minimal sink so the module is testable without touching the real streams. */
 export interface HostInstallIo {
@@ -53,6 +114,7 @@ export type HostSpawn = (
   cmd: string,
   args: string[],
   cwd: string,
+  env: NodeJS.ProcessEnv,
 ) => {
   status: number | null;
   signal?: NodeJS.Signals | null;
@@ -73,9 +135,13 @@ const CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
  * inheriting them live would leak (e.g. `npm warn invalid config
  * registry="SECRET"`).  `shell:false` keeps args as discrete argv items.
  */
-const captureSpawn: HostSpawn = (cmd, args, cwd) => {
+const captureSpawn: HostSpawn = (cmd, args, cwd, env) => {
   const r = spawnSync(cmd, args, {
     cwd,
+    // SECURITY: `env` carries the `npm_config_git` pin so a repo `.npmrc git=`
+    // cannot redirect npm's git binary during the PRE-TRUST part-1 install
+    // (see hostInstallEnv() / trustedGitPath()).
+    env,
     stdio: ['inherit', 'pipe', 'pipe'],
     shell: false,
     encoding: 'utf8',
@@ -95,8 +161,10 @@ const captureSpawn: HostSpawn = (cmd, args, cwd) => {
  * NO user args — its argv is credential-free — and lifecycle scripts can run
  * long, so users want LIVE progress.  Keep `stdio:'inherit'`; nothing to redact.
  */
-const inheritSpawn: HostSpawn = (cmd, args, cwd) => {
-  const r = spawnSync(cmd, args, { cwd, stdio: 'inherit', shell: false });
+const inheritSpawn: HostSpawn = (cmd, args, cwd, env) => {
+  // SECURITY: `env` carries the same git pin as part 1 (defense-in-depth;
+  // harmless for pnpm/yarn, which ignore npm_config_git).
+  const r = spawnSync(cmd, args, { cwd, env, stdio: 'inherit', shell: false });
   return { status: r.status, signal: r.signal, error: r.error };
 };
 
@@ -155,7 +223,7 @@ export function hostInstallNoScripts(
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
 }
 
 /** Mask user-arg values first (exact), then catch credential SHAPES. */
@@ -181,7 +249,7 @@ export function hostRunScripts(
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
   // hostRunScripts has no user args — finalArgs is credential-free, safe as displayArgs.
-  runOrThrow(cmd.cmd, finalArgs, repoDir, spawn, 'lifecycle-script run', io, finalArgs);
+  runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(), spawn, 'lifecycle-script run', io, finalArgs);
 }
 
 /**
@@ -202,13 +270,14 @@ function runOrThrow(
   cmd: string,
   args: string[],
   cwd: string,
+  env: NodeJS.ProcessEnv,
   spawn: HostSpawn,
   label: string,
   io: HostInstallIo,
   displayArgs: string[],
   onOutput?: (stdout: string, stderr: string) => void,
 ): void {
-  const r = spawn(cmd, args, cwd);
+  const r = spawn(cmd, args, cwd, env);
   // Surface captured output (redacted by the caller's closure) BEFORE any
   // error/throw check, so the PM's own diagnostics reach the log even when the
   // run failed.  A live-inheriting runner returns no stdout/stderr → no-op.

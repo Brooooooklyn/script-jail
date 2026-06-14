@@ -190,6 +190,29 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       );
       exitProcess(1);
     }
+    // SECURITY: the spoof inputs (spoof-platform / spoof-arch) are applied ONLY
+    // to the AUDITED scripts inside the sandbox.  Host part-2 (hostRunScripts)
+    // runs the REAL scripts on this runner with NO spoofing.  If the spoof
+    // target differs from the real execution host, a package can branch on
+    // process.platform / process.arch so the SPOOFED branch is audited while the
+    // runner EXECUTES the other branch — the trusted lock then does not describe
+    // what runs.  Fail closed BEFORE the audit (and before any host install)
+    // unless the spoof target equals the real runner.  The part-2 scripts run on
+    // this very process (hostRunScripts → local spawnSync), so the real host is
+    // `process.platform` (linux on a supported runner) and `actionHostArch`.
+    // The DEFAULTS — spoof-platform 'linux', spoof-arch = real host arch — pass
+    // on a Linux runner (linux == linux, arch == arch).
+    if (inputs.spoofPlatform !== process.platform || inputs.spoofArch !== actionHostArch) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires the spoof target to match the runner. ` +
+          `Spoof platform/arch (${inputs.spoofPlatform}/${inputs.spoofArch}) must equal the real ` +
+          `runner (${process.platform}/${actionHostArch}); otherwise an audited script can branch ` +
+          `on process.platform/arch so the sandbox audits one branch while the runner executes the ` +
+          `other, and the trusted lock would not describe what actually runs. Remove the spoof ` +
+          `override (or set it to the runner's real platform/arch) when using \`install\`.\n`,
+      );
+      exitProcess(1);
+    }
   }
 
   // --- Detect runner image -------------------------------------------------

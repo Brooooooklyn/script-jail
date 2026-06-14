@@ -30566,9 +30566,12 @@ ${fetchDetail}
   const collectedEvents = [];
   let rootPkgKeys = /* @__PURE__ */ new Set();
   let canonicalRootKey = null;
+  let hasRootPrepareScript = false;
   try {
     const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
     ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+    const prepare = rootManifest.scripts?.prepare;
+    hasRootPrepareScript = typeof prepare === "string" && prepare.length > 0;
   } catch {
   }
   const collectingEmitter = new Emitter(
@@ -30666,6 +30669,14 @@ ${stdoutTail}`;
   }
   const prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
   if (prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true)) {
+    if (hasRootPrepareScript && canonicalRootKey === null) {
+      emitter.emitError(
+        "Root `prepare` script present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root `prepare` unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
     diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
     let prepareRunner;
     let prepareEventsFilePath = eventsFilePath;

@@ -18,6 +18,18 @@ import type { MainDeps } from '../../src/main.js';
 
 const FIXTURES: ReadonlyArray<FixtureName> = ['spawns-gcc', 'writes-into-repo'];
 
+// The drop-in-install spoof gate (src/main.ts) fails closed unless the spoof
+// target equals the REAL runner.  These tests inject a fake VM and only care
+// about WHICH host half runs, not about spoofing — so they pin the spoof to the
+// real test host so the gate passes deterministically on Linux CI *and* a
+// macOS/arm64 dev host.  `process.platform` is 'linux' on CI ('darwin' locally)
+// and is a valid SpoofPlatform; `process.arch` is 'x64'|'arm64' on supported
+// runners and is a valid SpoofArch.
+const HOST_SPOOF = {
+  spoofPlatform: process.platform as 'linux' | 'darwin' | 'win32',
+  spoofArch: process.arch as 'x64' | 'arm64',
+};
+
 interface HostCaptures {
   installCalls: Array<{ pm: string; args: string[] }>;
   runCalls: Array<{ pm: string }>;
@@ -49,7 +61,7 @@ describe.sequential('e2e: drop-in install gating', () => {
 
     const result = await runMain({
       consumerDir: consumer.consumerDir,
-      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true },
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
       deps: { ...factory.deps, ...cap.hostSeams },
     });
 
@@ -70,7 +82,7 @@ describe.sequential('e2e: drop-in install gating', () => {
 
     const result = await runMain({
       consumerDir: consumer.consumerDir,
-      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true },
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
       deps: { ...factory.deps, ...cap.hostSeams },
     });
 
@@ -90,7 +102,7 @@ describe.sequential('e2e: drop-in install gating', () => {
 
     const result = await runMain({
       consumerDir: consumer.consumerDir,
-      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true },
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
       deps: { ...factory.deps, ...cap.hostSeams },
     });
 
@@ -105,7 +117,7 @@ describe.sequential('e2e: drop-in install gating', () => {
 
     await runMain({
       consumerDir: consumer.consumerDir,
-      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, args: '--omit=dev' },
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, args: '--omit=dev', ...HOST_SPOOF },
       deps: { ...factory.deps, ...cap.hostSeams },
     });
 
@@ -124,7 +136,7 @@ describe.sequential('e2e: drop-in install gating', () => {
 
     const result = await runMain({
       consumerDir: consumer.consumerDir,
-      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true },
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
       deps: { ...factory.deps, ...cap.hostSeams },
     });
 
@@ -181,5 +193,112 @@ describe.sequential('e2e: drop-in install gating', () => {
     expect(result.exit).toBeNull();
     expect(cap.installCalls).toHaveLength(0);
     expect(cap.runCalls).toHaveLength(0);
+  });
+
+  // --- FIX 3: install + spoof-target != real host → fail closed -------------
+  // The spoof inputs apply ONLY to audited scripts in the sandbox; host part-2
+  // runs the REAL scripts on the runner with no spoofing.  A spoof target that
+  // differs from the runner lets a package branch on process.platform/arch so
+  // the audited branch differs from what the runner executes.  Reject BEFORE
+  // any host install.
+
+  // A platform that is guaranteed != the real test host, so the gate trips
+  // deterministically on Linux CI (process.platform==='linux' → use 'darwin')
+  // and a macOS/arm64 dev host (process.platform==='darwin' → use 'linux').
+  const OTHER_PLATFORM = (process.platform === 'linux' ? 'darwin' : 'linux') as 'linux' | 'darwin';
+  const OTHER_ARCH = (process.arch === 'x64' ? 'arm64' : 'x64') as 'x64' | 'arm64';
+
+  it('install + spoof PLATFORM mismatch → fail-closed before any install, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: {
+        config: consumer.configPath,
+        lock: consumer.lockPath,
+        mode: 'check',
+        install: true,
+        spoofPlatform: OTHER_PLATFORM, // != runner platform
+        spoofArch: process.arch as 'x64' | 'arm64', // arch matches → only platform differs
+      },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/spoof target to match the runner/);
+    expect(cap.installCalls).toHaveLength(0); // exited before part 1
+    expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + spoof ARCH mismatch → fail-closed before any install, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: {
+        config: consumer.configPath,
+        lock: consumer.lockPath,
+        mode: 'check',
+        install: true,
+        spoofPlatform: process.platform as 'linux' | 'darwin' | 'win32', // platform matches
+        spoofArch: OTHER_ARCH, // != runner arch → only arch differs
+      },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/spoof target to match the runner/);
+    expect(cap.installCalls).toHaveLength(0);
+    expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + spoof BOTH platform and arch mismatch → fail-closed, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: {
+        config: consumer.configPath,
+        lock: consumer.lockPath,
+        mode: 'check',
+        install: true,
+        spoofPlatform: OTHER_PLATFORM,
+        spoofArch: OTHER_ARCH,
+      },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/spoof target to match the runner/);
+    expect(cap.installCalls).toHaveLength(0);
+    expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + spoof MATCHING the runner → allowed (both halves run)', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: {
+        config: consumer.configPath,
+        lock: consumer.lockPath,
+        mode: 'check',
+        install: true,
+        ...HOST_SPOOF, // spoof target == real runner platform/arch
+      },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toBeNull(); // clean match, gate passes
+    expect(cap.installCalls).toEqual([{ pm: 'npm', args: [] }]);
+    expect(cap.runCalls).toEqual([{ pm: 'npm' }]);
   });
 });

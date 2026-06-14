@@ -63,6 +63,18 @@ function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
   return path;
 }
 
+/**
+ * Write a root `package.json` into the agent's work_dir (= testDir).  The
+ * prepare-pass fail-closed gate (src/guest/agent.ts) refuses to emit a lockfile
+ * when a prepare pass would run but the root manifest has no usable `name`
+ * (canonicalRootKey === null).  Prepare-pass tests that expect a lockfile MUST
+ * write a NAMED root manifest so the gate is satisfied; the nameless-root test
+ * omits the name to exercise the fail-closed path.
+ */
+function writeRootPkg(dir: string, pkg: Record<string, unknown>): void {
+  writeFileSync(join(dir, 'package.json'), JSON.stringify(pkg), 'utf8');
+}
+
 /** Make a MemoryConnection where:
  *  - `readable` is a PassThrough we can push data into (simulating host → guest)
  *  - `writable` is a PassThrough we can read from (guest → host output)
@@ -1221,6 +1233,8 @@ describe('agent main() root-prepare second pass', () => {
   it('runs the prepare pass (npm) when prepareStrace is injected; merges its events', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → prepare-pass fail-closed gate is satisfied (canonicalRootKey set).
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
 
     const main_ = recordingEventStrace('MAINPROG');
     const prep = recordingEventStrace('PREPPROG');
@@ -1323,6 +1337,9 @@ describe('agent main() root-prepare second pass', () => {
   it('merges a prepare-pass tamper reason → fails closed at the tamper gate', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so we reach the prepare pass (and its tamper merge) rather than
+    // the nameless-root gate.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
 
     const main_ = recordingEventStrace('MAINPROG');
     // Prepare runner yields a POISONED shim-channel line (unparseable JSONL on
@@ -1385,6 +1402,8 @@ describe('agent main() root-prepare second pass', () => {
     // events-file tamper).
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so we reach the prepare pass (and its tamper merge).
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
 
     const main_ = recordingEventStrace('MAINPROG');
     const prepFileTamper: StraceRunner = {
@@ -1437,6 +1456,9 @@ describe('agent main() root-prepare second pass', () => {
     const { createEventsFile } = await import('../../src/guest/agent.js');
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so the nameless-root gate is satisfied and we reach the
+    // events-file-creation fail-closed path this test targets.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
     const main_ = recordingEventStrace('MAINPROG');
 
     let calls = 0;
@@ -1490,6 +1512,8 @@ describe('agent main() root-prepare second pass', () => {
     // lockfile would pass silently.  The gate must fail closed.
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so we reach the zero-event prepare gate this test targets.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
 
     const main_ = recordingEventStrace('MAINPROG');
     // Prepare runner yields ZERO events and exits nonzero — simulates
@@ -1542,6 +1566,9 @@ describe('agent main() root-prepare second pass', () => {
     // data.  The fix must NOT over-fail this case — the lock is still emitted.
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → the nameless-root gate is satisfied; this test exercises the
+    // separate "nonzero exit WITH events" non-fatal path.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
 
     const main_ = recordingEventStrace('MAINPROG');
     // Prepare runner yields ONE event (traced run) but exits nonzero.
@@ -1582,6 +1609,118 @@ describe('agent main() root-prepare second pass', () => {
     expect(nonFatalError).toBeDefined();
     expect(String(nonFatalError!['message'])).toMatch(/prepare pass.*exited non-zero/);
     // No fatal error — the run is not blocked.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  // --- FIX 2: nameless root + prepare → fail closed -------------------------
+  // If the root package.json has a `prepare` script but NO `name`,
+  // buildRootPkgKeys returns canonical=null; npm sets no npm_package_name, so
+  // the prepare's audited events get DROPPED at the dispatcher's
+  // null-attribution gate → an empty, deceptively-clean lock.  The agent must
+  // REFUSE to emit a lockfile rather than ship the unaudited prepare.
+  it('FAILS CLOSED (fatal, no lockfile) when the prepare pass would run but the root has no `name`', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Nameless root (only a version) → canonicalRootKey === null.
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        // prepareStrace injected so the test seam would ALLOW the prepare pass;
+        // the nameless-root gate must fire BEFORE the pass runs.
+        prepareStrace: prep.runner,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error frame naming the missing root `name`; no final lockfile; exit 1.
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/no usable `name`/);
+    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    // The prepare pass must NOT have run (gate fires before it).
+    expect(prep.calls).toHaveLength(0);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('NAMELESS root WITHOUT a prepare script → still produces a lockfile (no false trip)', async () => {
+    // Regression guard: for npm, resolvePrepareCommand is ALWAYS non-null
+    // (`npm run prepare --if-present` no-ops when there is no prepare script).
+    // The nameless-root gate must key off an ACTUAL `scripts.prepare`, not off
+    // the command, or a benign nameless npm root with no prepare would be
+    // wrongly blocked.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Nameless root, NO prepare script → gate must NOT fire.
+    writeRootPkg(testDir, { version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // No fatal error, and a final lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
+  it('NAMED root + prepare → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → canonicalRootKey is set, gate does NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The prepare pass ran and a final lockfile is emitted (no nameless-root trip).
+    expect(prep.calls).toHaveLength(1);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
     expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
   });
 });

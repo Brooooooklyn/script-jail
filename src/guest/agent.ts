@@ -3256,9 +3256,22 @@ export async function main(input: AgentInput): Promise<void> {
   // else the bare name, else null (degenerate no-root edge — nothing to force onto).
   let rootPkgKeys = new Set<string>();
   let canonicalRootKey: string | null = null;
+  // Whether the ROOT manifest actually declares a non-empty `prepare` script.
+  // The npm prepare pass uses `npm run prepare --if-present`, which no-ops when
+  // no `prepare` script exists — so the nameless-root fail-closed gate below
+  // must key off the SCRIPT's presence, NOT off `prepareCommand !== null`
+  // (which is unconditionally non-null for npm).  Otherwise a perfectly benign
+  // nameless npm root with no `prepare` would be wrongly blocked.
+  let hasRootPrepareScript = false;
   try {
-    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as { name?: unknown; version?: unknown };
+    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as {
+      name?: unknown;
+      version?: unknown;
+      scripts?: { prepare?: unknown };
+    };
     ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+    const prepare = rootManifest.scripts?.prepare;
+    hasRootPrepareScript = typeof prepare === 'string' && prepare.length > 0;
   } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
 
   // Wrap the emitter to also collect events for normalize.
@@ -3480,6 +3493,34 @@ export async function main(input: AgentInput): Promise<void> {
       input.strace === undefined ||
       input.forcePreparePass === true)
   ) {
+    // FAIL CLOSED: the root declares a `prepare` script that WILL run, but the
+    // root package.json has no usable `name` (canonicalRootKey === null).  In
+    // that state npm sets no npm_package_name, so attributionFromEnvVars returns
+    // null and the dispatcher DROPS every non-spawn prepare event at its
+    // null-attribution gate — BEFORE they reach the force-attribution emitter
+    // below.  The prepare's fs reads / writes / connects would therefore be
+    // silently dropped, leaving the root `prepare` UNAUDITED while a clean diff
+    // against the resulting lock could still return `trusted`.  Refuse to emit a
+    // lockfile (mirrors the other prepare-pass fatal gates: emitError(…,true) +
+    // flushAndExit(1) + return).
+    //
+    // Gate on `hasRootPrepareScript`, NOT on `prepareCommand !== null`: for npm
+    // the command is unconditionally non-null and `--if-present` no-ops when no
+    // `prepare` script exists, so keying off the command would wrongly block a
+    // benign nameless npm root that has no prepare script at all.  yarn already
+    // only resolves a command when a non-empty `scripts.prepare` is present, so
+    // `hasRootPrepareScript` is consistent across both managers.
+    if (hasRootPrepareScript && canonicalRootKey === null) {
+      emitter.emitError(
+        'Root `prepare` script present but root package.json has no usable `name` — ' +
+          'its audited events cannot be attributed and would be silently dropped, ' +
+          'leaving the root `prepare` unaudited. Refusing to emit a lockfile ' +
+          '(add a `name` to the root package.json).',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
     diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(' ')}`);
     // Obtain the prepare runner and its audit sink.  An injected runner owns
     // its own sink; otherwise build a fresh runner over a SEPARATE events file

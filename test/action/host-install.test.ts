@@ -5,6 +5,7 @@
 // package manager runs.
 
 import { describe, it, expect } from 'vitest';
+import { isAbsolute } from 'node:path';
 
 import { hostInstallNoScripts, hostRunScripts, type HostSpawn, type HostInstallIo } from '../../src/action/host-install.js';
 
@@ -362,5 +363,58 @@ describe('hostRunScripts (part 2)', () => {
     const rec = makeRecorder();
     const failSpawn: HostSpawn = () => ({ status: 7 });
     expect(() => hostRunScripts('pnpm', '/repo', rec.io, failSpawn)).toThrow(/exited with code 7/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SECURITY (FIX 1): pin npm's git binary against a repo `.npmrc git=` override
+// ---------------------------------------------------------------------------
+//
+// A repo `.npmrc` with `git=./evil` + a NON-GitHub git dependency makes
+// `npm ci --ignore-scripts` invoke `./evil` on the runner during the PRE-TRUST
+// part-1 install (`--ignore-scripts` disables lifecycle SCRIPTS, NOT which git
+// binary npm runs).  An env `npm_config_git` BEATS the project `.npmrc`, so
+// BOTH host spawns must set it.  Tests capture the env via the spawn seam.
+
+/** A spawn fake that records the env it was handed. */
+function envCapturingSpawn(captured: Array<NodeJS.ProcessEnv>): HostSpawn {
+  return (_cmd, _args, _cwd, env) => {
+    captured.push(env);
+    return { status: 0 };
+  };
+}
+
+describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense', () => {
+  it('part 1 (no-scripts install) sets npm_config_git to an ABSOLUTE path', () => {
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    expect(envs).toHaveLength(1);
+    const git = envs[0]!['npm_config_git'];
+    expect(git).toBeDefined();
+    // Absolute so a repo-placed `./git` in cwd can't shadow a bare `git`.  When
+    // PATH-resolution fails the documented fallback is the bare literal `git`,
+    // which still OVERRIDES the repo `.npmrc git=` entry; accept either.
+    expect(git === 'git' || isAbsolute(git!)).toBe(true);
+    // The pin MUST be present regardless of any (hypothetical) repo override.
+    expect(git).not.toBe('');
+  });
+
+  it('part 2 (lifecycle scripts) ALSO sets npm_config_git (defense-in-depth)', () => {
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostRunScripts('npm', '/repo', rec.io, envCapturingSpawn(envs));
+    expect(envs).toHaveLength(1);
+    const git = envs[0]!['npm_config_git'];
+    expect(git).toBeDefined();
+    expect(git === 'git' || isAbsolute(git!)).toBe(true);
+  });
+
+  it('preserves the inherited env (PATH/HOME etc.) by merging over process.env', () => {
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    // PATH (set in every test env) must survive the merge.
+    expect(envs[0]!['PATH']).toBe(process.env['PATH']);
   });
 });
