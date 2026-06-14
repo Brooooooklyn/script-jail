@@ -37,6 +37,16 @@ export type LifecycleStage = z.infer<typeof LifecycleStage>;
 // Both fields are STRIPPED before the event leaves `runInstallPhase`
 // (alongside `errno`).  They never appear in the rendered lockfile or
 // vsock JSONL stream — they exist solely for path canonicalization.
+// `root_anchored` is set ONLY on fs read/write events that attribute to a
+// root-project package key. UNLIKE the transport trio above (errno/dirfd/retFd,
+// which `protected-paths.ts` strips at emit), `root_anchored` is a SEMANTIC
+// field: it carries the non-forgeable repo-root-anchoring verdict (kernel
+// process tree + per-pid exec-cwd, computed in `phase-install.ts`) and is
+// intentionally KEPT through emit so `normalize.ts` can tell a genuine root
+// event from one forged via `npm_package_name=<root>`. It never reaches the
+// rendered lockfile: normalize turns events into string arrays and render
+// never reads raw events. It is OMITTED entirely (never set to `false`) on
+// non-root events, so existing event frames stay byte-identical.
 export const FsReadEvent = z.object({
   kind: z.literal('read'),
   path: z.string(),
@@ -46,6 +56,7 @@ export const FsReadEvent = z.object({
   errno: z.enum(['ENOENT', 'EACCES']).optional(),
   dirfd: z.number().optional(),
   retFd: z.number().optional(),
+  root_anchored: z.boolean().optional(),
 });
 export type FsReadEvent = z.infer<typeof FsReadEvent>;
 
@@ -58,6 +69,7 @@ export const FsWriteEvent = z.object({
   errno: z.enum(['ENOENT', 'EACCES']).optional(),
   dirfd: z.number().optional(),
   retFd: z.number().optional(),
+  root_anchored: z.boolean().optional(),
 });
 export type FsWriteEvent = z.infer<typeof FsWriteEvent>;
 

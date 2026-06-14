@@ -51,6 +51,7 @@ import type { Attribution, AttributionResult } from './attribution.js';
 import { attributionFromEnvVars } from './attribution.js';
 import { parseStraceLine, unescapeStraceString } from './strace-parser.js';
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
+import { isRepoRootAnchored } from './root-anchor.js';
 import { INSTALL_CMD, pnpmStoreDirArg } from '../shared/pm-commands.js';
 import {
   ExecEvent,
@@ -261,6 +262,19 @@ export interface PhaseInstallInput {
    * IDENTICAL — only the command/args at the head of the trace change.
    */
   commandOverride?: { cmd: string; args: string[] };
+  /**
+   * The set of root-project package keys (bare `name` AND `name@version`).
+   * When an fs read/write event attributes to one of these keys, the
+   * dispatcher tags the emitted raw event with the NON-forgeable
+   * `root_anchored` signal (computed from the kernel process tree + per-pid
+   * exec-cwd via {@link isRepoRootAnchored}), so `normalize.ts` can later
+   * distinguish a genuine root event from one a dependency forged by setting
+   * `npm_package_name=<root>`.
+   *
+   * Optional: when undefined (the current caller state — the agent populates
+   * it in a later task) NOTHING is tagged → zero behavior change.
+   */
+  rootPkgKeys?: ReadonlySet<string>;
 }
 
 export interface PhaseInstallResult {
@@ -1972,6 +1986,18 @@ export async function runInstallPhase(
   // the key is always a group root.
   const pidCwd = new Map<number, string>();
 
+  // Repo-root anchoring state (non-forgeable). Consumed only by the
+  // `rootAnchored` helper near the emit site to tag root-attributed fs
+  // events. These are RAW pid maps (NOT cwd-group keyed) because the
+  // process-tree walk in `isRepoRootAnchored` is over real pids:
+  //   - childParent: kernel-observed clone/fork/vfork edge, child -> parent.
+  //   - execCwd: resolved cwd snapshotted at a pid's FIRST execve. A string is
+  //     the cwd at exec time; `null` means the pid exec'd but its cwd was
+  //     unresolvable (fail closed); an absent key means the pid never exec'd
+  //     (forked but ran the parent's program, inheriting its identity).
+  const childParent = new Map<number, number>();
+  const execCwd = new Map<number, string | null>();
+
   // Audit-trust Finding (high, 2026-05-19, codex follow-up): set of pids
   // whose cwd state we OBSERVED a mutation event for but COULD NOT
   // resolve.  Membership in this set is "sticky": once a pid lands
@@ -2019,6 +2045,27 @@ export async function runInstallPhase(
   }
   function cwdUnknownDelete(pid: number): void {
     pidCwdUnknown.delete(rootedCwd(pid));
+  }
+
+  // Repo-root anchoring verdict for `pid`. Non-forgeable: walks pid -> parent
+  // up to the traced PM root via `childParent`, failing closed unless every
+  // ancestor either never exec'd or exec'd at the repo root (see
+  // `isRepoRootAnchored`). Recomputed per event — pid reuse across the install
+  // would make a cached value stale, the walk is short, and fs events are few.
+  function rootAnchored(pid: number): boolean {
+    const rootPid = installRootPid; // number | null
+    // No traced tree (test fake / non-Firecracker, getRootPid()===null): there
+    // is no process-tree signal to verify against, so trust the env attribution
+    // — macOS-bare/Firecracker handle enforcement at their own boundaries.
+    if (rootPid === null) return true;
+    return isRepoRootAnchored({
+      pid,
+      childParent,
+      execCwd,
+      pidCwdUnknown,
+      workDir: path.resolve(input.cwd),
+      rootPid,
+    });
   }
 
   // Audit-trust Finding (high, 2026-05-19, codex follow-up #2): set of
@@ -2781,6 +2828,11 @@ export async function runInstallPhase(
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path.resolve(input.cwd));
+        // Anchor the PM root's exec-cwd at the repo root. The trusted root pid
+        // IS the anchor in `isRepoRootAnchored`, but seeding execCwd here keeps
+        // the map self-consistent for any future use and makes the root's
+        // exec-cwd explicit rather than absent.
+        execCwd.set(pid, path.resolve(input.cwd));
       }
     }
 
@@ -3360,6 +3412,10 @@ export async function runInstallPhase(
           const childPid = parseInt(rcMatch[1] ?? '', 10);
           if (Number.isFinite(childPid) && childPid > 0) {
             propagateNodeBootstrap(pid, childPid);
+            // Record the kernel-observed parent edge for repo-root anchoring.
+            // `pid` is the PARENT (the per-pid strace file owner that issued
+            // the clone/fork/vfork); `childPid` is the new child. Unconditional.
+            childParent.set(childPid, pid);
 
             // Extract the clone-flag identifier list.  For `clone(...)`
             // strace renders `flags=CLONE_VM|CLONE_FS|...`; for
@@ -5244,6 +5300,15 @@ export async function runInstallPhase(
         // survives execve (per execve(2)), so the attacker's
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
+          // Repo-root anchoring: snapshot the pid's cwd at its FIRST execve
+          // only (later re-execs keep the first snapshot). The PM sets a
+          // lifecycle script's cwd to the package dir BEFORE the exec, so this
+          // kernel-observed value cannot be laundered by a later chdir.
+          // `cwdGet` returns `string | undefined`; `?? null` records "exec'd
+          // but cwd unknown" as null (a fail-closed signal for the walker).
+          if (!execCwd.has(rawEvent.pid)) {
+            execCwd.set(rawEvent.pid, cwdGet(rawEvent.pid) ?? null);
+          }
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
           packageManagerClientPids.delete(rawEvent.pid);
@@ -5836,10 +5901,23 @@ export async function runInstallPhase(
           // preserves discriminant + all transport fields; TS
           // narrows on the literal `kind` so the spread keeps the
           // read/write discriminated-union shape.
+          //
+          // Repo-root anchoring: ONLY when this read/write attributes to a
+          // root-project package key do we stamp the non-forgeable
+          // `root_anchored` verdict so normalize.ts can tell a genuine root
+          // event from a dependency forging `npm_package_name=<root>`. For all
+          // other events the field is OMITTED entirely (not set to false) so
+          // existing event frames stay byte-identical → zero behavior change
+          // while `rootPkgKeys` is undefined.
+          const isRootAttributed = input.rootPkgKeys?.has(result.pkg) === true;
           const resolved: RawEvent =
             rawEvent.kind === 'read'
-              ? { ...rawEvent, path: canonical }
-              : { ...rawEvent, path: canonical };
+              ? isRootAttributed
+                ? { ...rawEvent, path: canonical, root_anchored: rootAnchored(rawEvent.pid) }
+                : { ...rawEvent, path: canonical }
+              : isRootAttributed
+                ? { ...rawEvent, path: canonical, root_anchored: rootAnchored(rawEvent.pid) }
+                : { ...rawEvent, path: canonical };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
