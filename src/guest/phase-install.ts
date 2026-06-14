@@ -2062,7 +2062,11 @@ export async function runInstallPhase(
       pid,
       childParent,
       execCwd,
-      pidCwdUnknown,
+      // Group-aware: `pidCwdUnknown` is keyed by cwd-group root (CLONE_FS), so
+      // querying the raw pid would miss a pid marked unknown via a sibling.
+      // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
+      // walker's fail-closed disqualifier sees the real unknown state.
+      cwdUnknown: cwdUnknownHas,
       workDir: path.resolve(input.cwd),
       rootPid,
     });
@@ -5306,8 +5310,19 @@ export async function runInstallPhase(
           // kernel-observed value cannot be laundered by a later chdir.
           // `cwdGet` returns `string | undefined`; `?? null` records "exec'd
           // but cwd unknown" as null (a fail-closed signal for the walker).
+          //
+          // The cwdUnknown bit DOMINATES the cwdGet lookup (same invariant as
+          // canonicalizeForEmit, see bug #2 around line ~2196): after `unionCwd`
+          // reconciles a CLONE_FS group it can mark the group unknown while
+          // leaving a STALE non-null value in pidCwd. Snapshotting that stale
+          // value would let a provably-unknown pid be recorded as a workDir
+          // string and pass the root-anchor walk — a fail-closed bypass. So if
+          // the cwd is provably unknown at capture time, record `null`.
           if (!execCwd.has(rawEvent.pid)) {
-            execCwd.set(rawEvent.pid, cwdGet(rawEvent.pid) ?? null);
+            execCwd.set(
+              rawEvent.pid,
+              cwdUnknownHas(rawEvent.pid) ? null : (cwdGet(rawEvent.pid) ?? null),
+            );
           }
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
@@ -5910,14 +5925,11 @@ export async function runInstallPhase(
           // existing event frames stay byte-identical → zero behavior change
           // while `rootPkgKeys` is undefined.
           const isRootAttributed = input.rootPkgKeys?.has(result.pkg) === true;
-          const resolved: RawEvent =
-            rawEvent.kind === 'read'
-              ? isRootAttributed
-                ? { ...rawEvent, path: canonical, root_anchored: rootAnchored(rawEvent.pid) }
-                : { ...rawEvent, path: canonical }
-              : isRootAttributed
-                ? { ...rawEvent, path: canonical, root_anchored: rootAnchored(rawEvent.pid) }
-                : { ...rawEvent, path: canonical };
+          const resolved: RawEvent = {
+            ...rawEvent,
+            path: canonical,
+            ...(isRootAttributed ? { root_anchored: rootAnchored(rawEvent.pid) } : {}),
+          };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }

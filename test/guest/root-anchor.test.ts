@@ -14,7 +14,7 @@ function input(over: Partial<RepoRootAnchorInput>): RepoRootAnchorInput {
     pid: 0,
     childParent: new Map(),
     execCwd: new Map(),
-    pidCwdUnknown: new Set(),
+    cwdUnknown: () => false,
     workDir: WORK,
     rootPid: 100,
     ...over,
@@ -153,20 +153,22 @@ describe('isRepoRootAnchored', () => {
     expect(r).toBe(false);
   });
 
-  it('returns false when the leaf pid is in pidCwdUnknown', () => {
+  it('returns false when the leaf pid is reported unknown by the cwdUnknown predicate', () => {
+    const unknown = new Set([101]);
     const r = isRepoRootAnchored(
       input({
         pid: 101,
         rootPid: 100,
         childParent: new Map([[101, 100]]),
         execCwd: new Map([[101, WORK]]),
-        pidCwdUnknown: new Set([101]),
+        cwdUnknown: (pid) => unknown.has(pid),
       }),
     );
     expect(r).toBe(false);
   });
 
-  it('returns false when an ancestor pid is in pidCwdUnknown', () => {
+  it('returns false when an ancestor pid is reported unknown by the cwdUnknown predicate', () => {
+    const unknown = new Set([101]);
     const r = isRepoRootAnchored(
       input({
         pid: 102,
@@ -179,7 +181,28 @@ describe('isRepoRootAnchored', () => {
           [102, WORK],
           [101, WORK],
         ]),
-        pidCwdUnknown: new Set([101]),
+        cwdUnknown: (pid) => unknown.has(pid),
+      }),
+    );
+    expect(r).toBe(false);
+  });
+
+  it('cwdUnknown predicate disqualifies independently of execCwd: cwd looks anchored (execCwd=workDir) but is provably unknown', () => {
+    // Soundness regression guard. The exec-cwd snapshot says this leaf exec'd
+    // at the repo root (execCwd=workDir, which alone would pass), but the
+    // group-aware cwdUnknown predicate reports its cwd as provably unknown
+    // (e.g. a CLONE_FS sibling marked the group unknown while a stale workDir
+    // value lingered). The predicate disqualifier MUST fire regardless of the
+    // execCwd value, so the pid cannot be laundered into a root-anchored
+    // verdict. Pre-fix the helper queried a raw-pid Set and could miss this.
+    const unknown = new Set([101]);
+    const r = isRepoRootAnchored(
+      input({
+        pid: 101,
+        rootPid: 100,
+        childParent: new Map([[101, 100]]),
+        execCwd: new Map([[101, WORK]]), // exec snapshot looks anchored...
+        cwdUnknown: (pid) => unknown.has(pid), // ...but cwd is provably unknown.
       }),
     );
     expect(r).toBe(false);

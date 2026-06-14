@@ -25,8 +25,10 @@ export interface RepoRootAnchorInput {
    *  - null      = the pid exec'd but its cwd was unresolvable (fail closed)
    *  - absent    = the pid never exec'd (forked but same program as parent) */
   execCwd: Map<number, string | null>;
-  /** pids whose tracked cwd became unresolvable; treat as unprovable (fail closed). */
-  pidCwdUnknown: Set<number>;
+  /** returns true iff this pid's cwd is provably unknown; query through the
+   *  caller's group-aware accessor. A pid whose cwd became unresolvable is
+   *  unprovable, so the walk treats it as a disqualifier (fail closed). */
+  cwdUnknown: (pid: number) => boolean;
   /** the resolved repo root (path.resolve of the install cwd). */
   workDir: string;
   /** the traced package-manager root pid (the trusted anchor). */
@@ -46,7 +48,7 @@ const MAX_DEPTH = 1024;
  * lineage. Fail closed (return false) on any uncertainty.
  */
 export function isRepoRootAnchored(input: RepoRootAnchorInput): boolean {
-  const { childParent, execCwd, pidCwdUnknown, workDir, rootPid } = input;
+  const { childParent, execCwd, workDir, rootPid } = input;
 
   let cur = input.pid;
 
@@ -56,8 +58,11 @@ export function isRepoRootAnchored(input: RepoRootAnchorInput): boolean {
       return true;
     }
 
-    // This pid's cwd is unprovable: fail closed.
-    if (pidCwdUnknown.has(cur)) {
+    // This pid's cwd is unprovable: fail closed. The `cwdUnknown` predicate is
+    // group-aware (the caller routes it through its cwd-group accessor) so a pid
+    // marked unknown via a CLONE_FS sibling is disqualified even if a stale
+    // value lingers in the raw cwd map.
+    if (input.cwdUnknown(cur)) {
       return false;
     }
 
