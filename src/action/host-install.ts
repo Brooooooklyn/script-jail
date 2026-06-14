@@ -32,26 +32,70 @@ import {
   sanitizeInstallArgs,
   type Manager,
 } from '../shared/pm-commands.js';
+import { maskExactValues, redactCredentialShapes } from '../shared/redact.js';
 
 /** Minimal sink so the module is testable without touching the real streams. */
 export interface HostInstallIo {
   stdout: { write(s: string): void };
+  stderr: { write(s: string): void };
   warn(msg: string): void;
 }
 
 /**
  * Injectable process runner (tests pass a fake).  Returns the child's exit
  * status (`null` when killed by a signal) and any spawn-level error.
+ *
+ * A capturing runner additionally returns the child's `stdout`/`stderr` as
+ * strings so the caller can redact them before writing to the job log
+ * (`undefined` ⇒ the runner inherited the streams live, nothing to redact).
  */
 export type HostSpawn = (
   cmd: string,
   args: string[],
   cwd: string,
-) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error | undefined };
+) => {
+  status: number | null;
+  signal?: NodeJS.Signals | null;
+  error?: Error | undefined;
+  stdout?: string;
+  stderr?: string;
+};
 
-const defaultSpawn: HostSpawn = (cmd, args, cwd) => {
-  // stdio:'inherit' streams the install straight to the job log; shell:false
-  // (the default, asserted for clarity) keeps args as discrete argv items.
+// 64 MiB capture cap: verbose installs (npm/pnpm/yarn debug spew) can be large;
+// the default 1 MiB maxBuffer would truncate and surface ENOBUFS instead of the
+// real exit status, losing the diagnostic we need on failure.
+const CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Part-1 runner: inherit stdin, but CAPTURE stdout+stderr so they can be piped
+ * through the redactor before reaching the job log.  Part 1 takes the user
+ * `args`, so the PM's own diagnostics may echo a user-supplied secret back —
+ * inheriting them live would leak (e.g. `npm warn invalid config
+ * registry="SECRET"`).  `shell:false` keeps args as discrete argv items.
+ */
+const captureSpawn: HostSpawn = (cmd, args, cwd) => {
+  const r = spawnSync(cmd, args, {
+    cwd,
+    stdio: ['inherit', 'pipe', 'pipe'],
+    shell: false,
+    encoding: 'utf8',
+    maxBuffer: CAPTURE_MAX_BUFFER,
+  });
+  return {
+    status: r.status,
+    signal: r.signal,
+    error: r.error,
+    stdout: typeof r.stdout === 'string' ? r.stdout : '',
+    stderr: typeof r.stderr === 'string' ? r.stderr : '',
+  };
+};
+
+/**
+ * Part-2 runner: stream straight to the job log.  Part 2 (hostRunScripts) takes
+ * NO user args — its argv is credential-free — and lifecycle scripts can run
+ * long, so users want LIVE progress.  Keep `stdio:'inherit'`; nothing to redact.
+ */
+const inheritSpawn: HostSpawn = (cmd, args, cwd) => {
   const r = spawnSync(cmd, args, { cwd, stdio: 'inherit', shell: false });
   return { status: r.status, signal: r.signal, error: r.error };
 };
@@ -65,7 +109,7 @@ export function hostInstallNoScripts(
   repoDir: string,
   args: ReadonlyArray<string>,
   io: HostInstallIo,
-  spawn: HostSpawn = defaultSpawn,
+  spawn: HostSpawn = captureSpawn,
 ): void {
   const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
   // SECURITY: never log raw `dropped` tokens — they may carry credential values
@@ -101,7 +145,46 @@ export function hostInstallNoScripts(
   const safeDisplayArgs = kept.length > 0
     ? [...safeBaseArgs, `(+${kept.length} user install arg${kept.length === 1 ? '' : 's'}, not shown)`]
     : safeBaseArgs;
-  runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io, safeDisplayArgs);
+  // The PM's OWN captured stdout/stderr is run through the redactor before it
+  // reaches the job log (the user args this part takes can be echoed back by
+  // the PM — e.g. `npm warn invalid config registry="SECRET"`).  Written
+  // REGARDLESS of exit status: the user needs to see PM output, especially on
+  // failure.  Redaction is LOG-ONLY — the real `args` already went to spawn.
+  const sensitive = deriveSensitiveValues(kept);
+  const onOutput = (stdout: string, stderr: string): void => {
+    if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
+    if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
+  };
+  runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
+}
+
+/**
+ * Derive the exact literal values that must be masked out of part-1's captured
+ * PM output.  For each KEPT user token `t`:
+ *   * push `t` itself (the whole token — airtight literal match), and
+ *   * if `t` contains `=`, push the value substring after the first `=` — this
+ *     catches a PM that REFORMATS `--registry=SECRET` into `registry="SECRET"`;
+ *     the value `SECRET` still appears verbatim inside the reformatted echo.
+ * `maskExactValues` applies the `minLen >= 4` filter, so a short non-secret
+ * value like `dev` (from `--omit=dev`) is NOT masked — only the whole
+ * `--omit=dev` token is — which avoids mangling unrelated words (e.g.
+ * "devDependencies") in the PM output.  Nothing else is pushed.
+ */
+function deriveSensitiveValues(kept: readonly string[]): string[] {
+  const values: string[] = [];
+  for (const t of kept) {
+    values.push(t);
+    const eq = t.indexOf('=');
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}
+
+/** Mask user-arg values first (exact), then catch credential SHAPES. */
+function redactCaptured(text: string, sensitive: readonly string[]): string {
+  let red = maskExactValues(text, sensitive, 'REDACTED:USER-ARG');
+  red = redactCredentialShapes(red);
+  return red;
 }
 
 /**
@@ -112,7 +195,7 @@ export function hostRunScripts(
   pm: Manager,
   repoDir: string,
   io: HostInstallIo,
-  spawn: HostSpawn = defaultSpawn,
+  spawn: HostSpawn = inheritSpawn,
 ): void {
   const cmd = INSTALL_CMD[pm];
   // Same store-dir pin as part 1 / the guest install phase: pnpm must relink
@@ -145,8 +228,15 @@ function runOrThrow(
   label: string,
   io: HostInstallIo,
   displayArgs: string[],
+  onOutput?: (stdout: string, stderr: string) => void,
 ): void {
   const r = spawn(cmd, args, cwd);
+  // Surface captured output (redacted by the caller's closure) BEFORE any
+  // error/throw check, so the PM's own diagnostics reach the log even when the
+  // run failed.  A live-inheriting runner returns no stdout/stderr → no-op.
+  if (onOutput !== undefined && (r.stdout !== undefined || r.stderr !== undefined)) {
+    onOutput(r.stdout ?? '', r.stderr ?? '');
+  }
   if (r.error !== undefined) {
     // spawn-level failure: never had an argv in a shell — no leak path here.
     throw new Error(`script-jail: host ${label} could not spawn "${cmd}": ${r.error.message}`);

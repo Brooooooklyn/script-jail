@@ -26626,11 +26626,44 @@ function defaultGetInput(name) {
 
 // src/action/host-install.ts
 var import_node_child_process = require("node:child_process");
-var defaultSpawn = (cmd, args, cwd) => {
+
+// src/shared/redact.ts
+function redactCredentialShapes(text) {
+  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+}
+function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
+  const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
+  let out = text;
+  const replacement = `<${label}>`;
+  for (const value of unique) {
+    out = out.split(value).join(replacement);
+  }
+  return out;
+}
+
+// src/action/host-install.ts
+var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
+var captureSpawn = (cmd, args, cwd) => {
+  const r = (0, import_node_child_process.spawnSync)(cmd, args, {
+    cwd,
+    stdio: ["inherit", "pipe", "pipe"],
+    shell: false,
+    encoding: "utf8",
+    maxBuffer: CAPTURE_MAX_BUFFER
+  });
+  return {
+    status: r.status,
+    signal: r.signal,
+    error: r.error,
+    stdout: typeof r.stdout === "string" ? r.stdout : "",
+    stderr: typeof r.stderr === "string" ? r.stderr : ""
+  };
+};
+var inheritSpawn = (cmd, args, cwd) => {
   const r = (0, import_node_child_process.spawnSync)(cmd, args, { cwd, stdio: "inherit", shell: false });
   return { status: r.status, signal: r.signal, error: r.error };
 };
-function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = defaultSpawn) {
+function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = captureSpawn) {
   const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
   if (droppedKeys.length > 0) {
     const n = dropped.length;
@@ -26648,17 +26681,39 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = defaultSpawn) {
 `
   );
   const safeDisplayArgs = kept.length > 0 ? [...safeBaseArgs, `(+${kept.length} user install arg${kept.length === 1 ? "" : "s"}, not shown)`] : safeBaseArgs;
-  runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io, safeDisplayArgs);
+  const sensitive = deriveSensitiveValues(kept);
+  const onOutput = (stdout, stderr) => {
+    if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
+    if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
+  };
+  runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io, safeDisplayArgs, onOutput);
 }
-function hostRunScripts(pm, repoDir, io, spawn2 = defaultSpawn) {
+function deriveSensitiveValues(kept) {
+  const values = [];
+  for (const t of kept) {
+    values.push(t);
+    const eq = t.indexOf("=");
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}
+function redactCaptured(text, sensitive) {
+  let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");
+  red = redactCredentialShapes(red);
+  return red;
+}
+function hostRunScripts(pm, repoDir, io, spawn2 = inheritSpawn) {
   const cmd = INSTALL_CMD[pm];
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
 `);
   runOrThrow(cmd.cmd, finalArgs, repoDir, spawn2, "lifecycle-script run", io, finalArgs);
 }
-function runOrThrow(cmd, args, cwd, spawn2, label, io, displayArgs) {
+function runOrThrow(cmd, args, cwd, spawn2, label, io, displayArgs, onOutput) {
   const r = spawn2(cmd, args, cwd);
+  if (onOutput !== void 0 && (r.stdout !== void 0 || r.stderr !== void 0)) {
+    onOutput(r.stdout ?? "", r.stderr ?? "");
+  }
   if (r.error !== void 0) {
     throw new Error(`script-jail: host ${label} could not spawn "${cmd}": ${r.error.message}`);
   }
@@ -44346,7 +44401,7 @@ async function main(deps = {}) {
     }
   });
   if (inputs.install) {
-    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, warn });
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn });
     if (result.trusted) {
       const egress = collectNetworkAttempts(result.generatedLock ?? "");
       if (egress.length > 0) {
@@ -44365,7 +44420,7 @@ async function main(deps = {}) {
         warn(summary2);
         process.stdout.write(detail);
       }
-      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, warn });
+      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn });
     }
   }
   if (result.exitCode !== 0) exitProcess(result.exitCode);

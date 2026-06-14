@@ -11,19 +11,23 @@ import { hostInstallNoScripts, hostRunScripts, type HostSpawn, type HostInstallI
 interface Recorder {
   io: HostInstallIo;
   out: string[];
+  errs: string[];
   warns: string[];
   calls: Array<{ cmd: string; args: string[]; cwd: string }>;
 }
 
 function makeRecorder(): Recorder {
   const out: string[] = [];
+  const errs: string[] = [];
   const warns: string[] = [];
   return {
     out,
+    errs,
     warns,
     calls: [],
     io: {
       stdout: { write: (s: string) => { out.push(s); } },
+      stderr: { write: (s: string) => { errs.push(s); } },
       warn: (m: string) => { warns.push(m); },
     },
   };
@@ -146,6 +150,99 @@ describe('hostInstallNoScripts (part 1)', () => {
     hostInstallNoScripts('npm', '/repo', [], rec.io, okSpawn(rec));
     const logged = rec.out.join('');
     expect(logged).not.toContain('user install arg');
+  });
+
+  // ── Captured part-1 PM output: redacted before it reaches the job log ──────
+  // The PM's OWN diagnostics (warnings/errors) are captured (stdio pipe) and
+  // run through the redactor before being written, closing the leak where the
+  // package manager echoes a user-supplied secret back to the log.
+
+  function captureSpawn(rec: Recorder, result: { status: number | null; signal?: NodeJS.Signals | null; stdout?: string; stderr?: string }): HostSpawn {
+    return (cmd, args, cwd) => {
+      rec.calls.push({ cmd, args, cwd });
+      return result;
+    };
+  }
+
+  it('redacts a PM warning that REFORMATS --registry=SECRET into registry="SECRET" out of captured stderr', () => {
+    // npm 11.x emits `npm warn invalid config registry="SECRET_TOKEN" set in
+    // command line options` — the value substring survives the reformat, so the
+    // value-substring derivation must catch it.  The arg is STILL passed verbatim.
+    const rec = makeRecorder();
+    const spawn = captureSpawn(rec, {
+      status: 0,
+      stderr: 'npm warn invalid config registry="SECRET_TOKEN" set in command line options\n',
+    });
+    hostInstallNoScripts('npm', '/repo', ['--registry=SECRET_TOKEN'], rec.io, spawn);
+    const erred = rec.errs.join('');
+    expect(erred).not.toContain('SECRET_TOKEN');
+    // The diagnostic context survives (only the secret is masked).
+    expect(erred).toContain('npm warn invalid config registry=');
+    // The real arg reached spawn unchanged.
+    expect(rec.calls[0]!.args).toContain('--registry=SECRET_TOKEN');
+  });
+
+  it('masks a whole credential-shaped user-arg token echoed in captured stdout, still passes it to spawn', () => {
+    const credArg = '--//registry.npmjs.org/:_authToken=SECRET123';
+    const rec = makeRecorder();
+    const spawn = captureSpawn(rec, {
+      status: 0,
+      stdout: `using ${credArg} for auth\n`,
+    });
+    hostInstallNoScripts('npm', '/repo', [credArg], rec.io, spawn);
+    const logged = rec.out.join('');
+    expect(logged).not.toContain('SECRET123');
+    expect(logged).not.toContain(credArg);
+    expect(rec.calls[0]!.args).toContain(credArg);
+  });
+
+  it('redacts a credential SHAPE the PM emits that was NOT a user arg', () => {
+    // The PM prints its own resolved npm_ token + a credentialed URL — neither
+    // is a user arg, so redactCredentialShapes (not the value derivation) catches it.
+    const npmTok = 'npm_' + 'A'.repeat(36);
+    const rec = makeRecorder();
+    const spawn = captureSpawn(rec, {
+      status: 0,
+      stdout: `resolved token ${npmTok}\n`,
+      stderr: 'fetch https://user:HUNTER2PASSWORD@reg.example/pkg\n',
+    });
+    hostInstallNoScripts('npm', '/repo', [], rec.io, spawn);
+    const logged = rec.out.join('');
+    const erred = rec.errs.join('');
+    expect(logged).not.toContain(npmTok);
+    expect(logged).toContain('<REDACTED:NPM-TOKEN>');
+    expect(erred).not.toContain('HUNTER2PASSWORD');
+    expect(erred).toContain('<REDACTED:URL-CREDENTIALS>');
+  });
+
+  it('writes captured output even on failure (status !== 0) BEFORE throwing', () => {
+    const credArg = '--registry=SECRET_TOKEN';
+    const rec = makeRecorder();
+    const spawn = captureSpawn(rec, {
+      status: 1,
+      stdout: 'npm error something broke\n',
+      stderr: 'npm warn invalid config registry="SECRET_TOKEN"\n',
+    });
+    expect(() => hostInstallNoScripts('npm', '/repo', [credArg], rec.io, spawn)).toThrow(/exited with code 1/);
+    // Output reached the sinks despite the throw.
+    expect(rec.out.join('')).toContain('npm error something broke');
+    const erred = rec.errs.join('');
+    expect(erred).toContain('npm warn invalid config registry=');
+    expect(erred).not.toContain('SECRET_TOKEN');
+  });
+
+  it('does NOT mangle an unrelated word that contains a short user-arg value (minLen guard)', () => {
+    // `--omit=dev` → value "dev" is 3 chars (< minLen 4), so it must not blank
+    // out "devDependencies".  The WHOLE token --omit=dev IS masked though.
+    const rec = makeRecorder();
+    const spawn = captureSpawn(rec, {
+      status: 0,
+      stdout: 'pruned devDependencies; ran with --omit=dev\n',
+    });
+    hostInstallNoScripts('npm', '/repo', ['--omit=dev'], rec.io, spawn);
+    const logged = rec.out.join('');
+    expect(logged).toContain('devDependencies'); // unrelated word intact
+    expect(logged).not.toContain('--omit=dev'); // whole token masked
   });
 
   // ── Surface #6a: runOrThrow error messages must not leak argv credentials ──

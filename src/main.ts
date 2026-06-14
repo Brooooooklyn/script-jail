@@ -292,7 +292,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // scripts ONLINE on the runner (no netns sever) — trust derives from the
   // reviewed, matched lock.
   if (inputs.install) {
-    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, warn });
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn });
     if (result.trusted) {
       // Surface the egress from the GENERATED lock runAudit just produced — it
       // is guaranteed well-formed (the guest rendered it) and, on a trusted
@@ -327,7 +327,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
         warn(summary);
         process.stdout.write(detail);
       }
-      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, warn });
+      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn });
     }
   }
 
