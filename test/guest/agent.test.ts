@@ -1723,6 +1723,110 @@ describe('agent main() root-prepare second pass', () => {
     expect(finalFrame).toBeDefined();
     expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
   });
+
+  // --- FIX 2 (pnpm main-pass variant): nameless root + prepare → fail closed --
+  // resolvePrepareCommand('pnpm') is ALWAYS null, so the dedicated prepare-pass
+  // gate is never reached for pnpm.  But pnpm's MAIN Phase-B command
+  // (`pnpm rebuild --pending`) RUNS the root `prepare` with npm_package_name
+  // UNSET when the root has no `name`, so attribution returns null and the
+  // dispatcher drops every prepare event → a deceptively-clean lock.  A
+  // pnpm-only gate must fire BEFORE the main install runs.
+  it('FAILS CLOSED (fatal, no lockfile) for pnpm when the root has a `prepare` but no `name`', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // Nameless root (only a version) + a real prepare script → canonicalRootKey
+    // === null, and pnpm's main pass would run that prepare UNAUDITED.
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prep.runner,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error frame naming the missing root `name`; no final lockfile; exit 1.
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/no usable `name`/);
+    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    // The gate fires BEFORE the main install pass runs the root prepare.
+    expect(main_.calls).toHaveLength(0);
+    expect(prep.calls).toHaveLength(0);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('pnpm NAMELESS root WITHOUT a prepare script → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // Nameless root, NO prepare script → the pnpm gate must NOT fire.
+    writeRootPkg(testDir, { version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // No fatal error, the main install ran, and a final lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
+  it('pnpm NAMED root + prepare → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // Named root → canonicalRootKey is set, the pnpm gate does NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The main install ran and a final lockfile is emitted (no nameless-root trip).
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
 });
 
 describe('buildChildEnv protected-env-names length gate', () => {

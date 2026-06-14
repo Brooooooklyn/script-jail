@@ -30638,6 +30638,14 @@ ${fetchDetail}
     protectedPaths,
     rootPkgKeys
   };
+  if (manager === "pnpm" && hasRootPrepareScript && canonicalRootKey === null) {
+    emitter.emitError(
+      "Root `prepare` script present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root `prepare` unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
     if (installResult.eventCount === 0) {

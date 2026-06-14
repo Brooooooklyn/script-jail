@@ -3378,6 +3378,42 @@ export async function main(input: AgentInput): Promise<void> {
     protectedPaths,
     rootPkgKeys,
   };
+
+  // FAIL CLOSED (pnpm) — nameless-root unaudited `prepare`, MAIN-pass variant.
+  //
+  // The dedicated prepare-pass gate at section 11a only covers managers whose
+  // root `prepare` runs in a SEPARATE pass: npm (`npm run prepare`) and yarn
+  // (`yarn run prepare`).  resolvePrepareCommand('pnpm') is ALWAYS null, so that
+  // gate is never reached for pnpm.  But pnpm's MAIN Phase-B command
+  // (`pnpm rebuild --pending`, INSTALL_CMD.pnpm) DOES run the ROOT project's
+  // `prepare` — verified against pnpm 10.34/11.1: a root manifest with a
+  // `prepare` script but NO `name` runs that prepare with npm_package_name
+  // UNSET.  With no name, attributionFromEnvVars returns null and the
+  // dispatcher DROPS every non-spawn prepare event at its null-attribution
+  // gate, leaving the root `prepare` UNAUDITED while a clean diff against the
+  // resulting lock could still return `trusted` — and with `install: true` that
+  // clean lock then runs the lifecycle scripts on the host.  Refuse to emit a
+  // lockfile.
+  //
+  // Scope: this gate is pnpm-ONLY and fires BEFORE the main install runs the
+  // root prepare.  npm/yarn must NOT be added here — their main pass does NOT
+  // run the root prepare, so failing closed before it would falsely block a
+  // nameless npm/yarn root whose prepare never executes in this pass; their
+  // root prepare is gated (correctly) inside the dedicated pass at 11a.  Same
+  // signal (`hasRootPrepareScript` + `canonicalRootKey === null`) and same fatal
+  // shape (emitError(…, true) + flushAndExit(1) + return) as the 11a gate.
+  if (manager === 'pnpm' && hasRootPrepareScript && canonicalRootKey === null) {
+    emitter.emitError(
+      'Root `prepare` script present but root package.json has no usable `name` — ' +
+        'its audited events cannot be attributed and would be silently dropped, ' +
+        'leaving the root `prepare` unaudited. Refusing to emit a lockfile ' +
+        '(add a `name` to the root package.json).',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+
   // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux
   // uses the full strace+shim dispatcher.  Both share PhaseInstallInput /
   // PhaseInstallResult so the downstream exit-code / tamper / normalize logic
