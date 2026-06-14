@@ -701,8 +701,27 @@ export async function runInstallPhaseMacos(
       snapshotAttribution(shimEvent.pid);
     if (attribution === null) continue;
 
+    // Repo-root anchoring (read/write only): when this fs event attributes to a
+    // root-project package key we stamp `root_anchored` so normalize.ts can tell
+    // a genuine root event from a dependency forging `npm_package_name=<root>`.
+    // macOS-bare is OBSERVE-ONLY and has no strace process-tree / exec-cwd
+    // machinery (see this file's header — the union-find group model, per-pid
+    // cwd table, and the prepare-pass attribution all live on the Linux path),
+    // so we cannot compute the non-forgeable verdict here; root identity is
+    // env-trusted and we default to `root_anchored: true` (a documented
+    // residual). The Linux/Firecracker backend computes the real value via
+    // isRepoRootAnchored() and remains the enforcement boundary. The field is
+    // OMITTED entirely (never set to false) on non-root events so frames stay
+    // byte-identical → zero behavior change while `rootPkgKeys` is undefined.
+    const isRootAttributedFsEvent =
+      (shimEvent.kind === 'read' || shimEvent.kind === 'write') &&
+      input.rootPkgKeys?.has(attribution.pkg) === true;
+    const raw: RawEvent = isRootAttributedFsEvent
+      ? { ...shimEvent, root_anchored: true }
+      : shimEvent;
+
     const attributed: AttributedEvent = {
-      raw: shimEvent,
+      raw,
       pkg: attribution.pkg,
       lifecycle: attribution.lifecycle,
     };
