@@ -24904,7 +24904,8 @@ var FsReadEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -24914,7 +24915,8 @@ var FsWriteEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
@@ -25176,8 +25178,8 @@ var Attribution = class {
   }
   _walk(startPid) {
     let current = startPid;
-    const MAX_DEPTH = 1024;
-    for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    const MAX_DEPTH2 = 1024;
+    for (let depth = 0; depth < MAX_DEPTH2; depth++) {
       if (current === 0 || current === 1) {
         return null;
       }
@@ -26162,6 +26164,34 @@ function normalizePattern(p) {
   return p;
 }
 
+// src/guest/root-anchor.ts
+var MAX_DEPTH = 1024;
+function isRepoRootAnchored(input) {
+  const { childParent, execCwd, workDir, rootPid } = input;
+  let cur = input.pid;
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    if (cur === rootPid) {
+      return true;
+    }
+    if (input.cwdUnknown(cur)) {
+      return false;
+    }
+    const ec = execCwd.get(cur);
+    if (ec === null) {
+      return false;
+    }
+    if (ec !== void 0 && ec !== workDir) {
+      return false;
+    }
+    const parent = childParent.get(cur);
+    if (parent === void 0) {
+      return false;
+    }
+    cur = parent;
+  }
+  return false;
+}
+
 // src/guest/phase-install.ts
 var NODE_STARTUP_DONE_STRACE_PATH = "/tmp/script-jail-node-startup-done";
 function parseShimLine(line) {
@@ -26735,6 +26765,8 @@ async function runInstallPhase(input) {
   const dirfdTable = /* @__PURE__ */ new Map();
   const fdKey = (pid, fd) => `${rootedFd(pid)}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
+  const childParent = /* @__PURE__ */ new Map();
+  const execCwd = /* @__PURE__ */ new Map();
   const pidCwdUnknown = /* @__PURE__ */ new Set();
   function cwdGet(pid) {
     return pidCwd.get(rootedCwd(pid));
@@ -26753,6 +26785,22 @@ async function runInstallPhase(input) {
   }
   function cwdUnknownDelete(pid) {
     pidCwdUnknown.delete(rootedCwd(pid));
+  }
+  function rootAnchored(pid) {
+    const rootPid = installRootPid;
+    if (rootPid === null) return true;
+    return isRepoRootAnchored({
+      pid,
+      childParent,
+      execCwd,
+      // Group-aware: `pidCwdUnknown` is keyed by cwd-group root (CLONE_FS), so
+      // querying the raw pid would miss a pid marked unknown via a sibling.
+      // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
+      // walker's fail-closed disqualifier sees the real unknown state.
+      cwdUnknown: cwdUnknownHas,
+      workDir: path2.resolve(input.cwd),
+      rootPid
+    });
   }
   const dirfdStateUnknown = /* @__PURE__ */ new Set();
   function fdUnknownHas(pid) {
@@ -27029,6 +27077,7 @@ async function runInstallPhase(input) {
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path2.resolve(input.cwd));
+        execCwd.set(pid, path2.resolve(input.cwd));
       }
     }
     if (source === "shim") {
@@ -27158,6 +27207,7 @@ async function runInstallPhase(input) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
           if (Number.isFinite(childPid) && childPid > 0) {
             propagateNodeBootstrap(pid, childPid);
+            childParent.set(childPid, pid);
             let cloneFs = false;
             let cloneFiles = false;
             if (syscallName === "clone" || syscallName === "clone3") {
@@ -27866,6 +27916,12 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          if (!execCwd.has(rawEvent.pid)) {
+            execCwd.set(
+              rawEvent.pid,
+              cwdUnknownHas(rawEvent.pid) ? null : cwdGet(rawEvent.pid) ?? null
+            );
+          }
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
           packageManagerClientPids.delete(rawEvent.pid);
@@ -28045,7 +28101,12 @@ async function runInstallPhase(input) {
           if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
             continue;
           }
-          const resolved = rawEvent.kind === "read" ? { ...rawEvent, path: canonical } : { ...rawEvent, path: canonical };
+          const isRootAttributed = input.rootPkgKeys?.has(result.pkg) === true;
+          const resolved = {
+            ...rawEvent,
+            path: canonical,
+            ...isRootAttributed ? { root_anchored: rootAnchored(rawEvent.pid) } : {}
+          };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
@@ -28510,8 +28571,10 @@ async function runInstallPhaseMacos(input) {
     }
     const attribution = freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
     if (attribution === null) continue;
+    const isRootAttributedFsEvent = (shimEvent.kind === "read" || shimEvent.kind === "write") && input.rootPkgKeys?.has(attribution.pkg) === true;
+    const raw = isRootAttributedFsEvent ? { ...shimEvent, root_anchored: true } : shimEvent;
     const attributed = {
-      raw: shimEvent,
+      raw,
       pkg: attribution.pkg,
       lifecycle: attribution.lifecycle
     };
@@ -28745,19 +28808,21 @@ function normalize(events, ctx) {
     const fsPath = (ev.raw.kind === "read" || ev.raw.kind === "write") && os === "darwin" ? canonicalizePrivateRealpath(ev.raw.path) : ev.raw.kind === "read" || ev.raw.kind === "write" ? ev.raw.path : void 0;
     if (isSystemNoise(ev, fsPath, os)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
-    const isRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
-    if (pkgDir === void 0 && !isRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
+    const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
+    const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write") && ev.raw.root_anchored !== true;
+    if (pkgDir === void 0 && !claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`
       );
     }
+    const forgedPrefix = isForgedRoot ? "<FORGED_ROOT> " : "";
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
     switch (ev.raw.kind) {
       case "read": {
         const tokenized = normalizeVolatilePath(tokenize(fsPath, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
-        const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
-        block.external_reads.push(tagged);
+        const hiddenTag = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
+        block.external_reads.push(`${forgedPrefix}${hiddenTag}`);
         break;
       }
       case "write": {
@@ -28765,7 +28830,7 @@ function normalize(events, ctx) {
         if (isInsidePkg(tokenized)) continue;
         const hiddenPrefix = ev.raw.hidden ? "<HIDDEN> " : "";
         const crossPrefix = isCrossPackage(tokenized) ? "<CROSS_PACKAGE> " : "";
-        block.escaped_writes.push(`${hiddenPrefix}${crossPrefix}${tokenized}`);
+        block.escaped_writes.push(`${forgedPrefix}${hiddenPrefix}${crossPrefix}${tokenized}`);
         break;
       }
       case "env_read": {
@@ -30416,6 +30481,21 @@ ${fetchDetail}
     }
   }
   const collectedEvents = [];
+  const rootPkgKeys = /* @__PURE__ */ new Set();
+  let canonicalRootKey = null;
+  try {
+    const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
+    if (typeof rootManifest.name === "string" && rootManifest.name.length > 0) {
+      rootPkgKeys.add(rootManifest.name);
+      if (typeof rootManifest.version === "string" && rootManifest.version.length > 0) {
+        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
+        canonicalRootKey = `${rootManifest.name}@${rootManifest.version}`;
+      } else {
+        canonicalRootKey = rootManifest.name;
+      }
+    }
+  } catch {
+  }
   const collectingEmitter = new Emitter(
     new class extends import_node_stream.Writable {
       _write(chunk, _enc, cb) {
@@ -30477,7 +30557,8 @@ ${fetchDetail}
     // tailer's always-empty watchDir).  Per-pid `strace -ff` logs for a large
     // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
     straceBasePath: `${straceBaseDir}/strace.out`,
-    protectedPaths
+    protectedPaths,
+    rootPkgKeys
   };
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
@@ -30538,17 +30619,57 @@ ${stdoutTail}`;
     }
     const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
     const prepareEnv = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
+    const preparingEmitter = new Emitter(
+      new class extends import_node_stream.Writable {
+        _write(chunk, _enc, cb) {
+          const line = chunk.toString();
+          let frame;
+          try {
+            frame = JSON.parse(line);
+          } catch {
+            cb();
+            return;
+          }
+          if (frame["kind"] === "event") {
+            const raw = frame["raw"];
+            const forcedPkg = canonicalRootKey ?? frame["pkg"];
+            const forcedLifecycle = "prepare";
+            if ((raw.kind === "read" || raw.kind === "write") && canonicalRootKey !== null) {
+              raw.root_anchored = true;
+            }
+            const forcedFrame = {
+              ...frame,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+              raw
+            };
+            const forcedLine = `${JSON.stringify(forcedFrame)}
+`;
+            input.connection.writable.write(forcedLine);
+            collectedEvents.push({
+              raw,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle
+            });
+          } else {
+            input.connection.writable.write(line);
+          }
+          cb();
+        }
+      }()
+    );
     const prepareInput = {
       manager,
       cwd: config2.work_dir,
       env: prepareEnv,
       strace: prepareRunner,
       attribution,
-      emitter: collectingEmitter,
+      emitter: preparingEmitter,
       // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
       // the main install's files on the scratch disk.
       straceBasePath: `${straceBaseDir}/strace-prepare.out`,
       protectedPaths,
+      rootPkgKeys,
       commandOverride: prepareCommand
     };
     const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
@@ -30577,17 +30698,6 @@ ${stdoutTail}`;
   diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
   const pkgDirs = new Map(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
-  const rootPkgKeys = /* @__PURE__ */ new Set();
-  try {
-    const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
-    if (typeof rootManifest.name === "string" && rootManifest.name.length > 0) {
-      rootPkgKeys.add(rootManifest.name);
-      if (typeof rootManifest.version === "string") {
-        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
-      }
-    }
-  } catch {
-  }
   const ctx = isMacosBare ? { roots, pkgDirs, rootPkgKeys, os: "darwin" } : { roots, pkgDirs, rootPkgKeys };
   let yaml;
   try {

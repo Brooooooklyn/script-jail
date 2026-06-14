@@ -42990,7 +42990,8 @@ var FsReadEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -43000,7 +43001,8 @@ var FsWriteEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
@@ -43332,14 +43334,38 @@ function collectNetworkAttempts(generated) {
   }
   return out;
 }
-function formatEgressWarning(entries) {
+function formatEgressWarning(entries, opts) {
   const MAX = 20;
-  const summary2 = `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. The offline audit recorded ${entries.length} network egress attempt(s) that WILL now succeed (listed below). IPs are offline-audit values \u2014 the host may resolve different addresses; review the committed lock before trusting this install.`;
-  const lines = entries.slice(0, MAX).map((e) => {
+  const auditedOnly = [];
+  const hostBound = [];
+  for (const e of entries) {
+    if (e.stage === "prepare" && opts.manager !== "pnpm" && opts.rootPackageIds.has(e.packageId)) {
+      auditedOnly.push(e);
+    } else {
+      hostBound.push(e);
+    }
+  }
+  const summary2 = hostBound.length > 0 ? `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. The offline audit recorded ${hostBound.length} network egress attempt(s) that WILL now succeed (listed below). IPs are offline-audit values \u2014 the host may resolve different addresses; review the committed lock before trusting this install.` : (
+    // No host-bound egress: only audited-only root `prepare` entries remain.
+    // Do NOT claim host egress — the root `prepare` was audited in the
+    // sandbox and the host rebuild (npm/yarn) does not run it.
+    `script-jail install: part 2 runs lifecycle scripts on the host; the root \`prepare\` egress below was audited in the sandbox and will NOT run on the host.`
+  );
+  const lines = hostBound.slice(0, MAX).map((e) => {
     return `  ${e.packageId} (${e.stage})  ${e.entry}`;
   });
-  if (entries.length > MAX) {
-    lines.push(`  (+${entries.length - MAX} more \u2014 see the committed lock)`);
+  if (hostBound.length > MAX) {
+    lines.push(`  (+${hostBound.length - MAX} more \u2014 see the committed lock)`);
+  }
+  if (auditedOnly.length > 0) {
+    lines.push("  audited in the sandbox; NOT run on the host (root `prepare`):");
+    const auditedLines = auditedOnly.slice(0, MAX).map((e) => {
+      return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+    });
+    lines.push(...auditedLines);
+    if (auditedOnly.length > MAX) {
+      lines.push(`  (+${auditedOnly.length - MAX} more \u2014 see the committed lock)`);
+    }
   }
   const detail = `${lines.join("\n")}
 `;
@@ -44297,7 +44323,23 @@ async function main(deps = {}) {
     if (result.trusted) {
       const egress = collectNetworkAttempts(result.generatedLock ?? "");
       if (egress.length > 0) {
-        const { summary: summary2, detail } = formatEgressWarning(egress);
+        const rootPackageIds = /* @__PURE__ */ new Set();
+        try {
+          const rootManifest = JSON.parse(
+            (0, import_node_fs16.readFileSync)((0, import_node_path12.join)(repoDir, "package.json"), "utf8")
+          );
+          if (typeof rootManifest.name === "string" && rootManifest.name.length > 0) {
+            rootPackageIds.add(rootManifest.name);
+            if (typeof rootManifest.version === "string" && rootManifest.version.length > 0) {
+              rootPackageIds.add(`${rootManifest.name}@${rootManifest.version}`);
+            }
+          }
+        } catch {
+        }
+        const { summary: summary2, detail } = formatEgressWarning(egress, {
+          manager: pm.manager,
+          rootPackageIds
+        });
         warn(summary2);
         process.stdout.write(detail);
       }
