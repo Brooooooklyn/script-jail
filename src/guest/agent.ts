@@ -3578,7 +3578,13 @@ export async function main(input: AgentInput): Promise<void> {
             // Force attribution: this pass runs only the root's prepare.
             const forcedPkg = canonicalRootKey ?? (frame['pkg'] as string);
             const forcedLifecycle: import('../lock/schema.js').LifecycleStage = 'prepare';
-            if (raw.kind === 'read' || raw.kind === 'write') {
+            // Only stamp the non-forgeable root anchor when we actually have a
+            // parseable root manifest (canonicalRootKey).  With no root manifest
+            // `forcedPkg` falls back to the frame's own (dep) label, which is NOT
+            // the root — stamping root_anchored there would forge the very signal
+            // normalize relies on.  Inert today (the prepare pass only runs with a
+            // root manifest) but makes the intent explicit.
+            if ((raw.kind === 'read' || raw.kind === 'write') && canonicalRootKey !== null) {
               raw.root_anchored = true;
             }
             const forcedFrame = {

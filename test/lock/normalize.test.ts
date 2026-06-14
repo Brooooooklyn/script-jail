@@ -442,10 +442,30 @@ describe('normalize', () => {
       rootPkgKeys: new Set([rootKey]),
     };
 
+    // GENUINE root events carry the non-forgeable `root_anchored: true` verdict
+    // (Linux dispatcher derives it from the process tree; the prepare pass forces
+    // it true).  Only such events surface as the un-prefixed `$REPO/...`.
     function rootRead(path: string, hidden = false): AttributedEvent {
-      return { raw: { kind: 'read', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'prepare' };
+      return {
+        raw: { kind: 'read', path, pid: 1, ts: 0, hidden, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'prepare',
+      };
     }
     function rootWrite(path: string, hidden = false): AttributedEvent {
+      return {
+        raw: { kind: 'write', path, pid: 1, ts: 0, hidden, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'prepare',
+      };
+    }
+    // FORGED root events: the pkg CLAIMS the root key (forgeable npm_package_name)
+    // but `root_anchored` is absent — the non-forgeable verdict says "not the
+    // genuine root".  These must surface with the `<FORGED_ROOT> ` prefix.
+    function forgedRead(path: string, hidden = false): AttributedEvent {
+      return { raw: { kind: 'read', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'prepare' };
+    }
+    function forgedWrite(path: string, hidden = false): AttributedEvent {
       return { raw: { kind: 'write', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'prepare' };
     }
 
@@ -457,6 +477,7 @@ describe('normalize', () => {
     it('STILL throws for a non-root pkg with no pkgDir (forged/unknown attribution fails closed)', () => {
       const events = [rootWrite('/work/dist/index.js')];
       const notRoot: NormalizeContext = { roots, pkgDirs: new Map(), rootPkgKeys: new Set(['other@9.9.9']) };
+      // The pkg does NOT claim root (not in rootPkgKeys) and has no pkgDir.
       expect(() => normalize(events, notRoot)).toThrow(/pkgDirs missing entry/);
     });
 
@@ -479,6 +500,40 @@ describe('normalize', () => {
       const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
       expect(block?.escaped_writes).toEqual(['$REPO/prepare-built.txt']);
       expect(block?.external_reads).toEqual(['/etc/hostname']);
+    });
+
+    it('PREFIXES a FORGED-root write with <FORGED_ROOT> (root_anchored absent → not dropped, not thrown)', () => {
+      const events = [forgedWrite('/work/prepare-built.txt')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      // Surfaces (fail-loud), distinct from the genuine `$REPO/...` string.
+      expect(block?.escaped_writes).toEqual(['<FORGED_ROOT> $REPO/prepare-built.txt']);
+    });
+
+    it('PREFIXES a FORGED-root read with <FORGED_ROOT> (root_anchored absent → surfaces)', () => {
+      const events = [forgedRead('/etc/hostname')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.external_reads).toEqual(['<FORGED_ROOT> /etc/hostname']);
+    });
+
+    it('does NOT throw for a FORGED-root fs event (avoids dependency-triggered DoS)', () => {
+      const events = [forgedWrite('/work/anywhere.js'), forgedRead('/etc/hostname')];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    // SECURITY CRUX (non-collapse): a genuine root write and a forged write to
+    // the SAME path must BOTH appear.  Without the `<FORGED_ROOT> ` prefix the
+    // two identical `$REPO/dist/index.js` strings would dedupe-collapse to one
+    // in sortAndDedupe — hiding the forgery behind the legitimate write.
+    it('does NOT dedupe-collapse a forged write onto an identical genuine root write', () => {
+      const events = [
+        rootWrite('/work/dist/index.js'), // genuine (root_anchored: true)
+        forgedWrite('/work/dist/index.js'), // forged (same path, root_anchored absent)
+      ];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.escaped_writes).toEqual([
+        '$REPO/dist/index.js',
+        '<FORGED_ROOT> $REPO/dist/index.js',
+      ]);
     });
   });
 
