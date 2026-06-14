@@ -17,7 +17,7 @@
 // independently unit-tested.
 
 import { setOutput } from '@actions/core';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -303,7 +303,29 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       // ONLINE — they WILL succeed.
       const egress = collectNetworkAttempts(result.generatedLock ?? '');
       if (egress.length > 0) {
-        const { summary, detail } = formatEgressWarning(egress);
+        // Build the root-project package ids (bare `name` AND `name@version`)
+        // so formatEgressWarning can tell whether a `prepare` egress entry is
+        // the ROOT's.  The host rebuild does NOT run root `prepare` for
+        // npm/yarn, so that egress is audited-only there; pnpm's
+        // `rebuild --pending` does run it.  Mirrors the guest's rootPkgKeys.
+        const rootPackageIds = new Set<string>();
+        try {
+          const rootManifest = JSON.parse(
+            readFileSync(join(repoDir, 'package.json'), 'utf8'),
+          ) as { name?: unknown; version?: unknown };
+          if (typeof rootManifest.name === 'string' && rootManifest.name.length > 0) {
+            rootPackageIds.add(rootManifest.name);
+            if (typeof rootManifest.version === 'string' && rootManifest.version.length > 0) {
+              rootPackageIds.add(`${rootManifest.name}@${rootManifest.version}`);
+            }
+          }
+        } catch {
+          /* missing/invalid root package.json → empty set (no entry is root) */
+        }
+        const { summary, detail } = formatEgressWarning(egress, {
+          manager: pm.manager,
+          rootPackageIds,
+        });
         warn(summary);
         process.stdout.write(detail);
       }

@@ -26,6 +26,7 @@ import { createTwoFilesPatch, structuredPatch } from 'diff';
 import { parse as parseYaml } from 'yaml';
 
 import { Lock } from '../lock/schema.js';
+import type { Manager } from '../shared/pm-commands.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -341,23 +342,75 @@ export function collectNetworkAttempts(generated: string): NetworkAttemptEntry[]
  *               plain lines so the full block is readable in the job log.
  *
  * The IP caveat is folded into `summary` so the annotation itself carries it.
+ *
+ * Not every audited egress entry actually runs on the host.  Part 2 invokes
+ * `INSTALL_CMD[pm]`, and the host rebuild's coverage of the ROOT project's
+ * `prepare` script differs by manager:
+ *   * npm  (`npm rebuild --foreground-scripts`) — does NOT run root `prepare`.
+ *   * yarn (`yarn install --immutable`)          — does NOT run root `prepare`.
+ *   * pnpm (`pnpm rebuild --pending`)             — DOES run root `prepare`.
+ * The sandbox always audits root `prepare` via a dedicated prepare pass, so for
+ * npm/yarn that recorded root-prepare egress is listed in the lock yet will NOT
+ * fire on the host.  Surfacing it as "WILL now succeed" would over-claim, so we
+ * partition such entries out and label them as audited-only.
  */
-export function formatEgressWarning(entries: NetworkAttemptEntry[]): {
+export function formatEgressWarning(
+  entries: NetworkAttemptEntry[],
+  opts: { manager: Manager; rootPackageIds: ReadonlySet<string> },
+): {
   summary: string;
   detail: string;
 } {
   const MAX = 20;
+
+  // Partition: root `prepare` egress that the host rebuild will NOT run goes to
+  // `auditedOnly` (npm/yarn only); everything else is `hostBound` and genuinely
+  // runs online during part 2.  Input order is preserved on both sides, keeping
+  // the rendered output deterministic.
+  const auditedOnly: NetworkAttemptEntry[] = [];
+  const hostBound: NetworkAttemptEntry[] = [];
+  for (const e of entries) {
+    if (
+      e.stage === 'prepare' &&
+      opts.manager !== 'pnpm' &&
+      opts.rootPackageIds.has(e.packageId)
+    ) {
+      auditedOnly.push(e);
+    } else {
+      hostBound.push(e);
+    }
+  }
+
   const summary =
-    `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. ` +
-    `The offline audit recorded ${entries.length} network egress attempt(s) that ` +
-    `WILL now succeed (listed below). IPs are offline-audit values — the host ` +
-    `may resolve different addresses; review the committed lock before trusting this install.`;
-  const lines = entries.slice(0, MAX).map((e) => {
+    hostBound.length > 0
+      ? `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. ` +
+        `The offline audit recorded ${hostBound.length} network egress attempt(s) that ` +
+        `WILL now succeed (listed below). IPs are offline-audit values — the host ` +
+        `may resolve different addresses; review the committed lock before trusting this install.`
+      : // No host-bound egress: only audited-only root `prepare` entries remain.
+        // Do NOT claim host egress — the root `prepare` was audited in the
+        // sandbox and the host rebuild (npm/yarn) does not run it.
+        `script-jail install: part 2 runs lifecycle scripts on the host; the root ` +
+        `\`prepare\` egress below was audited in the sandbox and will NOT run on the host.`;
+
+  const lines = hostBound.slice(0, MAX).map((e) => {
     return `  ${e.packageId} (${e.stage})  ${e.entry}`;
   });
-  if (entries.length > MAX) {
-    lines.push(`  (+${entries.length - MAX} more — see the committed lock)`);
+  if (hostBound.length > MAX) {
+    lines.push(`  (+${hostBound.length - MAX} more — see the committed lock)`);
   }
+
+  if (auditedOnly.length > 0) {
+    lines.push('  audited in the sandbox; NOT run on the host (root `prepare`):');
+    const auditedLines = auditedOnly.slice(0, MAX).map((e) => {
+      return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+    });
+    lines.push(...auditedLines);
+    if (auditedOnly.length > MAX) {
+      lines.push(`  (+${auditedOnly.length - MAX} more — see the committed lock)`);
+    }
+  }
+
   const detail = `${lines.join('\n')}\n`;
   return { summary, detail };
 }

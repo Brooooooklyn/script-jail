@@ -544,9 +544,10 @@ describe('formatEgressWarning', () => {
     { packageId: 'better-sqlite3@11.0.0', stage: 'postinstall', entry: '<BLOCKED> connect 198.51.100.7:443' },
     { packageId: 'esbuild@0.21.0', stage: 'postinstall', entry: '<BLOCKED> connect 203.0.113.9:443' },
   ];
+  const noRoots = { manager: 'npm' as const, rootPackageIds: new Set<string>() };
 
   it('summary states ONLINE + count + the IP caveat (single line for the annotation)', () => {
-    const { summary } = formatEgressWarning(entries);
+    const { summary } = formatEgressWarning(entries, noRoots);
     expect(summary).not.toContain('\n');
     expect(summary).toContain('ONLINE');
     expect(summary).toContain('2 network egress attempt(s)');
@@ -554,7 +555,7 @@ describe('formatEgressWarning', () => {
   });
 
   it('detail lists each pkg+stage+entry on its own line', () => {
-    const { detail } = formatEgressWarning(entries);
+    const { detail } = formatEgressWarning(entries, noRoots);
     expect(detail).toContain('better-sqlite3@11.0.0 (postinstall)  <BLOCKED> connect 198.51.100.7:443');
     expect(detail).toContain('esbuild@0.21.0 (postinstall)  <BLOCKED> connect 203.0.113.9:443');
   });
@@ -565,9 +566,89 @@ describe('formatEgressWarning', () => {
       stage: 'postinstall',
       entry: `<BLOCKED> connect 198.51.100.${i}:443`,
     }));
-    const { summary, detail } = formatEgressWarning(many);
+    const { summary, detail } = formatEgressWarning(many, noRoots);
     expect(summary).toContain('23 network egress attempt(s)');
     expect(detail).toContain('(+3 more');
+  });
+
+  // --- root `prepare` partition: npm/yarn host rebuild does NOT run it -------
+
+  const rootPrepare = {
+    packageId: 'my-app@1.0.0',
+    stage: 'prepare',
+    entry: '<BLOCKED> connect 192.0.2.5:443',
+  };
+  const depPost = {
+    packageId: 'better-sqlite3@11.0.0',
+    stage: 'postinstall',
+    entry: '<BLOCKED> connect 198.51.100.7:443',
+  };
+  const rootIds = new Set(['my-app', 'my-app@1.0.0']);
+
+  it('npm: a root `prepare` egress is audited-only (excluded from the WILL-succeed count); a dep stays host-bound', () => {
+    const { summary, detail } = formatEgressWarning([rootPrepare, depPost], {
+      manager: 'npm',
+      rootPackageIds: rootIds,
+    });
+    // Only the dep counts toward the host-bound "WILL now succeed" total.
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    // The dep is host-bound, listed in the main block.
+    expect(detail).toContain('better-sqlite3@11.0.0 (postinstall)  <BLOCKED> connect 198.51.100.7:443');
+    // The root prepare is split into the audited-only block.
+    expect(detail).toContain('audited in the sandbox; NOT run on the host (root `prepare`):');
+    expect(detail).toContain('my-app@1.0.0 (prepare)  <BLOCKED> connect 192.0.2.5:443');
+  });
+
+  it('yarn: the same root `prepare` egress is audited-only', () => {
+    const { summary, detail } = formatEgressWarning([rootPrepare, depPost], {
+      manager: 'yarn',
+      rootPackageIds: rootIds,
+    });
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(detail).toContain('audited in the sandbox; NOT run on the host (root `prepare`):');
+    expect(detail).toContain('my-app@1.0.0 (prepare)  <BLOCKED> connect 192.0.2.5:443');
+  });
+
+  it('pnpm: the same root `prepare` egress stays host-bound (rebuild --pending runs it)', () => {
+    const { summary, detail } = formatEgressWarning([rootPrepare, depPost], {
+      manager: 'pnpm',
+      rootPackageIds: rootIds,
+    });
+    // Both entries are host-bound under pnpm.
+    expect(summary).toContain('2 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    expect(detail).toContain('my-app@1.0.0 (prepare)  <BLOCKED> connect 192.0.2.5:443');
+    // No audited-only block.
+    expect(detail).not.toContain('audited in the sandbox; NOT run on the host');
+  });
+
+  it('a `prepare` egress whose pkg is NOT a root id stays host-bound (only the ROOT prepare is special)', () => {
+    const nonRootPrepare = {
+      packageId: 'some-dep@2.0.0',
+      stage: 'prepare',
+      entry: '<BLOCKED> connect 203.0.113.9:443',
+    };
+    const { summary, detail } = formatEgressWarning([nonRootPrepare], {
+      manager: 'npm',
+      rootPackageIds: rootIds,
+    });
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    expect(detail).toContain('some-dep@2.0.0 (prepare)  <BLOCKED> connect 203.0.113.9:443');
+    expect(detail).not.toContain('audited in the sandbox; NOT run on the host');
+  });
+
+  it('host-bound empty + audited-only nonempty: summary must NOT claim host egress', () => {
+    const { summary, detail } = formatEgressWarning([rootPrepare], {
+      manager: 'npm',
+      rootPackageIds: rootIds,
+    });
+    expect(summary).not.toContain('WILL now succeed');
+    expect(summary).not.toContain('ONLINE');
+    expect(summary).toMatch(/will NOT run on the host/i);
+    expect(detail).toContain('audited in the sandbox; NOT run on the host (root `prepare`):');
+    expect(detail).toContain('my-app@1.0.0 (prepare)  <BLOCKED> connect 192.0.2.5:443');
   });
 });
 
