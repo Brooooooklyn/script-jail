@@ -8361,6 +8361,160 @@ describe('runInstallPhase', () => {
   });
 
   // =====================================================================
+  // Fix #2 (adversarial-review [medium], 2026-06-14) — deterministic
+  // root_anchored verdict + deferred exec-cwd reconcile.
+  //
+  // `strace -ff` writes one file per pid and the tailer drains them in
+  // NONDETERMINISTIC order, so a root child's exec+write can be processed
+  // BEFORE the parent's clone line.  Two coupled defects:
+  //   (A) the exec-cwd snapshot recorded `null` permanently when the clone
+  //       had not yet propagated the inherited cwd (not-yet-known confused
+  //       with provably-unknown), and
+  //   (B) the root_anchored verdict was computed AT EMIT TIME against an
+  //       incomplete process tree.
+  // Combined, the SAME genuine root write surfaced as genuine in one run and
+  // `<FORGED_ROOT>` in another → committed-lock drift / flaky `check` CI.
+  //
+  // Fix: defer the exec-cwd snapshot until the clone edge arrives, and defer
+  // the root_anchored verdict to end-of-drain when the tree is complete.
+  // These tests prove the verdict is now ORDER-INDEPENDENT.
+  // =====================================================================
+  describe('Fix #2 — deterministic root_anchored across strace drain order', () => {
+    const rootPkgName = 'det-root-app';
+    const rootPkgVersion = '3.1.0';
+    const rootPkgKey = `${rootPkgName}@${rootPkgVersion}`;
+    const ROOT_PID = 4100;
+    const CHILD_PID = 4200;
+    const rootEnv = {
+      npm_package_name: rootPkgName,
+      npm_package_version: rootPkgVersion,
+      npm_lifecycle_event: 'postinstall',
+    };
+
+    // Records for a GENUINE root child: cloned from the root PM pid, exec'd
+    // at the repo root (/work), wrote /work/dist/x.js.  `childFirst` controls
+    // whether the child's exec+write drain BEFORE the parent's clone line.
+    const childRecords = [
+      // Child execs at /work.  When drained before the clone, its exec-cwd is
+      // NOT-YET-KNOWN (clone hasn't propagated /work yet) → deferred snapshot.
+      // /bin/sh is neither `node` nor a PM client, so it does not trigger any
+      // node-bootstrap special handling.
+      {
+        pid: CHILD_PID,
+        line: 'execve("/bin/sh", ["sh", "build.sh"], 0x7ffd) = 0',
+        source: 'strace' as const,
+      },
+      // Child writes a genuine root build artifact (absolute path inside the
+      // repo).  Attributes to the root pkg via the child's npm_* env.
+      {
+        pid: CHILD_PID,
+        line: 'openat(AT_FDCWD, "/work/dist/x.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 5',
+        source: 'strace' as const,
+      },
+    ];
+    // The root PM clone line.  CLONE_FS so the child inherits /work via the
+    // shared cwd group.  Processing this record also seeds the root pid's cwd
+    // (= /work) at the top of the dispatcher loop.
+    const cloneRecord = {
+      pid: ROOT_PID,
+      line: `clone(child_stack=0, flags=CLONE_VM|CLONE_FS|SIGCHLD) = ${CHILD_PID}`,
+      source: 'strace' as const,
+    };
+
+    function rootWrites(lines: string[]): Record<string, unknown>[] {
+      return lines
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .filter((e) => {
+          const r = e['raw'] as Record<string, unknown>;
+          return r['kind'] === 'write' && r['path'] === '/work/dist/x.js';
+        });
+    }
+
+    function findRootWrite(lines: string[]): Record<string, unknown> | undefined {
+      return rootWrites(lines)[0];
+    }
+
+    async function runOrder(
+      records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }>,
+    ): Promise<string[]> {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: rootEnv },
+        [CHILD_PID]: { ppid: ROOT_PID, env: rootEnv },
+      });
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      return lines;
+    }
+
+    it('child drains BEFORE parent clone: genuine root write is root_anchored:true', async () => {
+      // The defect order: child exec + write FIRST, then the parent clone.
+      // Pre-fix: exec-cwd snapshotted `null` (not-yet-known) AND the verdict
+      // was computed at emit time against a tree missing the clone edge →
+      // root_anchored:false (<FORGED_ROOT>).  Post-fix: deferred snapshot is
+      // reconciled at the clone, verdict computed at end-of-drain → true.
+      const lines = await runOrder([...childRecords, cloneRecord]);
+      const writes = rootWrites(lines);
+      // Emitted exactly once (no double-emit, no drop).
+      expect(writes).toHaveLength(1);
+      expect((writes[0]!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    it('parent clone drains BEFORE child (mirror order): same verdict root_anchored:true', async () => {
+      // The benign order: clone first (propagates /work), then child exec +
+      // write.  Must yield the SAME verdict as the defect order → proves the
+      // verdict is order-independent (the determinism guarantee).
+      const lines = await runOrder([cloneRecord, ...childRecords]);
+      const writes = rootWrites(lines);
+      expect(writes).toHaveLength(1);
+      expect((writes[0]!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    it('pendingExecCwd leftover (clone never drains) fails closed: root_anchored:false', async () => {
+      // Child execs not-yet-known and its clone line NEVER arrives, so the
+      // child stays parked in `pendingExecCwd` to end-of-drain.  The flush
+      // finalizes it to `null` (unprovable cwd) and `childParent` has no edge
+      // to the root → the walk fails closed.  The write still emits (pkg
+      // matches rootPkgKey) but with root_anchored:false.
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: rootEnv },
+        [CHILD_PID]: { ppid: ROOT_PID, env: rootEnv },
+      });
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        // No clone record at all → CHILD_PID's exec-cwd is never reconciled
+        // and no parent edge is recorded.  ROOT_PID appears via a no-op read
+        // so the root is still seeded (cwd = /work) — proving the child fails
+        // closed on its OWN unprovable lineage, not on a missing root seed.
+        strace: cannedStraceRunner(
+          [
+            { pid: ROOT_PID, line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3', source: 'strace' },
+            ...childRecords,
+          ],
+          0,
+          { rootPid: ROOT_PID },
+        ),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      const write = findRootWrite(lines);
+      expect(write).toBeDefined();
+      expect((write!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+  });
+
+  // =====================================================================
   // codex follow-up #5 (2026-05-19) — close_range decimal flag parsing
   // and CLOEXEC fd tracking across execve.
   //
