@@ -3249,6 +3249,33 @@ export async function main(input: AgentInput): Promise<void> {
   // 10. Phase B: install (network off, under strace, StraceRunner owns the process)
   const collectedEvents: import('../lock/schema.js').AttributedEvent[] = [];
 
+  // ROOT package keys, computed ONCE here so BOTH Phase-B passes (main install
+  // and the root-prepare pass) and the post-phase normalize all agree on what
+  // counts as the root project.  The ROOT project is not in node_modules, so
+  // discoverPkgDirs never maps it; its lifecycle events attribute to
+  // `<rootName>@<rootVersion>` (or bare `<rootName>` when npm sets no version).
+  // Keys MUST match attribution's buildPkg().  Missing/invalid root package.json
+  // → empty set (unchanged semantics: no root lifecycle events to surface).
+  //
+  // `canonicalRootKey` is the SINGLE key the prepare pass forces every event
+  // onto (see the prepare-pass wrapping emitter below).  It is guaranteed to be
+  // a member of `rootPkgKeys`: version present → `<name>@<version>`, else the
+  // bare name, else null (degenerate no-root edge — nothing to force onto).
+  const rootPkgKeys = new Set<string>();
+  let canonicalRootKey: string | null = null;
+  try {
+    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as { name?: unknown; version?: unknown };
+    if (typeof rootManifest.name === 'string' && rootManifest.name.length > 0) {
+      rootPkgKeys.add(rootManifest.name);
+      if (typeof rootManifest.version === 'string' && rootManifest.version.length > 0) {
+        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
+        canonicalRootKey = `${rootManifest.name}@${rootManifest.version}`;
+      } else {
+        canonicalRootKey = rootManifest.name;
+      }
+    }
+  } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+
   // Wrap the emitter to also collect events for normalize.
   const collectingEmitter = new Emitter(
     new (class extends Writable {
@@ -3351,6 +3378,7 @@ export async function main(input: AgentInput): Promise<void> {
     // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
     straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
+    rootPkgKeys,
   };
   // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux
   // uses the full strace+shim dispatcher.  Both share PhaseInstallInput /
@@ -3515,17 +3543,79 @@ export async function main(input: AgentInput): Promise<void> {
     const prepareEnv = isMacosBare
       ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: '1' }
       : prepareChildEnv;
+    // FORCE-ATTRIBUTION emitter, used ONLY for the prepare pass.  This pass runs
+    // `<manager> run prepare`, so ONLY the root's `prepare` executes — EVERY
+    // event it produces genuinely belongs to the root's prepare, by
+    // construction.  A malicious dependency cannot inject itself into this pass,
+    // so this is bulletproof regardless of any forged `npm_package_name` /
+    // lifecycle env.  We override attribution here at the emitter boundary —
+    // the only place where "this came from the prepare pass" is still known;
+    // once events land in the shared `collectedEvents` the pass identity is
+    // lost.  This makes root identity NON-FORGEABLE for the prepare pass,
+    // independent of the Linux process-tree anchoring.
+    //
+    // Mirrors `collectingEmitter` EXACTLY for non-event frames
+    // (handshake/error/final/etc. pass through unchanged); only `kind:'event'`
+    // frames are rewritten: pkg → canonicalRootKey, lifecycle → 'prepare', and
+    // fs read/write events get `root_anchored = true` (non-fs raw is untouched;
+    // normalize only consults root_anchored for read/write).  The FORCED frame
+    // is what we push into the SHARED `collectedEvents` AND re-emit to the host
+    // stream, so the two stay consistent.
+    const preparingEmitter = new Emitter(
+      new (class extends Writable {
+        override _write(chunk: Buffer, _enc: string, cb: () => void): void {
+          const line = chunk.toString();
+          let frame: Record<string, unknown>;
+          try {
+            frame = JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            // Malformed line from a trusted internal writer — skip silently.
+            cb();
+            return;
+          }
+          if (frame['kind'] === 'event') {
+            const raw = frame['raw'] as import('../lock/schema.js').RawEvent;
+            // Force attribution: this pass runs only the root's prepare.
+            const forcedPkg = canonicalRootKey ?? (frame['pkg'] as string);
+            const forcedLifecycle: import('../lock/schema.js').LifecycleStage = 'prepare';
+            if (raw.kind === 'read' || raw.kind === 'write') {
+              raw.root_anchored = true;
+            }
+            const forcedFrame = {
+              ...frame,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+              raw,
+            };
+            const forcedLine = `${JSON.stringify(forcedFrame)}\n`;
+            // Re-emit the FORCED frame to the real emitter (host stream stays
+            // consistent with what normalize sees).
+            input.connection.writable.write(forcedLine);
+            // Collect the FORCED event for normalize.
+            collectedEvents.push({
+              raw,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+            });
+          } else {
+            input.connection.writable.write(line);
+          }
+          cb();
+        }
+      })()
+    );
     const prepareInput = {
       manager,
       cwd: config.work_dir,
       env: prepareEnv,
       strace: prepareRunner,
       attribution,
-      emitter: collectingEmitter,
+      emitter: preparingEmitter,
       // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
       // the main install's files on the scratch disk.
       straceBasePath: `${straceBaseDir}/strace-prepare.out`,
       protectedPaths,
+      rootPkgKeys,
       commandOverride: prepareCommand,
     };
     const prepareResult = isMacosBare
@@ -3637,16 +3727,8 @@ export async function main(input: AgentInput): Promise<void> {
   // `rootPkgKeys`, which tokenizes the root's fs events against $REPO/
   // $NODE_MODULES and SURFACES them (external_reads / escaped_writes) instead of
   // throwing on the missing pkgDir.  Keys MUST match attribution's buildPkg().
-  const rootPkgKeys = new Set<string>();
-  try {
-    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as { name?: unknown; version?: unknown };
-    if (typeof rootManifest.name === 'string' && rootManifest.name.length > 0) {
-      rootPkgKeys.add(rootManifest.name);
-      if (typeof rootManifest.version === 'string') {
-        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
-      }
-    }
-  } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+  // `rootPkgKeys` is computed ONCE before the Phase-B passes (section 10) and
+  // threaded into both — we reuse the SAME set here.
 
   // 12. Normalize + render
   //
