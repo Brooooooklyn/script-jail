@@ -8,6 +8,8 @@ import {
   renderDiff,
   findAuditBypass,
   formatAuditBypassError,
+  collectNetworkAttempts,
+  formatEgressWarning,
 } from '../../src/action/diff.js';
 
 // ---------------------------------------------------------------------------
@@ -301,12 +303,14 @@ describe('renderDiff — volatile field canonicalization', () => {
 // of any future render-side reshuffling.
 function lockfileWith(opts: {
   audit_bypass?: string[];
+  network_attempts?: string[];
   pkgId?: string;
   stage?: string;
 }): string {
   const pkgId = opts.pkgId ?? 'evil-pkg@1.0.0';
   const stage = opts.stage ?? 'postinstall';
   const bypass = opts.audit_bypass ?? [];
+  const network = opts.network_attempts ?? [];
   const lines: string[] = [];
   lines.push('schema_version: 1');
   lines.push('manager: npm');
@@ -323,7 +327,12 @@ function lockfileWith(opts: {
   lines.push('        spawn_attempts: []');
   lines.push('        spawn_blocked: []');
   lines.push('        dlopen_attempts: []');
-  lines.push('        network_attempts: []');
+  if (network.length > 0) {
+    lines.push('        network_attempts:');
+    for (const e of network) lines.push(`          - "${e}"`);
+  } else {
+    lines.push('        network_attempts: []');
+  }
   if (bypass.length > 0) {
     lines.push('        audit_bypass:');
     for (const e of bypass) {
@@ -460,6 +469,105 @@ describe('formatAuditBypassError', () => {
     }));
     const msg = formatAuditBypassError(entries);
     expect(msg).toContain('(+15 more)');
+  });
+});
+
+describe('collectNetworkAttempts', () => {
+  it('returns an empty list for a lockfile with no network_attempts', () => {
+    expect(collectNetworkAttempts(lockfileWith({}))).toEqual([]);
+  });
+
+  it('returns each entry with pkg+stage attribution', () => {
+    const yaml = lockfileWith({
+      pkgId: 'better-sqlite3@11.0.0',
+      stage: 'postinstall',
+      network_attempts: ['<BLOCKED> connect 198.51.100.7:443'],
+    });
+    expect(collectNetworkAttempts(yaml)).toEqual([
+      {
+        packageId: 'better-sqlite3@11.0.0',
+        stage: 'postinstall',
+        entry: '<BLOCKED> connect 198.51.100.7:443',
+      },
+    ]);
+  });
+
+  it('returns multiple entries across packages and stages', () => {
+    const yaml =
+      'schema_version: 1\n' +
+      'manager: npm\n' +
+      'manager_lockfile_sha256: "abc"\n' +
+      'node_version: 20.0.0\n' +
+      'generated_at: 2026-05-17T09:00:00.000Z\n' +
+      'packages:\n' +
+      '  a@1.0.0:\n' +
+      '    lifecycle:\n' +
+      '      postinstall:\n' +
+      '        external_reads: []\n' +
+      '        escaped_writes: []\n' +
+      '        env_read: []\n' +
+      '        spawn_attempts: []\n' +
+      '        spawn_blocked: []\n' +
+      '        dlopen_attempts: []\n' +
+      '        network_attempts:\n' +
+      '          - "<BLOCKED> connect 198.51.100.7:443"\n' +
+      '          - "<BLOCKED> connect 203.0.113.9:80"\n' +
+      '  b@2.0.0:\n' +
+      '    lifecycle:\n' +
+      '      prepare:\n' +
+      '        external_reads: []\n' +
+      '        escaped_writes: []\n' +
+      '        env_read: []\n' +
+      '        spawn_attempts: []\n' +
+      '        spawn_blocked: []\n' +
+      '        dlopen_attempts: []\n' +
+      '        network_attempts:\n' +
+      '          - "<BLOCKED> connect 192.0.2.5:443"\n';
+    const tuples = collectNetworkAttempts(yaml)
+      .map((e) => `${e.packageId}|${e.stage}|${e.entry}`)
+      .sort();
+    expect(tuples).toEqual([
+      'a@1.0.0|postinstall|<BLOCKED> connect 198.51.100.7:443',
+      'a@1.0.0|postinstall|<BLOCKED> connect 203.0.113.9:80',
+      'b@2.0.0|prepare|<BLOCKED> connect 192.0.2.5:443',
+    ]);
+  });
+
+  it('returns an empty list for malformed YAML or empty input (no throw)', () => {
+    expect(collectNetworkAttempts('not: [valid: yaml: at: all')).toEqual([]);
+    expect(collectNetworkAttempts('')).toEqual([]);
+  });
+});
+
+describe('formatEgressWarning', () => {
+  const entries = [
+    { packageId: 'better-sqlite3@11.0.0', stage: 'postinstall', entry: '<BLOCKED> connect 198.51.100.7:443' },
+    { packageId: 'esbuild@0.21.0', stage: 'postinstall', entry: '<BLOCKED> connect 203.0.113.9:443' },
+  ];
+
+  it('summary states ONLINE + count + the IP caveat (single line for the annotation)', () => {
+    const { summary } = formatEgressWarning(entries);
+    expect(summary).not.toContain('\n');
+    expect(summary).toContain('ONLINE');
+    expect(summary).toContain('2 network egress attempt(s)');
+    expect(summary).toMatch(/host may resolve different addresses/i);
+  });
+
+  it('detail lists each pkg+stage+entry on its own line', () => {
+    const { detail } = formatEgressWarning(entries);
+    expect(detail).toContain('better-sqlite3@11.0.0 (postinstall)  <BLOCKED> connect 198.51.100.7:443');
+    expect(detail).toContain('esbuild@0.21.0 (postinstall)  <BLOCKED> connect 203.0.113.9:443');
+  });
+
+  it('truncates the detail list past 20 entries with a "(+N more)" tail', () => {
+    const many = Array.from({ length: 23 }, (_, i) => ({
+      packageId: `pkg-${i}@1.0.0`,
+      stage: 'postinstall',
+      entry: `<BLOCKED> connect 198.51.100.${i}:443`,
+    }));
+    const { summary, detail } = formatEgressWarning(many);
+    expect(summary).toContain('23 network egress attempt(s)');
+    expect(detail).toContain('(+3 more');
   });
 });
 

@@ -62,6 +62,7 @@
 //   All three overlay files are OPTIONAL. Absence is the normal action and
 //   CLI path after the switch to arm64 CI parity.
 
+import { FETCH_CMD } from '../shared/pm-commands.js';
 import { applyPnpmArchOverlay } from './apply-pnpm-arch.js';
 import { loadPmFlags } from './load-pm-flags.js';
 
@@ -92,26 +93,31 @@ export interface PhaseFetchInput {
   pnpmArchPath?: string;
 }
 
-const FETCH_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
-  npm:  { cmd: 'npm',  args: ['ci', '--ignore-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false'] },
-  yarn: { cmd: 'yarn', args: ['install', '--immutable', '--mode=skip-build'] },
-};
+// FETCH_CMD lives in ../shared/pm-commands.ts so the host drop-in install
+// (src/action/host-install.ts part-1) uses the byte-identical command.
 
 export async function runFetchPhase(
   input: PhaseFetchInput,
 ): Promise<{ ok: boolean; stderr: string; stdout: string }> {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
 
-  // npm: append pm-flags.json extras (`--cpu/--os/--libc`) to `npm ci`.
-  // Order: npm ci <baseArgs> <extra_install_args>.  Extras go last so they
-  // appear after the fixed flags — they never conflict with `ci`'s flags.
+  // pm-flags.json carries two distinct channels (load-pm-flags.ts):
+  //   * extra_install_args — npm-ONLY arch hints (`--cpu/--os/--libc`).  pnpm
+  //     and yarn reject those CLI flags, so they are spliced for npm only.
+  //   * user_install_args  — DEVELOPER install flags (the action `args` input,
+  //     e.g. `-D`/`--prod`/`--omit=dev`), already sanitized of any
+  //     script-re-enabler host-side.  These are valid for ALL three managers
+  //     and MUST be applied identically here and in the host part-1 install
+  //     (src/action/host-install.ts) or the byte-stable lock drifts.
+  // Order: <cmd> <fixed baseArgs> <npm arch hints> <user args>.  User args go
+  // last (after the fixed flags) but BEFORE the pnpm `--store-dir` splice below.
+  const { extraInstallArgs, userInstallArgs } = loadPmFlags(input.pmFlagsPath);
   let args = baseArgs;
-  if (input.manager === 'npm') {
-    const { extraInstallArgs } = loadPmFlags(input.pmFlagsPath);
-    if (extraInstallArgs.length > 0) {
-      args = [...baseArgs, ...extraInstallArgs];
-    }
+  if (input.manager === 'npm' && extraInstallArgs.length > 0) {
+    args = [...args, ...extraInstallArgs];
+  }
+  if (userInstallArgs.length > 0) {
+    args = [...args, ...userInstallArgs];
   }
 
   // pnpm: pnpm rejects --cpu/--os/--libc on the CLI, so the arch hint is a

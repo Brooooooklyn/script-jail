@@ -25,8 +25,17 @@ import * as fs from 'node:fs';
 
 import { z } from 'zod';
 
+import { sanitizeInstallArgs } from '../shared/pm-commands.js';
+
+// `extra_install_args` carries npm-ONLY arch hints (`--cpu/--os/--libc`) and is
+// applied only to `npm ci` (pnpm/yarn reject those CLI flags — see
+// phase-fetch.ts). `user_install_args` carries DEVELOPER-supplied install flags
+// (the action `args` input, e.g. `-D`/`--prod`/`--omit=dev`) and is applied to
+// ALL THREE managers' fetch command. Both default to empty so the normal
+// same-arch / no-args parity path stays untouched.
 const PmFlagsSchema = z.object({
   extra_install_args: z.array(z.string()),
+  user_install_args: z.array(z.string()).optional(),
 });
 
 /** Absolute path inside the VM where the CLI lands the override file. */
@@ -34,14 +43,25 @@ export const PM_FLAGS_PATH = '/etc/script-jail/pm-flags.json';
 
 export function loadPmFlags(
   filePath: string = PM_FLAGS_PATH,
-): { extraInstallArgs: string[] } {
+): { extraInstallArgs: string[]; userInstallArgs: string[] } {
   try {
     const raw = fs.readFileSync(filePath, 'utf8');
     const parsed = PmFlagsSchema.safeParse(JSON.parse(raw));
-    if (!parsed.success) return { extraInstallArgs: [] };
-    return { extraInstallArgs: parsed.data.extra_install_args };
+    if (!parsed.success) return { extraInstallArgs: [], userInstallArgs: [] };
+    // SECURITY (defense in depth): this file is delivered through the
+    // repo-controlled staging namespace (`/work/etc/script-jail/pm-flags.json`
+    // on Firecracker, the staged repo copy on Docker/bare).  The host overlay
+    // always overwrites it with sanitized content, but a backend delivery gap
+    // must NEVER let a re-enabling flag survive into the network-on Phase A
+    // fetch — so we re-sanitize at the point of use, with the SAME denylist
+    // the host install applies.  `extra_install_args` (npm arch hints) carries
+    // no script controls, so sanitizing it is a no-op in the normal path.
+    return {
+      extraInstallArgs: sanitizeInstallArgs(parsed.data.extra_install_args).kept,
+      userInstallArgs: sanitizeInstallArgs(parsed.data.user_install_args ?? []).kept,
+    };
   } catch {
     // ENOENT, malformed JSON, EACCES, etc. — degrade silently.
-    return { extraInstallArgs: [] };
+    return { extraInstallArgs: [], userInstallArgs: [] };
   }
 }

@@ -25355,6 +25355,66 @@ var Emitter = class {
   }
 };
 
+// src/shared/pm-commands.ts
+var FETCH_CMD = {
+  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
+  pnpm: {
+    cmd: "pnpm",
+    args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"]
+  },
+  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
+};
+var INSTALL_CMD = {
+  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
+  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events). Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
+};
+function isBareFlag(token) {
+  return !token.includes("=");
+}
+function canonicalFlagKey(token) {
+  if (token.length === 0 || token[0] !== "-") return null;
+  let i = 0;
+  while (i < token.length && token[i] === "-") i += 1;
+  let body = token.slice(i);
+  const eq = body.indexOf("=");
+  if (eq !== -1) body = body.slice(0, eq);
+  body = body.toLowerCase();
+  if (body.startsWith("no-")) body = body.slice("no-".length);
+  if (body.startsWith("config.")) body = body.slice("config.".length);
+  let key = "";
+  for (const ch of body) {
+    if (ch !== "-" && ch !== "_" && ch !== ".") key += ch;
+  }
+  return key;
+}
+function isForbiddenFlag(token) {
+  const key = canonicalFlagKey(token);
+  if (key === null || key.length === 0) return false;
+  if (key.length >= 2 && "ignorescripts".startsWith(key)) return true;
+  if (key === "mode") return true;
+  return false;
+}
+function sanitizeInstallArgs(args) {
+  const kept = [];
+  const dropped = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (isForbiddenFlag(a)) {
+      dropped.push(a);
+      if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        dropped.push(args[++i]);
+      }
+      continue;
+    }
+    kept.push(a);
+  }
+  return { kept, dropped };
+}
+
 // src/guest/apply-pnpm-arch.ts
 var fs = __toESM(require("node:fs"), 1);
 var path = __toESM(require("node:path"), 1);
@@ -25403,34 +25463,34 @@ function applyPnpmArchOverlay(input) {
 // src/guest/load-pm-flags.ts
 var fs2 = __toESM(require("node:fs"), 1);
 var PmFlagsSchema = external_exports.object({
-  extra_install_args: external_exports.array(external_exports.string())
+  extra_install_args: external_exports.array(external_exports.string()),
+  user_install_args: external_exports.array(external_exports.string()).optional()
 });
 var PM_FLAGS_PATH = "/etc/script-jail/pm-flags.json";
 function loadPmFlags(filePath = PM_FLAGS_PATH) {
   try {
     const raw = fs2.readFileSync(filePath, "utf8");
     const parsed = PmFlagsSchema.safeParse(JSON.parse(raw));
-    if (!parsed.success) return { extraInstallArgs: [] };
-    return { extraInstallArgs: parsed.data.extra_install_args };
+    if (!parsed.success) return { extraInstallArgs: [], userInstallArgs: [] };
+    return {
+      extraInstallArgs: sanitizeInstallArgs(parsed.data.extra_install_args).kept,
+      userInstallArgs: sanitizeInstallArgs(parsed.data.user_install_args ?? []).kept
+    };
   } catch {
-    return { extraInstallArgs: [] };
+    return { extraInstallArgs: [], userInstallArgs: [] };
   }
 }
 
 // src/guest/phase-fetch.ts
-var FETCH_CMD = {
-  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"] },
-  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
-};
 async function runFetchPhase(input) {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
+  const { extraInstallArgs, userInstallArgs } = loadPmFlags(input.pmFlagsPath);
   let args = baseArgs;
-  if (input.manager === "npm") {
-    const { extraInstallArgs } = loadPmFlags(input.pmFlagsPath);
-    if (extraInstallArgs.length > 0) {
-      args = [...baseArgs, ...extraInstallArgs];
-    }
+  if (input.manager === "npm" && extraInstallArgs.length > 0) {
+    args = [...args, ...extraInstallArgs];
+  }
+  if (userInstallArgs.length > 0) {
+    args = [...args, ...userInstallArgs];
   }
   if (input.manager === "pnpm") {
     applyPnpmArchOverlay({ cwd: input.cwd, ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {} });
@@ -26101,14 +26161,6 @@ function normalizePattern(p) {
 }
 
 // src/guest/phase-install.ts
-var INSTALL_CMD = {
-  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
-  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
-  // sever; the cache Phase A populated makes this a zero-network relink+build.
-  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
-};
 var NODE_STARTUP_DONE_STRACE_PATH = "/tmp/script-jail-node-startup-done";
 function parseShimLine(line) {
   try {
@@ -28118,16 +28170,6 @@ function parseMacosShimLine(line) {
   }
   return parseShimLine(line);
 }
-var INSTALL_CMD2 = {
-  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
-  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
-  // rationale.  The macOS-bare backend is observe-only and does not sever the
-  // network, but the cache Phase A populated still makes this a relink+build
-  // with no required registry traffic.
-  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
-};
 var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
   "npm_package_name",
   "npm_package_version",
@@ -28144,7 +28186,7 @@ function macosManagerLaunch(manager, subArgs) {
   return { cmd: node, args: [corepackCli, manager, ...subArgs] };
 }
 function buildMacosInstallCommand(manager, cwd) {
-  const base = INSTALL_CMD2[manager];
+  const base = INSTALL_CMD[manager];
   const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
   return macosManagerLaunch(manager, managerArgs);
 }
@@ -30281,7 +30323,14 @@ async function main(input) {
     manager,
     cwd: config2.work_dir,
     env: fetchEnv,
-    spawner
+    spawner,
+    // Backends that cannot land the host-owned pm-flags sidecar at the default
+    // absolute `/etc/script-jail/pm-flags.json` (Docker, bare, macOS-bare —
+    // only Firecracker's init copies it into /etc) point us at the staged copy
+    // via this env var.  Unset on Firecracker → loadPmFlags() reads the /etc
+    // default.  loadPmFlags re-sanitizes whatever it reads, so this is safe
+    // even though the staged copy lives in the repo-controlled namespace.
+    ...process.env["SCRIPT_JAIL_PM_FLAGS_PATH"] !== void 0 ? { pmFlagsPath: process.env["SCRIPT_JAIL_PM_FLAGS_PATH"] } : {}
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
   if (!fetchResult.ok) {

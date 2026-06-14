@@ -35,6 +35,7 @@
 import { join, dirname } from 'node:path';
 
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
+import { INSTALL_CMD } from '../shared/pm-commands.js';
 import type { AttributionResult } from './attribution.js';
 import {
   parseShimLine,
@@ -95,16 +96,10 @@ function parseMacosShimLine(line: string): MacosShimLineEvent {
   return parseShimLine(line);
 }
 
-const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
-  npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
-  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
-  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
-  // rationale.  The macOS-bare backend is observe-only and does not sever the
-  // network, but the cache Phase A populated still makes this a relink+build
-  // with no required registry traffic.
-  yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
-};
+// INSTALL_CMD is imported from ../shared/pm-commands.ts (shared with Linux
+// Phase B and the host drop-in install). The macOS-bare backend is observe-only
+// and does not sever the network, but the cache Phase A populated still makes
+// the relink+build run with no required registry traffic.
 
 // env-spy.cjs stamps its `node_startup_done` JSONL marker by reading these three
 // npm lifecycle fields off `process.env` (signalNodeStartupDone, env-spy.cjs

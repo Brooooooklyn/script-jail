@@ -26434,6 +26434,98 @@ var import_node_path12 = require("node:path");
 
 // src/action/inputs.ts
 var import_node_path = require("node:path");
+
+// src/shared/pm-commands.ts
+var FETCH_CMD = {
+  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
+  pnpm: {
+    cmd: "pnpm",
+    args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"]
+  },
+  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
+};
+var INSTALL_CMD = {
+  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
+  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events). Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
+};
+function isBareFlag(token) {
+  return !token.includes("=");
+}
+function canonicalFlagKey(token) {
+  if (token.length === 0 || token[0] !== "-") return null;
+  let i = 0;
+  while (i < token.length && token[i] === "-") i += 1;
+  let body = token.slice(i);
+  const eq = body.indexOf("=");
+  if (eq !== -1) body = body.slice(0, eq);
+  body = body.toLowerCase();
+  if (body.startsWith("no-")) body = body.slice("no-".length);
+  if (body.startsWith("config.")) body = body.slice("config.".length);
+  let key = "";
+  for (const ch of body) {
+    if (ch !== "-" && ch !== "_" && ch !== ".") key += ch;
+  }
+  return key;
+}
+function isForbiddenFlag(token) {
+  const key = canonicalFlagKey(token);
+  if (key === null || key.length === 0) return false;
+  if (key.length >= 2 && "ignorescripts".startsWith(key)) return true;
+  if (key === "mode") return true;
+  return false;
+}
+function sanitizeInstallArgs(args) {
+  const kept = [];
+  const dropped = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (isForbiddenFlag(a)) {
+      dropped.push(a);
+      if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        dropped.push(args[++i]);
+      }
+      continue;
+    }
+    kept.push(a);
+  }
+  return { kept, dropped };
+}
+function splitInstallArgs(raw) {
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let started = false;
+  for (const ch of raw) {
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === " " || ch === "	" || ch === "\n" || ch === "\r") {
+      if (started) {
+        out.push(cur);
+        cur = "";
+        started = false;
+      }
+      continue;
+    }
+    cur += ch;
+    started = true;
+  }
+  if (started) out.push(cur);
+  return out;
+}
+
+// src/action/inputs.ts
 var VALID_PLATFORMS = /* @__PURE__ */ new Set(["linux", "darwin", "win32"]);
 var VALID_ARCHES = /* @__PURE__ */ new Set(["x64", "arm64"]);
 var VALID_MODES = /* @__PURE__ */ new Set(["check", "update"]);
@@ -26480,6 +26572,16 @@ function parseInputs(input) {
       `script-jail: invalid value for input "cache-firecracker": "${cacheStr}". Expected "true" or "false".`
     );
   }
+  const args = splitInstallArgs(getInput("args") ?? "");
+  const installStr = (getInput("install") ?? "").trim();
+  let install;
+  if (installStr === "" || installStr === "false") install = false;
+  else if (installStr === "true") install = true;
+  else {
+    throw new Error(
+      `script-jail: invalid value for input "install": "${installStr}". Expected "true" or "false".`
+    );
+  }
   const configRel = rawConfig.trim() === "" ? ".script-jail.yml" : rawConfig.trim();
   const lockRel = rawLock.trim() === "" ? ".script-jail.lock.yml" : rawLock.trim();
   return {
@@ -26489,7 +26591,9 @@ function parseInputs(input) {
     spoofPlatform: platformStr,
     spoofArch: archStr,
     backend: backendStr,
-    cacheFirecracker
+    cacheFirecracker,
+    args,
+    install
   };
 }
 function isMode(s) {
@@ -26511,6 +26615,48 @@ function resolveAgainstRepo(p, repoDir) {
 function defaultGetInput(name) {
   const key = `INPUT_${name.replace(/ /g, "_").toUpperCase()}`;
   return process.env[key];
+}
+
+// src/action/host-install.ts
+var import_node_child_process = require("node:child_process");
+var defaultSpawn = (cmd, args, cwd) => {
+  const r = (0, import_node_child_process.spawnSync)(cmd, args, { cwd, stdio: "inherit", shell: false });
+  return { status: r.status, signal: r.signal, error: r.error };
+};
+function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = defaultSpawn) {
+  const { kept, dropped } = sanitizeInstallArgs(args);
+  for (const d of dropped) {
+    io.warn(
+      `script-jail: ignoring install arg "${d}" \u2014 it would re-enable lifecycle scripts in the no-scripts install (the sandbox is the only place scripts run unaudited).`
+    );
+  }
+  const base = FETCH_CMD[pm];
+  const finalArgs = [...base.args, ...kept];
+  io.stdout.write(`[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${finalArgs.join(" ")}
+`);
+  runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io);
+}
+function hostRunScripts(pm, repoDir, io, spawn2 = defaultSpawn) {
+  const cmd = INSTALL_CMD[pm];
+  io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${cmd.args.join(" ")}
+`);
+  runOrThrow(cmd.cmd, cmd.args, repoDir, spawn2, "lifecycle-script run", io);
+}
+function runOrThrow(cmd, args, cwd, spawn2, label, io) {
+  const r = spawn2(cmd, args, cwd);
+  if (r.error !== void 0) {
+    throw new Error(`script-jail: host ${label} could not spawn "${cmd}": ${r.error.message}`);
+  }
+  if (r.signal != null) {
+    throw new Error(`script-jail: host ${label} (\`${cmd} ${args.join(" ")}\`) was killed by ${r.signal}`);
+  }
+  if (r.status !== 0) {
+    throw new Error(
+      `script-jail: host ${label} (\`${cmd} ${args.join(" ")}\`) exited with code ${r.status ?? "null"}`
+    );
+  }
+  io.stdout.write(`[script-jail] host ${label} complete
+`);
 }
 
 // src/shared/detect-pm.ts
@@ -27093,7 +27239,7 @@ var import_node_fs7 = require("node:fs");
 var import_promises3 = require("node:fs/promises");
 var import_node_path5 = require("node:path");
 var import_node_os2 = require("node:os");
-var import_node_child_process = require("node:child_process");
+var import_node_child_process2 = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
   const workDir = input.workDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path5.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
@@ -27187,7 +27333,7 @@ function ensureRealDirectory(path) {
 }
 function copyRootfs(src, dest) {
   if (import_node_process.platform === "linux") {
-    const result = (0, import_node_child_process.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
+    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
     if (result.status === 0) return;
   }
   (0, import_node_fs7.cpSync)(src, dest);
@@ -27197,7 +27343,7 @@ async function buildExt4Disk(opts) {
   const sizeSpec = `${sizeMB}M`;
   const mkfs = resolveMkfsExt4();
   if (mkfs !== null) {
-    const result = (0, import_node_child_process.spawnSync)(
+    const result = (0, import_node_child_process2.spawnSync)(
       mkfs,
       [
         ...srcDir !== void 0 ? ["-d", srcDir] : [],
@@ -27223,7 +27369,7 @@ async function buildExt4Disk(opts) {
   const imageName = (0, import_node_path5.basename)(outPath);
   const srcMount = srcDir !== void 0 ? `-v "${srcDir}:/work:ro" ` : "";
   const seedFlag = srcDir !== void 0 ? "-d /work " : "";
-  (0, import_node_child_process.execSync)(
+  (0, import_node_child_process2.execSync)(
     `docker run --rm ` + srcMount + `-v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
     { stdio: "inherit" }
   );
@@ -27237,7 +27383,7 @@ function resolveMkfsExt4() {
   ]) {
     if ((0, import_node_fs7.existsSync)(candidate)) return candidate;
   }
-  const lookup = (0, import_node_child_process.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
+  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
   return null;
 }
@@ -27270,7 +27416,7 @@ function estimateDiskSizeMB(dir) {
 var import_node_http2 = require("node:http");
 var import_node_fs8 = require("node:fs");
 var import_promises4 = require("node:fs/promises");
-var import_node_child_process2 = require("node:child_process");
+var import_node_child_process3 = require("node:child_process");
 var import_node_process2 = require("node:process");
 var DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off ro rootfstype=ext4 init=/sbin/init";
 async function launchVm(input) {
@@ -27380,12 +27526,12 @@ async function launchVm(input) {
   };
 }
 async function setupTapDevice(api) {
-  const existing = (0, import_node_child_process2.spawnSync)("ip", ["link", "show", "tap0"], {
+  const existing = (0, import_node_child_process3.spawnSync)("ip", ["link", "show", "tap0"], {
     stdio: ["ignore", "ignore", "ignore"]
   });
   const alreadyExists = existing.status === 0;
   if (!alreadyExists) {
-    const mkTap = (0, import_node_child_process2.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
+    const mkTap = (0, import_node_child_process3.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
       stdio: ["ignore", "pipe", "pipe"]
     });
     if (mkTap.status !== 0) {
@@ -27397,7 +27543,7 @@ async function setupTapDevice(api) {
       return;
     }
   }
-  (0, import_node_child_process2.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore" });
+  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore" });
   await api.put("/network-interfaces/eth0", {
     iface_id: "eth0",
     guest_mac: "06:00:AC:10:00:02",
@@ -27407,7 +27553,7 @@ async function setupTapDevice(api) {
 var NodeSpawner = class {
   spawn(cmd, args, opts) {
     const childStdio = opts.stdio === "ignore" ? "ignore" : ["ignore", "pipe", "pipe"];
-    const child = (0, import_node_child_process2.spawn)(cmd, [...args], {
+    const child = (0, import_node_child_process3.spawn)(cmd, [...args], {
       stdio: childStdio,
       detached: false
     });
@@ -43145,6 +43291,56 @@ function formatAuditBypassError(entries) {
   const more = entries.length > MAX ? ` (+${entries.length - MAX} more)` : "";
   return "Audit envelope was bypassed \u2014 see audit_bypass entries: [" + head.join("; ") + "]" + more;
 }
+function collectNetworkAttempts(generated) {
+  let doc;
+  try {
+    doc = (0, import_yaml.parse)(generated);
+  } catch {
+    return [];
+  }
+  if (doc === null || typeof doc !== "object") return [];
+  const parsed = Lock.safeParse(doc);
+  const packagesRaw = parsed.success ? parsed.data.packages : doc.packages;
+  if (packagesRaw === void 0 || packagesRaw === null || typeof packagesRaw !== "object") {
+    return [];
+  }
+  const out = [];
+  for (const [packageId, pkgRaw] of Object.entries(
+    packagesRaw
+  )) {
+    if (pkgRaw === null || typeof pkgRaw !== "object") continue;
+    const lifecycleRaw = pkgRaw.lifecycle;
+    if (lifecycleRaw === null || lifecycleRaw === void 0 || typeof lifecycleRaw !== "object") {
+      continue;
+    }
+    for (const [stage, blockRaw] of Object.entries(
+      lifecycleRaw
+    )) {
+      if (blockRaw === null || typeof blockRaw !== "object") continue;
+      const na = blockRaw.network_attempts;
+      if (!Array.isArray(na)) continue;
+      for (const entry of na) {
+        if (typeof entry === "string" && entry.length > 0) {
+          out.push({ packageId, stage, entry });
+        }
+      }
+    }
+  }
+  return out;
+}
+function formatEgressWarning(entries) {
+  const MAX = 20;
+  const summary2 = `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. The offline audit recorded ${entries.length} network egress attempt(s) that WILL now succeed (listed below). IPs are offline-audit values \u2014 the host may resolve different addresses; review the committed lock before trusting this install.`;
+  const lines = entries.slice(0, MAX).map((e) => {
+    return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+  });
+  if (entries.length > MAX) {
+    lines.push(`  (+${entries.length - MAX} more \u2014 see the committed lock)`);
+  }
+  const detail = `${lines.join("\n")}
+`;
+  return { summary: summary2, detail };
+}
 function countLines(s) {
   if (s === "") return 0;
   let n = 0;
@@ -43209,6 +43405,12 @@ async function runAudit(input) {
   let result;
   let overlay = null;
   try {
+    const userInstallArgs = sanitizeInstallArgs(input.args ?? []).kept;
+    const archPmFlags = archOverlay.pmFlagsJson;
+    const pmFlagsJson = {
+      extra_install_args: archPmFlags?.extra_install_args ?? [],
+      ...userInstallArgs.length > 0 ? { user_install_args: userInstallArgs } : {}
+    };
     const effectiveConfig = buildEffectiveConfig({
       userConfigPath: input.configPath,
       overrides: {
@@ -43220,7 +43422,7 @@ async function runAudit(input) {
       },
       workDir: scratchDir,
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
-      ...archOverlay.pmFlagsJson !== void 0 ? { pmFlagsJson: archOverlay.pmFlagsJson } : {},
+      pmFlagsJson,
       ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}
     });
     const extraRepoOverlayFiles = [];
@@ -43287,7 +43489,7 @@ async function runAudit(input) {
     );
     input.io.setOutput?.("lockfile", input.lockPath);
     input.io.setOutput?.("diff", "");
-    return { exitCode: 0 };
+    return { exitCode: 0, trusted: false };
   }
   const committed = (0, import_node_fs11.existsSync)(input.lockPath) ? (0, import_node_fs11.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
@@ -43312,9 +43514,9 @@ async function runAudit(input) {
     input.io.stderr.write(`${msg}
 `);
     input.io.emitAuditBypassAnnotation?.(lockLabel, msg);
-    return { exitCode: 1 };
+    return { exitCode: 1, trusted: false };
   }
-  return { exitCode: diff.match ? 0 : 1 };
+  return { exitCode: diff.match ? 0 : 1, trusted: diff.match, generatedLock: result.finalYaml };
 }
 function relativeForDisplay(absPath, repoDir) {
   const rel = (0, import_node_path7.relative)(repoDir, absPath);
@@ -43361,16 +43563,16 @@ var BackendUnavailableError = class extends Error {
 };
 
 // src/action/backend/process.ts
-var import_node_child_process3 = require("node:child_process");
+var import_node_child_process4 = require("node:child_process");
 function commandSucceeds(cmd, args, opts = {}) {
-  const result = (0, import_node_child_process3.spawnSync)(cmd, args, {
+  const result = (0, import_node_child_process4.spawnSync)(cmd, args, {
     stdio: "ignore",
     env: opts.env
   });
   return result.status === 0;
 }
 function runCommand(cmd, args, opts = {}) {
-  const result = (0, import_node_child_process3.spawnSync)(cmd, args, {
+  const result = (0, import_node_child_process4.spawnSync)(cmd, args, {
     stdio: "pipe",
     encoding: "utf8",
     env: opts.env
@@ -43383,7 +43585,7 @@ function runCommand(cmd, args, opts = {}) {
   }
 }
 async function runAgentProcess(input) {
-  const child = (0, import_node_child_process3.spawn)(input.cmd, input.args, {
+  const child = (0, import_node_child_process4.spawn)(input.cmd, input.args, {
     cwd: input.cwd,
     env: input.env,
     stdio: ["pipe", "pipe", "pipe"]
@@ -43704,6 +43906,13 @@ function createDockerBackend(deps = {}) {
           "mkdir -p /tmp/script-jail-strace",
           "export SCRIPT_JAIL_CONNECTION=stdio",
           "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
+          // The host-owned pm-flags sidecar is staged in the repo tree at
+          // /work/etc/script-jail/pm-flags.json (Docker does not copy it into
+          // /etc the way Firecracker's init does).  Point the guest at it so
+          // the sandbox fetch applies the SAME install args as the host part-1
+          // install — without it, Docker audits a different arg set than the
+          // host installs.  loadPmFlags re-sanitizes the file before use.
+          "export SCRIPT_JAIL_PM_FLAGS_PATH=/work/etc/script-jail/pm-flags.json",
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
         return await runAgentProcess({
@@ -43872,6 +44081,12 @@ function createBareBackend(deps = {}) {
             ...env,
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+            // Bare mode runs the agent directly on the host (no container /etc),
+            // so the host-owned pm-flags sidecar lives in the staged repo tree.
+            // Point the guest at it so the sandbox fetch applies the SAME
+            // install args as the host part-1 install.  loadPmFlags
+            // re-sanitizes the file before use.
+            SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path11.join)(staged.path, "etc/script-jail/pm-flags.json"),
             SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
             SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
             SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -43968,7 +44183,9 @@ async function main(deps = {}) {
     launchVm: doLaunchVm = launchVm,
     openVsockSession: doOpenVsockSession = openVsockSession,
     teardown: doTeardown = teardown,
-    exitProcess = process.exit
+    exitProcess = process.exit,
+    hostInstallNoScripts: doHostInstallNoScripts = hostInstallNoScripts,
+    hostRunScripts: doHostRunScripts = hostRunScripts
   } = deps;
   const selfTest = process.env["SCRIPT_JAIL_E2E_SELF_TEST"] === "1";
   if (!selfTest) {
@@ -43986,6 +44203,22 @@ async function main(deps = {}) {
       exitProcess(0);
     }
     throw err;
+  }
+  if (inputs.install) {
+    if (inputs.mode === "update") {
+      process.stdout.write(
+        "::error::script-jail: `install: true` requires `mode: check`. Update mode regenerates the lock and skips the audit-bypass gate, so there is no fail-closed signal to run lifecycle scripts against. Generate the lock with `mode: update` (install off), commit it, then enable `install` with `mode: check`.\n"
+      );
+      exitProcess(1);
+    }
+    if (!(0, import_node_fs16.existsSync)(inputs.lockPath)) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires a committed lock at ${inputs.lockPath}. Generate one with \`mode: update\` (install off), commit it, then enable \`install\`.
+`
+      );
+      exitProcess(1);
+    }
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, warn });
   }
   const runnerImage = detectRunnerImage();
   const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path12.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
@@ -44022,6 +44255,9 @@ async function main(deps = {}) {
     },
     pm: pm.manager,
     hostArch: actionHostArch,
+    // Developer install args reach the sandbox fetch (so the audited tree
+    // matches what part 1 installed on the host).
+    args: inputs.args,
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,
@@ -44053,6 +44289,15 @@ async function main(deps = {}) {
       }
     }
   });
+  if (inputs.install && result.trusted) {
+    const egress = collectNetworkAttempts(result.generatedLock ?? "");
+    if (egress.length > 0) {
+      const { summary: summary2, detail } = formatEgressWarning(egress);
+      warn(summary2);
+      process.stdout.write(detail);
+    }
+    doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, warn });
+  }
   if (result.exitCode !== 0) exitProcess(result.exitCode);
 }
 function detectActionHostArch(arch2 = process.arch) {

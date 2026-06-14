@@ -265,6 +265,76 @@ describe('runFetchPhase', () => {
   });
 
   // -------------------------------------------------------------------------
+  // user_install_args integration (the action `args` input)
+  // -------------------------------------------------------------------------
+  //
+  // Unlike `extra_install_args` (npm-only arch hints), `user_install_args`
+  // carries developer install flags and MUST be appended to ALL THREE managers'
+  // fetch command, after the fixed flags.  These flags must be applied
+  // identically here and in the host part-1 install or the byte-stable lock
+  // drifts.
+  describe('user_install_args integration', () => {
+    let testDir: string;
+    let pmFlagsPath: string;
+
+    beforeEach(() => {
+      testDir = mkdtempSync(join(tmpdir(), 'script-jail-fetch-user-args-'));
+      pmFlagsPath = join(testDir, 'pm-flags.json');
+    });
+    afterEach(() => {
+      try { rmSync(testDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    });
+
+    it('appends user_install_args to npm ci (after the fixed flags)', async () => {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--omit=dev'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual(['ci', '--ignore-scripts', '--omit=dev']);
+    });
+
+    it('appends user_install_args to pnpm install (before the --store-dir splice)', async () => {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--prod'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'pnpm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual([
+        'install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false',
+        '--prod', '--store-dir=/work/.pnpm-store',
+      ]);
+    });
+
+    it('appends user_install_args to yarn install', async () => {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--inline-builds'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'yarn', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual(['install', '--immutable', '--mode=skip-build', '--inline-builds']);
+    });
+
+    it('applies BOTH npm arch hints and user args, in order (arch then user)', async () => {
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: ['--cpu=x64'], user_install_args: ['--omit=dev'] }),
+      );
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual(['ci', '--ignore-scripts', '--cpu=x64', '--omit=dev']);
+    });
+
+    it('does NOT leak npm arch hints into pnpm but DOES apply user args', async () => {
+      // extra_install_args stays npm-only; user_install_args reaches pnpm.
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: ['--cpu=x64'], user_install_args: ['--prod'] }),
+      );
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'pnpm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual([
+        'install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false',
+        '--prod', '--store-dir=/work/.pnpm-store',
+      ]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // pnpm-arch.json integration (cross-arch parity for pnpm)
   // -------------------------------------------------------------------------
   //

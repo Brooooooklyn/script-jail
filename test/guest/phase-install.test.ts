@@ -16071,7 +16071,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       // Read a path that doesn't exist.
-      expect(loadPmFlags(join(testDir, 'absent.json'))).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(join(testDir, 'absent.json'))).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16079,7 +16079,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['--cpu=x64', '--os=linux'] }));
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--cpu=x64', '--os=linux'] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--cpu=x64', '--os=linux'], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16087,7 +16087,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, 'not json');
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16095,7 +16095,7 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, JSON.stringify({ other_field: 'oops' }));
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
     } finally { teardown(); }
   });
 
@@ -16103,7 +16103,29 @@ describe('loadPmFlags', () => {
     setup();
     try {
       writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['ok', 42] }));
-      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [] });
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
+    } finally { teardown(); }
+  });
+
+  it('parses user_install_args alongside extra_install_args', () => {
+    setup();
+    try {
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: ['--cpu=x64'], user_install_args: ['-D', '--omit=dev'] }),
+      );
+      expect(loadPmFlags(pmFlagsPath)).toEqual({
+        extraInstallArgs: ['--cpu=x64'],
+        userInstallArgs: ['-D', '--omit=dev'],
+      });
+    } finally { teardown(); }
+  });
+
+  it('defaults user_install_args to [] when only extra_install_args is present', () => {
+    setup();
+    try {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['--os=linux'] }));
+      expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--os=linux'], userInstallArgs: [] });
     } finally { teardown(); }
   });
 });

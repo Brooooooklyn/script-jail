@@ -356,6 +356,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       lockPath,
       mode,
       pm,
+      args: args.args,
       spoofPlatform: args.spoofPlatform,
       effectiveSpoofArch,
       warn,
@@ -399,6 +400,7 @@ export async function run(deps: CliDeps = {}): Promise<number> {
       lockPath,
       mode,
       pm,
+      args: args.args,
       spoofPlatform: args.spoofPlatform,
       effectiveSpoofArch,
       warn,
@@ -517,6 +519,9 @@ export async function run(deps: CliDeps = {}): Promise<number> {
         spoofArch: effectiveSpoofArch,
       },
       pm,
+      // Developer install args (the `--args` flag) reach the audit fetch so a
+      // locally-generated lock matches a CI run using the same action `args`.
+      args: args.args,
       // hostArch comes from the injected detectPlatform (NOT re-derived from
       // process.arch) so unit tests can exercise the arm64 codepath from
       // an x64 dev box without monkey-patching process.arch.
@@ -564,6 +569,7 @@ interface RunLinuxInput {
   lockPath: string;
   mode: VmMode;
   pm: 'npm' | 'pnpm' | 'yarn';
+  args: string[];
   spoofPlatform: 'linux' | 'darwin' | 'win32';
   effectiveSpoofArch: 'x64' | 'arm64';
   warn: (msg: string) => void;
@@ -625,6 +631,7 @@ async function runLinux(input: RunLinuxInput): Promise<number> {
         spoofArch: input.effectiveSpoofArch,
       },
       pm: input.pm,
+      args: input.args,
       hostArch: arch,
       workDir: tmpdir(),
       // Backend executor: runAudit prepares the common config/sidecars, then
@@ -675,6 +682,7 @@ interface RunMacBareInput {
   lockPath: string;
   mode: VmMode;
   pm: 'npm' | 'pnpm' | 'yarn';
+  args: string[];
   spoofPlatform: 'linux' | 'darwin' | 'win32';
   effectiveSpoofArch: 'x64' | 'arm64';
   warn: (msg: string) => void;
@@ -712,6 +720,7 @@ async function runMacBare(input: RunMacBareInput): Promise<number> {
         spoofArch: input.effectiveSpoofArch,
       },
       pm: input.pm,
+      args: input.args,
       hostArch: platform.arch,
       // os.tmpdir() — never `cwd` — so the rewritten config + sidecars cannot
       // pollute the user's repo.  runAudit creates a private mkdtemp dir here.

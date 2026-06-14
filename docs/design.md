@@ -145,6 +145,50 @@ Phase B starts after fetch. The network is disabled, `strace` is attached, and
 the lifecycle rebuild/install command runs. Only Phase B events enter the
 lockfile.
 
+### Drop-in Install Trust Model (`install: true`)
+
+By default the host runner never receives a `node_modules` — the install runs on
+a throwaway copy inside the backend and only the lockfile YAML crosses back. The
+opt-in `install: true` mode turns the Action into a drop-in install replacement
+by reusing the SAME two-phase split on the host:
+
+1. **Host part 1** — the package manager installs with `--ignore-scripts`
+   (`--mode=skip-build` for yarn). No third-party code runs; the real
+   `node_modules` is populated safely.
+2. **Sandbox audit** — unchanged. The lockfile is diffed against the committed
+   `.script-jail.lock.yml` and the audit-bypass gate fires.
+3. **Host part 2** — the deferred lifecycle scripts run on the host, but ONLY
+   when the audit is *trusted*: `mode === 'check'` ∧ the lock matched ∧ no
+   audit-bypass entry. On drift or bypass the scripts never run; the safe
+   no-scripts tree is left in place and the job fails.
+
+The command shapes for both host halves are the single source of truth in
+`src/shared/pm-commands.ts`, shared with the guest phases so the host install is
+byte-identical to what the sandbox audited. The trust signal is surfaced from
+`runAudit` as `{ exitCode, trusted }`; `main.ts` gates part 2 on `trusted`.
+
+**Accepted residual — host part 2 runs online.** Real lifecycle scripts
+(`prebuild-install`, `node-pre-gyp`) fetch prebuilt binaries, so part 2 cannot
+run inside an offline network namespace on a generic runner. Consequence: a
+`connect` the sandbox recorded as `<BLOCKED>` (Phase B is offline) WILL succeed
+when the same script runs on the host. Trust therefore derives from the committed
+lock being **human-reviewed**, not from host isolation — a matching audit means
+"behaviour is unchanged from the reviewed lock," not "safe to run with the
+network on." This is strictly safer than an unaudited install step (which runs
+the same scripts online with zero recording) but weaker than the audit-only mode,
+where every script stays inside the sandbox. `install` requires a committed lock
+and is rejected in `update` mode (which regenerates the lock and skips the
+bypass scan, leaving no fail-closed gate). See also the [README drop-in install
+section](../README.md#drop-in-install).
+
+To keep that online egress from being silent, part 2 first scans the matched
+lock (`collectNetworkAttempts`) and, if any `network_attempts` are recorded,
+emits a `::warning::` with the count plus a per-package list before running the
+scripts. The recorded destination is the resolved **IP:port** the offline audit
+captured — `strace` parses the `connect()` sockaddr, never a DNS name — so the
+warning notes the host may resolve a different address. It is a directional
+heads-up that egress *will* happen, not an exact preview of where.
+
 ### Layered Observation
 
 No single layer sees everything:

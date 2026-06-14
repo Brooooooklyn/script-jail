@@ -3041,6 +3041,15 @@ export async function main(input: AgentInput): Promise<void> {
     cwd: config.work_dir,
     env: fetchEnv,
     spawner,
+    // Backends that cannot land the host-owned pm-flags sidecar at the default
+    // absolute `/etc/script-jail/pm-flags.json` (Docker, bare, macOS-bare —
+    // only Firecracker's init copies it into /etc) point us at the staged copy
+    // via this env var.  Unset on Firecracker → loadPmFlags() reads the /etc
+    // default.  loadPmFlags re-sanitizes whatever it reads, so this is safe
+    // even though the staged copy lives in the repo-controlled namespace.
+    ...(process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] !== undefined
+      ? { pmFlagsPath: process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] }
+      : {}),
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
 

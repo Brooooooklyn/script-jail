@@ -51,6 +51,7 @@ import type { Attribution, AttributionResult } from './attribution.js';
 import { attributionFromEnvVars } from './attribution.js';
 import { parseStraceLine, unescapeStraceString } from './strace-parser.js';
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
+import { INSTALL_CMD } from '../shared/pm-commands.js';
 import {
   ExecEvent,
   EnvTamperEvent,
@@ -286,14 +287,9 @@ export interface PhaseInstallResult {
   installStdoutTail: string;
 }
 
-const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
-  npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
-  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
-  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
-  // sever; the cache Phase A populated makes this a zero-network relink+build.
-  yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
-};
+// INSTALL_CMD lives in ../shared/pm-commands.ts so the host drop-in install
+// (src/action/host-install.ts part-2) uses the byte-identical command. The
+// per-flag rationale (incl. why Berry has no `--offline`) is in the file header.
 
 // LOAD-BEARING: env-spy.cjs opens this exact path after installing the
 // process.env Proxy. The open is expected to fail with ENOENT; its only job is

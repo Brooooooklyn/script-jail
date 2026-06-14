@@ -60,6 +60,9 @@ describe('parseInputs — defaults', () => {
     expect(result.lockPath).toBe(join(repoDir, '.script-jail.lock.yml'));
     expect(isAbsolute(result.configPath)).toBe(true);
     expect(isAbsolute(result.lockPath)).toBe(true);
+    // Drop-in install is opt-in: default off, no extra args.
+    expect(result.install).toBe(false);
+    expect(result.args).toEqual([]);
   });
 
   it('uses the injected default spoof arch when spoof-arch is omitted', () => {
@@ -347,5 +350,44 @@ describe('parseInputs — default getInput from process.env', () => {
       if (prevRight === undefined) delete process.env['INPUT_SPOOF-PLATFORM'];
       else process.env['INPUT_SPOOF-PLATFORM'] = prevRight;
     }
+  });
+});
+
+describe('parseInputs — args', () => {
+  const repoDir = '/fake/repo';
+
+  it('defaults to [] when unset or blank', () => {
+    expect(parseInputs({ repoDir, getInput: makeGetInput({}) }).args).toEqual([]);
+    expect(parseInputs({ repoDir, getInput: makeGetInput({ args: '   ' }) }).args).toEqual([]);
+  });
+
+  it('splits a space-separated flag string into an argv array', () => {
+    const r = parseInputs({ repoDir, getInput: makeGetInput({ args: '-D --omit=dev' }) });
+    expect(r.args).toEqual(['-D', '--omit=dev']);
+  });
+
+  it('groups quoted values that contain spaces', () => {
+    const r = parseInputs({ repoDir, getInput: makeGetInput({ args: '--filter "my pkg" -P' }) });
+    expect(r.args).toEqual(['--filter', 'my pkg', '-P']);
+  });
+});
+
+describe('parseInputs — install', () => {
+  const repoDir = '/fake/repo';
+
+  it('defaults to false when unset or blank', () => {
+    expect(parseInputs({ repoDir, getInput: makeGetInput({}) }).install).toBe(false);
+    expect(parseInputs({ repoDir, getInput: makeGetInput({ install: '' }) }).install).toBe(false);
+  });
+
+  it('accepts "true" and "false"', () => {
+    expect(parseInputs({ repoDir, getInput: makeGetInput({ install: 'true' }) }).install).toBe(true);
+    expect(parseInputs({ repoDir, getInput: makeGetInput({ install: 'false' }) }).install).toBe(false);
+  });
+
+  it('throws on any other value', () => {
+    expect(() => parseInputs({ repoDir, getInput: makeGetInput({ install: 'yes' }) })).toThrow(
+      /invalid value for input "install"/,
+    );
   });
 });

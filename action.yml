@@ -33,6 +33,14 @@ inputs:
     description: Cache the Firecracker binary + kernel across runs when backend includes Firecracker.
     required: false
     default: "true"
+  args:
+    description: "Extra package-manager install args (e.g. `-D --omit=dev`), applied identically to the sandbox audit and the host install. Quote-grouped; never run through a shell."
+    required: false
+    default: ""
+  install:
+    description: "Drop-in install: `true` ALSO installs deps on the runner (package-manager install with lifecycle scripts disabled, then runs lifecycle scripts on the host ONLY if the sandbox audit matches the committed lock). Requires `mode: check` and a committed lock. Default `false` (audit only)."
+    required: false
+    default: "false"
 
 outputs:
   lockfile:

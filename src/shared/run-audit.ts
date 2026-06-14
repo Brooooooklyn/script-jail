@@ -52,6 +52,7 @@ import {
   renderDiff,
 } from '../action/diff.js';
 import { buildEffectiveConfig } from '../action/config-override.js';
+import { sanitizeInstallArgs } from './pm-commands.js';
 import {
   makeOverlay,
   type OverlayResult,
@@ -136,6 +137,13 @@ export interface RunAuditInput {
   /** Host architecture of the runner / dev box. */
   hostArch: 'x64' | 'arm64';
   /**
+   * Developer-supplied package-manager install args (the action `args` input),
+   * already split + sanitized.  Threaded into the sandbox fetch via the
+   * pm-flags.json `user_install_args` channel so the audited tree matches what
+   * the host install resolves.  Undefined / empty = no extra args.
+   */
+  args?: string[] | undefined;
+  /**
    * Absolute path to the base rootfs ext4. Required by the legacy
    * makeOverlay+launch path; unused when `execute` is supplied.
    */
@@ -190,7 +198,7 @@ export interface RunAuditInput {
 
 export async function runAudit(
   input: RunAuditInput,
-): Promise<{ exitCode: number }> {
+): Promise<{ exitCode: number; trusted: boolean; generatedLock?: string }> {
   const doBuildArchFlagOverlay =
     input.buildArchFlagOverlay ?? buildArchFlagOverlay;
   const doMakeOverlay = input.makeOverlay ?? makeOverlay;
@@ -219,6 +227,34 @@ export async function runAudit(
   let result: LauncherResult;
   let overlay: OverlayResult | null = null;
   try {
+    // Merge the two pm-flags.json channels: npm-only arch hints from the
+    // (production no-op) arch overlay, plus the developer `args` input on the
+    // separate `user_install_args` channel (applied to all managers in the
+    // guest).  Emit the sidecar only when at least one channel has content so
+    // the normal no-args parity path stays byte-identical to before.
+    //
+    // SECURITY + PARITY: sanitize the user args HERE, with the SAME
+    // `sanitizeInstallArgs` the host install uses, so (a) no script-re-enabling
+    // arg ever reaches the network-on Phase A fetch in the sandbox, and (b) the
+    // audited tree is built from the identical argv as the host no-scripts
+    // install.  Without this the sandbox fetch would receive RAW args and could
+    // diverge from — or be more permissive than — the host part-1 install.
+    const userInstallArgs = sanitizeInstallArgs(input.args ?? []).kept;
+    const archPmFlags = archOverlay.pmFlagsJson;
+    // SECURITY (host-owned sidecar): ALWAYS emit pm-flags.json — even when both
+    // channels are empty.  The overlay writer (`materializeExtraFiles` /
+    // overlay.ts) rm+writes, so an always-present host file OVERWRITES any
+    // repo-committed `etc/script-jail/pm-flags.json` (which the Firecracker
+    // init copies into `/etc` and the guest would otherwise trust verbatim).
+    // This is the same reason `config.yml` is safe — the host always writes it.
+    // An empty file makes the guest append nothing, so the no-args parity path
+    // stays byte-identical; a repo can no longer inject install args (benign OR
+    // script-re-enabling) into the network-on Phase A fetch.
+    const pmFlagsJson = {
+      extra_install_args: archPmFlags?.extra_install_args ?? [],
+      ...(userInstallArgs.length > 0 ? { user_install_args: userInstallArgs } : {}),
+    };
+
     // 3. Build the effective config + sidecars under the private scratch.
     //    The user's source config file on the host is never modified.
     const effectiveConfig = buildEffectiveConfig({
@@ -234,9 +270,7 @@ export async function runAudit(
       ...(archOverlay.yarnrcOverlay !== undefined
         ? { yarnrcOverlay: archOverlay.yarnrcOverlay }
         : {}),
-      ...(archOverlay.pmFlagsJson !== undefined
-        ? { pmFlagsJson: archOverlay.pmFlagsJson }
-        : {}),
+      pmFlagsJson,
       ...(archOverlay.pnpmArchOverlay !== undefined
         ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay }
         : {}),
@@ -310,6 +344,12 @@ export async function runAudit(
   }
 
   // 6. Post-VM: write or diff.
+  //
+  // `trusted` is the host's signal that it is safe to run lifecycle scripts on
+  // the runner (the drop-in install part-2).  It is TRUE only on a clean
+  // `check`: the generated lock matches the committed one AND no audit-bypass
+  // entry is present.  `update` mode is NEVER trusted — it regenerates the lock
+  // and skips the bypass scan entirely, so there is no fail-closed gate.
   if (input.mode === 'update') {
     writeFileSync(input.lockPath, result.finalYaml, 'utf8');
     // Diagnostic: emit path + byte count so the next workflow run can map
@@ -321,7 +361,7 @@ export async function runAudit(
     );
     input.io.setOutput?.('lockfile', input.lockPath);
     input.io.setOutput?.('diff', '');
-    return { exitCode: 0 };
+    return { exitCode: 0, trusted: false };
   }
 
   // mode === 'check'
@@ -365,10 +405,17 @@ export async function runAudit(
     // passes undefined for emitAuditBypassAnnotation — its stderr
     // message above is sufficient.
     input.io.emitAuditBypassAnnotation?.(lockLabel, msg);
-    return { exitCode: 1 };
+    return { exitCode: 1, trusted: false };
   }
 
-  return { exitCode: diff.match ? 0 : 1 };
+  // Clean check: trusted ⇔ the generated lock matches the committed one (and we
+  // already returned above if any bypass entry was present).  Return the
+  // GENERATED lock (well-formed — the guest just rendered it) so the drop-in
+  // install can surface its recorded egress from a guaranteed-parseable source.
+  // Reading the committed file instead would risk a parse failure (it can be
+  // malformed in a canonicalized volatile field yet still diff-match), silently
+  // skipping the egress warning before part 2 runs scripts online.
+  return { exitCode: diff.match ? 0 : 1, trusted: diff.match, generatedLock: result.finalYaml };
 }
 
 // ---------------------------------------------------------------------------

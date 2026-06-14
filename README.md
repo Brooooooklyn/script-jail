@@ -70,6 +70,64 @@ jobs:
 available. On GitHub-hosted `ubuntu-24.04-arm`, KVM is unavailable, so the
 parity workflow normally falls through to Docker.
 
+## Drop-in Install
+
+By default the Action only **audits** — it never installs dependencies on your
+runner. Set `install: true` to make it a **drop-in replacement for your install
+step**. It splits the install into two halves:
+
+1. **On the runner, with lifecycle scripts disabled** — `npm ci`/`pnpm install
+   --frozen-lockfile`/`yarn install --immutable` with `--ignore-scripts`
+   (`--mode=skip-build` for yarn). This is always safe: no third-party code runs.
+   It populates your real `node_modules`.
+2. **In the sandbox** — the same install runs under the audit envelope and the
+   generated lockfile is diffed against the committed `.script-jail.lock.yml`.
+3. **On the runner, only if the audit matches** — the deferred lifecycle scripts
+   run on the host, completing a usable `node_modules`. On any drift or
+   audit-bypass the scripts are **never** run and the job fails.
+
+```yaml
+      - uses: Brooooooklyn/script-jail@<pinned-tag>
+        with:
+          mode: check          # required for install (see below)
+          install: true
+          # Extra package-manager install flags, applied to BOTH the host
+          # install and the sandbox audit (so the lock can't drift):
+          args: "--omit=dev"
+```
+
+Then your build steps can use `node_modules` directly — no second `install` step.
+
+**Requirements & semantics**
+
+- `install: true` requires `mode: check` **and** a committed `.script-jail.lock.yml`.
+  Generate the lock once with `mode: update` (install off), commit it, then turn
+  `install` on. `install` is rejected in `update` mode (update regenerates the
+  lock and skips the bypass scan, so there is no fail-closed gate).
+- On audit **drift or bypass**, the safe no-scripts `node_modules` is left in
+  place but the lifecycle scripts are skipped and the job exits non-zero.
+- `args` is split into discrete argv items (quote values that contain spaces)
+  and passed to the package manager directly — never through a shell. Flags that
+  would re-enable scripts in step 1 (`--no-ignore-scripts`, yarn `--mode`, …) are
+  dropped with a warning.
+
+> **Security note.** Step 3 runs the lifecycle scripts **on the runner with the
+> network on** (real postinstalls fetch prebuilt binaries, so this is
+> unavoidable). The sandbox audited them offline, so a `connect` recorded as
+> `<BLOCKED>` in the lock **will succeed** on the runner. Trust comes from the
+> committed lock being reviewed, not from host isolation: a matching audit means
+> "behaviour is unchanged from the reviewed lock," not "safe to run online."
+> Review the recorded reads/writes/spawns/connects before committing a lock. This
+> is still strictly safer than an unaudited `install` step. Audit-only mode
+> (`install` unset) keeps scripts entirely inside the sandbox.
+>
+> Before step 3 runs, if the matched lock recorded any `network_attempts`, the
+> action emits a `::warning::` naming the count and the destinations those
+> scripts will now reach online. The destinations are the **IP:port** the
+> offline audit observed (`connect()` carries a resolved address, not a DNS
+> name), so a fresh online resolve may hit a different address — treat the list
+> as a heads-up, not an exact preview.
+
 ## Configuration
 
 `.script-jail.yml` defines which files and env vars should be hidden from

@@ -254,6 +254,115 @@ export function formatAuditBypassError(entries: AuditBypassEntry[]): string {
 }
 
 // ---------------------------------------------------------------------------
+// network egress surfacing (drop-in install part-2)
+// ---------------------------------------------------------------------------
+
+/**
+ * One recorded `network_attempts` entry surfaced from a lockfile, carrying its
+ * package id and lifecycle stage.  The `entry` string is the rendered form,
+ * e.g. `<BLOCKED> connect 198.51.100.7:443`.
+ */
+export interface NetworkAttemptEntry {
+  packageId: string;
+  stage: string;
+  entry: string;
+}
+
+/**
+ * Scan a lockfile (YAML text) for every non-empty `network_attempts` array
+ * under `packages.<pkg>.lifecycle.<stage>`.  Same defensive shape-walk as
+ * {@link findAuditBypass} (strict schema parse first, hand-walk fallback).
+ *
+ * Used by the drop-in install (`install: true`): part 2 runs lifecycle scripts
+ * ONLINE on the host, so any egress the OFFLINE audit recorded (as `<BLOCKED>`)
+ * WILL succeed there.  Surfacing these before part 2 keeps that egress from
+ * being silent.  NOTE: the recorded host is the resolved IP the sandbox saw
+ * (strace parses `connect()` sockaddrs, never DNS names), and the online host
+ * may resolve a different address — so this is a directional heads-up, not an
+ * exact preview.
+ */
+export function collectNetworkAttempts(generated: string): NetworkAttemptEntry[] {
+  let doc: unknown;
+  try {
+    doc = parseYaml(generated);
+  } catch {
+    return [];
+  }
+  if (doc === null || typeof doc !== 'object') return [];
+
+  const parsed = Lock.safeParse(doc);
+  const packagesRaw = parsed.success
+    ? parsed.data.packages
+    : (doc as { packages?: unknown }).packages;
+  if (
+    packagesRaw === undefined ||
+    packagesRaw === null ||
+    typeof packagesRaw !== 'object'
+  ) {
+    return [];
+  }
+
+  const out: NetworkAttemptEntry[] = [];
+  for (const [packageId, pkgRaw] of Object.entries(
+    packagesRaw as Record<string, unknown>,
+  )) {
+    if (pkgRaw === null || typeof pkgRaw !== 'object') continue;
+    const lifecycleRaw = (pkgRaw as { lifecycle?: unknown }).lifecycle;
+    if (
+      lifecycleRaw === null ||
+      lifecycleRaw === undefined ||
+      typeof lifecycleRaw !== 'object'
+    ) {
+      continue;
+    }
+    for (const [stage, blockRaw] of Object.entries(
+      lifecycleRaw as Record<string, unknown>,
+    )) {
+      if (blockRaw === null || typeof blockRaw !== 'object') continue;
+      const na = (blockRaw as { network_attempts?: unknown }).network_attempts;
+      if (!Array.isArray(na)) continue;
+      for (const entry of na) {
+        if (typeof entry === 'string' && entry.length > 0) {
+          out.push({ packageId, stage, entry });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Build the two-part egress heads-up for drop-in install part 2.
+ *
+ *   `summary` — one line, emitted as a `::warning::` annotation (GH Actions
+ *               annotations are single-line, so the per-package list cannot
+ *               live here).
+ *   `detail`  — the per-package list + a review pointer, written to stdout as
+ *               plain lines so the full block is readable in the job log.
+ *
+ * The IP caveat is folded into `summary` so the annotation itself carries it.
+ */
+export function formatEgressWarning(entries: NetworkAttemptEntry[]): {
+  summary: string;
+  detail: string;
+} {
+  const MAX = 20;
+  const summary =
+    `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. ` +
+    `The offline audit recorded ${entries.length} network egress attempt(s) that ` +
+    `WILL now succeed (listed below). IPs are offline-audit values — the host ` +
+    `may resolve different addresses; review the committed lock before trusting this install.`;
+  const lines = entries.slice(0, MAX).map((e) => {
+    return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+  });
+  if (entries.length > MAX) {
+    lines.push(`  (+${entries.length - MAX} more — see the committed lock)`);
+  }
+  const detail = `${lines.join('\n')}\n`;
+  return { summary, detail };
+}
+
+// ---------------------------------------------------------------------------
 
 /**
  * Count the number of lines in `s`.  An empty string is 0 lines.  A trailing

@@ -374,8 +374,12 @@ describe('runAudit — arch-flag overlay fan-out', () => {
       (e) => e.relPath === 'etc/script-jail/pnpm-arch.json',
     );
     expect(archEntry).toBeDefined();
-    // pnpm-style pmFlagsJson must NOT also appear.
-    expect(extras!.some((e) => e.relPath === 'etc/script-jail/pm-flags.json')).toBe(false);
+    // pm-flags.json IS always emitted now (host-owned sidecar that overwrites
+    // any repo-committed copy), but for a pnpm arch run with no user args it is
+    // EMPTY — no npm `extra_install_args`, no `user_install_args`.
+    const pmEntry = extras!.find((e) => e.relPath === 'etc/script-jail/pm-flags.json');
+    expect(pmEntry).toBeDefined();
+    expect(JSON.parse(pmEntry!.content)).toEqual({ extra_install_args: [] });
     expect(archEntry!.content).toBe(archJson);
   });
 });
@@ -457,5 +461,206 @@ describe('runAudit — scratch dir isolation', () => {
     await expect(runAudit(input)).rejects.toThrow(/launch boom/);
     const afterEntries = readdirSync(input.workDir).filter((e) => !beforeEntries.has(e));
     expect(afterEntries).toEqual([]);
+  });
+});
+
+describe('runAudit — trusted signal (drop-in install gate)', () => {
+  function lockYaml(): string {
+    return [
+      'schema_version: 1',
+      'generated_at: <ts>',
+      'manager: pnpm',
+      'manager_lockfile_sha256: <hash>',
+      'packages:',
+      '',
+    ].join('\n');
+  }
+
+  it('update mode is NEVER trusted (regenerates the lock, skips the bypass scan)', async () => {
+    const input = baseInput(async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }), { mode: 'update' });
+    const result = await runAudit(input);
+    expect(result.exitCode).toBe(0);
+    expect(result.trusted).toBe(false);
+  });
+
+  it('check + match (no bypass) is trusted', async () => {
+    const yaml = lockYaml();
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    writeFileSync(lockPath, yaml);
+    const result = await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'check',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'pnpm', hostArch: 'x64',
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: yaml, nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.trusted).toBe(true);
+  });
+
+  it('returns the GENERATED lock on a clean check (drop-in install egress source)', async () => {
+    // The drop-in install reads egress from this generated lock — NOT a re-read
+    // of the committed file, which could be malformed in a canonicalized
+    // volatile field yet still diff-match.  The generated lock is what the
+    // guest just rendered, so it is always well-formed.
+    const yaml = lockYaml();
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    writeFileSync(lockPath, yaml);
+    const result = await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'check',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'pnpm', hostArch: 'x64',
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: yaml, nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir),
+    });
+    expect(result.trusted).toBe(true);
+    expect(result.generatedLock).toBe(yaml);
+  });
+
+  it('check + drift is NOT trusted', async () => {
+    const committed = lockYaml();
+    const generated = lockYaml() + '# drift\n';
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    writeFileSync(lockPath, committed);
+    const result = await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'check',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'pnpm', hostArch: 'x64',
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: generated, nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.trusted).toBe(false);
+  });
+
+  it('check + audit-bypass (even byte-equal) is NOT trusted', async () => {
+    const yaml = [
+      'schema_version: 1',
+      'packages:',
+      '  malicious@1.0.0:',
+      '    lifecycle:',
+      '      postinstall:',
+      '        audit_bypass:',
+      '          - "<EXEC_FAIL_OPEN> /usr/bin/curl"',
+      '',
+    ].join('\n');
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    writeFileSync(lockPath, yaml); // byte-equal → diff matches, but bypass present
+    const result = await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'check',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'pnpm', hostArch: 'x64',
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: yaml, nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.trusted).toBe(false);
+  });
+});
+
+describe('runAudit — args threading (user_install_args)', () => {
+  function pmFlagsContent(
+    calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]>,
+  ): string | undefined {
+    const extras = calls[0]?.extraRepoOverlayFiles ?? [];
+    return extras.find((e) => e.relPath === 'etc/script-jail/pm-flags.json')?.content;
+  }
+
+  it('writes args into pm-flags.json as user_install_args', async () => {
+    const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'npm', hostArch: 'x64',
+      args: ['-D', '--omit=dev'],
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir, { calls, cleanups: 0 }),
+    });
+    const content = pmFlagsContent(calls);
+    expect(content).toBeDefined();
+    const parsed = JSON.parse(content!) as { extra_install_args: string[]; user_install_args?: string[] };
+    expect(parsed.user_install_args).toEqual(['-D', '--omit=dev']);
+    expect(parsed.extra_install_args).toEqual([]);
+  });
+
+  it('ALWAYS emits pm-flags.json — empty when neither arch flags nor user args (host-owned, overwrites repo copy)', async () => {
+    // SECURITY: the host-owned sidecar must always be written so it overwrites
+    // any repo-committed `etc/script-jail/pm-flags.json` (which Firecracker's
+    // init copies into /etc and the guest would otherwise trust).  Empty
+    // content means the guest appends nothing → byte-identical no-args parity.
+    const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'npm', hostArch: 'x64',
+      // no args
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir, { calls, cleanups: 0 }),
+    });
+    const content = pmFlagsContent(calls);
+    expect(content).toBeDefined();
+    expect(JSON.parse(content!)).toEqual({ extra_install_args: [] });
+  });
+
+  it('carries BOTH arch flags and user args in pm-flags.json', async () => {
+    const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'npm', hostArch: 'arm64',
+      args: ['--prod'],
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir, { calls, cleanups: 0 }),
+      buildArchFlagOverlay: () => ({ warnings: [], pmFlagsJson: { extra_install_args: ['--cpu=arm64'] } }),
+    });
+    const parsed = JSON.parse(pmFlagsContent(calls)!) as { extra_install_args: string[]; user_install_args?: string[] };
+    expect(parsed.extra_install_args).toEqual(['--cpu=arm64']);
+    expect(parsed.user_install_args).toEqual(['--prod']);
+  });
+
+  it('SANITIZES args on the audit side too — a script re-enabler never reaches the sandbox', async () => {
+    // Parity fix: the host install drops `--ignore-scripts false` via
+    // sanitizeInstallArgs; the audit overlay MUST drop it identically, else the
+    // sandbox would fetch with scripts re-enabled (and the lock would drift from
+    // the host tree). Only the clean `-D` survives into user_install_args.
+    const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'npm', hostArch: 'x64',
+      args: ['--ignore-scripts', 'false', '--mode=update-lockfile', '-D'],
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+      io: makeIo().io,
+      makeOverlay: stubOverlay(workDir, { calls, cleanups: 0 }),
+    });
+    const parsed = JSON.parse(pmFlagsContent(calls)!) as { user_install_args?: string[] };
+    expect(parsed.user_install_args).toEqual(['-D']);
   });
 });
