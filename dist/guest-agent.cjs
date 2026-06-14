@@ -25420,10 +25420,14 @@ function isForbiddenFlag(token) {
 function sanitizeInstallArgs(args) {
   const kept = [];
   const dropped = [];
+  const droppedKeys = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (isForbiddenFlag(a)) {
       dropped.push(a);
+      const rawKey = canonicalFlagKey(a) ?? "unknown";
+      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : rawKey;
+      droppedKeys.push(`--${displayKey}`);
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
         dropped.push(args[++i]);
       }
@@ -25431,7 +25435,7 @@ function sanitizeInstallArgs(args) {
     }
     kept.push(a);
   }
-  return { kept, dropped };
+  return { kept, dropped, droppedKeys };
 }
 
 // src/guest/apply-pnpm-arch.ts

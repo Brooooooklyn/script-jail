@@ -26484,10 +26484,14 @@ function isForbiddenFlag(token) {
 function sanitizeInstallArgs(args) {
   const kept = [];
   const dropped = [];
+  const droppedKeys = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (isForbiddenFlag(a)) {
       dropped.push(a);
+      const rawKey = canonicalFlagKey(a) ?? "unknown";
+      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : rawKey;
+      droppedKeys.push(`--${displayKey}`);
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
         dropped.push(args[++i]);
       }
@@ -26495,7 +26499,7 @@ function sanitizeInstallArgs(args) {
     }
     kept.push(a);
   }
-  return { kept, dropped };
+  return { kept, dropped, droppedKeys };
 }
 function splitInstallArgs(raw) {
   const out = [];
@@ -26627,40 +26631,43 @@ var defaultSpawn = (cmd, args, cwd) => {
   return { status: r.status, signal: r.signal, error: r.error };
 };
 function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = defaultSpawn) {
-  const { kept, dropped } = sanitizeInstallArgs(args);
-  for (const d of dropped) {
+  const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
+  if (droppedKeys.length > 0) {
+    const n = dropped.length;
+    const keys = droppedKeys.join(", ");
     io.warn(
-      `script-jail: ignoring install arg "${d}" \u2014 it would re-enable lifecycle scripts in the no-scripts install (the sandbox is the only place scripts run unaudited).`
+      `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} matching ${keys} \u2014 it would re-enable lifecycle scripts in the no-scripts install (the sandbox is the only place scripts run unaudited).`
     );
   }
   const base = FETCH_CMD[pm];
   const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir)];
-  const safeArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir)];
+  const safeBaseArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir)];
   const userArgSuffix = kept.length > 0 ? ` (+${kept.length} user install arg${kept.length === 1 ? "" : "s"}, not shown)` : "";
   io.stdout.write(
-    `[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${safeArgs.join(" ")}${userArgSuffix}
+    `[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${safeBaseArgs.join(" ")}${userArgSuffix}
 `
   );
-  runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io);
+  const safeDisplayArgs = kept.length > 0 ? [...safeBaseArgs, `(+${kept.length} user install arg${kept.length === 1 ? "" : "s"}, not shown)`] : safeBaseArgs;
+  runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io, safeDisplayArgs);
 }
 function hostRunScripts(pm, repoDir, io, spawn2 = defaultSpawn) {
   const cmd = INSTALL_CMD[pm];
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
 `);
-  runOrThrow(cmd.cmd, finalArgs, repoDir, spawn2, "lifecycle-script run", io);
+  runOrThrow(cmd.cmd, finalArgs, repoDir, spawn2, "lifecycle-script run", io, finalArgs);
 }
-function runOrThrow(cmd, args, cwd, spawn2, label, io) {
+function runOrThrow(cmd, args, cwd, spawn2, label, io, displayArgs) {
   const r = spawn2(cmd, args, cwd);
   if (r.error !== void 0) {
     throw new Error(`script-jail: host ${label} could not spawn "${cmd}": ${r.error.message}`);
   }
   if (r.signal != null) {
-    throw new Error(`script-jail: host ${label} (\`${cmd} ${args.join(" ")}\`) was killed by ${r.signal}`);
+    throw new Error(`script-jail: host ${label} (\`${cmd} ${displayArgs.join(" ")}\`) was killed by ${r.signal}`);
   }
   if (r.status !== 0) {
     throw new Error(
-      `script-jail: host ${label} (\`${cmd} ${args.join(" ")}\`) exited with code ${r.status ?? "null"}`
+      `script-jail: host ${label} (\`${cmd} ${displayArgs.join(" ")}\`) exited with code ${r.status ?? "null"}`
     );
   }
   io.stdout.write(`[script-jail] host ${label} complete
