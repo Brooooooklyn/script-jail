@@ -1364,6 +1364,109 @@ describe('agent main() root-prepare second pass', () => {
     expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
     expect(exitedWith).toBe(1);
   });
+
+  it('FAILS CLOSED (no lockfile) when prepare exits nonzero with ZERO events (untraced-prepare audit-bypass)', async () => {
+    // The prepare pass is KNOWN to exist (prepareCommand !== null), so a
+    // traced run must produce events.  Zero events + nonzero exit = strace
+    // couldn't attach or the PM aborted before spawning the prepare script —
+    // the root `prepare` ran UNAUDITED.  A clean diff against the resulting
+    // lockfile would pass silently.  The gate must fail closed.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    // Prepare runner yields ZERO events and exits nonzero — simulates
+    // strace failing to attach or PM aborting before the prepare script runs.
+    const prepZeroEvents: StraceRunner = {
+      async *run() { /* no events */ },
+      getExitCode() { return 1; },
+      getTamperReason() { return null; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return null; },
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prepZeroEvents,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error frame (fatal: true) mentioning the untraced prepare.
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/prepare pass/);
+    expect(String(fatal!['message'])).toMatch(/no audit events/);
+    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
+    // No final lockfile frame must be emitted.
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('does NOT fail closed when prepare exits nonzero WITH events (traced failure is fine)', async () => {
+    // Counter-test: a prepare that fails offline but was traced produces audit
+    // data.  The fix must NOT over-fail this case — the lock is still emitted.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    // Prepare runner yields ONE event (traced run) but exits nonzero.
+    const prepNonzeroWithEvents: StraceRunner = {
+      async *run(cmd: string, args: string[]) {
+        void cmd; void args;
+        yield {
+          pid: 8001,
+          line: 'execve("/usr/bin/PREPPROG", ["PREPPROG"], 0x7ffd /* 12 vars */) = 0',
+          source: 'strace' as const,
+        };
+      },
+      getExitCode() { return 1; },
+      getTamperReason() { return null; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return 8001; },
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prepNonzeroWithEvents,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // A final lockfile is still emitted (not fail-closed).
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    // A non-fatal error frame is emitted for the prepare failure.
+    const nonFatalError = frames.find((f) => f['kind'] === 'error' && f['fatal'] === false);
+    expect(nonFatalError).toBeDefined();
+    expect(String(nonFatalError!['message'])).toMatch(/prepare pass.*exited non-zero/);
+    // No fatal error — the run is not blocked.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
 });
 
 describe('buildChildEnv protected-env-names length gate', () => {

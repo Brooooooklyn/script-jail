@@ -3624,14 +3624,26 @@ export async function main(input: AgentInput): Promise<void> {
       input,
       `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`,
     );
-    // MERGE.  No separate fail-closed for the prepare pass: a prepare that
-    // fails offline but produced events is audit data, and a prepare that
-    // exits nonzero with zero events must NOT fail the audit since the main
-    // install was fine.  We fold the prepare's eventCount and tamperReason
-    // into installResult so the tamper gate (11b) sees a tampering prepare and
-    // fails closed; installResult.exitCode is left untouched.
+    // MERGE.  Mirrors the main-path fail-closed gate (~3402-3452):
     //
-    // TWO tamper sources, exactly mirroring what 11b does for the MAIN runner
+    //   - prepareResult.exitCode !== 0 && prepareResult.eventCount === 0:
+    //     FATAL.  The prepare script is KNOWN to exist (we only reach this
+    //     branch when prepareCommand !== null), so a traced run must produce
+    //     at least some events (node/sh startup emits fs reads).  Zero events
+    //     with a nonzero exit means strace could not attach or the PM aborted
+    //     before spawning the prepare script — i.e. the root `prepare` ran
+    //     UNAUDITED.  A clean diff against the resulting lockfile would be
+    //     untrustworthy.  Fail closed, exactly mirroring the main path.
+    //
+    //   - prepareResult.exitCode !== 0 && prepareResult.eventCount > 0:
+    //     Non-fatal.  Audit data exists (prepare failed offline but was
+    //     traced).  Fold counts/tamper and continue — same as the main path's
+    //     non-fatal nonzero handling.
+    //
+    //   - prepareResult.exitCode === 0: unchanged (fold counts/tamper).
+    //
+    // TWO tamper sources for the non-fatal paths, exactly mirroring what 11b
+    // does for the MAIN runner
     // (`installResult.tamperReason ?? straceRunner.getTamperReason()`):
     //   - `prepareResult.tamperReason` — the prepare DISPATCHER's owned reason
     //     (shim-channel parse failure / bad LineSource).
@@ -3641,6 +3653,26 @@ export async function main(input: AgentInput): Promise<void> {
     //     the prepare runner — so without folding it in here a file-tamper on
     //     the prepare pass's own events file would NOT fail closed.  First-
     //     non-null wins (preserve the earliest, most specific reason).
+    if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) ` +
+          'and produced no audit events — the root `prepare` script likely ran ' +
+          'untraced (strace could not attach) or the package manager aborted ' +
+          'before spawning it. Refusing to emit a lockfile: the root `prepare` ' +
+          'would be unaudited and a clean diff against it would be untrustworthy.',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    if (prepareResult.exitCode !== 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) — ` +
+          'the root `prepare` script failed under audit. This is recorded in the ' +
+          'lockfile, not treated as a fatal error.',
+        false,
+      );
+    }
     installResult.eventCount += prepareResult.eventCount;
     const prepareTamper =
       prepareResult.tamperReason ?? prepareRunner.getTamperReason();
