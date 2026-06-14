@@ -47,12 +47,30 @@ describe('hostInstallNoScripts (part 1)', () => {
 
   it.each([
     ['npm', ['ci', '--ignore-scripts']],
-    ['pnpm', ['install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false']],
+    ['pnpm', ['install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store']],
     ['yarn', ['install', '--immutable', '--mode=skip-build']],
   ] as const)('uses the correct no-scripts base command for %s', (pm, base) => {
     const rec = makeRecorder();
     hostInstallNoScripts(pm, '/repo', [], rec.io, okSpawn(rec));
     expect(rec.calls[0]!.args).toEqual(base);
+  });
+
+  it('pins pnpm --store-dir to the repo (parity with the guest); npm/yarn get no store flag', () => {
+    // The audited sandbox always links pnpm against `<repo>/.pnpm-store`; the
+    // host must use the SAME store or the dependency layout diverges.  The flag
+    // is rooted at the ACTUAL repoDir and appended AFTER user args.
+    const rec = makeRecorder();
+    hostInstallNoScripts('pnpm', '/myrepo', ['--omit=dev'], rec.io, okSpawn(rec));
+    expect(rec.calls[0]!.args).toEqual([
+      'install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false',
+      '--omit=dev', '--store-dir=/myrepo/.pnpm-store',
+    ]);
+    // npm / yarn never get a --store-dir flag.
+    for (const pm of ['npm', 'yarn'] as const) {
+      const r = makeRecorder();
+      hostInstallNoScripts(pm, '/myrepo', [], r.io, okSpawn(r));
+      expect(r.calls[0]!.args.some((a) => a.startsWith('--store-dir'))).toBe(false);
+    }
   });
 
   it('drops script-re-enabling args and warns about each', () => {
@@ -93,7 +111,7 @@ describe('hostInstallNoScripts (part 1)', () => {
 describe('hostRunScripts (part 2)', () => {
   it.each([
     ['npm', ['rebuild', '--foreground-scripts']],
-    ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false']],
+    ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store']],
     ['yarn', ['install', '--immutable']],
   ] as const)('runs the INSTALL_CMD for %s in repoDir', (pm, expected) => {
     const rec = makeRecorder();

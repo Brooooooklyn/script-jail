@@ -25,7 +25,13 @@
 
 import { spawnSync } from 'node:child_process';
 
-import { FETCH_CMD, INSTALL_CMD, sanitizeInstallArgs, type Manager } from '../shared/pm-commands.js';
+import {
+  FETCH_CMD,
+  INSTALL_CMD,
+  pnpmStoreDirArg,
+  sanitizeInstallArgs,
+  type Manager,
+} from '../shared/pm-commands.js';
 
 /** Minimal sink so the module is testable without touching the real streams. */
 export interface HostInstallIo {
@@ -69,7 +75,10 @@ export function hostInstallNoScripts(
     );
   }
   const base = FETCH_CMD[pm];
-  const finalArgs = [...base.args, ...kept];
+  // Order mirrors the guest fetch phase: <fixed args> <user args> <store-dir>.
+  // The pnpm `--store-dir` pin is appended last so the host links against the
+  // same repo-local store the audited sandbox used (see pnpmStoreDirArg).
+  const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${finalArgs.join(' ')}\n`);
   runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io);
 }
@@ -85,8 +94,11 @@ export function hostRunScripts(
   spawn: HostSpawn = defaultSpawn,
 ): void {
   const cmd = INSTALL_CMD[pm];
-  io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${cmd.args.join(' ')}\n`);
-  runOrThrow(cmd.cmd, cmd.args, repoDir, spawn, 'lifecycle-script run', io);
+  // Same store-dir pin as part 1 / the guest install phase: pnpm must relink
+  // against the repo-local store, not the runner default (parity).
+  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
+  io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
+  runOrThrow(cmd.cmd, finalArgs, repoDir, spawn, 'lifecycle-script run', io);
 }
 
 function runOrThrow(

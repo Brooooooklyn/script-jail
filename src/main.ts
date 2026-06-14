@@ -162,14 +162,16 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     throw err;
   }
 
-  // --- Drop-in install: validate + part 1 (no-scripts host install) --------
-  // When `install: true`, the action ALSO installs deps on the runner.  Part 1
-  // (here) is always safe — lifecycle scripts are disabled.  Part 2 (run the
-  // scripts) happens AFTER the audit and only if it is `trusted`.
-  //
-  // Fail-closed preconditions: install needs a committed lock to gate against,
-  // and must run in `check` (update regenerates the lock and skips the
-  // audit-bypass scan, so there would be no fail-closed signal).
+  // --- Drop-in install: fail-closed preconditions --------------------------
+  // When `install: true` the action ALSO installs deps on the runner, but BOTH
+  // host halves run AFTER the audit (below), never here: part 1 must not
+  // populate node_modules before the backend stages its copy of the repo, or
+  // the freshly built tree (esp. pnpm's external-store symlinks) gets copied
+  // into the sandbox and diverges the audit.  Here we only enforce the
+  // preconditions that must fail BEFORE spending an audit: install needs a
+  // committed lock to gate against, and must run in `check` (update regenerates
+  // the lock and skips the audit-bypass scan, so there would be no fail-closed
+  // signal to run lifecycle scripts against).
   if (inputs.install) {
     if (inputs.mode === 'update') {
       process.stdout.write(
@@ -187,7 +189,6 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       );
       exitProcess(1);
     }
-    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, warn });
   }
 
   // --- Detect runner image -------------------------------------------------
@@ -278,27 +279,36 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     },
   });
 
-  // --- Drop-in install: part 2 (run lifecycle scripts on the host) ---------
-  // Gated STRICTLY on a clean audit (`trusted` ⇔ check-mode, lock matched, no
-  // audit-bypass entry).  On drift/bypass `trusted` is false → scripts NEVER
-  // run; the safe no-scripts tree from part 1 stays in place and the job fails
-  // via the non-zero exit below.  Part 2 runs the scripts ONLINE on the runner
-  // (no netns sever) — trust derives from the reviewed, matched lock.
-  if (inputs.install && result.trusted) {
-    // Surface the egress from the GENERATED lock runAudit just produced — it is
-    // guaranteed well-formed (the guest rendered it) and, on a trusted check,
-    // semantically equals the committed lock.  Re-reading the committed file
-    // would risk a parse failure (it can be malformed in a canonicalized
-    // volatile field yet still diff-match), silently dropping the warning while
-    // part 2 still runs scripts online.  Phase B was offline so these connects
-    // were recorded `<BLOCKED>`, but part 2 runs ONLINE — they WILL succeed.
-    const egress = collectNetworkAttempts(result.generatedLock ?? '');
-    if (egress.length > 0) {
-      const { summary, detail } = formatEgressWarning(egress);
-      warn(summary);
-      process.stdout.write(detail);
+  // --- Drop-in install: part 1 (host no-scripts) + part 2 (run scripts) ----
+  // Both host halves run AFTER the audit so the freshly built node_modules is
+  // never staged into the sandbox copy (which would diverge the audit — pnpm's
+  // external-store symlinks in particular).  Part 1 (lifecycle scripts
+  // disabled) is always safe and runs even on drift, so the safe no-scripts
+  // tree is left on the runner.  Part 2 (run the deferred scripts) is gated
+  // STRICTLY on a clean audit (`trusted` ⇔ check-mode, lock matched, no
+  // audit-bypass entry); on drift/bypass it is skipped, the safe tree stays in
+  // place, and the job fails via the non-zero exit below.  Part 2 runs the
+  // scripts ONLINE on the runner (no netns sever) — trust derives from the
+  // reviewed, matched lock.
+  if (inputs.install) {
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, warn });
+    if (result.trusted) {
+      // Surface the egress from the GENERATED lock runAudit just produced — it
+      // is guaranteed well-formed (the guest rendered it) and, on a trusted
+      // check, semantically equals the committed lock.  Re-reading the
+      // committed file would risk a parse failure (it can be malformed in a
+      // canonicalized volatile field yet still diff-match), silently dropping
+      // the warning while part 2 still runs scripts online.  Phase B was
+      // offline so these connects were recorded `<BLOCKED>`, but part 2 runs
+      // ONLINE — they WILL succeed.
+      const egress = collectNetworkAttempts(result.generatedLock ?? '');
+      if (egress.length > 0) {
+        const { summary, detail } = formatEgressWarning(egress);
+        warn(summary);
+        process.stdout.write(detail);
+      }
+      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, warn });
     }
-    doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, warn });
   }
 
   // Preserve the existing semantics: in `update` mode runAudit returns

@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import {
   FETCH_CMD,
   INSTALL_CMD,
+  pnpmStoreDirArg,
   sanitizeInstallArgs,
   splitInstallArgs,
 } from '../../src/shared/pm-commands.js';
@@ -23,6 +24,20 @@ describe('FETCH_CMD / INSTALL_CMD tables', () => {
     expect(INSTALL_CMD.pnpm.args).toContain('--pending');
     expect(INSTALL_CMD.yarn.args).toEqual(['install', '--immutable']);
     expect(INSTALL_CMD.yarn.args).not.toContain('--offline');
+  });
+});
+
+describe('pnpmStoreDirArg', () => {
+  it('returns the repo-local store flag for pnpm only', () => {
+    expect(pnpmStoreDirArg('pnpm', '/repo')).toEqual(['--store-dir=/repo/.pnpm-store']);
+    expect(pnpmStoreDirArg('npm', '/repo')).toEqual([]);
+    expect(pnpmStoreDirArg('yarn', '/repo')).toEqual([]);
+  });
+
+  it('roots the store at the given cwd', () => {
+    expect(pnpmStoreDirArg('pnpm', '/home/runner/work/app')).toEqual([
+      '--store-dir=/home/runner/work/app/.pnpm-store',
+    ]);
   });
 });
 

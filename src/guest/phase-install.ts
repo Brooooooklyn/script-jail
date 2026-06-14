@@ -51,7 +51,7 @@ import type { Attribution, AttributionResult } from './attribution.js';
 import { attributionFromEnvVars } from './attribution.js';
 import { parseStraceLine, unescapeStraceString } from './strace-parser.js';
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
-import { INSTALL_CMD } from '../shared/pm-commands.js';
+import { INSTALL_CMD, pnpmStoreDirArg } from '../shared/pm-commands.js';
 import {
   ExecEvent,
   EnvTamperEvent,
@@ -608,14 +608,12 @@ export async function runInstallPhase(
   // dependency resolution is already done by the time Phase B runs.
 
   // For pnpm: pin the store-dir to the repo overlay disk — IDENTICAL to
-  // the value spliced in phase-fetch.ts.  `pnpm rebuild` operates on the
-  // node_modules tree Phase A materialised, but still resolves store
-  // config; a mismatched --store-dir would point pnpm at an empty store
-  // on the cramped rootfs ext4.  Keep both phases in lockstep via
-  // `input.cwd`.
-  const args = input.manager === 'pnpm'
-    ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`]
-    : baseArgs;
+  // the value spliced in phase-fetch.ts (and the host install).  `pnpm
+  // rebuild` operates on the node_modules tree Phase A materialised, but
+  // still resolves store config; a mismatched --store-dir would point pnpm
+  // at an empty store on the cramped rootfs ext4.  The shared pnpmStoreDirArg
+  // helper keeps all three call sites in lockstep via `input.cwd`.
+  const args = [...baseArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`

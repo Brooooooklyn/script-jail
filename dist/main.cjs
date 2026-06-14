@@ -26452,6 +26452,9 @@ var INSTALL_CMD = {
   // sever; the cache Phase A populated makes this a zero-network relink+build.
   yarn: { cmd: "yarn", args: ["install", "--immutable"] }
 };
+function pnpmStoreDirArg(pm, cwd) {
+  return pm === "pnpm" ? [`--store-dir=${cwd}/.pnpm-store`] : [];
+}
 function isBareFlag(token) {
   return !token.includes("=");
 }
@@ -26631,16 +26634,17 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = defaultSpawn) {
     );
   }
   const base = FETCH_CMD[pm];
-  const finalArgs = [...base.args, ...kept];
+  const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${finalArgs.join(" ")}
 `);
   runOrThrow(base.cmd, finalArgs, repoDir, spawn2, "no-scripts install", io);
 }
 function hostRunScripts(pm, repoDir, io, spawn2 = defaultSpawn) {
   const cmd = INSTALL_CMD[pm];
-  io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${cmd.args.join(" ")}
+  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
+  io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
 `);
-  runOrThrow(cmd.cmd, cmd.args, repoDir, spawn2, "lifecycle-script run", io);
+  runOrThrow(cmd.cmd, finalArgs, repoDir, spawn2, "lifecycle-script run", io);
 }
 function runOrThrow(cmd, args, cwd, spawn2, label, io) {
   const r = spawn2(cmd, args, cwd);
@@ -44218,7 +44222,6 @@ async function main(deps = {}) {
       );
       exitProcess(1);
     }
-    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, warn });
   }
   const runnerImage = detectRunnerImage();
   const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path12.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
@@ -44289,14 +44292,17 @@ async function main(deps = {}) {
       }
     }
   });
-  if (inputs.install && result.trusted) {
-    const egress = collectNetworkAttempts(result.generatedLock ?? "");
-    if (egress.length > 0) {
-      const { summary: summary2, detail } = formatEgressWarning(egress);
-      warn(summary2);
-      process.stdout.write(detail);
+  if (inputs.install) {
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, warn });
+    if (result.trusted) {
+      const egress = collectNetworkAttempts(result.generatedLock ?? "");
+      if (egress.length > 0) {
+        const { summary: summary2, detail } = formatEgressWarning(egress);
+        warn(summary2);
+        process.stdout.write(detail);
+      }
+      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, warn });
     }
-    doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, warn });
   }
   if (result.exitCode !== 0) exitProcess(result.exitCode);
 }

@@ -62,7 +62,7 @@
 //   All three overlay files are OPTIONAL. Absence is the normal action and
 //   CLI path after the switch to arm64 CI parity.
 
-import { FETCH_CMD } from '../shared/pm-commands.js';
+import { FETCH_CMD, pnpmStoreDirArg } from '../shared/pm-commands.js';
 import { applyPnpmArchOverlay } from './apply-pnpm-arch.js';
 import { loadPmFlags } from './load-pm-flags.js';
 
@@ -138,10 +138,9 @@ export async function runFetchPhase(
   // place to set it — the `npm_config_store_dir` env in agent.ts
   // turned out to be a no-op in pnpm 11.x against fixtures that ship
   // their own .npmrc.  `--store-dir` is a global pnpm flag and may
-  // legally appear before or after the subcommand.
-  if (input.manager === 'pnpm') {
-    args = [...args, `--store-dir=${input.cwd}/.pnpm-store`];
-  }
+  // legally appear before or after the subcommand.  The flag string is
+  // shared with the host install via pnpmStoreDirArg so the two cannot drift.
+  args = [...args, ...pnpmStoreDirArg(input.manager, input.cwd)];
 
   const result = await input.spawner.spawn(cmd, args, {
     env: input.env,

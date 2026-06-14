@@ -25372,6 +25372,9 @@ var INSTALL_CMD = {
   // sever; the cache Phase A populated makes this a zero-network relink+build.
   yarn: { cmd: "yarn", args: ["install", "--immutable"] }
 };
+function pnpmStoreDirArg(pm, cwd) {
+  return pm === "pnpm" ? [`--store-dir=${cwd}/.pnpm-store`] : [];
+}
 function isBareFlag(token) {
   return !token.includes("=");
 }
@@ -25495,9 +25498,7 @@ async function runFetchPhase(input) {
   if (input.manager === "pnpm") {
     applyPnpmArchOverlay({ cwd: input.cwd, ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {} });
   }
-  if (input.manager === "pnpm") {
-    args = [...args, `--store-dir=${input.cwd}/.pnpm-store`];
-  }
+  args = [...args, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const result = await input.spawner.spawn(cmd, args, {
     env: input.env,
     cwd: input.cwd
@@ -26288,7 +26289,7 @@ function cloneFlagsHaveUntraced(line) {
 }
 async function runInstallPhase(input) {
   const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
-  const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
+  const args = [...baseArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],

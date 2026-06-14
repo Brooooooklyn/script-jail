@@ -48,6 +48,30 @@ export const INSTALL_CMD: Record<Manager, PmCommand> = {
   yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
 };
 
+/**
+ * pnpm only: force the content-addressed store onto the repo-local tree.
+ *
+ * The guest pins `--store-dir=<cwd>/.pnpm-store` so the store shares the repo
+ * overlay disk (where node_modules lives, so hardlinks work) instead of the
+ * small rootfs ext4 that the default `~/.local/share/pnpm/store` would overrun.
+ * The HOST drop-in install must append the SAME flag (rooted at the host repo
+ * dir) or the host and the audited sandbox resolve/link against DIFFERENT
+ * stores — diverging the dependency layout the PR documents as identical.
+ * `--store-dir` is a global pnpm flag and wins over .npmrc / env in pnpm's
+ * config precedence chain.
+ *
+ * Returns the flag for pnpm, `[]` for npm / yarn (self-guarding so call sites
+ * can append it unconditionally).  This single source is what keeps the guest
+ * phases (phase-fetch / phase-install) and the host install (host-install.ts)
+ * byte-identical.
+ *
+ * @param pm   the detected package manager.
+ * @param cwd  the install root: sandbox `input.cwd`, host `repoDir`.
+ */
+export function pnpmStoreDirArg(pm: Manager, cwd: string): string[] {
+  return pm === 'pnpm' ? [`--store-dir=${cwd}/.pnpm-store`] : [];
+}
+
 /** A bare boolean-style flag (no `=value`) that may consume the next token. */
 function isBareFlag(token: string): boolean {
   return !token.includes('=');
