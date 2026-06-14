@@ -106,6 +106,43 @@ describe('hostInstallNoScripts (part 1)', () => {
     const errSpawn: HostSpawn = () => ({ status: null, error: new Error('ENOENT npm') });
     expect(() => hostInstallNoScripts('npm', '/repo', [], rec.io, errSpawn)).toThrow(/could not spawn/);
   });
+
+  it('does not echo credential-shaped user args to stdout, but still passes them to spawn', () => {
+    // Regression guard: a user arg such as --//registry.npmjs.org/:_authToken=SECRET123
+    // must NOT appear in the action log (GitHub masking only strips registered secrets).
+    const credArg = '--//registry.npmjs.org/:_authToken=SECRET123';
+    const rec = makeRecorder();
+    hostInstallNoScripts('npm', '/repo', [credArg], rec.io, okSpawn(rec));
+
+    const logged = rec.out.join('');
+
+    // 1. Secret value must not appear in the log.
+    expect(logged).not.toContain('SECRET123');
+    expect(logged).not.toContain(credArg);
+
+    // 2. The command and fixed base args ARE still shown (diagnostic is useful).
+    expect(logged).toContain('npm ci --ignore-scripts');
+
+    // 3. The count of suppressed user args is shown.
+    expect(logged).toMatch(/\+1 user install arg, not shown/);
+
+    // 4. Spawn still received the full argv including the credential arg.
+    expect(rec.calls[0]!.args).toContain(credArg);
+  });
+
+  it('shows plural "args" in the suffix when multiple user args are supplied', () => {
+    const rec = makeRecorder();
+    hostInstallNoScripts('npm', '/repo', ['--omit=dev', '--omit=peer'], rec.io, okSpawn(rec));
+    const logged = rec.out.join('');
+    expect(logged).toMatch(/\+2 user install args, not shown/);
+  });
+
+  it('omits the user-arg suffix entirely when no user args survive sanitization', () => {
+    const rec = makeRecorder();
+    hostInstallNoScripts('npm', '/repo', [], rec.io, okSpawn(rec));
+    const logged = rec.out.join('');
+    expect(logged).not.toContain('user install arg');
+  });
 });
 
 describe('hostRunScripts (part 2)', () => {

@@ -79,7 +79,14 @@ export function hostInstallNoScripts(
   // The pnpm `--store-dir` pin is appended last so the host links against the
   // same repo-local store the audited sandbox used (see pnpmStoreDirArg).
   const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir)];
-  io.stdout.write(`[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${finalArgs.join(' ')}\n`);
+  const safeArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir)];
+  const userArgSuffix =
+    kept.length > 0
+      ? ` (+${kept.length} user install arg${kept.length === 1 ? '' : 's'}, not shown)`
+      : '';
+  io.stdout.write(
+    `[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${safeArgs.join(' ')}${userArgSuffix}\n`,
+  );
   runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io);
 }
 
