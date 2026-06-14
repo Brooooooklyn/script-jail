@@ -58,6 +58,23 @@ describe('redactCredentialShapes', () => {
     // By the line-local contract, this is not a credential.
     expect(out).toContain('TOKEN0123456789ABCDEF');
   });
+
+  it('is linear-time on a long contiguous [a-z0-9+.-] run (URL-creds ReDoS regression)', () => {
+    // The URL-credentials scheme prefix used to be unbounded (`*`) with no
+    // `://` tail, backtracking O(N) per start position → O(N²): 160 KB took
+    // ~12 s.  Bounding the scheme to {0,31} drops the fixed path to ~12 ms.
+    // A 200 KB contiguous class-char run has no `://`, so it matches NOTHING
+    // and must be returned unchanged — and must finish well under the bound.
+    const input = 'a'.repeat(200_000);
+    const start = performance.now();
+    const out = redactCredentialShapes(input);
+    const elapsedMs = performance.now() - start;
+    // (a) no `://` → no match → input returned unchanged.
+    expect(out).toBe(input);
+    // (b) generous wall-clock bound: fixed path is ~12 ms; ~2 s never flakes
+    // under CI load yet still catches the multi-second O(N²) regression.
+    expect(elapsedMs).toBeLessThan(2000);
+  });
 });
 
 describe('maskExactValues', () => {

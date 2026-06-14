@@ -26629,7 +26629,7 @@ var import_node_child_process = require("node:child_process");
 
 // src/shared/redact.ts
 function redactCredentialShapes(text) {
-  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
 }
 function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);

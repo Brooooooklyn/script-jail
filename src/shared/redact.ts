@@ -8,6 +8,12 @@
 // so it can be safely bundled into both `dist/main.cjs` and
 // `dist/guest-agent.cjs` (mirrors the `buildRootPkgKeys` single-source
 // precedent — one helper, used by guest + host, to eliminate divergence).
+//
+// LINEAR-TIME INVARIANT: every regex here runs on attacker-influenced,
+// multi-MB package-manager output (Phase-A yarn buffers, host part-1 capture).
+// Each pattern MUST be linear-time — no unbounded overlapping/greedy
+// quantifiers that can backtrack O(N²). Bound any prefix that precedes a
+// required literal (see the scheme cap below) rather than leaving it `*`.
 
 /**
  * Redact credential SHAPES regardless of any protected-name list.
@@ -32,7 +38,11 @@
 export function redactCredentialShapes(text: string): string {
   return text
     // scheme://user:pass@host  → keep scheme + host, drop userinfo
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
+    // Scheme length is RFC-bounded ({0,31}) so the prefix can't backtrack:
+    // an unbounded `*` here is O(N) per start position → O(N²) ReDoS on long
+    // contiguous [a-z0-9+.-] runs (integrity hashes, long resolved URLs).  No
+    // real URI scheme exceeds 32 chars, so this is output-preserving.
+    .replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
     // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
     .replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, '$1<REDACTED>')
     // Bearer <token>
@@ -54,6 +64,9 @@ export function redactCredentialShapes(text: string): string {
  *   * `minLen` guard (default 4): values shorter than `minLen` are skipped so a
  *     short non-secret (e.g. `dev` from `--omit=dev`) does not blank out
  *     unrelated words (e.g. `devDependencies`) in the surrounding output.
+ *     SECURITY CONSEQUENCE: a value shorter than `minLen` is NOT masked at all
+ *     — accepted because genuine credentials are never < 4 chars, so the guard
+ *     trades no real-secret coverage for the false-positive protection.
  *   * dedupe: identical values are masked once.
  *   * longest-first: sorted by length descending so a value that is a substring
  *     of another is not partially pre-masked.
