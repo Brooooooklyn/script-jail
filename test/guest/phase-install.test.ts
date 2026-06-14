@@ -8202,6 +8202,71 @@ describe('runInstallPhase', () => {
       expect(unresolved.length).toBeGreaterThanOrEqual(1);
     });
 
+    // Security regression: null rootPid MUST fail closed on root-attributed
+    // fs events (adversarial-review finding [high], 2026-06-14).
+    //
+    // When the Linux dispatcher's getRootPid() returns null (production CASE B
+    // in agent.ts: strace spawned but readStraceChildPid timed out / /proc
+    // unavailable), rootAnchored() previously returned `true` — FAIL OPEN.
+    // A dependency forging `npm_package_name=<root>` in that degraded run
+    // would get root_anchored:true, making its repo write look genuine.
+    //
+    // Post-fix: null rootPid → root_anchored:false (FAIL CLOSED).
+    // normalize.ts treats root_anchored !== true as <FORGED_ROOT>, which is
+    // fail-loud and unambiguous. The unconditional-true path is reserved for
+    // the observe-only macOS-bare file (phase-install-macos.ts) only.
+    it('null rootPid fails closed: root-attributed fs write gets root_anchored:false (not true)', async () => {
+      // Root project environment: the forging dep or degraded-production root
+      // runs under these env vars, claimed via npm_package_name.
+      const rootPkgName = 'my-root-app';
+      const rootPkgVersion = '2.0.0';
+      const rootPkgKey = `${rootPkgName}@${rootPkgVersion}`;
+      const proc = mockProcReader({
+        8350: {
+          ppid: 1,
+          env: {
+            npm_package_name: rootPkgName,
+            npm_package_version: rootPkgVersion,
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Absolute open inside the repo cwd — this is the forged/degraded
+        // root write that must NOT get root_anchored:true.
+        {
+          pid: 8350,
+          line: 'openat(AT_FDCWD, "/work/dist/output.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        // rootPid explicitly null — mirrors CASE B: strace spawned but
+        // readStraceChildPid returned null (deadline/proc-unavailable).
+        // Pre-fix: rootAnchored() returned true  → FAIL OPEN (bug).
+        // Post-fix: rootAnchored() returns false → FAIL CLOSED (correct).
+        strace: cannedStraceRunner(records, 0, { rootPid: null }),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The write event must have been emitted (pkg matches rootPkgKey).
+      const writeEvent = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'write' && r['path'] === '/work/dist/output.js';
+      });
+      expect(writeEvent).toBeDefined();
+      // root_anchored MUST be false (fail closed), NOT true (fail open).
+      // A true here would mean normalize sees this as a genuine root write,
+      // laundering a potential forgery as $REPO/dist/output.js.
+      expect((writeEvent!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+
     // Bug #4 — clone3 return-value parsing anchored on the closing `)`.
     //  Real-shape clone3 lines contain numeric struct fields BEFORE the
     //  trailing rc (`stack_size=0`, `exit_signal=17`).  Pre-fix the rc

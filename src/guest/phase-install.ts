@@ -2054,10 +2054,20 @@ export async function runInstallPhase(
   // would make a cached value stale, the walk is short, and fs events are few.
   function rootAnchored(pid: number): boolean {
     const rootPid = installRootPid; // number | null
-    // No traced tree (test fake / non-Firecracker, getRootPid()===null): there
-    // is no process-tree signal to verify against, so trust the env attribution
-    // — macOS-bare/Firecracker handle enforcement at their own boundaries.
-    if (rootPid === null) return true;
+    // No traced root pid (production CASE B in agent.ts: strace spawned but
+    // readStraceChildPid returned null — deadline/ambiguous/proc-unavailable —
+    // so _rootPid was left null and the per-pid-file fallback was disabled).
+    // We cannot prove repo-root anchoring without the process-tree signal, so
+    // we FAIL CLOSED: return false → normalize.ts prefixes the event with
+    // `<FORGED_ROOT>`, which is fail-loud and visible to reviewers.
+    //
+    // NOTE: returning `true` unconditionally when rootPid is null is reserved
+    // exclusively for the observe-only macOS-bare path
+    // (src/guest/phase-install-macos.ts).  This file is the Linux dispatcher
+    // used by ALL enforcing backends (Firecracker, Docker, bare Linux); it
+    // must never trust env attribution without a corroborating process-tree
+    // signal.
+    if (rootPid === null) return false;
     return isRepoRootAnchored({
       pid,
       childParent,
