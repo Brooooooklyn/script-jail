@@ -171,3 +171,44 @@ describe('fixture: unsets-ld-preload', () => {
     expect(yaml).not.toContain('audit_bypass:');
   });
 });
+
+describe('fixture: runs-root-prepare', () => {
+  // The ROOT project is not in node_modules, so it has no pkgDir.  The guest
+  // agent passes its key(s) via `rootPkgKeys` (NOT as a work_dir pkgDir — see
+  // Codex review #1), so normalize SURFACES the root's fs events instead of
+  // dropping them as $PKG or throwing.  We mirror that here: a root build
+  // `prepare` writing into the repo surfaces as `$REPO/...` in escaped_writes
+  // (visible + diffable, so a forged-root write can't hide), and an escaping
+  // read surfaces under external_reads.
+  it('does not crash and SURFACES root prepare events (no $PKG drop)', () => {
+    const events = loadExpectedEvents('runs-root-prepare');
+    const ctx: NormalizeContext = {
+      roots: ROOTS,
+      pkgDirs: new Map(),
+      rootPkgKeys: new Set(['runs-root-prepare@1.0.0']),
+    };
+    const packages = normalize(events, ctx);
+    const yaml = render({
+      manager: 'npm',
+      manager_lockfile_sha256: 'deadbeef',
+      node_version: '20.19.0',
+      generated_at: '2026-05-16T00:00:00Z',
+      packages,
+    });
+
+    expect(yaml).toContain('runs-root-prepare@1.0.0:');
+    expect(yaml).toContain('prepare:');
+    // (b) escaping read SURFACES under the root pkg's prepare.external_reads.
+    expect(yaml).toContain('external_reads:');
+    expect(yaml).toContain('/etc/hostname');
+    // (c) protected env read recorded hidden in the prepare pass.
+    expect(yaml).toContain('<HIDDEN> NPM_TOKEN');
+    // (a) intra-repo build output SURFACES as $REPO/prepare-built.txt — NOT
+    // dropped as $PKG. This is the forgery-safe behavior: a write under /work
+    // attributed to the root is always visible in the lock.
+    expect(yaml).toContain('$REPO/prepare-built.txt');
+    // postinstall (main pass) carries CI_SECRET so the two passes compose.
+    expect(yaml).toContain('postinstall:');
+    expect(yaml).toContain('<HIDDEN> CI_SECRET');
+  });
+});

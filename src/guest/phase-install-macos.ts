@@ -171,11 +171,24 @@ export function macosManagerLaunch(
  * Build the Phase-B install command for macOS — `macosManagerLaunch` with the
  * Phase-B subcommand (`rebuild`/`install`) and pnpm's repo-disk store-dir pin
  * (IDENTICAL store-dir value to the one the fetch phase splices).
+ *
+ * When `commandOverride` is supplied (the agent's prepare-only second pass —
+ * e.g. `{cmd:'npm', args:['run','prepare',…]}`), we route the OVERRIDE'S ARGS
+ * through `macosManagerLaunch` exactly the same way: the override's `cmd`
+ * (`npm`/`yarn`) is intentionally discarded — `macosManagerLaunch` always
+ * launches via the provisioned, re-signed `process.execPath` + the manager's
+ * JS entry so DYLD_INSERT_LIBRARIES survives the first exec.  No pnpm
+ * store-dir splice is added for an override (prepare passes are npm/yarn only;
+ * the resolver returns null for pnpm).
  */
 function buildMacosInstallCommand(
   manager: 'npm' | 'pnpm' | 'yarn',
   cwd: string,
+  commandOverride?: { cmd: string; args: string[] },
 ): { cmd: string; args: string[] } {
+  if (commandOverride !== undefined) {
+    return macosManagerLaunch(manager, commandOverride.args);
+  }
   const base = INSTALL_CMD[manager];
   const managerArgs =
     manager === 'pnpm' ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
@@ -196,7 +209,7 @@ export async function runInstallPhaseMacos(
   // Launch as `<re-signed node> <manager-cli.js> …` so DYLD survives the first
   // exec (see buildMacosInstallCommand).  pnpm's store-dir pin is folded in
   // there, IDENTICAL to the value the fetch phase splices.
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
+  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd, input.commandOverride);
   // No per-pid strace files on macOS; the basePath still gives runStraceTailer
   // a watchDir.  Default to a macOS tmp path when the caller didn't supply one.
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';

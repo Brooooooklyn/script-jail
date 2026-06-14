@@ -125,6 +125,19 @@ export interface NormalizeContext {
   roots: TokenizeRoots;
   // pkg@version → installed path inside the VM (e.g. /work/node_modules/esbuild)
   pkgDirs: Map<string, string>;
+  // Keys (name AND name@version) identifying the ROOT project, which has no
+  // node_modules dir.  Its lifecycle events (root pre/install/postinstall from
+  // the main install pass; root `prepare` from the prepare pass) attribute to
+  // these keys.  We deliberately give the root NO pkgDir: mapping it to the
+  // repo root would treat the WHOLE repo as $PKG, so every root write into the
+  // repo would drop as "intra-package" — hiding the build/escape behaviour we
+  // audit, and letting a dependency FORGE `npm_package_name=<root>` to write
+  // anywhere under the repo with the write silently dropped.  Instead, listing
+  // the root here makes normalize SURFACE the root's fs events (external_reads /
+  // escaped_writes) rather than throw on the missing pkgDir — visible in the
+  // lock, diffable, forgery-safe.  Omitted/empty ⇒ no root events to surface
+  // (byte-identical to the pre-feature behaviour for every existing caller).
+  rootPkgKeys?: Set<string>;
   // Host OS the audit ran on.  Defaults to 'linux' when omitted so every
   // existing caller (the Linux Action guest, all unit/integration tests)
   // produces byte-identical output.  Only 'darwin' enables the macOS-only
@@ -156,10 +169,17 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
 
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
 
+    // The ROOT project legitimately has no pkgDir (it is not under
+    // node_modules).  Its fs events tokenize against $REPO/$NODE_MODULES (no
+    // $PKG) and SURFACE as external_reads / escaped_writes — see rootPkgKeys.
+    const isRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
+
     // For fs events (read/write) a missing pkgDirs entry is an error: without
     // pkgDir the $PKG token can never form, so intra-package reads would
-    // silently leak into external_reads — the opposite of what we want.
-    if (pkgDir === undefined && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
+    // silently leak into external_reads — the opposite of what we want.  The
+    // ROOT project is the one legitimate exception (handled above); everything
+    // else with no pkgDir is an unknown/forged attribution and we fail closed.
+    if (pkgDir === undefined && !isRoot && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`,
       );

@@ -418,6 +418,70 @@ describe('normalize', () => {
     });
   });
 
+  // Root-project prepare pass: the ROOT project is not in node_modules, so
+  // discoverPkgDirs never maps it. The guest agent registers it in pkgDirs
+  // mapping the root key -> work_dir (== roots.repo). Once registered, a root
+  // fs event MUST NOT throw, and:
+  //   - a write INTO the repo tokenizes to $PKG and DROPS as intra-package
+  //     (build output is benign), and
+  //   - a read OUTSIDE the repo SURFACES under external_reads.
+  // This is the regression for the SHIPPING BLOCKER: a build `prepare` writing
+  // dist/ used to crash normalize() with `pkgDirs missing entry for <root>`.
+  describe('root-project events (rootPkgKeys → surfaced, never dropped)', () => {
+    const rootKey = 'runs-root-prepare@1.0.0';
+    // The agent passes the root key(s) via rootPkgKeys and gives the root NO
+    // pkgDir.  SECURITY-CRITICAL (Codex review #1): mapping the root to work_dir
+    // would make the whole repo $PKG, dropping every root write into the repo as
+    // "intra-package" — which a dependency could exploit by forging
+    // npm_package_name=<root> to hide a write anywhere under /work.  Instead the
+    // root's fs events tokenize against $REPO/$NODE_MODULES and SURFACE
+    // (external_reads / escaped_writes), so real OR forged, they always show.
+    const rootCtx: NormalizeContext = {
+      roots,
+      pkgDirs: new Map(),
+      rootPkgKeys: new Set([rootKey]),
+    };
+
+    function rootRead(path: string, hidden = false): AttributedEvent {
+      return { raw: { kind: 'read', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'prepare' };
+    }
+    function rootWrite(path: string, hidden = false): AttributedEvent {
+      return { raw: { kind: 'write', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'prepare' };
+    }
+
+    it('does NOT throw for a root-pkg fs event when listed in rootPkgKeys', () => {
+      const events = [rootWrite('/work/dist/index.js'), rootRead('/etc/hostname')];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    it('STILL throws for a non-root pkg with no pkgDir (forged/unknown attribution fails closed)', () => {
+      const events = [rootWrite('/work/dist/index.js')];
+      const notRoot: NormalizeContext = { roots, pkgDirs: new Map(), rootPkgKeys: new Set(['other@9.9.9']) };
+      expect(() => normalize(events, notRoot)).toThrow(/pkgDirs missing entry/);
+    });
+
+    it('SURFACES an intra-repo root write as $REPO/... (closes the forged-root hide hole)', () => {
+      const events = [rootWrite('/work/prepare-built.txt')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.escaped_writes).toEqual(['$REPO/prepare-built.txt']);
+    });
+
+    it('SURFACES an escaping root read under external_reads', () => {
+      const events = [rootRead('/etc/hostname')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      // /etc/hostname is NOT a system-noise prefix (unlike /etc/hosts), so it
+      // survives to external_reads.
+      expect(block?.external_reads).toEqual(['/etc/hostname']);
+    });
+
+    it('classifies both in one pass: repo write AND escaping read both surfaced', () => {
+      const events = [rootWrite('/work/prepare-built.txt'), rootRead('/etc/hostname')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['prepare'];
+      expect(block?.escaped_writes).toEqual(['$REPO/prepare-built.txt']);
+      expect(block?.external_reads).toEqual(['/etc/hostname']);
+    });
+  });
+
   // Imp 4: argv[0] must be tokenized when absolute, and well-known binary paths
   // must be collapsed to their basename for byte-stability across rootfs variants.
   describe('spawn argv[0] tokenization (Imp 4)', () => {

@@ -1,0 +1,46 @@
+[
+  {
+    "raw": {
+      "kind": "write",
+      "path": "/work/prepare-built.txt",
+      "pid": 1010,
+      "ts": 0,
+      "hidden": false
+    },
+    "pkg": "runs-root-prepare@1.0.0",
+    "lifecycle": "prepare"
+  },
+  {
+    "raw": {
+      "kind": "read",
+      "path": "/etc/hostname",
+      "pid": 1010,
+      "ts": 1,
+      "hidden": false
+    },
+    "pkg": "runs-root-prepare@1.0.0",
+    "lifecycle": "prepare"
+  },
+  {
+    "raw": {
+      "kind": "env_read",
+      "name": "NPM_TOKEN",
+      "pid": 1010,
+      "ts": 2,
+      "hidden": true
+    },
+    "pkg": "runs-root-prepare@1.0.0",
+    "lifecycle": "prepare"
+  },
+  {
+    "raw": {
+      "kind": "env_read",
+      "name": "CI_SECRET",
+      "pid": 1011,
+      "ts": 3,
+      "hidden": true
+    },
+    "pkg": "runs-root-prepare@1.0.0",
+    "lifecycle": "postinstall"
+  }
+]

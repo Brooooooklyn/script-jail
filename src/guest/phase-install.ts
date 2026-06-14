@@ -250,6 +250,17 @@ export interface PhaseInstallInput {
    * behaviour from the policy filter.
    */
   protectedPaths?: ProtectedPathsMatcher;
+  /**
+   * Optional override for the traced command.  When omitted, the phase traces
+   * `INSTALL_CMD[manager]` (the canonical Phase-B install).  The agent supplies
+   * this for the second, prepare-only audit pass (`npm run prepare …` /
+   * `yarn run prepare`) — npm's `rebuild --foreground-scripts` and yarn's
+   * `install --immutable` do NOT run the ROOT project's `prepare` script, so a
+   * malicious root `prepare` would otherwise never be audited.  Everything else
+   * about the dispatch (the security loop, synthesis, pnpm store-dir splice) is
+   * IDENTICAL — only the command/args at the head of the trace change.
+   */
+  commandOverride?: { cmd: string; args: string[] };
 }
 
 export interface PhaseInstallResult {
@@ -603,7 +614,7 @@ function cloneFlagsHaveUntraced(line: string): boolean {
 export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
-  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
+  const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
   // pm-flags.json extras are spliced into Phase A (fetch/resolve), not here —
   // dependency resolution is already done by the time Phase B runs.
 

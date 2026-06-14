@@ -10363,6 +10363,7 @@ __export(agent_exports, {
   main: () => main,
   readStraceChildPid: () => readStraceChildPid,
   redactSensitive: () => redactSensitive,
+  resolvePrepareCommand: () => resolvePrepareCommand,
   runStraceTailer: () => runStraceTailer,
   scratchBaseDir: () => scratchBaseDir
 });
@@ -26288,7 +26289,7 @@ function cloneFlagsHaveUntraced(line) {
   return false;
 }
 async function runInstallPhase(input) {
-  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
+  const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
   const args = [...baseArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
@@ -28186,7 +28187,10 @@ function macosManagerLaunch(manager, subArgs) {
   const corepackCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
   return { cmd: node, args: [corepackCli, manager, ...subArgs] };
 }
-function buildMacosInstallCommand(manager, cwd) {
+function buildMacosInstallCommand(manager, cwd, commandOverride) {
+  if (commandOverride !== void 0) {
+    return macosManagerLaunch(manager, commandOverride.args);
+  }
   const base = INSTALL_CMD[manager];
   const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
   return macosManagerLaunch(manager, managerArgs);
@@ -28198,7 +28202,7 @@ function pathBasename2(pathLike) {
   return slash === -1 ? value : value.slice(slash + 1);
 }
 async function runInstallPhaseMacos(input) {
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
+  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd, input.commandOverride);
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -28741,7 +28745,8 @@ function normalize(events, ctx) {
     const fsPath = (ev.raw.kind === "read" || ev.raw.kind === "write") && os === "darwin" ? canonicalizePrivateRealpath(ev.raw.path) : ev.raw.kind === "read" || ev.raw.kind === "write" ? ev.raw.path : void 0;
     if (isSystemNoise(ev, fsPath, os)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
-    if (pkgDir === void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
+    const isRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
+    if (pkgDir === void 0 && !isRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`
       );
@@ -30251,6 +30256,25 @@ function diag(input, msg) {
   else process.stderr.write(`[agent] ${msg}
 `);
 }
+function resolvePrepareCommand(manager, cwd) {
+  if (manager === "npm") {
+    return { cmd: "npm", args: ["run", "prepare", "--if-present", "--foreground-scripts"] };
+  }
+  if (manager === "yarn") {
+    try {
+      const pkgRaw = (0, import_node_fs3.readFileSync)((0, import_node_path4.join)(cwd, "package.json"), "utf8");
+      const pkg = JSON.parse(pkgRaw);
+      const prepare = pkg.scripts?.["prepare"];
+      if (typeof prepare === "string" && prepare.length > 0) {
+        return { cmd: "yarn", args: ["run", "prepare"] };
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+  return null;
+}
 function redactSensitive(text, protectedEnvNames, env = process.env) {
   let out = text;
   const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
@@ -30484,6 +30508,60 @@ ${stdoutTail}`;
       false
     );
   }
+  const prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
+  if (prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true)) {
+    diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
+    let prepareRunner;
+    let prepareEventsFilePath = eventsFilePath;
+    if (input.prepareStrace !== void 0) {
+      prepareRunner = input.prepareStrace;
+    } else {
+      let pf;
+      try {
+        pf = makeEventsFile();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        emitter.emitError(
+          `script-jail agent: failed to create the audit-events file for the root-prepare pass \u2014 ${reason}. Refusing to emit a lockfile: the root \`prepare\` script would otherwise run UNAUDITED and a clean diff against it would be untrustworthy.`,
+          true
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+      prepareEventsFilePath = pf.path;
+      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf) : new LinuxStraceRunner(
+        void 0,
+        pf,
+        (s) => redactSensitive(s, config2.protected.env),
+        stdoutTailBytes
+      );
+    }
+    const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
+    const prepareEnv = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
+    const prepareInput = {
+      manager,
+      cwd: config2.work_dir,
+      env: prepareEnv,
+      strace: prepareRunner,
+      attribution,
+      emitter: collectingEmitter,
+      // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
+      // the main install's files on the scratch disk.
+      straceBasePath: `${straceBaseDir}/strace-prepare.out`,
+      protectedPaths,
+      commandOverride: prepareCommand
+    };
+    const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
+    diag(
+      input,
+      `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
+    );
+    installResult.eventCount += prepareResult.eventCount;
+    const prepareTamper = prepareResult.tamperReason ?? prepareRunner.getTamperReason();
+    if (installResult.tamperReason === null) {
+      installResult.tamperReason = prepareTamper;
+    }
+  }
   const tamperReason = installResult.tamperReason ?? straceRunner.getTamperReason();
   if (tamperReason !== null) {
     emitter.emitError(
@@ -30499,7 +30577,18 @@ ${stdoutTail}`;
   diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
   const pkgDirs = new Map(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
-  const ctx = isMacosBare ? { roots, pkgDirs, os: "darwin" } : { roots, pkgDirs };
+  const rootPkgKeys = /* @__PURE__ */ new Set();
+  try {
+    const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
+    if (typeof rootManifest.name === "string" && rootManifest.name.length > 0) {
+      rootPkgKeys.add(rootManifest.name);
+      if (typeof rootManifest.version === "string") {
+        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
+      }
+    }
+  } catch {
+  }
+  const ctx = isMacosBare ? { roots, pkgDirs, rootPkgKeys, os: "darwin" } : { roots, pkgDirs, rootPkgKeys };
   let yaml;
   try {
     const packages = normalize(collectedEvents, ctx);
@@ -30584,6 +30673,7 @@ if (isMain) {
   main,
   readStraceChildPid,
   redactSensitive,
+  resolvePrepareCommand,
   runStraceTailer,
   scratchBaseDir
 });

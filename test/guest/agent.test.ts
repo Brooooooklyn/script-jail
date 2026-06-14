@@ -1071,6 +1071,301 @@ describe('agent main()', () => {
   });
 });
 
+describe('agent main() root-prepare second pass', () => {
+  // A StraceRunner that yields ONE strace execve line with no paired shim exec
+  // → recorded as a `<SYSCALL_EXEC_BYPASS>` event, which emits even without
+  // /proc attribution (lands under `<unattributed>`).  So the pass reports
+  // eventCount>0, AND we record the (cmd,args) it was asked to run.  The
+  // DISTINCT argv[0] basename (rendered verbatim by the bypass synthesis) lets
+  // us tell the main pass's event apart from the prepare pass's in the lock.
+  function recordingEventStrace(progName: string): {
+    runner: StraceRunner;
+    calls: Array<{ cmd: string; args: string[] }>;
+  } {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const runner: StraceRunner = {
+      async *run(cmd: string, args: string[]) {
+        calls.push({ cmd, args });
+        const pid = 7000 + calls.length;
+        yield {
+          pid,
+          line: `execve("/usr/bin/${progName}", ["${progName}"], 0x7ffd /* 12 vars */) = 0`,
+          source: 'strace' as const,
+        };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op */ },
+      getRootPid() { return 7001; },
+    };
+    return { runner, calls };
+  }
+
+  it('runs the prepare pass (npm) when prepareStrace is injected; merges its events', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+    const diagMsgs: string[] = [];
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+      diag: (m) => diagMsgs.push(m),
+    });
+
+    // The prepare runner WAS invoked, with the npm prepare command (NOT rebuild).
+    expect(prep.calls).toHaveLength(1);
+    expect(prep.calls[0]!.cmd).toBe('npm');
+    expect(prep.calls[0]!.args).toEqual(['run', 'prepare', '--if-present', '--foreground-scripts']);
+    // The main install runner ran the install command.
+    expect(main_.calls).toHaveLength(1);
+    expect(main_.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // A final lockfile is emitted and contains BOTH passes' events (merged into
+    // the same collectingEmitter → collectedEvents → lockfile).
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    expect(yaml).toContain('MAINPROG');
+    expect(yaml).toContain('PREPPROG');
+
+    // A diag breadcrumb confirms the prepare pass fired.
+    expect(diagMsgs.some((m) => m.includes('prepare pass'))).toBe(true);
+  });
+
+  it('SKIPS the prepare pass when only strace is injected (no prepareStrace)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const diagMsgs: string[] = [];
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      // prepareStrace intentionally omitted → test seam skips the pass.
+      dnsLookup: offlineLookup,
+      diag: (m) => diagMsgs.push(m),
+    });
+
+    // Only the main install ran.
+    expect(main_.calls).toHaveLength(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    expect(yaml).toContain('MAINPROG');
+    expect(yaml).not.toContain('PREPPROG');
+
+    // No prepare-pass breadcrumb.
+    expect(diagMsgs.some((m) => m.includes('prepare pass'))).toBe(false);
+  });
+
+  it('SKIPS the prepare pass for pnpm even with prepareStrace (resolver returns null)', async () => {
+    const { conn, hostSend } = makeConn();
+    // pnpm config — root prepare already covered by `pnpm rebuild --pending`.
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    // resolvePrepareCommand('pnpm', …) → null, so the prepare runner is never
+    // invoked even though it was injected.
+    expect(prep.calls).toHaveLength(0);
+    expect(main_.calls).toHaveLength(1);
+  });
+
+  it('merges a prepare-pass tamper reason → fails closed at the tamper gate', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    // Prepare runner yields a POISONED shim-channel line (unparseable JSONL on
+    // the trusted channel). The prepare dispatcher's `setPhaseTamper` fires and
+    // surfaces the reason via `prepareResult.tamperReason`, which the agent
+    // MERGES into installResult.tamperReason → the 11b tamper gate fails closed.
+    // (A test fake's `getTamperReason()` would NOT flow through the merge — only
+    // the dispatcher-owned reason does — so we drive the real dispatcher path.)
+    const prepTamper: StraceRunner = {
+      async *run() {
+        yield { pid: 9001, line: 'not-json-at-all{', source: 'shim' as const };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return 9001; },
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prepTamper,
+        dnsLookup: offlineLookup,
+      });
+      // flushAndExit's callback fires one tick later.
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error frame, no final lockfile.
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toContain('audit pipeline tampered with');
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('fails closed on a prepare-RUNNER file-tamper surfaced via getTamperReason()', async () => {
+    // The PRODUCTION events-file tamper signal (unlink / inode-swap / mtime
+    // regression) is reported by the runner's `getTamperReason()`, NOT by the
+    // dispatcher's owned reason — and runInstallPhase's PhaseInstallResult only
+    // carries the dispatcher-owned reason.  The 11b gate consults the MAIN
+    // runner's getTamperReason(), but the PREPARE runner's is only reachable
+    // through the merge.  This asserts that merge folds it in (regression guard
+    // for the gap a clean lockfile would otherwise hide on a prepare-pass
+    // events-file tamper).
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prepFileTamper: StraceRunner = {
+      async *run() { /* zero dispatcher events; tamper is file-level */ },
+      getExitCode() { return 0; },
+      // Dispatcher-owned reason stays null; the file-tamper rides here.
+      getTamperReason() { return '<EVENTS_FILE_UNLINKED> prepare'; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return null; },
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prepFileTamper,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toContain('audit pipeline tampered with');
+    expect(String(fatal!['message'])).toContain('<EVENTS_FILE_UNLINKED>');
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('FAILS CLOSED (no lockfile) when the prepare events-file cannot be created (review #2)', async () => {
+    // The prepare pass must NEVER silently skip: skipping would render a final
+    // lock with the root `prepare` UNAUDITED while `check` mode could still
+    // return trusted.  `forcePreparePass` drives the production "build my own
+    // runner / events file" branch with an injected MAIN runner; the 2nd
+    // createEventsFile call (the prepare events file) throws → fatal, no lock.
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    const main_ = recordingEventStrace('MAINPROG');
+
+    let calls = 0;
+    const createEventsFileCounting = () => {
+      calls += 1;
+      if (calls === 1) return createEventsFile(); // main events file — real, so the main pass works
+      const err = new Error('ENOSPC: scratch full') as NodeJS.ErrnoException;
+      err.code = 'ENOSPC';
+      throw err; // prepare events file — fail
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        forcePreparePass: true, // drive the build-own-runner branch with an injected main runner
+        createEventsFile: createEventsFileCounting,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/root-prepare pass/);
+    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
+    // The main install ran, but NO final lockfile ships (fail closed).
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+});
+
 describe('buildChildEnv protected-env-names length gate', () => {
   // Audit-trust Finding 2 (2026-05-18): the Rust shim's `capture_canon`
   // copies SCRIPT_JAIL_PROTECTED_ENV_NAMES into a fixed-size CanonBuf

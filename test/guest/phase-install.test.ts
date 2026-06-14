@@ -225,6 +225,59 @@ describe('runInstallPhase', () => {
       });
       expect(callCount).toBe(1);
     });
+
+    it('commandOverride is honored: traces the override cmd/args, NOT INSTALL_CMD', async () => {
+      // The agent's root-prepare pass supplies a commandOverride so the SAME
+      // dispatch loop traces `npm run prepare …` instead of `npm rebuild …`.
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const strace: StraceRunner = {
+        async *run(cmd, args) { calls.push({ cmd, args }); },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(mockProcReader({})),
+        emitter,
+        commandOverride: { cmd: 'npm', args: ['run', 'prepare', '--if-present', '--foreground-scripts'] },
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.cmd).toBe('npm');
+      expect(calls[0]!.args).toEqual(['run', 'prepare', '--if-present', '--foreground-scripts']);
+      // Crucially NOT the install command.
+      expect(calls[0]!.args).not.toEqual(['rebuild', '--foreground-scripts']);
+    });
+
+    it('commandOverride still splices the pnpm store-dir (manager-keyed, not command-keyed)', async () => {
+      // pnpmStoreDirArg keys off `manager`, so even an override gets the pin
+      // when manager==='pnpm'. The resolver never returns a pnpm override in
+      // production, but the dispatch contract must stay consistent.
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const strace: StraceRunner = {
+        async *run(cmd, args) { calls.push({ cmd, args }); },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter } = makeEmitter();
+      await runInstallPhase({
+        manager: 'pnpm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(mockProcReader({})),
+        emitter,
+        commandOverride: { cmd: 'pnpm', args: ['run', 'prepare'] },
+      });
+      expect(calls[0]!.args).toEqual(['run', 'prepare', '--store-dir=/work/.pnpm-store']);
+    });
   });
 
   describe('strace line processing', () => {

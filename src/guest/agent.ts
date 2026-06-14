@@ -2697,6 +2697,26 @@ export interface AgentInput {
   /** Used for Phase B (install under strace). Defaults to LinuxStraceRunner. */
   strace?: StraceRunner;
   /**
+   * Optional runner for the SECOND Phase-B pass that audits the ROOT project's
+   * `prepare` script (npm `rebuild --foreground-scripts` / yarn `install
+   * --immutable` do NOT run a root `prepare`, so it would otherwise never be
+   * audited).  Production leaves this undefined and the agent constructs a
+   * fresh runner over a SEPARATE events file.  TEST SEAM: when `strace` is
+   * injected (tests) the prepare pass is SKIPPED unless `prepareStrace` is ALSO
+   * injected — keeping every existing test (which injects only `strace`)
+   * byte-for-byte unaffected.
+   */
+  prepareStrace?: StraceRunner;
+  /**
+   * TEST-ONLY seam.  Forces the prepare pass to run even when `strace` is
+   * injected and `prepareStrace` is NOT — i.e. it drives the agent down the
+   * "build my own prepare runner / events file" branch with an injected main
+   * runner, so the fail-closed path (prepare events-file creation failure ⇒
+   * fatal, no lockfile) can be exercised without a real strace.  Never set in
+   * production (the `strace === undefined` branch covers it there).
+   */
+  forcePreparePass?: boolean;
+  /**
    * Override for the running Node's version string.  Defaults to
    * `process.version` (e.g. "v20.11.0").  The leading "v" is stripped before
    * being written into the rendered lockfile so the field contains a plain
@@ -2828,6 +2848,56 @@ async function defaultDropEth0(spawner: Spawner, env: NodeJS.ProcessEnv): Promis
 function diag(input: AgentInput, msg: string): void {
   if (input.diag) input.diag(msg);
   else process.stderr.write(`[agent] ${msg}\n`);
+}
+
+/**
+ * Resolve the command for the second Phase-B pass that audits the ROOT
+ * project's `prepare` lifecycle script.
+ *
+ * Why this pass exists: the main Phase-B install command for npm
+ * (`npm rebuild --foreground-scripts`) and yarn-berry (`yarn install
+ * --immutable`) does NOT run the ROOT project's `prepare` script — only
+ * dependencies' lifecycle scripts.  A malicious root `prepare` would therefore
+ * escape the audit (and the diff gate) entirely.  pnpm's `pnpm rebuild
+ * --pending` DOES run the root `prepare` (confirmed), so pnpm needs no second
+ * pass → returns `null`.
+ *
+ * Per manager:
+ *   - npm  → `npm run prepare --if-present --foreground-scripts`.  `--if-present`
+ *            makes it a clean exit-0 no-op when no `prepare` script exists, so we
+ *            don't need to read package.json first.
+ *   - yarn → yarn-berry has NO `--if-present`; `yarn run prepare` exits 1 when
+ *            there is no `prepare` script, which would be a wasted (and
+ *            confusingly nonzero) pass.  So we READ `${cwd}/package.json` and
+ *            only return a command when `scripts.prepare` is a non-empty string.
+ *            Any read/parse error → `null` (skip).
+ *   - pnpm → `null` (already covered by `pnpm rebuild --pending`).
+ *
+ * Returns `null` when no prepare pass should run.
+ */
+export function resolvePrepareCommand(
+  manager: 'npm' | 'pnpm' | 'yarn',
+  cwd: string,
+): { cmd: string; args: string[] } | null {
+  if (manager === 'npm') {
+    return { cmd: 'npm', args: ['run', 'prepare', '--if-present', '--foreground-scripts'] };
+  }
+  if (manager === 'yarn') {
+    try {
+      const pkgRaw = readFileSync(joinPath(cwd, 'package.json'), 'utf8');
+      const pkg = JSON.parse(pkgRaw) as { scripts?: Record<string, unknown> };
+      const prepare = pkg.scripts?.['prepare'];
+      if (typeof prepare === 'string' && prepare.length > 0) {
+        return { cmd: 'yarn', args: ['run', 'prepare'] };
+      }
+    } catch {
+      // No package.json, unreadable, or malformed JSON → skip the prepare pass.
+      return null;
+    }
+    return null;
+  }
+  // pnpm: `pnpm rebuild --pending` already runs the root prepare.
+  return null;
 }
 
 /**
@@ -3361,6 +3431,135 @@ export async function main(input: AgentInput): Promise<void> {
     );
   }
 
+  // 11a. PREPARE PASS.  The main Phase-B install (`npm rebuild
+  //      --foreground-scripts` / `yarn install --immutable`) does NOT run the
+  //      ROOT project's `prepare` script — only dependencies' lifecycle
+  //      scripts.  A malicious root `prepare` would otherwise escape the audit
+  //      entirely.  pnpm's `pnpm rebuild --pending` DOES run the root prepare,
+  //      so resolvePrepareCommand returns null for it (pass skipped).
+  //
+  //      This is a SECOND `runInstallPhase`/`runInstallPhaseMacos` pass — we
+  //      reuse the whole security-critical dispatch loop (per-pid bypass
+  //      detection, events-file forgery, synthesis) verbatim via the
+  //      `commandOverride` seam rather than duplicating it.  Its events land
+  //      in the SAME `collectingEmitter` → `collectedEvents` → the lockfile,
+  //      and its tamper signal is MERGED into installResult below so the
+  //      tamper gate at 11b still fails closed on a tampering prepare.
+  //
+  //      The pass needs its OWN events file: a fresh runner over the SHARED
+  //      main events file would re-read from offset 0 and DOUBLE-EMIT every
+  //      main event.
+  //
+  //      TEST SEAM: when `input.strace` was injected (tests) we only run the
+  //      prepare pass if `input.prepareStrace` was ALSO injected.  Every
+  //      existing test injects only `input.strace`, so this keeps them
+  //      byte-for-byte unaffected (no prepare pass, no golden drift).
+  const prepareCommand = resolvePrepareCommand(manager, config.work_dir);
+  // Run the prepare pass when a command is resolved AND we have (or can build)
+  // a runner.  TEST SEAM: the existing suite injects only `input.strace`; those
+  // tests must neither run a prepare pass NOR fail closed, so we run only when a
+  // prepare runner was injected (`input.prepareStrace`), or we are in production
+  // (`input.strace === undefined`), or a test explicitly opts in
+  // (`input.forcePreparePass`, used purely to exercise the fail-closed path).
+  if (
+    prepareCommand !== null &&
+    (input.prepareStrace !== undefined ||
+      input.strace === undefined ||
+      input.forcePreparePass === true)
+  ) {
+    diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(' ')}`);
+    // Obtain the prepare runner and its audit sink.  An injected runner owns
+    // its own sink; otherwise build a fresh runner over a SEPARATE events file
+    // — a fresh runner over the SHARED main events file would re-read from
+    // offset 0 and DOUBLE-EMIT every main event.
+    let prepareRunner: StraceRunner;
+    let prepareEventsFilePath = eventsFilePath;
+    if (input.prepareStrace !== undefined) {
+      prepareRunner = input.prepareStrace;
+    } else {
+      // FAIL CLOSED when the prepare events file cannot be created.  Silently
+      // skipping (the earlier draft) would render a final lock with the root
+      // `prepare` UNAUDITED, yet `check` mode could still return `trusted` if
+      // that lock matched a committed one produced under the same degraded
+      // condition (Codex review #2).  Same fatal posture as the MAIN events
+      // file (section 4): an unaudited lifecycle stage must never ship.
+      let pf: EventsFile;
+      try {
+        pf = makeEventsFile();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        emitter.emitError(
+          'script-jail agent: failed to create the audit-events file for the ' +
+            `root-prepare pass — ${reason}. Refusing to emit a lockfile: the ` +
+            'root `prepare` script would otherwise run UNAUDITED and a clean ' +
+            'diff against it would be untrustworthy.',
+          true,
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+      prepareEventsFilePath = pf.path;
+      prepareRunner = isMacosBare
+        ? new MacOSInstallRunner(undefined, pf)
+        : new LinuxStraceRunner(
+            undefined,
+            pf,
+            (s) => redactSensitive(s, config.protected.env),
+            stdoutTailBytes,
+          );
+    }
+    // Point the prepare child's audit sink at the events file the runner uses.
+    const prepareChildEnv = isMacosBare
+      ? buildChildEnvMacos(process.env, config, prepareEventsFilePath, input.preloadPaths)
+      : buildChildEnv(process.env, config, prepareEventsFilePath, input.preloadPaths);
+    const prepareEnv = isMacosBare
+      ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: '1' }
+      : prepareChildEnv;
+    const prepareInput = {
+      manager,
+      cwd: config.work_dir,
+      env: prepareEnv,
+      strace: prepareRunner,
+      attribution,
+      emitter: collectingEmitter,
+      // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
+      // the main install's files on the scratch disk.
+      straceBasePath: `${straceBaseDir}/strace-prepare.out`,
+      protectedPaths,
+      commandOverride: prepareCommand,
+    };
+    const prepareResult = isMacosBare
+      ? await runInstallPhaseMacos(prepareInput)
+      : await runInstallPhase(prepareInput);
+    diag(
+      input,
+      `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`,
+    );
+    // MERGE.  No separate fail-closed for the prepare pass: a prepare that
+    // fails offline but produced events is audit data, and a prepare that
+    // exits nonzero with zero events must NOT fail the audit since the main
+    // install was fine.  We fold the prepare's eventCount and tamperReason
+    // into installResult so the tamper gate (11b) sees a tampering prepare and
+    // fails closed; installResult.exitCode is left untouched.
+    //
+    // TWO tamper sources, exactly mirroring what 11b does for the MAIN runner
+    // (`installResult.tamperReason ?? straceRunner.getTamperReason()`):
+    //   - `prepareResult.tamperReason` — the prepare DISPATCHER's owned reason
+    //     (shim-channel parse failure / bad LineSource).
+    //   - `prepareRunner.getTamperReason()` — the prepare RUNNER's events-file
+    //     tamper (unlink / inode-swap / mtime regression on the prepare events
+    //     file).  Critically, 11b only consults the MAIN `straceRunner`, never
+    //     the prepare runner — so without folding it in here a file-tamper on
+    //     the prepare pass's own events file would NOT fail closed.  First-
+    //     non-null wins (preserve the earliest, most specific reason).
+    installResult.eventCount += prepareResult.eventCount;
+    const prepareTamper =
+      prepareResult.tamperReason ?? prepareRunner.getTamperReason();
+    if (installResult.tamperReason === null) {
+      installResult.tamperReason = prepareTamper;
+    }
+  }
+
   // 11b. Events-file tamper check (Findings A + B): the tailer baseline-
   //      stats the SCRIPT_JAIL_LOG_FILE path on every drain cycle and records
   //      any anomaly (unlink, inode mismatch, truncate, EACCES, parent-dir
@@ -3426,6 +3625,29 @@ export async function main(input: AgentInput): Promise<void> {
   const pkgDirs = new Map<string, string>(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
 
+  // The ROOT project is not in node_modules, so discoverPkgDirs never maps it.
+  // Its lifecycle events attribute to `<rootName>@<rootVersion>` (or bare
+  // `<rootName>` when npm sets no version): root pre/install/postinstall from
+  // the MAIN install pass, and root `prepare` from the prepare pass.  We do NOT
+  // register the root as a pkgDir — mapping it to work_dir would make the WHOLE
+  // repo $PKG, dropping every root write into the repo as intra-package (hiding
+  // the audited behaviour) and letting a dependency forge `npm_package_name=
+  // <root>` to write anywhere under the repo with the write silently dropped
+  // (Codex review #1).  Instead we pass the root keys to normalize as
+  // `rootPkgKeys`, which tokenizes the root's fs events against $REPO/
+  // $NODE_MODULES and SURFACES them (external_reads / escaped_writes) instead of
+  // throwing on the missing pkgDir.  Keys MUST match attribution's buildPkg().
+  const rootPkgKeys = new Set<string>();
+  try {
+    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as { name?: unknown; version?: unknown };
+    if (typeof rootManifest.name === 'string' && rootManifest.name.length > 0) {
+      rootPkgKeys.add(rootManifest.name);
+      if (typeof rootManifest.version === 'string') {
+        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
+      }
+    }
+  } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+
   // 12. Normalize + render
   //
   // On macOS-bare the normalize pass MUST run with `os: 'darwin'` so the
@@ -3435,8 +3657,8 @@ export async function main(input: AgentInput): Promise<void> {
   // that never reconcile against the Linux-produced committed lock.  The Linux
   // path keeps the default (`os` undefined → 'linux').
   const ctx: NormalizeContext = isMacosBare
-    ? { roots, pkgDirs, os: 'darwin' }
-    : { roots, pkgDirs };
+    ? { roots, pkgDirs, rootPkgKeys, os: 'darwin' }
+    : { roots, pkgDirs, rootPkgKeys };
 
   let yaml: string;
   try {

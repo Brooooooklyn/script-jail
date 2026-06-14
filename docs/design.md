@@ -189,6 +189,26 @@ captured — `strace` parses the `connect()` sockaddr, never a DNS name — so t
 warning notes the host may resolve a different address. It is a directional
 heads-up that egress *will* happen, not an exact preview of where.
 
+**Accepted residual — the root `prepare` is audited but not run on the host.**
+The sandbox runs a dedicated second audited pass for the *root* project's
+`prepare` script (`npm rebuild --foreground-scripts` and yarn-berry
+`install --immutable` never run a root `prepare`), so its reads/writes/egress
+*are* recorded in the lock. But host part 2 runs only `INSTALL_CMD[pm]`
+(`npm rebuild` / `pnpm rebuild --pending` / `yarn install --immutable`) — it
+does **not** run the root `prepare`. The asymmetry is deliberate: the host drop-in
+install is for consuming a project's dependencies safely, not for building the
+project itself. Two consequences follow:
+
+- For a project whose root `prepare` generates build output (e.g. compiling
+  `dist/`), `install: true` does **not** produce that output on the host — it is
+  **not** a full `npm install` / `yarn install` for the root package. Run your
+  build step separately after the Action.
+- The egress warning above may list `network_attempts` that came from the
+  root-`prepare` audit pass. Those connects will **not** fire during host part 2,
+  because the root `prepare` does not run there. The warning still surfaces them
+  for review (they describe behaviour the lock captured), but for the root
+  `prepare` specifically the "will happen on the host" framing does not apply.
+
 ### Layered Observation
 
 No single layer sees everything:

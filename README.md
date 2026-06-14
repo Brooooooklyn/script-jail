@@ -110,6 +110,14 @@ Then your build steps can use `node_modules` directly — no second `install` st
   and passed to the package manager directly — never through a shell. Flags that
   would re-enable scripts in step 1 (`--no-ignore-scripts`, yarn `--mode`, …) are
   dropped with a warning.
+- The Action **audits** your root project's `prepare` script in the sandbox but
+  does **not run it on the runner** in step 3 (it runs only `rebuild`/`install
+  --immutable`, which never invoke a root `prepare`). So `install: true` is a
+  drop-in replacement for installing your **dependencies**, not a full build of
+  your **own** package: if your root `prepare` generates build output (compiling
+  `dist/`, etc.), run your build step separately afterwards. Any
+  `network_attempts` the warning lists that originate from the root `prepare`
+  pass will **not** fire on the runner.
 
 > **Security note.** Step 3 runs the lifecycle scripts **on the runner with the
 > network on** (real postinstalls fetch prebuilt binaries, so this is
