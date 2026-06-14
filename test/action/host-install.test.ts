@@ -73,11 +73,15 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
-  it('drops script-re-enabling args and warns about each', () => {
+  it('drops script-re-enabling args and warns using the canonical flag name (not raw user text)', () => {
     const rec = makeRecorder();
     hostInstallNoScripts('npm', '/repo', ['--no-ignore-scripts', '-D'], rec.io, okSpawn(rec));
     expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts', '-D']);
-    expect(rec.warns.join('\n')).toMatch(/--no-ignore-scripts/);
+    // Warning must name the canonical flag (safe constant), NOT the raw user token.
+    const warn = rec.warns.join('\n');
+    expect(warn).toMatch(/--ignore-scripts/);
+    // Raw user token must NOT appear in the warning.
+    expect(warn).not.toContain('--no-ignore-scripts');
   });
 
   it('drops the SPLIT boolean re-enabler `--ignore-scripts false` WITH its value token', () => {
@@ -142,6 +146,107 @@ describe('hostInstallNoScripts (part 1)', () => {
     hostInstallNoScripts('npm', '/repo', [], rec.io, okSpawn(rec));
     const logged = rec.out.join('');
     expect(logged).not.toContain('user install arg');
+  });
+
+  // ── Surface #6a: runOrThrow error messages must not leak argv credentials ──
+
+  it('#6a: non-zero exit error does not contain credential-shaped user args', () => {
+    const credArg = '--//registry.npmjs.org/:_authToken=SECRET123';
+    const rec = makeRecorder();
+    const failSpawn: HostSpawn = (cmd, args, cwd) => {
+      rec.calls.push({ cmd, args, cwd });
+      return { status: 1 };
+    };
+    let thrown: Error | undefined;
+    try {
+      hostInstallNoScripts('npm', '/repo', [credArg], rec.io, failSpawn);
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown).toBeDefined();
+    // Error must mention command + exit code (useful for diagnosis).
+    expect(thrown!.message).toMatch(/exited with code 1/);
+    expect(thrown!.message).toMatch(/npm/);
+    // Secret must NOT appear in the error message.
+    expect(thrown!.message).not.toContain('SECRET123');
+    expect(thrown!.message).not.toContain(credArg);
+    // Spawn still received the full real argv including the credential.
+    expect(rec.calls[0]!.args).toContain(credArg);
+  });
+
+  it('#6a: signal-killed error does not contain credential-shaped user args', () => {
+    const credArg = '--registry=https://user:SECRET_PASS@private.registry.example/';
+    const rec = makeRecorder();
+    const sigSpawn: HostSpawn = (cmd, args, cwd) => {
+      rec.calls.push({ cmd, args, cwd });
+      return { status: null, signal: 'SIGKILL' };
+    };
+    let thrown: Error | undefined;
+    try {
+      hostInstallNoScripts('npm', '/repo', [credArg], rec.io, sigSpawn);
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown).toBeDefined();
+    // Error must mention signal (useful for diagnosis).
+    expect(thrown!.message).toMatch(/killed by SIGKILL/);
+    // Secret must NOT appear in the error message.
+    expect(thrown!.message).not.toContain('SECRET_PASS');
+    expect(thrown!.message).not.toContain(credArg);
+    // Spawn still received the full real argv including the credential.
+    expect(rec.calls[0]!.args).toContain(credArg);
+  });
+
+  // ── Surface #6b: dropped-arg warnings must not echo raw user tokens ──
+
+  it('#6b: dropped joined flag with embedded secret does not appear in warnings', () => {
+    // A user could supply --ignore-scripts=SECRET456 as an attempt to re-enable
+    // scripts.  It is forbidden and dropped — but its raw text must not be logged.
+    const rec = makeRecorder();
+    hostInstallNoScripts('npm', '/repo', ['--ignore-scripts=SECRET456', '-D'], rec.io, okSpawn(rec));
+    const warn = rec.warns.join('\n');
+    // Secret must NOT appear in the warning.
+    expect(warn).not.toContain('SECRET456');
+    expect(warn).not.toContain('--ignore-scripts=SECRET456');
+    // The canonical flag name (safe constant) IS mentioned.
+    expect(warn).toMatch(/--ignore-scripts/);
+    // The arg count is emitted.
+    expect(warn).toMatch(/1 install arg/);
+  });
+
+  it('#6b: dropped bare flag + value token — value does not appear in warnings', () => {
+    // `--ignore-scripts false` causes the value token "false" to be consumed.
+    // That value slot could theoretically carry user-controlled text; verify it
+    // is not echoed.
+    const rec = makeRecorder();
+    hostInstallNoScripts('npm', '/repo', ['--ignore-scripts', 'false', '-D'], rec.io, okSpawn(rec));
+    const warn = rec.warns.join('\n');
+    // The raw value token must NOT appear in the warning.
+    expect(warn).not.toContain('"false"');
+    // Two raw tokens are dropped (flag + value); count reflects that.
+    expect(warn).toMatch(/2 install args/);
+    // The canonical flag name is still shown.
+    expect(warn).toMatch(/--ignore-scripts/);
+  });
+
+  it('#6b: warns once (combined) for multiple dropped groups', () => {
+    // Two separate forbidden flags: one joined, one bare+value.
+    const rec = makeRecorder();
+    hostInstallNoScripts(
+      'yarn', '/repo',
+      ['--no-ignore-scripts', '--mode', 'update-lockfile', '-P'],
+      rec.io, okSpawn(rec),
+    );
+    // Should produce exactly one warning (combined, not one per token).
+    expect(rec.warns).toHaveLength(1);
+    const warn = rec.warns[0]!;
+    // Both canonical keys should appear.
+    expect(warn).toMatch(/--ignore-scripts/);
+    expect(warn).toMatch(/--mode/);
+    // Raw user value "update-lockfile" must NOT appear.
+    expect(warn).not.toContain('update-lockfile');
+    // Total raw token count: 3 (--no-ignore-scripts, --mode, update-lockfile).
+    expect(warn).toMatch(/3 install args/);
   });
 });
 

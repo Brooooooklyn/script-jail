@@ -67,11 +67,17 @@ export function hostInstallNoScripts(
   io: HostInstallIo,
   spawn: HostSpawn = defaultSpawn,
 ): void {
-  const { kept, dropped } = sanitizeInstallArgs(args);
-  for (const d of dropped) {
+  const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
+  // SECURITY: never log raw `dropped` tokens — they may carry credential values
+  // (e.g. `--ignore-scripts=SECRET`).  Log only the canonical flag names
+  // (droppedKeys) which are well-known constants, never user-supplied text.
+  if (droppedKeys.length > 0) {
+    const n = dropped.length; // raw token count (flag + consumed value tokens)
+    const keys = droppedKeys.join(', ');
     io.warn(
-      `script-jail: ignoring install arg "${d}" — it would re-enable lifecycle ` +
-        `scripts in the no-scripts install (the sandbox is the only place scripts run unaudited).`,
+      `script-jail: ignoring ${n} install arg${n === 1 ? '' : 's'} matching ${keys} — ` +
+        `it would re-enable lifecycle scripts in the no-scripts install ` +
+        `(the sandbox is the only place scripts run unaudited).`,
     );
   }
   const base = FETCH_CMD[pm];
@@ -79,15 +85,23 @@ export function hostInstallNoScripts(
   // The pnpm `--store-dir` pin is appended last so the host links against the
   // same repo-local store the audited sandbox used (see pnpmStoreDirArg).
   const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir)];
-  const safeArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir)];
+  // SECURITY: safeDisplayArgs is used for the banner AND error messages.  It
+  // contains ONLY the fixed base args + store-dir (no user-supplied tokens).
+  // A count-only suffix documents that user args exist without echoing them.
+  const safeBaseArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir)];
   const userArgSuffix =
     kept.length > 0
       ? ` (+${kept.length} user install arg${kept.length === 1 ? '' : 's'}, not shown)`
       : '';
   io.stdout.write(
-    `[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${safeArgs.join(' ')}${userArgSuffix}\n`,
+    `[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${safeBaseArgs.join(' ')}${userArgSuffix}\n`,
   );
-  runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io);
+  // Pass safeBaseArgs (without user tokens) as displayArgs so that error
+  // messages (signal / non-zero exit) never expose credentials.
+  const safeDisplayArgs = kept.length > 0
+    ? [...safeBaseArgs, `(+${kept.length} user install arg${kept.length === 1 ? '' : 's'}, not shown)`]
+    : safeBaseArgs;
+  runOrThrow(base.cmd, finalArgs, repoDir, spawn, 'no-scripts install', io, safeDisplayArgs);
 }
 
 /**
@@ -105,9 +119,24 @@ export function hostRunScripts(
   // against the repo-local store, not the runner default (parity).
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
-  runOrThrow(cmd.cmd, finalArgs, repoDir, spawn, 'lifecycle-script run', io);
+  // hostRunScripts has no user args — finalArgs is credential-free, safe as displayArgs.
+  runOrThrow(cmd.cmd, finalArgs, repoDir, spawn, 'lifecycle-script run', io, finalArgs);
 }
 
+/**
+ * Spawn `cmd args` in `cwd` and throw a descriptive error on failure.
+ *
+ * SECURITY: error messages MUST NOT interpolate the real `args` when the caller
+ * passes user-controlled tokens (e.g. registry auth tokens).  Instead the caller
+ * supplies a separate `displayArgs` whose text is safe to expose in the GitHub
+ * Actions log.  The real `args` are passed to `spawn` unchanged — only the
+ * human-readable error messages use `displayArgs`.
+ *
+ * `displayArgs` MUST be set to a credential-free representation.  For
+ * `hostInstallNoScripts` that means the fixed base args + a count-only suffix
+ * for any user args; for `hostRunScripts` (no user args) it is identical to
+ * `args`.
+ */
 function runOrThrow(
   cmd: string,
   args: string[],
@@ -115,17 +144,21 @@ function runOrThrow(
   spawn: HostSpawn,
   label: string,
   io: HostInstallIo,
+  displayArgs: string[],
 ): void {
   const r = spawn(cmd, args, cwd);
   if (r.error !== undefined) {
+    // spawn-level failure: never had an argv in a shell — no leak path here.
     throw new Error(`script-jail: host ${label} could not spawn "${cmd}": ${r.error.message}`);
   }
   if (r.signal != null) {
-    throw new Error(`script-jail: host ${label} (\`${cmd} ${args.join(' ')}\`) was killed by ${r.signal}`);
+    // Use displayArgs (safe), NOT args (may contain credentials).
+    throw new Error(`script-jail: host ${label} (\`${cmd} ${displayArgs.join(' ')}\`) was killed by ${r.signal}`);
   }
   if (r.status !== 0) {
+    // Use displayArgs (safe), NOT args (may contain credentials).
     throw new Error(
-      `script-jail: host ${label} (\`${cmd} ${args.join(' ')}\`) exited with code ${r.status ?? 'null'}`,
+      `script-jail: host ${label} (\`${cmd} ${displayArgs.join(' ')}\`) exited with code ${r.status ?? 'null'}`,
     );
   }
   io.stdout.write(`[script-jail] host ${label} complete\n`);

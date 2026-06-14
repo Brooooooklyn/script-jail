@@ -46,6 +46,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['-D', '--omit=dev', '--prod'])).toEqual({
       kept: ['-D', '--omit=dev', '--prod'],
       dropped: [],
+      droppedKeys: [],
     });
   });
 
@@ -74,6 +75,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['--ignore-scripts', 'false', '-D'])).toEqual({
       kept: ['-D'],
       dropped: ['--ignore-scripts', 'false'],
+      droppedKeys: ['--ignore-scripts'],
     });
   });
 
@@ -84,14 +86,17 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['-ignore-scripts=false', '-D'])).toEqual({
       kept: ['-D'],
       dropped: ['-ignore-scripts=false'],
+      droppedKeys: ['--ignore-scripts'],
     });
     expect(sanitizeInstallArgs(['-ignore-scripts', 'false', '-D'])).toEqual({
       kept: ['-D'],
       dropped: ['-ignore-scripts', 'false'],
+      droppedKeys: ['--ignore-scripts'],
     });
     expect(sanitizeInstallArgs(['-no-ignore-scripts', '-D'])).toEqual({
       kept: ['-D'],
       dropped: ['-no-ignore-scripts'],
+      droppedKeys: ['--ignore-scripts'],
     });
     // Triple-dash (and a single-dash yarn --mode) are over-matched on purpose —
     // dropping MORE is the safe direction.
@@ -101,6 +106,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['-mode', 'update-lockfile', '-P'])).toEqual({
       kept: ['-P'],
       dropped: ['-mode', 'update-lockfile'],
+      droppedKeys: ['--mode'],
     });
   });
 
@@ -117,6 +123,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['--ignore-script', 'false', '-D'])).toEqual({
       kept: ['-D'],
       dropped: ['--ignore-script', 'false'],
+      droppedKeys: ['--ignore-scripts'],
     });
   });
 
@@ -150,6 +157,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['--config.ignore-scripts', 'false', '-P'])).toEqual({
       kept: ['-P'],
       dropped: ['--config.ignore-scripts', 'false'],
+      droppedKeys: ['--ignore-scripts'],
     });
   });
 
@@ -160,6 +168,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['--config.ignore.scripts', 'false', '-P'])).toEqual({
       kept: ['-P'],
       dropped: ['--config.ignore.scripts', 'false'],
+      droppedKeys: ['--ignore-scripts'],
     });
     // A legit dotted pnpm config that is NOT a script control survives.
     expect(sanitizeInstallArgs(['--config.store-dir=/tmp/x']).kept).toEqual([
@@ -171,6 +180,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['--ignore-scripts', '--omit=dev'])).toEqual({
       kept: ['--omit=dev'],
       dropped: ['--ignore-scripts'],
+      droppedKeys: ['--ignore-scripts'],
     });
   });
 
@@ -178,6 +188,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['--mode=update-lockfile', '-P'])).toEqual({
       kept: ['-P'],
       dropped: ['--mode=update-lockfile'],
+      droppedKeys: ['--mode'],
     });
   });
 
@@ -185,6 +196,7 @@ describe('sanitizeInstallArgs', () => {
     expect(sanitizeInstallArgs(['--mode', 'update-lockfile', '--prod'])).toEqual({
       kept: ['--prod'],
       dropped: ['--mode', 'update-lockfile'],
+      droppedKeys: ['--mode'],
     });
   });
 });

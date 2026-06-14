@@ -176,25 +176,44 @@ function isForbiddenFlag(token: string): boolean {
 export function sanitizeInstallArgs(args: ReadonlyArray<string>): {
   kept: string[];
   dropped: string[];
+  /** Canonical option names (e.g. "ignore-scripts", "mode") for each DROP
+   *  GROUP.  One entry per LOGICAL drop: a bare flag + its consumed value token
+   *  count as a single entry.  These are always well-known constants derived
+   *  from the flag grammar — never raw user-supplied text — so they are safe to
+   *  log without leaking credentials. */
+  droppedKeys: string[];
 } {
   const kept: string[] = [];
   const dropped: string[] = [];
+  const droppedKeys: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (isForbiddenFlag(a)) {
       dropped.push(a);
+      // Derive the SAFE canonical key for this drop group.  canonicalFlagKey
+      // returns the separator-stripped lowercase option name (e.g. "ignorescripts"
+      // or an unambiguous prefix like "ignorescript").  Rehydrate to the
+      // conventional kebab display name so the warning is human-readable.
+      // Any prefix of "ignorescripts" (length ≥2) resolves to --ignore-scripts.
+      const rawKey = canonicalFlagKey(a) ?? 'unknown';
+      const displayKey = 'ignorescripts'.startsWith(rawKey) && rawKey.length >= 2
+        ? 'ignore-scripts'
+        : rawKey;
+      droppedKeys.push(`--${displayKey}`);
       // Bare form (no `=value`): the package manager would consume the NEXT
       // token as the value (`--ignore-scripts false`, `--mode update-lockfile`).
       // Drop that value token too so a re-enabling value — or a dangling
       // positional — can never reach the argv.
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1]!.startsWith('-')) {
         dropped.push(args[++i]!);
+        // The consumed value belongs to the same logical drop group — do NOT
+        // add a second droppedKeys entry; the flag key already names the reason.
       }
       continue;
     }
     kept.push(a);
   }
-  return { kept, dropped };
+  return { kept, dropped, droppedKeys };
 }
 
 /**
