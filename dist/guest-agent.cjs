@@ -25115,6 +25115,19 @@ function isCanonicalStage(s) {
 function buildPkg(name, version2) {
   return version2 !== void 0 ? `${name}@${version2}` : name;
 }
+function buildRootPkgKeys(manifest) {
+  const keys = /* @__PURE__ */ new Set();
+  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+    return { keys, canonical: null };
+  }
+  const name = manifest.name;
+  keys.add(name);
+  if (typeof manifest.version === "string") {
+    keys.add(`${name}@${manifest.version}`);
+    return { keys, canonical: `${name}@${manifest.version}` };
+  }
+  return { keys, canonical: name };
+}
 function attributionFromEnvVars(name, version2, event) {
   if (name !== void 0 && name.length > 0 && event !== void 0 && isCanonicalStage(event)) {
     return { pkg: buildPkg(name, version2), lifecycle: event };
@@ -26332,11 +26345,19 @@ async function runInstallPhase(input) {
     if (phaseTamperReason === null) phaseTamperReason = reason;
     input.strace.recordTamper(reason);
   };
-  const emit = (ev) => {
+  const emitFinal = (ev) => {
     const filtered = applyProtectedPathsPolicy(ev, matcher);
     if (filtered === null) return;
     input.emitter.emitEvent(filtered);
     eventCount++;
+  };
+  const deferredRootFsEvents = [];
+  const emit = (ev) => {
+    if (input.rootPkgKeys !== void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write") && input.rootPkgKeys.has(ev.pkg) && ev.raw.root_anchored === void 0) {
+      deferredRootFsEvents.push(ev);
+      return;
+    }
+    emitFinal(ev);
   };
   const straceExecsByPid = /* @__PURE__ */ new Map();
   const shimExecCountByPid = /* @__PURE__ */ new Map();
@@ -26767,6 +26788,7 @@ async function runInstallPhase(input) {
   const pidCwd = /* @__PURE__ */ new Map();
   const childParent = /* @__PURE__ */ new Map();
   const execCwd = /* @__PURE__ */ new Map();
+  const pendingExecCwd = /* @__PURE__ */ new Set();
   const pidCwdUnknown = /* @__PURE__ */ new Set();
   function cwdGet(pid) {
     return pidCwd.get(rootedCwd(pid));
@@ -26788,7 +26810,7 @@ async function runInstallPhase(input) {
   }
   function rootAnchored(pid) {
     const rootPid = installRootPid;
-    if (rootPid === null) return true;
+    if (rootPid === null) return false;
     return isRepoRootAnchored({
       pid,
       childParent,
@@ -27268,6 +27290,13 @@ async function runInstallPhase(input) {
               } else if (parentCwd !== void 0 && currentChildCwd === void 0) {
                 cwdSet(childPid, parentCwd);
               }
+            }
+            if (pendingExecCwd.has(childPid)) {
+              execCwd.set(
+                childPid,
+                cwdUnknownHas(childPid) ? null : cwdGet(childPid) ?? null
+              );
+              pendingExecCwd.delete(childPid);
             }
             if (cloneFiles && !childHadPendingFdDetach) {
               unionFd(pid, childPid);
@@ -27917,10 +27946,16 @@ async function runInstallPhase(input) {
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
           if (!execCwd.has(rawEvent.pid)) {
-            execCwd.set(
-              rawEvent.pid,
-              cwdUnknownHas(rawEvent.pid) ? null : cwdGet(rawEvent.pid) ?? null
-            );
+            if (cwdUnknownHas(rawEvent.pid)) {
+              execCwd.set(rawEvent.pid, null);
+            } else {
+              const cwd = cwdGet(rawEvent.pid);
+              if (cwd !== void 0) {
+                execCwd.set(rawEvent.pid, cwd);
+              } else {
+                pendingExecCwd.add(rawEvent.pid);
+              }
+            }
           }
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
@@ -28101,11 +28136,9 @@ async function runInstallPhase(input) {
           if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
             continue;
           }
-          const isRootAttributed = input.rootPkgKeys?.has(result.pkg) === true;
           const resolved = {
             ...rawEvent,
-            path: canonical,
-            ...isRootAttributed ? { root_anchored: rootAnchored(rawEvent.pid) } : {}
+            path: canonical
           };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
@@ -28204,6 +28237,19 @@ async function runInstallPhase(input) {
       lifecycle: sample.lifecycle
     });
   }
+  for (const pid of pendingExecCwd) execCwd.set(pid, null);
+  pendingExecCwd.clear();
+  for (const ev of deferredRootFsEvents) {
+    if (ev.raw.kind !== "read" && ev.raw.kind !== "write") {
+      emitFinal(ev);
+      continue;
+    }
+    emitFinal({
+      ...ev,
+      raw: { ...ev.raw, root_anchored: rootAnchored(ev.raw.pid) }
+    });
+  }
+  deferredRootFsEvents.length = 0;
   const exitCode = input.strace.getExitCode();
   const installStdoutTail = input.strace.getStdoutTail?.() ?? "";
   return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
@@ -30481,19 +30527,11 @@ ${fetchDetail}
     }
   }
   const collectedEvents = [];
-  const rootPkgKeys = /* @__PURE__ */ new Set();
+  let rootPkgKeys = /* @__PURE__ */ new Set();
   let canonicalRootKey = null;
   try {
     const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
-    if (typeof rootManifest.name === "string" && rootManifest.name.length > 0) {
-      rootPkgKeys.add(rootManifest.name);
-      if (typeof rootManifest.version === "string" && rootManifest.version.length > 0) {
-        rootPkgKeys.add(`${rootManifest.name}@${rootManifest.version}`);
-        canonicalRootKey = `${rootManifest.name}@${rootManifest.version}`;
-      } else {
-        canonicalRootKey = rootManifest.name;
-      }
-    }
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
   } catch {
   }
   const collectingEmitter = new Emitter(

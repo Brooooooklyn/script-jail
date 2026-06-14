@@ -44201,6 +44201,22 @@ async function runSelectedBackend(input) {
   );
 }
 
+// src/guest/attribution.ts
+var CANONICAL_STAGES = new Set(LifecycleStage.options);
+function buildRootPkgKeys(manifest) {
+  const keys = /* @__PURE__ */ new Set();
+  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+    return { keys, canonical: null };
+  }
+  const name = manifest.name;
+  keys.add(name);
+  if (typeof manifest.version === "string") {
+    keys.add(`${name}@${manifest.version}`);
+    return { keys, canonical: `${name}@${manifest.version}` };
+  }
+  return { keys, canonical: name };
+}
+
 // src/main.ts
 async function main(deps = {}) {
   const {
@@ -44323,17 +44339,12 @@ async function main(deps = {}) {
     if (result.trusted) {
       const egress = collectNetworkAttempts(result.generatedLock ?? "");
       if (egress.length > 0) {
-        const rootPackageIds = /* @__PURE__ */ new Set();
+        let rootPackageIds = /* @__PURE__ */ new Set();
         try {
           const rootManifest = JSON.parse(
             (0, import_node_fs16.readFileSync)((0, import_node_path12.join)(repoDir, "package.json"), "utf8")
           );
-          if (typeof rootManifest.name === "string" && rootManifest.name.length > 0) {
-            rootPackageIds.add(rootManifest.name);
-            if (typeof rootManifest.version === "string" && rootManifest.version.length > 0) {
-              rootPackageIds.add(`${rootManifest.name}@${rootManifest.version}`);
-            }
-          }
+          ({ keys: rootPackageIds } = buildRootPkgKeys(rootManifest));
         } catch {
         }
         const { summary: summary2, detail } = formatEgressWarning(egress, {
