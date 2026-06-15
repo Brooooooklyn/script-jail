@@ -25,6 +25,7 @@ import { dirname, basename, join as joinPath } from 'node:path';
 
 import { Attribution, buildRootPkgKeys } from './attribution.js';
 import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
+import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
@@ -3296,6 +3297,28 @@ export async function main(input: AgentInput): Promise<void> {
           nonEmpty(scripts.rebuild) ||
           nonEmpty(scripts.postrebuild)));
   } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+
+  // FAIL CLOSED — alternate root manifest (package.yaml / package.json5) with no
+  // package.json.  script-jail reads root identity + lifecycle scripts from
+  // package.json ONLY, but pnpm also reads them (and pnpm.configDependencies)
+  // from those alternates.  Such a repo would run its root lifecycle with
+  // npm_package_name UNSET (events DROPPED at the null-attribution gate, exactly
+  // the nameless-root class), yielding a deceptively CLEAN lock that `check`
+  // could later trust.  We have no JSON5 parser and being package.json-only is
+  // load-bearing throughout, so refuse to emit a lockfile (package.json shadows
+  // the alternates, so this only fires when there is genuinely no package.json).
+  const altRootManifest = unsupportedAltRootManifest(config.work_dir);
+  if (altRootManifest !== null) {
+    emitter.emitError(
+      `Root manifest is \`${altRootManifest}\` with no \`package.json\` — script-jail reads ` +
+        'root identity and lifecycle scripts from package.json only, so an alternate-manifest ' +
+        'root would run its lifecycle unaudited (events unattributable) and produce a ' +
+        'deceptively clean lock. Refusing to emit a lockfile (use a `package.json` root manifest).',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
 
   // Wrap the emitter to also collect events for normalize.
   const collectingEmitter = new Emitter(

@@ -97,6 +97,22 @@ describe('detectPreTrustConfigExec — pnpm', () => {
     expect(detectPreTrustConfigExec(dir, 'pnpm')).toBeNull();
   });
 
+  it('blocks a package.yaml root manifest with no package.json (pnpm 10 reads its pnpm config)', () => {
+    write('package.yaml', 'name: x\npnpm:\n  configDependencies:\n    cfg: "1.0.0+sha512-deadbeef"\n');
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/package\.yaml/);
+  });
+
+  it('blocks a package.json5 root manifest with no package.json', () => {
+    write('package.json5', '{ name: "x", /* json5 */ }');
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/package\.json5/);
+  });
+
+  it('does NOT block package.yaml when a package.json also exists (package.json shadows it)', () => {
+    write('package.json', '{"name":"x"}');
+    write('package.yaml', 'pnpm:\n  configDependencies:\n    cfg: "1.0.0+sha512-x"\n');
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toBeNull();
+  });
+
   it('returns null for a clean pnpm repo (lock + plain workspace, no hooks)', () => {
     write('package.json', '{"name":"x"}');
     write('pnpm-workspace.yaml', 'packages:\n  - "pkgs/*"\n');
@@ -130,6 +146,18 @@ describe('detectPreTrustConfigExec — yarn (Berry)', () => {
     write('.yarnrc.yml', 'enableConstraintsChecks: true\n');
     write('yarn.config.cjs', 'module.exports = {}');
     expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/enableConstraintsChecks/);
+  });
+
+  it.each(['1', "'1'", 'true', '"true"'])('blocks enableConstraintsChecks:%s (every yarn-enabling representation) with a yarn.config.cjs', (val) => {
+    write('.yarnrc.yml', `enableConstraintsChecks: ${val}\n`);
+    write('yarn.config.cjs', 'module.exports = {}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/enableConstraintsChecks/);
+  });
+
+  it.each(['false', '0', '"false"'])('does NOT block enableConstraintsChecks:%s (definitely false)', (val) => {
+    write('.yarnrc.yml', `enableConstraintsChecks: ${val}\n`);
+    write('yarn.config.cjs', 'module.exports = {}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
   });
 
   it('does NOT block enableConstraintsChecks:true without a yarn.config file (hook no-ops)', () => {

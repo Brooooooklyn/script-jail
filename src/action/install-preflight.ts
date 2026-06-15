@@ -41,6 +41,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
 import type { Manager } from '../shared/pm-commands.js';
+import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
 
 /**
  * Returns a human-readable reason string when `install: true` must be REFUSED
@@ -108,6 +109,20 @@ function detectPnpmfile(repoDir: string): string | null {
       }
     }
   }
+  // pnpm 10 also reads `pnpm.configDependencies` (and lifecycle scripts) from a
+  // `package.yaml` / `package.json5` root manifest when there is NO package.json
+  // — slipping the configDependencies fetch and the nameless-root lifecycle past
+  // the package.json-only checks above.  We do not parse those formats (no JSON5
+  // parser; parsing alone would not make the rest of the pipeline format-aware),
+  // so fail closed on that exact shape.  `install: true` needs a package.json we
+  // can fully reason about; the repo can still audit without `install`.
+  const altManifest = unsupportedAltRootManifest(repoDir);
+  if (altManifest !== null) {
+    return `a repo \`${altManifest}\` root manifest with no \`package.json\` (pnpm reads ` +
+      'its `pnpm.configDependencies` and lifecycle scripts, which script-jail cannot vet ' +
+      'pre-trust); `install: true` requires a `package.json`. Audit without `install`, ' +
+      'or convert the root manifest to `package.json`.';
+  }
   return null;
 }
 
@@ -135,11 +150,15 @@ function detectYarnStartupExec(repoDir: string): string | null {
   if (Array.isArray(parsed['plugins']) && parsed['plugins'].length > 0) {
     return 'a repo `.yarnrc.yml` `plugins` entry' + YARN_GUIDANCE;
   }
-  // `enableConstraintsChecks: true` runs `yarn.config.cjs`/`.js` via the
-  // install-time validate hook — only when that config file actually exists
-  // (without it the hook no-ops), so require both to avoid over-firing.
+  // `enableConstraintsChecks` runs `yarn.config.cjs`/`.js` via the install-time
+  // validate hook — only when that config file actually exists (without it the
+  // hook no-ops), so require both to avoid over-firing.  Yarn coerces several
+  // representations to enabled (true / "true" / 1 / "1"); rather than enumerate
+  // them, fail closed for ANYTHING that is not DEFINITELY false (matches yarn's
+  // own behavior, which throws on unrecognized values — refusing is the safe
+  // direction).
   if (
-    isTruthyYamlBool(parsed['enableConstraintsChecks']) &&
+    isNotDefinitelyFalse(parsed['enableConstraintsChecks']) &&
     (existsSync(join(repoDir, 'yarn.config.cjs')) || existsSync(join(repoDir, 'yarn.config.js')))
   ) {
     return 'a repo `.yarnrc.yml` `enableConstraintsChecks` with a `yarn.config.cjs`' + YARN_GUIDANCE;
@@ -160,9 +179,23 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** YAML boolean `true`, tolerating a quoted `"true"` string. */
-function isTruthyYamlBool(v: unknown): boolean {
-  return v === true || v === 'true';
+/**
+ * True unless the parsed value is one yarn DEFINITELY treats as false (or is
+ * absent).  Used so `enableConstraintsChecks` is rejected for every enabling
+ * representation yarn accepts (true / "true" / 1 / "1", and the values yarn
+ * errors on) without enumerating them — only an explicit false/0/empty/null
+ * disables the constraints hook.
+ */
+function isNotDefinitelyFalse(v: unknown): boolean {
+  return !(
+    v === false ||
+    v === 'false' ||
+    v === 0 ||
+    v === '0' ||
+    v === null ||
+    v === '' ||
+    v === undefined
+  );
 }
 
 /**

@@ -10368,7 +10368,7 @@ __export(agent_exports, {
   scratchBaseDir: () => scratchBaseDir
 });
 module.exports = __toCommonJS(agent_exports);
-var import_node_fs3 = require("node:fs");
+var import_node_fs4 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_readline2 = require("node:readline");
 var import_node_net = require("node:net");
@@ -24892,7 +24892,7 @@ function date4(params) {
 config(en_default());
 
 // src/guest/agent.ts
-var import_node_path4 = require("node:path");
+var import_node_path5 = require("node:path");
 
 // src/lock/schema.ts
 var LifecycleStage = external_exports.enum(["preinstall", "install", "postinstall", "prepare"]);
@@ -25240,8 +25240,20 @@ function deriveSensitiveValues(args) {
   return values;
 }
 
-// src/guest/proc-reader.ts
+// src/shared/root-manifest.ts
 var import_node_fs = require("node:fs");
+var import_node_path = require("node:path");
+var ALT_ROOT_MANIFESTS = ["package.yaml", "package.json5"];
+function unsupportedAltRootManifest(repoDir) {
+  if ((0, import_node_fs.existsSync)((0, import_node_path.join)(repoDir, "package.json"))) return null;
+  for (const name of ALT_ROOT_MANIFESTS) {
+    if ((0, import_node_fs.existsSync)((0, import_node_path.join)(repoDir, name))) return name;
+  }
+  return null;
+}
+
+// src/guest/proc-reader.ts
+var import_node_fs2 = require("node:fs");
 var LinuxProcReader = class {
   root;
   /**
@@ -25257,7 +25269,7 @@ var LinuxProcReader = class {
    */
   readPpid(pid) {
     try {
-      const text = (0, import_node_fs.readFileSync)(`${this.root}/${pid}/status`, "utf8");
+      const text = (0, import_node_fs2.readFileSync)(`${this.root}/${pid}/status`, "utf8");
       const match = text.match(/^PPid:\s*(\d+)/m);
       if (match === null) return null;
       const raw = match[1];
@@ -25277,7 +25289,7 @@ var LinuxProcReader = class {
    */
   readEnviron(pid) {
     try {
-      const buf = (0, import_node_fs.readFileSync)(`${this.root}/${pid}/environ`);
+      const buf = (0, import_node_fs2.readFileSync)(`${this.root}/${pid}/environ`);
       const text = buf.toString("utf8");
       const map2 = /* @__PURE__ */ new Map();
       for (const token of text.split("\0")) {
@@ -28291,7 +28303,7 @@ async function runInstallPhase(input) {
 }
 
 // src/guest/phase-install-macos.ts
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 function parseMacosShimLine(line) {
   let obj;
   try {
@@ -28321,12 +28333,12 @@ var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
 ]);
 function macosManagerLaunch(manager, subArgs) {
   const node = process.execPath;
-  const toolchainRoot = (0, import_node_path.dirname)((0, import_node_path.dirname)(node));
+  const toolchainRoot = (0, import_node_path2.dirname)((0, import_node_path2.dirname)(node));
   if (manager === "npm") {
-    const npmCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    const npmCli = (0, import_node_path2.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
     return { cmd: node, args: [npmCli, ...subArgs] };
   }
-  const corepackCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
+  const corepackCli = (0, import_node_path2.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
   return { cmd: node, args: [corepackCli, manager, ...subArgs] };
 }
 function buildMacosInstallCommand(manager, cwd, commandOverride) {
@@ -28684,7 +28696,7 @@ async function runInstallPhaseMacos(input) {
 
 // src/guest/macos-install-runner.ts
 var import_node_child_process2 = require("node:child_process");
-var import_node_path2 = require("node:path");
+var import_node_path3 = require("node:path");
 var import_node_readline = require("node:readline");
 var MacOSInstallRunner = class {
   _exitCode = 0;
@@ -28767,8 +28779,8 @@ var MacOSInstallRunner = class {
         resolve2();
       });
     });
-    const watchDir = (0, import_node_path2.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path2.basename)(opts.basePath);
+    const watchDir = (0, import_node_path3.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path3.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
@@ -29153,30 +29165,30 @@ function renderBlock(block) {
 }
 
 // src/guest/discover-pkg-dirs.ts
-var import_node_fs2 = require("node:fs");
-var import_node_path3 = require("node:path");
+var import_node_fs3 = require("node:fs");
+var import_node_path4 = require("node:path");
 function discoverPkgDirs(nodeModulesDir) {
   const result = /* @__PURE__ */ new Map();
   let entries;
   try {
-    entries = (0, import_node_fs2.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
+    entries = (0, import_node_fs3.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return result;
   }
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
-    const entryPath = (0, import_node_path3.join)(nodeModulesDir, entry.name);
+    const entryPath = (0, import_node_path4.join)(nodeModulesDir, entry.name);
     if (entry.name.startsWith("@")) {
       let scopeEntries;
       try {
-        scopeEntries = (0, import_node_fs2.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
+        scopeEntries = (0, import_node_fs3.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
       } catch {
         continue;
       }
       for (const scopeEntry of scopeEntries) {
         if (scopeEntry.name.startsWith(".")) continue;
         if (!scopeEntry.isDirectory() && !scopeEntry.isSymbolicLink()) continue;
-        const pkgPath = (0, import_node_path3.join)(entryPath, scopeEntry.name);
+        const pkgPath = (0, import_node_path4.join)(entryPath, scopeEntry.name);
         readAndRegister(pkgPath, result);
       }
     } else {
@@ -29184,22 +29196,22 @@ function discoverPkgDirs(nodeModulesDir) {
       readAndRegister(entryPath, result);
     }
   }
-  scanPnpmVirtualStore((0, import_node_path3.join)(nodeModulesDir, ".pnpm"), result);
+  scanPnpmVirtualStore((0, import_node_path4.join)(nodeModulesDir, ".pnpm"), result);
   return result;
 }
 function scanPnpmVirtualStore(pnpmDir, result) {
   let flatEntries;
   try {
-    flatEntries = (0, import_node_fs2.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
+    flatEntries = (0, import_node_fs3.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return;
   }
   for (const flat of flatEntries) {
     if (!flat.isDirectory()) continue;
-    const innerNm = (0, import_node_path3.join)(pnpmDir, flat.name, "node_modules");
+    const innerNm = (0, import_node_path4.join)(pnpmDir, flat.name, "node_modules");
     let innerEntries;
     try {
-      innerEntries = (0, import_node_fs2.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
+      innerEntries = (0, import_node_fs3.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
     } catch {
       continue;
     }
@@ -29207,29 +29219,29 @@ function scanPnpmVirtualStore(pnpmDir, result) {
       if (inner.name.startsWith(".")) continue;
       if (inner.isSymbolicLink() || !inner.isDirectory()) continue;
       if (inner.name.startsWith("@")) {
-        const scopeDir = (0, import_node_path3.join)(innerNm, inner.name);
+        const scopeDir = (0, import_node_path4.join)(innerNm, inner.name);
         let scopeEntries;
         try {
-          scopeEntries = (0, import_node_fs2.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
+          scopeEntries = (0, import_node_fs3.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
         } catch {
           continue;
         }
         for (const se of scopeEntries) {
           if (se.name.startsWith(".")) continue;
           if (se.isSymbolicLink() || !se.isDirectory()) continue;
-          readAndRegister((0, import_node_path3.join)(scopeDir, se.name), result);
+          readAndRegister((0, import_node_path4.join)(scopeDir, se.name), result);
         }
       } else {
-        readAndRegister((0, import_node_path3.join)(innerNm, inner.name), result);
+        readAndRegister((0, import_node_path4.join)(innerNm, inner.name), result);
       }
     }
   }
 }
 function readAndRegister(pkgPath, result) {
-  const manifestPath = (0, import_node_path3.join)(pkgPath, "package.json");
+  const manifestPath = (0, import_node_path4.join)(pkgPath, "package.json");
   let raw;
   try {
-    raw = (0, import_node_fs2.readFileSync)(manifestPath, "utf8");
+    raw = (0, import_node_fs3.readFileSync)(manifestPath, "utf8");
   } catch (err) {
     if (err.code !== "ENOENT") {
       process.stderr.write(
@@ -29445,7 +29457,7 @@ async function* runStraceTailer(opts) {
     const pos = filePos.get(name) ?? 0;
     let size = 0;
     try {
-      size = (0, import_node_fs3.statSync)(fullPath).size;
+      size = (0, import_node_fs4.statSync)(fullPath).size;
     } catch {
       return;
     }
@@ -29455,18 +29467,18 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs3.openSync)(fullPath, "r");
-      bytesRead = (0, import_node_fs3.readSync)(fd, buf, 0, toRead, pos);
+      fd = (0, import_node_fs4.openSync)(fullPath, "r");
+      bytesRead = (0, import_node_fs4.readSync)(fd, buf, 0, toRead, pos);
     } catch {
       if (fd >= 0) {
         try {
-          (0, import_node_fs3.closeSync)(fd);
+          (0, import_node_fs4.closeSync)(fd);
         } catch {
         }
       }
       return;
     }
-    (0, import_node_fs3.closeSync)(fd);
+    (0, import_node_fs4.closeSync)(fd);
     filePos.set(name, pos + bytesRead);
     const chunk = (fileBuf.get(name) ?? "") + buf.slice(0, bytesRead).toString("utf8");
     const newlineIdx = chunk.lastIndexOf("\n");
@@ -29487,7 +29499,7 @@ async function* runStraceTailer(opts) {
   function pollDir() {
     let entries;
     try {
-      entries = (0, import_node_fs3.readdirSync)(opts.watchDir);
+      entries = (0, import_node_fs4.readdirSync)(opts.watchDir);
     } catch {
       return;
     }
@@ -29517,7 +29529,7 @@ async function* runStraceTailer(opts) {
     if (path3 === void 0 || path3 === "") return;
     let stat;
     try {
-      stat = (0, import_node_fs3.statSync)(path3, { bigint: true });
+      stat = (0, import_node_fs4.statSync)(path3, { bigint: true });
     } catch (err) {
       const code = err.code;
       if (code === "ENOENT") {
@@ -29589,22 +29601,22 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs3.openSync)(path3, "r");
+      fd = (0, import_node_fs4.openSync)(path3, "r");
       if (baseline !== void 0) {
-        const fdStat = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+        const fdStat = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
         if (fdStat.ino !== baseline.ino || fdStat.dev !== baseline.dev) {
-          (0, import_node_fs3.closeSync)(fd);
+          (0, import_node_fs4.closeSync)(fd);
           recordTamper(
             `events file fd-stat mismatch on open (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${fdStat.dev} ino=${fdStat.ino}): ${path3}`
           );
           return;
         }
       }
-      bytesRead = (0, import_node_fs3.readSync)(fd, buf, 0, toRead, eventsPos);
+      bytesRead = (0, import_node_fs4.readSync)(fd, buf, 0, toRead, eventsPos);
     } catch (err) {
       if (fd >= 0) {
         try {
-          (0, import_node_fs3.closeSync)(fd);
+          (0, import_node_fs4.closeSync)(fd);
         } catch {
         }
       }
@@ -29614,7 +29626,7 @@ async function* runStraceTailer(opts) {
       }
       return;
     }
-    (0, import_node_fs3.closeSync)(fd);
+    (0, import_node_fs4.closeSync)(fd);
     eventsPos += bytesRead;
     lastConsumedCtime = ctimeBig;
     const chunk = eventsBuf + buf.slice(0, bytesRead).toString("utf8");
@@ -29650,7 +29662,7 @@ async function* runStraceTailer(opts) {
   }
   let watcher = null;
   try {
-    watcher = (0, import_node_fs3.watch)(opts.watchDir, (_event, _filename) => {
+    watcher = (0, import_node_fs4.watch)(opts.watchDir, (_event, _filename) => {
       drainEventsFile();
       pollDir();
       wake();
@@ -29662,7 +29674,7 @@ async function* runStraceTailer(opts) {
   let eventsWatcher = null;
   if (opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     try {
-      eventsWatcher = (0, import_node_fs3.watch)(opts.eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = (0, import_node_fs4.watch)(opts.eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
         wake();
       });
@@ -29675,7 +29687,7 @@ async function* runStraceTailer(opts) {
   if (opts.eventsDirPath !== void 0 && opts.eventsDirPath !== "" && opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     const expectedBasename = opts.eventsFileBasename ?? opts.eventsFilePath.slice(opts.eventsFilePath.lastIndexOf("/") + 1);
     try {
-      eventsDirWatcher = (0, import_node_fs3.watch)(
+      eventsDirWatcher = (0, import_node_fs4.watch)(
         opts.eventsDirPath,
         { persistent: false },
         (event, filename) => {
@@ -29842,7 +29854,7 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
     if (Date.now() - start >= deadlineMs) break;
     let raw;
     try {
-      raw = (0, import_node_fs3.readFileSync)(
+      raw = (0, import_node_fs4.readFileSync)(
         `/proc/${stracePid}/task/${stracePid}/children`,
         "utf8"
       ).trim();
@@ -30066,8 +30078,8 @@ var LinuxStraceRunner = class {
         resolve2();
       });
     });
-    const watchDir = (0, import_node_path4.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path4.basename)(opts.basePath);
+    const watchDir = (0, import_node_path5.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path5.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
@@ -30086,7 +30098,7 @@ var LinuxStraceRunner = class {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
           eventsDirPath: this._eventsFile.dirPath,
-          eventsFileBasename: (0, import_node_path4.basename)(this._eventsFile.path),
+          eventsFileBasename: (0, import_node_path5.basename)(this._eventsFile.path),
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
@@ -30122,8 +30134,8 @@ var LinuxStraceRunner = class {
   }
 };
 function detectManager(cwd) {
-  if ((0, import_node_fs3.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
-  if ((0, import_node_fs3.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
+  if ((0, import_node_fs4.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
+  if ((0, import_node_fs4.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
   return "npm";
 }
 async function waitForGo(readable) {
@@ -30326,7 +30338,7 @@ function macosTokenizeRoots(workDir) {
   const rawTmp = (0, import_node_os.tmpdir)();
   let tmp;
   try {
-    tmp = (0, import_node_fs3.realpathSync)(rawTmp);
+    tmp = (0, import_node_fs4.realpathSync)(rawTmp);
   } catch {
     tmp = rawTmp;
   }
@@ -30344,21 +30356,21 @@ function scratchBaseDir(env = process.env) {
 }
 function createEventsFile(parentDir = scratchBaseDir()) {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
-  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path4.join)(parentDir, `script-jail-events-${tag}-`));
-  (0, import_node_fs3.chmodSync)(dirPath, 448);
-  const path3 = (0, import_node_path4.join)(dirPath, `events-${tag}.jsonl`);
-  const fd = (0, import_node_fs3.openSync)(
+  const dirPath = (0, import_node_fs4.mkdtempSync)((0, import_node_path5.join)(parentDir, `script-jail-events-${tag}-`));
+  (0, import_node_fs4.chmodSync)(dirPath, 448);
+  const path3 = (0, import_node_path5.join)(dirPath, `events-${tag}.jsonl`);
+  const fd = (0, import_node_fs4.openSync)(
     path3,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition
-    import_node_fs3.constants.O_RDWR | import_node_fs3.constants.O_CREAT | import_node_fs3.constants.O_EXCL | import_node_fs3.constants.O_NOFOLLOW,
+    import_node_fs4.constants.O_RDWR | import_node_fs4.constants.O_CREAT | import_node_fs4.constants.O_EXCL | import_node_fs4.constants.O_NOFOLLOW,
     384
   );
   let baseline;
   try {
-    const s = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+    const s = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
     baseline = { ino: s.ino, dev: s.dev, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
   } finally {
-    (0, import_node_fs3.closeSync)(fd);
+    (0, import_node_fs4.closeSync)(fd);
   }
   return { path: path3, dirPath, baseline };
 }
@@ -30408,7 +30420,7 @@ function resolvePrepareCommand(manager, cwd) {
   }
   if (manager === "yarn") {
     try {
-      const pkgRaw = (0, import_node_fs3.readFileSync)((0, import_node_path4.join)(cwd, "package.json"), "utf8");
+      const pkgRaw = (0, import_node_fs4.readFileSync)((0, import_node_path5.join)(cwd, "package.json"), "utf8");
       const pkg = JSON.parse(pkgRaw);
       const prepare = pkg.scripts?.["prepare"];
       if (typeof prepare === "string" && prepare.length > 0) {
@@ -30437,7 +30449,7 @@ async function main(input) {
   diag(input, `main(): configPath=${configPath}`);
   let rawConfig;
   try {
-    const text = (0, import_node_fs3.readFileSync)(configPath, "utf8");
+    const text = (0, import_node_fs4.readFileSync)(configPath, "utf8");
     rawConfig = (0, import_yaml2.parse)(text);
   } catch (err) {
     throw new Error(`script-jail agent: failed to read config at ${configPath}: ${String(err)}`);
@@ -30569,13 +30581,22 @@ ${fetchDetail}
   let hasRootPrepareScript = false;
   let hasRootMainPassLifecycle = false;
   try {
-    const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
+    const rootManifest = JSON.parse((0, import_node_fs4.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
     ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
     const scripts = rootManifest.scripts ?? {};
     const nonEmpty = (s) => typeof s === "string" && s.length > 0;
     hasRootPrepareScript = nonEmpty(scripts.prepare);
     hasRootMainPassLifecycle = nonEmpty(scripts.preinstall) || nonEmpty(scripts.install) || nonEmpty(scripts.postinstall) || manager === "pnpm" && (nonEmpty(scripts.prepublish) || nonEmpty(scripts.prerebuild) || nonEmpty(scripts.rebuild) || nonEmpty(scripts.postrebuild));
   } catch {
+  }
+  const altRootManifest = unsupportedAltRootManifest(config2.work_dir);
+  if (altRootManifest !== null) {
+    emitter.emitError(
+      `Root manifest is \`${altRootManifest}\` with no \`package.json\` \u2014 script-jail reads root identity and lifecycle scripts from package.json only, so an alternate-manifest root would run its lifecycle unaudited (events unattributable) and produce a deceptively clean lock. Refusing to emit a lockfile (use a \`package.json\` root manifest).`,
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
   }
   const collectingEmitter = new Emitter(
     new class extends import_node_stream.Writable {
@@ -30621,7 +30642,7 @@ ${fetchDetail}
   });
   const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
   try {
-    (0, import_node_fs3.mkdirSync)(straceBaseDir, { recursive: true });
+    (0, import_node_fs4.mkdirSync)(straceBaseDir, { recursive: true });
   } catch {
   }
   const installInput = {
@@ -30824,7 +30845,7 @@ ${stdoutTail}`;
     let sha256 = config2.manager_lockfile_sha256;
     if (!sha256 && config2.lockfile_path) {
       try {
-        const lockfileContent = (0, import_node_fs3.readFileSync)(config2.lockfile_path);
+        const lockfileContent = (0, import_node_fs4.readFileSync)(config2.lockfile_path);
         sha256 = (0, import_node_crypto.createHash)("sha256").update(lockfileContent).digest("hex");
       } catch {
         sha256 = "";

@@ -1923,6 +1923,83 @@ describe('agent main() root-prepare second pass', () => {
     });
   }
 
+  // --- alternate root manifest (package.yaml / package.json5) → fail closed ----
+  // pnpm ALSO accepts package.yaml / package.json5 as the root manifest and reads
+  // its lifecycle scripts + pnpm.configDependencies from them.  script-jail reads
+  // root identity from package.json ONLY, so such a root would run its lifecycle
+  // with npm_package_name UNSET → events dropped → a deceptively clean lock (the
+  // nameless-root class, reached via the manifest FORMAT).  The guest must refuse
+  // to emit a lockfile.  package.json SHADOWS the alternates, so the gate only
+  // fires when there is genuinely no package.json.
+  for (const altManifest of ['package.yaml', 'package.json5'] as const) {
+    it(`FAILS CLOSED (fatal, no lockfile) when the root manifest is \`${altManifest}\` with no package.json`, async () => {
+      const { conn, hostSend, getOutput } = makeConn();
+      const configPath = writeConfig(testDir, { manager: 'pnpm' });
+      // Alternate manifest, NO package.json → the package.json-only pipeline cannot
+      // see the root's identity or scripts.
+      writeFileSync(join(testDir, altManifest), 'name: evil\npnpm:\n  configDependencies:\n    cfg: "1.0.0+sha512-x"\n', 'utf8');
+
+      const main_ = recordingEventStrace('MAINPROG');
+
+      const origExit = process.exit.bind(process);
+      let exitedWith: number | string | undefined;
+      // @ts-expect-error — patching process.exit for test
+      process.exit = (code?: number | string) => { exitedWith = code; };
+
+      setTimeout(() => hostSend('go\n'), 10);
+      try {
+        await main({
+          configPath,
+          connection: conn,
+          spawner: mockSpawner().spawner,
+          strace: main_.runner,
+          dnsLookup: offlineLookup,
+        });
+        await new Promise<void>((r) => setImmediate(r));
+      } finally {
+        process.exit = origExit;
+      }
+
+      const lines = getOutput().split('\n').filter((l) => l.trim());
+      const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+      const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+      expect(fatal).toBeDefined();
+      expect(String(fatal!['message'])).toMatch(new RegExp(altManifest.replace('.', '\\.')));
+      expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+      // The gate fires BEFORE any install pass runs.
+      expect(main_.calls).toHaveLength(0);
+      expect(exitedWith).toBe(1);
+    });
+  }
+
+  it('package.yaml alongside a package.json → NO trip (package.json shadows the alternate)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // A real package.json shadows the alternate (pnpm ignores package.yaml when a
+    // package.json exists), so the gate must NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+    writeFileSync(join(testDir, 'package.yaml'), 'name: shadowed\n', 'utf8');
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
   it('npm NAMELESS root with only a `prepublish` → still produces a lockfile (npm rebuild does not run it)', async () => {
     // No-over-fire: `npm rebuild --foreground-scripts` does NOT run root prepublish
     // (only pnpm does), so the npm gate must not block a nameless npm root that
