@@ -253,27 +253,93 @@ rendered):
   runs `<manager> run prepare` and nothing else, so *every* event it produces
   genuinely belongs to the root's prepare regardless of any forged env. A
   force-attribution emitter (in `src/guest/agent.ts`) rewrites each event in the
-  pass onto the canonical root key with `root_anchored = true` at the emitter
-  boundary — the only point where "this came from the prepare pass" is still
+  pass onto the canonical root key with `root_anchored = true` (for the full
+  anchorable set: read/write AND spawn/connect/env_read, so a genuine root prepare
+  non-fs event never mis-renders `<FORGED_ROOT>`) at the emitter boundary — the only point where "this came from the prepare pass" is still
   known. No untrusted actor can be in that pass, so it needs no process-tree walk.
 - **macOS-bare defaults it `true`** (observe-only; see `docs/divergence.md`). It
   has no strace process-tree / exec-cwd machinery, so root identity there is
   env-trusted — a documented residual, with Firecracker as the enforcement
   boundary.
 
-`normalize.ts` then surfaces the three cases distinctly:
+`normalize.ts` then surfaces the cases distinctly. The verdict + `<FORGED_ROOT>`
+treatment is **no longer read/write-only** — it now covers the non-fs trio
+(`spawn` / `connect` / `env_read`) as well, since all of those carry `pid` and
+`isRepoRootAnchored` is purely pid-based:
 
 | Event | `root_anchored` | Renders as |
 | --- | --- | --- |
-| genuine root | `true` | `$REPO/...` (exactly as before) |
-| forged root (claims root, not anchored) | `!== true` | `<FORGED_ROOT> $REPO/...` (outermost prefix) |
+| genuine root (read/write) | `true` | `$REPO/...` (exactly as before) |
+| forged root read/write (claims root, not anchored) | `!== true` | `<FORGED_ROOT> $REPO/...` (outermost prefix) |
+| genuine root spawn/connect/env_read | `true` | unmarked (`node …` / `connect host:port` / `NAME`, as before) |
+| forged root spawn/connect/env_read | `!== true` | `<FORGED_ROOT> ` outermost (before any `<BLOCKED>`/`<ENOENT>`/`<AUDIT_BLIND>` tag) |
 | non-root with no package dir | n/a | throws (fail closed) |
 
 A forged-root event is **never dropped and never throws** — dropping would be a
 dependency-triggered hide, throwing would crash the whole audit. The
 `<FORGED_ROOT> ` prefix makes it a distinct string that can never dedupe-collapse
 with a genuine root entry, so a laundering attempt is fail-loud for the reviewer.
-Genuine root output is byte-identical to before the change.
+Extending it to non-fs kinds closes two harms a dependency that unsets
+`npm_package_name` (while keeping a recognised `npm_lifecycle_event`) could
+otherwise cause: (1) its `connect`/`spawn`/`env_read` would dedupe-collapse with —
+or be indistinguishable from — a genuine root entry, and (2) the drop-in-install
+egress warning (`src/action/diff.ts`) would misclassify a forged `<repo-root>`
+`prepare` connect as "audited-only / will NOT run on the host" for npm/yarn, even
+though under `install:true` the forging dependency's lifecycle DOES run online on
+the host — understating a real egress risk. The diff partition now routes any
+`<FORGED_ROOT> ` egress to host-bound. Genuine root output is byte-identical to
+before the change.
+
+**Nameless roots are audited, not refused.** A root `package.json` with no `name`
+(e.g. an unnamed private monorepo root running `preinstall: npx only-allow pnpm` +
+`postinstall: simple-git-hooks`) leaves `npm_package_name` empty, so its own
+lifecycle events would attribute to null and be dropped at the null-attribution
+gate — leaving the root unaudited and the lock deceptively clean. The agent used to
+**fail closed** (refuse to emit a lockfile) whenever a nameless root ran a main-pass
+lifecycle or `prepare` script. That over-fired: it refused to audit the very common
+unnamed monorepo root even in pure-audit mode, where the only consequence is a
+weaker audit, not RCE. Now `buildRootPkgKeys` gives a nameless-but-parseable root
+the synthetic key `ROOT_SENTINEL = '<repo-root>'` (`src/guest/attribution.ts`), and
+nameless handling lives in the **attribution layer**, not a dispatcher rescue:
+`attributionFromEnvVars` takes a `rootSentinel` parameter and, when the observed env
+has an empty `npm_package_name` but a recognised `npm_lifecycle_event`, attributes
+the event to the sentinel. "Recognised" means a *canonical*
+`LifecycleStage` (`preinstall` / `install` / `postinstall` / `prepare`), one of
+pnpm's main-pass root rebuild-class hooks (`prepublish` / `prerebuild` / `rebuild`
+/ `postrebuild`, which `pnpm rebuild --pending` runs on the root with a
+non-canonical lifecycle name; folded into `install`), or one of npm's
+prepare-wrapper hooks (`preprepare` / `postprepare`, which `npm run prepare` fires
+around the dedicated root-prepare pass; folded into `prepare`). The non-canonical
+hooks are folded so they are audited rather than silently dropped at the
+null-attribution gate before the prepare pass's force-attribution emitter could
+restamp them. This widening is **scoped to the nameless-root sentinel**: a named
+package keeps the strict 4-stage gate, so it never changes named-package
+attribution. This is consumed by both the `/proc` walk (the
+`Attribution` ctor carries the sentinel) and the shim fast-path
+(`shimExecAttribution` / `classifyShimNodeStartupMarker`, the only attribution
+source on macOS, which has no `/proc` environ). Two consequences fall out for free:
+(1) **all** event kinds for the nameless root's lifecycle surface — `spawn` /
+`connect` / `env_read`, not just `read` / `write` (the old read/write-only rescue
+dropped the rest); and **all** of them route through the same defer →
+end-of-drain `root_anchored` stamp (the defer predicate covers
+read/write/spawn/connect/env_read, never `exec`). A genuine root event renders
+unmarked (`$REPO/...` for fs, `node …` / `connect host:port` / `NAME` for non-fs);
+a forged/unanchored one gets the `<FORGED_ROOT> ` prefix (outermost, before any
+`<BLOCKED>`/`<ENOENT>`/`<AUDIT_BLIND>`/`<HIDDEN>` tag). This closes the prior
+unmarked-non-fs residual: a forged root `connect`/`spawn`/`env_read` can no longer
+dedupe-collapse with a genuine root entry, and a forged `<repo-root>` `prepare`
+connect is no longer mistaken for the genuine root's host-safe prepare by the
+drop-in-install egress partition.
+(2) The package-manager **driver** and its non-lifecycle workers carry *no*
+canonical `npm_lifecycle_event`, so they still attribute to null → dropped — which
+is what stops the driver's bulk store/cache/`$REPO` I/O from flooding `<repo-root>`
+(the driver pid is also null-attributed and equals the root pid, so a read/write
+rescue keyed only on null attribution would have swept it all in). Because anchoring
+keeps the lock non-deceptive (escaping behaviour surfaces and the diff gate fails on
+it), the refusal is unnecessary and was removed. The fail-closed gates for a
+genuinely-unparseable alternate root manifest (`package.yaml` / `package.json5` with
+no `package.json`) and for a zero-event `prepare` pass remain — both orthogonal to
+the nameless class.
 
 ### Layered Observation
 

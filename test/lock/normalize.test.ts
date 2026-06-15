@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { normalize, type NormalizeContext } from '../../src/lock/normalize.js';
+import { render, type RenderInput } from '../../src/lock/render.js';
+import { ROOT_SENTINEL } from '../../src/guest/attribution.js';
 import type { AttributedEvent } from '../../src/lock/schema.js';
 
 const roots = {
@@ -534,6 +536,386 @@ describe('normalize', () => {
         '$REPO/dist/index.js',
         '<FORGED_ROOT> $REPO/dist/index.js',
       ]);
+    });
+  });
+
+  // NAMELESS root project (no `name` in the root package.json).  The guest's
+  // attribution maps such a root to the synthetic ROOT_SENTINEL ('<repo-root>')
+  // key (see src/guest/attribution.ts buildRootPkgKeys) instead of dropping its
+  // lifecycle events silently.  normalize treats the sentinel EXACTLY like a
+  // named root key: it is listed in rootPkgKeys, has NO pkgDir, and its fs
+  // events carry the non-forgeable `root_anchored` verdict.  These tests mirror
+  // the named-root <FORGED_ROOT> suite above, but with the nameless sentinel as
+  // the root key — proving the genuine/forged/no-collapse/byte-stable contract
+  // holds for the nameless-root case too.
+  describe('nameless-root events via <repo-root> sentinel', () => {
+    const rootKey = ROOT_SENTINEL; // '<repo-root>'
+    const rootCtx: NormalizeContext = {
+      roots,
+      pkgDirs: new Map(),
+      rootPkgKeys: new Set([rootKey]),
+    };
+
+    // GENUINE nameless-root events carry root_anchored:true (the phase-install
+    // end-of-drain flush stamps it from rootAnchored(pid)).
+    function rootRead(path: string, hidden = false): AttributedEvent {
+      return {
+        raw: { kind: 'read', path, pid: 1, ts: 0, hidden, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+    function rootWrite(path: string, hidden = false): AttributedEvent {
+      return {
+        raw: { kind: 'write', path, pid: 1, ts: 0, hidden, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+    // FORGED: pkg CLAIMS the sentinel but root_anchored is absent (a dependency
+    // exporting npm_package_name=<repo-root> cannot also forge the verdict).
+    function forgedRead(path: string, hidden = false): AttributedEvent {
+      return { raw: { kind: 'read', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'install' };
+    }
+    function forgedWrite(path: string, hidden = false): AttributedEvent {
+      return { raw: { kind: 'write', path, pid: 1, ts: 0, hidden }, pkg: rootKey, lifecycle: 'install' };
+    }
+    // FORGED variant: root_anchored present but explicitly false (non-anchored
+    // pid).  Must classify forged identically to "field absent".
+    function forgedFalseWrite(path: string, hidden = false): AttributedEvent {
+      return {
+        raw: { kind: 'write', path, pid: 1, ts: 0, hidden, root_anchored: false },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+
+    // (a) GENUINE: read+write with root_anchored:true, sentinel in rootPkgKeys,
+    // NO pkgDir for the sentinel → must NOT throw and surface as $REPO/... with
+    // NO <FORGED_ROOT> prefix.
+    it('does NOT throw for a genuine nameless-root fs event (no pkgDir for the sentinel)', () => {
+      const events = [rootWrite('/work/dist/index.js'), rootRead('/work/src/index.ts')];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    it('surfaces a GENUINE nameless-root read as $REPO/... with NO <FORGED_ROOT> prefix', () => {
+      const events = [rootRead('/work/src/index.ts')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.external_reads).toEqual(['$REPO/src/index.ts']);
+      expect(block?.external_reads[0]).not.toContain('<FORGED_ROOT>');
+    });
+
+    it('surfaces a GENUINE nameless-root write as $REPO/... with NO <FORGED_ROOT> prefix', () => {
+      const events = [rootWrite('/work/dist/index.js')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.escaped_writes).toEqual(['$REPO/dist/index.js']);
+      expect(block?.escaped_writes[0]).not.toContain('<FORGED_ROOT>');
+    });
+
+    // (b) FORGED: root_anchored absent → <FORGED_ROOT> $REPO/...
+    it('prefixes a FORGED nameless-root write (root_anchored absent) with <FORGED_ROOT>', () => {
+      const events = [forgedWrite('/work/dist/index.js')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.escaped_writes).toEqual(['<FORGED_ROOT> $REPO/dist/index.js']);
+    });
+
+    it('prefixes a FORGED nameless-root read (root_anchored absent) with <FORGED_ROOT>', () => {
+      const events = [forgedRead('/work/src/index.ts')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.external_reads).toEqual(['<FORGED_ROOT> $REPO/src/index.ts']);
+    });
+
+    // (b) separate case: root_anchored EXPLICITLY false (not just absent).
+    it('prefixes a FORGED nameless-root write (root_anchored:false) with <FORGED_ROOT>', () => {
+      const events = [forgedFalseWrite('/work/dist/index.js')];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.escaped_writes).toEqual(['<FORGED_ROOT> $REPO/dist/index.js']);
+    });
+
+    it('does NOT throw for a FORGED nameless-root fs event (dependency-triggered DoS guard)', () => {
+      const events = [forgedWrite('/work/anywhere.js'), forgedRead('/work/secret')];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    // (c) NO-COLLAPSE: a genuine root write to $REPO/x AND a forged write to the
+    // SAME $REPO/x → BOTH appear, distinct, no dedupe-collapse.
+    it('does NOT dedupe-collapse a forged write onto an identical genuine nameless-root write', () => {
+      const events = [
+        rootWrite('/work/dist/index.js'), // genuine (root_anchored: true)
+        forgedWrite('/work/dist/index.js'), // forged (same path, root_anchored absent)
+      ];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.escaped_writes).toEqual([
+        '$REPO/dist/index.js',
+        '<FORGED_ROOT> $REPO/dist/index.js',
+      ]);
+    });
+
+    it('does NOT dedupe-collapse a forged read onto an identical genuine nameless-root read', () => {
+      const events = [
+        rootRead('/work/src/index.ts'),
+        forgedRead('/work/src/index.ts'),
+      ];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.external_reads).toEqual([
+        '$REPO/src/index.ts',
+        '<FORGED_ROOT> $REPO/src/index.ts',
+      ]);
+    });
+
+    // (d) BYTE/SORT: the '<repo-root>' package block key sorts deterministically
+    // (codepoint) and renders stably.
+    it('uses the sentinel as the package block key', () => {
+      const events = [rootWrite('/work/dist/index.js')];
+      const result = normalize(events, rootCtx);
+      expect(result.has(ROOT_SENTINEL)).toBe(true);
+      expect(ROOT_SENTINEL).toBe('<repo-root>');
+    });
+
+    it('sorts the <repo-root> key before a named package by codepoint (< 0x3C before letters)', () => {
+      // render() sorts package keys by codepoint.  '<' (0x3C) precedes any
+      // letter, so the sentinel block must render BEFORE 'esbuild@...'.
+      const packages = normalize(
+        [rootWrite('/work/dist/index.js'), readEv('/root/.npmrc')],
+        { ...rootCtx, pkgDirs: new Map([[pkgId, pkgDir]]) },
+      );
+      const baseInput: RenderInput = {
+        manager: 'pnpm',
+        manager_lockfile_sha256: 'deadbeef',
+        node_version: '20.19.0',
+        generated_at: '2026-06-15T00:00:00Z',
+        packages,
+      };
+      const out = render(baseInput);
+      const sentinelIdx = out.indexOf(`${ROOT_SENTINEL}:`);
+      const namedIdx = out.indexOf(`${pkgId}:`);
+      expect(sentinelIdx).toBeGreaterThanOrEqual(0);
+      expect(namedIdx).toBeGreaterThanOrEqual(0);
+      expect(sentinelIdx).toBeLessThan(namedIdx);
+    });
+
+    it('renders the <repo-root> block byte-identically across repeated renders', () => {
+      const packages = normalize(
+        [
+          rootWrite('/work/dist/index.js'),
+          forgedWrite('/work/dist/index.js'),
+          rootRead('/work/src/index.ts'),
+        ],
+        rootCtx,
+      );
+      const baseInput: RenderInput = {
+        manager: 'pnpm',
+        manager_lockfile_sha256: 'deadbeef',
+        node_version: '20.19.0',
+        generated_at: '2026-06-15T00:00:00Z',
+        packages,
+      };
+      expect(render(baseInput)).toBe(render(baseInput));
+    });
+
+    // (e) NON-FS kinds (the blind-spot fix + the FORGED_ROOT extension).  The
+    // attribution layer surfaces a nameless root lifecycle's spawn / connect /
+    // env_read under the sentinel, and — like read/write — they now carry the
+    // non-forgeable `root_anchored` verdict (stamped at the phase-install
+    // end-of-drain flush).  GENUINE (root_anchored:true) → unmarked; forged /
+    // unanchored (absent OR false) → `<FORGED_ROOT> ` outermost prefix.  All
+    // must normalize WITHOUT throwing even with no pkgDir for the sentinel.
+    function rootSpawn(argv: string[]): AttributedEvent {
+      return {
+        raw: { kind: 'spawn', argv, result: 'ok', pid: 1, ts: 0, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+    function forgedSpawn(argv: string[], result: 'ok' | 'enoent' = 'ok'): AttributedEvent {
+      // root_anchored absent → forged.
+      return {
+        raw: { kind: 'spawn', argv, result, pid: 1, ts: 0 },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+    function rootConnect(host: string, port: number): AttributedEvent {
+      return {
+        raw: { kind: 'connect', host, port, result: 'ok', pid: 1, ts: 0, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+    function forgedConnect(host: string, port: number): AttributedEvent {
+      // root_anchored absent → forged.
+      return {
+        raw: { kind: 'connect', host, port, result: 'ok', pid: 1, ts: 0 },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+    function rootEnvRead(name: string): AttributedEvent {
+      return {
+        raw: { kind: 'env_read', name, pid: 1, ts: 0, hidden: false, root_anchored: true },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+    function forgedEnvRead(name: string): AttributedEvent {
+      // root_anchored absent → forged.
+      return {
+        raw: { kind: 'env_read', name, pid: 1, ts: 0, hidden: false },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+
+    it('does NOT throw for nameless-root non-fs events (spawn/connect/env_read, no pkgDir)', () => {
+      const events = [
+        rootSpawn(['node', 'preinstall.js']),
+        rootConnect('registry.npmjs.org', 443),
+        rootEnvRead('AWS_SECRET_ACCESS_KEY'),
+        forgedSpawn(['node', 'preinstall.js']),
+        forgedConnect('registry.npmjs.org', 443),
+        forgedEnvRead('AWS_SECRET_ACCESS_KEY'),
+      ];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    // GENUINE (root_anchored:true) → unmarked, byte-identical to before.
+    it('surfaces a GENUINE nameless-root spawn in spawn_attempts UNMARKED', () => {
+      const block = normalize([rootSpawn(['node', 'preinstall.js'])], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.spawn_attempts).toEqual(['node preinstall.js']);
+    });
+
+    it('surfaces a GENUINE nameless-root connect in network_attempts UNMARKED', () => {
+      const block = normalize([rootConnect('evil.example.com', 443)], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.network_attempts).toEqual(['connect evil.example.com:443']);
+    });
+
+    it('surfaces a GENUINE nameless-root env_read in env_read UNMARKED', () => {
+      const block = normalize([rootEnvRead('AWS_SECRET_ACCESS_KEY')], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.env_read).toEqual(['AWS_SECRET_ACCESS_KEY']);
+    });
+
+    // FORGED (root_anchored absent) → <FORGED_ROOT> outermost.
+    it('prefixes a FORGED nameless-root spawn (ok) with <FORGED_ROOT> outermost', () => {
+      const block = normalize([forgedSpawn(['node', 'preinstall.js'])], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.spawn_attempts).toEqual(['<FORGED_ROOT> node preinstall.js']);
+    });
+
+    it('prefixes a FORGED nameless-root spawn (blocked) with <FORGED_ROOT> before the result tag', () => {
+      const block = normalize([forgedSpawn(['/bin/curl', 'evil'], 'enoent')], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      // <FORGED_ROOT> is the OUTERMOST prefix, before the <ENOENT> result tag.
+      expect(block?.spawn_blocked).toEqual(['<FORGED_ROOT> <ENOENT> /bin/curl evil']);
+    });
+
+    it('prefixes a FORGED nameless-root connect with <FORGED_ROOT> outermost', () => {
+      const block = normalize([forgedConnect('evil.example.com', 443)], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.network_attempts).toEqual(['<FORGED_ROOT> connect evil.example.com:443']);
+    });
+
+    it('prefixes a FORGED nameless-root env_read with <FORGED_ROOT> outermost', () => {
+      const block = normalize([forgedEnvRead('AWS_SECRET_ACCESS_KEY')], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.env_read).toEqual(['<FORGED_ROOT> AWS_SECRET_ACCESS_KEY']);
+    });
+
+    // NO-COLLAPSE: a genuine connect AND a forged connect to the SAME host:port
+    // → BOTH survive as distinct strings (no Set-based dedupe-collapse). The
+    // final array is codepoint-sorted by sortAndDedupe, so `<FORGED_ROOT> …`
+    // (leading '<' = 0x3C) sorts BEFORE the un-prefixed `connect …` ('c' = 0x63).
+    it('does NOT dedupe-collapse a forged connect onto an identical genuine connect', () => {
+      const events = [
+        rootConnect('registry.npmjs.org', 443), // genuine (root_anchored:true)
+        forgedConnect('registry.npmjs.org', 443), // forged (same host:port, absent)
+      ];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.network_attempts).toEqual([
+        '<FORGED_ROOT> connect registry.npmjs.org:443',
+        'connect registry.npmjs.org:443',
+      ]);
+      // The security invariant: both survive (2 distinct entries, not collapsed to 1).
+      expect(block?.network_attempts).toHaveLength(2);
+    });
+
+    // env_tamper completeness: the `<REFUSED>` variant is the last root-claimable
+    // + rendered + deduped kind that was UNMARKED.  It now carries the same
+    // non-forgeable `root_anchored` verdict — GENUINE (root_anchored:true) →
+    // unmarked `<REFUSED> …`; forged/unanchored (absent OR false) → `<FORGED_ROOT>`
+    // as the OUTERMOST prefix.  (The `audit_fd_lost` variant routes to audit_bypass
+    // and is gated independently by findAuditBypass, so it is NOT anchored here.)
+    function rootTamper(op: 'unsetenv' | 'putenv' | 'clearenv', name?: string): AttributedEvent {
+      const raw = name !== undefined
+        ? { kind: 'env_tamper' as const, op, name, refused: true as const, pid: 1, ts: 0, root_anchored: true }
+        : { kind: 'env_tamper' as const, op, refused: true as const, pid: 1, ts: 0, root_anchored: true };
+      return { raw, pkg: rootKey, lifecycle: 'install' };
+    }
+    function forgedTamper(op: 'unsetenv' | 'putenv' | 'clearenv', name?: string): AttributedEvent {
+      // root_anchored absent → forged.
+      const raw = name !== undefined
+        ? { kind: 'env_tamper' as const, op, name, refused: true as const, pid: 1, ts: 0 }
+        : { kind: 'env_tamper' as const, op, refused: true as const, pid: 1, ts: 0 };
+      return { raw, pkg: rootKey, lifecycle: 'install' };
+    }
+    function forgedFalseTamper(op: 'unsetenv', name: string): AttributedEvent {
+      // root_anchored present but explicitly false → forged (identical to absent).
+      return {
+        raw: { kind: 'env_tamper' as const, op, name, refused: true as const, pid: 1, ts: 0, root_anchored: false },
+        pkg: rootKey,
+        lifecycle: 'install',
+      };
+    }
+
+    it('does NOT throw for a nameless-root env_tamper (no pkgDir for the sentinel)', () => {
+      const events = [rootTamper('unsetenv', 'LD_PRELOAD'), forgedTamper('unsetenv', 'LD_PRELOAD')];
+      expect(() => normalize(events, rootCtx)).not.toThrow();
+    });
+
+    it('surfaces a GENUINE nameless-root env_tamper in env_tamper UNMARKED', () => {
+      const block = normalize([rootTamper('unsetenv', 'LD_PRELOAD')], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.env_tamper).toEqual(['<REFUSED> unsetenv LD_PRELOAD']);
+    });
+
+    it('surfaces a GENUINE nameless-root clearenv env_tamper UNMARKED (no name tail)', () => {
+      const block = normalize([rootTamper('clearenv')], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.env_tamper).toEqual(['<REFUSED> clearenv']);
+    });
+
+    it('prefixes a FORGED nameless-root env_tamper (root_anchored absent) with <FORGED_ROOT> outermost', () => {
+      const block = normalize([forgedTamper('unsetenv', 'LD_PRELOAD')], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      // <FORGED_ROOT> is the OUTERMOST prefix, before the <REFUSED> tag.
+      expect(block?.env_tamper).toEqual(['<FORGED_ROOT> <REFUSED> unsetenv LD_PRELOAD']);
+    });
+
+    it('prefixes a FORGED nameless-root env_tamper (root_anchored:false) with <FORGED_ROOT>', () => {
+      const block = normalize([forgedFalseTamper('unsetenv', 'LD_PRELOAD')], rootCtx)
+        .get(rootKey)?.lifecycle['install'];
+      expect(block?.env_tamper).toEqual(['<FORGED_ROOT> <REFUSED> unsetenv LD_PRELOAD']);
+    });
+
+    // NO-COLLAPSE: a genuine env_tamper AND a forged env_tamper for the SAME
+    // op+name → BOTH survive as distinct strings (no Set-based dedupe-collapse).
+    // codepoint-sorted: `<FORGED_ROOT> …` (leading '<' = 0x3C) sorts BEFORE the
+    // un-prefixed `<REFUSED> …` — both lead with '<', so the next chars decide
+    // ('F' 0x46 < 'R' 0x52), keeping the forged entry first.
+    it('does NOT dedupe-collapse a forged env_tamper onto an identical genuine one', () => {
+      const events = [
+        rootTamper('unsetenv', 'LD_PRELOAD'), // genuine (root_anchored:true)
+        forgedTamper('unsetenv', 'LD_PRELOAD'), // forged (same op+name, absent)
+      ];
+      const block = normalize(events, rootCtx).get(rootKey)?.lifecycle['install'];
+      expect(block?.env_tamper).toEqual([
+        '<FORGED_ROOT> <REFUSED> unsetenv LD_PRELOAD',
+        '<REFUSED> unsetenv LD_PRELOAD',
+      ]);
+      // The security invariant: both survive (2 distinct entries, not collapsed to 1).
+      expect(block?.env_tamper).toHaveLength(2);
     });
   });
 

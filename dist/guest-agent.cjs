@@ -24923,7 +24923,13 @@ var EnvReadEvent = external_exports.object({
   name: external_exports.string(),
   pid: external_exports.number(),
   ts: external_exports.number(),
-  hidden: external_exports.boolean()
+  hidden: external_exports.boolean(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_read events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed env_read). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var SpawnEvent = external_exports.object({
   kind: external_exports.literal("spawn"),
@@ -24945,7 +24951,13 @@ var SpawnEvent = external_exports.object({
   // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
   // benign find/sed use stays green; a reviewer just sees the marker). Omitted
   // (never `false`) so existing/non-blind records stay byte-identical.
-  audit_blind: external_exports.boolean().optional()
+  audit_blind: external_exports.boolean().optional(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on spawn events that
+  // attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed spawn). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -24963,7 +24975,15 @@ var NetworkEvent = external_exports.object({
   // 'ok' = phase A (fetch with network on). 'blocked' = phase B (offline).
   result: external_exports.enum(["ok", "blocked"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on connect events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed connect). Closes the unmarked-non-fs gap and
+  // the drop-in-install egress-misclassification (a forged root prepare connect
+  // is no longer mistaken for the genuine root's host-safe prepare).
+  root_anchored: external_exports.boolean().optional()
 });
 var ExecEvent = external_exports.object({
   kind: external_exports.literal("exec"),
@@ -25052,7 +25072,16 @@ var EnvTamperEvent = external_exports.object({
   reason: external_exports.string().optional(),
   refused: external_exports.literal(true),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_tamper events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed `<REFUSED>` env_tamper). Closes the last
+  // unmarked root-claimable + rendered + deduped kind. Does NOT apply to the
+  // `audit_fd_lost` variant — that routes to audit_bypass and is hard-failed
+  // independently by findAuditBypass, so dedupe-collapse cannot hide it.
+  root_anchored: external_exports.boolean().optional()
 });
 var RawEvent = external_exports.discriminatedUnion("kind", [
   FsReadEvent,
@@ -25112,13 +25141,24 @@ var CANONICAL_STAGES = new Set(LifecycleStage.options);
 function isCanonicalStage(s) {
   return CANONICAL_STAGES.has(s);
 }
+var PNPM_ROOT_REBUILD_HOOKS = /* @__PURE__ */ new Set([
+  "prepublish",
+  "prerebuild",
+  "rebuild",
+  "postrebuild"
+]);
+var NPM_ROOT_PREPARE_WRAPPER_HOOKS = /* @__PURE__ */ new Set(["preprepare", "postprepare"]);
 function buildPkg(name, version2) {
   return version2 !== void 0 ? `${name}@${version2}` : name;
 }
+var ROOT_SENTINEL = "<repo-root>";
 function buildRootPkgKeys(manifest) {
   const keys = /* @__PURE__ */ new Set();
-  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+  if (manifest.name !== void 0 && typeof manifest.name !== "string") {
     return { keys, canonical: null };
+  }
+  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+    return { keys: /* @__PURE__ */ new Set([ROOT_SENTINEL]), canonical: ROOT_SENTINEL };
   }
   const name = manifest.name;
   keys.add(name);
@@ -25128,9 +25168,20 @@ function buildRootPkgKeys(manifest) {
   }
   return { keys, canonical: name };
 }
-function attributionFromEnvVars(name, version2, event) {
+function attributionFromEnvVars(name, version2, event, rootSentinel) {
   if (name !== void 0 && name.length > 0 && event !== void 0 && isCanonicalStage(event)) {
     return { pkg: buildPkg(name, version2), lifecycle: event };
+  }
+  if (rootSentinel !== void 0 && (name === void 0 || name.length === 0) && event !== void 0) {
+    if (isCanonicalStage(event)) {
+      return { pkg: rootSentinel, lifecycle: event };
+    }
+    if (PNPM_ROOT_REBUILD_HOOKS.has(event)) {
+      return { pkg: rootSentinel, lifecycle: "install" };
+    }
+    if (NPM_ROOT_PREPARE_WRAPPER_HOOKS.has(event)) {
+      return { pkg: rootSentinel, lifecycle: "prepare" };
+    }
   }
   return null;
 }
@@ -25146,14 +25197,32 @@ var Attribution = class {
   // recycled pid re-reads /proc instead of returning the dead generation's
   // result.
   cache = /* @__PURE__ */ new Map();
-  constructor(reader) {
+  /**
+   * Synthetic root key for a NAMELESS-but-parseable root manifest, or undefined
+   * when the root is named or absent. Threaded into every
+   * {@link attributionFromEnvVars} call inside {@link _walk}, so a /proc-observed
+   * pid running the nameless root's OWN lifecycle (empty npm_package_name +
+   * canonical npm_lifecycle_event) attributes to this sentinel instead of null.
+   * The PM driver and its non-lifecycle workers carry NO canonical lifecycle, so
+   * they still attribute to null → dropped (no flood). Inert when undefined.
+   */
+  rootSentinel;
+  constructor(reader, rootSentinel) {
     this.reader = reader;
+    this.rootSentinel = rootSentinel;
   }
   /**
    * Walk pid → ppid → ppid' … until we find the process itself or its nearest
    * ancestor whose environ has `npm_package_name` (non-empty) AND
    * `npm_lifecycle_event` is one of the four canonical LifecycleStage values.
    * Return that pkg + lifecycle pair.
+   *
+   * When this instance was constructed with a {@link rootSentinel} (nameless
+   * root), an ancestor with EMPTY `npm_package_name` but a canonical
+   * `npm_lifecycle_event` also matches — attributing to the sentinel. This is
+   * how the nameless root's OWN lifecycle pids (and env-inheriting descendants)
+   * surface for ALL event kinds; the PM driver carries no canonical lifecycle
+   * and still walks to null.
    *
    * Returns null when:
    *   - The walk reaches pid 0 or 1 without finding a match.
@@ -25163,6 +25232,10 @@ var Attribution = class {
    * Results are cached per starting pid. A second call with the same pid will
    * return the cached value without any additional /proc reads — unless
    * {@link invalidate} has been called for the pid in between.
+   *
+   * When this instance carries a {@link rootSentinel}, a nameless root's own
+   * lifecycle pid (empty npm_package_name + canonical npm_lifecycle_event)
+   * attributes to that sentinel rather than null; see {@link _walk}.
    */
   attribute(pid) {
     if (this.cache.has(pid)) {
@@ -25201,7 +25274,8 @@ var Attribution = class {
         const attrib = attributionFromEnvVars(
           env.get("npm_package_name"),
           env.get("npm_package_version"),
-          env.get("npm_lifecycle_event")
+          env.get("npm_lifecycle_event"),
+          this.rootSentinel
         );
         if (attrib !== null) {
           return attrib;
@@ -26290,8 +26364,8 @@ function parseShimLine(line) {
     return null;
   }
 }
-function shimExecAttribution(line) {
-  return shimNpmAttribution(line, "exec");
+function shimExecAttribution(line, rootSentinel) {
+  return shimNpmAttribution(line, "exec", rootSentinel);
 }
 function shimNpmFields(line, kind) {
   try {
@@ -26311,17 +26385,17 @@ function shimNpmFields(line, kind) {
     return null;
   }
 }
-function shimNpmAttribution(line, kind) {
+function shimNpmAttribution(line, kind, rootSentinel) {
   const fields = shimNpmFields(line, kind);
   if (fields === null || fields.pathological) return null;
-  return attributionFromEnvVars(fields.name, fields.version, fields.event);
+  return attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel);
 }
-function classifyShimNodeStartupMarker(line) {
+function classifyShimNodeStartupMarker(line, rootSentinel) {
   const fields = shimNpmFields(line, "node_startup_done");
   if (fields === null) return { attribution: null, pathological: false };
   if (fields.pathological) return { attribution: null, pathological: true };
   return {
-    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event),
+    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel),
     pathological: false
   };
 }
@@ -26398,10 +26472,10 @@ async function runInstallPhase(input) {
     input.emitter.emitEvent(filtered);
     eventCount++;
   };
-  const deferredRootFsEvents = [];
+  const deferredRootEvents = [];
   const emit = (ev) => {
-    if (input.rootPkgKeys !== void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write") && input.rootPkgKeys.has(ev.pkg) && ev.raw.root_anchored === void 0) {
-      deferredRootFsEvents.push(ev);
+    if (input.rootPkgKeys !== void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_read" || ev.raw.kind === "env_tamper") && input.rootPkgKeys.has(ev.pkg) && ev.raw.root_anchored === void 0) {
+      deferredRootEvents.push(ev);
       return;
     }
     emitFinal(ev);
@@ -27164,7 +27238,7 @@ async function runInstallPhase(input) {
           completedPackageManagerClientPids.delete(shimEvent.pid);
           packageManagerClientPids.add(shimEvent.pid);
         }
-        const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line);
+        const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel);
         nodeStartupMarkerByPid.set(shimEvent.pid, {
           ts: lineTs,
           pathological: startupPathological
@@ -27182,7 +27256,7 @@ async function runInstallPhase(input) {
         continue;
       }
       const result = input.attribution.attribute(shimEvent.pid);
-      const shimAttrib = shimExecAttribution(line);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
       if (shimEvent.kind === "exec") {
         const current = shimExecCountByPid.get(shimEvent.pid) ?? 0;
         const next = shimEvent.result === "failed" ? current > 0 ? current - 1 : 0 : current + 1;
@@ -28160,6 +28234,7 @@ async function runInstallPhase(input) {
                 lifecycle: isStale ? "install" : spawnSnapshot.lifecycle
               });
             }
+            continue;
           }
           continue;
         }
@@ -28286,17 +28361,29 @@ async function runInstallPhase(input) {
   }
   for (const pid of pendingExecCwd) execCwd.set(pid, null);
   pendingExecCwd.clear();
-  for (const ev of deferredRootFsEvents) {
-    if (ev.raw.kind !== "read" && ev.raw.kind !== "write") {
-      emitFinal(ev);
-      continue;
-    }
-    emitFinal({
-      ...ev,
-      raw: { ...ev.raw, root_anchored: rootAnchored(ev.raw.pid) }
-    });
+  for (const pid of straceExecsByPid.keys()) {
+    if (!execCwd.has(pid)) execCwd.set(pid, null);
   }
-  deferredRootFsEvents.length = 0;
+  for (const [pid, count] of shimExecCountByPid) {
+    if (count > 0 && !execCwd.has(pid)) execCwd.set(pid, null);
+  }
+  for (const ev of deferredRootEvents) {
+    const anchored = rootAnchored(ev.raw.pid);
+    switch (ev.raw.kind) {
+      case "read":
+      case "write":
+      case "spawn":
+      case "connect":
+      case "env_read":
+      case "env_tamper":
+        emitFinal({ ...ev, raw: { ...ev.raw, root_anchored: anchored } });
+        break;
+      default:
+        emitFinal(ev);
+        break;
+    }
+  }
+  deferredRootEvents.length = 0;
   const exitCode = input.strace.getExitCode();
   const installStdoutTail = input.strace.getStdoutTail?.() ?? "";
   return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
@@ -28588,7 +28675,7 @@ async function runInstallPhaseMacos(input) {
       continue;
     }
     if (shimEvent.kind === "node_startup_done") {
-      const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line);
+      const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel);
       nodeStartupMarkerByPid.set(shimEvent.pid, { ts: lineTs, pathological: startupPathological });
       if (startupAttrib !== null) {
         nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
@@ -28602,7 +28689,7 @@ async function runInstallPhaseMacos(input) {
       continue;
     }
     if (shimEvent.kind === "exec") {
-      const shimAttrib = shimExecAttribution(line);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
       if (shimAttrib !== null) recordAttribution(shimEvent.pid, shimAttrib, lineTs);
       if (shimEvent.envp_alloc_failed) {
         const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
@@ -28638,7 +28725,8 @@ async function runInstallPhaseMacos(input) {
         };
         const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
         if (attribution2 !== null) {
-          emit({ raw: spawnRaw, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+          const raw2 = input.rootPkgKeys?.has(attribution2.pkg) === true ? { ...spawnRaw, root_anchored: true } : spawnRaw;
+          emit({ raw: raw2, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
         }
       } else {
         const failedResult = shimEvent.exec_errno === "ENOENT" ? "enoent" : shimEvent.exec_errno === "EACCES" ? "eacces" : null;
@@ -28653,7 +28741,8 @@ async function runInstallPhaseMacos(input) {
           };
           const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
           if (attribution2 !== null) {
-            emit({ raw: spawnRaw, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+            const raw2 = input.rootPkgKeys?.has(attribution2.pkg) === true ? { ...spawnRaw, root_anchored: true } : spawnRaw;
+            emit({ raw: raw2, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
           }
         }
       }
@@ -28663,9 +28752,11 @@ async function runInstallPhaseMacos(input) {
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) continue;
     }
     const attribution = freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
-    if (attribution === null) continue;
-    const isRootAttributedFsEvent = (shimEvent.kind === "read" || shimEvent.kind === "write") && input.rootPkgKeys?.has(attribution.pkg) === true;
-    const raw = isRootAttributedFsEvent ? { ...shimEvent, root_anchored: true } : shimEvent;
+    if (attribution === null) {
+      continue;
+    }
+    const isRootAttributedAnchorableEvent = (shimEvent.kind === "read" || shimEvent.kind === "write" || shimEvent.kind === "connect" || shimEvent.kind === "env_read" || shimEvent.kind === "env_tamper") && input.rootPkgKeys?.has(attribution.pkg) === true;
+    const raw = isRootAttributedAnchorableEvent ? { ...shimEvent, root_anchored: true } : shimEvent;
     const attributed = {
       raw,
       pkg: attribution.pkg,
@@ -28902,7 +28993,7 @@ function normalize(events, ctx) {
     if (isSystemNoise(ev, fsPath, os)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
     const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
-    const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write") && ev.raw.root_anchored !== true;
+    const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "env_read" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_tamper") && ev.raw.root_anchored !== true;
     if (pkgDir === void 0 && !claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`
@@ -28928,7 +29019,7 @@ function normalize(events, ctx) {
       }
       case "env_read": {
         const tagged = ev.raw.hidden ? `<HIDDEN> ${ev.raw.name}` : ev.raw.name;
-        block.env_read.push(tagged);
+        block.env_read.push(`${forgedPrefix}${tagged}`);
         break;
       }
       case "spawn": {
@@ -28943,8 +29034,11 @@ function normalize(events, ctx) {
         });
         const cmd = tokenizedArgv.join(" ");
         const auditBlind = ev.raw.audit_blind === true ? "<AUDIT_BLIND> " : "";
-        if (ev.raw.result === "ok") block.spawn_attempts.push(`${auditBlind}${cmd}`);
-        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`);
+        if (ev.raw.result === "ok") block.spawn_attempts.push(`${forgedPrefix}${auditBlind}${cmd}`);
+        else
+          block.spawn_blocked.push(
+            `${forgedPrefix}<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`
+          );
         break;
       }
       case "dlopen": {
@@ -28954,7 +29048,7 @@ function normalize(events, ctx) {
       }
       case "connect": {
         const tag = ev.raw.result === "blocked" ? "<BLOCKED> " : "";
-        block.network_attempts.push(`${tag}connect ${ev.raw.host}:${ev.raw.port}`);
+        block.network_attempts.push(`${forgedPrefix}${tag}connect ${ev.raw.host}:${ev.raw.port}`);
         break;
       }
       case "exec": {
@@ -28986,7 +29080,7 @@ function normalize(events, ctx) {
         }
         const name = ev.raw.name;
         const entry = name !== void 0 ? `<REFUSED> ${ev.raw.op} ${name}` : `<REFUSED> ${ev.raw.op}`;
-        block.env_tamper.push(entry);
+        block.env_tamper.push(`${forgedPrefix}${entry}`);
         break;
       }
     }
@@ -30498,8 +30592,26 @@ async function main(input) {
     (s) => redactSensitive(s, config2.protected.env),
     stdoutTailBytes
   ));
+  let rootPkgKeys = /* @__PURE__ */ new Set();
+  let canonicalRootKey = null;
+  let malformedRootName = false;
+  try {
+    const rootManifest = JSON.parse((0, import_node_fs4.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
+    malformedRootName = rootManifest.name !== void 0 && typeof rootManifest.name !== "string";
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+  } catch {
+  }
+  if (malformedRootName) {
+    emitter.emitError(
+      "Root `package.json` has a non-string `name` (e.g. a number/object/array). The package manager coerces it to a string it runs the root lifecycle under, which script-jail cannot portably attribute to the repo root \u2014 the root would run effectively unaudited and produce a deceptively clean lock. Refusing to emit a lockfile (give the root a string `name`, or remove it for a nameless root).",
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
   const attribution = new Attribution(
-    isMacosBare ? new MacOSProcReader() : new LinuxProcReader()
+    isMacosBare ? new MacOSProcReader() : new LinuxProcReader(),
+    canonicalRootKey === ROOT_SENTINEL ? ROOT_SENTINEL : void 0
   );
   diag(input, `Phase A starting: ${manager} fetch in ${config2.work_dir}`);
   const fetchResult = await runFetchPhase({
@@ -30576,19 +30688,6 @@ ${fetchDetail}
     }
   }
   const collectedEvents = [];
-  let rootPkgKeys = /* @__PURE__ */ new Set();
-  let canonicalRootKey = null;
-  let hasRootPrepareScript = false;
-  let hasRootMainPassLifecycle = false;
-  try {
-    const rootManifest = JSON.parse((0, import_node_fs4.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
-    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
-    const scripts = rootManifest.scripts ?? {};
-    const nonEmpty = (s) => typeof s === "string" && s.length > 0;
-    hasRootPrepareScript = nonEmpty(scripts.prepare);
-    hasRootMainPassLifecycle = nonEmpty(scripts.preinstall) || nonEmpty(scripts.install) || nonEmpty(scripts.postinstall) || manager === "pnpm" && (nonEmpty(scripts.prepublish) || nonEmpty(scripts.prerebuild) || nonEmpty(scripts.rebuild) || nonEmpty(scripts.postrebuild));
-  } catch {
-  }
   const altRootManifest = unsupportedAltRootManifest(config2.work_dir);
   if (altRootManifest !== null) {
     emitter.emitError(
@@ -30660,24 +30759,20 @@ ${fetchDetail}
     // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
     straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
-    rootPkgKeys
+    rootPkgKeys,
+    // Nameless root → the root's OWN lifecycle pids have empty npm_package_name
+    // but a canonical npm_lifecycle_event.  The ATTRIBUTION LAYER (Attribution
+    // ctor's rootSentinel on the /proc walk + shimNpmAttribution on the shim
+    // fast-path) attributes them to the `<repo-root>` sentinel for ALL event
+    // kinds; the dispatcher then defers fs events (pkg ∈ rootPkgKeys) and stamps
+    // the non-forgeable `root_anchored` verdict.  rootSentinel is threaded here
+    // ONLY so the shim fast-path (shimExecAttribution / classifyShimNodeStartup
+    // Marker) sees it — REQUIRED on macOS, where MacOSProcReader has no environ
+    // and attribution flows entirely through the shim seed.  Conditionally spread
+    // so the field is OMITTED (not set to undefined — PhaseInstallInput uses
+    // exactOptionalPropertyTypes) for a named/absent root, keeping it inert.
+    ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {}
   };
-  if (manager === "pnpm" && hasRootPrepareScript && canonicalRootKey === null) {
-    emitter.emitError(
-      "Root `prepare` script present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root `prepare` unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
-      true
-    );
-    flushAndExit(input.connection.writable, 1);
-    return;
-  }
-  if ((manager === "npm" || manager === "pnpm") && hasRootMainPassLifecycle && canonicalRootKey === null) {
-    emitter.emitError(
-      "Root install-time lifecycle script (preinstall/install/postinstall, or for pnpm also prepublish/rebuild) present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root lifecycle unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
-      true
-    );
-    flushAndExit(input.connection.writable, 1);
-    return;
-  }
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
     if (installResult.eventCount === 0) {
@@ -30709,14 +30804,6 @@ ${stdoutTail}`;
   }
   const prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
   if (prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true)) {
-    if (hasRootPrepareScript && canonicalRootKey === null) {
-      emitter.emitError(
-        "Root `prepare` script present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root `prepare` unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
-        true
-      );
-      flushAndExit(input.connection.writable, 1);
-      return;
-    }
     diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
     let prepareRunner;
     let prepareEventsFilePath = eventsFilePath;
@@ -30760,7 +30847,7 @@ ${stdoutTail}`;
             const raw = frame["raw"];
             const forcedPkg = canonicalRootKey ?? frame["pkg"];
             const forcedLifecycle = "prepare";
-            if ((raw.kind === "read" || raw.kind === "write") && canonicalRootKey !== null) {
+            if (canonicalRootKey !== null && (raw.kind === "read" || raw.kind === "write" || raw.kind === "spawn" || raw.kind === "connect" || raw.kind === "env_read" || raw.kind === "env_tamper")) {
               raw.root_anchored = true;
             }
             const forcedFrame = {
@@ -30796,6 +30883,13 @@ ${stdoutTail}`;
       straceBasePath: `${straceBaseDir}/strace-prepare.out`,
       protectedPaths,
       rootPkgKeys,
+      // Nameless root: its prepare-pass lifecycle pids surface under `<repo-root>`
+      // via the attribution layer (shim fast-path threaded with this sentinel; on
+      // Linux the shared Attribution instance already carries it).  The
+      // preparingEmitter then re-stamps lifecycle = 'prepare' + root_anchored.
+      // Conditionally spread (omitted, not undefined) for a named/absent root —
+      // see the installInput note above.
+      ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {},
       commandOverride: prepareCommand
     };
     const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);

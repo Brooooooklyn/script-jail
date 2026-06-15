@@ -275,6 +275,28 @@ export interface PhaseInstallInput {
    * it in a later task) NOTHING is tagged → zero behavior change.
    */
   rootPkgKeys?: ReadonlySet<string>;
+  /**
+   * The synthetic key for a NAMELESS root (`ROOT_SENTINEL`), or undefined when
+   * the root is named or absent.  Set ONLY when the root manifest parsed but
+   * carried no usable `name`.
+   *
+   * A nameless root leaves `npm_package_name` unset, so its own lifecycle events
+   * would attribute to null and be DROPPED — leaving the root unaudited.  This
+   * value is threaded into the shim FAST-PATH attribution helpers
+   * ({@link shimExecAttribution} / {@link classifyShimNodeStartupMarker} →
+   * {@link attributionFromEnvVars}) so a nameless root's own lifecycle pid (empty
+   * npm_package_name + canonical npm_lifecycle_event) attributes to this sentinel
+   * for ALL event kinds.  On Linux the shared {@link Attribution} instance ALSO
+   * carries it (the /proc walk), so the shim path and the walk agree; on macOS
+   * (no /proc environ) the shim path is the only source, which is why threading
+   * it here is REQUIRED.  ALL deferrable kinds (read/write AND spawn/connect/
+   * env_read) are then deferred and stamped with the non-forgeable `root_anchored`
+   * verdict (genuine root → unmarked, e.g. `$REPO/...`; a forged/unanchored
+   * nameless event → `<FORGED_ROOT>`) — the prior unmarked-non-fs gap is closed.
+   * Inert for named roots (they surface via name attribution) — `rootSentinel` is
+   * then undefined.
+   */
+  rootSentinel?: string;
 }
 
 export interface PhaseInstallResult {
@@ -422,8 +444,11 @@ export function parseShimLine(line: string): ShimLineEvent | null {
  * macOS-VZ-vs-Docker race for short-lived `.bin` shell-shim helpers without a
  * /proc walk.
  */
-export function shimExecAttribution(line: string): AttributionResult | null {
-  return shimNpmAttribution(line, 'exec');
+export function shimExecAttribution(
+  line: string,
+  rootSentinel?: string,
+): AttributionResult | null {
+  return shimNpmAttribution(line, 'exec', rootSentinel);
 }
 
 /**
@@ -447,8 +472,9 @@ export function shimExecAttribution(line: string): AttributionResult | null {
  */
 export function shimNodeStartupAttribution(
   line: string,
+  rootSentinel?: string,
 ): AttributionResult | null {
-  return shimNpmAttribution(line, 'node_startup_done');
+  return shimNpmAttribution(line, 'node_startup_done', rootSentinel);
 }
 
 /**
@@ -508,10 +534,11 @@ function shimNpmFields(
 function shimNpmAttribution(
   line: string,
   kind: 'exec' | 'node_startup_done',
+  rootSentinel?: string,
 ): AttributionResult | null {
   const fields = shimNpmFields(line, kind);
   if (fields === null || fields.pathological) return null;
-  return attributionFromEnvVars(fields.name, fields.version, fields.event);
+  return attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel);
 }
 
 /**
@@ -531,7 +558,10 @@ function shimNpmAttribution(
  *     reads still belong to their ancestor-propagated snapshot.  Demoting them
  *     would regress the very fast-exit attribution this machinery provides.
  */
-export function classifyShimNodeStartupMarker(line: string): {
+export function classifyShimNodeStartupMarker(
+  line: string,
+  rootSentinel?: string,
+): {
   attribution: AttributionResult | null;
   pathological: boolean;
 } {
@@ -539,7 +569,7 @@ export function classifyShimNodeStartupMarker(line: string): {
   if (fields === null) return { attribution: null, pathological: false };
   if (fields.pathological) return { attribution: null, pathological: true };
   return {
-    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event),
+    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel),
     pathological: false,
   };
 }
@@ -686,23 +716,41 @@ export async function runInstallPhase(
   // see an incomplete tree and fail closed → `<FORGED_ROOT>` in one run and a
   // genuine root path in another → committed-lock drift / flaky `check` CI.
   //
-  // Fix: DEFER root-attributed fs read/write events until the whole tree has
-  // drained, then stamp `root_anchored` against the COMPLETE maps. `emit` is
-  // the single chokepoint every event flows through (including node-bootstrap
-  // candidate replays via `flushAllNodeBootstrapCandidates`, which re-enter
-  // here), so capturing here catches them all. Non-root and non-fs events are
-  // emitted immediately (unchanged). Events that already carry an explicit
-  // `root_anchored` (none produced in this file today) are NOT re-deferred —
-  // their verdict is final.
-  const deferredRootFsEvents: AttributedEvent[] = [];
+  // Fix: DEFER root-attributed events until the whole tree has drained, then
+  // stamp `root_anchored` against the COMPLETE maps. `emit` is the single
+  // chokepoint every event flows through (including node-bootstrap candidate
+  // replays via `flushAllNodeBootstrapCandidates`, which re-enter here), so
+  // capturing here catches them all.
+  //
+  // The deferred kinds are read/write AND the non-fs set spawn/connect/env_read/
+  // env_tamper: ALL carry `pid` and `rootAnchored(pid)` is purely pid-based, so
+  // the verdict stamps identically. This closes the unmarked-non-fs gap — a
+  // forged/unanchored root-claimed spawn/connect/env_read/env_tamper now renders
+  // `<FORGED_ROOT>` instead of dedupe-collapsing with (or being mistaken for) a
+  // genuine root entry. (The `audit_fd_lost` env_tamper variant routes to
+  // audit_bypass and is gated independently by findAuditBypass; deferring +
+  // stamping it is harmless — normalize never reads root_anchored for it.)
+  //
+  // `exec` events are NOT deferred (intentionally absent from the kind test):
+  // the strace-vs-shim bypass synthesis emits them from raw strace counts and
+  // their relative order must be preserved (see the flush note below). Non-root
+  // events are emitted immediately (unchanged). Events that already carry an
+  // explicit `root_anchored` (none produced in this file today) are NOT
+  // re-deferred — their verdict is final.
+  const deferredRootEvents: AttributedEvent[] = [];
   const emit = (ev: AttributedEvent): void => {
     if (
       input.rootPkgKeys !== undefined &&
-      (ev.raw.kind === 'read' || ev.raw.kind === 'write') &&
+      (ev.raw.kind === 'read' ||
+        ev.raw.kind === 'write' ||
+        ev.raw.kind === 'spawn' ||
+        ev.raw.kind === 'connect' ||
+        ev.raw.kind === 'env_read' ||
+        ev.raw.kind === 'env_tamper') &&
       input.rootPkgKeys.has(ev.pkg) &&
       ev.raw.root_anchored === undefined
     ) {
-      deferredRootFsEvents.push(ev);
+      deferredRootEvents.push(ev);
       return;
     }
     emitFinal(ev);
@@ -2958,7 +3006,7 @@ export async function runInstallPhase(
         // site would fall through to it and the overlong-name fail-closed guard
         // would not actually fail closed (audit-trust re-review, 2026-06-04).
         const { attribution: startupAttrib, pathological: startupPathological } =
-          classifyShimNodeStartupMarker(line);
+          classifyShimNodeStartupMarker(line, input.rootSentinel);
         nodeStartupMarkerByPid.set(shimEvent.pid, {
           ts: lineTs,
           pathological: startupPathological,
@@ -2985,7 +3033,7 @@ export async function runInstallPhase(
       // the macOS-VZ-vs-Docker capture race for short-lived `.bin` shell-shim
       // helpers.  Non-exec shim records / unshimmed processes yield null here
       // and fall back to /proc exactly as before.
-      const shimAttrib = shimExecAttribution(line);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
       // Audit-trust Finding 1: track the shim's exec events per pid so
       // the post-loop cross-check can pair each strace execve with a
       // shim exec.  We count regardless of whether attribution succeeded
@@ -5535,6 +5583,11 @@ export async function runInstallPhase(
           continue;
         }
 
+        // Nameless-root handling is at the attribution layer now: a nameless
+        // root's own lifecycle pid attributes to ROOT_SENTINEL here (the
+        // Attribution instance carries the sentinel), so `result` is already
+        // non-null for it; the driver (no canonical lifecycle) stays null →
+        // dropped at the null-attribution gate below. See the NOTE there.
         const result = input.attribution.attribute(rawEvent.pid);
 
         // Audit-trust Finding A (high, 2026-05-18): kernel-observed
@@ -5906,7 +5959,21 @@ export async function runInstallPhase(
             // processed.  This branch therefore only fires for genuinely
             // unshimmed processes (static/setuid/env-scrubbed), which fall back
             // to /proc exactly as before.
+            continue;
           }
+          // NOTE — nameless-root lifecycle attribution now happens at the
+          // ATTRIBUTION LAYER (attributionFromEnvVars + the Attribution ctor's
+          // rootSentinel on the /proc walk, and shimNpmAttribution on the shim
+          // fast-path), NOT here.  For a nameless root's own lifecycle pid
+          // (empty npm_package_name + canonical npm_lifecycle_event) `result` is
+          // already non-null (= ROOT_SENTINEL) for EVERY event kind — fixing the
+          // old rescue's blind spot, which surfaced read/write only and dropped
+          // spawn/connect/env_read.  The PM driver and its non-lifecycle workers
+          // carry NO canonical npm_lifecycle_event, so they correctly stay null
+          // → dropped here — fixing the old rescue's flood, which rescued the
+          // driver's bulk store/cache/$REPO reads (driver pid == rootPid, also
+          // null-attributed) into `<repo-root>`.  So a genuine null at THIS gate
+          // is a real non-lifecycle process: drop it.
           continue;
         }
 
@@ -6185,13 +6252,13 @@ export async function runInstallPhase(
   }
 
   // Determinism (Fix #2, [medium], 2026-06-14): stamp + flush the deferred
-  // root-attributed fs events. We run this AFTER:
+  // root-attributed events. We run this AFTER:
   //   - the main drain loop and `flushAllNodeBootstrapCandidates()` (so any
   //     node-bootstrap candidate replays have re-entered `emit` and landed in
-  //     `deferredRootFsEvents`), and
-  //   - the strace-vs-shim bypass synthesis (those emit `exec` events, never
-  //     read/write, so they are never deferred — emitting them first keeps
-  //     their relative order unchanged).
+  //     `deferredRootEvents`), and
+  //   - the strace-vs-shim bypass synthesis (those emit `exec` events, which the
+  //     defer predicate never matches, so they are never deferred — emitting
+  //     them first keeps their relative order unchanged).
   // At this point the childParent/execCwd maps are COMPLETE, so `rootAnchored`
   // computes a deterministic verdict regardless of strace -ff drain order.
   //
@@ -6200,20 +6267,57 @@ export async function runInstallPhase(
   // (fail closed) so the walk disqualifies it.
   for (const pid of pendingExecCwd) execCwd.set(pid, null);
   pendingExecCwd.clear();
-  for (const ev of deferredRootFsEvents) {
-    // `deferredRootFsEvents` only ever holds read/write events (the `emit`
-    // filter guarantees it); narrow on `kind` so TS keeps the discriminated
-    // read/write shape when we attach `root_anchored`.
-    if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') {
-      emitFinal(ev);
-      continue;
-    }
-    emitFinal({
-      ...ev,
-      raw: { ...ev.raw, root_anchored: rootAnchored(ev.raw.pid) },
-    });
+
+  // Defense-in-depth (fail-closed): enforce the invariant "a pid known to have
+  // exec'd MUST have an execCwd entry".  `isRepoRootAnchored` treats an ABSENT
+  // execCwd entry as "this pid never exec'd → inherits its parent's identity →
+  // keep walking up" (fail-OPEN).  That is correct ONLY for a genuine fork.  If
+  // a pid that DID exec ever reached the walk with no execCwd entry, the walker
+  // would mis-classify it as a benign fork and could anchor a FORGED root-
+  // claimed event as genuine.  Here we sweep every pid the kernel/shim observed
+  // exec'ing — `straceExecsByPid` (one strace execve sample per pid) UNION the
+  // pids with a positive `shimExecCountByPid` (libc-wrapped exec count) — and
+  // fail closed (`null`) any that lack an execCwd verdict, so the walk
+  // disqualifies them instead of fail-OPENing.  First-writer-wins (`!has`): we
+  // never overwrite an existing string (exec-time cwd) or `null` (already
+  // disqualified) verdict.  Running here — AFTER both maps are complete and the
+  // pendingExecCwd finalize, BEFORE the deferredRootEvents stamp loop — makes it
+  // deterministic and independent of strace -ff drain order.  This is a NO-OP on
+  // real `strace -ff` installs: every traced execve sets execCwd (or parks in
+  // pendingExecCwd → finalized to null above), so an exec'd pid always already
+  // has an entry.  Pure future-proofing against any parser gap or launch-model
+  // change that could let an exec'd pid slip through without an execCwd snapshot.
+  for (const pid of straceExecsByPid.keys()) {
+    if (!execCwd.has(pid)) execCwd.set(pid, null);
   }
-  deferredRootFsEvents.length = 0;
+  for (const [pid, count] of shimExecCountByPid) {
+    if (count > 0 && !execCwd.has(pid)) execCwd.set(pid, null);
+  }
+
+  for (const ev of deferredRootEvents) {
+    // `deferredRootEvents` holds read/write/spawn/connect/env_read/env_tamper (the
+    // `emit` filter guarantees it — exec is never deferred). Each of these kinds
+    // now carries an optional `root_anchored`, so we stamp the per-pid verdict
+    // uniformly; the inline `kind` test narrows the discriminated union so TS
+    // keeps the right member shape on each `...ev.raw` spread. A non-deferrable
+    // kind (defensive `default`) emits UNSTAMPED — dead in practice, present for
+    // exhaustiveness.
+    const anchored = rootAnchored(ev.raw.pid);
+    switch (ev.raw.kind) {
+      case 'read':
+      case 'write':
+      case 'spawn':
+      case 'connect':
+      case 'env_read':
+      case 'env_tamper':
+        emitFinal({ ...ev, raw: { ...ev.raw, root_anchored: anchored } });
+        break;
+      default:
+        emitFinal(ev);
+        break;
+    }
+  }
+  deferredRootEvents.length = 0;
 
   // Exit code is owned by the StraceRunner (it ran the only install process).
   const exitCode = input.strace.getExitCode();

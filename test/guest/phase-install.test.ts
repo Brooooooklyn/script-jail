@@ -10,6 +10,7 @@ import {
   NODE_STARTUP_DONE_STRACE_PATH,
   runInstallPhase,
   loadPmFlags,
+  shimExecAttribution,
   type StraceRunner,
 } from '../../src/guest/phase-install.js';
 import { Emitter } from '../../src/guest/emit.js';
@@ -8511,6 +8512,751 @@ describe('runInstallPhase', () => {
       const write = findRootWrite(lines);
       expect(write).toBeDefined();
       expect((write!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+  });
+
+  // =====================================================================
+  // Defense-in-depth: "exec'd ⟹ execCwd entry present" invariant.
+  //
+  // `isRepoRootAnchored` treats a MISSING execCwd entry as "this pid never
+  // exec'd (forked, inherits parent identity) → keep walking up" (fail-OPEN).
+  // That is correct ONLY when the pid genuinely never exec'd.  If a pid that
+  // DID exec ever lacked an execCwd entry, the walk would mis-classify it as a
+  // benign fork and could anchor a FORGED root-claimed event as genuine.
+  //
+  // Under `strace -ff` today this is unreachable (every real libc/raw exec is
+  // traced → the strace `spawn` path always sets execCwd or parks the pid in
+  // `pendingExecCwd`, which the end-of-drain flush finalizes to `null`).  The
+  // SHIM exec channel, however, increments `shimExecCountByPid` WITHOUT
+  // touching execCwd — so a pid known-exec'd via the shim count, with NO
+  // corresponding strace execve, is the deterministic proxy for "a pid known
+  // to have exec'd but missing an execCwd entry".  The end-of-drain fail-closed
+  // sweep must finalize such a pid's execCwd to `null` so the walk disqualifies
+  // it instead of treating it as a never-exec'd fork.
+  // =====================================================================
+  describe('fail-closed sweep — exec\'d pid missing execCwd cannot fail-OPEN', () => {
+    const rootPkgName = 'sweep-root-app';
+    const rootPkgVersion = '9.9.0';
+    const rootPkgKey = `${rootPkgName}@${rootPkgVersion}`;
+    const ROOT_PID = 7100;
+    const CHILD_PID = 7200;
+    const rootEnv = {
+      npm_package_name: rootPkgName,
+      npm_package_version: rootPkgVersion,
+      npm_lifecycle_event: 'postinstall',
+    };
+
+    function rootWrites(lines: string[]): Record<string, unknown>[] {
+      return lines
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .filter((e) => {
+          const r = e['raw'] as Record<string, unknown>;
+          return r['kind'] === 'write' && r['path'] === '/work/dist/sweep.js';
+        });
+    }
+
+    it('(1) red: shim-exec\'d child (no strace execve → no execCwd) with CLONE_FS lineage to root → root_anchored:false', async () => {
+      // CHILD_PID is cloned CLONE_FS from the root PM pid (inherits /work, so
+      // cwdUnknown is FALSE — the only disqualifier left is the missing exec
+      // verdict) and it exec'd ONLY via the shim channel (shimExecCountByPid>0,
+      // straceExecsByPid empty), so NO execCwd entry is ever recorded and it is
+      // NOT parked in pendingExecCwd.  Its strace write to /work/dist/sweep.js
+      // attributes to the root pkg (CHILD's npm_* env) → deferred root event.
+      //
+      // WITHOUT the sweep: the walk sees execCwd.get(CHILD)===undefined → treats
+      // it as a never-exec'd fork → continues to ROOT_PID → root_anchored:TRUE
+      // (a forged root path laundered as genuine).
+      // WITH the sweep: execCwd.set(CHILD, null) at end-of-drain → walk hits
+      // `ec === null` → root_anchored:FALSE (<FORGED_ROOT>).
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: rootEnv },
+        [CHILD_PID]: { ppid: ROOT_PID, env: rootEnv },
+      });
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(
+          [
+            // Seed root cwd = /work (no-op read on the root pid).
+            { pid: ROOT_PID, line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3', source: 'strace' },
+            // CLONE_FS edge ROOT→CHILD: records childParent + propagates /work.
+            {
+              pid: ROOT_PID,
+              line: `clone(child_stack=0, flags=CLONE_VM|CLONE_FS|SIGCHLD) = ${CHILD_PID}`,
+              source: 'strace',
+            },
+            // SHIM exec only: increments shimExecCountByPid, NEVER sets execCwd
+            // and never parks in pendingExecCwd (that is the strace-spawn path).
+            {
+              pid: CHILD_PID,
+              source: 'shim',
+              line: JSON.stringify({
+                kind: 'exec',
+                prog: '/bin/sh',
+                argv0: 'sh',
+                envp_alloc_failed: false,
+                pid: CHILD_PID,
+                ts: 2,
+              }),
+            },
+            // Genuine-looking root build artifact write from the shim-exec'd
+            // child (strace write does NOT touch execCwd).
+            {
+              pid: CHILD_PID,
+              line: 'openat(AT_FDCWD, "/work/dist/sweep.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 5',
+              source: 'strace',
+            },
+          ],
+          0,
+          { rootPid: ROOT_PID },
+        ),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      const writes = rootWrites(lines);
+      expect(writes).toHaveLength(1);
+      expect((writes[0]!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+
+    it('(2a) regression: genuine root child that exec\'d at /work (execCwd present) is UNAFFECTED → root_anchored:true', async () => {
+      // The child exec's via strace at /work, so execCwd.get(CHILD)===/work is
+      // recorded BEFORE the sweep.  The sweep is first-writer-wins, so it must
+      // NOT overwrite the genuine /work verdict → the walk still anchors true.
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: rootEnv },
+        [CHILD_PID]: { ppid: ROOT_PID, env: rootEnv },
+      });
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(
+          [
+            { pid: ROOT_PID, line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3', source: 'strace' },
+            {
+              pid: ROOT_PID,
+              line: `clone(child_stack=0, flags=CLONE_VM|CLONE_FS|SIGCHLD) = ${CHILD_PID}`,
+              source: 'strace',
+            },
+            // Real strace execve at /work → execCwd.set(CHILD, '/work').
+            { pid: CHILD_PID, line: 'execve("/bin/sh", ["sh", "build.sh"], 0x7ffd) = 0', source: 'strace' },
+            {
+              pid: CHILD_PID,
+              line: 'openat(AT_FDCWD, "/work/dist/sweep.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 5',
+              source: 'strace',
+            },
+          ],
+          0,
+          { rootPid: ROOT_PID },
+        ),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      const writes = rootWrites(lines);
+      expect(writes).toHaveLength(1);
+      expect((writes[0]!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    it('(2b) regression: genuine never-exec\'d fork (no strace/shim exec, execCwd absent) still walks up → root_anchored:true', async () => {
+      // CHILD_PID is a pure fork: it NEVER exec'd (not in straceExecsByPid, no
+      // shimExecCount) and inherits ROOT's identity.  The sweep keys off the
+      // exec-known union ONLY, so it must NOT touch this pid → execCwd stays
+      // absent → the walk treats the hop as a benign fork and continues to
+      // ROOT_PID.  Legitimate fork-inheritance still anchors true.
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: rootEnv },
+        [CHILD_PID]: { ppid: ROOT_PID, env: rootEnv },
+      });
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(
+          [
+            { pid: ROOT_PID, line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3', source: 'strace' },
+            {
+              pid: ROOT_PID,
+              line: `clone(child_stack=0, flags=CLONE_VM|CLONE_FS|SIGCHLD) = ${CHILD_PID}`,
+              source: 'strace',
+            },
+            // NO exec on CHILD_PID (neither strace execve nor shim exec): pure
+            // fork.  It just writes a root artifact directly.
+            {
+              pid: CHILD_PID,
+              line: 'openat(AT_FDCWD, "/work/dist/sweep.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 5',
+              source: 'strace',
+            },
+          ],
+          0,
+          { rootPid: ROOT_PID },
+        ),
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([rootPkgKey]),
+      });
+      const writes = rootWrites(lines);
+      expect(writes).toHaveLength(1);
+      expect((writes[0]!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+  });
+
+  // =====================================================================
+  // Nameless-root attribution-layer surfacing (re-arch 2026-06-15).
+  //
+  // A root `package.json` with no usable `name` leaves `npm_package_name`
+  // EMPTY, but npm/pnpm STILL set a canonical `npm_lifecycle_event` when running
+  // the root's OWN lifecycle script.  Nameless handling lives in the ATTRIBUTION
+  // LAYER (attributionFromEnvVars's 4th `rootSentinel` param, consumed by the
+  // Attribution /proc walk and by the shim fast-path), NOT in a dispatcher
+  // rescue.  Consequences, all exercised below:
+  //
+  //   * ALL event kinds surface for the nameless root's lifecycle pid (the old
+  //     read/write-only rescue dropped spawn/connect/env_read — the blind spot).
+  //   * fs read/write still carry the NON-forgeable `root_anchored` verdict
+  //     (genuine → root_anchored:true → $REPO/...; unanchored → false →
+  //     <FORGED_ROOT>).
+  //   * a pid with NO canonical lifecycle (a driver-like / non-lifecycle pid)
+  //     attributes to null → DROPPED — no `<repo-root>` flood.
+  //   * GATED on rootSentinel: a nameless lifecycle pid attributes to null when
+  //     rootSentinel is undefined (named/absent root parity).
+  //
+  // The Attribution instance is constructed with ROOT_SENTINEL to model the
+  // agent threading it into the ctor for a nameless-but-parseable root.
+  // =====================================================================
+  describe('nameless-root attribution layer (rootSentinel)', () => {
+    const ROOT_SENTINEL = '<repo-root>';
+    const ROOT_PID = 7700;
+
+    // A nameless root's own lifecycle pid: empty npm_package_name + a canonical
+    // npm_lifecycle_event.  `new Attribution(proc, ROOT_SENTINEL)` attributes it
+    // to the sentinel via the /proc walk.
+    const namelessLifecycleEnv = {
+      npm_package_name: '',
+      npm_lifecycle_event: 'install',
+      PATH: '/usr/bin',
+    } as const;
+
+    // (a) GENUINE nameless root.  The traced PM root pid runs the root's own
+    // lifecycle (empty name + canonical event) and reads/writes an absolute repo
+    // path.  Because the runner reports ROOT_PID as the strace root, the
+    // dispatcher seeds installRootPid + execCwd[ROOT_PID] = /work, so the
+    // end-of-drain `rootAnchored(ROOT_PID)` walk hits the trusted anchor and
+    // returns true.
+    it('(a) genuine: nameless root lifecycle read at repo root → <repo-root> + root_anchored:true', async () => {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/build-config.json", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const read = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/build-config.json';
+      });
+      expect(read).toBeDefined();
+      expect(read!['pkg']).toBe(ROOT_SENTINEL);
+      expect(read!['lifecycle']).toBe('install');
+      expect((read!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    it('(a) genuine: nameless root lifecycle write at repo root → root_anchored:true', async () => {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/dist/out.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 5',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const write = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'write' && r['path'] === '/work/dist/out.js';
+      });
+      expect(write).toBeDefined();
+      expect(write!['pkg']).toBe(ROOT_SENTINEL);
+      expect((write!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    // (a-blindspot) The fix's whole point: a nameless root lifecycle's
+    // spawn / connect / env_read now SURFACE under <repo-root> (the old
+    // read/write-only rescue DROPPED these).  A `connect` strace line from the
+    // root lifecycle pid must land under the sentinel.
+    it('(a) blind-spot fix: nameless root lifecycle CONNECT surfaces under <repo-root>', async () => {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line:
+            'connect(7, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("198.51.100.7")}, 16) = -1 EINPROGRESS (Operation now in progress)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const connect = events.find((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'connect');
+      expect(connect).toBeDefined();
+      expect(connect!['pkg']).toBe(ROOT_SENTINEL);
+      expect(connect!['lifecycle']).toBe('install');
+      // The genuine root pid is anchored to /work → non-fs events now carry the
+      // SAME non-forgeable verdict as read/write (stamped at end-of-drain).
+      expect((connect!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    it('(a) blind-spot fix: nameless root lifecycle ENV_READ surfaces under <repo-root>', async () => {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: JSON.stringify({ kind: 'env_read', name: 'AWS_SECRET_ACCESS_KEY', pid: ROOT_PID, ts: 1, hidden: false }),
+          source: 'shim',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const envRead = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'env_read' && r['name'] === 'AWS_SECRET_ACCESS_KEY';
+      });
+      expect(envRead).toBeDefined();
+      expect(envRead!['pkg']).toBe(ROOT_SENTINEL);
+      expect(envRead!['lifecycle']).toBe('install');
+      // Genuine anchored root pid → env_read carries root_anchored:true too.
+      expect((envRead!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    // env_tamper is the last root-claimable + rendered + deduped kind that was
+    // unmarked.  A genuine root lifecycle's refused env-tamper must now be
+    // deferred and stamped root_anchored:true at end-of-drain, exactly like the
+    // env_read above.
+    it('(a) blind-spot fix: nameless root lifecycle ENV_TAMPER surfaces under <repo-root> + root_anchored:true', async () => {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: JSON.stringify({ kind: 'env_tamper', op: 'unsetenv', name: 'LD_PRELOAD', refused: true, pid: ROOT_PID, ts: 1 }),
+          source: 'shim',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const tamper = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'env_tamper' && r['name'] === 'LD_PRELOAD';
+      });
+      expect(tamper).toBeDefined();
+      expect(tamper!['pkg']).toBe(ROOT_SENTINEL);
+      expect(tamper!['lifecycle']).toBe('install');
+      // Genuine anchored root pid (pinned ROOT_PID) → env_tamper carries true.
+      expect((tamper!['raw'] as Record<string, unknown>)['root_anchored']).toBe(true);
+    });
+
+    // (b) FORGED/unanchored nameless non-fs events (spawn/connect/env_read).  A
+    // pid that runs with empty name + canonical event (attributes → sentinel)
+    // but is NOT the traced root and has NO clone-edge lineage → the anchoring
+    // walk fails closed.  Like read/write, the non-fs event now SURFACES under
+    // the sentinel but with root_anchored:false → <FORGED_ROOT> at render time.
+    // This closes the dedupe-collapse + egress-misclassification gap.
+    it('(b) forged: unanchored nameless CONNECT (no lineage to root) → <repo-root> + root_anchored:false', async () => {
+      const FORGER_PID = 7798;
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+        // The forger ALSO presents a nameless lifecycle env → attributes to the
+        // sentinel, but ppid 1 → no lineage to ROOT_PID in childParent.
+        [FORGER_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3',
+          source: 'strace',
+        },
+        {
+          pid: FORGER_PID,
+          line:
+            'connect(7, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("198.51.100.7")}, 16) = -1 EINPROGRESS (Operation now in progress)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const connect = events.find((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'connect');
+      expect(connect).toBeDefined();
+      expect(connect!['pkg']).toBe(ROOT_SENTINEL);
+      expect((connect!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+
+    it('(b) forged: unanchored nameless ENV_READ (no lineage to root) → <repo-root> + root_anchored:false', async () => {
+      const FORGER_PID = 7797;
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+        [FORGER_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3',
+          source: 'strace',
+        },
+        {
+          pid: FORGER_PID,
+          line: JSON.stringify({
+            kind: 'env_read',
+            name: 'AWS_SECRET_ACCESS_KEY',
+            pid: FORGER_PID,
+            ts: 1,
+            hidden: false,
+          }),
+          source: 'shim',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const envRead = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'env_read' && r['name'] === 'AWS_SECRET_ACCESS_KEY';
+      });
+      expect(envRead).toBeDefined();
+      expect(envRead!['pkg']).toBe(ROOT_SENTINEL);
+      expect((envRead!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+
+    it('(b) forged: unanchored nameless ENV_TAMPER (no lineage to root) → <repo-root> + root_anchored:false', async () => {
+      const FORGER_PID = 7796;
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+        [FORGER_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3',
+          source: 'strace',
+        },
+        {
+          pid: FORGER_PID,
+          line: JSON.stringify({ kind: 'env_tamper', op: 'unsetenv', name: 'LD_PRELOAD', refused: true, pid: FORGER_PID, ts: 1 }),
+          source: 'shim',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const tamper = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'env_tamper' && r['name'] === 'LD_PRELOAD';
+      });
+      expect(tamper).toBeDefined();
+      expect(tamper!['pkg']).toBe(ROOT_SENTINEL);
+      expect((tamper!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+
+    // (bypass) The defer/stamp change must NOT capture synthesised exec events.
+    // Bypass synthesis emits kind:'exec' from raw strace counts BEFORE the
+    // deferred flush; even when the bypass pid attributes to the sentinel and
+    // rootPkgKeys is set, the exec event is emitted directly (never deferred,
+    // never stamped) — proving the defer predicate is exec-blind as designed.
+    it('(bypass) syscall_bypass exec event still emits under sentinel attribution (unaffected by defer)', async () => {
+      const proc = mockProcReader({
+        // Nameless lifecycle env → attributes to ROOT_SENTINEL.
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      // One strace-source execve, NO matching shim exec → bypass synthesis fires.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'execve("/usr/bin/curl", ["curl", "https://evil.example"], 0x1234 /* 0 vars */) = 0',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const synthExec = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'exec' && raw['syscall_bypass'] === true;
+      });
+      expect(synthExec).toBeDefined();
+      expect(synthExec!['pkg']).toBe(ROOT_SENTINEL);
+      // exec events never carry root_anchored (defer predicate is read/write/
+      // env_read/spawn/connect — never exec).
+      expect((synthExec!['raw'] as Record<string, unknown>)['root_anchored']).toBeUndefined();
+    });
+
+    // (b) FORGED/unanchored nameless.  A pid that ALSO runs with empty name +
+    // canonical event (so attribution → sentinel) but is NOT the traced root and
+    // has NO clone-edge lineage to it → the anchoring walk fails closed.  The
+    // event SURFACES under the sentinel but with root_anchored:false →
+    // <FORGED_ROOT> at render time.
+    it('(b) forged: unanchored nameless write (no lineage to root) → <repo-root> + root_anchored:false', async () => {
+      const FORGER_PID = 7799;
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+        // The forger ALSO presents a nameless lifecycle env → attributes to the
+        // sentinel, but ppid 1 → no lineage to ROOT_PID in childParent.
+        [FORGER_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/package.json", O_RDONLY) = 3',
+          source: 'strace',
+        },
+        {
+          pid: FORGER_PID,
+          line: 'openat(AT_FDCWD, "/work/dist/forged.js", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 6',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const forged = events.find((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'write' && r['path'] === '/work/dist/forged.js';
+      });
+      expect(forged).toBeDefined();
+      expect(forged!['pkg']).toBe(ROOT_SENTINEL);
+      expect((forged!['raw'] as Record<string, unknown>)['root_anchored']).toBe(false);
+    });
+
+    // (flood) A DRIVER-like pid — null-attribution because it carries NO
+    // canonical npm_lifecycle_event (the pnpm/npm driver itself, also == rootPid
+    // in the wild) — must be DROPPED, never rescued into <repo-root>, EVEN with
+    // rootSentinel in play.  This is the over-fire the old read/write rescue had.
+    it('(flood) driver-like pid (no canonical lifecycle) read is DROPPED even with rootSentinel set', async () => {
+      const proc = mockProcReader({
+        // No npm_* env at all → not a lifecycle pid → attribution null.
+        [ROOT_PID]: { ppid: 1, env: { PATH: '/usr/bin' } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/node_modules/.pnpm/store/bulk.json", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      expect(lines.filter((l) => l.includes('/work/node_modules/.pnpm/store/bulk.json'))).toHaveLength(0);
+    });
+
+    // (c) GATED OFF: without rootSentinel a nameless lifecycle pid attributes to
+    // null (the Attribution ctor was not given the sentinel) → DROPPED, the
+    // named/absent-root behavior.
+    it('(c) gated: nameless lifecycle read is DROPPED when rootSentinel/ctor-sentinel are absent', async () => {
+      const proc = mockProcReader({
+        [ROOT_PID]: { ppid: 1, env: { ...namelessLifecycleEnv } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line: 'openat(AT_FDCWD, "/work/build-config.json", O_RDONLY) = 4',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        // Attribution ctor WITHOUT the sentinel → nameless pid → null.
+        attribution: new Attribution(proc),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        // rootSentinel intentionally omitted from the input too.
+      });
+      expect(lines.filter((l) => l.includes('/work/build-config.json'))).toHaveLength(0);
+    });
+
+    // (rebuild-hook) pnpm root rebuild-class hook: the nameless root runs a
+    // script literally named `rebuild` (pnpm main-pass `rebuild --pending`), so
+    // its lifecycle pid carries npm_lifecycle_event=rebuild — NON-canonical.  The
+    // attribution layer folds it into `install`, so a connect from that hook
+    // SURFACES under <repo-root> rather than being dropped (closes the
+    // fail-closed-gate regression the adversarial review flagged).
+    it('(rebuild-hook) nameless root `rebuild` hook connect surfaces under <repo-root> (folded to install)', async () => {
+      const proc = mockProcReader({
+        // npm_lifecycle_event=rebuild (pnpm root rebuild-class hook), name empty.
+        [ROOT_PID]: {
+          ppid: 1,
+          env: { npm_package_name: '', npm_lifecycle_event: 'rebuild', PATH: '/usr/bin' },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: ROOT_PID,
+          line:
+            'connect(7, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("198.51.100.7")}, 16) = -1 EINPROGRESS (Operation now in progress)',
+          source: 'strace',
+        },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'pnpm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace: cannedStraceRunner(records, 0, { rootPid: ROOT_PID }),
+        attribution: new Attribution(proc, ROOT_SENTINEL),
+        emitter,
+        rootPkgKeys: new Set([ROOT_SENTINEL]),
+        rootSentinel: ROOT_SENTINEL,
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const connect = events.find((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'connect');
+      expect(connect).toBeDefined();
+      expect(connect!['pkg']).toBe(ROOT_SENTINEL);
+      // Folded into the canonical `install` bucket (rebuild is not a LifecycleStage).
+      expect(connect!['lifecycle']).toBe('install');
+    });
+
+    // (shim) Shim fast-path: shimExecAttribution on a shim `exec` record carrying
+    // an EMPTY npm_package_name + canonical event, with the sentinel threaded,
+    // yields ROOT_SENTINEL (the macOS-and-fast-exit-child attribution source).
+    it('(shim) shimExecAttribution(empty-name + canonical event, rootSentinel) → ROOT_SENTINEL', () => {
+      const line = JSON.stringify({
+        kind: 'exec',
+        prog: '/work/scripts/preinstall.js',
+        npm_package_name: '',
+        npm_lifecycle_event: 'preinstall',
+        pid: 9001,
+        ts: 1,
+        result: 'ok',
+      });
+      expect(shimExecAttribution(line, ROOT_SENTINEL)).toEqual({
+        pkg: ROOT_SENTINEL,
+        lifecycle: 'preinstall',
+      });
+      // WITHOUT the sentinel → null (gated off).
+      expect(shimExecAttribution(line)).toBeNull();
     });
   });
 

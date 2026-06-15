@@ -676,6 +676,30 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   **Firecracker is the enforcement boundary**; the env-trusted default is a known
   no-strace fidelity gap, not a parity bug.
 
+  This residual extends to **nameless roots** (a parseable root `package.json`
+  with no `name`, e.g. an unnamed private monorepo root running
+  `preinstall: npx only-allow pnpm` + `postinstall: simple-git-hooks`). Such a
+  root's own lifecycle is recognised in the **attribution layer** — an empty
+  `npm_package_name` plus a canonical `npm_lifecycle_event` attributes to the
+  synthetic `<repo-root>` sentinel (`ROOT_SENTINEL`; see `docs/design.md`
+  "Non-forgeable root identity"). On macOS-bare this flows through the shim
+  fast-path (`shimExecAttribution` / `classifyShimNodeStartupMarker`), which is
+  the only attribution source there (no `/proc` environ). Its lifecycle events
+  are now **surfaced** — not dropped, and no longer fail-closed — for **all** event
+  kinds (`spawn` / `connect` / `env_read` as well as `read` / `write`); and **all**
+  of those kinds now route through the same `root_anchored` stamp as a named root
+  (the prior unmarked-non-fs residual is closed). Linux/Firecracker computes the
+  real verdict from the process tree; macOS-bare, having no process tree,
+  **defaults `root_anchored: true`** on every root-attributed read/write/spawn/
+  connect/env_read. So a **forged/unanchored** nameless event of any kind can
+  render differently across backends — Linux marks it `<FORGED_ROOT> …` (e.g.
+  `<FORGED_ROOT> $REPO/...` or `<FORGED_ROOT> connect host:port`), macOS-bare
+  renders it unmarked (genuine) — exactly as for a named forged root. Benign
+  nameless-root fixtures anchor `true` on Linux and render identically on both
+  sides (the macOS-bare non-fs default `true` is precisely what preserves that
+  parity — without it a benign root's non-fs events would mis-render
+  `<FORGED_ROOT>` on macOS only); Firecracker remains the enforcement boundary.
+
 - **Dropped `audit_bypass` detectors.** Three `audit_bypass` event kinds are
   **strace-derived** and have no macOS equivalent, because there is no kernel
   syscall channel to cross-check the libc-level shim against:

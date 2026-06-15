@@ -373,7 +373,15 @@ export function formatEgressWarning(
     if (
       e.stage === 'prepare' &&
       opts.manager !== 'pnpm' &&
-      opts.rootPackageIds.has(e.packageId)
+      opts.rootPackageIds.has(e.packageId) &&
+      // A `<FORGED_ROOT> ` entry attributes to a root key but is NOT the genuine
+      // root's prepare (normalize stamps the prefix when the non-forgeable
+      // root_anchored verdict is not true). Under `install:true` the forging
+      // dependency's lifecycle DOES run online on the host, so a forged connect
+      // is a REAL egress risk — it must route to hostBound, never be carved out
+      // as audited-only/host-safe. (Genuine root prepare connects render without
+      // the prefix and stay audited-only.)
+      !e.entry.startsWith('<FORGED_ROOT> ')
     ) {
       auditedOnly.push(e);
     } else {

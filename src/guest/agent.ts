@@ -23,7 +23,7 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
 
-import { Attribution, buildRootPkgKeys } from './attribution.js';
+import { Attribution, buildRootPkgKeys, ROOT_SENTINEL } from './attribution.js';
 import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
 import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
 import { LinuxProcReader } from './proc-reader.js';
@@ -3077,11 +3077,78 @@ export async function main(input: AgentInput): Promise<void> {
           stdoutTailBytes,
         ));
 
+  // ROOT package keys, computed ONCE here so the Attribution ctor (below), BOTH
+  // Phase-B passes (main install + the root-prepare pass) and the post-phase
+  // normalize all agree on what counts as the root project.  The ROOT project is
+  // not in node_modules, so discoverPkgDirs never maps it; its lifecycle events
+  // attribute to `<rootName>@<rootVersion>` (or bare `<rootName>` when npm sets
+  // no version).  Keys MUST match attribution's buildPkg() — use
+  // buildRootPkgKeys() as the single source of truth.  Missing/invalid root
+  // package.json → empty set (unchanged semantics: no root lifecycle events).
+  //
+  // `canonicalRootKey` is the SINGLE key the prepare pass forces every event onto
+  // (see the prepare-pass wrapping emitter below).  It is guaranteed to be a
+  // member of `rootPkgKeys`: version present (even '') → `<name>@<version>`, else
+  // the bare name; for a nameless-but-parseable root the `<repo-root>` sentinel;
+  // null ONLY when no manifest exists at all (degenerate no-root edge — nothing
+  // to force onto; the prepare pass does not run in that case).
+  //
+  // Computed HERE (not at section 10) so the nameless-root sentinel can be passed
+  // into the Attribution ctor: only reads `config.work_dir/package.json` from
+  // disk, which is already in place, so the early move is side-effect-free.
+  let rootPkgKeys = new Set<string>();
+  let canonicalRootKey: string | null = null;
+  // A PRESENT-but-non-string root `name` (`"name": 42`) is malformed: the PM
+  // coerces it to a string `npm_package_name` we cannot portably predict, so the
+  // root's events would attribute under that coerced id (which `<repo-root>`
+  // never matches) → a sentinel mismatch that fails normalization or records a
+  // phantom package.  buildRootPkgKeys returns `canonical: null` for it; we flag
+  // it here to fail closed below (distinct from a genuinely ABSENT manifest,
+  // where JSON.parse throws and this stays false).
+  let malformedRootName = false;
+  try {
+    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as {
+      name?: unknown;
+      version?: unknown;
+    };
+    malformedRootName =
+      rootManifest.name !== undefined && typeof rootManifest.name !== 'string';
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+  } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+
+  // FAIL CLOSED — malformed root `name` (present but not a string).  The PM runs
+  // the root's lifecycle under a coerced `npm_package_name` that won't match the
+  // `<repo-root>` sentinel, so the root would run effectively unattributed and the
+  // lock could look deceptively clean.  Refuse to emit (a non-string `name` is
+  // malformed and never appears in a real repo, so unlike the removed nameless
+  // gate this cannot over-fire on benign unnamed monorepos).
+  if (malformedRootName) {
+    emitter.emitError(
+      'Root `package.json` has a non-string `name` (e.g. a number/object/array). The package ' +
+        'manager coerces it to a string it runs the root lifecycle under, which script-jail ' +
+        'cannot portably attribute to the repo root — the root would run effectively unaudited ' +
+        'and produce a deceptively clean lock. Refusing to emit a lockfile (give the root a ' +
+        'string `name`, or remove it for a nameless root).',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+
   // 7. Attribution.  Linux reads /proc; macOS has no /proc, so MacOSProcReader
   //    returns null environ (attribution flows through the shim event seed) and
   //    best-effort ppid via the sj-procinfo helper.
+  //
+  //    NAMELESS ROOT: when `canonicalRootKey === ROOT_SENTINEL` (the root parsed
+  //    but had no usable `name`), pass the sentinel into the ctor so the /proc
+  //    walk attributes the root's OWN lifecycle pids (empty npm_package_name +
+  //    canonical npm_lifecycle_event) to `<repo-root>` for ALL event kinds.  The
+  //    PM driver / non-lifecycle workers carry no canonical lifecycle → still
+  //    null → dropped (no flood).  Undefined for a named/absent root, so the
+  //    walk is byte-identical to before for them.
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader(),
+    canonicalRootKey === ROOT_SENTINEL ? ROOT_SENTINEL : undefined,
   );
 
   // 8. Phase A: fetch (network on, no strace)
@@ -3242,61 +3309,9 @@ export async function main(input: AgentInput): Promise<void> {
   // 10. Phase B: install (network off, under strace, StraceRunner owns the process)
   const collectedEvents: import('../lock/schema.js').AttributedEvent[] = [];
 
-  // ROOT package keys, computed ONCE here so BOTH Phase-B passes (main install
-  // and the root-prepare pass) and the post-phase normalize all agree on what
-  // counts as the root project.  The ROOT project is not in node_modules, so
-  // discoverPkgDirs never maps it; its lifecycle events attribute to
-  // `<rootName>@<rootVersion>` (or bare `<rootName>` when npm sets no version).
-  // Keys MUST match attribution's buildPkg() — use buildRootPkgKeys() as the
-  // single source of truth.  Missing/invalid root package.json → empty set
-  // (unchanged semantics: no root lifecycle events to surface).
-  //
-  // `canonicalRootKey` is the SINGLE key the prepare pass forces every event
-  // onto (see the prepare-pass wrapping emitter below).  It is guaranteed to be
-  // a member of `rootPkgKeys`: version present (even '') → `<name>@<version>`,
-  // else the bare name, else null (degenerate no-root edge — nothing to force onto).
-  let rootPkgKeys = new Set<string>();
-  let canonicalRootKey: string | null = null;
-  // Whether the ROOT manifest actually declares a non-empty `prepare` script.
-  // The npm prepare pass uses `npm run prepare --if-present`, which no-ops when
-  // no `prepare` script exists — so the nameless-root fail-closed gate below
-  // must key off the SCRIPT's presence, NOT off `prepareCommand !== null`
-  // (which is unconditionally non-null for npm).  Otherwise a perfectly benign
-  // nameless npm root with no `prepare` would be wrongly blocked.
-  let hasRootPrepareScript = false;
-  // Whether the ROOT manifest declares a non-empty lifecycle script that the
-  // MAIN Phase-B command runs on the ROOT.  npm `npm rebuild --foreground-scripts`
-  // runs ONLY preinstall/install/postinstall.  pnpm `pnpm rebuild --pending`
-  // ADDITIONALLY runs prepublish (pnpm 10) and prerebuild/rebuild/postrebuild
-  // (pnpm 11) — verified by an exhaustive 24-candidate probe across pnpm 10.34 +
-  // 11.1, all firing with npm_package_name UNSET on a nameless root.  The sandbox
-  // pnpm floats to the repo's `packageManager`, so the gate must cover the UNION
-  // of both pnpm versions.  `prepare` is gated separately (npm/yarn dedicated
-  // pass; pnpm main-pass prepare gate above).  Drives the nameless-root gate below.
-  let hasRootMainPassLifecycle = false;
-  try {
-    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as {
-      name?: unknown;
-      version?: unknown;
-      scripts?: {
-        prepare?: unknown; preinstall?: unknown; install?: unknown; postinstall?: unknown;
-        prepublish?: unknown; prerebuild?: unknown; rebuild?: unknown; postrebuild?: unknown;
-      };
-    };
-    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
-    const scripts = rootManifest.scripts ?? {};
-    const nonEmpty = (s: unknown): boolean => typeof s === 'string' && s.length > 0;
-    hasRootPrepareScript = nonEmpty(scripts.prepare);
-    hasRootMainPassLifecycle =
-      nonEmpty(scripts.preinstall) ||
-      nonEmpty(scripts.install) ||
-      nonEmpty(scripts.postinstall) ||
-      (manager === 'pnpm' &&
-        (nonEmpty(scripts.prepublish) ||
-          nonEmpty(scripts.prerebuild) ||
-          nonEmpty(scripts.rebuild) ||
-          nonEmpty(scripts.postrebuild)));
-  } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+  // `rootPkgKeys` / `canonicalRootKey` were computed at section 7 (just before
+  // `new Attribution(...)`) so the nameless-root sentinel could be threaded into
+  // the Attribution ctor.  See the comment there for the full contract.
 
   // FAIL CLOSED — alternate root manifest (package.yaml / package.json5) with no
   // package.json.  script-jail reads root identity + lifecycle scripts from
@@ -3423,81 +3438,48 @@ export async function main(input: AgentInput): Promise<void> {
     straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
     rootPkgKeys,
+    // Nameless root → the root's OWN lifecycle pids have empty npm_package_name
+    // but a canonical npm_lifecycle_event.  The ATTRIBUTION LAYER (Attribution
+    // ctor's rootSentinel on the /proc walk + shimNpmAttribution on the shim
+    // fast-path) attributes them to the `<repo-root>` sentinel for ALL event
+    // kinds; the dispatcher then defers fs events (pkg ∈ rootPkgKeys) and stamps
+    // the non-forgeable `root_anchored` verdict.  rootSentinel is threaded here
+    // ONLY so the shim fast-path (shimExecAttribution / classifyShimNodeStartup
+    // Marker) sees it — REQUIRED on macOS, where MacOSProcReader has no environ
+    // and attribution flows entirely through the shim seed.  Conditionally spread
+    // so the field is OMITTED (not set to undefined — PhaseInstallInput uses
+    // exactOptionalPropertyTypes) for a named/absent root, keeping it inert.
+    ...(canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {}),
   };
 
-  // FAIL CLOSED (pnpm) — nameless-root unaudited `prepare`, MAIN-pass variant.
+  // NOTE — the nameless-root fail-closed gates that used to live here have been
+  // REMOVED (superseded by non-forgeable root anchoring).  They previously
+  // refused any root with no `name` that ran a main-pass lifecycle (npm/pnpm
+  // preinstall/install/postinstall, plus pnpm's prepublish/rebuild union) or a
+  // pnpm main-pass `prepare`, because such events attributed to null and were
+  // DROPPED — a deceptively-clean lock.  That over-fired on the (extremely
+  // common) unnamed private monorepo root (e.g. pnpm root with `only-allow pnpm`
+  // + git-hooks), refusing to audit it at all, even in pure-audit mode where the
+  // only consequence is a weaker audit.
   //
-  // The dedicated prepare-pass gate at section 11a only covers managers whose
-  // root `prepare` runs in a SEPARATE pass: npm (`npm run prepare`) and yarn
-  // (`yarn run prepare`).  resolvePrepareCommand('pnpm') is ALWAYS null, so that
-  // gate is never reached for pnpm.  But pnpm's MAIN Phase-B command
-  // (`pnpm rebuild --pending`, INSTALL_CMD.pnpm) DOES run the ROOT project's
-  // `prepare` — verified against pnpm 10.34/11.1: a root manifest with a
-  // `prepare` script but NO `name` runs that prepare with npm_package_name
-  // UNSET.  With no name, attributionFromEnvVars returns null and the
-  // dispatcher DROPS every non-spawn prepare event at its null-attribution
-  // gate, leaving the root `prepare` UNAUDITED while a clean diff against the
-  // resulting lock could still return `trusted` — and with `install: true` that
-  // clean lock then runs the lifecycle scripts on the host.  Refuse to emit a
-  // lockfile.
-  //
-  // Scope: this gate is pnpm-ONLY and fires BEFORE the main install runs the
-  // root prepare.  npm/yarn must NOT be added here — their main pass does NOT
-  // run the root prepare, so failing closed before it would falsely block a
-  // nameless npm/yarn root whose prepare never executes in this pass; their
-  // root prepare is gated (correctly) inside the dedicated pass at 11a.  Same
-  // signal (`hasRootPrepareScript` + `canonicalRootKey === null`) and same fatal
-  // shape (emitError(…, true) + flushAndExit(1) + return) as the 11a gate.
-  if (manager === 'pnpm' && hasRootPrepareScript && canonicalRootKey === null) {
-    emitter.emitError(
-      'Root `prepare` script present but root package.json has no usable `name` — ' +
-        'its audited events cannot be attributed and would be silently dropped, ' +
-        'leaving the root `prepare` unaudited. Refusing to emit a lockfile ' +
-        '(add a `name` to the root package.json).',
-      true,
-    );
-    flushAndExit(input.connection.writable, 1);
-    return;
-  }
-
-  // FAIL CLOSED (npm/pnpm) — nameless-root unaudited main-pass lifecycle scripts.
-  //
-  // The MAIN Phase-B install runs ROOT lifecycle scripts: npm
-  // `npm rebuild --foreground-scripts` runs preinstall/install/postinstall; pnpm
-  // `pnpm rebuild --pending` runs those PLUS prepublish (pnpm 10) and
-  // prerebuild/rebuild/postrebuild (pnpm 11) — all verified to fire on a nameless
-  // root with npm_package_name UNSET.  With no usable `name`
-  // (canonicalRootKey === null) attributionFromEnvVars returns null, so the
-  // dispatcher DROPS every non-spawn event from those scripts at its
-  // null-attribution gate — the root lifecycle runs UNAUDITED, the lock looks
-  // clean, and with `install: true` host part-2 then runs those same scripts on
-  // the runner trusting that clean lock.  Refuse to emit a lockfile.  This is the
-  // same unaudited-nameless-root class the prepare gates (above + 11a) close,
-  // reached through the non-prepare main-pass lifecycles.  `hasRootMainPassLifecycle`
-  // already encodes the per-manager set (npm: 3 names; pnpm: the wider union).
-  //
-  // Scope: npm + pnpm ONLY.  yarn (Berry) SYNTHESIZES an npm_package_name
-  // (`root-workspace-<hash>`) for the root, so its lifecycle events are NOT
-  // dropped (they surface, or fail the normalize pkgDir lookup) — gating yarn
-  // here would FALSELY block a nameless yarn root whose benign lifecycle emitted
-  // no escaping events.  Fires BEFORE the main install pass, same fatal shape as
-  // the pnpm prepare gate above.
-  if (
-    (manager === 'npm' || manager === 'pnpm') &&
-    hasRootMainPassLifecycle &&
-    canonicalRootKey === null
-  ) {
-    emitter.emitError(
-      'Root install-time lifecycle script (preinstall/install/postinstall, or for ' +
-        'pnpm also prepublish/rebuild) present but root package.json has no usable ' +
-        '`name` — its audited events cannot be attributed and would be silently ' +
-        'dropped, leaving the root lifecycle unaudited. Refusing to emit a lockfile ' +
-        '(add a `name` to the root package.json).',
-      true,
-    );
-    flushAndExit(input.connection.writable, 1);
-    return;
-  }
+  // Now: `buildRootPkgKeys` gives a nameless-but-parseable root the `<repo-root>`
+  // sentinel key, and the ATTRIBUTION LAYER (not a dispatcher rescue) surfaces
+  // its lifecycle events under that key.  ALL kinds carry the non-forgeable
+  // `root_anchored` verdict (read/write tokenized to `$REPO/...`; spawn/connect/
+  // env_read in their own channels) — genuine root → unmarked; a forged/unanchored
+  // nameless event → `<FORGED_ROOT>`.  Non-fs kinds (spawn/connect/env_read),
+  // which the OLD rescue dropped, now SURFACE under `<repo-root>` AND are anchored
+  // (the prior unmarked-non-fs gap is closed).  Critically, the PM driver and its
+  // non-lifecycle workers carry NO canonical npm_lifecycle_event, so they stay
+  // null → dropped, which is what stops the driver's bulk store/cache/$REPO I/O
+  // from flooding `<repo-root>` (the over-fire the old read/write rescue had,
+  // since the driver pid was also null-attributed and == rootPid).  The lock is
+  // no longer deceptively clean (escaping behavior surfaces and the diff gate
+  // fails on it), so no fail-closed refusal is needed, for any manager or for
+  // `install: true`.  The dedicated prepare-pass force-attribution (section 11)
+  // likewise now stamps nameless roots (canonicalRootKey is the sentinel, not
+  // null).  The alt-manifest gate (genuinely unparseable package.yaml/json5 root)
+  // and the prepare-pass ZERO-EVENT gate remain — both orthogonal to this class.
 
   // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux
   // uses the full strace+shim dispatcher.  Both share PhaseInstallInput /
@@ -3614,34 +3596,14 @@ export async function main(input: AgentInput): Promise<void> {
       input.strace === undefined ||
       input.forcePreparePass === true)
   ) {
-    // FAIL CLOSED: the root declares a `prepare` script that WILL run, but the
-    // root package.json has no usable `name` (canonicalRootKey === null).  In
-    // that state npm sets no npm_package_name, so attributionFromEnvVars returns
-    // null and the dispatcher DROPS every non-spawn prepare event at its
-    // null-attribution gate — BEFORE they reach the force-attribution emitter
-    // below.  The prepare's fs reads / writes / connects would therefore be
-    // silently dropped, leaving the root `prepare` UNAUDITED while a clean diff
-    // against the resulting lock could still return `trusted`.  Refuse to emit a
-    // lockfile (mirrors the other prepare-pass fatal gates: emitError(…,true) +
-    // flushAndExit(1) + return).
-    //
-    // Gate on `hasRootPrepareScript`, NOT on `prepareCommand !== null`: for npm
-    // the command is unconditionally non-null and `--if-present` no-ops when no
-    // `prepare` script exists, so keying off the command would wrongly block a
-    // benign nameless npm root that has no prepare script at all.  yarn already
-    // only resolves a command when a non-empty `scripts.prepare` is present, so
-    // `hasRootPrepareScript` is consistent across both managers.
-    if (hasRootPrepareScript && canonicalRootKey === null) {
-      emitter.emitError(
-        'Root `prepare` script present but root package.json has no usable `name` — ' +
-          'its audited events cannot be attributed and would be silently dropped, ' +
-          'leaving the root `prepare` unaudited. Refusing to emit a lockfile ' +
-          '(add a `name` to the root package.json).',
-        true,
-      );
-      flushAndExit(input.connection.writable, 1);
-      return;
-    }
+    // (The nameless-root prepare fail-closed gate that used to live here is
+    // REMOVED — superseded by root anchoring.  A nameless root now force-attributes
+    // its prepare events under the `<repo-root>` sentinel via the prepare emitter
+    // below (canonicalRootKey is the sentinel, not null); the ATTRIBUTION LAYER
+    // (Attribution ctor rootSentinel + shim fast-path) attributes the root's own
+    // prepare lifecycle pids to the sentinel rather than null, so the events reach
+    // the emitter rather than being dropped — the prepare is audited and surfaces
+    // with the non-forgeable `root_anchored` verdict.  See the NOTE in section 10.)
     diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(' ')}`);
     // Obtain the prepare runner and its audit sink.  An injected runner owns
     // its own sink; otherwise build a fresh runner over a SEPARATE events file
@@ -3704,10 +3666,11 @@ export async function main(input: AgentInput): Promise<void> {
     // Mirrors `collectingEmitter` EXACTLY for non-event frames
     // (handshake/error/final/etc. pass through unchanged); only `kind:'event'`
     // frames are rewritten: pkg → canonicalRootKey, lifecycle → 'prepare', and
-    // fs read/write events get `root_anchored = true` (non-fs raw is untouched;
-    // normalize only consults root_anchored for read/write).  The FORCED frame
-    // is what we push into the SHARED `collectedEvents` AND re-emit to the host
-    // stream, so the two stay consistent.
+    // the full anchorable set (read/write/spawn/connect/env_read) gets
+    // `root_anchored = true` — normalize now consults root_anchored for all of
+    // those kinds (`exec` is excluded: it carries no root_anchored).  The FORCED
+    // frame is what we push into the SHARED `collectedEvents` AND re-emit to the
+    // host stream, so the two stay consistent.
     const preparingEmitter = new Emitter(
       new (class extends Writable {
         override _write(chunk: Buffer, _enc: string, cb: () => void): void {
@@ -3726,12 +3689,40 @@ export async function main(input: AgentInput): Promise<void> {
             const forcedPkg = canonicalRootKey ?? (frame['pkg'] as string);
             const forcedLifecycle: import('../lock/schema.js').LifecycleStage = 'prepare';
             // Only stamp the non-forgeable root anchor when we actually have a
-            // parseable root manifest (canonicalRootKey).  With no root manifest
+            // parseable root manifest (canonicalRootKey is non-null).  This now
+            // INCLUDES a nameless-but-parseable root, whose canonicalRootKey is
+            // the `<repo-root>` sentinel — its prepare events force-attribute to
+            // the sentinel and are correctly stamped (the attribution layer —
+            // Attribution ctor rootSentinel + shim fast-path — attributes the
+            // root's own prepare lifecycle to the sentinel so the events reach
+            // this emitter instead of being dropped at the null gate).
+            // With NO root manifest at all, canonicalRootKey stays null and
             // `forcedPkg` falls back to the frame's own (dep) label, which is NOT
-            // the root — stamping root_anchored there would forge the very signal
-            // normalize relies on.  Inert today (the prepare pass only runs with a
-            // root manifest) but makes the intent explicit.
-            if ((raw.kind === 'read' || raw.kind === 'write') && canonicalRootKey !== null) {
+            // the root — the guard then withholds the stamp so we never forge the
+            // very signal normalize relies on (the prepare pass does not run in
+            // the no-manifest case anyway).
+            //
+            // Stamp the FULL anchorable set (read/write AND the non-fs set
+            // spawn/connect/env_read/env_tamper), matching normalize.ts's
+            // `<FORGED_ROOT>` contract: this pass runs ONLY the root's prepare, so
+            // EVERY event is genuinely root by construction (the comment above) —
+            // independent of the process-tree anchoring `runInstallPhase` computes.
+            // Without this a genuine root `prepare` connect/spawn/env_read/
+            // env_tamper whose process-tree verdict came back unanchored (e.g. a
+            // rootPid-null fail-closed run, or a prepare descendant that chdir'd
+            // away) would render `<FORGED_ROOT>` while the read/write equivalent
+            // renders clean — an inconsistency and a false host-bound egress
+            // warning in diff.ts. `exec` carries no root_anchored (never deferred
+            // / not in the anchorable set), so it is deliberately excluded.
+            if (
+              canonicalRootKey !== null &&
+              (raw.kind === 'read' ||
+                raw.kind === 'write' ||
+                raw.kind === 'spawn' ||
+                raw.kind === 'connect' ||
+                raw.kind === 'env_read' ||
+                raw.kind === 'env_tamper')
+            ) {
               raw.root_anchored = true;
             }
             const forcedFrame = {
@@ -3769,6 +3760,13 @@ export async function main(input: AgentInput): Promise<void> {
       straceBasePath: `${straceBaseDir}/strace-prepare.out`,
       protectedPaths,
       rootPkgKeys,
+      // Nameless root: its prepare-pass lifecycle pids surface under `<repo-root>`
+      // via the attribution layer (shim fast-path threaded with this sentinel; on
+      // Linux the shared Attribution instance already carries it).  The
+      // preparingEmitter then re-stamps lifecycle = 'prepare' + root_anchored.
+      // Conditionally spread (omitted, not undefined) for a named/absent root —
+      // see the installInput note above.
+      ...(canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {}),
       commandOverride: prepareCommand,
     };
     const prepareResult = isMacosBare

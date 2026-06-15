@@ -650,6 +650,125 @@ describe('formatEgressWarning', () => {
     expect(detail).toContain('audited in the sandbox; NOT run on the host (root `prepare`):');
     expect(detail).toContain('my-app@1.0.0 (prepare)  <BLOCKED> connect 192.0.2.5:443');
   });
+
+  // --- nameless root: events surface under the `<repo-root>` sentinel --------
+  // A root `package.json` with no usable `name` makes buildRootPkgKeys() (and
+  // thus main.ts's rootPackageIds) collapse to the single ROOT_SENTINEL key
+  // `<repo-root>` (see src/guest/attribution.ts).  The prepare carve-out must
+  // recognise that sentinel exactly as it does a named root id.
+  const sentinelPrepare = {
+    packageId: '<repo-root>',
+    stage: 'prepare',
+    entry: '<BLOCKED> connect 192.0.2.5:443',
+  };
+  const sentinelRootIds = new Set(['<repo-root>']);
+
+  it('npm: a nameless-root (`<repo-root>`) `prepare` egress is audited-only; a dep stays host-bound', () => {
+    const { summary, detail } = formatEgressWarning([sentinelPrepare, depPost], {
+      manager: 'npm',
+      rootPackageIds: sentinelRootIds,
+    });
+    // Only the dep counts toward the host-bound "WILL now succeed" total.
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    // The dep is host-bound, listed in the main block.
+    expect(detail).toContain('better-sqlite3@11.0.0 (postinstall)  <BLOCKED> connect 198.51.100.7:443');
+    // The sentinel root prepare is split into the audited-only block.
+    expect(detail).toContain('audited in the sandbox; NOT run on the host (root `prepare`):');
+    expect(detail).toContain('<repo-root> (prepare)  <BLOCKED> connect 192.0.2.5:443');
+  });
+
+  it('yarn: the same nameless-root (`<repo-root>`) `prepare` egress is audited-only', () => {
+    const { summary, detail } = formatEgressWarning([sentinelPrepare, depPost], {
+      manager: 'yarn',
+      rootPackageIds: sentinelRootIds,
+    });
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(detail).toContain('audited in the sandbox; NOT run on the host (root `prepare`):');
+    expect(detail).toContain('<repo-root> (prepare)  <BLOCKED> connect 192.0.2.5:443');
+  });
+
+  it('pnpm: the nameless-root (`<repo-root>`) `prepare` egress stays host-bound (rebuild --pending runs it)', () => {
+    const { summary, detail } = formatEgressWarning([sentinelPrepare, depPost], {
+      manager: 'pnpm',
+      rootPackageIds: sentinelRootIds,
+    });
+    // Both entries are host-bound under pnpm.
+    expect(summary).toContain('2 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    expect(detail).toContain('<repo-root> (prepare)  <BLOCKED> connect 192.0.2.5:443');
+    // No audited-only block.
+    expect(detail).not.toContain('audited in the sandbox; NOT run on the host');
+  });
+
+  it('a non-prepare stage for `<repo-root>` is host-bound regardless of manager (carve-out is prepare-only)', () => {
+    const sentinelPost = {
+      packageId: '<repo-root>',
+      stage: 'postinstall',
+      entry: '<BLOCKED> connect 192.0.2.5:443',
+    };
+    for (const manager of ['npm', 'yarn', 'pnpm'] as const) {
+      const { summary, detail } = formatEgressWarning([sentinelPost], {
+        manager,
+        rootPackageIds: sentinelRootIds,
+      });
+      expect(summary).toContain('1 network egress attempt(s)');
+      expect(summary).toContain('WILL now succeed');
+      expect(detail).toContain('<repo-root> (postinstall)  <BLOCKED> connect 192.0.2.5:443');
+      expect(detail).not.toContain('audited in the sandbox; NOT run on the host');
+    }
+  });
+
+  // --- FORGED-root prepare egress must NOT inherit the audited-only carve-out --
+  // A dependency that folds its connect under `<repo-root>`+prepare (forging the
+  // root label) renders with a `<FORGED_ROOT> ` prefix (normalize.ts).  Such an
+  // entry is NOT the genuine root's prepare: under `install:true` the dependency
+  // DOES run online on the host, so it must route to HOST-BOUND ("WILL now
+  // succeed") — never audited-only — or the operator under-counts a real egress.
+  const forgedSentinelPrepare = {
+    packageId: '<repo-root>',
+    stage: 'prepare',
+    entry: '<FORGED_ROOT> <BLOCKED> connect 192.0.2.5:443',
+  };
+
+  it('npm: a FORGED `<repo-root>` prepare egress is HOST-BOUND, not audited-only', () => {
+    const { summary, detail } = formatEgressWarning([forgedSentinelPrepare], {
+      manager: 'npm',
+      rootPackageIds: sentinelRootIds,
+    });
+    // It counts toward the host-bound "WILL now succeed" total (real risk).
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    expect(detail).toContain('<repo-root> (prepare)  <FORGED_ROOT> <BLOCKED> connect 192.0.2.5:443');
+    // It must NOT be hidden in the audited-only block.
+    expect(detail).not.toContain('audited in the sandbox; NOT run on the host');
+  });
+
+  it('yarn: a FORGED `<repo-root>` prepare egress is HOST-BOUND, not audited-only', () => {
+    const { summary, detail } = formatEgressWarning([forgedSentinelPrepare], {
+      manager: 'yarn',
+      rootPackageIds: sentinelRootIds,
+    });
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    expect(detail).toContain('<repo-root> (prepare)  <FORGED_ROOT> <BLOCKED> connect 192.0.2.5:443');
+    expect(detail).not.toContain('audited in the sandbox; NOT run on the host');
+  });
+
+  it('a GENUINE `<repo-root>` prepare stays audited-only alongside a FORGED one routed host-bound', () => {
+    const { summary, detail } = formatEgressWarning([sentinelPrepare, forgedSentinelPrepare], {
+      manager: 'npm',
+      rootPackageIds: sentinelRootIds,
+    });
+    // Only the forged entry is host-bound (counts); the genuine one is carved out.
+    expect(summary).toContain('1 network egress attempt(s)');
+    expect(summary).toContain('WILL now succeed');
+    // Genuine → audited-only block.
+    expect(detail).toContain('audited in the sandbox; NOT run on the host (root `prepare`):');
+    expect(detail).toContain('<repo-root> (prepare)  <BLOCKED> connect 192.0.2.5:443');
+    // Forged → host-bound main block.
+    expect(detail).toContain('<repo-root> (prepare)  <FORGED_ROOT> <BLOCKED> connect 192.0.2.5:443');
+  });
 });
 
 // ---------------------------------------------------------------------------

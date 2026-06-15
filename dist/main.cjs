@@ -43223,7 +43223,13 @@ var EnvReadEvent = external_exports.object({
   name: external_exports.string(),
   pid: external_exports.number(),
   ts: external_exports.number(),
-  hidden: external_exports.boolean()
+  hidden: external_exports.boolean(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_read events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed env_read). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var SpawnEvent = external_exports.object({
   kind: external_exports.literal("spawn"),
@@ -43245,7 +43251,13 @@ var SpawnEvent = external_exports.object({
   // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
   // benign find/sed use stays green; a reviewer just sees the marker). Omitted
   // (never `false`) so existing/non-blind records stay byte-identical.
-  audit_blind: external_exports.boolean().optional()
+  audit_blind: external_exports.boolean().optional(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on spawn events that
+  // attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed spawn). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -43263,7 +43275,15 @@ var NetworkEvent = external_exports.object({
   // 'ok' = phase A (fetch with network on). 'blocked' = phase B (offline).
   result: external_exports.enum(["ok", "blocked"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on connect events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed connect). Closes the unmarked-non-fs gap and
+  // the drop-in-install egress-misclassification (a forged root prepare connect
+  // is no longer mistaken for the genuine root's host-safe prepare).
+  root_anchored: external_exports.boolean().optional()
 });
 var ExecEvent = external_exports.object({
   kind: external_exports.literal("exec"),
@@ -43352,7 +43372,16 @@ var EnvTamperEvent = external_exports.object({
   reason: external_exports.string().optional(),
   refused: external_exports.literal(true),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_tamper events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed `<REFUSED>` env_tamper). Closes the last
+  // unmarked root-claimable + rendered + deduped kind. Does NOT apply to the
+  // `audit_fd_lost` variant — that routes to audit_bypass and is hard-failed
+  // independently by findAuditBypass, so dedupe-collapse cannot hide it.
+  root_anchored: external_exports.boolean().optional()
 });
 var RawEvent = external_exports.discriminatedUnion("kind", [
   FsReadEvent,
@@ -43553,7 +43582,14 @@ function formatEgressWarning(entries, opts) {
   const auditedOnly = [];
   const hostBound = [];
   for (const e of entries) {
-    if (e.stage === "prepare" && opts.manager !== "pnpm" && opts.rootPackageIds.has(e.packageId)) {
+    if (e.stage === "prepare" && opts.manager !== "pnpm" && opts.rootPackageIds.has(e.packageId) && // A `<FORGED_ROOT> ` entry attributes to a root key but is NOT the genuine
+    // root's prepare (normalize stamps the prefix when the non-forgeable
+    // root_anchored verdict is not true). Under `install:true` the forging
+    // dependency's lifecycle DOES run online on the host, so a forged connect
+    // is a REAL egress risk — it must route to hostBound, never be carved out
+    // as audited-only/host-safe. (Genuine root prepare connects render without
+    // the prefix and stay audited-only.)
+    !e.entry.startsWith("<FORGED_ROOT> ")) {
       auditedOnly.push(e);
     } else {
       hostBound.push(e);
@@ -44417,10 +44453,14 @@ async function runSelectedBackend(input) {
 
 // src/guest/attribution.ts
 var CANONICAL_STAGES = new Set(LifecycleStage.options);
+var ROOT_SENTINEL = "<repo-root>";
 function buildRootPkgKeys(manifest) {
   const keys = /* @__PURE__ */ new Set();
-  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+  if (manifest.name !== void 0 && typeof manifest.name !== "string") {
     return { keys, canonical: null };
+  }
+  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+    return { keys: /* @__PURE__ */ new Set([ROOT_SENTINEL]), canonical: ROOT_SENTINEL };
   }
   const name = manifest.name;
   keys.add(name);

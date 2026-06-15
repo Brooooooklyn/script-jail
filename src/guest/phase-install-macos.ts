@@ -551,7 +551,7 @@ export async function runInstallPhaseMacos(
       // REPLACE the attribution entry (set for valid, DELETE for bare /
       // non-canonical / overlong so a recycled pid fails closed).
       const { attribution: startupAttrib, pathological: startupPathological } =
-        classifyShimNodeStartupMarker(line);
+        classifyShimNodeStartupMarker(line, input.rootSentinel);
       nodeStartupMarkerByPid.set(shimEvent.pid, { ts: lineTs, pathological: startupPathological });
       if (startupAttrib !== null) {
         nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
@@ -574,7 +574,12 @@ export async function runInstallPhaseMacos(
       // Seed attribution from the shim's in-process npm lifecycle env (the
       // authoritative, never-reaped source on macOS).  Byte-identical to the
       // /proc-walk path via attributionFromEnvVars (inside shimExecAttribution).
-      const shimAttrib = shimExecAttribution(line);
+      // rootSentinel is threaded so a nameless root's own lifecycle exec (empty
+      // npm_package_name + canonical npm_lifecycle_event) seeds ROOT_SENTINEL —
+      // the macOS path's only attribution source (MacOSProcReader has no environ,
+      // so the /proc walk is inert; the dispatcher rescue that used to live here
+      // is deleted, attribution now flows entirely through this shim seed).
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
       if (shimAttrib !== null) recordAttribution(shimEvent.pid, shimAttrib, lineTs);
 
       // <EXEC_FAIL_OPEN>: the shim could not allocate the re-injected envp, so
@@ -650,7 +655,15 @@ export async function runInstallPhaseMacos(
           nodeStartupAttribution(shimEvent.pid) ??
           snapshotAttribution(shimEvent.pid);
         if (attribution !== null) {
-          emit({ raw: spawnRaw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
+          // Repo-root anchoring (observe-only default `true`; see the
+          // remaining-kinds chain below for the full rationale): a root-attributed
+          // spawn carries the verdict so normalize can distinguish a genuine root
+          // spawn from a forged one, in parity with Linux.
+          const raw: SpawnEvent =
+            input.rootPkgKeys?.has(attribution.pkg) === true
+              ? { ...spawnRaw, root_anchored: true }
+              : spawnRaw;
+          emit({ raw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
         }
       } else {
         // result:'failed'.  Linux's strace parser records a failed execve as a
@@ -681,7 +694,13 @@ export async function runInstallPhaseMacos(
             nodeStartupAttribution(shimEvent.pid) ??
             snapshotAttribution(shimEvent.pid);
           if (attribution !== null) {
-            emit({ raw: spawnRaw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
+            // Repo-root anchoring on a blocked spawn — same observe-only default
+            // `true` as the ok branch above, for normalize parity with Linux.
+            const raw: SpawnEvent =
+              input.rootPkgKeys?.has(attribution.pkg) === true
+                ? { ...spawnRaw, root_anchored: true }
+                : spawnRaw;
+            emit({ raw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
           }
         }
       }
@@ -695,28 +714,51 @@ export async function runInstallPhaseMacos(
 
     // ---- attribution chain for all remaining kinds (read/write/env_read/
     //      dlopen/connect/env_tamper) ----------------------------------------
+    // NOTE — nameless-root lifecycle attribution now happens at the ATTRIBUTION
+    // LAYER (shimExecAttribution / classifyShimNodeStartupMarker, threaded with
+    // input.rootSentinel above), NOT here.  For a nameless root's own lifecycle
+    // pid (empty npm_package_name + canonical npm_lifecycle_event) the shim seed
+    // already carries ROOT_SENTINEL for EVERY event kind — fixing the old
+    // rescue's blind spot (read/write only; spawn/connect/env_read were dropped).
+    // The PM driver / non-lifecycle workers carry no canonical lifecycle, so
+    // they seed nothing → null here → dropped (no flood).  A genuine null at
+    // this gate is a real non-lifecycle process: drop it.
     const attribution =
       freshSnapshotAttribution(shimEvent.pid) ??
       nodeStartupAttribution(shimEvent.pid) ??
       snapshotAttribution(shimEvent.pid);
-    if (attribution === null) continue;
+    if (attribution === null) {
+      continue;
+    }
 
-    // Repo-root anchoring (read/write only): when this fs event attributes to a
-    // root-project package key we stamp `root_anchored` so normalize.ts can tell
-    // a genuine root event from a dependency forging `npm_package_name=<root>`.
+    // Repo-root anchoring: when this event attributes to a root-project package
+    // key we stamp `root_anchored` so normalize.ts can tell a genuine root event
+    // from a dependency forging `npm_package_name=<root>`. This now covers the
+    // non-fs set (connect/env_read/env_tamper here, spawn at its own emit site
+    // above) in addition to read/write — matching the Linux defer/stamp extension
+    // that closes the unmarked-non-fs dedupe-collapse + egress-misclassification
+    // gap. env_tamper rides this same remaining-kinds chain (emitted directly
+    // below, like connect/env_read — it has NO dedicated emit site as spawn does),
+    // so stamping it here is the only macOS touch point needed.
     // macOS-bare is OBSERVE-ONLY and has no strace process-tree / exec-cwd
     // machinery (see this file's header — the union-find group model, per-pid
     // cwd table, and the prepare-pass attribution all live on the Linux path),
     // so we cannot compute the non-forgeable verdict here; root identity is
     // env-trusted and we default to `root_anchored: true` (a documented
-    // residual). The Linux/Firecracker backend computes the real value via
+    // residual). Without this default a BENIGN root's non-fs events would render
+    // `<FORGED_ROOT>` on macOS while Linux renders them clean — a parity break.
+    // The Linux/Firecracker backend computes the real value via
     // isRepoRootAnchored() and remains the enforcement boundary. The field is
     // OMITTED entirely (never set to false) on non-root events so frames stay
     // byte-identical → zero behavior change while `rootPkgKeys` is undefined.
-    const isRootAttributedFsEvent =
-      (shimEvent.kind === 'read' || shimEvent.kind === 'write') &&
+    const isRootAttributedAnchorableEvent =
+      (shimEvent.kind === 'read' ||
+        shimEvent.kind === 'write' ||
+        shimEvent.kind === 'connect' ||
+        shimEvent.kind === 'env_read' ||
+        shimEvent.kind === 'env_tamper') &&
       input.rootPkgKeys?.has(attribution.pkg) === true;
-    const raw: RawEvent = isRootAttributedFsEvent
+    const raw: RawEvent = isRootAttributedAnchorableEvent
       ? { ...shimEvent, root_anchored: true }
       : shimEvent;
 

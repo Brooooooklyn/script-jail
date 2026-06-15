@@ -196,11 +196,32 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
     //     `<FORGED_ROOT> ` so it is a DISTINCT string that can never
     //     dedupe-collapse with a genuine root entry and is fail-loud for review.
     const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
-    // `root_anchored` lives only on the read/write members of the RawEvent union;
-    // the inline `kind` test narrows the union so TS can read the field.
+    // `root_anchored` lives only on the read/write/env_read/spawn/connect/
+    // env_tamper members of the RawEvent union; the inline `kind` test narrows
+    // the union so TS can read the field. A forged/unanchored root-claimed event
+    // of ANY of these kinds gets the `<FORGED_ROOT>` prefix, so it can never
+    // dedupe-collapse with — or be mistaken for — a genuine root entry (incl. the
+    // drop-in-install egress partition in diff.ts).
+    //
+    // `dlopen` and `exec` are deliberately NOT anchored (conscious exclusions):
+    //   * dlopen renders `<BLOCKED>` only — the load NEVER executed and
+    //     dlopen-block.cjs is not in the default preload set, so a dedupe-
+    //     collapsed dlopen hides nothing executable.
+    //   * exec's audit-relevant output goes to `audit_bypass`, which
+    //     findAuditBypass (src/action/diff.ts, gate `entry.length > 0`) hard-fails
+    //     on independently of the byte-diff — so dedupe-collapse cannot hide it.
+    //     exec also cannot be deferred (bypass-synthesis ordering) nor reliably
+    //     emit-time anchored (incomplete process tree → flaky verdict).
+    // The env_tamper `audit_fd_lost` variant is likewise excluded below: it routes
+    // to audit_bypass and is gated independently by findAuditBypass.
     const isForgedRoot =
       claimsRoot &&
-      (ev.raw.kind === 'read' || ev.raw.kind === 'write') &&
+      (ev.raw.kind === 'read' ||
+        ev.raw.kind === 'write' ||
+        ev.raw.kind === 'env_read' ||
+        ev.raw.kind === 'spawn' ||
+        ev.raw.kind === 'connect' ||
+        ev.raw.kind === 'env_tamper') &&
       ev.raw.root_anchored !== true;
 
     // For fs events (read/write) a missing pkgDirs entry is an error: without
@@ -246,7 +267,8 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
       }
       case 'env_read': {
         const tagged = ev.raw.hidden ? `<HIDDEN> ${ev.raw.name}` : ev.raw.name;
-        block.env_read.push(tagged);
+        // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
+        block.env_read.push(`${forgedPrefix}${tagged}`);
         break;
       }
       case 'spawn': {
@@ -280,8 +302,13 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // stays green while a reviewer still sees which exec escaped the audit.
         // The marker sits AFTER any result tag, e.g. `<ENOENT> <AUDIT_BLIND> …`.
         const auditBlind = ev.raw.audit_blind === true ? '<AUDIT_BLIND> ' : '';
-        if (ev.raw.result === 'ok') block.spawn_attempts.push(`${auditBlind}${cmd}`);
-        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`);
+        // forgedPrefix is the OUTERMOST prefix, before BOTH the result tag and
+        // the <AUDIT_BLIND> marker (empty for genuine root / non-root).
+        if (ev.raw.result === 'ok') block.spawn_attempts.push(`${forgedPrefix}${auditBlind}${cmd}`);
+        else
+          block.spawn_blocked.push(
+            `${forgedPrefix}<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`,
+          );
         break;
       }
       case 'dlopen': {
@@ -291,7 +318,11 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
       }
       case 'connect': {
         const tag = ev.raw.result === 'blocked' ? '<BLOCKED> ' : '';
-        block.network_attempts.push(`${tag}connect ${ev.raw.host}:${ev.raw.port}`);
+        // forgedPrefix is the OUTERMOST prefix, before the <BLOCKED> result tag
+        // (empty for genuine root / non-root). diff.ts's drop-in-install egress
+        // partition keys off this prefix to route a forged root prepare connect
+        // to host-bound rather than misclassifying it as host-safe.
+        block.network_attempts.push(`${forgedPrefix}${tag}connect ${ev.raw.host}:${ev.raw.port}`);
         break;
       }
       case 'exec': {
@@ -397,6 +428,9 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // it and hard-fails the lockfile diff.  Same severity classification
         // as `<EXEC_FAIL_OPEN>`.
         if (ev.raw.op === 'audit_fd_lost') {
+          // audit_fd_lost is gated independently by findAuditBypass (hard-fails on
+          // any non-empty audit_bypass entry), so dedupe-collapse cannot hide it —
+          // it is NOT forged-root-prefixed. Leave UNCHANGED.
           block.audit_bypass.push('<AUDIT_FD_LOST>');
           break;
         }
@@ -404,7 +438,9 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         const entry = name !== undefined
           ? `<REFUSED> ${ev.raw.op} ${name}`
           : `<REFUSED> ${ev.raw.op}`;
-        block.env_tamper.push(entry);
+        // forgedPrefix is the OUTERMOST prefix, before the <REFUSED> tag (empty
+        // for genuine root / non-root → byte-identical output).
+        block.env_tamper.push(`${forgedPrefix}${entry}`);
         break;
       }
     }

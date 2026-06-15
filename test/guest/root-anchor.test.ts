@@ -281,6 +281,29 @@ describe('isRepoRootAnchored', () => {
     expect(r).toBe(true);
   });
 
+  it('returns false for an over-deep but otherwise-valid chain (exceeds MAX_DEPTH before reaching rootPid)', () => {
+    // The cycle tests cover the cyclic side of the depth bound; this covers the
+    // acyclic side: a STRUCTURALLY VALID linear chain (every hop exec'd at
+    // workDir, every parent edge present, terminating at rootPid) that is simply
+    // TOO LONG. The loop runs depth 0..1023 (MAX_DEPTH=1024); a chain that would
+    // only reach rootPid at depth 1024+ falls through the bound and fails closed.
+    //
+    // Build 1 (root) <- 2 <- ... <- 1100, all exec at workDir, starting at the
+    // 1100-deep leaf. Reaching rootPid (1) would require depth 1099, but the
+    // last executed iteration is depth 1023 (cur = 1100 - 1023 = 77 != 1), so it
+    // exits the loop and returns false despite the chain being entirely honest.
+    const childParent = new Map<number, number>();
+    const execCwd = new Map<number, string | null>();
+    for (let p = 2; p <= 1100; p++) {
+      childParent.set(p, p - 1);
+      execCwd.set(p, WORK);
+    }
+    const r = isRepoRootAnchored(
+      input({ pid: 1100, rootPid: 1, childParent, execCwd }),
+    );
+    expect(r).toBe(false);
+  });
+
   it('does NOT special-case workDir as a non-root subdir prefix match', () => {
     // A path that has workDir as a prefix but is a sibling, e.g.
     // '/work-evil', must be treated as a non-root dir (exact match only).

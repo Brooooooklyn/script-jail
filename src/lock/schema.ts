@@ -79,6 +79,12 @@ export const EnvReadEvent = z.object({
   pid: z.number(),
   ts: z.number(),
   hidden: z.boolean(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_read events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed env_read). Closes the unmarked-non-fs gap.
+  root_anchored: z.boolean().optional(),
 });
 export type EnvReadEvent = z.infer<typeof EnvReadEvent>;
 
@@ -102,6 +108,12 @@ export const SpawnEvent = z.object({
   // benign find/sed use stays green; a reviewer just sees the marker). Omitted
   // (never `false`) so existing/non-blind records stay byte-identical.
   audit_blind: z.boolean().optional(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on spawn events that
+  // attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed spawn). Closes the unmarked-non-fs gap.
+  root_anchored: z.boolean().optional(),
 });
 export type SpawnEvent = z.infer<typeof SpawnEvent>;
 
@@ -124,6 +136,14 @@ export const NetworkEvent = z.object({
   result: z.enum(['ok', 'blocked']),
   pid: z.number(),
   ts: z.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on connect events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed connect). Closes the unmarked-non-fs gap and
+  // the drop-in-install egress-misclassification (a forged root prepare connect
+  // is no longer mistaken for the genuine root's host-safe prepare).
+  root_anchored: z.boolean().optional(),
 });
 export type NetworkEvent = z.infer<typeof NetworkEvent>;
 
@@ -248,6 +268,15 @@ export const EnvTamperEvent = z.object({
   refused: z.literal(true),
   pid: z.number(),
   ts: z.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_tamper events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed `<REFUSED>` env_tamper). Closes the last
+  // unmarked root-claimable + rendered + deduped kind. Does NOT apply to the
+  // `audit_fd_lost` variant — that routes to audit_bypass and is hard-failed
+  // independently by findAuditBypass, so dedupe-collapse cannot hide it.
+  root_anchored: z.boolean().optional(),
 });
 export type EnvTamperEvent = z.infer<typeof EnvTamperEvent>;
 

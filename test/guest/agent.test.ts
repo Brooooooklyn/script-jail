@@ -64,12 +64,16 @@ function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
 }
 
 /**
- * Write a root `package.json` into the agent's work_dir (= testDir).  The
- * prepare-pass fail-closed gate (src/guest/agent.ts) refuses to emit a lockfile
- * when a prepare pass would run but the root manifest has no usable `name`
- * (canonicalRootKey === null).  Prepare-pass tests that expect a lockfile MUST
- * write a NAMED root manifest so the gate is satisfied; the nameless-root test
- * omits the name to exercise the fail-closed path.
+ * Write a root `package.json` into the agent's work_dir (= testDir).
+ *
+ * Historically the prepare-pass fail-closed gate refused to emit a lockfile when
+ * a prepare/lifecycle pass would run but the root manifest had no usable `name`
+ * (canonicalRootKey === null).  That gate is now REMOVED: root anchoring was
+ * extended to the nameless case, so a nameless-but-parseable root gets the
+ * `<repo-root>` sentinel (canonicalRootKey === ROOT_SENTINEL) and its lifecycle
+ * reads/writes surface under `$REPO/...` instead of being dropped.  Tests pass a
+ * NAMED root when they want the named-anchoring path and OMIT the name to
+ * exercise the nameless `<repo-root>` surfacing path.
  */
 function writeRootPkg(dir: string, pkg: Record<string, unknown>): void {
   writeFileSync(join(dir, 'package.json'), JSON.stringify(pkg), 'utf8');
@@ -1275,6 +1279,162 @@ describe('agent main() root-prepare second pass', () => {
     expect(diagMsgs.some((m) => m.includes('prepare pass'))).toBe(true);
   });
 
+  // REGRESSION (prepare-wrapper non-fs anchoring): the prepare-pass force-
+  // attribution emitter (`preparingEmitter`) must force-stamp `root_anchored:true`
+  // on the FULL anchorable set (read/write AND spawn/connect/env_read), not just
+  // read/write.  This pass runs ONLY the root's prepare, so EVERY event is
+  // genuinely root by construction — independent of the process-tree verdict.
+  //
+  // We drive the edge case where `runInstallPhase`'s OWN anchoring fails closed:
+  // the injected prepareStrace returns `getRootPid()===null`, so the dispatcher
+  // stamps `root_anchored:false` on the genuine root env_read (which WOULD render
+  // `<FORGED_ROOT>`).  The wrapper must rescue it to true.  A `node_startup_done`
+  // shim marker carrying the root's npm fields seeds the pid's attribution WITHOUT
+  // /proc (main() builds a real LinuxProcReader that can't see this fake pid), so
+  // the same-pid env_read attributes to the root key and reaches the wrapper.
+  //
+  // NEGATIVE CONTROL: against the OLD read/write-only wrapper this assertion FAILS
+  // (the yaml contains `<FORGED_ROOT> AWS_SECRET_ACCESS_KEY`).
+  it('prepare-pass wrapper force-stamps root_anchored on a genuine root env_read even when rootPid is null (no <FORGED_ROOT>)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → canonicalRootKey = 'rootpkg@1.0.0' (non-null; wrapper guard satisfied).
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const PID = 8200;
+    const prepareRunner: StraceRunner = {
+      async *run() {
+        // 1) Seed root attribution for PID via a shim node_startup_done marker
+        //    (npm fields read by shimNodeStartupAttribution, no /proc needed).
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'node_startup_done',
+            pid: PID,
+            ts: 1,
+            npm_package_name: 'rootpkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'prepare',
+          }),
+        };
+        // 2) A genuine root env_read on the SAME pid → attributes to the root via
+        //    the seed; root_anchored undefined → deferred → stamped false (rootPid
+        //    null) by runInstallPhase, leaving the wrapper to rescue it.
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'env_read',
+            name: 'AWS_SECRET_ACCESS_KEY',
+            pid: PID,
+            ts: 2,
+            hidden: false,
+          }),
+        };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op */ },
+      getRootPid() { return null; }, // forces runInstallPhase → root_anchored:false
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: emptyStrace(),
+      prepareStrace: prepareRunner,
+      dnsLookup: offlineLookup,
+    });
+
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    // The genuine root prepare env_read surfaced...
+    expect(yaml).toContain('AWS_SECRET_ACCESS_KEY');
+    // ...and was NOT mislabeled forged (the wrapper force-stamped root_anchored:true).
+    expect(yaml).not.toContain('<FORGED_ROOT>');
+  });
+
+  // env_tamper is the last root-claimable + rendered + deduped kind added to the
+  // anchorable set, so the prepare-pass wrapper must force-stamp it too.  Same
+  // edge case as the env_read test above: runInstallPhase's own anchoring fails
+  // closed (rootPid null → root_anchored:false), and the wrapper must rescue the
+  // genuine root prepare env_tamper to true so it renders `<REFUSED> …` UNMARKED.
+  // NEGATIVE CONTROL: against an env_tamper-blind wrapper this assertion FAILS
+  // (the yaml contains `<FORGED_ROOT> <REFUSED> unsetenv LD_PRELOAD`).
+  it('prepare-pass wrapper force-stamps root_anchored on a genuine root env_tamper even when rootPid is null (no <FORGED_ROOT>)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const PID = 8300;
+    const prepareRunner: StraceRunner = {
+      async *run() {
+        // 1) Seed root attribution for PID via a shim node_startup_done marker.
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'node_startup_done',
+            pid: PID,
+            ts: 1,
+            npm_package_name: 'rootpkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'prepare',
+          }),
+        };
+        // 2) A genuine root env_tamper on the SAME pid → attributes to the root
+        //    via the seed; root_anchored undefined → deferred → stamped false
+        //    (rootPid null) by runInstallPhase, leaving the wrapper to rescue it.
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'env_tamper',
+            op: 'unsetenv',
+            name: 'LD_PRELOAD',
+            refused: true,
+            pid: PID,
+            ts: 2,
+          }),
+        };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op */ },
+      getRootPid() { return null; }, // forces runInstallPhase → root_anchored:false
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: emptyStrace(),
+      prepareStrace: prepareRunner,
+      dnsLookup: offlineLookup,
+    });
+
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    // The genuine root prepare env_tamper surfaced as a refused entry...
+    expect(yaml).toContain('<REFUSED> unsetenv LD_PRELOAD');
+    // ...and was NOT mislabeled forged (the wrapper force-stamped root_anchored:true).
+    expect(yaml).not.toContain('<FORGED_ROOT>');
+  });
+
   it('SKIPS the prepare pass when only strace is injected (no prepareStrace)', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
@@ -1612,63 +1772,65 @@ describe('agent main() root-prepare second pass', () => {
     expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
   });
 
-  // --- FIX 2: nameless root + prepare → fail closed -------------------------
-  // If the root package.json has a `prepare` script but NO `name`,
-  // buildRootPkgKeys returns canonical=null; npm sets no npm_package_name, so
-  // the prepare's audited events get DROPPED at the dispatcher's
-  // null-attribution gate → an empty, deceptively-clean lock.  The agent must
-  // REFUSE to emit a lockfile rather than ship the unaudited prepare.
-  it('FAILS CLOSED (fatal, no lockfile) when the prepare pass would run but the root has no `name`', async () => {
+  // --- nameless root + prepare → audits under <repo-root> (no fail-closed) ----
+  // These tests USED to assert fail-closed: a root `package.json` with a
+  // lifecycle/prepare script but NO `name` made buildRootPkgKeys return
+  // canonical=null; npm/pnpm set no npm_package_name, so the audited events were
+  // DROPPED at the dispatcher's null-attribution gate → an empty, deceptively-
+  // clean lock, which we blocked with a fatal gate.
+  //
+  // That fail-closed gate is now REMOVED.  Root anchoring was extended to the
+  // NAMELESS case: buildRootPkgKeys gives a nameless-but-parseable root the
+  // `<repo-root>` sentinel key (canonicalRootKey === ROOT_SENTINEL), the agent
+  // threads `rootSentinel` into the install/prepare inputs, and the dispatcher's
+  // nameless-root rescue force-attributes the root's reads/writes to the sentinel
+  // (tokenized to `$REPO/...`) carrying the non-forgeable `root_anchored` verdict.
+  // So the install RUNS, the events surface under `<repo-root>`, and a clean lock
+  // is produced — no fatal abort.
+  //
+  // The fake strace here (recordingEventStrace) emits an EXEC-bypass event, not
+  // an fs read/write, so we cannot assert `<repo-root>` entries at this layer —
+  // only that the gate no longer blocks (main pass ran, a `final` lockfile is
+  // emitted, no fatal error frame).  The cross-file `<repo-root>` surfacing
+  // assertions live in phase-install.test.ts.
+  it('NAMELESS root + prepare → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
-    // Nameless root (only a version) → canonicalRootKey === null.
+    // Nameless root (only a version) → canonicalRootKey === ROOT_SENTINEL.
     writeRootPkg(testDir, { version: '1.0.0', scripts: { prepare: 'node prep.js' } });
 
     const main_ = recordingEventStrace('MAINPROG');
     const prep = recordingEventStrace('PREPPROG');
 
-    const origExit = process.exit.bind(process);
-    let exitedWith: number | string | undefined;
-    // @ts-expect-error — patching process.exit for test
-    process.exit = (code?: number | string) => { exitedWith = code; };
-
     setTimeout(() => hostSend('go\n'), 10);
-    try {
-      await main({
-        configPath,
-        connection: conn,
-        spawner: mockSpawner().spawner,
-        strace: main_.runner,
-        // prepareStrace injected so the test seam would ALLOW the prepare pass;
-        // the nameless-root gate must fire BEFORE the pass runs.
-        prepareStrace: prep.runner,
-        dnsLookup: offlineLookup,
-      });
-      await new Promise<void>((r) => setImmediate(r));
-    } finally {
-      process.exit = origExit;
-    }
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      // prepareStrace injected so the test seam allows the prepare pass; the
+      // removed nameless-root gate no longer blocks it.
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
 
     const lines = getOutput().split('\n').filter((l) => l.trim());
     const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
 
-    // Fatal error frame naming the missing root `name`; no final lockfile; exit 1.
-    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
-    expect(fatal).toBeDefined();
-    expect(String(fatal!['message'])).toMatch(/no usable `name`/);
-    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
-    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
-    // The prepare pass must NOT have run (gate fires before it).
-    expect(prep.calls).toHaveLength(0);
-    expect(exitedWith).toBe(1);
+    // No fatal abort: the main install ran, the prepare pass ran, and a final
+    // lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(main_.calls).toHaveLength(1);
+    expect(prep.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
   });
 
   it('NAMELESS root WITHOUT a prepare script → still produces a lockfile (no false trip)', async () => {
     // Regression guard: for npm, resolvePrepareCommand is ALWAYS non-null
     // (`npm run prepare --if-present` no-ops when there is no prepare script).
-    // The nameless-root gate must key off an ACTUAL `scripts.prepare`, not off
-    // the command, or a benign nameless npm root with no prepare would be
-    // wrongly blocked.
+    // A benign nameless npm root with no prepare must still produce a lockfile —
+    // the run is never blocked (the old nameless-root fail-closed gate is gone;
+    // a nameless root now anchors to `<repo-root>` either way).
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
     // Nameless root, NO prepare script → gate must NOT fire.
@@ -1724,56 +1886,43 @@ describe('agent main() root-prepare second pass', () => {
     expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
   });
 
-  // --- FIX 2 (pnpm main-pass variant): nameless root + prepare → fail closed --
-  // resolvePrepareCommand('pnpm') is ALWAYS null, so the dedicated prepare-pass
-  // gate is never reached for pnpm.  But pnpm's MAIN Phase-B command
-  // (`pnpm rebuild --pending`) RUNS the root `prepare` with npm_package_name
-  // UNSET when the root has no `name`, so attribution returns null and the
-  // dispatcher drops every prepare event → a deceptively-clean lock.  A
-  // pnpm-only gate must fire BEFORE the main install runs.
-  it('FAILS CLOSED (fatal, no lockfile) for pnpm when the root has a `prepare` but no `name`', async () => {
+  // --- pnpm main-pass variant: nameless root + prepare → audits under <repo-root> --
+  // resolvePrepareCommand('pnpm') is ALWAYS null, so the dedicated prepare pass
+  // never runs for pnpm.  pnpm's MAIN Phase-B command (`pnpm rebuild --pending`)
+  // RUNS the root `prepare`; on a nameless root npm_package_name is UNSET, so the
+  // events used to be dropped at the null-attribution gate → a deceptively-clean
+  // lock, which the (now-removed) pnpm gate blocked.  With root anchoring extended
+  // to the nameless case, the main pass RUNS and the root's reads/writes surface
+  // under `<repo-root>` — no fatal abort.
+  it('pnpm NAMELESS root + prepare → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'pnpm' });
     // Nameless root (only a version) + a real prepare script → canonicalRootKey
-    // === null, and pnpm's main pass would run that prepare UNAUDITED.
+    // === ROOT_SENTINEL; pnpm's main pass runs it and the events surface.
     writeRootPkg(testDir, { version: '1.0.0', scripts: { prepare: 'node prep.js' } });
 
     const main_ = recordingEventStrace('MAINPROG');
     const prep = recordingEventStrace('PREPPROG');
 
-    const origExit = process.exit.bind(process);
-    let exitedWith: number | string | undefined;
-    // @ts-expect-error — patching process.exit for test
-    process.exit = (code?: number | string) => { exitedWith = code; };
-
     setTimeout(() => hostSend('go\n'), 10);
-    try {
-      await main({
-        configPath,
-        connection: conn,
-        spawner: mockSpawner().spawner,
-        strace: main_.runner,
-        prepareStrace: prep.runner,
-        dnsLookup: offlineLookup,
-      });
-      await new Promise<void>((r) => setImmediate(r));
-    } finally {
-      process.exit = origExit;
-    }
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
 
     const lines = getOutput().split('\n').filter((l) => l.trim());
     const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
 
-    // Fatal error frame naming the missing root `name`; no final lockfile; exit 1.
-    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
-    expect(fatal).toBeDefined();
-    expect(String(fatal!['message'])).toMatch(/no usable `name`/);
-    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
-    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
-    // The gate fires BEFORE the main install pass runs the root prepare.
-    expect(main_.calls).toHaveLength(0);
+    // No fatal abort: the main install pass ran and a final lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(main_.calls).toHaveLength(1);
+    // pnpm resolvePrepareCommand returns null → the dedicated prepare pass never runs.
     expect(prep.calls).toHaveLength(0);
-    expect(exitedWith).toBe(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
   });
 
   it('pnpm NAMELESS root WITHOUT a prepare script → still produces a lockfile (no false trip)', async () => {
@@ -1802,6 +1951,77 @@ describe('agent main() root-prepare second pass', () => {
     expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
   });
 
+  // MALFORMED root `name` (present but non-string) → FAIL CLOSED.  The PM
+  // coerces it to a string `npm_package_name` (verified: npm runs the root
+  // lifecycle under `npm_package_name="42"` for `"name": 42`) that `<repo-root>`
+  // never matches, so the root would run effectively unattributed.  A non-string
+  // `name` is malformed and absent from real repos, so failing closed cannot
+  // over-fire the way the removed nameless gate did.
+  it('MALFORMED root name (number) → FATAL, no lockfile (fail closed)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 42, version: '1.0.0', scripts: { postinstall: 'node p.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    // The fail-closed path calls flushAndExit → process.exit(1); stub it so the
+    // test process doesn't terminate (mirrors the other fail-closed tests here).
+    const origExit = process.exit.bind(process);
+    // @ts-expect-error — patching process.exit for test
+    process.exit = () => { /* no-op */ };
+    try {
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error emitted, the install pass NEVER ran, and NO lockfile shipped.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(true);
+    expect(main_.calls).toHaveLength(0);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeUndefined();
+  });
+
+  it('MALFORMED root name (object) → FATAL, no lockfile (fail closed)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    writeRootPkg(testDir, { name: { evil: true }, version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    const origExit = process.exit.bind(process);
+    // @ts-expect-error — patching process.exit for test
+    process.exit = () => { /* no-op */ };
+    try {
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(true);
+    expect(main_.calls).toHaveLength(0);
+  });
+
   it('pnpm NAMED root + prepare → still produces a lockfile (no false trip)', async () => {
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'pnpm' });
@@ -1828,77 +2048,28 @@ describe('agent main() root-prepare second pass', () => {
     expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
   });
 
-  // --- FIX 3: nameless root + preinstall/install/postinstall → fail closed -----
+  // --- nameless root + preinstall/install/postinstall → audits under <repo-root> --
   // The MAIN Phase-B command runs the ROOT's preinstall/install/postinstall for
   // npm (`npm rebuild --foreground-scripts`) and pnpm (`pnpm rebuild --pending`).
-  // On a nameless root npm_package_name is UNSET, so attribution returns null and
-  // the dispatcher DROPS those events → a deceptively-clean lock.  A npm/pnpm gate
-  // must fire BEFORE the main install runs.  (Same class as the prepare gates,
-  // reached through postinstall/preinstall/install instead.)
+  // On a nameless root npm_package_name is UNSET, so the events used to be DROPPED
+  // at the null-attribution gate → a deceptively-clean lock, which the (now-removed)
+  // npm/pnpm gate blocked.  With root anchoring extended to the nameless case, the
+  // main install RUNS and the root's reads/writes surface under `<repo-root>` — no
+  // fatal abort.  (Same class as the prepare case, reached through
+  // postinstall/preinstall/install instead.)
   for (const manager of ['npm', 'pnpm'] as const) {
     for (const lifecycle of ['postinstall', 'preinstall', 'install'] as const) {
-      it(`FAILS CLOSED (fatal, no lockfile) for ${manager} when the root has a \`${lifecycle}\` but no \`name\``, async () => {
+      it(`NAMELESS root + ${manager} ${lifecycle} → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)`, async () => {
         const { conn, hostSend, getOutput } = makeConn();
         const configPath = writeConfig(testDir, { manager });
         // Nameless root (only a version) + a real main-pass lifecycle script →
-        // canonicalRootKey === null, and the main install would run it UNAUDITED.
+        // canonicalRootKey === ROOT_SENTINEL; the main install runs it and the
+        // root's events surface under `<repo-root>`.
         writeRootPkg(testDir, { version: '1.0.0', scripts: { [lifecycle]: 'node hook.js' } });
 
         const main_ = recordingEventStrace('MAINPROG');
 
-        const origExit = process.exit.bind(process);
-        let exitedWith: number | string | undefined;
-        // @ts-expect-error — patching process.exit for test
-        process.exit = (code?: number | string) => { exitedWith = code; };
-
         setTimeout(() => hostSend('go\n'), 10);
-        try {
-          await main({
-            configPath,
-            connection: conn,
-            spawner: mockSpawner().spawner,
-            strace: main_.runner,
-            dnsLookup: offlineLookup,
-          });
-          await new Promise<void>((r) => setImmediate(r));
-        } finally {
-          process.exit = origExit;
-        }
-
-        const lines = getOutput().split('\n').filter((l) => l.trim());
-        const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
-
-        // Fatal error naming the missing root `name`; no lockfile; exit 1.
-        const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
-        expect(fatal).toBeDefined();
-        expect(String(fatal!['message'])).toMatch(/preinstall\/install\/postinstall/);
-        expect(String(fatal!['message'])).toMatch(/no usable `name`/);
-        expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
-        // The gate fires BEFORE the main install pass runs the root lifecycle.
-        expect(main_.calls).toHaveLength(0);
-        expect(exitedWith).toBe(1);
-      });
-    }
-  }
-
-  // pnpm `pnpm rebuild --pending` runs MORE root lifecycles than npm: prepublish
-  // (pnpm 10) and prerebuild/rebuild/postrebuild (pnpm 11) — all nameless-unaudited.
-  // The pnpm gate must cover the full union.
-  for (const lifecycle of ['prepublish', 'prerebuild', 'rebuild', 'postrebuild'] as const) {
-    it(`FAILS CLOSED for pnpm when the root has a \`${lifecycle}\` but no \`name\``, async () => {
-      const { conn, hostSend, getOutput } = makeConn();
-      const configPath = writeConfig(testDir, { manager: 'pnpm' });
-      writeRootPkg(testDir, { version: '1.0.0', scripts: { [lifecycle]: 'node hook.js' } });
-
-      const main_ = recordingEventStrace('MAINPROG');
-
-      const origExit = process.exit.bind(process);
-      let exitedWith: number | string | undefined;
-      // @ts-expect-error — patching process.exit for test
-      process.exit = (code?: number | string) => { exitedWith = code; };
-
-      setTimeout(() => hostSend('go\n'), 10);
-      try {
         await main({
           configPath,
           connection: conn,
@@ -1906,20 +2077,48 @@ describe('agent main() root-prepare second pass', () => {
           strace: main_.runner,
           dnsLookup: offlineLookup,
         });
-        await new Promise<void>((r) => setImmediate(r));
-      } finally {
-        process.exit = origExit;
-      }
+
+        const lines = getOutput().split('\n').filter((l) => l.trim());
+        const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+        // No fatal abort: the main install pass ran and a final lockfile IS emitted.
+        expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+        expect(main_.calls).toHaveLength(1);
+        expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+      });
+    }
+  }
+
+  // pnpm `pnpm rebuild --pending` runs MORE root lifecycles than npm: prepublish
+  // (pnpm 10) and prerebuild/rebuild/postrebuild (pnpm 11).  On a nameless root
+  // these used to be dropped at the null-attribution gate → a deceptively-clean
+  // lock blocked by the (now-removed) pnpm gate.  With root anchoring extended to
+  // the nameless case, the main install RUNS and the root's reads/writes surface
+  // under `<repo-root>` — no fatal abort.
+  for (const lifecycle of ['prepublish', 'prerebuild', 'rebuild', 'postrebuild'] as const) {
+    it(`NAMELESS root + pnpm ${lifecycle} → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)`, async () => {
+      const { conn, hostSend, getOutput } = makeConn();
+      const configPath = writeConfig(testDir, { manager: 'pnpm' });
+      writeRootPkg(testDir, { version: '1.0.0', scripts: { [lifecycle]: 'node hook.js' } });
+
+      const main_ = recordingEventStrace('MAINPROG');
+
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        dnsLookup: offlineLookup,
+      });
 
       const lines = getOutput().split('\n').filter((l) => l.trim());
       const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
 
-      const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
-      expect(fatal).toBeDefined();
-      expect(String(fatal!['message'])).toMatch(/no usable `name`/);
-      expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
-      expect(main_.calls).toHaveLength(0); // gate fires before the main install pass
-      expect(exitedWith).toBe(1);
+      // No fatal abort: the main install pass ran and a final lockfile IS emitted.
+      expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+      expect(main_.calls).toHaveLength(1);
+      expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
     });
   }
 
