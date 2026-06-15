@@ -26742,6 +26742,8 @@ async function runInstallPhase(input) {
     return r;
   }
   function unionCwd(parentPid, childPid) {
+    everCwdShared.add(parentPid);
+    everCwdShared.add(childPid);
     const pr = rootedCwd(parentPid);
     const cr = rootedCwd(childPid);
     if (pr === cr) return;
@@ -26871,6 +26873,7 @@ async function runInstallPhase(input) {
     const sharedCwd = pidCwd.get(sharedRoot);
     const sharedUnknown = pidCwdUnknown.has(sharedRoot);
     if (sharedRoot !== pid) {
+      everCwdShared.add(pid);
       cwdParent.delete(pid);
       if (sharedCwd !== void 0) pidCwd.set(pid, sharedCwd);
       if (sharedUnknown) pidCwdUnknown.add(pid);
@@ -26886,6 +26889,7 @@ async function runInstallPhase(input) {
     if (otherMembers.length === 0) {
       return;
     }
+    everCwdShared.add(pid);
     otherMembers.sort((a, b) => a - b);
     const newRoot = otherMembers[0];
     cwdParent.delete(newRoot);
@@ -26908,8 +26912,30 @@ async function runInstallPhase(input) {
   const fdKey = (pid, fd) => `${rootedFd(pid)}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
   const childParent = /* @__PURE__ */ new Map();
+  const childParentReused = /* @__PURE__ */ new Set();
+  const childAllParents = /* @__PURE__ */ new Map();
   const execCwd = /* @__PURE__ */ new Map();
   const pendingExecCwd = /* @__PURE__ */ new Set();
+  const firstCwdMutationTs = /* @__PURE__ */ new Map();
+  const everCwdShared = /* @__PURE__ */ new Set();
+  const pidCloneTimeCwd = /* @__PURE__ */ new Map();
+  const deferredRelOpens = [];
+  const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
+  function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
+    const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
+    for (const d of deferredRelOpens) {
+      if (d.stamped) continue;
+      if (d.rawEvent.pid !== childPid) continue;
+      if (d.pkg === null || d.lifecycle === null) {
+        d.inheritedAttrib = parentAttrib;
+      }
+      d.initialCwd = inheritedCwd;
+      d.cloneFsSeed = cloneFsSeed;
+      d.seedParentPid = parentPid;
+      d.bootstrapPendingInherited = bootstrapPendingInherited;
+      d.stamped = true;
+    }
+  }
   const pidCwdUnknown = /* @__PURE__ */ new Set();
   function cwdGet(pid) {
     return pidCwd.get(rootedCwd(pid));
@@ -27307,6 +27333,7 @@ async function runInstallPhase(input) {
       }
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
       if (chdirMatch !== null) {
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
         const rawTarget = chdirMatch[1] ?? "";
         const decoded = unescapeStraceString(rawTarget);
         if (path2.isAbsolute(decoded)) {
@@ -27324,6 +27351,7 @@ async function runInstallPhase(input) {
       }
       const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
       if (fchdirMatch !== null) {
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
         const fd = parseInt(fchdirMatch[1] ?? "", 10);
         if (Number.isFinite(fd)) {
           const dirEntry = dirfdTable.get(fdKey(pid, fd));
@@ -27350,7 +27378,19 @@ async function runInstallPhase(input) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
           if (Number.isFinite(childPid) && childPid > 0) {
             propagateNodeBootstrap(pid, childPid);
+            const priorParent = childParent.get(childPid);
+            if (priorParent !== void 0 && priorParent !== pid) {
+              childParentReused.add(childPid);
+            }
             childParent.set(childPid, pid);
+            let allParents = childAllParents.get(childPid);
+            if (allParents === void 0) {
+              allParents = /* @__PURE__ */ new Set();
+              childAllParents.set(childPid, allParents);
+            }
+            allParents.add(pid);
+            const parentCloneTimeCwd = cwdUnknownHas(pid) ? null : cwdGet(pid) ?? null;
+            if (!pidCloneTimeCwd.has(childPid)) pidCloneTimeCwd.set(childPid, parentCloneTimeCwd);
             let cloneFs = false;
             let cloneFiles = false;
             if (syscallName === "clone" || syscallName === "clone3") {
@@ -27362,6 +27402,10 @@ async function runInstallPhase(input) {
                   else if (tok === "CLONE_FILES") cloneFiles = true;
                 }
               }
+            }
+            if (cloneFs) {
+              everCwdShared.add(pid);
+              everCwdShared.add(childPid);
             }
             const childCwdSnap = pendingCwdDetach.get(childPid);
             pendingCwdDetach.delete(childPid);
@@ -27419,6 +27463,20 @@ async function runInstallPhase(input) {
               );
               pendingExecCwd.delete(childPid);
             }
+            let parentAttribForStamp = freshSnapshotAttribution(pid);
+            if (parentAttribForStamp === null) {
+              const sampled = input.attribution.attribute(pid);
+              if (sampled !== null) {
+                parentAttribForStamp = { pkg: sampled.pkg, lifecycle: sampled.lifecycle };
+              }
+            }
+            stampDeferredRelOpens(
+              childPid,
+              parentCloneTimeCwd,
+              cloneFs,
+              parentAttribForStamp,
+              pid
+            );
             if (cloneFiles && !childHadPendingFdDetach) {
               unionFd(pid, childPid);
               if (standaloneFdTombstones !== void 0 && standaloneFdTombstones.length > 0) {
@@ -28126,6 +28184,9 @@ async function runInstallPhase(input) {
         if (rawEvent.kind === "read" && rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH) {
           completeNodeBootstrapCandidateFileMarker(rawEvent.pid);
           nodeBootstrapFileCompletedPids.add(rawEvent.pid);
+          if (!nodeBootstrapFileEndedTs.has(rawEvent.pid)) {
+            nodeBootstrapFileEndedTs.set(rawEvent.pid, rawEvent.ts);
+          }
           clearNodeBootstrapFile(rawEvent.pid);
           continue;
         }
@@ -28236,6 +28297,14 @@ async function runInstallPhase(input) {
             }
             continue;
           }
+          if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.dirfd === void 0 && !path2.isAbsolute(rawEvent.path) && canonicalizeForEmit(rawEvent.pid, rawEvent.path, rawEvent.dirfd) === null) {
+            deferredRelOpens.push({
+              rawEvent,
+              pkg: null,
+              lifecycle: null,
+              sharedAtRead: everCwdShared.has(rawEvent.pid)
+            });
+          }
           continue;
         }
         if (rawEvent.kind === "read" || rawEvent.kind === "write") {
@@ -28245,14 +28314,23 @@ async function runInstallPhase(input) {
             rawEvent.dirfd
           );
           if (canonical === null) {
-            unresolvedPathSamples.push({
-              pid: rawEvent.pid,
-              ts: rawEvent.ts,
-              path: rawEvent.path,
-              kind: rawEvent.kind,
-              pkg: result.pkg,
-              lifecycle: result.lifecycle
-            });
+            if (rawEvent.dirfd === void 0 && !path2.isAbsolute(rawEvent.path)) {
+              deferredRelOpens.push({
+                rawEvent,
+                pkg: result.pkg,
+                lifecycle: result.lifecycle,
+                sharedAtRead: everCwdShared.has(rawEvent.pid)
+              });
+            } else {
+              unresolvedPathSamples.push({
+                pid: rawEvent.pid,
+                ts: rawEvent.ts,
+                path: rawEvent.path,
+                kind: rawEvent.kind,
+                pkg: result.pkg,
+                lifecycle: result.lifecycle
+              });
+            }
             continue;
           }
           if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
@@ -28287,6 +28365,112 @@ async function runInstallPhase(input) {
       `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). Audit-pipeline contract requires source \u2208 {"shim","strace"}.`
     );
   }
+  const lineageEverCwdShared = (startPid) => {
+    let a = startPid;
+    let guard = 0;
+    const seen = /* @__PURE__ */ new Set();
+    while (a !== void 0) {
+      if (guard++ >= 1e5) return true;
+      if (seen.has(a)) return true;
+      if (everCwdShared.has(a)) return true;
+      if (childParentReused.has(a)) return true;
+      seen.add(a);
+      a = childParent.get(a);
+    }
+    return false;
+  };
+  for (const d of deferredRelOpens) {
+    const P = d.rawEvent.pid;
+    let pkg = d.pkg;
+    let lifecycle = d.lifecycle;
+    if (pkg === null || lifecycle === null) {
+      const inh = d.inheritedAttrib;
+      if (inh === null || inh === void 0) {
+        continue;
+      }
+      pkg = inh.pkg;
+      lifecycle = inh.lifecycle;
+    }
+    let initial = d.initialCwd;
+    let childPidReuseHidCloneFs = false;
+    if (childParentReused.has(P)) {
+      const parents = childAllParents.get(P);
+      if (parents !== void 0) {
+        for (const pp of parents) {
+          if (lineageEverCwdShared(pp)) {
+            childPidReuseHidCloneFs = true;
+            break;
+          }
+        }
+      }
+    }
+    if ((initial === null || initial === void 0) && d.stamped === true) {
+      let a = d.seedParentPid;
+      let guard = 0;
+      const seen = /* @__PURE__ */ new Set();
+      while (a !== void 0) {
+        if (guard++ >= 1e5) break;
+        if (seen.has(a)) break;
+        if (firstCwdMutationTs.has(a)) break;
+        const acwd = pidCloneTimeCwd.get(a);
+        if (typeof acwd === "string") {
+          initial = acwd;
+          break;
+        }
+        seen.add(a);
+        a = childParent.get(a);
+      }
+    }
+    const sharedAtRead = d.sharedAtRead || d.cloneFsSeed === true || childPidReuseHidCloneFs || d.seedParentPid !== void 0 && lineageEverCwdShared(d.seedParentPid);
+    let canonical = null;
+    if (d.stamped === true && typeof initial === "string" && !sharedAtRead) {
+      const firstMut = firstCwdMutationTs.get(P);
+      const provable = firstMut === void 0 || d.rawEvent.ts < firstMut;
+      if (provable) {
+        canonical = path2.resolve(initial, d.rawEvent.path);
+      }
+    }
+    if (canonical !== null) {
+      if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
+        continue;
+      }
+      const resolved = { ...d.rawEvent, path: canonical };
+      if (resolved.kind === "read" && !resolved.hidden && !matcher.isProtected(resolved.path)) {
+        const endedTs = nodeBootstrapFileEndedTs.get(P);
+        const childOwnWindowAtRead = endedTs !== void 0 && d.rawEvent.ts < endedTs;
+        const inheritedPending = d.bootstrapPendingInherited === true;
+        const readTimePending = inheritedPending && (endedTs === void 0 || d.rawEvent.ts < endedTs) || childOwnWindowAtRead;
+        if (readTimePending) {
+          nodeBootstrapFileReads.add(resolved.path);
+          continue;
+        }
+        if (nodeBootstrapFileReads.has(resolved.path)) {
+          continue;
+        }
+      } else if (shouldFilterNodeBootstrapFileRead(resolved)) {
+        continue;
+      }
+      const attributed = {
+        raw: resolved,
+        pkg,
+        lifecycle
+      };
+      if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+        continue;
+      }
+      emit(attributed);
+    } else {
+      unresolvedPathSamples.push({
+        pid: P,
+        ts: d.rawEvent.ts,
+        path: d.rawEvent.path,
+        kind: d.rawEvent.kind,
+        pkg,
+        lifecycle
+      });
+    }
+  }
+  deferredRelOpens.length = 0;
   flushAllNodeBootstrapCandidates();
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;

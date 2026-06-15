@@ -1736,6 +1736,13 @@ export async function runInstallPhase(
   //     ...) fails closed via the missing-entry path); fdUnknown on
   //     EITHER side propagates.
   function unionCwd(parentPid: number, childPid: number): void {
+    // Determinism (defer-and-re-resolve): both pids are now in a CLONE_FS cwd
+    // group. Mark them STICKILY so a deferred relative open from either can
+    // never be (mis)resolved via the single-file COPY ts gate — even if one
+    // side later unshares back to a singleton. Marked unconditionally (also for
+    // an already-merged no-op below) so the sharing relationship is recorded.
+    everCwdShared.add(parentPid);
+    everCwdShared.add(childPid);
     const pr = rootedCwd(parentPid);
     const cr = rootedCwd(childPid);
     if (pr === cr) return;
@@ -1967,10 +1974,22 @@ export async function runInstallPhase(
   }
 
   function detachCwdGroup(pid: number): void {
+    // Determinism (defer-and-re-resolve): mark `pid` sticky-shared ONLY when the
+    // detach proves it was ACTUALLY in a multi-member CLONE_FS cwd group at this
+    // instant. This handler is also called for `unshare(CLONE_NEWUSER|CLONE_NEWNS)`
+    // which the kernel treats as an fs-detach even for a SINGLETON (a no-op for
+    // sharing). Marking a singleton would falsely capture `sharedAtRead:true` on a
+    // later deferred read and fail-close a read the clone-first order would emit
+    // (adversarial-review 4th pass). A genuine CLONE_FS share whose clone drains
+    // AFTER this unshare is still marked at the clone handler (`if (cloneFs)` /
+    // `unionCwd`), so this only DROPS false positives. Marking is therefore done
+    // inside the two genuinely-shared branches below, NOT unconditionally here.
     const sharedRoot = rootedCwd(pid);
     const sharedCwd = pidCwd.get(sharedRoot);
     const sharedUnknown = pidCwdUnknown.has(sharedRoot);
     if (sharedRoot !== pid) {
+      // `pid` is a non-root member of a multi-member group → genuinely shared.
+      everCwdShared.add(pid);
       cwdParent.delete(pid);
       if (sharedCwd !== undefined) pidCwd.set(pid, sharedCwd);
       if (sharedUnknown) pidCwdUnknown.add(pid);
@@ -1985,9 +2004,11 @@ export async function runInstallPhase(
       }
     }
     if (otherMembers.length === 0) {
-      // Singleton — no-op.
+      // Singleton — no-op (NOT shared → do not mark everCwdShared).
       return;
     }
+    // Root of a multi-member group → genuinely shared.
+    everCwdShared.add(pid);
     otherMembers.sort((a, b) => a - b);
     const newRoot = otherMembers[0]!;
     cwdParent.delete(newRoot);
@@ -2074,6 +2095,34 @@ export async function runInstallPhase(
   //     unresolvable (fail closed); an absent key means the pid never exec'd
   //     (forked but ran the parent's program, inheriting its identity).
   const childParent = new Map<number, number>();
+  // Determinism (defer-and-re-resolve) FIX #1 TRANSITIVE PROVENANCE (codex round-3
+  // [high], 2026-06-16 follow-up): pids whose `childParent` edge was OVERWRITTEN with a
+  // DIFFERENT parent — i.e. a recycled pid that got a new clone parent within this
+  // drain. `lineageEverCwdShared` walks `childParent` UP the lineage of a deferred
+  // read; if any pid on that path had its edge repointed by pid-reuse, the final map no
+  // longer reflects the ORIGINAL CLONE_FS ancestry the deferred read inherited from, so
+  // the walk could silently MISS a shared ancestor and resolve against a stale cwd (a
+  // protected-path FALSE NEGATIVE). We mark such pids here (sticky, add-only, complete
+  // at end-of-drain → drain-independent) and FAIL CLOSED at replay when the walk hits
+  // one. This is a conservative over-fire (a reused intermediate whose true lineage
+  // never shared also fails closed) consistent with the sticky-`everCwdShared`
+  // over-fire — SAFE (the probe surfaces as a fail-loud audit_bypass) and confined to
+  // pid-reuse within a single deferred-read's lineage, which does not occur in normal
+  // npm/pnpm/yarn plain-fork trees.
+  const childParentReused = new Set<number>();
+  // Determinism (defer-and-re-resolve) FIX #1 DEFERRED-CHILD PID REUSE (codex round-3
+  // final [high], 2026-06-16): every DISTINCT parent pid ever observed to clone a given
+  // child pid, across ALL generations of a recycled pid. A deferred read is first-stamp-
+  // wins bound by numeric child pid, so if its OWN pid is recycled and a LATER (private)
+  // generation's clone drains BEFORE the read's TRUE seeding clone, the entry is stamped
+  // with the wrong generation's lineage — laundering a CLONE_FS ancestor out of the
+  // replay walk. At replay we fail closed iff the read's pid was reused AND ANY of its
+  // recorded parent generations has a CLONE_FS lineage (i.e. the stamp MIGHT have hidden
+  // a real shared ancestor). This is PRECISE (a pure plain-fork recycled pid — the
+  // accepted F6 reaped-pid residual — has NO CLONE_FS parent generation, so it still
+  // resolves) and drain-independent (the multimap + everCwdShared are complete at
+  // end-of-drain).
+  const childAllParents = new Map<number, Set<number>>();
   const execCwd = new Map<number, string | null>();
   // Determinism (Fix #2, adversarial-review [medium], 2026-06-14): pids that
   // exec'd BEFORE their parent's clone line had drained. At exec time such a
@@ -2087,6 +2136,187 @@ export async function runInstallPhase(
   // closed). See the clone-handler reconcile (~L3690) and the end-of-drain
   // flush (~L6110).
   const pendingExecCwd = new Set<number>();
+
+  // Determinism (defer-and-re-resolve, [medium], 2026-06-15): close the
+  // pre-existing strace -ff drain-order race for NON-ROOT clone children.
+  // `strace -ff` writes one trace file per pid and the guest drains them in
+  // readdir (inode) order with NO causal-ordering key. A child's relative
+  // `openat(AT_FDCWD, "pkg.json")` can therefore be processed BEFORE its
+  // parent's `clone()=<child>` line. At that moment the child has no cwd →
+  // `canonicalizeForEmit` fails closed → the read is dropped inline and a
+  // synthetic `<UNRESOLVED_PATH>` (audit_bypass) surfaces → NON-DETERMINISTIC
+  // lockfile (fires ~1/3 of CI runs on unrs-resolver's napi-postinstall child
+  // reading its own package.json at startup). The root pid was already fixed
+  // via a spawn-time /proc children query, but a non-root clone child is dead
+  // at drain time (/proc gone) and there is NO on-wire ordering signal.
+  //
+  // Fix: DEFER the unresolved AT_FDCWD-relative open instead of dropping it,
+  // then re-resolve once the parent's clone line drains and the inherited cwd
+  // propagates, gated by a SOUND proof that cwd-at-read-time provably equals
+  // that inherited INITIAL cwd.
+  //
+  // The deferred open captures its resolution context EAGERLY, the instant the
+  // clone line seeds the child's cwd (see the clone handler's back-fill). This
+  // matters for two adversarial-review findings (2026-06-15):
+  //   - exit eviction (finding 1): per-pid maps that are evicted on the child's
+  //     `+++ exited +++` line would lose the snapshot a not-yet-replayed
+  //     deferred open still needs (a valid drain order is open→clone→exit→
+  //     replay). Capturing into the deferred entry makes replay independent of
+  //     any later eviction, so we no longer evict on exit.
+  //   - topology drift (finding 2): the COPY-vs-UNION decision read at end-of-
+  //     drain via `isCwdSingleton` is WRONG for a CLONE_FS child that later
+  //     unshares (it is a singleton by then), hiding a shared-window sibling/
+  //     parent chdir. We instead consult a STICKY "ever CLONE_FS-shared" mark
+  //     and FAIL CLOSED for any pid that ever shared a cwd group — the
+  //     UNION-resolve path was speculative; the real-world race (unrs-resolver's
+  //     napi-postinstall child) is a plain fork/copy child.
+  //
+  //   firstCwdMutationTs: lineTs of the FIRST cwd-mutating event in a pid's OWN
+  //     per-pid stream (chdir/fchdir, INCLUDING the unknown-marking failure).
+  //     Used by the COPY-case ts gate — sound because a pid's read and its own
+  //     chdirs share ONE per-pid file, so their `ts` reflects happens-before.
+  const firstCwdMutationTs = new Map<number, number>();
+  //   everCwdShared: STICKY set of pids that were EVER members of a CLONE_FS cwd
+  //     group (set inside `unionCwd` and `detachCwdGroup` for ALL participants).
+  //     A pid in this set NEVER had a purely-private cwd, so a deferred open from
+  //     it cannot be soundly proven via the single-file ts gate → fail closed.
+  const everCwdShared = new Set<number>();
+  //   pidCloneTimeCwd: for each child pid, the PARENT's clone-time cwd captured at
+  //     the seeding clone (the value clone(2) copied into the child's INITIAL cwd),
+  //     first-write-wins by numeric child pid (binds to the FIRST seeding
+  //     generation, mirroring `stampDeferredRelOpens`). `null` means the parent had
+  //     no known cwd at clone time (e.g. a plain-fork INTERMEDIATE whose own seeding
+  //     clone has not yet drained). Used at replay to TRANSITIVELY recover a deferred
+  //     read's `initialCwd` for a deep (>2-gen) chain: when the immediate parent's
+  //     clone-time cwd is null (the LEAF-UP drain order), walk UP `childParent` to the
+  //     nearest non-mutating ancestor with a known clone-time cwd (ultimately the
+  //     cwd-seeded root). Drain-independent at end-of-drain (both this map and
+  //     `childParent` are complete). See the replay transitive-recovery walk.
+  const pidCloneTimeCwd = new Map<number, string | null>();
+  //   deferredRelOpens: unresolved AT_FDCWD-relative opens parked for re-
+  //     resolution. ONLY truly-relative AT_FDCWD opens are deferred; absolute
+  //     paths and numeric-dirfd opens NEVER depend on clone order and stay on
+  //     the immediate fail-closed (synth) path.
+  interface DeferredRelOpen {
+    // Only read/write opens are ever deferred (the inline drop site is inside a
+    // `kind === 'read' || kind === 'write'` guard), so narrow the union — this
+    // keeps `.path` present and lets the re-resolution spread stay well-typed.
+    rawEvent: Extract<RawEvent, { kind: 'read' | 'write' }>;
+    // pkg/lifecycle are NULL when the read was deferred at the null-ATTRIBUTION
+    // gate (a reaped short-lived child whose /proc is gone and whose clone line
+    // hasn't drained — adversarial-review 5th pass F6). The clone handler fills
+    // them from the parent-propagated child snapshot at stamp time; an entry
+    // still null at replay is genuinely unattributable → DROPPED (preserving the
+    // null-gate's "don't flood the lockfile with system-pid noise" floor — NOT
+    // synthed, since an unattributed event has no package to land in).
+    pkg: string | null;
+    lifecycle: AttributedEvent['lifecycle'] | null;
+    // ---- READ-TIME state, captured AT DEFER (the read), never clone-seed time.
+    // Clone-seed time can differ from read time and contaminate the verdict
+    // (adversarial-review 3rd pass F2), so anything that varies over the pid's
+    // life is snapshotted here, at the instant the read happened:
+    //   sharedAtRead — was the pid ALREADY in a CLONE_FS cwd group at read time?
+    sharedAtRead: boolean;
+    // ---- Back-filled EXACTLY ONCE when the FIRST clone line for this pid drains
+    // (first-stamp-wins, so a recycled pid's later clone cannot poison an
+    // already-stamped entry). Both are read-time-invariant facts a clone reveals:
+    //   initialCwd  — the PARENT's clone-time cwd = the child's inherited cwd
+    //                 per clone(2) (string | null), the value a racing open that
+    //                 predates its own first chdir resolves against.
+    //   cloneFsSeed — did the SEEDING clone share the fs_struct (CLONE_FS)? If so
+    //                 the child shared the parent's cwd FROM creation, i.e. at
+    //                 read time → fail closed (cross-file sibling/parent chdir is
+    //                 non-causal). This is the only sharing relevant to the read;
+    //                 a LATER share (the pid clones a CLONE_FS child afterwards)
+    //                 is excluded by construction.
+    //   bootstrapPendingInherited — did the pid inherit Node file-pending from
+    //                 its parent at the SEEDING clone? Combined at replay with the
+    //                 pid's OWN startup-done marker ts (same per-pid file → causal)
+    //                 to decide the read-time pending state without depending on
+    //                 cross-file drain order (3rd-pass F4).
+    //   inheritedAttrib — for an entry deferred with NULL attribution (F6), the
+    //                 parent-propagated attribution captured AT the seeding clone
+    //                 (generation-bound), so a LATER recycled-pid clone that
+    //                 overwrites the pid's snapshot cannot mis-attribute this read
+    //                 at replay (5th-pass F6 follow-up). `null` = parent had no
+    //                 attribution at the clone → drop at replay.
+    initialCwd?: string | null;
+    cloneFsSeed?: boolean;
+    bootstrapPendingInherited?: boolean;
+    //   seedParentPid — the PARENT pid at the SEEDING clone drain. Used at replay by
+    //                 BOTH FIX #1 and FIX #3 (it is the only parent identity the
+    //                 deferred entry retains; no stamp-time parent-state sample is
+    //                 stored — both verdicts are recomputed at replay from FINAL,
+    //                 drain-INDEPENDENT state):
+    //                 - FIX #1 (parent-side CLONE_FS provenance): fail this read
+    //                   closed if `everCwdShared.has(seedParentPid)` — the parent was
+    //                   EVER in a CLONE_FS cwd group, so its `initialCwd` snapshot may
+    //                   be stale (a sibling/grandparent chdir of the shared group cwd
+    //                   can be causally-prior to the read yet drain after the clone
+    //                   snapshot → a protected-path FALSE NEGATIVE). The sticky set is
+    //                   complete after the full drain, closing the stamp-time blind
+    //                   spot where the parent's OWN CLONE_FS membership edge had not
+    //                   yet drained when it plain-forked this child (ROUND-2 #1).
+    //                 - FIX #3 (bootstrap inherited-pending): the `bootstrapPending
+    //                   Inherited` sample is gated by the child's OWN marker only; the
+    //                   prior cross-file `read.ts < parentEndedTs` parent-window
+    //                   inference was DROPPED (prefer-EMIT, ROUND-2 #3) — so the parent
+    //                   pid is no longer consulted for the pending recompute, but is
+    //                   retained for FIX #1.
+    //                 seedParentPid is bound to THIS seeding generation
+    //                 (first-stamp-wins), so a later recycled-pid clone cannot
+    //                 repoint it.
+    seedParentPid?: number;
+    inheritedAttrib?: { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null;
+    stamped?: boolean;
+  }
+  const deferredRelOpens: DeferredRelOpen[] = [];
+  //   nodeBootstrapFileEndedTs: ts of a pid's OWN node-startup-done marker (the
+  //     strace open of NODE_STARTUP_DONE_STRACE_PATH or its shim event), first-
+  //     writer-wins. Same per-pid file as the pid's reads → causal ts. Used at
+  //     replay to decide whether a deferred read predates the close of the pid's
+  //     inherited Node file-pending window (3rd-pass F4).
+  const nodeBootstrapFileEndedTs = new Map<number, number>();
+  // Back-fill the clone-revealed facts (inherited cwd; whether the seeding clone
+  // was CLONE_FS; whether the child inherited Node file-pending; the parent-
+  // propagated attribution for NULL-attributed F6 entries) of every still-
+  // unstamped deferred open for `childPid`. Called from the clone handler with
+  // the PARENT's clone-time cwd (read BEFORE reconciliation, so a post-read child
+  // chdir cannot taint it), the seeding clone's CLONE_FS flag, and the parent's
+  // attribution at this clone (so a NULL-attributed entry binds to THIS
+  // generation, not a later recycled-pid snapshot — 5th-pass F6 follow-up). The
+  // pending-inherit is read from `nodeBootstrapFilePendingPids` right AFTER
+  // `propagateNodeBootstrap` ran on this clone line. First-stamp-wins.
+  //
+  // `parentPid` is the seeding clone's parent pid, stored as `seedParentPid` so
+  // replay can (FIX #1) fail this read closed if the parent was EVER in a CLONE_FS
+  // cwd group (`everCwdShared.has(seedParentPid)`, drain-independent) — closing the
+  // ROUND-2 #1 stamp-time blind spot — and is retained for FIX #3 bookkeeping. No
+  // stamp-time parent-state SAMPLE is captured: both verdicts are recomputed at
+  // replay from FINAL state.
+  function stampDeferredRelOpens(
+    childPid: number,
+    inheritedCwd: string | null,
+    cloneFsSeed: boolean,
+    parentAttrib: { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null,
+    parentPid: number,
+  ): void {
+    const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
+    for (const d of deferredRelOpens) {
+      if (d.stamped) continue;
+      if (d.rawEvent.pid !== childPid) continue;
+      // Only F6 entries (deferred with null attribution) need filling; an entry
+      // that already attributed at the resolved-path defer site keeps its pkg.
+      if (d.pkg === null || d.lifecycle === null) {
+        d.inheritedAttrib = parentAttrib;
+      }
+      d.initialCwd = inheritedCwd;
+      d.cloneFsSeed = cloneFsSeed;
+      d.seedParentPid = parentPid;
+      d.bootstrapPendingInherited = bootstrapPendingInherited;
+      d.stamped = true;
+    }
+  }
 
   // Audit-trust Finding (high, 2026-05-19, codex follow-up): set of pids
   // whose cwd state we OBSERVED a mutation event for but COULD NOT
@@ -2932,6 +3162,9 @@ export async function runInstallPhase(
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path.resolve(input.cwd));
+        // Determinism (defer-and-re-resolve): the root's cwd is seeded above, so
+        // a root AT_FDCWD-relative open ALWAYS resolves inline and never reaches
+        // the deferral path — no separate initial-cwd capture is needed here.
         // Anchor the PM root's exec-cwd at the repo root. The trusted root pid
         // IS the anchor in `isRepoRootAnchored`, but seeding execCwd here keeps
         // the map self-consistent for any future use and makes the root's
@@ -3250,6 +3483,16 @@ export async function runInstallPhase(
         if (packageManagerClientPids.delete(pid)) {
           completedPackageManagerClientPids.add(pid);
         }
+        // Determinism (defer-and-re-resolve): do NOT evict cwd proof state on
+        // exit. A deferred relative open replays only at end-of-drain, and a
+        // valid drain order is open(deferred) → clone(seeds) → exit → replay;
+        // evicting here would lose the snapshot the replay still needs and
+        // re-introduce the byte drift this fix removes (adversarial-review
+        // finding 1). The deferred entry captures its own resolution context at
+        // clone-seed time, so a recycled pid cannot poison an already-stamped
+        // open; `firstCwdMutationTs` is first-writer-wins per pid (the existing
+        // file already accepts the theoretical pid-reuse residual on per-pid
+        // cwd state — see the long exit-handler note above).
         // Audit-trust final model (Codex review of 2496405,
         // 2026-05-19): the snapshot is NEVER evicted on exit.
         //
@@ -3340,6 +3583,11 @@ export async function runInstallPhase(
       // for any subsequent AT_FDCWD-relative openat from that pid.
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
       if (chdirMatch !== null) {
+        // Determinism (defer-and-re-resolve): record the FIRST cwd mutation in
+        // THIS pid's own stream, keyed by the line's own pid, BEFORE mutating.
+        // The COPY-case re-resolution gate compares a deferred read's ts
+        // against this — sound because read and chdir share one per-pid file.
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
         const rawTarget = chdirMatch[1] ?? '';
         const decoded = unescapeStraceString(rawTarget);
         if (path.isAbsolute(decoded)) {
@@ -3379,6 +3627,10 @@ export async function runInstallPhase(
       }
       const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
       if (fchdirMatch !== null) {
+        // Determinism (defer-and-re-resolve): an fchdir is a cwd mutation too —
+        // record it (first-writer-wins, keyed by this line's own pid) before
+        // mutating, so the COPY ts gate and UNION group-mutation check see it.
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
         const fd = parseInt(fchdirMatch[1] ?? '', 10);
         if (Number.isFinite(fd)) {
           const dirEntry = dirfdTable.get(fdKey(pid, fd));
@@ -3519,7 +3771,57 @@ export async function runInstallPhase(
             // Record the kernel-observed parent edge for repo-root anchoring.
             // `pid` is the PARENT (the per-pid strace file owner that issued
             // the clone/fork/vfork); `childPid` is the new child. Unconditional.
+            //
+            // Determinism (defer-and-re-resolve) FIX #1 TRANSITIVE follow-up: if this
+            // OVERWRITES an existing edge with a DIFFERENT parent, `childPid` is a
+            // recycled pid. Its prior lineage (which a still-deferred read may have
+            // inherited CLONE_FS provenance through) is now lost from the map → mark it
+            // so the replay lineage walk fails closed instead of silently resolving
+            // against a stale cwd. (Marked BEFORE the set so we compare the old value.)
+            const priorParent = childParent.get(childPid);
+            if (priorParent !== undefined && priorParent !== pid) {
+              childParentReused.add(childPid);
+            }
             childParent.set(childPid, pid);
+            // FIX #1 DEFERRED-CHILD PID REUSE: record EVERY distinct parent generation
+            // of this child pid (used at replay to decide whether a reused deferred-read
+            // pid might have had its CLONE_FS lineage laundered by a wrong-generation
+            // stamp — see `childAllParents` decl).
+            let allParents = childAllParents.get(childPid);
+            if (allParents === undefined) {
+              allParents = new Set<number>();
+              childAllParents.set(childPid, allParents);
+            }
+            allParents.add(pid);
+
+            // Determinism (defer-and-re-resolve): capture the PARENT's cwd at
+            // clone time, BEFORE any union/copy reconciliation. clone(2) copies
+            // the parent's cwd to the child, so THIS is the child's inherited
+            // INITIAL cwd — the value a racing child open that PREDATES its own
+            // later chdir must resolve against. We must read it here (not from
+            // the child after reconciliation): a post-read child chdir can make
+            // the reconciler taint the child's cwd unknown, which would wrongly
+            // capture `null` and fail-close a read that predates that chdir
+            // (adversarial-review re-review finding 3).
+            const parentCloneTimeCwd = cwdUnknownHas(pid) ? null : (cwdGet(pid) ?? null);
+
+            // Determinism (defer-and-re-resolve) DEEP-CHAIN follow-up (codex round-3
+            // [high], 2026-06-16): record THIS child's clone-time inherited cwd so a
+            // deferred read of a DEEPER descendant can transitively recover its
+            // `initialCwd` at replay when the immediate parent's clone-time value was
+            // null (the LEAF-UP drain order, where an INTERMEDIATE plain-fork pid has
+            // no cwd yet when it seeds its child). First-write-wins by numeric child
+            // pid binds to the FIRST seeding generation (mirrors stampDeferredRelOpens),
+            // so a recycled-pid clone cannot repoint it.
+            if (!pidCloneTimeCwd.has(childPid)) pidCloneTimeCwd.set(childPid, parentCloneTimeCwd);
+
+            // FIX #1 (parent-side CLONE_FS provenance) is now decided ENTIRELY at
+            // replay via the STICKY `everCwdShared.has(seedParentPid)`. We do NOT
+            // sample the parent's LIVE CLONE_FS-group membership here: a stamp-time
+            // sample is BLIND when the edge that makes the parent a member (e.g. a
+            // grandparent `clone(CLONE_FS) = parent`) drains AFTER the parent
+            // plain-forks this child (ROUND-2 #1), silently resolving against a stale
+            // cwd. The replay-time sticky check is drain-independent and closes that.
 
             // Extract the clone-flag identifier list.  For `clone(...)`
             // strace renders `flags=CLONE_VM|CLONE_FS|...`; for
@@ -3538,6 +3840,21 @@ export async function runInstallPhase(
                   else if (tok === 'CLONE_FILES') cloneFiles = true;
                 }
               }
+            }
+
+            // Determinism (defer-and-re-resolve): if the kernel shared the
+            // fs_struct (CLONE_FS), mark BOTH pids sticky-shared up front —
+            // regardless of whether reconciliation takes the `unionCwd` path or
+            // the pending-detach COPY path below. The COPY path (taken when the
+            // child's unshare drained first) skips `unionCwd`, so without this
+            // the PARENT would never be marked even though it shared the cwd
+            // until the unshare; a parent deferred open could then wrongly use
+            // the single-file COPY ts gate (adversarial-review re-review
+            // finding 1). The shared window means any cross-file chdir is
+            // non-causal → both sides must fail closed.
+            if (cloneFs) {
+              everCwdShared.add(pid);
+              everCwdShared.add(childPid);
             }
 
             // --- cwd group: union if CLONE_FS, else copy. -----------
@@ -3799,6 +4116,46 @@ export async function runInstallPhase(
               );
               pendingExecCwd.delete(childPid);
             }
+
+            // Determinism (defer-and-re-resolve): back-fill the clone-revealed
+            // facts of any AT_FDCWD-relative open from `childPid` that raced ahead
+            // of this clone line. The inherited INITIAL cwd is the PARENT's
+            // clone-time cwd (`parentCloneTimeCwd`, captured BEFORE reconciliation
+            // so a post-read child chdir can't taint it to null — 3rd-pass F3).
+            // The sharing flag passed is THIS seeding clone's `cloneFs` ONLY —
+            // NOT `everCwdShared.has(childPid)` (which would fold in a FUTURE
+            // same-pid share) and NOT `childHadPendingCwdDetach` (a detach without
+            // CLONE_FS proves no share via this edge) — so the read-time sharing
+            // verdict is exact (3rd-pass F2). First-stamp-wins per entry binds
+            // each open to its read-time generation.
+            //
+            // The parent attribution passed binds a NULL-attributed (F6) entry to
+            // THIS clone's generation so a later recycled-pid snapshot can't
+            // mis-attribute it at replay (5th-pass F6 follow-up). The parent is
+            // alive here (it just cloned), so its snapshot exists; fall back to a
+            // /proc sample (same as the attribution propagation below) when the
+            // parent's first observed line IS this clone. Stale snapshots are
+            // rejected (`freshSnapshotAttribution`): a dead parent generation must
+            // not attribute the child.
+            let parentAttribForStamp = freshSnapshotAttribution(pid);
+            if (parentAttribForStamp === null) {
+              const sampled = input.attribution.attribute(pid);
+              if (sampled !== null) {
+                parentAttribForStamp = { pkg: sampled.pkg, lifecycle: sampled.lifecycle };
+              }
+            }
+            // `pid` (the parent) is stored as `seedParentPid` so replay can decide
+            // FIX #1 (fail closed if `everCwdShared.has(seedParentPid)` — parent ever
+            // CLONE_FS-shared, drain-independent) and carry the FIX #3 bookkeeping. No
+            // stamp-time parent-state sample is threaded — both verdicts recompute at
+            // replay from FINAL state.
+            stampDeferredRelOpens(
+              childPid,
+              parentCloneTimeCwd,
+              cloneFs,
+              parentAttribForStamp,
+              pid,
+            );
 
             // --- fd group: union if CLONE_FILES, else copy. ---------
             if (cloneFiles && !childHadPendingFdDetach) {
@@ -5579,6 +5936,13 @@ export async function runInstallPhase(
         ) {
           completeNodeBootstrapCandidateFileMarker(rawEvent.pid);
           nodeBootstrapFileCompletedPids.add(rawEvent.pid);
+          // Determinism (defer-and-re-resolve, 3rd-pass F4): record this pid's
+          // OWN file-pending window close ts (same per-pid file as its reads →
+          // causal). A deferred read with ts >= this is POST-bootstrap and must
+          // NOT be filtered as Node startup at replay. First-writer-wins.
+          if (!nodeBootstrapFileEndedTs.has(rawEvent.pid)) {
+            nodeBootstrapFileEndedTs.set(rawEvent.pid, rawEvent.ts);
+          }
           clearNodeBootstrapFile(rawEvent.pid);
           continue;
         }
@@ -5974,6 +6338,31 @@ export async function runInstallPhase(
           // driver's bulk store/cache/$REPO reads (driver pid == rootPid, also
           // null-attributed) into `<repo-root>`.  So a genuine null at THIS gate
           // is a real non-lifecycle process: drop it.
+          //
+          // Determinism (defer-and-re-resolve, 5th-pass F6): EXCEPT an unresolved
+          // AT_FDCWD-relative read/write may be a reaped short-lived clone child
+          // whose /proc is already gone AND whose parent's clone line (which both
+          // seeds its cwd AND propagates the parent's attribution snapshot) has
+          // not drained yet. Dropping it here would lose a protected-path probe /
+          // package read for the SAME drain-order reason this fix exists. DEFER it
+          // with NULL attribution; the clone handler fills pkg/lifecycle from the
+          // parent-propagated child snapshot at stamp time, and an entry still
+          // unattributed at replay is dropped (the null-gate floor holds). Gated
+          // identically to the resolved-path deferral (truly-relative AT_FDCWD
+          // only; absolute / numeric-dirfd never depend on clone order).
+          if (
+            (rawEvent.kind === 'read' || rawEvent.kind === 'write') &&
+            rawEvent.dirfd === undefined &&
+            !path.isAbsolute(rawEvent.path) &&
+            canonicalizeForEmit(rawEvent.pid, rawEvent.path, rawEvent.dirfd) === null
+          ) {
+            deferredRelOpens.push({
+              rawEvent,
+              pkg: null,
+              lifecycle: null,
+              sharedAtRead: everCwdShared.has(rawEvent.pid),
+            });
+          }
           continue;
         }
 
@@ -6018,17 +6407,46 @@ export async function runInstallPhase(
             rawEvent.dirfd,
           );
           if (canonical === null) {
-            // Fail closed: record an UnresolvedPathSample for
-            // post-loop synthesis and DROP the raw event so a
-            // relative path never reaches normalize/tokenize.
-            unresolvedPathSamples.push({
-              pid: rawEvent.pid,
-              ts: rawEvent.ts,
-              path: rawEvent.path,
-              kind: rawEvent.kind,
-              pkg: result.pkg,
-              lifecycle: result.lifecycle,
-            });
+            // Determinism (defer-and-re-resolve, [medium], 2026-06-15): an
+            // unresolved AT_FDCWD-relative open may be a strace -ff drain-order
+            // RACE — the child's open drained before its parent's clone line,
+            // so the inherited cwd has not propagated yet. DEFER it and
+            // re-resolve at end-of-drain against the clone-inherited initial cwd
+            // (see the deferredRelOpens declaration). ONLY truly-relative
+            // AT_FDCWD opens race on clone order; an absolute path or a
+            // numeric-dirfd open NEVER depends on clone propagation, so those
+            // keep the immediate fail-closed (synth) path unchanged.
+            if (rawEvent.dirfd === undefined && !path.isAbsolute(rawEvent.path)) {
+              // Capture READ-TIME sharing state HERE (at the read), NOT at
+              // clone-seed time — a LATER share (e.g. the pid clones a CLONE_FS
+              // child afterwards) must NOT retroactively fail-close this read
+              // (adversarial-review 3rd pass F2). Node-bootstrap filtering is NOT
+              // captured here: it is applied at replay via the LIVE classifier
+              // (final `nodeBootstrapFileReads` path set + final pending), which
+              // is drain-order-INDEPENDENT (set union + "did the startup-done
+              // marker drain") and so deterministic. A deferred AT_FDCWD-RELATIVE
+              // read being a genuine Node-startup read is not realistic anyway —
+              // Node's startup reads use absolute module paths, never a relative
+              // open from an unknown cwd.
+              deferredRelOpens.push({
+                rawEvent,
+                pkg: result.pkg,
+                lifecycle: result.lifecycle,
+                sharedAtRead: everCwdShared.has(rawEvent.pid),
+              });
+            } else {
+              // Fail closed: record an UnresolvedPathSample for
+              // post-loop synthesis and DROP the raw event so a
+              // relative path never reaches normalize/tokenize.
+              unresolvedPathSamples.push({
+                pid: rawEvent.pid,
+                ts: rawEvent.ts,
+                path: rawEvent.path,
+                kind: rawEvent.kind,
+                pkg: result.pkg,
+                lifecycle: result.lifecycle,
+              });
+            }
             continue;
           }
           // Drop env-spy's OWN append to the events file.  Every shim-loaded
@@ -6127,6 +6545,346 @@ export async function runInstallPhase(
         'Audit-pipeline contract requires source ∈ {"shim","strace"}.',
     );
   }
+
+  // Determinism (defer-and-re-resolve, [medium], 2026-06-15): re-resolve the
+  // AT_FDCWD-relative opens deferred during the drain (a child open that raced
+  // ahead of its parent's clone line). Runs AFTER the main drain loop (the full
+  // clone graph + per-pid cwd history is known) but BEFORE
+  // `flushAllNodeBootstrapCandidates()` so a re-resolved read participates in
+  // the SAME node-bootstrap classifier as the inline path — it is filtered AND
+  // buffered identically, closing the byte-stability gap a post-flush emit would
+  // open for a deferred Node startup read (adversarial-review finding 3).
+  // Re-resolved root-attributed reads `emit()` into `deferredRootEvents`, whose
+  // flush runs at the very end, so `root_anchored` is still stamped against the
+  // COMPLETE tree. Unprovable deferrals fold into `unresolvedPathSamples`, whose
+  // synth loop runs even later.
+  //
+  // SOUND re-resolution criterion (the crux): resolve a deferred read d on pid P
+  // against P's clone-inherited INITIAL cwd ONLY when we can PROVE cwd-at-read
+  // equals that initial cwd. Determinism requires reproducing EXACTLY what inline
+  // resolution would have produced had the clone drained first — inline resolves
+  // a read against cwd-at-read, which for a read before P's first cwd mutation IS
+  // the inherited initial cwd. Hence the gate uses ONLY READ-TIME state:
+  //   - `d.sharedAtRead` (captured at the read) OR `d.cloneFsSeed` (the seeding
+  //     clone shared the fs_struct) → the pid shared a CLONE_FS cwd group AT read
+  //     time → fail closed: a cross-file sibling/parent chdir is non-causal
+  //     w.r.t. P's read so we cannot prove the read predates it. We do NOT fold
+  //     in final `everCwdShared`/topology, so a LATER same-pid share never
+  //     retroactively fails a read inline order would have emitted (3rd-pass F2).
+  //   - `d.stamped` is false iff P's clone line never drained → no initial cwd
+  //     was bound → unprovable.
+  //   - Otherwise (private cwd at read time), the COPY ts gate is sound: P's read
+  //     and P's own chdirs share ONE per-pid file, so `ts` reflects happens-
+  //     before. Provable iff P recorded no own mutation, or the read precedes
+  //     the first. (initialCwd is the parent's clone-time cwd, immune to a post-
+  //     read child chdir taint — 3rd-pass F3 — and to exit eviction — finding 1.)
+  //
+  // ACCEPTED RESIDUAL (3rd-pass F5): re-resolution emits the resolved read/write
+  // but does NOT replay fd-table SIDE EFFECTS of a successful deferred opener
+  // (its `retFd` → path mapping). A racing `openat(AT_FDCWD,"dir") = 7` whose cwd
+  // was unknown leaves fd 7 opaque (the inline dirfdTable populator already
+  // failed closed), so a same-pid later `openat(7,"file")` — processed inline in
+  // the main loop, BEFORE this replay — still surfaces `<UNRESOLVED_PATH>`. That
+  // dependent open was ALREADY drain-order-nondeterministic before this fix (fd 7
+  // mapped iff the clone drained first); this change does not alter it. The only
+  // new artifact is an opener-resolved / dependent-unresolved pair, which is
+  // forensically benign (the dependent still fails closed → audit_bypass). The
+  // real-world flake this fix targets (a lone relative package.json read) has no
+  // dependent dirfd chain. Replaying fd-table side effects + dependent numeric-
+  // dirfd opens would require deferring those too and a dependency-ordered
+  // replay — out of scope for this relative-read determinism fix.
+  //
+  // FIX #1 TRANSITIVE PROVENANCE (codex round-3 [high], 2026-06-16): fail closed if
+  // ANY ancestor in the deferred read's process lineage was EVER in a CLONE_FS cwd
+  // group — not just the IMMEDIATE seedParentPid. A plain-fork intermediate P that is
+  // NOT itself in `everCwdShared` can carry a STALE shared-group cwd down to this
+  // child via the COPY branch (cwdSet(child, cwdGet(parent))) without P appearing in
+  // `everCwdShared` (the L3784 add is gated on `cloneFs`, so a plain-fork edge never
+  // marks P). Walking UP `childParent` re-derives the transitive provenance. Both
+  // `everCwdShared` (sticky, add-only) and `childParent` (set unconditionally for
+  // every clone/fork/vfork child) are COMPLETE at end-of-drain, so the walk result is
+  // DRAIN-INDEPENDENT. The walk terminates cleanly at the root pid
+  // (childParent.get(root) === undefined) or an unobserved parent.
+  //
+  // FAIL CLOSED ON AMBIGUITY (codex round-3 [high] follow-up, 2026-06-16): a clean
+  // `false` (lineage never shared) is only trustworthy when the walked path is
+  // UNAMBIGUOUS. Three ambiguity sources make `false` unsound — all return TRUE:
+  //   1. a pid on the path is in `childParentReused` — its edge was repointed by
+  //      pid-reuse, so the final map may follow the RECYCLED parent chain instead of
+  //      the original CLONE_FS ancestry the deferred read inherited from.
+  //   2. a cycle (`seen.has(a)`) — only possible via pid-reuse repointing, equally
+  //      untrustworthy.
+  //   3. cap exhaustion — a pathological lineage we cannot fully verify.
+  // This is a conservative over-fire (a genuinely-private reused lineage also fails
+  // closed) but it is SAFE: the deferred read surfaces as a fail-loud
+  // `<UNRESOLVED_PATH>` audit_bypass, never a silent missed protected path.
+  const lineageEverCwdShared = (startPid: number): boolean => {
+    let a: number | undefined = startPid;
+    let guard = 0;
+    const seen = new Set<number>();
+    while (a !== undefined) {
+      if (guard++ >= 100000) return true; // cap exhaustion → ambiguous → fail closed
+      if (seen.has(a)) return true; // cycle (only via pid-reuse) → fail closed
+      if (everCwdShared.has(a)) return true; // CLONE_FS ancestor found
+      if (childParentReused.has(a)) return true; // reused edge → lineage unverifiable
+      seen.add(a);
+      a = childParent.get(a);
+    }
+    return false; // clean, unambiguous walk to the root → lineage never shared
+  };
+  for (const d of deferredRelOpens) {
+    const P = d.rawEvent.pid;
+    // Resolve attribution (5th-pass F6 + follow-up): an entry deferred at the
+    // null-ATTRIBUTION gate carries pkg=null; fill it from `d.inheritedAttrib`,
+    // the parent-propagated attribution captured AT the seeding clone and bound
+    // to THAT generation (NOT a fresh end-of-drain `snapshotAttribution(P)`
+    // lookup, which a recycled-pid clone could have overwritten — that would
+    // mis-attribute under a later package OR resurrect a genuinely-system read as
+    // a package `<UNRESOLVED_PATH>`). `inheritedAttrib` is null/undefined when the
+    // parent had no fresh attribution at the clone, OR `d.stamped` is false (the
+    // clone never drained) → DROP (the null-gate floor: never emit AND never
+    // synth an unattributed event, as it has no package to land in).
+    let pkg = d.pkg;
+    let lifecycle = d.lifecycle;
+    if (pkg === null || lifecycle === null) {
+      const inh = d.inheritedAttrib;
+      if (inh === null || inh === undefined) {
+        continue; // unattributable (or clone never drained) → drop
+      }
+      pkg = inh.pkg;
+      lifecycle = inh.lifecycle;
+    }
+    let initial = d.initialCwd;
+    // FIX #1 (ROUND-2 #1 — parent-side CLONE_FS provenance via REPLAY-time sticky
+    // membership). Fail closed when the inherited cwd came from a LINEAGE that was
+    // EVER in a CLONE_FS cwd group. `d.sharedAtRead` / `d.cloneFsSeed` cover the
+    // CHILD's own sharing; this covers the case where some ANCESTOR shares a cwd group
+    // (with a sibling/grandparent) whose chdir is causally-prior to the child's read
+    // but drains AFTER the clone snapshot, leaving `initialCwd` STALE → resolving
+    // would yield a wrong absolute path (a protected-path FALSE NEGATIVE).
+    //
+    // We use the REPLAY-time STICKY `lineageEverCwdShared(d.seedParentPid)` rather than
+    // a stamp-time `cwdGroupCurrentlyShared(parent)` sample. The stamp-time sample is
+    // BLIND when the edge that makes an ancestor a CLONE_FS-group member (e.g. a
+    // GRANDPARENT `clone(CLONE_FS) = parent`) has not yet drained at the instant the
+    // parent plain-forks this child (codex ROUND-2 #1): it reports the parent as a
+    // private singleton and resolves the child against a stale cwd. `everCwdShared`
+    // at replay is DRAIN-INDEPENDENT (complete after the full drain), so it sees that
+    // late edge and fails closed. `seedParentPid` is bound to THIS seeding generation
+    // (first-stamp-wins), so a recycled-pid clone cannot repoint it.
+    //
+    // TRANSITIVE (codex round-3 [high], 2026-06-16): the immediate `seedParentPid` may
+    // itself be a PLAIN-fork intermediate that is NOT in `everCwdShared` yet carries a
+    // STALE shared-group cwd COPIED down from a CLONE_FS-shared ancestor. The L3784
+    // `if (cloneFs)` add marks only the two pids of a CLONE_FS edge; a plain-fork edge
+    // never marks the parent. `lineageEverCwdShared` walks UP `childParent` (set
+    // unconditionally for every clone/fork/vfork child) and fails closed if ANY
+    // ancestor was EVER CLONE_FS-shared — drain-independent, since both structures are
+    // complete at end-of-drain. A lineage that NEVER shared (the real napi plain-fork
+    // flake this whole fix targets) stays absent → the child still resolves.
+    //
+    // ACCEPTED CONSERVATIVE OVER-FIRE (adversarial-review CLAIM A, now FLIPPED): a
+    // parent that CLONE_FS-shared then `detachCwdGroup`'d back to a private singleton
+    // STILL carries the sticky bit, so a plain-COPY child it forks AFTER the detach
+    // now fails closed even though inline order could resolve against the parent's
+    // private cwd. This is SAFE (audit_bypass surfaced, never a missed protected
+    // path) and pathological (detach-then-plain-fork in a lifecycle script does not
+    // occur in normal npm/pnpm/yarn trees). We prefer this fail-loud over-record to
+    // the blind stamp-time gate's silent false negative. A parent that NEVER shared
+    // (the real napi plain-fork flake this fix targets) is absent from everCwdShared
+    // → the child still resolves, preserving the determinism fix.
+    // DEFERRED-CHILD PID REUSE (codex round-3 final [high], 2026-06-16): the deferred
+    // entry is first-stamp-wins bound by NUMERIC child pid (`stampDeferredRelOpens`),
+    // so if pid `P` (= `d.rawEvent.pid`) is RECYCLED and a LATER (private) generation's
+    // clone line drains BEFORE the read's ORIGINAL seeding clone, the entry is stamped
+    // with the WRONG generation's `seedParentPid` / `initialCwd` (the private later-gen
+    // lineage), laundering the read's TRUE CLONE_FS ancestor out of the walk → a silent
+    // protected-path FALSE NEGATIVE. We fail closed when the read's pid was reused
+    // (`childParentReused.has(P)`) AND ANY recorded parent GENERATION of that pid has a
+    // CLONE_FS lineage (`childAllParents`) — i.e. the wrong-gen stamp MIGHT have hidden a
+    // real shared ancestor. This is PRECISE: a pure plain-fork recycled pid (the
+    // ACCEPTED F6 reaped-pid residual — see MEMORY) has NO CLONE_FS parent generation, so
+    // it still resolves under its stamped generation. Drain-independent: the reuse set,
+    // the parent multimap, and `everCwdShared` are all complete at end-of-drain.
+    let childPidReuseHidCloneFs = false;
+    if (childParentReused.has(P)) {
+      const parents = childAllParents.get(P);
+      if (parents !== undefined) {
+        for (const pp of parents) {
+          if (lineageEverCwdShared(pp)) {
+            childPidReuseHidCloneFs = true;
+            break;
+          }
+        }
+      }
+    }
+    // Determinism (defer-and-re-resolve) DEEP-CHAIN TRANSITIVE INITIAL-CWD RECOVERY
+    // (codex round-3 [high] BLOCKER, 2026-06-16): the 2-gen defer-and-re-resolve fix
+    // stamps `initialCwd` = the PARENT's clone-time cwd, but only `rootPid` is
+    // cwd-seeded — every intermediate gets a cwd ONLY via clone propagation. In the
+    // REAL unrs-resolver shape (npm root → node[unrs-resolver] → node[napi-postinstall]
+    // → helper, a chain DEEPER than 2 generations), when an INNER clone line
+    // (B-clone-C) drains BEFORE the OUTER one (A-clone-B) — pure LEAF-UP drain order —
+    // the intermediate B has NO cwd yet, so C's stamped `initialCwd` is null. Because
+    // stampDeferredRelOpens is first-stamp-wins, the later A-clone-B never re-stamps C,
+    // and the gate below folds C to a SYNTH `<UNRESOLVED_PATH>`. ROOT-DOWN drain order
+    // resolves it → a DRAIN-ORDER-DEPENDENT divergence (the exact flake the fix
+    // targets), un-fixed for deep chains.
+    //
+    // Recover transitively: when `initial` is null/undefined AND the entry was stamped
+    // (its seeding clone drained → its lineage is observed), walk UP `childParent` from
+    // `seedParentPid` to the nearest non-mutating ancestor that HAS a known clone-time
+    // cwd (`pidCloneTimeCwd`), which terminates at the cwd-seeded root.
+    //
+    // SOUNDNESS: a null clone-time cwd for ancestor `a` means `a` had done NO chdir by
+    // the moment it cloned (else cwdGet(a) would be set), so clone(2)-copy makes `a`'s
+    // inherited cwd EQUAL to the cwd it propagated to its child — i.e. the nearest
+    // non-mutating ancestor's KNOWN clone-time cwd IS the cwd this whole null-chain
+    // inherited. The `firstCwdMutationTs.has(a)` BREAK keeps the SAFE direction: if an
+    // ancestor `a` did a chdir, its clone-time cwd may NOT equal the cwd it propagated
+    // (the chdir could precede or follow the clone, and that cross-FILE ordering is NOT
+    // a proven kernel happens-before), so we leave `initial` null → SYNTH (never a
+    // wrong path). Visited-set + cap guarantee termination under pid-reuse cycles
+    // (mirrors the `lineageEverCwdShared` lineage-walk guard). The CLONE_FS / pid-reuse
+    // / COPY-ts gates are untouched and still fire on the recovered value.
+    if ((initial === null || initial === undefined) && d.stamped === true) {
+      let a: number | undefined = d.seedParentPid;
+      let guard = 0;
+      const seen = new Set<number>();
+      while (a !== undefined) {
+        if (guard++ >= 100000) break; // cap exhaustion → leave null → SYNTH (safe)
+        if (seen.has(a)) break; // cycle (only via pid-reuse) → leave null → SYNTH
+        if (firstCwdMutationTs.has(a)) break; // ancestor chdir'd → unprovable → SYNTH
+        const acwd = pidCloneTimeCwd.get(a);
+        if (typeof acwd === 'string') {
+          initial = acwd; // nearest non-mutating ancestor's known inherited cwd
+          break;
+        }
+        seen.add(a);
+        a = childParent.get(a); // ancestor's own clone-time cwd also null → keep walking
+      }
+    }
+    const sharedAtRead =
+      d.sharedAtRead ||
+      d.cloneFsSeed === true ||
+      childPidReuseHidCloneFs ||
+      (d.seedParentPid !== undefined && lineageEverCwdShared(d.seedParentPid));
+    let canonical: string | null = null;
+    if (d.stamped === true && typeof initial === 'string' && !sharedAtRead) {
+      const firstMut = firstCwdMutationTs.get(P);
+      const provable = firstMut === undefined || d.rawEvent.ts < firstMut;
+      if (provable) {
+        canonical = path.resolve(initial, d.rawEvent.path);
+      }
+    }
+    if (canonical !== null) {
+      // Mirror the inline resolved-read emit path EXACTLY: producer-write drop →
+      // node-bootstrap filter → node-bootstrap candidate buffering → emit.
+      if (
+        d.rawEvent.kind === 'write' &&
+        eventsFilePathCanonical !== null &&
+        (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)
+      ) {
+        continue;
+      }
+      const resolved: RawEvent = { ...d.rawEvent, path: canonical };
+      // Node-bootstrap FILE filter, reproducing inline `shouldFilterNodeBootstrap
+      // FileRead` semantics but with a READ-TIME pending verdict (NOT the live
+      // end-of-drain pending set, which a post-read clone-propagation would
+      // wrongly flip on — 3rd-pass F4). Both inputs are drain-order-INDEPENDENT:
+      //   - `bootstrapPendingInherited`: did the pid inherit file-pending at its
+      //     seeding clone (kernel-causally before the read)?
+      //   - the pid's OWN startup-done marker ts (`nodeBootstrapFileEndedTs`),
+      //     same per-pid file as the read → causal: the window is open at the
+      //     read iff no marker, or the read predates it.
+      // Mirror the inline guard (non-hidden, non-protected read) and branches:
+      // in-window → filter + record the path; else → filter iff the path is in
+      // the (drain-order-independent) `nodeBootstrapFileReads` baseline set.
+      if (resolved.kind === 'read' && !resolved.hidden && !matcher.isProtected(resolved.path)) {
+        const endedTs = nodeBootstrapFileEndedTs.get(P);
+        // FIX #3 (ROUND-2 #3 — bootstrap inherited-pending recompute is FAIL-SAFE,
+        // prefer-EMIT). A deferred read is filtered as Node-bootstrap noise ONLY on
+        // POSITIVE, drain-INDEPENDENT evidence. We do NOT suppress it via a
+        // cross-file `read.ts < parentEndedTs` parent-window inference, because that
+        // comparison is GLOBAL drain order (a CHILD-file ts vs a PARENT-file ts), not
+        // a proven kernel happens-before — and it can OVER-FILTER a genuine package
+        // read of a NON-Node helper that was plain-forked AFTER the parent's window
+        // already closed but whose racing read drained before the parent's marker
+        // (codex ROUND-2 #3). Suppressing a real package read is the dangerous
+        // direction for a security audit, so the recompute is restricted to:
+        //   (a) `d.bootstrapPendingInherited` — the clone-DRAIN-time sample that the
+        //       child inherited file-pending at its SEEDING clone (the live
+        //       propagation the inline path also used), gated by the child's OWN
+        //       marker so a post-window read is not over-filtered; OR
+        //   (b) the child has its OWN node-bootstrap window — its OWN startup-done
+        //       marker drained (`endedTs` set) and the read predates it
+        //       (`read.ts < endedTs`, SAME per-pid file → causal happens-before).
+        //       Same-pid signal only → drain-INDEPENDENT; OR
+        //   (c) the resolved path is already in the (set-union, drain-independent)
+        //       `nodeBootstrapFileReads` baseline — the existing second branch.
+        // Otherwise EMIT. This drops the prior parent-window inheritance branch.
+        //
+        // We deliberately do NOT use `nodeBootstrapFilePendingPids.has(P)` at end of
+        // drain as own-window evidence: a still-pending child can be pending only
+        // because a still-pending PARENT re-propagated to it at the clone — that is
+        // the SAME cross-file inheritance signal we are removing, and it would
+        // over-filter a genuine POST-bootstrap read (the child's own marker already
+        // closed its window before the read). The only sound own-window discriminator
+        // is the child's OWN marker ts vs the read ts (same per-pid file).
+        //
+        // Residual (ACCEPTED, SAFE): "ORDER D" with a NON-Node child that does an
+        // in-parent-window read yet has NO own marker is now EMITTED (over-recorded
+        // as package behavior) rather than filtered — the benign direction (a
+        // Node-internal read surfacing as a package read never suppresses real
+        // behavior; a missed protected path is impossible — protected reads bypass
+        // this whole branch). A child WITH its own node exec (ORDER D round-1 case)
+        // still filters via (b). Real npm/pnpm/yarn plain-fork lifecycle trees do
+        // not contain a non-Node helper reading inside its parent's bootstrap window.
+        const childOwnWindowAtRead = endedTs !== undefined && d.rawEvent.ts < endedTs;
+        const inheritedPending = d.bootstrapPendingInherited === true;
+        // Preserve the pid's-OWN-marker gate so genuine post-bootstrap reads (the
+        // child's own window already closed before the read) are NOT over-filtered.
+        const readTimePending =
+          (inheritedPending && (endedTs === undefined || d.rawEvent.ts < endedTs)) ||
+          childOwnWindowAtRead;
+        if (readTimePending) {
+          nodeBootstrapFileReads.add(resolved.path);
+          continue;
+        }
+        if (nodeBootstrapFileReads.has(resolved.path)) {
+          continue;
+        }
+      } else if (shouldFilterNodeBootstrapFileRead(resolved)) {
+        // Non-read / hidden / protected: the helper returns false anyway, but
+        // call it for parity/robustness (write events never match).
+        continue;
+      }
+      const attributed: AttributedEvent = {
+        raw: resolved,
+        pkg,
+        lifecycle,
+      };
+      if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+        continue;
+      }
+      // `emit` routes a root-attributed read/write into `deferredRootEvents` for
+      // `root_anchored` stamping (the flush runs at the very end).
+      emit(attributed);
+    } else {
+      // Unprovable → fail closed: fold into the `<UNRESOLVED_PATH>` synth (pkg /
+      // lifecycle are now resolved non-null — an unattributable entry already
+      // `continue`d above).
+      unresolvedPathSamples.push({
+        pid: P,
+        ts: d.rawEvent.ts,
+        path: d.rawEvent.path,
+        kind: d.rawEvent.kind,
+        pkg,
+        lifecycle,
+      });
+    }
+  }
+  deferredRelOpens.length = 0;
 
   flushAllNodeBootstrapCandidates();
 

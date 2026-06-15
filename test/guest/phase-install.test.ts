@@ -6420,6 +6420,2442 @@ describe('runInstallPhase', () => {
       expect(unresolved).toHaveLength(0);
     });
 
+    // Determinism (defer-and-re-resolve, [medium], 2026-06-15): the DECISIVE
+    // race.  strace -ff drains per-pid files in inode (readdir) order with NO
+    // causal-ordering key, so a CHILD's AT_FDCWD-relative openat can be
+    // processed BEFORE its parent's `clone()=<child>` line.  At read time the
+    // child has no cwd → canonicalizeForEmit fails closed.  Pre-fix that DROPS
+    // the read inline and synthesises a `<UNRESOLVED_PATH>` audit_bypass entry
+    // → NON-DETERMINISTIC lockfile (fires ~1/3 of CI runs on unrs-resolver).
+    // Post-fix the unresolved AT_FDCWD-relative open is DEFERRED and
+    // re-resolved at end-of-drain against the clone-inherited INITIAL cwd, once
+    // the full clone graph is known.  This test orders the child's open BEFORE
+    // the parent's clone — it FAILS on HEAD (synth) and PASSES after the fix.
+    it('child AT_FDCWD-relative open BEFORE parent clone line → deferred + re-resolved (determinism race)', async () => {
+      const proc = mockProcReader({
+        2201: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2202: {
+          ppid: 2201,
+          env: {
+            npm_package_name: 'race-parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent (pid 2201) chdirs to $HOME so the clone-inherited cwd is /root.
+        {
+          pid: 2201,
+          line: 'chdir("/root") = 0',
+          source: 'strace',
+        },
+        // RACE: the child's AT_FDCWD-relative probe drains BEFORE the parent's
+        // clone line.  The child has no cwd yet → fail closed → DEFERRED.
+        {
+          pid: 2202,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // Parent's clone line drains LAST: child 2202 inherits cwd /root (copy).
+        {
+          pid: 2201,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 2202',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2201 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Re-resolved exactly once to the correct absolute path, hidden=true.
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/root/.ssh/id_rsa');
+      expect(raw['hidden']).toBe(true);
+      // ZERO <UNRESOLVED_PATH> / unresolved_path:true — the deferral resolved.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) FAIL-CLOSED #1: the COPY-case ts gate.
+    // The child has a CLEAN clone-inherited initial cwd (a real string — the
+    // child chdir'd to the SAME path the parent held at clone time, so the
+    // copy-branch reconciliation sees no conflict and never taints unknown),
+    // BUT a cwd-mutation was recorded in the child's own stream at a ts that
+    // does NOT happen-before the racing read (read.ts >= firstCwdMutationTs).
+    // The gate cannot PROVE cwd-at-read == initial, so it fails closed and
+    // synthesises `<UNRESOLVED_PATH>` — even though the value happens to match.
+    // This isolates the ts gate from the null-initial path exercised by #2.
+    it('deferred re-resolve fails closed via the COPY ts gate (mutation not proven before the read)', async () => {
+      const proc = mockProcReader({
+        2211: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-chdir-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2212: {
+          ppid: 2211,
+          env: {
+            npm_package_name: 'race-chdir-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      // Dispatch (drain) order: parent-chdir, child-READ, child-chdir, clone.
+      // The read drains BEFORE both the child's chdir AND the parent's clone,
+      // so at read time the child has no cwd → DEFERRED.  The explicit ts pins
+      // the CAUSAL order inside the child's own per-pid file: chdir(ts=10)
+      // happens-before read(ts=20).  At re-resolution the child has a clean
+      // string initial (/root, via the no-conflict copy), but firstCwdMutationTs
+      // (=10) is NOT > read.ts (=20) → cannot prove → fail closed.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace'; ts?: number }> = [
+        { pid: 2211, line: 'chdir("/root") = 0', source: 'strace', ts: 1 },
+        // Child's racing read (ts=20) drains first → deferred.
+        {
+          pid: 2212,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+          ts: 20,
+        },
+        // Child chdir to /root (== parent's cwd → NO conflict at clone copy),
+        // causally at ts=10 (before the read).
+        { pid: 2212, line: 'chdir("/root") = 0', source: 'strace', ts: 10 },
+        // Parent's clone drains LAST: copy branch seeds /root (no conflict).
+        {
+          pid: 2211,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2212',
+          source: 'strace',
+          ts: 30,
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2211 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // MUST NOT certify against the (wrong) initial cwd /root.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // MUST still surface a single <UNRESOLVED_PATH> for the child.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2212;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) FAIL-CLOSED #2: the parent's clone
+    // line NEVER drains (omitted), so `pidInitialCwd` has no entry for the
+    // child.  The deferral cannot prove an initial cwd → MUST still synth
+    // `<UNRESOLVED_PATH>`.
+    it('deferred re-resolve fails closed when the clone line never drains', async () => {
+      const proc = mockProcReader({
+        2221: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-noclone-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2222: {
+          ppid: 2221,
+          env: {
+            npm_package_name: 'race-noclone-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent chdirs but its clone(=2222) line is NEVER yielded.
+        { pid: 2221, line: 'chdir("/root") = 0', source: 'strace' },
+        // Child's AT_FDCWD-relative open — deferred, but no clone edge ever
+        // seeds pidInitialCwd[2222] → unprovable → synth.
+        {
+          pid: 2222,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2221 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2222;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION (adversarial-review high
+    // finding 1, 2026-06-15): the child's exit line drains AFTER its parent's
+    // clone line but BEFORE end-of-drain replay.  The clone seeds the initial
+    // cwd; the replay needs it.  If the exit handler evicted the initial-cwd
+    // snapshot, the deferred read would re-resolve to undefined and synth a
+    // `<UNRESOLVED_PATH>` — re-introducing exactly the byte drift this fix
+    // removes.  This ordering MUST still resolve cleanly.
+    it('deferred re-resolve survives the child exit line draining before replay (regression)', async () => {
+      const proc = mockProcReader({
+        2231: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-exit-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2232: {
+          ppid: 2231,
+          env: {
+            npm_package_name: 'race-exit-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 2231, line: 'chdir("/root") = 0', source: 'strace' },
+        // Child's racing read drains first → deferred.
+        {
+          pid: 2232,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // Parent's clone drains → seeds pidInitialCwd[2232]=/root (copy).
+        {
+          pid: 2231,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2232',
+          source: 'strace',
+        },
+        // Child's exit line drains BEFORE end-of-drain replay. Must NOT evict
+        // the proof state the deferred read still needs.
+        { pid: 2232, line: '+++ exited with 0 +++', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2231 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(1);
+      expect((reads[0]!['raw'] as Record<string, unknown>)['path']).toBe('/root/.ssh/id_rsa');
+      expect((reads[0]!['raw'] as Record<string, unknown>)['hidden']).toBe(true);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) FAIL-CLOSED #3 (adversarial-review
+    // high finding 2, 2026-06-15): a CLONE_FS child whose relative open raced
+    // ahead of the clone line MUST fail closed. The child shares a cwd group, so
+    // a parent/sibling chdir during the shared window is in a DIFFERENT per-pid
+    // file (cross-file ts is NOT causal). The sticky `everCwdShared` mark forces
+    // the synth path — even though `isCwdSingleton` at end-of-drain might say
+    // otherwise after a later unshare. Here the parent also chdir's in the shared
+    // window, so resolving would certify the WRONG cwd.
+    it('deferred re-resolve fails closed for a CLONE_FS-shared child (no causal order across files)', async () => {
+      const proc = mockProcReader({
+        2241: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-clonefs-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2242: {
+          ppid: 2241,
+          env: {
+            npm_package_name: 'race-clonefs-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Install root seeds /work.
+        { pid: 2241, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // CLONE_FS clone — parent + child SHARE the cwd struct. Drains AFTER the
+        // child's racing read, so the read is deferred.
+        // (child's read appears before this line)
+        {
+          pid: 2242,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        {
+          pid: 2241,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2242',
+          source: 'strace',
+        },
+        // PARENT chdir's in the shared window (kernel moves the shared cwd). The
+        // child's deferred read CANNOT be soundly resolved against the inherited
+        // /work because the shared cwd changed.
+        { pid: 2241, line: 'chdir("/root") = 0', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2241 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // MUST NOT certify against the inherited /work (would miss the shared chdir).
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2242;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) FAIL-CLOSED (FIX #1, parent-side CLONE_FS
+    // provenance): a PLAIN (COPY) child C of a CLONE_FS-shared parent P. P shares
+    // its cwd struct with a SIBLING S (CLONE_FS). C's racing relative read drains
+    // BEFORE P's clone-of-C line, so it is deferred. P's clone-of-C captures the
+    // PARENT clone-time cwd as initialCwd — but S's chdir of the SHARED group cwd
+    // drains AFTER that capture, so cwdGet(P) is STALE at capture. Resolving C's
+    // read against the stale /work would be a SECURITY FALSE NEGATIVE for the
+    // protected path. The replay MUST fail closed: P was CLONE_FS-shared at the
+    // C-clone instant (parentSharedAtClone), so the inherited cwd snapshot may not
+    // reflect the causally-prior sibling chdir → <UNRESOLVED_PATH>, never a wrong
+    // resolved $REPO/.ssh/id_rsa.
+    it('deferred re-resolve fails closed for a PLAIN child of a CLONE_FS-shared parent (sibling chdir races the snapshot)', async () => {
+      const proc = mockProcReader({
+        2261: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-parentshared-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2262: {
+          ppid: 2261,
+          env: {
+            npm_package_name: 'race-parentshared-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2263: {
+          ppid: 2261,
+          env: {
+            npm_package_name: 'race-parentshared-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Install root seeds /work (parent P = 2261).
+        { pid: 2261, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // RACE: PLAIN child C (2262) relative protected read drains FIRST → deferred
+        // (C has no cwd yet, clone not drained).
+        {
+          pid: 2262,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // P clones a SIBLING S (2263) with CLONE_FS → P + S share the cwd struct,
+        // marking P sticky everCwdShared.
+        {
+          pid: 2261,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2263',
+          source: 'strace',
+        },
+        // P clones the PLAIN child C (2262) — non-CLONE_FS COPY. At THIS instant P
+        // is in a CLONE_FS group (parentSharedAtClone=true). C inherits a COPY of
+        // P's cwd, captured as initialCwd=/work.
+        {
+          pid: 2261,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2262',
+          source: 'strace',
+        },
+        // SIBLING S chdir's the SHARED group cwd AFTER the C-clone snapshot drained.
+        // This causally-prior-to-C-read shared chdir is NOT reflected in C's
+        // inherited-cwd snapshot — so resolving C's read against /work is unsound.
+        { pid: 2263, line: 'chdir("/root") = 0', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2261 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // SECURITY: MUST NOT certify the read against the stale inherited /work — that
+      // would surface a NON-protected $REPO/.ssh/id_rsa, a false negative.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // It MUST fail closed to <UNRESOLVED_PATH> for the racing child C.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2262;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) FAIL-CLOSED (codex ROUND-2 #1 — parent's
+    // OWN CLONE_FS membership edge drains LATE). The stamp-time
+    // `cwdGroupCurrentlyShared(P)` gate is BLIND when the edge that makes P a member
+    // of a CLONE_FS cwd group (the GRANDPARENT `clone(CLONE_FS) = P`) has not drained
+    // yet at the instant P plain-forks the deferred-read child C. Sequence:
+    //   1. C's racing relative protected read drains FIRST → deferred.
+    //   2. P self-seeds a private cwd via an ABSOLUTE chdir(/work).
+    //   3. P plain-forks C — at THIS clone instant P is NOT yet unioned with the
+    //      grandparent (the GP→P CLONE_FS edge has not drained), so
+    //      cwdGroupCurrentlyShared(P) is FALSE → the OLD stamp-time
+    //      `parentSharedAtClone` is FALSE (the blind spot). C inherits initialCwd
+    //      =/work (a STALE snapshot).
+    //   4. The GRANDPARENT's `clone(CLONE_FS) = P` edge drains LATE → unions GP+P and
+    //      marks P sticky everCwdShared.
+    //   5. The grandparent (sharing P's cwd group) chdir's the SHARED cwd to /root —
+    //      causally-prior to C's read but draining AFTER the P→C clone snapshot.
+    // Resolving C's read against the stale /work yields /work/.ssh/id_rsa — a
+    // NON-protected path — a SECURITY FALSE NEGATIVE (the true shared cwd was /root,
+    // so /root/.ssh/id_rsa is protected). FIX #1 replaces the blind stamp-time gate
+    // with the REPLAY-time `everCwdShared.has(seedParentPid)` check: by replay the
+    // GP→P edge has drained, so P ∈ everCwdShared → fail closed → <UNRESOLVED_PATH>,
+    // never a wrong resolved /work/.ssh/id_rsa.
+    it('deferred re-resolve fails closed when the parent CLONE_FS membership edge drains AFTER the plain-fork (ROUND-2 #1)', async () => {
+      const proc = mockProcReader({
+        3001: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'round2-1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        3002: {
+          ppid: 3001,
+          env: {
+            npm_package_name: 'round2-1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        3003: {
+          ppid: 3002,
+          env: {
+            npm_package_name: 'round2-1-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // GRANDPARENT (root GP=3001) seeds /work.
+        { pid: 3001, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // RACE: PLAIN child C (3003) relative protected read drains FIRST → deferred
+        // (C has no cwd yet, its clone not drained).
+        {
+          pid: 3003,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // P (3002) self-seeds a private cwd via an ABSOLUTE chdir.
+        { pid: 3002, line: 'chdir("/work") = 0', source: 'strace' },
+        // P plain-forks C (3003) — non-CLONE_FS COPY. At THIS instant the GP→P
+        // CLONE_FS edge has NOT drained, so cwdGroupCurrentlyShared(P) is FALSE.
+        // C inherits initialCwd=/work (STALE).
+        {
+          pid: 3002,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 3003',
+          source: 'strace',
+        },
+        // GRANDPARENT clones P (3002) with CLONE_FS — drains LATE → unions GP+P,
+        // marks P sticky everCwdShared.
+        {
+          pid: 3001,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 3002',
+          source: 'strace',
+        },
+        // GP chdir's the SHARED group cwd to /root (causally-prior to C's read but
+        // draining AFTER the P→C clone snapshot). The TRUE shared cwd is /root.
+        { pid: 3001, line: 'chdir("/root") = 0', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 3001 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // SECURITY: MUST NOT certify the read against the stale inherited /work. The
+      // probe read is ENOENT; resolved against /work it is a NON-protected path that
+      // `applyProtectedPathsPolicy` silently DROPS (the false negative). We assert
+      // both the absence of any /work resolution AND the fail-closed synth.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // It MUST fail closed to <UNRESOLVED_PATH> for the racing child C.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 3003;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) TRANSITIVE CLONE_FS cwd-group provenance
+    // (codex round-3 [high], 2026-06-16). The FIX #1 replay gate must fail closed when
+    // ANY ancestor in the deferred read's process lineage was EVER in a CLONE_FS cwd
+    // group — not just the IMMEDIATE seedParentPid. Scenario:
+    //   R(2401) clone(CLONE_FS) S(2402)  → R,S share cwd group (everCwdShared += R,S)
+    //   S plain-fork P(2403)             → P COPIES the shared-group cwd (STALE /work,
+    //                                       because R's chdir has NOT drained yet);
+    //                                       P is a plain fork → NOT in everCwdShared
+    //   P plain-fork C(2404)             → C COPIES P's stale /work; seedParentPid=P
+    //   C racing relative .ssh/id_rsa read drains FIRST → deferred
+    //   R chdir("/root") drains LAST     → TRUE shared cwd is /root, but P/C already
+    //                                       COPIED the stale /work
+    // The deferred read's IMMEDIATE parent P is NOT in everCwdShared, so the HEAD gate
+    // (`everCwdShared.has(seedParentPid)`) resolves C against the STALE /work →
+    // /work/.ssh/id_rsa is non-protected and silently DROPPED = protected-path FALSE
+    // NEGATIVE. The fix walks UP childParent and fails closed because the CLONE_FS
+    // ancestor R/S is in everCwdShared. C MUST fail closed to <UNRESOLVED_PATH>.
+    it('deferred re-resolve fails closed for a TRANSITIVE CLONE_FS ancestor reached via plain-fork intermediates (round-3 #1)', async () => {
+      const proc = mockProcReader({
+        2401: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'transitive-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2402: {
+          ppid: 2401,
+          env: {
+            npm_package_name: 'transitive-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2403: {
+          ppid: 2402,
+          env: {
+            npm_package_name: 'transitive-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2404: {
+          ppid: 2403,
+          env: {
+            npm_package_name: 'transitive-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // R (root 2401) seeds the shared cwd at /work.
+        { pid: 2401, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // R clone(CLONE_FS) S (2402) → unions R+S, marks BOTH sticky everCwdShared.
+        {
+          pid: 2401,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2402',
+          source: 'strace',
+        },
+        // S plain-forks P (2403) — COPY. cwdGet(S) still resolves to the STALE /work
+        // (R's chdir has NOT drained), so P copies /work. P is a plain fork → it is
+        // NOT added to everCwdShared. childParent[2403]=2402.
+        {
+          pid: 2402,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2403',
+          source: 'strace',
+        },
+        // RACE: PLAIN grandchild C (2404) relative protected read drains FIRST →
+        // deferred (C has no cwd yet, its clone not drained).
+        {
+          pid: 2404,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // P plain-forks C (2404) — COPY. P's cwd is the stale /work → C inherits
+        // initialCwd=/work (STALE). seedParentPid=P=2403, which is NOT in
+        // everCwdShared. childParent[2404]=2403.
+        {
+          pid: 2403,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2404',
+          source: 'strace',
+        },
+        // R chdir's the SHARED group cwd to /root, draining LAST. The TRUE cwd of the
+        // CLONE_FS group at C's read is /root, but P/C already took a private COPY of
+        // the stale /work.
+        { pid: 2401, line: 'chdir("/root") = 0', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2401 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // SECURITY: MUST NOT certify the read against the stale inherited /work. Resolved
+      // against /work the read is a NON-protected path silently DROPPED (false neg).
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // It MUST fail closed to <UNRESOLVED_PATH> for the racing grandchild C.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2404;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) FIX #1 TRANSITIVE PID-REUSE (codex round-3
+    // [high] follow-up, 2026-06-16). The lineage walk reads the FINAL `childParent`
+    // map. If an INTERMEDIATE ancestor pid on the deferred read's lineage is RECYCLED
+    // before end-of-drain replay — re-cloned by a NON-CLONE_FS parent, overwriting its
+    // `childParent` edge — the walk would follow the recycled chain and MISS the
+    // original CLONE_FS ancestor → silently resolve against the stale cwd (a FALSE
+    // NEGATIVE). The fix marks an overwritten edge in `childParentReused` and fails the
+    // walk CLOSED when it hits one. Scenario:
+    //   R(2501) clone(CLONE_FS) S(2502)  → everCwdShared += R,S; childParent[2502]=2501
+    //   S plain-fork P(2503)             → childParent[2503]=2502 (the CLONE_FS link)
+    //   C(2504) racing relative read drains FIRST → deferred
+    //   P plain-fork C(2504)             → seedParentPid=P=2503; childParent[2504]=2503
+    //   X(2505) plain-fork pid 2503      → childParent.set(2503, 2505) OVERWRITES the
+    //                                       2503→2502 edge → 2503 marked reused
+    //   R chdir("/root") drains LAST
+    // Walk from seedParentPid=2503: 2503 is in childParentReused → fail closed. C MUST
+    // surface <UNRESOLVED_PATH>, NOT resolve against the stale /work.
+    it('deferred re-resolve fails closed when a CLONE_FS-lineage intermediate pid is reused before replay (round-3 pid-reuse)', async () => {
+      const proc = mockProcReader({
+        2501: { ppid: 1, env: { npm_package_name: 'pidreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2502: { ppid: 2501, env: { npm_package_name: 'pidreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2503: { ppid: 2502, env: { npm_package_name: 'pidreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2504: { ppid: 2503, env: { npm_package_name: 'pidreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2505: { ppid: 2501, env: { npm_package_name: 'pidreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 2501, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // R clone(CLONE_FS) S → R,S sticky everCwdShared. childParent[2502]=2501.
+        { pid: 2501, line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2502', source: 'strace' },
+        // S plain-forks P (the CLONE_FS lineage link). childParent[2503]=2502.
+        { pid: 2502, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2503', source: 'strace' },
+        // RACE: C's relative protected read drains FIRST → deferred.
+        { pid: 2504, line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)', source: 'strace' },
+        // P plain-forks C → seedParentPid=2503, childParent[2504]=2503.
+        { pid: 2503, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2504', source: 'strace' },
+        // PID REUSE: pid 2503 is recycled as a NEW plain child of NON-CLONE_FS X=2505.
+        // childParent.set(2503, 2505) OVERWRITES childParent[2503]=2502 → 2503 marked
+        // reused, so the walk can no longer trust the 2503→…→CLONE_FS chain.
+        { pid: 2505, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2503', source: 'strace' },
+        { pid: 2501, line: 'chdir("/root") = 0', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2501 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // MUST NOT resolve against the stale /work (silent non-protected drop).
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // MUST fail closed to <UNRESOLVED_PATH> for the racing grandchild C.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2504;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) FIX #1 DEFERRED-CHILD PID REUSE (codex round-3
+    // final [high], 2026-06-16). The deferred entry is first-stamp-wins bound by NUMERIC
+    // child pid. If the deferred read's OWN pid is RECYCLED and a LATER generation's
+    // clone line drains BEFORE the read's ORIGINAL seeding clone, the entry is stamped
+    // with the WRONG generation's lineage — laundering the read's TRUE CLONE_FS ancestor
+    // out of the replay walk → a silent protected-path FALSE NEGATIVE. The fix fails
+    // closed when `childParentReused.has(P)` (the read's own pid was re-cloned with a
+    // different parent within this drain). Scenario:
+    //   R(2701) clone(CLONE_FS) S(2705)  → R,S sticky everCwdShared
+    //   R plain-fork P(2702)             → gen0 lineage P->R->[CLONE_FS]
+    //   gen0 C(2703) racing protected read drains FIRST → deferred (unstamped)
+    //   X(2704, PRIVATE) plain-fork pid 2703 (gen1) drains FIRST → first-stamps the gen0
+    //     entry with PRIVATE seedParentPid=2704 + initialCwd=/work
+    //   gen0's ORIGINAL P(2702)->C(2703) clone drains LATE → 2703 marked reused
+    //   R chdir("/root") (gen0's true shared cwd)
+    // Without the child-reuse term the walk from 2704 sees no CLONE_FS ancestor and
+    // resolves against the stale private /work (false negative). With it, 2703 reused →
+    // fail closed.
+    it('deferred re-resolve fails closed when the deferred read pid itself is reused with a wrong-generation stamp (round-3 child-reuse)', async () => {
+      // gen0 of C=2703 is forked by P=2702 whose parent R=2701 is CLONE_FS-shared with
+      // S=2705 (so gen0's TRUE lineage has a CLONE_FS ancestor). gen0's seeding clone
+      // (P->C) drains LATE. Meanwhile pid 2703 is RECYCLED: gen1 of 2703 is forked by a
+      // PRIVATE parent X=2704, and gen1's clone line drains FIRST → first-stamp-wins
+      // binds the gen0 deferred read to gen1's PRIVATE seedParentPid=2704.
+      const proc = mockProcReader({
+        2701: { ppid: 1, env: { npm_package_name: 'cr', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2702: { ppid: 2701, env: { npm_package_name: 'cr', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2703: { ppid: 2702, env: { npm_package_name: 'cr', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2704: { ppid: 2701, env: { npm_package_name: 'cr', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2705: { ppid: 2701, env: { npm_package_name: 'cr', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 2701, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // R clone(CLONE_FS) S → R,S sticky everCwdShared.
+        { pid: 2701, line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2705', source: 'strace' },
+        // R plain-forks P (gen0 lineage: P->R->[CLONE_FS S]). childParent[2702]=2701.
+        { pid: 2701, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2702', source: 'strace' },
+        // gen0 of C=2703 racing protected read drains FIRST → deferred (unstamped).
+        { pid: 2703, line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)', source: 'strace' },
+        // PID REUSE: gen1 of 2703 forked by PRIVATE X=2704; this clone drains FIRST →
+        // first-stamp-wins binds the gen0 deferred entry to seedParentPid=2704.
+        { pid: 2704, line: 'chdir("/work") = 0', source: 'strace' },
+        { pid: 2704, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2703', source: 'strace' },
+        // gen0's ORIGINAL seeding clone P->C drains LATE → overwrites childParent[2703].
+        { pid: 2702, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2703', source: 'strace' },
+        // R chdir's the SHARED group cwd to /root (gen0's true cwd).
+        { pid: 2701, line: 'chdir("/root") = 0', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm', cwd: '/work', env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2701 }),
+        attribution: new Attribution(proc), emitter,
+        protectedPaths: new ProtectedPathsMatcher({ patterns: ['$HOME/.ssh/**'], roots: { repo: '/work', nodeModules: '/work/node_modules', home: '/root', tmp: '/tmp', cache: '/root/.cache/pnpm' } }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // MUST NOT resolve against the wrong-generation private /work (silent drop).
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // MUST fail closed to <UNRESOLVED_PATH> for the reused deferred-read pid 2703.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2703;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // ACCEPTED PRE-EXISTING RESIDUAL — SAME-PARENT pid-reuse generation ambiguity
+    // (codex round-4 [high], VERIFIED pre-existing on HEAD c198ee3, 2026-06-16). When
+    // the SAME numeric parent P clones the SAME child pid C twice and P's OWN cwd
+    // changed between generations, the deferred read (gen0, true cwd /root) can be
+    // first-stamp-wins bound to gen1's cwd (/work) if gen1's clone drains first. This
+    // resolves /work/.ssh/id_rsa (non-protected) and silently drops the true protected
+    // /root/.ssh/id_rsa. This is NOT introduced by the defer-and-re-resolve CLONE_FS
+    // provenance work: the ORIGINAL `everCwdShared.has(seedParentPid)` gate on HEAD
+    // c198ee3 ALSO keys on the (wrong-generation) seedParentPid/initialCwd and produces
+    // the identical silent drop (verified by stashing the fix and re-running this exact
+    // record sequence → still []). It is the same IRREDUCIBLE generation-ambiguity
+    // class as the accepted reaped-pid env_read residual (MEMORY:
+    // reaped-child-env-read-pid-reuse-residual): the wrong-gen stamp's signature is
+    // byte-identical to a legitimate same-generation stamp (no observable signal
+    // distinguishes "the first-draining clone is the read's true seeder" from "a later
+    // same-parent recycled clone drained first"), and there is NO CLONE_FS lineage to
+    // trip the precise own-pid-reuse gate. Failing closed here would (a) break the F6
+    // 'STAMPING clone generation' test's legitimate resolve and (b) over-fire the whole
+    // reaped-pid class. We PIN the current (pre-existing) behavior so a future
+    // generation-qualified rewrite is a deliberate, visible change — this is NOT a
+    // claim the drop is harmless.
+    it('SAME-PARENT pid reuse wrong-generation stamp (ACCEPTED PRE-EXISTING residual, pinned)', async () => {
+      // P=2802 clones C=2803 TWICE (same numeric parent). gen0: P at /root forks C; C's
+      // read drains. gen1: P chdir's to /work then re-forks C; gen1's clone drains FIRST
+      // → first-stamp-wins stamps the gen0 deferred read with gen1's cwd /work.
+      const proc = mockProcReader({
+        2801: { ppid: 1, env: { npm_package_name: 'sp', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2802: { ppid: 2801, env: { npm_package_name: 'sp', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2803: { ppid: 2802, env: { npm_package_name: 'sp', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // P seeds /root.
+        { pid: 2802, line: 'chdir("/root") = 0', source: 'strace' },
+        // gen0 C=2803 racing protected read drains FIRST → deferred (unstamped).
+        { pid: 2803, line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)', source: 'strace' },
+        // P chdir's to /work (gen0 has already died; pid 2803 free to recycle).
+        { pid: 2802, line: 'chdir("/work") = 0', source: 'strace' },
+        // gen1: SAME parent P re-forks pid 2803. This clone drains FIRST → first-stamp-
+        // wins stamps the gen0 entry with parentCloneTimeCwd=/work.
+        { pid: 2802, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2803', source: 'strace' },
+        // gen0's ORIGINAL clone (also P->2803) drains LATE.
+        { pid: 2802, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2803', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm', cwd: '/work', env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2801 }),
+        attribution: new Attribution(proc), emitter,
+        protectedPaths: new ProtectedPathsMatcher({ patterns: ['$HOME/.ssh/**'], roots: { repo: '/work', nodeModules: '/work/node_modules', home: '/root', tmp: '/tmp', cache: '/root/.cache/pnpm' } }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'read');
+      // PINNED RESIDUAL: the true protected /root/.ssh/id_rsa is NOT surfaced...
+      const trueProtected = reads.filter(
+        (e) => (e['raw'] as Record<string, unknown>)['path'] === '/root/.ssh/id_rsa',
+      );
+      expect(trueProtected).toHaveLength(0);
+      // ...the wrong-gen /work/.ssh/id_rsa is non-protected → silently dropped (not
+      // emitted), with NO <UNRESOLVED_PATH> synth. Identical to HEAD c198ee3 (pre-fix).
+      const stale = reads.filter(
+        (e) => (e['raw'] as Record<string, unknown>)['path'] === '/work/.ssh/id_rsa',
+      );
+      expect(stale).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0); // pre-existing silent drop (accepted residual)
+    });
+
+    // ACCEPTED CONSERVATIVE OVER-FIRE (codex round-3 pid-reuse follow-up [medium],
+    // 2026-06-16): a PURE plain-fork chain with NO CLONE_FS anywhere, but whose
+    // intermediate seedParent pid is RECYCLED before replay, ALSO fails closed. The
+    // lineage walk reads the FINAL `childParent` map; once an edge is overwritten by
+    // pid-reuse the ORIGINAL lineage is unverifiable, so the walk cannot PROVE the
+    // lineage never shared and must fail closed (it would otherwise risk the symmetric
+    // false negative — see the analysis: no single-edge-per-pid map is
+    // generation-correct under reuse, only generation-SAFE). This is SAFE (the probe
+    // surfaces as a fail-loud <UNRESOLVED_PATH> audit_bypass, never a silent missed
+    // protected path) and confined to pid-reuse of a deferred read's own lineage
+    // intermediate within a single Phase-B drain — which does not occur in normal
+    // npm/pnpm/yarn plain-fork trees. We prefer this fail-loud over-record to a silent
+    // resolution that an attacker could weaponize by recycling a pid to launder a
+    // CLONE_FS ancestor out of the walk.
+    it('deferred re-resolve fails closed for a plain-fork chain whose seedParent pid is reused (accepted reuse over-fire)', async () => {
+      const proc = mockProcReader({
+        2601: { ppid: 1, env: { npm_package_name: 'plainreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2602: { ppid: 2601, env: { npm_package_name: 'plainreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2603: { ppid: 2602, env: { npm_package_name: 'plainreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        2604: { ppid: 2601, env: { npm_package_name: 'plainreuse-pkg', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // NO CLONE_FS anywhere in this scenario.
+        { pid: 2601, line: 'chdir("/root") = 0', source: 'strace' },
+        // R plain-forks P (2602).
+        { pid: 2601, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2602', source: 'strace' },
+        // RACE: C's relative read drains FIRST → deferred.
+        { pid: 2603, line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)', source: 'strace' },
+        // P plain-forks C → seedParentPid=2602, childParent[2603]=2602.
+        { pid: 2602, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2603', source: 'strace' },
+        // PID REUSE: pid 2602 recycled by X=2604 → overwrites childParent[2602] → 2602
+        // marked reused → the walk from seedParentPid=2602 fails closed.
+        { pid: 2604, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2602', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2601 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // ACCEPTED OVER-FIRE: it MUST fail closed (fail-loud), NOT resolve to the
+      // inherited /root, because the recycled edge makes the lineage unverifiable.
+      const probe = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(probe).toBeUndefined();
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2603;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // PRESERVATION (codex round-3 [high], 2026-06-16): a MULTI-GENERATION plain-fork
+    // chain with NO CLONE_FS anywhere in the lineage AND no intermediate pid reuse
+    // (the real napi/unrs-resolver plain-fork flake this whole determinism fix targets)
+    // must STILL resolve. The ancestor walk completes cleanly to the root and returns
+    // false (everCwdShared empty, no reused edge), so the deferred read resolves against
+    // the inherited cwd exactly as before — the fix adds NO over-fire for this case.
+    // (The separate over-fire for a plain-fork chain WITH a recycled intermediate is
+    // covered by the 'accepted reuse over-fire' test above.)
+    //   R(2421) seeds /root; R plain-fork P(2422); P plain-fork C(2423);
+    //   C racing relative read drains FIRST → deferred; resolves against inherited
+    //   /root → /root/.ssh/id_rsa, hidden=true.
+    it('deferred re-resolve RESOLVES a plain-fork chain with NO CLONE_FS ancestor (napi preservation, round-3)', async () => {
+      const proc = mockProcReader({
+        2421: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'napi-chain-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2422: {
+          ppid: 2421,
+          env: {
+            npm_package_name: 'napi-chain-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2423: {
+          ppid: 2422,
+          env: {
+            npm_package_name: 'napi-chain-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // R seeds /root.
+        { pid: 2421, line: 'chdir("/root") = 0', source: 'strace' },
+        // R plain-forks P (COPY of /root).
+        {
+          pid: 2421,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2422',
+          source: 'strace',
+        },
+        // RACE: PLAIN grandchild C relative read drains FIRST → deferred.
+        {
+          pid: 2423,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // P plain-forks C (COPY of /root). seedParentPid=P=2422 — NEVER CLONE_FS.
+        {
+          pid: 2422,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2423',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2421 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The deferred read MUST resolve against the inherited /root (no CLONE_FS in the
+      // lineage → no fail-close). This is the napi plain-fork determinism fix.
+      const reads = events.filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'read');
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/root/.ssh/id_rsa');
+      expect(raw['hidden']).toBe(true);
+      // No fail-closed synth.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) DEEP-CHAIN RESOLVE (codex round-3 [high]
+    // BLOCKER, 2026-06-16): the REAL unrs-resolver shape is a clone chain DEEPER than
+    // two generations — npm(root=seeded) → node[unrs-resolver postinstall] → node[napi-
+    // postinstall] → helper. Only `rootPid` is cwd-seeded; intermediates get a cwd ONLY
+    // via clone propagation. When the INNER clone line (B-clone-C) drains BEFORE the
+    // OUTER one (A-clone-B) — pure LEAF-UP drain order — the intermediate B has NO cwd
+    // when C is stamped, so `parentCloneTimeCwd` is null and C's `initialCwd` is stamped
+    // null. `stampDeferredRelOpens` is first-stamp-wins, so the later A-clone-B never
+    // re-stamps C → at replay the gate sees null → folds to a SYNTH `<UNRESOLVED_PATH>`.
+    // ROOT-DOWN drain order (A-clone-B before B-clone-C) resolves to /work, so the
+    // LEAF-UP synth is a DRAIN-ORDER-DEPENDENT divergence — the exact non-determinism
+    // the defer-and-re-resolve fix targets, which the 2-gen fix did NOT close for deep
+    // chains. The fix recovers `initialCwd` transitively at replay by walking UP
+    // `childParent` from `seedParentPid` to the nearest non-mutating ancestor with a
+    // known clone-time cwd (ultimately the seeded root). This is a PLAIN-fork chain (NO
+    // CLONE_FS, NO pid-reuse), so no fail-close gate fires → C MUST resolve.
+    it('deferred re-resolve RESOLVES a deep (3-gen) plain-fork chain in LEAF-UP drain order (round-3 deep-chain BLOCKER)', async () => {
+      const proc = mockProcReader({
+        100: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unrs-resolver',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        101: {
+          ppid: 100,
+          env: {
+            npm_package_name: 'unrs-resolver',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        102: {
+          ppid: 101,
+          env: {
+            npm_package_name: 'unrs-resolver',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      // A=100 is the seeded root (cwd /work, NO chdir). B=101, C=102 are plain forks
+      // (no CLONE_FS). C reads a racing relative protected file `secret.txt`.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // RACE: leaf C's relative read drains FIRST → deferred (C has no cwd yet).
+        {
+          pid: 102,
+          line: 'openat(AT_FDCWD, "secret.txt", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // INNER clone B-clone-C drains BEFORE the outer one. At THIS instant B (101)
+        // has NO cwd (A-clone-B has not drained), so parentCloneTimeCwd=null → C
+        // stamped initialCwd=null (the BUG: first-stamp-wins, never re-stamped).
+        {
+          pid: 101,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 102',
+          source: 'strace',
+        },
+        // OUTER clone A-clone-B drains LAST: B inherits /work (copy), but C is already
+        // stamped — only the transitive replay walk can recover C's true /work.
+        {
+          pid: 100,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 101',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 100 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          // The chain's inherited cwd is the seeded repo root /work, so the
+          // relative read resolves to /work/secret.txt (tokenized $REPO/secret.txt
+          // — home is kept DISTINCT to avoid a $REPO/$HOME tokenizer collision) and
+          // surfaces as a hidden protected read.
+          patterns: ['$REPO/secret.txt'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/home/user',
+            tmp: '/tmp',
+            cache: '/home/user/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The deferred leaf read MUST resolve transitively against the inherited /work
+      // (no CLONE_FS in the lineage → no fail-close). This is the deep-chain fix.
+      const reads = events.filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'read');
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/work/secret.txt');
+      expect(raw['hidden']).toBe(true);
+      // NO fail-closed synth — the LEAF-UP divergence is gone.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) DEEP-CHAIN ROOT-DOWN PARITY (codex round-3,
+    // 2026-06-16): the SAME 3-gen chain in ROOT-DOWN drain order (A-clone-B before
+    // B-clone-C) ALWAYS resolved to /work (intermediates already had a cwd). Pin it so
+    // both drain orders produce the IDENTICAL resolved /work/secret.txt — the
+    // determinism the fix guarantees.
+    it('deferred re-resolve RESOLVES a deep (3-gen) plain-fork chain in ROOT-DOWN drain order (parity)', async () => {
+      const proc = mockProcReader({
+        100: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'unrs-resolver',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        101: {
+          ppid: 100,
+          env: {
+            npm_package_name: 'unrs-resolver',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        102: {
+          ppid: 101,
+          env: {
+            npm_package_name: 'unrs-resolver',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // RACE: leaf C's read still drains FIRST → deferred.
+        {
+          pid: 102,
+          line: 'openat(AT_FDCWD, "secret.txt", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // ROOT-DOWN: outer A-clone-B drains BEFORE inner B-clone-C, so B has /work
+        // when C is stamped → C stamped initialCwd=/work directly (no walk needed).
+        {
+          pid: 100,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 101',
+          source: 'strace',
+        },
+        {
+          pid: 101,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 102',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 100 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$REPO/secret.txt'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/home/user',
+            tmp: '/tmp',
+            cache: '/home/user/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'read');
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/work/secret.txt');
+      expect(raw['hidden']).toBe(true);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) DEEP-CHAIN 4-GEN RESOLVE (codex round-3,
+    // 2026-06-16): a 4-generation plain-fork chain A→B→C→D in pure LEAF-UP drain order
+    // (D-read, C-clone-D, B-clone-C, A-clone-B) exercises a TWO-HOP transitive walk
+    // (C and B both have null clone-time cwd when D is stamped). The walk must skip
+    // both null-cwd intermediates and terminate at the seeded root A.
+    it('deferred re-resolve RESOLVES a deep (4-gen) plain-fork chain in LEAF-UP drain order (two-hop walk)', async () => {
+      const proc = mockProcReader({
+        200: { ppid: 1, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        201: { ppid: 200, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        202: { ppid: 201, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        203: { ppid: 202, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // LEAF-UP: D's read first → deferred; then C-clone-D, B-clone-C, A-clone-B.
+        {
+          pid: 203,
+          line: 'openat(AT_FDCWD, "secret.txt", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        { pid: 202, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 203', source: 'strace' },
+        { pid: 201, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 202', source: 'strace' },
+        { pid: 200, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 201', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 200 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$REPO/secret.txt'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/home/user',
+            tmp: '/tmp',
+            cache: '/home/user/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'read');
+      expect(reads).toHaveLength(1);
+      const raw = reads[0]!['raw'] as Record<string, unknown>;
+      expect(raw['path']).toBe('/work/secret.txt');
+      expect(raw['hidden']).toBe(true);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) DEEP-CHAIN RECOVERY + ANCESTOR PID-REUSE
+    // (codex round-4 [high] surfaced-then-dropped concern, VERIFIED fail-closed
+    // 2026-06-16): the deep-chain `initialCwd` recovery walk reads `pidCloneTimeCwd[a]`
+    // for each ancestor `a` it climbs to. That map is FIRST-WRITE-WINS by NUMERIC pid,
+    // so a RECYCLED ancestor pid keeps its FIRST generation's clone-time cwd. The
+    // concern: a pid-reuse interleaving where the walk adopts a STALE `pidCloneTimeCwd`
+    // from a PRIOR generation of a reused ancestor and RESOLVES a deferred protected
+    // read to a WRONG absolute path (a real, NON-fail-closed false negative).
+    //
+    // Scenario (PURE plain-fork — NO CLONE_FS anywhere; this is the strongest form, the
+    // reuse gate is the ONLY thing that can fire):
+    //   R(100, cwd /work) plain-fork A(200)  → pidCloneTimeCwd[200]=/work (gen-1)
+    //   D(300) chdir /work/node_modules/evil  (D's gen-2 cwd)
+    //   leaf C(202) racing relative protected read drains FIRST → deferred, initialCwd
+    //     stamped null (LEAF-UP: B(201) had no cwd when it cloned C)
+    //   B(201) clone C(202); 200 clone B(201)   (gen-2 inner clones)
+    //   D(300) plain-fork pid 200 (REUSE) drains LAST → childParent[200] overwritten
+    //     (was 100) → 200 marked `childParentReused`. pidCloneTimeCwd[200] stays the
+    //     STALE gen-1 /work.
+    // The chain's TRUE gen-2 inherited cwd is /work/node_modules/evil (from D), so the
+    // protected pattern $NODE_MODULES/evil/secret.txt matches the inline-causal resolve
+    // (proven by the BASELINE INLINE companion analysis). The deep-chain recovery walk
+    // from seedParentPid=201 climbs 201(null pidCloneTimeCwd) → 200, and 200 holds the
+    // STALE /work — the walk WOULD adopt it (a NON-reuse control with the identical
+    // chain resolves to /work/secret.txt). If adopted as `initial`, the read would
+    // resolve to the WRONG /work/secret.txt (NON-protected → silent false negative).
+    //
+    // It DOES NOT: the stale value is neutralized by the EXISTING pid-reuse gate. After
+    // the walk adopts /work, `sharedAtRead` is recomputed as
+    //   d.sharedAtRead || d.cloneFsSeed || childPidReuseHidCloneFs
+    //     || lineageEverCwdShared(d.seedParentPid)
+    // and `lineageEverCwdShared(201)` walks 201 → 200 and hits
+    // `childParentReused.has(200)` → returns true (phase-install.ts:6629). With
+    // `sharedAtRead === true` the resolve gate (`...&& !sharedAtRead`) is skipped →
+    // `canonical` stays null → fail-loud `<UNRESOLVED_PATH>` SYNTH. SAFE: the stale
+    // path is never emitted; the only observable outcome is a fail-loud audit_bypass.
+    it('deferred re-resolve fails closed when the deep-chain recovery walk would adopt a STALE pidCloneTimeCwd of a REUSED ancestor (round-4 ancestor-reuse)', async () => {
+      const pkgEnv = {
+        npm_package_name: 'unrs-resolver',
+        npm_package_version: '1.0.0',
+        npm_lifecycle_event: 'postinstall',
+      };
+      const proc = mockProcReader({
+        100: { ppid: 1, env: pkgEnv },
+        200: { ppid: 100, env: pkgEnv }, // gen-1 ancestor A; gen-2 reused parent
+        201: { ppid: 200, env: pkgEnv }, // B (intermediate, null clone-time cwd)
+        202: { ppid: 201, env: pkgEnv }, // C (deferred protected read)
+        300: { ppid: 100, env: pkgEnv }, // D, the gen-2 reuser (cwd node_modules/evil)
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 100, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // gen-1: R(/work) plain-forks A(200) → pidCloneTimeCwd[200]=/work (first-write-wins).
+        { pid: 100, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 200', source: 'strace' },
+        // D establishes its OWN cwd (the gen-2 lineage's true inherited dir).
+        { pid: 300, line: 'chdir("/work/node_modules/evil") = 0', source: 'strace' },
+        // RACE: leaf C's racing relative protected read drains FIRST → deferred (no cwd).
+        { pid: 202, line: 'openat(AT_FDCWD, "secret.txt", O_RDONLY) = -1 ENOENT (No such file or directory)', source: 'strace' },
+        // LEAF-UP inner clones: B(201) clone C(202) — B has no cwd → C.initialCwd=null.
+        { pid: 201, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 202', source: 'strace' },
+        { pid: 200, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 201', source: 'strace' },
+        // PID REUSE (gen-2): D(300) plain-forks pid 200, OVERWRITING childParent[200]
+        // (was 100) → 200 marked reused. pidCloneTimeCwd[200] stays STALE /work.
+        { pid: 300, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 200', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 100 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$NODE_MODULES/evil/secret.txt', '$REPO/secret.txt'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/home/user',
+            tmp: '/tmp',
+            cache: '/home/user/.cache/pnpm',
+          },
+        }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // MUST NOT adopt the stale gen-1 /work → MUST NOT emit /work/secret.txt (silent
+      // non-protected false negative) NOR any other concrete resolve of C's read.
+      const concrete = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['pid'] === 202;
+      });
+      expect(concrete).toHaveLength(0);
+      // MUST fail closed to a fail-loud <UNRESOLVED_PATH> for the deferred read C (202).
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 202;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) DEEP-CHAIN SAFE-DIRECTION GUARD (codex
+    // round-3, 2026-06-16): the transitive `initialCwd` recovery walk MUST stop at the
+    // FIRST ancestor that did a chdir (`firstCwdMutationTs.has(a)`) and leave `initial`
+    // null → SYNTH. Rationale: an ancestor's clone-time cwd may NOT equal the cwd it
+    // propagated to a child if it chdir'd, and cross-FILE ordering (the ancestor's
+    // chdir ts vs the clone ts) is NOT a proven kernel happens-before. Here B (101)
+    // does an ABSOLUTE chdir("/elsewhere") AFTER cloning C, all in LEAF-UP drain order.
+    // The walk hits `firstCwdMutationTs.has(101)` → BREAKS → C stays null → SYNTH. C
+    // MUST NOT resolve to a wrong path (neither the stale /work nor /elsewhere): the
+    // SAFE direction is fail-loud `<UNRESOLVED_PATH>`, never a forged path.
+    it('deferred re-resolve SAFE-direction: deep chain whose intermediate chdirs after cloning SYNTHs (no wrong path)', async () => {
+      const proc = mockProcReader({
+        100: { ppid: 1, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        101: { ppid: 100, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        102: { ppid: 101, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // LEAF-UP: C's read first → deferred (initialCwd will be null).
+        {
+          pid: 102,
+          line: 'openat(AT_FDCWD, "secret.txt", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // B clones C (B has no cwd yet → C stamped null).
+        { pid: 101, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 102', source: 'strace' },
+        // B does an ABSOLUTE chdir AFTER cloning C → firstCwdMutationTs[101] set. The
+        // walk must BREAK here (B's clone-time cwd may differ from what it propagated;
+        // cross-file order unprovable) and leave C null → SYNTH.
+        { pid: 101, line: 'chdir("/elsewhere") = 0', source: 'strace' },
+        // A clones B (B inherits /work at clone time, but B later chdir'd).
+        { pid: 100, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 101', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 100 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$REPO/secret.txt'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/home/user',
+            tmp: '/tmp',
+            cache: '/home/user/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The read MUST NOT resolve to any concrete path (not /work, not /elsewhere).
+      const anyRead = events.filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'read');
+      expect(anyRead).toHaveLength(0);
+      // It MUST fail closed to a fail-loud <UNRESOLVED_PATH> for child C (pid 102).
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 102;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // CONTEXT — PRE-EXISTING INLINE SILENT FALSE-NEGATIVE RESIDUAL (NOT the fix
+    // target): the INLINE ordering of the SAME transitive CLONE_FS structure (all clone
+    // lines drain BEFORE C's read, R's chdir drains LAST) ALSO resolves C against the
+    // stale /work via the COPY-branch mechanism — P/C take a private COPY of the
+    // shared-group cwd before R's chdir propagates. The TRUE kernel path is the shared
+    // /root/.ssh/id_rsa (PROTECTED), but the model resolves /work/.ssh/id_rsa
+    // (non-protected) and SILENTLY DROPS it — i.e. this IS a protected-path false
+    // negative, identical in mechanism to the deferred-path bug, but on the inline
+    // (non-deferred) resolution which this defer-and-re-resolve fix does not touch. It
+    // is an ACCEPTED PRE-EXISTING residual: the COPY-branch staleness predates the
+    // deferral and the lineage walk does not change it; closing it would require
+    // deferring inline COPY resolutions too (a separate, larger change). This test
+    // pins the residual so a future inline fix is a deliberate, visible change — it is
+    // NOT a claim that the inline drop is harmless.
+    it('INLINE transitive CLONE_FS COPY resolves the stale shared cwd (PRE-EXISTING inline false-negative residual)', async () => {
+      const proc = mockProcReader({
+        2411: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'transitive-inline-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2412: {
+          ppid: 2411,
+          env: {
+            npm_package_name: 'transitive-inline-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2413: {
+          ppid: 2412,
+          env: {
+            npm_package_name: 'transitive-inline-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2414: {
+          ppid: 2413,
+          env: {
+            npm_package_name: 'transitive-inline-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 2411, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // R clone(CLONE_FS) S.
+        {
+          pid: 2411,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2412',
+          source: 'strace',
+        },
+        // S plain-forks P (COPY of stale /work — R's chdir not yet drained).
+        {
+          pid: 2412,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2413',
+          source: 'strace',
+        },
+        // P plain-forks C (COPY of stale /work). C's clone drains BEFORE C's read
+        // (INLINE order) — no deferral.
+        {
+          pid: 2413,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2414',
+          source: 'strace',
+        },
+        // C's relative protected read — resolved INLINE against C's already-copied
+        // stale /work.
+        {
+          pid: 2414,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // R chdir's the shared group to /root — drains AFTER the COPYs, too late.
+        { pid: 2411, line: 'chdir("/root") = 0', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2411 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // PINNED RESIDUAL: the inline COPY resolves against the stale /work, so the TRUE
+      // protected /root/.ssh/id_rsa is NOT surfaced (the silent false negative)...
+      const trueProtected = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(trueProtected).toHaveLength(0);
+      // ...and because /work/.ssh/id_rsa is non-protected, it is SILENTLY DROPPED with
+      // NO <UNRESOLVED_PATH> synth either (the residual: the inline path neither
+      // surfaces the protected read NOR fails loud). This pins the pre-existing inline
+      // false negative; a future inline fix should make this assertion change visibly.
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0); // dropped as non-protected (not emitted)
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2414;
+      });
+      expect(unresolved).toHaveLength(0); // silent drop — no fail-loud synth (residual)
+    });
+
+    // Determinism (defer-and-re-resolve) ACCEPTED CONSERVATIVE OVER-FIRE (FIX #1
+    // ROUND-2 — sticky parent membership; was adversarial-review CLAIM A, now
+    // FLIPPED): the parent P CLONE_FS-shares with a sibling S, then `unshare(CLONE_FS)`
+    // DETACHES P back to a private singleton and P absolute-chdir's to /root, then
+    // plain-forks a deferred-read child C. With the REPLAY-time
+    // `everCwdShared.has(seedParentPid)` gate (drain-independent, required to close
+    // the ROUND-2 #1 stamp-time blind spot), `everCwdShared` is STICKY (never cleared
+    // on detach), so P remains a member at replay → C FAILS CLOSED to
+    // <UNRESOLVED_PATH> even though inline (clone-first) order would resolve C's read
+    // against P's private /root. This is an ACCEPTED over-fire: it is SAFE (the probe
+    // surfaces as a fail-loud audit_bypass, never a missed protected path) and the
+    // pattern (a lifecycle process detaching from a CLONE_FS group then plain-forking
+    // a child whose racing read drains first) is pathological — it does not occur in
+    // normal npm/pnpm/yarn plain-fork trees. We deliberately prefer this fail-loud
+    // over-record to the blind stamp-time gate's SILENT false negative (ROUND-2 #1).
+    it('deferred re-resolve fails closed for a PLAIN child after the parent detaches from a CLONE_FS group (accepted sticky over-fire)', async () => {
+      const proc = mockProcReader({
+        2271: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2272: {
+          ppid: 2271,
+          env: {
+            npm_package_name: 'race-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2273: {
+          ppid: 2271,
+          env: {
+            npm_package_name: 'race-detach-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Install root seeds /work (parent P = 2271).
+        { pid: 2271, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // P CLONE_FS-shares with a SIBLING S (2273) → P enters a multi-member group
+        // and is marked sticky everCwdShared.
+        {
+          pid: 2271,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2273',
+          source: 'strace',
+        },
+        // P DETACHES from the shared cwd group via unshare(CLONE_FS) → P becomes a
+        // private singleton (the sticky everCwdShared bit on P REMAINS set).
+        { pid: 2271, line: 'unshare(CLONE_FS) = 0', source: 'strace' },
+        // P re-establishes a private cwd via an ABSOLUTE chdir.
+        { pid: 2271, line: 'chdir("/root") = 0', source: 'strace' },
+        // RACE: PLAIN child C (2272) relative protected read drains BEFORE the
+        // P-clone-C line → deferred.
+        {
+          pid: 2272,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // P plain-forks C (non-CLONE_FS COPY). P detached from the live group, but
+        // P's STICKY everCwdShared bit remains set → at replay the gate fails C
+        // closed (accepted conservative over-fire).
+        {
+          pid: 2271,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2272',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2271 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // ACCEPTED OVER-FIRE: the sticky parent-membership gate fails C closed. The
+      // read MUST NOT resolve against P's private /root...
+      const probe = events.find((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read' && raw['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(probe).toBeUndefined();
+      // ...it MUST fail closed to a fail-loud <UNRESOLVED_PATH> for child C.
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2272;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION (adversarial-review re-review
+    // high finding 3, 2026-06-15): a COPY child does open(ts=10) THEN
+    // chdir("/tmp", ts=20), and BOTH drain before the parent's clone line. The
+    // read causally PRECEDES the child's own chdir, so in non-racing order it
+    // would resolve against the inherited cwd (/root) and emit /root/.ssh/id_rsa.
+    // The replay MUST reproduce that (resolve, hidden) — NOT fail closed just
+    // because the post-read chdir made the clone-time reconciler taint the child.
+    it('deferred re-resolve resolves a read that precedes the child own chdir (no drift)', async () => {
+      const proc = mockProcReader({
+        2251: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'race-prechdir-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        2252: {
+          ppid: 2251,
+          env: {
+            npm_package_name: 'race-prechdir-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace'; ts?: number }> = [
+        { pid: 2251, line: 'chdir("/root") = 0', source: 'strace', ts: 1 },
+        // Child read (ts=10) — deferred (clone not yet drained).
+        {
+          pid: 2252,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+          ts: 10,
+        },
+        // Child's OWN chdir (ts=20) AFTER the read — must not retroactively
+        // invalidate the earlier read's resolution against the inherited cwd.
+        { pid: 2252, line: 'chdir("/tmp") = 0', source: 'strace', ts: 20 },
+        // Parent's plain (non-CLONE_FS) clone drains LAST.
+        {
+          pid: 2251,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2252',
+          source: 'strace',
+          ts: 30,
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2251 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(1);
+      expect((reads[0]!['raw'] as Record<string, unknown>)['path']).toBe('/root/.ssh/id_rsa');
+      expect((reads[0]!['raw'] as Record<string, unknown>)['hidden']).toBe(true);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION (adversarial-review re-review
+    // high finding 4, 2026-06-15): a deferred Node-startup read must be FILTERED
+    // identically to the inline path even when the startup-done marker clears
+    // the live file-pending set BEFORE end-of-drain replay. The child inherits
+    // file-pending on the clone line; the deferred entry captures that read-time
+    // pending state, so replay filters the read (records it into the bootstrap
+    // baseline) instead of leaking it as package behavior.
+    it('deferred re-resolve filters a Node-startup read even if the marker clears pending before replay (regression)', async () => {
+      const proc = mockProcReader({
+        42: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'bootstrap-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        43: {
+          ppid: 42,
+          env: {
+            npm_package_name: 'bootstrap-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source?: 'shim' | 'strace' }> = [
+        // Root pid 42 execs Node → begins the bootstrap (file-pending) window.
+        { pid: 42, line: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/node", ["node", "x.js"], 0x7ffd) = 0', source: 'strace' },
+        // Child 43's startup read drains FIRST (deferred — clone not yet drained,
+        // 43 has no cwd). This is a Node internal startup read.
+        { pid: 43, line: 'openat(AT_FDCWD, "internal-bootstrap.js", O_RDONLY) = 5', source: 'strace' },
+        // Parent clones 43 → propagates file-pending to 43 AND stamps the
+        // deferred read with bootstrapFilePending=true + initialCwd=/work.
+        { pid: 42, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 43', source: 'strace' },
+        // 43's startup-done marker drains → clears 43's LIVE file-pending.
+        { pid: 43, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)`, source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 42 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The startup read MUST be filtered (NOT emitted as a package read) and
+      // MUST NOT surface as <UNRESOLVED_PATH> (it resolved, then was filtered).
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/internal-bootstrap.js';
+      });
+      expect(leaked).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION (adversarial-review 3rd pass
+    // F4, the CONVERSE of the prior test): the child's OWN startup-done marker
+    // causally PRECEDES the deferred read (same per-pid file, smaller ts), so the
+    // read is POST-bootstrap and inline order would EMIT it. The replay must NOT
+    // over-filter it just because the child inherited file-pending at clone.
+    it('deferred re-resolve emits a POST-bootstrap read whose marker precedes it (no over-filter)', async () => {
+      const proc = mockProcReader({
+        52: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'postboot-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        53: {
+          ppid: 52,
+          env: {
+            npm_package_name: 'postboot-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source?: 'shim' | 'strace'; ts?: number }> = [
+        { pid: 52, line: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/node", ["node", "x.js"], 0x7ffd) = 0', source: 'strace', ts: 1 },
+        // Child 53's startup-done marker (ts=10) — closes its file window.
+        { pid: 53, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)`, source: 'strace', ts: 10 },
+        // Child 53's read (ts=20) — AFTER its own marker (post-bootstrap), but
+        // drains before the clone so it is deferred.
+        { pid: 53, line: 'openat(AT_FDCWD, "real-package-read.js", O_RDONLY) = 5', source: 'strace', ts: 20 },
+        // Parent clones 53 (ts=30) → 53 inherits file-pending (52 still pending),
+        // stamps bootstrapPendingInherited=true + initialCwd=/work.
+        { pid: 52, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 53', source: 'strace', ts: 30 },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 52 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The post-bootstrap read MUST be emitted (resolved against /work), NOT
+      // filtered as Node startup.
+      const reads = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/real-package-read.js';
+      });
+      expect(reads).toHaveLength(1);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION ("ORDER D", round-1 #3, re-
+    // evaluated under FIX #3 ROUND-2 prefer-EMIT): the child begins bootstrap (its
+    // OWN node exec) and does an in-window relative startup read, then BOTH the
+    // child's own startup-done marker AND the PARENT's startup-done marker drain
+    // BEFORE the parent's clone-of-child line. Because the parent is no longer
+    // file-pending at the clone drain, propagateNodeBootstrap does NOT re-add the
+    // child → stampDeferredRelOpens samples bootstrapPendingInherited=FALSE. The
+    // in-window read would then LEAK as a package read (drain-order-dependent lock =
+    // byte instability). The read MUST still be FILTERED — but NOW via the child's
+    // OWN drain-independent bootstrap evidence: the child has its OWN startup-done
+    // marker (`nodeBootstrapFileEndedTs`) and the read PRECEDES it (same per-pid
+    // file → causal), so the child's own window was open at the read. (FIX #3's
+    // ROUND-2 change dropped the cross-file `read.ts < parentEndedTs` parent-window
+    // inference; this case keeps filtering only because the child has its OWN node
+    // exec/marker — a NON-Node helper with no own marker would now EMIT, the SAFE
+    // direction.)
+    it('deferred re-resolve filters an in-window Node-startup read when both markers clear before the parent clone (ORDER D)', async () => {
+      const proc = mockProcReader({
+        82: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'orderd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        83: {
+          ppid: 82,
+          env: {
+            npm_package_name: 'orderd-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source?: 'shim' | 'strace'; ts?: number }> = [
+        // Parent pid 82 execs Node → begins the parent's bootstrap (file-pending)
+        // window (ts=1).
+        { pid: 82, line: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/node", ["node", "x.js"], 0x7ffd) = 0', source: 'strace', ts: 1 },
+        // Child 83 execs Node → begins ITS OWN bootstrap window (ts=2).
+        { pid: 83, line: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/node", ["node", "y.js"], 0x7ffd) = 0', source: 'strace', ts: 2 },
+        // Child 83's in-window relative startup read (ts=10), deferred (no cwd; the
+        // clone has not drained yet). This is Node-internal startup noise.
+        { pid: 83, line: 'openat(AT_FDCWD, "internal-bootstrap.js", O_RDONLY) = 5', source: 'strace', ts: 10 },
+        // Child 83's OWN startup-done marker (ts=20) → closes 83's window.
+        { pid: 83, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)`, source: 'strace', ts: 20 },
+        // PARENT 82's startup-done marker (ts=30) → closes 82's window. 82 is no
+        // longer file-pending.
+        { pid: 82, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)`, source: 'strace', ts: 30 },
+        // PARENT clones 83 LAST (ts=40). 82 is NOT pending → no re-propagation →
+        // clone-drain-time pending sample is FALSE. The clone ts (40) is AFTER 82's
+        // window close (30), but the read (ts=10) was in-window for the parent at
+        // the time it would have propagated in inline order.
+        { pid: 82, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 83', source: 'strace', ts: 40 },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 82 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The in-window startup read MUST be FILTERED (not emitted as a package read)
+      // and MUST NOT surface as <UNRESOLVED_PATH> (it resolved, then was filtered).
+      const leaked = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/internal-bootstrap.js';
+      });
+      expect(leaked).toHaveLength(0);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION (codex ROUND-2 #3, fail-safe
+    // prefer-EMIT): a Node parent P execs node, emits its OWN startup-done marker
+    // (its bootstrap window CLOSES — P is no longer pending), THEN plain-forks a
+    // NON-Node helper C (C has no own node exec, no own marker, no own bootstrap
+    // evidence). C does a racing relative PACKAGE read. In the RACE drain order C's
+    // read drains BEFORE P's marker (so the deferred read ts < the parent's marker
+    // ts), and the clone drains LAST. The OLD stamp-time recompute would mark the
+    // read inheritedPending=true via the cross-file `read.ts < parentEndedTs`
+    // parent-window branch and SUPPRESS this genuine package read — diverging from
+    // the inline (clone-first) order, which EMITS it (P not pending at fork). For a
+    // security audit a SUPPRESSED real package read is the dangerous direction. The
+    // fail-safe fix drops the cross-file parent-window inheritance branch: a deferred
+    // read is filtered ONLY on POSITIVE drain-independent evidence (its resolved path
+    // is already in the `nodeBootstrapFileReads` baseline, OR the child has its own
+    // bootstrap evidence). Otherwise it EMITS. So C's read MUST be EMITTED here.
+    it('deferred re-resolve EMITS a non-Node helper read forked after the parent bootstrap window closed (ROUND-2 #3, prefer-emit)', async () => {
+      const proc = mockProcReader({
+        92: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'helper-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        93: {
+          ppid: 92,
+          env: {
+            npm_package_name: 'helper-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source?: 'shim' | 'strace'; ts?: number }> = [
+        // P (92) execs node → begins P's bootstrap (file-pending) window (ts=1).
+        { pid: 92, line: 'execve("/opt/vp/js_runtime/node/24.15.0/bin/node", ["node", "x.js"], 0x7ffd) = 0', source: 'strace', ts: 1 },
+        // Helper C (93, NON-Node — no own exec, no own marker) does a relative
+        // PACKAGE read; drains FIRST (deferred — no cwd, clone not drained yet).
+        { pid: 93, line: 'openat(AT_FDCWD, "lib/helper-real.js", O_RDONLY) = 5', source: 'strace', ts: 10 },
+        // P's OWN startup-done marker drains (ts=30) → P window CLOSES, P NOT pending.
+        { pid: 92, line: `openat(AT_FDCWD, "${NODE_STARTUP_DONE_STRACE_PATH}", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)`, source: 'strace', ts: 30 },
+        // P plain-forks C LAST (ts=40), AFTER P's marker → bootstrapPendingInherited
+        // sampled FALSE; but the deferred read ts(10) < parentEndedTs(30) — the OLD
+        // cross-file parent-window branch over-filtered here.
+        { pid: 92, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 93', source: 'strace', ts: 40 },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 92 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The genuine helper package read MUST be EMITTED (resolved against /work),
+      // matching the inline (clone-first) order — NOT suppressed as Node bootstrap.
+      const reads = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/lib/helper-real.js';
+      });
+      expect(reads).toHaveLength(1);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION (adversarial-review 4th pass):
+    // a SINGLETON child does unshare(CLONE_NEWUSER) (which the kernel treats as an
+    // fs-detach but is a no-op for SHARING since the child never CLONE_FS-shared),
+    // then a deferred relative read, then a delayed NON-CLONE_FS clone. The detach
+    // MUST NOT mark the child everCwdShared (it was a singleton), so the read
+    // resolves against the inherited cwd exactly like clone-first order — NOT
+    // fail-closed.
+    it('deferred re-resolve resolves after a singleton unshare(CLONE_NEWUSER) + non-CLONE_FS clone (no false share)', async () => {
+      const proc = mockProcReader({
+        62: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'singleton-unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        63: {
+          ppid: 62,
+          env: {
+            npm_package_name: 'singleton-unshare-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 62, line: 'chdir("/root") = 0', source: 'strace' },
+        // Child 63 unshares CLONE_NEWUSER as a SINGLETON (clone not yet drained) —
+        // a no-op for cwd sharing; must NOT mark 63 as everCwdShared.
+        { pid: 63, line: 'unshare(CLONE_NEWUSER) = 0', source: 'strace' },
+        // Child 63's racing relative read — deferred.
+        {
+          pid: 63,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // Delayed NON-CLONE_FS clone of 63 → 63 inherits /root (copy).
+        {
+          pid: 62,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 63',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 62 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads = events.filter((e) => {
+        const raw = e['raw'] as Record<string, unknown>;
+        return raw['kind'] === 'read';
+      });
+      expect(reads).toHaveLength(1);
+      expect((reads[0]!['raw'] as Record<string, unknown>)['path']).toBe('/root/.ssh/id_rsa');
+      expect((reads[0]!['raw'] as Record<string, unknown>)['hidden']).toBe(true);
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) REGRESSION (adversarial-review 5th pass
+    // F6): the child is a REAPED short-lived clone child — its /proc is gone, so
+    // attribution at read time returns null. Its relative read drains BEFORE the
+    // parent's clone line, which seeds BOTH the child's cwd AND its attribution
+    // (propagated from the parent). The read must be DEFERRED at the null-
+    // attribution gate (not dropped), then resolved + attributed under the
+    // parent's package at replay — not lost silently.
+    it('deferred re-resolve recovers a REAPED child whose read drains before the attribution-seeding clone', async () => {
+      // NOTE: pid 73 is intentionally ABSENT from the proc map → attribute(73)
+      // returns null at read-dispatch time (reaped child, /proc gone).
+      const proc = mockProcReader({
+        72: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'reaped-parent-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent 72 reads something so it is observed + attributed (snapshot seeded).
+        { pid: 72, line: 'openat(AT_FDCWD, "/work/parent.js", O_RDONLY) = 3', source: 'strace' },
+        { pid: 72, line: 'chdir("/root") = 0', source: 'strace' },
+        // Reaped child 73's relative read drains FIRST (no /proc → null attribution,
+        // no cwd → deferred at the null-attribution gate).
+        {
+          pid: 73,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // Parent's clone drains → seeds 73's cwd (/root) AND attribution (parent pkg).
+        {
+          pid: 72,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 73',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 72 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // The reaped child's probe MUST resolve to /root/.ssh/id_rsa, hidden, and be
+      // attributed under the parent's package — NOT lost.
+      const probe = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(probe).toHaveLength(1);
+      expect((probe[0]!['raw'] as Record<string, unknown>)['hidden']).toBe(true);
+      expect(probe[0]!['pkg']).toBe('reaped-parent-pkg@1.0.0');
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true;
+      });
+      expect(unresolved).toHaveLength(0);
+    });
+
+    it('null-attributed deferred read binds to the STAMPING clone generation, not a recycled-pid snapshot (F6 follow-up)', async () => {
+      // Pid 73 is reused: parent 72 (pkg A) clones it FIRST (seeding the
+      // deferred read's cwd + attribution), then — after 73 dies — parent 80
+      // (pkg B) reuses pid 73 via a LATER clone. The recycled clone overwrites
+      // 73's live attribution snapshot to pkg B (recordAttribution monotonicity).
+      // The deferred read MUST attribute under pkg A (the generation that
+      // stamped it), NOT the recycled pkg B — a fresh end-of-drain
+      // snapshotAttribution(73) lookup would have wrongly picked pkg B.
+      const proc = mockProcReader({
+        72: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'gen-a-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'postinstall',
+          },
+        },
+        80: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'gen-b-pkg',
+            npm_package_version: '2.0.0',
+            npm_lifecycle_event: 'install',
+          },
+        },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // Parent A (72, pkg A) is observed at /root and attributed.
+        { pid: 72, line: 'openat(AT_FDCWD, "/work/a.js", O_RDONLY) = 3', source: 'strace' },
+        { pid: 72, line: 'chdir("/root") = 0', source: 'strace' },
+        // Reaped child 73's relative read drains FIRST → null attribution, no
+        // cwd → deferred at the null-attribution gate.
+        {
+          pid: 73,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // Parent A's clone = 73 drains → STAMPS 73's cwd (/root) + inheritedAttrib
+        // (pkg A) into the deferred entry; records attribution(73, pkg A).
+        {
+          pid: 72,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 73',
+          source: 'strace',
+        },
+        // Parent B (80, pkg B) is observed, then RECYCLES pid 73 via a later
+        // clone → recordAttribution(73, pkg B) overwrites the live snapshot.
+        { pid: 80, line: 'openat(AT_FDCWD, "/work/b.js", O_RDONLY) = 4', source: 'strace' },
+        {
+          pid: 80,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 73',
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 72 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const probe = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/root/.ssh/id_rsa';
+      });
+      expect(probe).toHaveLength(1);
+      expect((probe[0]!['raw'] as Record<string, unknown>)['hidden']).toBe(true);
+      // The KEY assertion: pkg A (the stamping generation), never pkg B.
+      expect(probe[0]!['pkg']).toBe('gen-a-pkg@1.0.0');
+      expect(probe[0]!['pkg']).not.toBe('gen-b-pkg@2.0.0');
+    });
+
     // Codex finding #1: a parent's fd-table is copied to the child at
     // fork.  The child can use an INHERITED dirfd in subsequent
     // openat(<fd>, "relative", …) calls; the dispatcher must

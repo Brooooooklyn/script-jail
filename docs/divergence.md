@@ -448,6 +448,92 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
     exit} AND {no later observed activity} — the **same class** as PR #10's
     accepted post-exit-freeze residual (a root attacker racing the tailer is
     outside the enforceable boundary).
+  - **Defer-and-re-resolve: two irreducible single-pass cross-file ordering limits,
+    handled in the SAFE direction (accepted residuals).** `strace -ff` writes one
+    trace file per pid and the guest drains them in `readdir` (inode) order with no
+    causal key, so a clone child's relative `openat(AT_FDCWD, …)` can be processed
+    BEFORE its parent's `clone() = <child>` line. The deterministic fix
+    (`src/guest/phase-install.ts`, "defer-and-re-resolve") parks such an unresolved
+    relative open and re-resolves it at end-of-drain against the clone-inherited
+    initial cwd. Two cross-file orderings cannot be disambiguated in a single pass;
+    both resolve to a **fail-loud, never-hide-real-behavior** outcome:
+    - **(#1) CLONE_FS cwd-group provenance → fail closed to `<UNRESOLVED_PATH>`.**
+      A deferred read ANY of whose process-lineage ancestors was EVER a member of a
+      `CLONE_FS` cwd group is failed closed rather than resolved, because a
+      sibling/grandparent `chdir` of the shared group cwd can be causally-prior to the
+      read yet drain AFTER the clone snapshot, leaving the inherited cwd STALE
+      (resolving would risk a protected-path FALSE NEGATIVE). The gate is a
+      **replay-time** bounded walk UP the `childParent` lineage
+      (`lineageEverCwdShared(seedParentPid)`) against the sticky `everCwdShared` set —
+      both structures are complete after the full drain, so the verdict is
+      drain-independent. The walk covers ANY `CLONE_FS` ancestor in the lineage, not
+      just the immediate parent: a plain-fork intermediate that is NOT itself in
+      `everCwdShared` can COPY a stale shared-group cwd down to the child from a
+      `CLONE_FS`-shared ancestor whose `chdir` drained late (codex round-3 #1) — a
+      pure `everCwdShared.has(seedParentPid)` check (the immediate parent only) missed
+      that transitive case and silently resolved against the stale cwd. The earlier
+      stamp-time membership sample is likewise blind when even the immediate parent's
+      own `CLONE_FS` membership edge drains after it plain-forks the child
+      (codex round-2 #1). The walk also **fails closed on lineage ambiguity** (codex
+      round-3 pid-reuse follow-up): the final `childParent` map is read at replay, so a
+      recycled intermediate pid (re-cloned by a different, non-`CLONE_FS` parent before
+      replay, overwriting its parent edge) could otherwise route the walk down the
+      recycled chain and silently MISS the original `CLONE_FS` ancestor. An overwritten
+      edge is recorded in `childParentReused`; the walk returns "shared" (fail closed)
+      when it hits a reused edge, a cycle, or the iteration cap — `false` is trusted
+      only for an unambiguous walk to the lineage root. (No single-edge-per-pid map is
+      generation-CORRECT under reuse — first-write and last-write each lose a different
+      generation — so the walk is generation-SAFE, not correct: it never yields a silent
+      false negative, at the cost of the reuse over-fire.) Accepted conservative
+      over-fires, both SAFE (the probe surfaces as a fail-loud `<UNRESOLVED_PATH>`
+      audit_bypass, never a missed protected path) and confined to pathological trees:
+      (a) a parent that shared then `unshare(CLONE_FS)`-detached still carries the
+      sticky bit, so a plain child it forks afterward also fails closed; (b) a PURE
+      plain-fork chain with NO `CLONE_FS` ancestor but whose deferred read's lineage
+      intermediate (seedParent-walk) pid is RECYCLED mid-drain also fails closed (the
+      recycled edge makes the original lineage unverifiable); and (c) a deferred read
+      whose OWN pid is recycled across generations with DIFFERENT-parent clones
+      (`childParentReused.has(P)`) AND where some parent generation has a `CLONE_FS`
+      lineage (`childAllParents`) fails closed — the wrong-generation stamp might have
+      laundered a real shared ancestor out of the walk. The own-pid-reuse gate is
+      PRECISE: a pure plain-fork recycled pid (no `CLONE_FS` parent generation) still
+      resolves under its stamped generation, preserving the accepted reaped-pid residual
+      (MEMORY: `reaped-child-env-read-pid-reuse-residual`). A lineage with NO `CLONE_FS`
+      ancestor AND no pid reuse (the real napi/plain-fork flake this fix targets)
+      completes a clean walk to the root and still resolves. Two **accepted
+      pre-existing SILENT false-negative residuals** (out of scope — verified to predate
+      this fix on HEAD; the lineage walk does not change either): **(i) inline COPY
+      staleness** — the INLINE (non-deferred) path takes a private COPY of the shared
+      group-root cwd at clone-drain, so when the shared `chdir` drains last the model
+      resolves against the stale copy; the true protected path (e.g. shared
+      `$HOME/.ssh/...`) is not surfaced and the stale non-protected resolution is dropped
+      with no `<UNRESOLVED_PATH>`. **(ii) same-parent pid-reuse generation ambiguity** —
+      when the SAME numeric parent re-forks the SAME child pid and the parent's own cwd
+      changed between generations, the deferred read can be first-stamp-wins bound to the
+      wrong generation's cwd (verified identical on HEAD `c198ee3` — the original
+      `everCwdShared.has(seedParentPid)` gate keys on the same wrong-gen
+      seedParent/initialCwd). This is the same irreducible generation-ambiguity class as
+      the reaped-pid residual: the wrong-gen stamp is byte-identical to a legitimate
+      same-generation stamp and there is no `CLONE_FS` signal to trip the precise gate,
+      so failing closed would break the legitimate same-pid fast-exit resolve and
+      over-fire the reaped-pid class. Both residuals are pinned by regressions so a
+      future generation-qualified rewrite (the only sound closure) is a deliberate,
+      visible change; neither is claimed harmless.
+    - **(#3) Inherited Node-bootstrap window → emit (over-record), never suppress.**
+      A deferred read in an inherited Node-bootstrap window is EMITTED (over-recorded
+      as package behavior) rather than suppressed when cross-file ordering is
+      ambiguous. The replay filters a deferred read as bootstrap noise ONLY on
+      POSITIVE, drain-independent evidence — the resolved path is already in the
+      `nodeBootstrapFileReads` baseline, the child inherited file-pending at its
+      seeding clone (gated by the child's OWN startup-done marker), or the child has
+      its OWN bootstrap window (own marker ts vs read ts, same per-pid file → causal).
+      The prior cross-file `read.ts < parentEndedTs` parent-window inference was
+      DROPPED: it could SUPPRESS a genuine package read of a non-Node helper forked
+      after the parent's bootstrap window closed but whose racing read drained before
+      the parent's marker (codex round-2 #3) — and suppressing a real package read is
+      the dangerous direction for a security audit. The residual (a Node-internal
+      read of a non-Node child over-recorded as package behavior) never hides real
+      behavior and does not occur in normal npm/pnpm/yarn plain-fork lifecycle trees.
   Any finding **fails the gate** even when the
   comparable text is byte-equal, so the exclusion can never launder a real
   escape. The exclusion is also **symmetric down to the lifecycle stage**: a
