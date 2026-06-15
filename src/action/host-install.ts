@@ -112,9 +112,15 @@ function resolveGitFromPath(): string | undefined {
  * SCOPE: `YARN_PLUGINS=''` governs only the ENV plugin source, NOT the rc-file
  * `plugins:` cascade — Berry still loads a `plugins:` entry from a PARENT-dir or
  * `~/.yarnrc.yml` even under this env (the rc loop runs unconditionally when
- * `useRc`).  That is out of the PR-author threat model (actions/checkout confines a
- * PR to `$GITHUB_WORKSPACE`; parent dirs and `~` are runner-owned), and the repo's
- * own `.yarnrc.yml plugins:` is rejected by the preflight before this env is used.
+ * `useRc`).  Parent dirs ABOVE the checkout and `~` are runner-owned (out of the
+ * PR-author threat model: actions/checkout confines a PR to `$GITHUB_WORKSPACE`).
+ * But repoDir is NOT always the checkout root: with `SCRIPT_JAIL_REPO_DIR` it can
+ * be a SUBDIRECTORY of the checkout, in which case the PR-controlled ancestor rc
+ * files BETWEEN repoDir and `$GITHUB_WORKSPACE` ARE in scope — so the preflight
+ * (install-preflight.ts) now scans every `.yarnrc.yml` from repoDir up to and
+ * including `$GITHUB_WORKSPACE`, rejecting an ancestor `plugins:`/`yarnPath`
+ * before this env is ever used.  The repo's own `.yarnrc.yml plugins:` is
+ * likewise rejected there.
  */
 function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, npm_config_git: trustedGitPath() };

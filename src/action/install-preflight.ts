@@ -36,8 +36,8 @@
 //     non-GitHub git dep) is already neutralized by the `npm_config_git` pin in
 //     host-install.ts.  Nothing left to detect here.
 
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
 import type { Manager } from '../shared/pm-commands.js';
@@ -47,11 +47,81 @@ import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
  * Returns a human-readable reason string when `install: true` must be REFUSED
  * because the repo declares config that would execute code on the runner during
  * the pre-trust host no-scripts install; null when safe to proceed.
+ *
+ * `workspaceRoot` (GITHUB_WORKSPACE on the runner) bounds the ancestor scans:
+ * when `repoDir` is a SUBDIRECTORY of the checkout, yarn (and pnpm's
+ * `configDependencies`) walk UP parent directories at install startup, so the
+ * preflight must inspect every dir from `repoDir` up to and INCLUDING the
+ * workspace root — but NEVER above it (parent dirs / `~` are runner-owned, not
+ * PR-controlled).  When omitted, undefined, or when `repoDir` is OUTSIDE the
+ * workspace (e2e: SCRIPT_JAIL_REPO_DIR points at a runner-temp consumer dir),
+ * only `repoDir` itself is scanned — byte-identical to the pre-ancestor-scan
+ * behavior and the common `repoDir === workspaceRoot` consumer case.
  */
-export function detectPreTrustConfigExec(repoDir: string, manager: Manager): string | null {
-  if (manager === 'pnpm') return detectPnpmfile(repoDir);
-  if (manager === 'yarn') return detectYarnStartupExec(repoDir);
+export function detectPreTrustConfigExec(
+  repoDir: string,
+  manager: Manager,
+  workspaceRoot?: string,
+): string | null {
+  if (manager === 'pnpm') return detectPnpmfile(repoDir, workspaceRoot);
+  if (manager === 'yarn') return detectYarnStartupExec(repoDir, workspaceRoot);
   return null;
+}
+
+/**
+ * The list of directories to inspect for repo-controlled config, ordered from
+ * `repoDir` UP to (and including) `workspaceRoot`.  Boundary rules:
+ *   * `workspaceRoot` undefined/empty → only `repoDir` (non-action / local).
+ *   * `repoDir` NOT inside `workspaceRoot` (e.g. an outside runner-temp consumer
+ *     dir) → only `repoDir`; its ancestors are runner-owned, not PR-controlled.
+ *   * otherwise walk via `dirname` from `repoDir` up, STOPPING after the dir
+ *     equal to `workspaceRoot`; never above it.  FS-root safety guards the loop.
+ *   * common `repoDir === workspaceRoot` → exactly one dir (`repoDir`).
+ *
+ * Both paths are resolved to their REAL (symlink-free) form first, so a
+ * symlinked `repoDir` walks the same ancestor chain Yarn/pnpm actually read on
+ * disk (a lexical-only walk could diverge from the real cwd and miss a real
+ * PR-controlled ancestor — or inspect the wrong parent chain).
+ */
+function scanDirs(repoDir: string, workspaceRoot?: string): string[] {
+  const repo = realpathOrResolve(repoDir);
+  if (workspaceRoot === undefined || workspaceRoot === '') return [repo];
+  const root = realpathOrResolve(workspaceRoot);
+  // Separator-aware containment: `relative()` of '' means repo === root; a normal
+  // relative path means repo is a DESCENDANT.  Only a result of exactly '..',
+  // one that starts with '..' + path separator, or an absolute path means repo is
+  // genuinely OUTSIDE root.  A bare `.startsWith('..')` is WRONG: it misclassifies
+  // a sibling-named child like `<root>/..pkg/app` (rel `..pkg/app`) as outside and
+  // would skip the PR-controlled ancestors between it and root.
+  const rel = relative(root, repo);
+  const outside = rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel);
+  if (outside) return [repo];
+  const dirs: string[] = [];
+  let cur = repo;
+  // Walk up to and including `root`.  Stop at `root`, and guard the FS root.
+  for (;;) {
+    dirs.push(cur);
+    if (cur === root) break;
+    const parent = dirname(cur);
+    if (parent === cur) break; // FS-root safety (should not trigger: repo is under root)
+    cur = parent;
+  }
+  return dirs;
+}
+
+/**
+ * Resolve a path to its real (symlink-free) absolute form so the ancestor walk
+ * matches the actual files Yarn/pnpm read on disk.  Falls back to a lexical
+ * `resolve()` when the path does not exist yet (realpathSync throws ENOENT) so
+ * non-existent inputs behave exactly as the pre-realpath code did.
+ */
+function realpathOrResolve(p: string): string {
+  const abs = resolve(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
 }
 
 const PNPM_GUIDANCE =
@@ -59,7 +129,33 @@ const PNPM_GUIDANCE =
   '`install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, ' +
   'or audit without `install` (the sandbox still records the pnpmfile there).';
 
-function detectPnpmfile(repoDir: string): string | null {
+function detectPnpmfile(repoDir: string, workspaceRoot?: string): string | null {
+  // First, the full set of repoDir checks (byte-identical to before).  These
+  // include the pnpmfile vectors — kept as the clean early UX message even
+  // though the host `--ignore-pnpmfile` already backstops every pnpmfile variant.
+  const atRepo = detectPnpmConfigInRepoDir(repoDir);
+  if (atRepo !== null) return atRepo;
+  // Then the ANCESTOR scan — but ONLY for `configDependencies`.  Unlike the
+  // pnpmfile vectors (which `--ignore-pnpmfile` suppresses regardless of which
+  // directory pnpm found them in — see host-install.ts), a `configDependencies:`
+  // declared in an ANCESTOR `pnpm-workspace.yaml`/`package.json` within the
+  // checkout is FETCHED + EXTRACTED during the pre-trust install (pnpm's
+  // workspace-root discovery walks UP) and is NOT covered by `--ignore-pnpmfile`
+  // (the fetch/extract runs in config bootstrap, outside that guard).  Mirror the
+  // repoDir `configDependencies` reject up the ancestor chain, bounded to the
+  // workspace.  (The other pnpm sources need no ancestor scan: pnpmfiles are
+  // backstopped, and an alt root manifest only matters at the project root pnpm
+  // picks, already handled at repoDir.)
+  const ancestors = scanDirs(repoDir, workspaceRoot);
+  for (let i = 1; i < ancestors.length; i++) {
+    const reason = detectPnpmConfigDepsInDir(ancestors[i]!);
+    if (reason !== null) return reason;
+  }
+  return null;
+}
+
+/** The repoDir-only checks: pnpmfile variants + configDependencies + alt manifest. */
+function detectPnpmConfigInRepoDir(repoDir: string): string | null {
   // Default pnpmfile.  Only `.pnpmfile.cjs` (leading dot) is a pnpm default;
   // `pnpmfile.cjs` without the dot is NOT auto-loaded (verified) — do not flag it.
   if (existsSync(join(repoDir, '.pnpmfile.cjs'))) {
@@ -126,29 +222,86 @@ function detectPnpmfile(repoDir: string): string | null {
   return null;
 }
 
+/**
+ * ANCESTOR-only check: a `configDependencies` declaration in an ancestor
+ * `pnpm-workspace.yaml` or `package.json` `pnpm.configDependencies`.  pnpm
+ * discovers the workspace root by walking UP, so an ancestor declaration is
+ * fetched + extracted pre-trust (NOT suppressed by `--ignore-pnpmfile`).  We do
+ * NOT re-check the ancestor pnpmfile vectors (backstopped) here.  Unparseable
+ * ancestor config fails closed (cannot prove it declares no configDependencies).
+ */
+function detectPnpmConfigDepsInDir(dir: string): string | null {
+  const ws = tryReadFile(join(dir, 'pnpm-workspace.yaml'));
+  if (ws !== null) {
+    let parsed: unknown;
+    try {
+      parsed = parseYaml(ws);
+    } catch {
+      return `an ancestor (\`${dir}\`) unparseable \`pnpm-workspace.yaml\` (cannot prove no \`configDependencies\`)` + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && 'configDependencies' in parsed) {
+      return `an ancestor (\`${dir}\`) \`pnpm-workspace.yaml\` \`configDependencies\`` + PNPM_GUIDANCE;
+    }
+  }
+  const pkgJson = tryReadFile(join(dir, 'package.json'));
+  if (pkgJson !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(pkgJson) as unknown;
+    } catch {
+      return `an ancestor (\`${dir}\`) unparseable \`package.json\` (cannot prove no \`pnpm.configDependencies\`)` + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && isRecord(parsed['pnpm']) && 'configDependencies' in parsed['pnpm']) {
+      return `an ancestor (\`${dir}\`) \`package.json\` \`pnpm.configDependencies\`` + PNPM_GUIDANCE;
+    }
+  }
+  return null;
+}
+
 const YARN_GUIDANCE =
   ' executes repo-controlled code on the runner at `yarn install` startup, ' +
   'BEFORE the audit decides anything. `install: true` cannot run that pre-trust. ' +
   'Remove it, or audit without `install` (the sandbox still records it there).';
 
-function detectYarnStartupExec(repoDir: string): string | null {
+function detectYarnStartupExec(repoDir: string, workspaceRoot?: string): string | null {
+  // Berry walks UP from the install cwd and loads `.yarnrc.yml` from EACH
+  // ancestor dir at startup, so a `plugins:`/`yarnPath` in a parent rc within the
+  // checkout executes repo code pre-trust even when repoDir's own rc is clean.
+  // Scan every dir from repoDir up to (and including) the workspace root; the
+  // common repoDir===workspaceRoot case scans exactly repoDir (unchanged).
+  const repo = resolve(repoDir);
+  for (const dir of scanDirs(repoDir, workspaceRoot)) {
+    const reason = detectYarnStartupExecInDir(dir, dir === repo);
+    if (reason !== null) return reason;
+  }
+  return null;
+}
+
+/**
+ * Apply the yarn startup-exec checks to a SINGLE directory's `.yarnrc.yml`.
+ * `atRepoDir` controls whether the error message names the ancestor dir (for a
+ * clear diagnostic when the offending rc is NOT the repo's own).
+ */
+function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean): string | null {
   // Berry reads ONLY `.yarnrc.yml`; classic `.yarnrc` `yarn-path` is ignored
   // under corepack/Berry (verified), so it is not a vector and is not checked.
-  const content = tryReadFile(join(repoDir, '.yarnrc.yml'));
+  const content = tryReadFile(join(dir, '.yarnrc.yml'));
   if (content === null) return null;
+  // For an ancestor rc, name the dir so the user can find the offending file.
+  const where = atRepoDir ? 'a repo' : `an ancestor (\`${dir}\`)`;
   let parsed: unknown;
   try {
     parsed = parseYaml(content);
   } catch {
     // Present but unparseable: cannot prove it declares no startup exec. Fail closed.
-    return 'a present-but-unparseable `.yarnrc.yml` (cannot prove no `yarnPath`/`plugins`)' + YARN_GUIDANCE;
+    return `${where} present-but-unparseable \`.yarnrc.yml\` (cannot prove no \`yarnPath\`/\`plugins\`)` + YARN_GUIDANCE;
   }
   if (!isRecord(parsed)) return null; // empty / scalar yaml declares nothing
   if (typeof parsed['yarnPath'] === 'string' && parsed['yarnPath'].length > 0) {
-    return 'a repo `.yarnrc.yml` `yarnPath`' + YARN_GUIDANCE;
+    return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
   }
   if (Array.isArray(parsed['plugins']) && parsed['plugins'].length > 0) {
-    return 'a repo `.yarnrc.yml` `plugins` entry' + YARN_GUIDANCE;
+    return `${where} \`.yarnrc.yml\` \`plugins\` entry` + YARN_GUIDANCE;
   }
   // `enableConstraintsChecks` runs `yarn.config.cjs` via the install-time validate
   // hook — only when that config file actually exists (without it the hook
@@ -158,12 +311,14 @@ function detectYarnStartupExec(repoDir: string): string | null {
   // must not trip this gate.  Yarn coerces several representations to enabled
   // (true / "true" / 1 / "1"); rather than enumerate them, fail closed for
   // ANYTHING that is not DEFINITELY false (matches yarn's own behavior, which
-  // throws on unrecognized values — refusing is the safe direction).
+  // throws on unrecognized values — refusing is the safe direction).  Yarn
+  // resolves `yarn.config.cjs` from the rc's PROJECT ROOT (the dir holding the
+  // enabling rc), so check it in the SAME dir as the rc that enabled the hook.
   if (
     isNotDefinitelyFalse(parsed['enableConstraintsChecks']) &&
-    existsSync(join(repoDir, 'yarn.config.cjs'))
+    existsSync(join(dir, 'yarn.config.cjs'))
   ) {
-    return 'a repo `.yarnrc.yml` `enableConstraintsChecks` with a `yarn.config.cjs`' + YARN_GUIDANCE;
+    return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
   }
   return null;
 }

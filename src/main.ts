@@ -131,16 +131,18 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   }
 
   // Source of truth for "where is the user's repo?" is the SCRIPT_JAIL_REPO_DIR
-  // env var if set, then the action step's working-directory (process.cwd()),
-  // and only as a final fallback GITHUB_WORKSPACE.  GitHub Actions reserves
-  // GITHUB_WORKSPACE as a default environment variable and silently ignores
-  // step-level `env: GITHUB_WORKSPACE: …` overrides — so the e2e self-test
-  // workflow (which needs to point the action at a staged consumer dir under
-  // RUNNER_TEMP, not at the checkout) cannot use that mechanism.  Honoring
-  // `working-directory:` (which Actions DOES respect for JS actions by
-  // chdir-ing the spawned Node process) gives a reliable knob without
-  // introducing a new action input.  For ordinary consumers, the action's
-  // cwd equals GITHUB_WORKSPACE so behaviour is unchanged.
+  // env var if set, then process.cwd(), and only as a final fallback
+  // GITHUB_WORKSPACE.  For a `uses:` (JS) action the runner sets the process cwd
+  // to GITHUB_WORKSPACE and does NOT honor a step-level `working-directory:`
+  // (that applies only to `run:` shell steps — a JS action would have to
+  // process.chdir() itself, which we never do).  So for ordinary consumers
+  // process.cwd() === GITHUB_WORKSPACE and behaviour is unchanged.  GitHub
+  // Actions also reserves GITHUB_WORKSPACE as a default env var and silently
+  // ignores a step-level `env: GITHUB_WORKSPACE: …` override, so the e2e
+  // self-test workflow (which must point the action at a staged consumer dir
+  // under RUNNER_TEMP, not the checkout) cannot use that mechanism.
+  // SCRIPT_JAIL_REPO_DIR is the only knob that points the action at a different
+  // dir, and is the documented escape hatch used by the e2e workflow.
   const repoDir =
     process.env['SCRIPT_JAIL_REPO_DIR'] ??
     process.cwd() ??
@@ -223,8 +225,14 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     // inside the sandbox (audited by design), so the gate is install-only.  The
     // pnpm side has a robust host `--ignore-pnpmfile` backstop (host-install.ts);
     // this static reject is the clean early message + the sole enforcement for
-    // yarn (no yarn flag suppresses all three vectors).
-    const configExecReason = detectPreTrustConfigExec(repoDir, pm.manager);
+    // yarn (no yarn flag suppresses all three vectors).  When repoDir is a
+    // SUBDIRECTORY of the checkout (SCRIPT_JAIL_REPO_DIR pointing at a subdir),
+    // yarn Berry walks UP and loads an ANCESTOR `.yarnrc.yml plugins:`/`yarnPath`
+    // at startup; pass GITHUB_WORKSPACE as the bound so the preflight scans
+    // ancestor config up to (but never above) the checkout root.  For ordinary
+    // consumers repoDir === workspaceRoot, so this scans exactly repoDir.
+    const workspaceRoot = process.env['GITHUB_WORKSPACE'];
+    const configExecReason = detectPreTrustConfigExec(repoDir, pm.manager, workspaceRoot);
     if (configExecReason !== null) {
       process.stdout.write(
         `::error::script-jail: \`install: true\` refused — ${configExecReason}\n`,

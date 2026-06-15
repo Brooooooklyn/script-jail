@@ -6,15 +6,18 @@
 // install before any of that code can run on the runner.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { detectPreTrustConfigExec } from '../../src/action/install-preflight.js';
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'sj-preflight-'));
+  // realpathSync resolves the macOS /var -> /private/var symlink so the path
+  // equality checks in the ancestor-scan boundary logic match what callers see.
+  dir = realpathSync(mkdtempSync(join(tmpdir(), 'sj-preflight-')));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -23,6 +26,12 @@ afterEach(() => {
 const write = (rel: string, content: string): void => {
   const full = join(dir, rel);
   mkdirSync(join(full, '..'), { recursive: true });
+  writeFileSync(full, content);
+};
+
+/** Write `content` to an absolute path, creating parent dirs. */
+const writeAt = (full: string, content: string): void => {
+  mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, content);
 };
 
@@ -193,5 +202,189 @@ describe('detectPreTrustConfigExec — yarn (Berry)', () => {
   it('returns null for a clean Berry repo (benign .yarnrc.yml)', () => {
     write('.yarnrc.yml', 'nodeLinker: node-modules\nenableTelemetry: false\n');
     expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ancestor-rc scan (yarn Berry): when repoDir is a SUBDIRECTORY of the
+// workspace checkout, Yarn Berry walks UP parent dirs and loads `plugins:` /
+// `yarnPath` from an ANCESTOR `.yarnrc.yml` at startup — executing repo code on
+// the runner pre-trust.  The preflight scans every dir from repoDir up to and
+// INCLUDING workspaceRoot, but NEVER above it (parent dirs / ~ are runner-owned).
+// ---------------------------------------------------------------------------
+describe('detectPreTrustConfigExec — yarn ancestor .yarnrc.yml scan', () => {
+  it('blocks a plugins: entry in an ANCESTOR .yarnrc.yml within the workspace', () => {
+    // repoDir = <ws>/pkg ; the offending rc lives at <ws>/.yarnrc.yml.
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    const reason = detectPreTrustConfigExec(pkg, 'yarn', ws);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/plugins/);
+  });
+
+  it('blocks a yarnPath in an ANCESTOR .yarnrc.yml and names the ancestor dir', () => {
+    const ws = dir;
+    const pkg = join(ws, 'apps', 'web');
+    writeAt(join(ws, '.yarnrc.yml'), 'yarnPath: ./.evil-yarn.cjs\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"web"}');
+    const reason = detectPreTrustConfigExec(pkg, 'yarn', ws);
+    expect(reason).toMatch(/yarnPath/);
+    // The error should mention the ancestor dir (not repoDir) so the message is clear.
+    expect(reason).toContain(ws);
+  });
+
+  it('does NOT scan a .yarnrc.yml ABOVE the workspace root (out of PR scope)', () => {
+    // Layout: <root>/ws is the workspace; the offending rc is at <root>/.yarnrc.yml
+    // (above ws).  repoDir === ws.  Must never walk above workspaceRoot.
+    const root = dir;
+    const ws = join(root, 'ws');
+    writeAt(join(root, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    expect(detectPreTrustConfigExec(ws, 'yarn', ws)).toBeNull();
+  });
+
+  it('repoDir === workspaceRoot: ancestor-only rc absent → no false reject', () => {
+    const ws = dir;
+    writeAt(join(ws, '.yarnrc.yml'), 'nodeLinker: node-modules\n');
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    expect(detectPreTrustConfigExec(ws, 'yarn', ws)).toBeNull();
+  });
+
+  it('repoDir === workspaceRoot: an at-repoDir plugins rc still blocks (existing behavior preserved)', () => {
+    const ws = dir;
+    writeAt(join(ws, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    expect(detectPreTrustConfigExec(ws, 'yarn', ws)).toMatch(/plugins/);
+  });
+
+  it('repoDir OUTSIDE workspaceRoot (e2e-style): scans only repoDir, ignores rc above it', () => {
+    // repoDir is a consumer dir staged outside the checkout (RUNNER_TEMP).  An
+    // ancestor rc ABOVE the consumer dir is runner-owned and must NOT be inspected.
+    const consumerParent = join(dir, 'tmpx');
+    const consumer = join(consumerParent, 'consumer');
+    const checkout = join(dir, 'checkout');
+    writeAt(join(consumerParent, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    writeAt(join(consumer, 'package.json'), '{"name":"consumer"}');
+    writeAt(join(checkout, 'package.json'), '{"name":"checkout"}');
+    // consumer is NOT inside checkout → scan only consumer (which is clean).
+    expect(detectPreTrustConfigExec(consumer, 'yarn', checkout)).toBeNull();
+  });
+
+  it('repoDir OUTSIDE workspaceRoot: an rc AT repoDir still blocks', () => {
+    const consumer = join(dir, 'tmpx', 'consumer');
+    const checkout = join(dir, 'checkout');
+    writeAt(join(consumer, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    expect(detectPreTrustConfigExec(consumer, 'yarn', checkout)).toMatch(/plugins/);
+  });
+
+  it('workspaceRoot omitted/undefined: scans only repoDir (back-compat)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    // No workspaceRoot → behave exactly as before (scan only repoDir, which is clean).
+    expect(detectPreTrustConfigExec(pkg, 'yarn')).toBeNull();
+  });
+
+  it('ancestor enableConstraintsChecks + a yarn.config.cjs at the ancestor project root blocks', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'enableConstraintsChecks: true\n');
+    writeAt(join(ws, 'yarn.config.cjs'), 'module.exports = {}');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/enableConstraintsChecks/);
+  });
+
+  it('fails closed on an unparseable ANCESTOR .yarnrc.yml', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'yarnPath: : : [unbalanced\n  - {');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/unparseable/);
+  });
+
+  // Containment regression: a child directory whose NAME starts with ".." (e.g.
+  // "..pkg") yields a `relative(ws, repo)` of "..pkg/app".  A naive
+  // `startsWith('..')` containment check wrongly classifies that valid child as
+  // OUTSIDE the workspace and skips the PR-controlled ancestors — leaving the
+  // pre-trust startup-exec hole reachable.  It MUST be walked up to the workspace.
+  it('blocks an ancestor rc when repoDir is a child named "..pkg" (dot-dot-prefix containment)', () => {
+    const ws = dir;
+    const pkg = join(ws, '..pkg', 'app');
+    writeAt(join(ws, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"app"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/plugins/);
+  });
+
+  // Symlink: a symlinked repoDir must be resolved to its real path so the walk
+  // follows the ancestor chain Yarn actually reads on disk.
+  it('resolves a symlinked repoDir before walking, still reaching the workspace ancestor rc', () => {
+    const ws = dir;
+    const app = join(ws, 'real', 'app');
+    writeAt(join(ws, '.yarnrc.yml'), 'plugins:\n  - ./p.cjs\n');
+    writeAt(join(app, 'package.json'), '{"name":"app"}');
+    const link = join(ws, 'link');
+    symlinkSync(join(ws, 'real'), link); // <ws>/link -> <ws>/real
+    // repoDir given THROUGH the symlink; realpath => <ws>/real/app (under ws).
+    expect(detectPreTrustConfigExec(join(link, 'app'), 'yarn', ws)).toMatch(/plugins/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pnpm ancestor scan: configDependencies in an ANCESTOR pnpm-workspace.yaml /
+// package.json is fetched + extracted pre-trust (NOT suppressed by the host
+// `--ignore-pnpmfile` backstop, which only covers pnpmfile code-exec).  The
+// pnpmfile vectors themselves are fully backstopped and need no ancestor scan.
+// ---------------------------------------------------------------------------
+describe('detectPreTrustConfigExec — pnpm ancestor configDependencies scan', () => {
+  it('blocks configDependencies in an ANCESTOR pnpm-workspace.yaml within the workspace', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, 'pnpm-workspace.yaml'), 'configDependencies:\n  cfg: "1.0.0+sha512-deadbeef"\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toMatch(/configDependencies|pnpm-workspace\.yaml/);
+  });
+
+  it('blocks pnpm.configDependencies in an ANCESTOR package.json within the workspace', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, 'package.json'), JSON.stringify({ name: 'x', pnpm: { configDependencies: { cfg: '1.0.0+sha512-deadbeef' } } }));
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toMatch(/configDependencies|package\.json/);
+  });
+
+  it('does NOT block an ancestor .pnpmfile.cjs (host --ignore-pnpmfile backstops it)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.pnpmfile.cjs'), 'console.log("hi")');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toBeNull();
+  });
+
+  it('does NOT scan configDependencies ABOVE the workspace root', () => {
+    const root = dir;
+    const ws = join(root, 'ws');
+    writeAt(join(root, 'pnpm-workspace.yaml'), 'configDependencies:\n  cfg: "1.0.0+sha512-deadbeef"\n');
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    expect(detectPreTrustConfigExec(ws, 'pnpm', ws)).toBeNull();
+  });
+
+  it('pnpm with workspaceRoot omitted scans only repoDir (back-compat)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, 'pnpm-workspace.yaml'), 'configDependencies:\n  cfg: "1.0.0+sha512-deadbeef"\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm')).toBeNull();
+  });
+
+  // Same dot-dot-prefix containment regression as the yarn side: an ancestor
+  // configDependencies must still be found when repoDir is a child named "..pkg".
+  it('blocks ancestor configDependencies when repoDir is a child named "..pkg"', () => {
+    const ws = dir;
+    const pkg = join(ws, '..pkg', 'app');
+    writeAt(join(ws, 'pnpm-workspace.yaml'), 'configDependencies:\n  cfg: "1.0.0+sha512-deadbeef"\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"app"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toMatch(/configDependencies/);
   });
 });
