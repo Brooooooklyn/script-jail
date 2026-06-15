@@ -30567,11 +30567,14 @@ ${fetchDetail}
   let rootPkgKeys = /* @__PURE__ */ new Set();
   let canonicalRootKey = null;
   let hasRootPrepareScript = false;
+  let hasRootMainPassLifecycle = false;
   try {
     const rootManifest = JSON.parse((0, import_node_fs3.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
     ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
-    const prepare = rootManifest.scripts?.prepare;
-    hasRootPrepareScript = typeof prepare === "string" && prepare.length > 0;
+    const scripts = rootManifest.scripts ?? {};
+    const nonEmpty = (s) => typeof s === "string" && s.length > 0;
+    hasRootPrepareScript = nonEmpty(scripts.prepare);
+    hasRootMainPassLifecycle = nonEmpty(scripts.preinstall) || nonEmpty(scripts.install) || nonEmpty(scripts.postinstall);
   } catch {
   }
   const collectingEmitter = new Emitter(
@@ -30641,6 +30644,14 @@ ${fetchDetail}
   if (manager === "pnpm" && hasRootPrepareScript && canonicalRootKey === null) {
     emitter.emitError(
       "Root `prepare` script present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root `prepare` unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+  if ((manager === "npm" || manager === "pnpm") && hasRootMainPassLifecycle && canonicalRootKey === null) {
+    emitter.emitError(
+      "Root preinstall/install/postinstall script present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root lifecycle unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
       true
     );
     flushAndExit(input.connection.writable, 1);

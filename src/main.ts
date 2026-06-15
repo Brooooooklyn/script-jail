@@ -23,6 +23,7 @@ import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
 import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
+import { detectPreTrustConfigExec } from './action/install-preflight.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
@@ -210,6 +211,23 @@ export async function main(deps: MainDeps = {}): Promise<void> {
           `on process.platform/arch so the sandbox audits one branch while the runner executes the ` +
           `other, and the trusted lock would not describe what actually runs. Remove the spoof ` +
           `override (or set it to the runner's real platform/arch) when using \`install\`.\n`,
+      );
+      exitProcess(1);
+    }
+    // SECURITY: refuse install when the repo declares package-manager CONFIG
+    // that EXECUTES repo-controlled code on the runner during the pre-trust
+    // no-scripts host install (pnpm `.pnpmfile.cjs` / relocated pnpmfiles; yarn
+    // `.yarnrc.yml` yarnPath / plugins / constraints).  `--ignore-scripts` /
+    // `--mode=skip-build` do NOT stop these config hooks, and host part-1 runs
+    // BEFORE the trust gate.  In pure-audit mode (install off) these run only
+    // inside the sandbox (audited by design), so the gate is install-only.  The
+    // pnpm side has a robust host `--ignore-pnpmfile` backstop (host-install.ts);
+    // this static reject is the clean early message + the sole enforcement for
+    // yarn (no yarn flag suppresses all three vectors).
+    const configExecReason = detectPreTrustConfigExec(repoDir, pm.manager);
+    if (configExecReason !== null) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` refused — ${configExecReason}\n`,
       );
       exitProcess(1);
     }

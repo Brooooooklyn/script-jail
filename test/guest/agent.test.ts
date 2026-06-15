@@ -1827,6 +1827,140 @@ describe('agent main() root-prepare second pass', () => {
     expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
     expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
   });
+
+  // --- FIX 3: nameless root + preinstall/install/postinstall → fail closed -----
+  // The MAIN Phase-B command runs the ROOT's preinstall/install/postinstall for
+  // npm (`npm rebuild --foreground-scripts`) and pnpm (`pnpm rebuild --pending`).
+  // On a nameless root npm_package_name is UNSET, so attribution returns null and
+  // the dispatcher DROPS those events → a deceptively-clean lock.  A npm/pnpm gate
+  // must fire BEFORE the main install runs.  (Same class as the prepare gates,
+  // reached through postinstall/preinstall/install instead.)
+  for (const manager of ['npm', 'pnpm'] as const) {
+    for (const lifecycle of ['postinstall', 'preinstall', 'install'] as const) {
+      it(`FAILS CLOSED (fatal, no lockfile) for ${manager} when the root has a \`${lifecycle}\` but no \`name\``, async () => {
+        const { conn, hostSend, getOutput } = makeConn();
+        const configPath = writeConfig(testDir, { manager });
+        // Nameless root (only a version) + a real main-pass lifecycle script →
+        // canonicalRootKey === null, and the main install would run it UNAUDITED.
+        writeRootPkg(testDir, { version: '1.0.0', scripts: { [lifecycle]: 'node hook.js' } });
+
+        const main_ = recordingEventStrace('MAINPROG');
+
+        const origExit = process.exit.bind(process);
+        let exitedWith: number | string | undefined;
+        // @ts-expect-error — patching process.exit for test
+        process.exit = (code?: number | string) => { exitedWith = code; };
+
+        setTimeout(() => hostSend('go\n'), 10);
+        try {
+          await main({
+            configPath,
+            connection: conn,
+            spawner: mockSpawner().spawner,
+            strace: main_.runner,
+            dnsLookup: offlineLookup,
+          });
+          await new Promise<void>((r) => setImmediate(r));
+        } finally {
+          process.exit = origExit;
+        }
+
+        const lines = getOutput().split('\n').filter((l) => l.trim());
+        const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+        // Fatal error naming the missing root `name`; no lockfile; exit 1.
+        const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+        expect(fatal).toBeDefined();
+        expect(String(fatal!['message'])).toMatch(/preinstall\/install\/postinstall/);
+        expect(String(fatal!['message'])).toMatch(/no usable `name`/);
+        expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+        // The gate fires BEFORE the main install pass runs the root lifecycle.
+        expect(main_.calls).toHaveLength(0);
+        expect(exitedWith).toBe(1);
+      });
+    }
+  }
+
+  it('yarn NAMELESS root + postinstall → still produces a lockfile (gate is npm/pnpm-only)', async () => {
+    // yarn (Berry) SYNTHESIZES an npm_package_name for the root, so its
+    // lifecycle events are NOT silently dropped (they surface / fail the
+    // pkgDir lookup).  The FIX-3 main-pass gate is scoped to npm+pnpm; gating
+    // yarn would FALSELY block a nameless yarn root whose lifecycle is benign.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'yarn' });
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { postinstall: 'node hook.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The new gate did NOT fire: main install ran, lockfile emitted, no fatal.
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  it('NAMED root + postinstall → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → canonicalRootKey is set, the main-pass gate does NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0', scripts: { postinstall: 'node hook.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  it('NAMELESS root with only a NON-lifecycle script (build) → still produces a lockfile', async () => {
+    // The gate keys off preinstall/install/postinstall specifically — a nameless
+    // root whose only script is an arbitrary `build` (never run by the main pass)
+    // must NOT be blocked.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { build: 'tsc' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
 });
 
 describe('buildChildEnv protected-env-names length gate', () => {

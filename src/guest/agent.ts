@@ -3263,15 +3263,24 @@ export async function main(input: AgentInput): Promise<void> {
   // (which is unconditionally non-null for npm).  Otherwise a perfectly benign
   // nameless npm root with no `prepare` would be wrongly blocked.
   let hasRootPrepareScript = false;
+  // Whether the ROOT manifest declares a non-empty preinstall / install /
+  // postinstall.  The MAIN Phase-B command runs THESE on the ROOT for npm
+  // (`npm rebuild --foreground-scripts`) and pnpm (`pnpm rebuild --pending`) —
+  // verified npm 11.13 / pnpm 10.34+11.1 run all three on a nameless root with
+  // npm_package_name UNSET.  Drives the nameless-root main-pass gate below.
+  let hasRootMainPassLifecycle = false;
   try {
     const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as {
       name?: unknown;
       version?: unknown;
-      scripts?: { prepare?: unknown };
+      scripts?: { prepare?: unknown; preinstall?: unknown; install?: unknown; postinstall?: unknown };
     };
     ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
-    const prepare = rootManifest.scripts?.prepare;
-    hasRootPrepareScript = typeof prepare === 'string' && prepare.length > 0;
+    const scripts = rootManifest.scripts ?? {};
+    const nonEmpty = (s: unknown): boolean => typeof s === 'string' && s.length > 0;
+    hasRootPrepareScript = nonEmpty(scripts.prepare);
+    hasRootMainPassLifecycle =
+      nonEmpty(scripts.preinstall) || nonEmpty(scripts.install) || nonEmpty(scripts.postinstall);
   } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
 
   // Wrap the emitter to also collect events for normalize.
@@ -3408,6 +3417,42 @@ export async function main(input: AgentInput): Promise<void> {
         'its audited events cannot be attributed and would be silently dropped, ' +
         'leaving the root `prepare` unaudited. Refusing to emit a lockfile ' +
         '(add a `name` to the root package.json).',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+
+  // FAIL CLOSED (npm/pnpm) — nameless-root unaudited preinstall/install/postinstall.
+  //
+  // The MAIN Phase-B install runs the ROOT project's preinstall/install/
+  // postinstall scripts: npm `npm rebuild --foreground-scripts` and pnpm
+  // `pnpm rebuild --pending` BOTH do (verified npm 11.13 / pnpm 10.34+11.1 — all
+  // three fire on a nameless root, npm_package_name UNSET).  With no usable
+  // `name` (canonicalRootKey === null) attributionFromEnvVars returns null, so
+  // the dispatcher DROPS every non-spawn event from those scripts at its
+  // null-attribution gate — the root lifecycle runs UNAUDITED, the lock looks
+  // clean, and with `install: true` host part-2 then runs those same scripts on
+  // the runner trusting that clean lock.  Refuse to emit a lockfile.  This is the
+  // same unaudited-nameless-root class the prepare gates (above + 11a) close,
+  // reached through preinstall/install/postinstall instead of prepare.
+  //
+  // Scope: npm + pnpm ONLY.  yarn (Berry) SYNTHESIZES an npm_package_name
+  // (`root-workspace-<hash>`) for the root, so its lifecycle events are NOT
+  // dropped (they surface, or fail the normalize pkgDir lookup) — gating yarn
+  // here would FALSELY block a nameless yarn root whose benign lifecycle emitted
+  // no escaping events.  Fires BEFORE the main install pass, same fatal shape as
+  // the pnpm prepare gate above.
+  if (
+    (manager === 'npm' || manager === 'pnpm') &&
+    hasRootMainPassLifecycle &&
+    canonicalRootKey === null
+  ) {
+    emitter.emitError(
+      'Root preinstall/install/postinstall script present but root package.json ' +
+        'has no usable `name` — its audited events cannot be attributed and would ' +
+        'be silently dropped, leaving the root lifecycle unaudited. Refusing to ' +
+        'emit a lockfile (add a `name` to the root package.json).',
       true,
     );
     flushAndExit(input.connection.writable, 1);

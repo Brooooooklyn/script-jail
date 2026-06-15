@@ -52,7 +52,7 @@ describe('hostInstallNoScripts (part 1)', () => {
 
   it.each([
     ['npm', ['ci', '--ignore-scripts']],
-    ['pnpm', ['install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store']],
+    ['pnpm', ['install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store', '--ignore-pnpmfile']],
     ['yarn', ['install', '--immutable', '--mode=skip-build']],
   ] as const)('uses the correct no-scripts base command for %s', (pm, base) => {
     const rec = makeRecorder();
@@ -68,13 +68,30 @@ describe('hostInstallNoScripts (part 1)', () => {
     hostInstallNoScripts('pnpm', '/myrepo', ['--omit=dev'], rec.io, okSpawn(rec));
     expect(rec.calls[0]!.args).toEqual([
       'install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false',
-      '--omit=dev', '--store-dir=/myrepo/.pnpm-store',
+      '--omit=dev', '--store-dir=/myrepo/.pnpm-store', '--ignore-pnpmfile',
     ]);
     // npm / yarn never get a --store-dir flag.
     for (const pm of ['npm', 'yarn'] as const) {
       const r = makeRecorder();
       hostInstallNoScripts(pm, '/myrepo', [], r.io, okSpawn(r));
       expect(r.calls[0]!.args.some((a) => a.startsWith('--store-dir'))).toBe(false);
+    }
+  });
+
+  it('hardens the pnpm host part-1 with --ignore-pnpmfile; npm/yarn get no such flag', () => {
+    // SECURITY: pnpm executes a repo `.pnpmfile.cjs` (and relocated pnpmfiles) at
+    // require-time during a no-scripts install, BEFORE the trust gate.
+    // `--ignore-pnpmfile` is the robust host-only catch-all (a no-op for clean
+    // repos, checksum-fail-closed for a committed pnpmfile).  Only pnpm gets it.
+    const rec = makeRecorder();
+    hostInstallNoScripts('pnpm', '/repo', [], rec.io, okSpawn(rec));
+    expect(rec.calls[0]!.args).toContain('--ignore-pnpmfile');
+    // It is the LAST flag (appended after the store-dir pin).
+    expect(rec.calls[0]!.args.at(-1)).toBe('--ignore-pnpmfile');
+    for (const pm of ['npm', 'yarn'] as const) {
+      const r = makeRecorder();
+      hostInstallNoScripts(pm, '/repo', [], r.io, okSpawn(r));
+      expect(r.calls[0]!.args).not.toContain('--ignore-pnpmfile');
     }
   });
 

@@ -12,6 +12,8 @@
 //   install: false (default)        → neither runs (audit only)
 
 import { describe, it, expect } from 'vitest';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { setUpConsumer, fakeVmFactory, runMain, type FixtureName } from './harness.js';
 import type { MainDeps } from '../../src/main.js';
@@ -300,5 +302,65 @@ describe.sequential('e2e: drop-in install gating', () => {
     expect(result.exit).toBeNull(); // clean match, gate passes
     expect(cap.installCalls).toEqual([{ pm: 'npm', args: [] }]);
     expect(cap.runCalls).toEqual([{ pm: 'npm' }]);
+  });
+
+  // --- pre-trust config-exec gate: pnpm pnpmfile / yarn .yarnrc.yml ---------
+  // Some package managers EXECUTE repo-controlled config during the no-scripts
+  // host install (host part-1), which runs BEFORE the trust gate.  main() must
+  // refuse `install: true` before any host install when such config is present.
+
+  it('install + pnpm with a .pnpmfile.cjs → fail-closed before any install, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'pnpm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    // A repo pnpmfile would run unaudited on the runner during part 1.
+    writeFileSync(join(consumer.consumerDir, '.pnpmfile.cjs'), 'module.exports = {}\n', 'utf8');
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/\.pnpmfile\.cjs/);
+    expect(cap.installCalls).toHaveLength(0); // exited before part 1
+    expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + yarn with a .yarnrc.yml yarnPath → fail-closed before any install, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'yarn', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    // A repo yarnPath re-execs a repo binary at `yarn install` startup.
+    writeFileSync(join(consumer.consumerDir, '.yarnrc.yml'), 'yarnPath: ./.evil-yarn.cjs\n', 'utf8');
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/yarnPath/);
+    expect(cap.installCalls).toHaveLength(0);
+    expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + pnpm with NO pnpmfile → allowed (both halves run)', async () => {
+    // No-over-fire: a clean pnpm repo (no pnpmfile / relocation) must still run.
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'pnpm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toBeNull();
+    expect(cap.installCalls).toEqual([{ pm: 'pnpm', args: [] }]);
+    expect(cap.runCalls).toEqual([{ pm: 'pnpm' }]);
   });
 });

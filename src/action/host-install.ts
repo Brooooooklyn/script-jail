@@ -193,14 +193,26 @@ export function hostInstallNoScripts(
     );
   }
   const base = FETCH_CMD[pm];
+  // SECURITY (host part-1 ONLY): pnpm executes a repo `.pnpmfile.cjs` (and
+  // config-relocated pnpmfiles) at `require` time during `pnpm install
+  // --ignore-scripts`, BEFORE the trust gate — `--ignore-scripts` does NOT stop
+  // it.  `--ignore-pnpmfile` is a robust catch-all (no path-enumeration gap) that
+  // suppresses EVERY pnpmfile variant; for a repo that legitimately ships a
+  // pnpmfile its committed `pnpmfileChecksum` then makes this `--frozen-lockfile`
+  // install abort (fail closed).  This is a HOST-ONLY deviation from the shared
+  // FETCH_CMD: the SANDBOX fetch keeps the pnpmfile so the hook is AUDITED there
+  // (the enforcement boundary).  Repos that ship a pnpmfile are already refused
+  // install upstream (install-preflight.ts), so for the clean repos that reach
+  // here this flag is a no-op and the host/sandbox trees still match byte-for-byte.
+  const hostHardening = pm === 'pnpm' ? ['--ignore-pnpmfile'] : [];
   // Order mirrors the guest fetch phase: <fixed args> <user args> <store-dir>.
   // The pnpm `--store-dir` pin is appended last so the host links against the
   // same repo-local store the audited sandbox used (see pnpmStoreDirArg).
-  const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir)];
+  const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   // SECURITY: safeDisplayArgs is used for the banner AND error messages.  It
   // contains ONLY the fixed base args + store-dir (no user-supplied tokens).
   // A count-only suffix documents that user args exist without echoing them.
-  const safeBaseArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir)];
+  const safeBaseArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   const userArgSuffix =
     kept.length > 0
       ? ` (+${kept.length} user install arg${kept.length === 1 ? '' : 's'}, not shown)`
