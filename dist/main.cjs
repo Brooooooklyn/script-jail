@@ -26672,8 +26672,15 @@ function resolveGitFromPath() {
   }
   return void 0;
 }
-function hostInstallEnv() {
-  return { ...process.env, npm_config_git: trustedGitPath() };
+function hostInstallEnv(pm) {
+  const env = { ...process.env, npm_config_git: trustedGitPath() };
+  if (pm === "yarn") {
+    env["YARN_IGNORE_PATH"] = "1";
+    env["YARN_RC_FILENAME"] = ".yarnrc.yml";
+    env["YARN_PLUGINS"] = "";
+    env["YARN_ENABLE_CONSTRAINTS_CHECKS"] = "false";
+  }
+  return env;
 }
 var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
 var captureSpawn = (cmd, args, cwd, env) => {
@@ -26724,7 +26731,7 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = captureSpawn) {
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(), spawn2, "no-scripts install", io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn2, "no-scripts install", io, safeDisplayArgs, onOutput);
 }
 function redactCaptured(text, sensitive) {
   let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");
@@ -26736,7 +26743,7 @@ function hostRunScripts(pm, repoDir, io, spawn2 = inheritSpawn) {
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
 `);
-  runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(), spawn2, "lifecycle-script run", io, finalArgs);
+  runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn2, "lifecycle-script run", io, finalArgs);
 }
 function runOrThrow(cmd, args, cwd, env, spawn2, label, io, displayArgs, onOutput) {
   const r = spawn2(cmd, args, cwd, env);
@@ -26786,6 +26793,21 @@ function detectPnpmfile(repoDir) {
     }
     if (isRecord(parsed) && ("pnpmfile" in parsed || "configDependencies" in parsed)) {
       return "a repo `pnpm-workspace.yaml` `pnpmfile`/`configDependencies`" + PNPM_GUIDANCE;
+    }
+  }
+  const pkgJson = tryReadFile((0, import_node_path3.join)(repoDir, "package.json"));
+  if (pkgJson !== null) {
+    let parsed;
+    try {
+      parsed = JSON.parse(pkgJson);
+    } catch {
+      return "an unparseable root `package.json` (cannot prove no `pnpm.configDependencies`)" + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && isRecord(parsed["pnpm"])) {
+      const pnpmField = parsed["pnpm"];
+      if ("configDependencies" in pnpmField || "pnpmfile" in pnpmField) {
+        return "a repo `package.json` `pnpm.configDependencies`/`pnpm.pnpmfile`" + PNPM_GUIDANCE;
+      }
     }
   }
   return null;

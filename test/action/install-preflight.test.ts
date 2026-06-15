@@ -77,6 +77,26 @@ describe('detectPreTrustConfigExec — pnpm', () => {
     expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/unparseable/);
   });
 
+  it('blocks a package.json pnpm.configDependencies (pnpm 10 fetch/extract vector)', () => {
+    write('package.json', JSON.stringify({ name: 'x', pnpm: { configDependencies: { 'my-cfg': '1.0.0+sha512-deadbeef' } } }));
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/package\.json/);
+  });
+
+  it('blocks a package.json pnpm.pnpmfile (defense in depth)', () => {
+    write('package.json', JSON.stringify({ name: 'x', pnpm: { pnpmfile: './evil.cjs' } }));
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/package\.json/);
+  });
+
+  it('fails closed on an unparseable package.json', () => {
+    write('package.json', '{ not: valid json ');
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/unparseable root .package\.json/);
+  });
+
+  it('does NOT block a package.json with a benign pnpm block', () => {
+    write('package.json', JSON.stringify({ name: 'x', pnpm: { onlyBuiltDependencies: ['esbuild'] } }));
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toBeNull();
+  });
+
   it('returns null for a clean pnpm repo (lock + plain workspace, no hooks)', () => {
     write('package.json', '{"name":"x"}');
     write('pnpm-workspace.yaml', 'packages:\n  - "pkgs/*"\n');

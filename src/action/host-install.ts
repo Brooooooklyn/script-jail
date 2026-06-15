@@ -88,11 +88,36 @@ function resolveGitFromPath(): string | undefined {
 
 /**
  * Child env for the host PM spawns: the inherited environment plus the
- * `npm_config_git` pin (see the security note above).  MERGES over
- * `process.env` so PATH / HOME / registry auth are preserved.
+ * `npm_config_git` pin (see the security note above) and, for yarn, the
+ * startup-exec env neutralizers below.  MERGES over `process.env` so PATH /
+ * HOME / registry auth are preserved.
+ *
+ * SECURITY (yarn): Yarn Berry maps env vars to config, so an INHERITED `YARN_*`
+ * can re-introduce exactly the startup code-exec the preflight blocks in
+ * `.yarnrc.yml`:
+ *   * `YARN_YARN_PATH` re-execs a repo binary as "yarn",
+ *   * `YARN_PLUGINS` loads a repo module at startup,
+ *   * `YARN_RC_FILENAME` redirects yarn to an ALTERNATE repo rc that declares
+ *     yarnPath/plugins — dodging the preflight, which inspects only `.yarnrc.yml`,
+ *   * `YARN_ENABLE_CONSTRAINTS_CHECKS` runs a repo `yarn.config.cjs`.
+ * The host process inherits `process.env`, so we override these four on the yarn
+ * child to neutralize every vector (verified against Yarn Berry 4.x).  Registry
+ * auth flows through UNRELATED keys (`YARN_NPM_AUTH_TOKEN` /
+ * `YARN_NPM_REGISTRY_SERVER`) and is preserved.  This mirrors the `npm_config_git`
+ * pin (a config-redirect defense) and is HOST-ONLY: the SANDBOX keeps repo config
+ * so the hooks are AUDITED there (the enforcement boundary).  `YARN_IGNORE_PATH=1`
+ * kills yarnPath from BOTH the file and the env; `YARN_RC_FILENAME` is forced to
+ * the preflight-vetted default so an env redirect cannot dodge the static reject.
  */
-function hostInstallEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, npm_config_git: trustedGitPath() };
+function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, npm_config_git: trustedGitPath() };
+  if (pm === 'yarn') {
+    env['YARN_IGNORE_PATH'] = '1';
+    env['YARN_RC_FILENAME'] = '.yarnrc.yml';
+    env['YARN_PLUGINS'] = '';
+    env['YARN_ENABLE_CONSTRAINTS_CHECKS'] = 'false';
+  }
+  return env;
 }
 
 /** Minimal sink so the module is testable without touching the real streams. */
@@ -235,7 +260,7 @@ export function hostInstallNoScripts(
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
 }
 
 /** Mask user-arg values first (exact), then catch credential SHAPES. */
@@ -261,7 +286,7 @@ export function hostRunScripts(
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
   // hostRunScripts has no user args — finalArgs is credential-free, safe as displayArgs.
-  runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(), spawn, 'lifecycle-script run', io, finalArgs);
+  runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn, 'lifecycle-script run', io, finalArgs);
 }
 
 /**

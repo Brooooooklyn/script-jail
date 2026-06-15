@@ -1881,6 +1881,75 @@ describe('agent main() root-prepare second pass', () => {
     }
   }
 
+  // pnpm `pnpm rebuild --pending` runs MORE root lifecycles than npm: prepublish
+  // (pnpm 10) and prerebuild/rebuild/postrebuild (pnpm 11) — all nameless-unaudited.
+  // The pnpm gate must cover the full union.
+  for (const lifecycle of ['prepublish', 'prerebuild', 'rebuild', 'postrebuild'] as const) {
+    it(`FAILS CLOSED for pnpm when the root has a \`${lifecycle}\` but no \`name\``, async () => {
+      const { conn, hostSend, getOutput } = makeConn();
+      const configPath = writeConfig(testDir, { manager: 'pnpm' });
+      writeRootPkg(testDir, { version: '1.0.0', scripts: { [lifecycle]: 'node hook.js' } });
+
+      const main_ = recordingEventStrace('MAINPROG');
+
+      const origExit = process.exit.bind(process);
+      let exitedWith: number | string | undefined;
+      // @ts-expect-error — patching process.exit for test
+      process.exit = (code?: number | string) => { exitedWith = code; };
+
+      setTimeout(() => hostSend('go\n'), 10);
+      try {
+        await main({
+          configPath,
+          connection: conn,
+          spawner: mockSpawner().spawner,
+          strace: main_.runner,
+          dnsLookup: offlineLookup,
+        });
+        await new Promise<void>((r) => setImmediate(r));
+      } finally {
+        process.exit = origExit;
+      }
+
+      const lines = getOutput().split('\n').filter((l) => l.trim());
+      const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+      const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+      expect(fatal).toBeDefined();
+      expect(String(fatal!['message'])).toMatch(/no usable `name`/);
+      expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+      expect(main_.calls).toHaveLength(0); // gate fires before the main install pass
+      expect(exitedWith).toBe(1);
+    });
+  }
+
+  it('npm NAMELESS root with only a `prepublish` → still produces a lockfile (npm rebuild does not run it)', async () => {
+    // No-over-fire: `npm rebuild --foreground-scripts` does NOT run root prepublish
+    // (only pnpm does), so the npm gate must not block a nameless npm root that
+    // merely declares prepublish.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { prepublish: 'node hook.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
   it('yarn NAMELESS root + postinstall → still produces a lockfile (gate is npm/pnpm-only)', async () => {
     // yarn (Berry) SYNTHESIZES an npm_package_name for the root, so its
     // lifecycle events are NOT silently dropped (they surface / fail the

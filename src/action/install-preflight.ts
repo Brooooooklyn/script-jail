@@ -86,6 +86,28 @@ function detectPnpmfile(repoDir: string): string | null {
       return 'a repo `pnpm-workspace.yaml` `pnpmfile`/`configDependencies`' + PNPM_GUIDANCE;
     }
   }
+  // Root `package.json` `pnpm.configDependencies` (pnpm 10) injects an
+  // attacker-published config package that pnpm FETCHES + extracts during the
+  // install — BEFORE the trust gate, and NOT suppressed by `--ignore-pnpmfile`
+  // (the fetch/extract happens in config bootstrap, outside that guard; on pnpm
+  // 10 even `--frozen-lockfile` is no defense).  `pnpm.pnpmfile` is not honored
+  // from package.json on current pnpm, but is rejected for defense in depth.
+  const pkgJson = tryReadFile(join(repoDir, 'package.json'));
+  if (pkgJson !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(pkgJson) as unknown;
+    } catch {
+      // Unparseable root package.json: cannot prove it declares no pnpm config. Fail closed.
+      return 'an unparseable root `package.json` (cannot prove no `pnpm.configDependencies`)' + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && isRecord(parsed['pnpm'])) {
+      const pnpmField = parsed['pnpm'];
+      if ('configDependencies' in pnpmField || 'pnpmfile' in pnpmField) {
+        return 'a repo `package.json` `pnpm.configDependencies`/`pnpm.pnpmfile`' + PNPM_GUIDANCE;
+      }
+    }
+  }
   return null;
 }
 

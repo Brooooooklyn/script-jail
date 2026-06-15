@@ -30574,7 +30574,7 @@ ${fetchDetail}
     const scripts = rootManifest.scripts ?? {};
     const nonEmpty = (s) => typeof s === "string" && s.length > 0;
     hasRootPrepareScript = nonEmpty(scripts.prepare);
-    hasRootMainPassLifecycle = nonEmpty(scripts.preinstall) || nonEmpty(scripts.install) || nonEmpty(scripts.postinstall);
+    hasRootMainPassLifecycle = nonEmpty(scripts.preinstall) || nonEmpty(scripts.install) || nonEmpty(scripts.postinstall) || manager === "pnpm" && (nonEmpty(scripts.prepublish) || nonEmpty(scripts.prerebuild) || nonEmpty(scripts.rebuild) || nonEmpty(scripts.postrebuild));
   } catch {
   }
   const collectingEmitter = new Emitter(
@@ -30651,7 +30651,7 @@ ${fetchDetail}
   }
   if ((manager === "npm" || manager === "pnpm") && hasRootMainPassLifecycle && canonicalRootKey === null) {
     emitter.emitError(
-      "Root preinstall/install/postinstall script present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root lifecycle unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
+      "Root install-time lifecycle script (preinstall/install/postinstall, or for pnpm also prepublish/rebuild) present but root package.json has no usable `name` \u2014 its audited events cannot be attributed and would be silently dropped, leaving the root lifecycle unaudited. Refusing to emit a lockfile (add a `name` to the root package.json).",
       true
     );
     flushAndExit(input.connection.writable, 1);

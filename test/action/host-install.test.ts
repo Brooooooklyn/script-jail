@@ -78,6 +78,48 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
+  it('neutralizes yarn startup-exec env on the host child; npm/pnpm get none; auth env preserved', () => {
+    // SECURITY: an inherited YARN_* (YARN_YARN_PATH / YARN_PLUGINS / YARN_RC_FILENAME /
+    // YARN_ENABLE_CONSTRAINTS_CHECKS) would re-introduce the startup code-exec the
+    // preflight blocks in .yarnrc.yml.  The host yarn child overrides all four;
+    // registry-auth env (YARN_NPM_*) is preserved.
+    function envCapture(): { spawn: HostSpawn; env: () => NodeJS.ProcessEnv } {
+      let seen: NodeJS.ProcessEnv = {};
+      return { spawn: (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; }, env: () => seen };
+    }
+
+    const prevAuth = process.env['YARN_NPM_AUTH_TOKEN'];
+    process.env['YARN_NPM_AUTH_TOKEN'] = 'tok-preserve-me';
+    try {
+      // yarn part 1: all four neutralizers set, auth preserved.
+      const y1 = envCapture();
+      hostInstallNoScripts('yarn', '/repo', [], makeRecorder().io, y1.spawn);
+      expect(y1.env()['YARN_IGNORE_PATH']).toBe('1');
+      expect(y1.env()['YARN_RC_FILENAME']).toBe('.yarnrc.yml');
+      expect(y1.env()['YARN_PLUGINS']).toBe('');
+      expect(y1.env()['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBe('false');
+      expect(y1.env()['YARN_NPM_AUTH_TOKEN']).toBe('tok-preserve-me'); // auth survives
+
+      // yarn part 2 (run-scripts) is hardened identically.
+      const y2 = envCapture();
+      hostRunScripts('yarn', '/repo', makeRecorder().io, y2.spawn);
+      expect(y2.env()['YARN_IGNORE_PATH']).toBe('1');
+      expect(y2.env()['YARN_PLUGINS']).toBe('');
+
+      // npm / pnpm never get the yarn neutralizers (these keys are our additions).
+      for (const pm of ['npm', 'pnpm'] as const) {
+        const c = envCapture();
+        hostInstallNoScripts(pm, '/repo', [], makeRecorder().io, c.spawn);
+        expect(c.env()['YARN_RC_FILENAME']).toBeUndefined();
+        expect(c.env()['YARN_PLUGINS']).toBeUndefined();
+        expect(c.env()['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBeUndefined();
+      }
+    } finally {
+      if (prevAuth === undefined) delete process.env['YARN_NPM_AUTH_TOKEN'];
+      else process.env['YARN_NPM_AUTH_TOKEN'] = prevAuth;
+    }
+  });
+
   it('hardens the pnpm host part-1 with --ignore-pnpmfile; npm/yarn get no such flag', () => {
     // SECURITY: pnpm executes a repo `.pnpmfile.cjs` (and relocated pnpmfiles) at
     // require-time during a no-scripts install, BEFORE the trust gate.

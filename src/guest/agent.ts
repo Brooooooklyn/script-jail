@@ -3263,24 +3263,38 @@ export async function main(input: AgentInput): Promise<void> {
   // (which is unconditionally non-null for npm).  Otherwise a perfectly benign
   // nameless npm root with no `prepare` would be wrongly blocked.
   let hasRootPrepareScript = false;
-  // Whether the ROOT manifest declares a non-empty preinstall / install /
-  // postinstall.  The MAIN Phase-B command runs THESE on the ROOT for npm
-  // (`npm rebuild --foreground-scripts`) and pnpm (`pnpm rebuild --pending`) —
-  // verified npm 11.13 / pnpm 10.34+11.1 run all three on a nameless root with
-  // npm_package_name UNSET.  Drives the nameless-root main-pass gate below.
+  // Whether the ROOT manifest declares a non-empty lifecycle script that the
+  // MAIN Phase-B command runs on the ROOT.  npm `npm rebuild --foreground-scripts`
+  // runs ONLY preinstall/install/postinstall.  pnpm `pnpm rebuild --pending`
+  // ADDITIONALLY runs prepublish (pnpm 10) and prerebuild/rebuild/postrebuild
+  // (pnpm 11) — verified by an exhaustive 24-candidate probe across pnpm 10.34 +
+  // 11.1, all firing with npm_package_name UNSET on a nameless root.  The sandbox
+  // pnpm floats to the repo's `packageManager`, so the gate must cover the UNION
+  // of both pnpm versions.  `prepare` is gated separately (npm/yarn dedicated
+  // pass; pnpm main-pass prepare gate above).  Drives the nameless-root gate below.
   let hasRootMainPassLifecycle = false;
   try {
     const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as {
       name?: unknown;
       version?: unknown;
-      scripts?: { prepare?: unknown; preinstall?: unknown; install?: unknown; postinstall?: unknown };
+      scripts?: {
+        prepare?: unknown; preinstall?: unknown; install?: unknown; postinstall?: unknown;
+        prepublish?: unknown; prerebuild?: unknown; rebuild?: unknown; postrebuild?: unknown;
+      };
     };
     ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
     const scripts = rootManifest.scripts ?? {};
     const nonEmpty = (s: unknown): boolean => typeof s === 'string' && s.length > 0;
     hasRootPrepareScript = nonEmpty(scripts.prepare);
     hasRootMainPassLifecycle =
-      nonEmpty(scripts.preinstall) || nonEmpty(scripts.install) || nonEmpty(scripts.postinstall);
+      nonEmpty(scripts.preinstall) ||
+      nonEmpty(scripts.install) ||
+      nonEmpty(scripts.postinstall) ||
+      (manager === 'pnpm' &&
+        (nonEmpty(scripts.prepublish) ||
+          nonEmpty(scripts.prerebuild) ||
+          nonEmpty(scripts.rebuild) ||
+          nonEmpty(scripts.postrebuild)));
   } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
 
   // Wrap the emitter to also collect events for normalize.
@@ -3423,19 +3437,21 @@ export async function main(input: AgentInput): Promise<void> {
     return;
   }
 
-  // FAIL CLOSED (npm/pnpm) — nameless-root unaudited preinstall/install/postinstall.
+  // FAIL CLOSED (npm/pnpm) — nameless-root unaudited main-pass lifecycle scripts.
   //
-  // The MAIN Phase-B install runs the ROOT project's preinstall/install/
-  // postinstall scripts: npm `npm rebuild --foreground-scripts` and pnpm
-  // `pnpm rebuild --pending` BOTH do (verified npm 11.13 / pnpm 10.34+11.1 — all
-  // three fire on a nameless root, npm_package_name UNSET).  With no usable
-  // `name` (canonicalRootKey === null) attributionFromEnvVars returns null, so
-  // the dispatcher DROPS every non-spawn event from those scripts at its
+  // The MAIN Phase-B install runs ROOT lifecycle scripts: npm
+  // `npm rebuild --foreground-scripts` runs preinstall/install/postinstall; pnpm
+  // `pnpm rebuild --pending` runs those PLUS prepublish (pnpm 10) and
+  // prerebuild/rebuild/postrebuild (pnpm 11) — all verified to fire on a nameless
+  // root with npm_package_name UNSET.  With no usable `name`
+  // (canonicalRootKey === null) attributionFromEnvVars returns null, so the
+  // dispatcher DROPS every non-spawn event from those scripts at its
   // null-attribution gate — the root lifecycle runs UNAUDITED, the lock looks
   // clean, and with `install: true` host part-2 then runs those same scripts on
   // the runner trusting that clean lock.  Refuse to emit a lockfile.  This is the
   // same unaudited-nameless-root class the prepare gates (above + 11a) close,
-  // reached through preinstall/install/postinstall instead of prepare.
+  // reached through the non-prepare main-pass lifecycles.  `hasRootMainPassLifecycle`
+  // already encodes the per-manager set (npm: 3 names; pnpm: the wider union).
   //
   // Scope: npm + pnpm ONLY.  yarn (Berry) SYNTHESIZES an npm_package_name
   // (`root-workspace-<hash>`) for the root, so its lifecycle events are NOT
@@ -3449,10 +3465,11 @@ export async function main(input: AgentInput): Promise<void> {
     canonicalRootKey === null
   ) {
     emitter.emitError(
-      'Root preinstall/install/postinstall script present but root package.json ' +
-        'has no usable `name` — its audited events cannot be attributed and would ' +
-        'be silently dropped, leaving the root lifecycle unaudited. Refusing to ' +
-        'emit a lockfile (add a `name` to the root package.json).',
+      'Root install-time lifecycle script (preinstall/install/postinstall, or for ' +
+        'pnpm also prepublish/rebuild) present but root package.json has no usable ' +
+        '`name` — its audited events cannot be attributed and would be silently ' +
+        'dropped, leaving the root lifecycle unaudited. Refusing to emit a lockfile ' +
+        '(add a `name` to the root package.json).',
       true,
     );
     flushAndExit(input.connection.writable, 1);
