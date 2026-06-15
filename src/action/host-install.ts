@@ -101,13 +101,20 @@ function resolveGitFromPath(): string | undefined {
  *     yarnPath/plugins — dodging the preflight, which inspects only `.yarnrc.yml`,
  *   * `YARN_ENABLE_CONSTRAINTS_CHECKS` runs a repo `yarn.config.cjs`.
  * The host process inherits `process.env`, so we override these four on the yarn
- * child to neutralize every vector (verified against Yarn Berry 4.x).  Registry
- * auth flows through UNRELATED keys (`YARN_NPM_AUTH_TOKEN` /
+ * child to neutralize every inherited-ENV vector (verified against Yarn Berry
+ * 4.x).  Registry auth flows through UNRELATED keys (`YARN_NPM_AUTH_TOKEN` /
  * `YARN_NPM_REGISTRY_SERVER`) and is preserved.  This mirrors the `npm_config_git`
  * pin (a config-redirect defense) and is HOST-ONLY: the SANDBOX keeps repo config
  * so the hooks are AUDITED there (the enforcement boundary).  `YARN_IGNORE_PATH=1`
  * kills yarnPath from BOTH the file and the env; `YARN_RC_FILENAME` is forced to
  * the preflight-vetted default so an env redirect cannot dodge the static reject.
+ *
+ * SCOPE: `YARN_PLUGINS=''` governs only the ENV plugin source, NOT the rc-file
+ * `plugins:` cascade — Berry still loads a `plugins:` entry from a PARENT-dir or
+ * `~/.yarnrc.yml` even under this env (the rc loop runs unconditionally when
+ * `useRc`).  That is out of the PR-author threat model (actions/checkout confines a
+ * PR to `$GITHUB_WORKSPACE`; parent dirs and `~` are runner-owned), and the repo's
+ * own `.yarnrc.yml plugins:` is rejected by the preflight before this env is used.
  */
 function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, npm_config_git: trustedGitPath() };
