@@ -150,16 +150,18 @@ function detectYarnStartupExec(repoDir: string): string | null {
   if (Array.isArray(parsed['plugins']) && parsed['plugins'].length > 0) {
     return 'a repo `.yarnrc.yml` `plugins` entry' + YARN_GUIDANCE;
   }
-  // `enableConstraintsChecks` runs `yarn.config.cjs`/`.js` via the install-time
-  // validate hook — only when that config file actually exists (without it the
-  // hook no-ops), so require both to avoid over-firing.  Yarn coerces several
-  // representations to enabled (true / "true" / 1 / "1"); rather than enumerate
-  // them, fail closed for ANYTHING that is not DEFINITELY false (matches yarn's
-  // own behavior, which throws on unrecognized values — refusing is the safe
-  // direction).
+  // `enableConstraintsChecks` runs `yarn.config.cjs` via the install-time validate
+  // hook — only when that config file actually exists (without it the hook
+  // no-ops), so require both to avoid over-firing.  The filename is `yarn.config.cjs`
+  // ONLY: yarn Berry's `loadUserConfig()` hardcodes that literal (verified across
+  // 4.5.0–4.16.0) — `yarn.config.js`/`.mjs` are NEVER loaded, so an inert `.js`
+  // must not trip this gate.  Yarn coerces several representations to enabled
+  // (true / "true" / 1 / "1"); rather than enumerate them, fail closed for
+  // ANYTHING that is not DEFINITELY false (matches yarn's own behavior, which
+  // throws on unrecognized values — refusing is the safe direction).
   if (
     isNotDefinitelyFalse(parsed['enableConstraintsChecks']) &&
-    (existsSync(join(repoDir, 'yarn.config.cjs')) || existsSync(join(repoDir, 'yarn.config.js')))
+    existsSync(join(repoDir, 'yarn.config.cjs'))
   ) {
     return 'a repo `.yarnrc.yml` `enableConstraintsChecks` with a `yarn.config.cjs`' + YARN_GUIDANCE;
   }

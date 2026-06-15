@@ -26847,7 +26847,7 @@ function detectYarnStartupExec(repoDir) {
   if (Array.isArray(parsed["plugins"]) && parsed["plugins"].length > 0) {
     return "a repo `.yarnrc.yml` `plugins` entry" + YARN_GUIDANCE;
   }
-  if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, "yarn.config.cjs")) || (0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, "yarn.config.js")))) {
+  if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && (0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, "yarn.config.cjs"))) {
     return "a repo `.yarnrc.yml` `enableConstraintsChecks` with a `yarn.config.cjs`" + YARN_GUIDANCE;
   }
   return null;

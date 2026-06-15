@@ -165,6 +165,15 @@ describe('detectPreTrustConfigExec — yarn (Berry)', () => {
     expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
   });
 
+  it('does NOT block enableConstraintsChecks:true with only a yarn.config.js (yarn loads .cjs only)', () => {
+    // yarn Berry's loadUserConfig() hardcodes the literal `yarn.config.cjs`
+    // (verified 4.5.0–4.16.0); a `yarn.config.js` is never executed, so an inert
+    // one must not over-fire the gate.
+    write('.yarnrc.yml', 'enableConstraintsChecks: true\n');
+    write('yarn.config.js', 'module.exports = {}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
+  });
+
   it('does NOT block a yarn.config.cjs when the flag is off (default false)', () => {
     write('.yarnrc.yml', 'nodeLinker: node-modules\n');
     write('yarn.config.cjs', 'module.exports = {}');
