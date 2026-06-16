@@ -350,10 +350,12 @@ export function hostInstallNoScripts(
     const keys = droppedKeys.join(', ');
     io.warn(
       `script-jail: ignoring ${n} install arg${n === 1 ? '' : 's'} (${keys}) — ` +
-        `not on the allowlist of dependency-selection flags ` +
-        `(only flags that filter the lockfile-pinned tree are passed through; ` +
-        `anything that could redirect the lock/root/output/source or re-enable ` +
-        `lifecycle scripts is dropped).`,
+        `not on the allowlist of dependency-selection flags, or carrying an ` +
+        `unsafe value (e.g. an inline-credential --registry URL). Only flags ` +
+        `that filter the lockfile-pinned tree (plus a credential-free ` +
+        `--registry) are forwarded; anything that could redirect the ` +
+        `lock/root/output/source, re-enable lifecycle scripts, or carry an ` +
+        `inline credential is dropped.`,
     );
   }
   const base = FETCH_CMD[pm];

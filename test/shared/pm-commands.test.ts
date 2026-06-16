@@ -192,6 +192,30 @@ describe('sanitizeInstallArgs (fail-closed allowlist)', () => {
     ]);
   });
 
+  it('MUST-DROP: a --registry URL embedding inline credentials is dropped, secret never echoed (F1)', () => {
+    // Registry AUTH must live in .npmrc/env — an inline `user:pass@` URL would be
+    // staged VERBATIM into the Phase-B-readable pm-flags.json sidecar, so it is
+    // rejected at the value level even though the `registry` key is allowlisted.
+    const joined = '--registry=https://user:SECRET_PASS@npm.acme.internal/';
+    const r1 = sanitizeInstallArgs([joined]);
+    expect(r1.kept).toEqual([]);
+    expect(r1.droppedKeys).toEqual(['--registry (inline credentials — set registry auth in .npmrc/env)']);
+    // The reason is a FIXED constant — the secret value appears nowhere in it.
+    expect(r1.droppedKeys.join('\n')).not.toContain('SECRET_PASS');
+
+    // Split form: the credential value token is consumed into `dropped`, not kept.
+    const split = sanitizeInstallArgs(['--registry', 'https://user:SECRET_PASS@npm.acme.internal/', '--prod']);
+    expect(split.kept).toEqual(['--prod']);
+    expect(split.dropped).toEqual(['--registry', 'https://user:SECRET_PASS@npm.acme.internal/']);
+    expect(split.droppedKeys).toEqual(['--registry (inline credentials — set registry auth in .npmrc/env)']);
+
+    // pnpm `--config.registry=` alias with creds → same value-level drop.
+    expect(sanitizeInstallArgs(['--config.registry=https://TOKEN@npm.acme.internal/']).kept).toEqual([]);
+
+    // A bare userinfo (token only, no password) is still credentials → dropped.
+    expect(sanitizeInstallArgs(['--registry=https://AUTHTOKEN@npm.acme.internal/']).kept).toEqual([]);
+  });
+
   it('MUST-DROP: a bare positional fails closed and reports <positional> (never the raw token)', () => {
     expect(sanitizeInstallArgs(['some-package'])).toEqual({
       kept: [],

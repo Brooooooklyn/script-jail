@@ -78,6 +78,35 @@ function isBareFlag(token: string): boolean {
 }
 
 /**
+ * True when a `--registry` value embeds credentials in the URL userinfo
+ * (`scheme://user:pass@host`, or a bare `scheme://token@host`).
+ *
+ * SECURITY (adversarial-review F1): a KEPT install arg is staged VERBATIM into
+ * the repo-visible `etc/script-jail/pm-flags.json` sidecar (so the guest can
+ * load it in Phase A).  That file sits inside the audit work_dir — the cwd of
+ * the UNTRUSTED lifecycle scripts in Phase B — so any secret it carries is
+ * readable by the very code being audited (and could surface via raw stderr
+ * forwarding).  Registry AUTH therefore must live in `.npmrc` / env (honored by
+ * the sandbox), NEVER inline in a CLI arg.  An inline-credential `--registry`
+ * value is dropped (the bare `--registry=https://host/` form stays allowed).
+ *
+ * Detection mirrors `redact.ts`'s URL-credentials shape: an `@` in the authority
+ * component (after `scheme://`, before the first `/`, `?`, or `#`).  Both a
+ * structured `URL` parse and a bounded regex are used so an odd-but-credentialed
+ * value can't slip the parser.  Linear-time: the scheme prefix is RFC-bounded
+ * (`{0,31}`) and the userinfo class excludes whitespace, so it can't backtrack.
+ */
+function registryUrlHasCredentials(value: string): boolean {
+  try {
+    const u = new URL(value);
+    if (u.username.length > 0 || u.password.length > 0) return true;
+  } catch {
+    // not a parseable absolute URL — fall through to the shape check
+  }
+  return /^[a-z][a-z0-9+.-]{0,31}:\/\/[^/?#\s]*@/i.test(value);
+}
+
+/**
  * Reduce a CLI token to the canonical option key it would resolve to, or null
  * if it is not an option flag at all.  Mirrors how npm/nopt (and pnpm) accept
  * the same option under many surface spellings:
@@ -176,6 +205,11 @@ function dropReason(key: string): string {
       return '--mode';
     case 'immutable':
       return '--immutable';
+    case 'registry':
+      // Reached only via the value-level reject (inline-credential URL); the key
+      // itself is allowlisted.  Fixed constant — explains WHY without echoing the
+      // (secret-bearing) value.
+      return '--registry (inline credentials — set registry auth in .npmrc/env)';
     default:
       return '<flag>'; // unknown / un-named flag — never echo the raw key (see note)
   }
@@ -218,14 +252,25 @@ function dropReason(key: string): string {
  *     lowercases, so `-d`/`-p` (npm `--loglevel info` / `--parseable`) also map
  *     here; both are harmless.  The documented action `args` example uses `-D`,
  *     so keeping these keeps that example valid.
- *   * registry — the resolution SOURCE (value-taking).  NOT a steering knob:
- *     under the fixed `--frozen-lockfile` / `npm ci` it does NOT relax the
+ *   * registry — the resolution SOURCE (value-taking).  NOT a steering knob.
+ *     Under the fixed `--frozen-lockfile` / `npm ci` it does NOT relax the
  *     root-lock validation (a stale lock still errors `ERR_PNPM_OUTDATED_LOCKFILE`
- *     even with `--registry` — verified on real pnpm), and the lockfile integrity
- *     hashes reject any tarball whose bytes differ from the pinned content, so a
- *     swapped registry can only serve byte-identical packages or fail closed.
- *     Allowlisted by owner decision for private-registry consumers; registry AUTH
- *     belongs in `.npmrc` / env (honored by the sandbox), not in CLI args.
+ *     even with `--registry` — verified on real pnpm).  For WELL-FORMED locks
+ *     (the normal case: every registry dep carries `resolved` + `integrity`) npm
+ *     follows the lock's `resolved` URL and validates the integrity hash, so
+ *     `--registry` cannot steer the installed bytes; pnpm's frozen-lockfile
+ *     validation is likewise unaffected.  CAVEAT: a MALFORMED lock whose registry
+ *     entry lacks `integrity` lets npm re-resolve bytes from the in-effect
+ *     registry — but that is a PRE-EXISTING npm property independent of this flag
+ *     (it occurs with the default registry and with a PR-controlled `.npmrc` too),
+ *     and `--registry` here is a maintainer-fixed input (it rides the Action
+ *     `args`, read from the base repo on `pull_request`, not PR-controllable), so
+ *     allowlisting it adds no attacker capability.  Allowlisted by owner decision
+ *     for private-registry consumers.  Registry AUTH belongs in `.npmrc` / env
+ *     (honored by the sandbox), NOT in CLI args: a `rejectValue` predicate DROPS
+ *     any `--registry` value embedding inline URL credentials (see
+ *     `registryUrlHasCredentials` — the secret would otherwise be staged into the
+ *     Phase-B-readable `pm-flags.json` sidecar).
  *
  * NOTE on negations: `--no-<allowlisted>` folds to the base key (e.g.
  * `--no-optional` → `optional`) and is itself dependency-selection, so it is
@@ -234,7 +279,15 @@ function dropReason(key: string): string {
  * `lockfile*`, `frozenlockfile`, `fixlockfile`, `immutable`, `mode`,
  * `ignorescripts`, …) are not in this set and never collapse into it.
  */
-const ALLOWED_FLAG_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map([
+/** An allowlist entry: whether the flag takes a value, and an optional
+ *  value-level policy that DROPS the flag when the value itself is unsafe
+ *  (e.g. a `--registry` URL embedding inline credentials). */
+interface AllowEntry {
+  takesValue: boolean;
+  rejectValue?: (value: string) => boolean;
+}
+
+const ALLOWED_FLAG_KEYS: ReadonlyMap<string, AllowEntry> = new Map([
   ['omit', { takesValue: true }],
   ['include', { takesValue: true }],
   ['prod', { takesValue: false }],
@@ -243,7 +296,9 @@ const ALLOWED_FLAG_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map(
   ['optional', { takesValue: false }],
   ['p', { takesValue: false }], // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
   ['d', { takesValue: false }], // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
-  ['registry', { takesValue: true }], // private-registry SOURCE; content-protected by lock integrity, root-lock gate unaffected (see note)
+  // private-registry SOURCE; root-lock gate unaffected (see note).  AUTH must go
+  // in .npmrc/env — an inline-credential URL value is rejected (F1).
+  ['registry', { takesValue: true, rejectValue: registryUrlHasCredentials }],
 ]);
 
 /**
@@ -262,7 +317,7 @@ const ALLOWED_FLAG_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map(
  * channel functional if `buildArchFlagOverlay` is ever revived while refusing
  * everything else.
  */
-const ALLOWED_ARCH_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map([
+const ALLOWED_ARCH_KEYS: ReadonlyMap<string, AllowEntry> = new Map([
   ['cpu', { takesValue: true }],
   ['os', { takesValue: true }],
   ['libc', { takesValue: true }],
@@ -292,8 +347,8 @@ const ALLOWED_ARCH_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map(
  * `--no-` negation (script re-enable), `--global`/`-g`/`--workspace-root`/`-w`/
  * `--recursive`/`-r`/`--filter` (scope steering), and any bare package name /
  * path positional.  (`--registry` is the one allowed SOURCE flag — see
- * `ALLOWED_FLAG_KEYS`; it is content-protected by lock integrity and does not
- * relax the root-lock gate.)
+ * `ALLOWED_FLAG_KEYS`; it does not relax the root-lock gate, and an inline-
+ * credential URL value is rejected so no secret reaches the staged sidecar.)
  *
  * Value tokens: an allowlisted VALUE-taking flag in SPLIT form (`--omit dev`)
  * keeps its following value token too (not dropped, not left dangling as a
@@ -328,7 +383,7 @@ export interface SanitizeResult {
  */
 function filterAgainstAllowlist(
   args: ReadonlyArray<string>,
-  allow: ReadonlyMap<string, { takesValue: boolean }>,
+  allow: ReadonlyMap<string, AllowEntry>,
 ): SanitizeResult {
   const kept: string[] = [];
   const dropped: string[] = [];
@@ -339,16 +394,32 @@ function filterAgainstAllowlist(
     if (key !== null && key.length > 0) {
       const allowed = allow.get(key);
       if (allowed !== undefined) {
-        // KEEP the flag.  A value-taking allowlisted flag in SPLIT form
-        // (`--omit dev`) must keep its following non-flag value token too, so it
-        // does not dangle as a positional and get dropped on the next iteration.
-        kept.push(a);
-        if (
+        // Resolve this flag's VALUE in either joined (`--registry=URL`) or split
+        // (`--registry URL`) form so a value-level policy can inspect it.  A
+        // value-taking flag in SPLIT form consumes the following non-flag token.
+        const eq = a.indexOf('=');
+        const splitValue =
           allowed.takesValue &&
           isBareFlag(a) &&
           i + 1 < args.length &&
           !args[i + 1]!.startsWith('-')
-        ) {
+            ? args[i + 1]!
+            : undefined;
+        const value = eq >= 0 ? a.slice(eq + 1) : splitValue;
+        // VALUE-LEVEL rejection: the flag is on the allowlist but THIS value is
+        // unsafe (e.g. a `--registry` URL embedding inline credentials).  Drop it
+        // and report only the fixed key — NEVER the value, which may be a secret.
+        if (allowed.rejectValue !== undefined && value !== undefined && allowed.rejectValue(value)) {
+          dropped.push(a);
+          droppedKeys.push(dropReason(key));
+          if (splitValue !== undefined) dropped.push(args[++i]!);
+          continue;
+        }
+        // KEEP the flag.  A value-taking allowlisted flag in SPLIT form
+        // (`--omit dev`) must keep its following non-flag value token too, so it
+        // does not dangle as a positional and get dropped on the next iteration.
+        kept.push(a);
+        if (splitValue !== undefined) {
           kept.push(args[++i]!);
         }
         continue;

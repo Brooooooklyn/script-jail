@@ -250,16 +250,23 @@ describe('hostInstallNoScripts (part 1)', () => {
     };
   }
 
-  it('a kept --registry URL is forwarded to spawn but its embedded credentials are redacted from captured output', () => {
+  it('a credential-free --registry is forwarded to spawn (private-registry mirror)', () => {
     // Owner decision: `--registry` is allowlisted so private-registry consumers
     // can point the install at their mirror.  It does NOT bypass the frozen-lock
-    // root gate (a stale lock still errors), so it is a SOURCE-only flag — safe
-    // to forward.  A consumer MAY embed credentials in the URL; those reach
-    // spawn (the PM needs them) but MUST NOT survive into the job log.  Two
-    // defenses cover the captured PM output: maskExactValues blanks the exact
-    // kept value, and redactCredentialShapes catches the URL-userinfo shape even
-    // when the PM reformats it.  (Error messages can't leak it either — they use
-    // safeDisplayArgs, which never includes user tokens.)
+    // root gate (a stale lock still errors), so a credential-FREE registry URL is
+    // a safe SOURCE-only flag and is forwarded to spawn.
+    const rec = makeRecorder();
+    hostInstallNoScripts('npm', '/repo', ['--registry=https://npm.acme.internal/'], rec.io, okSpawn(rec));
+    expect(rec.calls[0]!.args).toContain('--registry=https://npm.acme.internal/');
+    // No drop warning — a clean registry is on the allowlist.
+    expect(rec.warns.join('\n')).not.toMatch(/ignoring .* install arg/);
+  });
+
+  it('a --registry URL with inline credentials is DROPPED — never spawned, never logged (F1)', () => {
+    // Registry AUTH must live in .npmrc/env.  An inline `user:pass@` URL would
+    // otherwise be staged VERBATIM into the Phase-B-readable pm-flags.json sidecar
+    // that the audited (untrusted) lifecycle scripts can read, so it is dropped at
+    // the value level — the credential never reaches spawn or any log/warning.
     const credUrl = 'https://user:SECRET_PASS@npm.acme.internal/';
     const rec = makeRecorder();
     const spawn = captureSpawn(rec, {
@@ -267,14 +274,15 @@ describe('hostInstallNoScripts (part 1)', () => {
       stderr: `npm warn invalid config registry="${credUrl}" set in command line options\n`,
     });
     hostInstallNoScripts('npm', '/repo', [`--registry=${credUrl}`], rec.io, spawn);
-    // The registry flag IS forwarded to spawn — consumers depend on it.
-    expect(rec.calls[0]!.args).toContain(`--registry=${credUrl}`);
-    // ...but the credential never survives into the captured/logged output.
-    const errd = rec.errs.join('');
-    expect(errd).not.toContain('SECRET_PASS');
-    expect(errd).toContain('<REDACTED');
-    // No drop warning — registry is on the allowlist.
-    expect(rec.warns.join('\n')).not.toMatch(/ignoring .* install arg/);
+    // Dropped — spawn got only the fixed base args; the secret never reached it.
+    expect(rec.calls[0]!.args).not.toContain(`--registry=${credUrl}`);
+    expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts']);
+    // The drop warning names registry but NEVER echoes the secret value.
+    const warn = rec.warns.join('\n');
+    expect(warn).toMatch(/--registry/);
+    expect(warn).not.toContain('SECRET_PASS');
+    // No KEPT user args, so no "+N user install arg" suffix is emitted.
+    expect(rec.out.join('')).not.toContain('user install arg');
   });
 
   it('a credential-shaped user-arg is DROPPED (not on the allowlist) so it never reaches spawn', () => {

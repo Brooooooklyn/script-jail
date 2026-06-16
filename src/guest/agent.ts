@@ -1979,11 +1979,22 @@ export class LinuxStraceRunner implements StraceRunner {
     // Forward strace's stderr line-by-line to process.stderr with a [strace]
     // prefix so any strace diagnostics (e.g. "strace: exec failed", ptrace
     // permission errors) land on the guest's ttyS0 console.
+    //
+    // SECURITY (adversarial-review F1): the tracee inherits strace's fd2, so the
+    // install command AND its lifecycle children write their stderr here too.
+    // Apply the SAME redactor wired into the stdout tail (`_redactStdout` =
+    // redactSensitive: exact protected-env values + credential SHAPES) so a
+    // lifecycle script cannot leak a secret to the console via stderr while the
+    // stdout sibling masks it.  readline yields COMPLETE lines (crlfDelay:
+    // Infinity), matching the redactor's line-local contract.  This forwarder is
+    // purely human-visible console output — the parsed trace goes to the `-o`
+    // files (fd-based), never here — so redaction can't corrupt attribution.
     let stderrRl: ReturnType<typeof createInterface> | null = null;
     if (child.stderr) {
       stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
       stderrRl.on('line', (line: string) => {
-        process.stderr.write(`[strace] ${line}\n`);
+        const safe = this._redactStdout ? this._redactStdout(line) : line;
+        process.stderr.write(`[strace] ${safe}\n`);
       });
     }
 

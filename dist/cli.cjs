@@ -7806,6 +7806,14 @@ async function spawnVm(vmConfig, options = {}) {
 function isBareFlag(token) {
   return !token.includes("=");
 }
+function registryUrlHasCredentials(value) {
+  try {
+    const u = new URL(value);
+    if (u.username.length > 0 || u.password.length > 0) return true;
+  } catch {
+  }
+  return /^[a-z][a-z0-9+.-]{0,31}:\/\/[^/?#\s]*@/i.test(value);
+}
 function canonicalFlagKey(token) {
   if (token.length === 0 || token[0] !== "-") return null;
   let i = 0;
@@ -7858,6 +7866,8 @@ function dropReason(key) {
       return "--mode";
     case "immutable":
       return "--immutable";
+    case "registry":
+      return "--registry (inline credentials \u2014 set registry auth in .npmrc/env)";
     default:
       return "<flag>";
   }
@@ -7873,8 +7883,9 @@ var ALLOWED_FLAG_KEYS = /* @__PURE__ */ new Map([
   // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
   ["d", { takesValue: false }],
   // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
-  ["registry", { takesValue: true }]
-  // private-registry SOURCE; content-protected by lock integrity, root-lock gate unaffected (see note)
+  // private-registry SOURCE; root-lock gate unaffected (see note).  AUTH must go
+  // in .npmrc/env — an inline-credential URL value is rejected (F1).
+  ["registry", { takesValue: true, rejectValue: registryUrlHasCredentials }]
 ]);
 function filterAgainstAllowlist(args, allow) {
   const kept = [];
@@ -7886,8 +7897,17 @@ function filterAgainstAllowlist(args, allow) {
     if (key !== null && key.length > 0) {
       const allowed = allow.get(key);
       if (allowed !== void 0) {
+        const eq = a.indexOf("=");
+        const splitValue = allowed.takesValue && isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-") ? args[i + 1] : void 0;
+        const value = eq >= 0 ? a.slice(eq + 1) : splitValue;
+        if (allowed.rejectValue !== void 0 && value !== void 0 && allowed.rejectValue(value)) {
+          dropped.push(a);
+          droppedKeys.push(dropReason(key));
+          if (splitValue !== void 0) dropped.push(args[++i]);
+          continue;
+        }
         kept.push(a);
-        if (allowed.takesValue && isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        if (splitValue !== void 0) {
           kept.push(args[++i]);
         }
         continue;

@@ -4772,6 +4772,68 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     }
   });
 
+  it('redacts credential shapes + protected-env values in forwarded stderr (parity with the stdout tail, F1)', async () => {
+    // The tracee inherits strace's fd2, so a malicious lifecycle script can print
+    // a secret (e.g. one it read from the staged pm-flags.json sidecar) to its own
+    // stderr.  The forwarder MUST apply the same redactor the stdout tail uses, so
+    // a credential can't leak to the console via stderr while stdout masks it.
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: undefined,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    // Same redactor the agent wires for the stdout tail: exact protected-env
+    // values (layer 1) + credential SHAPES (layer 2).
+    const redact = (s: string): string => redactSensitive(s, ['MY_SECRET'], { MY_SECRET: 'HUNTER2SECRET' });
+    const runner = new LinuxStraceRunner(() => fakeChild, null, redact);
+
+    const capturedStderr: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]): boolean => {
+      capturedStderr.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+      return origWrite(chunk as Parameters<typeof origWrite>[0], ...(args as Parameters<typeof origWrite>[1][]));
+    }) as typeof process.stderr.write;
+
+    try {
+      const basePath = `${tailerDir}/strace.out`;
+      const runIter = runner.run('npm', ['rebuild'], { env: {}, cwd: tailerDir, basePath });
+      const itemsPromise = (async () => {
+        const collected: unknown[] = [];
+        for await (const item of runIter) collected.push(item);
+        return collected;
+      })();
+
+      // A dep that read the sidecar and echoes its content to stderr:
+      fakeStderr.push('fetch https://user:DEPLOYKEYSECRET@reg.example/pkg\n'); // URL userinfo → layer 2
+      fakeStderr.push('leaked MY_SECRET=HUNTER2SECRET\n'); // protected-env value → layer 1
+      fakeStderr.push(null);
+      fakeFd3.push(null);
+      setTimeout(() => { closeListener?.(0); }, 30);
+      await itemsPromise;
+
+      const forwarded = capturedStderr.join('');
+      // Credential SHAPE masked.
+      expect(forwarded).not.toContain('DEPLOYKEYSECRET');
+      expect(forwarded).toContain('<REDACTED:URL-CREDENTIALS>');
+      // Exact protected-env value masked.
+      expect(forwarded).not.toContain('HUNTER2SECRET');
+      expect(forwarded).toContain('<REDACTED:MY_SECRET>');
+      // Prefix still applied.
+      expect(forwarded).toMatch(/\[strace\] /);
+    } finally {
+      process.stderr.write = origWrite;
+    }
+  });
+
   // Codex follow-up (bug #3, high, 2026-05-19): tri-state rootPid resolution.
   // When `child.pid` is defined AND readStraceChildPid returns null (timeout,
   // ambiguous, /proc unavailable), the per-pid-file fallback MUST be suppressed.
