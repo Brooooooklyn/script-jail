@@ -27,6 +27,19 @@ determinism across hosts:
   Virtualization.framework expose different device and procfs/sysfs shapes.
   Most package installs do not inspect these, but a native postinstall can.
 
+- **`install: true` audit cwd (cwd-detection parity).** Under `install: true`
+  the host re-runs lifecycle scripts at the real repoDir, so the audit aligns its
+  cwd to match: **Firecracker/Docker** pin the guest `work_dir` to `${repoDir}`
+  (Docker `-v staged:${repoDir}`; Firecracker `mount --move`s the repo disk there
+  in `init.sh`, falling back to a `/work` audit if the move fails). The
+  **`bare`/`mac-bare`** backends audit at a staged temp path and do **not** align,
+  so under `install: true` their `process.cwd()` differs from the host re-run — a
+  cwd-detection residual. Firecracker is the enforcement boundary; a payload that
+  branches on `process.cwd()` would be caught there, recorded as a host-vs-sandbox
+  cwd parity only on FC/Docker. Either way this is defense-in-depth, not a complete
+  sandbox guarantee — see the `install: true` trust model in
+  [docs/design.md](./design.md#drop-in-install-trust-model-install-true).
+
 - **Native binaries the lifecycle script execs directly.** Some scripts
   shell out to a host-provided binary (`python`, `cc`, `make`). Whether the
   VM rootfs ships that binary is a property of the rootfs build, not of the

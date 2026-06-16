@@ -496,3 +496,78 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     expect(envs[0]!['PATH']).toBe(process.env['PATH']);
   });
 });
+
+describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true defense-in-depth)', () => {
+  /** Run `body` with extra env vars set, restoring the prior values after. */
+  function withEnv(extra: Record<string, string>, body: () => void): void {
+    const prior: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(extra)) {
+      prior[k] = process.env[k];
+      process.env[k] = v;
+    }
+    try {
+      body();
+    } finally {
+      for (const k of Object.keys(extra)) {
+        if (prior[k] === undefined) delete process.env[k];
+        else process.env[k] = prior[k];
+      }
+    }
+  }
+
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'strips HOSTNAME / PWD / every SCRIPT_JAIL_* from the part-2 lifecycle env (%s)',
+    (pm) => {
+      withEnv(
+        {
+          HOSTNAME: 'fv-az-runner-123',
+          PWD: '/home/runner/work/repo/repo',
+          TERM: 'xterm',
+          SCRIPT_JAIL_REPO_DIR: '/home/runner/work/repo/repo',
+          SCRIPT_JAIL_CACHE_DIR: '/tmp/sj-cache',
+          SCRIPT_JAIL_ACTION_ROOT: '/opt/action',
+        },
+        () => {
+          const rec = makeRecorder();
+          const envs: Array<NodeJS.ProcessEnv> = [];
+          hostRunScripts(pm, '/repo', rec.io, envCapturingSpawn(envs));
+          const env = envs[0]!;
+          // Sandbox tells that an env-sensitive payload could branch on are gone.
+          expect(env['HOSTNAME']).toBeUndefined();
+          expect(env['PWD']).toBeUndefined();
+          expect(env['TERM']).toBeUndefined();
+          for (const k of Object.keys(env)) {
+            expect(k.startsWith('SCRIPT_JAIL_')).toBe(false);
+          }
+          // The security pins / inherited essentials still survive the strip.
+          expect(env['npm_config_git']).toBeDefined();
+          expect(env['PATH']).toBe(process.env['PATH']);
+        },
+      );
+    },
+  );
+
+  it('also strips the tells from the part-1 no-scripts env', () => {
+    withEnv({ HOSTNAME: 'fv-az-1', SCRIPT_JAIL_REPO_DIR: '/x' }, () => {
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+      const env = envs[0]!;
+      expect(env['HOSTNAME']).toBeUndefined();
+      expect(env['SCRIPT_JAIL_REPO_DIR']).toBeUndefined();
+      expect(env['npm_config_git']).toBeDefined();
+    });
+  });
+
+  it('keeps yarn neutralizers after the strip (hygiene runs before the pins)', () => {
+    withEnv({ SCRIPT_JAIL_REPO_DIR: '/x' }, () => {
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostRunScripts('yarn', '/repo', rec.io, envCapturingSpawn(envs));
+      const env = envs[0]!;
+      expect(env['YARN_IGNORE_PATH']).toBe('1');
+      expect(env['YARN_PLUGINS']).toBe('');
+      expect(env['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBe('false');
+    });
+  });
+});

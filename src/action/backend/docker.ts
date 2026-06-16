@@ -65,6 +65,13 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
         extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
       });
       const containerName = `script-jail-${randomBytes(4).toString('hex')}`;
+      // install:true cwd parity — mount the staged repo at the SAME absolute
+      // path the host re-run uses (ctx.repoDir, threaded via auditWorkDir) so
+      // the audited `process.cwd()` matches the host's, closing a cwd oracle;
+      // falls back to `/work` for a normal audit.  The config's work_dir
+      // matches (set by buildEffectiveConfig from installWorkDir), so the
+      // agent cd's here.
+      const workDir = ctx.auditWorkDir ?? '/work';
       try {
         const script = [
           'set -eu',
@@ -82,12 +89,13 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
           'export SCRIPT_JAIL_CONNECTION=stdio',
           'export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml',
           // The host-owned pm-flags sidecar is staged in the repo tree at
-          // /work/etc/script-jail/pm-flags.json (Docker does not copy it into
-          // /etc the way Firecracker's init does).  Point the guest at it so
-          // the sandbox fetch applies the SAME install args as the host part-1
-          // install — without it, Docker audits a different arg set than the
-          // host installs.  loadPmFlags re-sanitizes the file before use.
-          'export SCRIPT_JAIL_PM_FLAGS_PATH=/work/etc/script-jail/pm-flags.json',
+          // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it
+          // into /etc the way Firecracker's init does).  Point the guest at it
+          // so the sandbox fetch applies the SAME install args as the host
+          // part-1 install — without it, Docker audits a different arg set than
+          // the host installs.  loadPmFlags re-sanitizes the file before use.
+          // Follows workDir so the cwd-parity mount (install:true) stays correct.
+          `export SCRIPT_JAIL_PM_FLAGS_PATH=${workDir}/etc/script-jail/pm-flags.json`,
           'exec node /usr/local/lib/script-jail/guest-agent.cjs',
         ].join('; ');
 
@@ -100,7 +108,7 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
             '--name', containerName,
             '--cap-add=SYS_PTRACE',
             '--security-opt', 'seccomp=unconfined',
-            '-v', `${staged.path}:/work`,
+            '-v', `${staged.path}:${workDir}`,
             '-v', `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
             imageRef,
             '/bin/sh',

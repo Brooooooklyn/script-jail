@@ -301,6 +301,56 @@ if [ -f /work/etc/script-jail/pnpm-arch.json ]; then
   cp /work/etc/script-jail/pnpm-arch.json /etc/script-jail/pnpm-arch.json
 fi
 
+# --- install:true cwd parity (relocate the repo mount to the host repoDir) ---
+# For `install: true` the host re-runs lifecycle scripts on the UNINSTRUMENTED
+# runner at the real checkout path (repoDir), while the audit ran at /work.  A
+# dependency script can branch on `process.cwd()` (the getcwd syscall is NOT
+# traced) — benign under /work, malicious on the host — and the byte-stable lock
+# still matches.  The host pins the config `work_dir` to repoDir for that case;
+# relocate the repo mount there so the audited cwd equals the host re-run's.
+#
+# Runs HERE on purpose: still root with CAP_SYS_ADMIN (the line ~413 setpriv
+# drops sys_admin), and AFTER every /work read above (config/pm-flags/pnpm-arch
+# are already copied to the fixed /etc paths).  `mount --move` (util-linux; the
+# rootfs ships it — see the blkid -L use above) leaves no /work alias, so strace
+# can only observe repo opens under repoDir = roots.repo → tokenized to $REPO.
+# /scratch and /sjtmp are SIBLING mounts, untouched by moving /work.
+#
+# No-op for the default /work audit (work_dir absent or == /work).  On any
+# relocate failure we FALL BACK to auditing at /work (rewrite work_dir) rather
+# than break the run: the audit still happens; only the install:true cwd parity
+# (defense-in-depth) is skipped for that run.  Both paths are byte-stable
+# ($REPO either way).  The leading-anchor sed only matches a top-level key.
+SJ_WD="$(sed -n 's/^work_dir:[[:space:]]*//p' /etc/script-jail/config.yml | head -n1)"
+SJ_WD="${SJ_WD%\"}"; SJ_WD="${SJ_WD#\"}"; SJ_WD="${SJ_WD%\'}"; SJ_WD="${SJ_WD#\'}"
+if [ -n "$SJ_WD" ] && [ "$SJ_WD" != "/work" ]; then
+  case "$SJ_WD" in
+    # Never relocate onto the FS root, a /work descendant, or a system mount
+    # (would shatter the rootfs).  A real repoDir is always a nested checkout
+    # path (e.g. /home/runner/work/x/x or /opt/actions-runner/_work/x/x), never
+    # exactly one of these — so this guard never fires on a valid run.
+    /|/work/*|/etc|/usr|/bin|/sbin|/lib|/lib64|/proc|/sys|/dev|/run|/var|/tmp|/opt|/root|/home|/scratch|/sjtmp)
+      fatal "refusing to relocate repo mount onto unsafe work_dir '$SJ_WD'" ;;
+    /*)
+      sj_relocated=0
+      if mkdir -p "$SJ_WD"; then
+        # Clear shared propagation so MS_MOVE is permitted, then move.
+        mount --make-private /work 2>/dev/null || true
+        if mount --move /work "$SJ_WD" 2>/dev/null; then
+          sj_relocated=1
+        fi
+      fi
+      if [ "$sj_relocated" != "1" ]; then
+        echo "[init] repo relocate to '$SJ_WD' failed; auditing at /work (install cwd parity skipped)" >&2
+        sed -i 's|^work_dir:.*|work_dir: /work|' /etc/script-jail/config.yml \
+          || fatal "could not reset work_dir to /work after a failed relocate"
+      fi
+      ;;
+    *)
+      fatal "work_dir '$SJ_WD' is not an absolute path" ;;
+  esac
+fi
+
 # --- Node toolchain (vite-plus) ----------------------------------------------
 # The rootfs bakes the standalone `vp` binary (see Dockerfile.base).  While
 # Phase A still has network, `vp env install` downloads the pinned Node

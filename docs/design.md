@@ -174,11 +174,16 @@ run inside an offline network namespace on a generic runner. Consequence: a
 when the same script runs on the host. Trust therefore derives from the committed
 lock being **human-reviewed**, not from host isolation — a matching audit means
 "behaviour is unchanged from the reviewed lock," not "safe to run with the
-network on." This is strictly safer than an unaudited install step (which runs
-the same scripts online with zero recording) but weaker than the audit-only mode,
-where every script stays inside the sandbox. `install` requires a committed lock
-and is rejected in `update` mode (which regenerates the lock and skips the
-bypass scan, leaving no fail-closed gate). See also the [README drop-in install
+network on." Compared with an unaudited install step (which runs the same scripts
+online with zero recording), `install: true` at least records and gates on the
+behaviour the sandbox observed; but it is **weaker** than the audit-only mode and
+is **not** a guarantee that the host run matches the audit. Host part 2 happens on
+the *uninstrumented* runner, so an environment-sensitive script can detect the
+sandbox and behave differently there (see *Accepted residual — environment-sensitive
+scripts can detect the sandbox*, below). Trust is bounded by the **human-reviewed
+lock**, not by host/sandbox parity. `install` requires a committed lock and is
+rejected in `update` mode (which regenerates the lock and skips the bypass scan,
+leaving no fail-closed gate). See also the [README drop-in install
 section](../README.md#drop-in-install).
 
 To keep that online egress from being silent, part 2 first scans the matched
@@ -222,6 +227,46 @@ project itself. Two consequences follow:
   the warning's separate audited-only block (above); for pnpm they stay
   host-bound. The warning still surfaces them for review (they describe behaviour
   the lock captured) either way.
+
+**Accepted residual — environment-sensitive scripts can detect the sandbox.**
+Host part 2 re-runs the lifecycle scripts on the *uninstrumented* runner, in an
+environment that cannot be made byte-identical to the audited one. A script that
+*detects* it is being audited can stay benign in the sandbox and misbehave only on
+the host — and the byte-stable lock still matches, because the audit never saw the
+malicious branch. This is inherent to re-running on a host the auditor does not
+control; the trust boundary is the human-reviewed lock, **not** host/sandbox parity.
+
+script-jail closes the most ergonomic tells as **defense-in-depth (not a complete
+fix)**:
+
+- **cwd parity.** `process.cwd()` (the `getcwd` syscall) is not traced, so a
+  cwd-branch is invisible to the lock. For `install: true` the audit `work_dir` is
+  pinned to the real host repoDir (`installWorkDir` → the effective config's
+  `work_dir`), so the audited cwd equals the host re-run's: Docker mounts the
+  staged repo at `${repoDir}` (`-v staged:${repoDir}`); Firecracker `mount --move`s
+  the repo disk from `/work` to `${repoDir}` in `init.sh` while still privileged
+  (before the `setpriv` cap-drop), falling back to a `/work` audit if the move
+  fails. The literal path never reaches the lock — it tokenizes to `$REPO`.
+- **env hygiene.** The host re-run drops the env-var tells the sandbox does not
+  carry (`HOSTNAME`, `PWD`, every `SCRIPT_JAIL_*` host knob), aligning the env-var
+  view with what the audit saw.
+
+What this CANNOT close (irreducible while host part 2 runs uninstrumented):
+
+- **Syscalls** — `os.hostname()`/`uname()` (no backend hooks them) and other
+  kernel-observable differences (the microVM/container `/proc`, mount table, …).
+- **Marker files** — `/.dockerenv` (Docker), `/etc/script-jail/config.yml`.
+- **The instrument itself** — the audited child MUST carry
+  `LD_PRELOAD=libscriptjail.so` and `NODE_OPTIONS=--require …preloads`; a script
+  keyed on their *absence* fires only on the host. Removing them disables the audit.
+- **bare / mac-bare cwd** — the cwd parity above is Firecracker/Docker only. The
+  `bare`/`mac-bare` backends audit at a staged temp path, so their `process.cwd()`
+  still differs from the host re-run (documented in
+  [docs/divergence.md](./divergence.md); Firecracker is the enforcement boundary).
+
+Bottom line: `install: true` is a convenience that records and gates on observed
+behaviour — **not** a sandbox guarantee against an adversary who tailors a payload
+to the audit environment. Review the lock.
 
 **Non-forgeable root identity (`root_anchored`).** The root project's events are
 privileged: it is not under `node_modules`, so a root-attributed fs event has no

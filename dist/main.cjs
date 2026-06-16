@@ -26672,8 +26672,25 @@ function resolveGitFromPath() {
   }
   return void 0;
 }
+var HOST_INSTALL_STRIP_ENV_NAMES = /* @__PURE__ */ new Set([
+  "HOSTNAME",
+  // os.hostname() syscall still differs; this only aligns the env var
+  "PWD",
+  // process.cwd() ignores PWD, but a script may read it directly
+  "COLS",
+  "LINES",
+  "POSIXLY_CORRECT",
+  "TERM"
+]);
 function hostInstallEnv(pm) {
-  const env = { ...process.env, npm_config_git: trustedGitPath() };
+  const env = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value === void 0) continue;
+    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name)) continue;
+    if (name.startsWith("SCRIPT_JAIL_")) continue;
+    env[name] = value;
+  }
+  env["npm_config_git"] = trustedGitPath();
   if (pm === "yarn") {
     env["YARN_IGNORE_PATH"] = "1";
     env["YARN_RC_FILENAME"] = ".yarnrc.yml";
@@ -43736,6 +43753,9 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
+  if (input.workDirOverride !== void 0) {
+    config2["work_dir"] = input.workDirOverride;
+  }
   const outDir = input.workDir ?? (0, import_node_fs13.mkdtempSync)((0, import_node_path9.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
   const configPath = (0, import_node_path9.join)(outDir, "config.yml");
   (0, import_node_fs13.writeFileSync)(configPath, (0, import_yaml3.stringify)(config2), "utf8");
@@ -43791,6 +43811,9 @@ async function runAudit(input) {
         spoofArch: input.overrides.spoofArch ?? input.hostArch
       },
       workDir: scratchDir,
+      // install:true cwd parity — pin the guest audit work_dir to the host
+      // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
+      ...input.installWorkDir !== void 0 ? { workDirOverride: input.installWorkDir } : {},
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
       pmFlagsJson,
       ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}
@@ -43822,7 +43845,8 @@ async function runAudit(input) {
         scratchDir,
         pm: input.pm,
         hostArch: input.hostArch,
-        mode: input.mode
+        mode: input.mode,
+        auditWorkDir: input.installWorkDir ?? "/work"
       });
     } else {
       if (input.launch === void 0) {
@@ -44260,6 +44284,7 @@ function createDockerBackend(deps = {}) {
         extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
       });
       const containerName = `script-jail-${(0, import_node_crypto6.randomBytes)(4).toString("hex")}`;
+      const workDir = ctx.auditWorkDir ?? "/work";
       try {
         const script = [
           "set -eu",
@@ -44277,12 +44302,13 @@ function createDockerBackend(deps = {}) {
           "export SCRIPT_JAIL_CONNECTION=stdio",
           "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
           // The host-owned pm-flags sidecar is staged in the repo tree at
-          // /work/etc/script-jail/pm-flags.json (Docker does not copy it into
-          // /etc the way Firecracker's init does).  Point the guest at it so
-          // the sandbox fetch applies the SAME install args as the host part-1
-          // install — without it, Docker audits a different arg set than the
-          // host installs.  loadPmFlags re-sanitizes the file before use.
-          "export SCRIPT_JAIL_PM_FLAGS_PATH=/work/etc/script-jail/pm-flags.json",
+          // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it
+          // into /etc the way Firecracker's init does).  Point the guest at it
+          // so the sandbox fetch applies the SAME install args as the host
+          // part-1 install — without it, Docker audits a different arg set than
+          // the host installs.  loadPmFlags re-sanitizes the file before use.
+          // Follows workDir so the cwd-parity mount (install:true) stays correct.
+          `export SCRIPT_JAIL_PM_FLAGS_PATH=${workDir}/etc/script-jail/pm-flags.json`,
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
         return await runAgentProcess({
@@ -44297,7 +44323,7 @@ function createDockerBackend(deps = {}) {
             "--security-opt",
             "seccomp=unconfined",
             "-v",
-            `${staged.path}:/work`,
+            `${staged.path}:${workDir}`,
             "-v",
             `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
             imageRef,
@@ -44669,6 +44695,13 @@ async function main(deps = {}) {
     // Developer install args reach the sandbox fetch (so the audited tree
     // matches what part 1 installed on the host).
     args: inputs.args,
+    // install:true cwd parity: pin the guest audit work_dir to the real
+    // repoDir so the sandbox runs lifecycle scripts at the SAME cwd the
+    // uninstrumented host re-run uses, closing a `process.cwd()` detection
+    // oracle (FC/docker; bare/mac-bare re-pin to their staged path, so the
+    // cwd parity is a documented residual there).  Undefined in pure-audit
+    // mode (guest default /work stands).
+    ...inputs.install ? { installWorkDir: repoDir } : {},
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,

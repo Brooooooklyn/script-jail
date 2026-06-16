@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 
 import {
   runAudit,
@@ -662,5 +663,60 @@ describe('runAudit — args threading (user_install_args)', () => {
     });
     const parsed = JSON.parse(pmFlagsContent(calls)!) as { user_install_args?: string[] };
     expect(parsed.user_install_args).toEqual(['-D']);
+  });
+});
+
+describe('runAudit — install:true cwd parity threading (installWorkDir)', () => {
+  // The `execute` backend path is what the GitHub Action uses; it receives the
+  // effective configPath + the resolved auditWorkDir.  These assert that
+  // installWorkDir flows to BOTH the effective config (work_dir) AND the
+  // executor input (auditWorkDir) so docker/FC can align the audit cwd.
+  // runAudit cleans the scratch dir (holding the effective config.yml) in its
+  // `finally`, so the config must be read INSIDE execute, not after the await.
+  function captureExecute(): {
+    seen: { auditWorkDir?: string | undefined; configWorkDir?: unknown };
+    execute: NonNullable<RunAuditInput['execute']>;
+  } {
+    const seen: { auditWorkDir?: string | undefined; configWorkDir?: unknown } = {};
+    return {
+      seen,
+      execute: async (ai) => {
+        seen.auditWorkDir = ai.auditWorkDir;
+        const cfg = parseYaml(readFileSync(ai.configPath, 'utf8')) as Record<string, unknown>;
+        seen.configWorkDir = cfg['work_dir'];
+        return { finalYaml: 'pkg: demo\n', nonFatalWarnings: [] };
+      },
+    };
+  }
+
+  it('pins auditWorkDir + effective config work_dir to repoDir when installWorkDir is set', async () => {
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    const { seen, execute } = captureExecute();
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'pnpm', hostArch: 'x64',
+      installWorkDir: repoDir,
+      execute,
+      io: makeIo().io,
+    });
+    expect(seen.auditWorkDir).toBe(repoDir);
+    expect(seen.configWorkDir).toBe(repoDir);
+  });
+
+  it('defaults auditWorkDir to /work and leaves config work_dir unset when installWorkDir is absent', async () => {
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    const { seen, execute } = captureExecute();
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'pnpm', hostArch: 'x64',
+      execute,
+      io: makeIo().io,
+    });
+    expect(seen.auditWorkDir).toBe('/work');
+    expect(seen.configWorkDir).toBeUndefined();
   });
 });

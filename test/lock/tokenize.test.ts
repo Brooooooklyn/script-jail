@@ -256,3 +256,52 @@ describe('isCrossPackage', () => {
     expect(isCrossPackage('$NODE_MODULESEXTRA/foo')).toBe(false);
   });
 });
+
+describe('byte-stability under an arbitrary absolute repo root (install:true cwd parity)', () => {
+  // M1 pins the guest audit work_dir to the real (runner-specific) repoDir so
+  // process.cwd() matches the host re-run.  tokenize() keys off roots.repo
+  // dynamically (never a hardcoded /work), so an arbitrary absolute root must
+  // produce IDENTICAL tokenized output — otherwise the lock would not be
+  // reproducible across runners.  This pins that invariant.
+  function rootsFor(repo: string): TokenizeRoots {
+    return {
+      repo,
+      nodeModules: `${repo}/node_modules`,
+      home: '/root',
+      tmp: '/tmp',
+      cache: '/root/.local/share/pnpm/store',
+    };
+  }
+
+  const REPOS = [
+    '/work',
+    '/home/runner/work/myrepo/myrepo',
+    '/opt/actions-runner/_work/some-repo/some-repo',
+    '/var/folders/ab/cd/T/repo-stage-XXXX/work',
+  ];
+
+  it('renders $REPO / $NODE_MODULES / $PKG identically for every absolute root', () => {
+    const outputs = REPOS.map((repo) => {
+      const roots = rootsFor(repo);
+      const pkg = `${repo}/node_modules/esbuild`;
+      return [
+        tokenize(`${repo}/prepare-built.txt`, roots),
+        tokenize(`${repo}/src/index.ts`, roots),
+        tokenize(`${repo}/node_modules/debug/index.js`, roots),
+        tokenize(`${repo}/node_modules/esbuild/install.js`, roots, pkg),
+        // paths OUTSIDE the repo root stay backend-invariant too
+        tokenize('/root/.npmrc', roots),
+        tokenize('/etc/passwd', roots),
+      ].join('\n');
+    });
+    const expected = [
+      '$REPO/prepare-built.txt',
+      '$REPO/src/index.ts',
+      '$NODE_MODULES/debug/index.js',
+      '$PKG/install.js',
+      '$HOME/.npmrc',
+      '/etc/passwd',
+    ].join('\n');
+    for (const out of outputs) expect(out).toBe(expected);
+  });
+});

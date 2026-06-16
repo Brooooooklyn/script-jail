@@ -122,8 +122,42 @@ function resolveGitFromPath(): string | undefined {
  * before this env is ever used.  The repo's own `.yarnrc.yml plugins:` is
  * likewise rejected there.
  */
+/**
+ * Env-var names that betray the sandbox-vs-host split to a lifecycle script.
+ * Stripped from the host re-run so its env-var view matches what the SANDBOX
+ * audited (the guest's `sanitizeLifecycleBaseEnv` strips the same noise +
+ * unknown SCRIPT_JAIL_* from the audited child).
+ *
+ * DEFENSE-IN-DEPTH, NOT A COMPLETE ORACLE CLOSE: this aligns only the env-VAR
+ * layer.  An environment-sensitive payload can still distinguish the audit from
+ * the host via signals env-stripping cannot touch — `os.hostname()`/`uname()`
+ * (syscalls, no backend hooks them), the audit-only instrument env the guest
+ * MUST carry (`LD_PRELOAD`, `NODE_OPTIONS` preloads), and container/VM marker
+ * files (`/.dockerenv`, `/etc/script-jail/config.yml`, microVM `/proc`).
+ * `process.cwd()` is handled separately by the work_dir cwd-parity (M1).
+ */
+const HOST_INSTALL_STRIP_ENV_NAMES = new Set([
+  'HOSTNAME', // os.hostname() syscall still differs; this only aligns the env var
+  'PWD', // process.cwd() ignores PWD, but a script may read it directly
+  'COLS',
+  'LINES',
+  'POSIXLY_CORRECT',
+  'TERM',
+]);
+
 function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, npm_config_git: trustedGitPath() };
+  // Sanitize FIRST (drop sandbox tells), THEN layer the security pins on top so
+  // a stripped name can never accidentally remove the git pin / yarn neutralizers.
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name)) continue;
+    // Every SCRIPT_JAIL_* host knob (REPO_DIR, CACHE_DIR, ACTION_ROOT, …) is an
+    // audit-absent tell and is unused by the package manager — drop them all.
+    if (name.startsWith('SCRIPT_JAIL_')) continue;
+    env[name] = value;
+  }
+  env['npm_config_git'] = trustedGitPath();
   if (pm === 'yarn') {
     env['YARN_IGNORE_PATH'] = '1';
     env['YARN_RC_FILENAME'] = '.yarnrc.yml';

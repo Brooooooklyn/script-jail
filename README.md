@@ -135,9 +135,14 @@ Then your build steps can use `node_modules` directly — no second `install` st
 > `<BLOCKED>` in the lock **will succeed** on the runner. Trust comes from the
 > committed lock being reviewed, not from host isolation: a matching audit means
 > "behaviour is unchanged from the reviewed lock," not "safe to run online."
-> Review the recorded reads/writes/spawns/connects before committing a lock. This
-> is still strictly safer than an unaudited `install` step. Audit-only mode
-> (`install` unset) keeps scripts entirely inside the sandbox.
+> Review the recorded reads/writes/spawns/connects before committing a lock.
+> Because step 3 re-runs on the *uninstrumented* runner, an environment-sensitive
+> script can detect the sandbox (via `os.hostname()`, container marker files, or
+> the audit's own `LD_PRELOAD`) and behave differently there; script-jail aligns
+> the audit cwd and strips env tells as defense-in-depth, but this is **not** a
+> sandbox guarantee against a payload tailored to the audit environment (see the
+> [trust model](./docs/design.md#drop-in-install-trust-model-install-true)).
+> Audit-only mode (`install` unset) keeps scripts entirely inside the sandbox.
 >
 > Before step 3 runs, if the matched lock recorded any `network_attempts`, the
 > action emits a `::warning::` naming the count and the destinations those

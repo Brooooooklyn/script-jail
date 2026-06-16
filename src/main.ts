@@ -240,10 +240,14 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       exitProcess(1);
     }
     // SECURITY: a consumer `work_dir` (config-file field, no clamp) that diverges
-    // from the host install cwd (always repoDir root / `/work`) lets the guest
-    // audit a benign SUBPROJECT clean while host part-2 runs UN-AUDITED repo-root
+    // from the host install cwd (always repoDir root) lets the guest audit a
+    // benign SUBPROJECT clean while host part-2 runs UN-AUDITED repo-root
     // lifecycle scripts on the runner (FC/docker; bare/mac-bare discard work_dir).
     // Fail closed before the audit.  (install-preflight.ts:detectInstallWorkDirDivergence.)
+    // NB: this gate reads the CONSUMER config; M1 cwd parity then force-pins the
+    // EFFECTIVE config work_dir to repoDir (via installWorkDir above) on the
+    // ACCEPTED path — so a consumer subproject work_dir is still refused here,
+    // while the default path aligns guest cwd to repoDir for FC/docker.
     const workDirDivergence = detectInstallWorkDirDivergence(inputs.configPath);
     if (workDirDivergence !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused — ${workDirDivergence}\n`);
@@ -308,6 +312,13 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     // Developer install args reach the sandbox fetch (so the audited tree
     // matches what part 1 installed on the host).
     args: inputs.args,
+    // install:true cwd parity: pin the guest audit work_dir to the real
+    // repoDir so the sandbox runs lifecycle scripts at the SAME cwd the
+    // uninstrumented host re-run uses, closing a `process.cwd()` detection
+    // oracle (FC/docker; bare/mac-bare re-pin to their staged path, so the
+    // cwd parity is a documented residual there).  Undefined in pure-audit
+    // mode (guest default /work stands).
+    ...(inputs.install ? { installWorkDir: repoDir } : {}),
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,

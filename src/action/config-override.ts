@@ -63,6 +63,17 @@ export interface BuildEffectiveConfigInput {
    */
   workDir?: string;
   /**
+   * Optional override for the guest audit `work_dir` (the cwd the lifecycle
+   * scripts run at).  Set for `install: true` to the real host repoDir so the
+   * sandbox audit runs at the SAME absolute path as the host re-run, closing a
+   * `process.cwd()` detection oracle (FC/docker; bare/mac-bare re-pin work_dir
+   * to their staged path via `rewriteConfigWorkDir`, so this is overridden
+   * there — the cwd parity is a documented residual for those backends).  When
+   * undefined the guest schema default (`/work`) stands.  The literal value
+   * never reaches the lock — it is tokenized to `$REPO` (src/lock/tokenize.ts).
+   */
+  workDirOverride?: string;
+  /**
    * Optional `.yarnrc.yml` content to materialize alongside the config.
    * Optional Yarn Berry `supportedArchitectures` override.  Written verbatim
    * to `<workDir>/.yarnrc.yml`.
@@ -138,6 +149,14 @@ export function buildEffectiveConfig(
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch,
   };
+
+  // `install: true` cwd parity (FC/docker): pin the guest audit cwd to the real
+  // host repoDir so `process.cwd()` matches the uninstrumented host re-run.
+  // bare/mac-bare overwrite this with their staged path downstream.  Tokenized
+  // to `$REPO` in the lock, so the runner-specific value is byte-stable.
+  if (input.workDirOverride !== undefined) {
+    config['work_dir'] = input.workDirOverride;
+  }
 
   const outDir =
     input.workDir ?? mkdtempSync(join(tmpdir(), 'script-jail-config-'));

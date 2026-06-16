@@ -102,6 +102,41 @@ describe('buildEffectiveConfig', () => {
     expect(parsed['spoof']).toEqual({ platform: 'linux', arch: 'arm64' });
   });
 
+  it('pins work_dir to workDirOverride (install:true cwd parity) and leaves it unset otherwise', () => {
+    writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
+
+    // No override -> work_dir absent (guest schema default /work stands).
+    const without = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(without['work_dir']).toBeUndefined();
+
+    // Override -> the runner-specific repoDir is written verbatim (it is
+    // tokenized to $REPO in the lock, so this stays byte-stable).
+    const repoDir = '/home/runner/work/myrepo/myrepo';
+    const withOverride = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+          workDirOverride: repoDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(withOverride['work_dir']).toBe(repoDir);
+    // Siblings still preserved alongside the pinned work_dir.
+    expect(withOverride['node_version']).toBe(20);
+  });
+
   it('never mutates the user source file', () => {
     writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
     const before = readFileSync(userConfigPath, 'utf8');

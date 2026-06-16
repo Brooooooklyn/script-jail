@@ -111,6 +111,15 @@ export interface AuditExecutionInput {
   extraRepoOverlayFiles: ReadonlyArray<{ relPath: string; content: string }>;
   /** The private per-run scratch dir owned by runAudit for config sidecars. */
   scratchDir: string;
+  /**
+   * The absolute path the guest audit runs the lifecycle scripts at (the
+   * config `work_dir`).  `/work` for a normal audit; the real host repoDir for
+   * `install: true` (cwd parity with the uninstrumented host re-run — see
+   * `installWorkDir` on RunAuditInput).  Docker mounts the staged repo at this
+   * path; bare/mac-bare re-pin work_dir to their staged path and ignore it.
+   * Defaults to `/work` when unset.
+   */
+  auditWorkDir?: string;
   /** Detected package manager for the user's repo. */
   pm: 'npm' | 'pnpm' | 'yarn';
   /** Host architecture of the runner / dev box. */
@@ -143,6 +152,14 @@ export interface RunAuditInput {
    * the host install resolves.  Undefined / empty = no extra args.
    */
   args?: string[] | undefined;
+  /**
+   * When set (the action's `install: true` path), the absolute host repoDir to
+   * pin the guest audit `work_dir` to, so the sandbox audits lifecycle scripts
+   * at the SAME cwd the host re-run uses — closing a `process.cwd()` detection
+   * oracle.  Undefined for pure-audit / CLI runs (guest default `/work` stands).
+   * Tokenized to `$REPO` in the lock, so the runner-specific value is byte-stable.
+   */
+  installWorkDir?: string | undefined;
   /**
    * Absolute path to the base rootfs ext4. Required by the legacy
    * makeOverlay+launch path; unused when `execute` is supplied.
@@ -267,6 +284,11 @@ export async function runAudit(
         spoofArch: input.overrides.spoofArch ?? input.hostArch,
       },
       workDir: scratchDir,
+      // install:true cwd parity — pin the guest audit work_dir to the host
+      // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
+      ...(input.installWorkDir !== undefined
+        ? { workDirOverride: input.installWorkDir }
+        : {}),
       ...(archOverlay.yarnrcOverlay !== undefined
         ? { yarnrcOverlay: archOverlay.yarnrcOverlay }
         : {}),
@@ -310,6 +332,7 @@ export async function runAudit(
         pm: input.pm,
         hostArch: input.hostArch,
         mode: input.mode,
+        auditWorkDir: input.installWorkDir ?? '/work',
       });
     } else {
       if (input.launch === undefined) {
