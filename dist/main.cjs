@@ -26869,6 +26869,7 @@ function redactCaptured(text, sensitive) {
 }
 var HOST_PART2_MAX_LINE_BYTES = 1048576;
 var HOST_PART2_POISON_MARKER = "[script-jail] (oversized output line truncated)";
+var HOST_PART2_TRUNCATED_MARKER = "[script-jail] (trailing output dropped \u2014 pipe held open past grace)";
 var HOST_PART2_DRAIN_GRACE_MS = 2e3;
 function makeLineSink(which2, onLine, maxBytes = HOST_PART2_MAX_LINE_BYTES) {
   const decoder = new import_node_string_decoder.StringDecoder("utf8");
@@ -26894,13 +26895,18 @@ function makeLineSink(which2, onLine, maxBytes = HOST_PART2_MAX_LINE_BYTES) {
       poisoned = true;
     }
   };
-  const flush = () => {
+  const finalize2 = (streamEnded) => {
     pending += decoder.end();
-    if (!poisoned && pending.length > 0) onLine(which2, pending);
+    if (poisoned) {
+      pending = "";
+      poisoned = false;
+      return;
+    }
+    if (pending.length === 0) return;
+    onLine(which2, streamEnded ? pending : HOST_PART2_TRUNCATED_MARKER);
     pending = "";
-    poisoned = false;
   };
-  return { onData, flush };
+  return { onData, finalize: finalize2 };
 }
 var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
   let child;
@@ -26910,10 +26916,12 @@ var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
     resolve6({ status: null, signal: null, error: error51 });
     return;
   }
-  const outSink = makeLineSink("stdout", onLine, HOST_PART2_MAX_LINE_BYTES);
-  const errSink = makeLineSink("stderr", onLine, HOST_PART2_MAX_LINE_BYTES);
-  child.stdout?.on("data", outSink.onData);
-  child.stderr?.on("data", errSink.onData);
+  const sinks = {
+    stdout: { sink: makeLineSink("stdout", onLine, HOST_PART2_MAX_LINE_BYTES), stream: child.stdout, ended: false },
+    stderr: { sink: makeLineSink("stderr", onLine, HOST_PART2_MAX_LINE_BYTES), stream: child.stderr, ended: false }
+  };
+  child.stdout?.on("data", sinks.stdout.sink.onData);
+  child.stderr?.on("data", sinks.stderr.sink.onData);
   let exit = null;
   let settled = false;
   let graceTimer = null;
@@ -26921,23 +26929,24 @@ var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
     if (settled) return;
     settled = true;
     if (graceTimer !== null) clearTimeout(graceTimer);
-    outSink.flush();
-    errSink.flush();
-    child.stdout?.destroy();
-    child.stderr?.destroy();
+    for (const s of [sinks.stdout, sinks.stderr]) {
+      s.sink.finalize(s.ended);
+      s.stream?.destroy();
+    }
     resolve6(exit ?? { status: null, signal: null });
   };
   let ends = 0;
-  const wireEnd = (stream) => {
-    if (stream == null) return;
+  const wireEnd = (s) => {
+    if (s.stream == null) return;
     ends += 1;
-    stream.on("end", () => {
+    s.stream.on("end", () => {
+      s.ended = true;
       ends -= 1;
       if (ends === 0 && exit !== null) finish();
     });
   };
-  wireEnd(child.stdout);
-  wireEnd(child.stderr);
+  wireEnd(sinks.stdout);
+  wireEnd(sinks.stderr);
   child.on("error", (error51) => {
     exit = { status: null, signal: null, error: error51 };
     finish();

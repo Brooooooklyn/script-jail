@@ -24,6 +24,7 @@ import {
   streamSpawn,
   makeLineSink,
   HOST_PART2_POISON_MARKER,
+  HOST_PART2_TRUNCATED_MARKER,
   HOST_PART2_DRAIN_GRACE_MS,
   type HostSpawn,
   type HostStreamSpawn,
@@ -848,18 +849,40 @@ describe('makeLineSink (part-2 bounded line splitter)', () => {
     return { lines, onLine: (which, line) => { lines.push({ which, line }); } };
   }
 
-  it('forwards each COMPLETE line and holds a partial until flush (EOF)', () => {
+  it('forwards each COMPLETE line and holds a partial until finalize (EOF)', () => {
     const { lines, onLine } = collect();
     const sink = makeLineSink('stdout', onLine);
     sink.onData(Buffer.from('alpha\nbeta\npar'));
     expect(lines.map((l) => l.line)).toEqual(['alpha', 'beta']);
     sink.onData(Buffer.from('tial\n'));
     expect(lines.map((l) => l.line)).toEqual(['alpha', 'beta', 'partial']);
-    // A final unterminated line is forwarded ONLY on flush (terminated by EOF).
+    // A final unterminated line is forwarded ONLY on finalize(EOF).
     sink.onData(Buffer.from('last-no-newline'));
     expect(lines).toHaveLength(3);
-    sink.flush();
+    sink.finalize(true); // stream reached EOF → the complete trailing line forwards
     expect(lines.map((l) => l.line)).toEqual(['alpha', 'beta', 'partial', 'last-no-newline']);
+  });
+
+  it('DROPS a trailing partial on a NON-EOF finalize (grace path) — emits only a marker (F6 round-2)', () => {
+    const { lines, onLine } = collect();
+    const sink = makeLineSink('stdout', onLine);
+    sink.onData(Buffer.from('complete\nsuperSecretFragmentNoNewline'));
+    expect(lines.map((l) => l.line)).toEqual(['complete']); // partial still held
+    sink.finalize(false); // pipe still open at grace close → fragment must NOT leak
+    expect(lines).toEqual([
+      { which: 'stdout', line: 'complete' },
+      { which: 'stdout', line: HOST_PART2_TRUNCATED_MARKER },
+    ]);
+    // The raw mid-write fragment is never forwarded.
+    expect(lines.some((l) => l.line.includes('superSecretFragment'))).toBe(false);
+  });
+
+  it('emits NO marker on a NON-EOF finalize when there is no pending partial', () => {
+    const { lines, onLine } = collect();
+    const sink = makeLineSink('stdout', onLine);
+    sink.onData(Buffer.from('one\ntwo\n')); // both complete, pending empty
+    sink.finalize(false);
+    expect(lines.map((l) => l.line)).toEqual(['one', 'two']); // no spurious marker
   });
 
   it('does NOT corrupt a multibyte char split across chunk boundaries (StringDecoder)', () => {
@@ -938,4 +961,34 @@ describe('streamSpawn (part-2 real-child integration)', () => {
     expect(r.error).toBeInstanceOf(Error);
     expect(r.status).toBeNull();
   });
+
+  it('does NOT forward a mid-write fragment when a descendant holds the pipe past grace (F6 round-2)', async () => {
+    const { lines, onLine } = collect();
+    // Child writes a complete line, then spawns a DETACHED grandchild that
+    // inherits stdout and writes a SECRET FRAGMENT with NO trailing newline and
+    // holds the pipe open past the grace window, then the child exits 0.  The
+    // fragment is an unterminated partial on a non-EOF stream — it must be DROPPED
+    // (only the fixed marker emitted), never forwarded raw, or exact-value
+    // redaction (which needs the WHOLE value) would miss it and leak the prefix.
+    const SECRET_FRAGMENT = 'superSecretFragmentNoNewline';
+    const holderMs = HOST_PART2_DRAIN_GRACE_MS * 6;
+    const script =
+      'const cp=require("node:child_process");' +
+      'const fs=require("node:fs");' +
+      `const g=cp.spawn(process.execPath,["-e","const fs=require('fs'); fs.writeSync(1,'${SECRET_FRAGMENT}'); setTimeout(()=>{}, ${holderMs});"],{stdio:["ignore","inherit","inherit"],detached:true});` +
+      'g.unref();' +
+      'fs.writeSync(1,"complete-line\\n");' +
+      // give the grandchild a beat to write its fragment before the child exits
+      'setTimeout(()=>process.exit(0), 200);';
+    const start = Date.now();
+    const r = await streamSpawn(process.execPath, ['-e', script], process.cwd(), process.env, onLine);
+    const elapsed = Date.now() - start;
+    expect(r.status).toBe(0);
+    expect(elapsed).toBeLessThan(holderMs); // resolved via grace, not the holder's lifetime
+    // The complete line forwarded; the raw fragment did NOT.
+    expect(lines).toContainEqual({ which: 'stdout', line: 'complete-line' });
+    expect(lines.some((l) => l.line.includes(SECRET_FRAGMENT))).toBe(false);
+    // The grace-truncation marker stands in for the dropped fragment.
+    expect(lines).toContainEqual({ which: 'stdout', line: HOST_PART2_TRUNCATED_MARKER });
+  }, 20_000);
 });

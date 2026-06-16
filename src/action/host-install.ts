@@ -433,6 +433,17 @@ export const HOST_PART2_MAX_LINE_BYTES = 1_048_576;
 export const HOST_PART2_POISON_MARKER = '[script-jail] (oversized output line truncated)';
 
 /**
+ * Fixed (credential-free) marker emitted when the grace window closes while a
+ * pipe is still open (a detached descendant holds fd1/fd2).  The pending bytes
+ * are an UNTERMINATED, mid-write fragment on a NON-EOF stream — possibly the
+ * prefix of a secret the descendant is still writing.  Exact-value redaction
+ * only matches a COMPLETE declared value, so a fragment would slip through;
+ * therefore the fragment is DROPPED (never forwarded raw) and only this marker
+ * is emitted (adversarial-review F6 round-2).
+ */
+export const HOST_PART2_TRUNCATED_MARKER = '[script-jail] (trailing output dropped — pipe held open past grace)';
+
+/**
  * Grace window after the DIRECT child exits before `streamSpawn` resolves even
  * if the pipe never reaches EOF (adversarial-review F6, Claim A).  With
  * `stdio:['inherit','pipe','pipe']` a detached descendant that inherits fd1/fd2
@@ -456,7 +467,7 @@ export function makeLineSink(
   which: 'stdout' | 'stderr',
   onLine: (stream: 'stdout' | 'stderr', line: string) => void,
   maxBytes: number = HOST_PART2_MAX_LINE_BYTES,
-): { onData: (chunk: Buffer) => void; flush: () => void } {
+): { onData: (chunk: Buffer) => void; finalize: (streamEnded: boolean) => void } {
   const decoder = new StringDecoder('utf8');
   let pending = '';
   let poisoned = false; // sticky for the CURRENT oversized unterminated line
@@ -480,13 +491,22 @@ export function makeLineSink(
       poisoned = true;
     }
   };
-  const flush = (): void => {
+  // Finalize the stream.  `streamEnded` distinguishes the two teardown paths:
+  //   * true  — the stream emitted `end` (genuine EOF): the trailing `pending`
+  //     is a COMPLETE line (EOF-terminated), fully written, so redaction at the
+  //     call site sees the whole value → forward it.
+  //   * false — the grace window closed while the pipe is STILL OPEN (a detached
+  //     descendant holds it, possibly mid-write): `pending` is a fragment that
+  //     exact-value redaction cannot match → DROP it, emit only the fixed marker
+  //     (adversarial-review F6 round-2).
+  const finalize = (streamEnded: boolean): void => {
     pending += decoder.end();
-    if (!poisoned && pending.length > 0) onLine(which, pending);
+    if (poisoned) { pending = ''; poisoned = false; return; }
+    if (pending.length === 0) return;
+    onLine(which, streamEnded ? pending : HOST_PART2_TRUNCATED_MARKER);
     pending = '';
-    poisoned = false;
   };
-  return { onData, flush };
+  return { onData, finalize };
 }
 
 export const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
@@ -500,10 +520,15 @@ export const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
       resolve({ status: null, signal: null, error: error as Error });
       return;
     }
-    const outSink = makeLineSink('stdout', onLine, HOST_PART2_MAX_LINE_BYTES);
-    const errSink = makeLineSink('stderr', onLine, HOST_PART2_MAX_LINE_BYTES);
-    child.stdout?.on('data', outSink.onData);
-    child.stderr?.on('data', errSink.onData);
+    // Per-stream state: its sink + whether it reached natural EOF (`end`).  The
+    // `ended` flag decides how its trailing partial line is finalized (forward on
+    // EOF, drop+marker on the grace path) — see makeLineSink.finalize.
+    const sinks = {
+      stdout: { sink: makeLineSink('stdout', onLine, HOST_PART2_MAX_LINE_BYTES), stream: child.stdout, ended: false },
+      stderr: { sink: makeLineSink('stderr', onLine, HOST_PART2_MAX_LINE_BYTES), stream: child.stderr, ended: false },
+    };
+    child.stdout?.on('data', sinks.stdout.sink.onData);
+    child.stderr?.on('data', sinks.stderr.sink.onData);
 
     // Resolve disposition off the DIRECT child's `exit` (fires the moment the pm
     // process terminates, regardless of any descendant still holding the inherited
@@ -515,25 +540,27 @@ export const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
       if (settled) return;
       settled = true;
       if (graceTimer !== null) clearTimeout(graceTimer);
-      // Forward any final unterminated partial line, then stop reading so a
+      // Finalize each sink with its OWN EOF state: a stream that ended forwards
+      // its complete trailing line; a still-open stream (grace path) drops its
+      // mid-write fragment and emits only a fixed marker.  Then stop reading so a
       // descendant holding the pipe can't keep this process alive.
-      outSink.flush();
-      errSink.flush();
-      child.stdout?.destroy();
-      child.stderr?.destroy();
+      for (const s of [sinks.stdout, sinks.stderr]) {
+        s.sink.finalize(s.ended);
+        s.stream?.destroy();
+      }
       resolve(exit ?? { status: null, signal: null });
     };
     // Finish promptly once BOTH pipes reach natural EOF (the common case: no
     // descendant holds them) — clears the grace timer so there is no added
     // latency.  `ends` counts the wired streams down to 0.
     let ends = 0;
-    const wireEnd = (stream: Readable | null | undefined): void => {
-      if (stream == null) return;
+    const wireEnd = (s: { stream: Readable | null; ended: boolean }): void => {
+      if (s.stream == null) return;
       ends += 1;
-      stream.on('end', () => { ends -= 1; if (ends === 0 && exit !== null) finish(); });
+      s.stream.on('end', () => { s.ended = true; ends -= 1; if (ends === 0 && exit !== null) finish(); });
     };
-    wireEnd(child.stdout);
-    wireEnd(child.stderr);
+    wireEnd(sinks.stdout);
+    wireEnd(sinks.stderr);
     child.on('error', (error) => { exit = { status: null, signal: null, error }; finish(); });
     child.on('exit', (status, signal) => {
       exit ??= { status, signal };
