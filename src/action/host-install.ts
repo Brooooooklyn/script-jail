@@ -23,9 +23,11 @@
 //     `connect` the sandbox recorded as `<BLOCKED>` WILL succeed here.  Trust
 //     derives from the reviewed lock, not from host isolation.  See docs.
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve, sep } from 'node:path';
+import { createInterface } from 'node:readline';
+import type { Readable } from 'node:stream';
 
 import {
   FETCH_CMD,
@@ -318,18 +320,6 @@ const captureSpawn: HostSpawn = (cmd, args, cwd, env) => {
 };
 
 /**
- * Part-2 runner: stream straight to the job log.  Part 2 (hostRunScripts) takes
- * NO user args — its argv is credential-free — and lifecycle scripts can run
- * long, so users want LIVE progress.  Keep `stdio:'inherit'`; nothing to redact.
- */
-const inheritSpawn: HostSpawn = (cmd, args, cwd, env) => {
-  // SECURITY: `env` carries the same git pin as part 1 (defense-in-depth;
-  // harmless for pnpm/yarn, which ignore npm_config_git).
-  const r = spawnSync(cmd, args, { cwd, env, stdio: 'inherit', shell: false });
-  return { status: r.status, signal: r.signal, error: r.error };
-};
-
-/**
  * Part 1 — install dependencies on the host with lifecycle scripts disabled.
  * Throws on spawn failure or a non-zero exit (no usable tree → fail the job).
  */
@@ -412,15 +402,75 @@ function redactCaptured(text: string, sensitive: readonly string[]): string {
 }
 
 /**
+ * Async streaming runner for part 2.  Spawns the child with piped stdout/stderr,
+ * forwards each COMPLETE line through `onLine` (LIVE, line-buffered progress —
+ * the install can run long), and resolves with the exit disposition.  Unlike the
+ * old `stdio:'inherit'`, the lifecycle output passes through a redactor at the
+ * call site so a trusted script can't echo a secret to the job log raw
+ * (adversarial-review F6).  The trace itself is unaffected — this is the host
+ * runner; the sandbox audit already ran.
+ */
+export type HostStreamSpawn = (
+  cmd: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  onLine: (stream: 'stdout' | 'stderr', line: string) => void,
+) => Promise<{ status: number | null; signal: NodeJS.Signals | null; error?: Error }>;
+
+const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
+  new Promise((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      // fd0 inherits stdin; fd1/fd2 piped so each line can be redacted before it
+      // reaches the job log.  shell:false — argv is passed verbatim, never parsed.
+      child = spawn(cmd, args, { cwd, env, stdio: ['inherit', 'pipe', 'pipe'], shell: false });
+    } catch (error) {
+      resolve({ status: null, signal: null, error: error as Error });
+      return;
+    }
+    // Resolve only after the child has closed AND both line readers have drained,
+    // so a final unterminated line is never lost.  `pending` counts the child
+    // close/error plus one per wired stream.
+    let exit: { status: number | null; signal: NodeJS.Signals | null; error?: Error } | null = null;
+    let pending = 1;
+    const maybeDone = (): void => {
+      if (pending === 0 && exit !== null) resolve(exit);
+    };
+    const wire = (stream: Readable | null, which: 'stdout' | 'stderr'): void => {
+      if (stream === null) return;
+      pending += 1;
+      const rl = createInterface({ input: stream, crlfDelay: Infinity });
+      rl.on('line', (line: string) => onLine(which, line));
+      rl.on('close', () => { pending -= 1; maybeDone(); });
+    };
+    wire(child.stdout, 'stdout');
+    wire(child.stderr, 'stderr');
+    child.on('error', (error) => { exit = { status: null, signal: null, error }; pending -= 1; maybeDone(); });
+    child.on('close', (status, signal) => { exit ??= { status, signal }; pending -= 1; maybeDone(); });
+  });
+
+/**
  * Part 2 — run the lifecycle scripts part 1 deferred.  The caller MUST have
  * confirmed the audit is `trusted` before calling this.  Throws on failure.
+ *
+ * SECURITY (adversarial-review F6): these are the REAL (audit-trusted) lifecycle
+ * scripts, run on the runner with the job env (which may carry NPM_TOKEN /
+ * NODE_AUTH_TOKEN / registry auth).  A script can print to stdout/stderr, so —
+ * symmetric with the sandbox Phase-B tail and host part-1 capture — every line is
+ * redacted before it reaches the job log: exact `protectedEnvNames` values
+ * (`maskExactValues`) plus credential SHAPES (`redactCredentialShapes`).  The
+ * env_read audit gate remains the PRIMARY protection (a script that reads a
+ * secret is recorded in the lock and fails the PR pre-trust); this is
+ * defense-in-depth for the trusted-script host rerun.
  */
-export function hostRunScripts(
+export async function hostRunScripts(
   pm: Manager,
   repoDir: string,
   io: HostInstallIo,
-  spawn: HostSpawn = inheritSpawn,
-): void {
+  protectedEnvNames: readonly string[] = [],
+  spawn: HostStreamSpawn = streamSpawn,
+): Promise<void> {
   const cmd = INSTALL_CMD[pm];
   // SECURITY (host part-2, symmetric with part-1's --ignore-pnpmfile): `pnpm
   // rebuild` LOADS + EXECUTES a (possibly ANCESTOR workspace-root) `.pnpmfile`'s
@@ -437,8 +487,30 @@ export function hostRunScripts(
   // against the repo-local store, not the runner default (parity).
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
-  // hostRunScripts has no user args — finalArgs is credential-free, safe as displayArgs.
-  runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn, 'lifecycle-script run', io, finalArgs);
+  // Exact secret values to mask: the declared protected.env names' values in the
+  // host env (maskExactValues applies its own >=4-char floor + longest-first).
+  const sensitive = protectedEnvNames
+    .map((name) => process.env[name])
+    .filter((v): v is string => typeof v === 'string');
+  const onLine = (stream: 'stdout' | 'stderr', line: string): void => {
+    let safe = maskExactValues(line, sensitive, 'REDACTED:ENV');
+    safe = redactCredentialShapes(safe);
+    (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
+  };
+  const r = await spawn(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), onLine);
+  // finalArgs is credential-free (no user args), so it is safe to show in errors.
+  if (r.error !== undefined) {
+    throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);
+  }
+  if (r.signal != null) {
+    throw new Error(`script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(' ')}\`) was killed by ${r.signal}`);
+  }
+  if (r.status !== 0) {
+    throw new Error(
+      `script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(' ')}\`) exited with code ${r.status ?? 'null'}`,
+    );
+  }
+  io.stdout.write(`[script-jail] host lifecycle-script run complete\n`);
 }
 
 /**

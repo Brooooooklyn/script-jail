@@ -22,6 +22,7 @@ import {
   hostRunScripts,
   resolveGitFromPath,
   type HostSpawn,
+  type HostStreamSpawn,
   type HostInstallIo,
 } from '../../src/action/host-install.js';
 
@@ -54,6 +55,31 @@ function okSpawn(rec: Recorder): HostSpawn {
   return (cmd, args, cwd) => {
     rec.calls.push({ cmd, args, cwd });
     return { status: 0 };
+  };
+}
+
+/**
+ * Stream-spawn fake for part 2 (`hostRunScripts` is async, line-forwarding).
+ * Records the call, optionally replays scripted output lines through `onLine`
+ * (so a redaction test can assert what reaches the job log), then resolves with
+ * the exit disposition.
+ */
+function okStreamSpawn(
+  rec: Recorder,
+  lines: ReadonlyArray<{ stream: 'stdout' | 'stderr'; line: string }> = [],
+): HostStreamSpawn {
+  return async (cmd, args, cwd, _env, onLine) => {
+    rec.calls.push({ cmd, args, cwd });
+    for (const { stream, line } of lines) onLine(stream, line);
+    return { status: 0, signal: null };
+  };
+}
+
+/** Stream-spawn fake that records the env it was handed (part-2 variant). */
+function envCapturingStreamSpawn(captured: Array<NodeJS.ProcessEnv>): HostStreamSpawn {
+  return async (_cmd, _args, _cwd, env) => {
+    captured.push(env);
+    return { status: 0, signal: null };
   };
 }
 
@@ -94,14 +120,22 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
-  it('neutralizes yarn startup-exec env on the host child; npm/pnpm get none; auth env preserved', () => {
+  it('neutralizes yarn startup-exec env on the host child; npm/pnpm get none; auth env preserved', async () => {
     // SECURITY: an inherited YARN_* (YARN_YARN_PATH / YARN_PLUGINS / YARN_RC_FILENAME /
     // YARN_ENABLE_CONSTRAINTS_CHECKS) would re-introduce the startup code-exec the
     // preflight blocks in .yarnrc.yml.  The host yarn child overrides all four;
     // registry-auth env (YARN_NPM_*) is preserved.
-    function envCapture(): { spawn: HostSpawn; env: () => NodeJS.ProcessEnv } {
+    function envCapture(): {
+      spawn: HostSpawn;
+      streamSpawn: HostStreamSpawn;
+      env: () => NodeJS.ProcessEnv;
+    } {
       let seen: NodeJS.ProcessEnv = {};
-      return { spawn: (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; }, env: () => seen };
+      return {
+        spawn: (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; },
+        streamSpawn: async (_c, _a, _cwd, env) => { seen = env; return { status: 0, signal: null }; },
+        env: () => seen,
+      };
     }
 
     const prevAuth = process.env['YARN_NPM_AUTH_TOKEN'];
@@ -118,7 +152,7 @@ describe('hostInstallNoScripts (part 1)', () => {
 
       // yarn part 2 (run-scripts) is hardened identically.
       const y2 = envCapture();
-      hostRunScripts('yarn', '/repo', makeRecorder().io, y2.spawn);
+      await hostRunScripts('yarn', '/repo', makeRecorder().io, [], y2.streamSpawn);
       expect(y2.env()['YARN_IGNORE_PATH']).toBe('1');
       expect(y2.env()['YARN_PLUGINS']).toBe('');
 
@@ -462,19 +496,19 @@ describe('hostRunScripts (part 2)', () => {
     ['npm', ['rebuild', '--foreground-scripts']],
     ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store', '--config.ignore-pnpmfile=true']],
     ['yarn', ['install', '--immutable']],
-  ] as const)('runs the INSTALL_CMD for %s in repoDir', (pm, expected) => {
+  ] as const)('runs the INSTALL_CMD for %s in repoDir', async (pm, expected) => {
     const rec = makeRecorder();
-    hostRunScripts(pm, '/repo', rec.io, okSpawn(rec));
+    await hostRunScripts(pm, '/repo', rec.io, [], okStreamSpawn(rec));
     expect(rec.calls).toEqual([{ cmd: pm, args: expected, cwd: '/repo' }]);
   });
 
-  it('hardens the pnpm host part-2 (`pnpm rebuild`) with --config.ignore-pnpmfile=true; npm/yarn get no such flag', () => {
+  it('hardens the pnpm host part-2 (`pnpm rebuild`) with --config.ignore-pnpmfile=true; npm/yarn get no such flag', async () => {
     // SECURITY (symmetric with part-1's --ignore-pnpmfile): `pnpm rebuild` loads
     // + executes a (possibly ANCESTOR) pnpmfile's top-level code on the runner
     // AFTER the trust gate, unaudited.  Part-2 rejects the bare `--ignore-pnpmfile`
     // flag, so the config-namespaced form suppresses it.  Only pnpm gets it.
     const rec = makeRecorder();
-    hostRunScripts('pnpm', '/repo', rec.io, okSpawn(rec));
+    await hostRunScripts('pnpm', '/repo', rec.io, [], okStreamSpawn(rec));
     expect(rec.calls[0]!.args).toContain('--config.ignore-pnpmfile=true');
     // It is the LAST flag (appended after the store-dir pin).
     expect(rec.calls[0]!.args.at(-1)).toBe('--config.ignore-pnpmfile=true');
@@ -482,15 +516,54 @@ describe('hostRunScripts (part 2)', () => {
     expect(rec.calls[0]!.args).not.toContain('--ignore-pnpmfile');
     for (const pm of ['npm', 'yarn'] as const) {
       const r = makeRecorder();
-      hostRunScripts(pm, '/repo', r.io, okSpawn(r));
+      await hostRunScripts(pm, '/repo', r.io, [], okStreamSpawn(r));
       expect(r.calls[0]!.args).not.toContain('--config.ignore-pnpmfile=true');
     }
   });
 
-  it('throws on a non-zero exit', () => {
+  it('throws on a non-zero exit', async () => {
     const rec = makeRecorder();
-    const failSpawn: HostSpawn = () => ({ status: 7 });
-    expect(() => hostRunScripts('pnpm', '/repo', rec.io, failSpawn)).toThrow(/exited with code 7/);
+    const failSpawn: HostStreamSpawn = async () => ({ status: 7, signal: null });
+    await expect(hostRunScripts('pnpm', '/repo', rec.io, [], failSpawn)).rejects.toThrow(/exited with code 7/);
+  });
+
+  it('throws (kill signal) and (spawn error), with credential-free args in the message', async () => {
+    const rec = makeRecorder();
+    const sigSpawn: HostStreamSpawn = async () => ({ status: null, signal: 'SIGKILL' });
+    await expect(hostRunScripts('npm', '/repo', rec.io, [], sigSpawn)).rejects.toThrow(/killed by SIGKILL/);
+    const errSpawn: HostStreamSpawn = async () => ({ status: null, signal: null, error: new Error('ENOENT npm') });
+    await expect(hostRunScripts('npm', '/repo', rec.io, [], errSpawn)).rejects.toThrow(/could not spawn "npm": ENOENT npm/);
+  });
+
+  it('REDACTS streamed lifecycle output: protected-env values + credential shapes never reach the job log (F6)', async () => {
+    // SECURITY (adversarial-review F6): the host part-2 runs the AUDIT-TRUSTED
+    // lifecycle scripts on the runner with the job env (NPM_TOKEN etc.).  A
+    // trusted script can echo a secret; every streamed line is redacted before it
+    // reaches the GitHub Actions log — exact protected-env values via
+    // maskExactValues, plus credential SHAPES via redactCredentialShapes.
+    const rec = makeRecorder();
+    const SECRET = 'superSecretTokenValue1234';
+    const prev = process.env['MY_DEPLOY_TOKEN'];
+    process.env['MY_DEPLOY_TOKEN'] = SECRET;
+    try {
+      await hostRunScripts('npm', '/repo', rec.io, ['MY_DEPLOY_TOKEN'], okStreamSpawn(rec, [
+        { stream: 'stdout', line: `echoing the env value ${SECRET} here` },
+        { stream: 'stderr', line: 'fetching //user:hunter2hunter2@npm.acme.internal/' },
+        { stream: 'stdout', line: 'Authorization: Bearer ABCDEFGH01234567890123456789' },
+      ]));
+      const all = rec.out.join('') + rec.errs.join('');
+      // (a) the exact protected-env value is masked.
+      expect(all).not.toContain(SECRET);
+      expect(all).toContain('<REDACTED:ENV>');
+      // (b) URL userinfo + Bearer token shapes are masked too.
+      expect(all).not.toContain('hunter2hunter2');
+      expect(all).toContain('//<REDACTED:URL-CREDENTIALS>@npm.acme.internal/');
+      expect(all).not.toContain('ABCDEFGH01234567890123456789');
+      expect(all).toContain('Bearer <REDACTED>');
+    } finally {
+      if (prev === undefined) delete process.env['MY_DEPLOY_TOKEN'];
+      else process.env['MY_DEPLOY_TOKEN'] = prev;
+    }
   });
 });
 
@@ -528,10 +601,10 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     expect(git).not.toBe('');
   });
 
-  it('part 2 (lifecycle scripts) ALSO sets npm_config_git (defense-in-depth)', () => {
+  it('part 2 (lifecycle scripts) ALSO sets npm_config_git (defense-in-depth)', async () => {
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
-    hostRunScripts('npm', '/repo', rec.io, envCapturingSpawn(envs));
+    await hostRunScripts('npm', '/repo', rec.io, [], envCapturingStreamSpawn(envs));
     expect(envs).toHaveLength(1);
     const git = envs[0]!['npm_config_git'];
     expect(git).toBeDefined();
@@ -685,14 +758,14 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
 
 describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true defense-in-depth)', () => {
   /** Run `body` with extra env vars set, restoring the prior values after. */
-  function withEnv(extra: Record<string, string>, body: () => void): void {
+  async function withEnv(extra: Record<string, string>, body: () => void | Promise<void>): Promise<void> {
     const prior: Record<string, string | undefined> = {};
     for (const [k, v] of Object.entries(extra)) {
       prior[k] = process.env[k];
       process.env[k] = v;
     }
     try {
-      body();
+      await body();
     } finally {
       for (const k of Object.keys(extra)) {
         if (prior[k] === undefined) delete process.env[k];
@@ -703,8 +776,8 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
 
   it.each(['npm', 'pnpm', 'yarn'] as const)(
     'strips HOSTNAME / PWD / every SCRIPT_JAIL_* from the part-2 lifecycle env (%s)',
-    (pm) => {
-      withEnv(
+    async (pm) => {
+      await withEnv(
         {
           HOSTNAME: 'fv-az-runner-123',
           PWD: '/home/runner/work/repo/repo',
@@ -713,10 +786,10 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
           SCRIPT_JAIL_CACHE_DIR: '/tmp/sj-cache',
           SCRIPT_JAIL_ACTION_ROOT: '/opt/action',
         },
-        () => {
+        async () => {
           const rec = makeRecorder();
           const envs: Array<NodeJS.ProcessEnv> = [];
-          hostRunScripts(pm, '/repo', rec.io, envCapturingSpawn(envs));
+          await hostRunScripts(pm, '/repo', rec.io, [], envCapturingStreamSpawn(envs));
           const env = envs[0]!;
           // Sandbox tells that an env-sensitive payload could branch on are gone.
           expect(env['HOSTNAME']).toBeUndefined();
@@ -733,8 +806,8 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
     },
   );
 
-  it('also strips the tells from the part-1 no-scripts env', () => {
-    withEnv({ HOSTNAME: 'fv-az-1', SCRIPT_JAIL_REPO_DIR: '/x' }, () => {
+  it('also strips the tells from the part-1 no-scripts env', async () => {
+    await withEnv({ HOSTNAME: 'fv-az-1', SCRIPT_JAIL_REPO_DIR: '/x' }, () => {
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
       hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
@@ -745,11 +818,11 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
     });
   });
 
-  it('keeps yarn neutralizers after the strip (hygiene runs before the pins)', () => {
-    withEnv({ SCRIPT_JAIL_REPO_DIR: '/x' }, () => {
+  it('keeps yarn neutralizers after the strip (hygiene runs before the pins)', async () => {
+    await withEnv({ SCRIPT_JAIL_REPO_DIR: '/x' }, async () => {
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
-      hostRunScripts('yarn', '/repo', rec.io, envCapturingSpawn(envs));
+      await hostRunScripts('yarn', '/repo', rec.io, [], envCapturingStreamSpawn(envs));
       const env = envs[0]!;
       expect(env['YARN_IGNORE_PATH']).toBe('1');
       expect(env['YARN_PLUGINS']).toBe('');

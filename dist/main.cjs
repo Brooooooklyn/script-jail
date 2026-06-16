@@ -26711,6 +26711,7 @@ function defaultGetInput(name) {
 var import_node_child_process = require("node:child_process");
 var import_node_fs = require("node:fs");
 var import_node_path2 = require("node:path");
+var import_node_readline = require("node:readline");
 
 // src/shared/redact.ts
 function redactCredentialShapes(text) {
@@ -26835,11 +26836,7 @@ var captureSpawn = (cmd, args, cwd, env) => {
     stderr: typeof r.stderr === "string" ? r.stderr : ""
   };
 };
-var inheritSpawn = (cmd, args, cwd, env) => {
-  const r = (0, import_node_child_process.spawnSync)(cmd, args, { cwd, env, stdio: "inherit", shell: false });
-  return { status: r.status, signal: r.signal, error: r.error };
-};
-function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = captureSpawn) {
+function hostInstallNoScripts(pm, repoDir, args, io, spawn3 = captureSpawn) {
   const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
   if (droppedKeys.length > 0) {
     const n = dropped.length;
@@ -26863,23 +26860,79 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = captureSpawn) {
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn2, "no-scripts install", io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
 }
 function redactCaptured(text, sensitive) {
   let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");
   red = redactCredentialShapes(red);
   return red;
 }
-function hostRunScripts(pm, repoDir, io, spawn2 = inheritSpawn) {
+var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
+  let child;
+  try {
+    child = (0, import_node_child_process.spawn)(cmd, args, { cwd, env, stdio: ["inherit", "pipe", "pipe"], shell: false });
+  } catch (error51) {
+    resolve6({ status: null, signal: null, error: error51 });
+    return;
+  }
+  let exit = null;
+  let pending = 1;
+  const maybeDone = () => {
+    if (pending === 0 && exit !== null) resolve6(exit);
+  };
+  const wire = (stream, which2) => {
+    if (stream === null) return;
+    pending += 1;
+    const rl = (0, import_node_readline.createInterface)({ input: stream, crlfDelay: Infinity });
+    rl.on("line", (line) => onLine(which2, line));
+    rl.on("close", () => {
+      pending -= 1;
+      maybeDone();
+    });
+  };
+  wire(child.stdout, "stdout");
+  wire(child.stderr, "stderr");
+  child.on("error", (error51) => {
+    exit = { status: null, signal: null, error: error51 };
+    pending -= 1;
+    maybeDone();
+  });
+  child.on("close", (status, signal) => {
+    exit ??= { status, signal };
+    pending -= 1;
+    maybeDone();
+  });
+});
+async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = streamSpawn) {
   const cmd = INSTALL_CMD[pm];
   const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true"] : [];
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
 `);
-  runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn2, "lifecycle-script run", io, finalArgs);
+  const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
+  const onLine = (stream, line) => {
+    let safe = maskExactValues(line, sensitive, "REDACTED:ENV");
+    safe = redactCredentialShapes(safe);
+    (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
+`);
+  };
+  const r = await spawn3(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), onLine);
+  if (r.error !== void 0) {
+    throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);
+  }
+  if (r.signal != null) {
+    throw new Error(`script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(" ")}\`) was killed by ${r.signal}`);
+  }
+  if (r.status !== 0) {
+    throw new Error(
+      `script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(" ")}\`) exited with code ${r.status ?? "null"}`
+    );
+  }
+  io.stdout.write(`[script-jail] host lifecycle-script run complete
+`);
 }
-function runOrThrow(cmd, args, cwd, env, spawn2, label, io, displayArgs, onOutput) {
-  const r = spawn2(cmd, args, cwd, env);
+function runOrThrow(cmd, args, cwd, env, spawn3, label, io, displayArgs, onOutput) {
+  const r = spawn3(cmd, args, cwd, env);
   if (onOutput !== void 0 && (r.stdout !== void 0 || r.stderr !== void 0)) {
     onOutput(r.stdout ?? "", r.stderr ?? "");
   }
@@ -26916,6 +26969,16 @@ function unsupportedAltRootManifest(repoDir) {
 }
 
 // src/action/install-preflight.ts
+function readProtectedEnvNames(configPath) {
+  try {
+    const raw = (0, import_yaml.parse)((0, import_node_fs3.readFileSync)(configPath, "utf8"));
+    const env = raw?.protected?.env;
+    if (!Array.isArray(env)) return [];
+    return env.filter((e) => typeof e === "string" && e.length > 0);
+  } catch {
+    return [];
+  }
+}
 function detectPreTrustConfigExec(repoDir, manager, workspaceRoot) {
   if (manager === "pnpm") return detectPnpmfile(repoDir, workspaceRoot);
   if (manager === "yarn") return detectYarnStartupExec(repoDir, workspaceRoot);
@@ -28107,9 +28170,9 @@ var UnixSocketApiClient = class {
 var import_node_net = require("node:net");
 
 // src/shared/vsock-protocol.ts
-var import_node_readline = require("node:readline");
+var import_node_readline2 = require("node:readline");
 async function* parseFrames(readable) {
-  const rl = (0, import_node_readline.createInterface)({ input: readable, crlfDelay: Infinity });
+  const rl = (0, import_node_readline2.createInterface)({ input: readable, crlfDelay: Infinity });
   for await (const line of rl) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -44868,7 +44931,8 @@ async function main(deps = {}) {
         warn(summary2);
         process.stdout.write(detail);
       }
-      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn });
+      const protectedEnvNames = readProtectedEnvNames(inputs.configPath);
+      await doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
     }
   }
   if (result.exitCode !== 0) exitProcess(result.exitCode);

@@ -46,6 +46,27 @@ import type { Manager } from '../shared/pm-commands.js';
 import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
 
 /**
+ * Read the consumer config's declared `protected.env` secret NAMES, used by the
+ * host part-2 redactor (`hostRunScripts`) to mask those env values out of the
+ * trusted-script lifecycle output before it reaches the job log.  Best-effort: a
+ * missing / malformed config or absent field yields `[]` (no exact-value masking;
+ * credential-SHAPE redaction still applies).  Matches the guest schema default
+ * (`protected.env` defaults to `[]`), so host and sandbox mask the same names.
+ */
+export function readProtectedEnvNames(configPath: string): string[] {
+  try {
+    const raw = parseYaml(readFileSync(configPath, 'utf8')) as
+      | { protected?: { env?: unknown } }
+      | null;
+    const env = raw?.protected?.env;
+    if (!Array.isArray(env)) return [];
+    return env.filter((e): e is string => typeof e === 'string' && e.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Returns a human-readable reason string when `install: true` must be REFUSED
  * because the repo declares config that would execute code on the runner during
  * the pre-trust host no-scripts install; null when safe to proceed.

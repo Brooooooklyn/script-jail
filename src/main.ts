@@ -23,7 +23,7 @@ import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
 import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
-import { detectPreTrustConfigExec, detectInstallWorkDirDivergence } from './action/install-preflight.js';
+import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, readProtectedEnvNames } from './action/install-preflight.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
@@ -397,7 +397,11 @@ export async function main(deps: MainDeps = {}): Promise<void> {
         warn(summary);
         process.stdout.write(detail);
       }
-      doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn });
+      // Host part-2 redacts the trusted-script lifecycle output before it reaches
+      // the job log: the consumer-declared protected.env values (exact) + credential
+      // shapes (F6).  Names default to [] when no config / field — shapes still apply.
+      const protectedEnvNames = readProtectedEnvNames(inputs.configPath);
+      await doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
     }
   }
 

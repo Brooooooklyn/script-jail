@@ -48,7 +48,7 @@ function makeHostCaptures(): HostCaptures {
       hostInstallNoScripts: (pm, _repoDir, args) => {
         installCalls.push({ pm, args: [...args] });
       },
-      hostRunScripts: (pm) => {
+      hostRunScripts: async (pm) => {
         runCalls.push({ pm });
       },
     },
