@@ -216,12 +216,19 @@ describe('sanitizeInstallArgs (fail-closed allowlist)', () => {
     expect(sanitizeInstallArgs(['--registry=https://AUTHTOKEN@npm.acme.internal/']).kept).toEqual([]);
 
     // SCHEME-RELATIVE `//user:pass@host` (no scheme → `new URL` throws) must
-    // ALSO drop — the scheme-optional fallback regex catches it (F3 bypass).
+    // ALSO drop — the authority shape check catches it (F3 bypass).
     expect(sanitizeInstallArgs(['--registry=//user:SECRET_PASS@npm.acme.internal/']).kept).toEqual([]);
     expect(sanitizeInstallArgs(['--registry=//TOKEN@npm.acme.internal/']).kept).toEqual([]);
     const srSplit = sanitizeInstallArgs(['--registry', '//user:SECRET_PASS@npm.acme.internal/', '-D']);
     expect(srSplit.kept).toEqual(['-D']);
     expect(srSplit.droppedKeys).toEqual(['--registry (inline credentials — set registry auth in .npmrc/env)']);
+
+    // BARE userinfo with NO `//` (`new URL` reads `user:` as an opaque scheme, so
+    // username stays empty) must ALSO drop — npm/pnpm can exit 0 on these, and
+    // the secret would otherwise sit at rest in pm-flags.json (F5 residual).
+    expect(sanitizeInstallArgs(['--registry=user:SECRET_PASS@npm.acme.internal']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--registry=TOKEN@npm.acme.internal']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--registry=user:SECRET_PASS@host/path']).kept).toEqual([]);
   });
 
   it('MUST-PASS: a credential-FREE registry is kept even when its PATH contains @ (not userinfo)', () => {

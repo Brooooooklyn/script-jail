@@ -7812,7 +7812,12 @@ function registryUrlHasCredentials(value) {
     if (u.username.length > 0 || u.password.length > 0) return true;
   } catch {
   }
-  return /^(?:[a-z][a-z0-9+.-]{0,31}:)?\/\/[^/?#\s]*@/i.test(value);
+  let s = value.trim();
+  const scheme = /^[a-z][a-z0-9+.-]{0,31}:/i.exec(s);
+  if (scheme !== null) s = s.slice(scheme[0].length);
+  if (s.startsWith("//")) s = s.slice(2);
+  const authority = s.split(/[/?#]/, 1)[0] ?? "";
+  return authority.includes("@");
 }
 function canonicalFlagKey(token) {
   if (token.length === 0 || token[0] !== "-") return null;

@@ -17,12 +17,26 @@ describe('redactCredentialShapes', () => {
   });
 
   it('drops userinfo from a SCHEME-RELATIVE //user:pass@host URL too (F3 parity)', () => {
-    // The scheme is optional, so a scheme-relative authority is masked just like
-    // the schemeful form (mirrors pm-commands' credential rejector).
-    const out = redactCredentialShapes('registry=//user:PASSWORDABCDEF@npm.acme.internal/');
-    expect(out).not.toContain('PASSWORDABCDEF');
-    expect(out).not.toContain('user:');
-    expect(out).toContain('//<REDACTED:URL-CREDENTIALS>@npm.acme.internal/');
+    // The scheme-relative form is masked when it stands alone (at start-of-string
+    // or after a safe delimiter), mirroring pm-commands' credential rejector.
+    expect(redactCredentialShapes('registry=//user:PASSWORDABCDEF@npm.acme.internal/'))
+      .toBe('registry=//<REDACTED:URL-CREDENTIALS>@npm.acme.internal/');
+    expect(redactCredentialShapes('//user:PASSWORDABCDEF@host/')) // start-of-string
+      .toBe('//<REDACTED:URL-CREDENTIALS>@host/');
+    expect(redactCredentialShapes('see //user:PASSWORDABCDEF@host here')) // after space
+      .toContain('//<REDACTED:URL-CREDENTIALS>@host');
+  });
+
+  it('does NOT mask a // that appears INSIDE a URL path (F7 false-positive guard)', () => {
+    // A `//foo:bar@baz` deeper in a path is NOT userinfo (`new URL` reports an
+    // empty username), so the scheme-relative rule — anchored to start / a safe
+    // delimiter — must leave it untouched and not corrupt the diagnostic.
+    expect(redactCredentialShapes('registry=https://host/path//foo:bar@baz'))
+      .toBe('registry=https://host/path//foo:bar@baz');
+    expect(redactCredentialShapes('a//b:c@d')).toBe('a//b:c@d');
+    // The schemeful credential in the SAME string is still masked, the path // is not.
+    expect(redactCredentialShapes('https://u:PASSWORDXYZ@host/x//y:z@w'))
+      .toBe('https://<REDACTED:URL-CREDENTIALS>@host/x//y:z@w');
   });
 
   it('masks an npm rc _authToken= line value', () => {

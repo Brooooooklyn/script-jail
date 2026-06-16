@@ -90,25 +90,33 @@ function isBareFlag(token: string): boolean {
  * the sandbox), NEVER inline in a CLI arg.  An inline-credential `--registry`
  * value is dropped (the bare `--registry=https://host/` form stays allowed).
  *
- * Detection mirrors `redact.ts`'s URL-credentials shape: an `@` in the authority
- * component (after an OPTIONAL `scheme:` and the leading `//`, before the first
- * `/`, `?`, or `#`).  Both a structured `URL` parse and a bounded regex are used
- * so an odd-but-credentialed value can't slip the parser.  The regex scheme is
- * OPTIONAL so it also catches the SCHEME-RELATIVE form `//user:pass@host`, which
- * `new URL` rejects (no scheme → throws) and which a schemeful-only check would
- * wrongly KEEP (adversarial-review F3).  Linear-time: the scheme prefix is
- * RFC-bounded (`{0,31}`) and the userinfo class excludes whitespace + `/?#`, so
- * it can't backtrack.  An `@` AFTER the first path slash (e.g.
- * `https://host/org@scope/`) is NOT userinfo and is correctly left alone.
+ * Detection inspects the AUTHORITY component for userinfo (`user[:pass]@`).
+ * A structured `URL` parse handles schemeful URLs precisely (it decodes
+ * percent-encoded userinfo into username/password).  A shape check then covers
+ * the forms `new URL` misses or mis-parses (adversarial-review F3/F5):
+ *   * scheme-relative `//user:pass@host`   — `new URL` throws (no scheme)
+ *   * bare `user:pass@host` / `TOKEN@host` — `new URL` reads `user:` as an
+ *                                            opaque scheme, so username is empty
+ * The shape check strips an optional `scheme:` and a leading `//`, then takes
+ * everything up to the first `/`, `?`, or `#`; an `@` there is userinfo.  An `@`
+ * AFTER the first delimiter (a path segment like `https://host/org@scope/` or
+ * `host/a//b@c`) is NOT userinfo and is correctly left alone.  Linear-time: the
+ * scheme prefix is RFC-bounded (`{0,31}`) and `split` is linear, so no
+ * backtracking.
  */
 function registryUrlHasCredentials(value: string): boolean {
   try {
     const u = new URL(value);
     if (u.username.length > 0 || u.password.length > 0) return true;
   } catch {
-    // not a parseable absolute URL — fall through to the shape check
+    // not a parseable absolute URL — fall through to the authority shape check
   }
-  return /^(?:[a-z][a-z0-9+.-]{0,31}:)?\/\/[^/?#\s]*@/i.test(value);
+  let s = value.trim();
+  const scheme = /^[a-z][a-z0-9+.-]{0,31}:/i.exec(s);
+  if (scheme !== null) s = s.slice(scheme[0].length);
+  if (s.startsWith('//')) s = s.slice(2);
+  const authority = s.split(/[/?#]/, 1)[0] ?? '';
+  return authority.includes('@');
 }
 
 /**
