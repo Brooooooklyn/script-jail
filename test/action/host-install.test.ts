@@ -6,7 +6,15 @@
 
 import { describe, it, expect } from 'vitest';
 import { isAbsolute, join, delimiter } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  symlinkSync,
+  realpathSync,
+  existsSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import {
@@ -526,6 +534,109 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
       if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
       else process.env['GITHUB_WORKSPACE'] = origWs;
       rmSync(checkout, { recursive: true, force: true });
+    }
+  });
+
+  it('REJECTS a case-variant spelling of the checkout dir on a case-insensitive FS', () => {
+    // P1 (case-insensitive bypass): on macOS APFS/HFS+ (and Windows NTFS),
+    // `/work/Repo` and `/work/repo` are the SAME dir.  A lexical containment
+    // test misses the case-variant; the realpath + case-fold canonicalization
+    // must still reject it.  No-op assertion on a case-sensitive FS (Linux),
+    // where the variant is a genuinely different, non-existent dir.
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-Checkout-'));
+    const binDir = join(checkout, 'Bin');
+    mkdirSync(binDir);
+    const fakeGit = join(binDir, process.platform === 'win32' ? 'git.exe' : 'git');
+    writeFileSync(fakeGit, '#!/bin/sh\necho pwned\n', { mode: 0o755 });
+    const variantBin = binDir.toLowerCase();
+    const caseInsensitive =
+      variantBin !== binDir && existsSync(join(variantBin, process.platform === 'win32' ? 'git.exe' : 'git'));
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      if (!caseInsensitive) return; // FS folds no case — bypass class N/A here
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      // Case-variant of the checkout bin FIRST — the lexical-only check let it pass.
+      process.env['PATH'] = `${variantBin}${delimiter}${origPath ?? ''}`;
+      const resolved = resolveGitFromPath();
+      if (resolved !== undefined) {
+        expect(realpathSync(resolved)).not.toBe(realpathSync(fakeGit));
+        expect(realpathSync(resolved).toLowerCase().startsWith(realpathSync(checkout).toLowerCase())).toBe(
+          false,
+        );
+      }
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+    }
+  });
+
+  it('REJECTS a PATH dir that SYMLINKS into the checkout (realpath defense)', () => {
+    // P1 (symlink bypass): a runner-looking PATH entry that is actually a symlink
+    // INTO the checkout has a lexical path outside it; realpath must resolve the
+    // link and reject the real (checkout) target.
+    if (process.platform === 'win32') return; // symlink perms differ on Windows runners
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-co-'));
+    const cbin = join(checkout, 'bin');
+    mkdirSync(cbin);
+    const cgit = join(cbin, 'git');
+    writeFileSync(cgit, '#!/bin/sh\necho pwned\n', { mode: 0o755 });
+    const runner = mkdtempSync(join(tmpdir(), 'sj-rn-'));
+    const symbin = join(runner, 'symbin');
+    symlinkSync(cbin, symbin); // runner-located path → checkout/bin
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      process.env['PATH'] = `${symbin}${delimiter}${origPath ?? ''}`;
+      const resolved = resolveGitFromPath();
+      expect(resolved).not.toBe(join(symbin, 'git'));
+      if (resolved !== undefined) {
+        expect(realpathSync(resolved)).not.toBe(realpathSync(cgit));
+      }
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+      rmSync(runner, { recursive: true, force: true });
+    }
+  });
+
+  it('REJECTS a runner-dir git binary that SYMLINKS to a checkout git', () => {
+    // P1 (symlinked binary bypass): the PATH dir is genuinely outside the
+    // checkout, but the `git` inside it is a symlink whose real target lives in
+    // the checkout — the candidate-level realpath check must catch it.
+    if (process.platform === 'win32') return;
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-co-'));
+    const cbin = join(checkout, 'bin');
+    mkdirSync(cbin);
+    const cgit = join(cbin, 'git');
+    writeFileSync(cgit, '#!/bin/sh\necho pwned\n', { mode: 0o755 });
+    const runner = mkdtempSync(join(tmpdir(), 'sj-rn-'));
+    const rbin = join(runner, 'bin');
+    mkdirSync(rbin);
+    symlinkSync(cgit, join(rbin, 'git')); // runner dir, but git → checkout git
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      process.env['PATH'] = `${rbin}${delimiter}${origPath ?? ''}`;
+      const resolved = resolveGitFromPath();
+      if (resolved !== undefined) {
+        expect(realpathSync(resolved)).not.toBe(realpathSync(cgit));
+      }
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+      rmSync(runner, { recursive: true, force: true });
     }
   });
 

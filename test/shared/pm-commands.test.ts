@@ -241,11 +241,28 @@ describe('sanitizeInstallArgs', () => {
     }
   });
 
-  it('does NOT over-drop non-frozen flags that merely start with "f"', () => {
-    // Only prefixes of `frozenlockfile` resolve to --frozen-lockfile.  `--force`
-    // (force), `--filter` (filter), `--fix-lockfile` (fixlockfile) are NOT
-    // prefixes and must survive — confirms the prefix-match has no `f*` collision.
-    for (const arg of ['--force', '--filter', '--fix-lockfile', '--frozen-lockfile-extra']) {
+  it('drops pnpm --fix-lockfile (separate unfreeze path) — full, abbrev, =value, config.', () => {
+    // `--fix-lockfile` does NOT negate `frozen-lockfile`; it OVERRIDES it and
+    // rewrites + installs an unpinned lock even when one is missing — verified
+    // against real pnpm (bare `--frozen-lockfile` errors NO_LOCKFILE, adding
+    // `--fix-lockfile` OR its `--fix` abbreviation installs).  Drop every spelling.
+    for (const arg of [
+      '--fix-lockfile',
+      '--fix',
+      '--fixl',
+      '--fix-lockfile=true',
+      '--config.fix-lockfile=true',
+    ]) {
+      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
+      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--fix-lockfile']);
+    }
+  });
+
+  it('does NOT over-drop legit flags that merely start with "f"', () => {
+    // Only prefixes of `frozenlockfile` / `fixlockfile` resolve to those options.
+    // `--force` (force), `--filter` (filter), `--fetch-timeout` (fetchtimeout) are
+    // NOT prefixes of either and must survive — confirms no `f*` over-collision.
+    for (const arg of ['--force', '--filter', '--fetch-timeout=60000', '--frozen-lockfile-extra']) {
       expect(sanitizeInstallArgs([arg]).kept).toEqual([arg]);
       expect(sanitizeInstallArgs([arg]).dropped).toEqual([]);
     }

@@ -24,7 +24,7 @@
 //     derives from the reviewed lock, not from host isolation.  See docs.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve, sep } from 'node:path';
 
 import {
@@ -65,11 +65,40 @@ function trustedGitPath(): string {
   return RESOLVED_TRUSTED_GIT;
 }
 
+// Default filesystems on macOS (APFS/HFS+) and Windows (NTFS) are
+// case-INSENSITIVE: `/work/Repo` and `/work/repo` are the SAME directory, so a
+// purely lexical containment test (`abs.startsWith(root + sep)`) misses a
+// case-variant spelling of a checkout dir.  Case-fold on those platforms.
+const CASE_INSENSITIVE_FS = process.platform === 'darwin' || process.platform === 'win32';
+
+/**
+ * Canonicalize a path for containment comparison:
+ *   1. resolve to absolute, then
+ *   2. follow symlinks to the REAL on-disk target via `realpathSync` — so a
+ *      runner-looking PATH entry that is actually a symlink INTO the checkout
+ *      (or a checkout-resident `git` symlink) cannot slip past the test, and a
+ *      case-insensitive FS returns the canonical on-disk casing, then
+ *   3. lower-case on a case-insensitive FS so a different-case spelling of the
+ *      same dir still matches.
+ * Falls back to a lexical `resolve` when the path does not exist (`realpathSync`
+ * throws `ENOENT`) — a non-existent dir cannot host a real `git` anyway.
+ */
+function canonicalForCompare(p: string): string {
+  let abs: string;
+  try {
+    abs = realpathSync(resolve(p));
+  } catch {
+    abs = resolve(p);
+  }
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+
 /**
  * Directories a PR author can write into (the checkout tree): `$GITHUB_WORKSPACE`
  * (where actions/checkout places the PR), `$SCRIPT_JAIL_REPO_DIR` (an explicit
- * repo root, possibly a subdir of the checkout), and the process cwd.  Resolved
- * to absolute, de-duplicated implicitly by the containment test.
+ * repo root, possibly a subdir of the checkout), and the process cwd.
+ * Canonicalized (realpath + case-fold) so the containment test below is robust
+ * to symlinks and case-variant spellings; de-duplicated implicitly by the test.
  */
 function checkoutRoots(): string[] {
   const roots: string[] = [];
@@ -78,14 +107,19 @@ function checkoutRoots(): string[] {
     process.env['SCRIPT_JAIL_REPO_DIR'],
     process.cwd(),
   ]) {
-    if (v !== undefined && v !== '') roots.push(resolve(v));
+    if (v !== undefined && v !== '') roots.push(canonicalForCompare(v));
   }
   return roots;
 }
 
-/** True when `dir` is a checkout root or nested under one (PR-controlled). */
-function isUnderCheckout(dir: string, roots: ReadonlyArray<string>): boolean {
-  const abs = resolve(dir);
+/**
+ * True when `p`'s REAL path (symlinks resolved, case-folded on case-insensitive
+ * filesystems) is a checkout root or nested under one (PR-controlled).  `roots`
+ * MUST already be `canonicalForCompare`-canonicalized so both sides compare in
+ * the same space.
+ */
+function isUnderCheckout(p: string, roots: ReadonlyArray<string>): boolean {
+  const abs = canonicalForCompare(p);
   for (const root of roots) {
     if (abs === root || abs.startsWith(root + sep)) return true;
   }
@@ -102,9 +136,13 @@ function isUnderCheckout(dir: string, roots: ReadonlyArray<string>): boolean {
  * `git:` dependencies EVEN under `--ignore-scripts`.  A workflow that prepends a
  * checkout-controlled dir to PATH (e.g. `echo "$GITHUB_WORKSPACE/bin" >> $GITHUB_PATH`)
  * would otherwise let a PR-committed `bin/git` be picked as the "trusted" git and
- * run on the runner before anything is gated.  So we SKIP every PATH entry inside
- * the checkout (`isUnderCheckout`) and resolve git only from a runner-owned dir.
- * The `isAbsolute` check additionally rejects a relative entry (e.g. `.`).
+ * run on the runner before anything is gated.  So we SKIP every candidate whose
+ * REAL path is inside the checkout — both at the PATH-dir level and at the
+ * resolved-binary level (`isUnderCheckout` realpaths + case-folds, so a
+ * symlinked PATH entry pointing into the checkout, a checkout-resident `git`
+ * symlink, and a case-variant spelling on a case-insensitive runner FS are all
+ * rejected).  The `isAbsolute` check additionally rejects a relative entry
+ * (e.g. `.`).
  *
  * RESIDUAL (pathological, documented): if NO git exists on PATH outside the
  * checkout, the caller falls back to the bare literal `git`, which npm then
@@ -120,13 +158,18 @@ export function resolveGitFromPath(): string | undefined {
   for (const dir of pathVar.split(delimiter)) {
     if (dir === '') continue;
     // SECURITY: never resolve the "trusted" git from a checkout-controlled PATH
-    // entry — see the function note above.
+    // entry (cheap dir-level reject) — see the function note above.
     if (isUnderCheckout(dir, roots)) continue;
     for (const name of names) {
       const candidate = join(dir, name);
       // Only accept an ABSOLUTE candidate so a relative PATH entry (e.g. `.`)
       // can't point npm at a repo-placed shadow binary.
-      if (isAbsolute(candidate) && existsSync(candidate)) return candidate;
+      if (!isAbsolute(candidate) || !existsSync(candidate)) continue;
+      // SECURITY: the git BINARY itself may be a symlink whose real target lives
+      // in the checkout even when its PATH dir does not — re-check the resolved
+      // candidate's real path before trusting it.
+      if (isUnderCheckout(candidate, roots)) continue;
+      return candidate;
     }
   }
   return undefined;

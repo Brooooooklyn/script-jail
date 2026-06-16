@@ -26481,6 +26481,7 @@ function isForbiddenFlag(token) {
   if (key === "mode") return true;
   if (key === "immutable") return true;
   if (key.length >= 2 && "frozenlockfile".startsWith(key)) return true;
+  if (key.length >= 2 && "fixlockfile".startsWith(key)) return true;
   return false;
 }
 function sanitizeInstallArgs(args) {
@@ -26492,7 +26493,7 @@ function sanitizeInstallArgs(args) {
     if (isForbiddenFlag(a)) {
       dropped.push(a);
       const rawKey = canonicalFlagKey(a) ?? "unknown";
-      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : "frozenlockfile".startsWith(rawKey) && rawKey.length >= 2 ? "frozen-lockfile" : rawKey;
+      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : "frozenlockfile".startsWith(rawKey) && rawKey.length >= 2 ? "frozen-lockfile" : "fixlockfile".startsWith(rawKey) && rawKey.length >= 2 ? "fix-lockfile" : rawKey;
       droppedKeys.push(`--${displayKey}`);
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
         dropped.push(args[++i]);
@@ -26661,6 +26662,16 @@ function trustedGitPath() {
   RESOLVED_TRUSTED_GIT = resolveGitFromPath() ?? "git";
   return RESOLVED_TRUSTED_GIT;
 }
+var CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+function canonicalForCompare(p) {
+  let abs;
+  try {
+    abs = (0, import_node_fs.realpathSync)((0, import_node_path2.resolve)(p));
+  } catch {
+    abs = (0, import_node_path2.resolve)(p);
+  }
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
 function checkoutRoots() {
   const roots = [];
   for (const v of [
@@ -26668,12 +26679,12 @@ function checkoutRoots() {
     process.env["SCRIPT_JAIL_REPO_DIR"],
     process.cwd()
   ]) {
-    if (v !== void 0 && v !== "") roots.push((0, import_node_path2.resolve)(v));
+    if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
   }
   return roots;
 }
-function isUnderCheckout(dir, roots) {
-  const abs = (0, import_node_path2.resolve)(dir);
+function isUnderCheckout(p, roots) {
+  const abs = canonicalForCompare(p);
   for (const root of roots) {
     if (abs === root || abs.startsWith(root + import_node_path2.sep)) return true;
   }
@@ -26689,7 +26700,9 @@ function resolveGitFromPath() {
     if (isUnderCheckout(dir, roots)) continue;
     for (const name of names) {
       const candidate = (0, import_node_path2.join)(dir, name);
-      if ((0, import_node_path2.isAbsolute)(candidate) && (0, import_node_fs.existsSync)(candidate)) return candidate;
+      if (!(0, import_node_path2.isAbsolute)(candidate) || !(0, import_node_fs.existsSync)(candidate)) continue;
+      if (isUnderCheckout(candidate, roots)) continue;
+      return candidate;
     }
   }
   return void 0;

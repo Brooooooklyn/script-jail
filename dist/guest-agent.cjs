@@ -25526,6 +25526,7 @@ function isForbiddenFlag(token) {
   if (key === "mode") return true;
   if (key === "immutable") return true;
   if (key.length >= 2 && "frozenlockfile".startsWith(key)) return true;
+  if (key.length >= 2 && "fixlockfile".startsWith(key)) return true;
   return false;
 }
 function sanitizeInstallArgs(args) {
@@ -25537,7 +25538,7 @@ function sanitizeInstallArgs(args) {
     if (isForbiddenFlag(a)) {
       dropped.push(a);
       const rawKey = canonicalFlagKey(a) ?? "unknown";
-      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : "frozenlockfile".startsWith(rawKey) && rawKey.length >= 2 ? "frozen-lockfile" : rawKey;
+      const displayKey = "ignorescripts".startsWith(rawKey) && rawKey.length >= 2 ? "ignore-scripts" : "frozenlockfile".startsWith(rawKey) && rawKey.length >= 2 ? "frozen-lockfile" : "fixlockfile".startsWith(rawKey) && rawKey.length >= 2 ? "fix-lockfile" : rawKey;
       droppedKeys.push(`--${displayKey}`);
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
         dropped.push(args[++i]);

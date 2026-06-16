@@ -173,6 +173,15 @@ function isForbiddenFlag(token: string): boolean {
   // prefixes and survive — so over-matching is the safe direction.  yarn stays
   // EXACT above because clipanion rejects `--immut`/`--no-immut` (no abbrev).
   if (key.length >= 2 && 'frozenlockfile'.startsWith(key)) return true; // pnpm
+  // pnpm `--fix-lockfile` is a SEPARATE unfreeze path: it does NOT negate
+  // `frozen-lockfile`, it OVERRIDES it — with the fixed `--frozen-lockfile` still
+  // present, `pnpm install --frozen-lockfile --fix-lockfile` re-resolves and
+  // REWRITES a missing/out-of-sync `pnpm-lock.yaml` and installs the unpinned
+  // tree (empirically: the bare `--frozen-lockfile` errors `ERR_PNPM_NO_LOCKFILE`,
+  // adding `--fix-lockfile` makes it install).  Same nopt abbreviation applies
+  // (`--fix` → `--fix-lockfile`), so PREFIX-match it too; `--filter` (`filter`)
+  // is NOT a prefix of `fixlockfile` and survives.
+  if (key.length >= 2 && 'fixlockfile'.startsWith(key)) return true; // pnpm
   return false;
 }
 
@@ -192,6 +201,9 @@ function isForbiddenFlag(token: string): boolean {
  *     via the `no-`/`config.` peel) — they would unfreeze the install (last-flag-
  *     wins over the fixed `--immutable`/`--frozen-lockfile`) and resolve a tree
  *     not pinned by the committed manager lock.
+ *   * pnpm `--fix-lockfile` (and its `--fix` abbreviation / `--config.` alias) —
+ *     a SEPARATE unfreeze path that overrides the fixed `--frozen-lockfile` and
+ *     rewrites + installs an unpinned lock even when one is absent/out-of-sync.
  *
  * Returns the kept args (to append after the fixed flags) and the dropped args
  * (so the caller can warn).  Pure; no shell parsing — the input is already an
@@ -227,7 +239,9 @@ export function sanitizeInstallArgs(args: ReadonlyArray<string>): {
           ? 'ignore-scripts'
           : 'frozenlockfile'.startsWith(rawKey) && rawKey.length >= 2
             ? 'frozen-lockfile'
-            : rawKey;
+            : 'fixlockfile'.startsWith(rawKey) && rawKey.length >= 2
+              ? 'fix-lockfile'
+              : rawKey;
       droppedKeys.push(`--${displayKey}`);
       // Bare form (no `=value`): the package manager would consume the NEXT
       // token as the value (`--ignore-scripts false`, `--mode update-lockfile`).
