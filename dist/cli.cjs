@@ -7812,7 +7812,7 @@ function registryUrlHasCredentials(value) {
     if (u.username.length > 0 || u.password.length > 0) return true;
   } catch {
   }
-  return /^[a-z][a-z0-9+.-]{0,31}:\/\/[^/?#\s]*@/i.test(value);
+  return /^(?:[a-z][a-z0-9+.-]{0,31}:)?\/\/[^/?#\s]*@/i.test(value);
 }
 function canonicalFlagKey(token) {
   if (token.length === 0 || token[0] !== "-") return null;

@@ -37,12 +37,15 @@
  */
 export function redactCredentialShapes(text: string): string {
   return text
-    // scheme://user:pass@host  → keep scheme + host, drop userinfo
-    // Scheme length is RFC-bounded ({0,31}) so the prefix can't backtrack:
-    // an unbounded `*` here is O(N) per start position → O(N²) ReDoS on long
-    // contiguous [a-z0-9+.-] runs (integrity hashes, long resolved URLs).  No
-    // real URI scheme exceeds 32 chars, so this is output-preserving.
-    .replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
+    // scheme://user:pass@host (or scheme-relative //user:pass@host) → keep
+    // scheme + host, drop userinfo.  The scheme is OPTIONAL so the scheme-
+    // relative form is masked too (parity with pm-commands' credential rejector,
+    // adversarial-review F3).  Scheme length is RFC-bounded ({0,31}) so the
+    // prefix can't backtrack: an unbounded `*` here is O(N) per start position →
+    // O(N²) ReDoS on long contiguous [a-z0-9+.-] runs (integrity hashes, long
+    // resolved URLs).  No real URI scheme exceeds 32 chars, so this is output-
+    // preserving.
+    .replace(/((?:[a-z][a-z0-9+.-]{0,31}:)?\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
     // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
     .replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, '$1<REDACTED>')
     // Bearer <token>

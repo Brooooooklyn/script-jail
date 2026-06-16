@@ -48,6 +48,7 @@ export class MacOSInstallRunner implements StraceRunner {
   private _exitCode = 0;
   private readonly _spawnImpl: SpawnImpl;
   private readonly _eventsFile: EventsFile | null;
+  private readonly _redactStderr: ((s: string) => string) | undefined;
   private readonly _tamperRef: { reason: string | null } = { reason: null };
 
   /**
@@ -58,10 +59,21 @@ export class MacOSInstallRunner implements StraceRunner {
    *                   `null`, the runner does not tail a shared events file
    *                   (used by tests that supply a pre-set environment via the
    *                   `opts.env` passed to `run()`).
+   * @param redactStderr Optional redactor applied to each forwarded install
+   *                   stderr line (SAME contract as LinuxStraceRunner's stdout
+   *                   redactor: exact protected-env values + credential SHAPES).
+   *                   The macOS-bare runner forwards the install's STDERR to the
+   *                   console, so without this a lifecycle script could leak a
+   *                   secret there while the Linux path masks it (F1/F4).
    */
-  constructor(spawnImpl?: SpawnImpl, eventsFile?: EventsFile | null) {
+  constructor(
+    spawnImpl?: SpawnImpl,
+    eventsFile?: EventsFile | null,
+    redactStderr?: (s: string) => string,
+  ) {
     this._spawnImpl = spawnImpl ?? (spawn as unknown as SpawnImpl);
     this._eventsFile = eventsFile ?? null;
+    this._redactStderr = redactStderr;
   }
 
   getExitCode(): number {
@@ -163,11 +175,20 @@ export class MacOSInstallRunner implements StraceRunner {
 
     // Forward the install command's stderr line-by-line to process.stderr with
     // a [macos] prefix so diagnostics land on the orchestrator's console.
+    //
+    // SECURITY (adversarial-review F4): this is the install tree's OWN stderr
+    // (the runner spawns it directly), so a lifecycle script can print a secret
+    // here — e.g. one read from the staged pm-flags.json sidecar, or a protected
+    // env value.  Apply the same redactor the Linux runner uses for its stdout
+    // tail (exact protected-env values + credential SHAPES) so macOS-bare reaches
+    // redaction parity.  readline yields COMPLETE lines (crlfDelay: Infinity),
+    // matching the redactor's line-local contract.
     let stderrRl: ReturnType<typeof createInterface> | null = null;
     if (child.stderr) {
       stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
       stderrRl.on('line', (line: string) => {
-        process.stderr.write(`[macos] ${line}\n`);
+        const safe = this._redactStderr ? this._redactStderr(line) : line;
+        process.stderr.write(`[macos] ${safe}\n`);
       });
     }
 

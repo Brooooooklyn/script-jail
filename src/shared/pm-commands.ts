@@ -91,10 +91,15 @@ function isBareFlag(token: string): boolean {
  * value is dropped (the bare `--registry=https://host/` form stays allowed).
  *
  * Detection mirrors `redact.ts`'s URL-credentials shape: an `@` in the authority
- * component (after `scheme://`, before the first `/`, `?`, or `#`).  Both a
- * structured `URL` parse and a bounded regex are used so an odd-but-credentialed
- * value can't slip the parser.  Linear-time: the scheme prefix is RFC-bounded
- * (`{0,31}`) and the userinfo class excludes whitespace, so it can't backtrack.
+ * component (after an OPTIONAL `scheme:` and the leading `//`, before the first
+ * `/`, `?`, or `#`).  Both a structured `URL` parse and a bounded regex are used
+ * so an odd-but-credentialed value can't slip the parser.  The regex scheme is
+ * OPTIONAL so it also catches the SCHEME-RELATIVE form `//user:pass@host`, which
+ * `new URL` rejects (no scheme → throws) and which a schemeful-only check would
+ * wrongly KEEP (adversarial-review F3).  Linear-time: the scheme prefix is
+ * RFC-bounded (`{0,31}`) and the userinfo class excludes whitespace + `/?#`, so
+ * it can't backtrack.  An `@` AFTER the first path slash (e.g.
+ * `https://host/org@scope/`) is NOT userinfo and is correctly left alone.
  */
 function registryUrlHasCredentials(value: string): boolean {
   try {
@@ -103,7 +108,7 @@ function registryUrlHasCredentials(value: string): boolean {
   } catch {
     // not a parseable absolute URL — fall through to the shape check
   }
-  return /^[a-z][a-z0-9+.-]{0,31}:\/\/[^/?#\s]*@/i.test(value);
+  return /^(?:[a-z][a-z0-9+.-]{0,31}:)?\/\/[^/?#\s]*@/i.test(value);
 }
 
 /**

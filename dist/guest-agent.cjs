@@ -25293,7 +25293,7 @@ var Attribution = class {
 
 // src/shared/redact.ts
 function redactCredentialShapes(text) {
-  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+  return text.replace(/((?:[a-z][a-z0-9+.-]{0,31}:)?\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
 }
 function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
@@ -25509,7 +25509,7 @@ function registryUrlHasCredentials(value) {
     if (u.username.length > 0 || u.password.length > 0) return true;
   } catch {
   }
-  return /^[a-z][a-z0-9+.-]{0,31}:\/\/[^/?#\s]*@/i.test(value);
+  return /^(?:[a-z][a-z0-9+.-]{0,31}:)?\/\/[^/?#\s]*@/i.test(value);
 }
 function canonicalFlagKey(token) {
   if (token.length === 0 || token[0] !== "-") return null;
@@ -29091,6 +29091,7 @@ var MacOSInstallRunner = class {
   _exitCode = 0;
   _spawnImpl;
   _eventsFile;
+  _redactStderr;
   _tamperRef = { reason: null };
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through to
@@ -29100,10 +29101,17 @@ var MacOSInstallRunner = class {
    *                   `null`, the runner does not tail a shared events file
    *                   (used by tests that supply a pre-set environment via the
    *                   `opts.env` passed to `run()`).
+   * @param redactStderr Optional redactor applied to each forwarded install
+   *                   stderr line (SAME contract as LinuxStraceRunner's stdout
+   *                   redactor: exact protected-env values + credential SHAPES).
+   *                   The macOS-bare runner forwards the install's STDERR to the
+   *                   console, so without this a lifecycle script could leak a
+   *                   secret there while the Linux path masks it (F1/F4).
    */
-  constructor(spawnImpl, eventsFile) {
+  constructor(spawnImpl, eventsFile, redactStderr) {
     this._spawnImpl = spawnImpl ?? import_node_child_process2.spawn;
     this._eventsFile = eventsFile ?? null;
+    this._redactStderr = redactStderr;
   }
   getExitCode() {
     return this._exitCode;
@@ -29175,7 +29183,8 @@ var MacOSInstallRunner = class {
     if (child.stderr) {
       stderrRl = (0, import_node_readline.createInterface)({ input: child.stderr, crlfDelay: Infinity });
       stderrRl.on("line", (line) => {
-        process.stderr.write(`[macos] ${line}
+        const safe = this._redactStderr ? this._redactStderr(line) : line;
+        process.stderr.write(`[macos] ${safe}
 `);
       });
     }
@@ -30885,7 +30894,7 @@ async function main(input) {
     PHASE_B_STDOUT_TAIL_BYTES,
     4096 + maxProtectedValueBytes + 4096
   );
-  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(
+  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile, (s) => redactSensitive(s, config2.protected.env)) : new LinuxStraceRunner(
     void 0,
     eventsFile,
     (s) => redactSensitive(s, config2.protected.env),
@@ -31122,7 +31131,7 @@ ${stdoutTail}`;
         return;
       }
       prepareEventsFilePath = pf.path;
-      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf) : new LinuxStraceRunner(
+      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf, (s) => redactSensitive(s, config2.protected.env)) : new LinuxStraceRunner(
         void 0,
         pf,
         (s) => redactSensitive(s, config2.protected.env),

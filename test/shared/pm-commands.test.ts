@@ -214,6 +214,30 @@ describe('sanitizeInstallArgs (fail-closed allowlist)', () => {
 
     // A bare userinfo (token only, no password) is still credentials → dropped.
     expect(sanitizeInstallArgs(['--registry=https://AUTHTOKEN@npm.acme.internal/']).kept).toEqual([]);
+
+    // SCHEME-RELATIVE `//user:pass@host` (no scheme → `new URL` throws) must
+    // ALSO drop — the scheme-optional fallback regex catches it (F3 bypass).
+    expect(sanitizeInstallArgs(['--registry=//user:SECRET_PASS@npm.acme.internal/']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--registry=//TOKEN@npm.acme.internal/']).kept).toEqual([]);
+    const srSplit = sanitizeInstallArgs(['--registry', '//user:SECRET_PASS@npm.acme.internal/', '-D']);
+    expect(srSplit.kept).toEqual(['-D']);
+    expect(srSplit.droppedKeys).toEqual(['--registry (inline credentials — set registry auth in .npmrc/env)']);
+  });
+
+  it('MUST-PASS: a credential-FREE registry is kept even when its PATH contains @ (not userinfo)', () => {
+    // An `@` AFTER the first path slash is a scoped path segment, not userinfo —
+    // the value carries no credential and must NOT be wrongly dropped (F3 inverse).
+    expect(sanitizeInstallArgs(['--registry=https://npm.acme.internal/org@scope/']).kept).toEqual([
+      '--registry=https://npm.acme.internal/org@scope/',
+    ]);
+    // A credential-free scheme-relative registry is likewise kept.
+    expect(sanitizeInstallArgs(['--registry=//npm.acme.internal/']).kept).toEqual([
+      '--registry=//npm.acme.internal/',
+    ]);
+    // IPv6 host, no userinfo → kept.
+    expect(sanitizeInstallArgs(['--registry=https://[::1]:4873/']).kept).toEqual([
+      '--registry=https://[::1]:4873/',
+    ]);
   });
 
   it('MUST-DROP: a bare positional fails closed and reports <positional> (never the raw token)', () => {

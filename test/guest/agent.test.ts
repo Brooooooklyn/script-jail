@@ -5112,6 +5112,59 @@ describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)
     expect(runner.getTamperReason()).not.toBeNull();
     expect(runner.getTamperReason()).toMatch(/ctime advanced|without new bytes/);
   });
+
+  it('redacts credential shapes + protected-env values in forwarded [macos] stderr (F4)', async () => {
+    // macOS-bare forwards the install tree's OWN stderr to the console, so a
+    // lifecycle script could leak a secret there.  The runner must apply the
+    // SAME redactor the Linux path uses (parity), so the leak is closed on macOS
+    // too.
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    const fakeChild = {
+      stderr: fakeStderr as unknown as NodeJS.ReadableStream,
+      stdio: [null, null, fakeStderr, fakeFd3] as Array<NodeJS.ReadableStream | null | undefined>,
+      pid: undefined as number | undefined,
+      on(event: 'close' | 'error', listener: (...a: never[]) => void) {
+        if (event === 'close') closeListener = listener as unknown as (code: number | null) => void;
+        return this;
+      },
+    };
+    const fakeSpawn = (() => fakeChild) as unknown as SpawnImpl;
+
+    const redact = (s: string): string => redactSensitive(s, ['MY_SECRET'], { MY_SECRET: 'HUNTER2SECRET' });
+    const runner = new MacOSInstallRunner(fakeSpawn, null, redact);
+
+    const capturedStderr: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]): boolean => {
+      capturedStderr.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+      return origWrite(chunk as Parameters<typeof origWrite>[0], ...(args as Parameters<typeof origWrite>[1][]));
+    }) as typeof process.stderr.write;
+
+    try {
+      const runIter = runner.run('node', [], { env: {}, cwd: macDir, basePath: join(macDir, 'strace.out') });
+      const drain = (async () => { for await (const _ of runIter) { /* drain */ } })();
+
+      fakeStderr.push('fetch https://user:DEPLOYKEYSECRET@reg.example/pkg\n'); // URL userinfo → layer 2
+      fakeStderr.push('also //user:DEPLOYKEYSECRET@reg.example/ scheme-relative\n'); // F3 shape → layer 2
+      fakeStderr.push('leaked MY_SECRET=HUNTER2SECRET\n'); // protected env → layer 1
+      fakeStderr.push(null);
+      fakeFd3.push(null);
+      setTimeout(() => { closeListener?.(0); }, 30);
+      await drain;
+
+      const forwarded = capturedStderr.join('');
+      expect(forwarded).not.toContain('DEPLOYKEYSECRET');
+      expect(forwarded).not.toContain('HUNTER2SECRET');
+      expect(forwarded).toContain('<REDACTED:URL-CREDENTIALS>');
+      expect(forwarded).toContain('<REDACTED:MY_SECRET>');
+      expect(forwarded).toMatch(/\[macos\] /);
+    } finally {
+      process.stderr.write = origWrite;
+    }
+  });
 });
 
 describe('Phase B stdout capture (in-memory tail)', () => {

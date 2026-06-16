@@ -16,6 +16,15 @@ describe('redactCredentialShapes', () => {
     expect(out).toContain('https://<REDACTED:URL-CREDENTIALS>@host:8080/path');
   });
 
+  it('drops userinfo from a SCHEME-RELATIVE //user:pass@host URL too (F3 parity)', () => {
+    // The scheme is optional, so a scheme-relative authority is masked just like
+    // the schemeful form (mirrors pm-commands' credential rejector).
+    const out = redactCredentialShapes('registry=//user:PASSWORDABCDEF@npm.acme.internal/');
+    expect(out).not.toContain('PASSWORDABCDEF');
+    expect(out).not.toContain('user:');
+    expect(out).toContain('//<REDACTED:URL-CREDENTIALS>@npm.acme.internal/');
+  });
+
   it('masks an npm rc _authToken= line value', () => {
     const out = redactCredentialShapes('//registry.npmjs.org/:_authToken=npmTokenABCDEFGH01234567');
     expect(out).not.toContain('npmTokenABCDEFGH01234567');

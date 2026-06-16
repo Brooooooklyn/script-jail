@@ -3080,7 +3080,7 @@ export async function main(input: AgentInput): Promise<void> {
   const straceRunner: StraceRunner =
     input.strace ??
     (isMacosBare
-      ? new MacOSInstallRunner(undefined, eventsFile)
+      ? new MacOSInstallRunner(undefined, eventsFile, (s) => redactSensitive(s, config.protected.env))
       : new LinuxStraceRunner(
           undefined,
           eventsFile,
@@ -3648,7 +3648,7 @@ export async function main(input: AgentInput): Promise<void> {
       }
       prepareEventsFilePath = pf.path;
       prepareRunner = isMacosBare
-        ? new MacOSInstallRunner(undefined, pf)
+        ? new MacOSInstallRunner(undefined, pf, (s) => redactSensitive(s, config.protected.env))
         : new LinuxStraceRunner(
             undefined,
             pf,
