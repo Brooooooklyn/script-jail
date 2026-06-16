@@ -885,6 +885,26 @@ describe('makeLineSink (part-2 bounded line splitter)', () => {
     expect(lines.map((l) => l.line)).toEqual(['one', 'two']); // no spurious marker
   });
 
+  it('DOCUMENTS the accepted line-local residual: a concurrent newline completes a held prefix (F6 round-3)', () => {
+    // stdout/stderr are ONE shared pipe; the sink cannot tell "writer A prefix +
+    // writer B newline" from "writer A whole line".  So a no-newline prefix that
+    // a SECOND writer's newline completes IS forwarded as a line — exact-value
+    // redaction (whole declared value) misses a prefix.  This is the SAME
+    // irreducible LINE-LOCAL residual the guest forwarders carry, and it is
+    // DEFENSE-IN-DEPTH: the PRIMARY env_read audit gate stops a script from
+    // obtaining a protected value to leak (recorded read → PR fails pre-trust).
+    // The grace-path drop covers only a fragment that STAYS pending (no second
+    // newline) — assert that scope honestly so a future change can't silently
+    // shift it without re-examining the threat model.
+    const { lines, onLine } = collect();
+    const sink = makeLineSink('stdout', onLine);
+    sink.onData(Buffer.from('writerA-prefix'));       // writer A, no newline
+    sink.onData(Buffer.from('\nwriterB-line\n'));     // writer B supplies the newline
+    // The prefix IS forwarded (documented residual — NOT a regression to "fix"
+    // here; it is gated by the env_read primary control, not the redactor).
+    expect(lines.map((l) => l.line)).toEqual(['writerA-prefix', 'writerB-line']);
+  });
+
   it('does NOT corrupt a multibyte char split across chunk boundaries (StringDecoder)', () => {
     const { lines, onLine } = collect();
     const sink = makeLineSink('stdout', onLine);

@@ -437,9 +437,22 @@ export const HOST_PART2_POISON_MARKER = '[script-jail] (oversized output line tr
  * pipe is still open (a detached descendant holds fd1/fd2).  The pending bytes
  * are an UNTERMINATED, mid-write fragment on a NON-EOF stream — possibly the
  * prefix of a secret the descendant is still writing.  Exact-value redaction
- * only matches a COMPLETE declared value, so a fragment would slip through;
- * therefore the fragment is DROPPED (never forwarded raw) and only this marker
- * is emitted (adversarial-review F6 round-2).
+ * only matches a COMPLETE declared value, so this TRAILING fragment is DROPPED
+ * (only this marker emitted), never forwarded raw (adversarial-review F6 round-2).
+ *
+ * SCOPE (important — do NOT over-read this): this drops only the fragment that
+ * is STILL PENDING (no newline yet) when the grace window closes.  It does NOT,
+ * and on a shared pipe CANNOT, mask a secret that a concurrent writer's newline
+ * completes into a "line" mid-stream: stdout/stderr are one fd shared by the pm
+ * and every descendant, so "writer A's prefix + writer B's '\n'" is
+ * indistinguishable from "writer A's whole line" at the reader.  A secret
+ * interleaved/split across a newline on the shared pipe is therefore matched
+ * per-line only — the same irreducible LINE-LOCAL residual the guest forwarders
+ * carry (see src/shared/redact.ts LINE-LOCAL CONTRACT + attachStdoutTailCollector).
+ * This redactor is DEFENSE-IN-DEPTH; the PRIMARY protection is the env_read
+ * audit gate: a script cannot obtain a protected value to leak (whole or
+ * fragmented) without a recorded env_read that fails the PR pre-trust, so host
+ * part-2 never runs for it (adversarial-review F6 round-3, verified).
  */
 export const HOST_PART2_TRUNCATED_MARKER = '[script-jail] (trailing output dropped — pipe held open past grace)';
 
@@ -460,8 +473,10 @@ export const HOST_PART2_DRAIN_GRACE_MS = 2_000;
  * Per-stream bounded line splitter.  `StringDecoder` buffers an incomplete
  * multibyte sequence across chunk boundaries (so a redacted token is never split
  * mid-codepoint); complete lines are forwarded whole through `onLine`; an
- * unterminated line over the byte cap is poisoned.  `flush()` forwards a final
- * unterminated partial line (terminated by EOF, not a newline).
+ * unterminated line over the byte cap is poisoned.  `finalize(streamEnded)`
+ * forwards a final unterminated partial line ONLY on genuine EOF; on the grace
+ * path (still-open pipe) it drops the trailing fragment (see
+ * HOST_PART2_TRUNCATED_MARKER for the scope of that drop).
  */
 export function makeLineSink(
   which: 'stdout' | 'stderr',
@@ -582,10 +597,19 @@ export const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
  * NODE_AUTH_TOKEN / registry auth).  A script can print to stdout/stderr, so —
  * symmetric with the sandbox Phase-B tail and host part-1 capture — every line is
  * redacted before it reaches the job log: exact `protectedEnvNames` values
- * (`maskExactValues`) plus credential SHAPES (`redactCredentialShapes`).  The
- * env_read audit gate remains the PRIMARY protection (a script that reads a
- * secret is recorded in the lock and fails the PR pre-trust); this is
- * defense-in-depth for the trusted-script host rerun.
+ * (`maskExactValues`, minLen=1 for declared secrets) plus credential SHAPES
+ * (`redactCredentialShapes`).
+ *
+ * The env_read audit gate remains the PRIMARY protection and this is
+ * DEFENSE-IN-DEPTH.  Two residuals are accepted-by-design, both bounded by that
+ * gate: (1) redaction is per-COMPLETE-LINE + exact-value, so a secret a writer
+ * splits across a newline — or that a concurrent writer's newline completes on
+ * the shared stdout/stderr pipe — is matched per-line only (the irreducible
+ * LINE-LOCAL residual the guest forwarders also carry; see redact.ts); (2) the
+ * env-read shim/Proxy do not see a raw `environ[]` walk (documented gap).  In
+ * BOTH cases a script cannot obtain a protected value to leak without a recorded
+ * env_read that fails the PR pre-trust, so host part-2 never runs for it — the
+ * redactor only hardens the ACCIDENTAL-echo case for already-approved scripts.
  */
 export async function hostRunScripts(
   pm: Manager,
