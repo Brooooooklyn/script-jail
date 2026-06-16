@@ -2943,11 +2943,16 @@ export function redactSensitive(
 ): string {
   let out = text;
   // Layer 1 — exact protected values.  Sort longest-first so a value that is a
-  // substring of another is not partially pre-masked.
+  // substring of another is not partially pre-masked.  Floor is >=1 (mask every
+  // NON-EMPTY declared value): a `protected.env` name is an EXPLICIT secret
+  // declaration, so a 1-3 char declared value must still be masked or it would
+  // leak raw in the redacted install/strace output (adversarial-review F6,
+  // Finding 1 — parity with the host part-2 path).  Empty values (length 0) are
+  // skipped so an unset/blank protected var never mass-masks the output.
   const values = protectedEnvNames
     .map((name) => ({ name, value: env[name] }))
     .filter((e): e is { name: string; value: string } =>
-      typeof e.value === 'string' && e.value.length >= 4,
+      typeof e.value === 'string' && e.value.length >= 1,
     )
     .sort((a, b) => b.value.length - a.value.length);
   for (const { name, value } of values) {

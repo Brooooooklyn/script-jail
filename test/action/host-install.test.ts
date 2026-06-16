@@ -21,6 +21,10 @@ import {
   hostInstallNoScripts,
   hostRunScripts,
   resolveGitFromPath,
+  streamSpawn,
+  makeLineSink,
+  HOST_PART2_POISON_MARKER,
+  HOST_PART2_DRAIN_GRACE_MS,
   type HostSpawn,
   type HostStreamSpawn,
   type HostInstallIo,
@@ -828,5 +832,110 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
       expect(env['YARN_PLUGINS']).toBe('');
       expect(env['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBe('false');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SECURITY/RELIABILITY (adversarial-review F6, Finding 2): the async streaming
+// part-2 runner must (A) never hang when a detached descendant holds the
+// inherited pipe open after the package manager exits, and (B) never buffer an
+// unterminated line without bound (OOM).
+// ---------------------------------------------------------------------------
+
+describe('makeLineSink (part-2 bounded line splitter)', () => {
+  function collect(): { lines: Array<{ which: string; line: string }>; onLine: (which: 'stdout' | 'stderr', line: string) => void } {
+    const lines: Array<{ which: string; line: string }> = [];
+    return { lines, onLine: (which, line) => { lines.push({ which, line }); } };
+  }
+
+  it('forwards each COMPLETE line and holds a partial until flush (EOF)', () => {
+    const { lines, onLine } = collect();
+    const sink = makeLineSink('stdout', onLine);
+    sink.onData(Buffer.from('alpha\nbeta\npar'));
+    expect(lines.map((l) => l.line)).toEqual(['alpha', 'beta']);
+    sink.onData(Buffer.from('tial\n'));
+    expect(lines.map((l) => l.line)).toEqual(['alpha', 'beta', 'partial']);
+    // A final unterminated line is forwarded ONLY on flush (terminated by EOF).
+    sink.onData(Buffer.from('last-no-newline'));
+    expect(lines).toHaveLength(3);
+    sink.flush();
+    expect(lines.map((l) => l.line)).toEqual(['alpha', 'beta', 'partial', 'last-no-newline']);
+  });
+
+  it('does NOT corrupt a multibyte char split across chunk boundaries (StringDecoder)', () => {
+    const { lines, onLine } = collect();
+    const sink = makeLineSink('stdout', onLine);
+    const euro = Buffer.from('€', 'utf8'); // 3 bytes: e2 82 ac
+    sink.onData(euro.subarray(0, 2)); // first 2 bytes — incomplete codepoint
+    sink.onData(Buffer.concat([euro.subarray(2), Buffer.from('\n')])); // last byte + newline
+    expect(lines).toEqual([{ which: 'stdout', line: '€' }]);
+  });
+
+  it('POISONS an oversized unterminated line (no OOM, never forwarded raw), then resumes', () => {
+    const { lines, onLine } = collect();
+    const cap = 64;
+    const sink = makeLineSink('stderr', onLine, cap);
+    sink.onData(Buffer.from('X'.repeat(cap + 50))); // > cap, no newline
+    // Exactly one fixed marker; the raw oversized content is NOT forwarded.
+    expect(lines).toEqual([{ which: 'stderr', line: HOST_PART2_POISON_MARKER }]);
+    // Further oversized bytes (still no newline) do NOT emit more markers.
+    sink.onData(Buffer.from('Y'.repeat(cap + 10)));
+    expect(lines).toHaveLength(1);
+    // A newline ends the poisoned line; subsequent lines forward normally.
+    sink.onData(Buffer.from('tail-of-poison\nclean-line\n'));
+    expect(lines).toEqual([
+      { which: 'stderr', line: HOST_PART2_POISON_MARKER },
+      { which: 'stderr', line: 'clean-line' },
+    ]);
+    // The oversized bytes never appear in any forwarded line.
+    expect(lines.some((l) => l.line.includes('X') || l.line.includes('Y'))).toBe(false);
+  });
+});
+
+describe('streamSpawn (part-2 real-child integration)', () => {
+  function collect(): { lines: Array<{ which: string; line: string }>; onLine: (which: 'stdout' | 'stderr', line: string) => void } {
+    const lines: Array<{ which: string; line: string }> = [];
+    return { lines, onLine: (which, line) => { lines.push({ which, line }); } };
+  }
+
+  it('forwards stdout/stderr lines and resolves with the child exit code', async () => {
+    const { lines, onLine } = collect();
+    const script = 'const fs=require("node:fs"); fs.writeSync(1,"out-line\\n"); fs.writeSync(2,"err-line\\n"); process.exit(3);';
+    const r = await streamSpawn(process.execPath, ['-e', script], process.cwd(), process.env, onLine);
+    expect(r.status).toBe(3);
+    expect(lines).toContainEqual({ which: 'stdout', line: 'out-line' });
+    expect(lines).toContainEqual({ which: 'stderr', line: 'err-line' });
+  });
+
+  it('does NOT hang when a detached descendant holds the inherited pipe (F6 Claim A regression)', async () => {
+    const { lines, onLine } = collect();
+    // Child writes a line, spawns a DETACHED grandchild that inherits
+    // stdout/stderr and outlives the grace window, then exits 0.  The pipe never
+    // EOFs; streamSpawn must resolve off the child's `exit` (after the bounded
+    // grace), NOT hang until the descendant dies.
+    const holderMs = HOST_PART2_DRAIN_GRACE_MS * 6;
+    const script =
+      'const cp=require("node:child_process");' +
+      'const fs=require("node:fs");' +
+      `const g=cp.spawn(process.execPath,["-e","setTimeout(()=>{}, ${holderMs})"],{stdio:["ignore","inherit","inherit"],detached:true});` +
+      'g.unref();' +
+      'fs.writeSync(1,"line-before-exit\\n");' +
+      'process.exit(0);';
+    const start = Date.now();
+    const r = await streamSpawn(process.execPath, ['-e', script], process.cwd(), process.env, onLine);
+    const elapsed = Date.now() - start;
+    expect(r.status).toBe(0);
+    // Resolved via the grace path — well under the descendant's lifetime.
+    expect(elapsed).toBeLessThan(HOST_PART2_DRAIN_GRACE_MS + 4_000);
+    expect(elapsed).toBeLessThan(holderMs);
+    // The line written before the child exited was still forwarded.
+    expect(lines).toContainEqual({ which: 'stdout', line: 'line-before-exit' });
+  }, 20_000);
+
+  it('resolves with an error when the binary does not exist (no hang)', async () => {
+    const { onLine } = collect();
+    const r = await streamSpawn('definitely-not-a-real-binary-xyz', [], process.cwd(), process.env, onLine);
+    expect(r.error).toBeInstanceOf(Error);
+    expect(r.status).toBeNull();
   });
 });

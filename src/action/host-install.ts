@@ -26,8 +26,8 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve, sep } from 'node:path';
-import { createInterface } from 'node:readline';
 import type { Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 import {
   FETCH_CMD,
@@ -418,7 +418,78 @@ export type HostStreamSpawn = (
   onLine: (stream: 'stdout' | 'stderr', line: string) => void,
 ) => Promise<{ status: number | null; signal: NodeJS.Signals | null; error?: Error }>;
 
-const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
+/**
+ * Cap on a single UNTERMINATED line buffered in the action process.  A trusted
+ * lifecycle script that writes a huge run of bytes with no newline would
+ * otherwise grow `pending` without bound and OOM the runner (adversarial-review
+ * F6, Claim B).  Mirrors the guest's `PHASE_B_STDOUT_PENDING_MAX_BYTES` (1 MiB):
+ * an unterminated line over this bound is poisoned (one fixed marker, then bytes
+ * dropped until the next newline) — never forwarded raw, so a secret split
+ * across the cap cannot leak.
+ */
+export const HOST_PART2_MAX_LINE_BYTES = 1_048_576;
+
+/** Fixed (credential-free) marker emitted when an unterminated line is poisoned. */
+export const HOST_PART2_POISON_MARKER = '[script-jail] (oversized output line truncated)';
+
+/**
+ * Grace window after the DIRECT child exits before `streamSpawn` resolves even
+ * if the pipe never reaches EOF (adversarial-review F6, Claim A).  With
+ * `stdio:['inherit','pipe','pipe']` a detached descendant that inherits fd1/fd2
+ * keeps the pipe write-end open, so the read-end never EOFs and a `'close'`/
+ * `'end'`-gated resolve would hang until the CI job timeout — triggerable even
+ * by a benign postinstall that starts a background daemon.  The OS pipe buffer
+ * is small, so already-buffered output is delivered well within this window;
+ * the timer only matters when a descendant holds the pipe, where finishing
+ * promptly is the correct behaviour (the install/rebuild is already done).
+ */
+export const HOST_PART2_DRAIN_GRACE_MS = 2_000;
+
+/**
+ * Per-stream bounded line splitter.  `StringDecoder` buffers an incomplete
+ * multibyte sequence across chunk boundaries (so a redacted token is never split
+ * mid-codepoint); complete lines are forwarded whole through `onLine`; an
+ * unterminated line over the byte cap is poisoned.  `flush()` forwards a final
+ * unterminated partial line (terminated by EOF, not a newline).
+ */
+export function makeLineSink(
+  which: 'stdout' | 'stderr',
+  onLine: (stream: 'stdout' | 'stderr', line: string) => void,
+  maxBytes: number = HOST_PART2_MAX_LINE_BYTES,
+): { onData: (chunk: Buffer) => void; flush: () => void } {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let poisoned = false; // sticky for the CURRENT oversized unterminated line
+  const onData = (chunk: Buffer): void => {
+    pending += decoder.write(chunk);
+    let nl: number;
+    while ((nl = pending.indexOf('\n')) !== -1) {
+      const line = pending.slice(0, nl);
+      pending = pending.slice(nl + 1);
+      // A newline ends the (dropped) oversized line; reset and resume normally.
+      if (poisoned) { poisoned = false; continue; }
+      onLine(which, line);
+    }
+    // `pending` now holds no newline.  Bound it: an oversized unterminated line
+    // is poisoned once (never forwarded raw) and its bytes dropped until a '\n'.
+    if (poisoned) {
+      pending = '';
+    } else if (pending.length > maxBytes) {
+      onLine(which, HOST_PART2_POISON_MARKER);
+      pending = '';
+      poisoned = true;
+    }
+  };
+  const flush = (): void => {
+    pending += decoder.end();
+    if (!poisoned && pending.length > 0) onLine(which, pending);
+    pending = '';
+    poisoned = false;
+  };
+  return { onData, flush };
+}
+
+export const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
   new Promise((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
@@ -429,25 +500,50 @@ const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
       resolve({ status: null, signal: null, error: error as Error });
       return;
     }
-    // Resolve only after the child has closed AND both line readers have drained,
-    // so a final unterminated line is never lost.  `pending` counts the child
-    // close/error plus one per wired stream.
+    const outSink = makeLineSink('stdout', onLine, HOST_PART2_MAX_LINE_BYTES);
+    const errSink = makeLineSink('stderr', onLine, HOST_PART2_MAX_LINE_BYTES);
+    child.stdout?.on('data', outSink.onData);
+    child.stderr?.on('data', errSink.onData);
+
+    // Resolve disposition off the DIRECT child's `exit` (fires the moment the pm
+    // process terminates, regardless of any descendant still holding the inherited
+    // pipe) — NOT `close`, which waits for pipe EOF and would hang on a held pipe.
     let exit: { status: number | null; signal: NodeJS.Signals | null; error?: Error } | null = null;
-    let pending = 1;
-    const maybeDone = (): void => {
-      if (pending === 0 && exit !== null) resolve(exit);
+    let settled = false;
+    let graceTimer: NodeJS.Timeout | null = null;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (graceTimer !== null) clearTimeout(graceTimer);
+      // Forward any final unterminated partial line, then stop reading so a
+      // descendant holding the pipe can't keep this process alive.
+      outSink.flush();
+      errSink.flush();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve(exit ?? { status: null, signal: null });
     };
-    const wire = (stream: Readable | null, which: 'stdout' | 'stderr'): void => {
-      if (stream === null) return;
-      pending += 1;
-      const rl = createInterface({ input: stream, crlfDelay: Infinity });
-      rl.on('line', (line: string) => onLine(which, line));
-      rl.on('close', () => { pending -= 1; maybeDone(); });
+    // Finish promptly once BOTH pipes reach natural EOF (the common case: no
+    // descendant holds them) — clears the grace timer so there is no added
+    // latency.  `ends` counts the wired streams down to 0.
+    let ends = 0;
+    const wireEnd = (stream: Readable | null | undefined): void => {
+      if (stream == null) return;
+      ends += 1;
+      stream.on('end', () => { ends -= 1; if (ends === 0 && exit !== null) finish(); });
     };
-    wire(child.stdout, 'stdout');
-    wire(child.stderr, 'stderr');
-    child.on('error', (error) => { exit = { status: null, signal: null, error }; pending -= 1; maybeDone(); });
-    child.on('close', (status, signal) => { exit ??= { status, signal }; pending -= 1; maybeDone(); });
+    wireEnd(child.stdout);
+    wireEnd(child.stderr);
+    child.on('error', (error) => { exit = { status: null, signal: null, error }; finish(); });
+    child.on('exit', (status, signal) => {
+      exit ??= { status, signal };
+      // Pipes already drained → resolve now; else start the bounded grace window.
+      if (ends === 0) finish();
+      else {
+        graceTimer = setTimeout(finish, HOST_PART2_DRAIN_GRACE_MS);
+        graceTimer.unref?.();
+      }
+    });
   });
 
 /**
@@ -488,12 +584,19 @@ export async function hostRunScripts(
   const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
   // Exact secret values to mask: the declared protected.env names' values in the
-  // host env (maskExactValues applies its own >=4-char floor + longest-first).
+  // host env.  minLen=1 (mask every NON-EMPTY declared value, longest-first):
+  // the `maskExactValues` default >=4-char floor is a heuristic for the
+  // ARG-derived path (don't blank out "dev" from `--omit=dev`), but a user who
+  // names an env var in `protected.env` has explicitly declared it a SECRET —
+  // honour that regardless of length, or a 1-3 char declared secret echoed by a
+  // trusted post-trust script would reach the job log raw (adversarial-review
+  // F6, Finding 1).  Empty values (length 0) are still skipped by the >=1 floor,
+  // so an unset/blank protected var never mass-masks the output.
   const sensitive = protectedEnvNames
     .map((name) => process.env[name])
     .filter((v): v is string => typeof v === 'string');
   const onLine = (stream: 'stdout' | 'stderr', line: string): void => {
-    let safe = maskExactValues(line, sensitive, 'REDACTED:ENV');
+    let safe = maskExactValues(line, sensitive, 'REDACTED:ENV', 1);
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
   };

@@ -14681,7 +14681,7 @@ var require_util4 = __commonJS({
     var { getEncoding } = require_encoding();
     var { serializeAMimeType, parseMIMEType } = require_data_url();
     var { types } = require("node:util");
-    var { StringDecoder } = require("string_decoder");
+    var { StringDecoder: StringDecoder2 } = require("string_decoder");
     var { btoa: btoa2 } = require("node:buffer");
     var staticPropertyDescriptors = {
       enumerable: true,
@@ -14772,7 +14772,7 @@ var require_util4 = __commonJS({
             dataURL += serializeAMimeType(parsed);
           }
           dataURL += ";base64,";
-          const decoder = new StringDecoder("latin1");
+          const decoder = new StringDecoder2("latin1");
           for (const chunk of bytes) {
             dataURL += btoa2(decoder.write(chunk));
           }
@@ -14801,7 +14801,7 @@ var require_util4 = __commonJS({
         }
         case "BinaryString": {
           let binaryString = "";
-          const decoder = new StringDecoder("latin1");
+          const decoder = new StringDecoder2("latin1");
           for (const chunk of bytes) {
             binaryString += decoder.write(chunk);
           }
@@ -26711,7 +26711,7 @@ function defaultGetInput(name) {
 var import_node_child_process = require("node:child_process");
 var import_node_fs = require("node:fs");
 var import_node_path2 = require("node:path");
-var import_node_readline = require("node:readline");
+var import_node_string_decoder = require("node:string_decoder");
 
 // src/shared/redact.ts
 function redactCredentialShapes(text) {
@@ -26867,6 +26867,41 @@ function redactCaptured(text, sensitive) {
   red = redactCredentialShapes(red);
   return red;
 }
+var HOST_PART2_MAX_LINE_BYTES = 1048576;
+var HOST_PART2_POISON_MARKER = "[script-jail] (oversized output line truncated)";
+var HOST_PART2_DRAIN_GRACE_MS = 2e3;
+function makeLineSink(which2, onLine, maxBytes = HOST_PART2_MAX_LINE_BYTES) {
+  const decoder = new import_node_string_decoder.StringDecoder("utf8");
+  let pending = "";
+  let poisoned = false;
+  const onData = (chunk) => {
+    pending += decoder.write(chunk);
+    let nl;
+    while ((nl = pending.indexOf("\n")) !== -1) {
+      const line = pending.slice(0, nl);
+      pending = pending.slice(nl + 1);
+      if (poisoned) {
+        poisoned = false;
+        continue;
+      }
+      onLine(which2, line);
+    }
+    if (poisoned) {
+      pending = "";
+    } else if (pending.length > maxBytes) {
+      onLine(which2, HOST_PART2_POISON_MARKER);
+      pending = "";
+      poisoned = true;
+    }
+  };
+  const flush = () => {
+    pending += decoder.end();
+    if (!poisoned && pending.length > 0) onLine(which2, pending);
+    pending = "";
+    poisoned = false;
+  };
+  return { onData, flush };
+}
 var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
   let child;
   try {
@@ -26875,32 +26910,45 @@ var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
     resolve6({ status: null, signal: null, error: error51 });
     return;
   }
+  const outSink = makeLineSink("stdout", onLine, HOST_PART2_MAX_LINE_BYTES);
+  const errSink = makeLineSink("stderr", onLine, HOST_PART2_MAX_LINE_BYTES);
+  child.stdout?.on("data", outSink.onData);
+  child.stderr?.on("data", errSink.onData);
   let exit = null;
-  let pending = 1;
-  const maybeDone = () => {
-    if (pending === 0 && exit !== null) resolve6(exit);
+  let settled = false;
+  let graceTimer = null;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (graceTimer !== null) clearTimeout(graceTimer);
+    outSink.flush();
+    errSink.flush();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    resolve6(exit ?? { status: null, signal: null });
   };
-  const wire = (stream, which2) => {
-    if (stream === null) return;
-    pending += 1;
-    const rl = (0, import_node_readline.createInterface)({ input: stream, crlfDelay: Infinity });
-    rl.on("line", (line) => onLine(which2, line));
-    rl.on("close", () => {
-      pending -= 1;
-      maybeDone();
+  let ends = 0;
+  const wireEnd = (stream) => {
+    if (stream == null) return;
+    ends += 1;
+    stream.on("end", () => {
+      ends -= 1;
+      if (ends === 0 && exit !== null) finish();
     });
   };
-  wire(child.stdout, "stdout");
-  wire(child.stderr, "stderr");
+  wireEnd(child.stdout);
+  wireEnd(child.stderr);
   child.on("error", (error51) => {
     exit = { status: null, signal: null, error: error51 };
-    pending -= 1;
-    maybeDone();
+    finish();
   });
-  child.on("close", (status, signal) => {
+  child.on("exit", (status, signal) => {
     exit ??= { status, signal };
-    pending -= 1;
-    maybeDone();
+    if (ends === 0) finish();
+    else {
+      graceTimer = setTimeout(finish, HOST_PART2_DRAIN_GRACE_MS);
+      graceTimer.unref?.();
+    }
   });
 });
 async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = streamSpawn) {
@@ -26911,7 +26959,7 @@ async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = 
 `);
   const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
   const onLine = (stream, line) => {
-    let safe = maskExactValues(line, sensitive, "REDACTED:ENV");
+    let safe = maskExactValues(line, sensitive, "REDACTED:ENV", 1);
     safe = redactCredentialShapes(safe);
     (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
 `);
@@ -28170,9 +28218,9 @@ var UnixSocketApiClient = class {
 var import_node_net = require("node:net");
 
 // src/shared/vsock-protocol.ts
-var import_node_readline2 = require("node:readline");
+var import_node_readline = require("node:readline");
 async function* parseFrames(readable) {
-  const rl = (0, import_node_readline2.createInterface)({ input: readable, crlfDelay: Infinity });
+  const rl = (0, import_node_readline.createInterface)({ input: readable, crlfDelay: Infinity });
   for await (const line of rl) {
     const trimmed = line.trim();
     if (!trimmed) continue;

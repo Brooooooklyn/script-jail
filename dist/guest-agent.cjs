@@ -30843,7 +30843,7 @@ function resolvePrepareCommand(manager, cwd) {
 function redactSensitive(text, protectedEnvNames, env = process.env) {
   let out = text;
   const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
-    (e) => typeof e.value === "string" && e.value.length >= 4
+    (e) => typeof e.value === "string" && e.value.length >= 1
   ).sort((a, b) => b.value.length - a.value.length);
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);

@@ -2742,10 +2742,21 @@ describe('redactSensitive (Phase A failure dump)', () => {
     expect(out).not.toContain('super-secret-token-value');
   });
 
-  it('skips short/empty protected values so it cannot blank out an ENOSPC trace', async () => {
+  it('skips an EMPTY/unset protected value so it cannot blank out a trace', async () => {
+    // length-0 value → never mass-masks (the >=1 floor excludes it).
     const { redactSensitive } = await import('../../src/guest/agent.js');
-    const out = redactSensitive('ENOSPC: no space left on device', ['CI'], { CI: '1' });
-    expect(out).toBe('ENOSPC: no space left on device');
+    expect(redactSensitive('ENOSPC: no space left on device', ['SECRET'], { SECRET: '' }))
+      .toBe('ENOSPC: no space left on device');
+    expect(redactSensitive('ENOSPC: no space left on device', ['SECRET'], {}))
+      .toBe('ENOSPC: no space left on device');
+  });
+
+  it('MASKS a short (1-3 char) NON-EMPTY declared protected value (F6 Finding 1)', async () => {
+    // A `protected.env` name is an explicit secret declaration — honour it
+    // regardless of length, or a short declared secret leaks raw in the output.
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    expect(redactSensitive('token ab here', ['SECRET'], { SECRET: 'ab' }))
+      .toBe('token <REDACTED:SECRET> here');
   });
 
   it('redacts credential SHAPES not in the protected list', async () => {
