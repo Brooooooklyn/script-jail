@@ -26917,8 +26917,10 @@ async function runInstallPhase(input) {
   const execCwd = /* @__PURE__ */ new Map();
   const pendingExecCwd = /* @__PURE__ */ new Set();
   const firstCwdMutationTs = /* @__PURE__ */ new Map();
+  const lastCwdMutationTs = /* @__PURE__ */ new Map();
   const everCwdShared = /* @__PURE__ */ new Set();
   const pidCloneTimeCwd = /* @__PURE__ */ new Map();
+  const childSeedCloneTs = /* @__PURE__ */ new Map();
   const deferredRelOpens = [];
   const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
   function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
@@ -27334,6 +27336,7 @@ async function runInstallPhase(input) {
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
       if (chdirMatch !== null) {
         if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs);
         const rawTarget = chdirMatch[1] ?? "";
         const decoded = unescapeStraceString(rawTarget);
         if (path2.isAbsolute(decoded)) {
@@ -27352,6 +27355,7 @@ async function runInstallPhase(input) {
       const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
       if (fchdirMatch !== null) {
         if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs);
         const fd = parseInt(fchdirMatch[1] ?? "", 10);
         if (Number.isFinite(fd)) {
           const dirEntry = dirfdTable.get(fdKey(pid, fd));
@@ -27391,6 +27395,7 @@ async function runInstallPhase(input) {
             allParents.add(pid);
             const parentCloneTimeCwd = cwdUnknownHas(pid) ? null : cwdGet(pid) ?? null;
             if (!pidCloneTimeCwd.has(childPid)) pidCloneTimeCwd.set(childPid, parentCloneTimeCwd);
+            if (!childSeedCloneTs.has(childPid)) childSeedCloneTs.set(childPid, lineTs);
             let cloneFs = false;
             let cloneFiles = false;
             if (syscallName === "clone" || syscallName === "clone3") {
@@ -28405,19 +28410,42 @@ async function runInstallPhase(input) {
       }
     }
     if ((initial === null || initial === void 0) && d.stamped === true) {
+      let prev = P;
       let a = d.seedParentPid;
       let guard = 0;
       const seen = /* @__PURE__ */ new Set();
       while (a !== void 0) {
         if (guard++ >= 1e5) break;
         if (seen.has(a)) break;
-        if (firstCwdMutationTs.has(a)) break;
+        if (firstCwdMutationTs.has(a)) {
+          const seedTs = childSeedCloneTs.get(prev);
+          const firstMut = firstCwdMutationTs.get(a);
+          if (seedTs === void 0 || firstMut === void 0) break;
+          if (firstMut > seedTs) {
+            const acwd2 = pidCloneTimeCwd.get(a);
+            if (typeof acwd2 === "string") {
+              initial = acwd2;
+              break;
+            }
+            seen.add(a);
+            prev = a;
+            a = childParent.get(a);
+            continue;
+          }
+          const lastMut = lastCwdMutationTs.get(a);
+          if (lastMut !== void 0 && lastMut < seedTs) {
+            const afinal = cwdGet(a);
+            if (typeof afinal === "string") initial = afinal;
+          }
+          break;
+        }
         const acwd = pidCloneTimeCwd.get(a);
         if (typeof acwd === "string") {
           initial = acwd;
           break;
         }
         seen.add(a);
+        prev = a;
         a = childParent.get(a);
       }
     }

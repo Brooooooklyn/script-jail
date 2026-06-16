@@ -2176,6 +2176,14 @@ export async function runInstallPhase(
   //     Used by the COPY-case ts gate — sound because a pid's read and its own
   //     chdirs share ONE per-pid file, so their `ts` reflects happens-before.
   const firstCwdMutationTs = new Map<number, number>();
+  //   lastCwdMutationTs: lineTs of the LAST cwd-mutating event in a pid's OWN
+  //     per-pid stream (last-write-wins). Paired with `childSeedCloneTs` below, it
+  //     lets the deep-chain recovery walk decide — via the SAME within-file
+  //     happens-before that `firstCwdMutationTs` already relies on — whether ALL of
+  //     an ancestor's chdirs preceded the clone that seeded the next hop (so the
+  //     child inherited the ancestor's FINAL cwd) versus followed it (so the child
+  //     inherited the ancestor's PRE-chdir/inherited cwd).
+  const lastCwdMutationTs = new Map<number, number>();
   //   everCwdShared: STICKY set of pids that were EVER members of a CLONE_FS cwd
   //     group (set inside `unionCwd` and `detachCwdGroup` for ALL participants).
   //     A pid in this set NEVER had a purely-private cwd, so a deferred open from
@@ -2193,6 +2201,12 @@ export async function runInstallPhase(
   //     cwd-seeded root). Drain-independent at end-of-drain (both this map and
   //     `childParent` are complete). See the replay transitive-recovery walk.
   const pidCloneTimeCwd = new Map<number, string | null>();
+  //   childSeedCloneTs: lineTs of the clone line that created each child pid (the
+  //     PARENT's own per-pid file), first-write-wins by numeric child pid. The
+  //     same-file anchor compared against the parent's `first/lastCwdMutationTs` so
+  //     the deep-chain walk can prove, via within-file happens-before, the relative
+  //     order of an ancestor's chdir(s) and its clone of the next hop.
+  const childSeedCloneTs = new Map<number, number>();
   //   deferredRelOpens: unresolved AT_FDCWD-relative opens parked for re-
   //     resolution. ONLY truly-relative AT_FDCWD opens are deferred; absolute
   //     paths and numeric-dirfd opens NEVER depend on clone order and stay on
@@ -3588,6 +3602,7 @@ export async function runInstallPhase(
         // The COPY-case re-resolution gate compares a deferred read's ts
         // against this — sound because read and chdir share one per-pid file.
         if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs); // last-write-wins (deep-chain walk)
         const rawTarget = chdirMatch[1] ?? '';
         const decoded = unescapeStraceString(rawTarget);
         if (path.isAbsolute(decoded)) {
@@ -3631,6 +3646,7 @@ export async function runInstallPhase(
         // record it (first-writer-wins, keyed by this line's own pid) before
         // mutating, so the COPY ts gate and UNION group-mutation check see it.
         if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs); // last-write-wins (deep-chain walk)
         const fd = parseInt(fchdirMatch[1] ?? '', 10);
         if (Number.isFinite(fd)) {
           const dirEntry = dirfdTable.get(fdKey(pid, fd));
@@ -3814,6 +3830,11 @@ export async function runInstallPhase(
             // pid binds to the FIRST seeding generation (mirrors stampDeferredRelOpens),
             // so a recycled-pid clone cannot repoint it.
             if (!pidCloneTimeCwd.has(childPid)) pidCloneTimeCwd.set(childPid, parentCloneTimeCwd);
+            // Determinism deep-chain (chdir-vs-clone within-file order): record the
+            // lineTs of THIS clone line (in the PARENT's own file), first-write-wins,
+            // so the replay walk can compare it against the parent's chdir lineTs(s)
+            // to prove whether the parent had chdir'd by the time it seeded this child.
+            if (!childSeedCloneTs.has(childPid)) childSeedCloneTs.set(childPid, lineTs);
 
             // FIX #1 (parent-side CLONE_FS provenance) is now decided ENTIRELY at
             // replay via the STICKY `everCwdShared.has(seedParentPid)`. We do NOT
@@ -6740,27 +6761,68 @@ export async function runInstallPhase(
     // the moment it cloned (else cwdGet(a) would be set), so clone(2)-copy makes `a`'s
     // inherited cwd EQUAL to the cwd it propagated to its child — i.e. the nearest
     // non-mutating ancestor's KNOWN clone-time cwd IS the cwd this whole null-chain
-    // inherited. The `firstCwdMutationTs.has(a)` BREAK keeps the SAFE direction: if an
-    // ancestor `a` did a chdir, its clone-time cwd may NOT equal the cwd it propagated
-    // (the chdir could precede or follow the clone, and that cross-FILE ordering is NOT
-    // a proven kernel happens-before), so we leave `initial` null → SYNTH (never a
-    // wrong path). Visited-set + cap guarantee termination under pid-reuse cycles
-    // (mirrors the `lineageEverCwdShared` lineage-walk guard). The CLONE_FS / pid-reuse
-    // / COPY-ts gates are untouched and still fire on the recovered value.
+    // inherited.
+    //
+    // CHDIR ANCESTOR (deep-chain follow-up, 2026-06-16): an ancestor `a` that did a
+    // chdir used to BREAK unconditionally → SYNTH. That is over-conservative AND itself
+    // drain-order-dependent: `a`'s chdir and `a`'s clone of the next hop are BOTH in
+    // a's OWN per-pid file, so their `lineTs` order IS a proven WITHIN-file happens-
+    // before — the SAME within-file ordering the COPY ts gate below already trusts
+    // (`d.rawEvent.ts < firstMut`). Compare `childSeedCloneTs.get(prev)` (lineTs of a's
+    // clone of the next hop) against a's `first/lastCwdMutationTs`:
+    //   • ALL of a's chdirs AFTER it cloned `prev` (firstMut > seedTs): clone(2) copied
+    //     a's PRE-chdir (inherited) cwd into `prev`; a's chdir is irrelevant to it.
+    //     Treat `a` as transparent — use its inherited clone-time cwd, else keep
+    //     climbing. THIS is the real unrs flake: ROOT-DOWN drain resolves the inherited
+    //     cwd while LEAF-UP used to SYNTH; now both resolve identically (deterministic).
+    //   • ALL of a's chdirs BEFORE it cloned `prev` (lastMut < seedTs): `prev` inherited
+    //     a's FINAL cwd = cwdGet(a). (Realistically unreachable — a chdir-before-clone
+    //     leaves the stamp non-null so the read never defers here — but sound.)
+    //   • chdirs STRADDLE the clone, or the order is unprovable: leave null → SYNTH.
+    // The recovery only ever flips a provable case SYNTH→resolve; an unprovable case
+    // still fails closed (never a wrong path). Visited-set + cap guarantee termination
+    // under pid-reuse cycles. The CLONE_FS / pid-reuse / COPY-ts gates are untouched and
+    // still fire on the recovered value.
     if ((initial === null || initial === undefined) && d.stamped === true) {
+      let prev: number = P; // the node `a` cloned (start: the deferred read's own pid)
       let a: number | undefined = d.seedParentPid;
       let guard = 0;
       const seen = new Set<number>();
       while (a !== undefined) {
         if (guard++ >= 100000) break; // cap exhaustion → leave null → SYNTH (safe)
         if (seen.has(a)) break; // cycle (only via pid-reuse) → leave null → SYNTH
-        if (firstCwdMutationTs.has(a)) break; // ancestor chdir'd → unprovable → SYNTH
+        if (firstCwdMutationTs.has(a)) {
+          // `a` chdir'd — decide via within-file (same-pid) lineTs happens-before.
+          const seedTs = childSeedCloneTs.get(prev);
+          const firstMut = firstCwdMutationTs.get(a);
+          if (seedTs === undefined || firstMut === undefined) break; // unprovable → SYNTH
+          if (firstMut > seedTs) {
+            // a chdir'd AFTER cloning `prev` → `prev` inherited a's PRE-chdir cwd.
+            const acwd = pidCloneTimeCwd.get(a);
+            if (typeof acwd === 'string') {
+              initial = acwd; // a's inherited clone-time cwd (a's chdir irrelevant)
+              break;
+            }
+            seen.add(a);
+            prev = a;
+            a = childParent.get(a); // a's own clone-time cwd null → keep climbing
+            continue;
+          }
+          const lastMut = lastCwdMutationTs.get(a);
+          if (lastMut !== undefined && lastMut < seedTs) {
+            // a's chdirs ALL preceded cloning `prev` → `prev` inherited a's FINAL cwd.
+            const afinal = cwdGet(a);
+            if (typeof afinal === 'string') initial = afinal;
+          }
+          break; // straddling / unprovable → leave null → SYNTH
+        }
         const acwd = pidCloneTimeCwd.get(a);
         if (typeof acwd === 'string') {
           initial = acwd; // nearest non-mutating ancestor's known inherited cwd
           break;
         }
         seen.add(a);
+        prev = a;
         a = childParent.get(a); // ancestor's own clone-time cwd also null → keep walking
       }
     }

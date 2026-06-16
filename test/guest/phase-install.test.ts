@@ -7913,17 +7913,19 @@ describe('runInstallPhase', () => {
       expect(unresolved).toHaveLength(1);
     });
 
-    // Determinism (defer-and-re-resolve) DEEP-CHAIN SAFE-DIRECTION GUARD (codex
-    // round-3, 2026-06-16): the transitive `initialCwd` recovery walk MUST stop at the
-    // FIRST ancestor that did a chdir (`firstCwdMutationTs.has(a)`) and leave `initial`
-    // null → SYNTH. Rationale: an ancestor's clone-time cwd may NOT equal the cwd it
-    // propagated to a child if it chdir'd, and cross-FILE ordering (the ancestor's
-    // chdir ts vs the clone ts) is NOT a proven kernel happens-before. Here B (101)
-    // does an ABSOLUTE chdir("/elsewhere") AFTER cloning C, all in LEAF-UP drain order.
-    // The walk hits `firstCwdMutationTs.has(101)` → BREAKS → C stays null → SYNTH. C
-    // MUST NOT resolve to a wrong path (neither the stale /work nor /elsewhere): the
-    // SAFE direction is fail-loud `<UNRESOLVED_PATH>`, never a forged path.
-    it('deferred re-resolve SAFE-direction: deep chain whose intermediate chdirs after cloning SYNTHs (no wrong path)', async () => {
+    // Determinism (defer-and-re-resolve) DEEP-CHAIN CHDIR-AFTER-CLONE RESOLVE (deep-chain
+    // follow-up, 2026-06-16): the transitive `initialCwd` recovery walk MUST resolve a
+    // chain whose intermediate chdir'd AFTER it cloned the next hop, because clone(2)
+    // copied the intermediate's PRE-chdir (inherited) cwd into the child — the later
+    // chdir is irrelevant to it. Here B (101) clones C (102) and THEN does an ABSOLUTE
+    // chdir("/elsewhere"), all in LEAF-UP drain order. B's chdir lineTs > B's clone-of-C
+    // lineTs (same per-pid file → proven within-file happens-before), so the walk treats
+    // B as transparent and adopts B's inherited clone-time cwd (/work, from A's seed).
+    // C therefore resolves to /work/secret.txt — IDENTICAL to the ROOT-DOWN drain order
+    // (see the determinism test below), eliminating the drain-order divergence (the real
+    // unrs-resolver `<UNRESOLVED_PATH>` parity flake). Pinning the old LEAF-UP SYNTH only
+    // captured ONE side of that flake; the ROOT-DOWN order always resolved.
+    it('deferred re-resolve: deep chain whose intermediate chdirs AFTER cloning resolves to the inherited cwd (LEAF-UP)', async () => {
       const proc = mockProcReader({
         100: { ppid: 1, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
         101: { ppid: 100, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
@@ -7938,11 +7940,11 @@ describe('runInstallPhase', () => {
         },
         // B clones C (B has no cwd yet → C stamped null).
         { pid: 101, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 102', source: 'strace' },
-        // B does an ABSOLUTE chdir AFTER cloning C → firstCwdMutationTs[101] set. The
-        // walk must BREAK here (B's clone-time cwd may differ from what it propagated;
-        // cross-file order unprovable) and leave C null → SYNTH.
+        // B does an ABSOLUTE chdir AFTER cloning C → firstMut(101) > seedTs(102). The
+        // walk treats B as transparent (its chdir post-dates the clone of C, so C
+        // inherited B's PRE-chdir cwd) and adopts B's inherited cwd (/work).
         { pid: 101, line: 'chdir("/elsewhere") = 0', source: 'strace' },
-        // A clones B (B inherits /work at clone time, but B later chdir'd).
+        // A clones B (B inherits /work at clone time, before B later chdir'd).
         { pid: 100, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 101', source: 'strace' },
       ];
 
@@ -7967,15 +7969,110 @@ describe('runInstallPhase', () => {
       });
 
       const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
-      // The read MUST NOT resolve to any concrete path (not /work, not /elsewhere).
-      const anyRead = events.filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'read');
-      expect(anyRead).toHaveLength(0);
-      // It MUST fail closed to a fail-loud <UNRESOLVED_PATH> for child C (pid 102).
+      // C (102) MUST resolve to its TRUE inherited cwd /work → /work/secret.txt, and
+      // MUST NOT fall to the stale-but-wrong /elsewhere nor to a fail-loud SYNTH.
+      const reads102 = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['pid'] === 102;
+      });
+      expect(reads102).toHaveLength(1);
+      expect((reads102[0]!['raw'] as Record<string, unknown>)['path']).toBe('/work/secret.txt');
       const unresolved = events.filter((e) => {
         const r = e['raw'] as Record<string, unknown>;
         return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 102;
       });
-      expect(unresolved).toHaveLength(1);
+      expect(unresolved).toHaveLength(0);
+    });
+
+    // Determinism (defer-and-re-resolve) DETERMINISM GUARD (deep-chain follow-up,
+    // 2026-06-16): the chdir-after-clone chain MUST produce the SAME resolved read in
+    // BOTH the LEAF-UP drain order (above) and the ROOT-DOWN / natural causal order.
+    // This is the exact anti-flake invariant: the linux-backend strace tailer drains
+    // per-pid files in FS-dependent order, so the lock MUST NOT depend on which order
+    // the SAME process tree drains in.
+    it('deferred re-resolve DETERMINISM: chdir-after-clone chain resolves identically in ROOT-DOWN order', async () => {
+      const proc = mockProcReader({
+        100: { ppid: 1, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        101: { ppid: 100, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        102: { ppid: 101, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      // ROOT-DOWN / natural causal order: A-clone-B, B-clone-C, B-chdir, C-read.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 100, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 101', source: 'strace' },
+        { pid: 101, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 102', source: 'strace' },
+        { pid: 101, line: 'chdir("/elsewhere") = 0', source: 'strace' },
+        { pid: 102, line: 'openat(AT_FDCWD, "secret.txt", O_RDONLY) = -1 ENOENT (No such file or directory)', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 100 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$REPO/secret.txt'],
+          roots: { repo: '/work', nodeModules: '/work/node_modules', home: '/home/user', tmp: '/tmp', cache: '/home/user/.cache/pnpm' },
+        }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads102 = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['pid'] === 102;
+      });
+      expect(reads102).toHaveLength(1);
+      expect((reads102[0]!['raw'] as Record<string, unknown>)['path']).toBe('/work/secret.txt');
+    });
+
+    // Determinism (defer-and-re-resolve) STRADDLE DETERMINISM (deep-chain follow-up,
+    // 2026-06-16): when an intermediate's chdirs STRADDLE its clone of the next hop
+    // (one chdir BEFORE, one AFTER, in the same per-pid file), the child inherited the
+    // cwd in effect AT the clone — i.e. the BEFORE value. That value is captured by the
+    // non-null stamp (the before-chdir drains ahead of the clone in the parent's own
+    // file), so the read resolves to it WITHOUT reaching the walk, and identically in
+    // both drain orders. Here B (101) chdirs to /work/pkg, clones C (102), then chdirs
+    // to /elsewhere → C inherited /work/pkg and reads /work/pkg/secret.txt.
+    it('deferred re-resolve DETERMINISM: straddling chdirs resolve to the AT-CLONE cwd (the before value)', async () => {
+      const proc = mockProcReader({
+        100: { ppid: 1, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        101: { ppid: 100, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+        102: { ppid: 101, env: { npm_package_name: 'unrs-resolver', npm_package_version: '1.0.0', npm_lifecycle_event: 'postinstall' } },
+      });
+      // LEAF-UP, B straddles: chdir(/work/pkg) BEFORE clone-C, chdir(/elsewhere) AFTER.
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        { pid: 102, line: 'openat(AT_FDCWD, "secret.txt", O_RDONLY) = -1 ENOENT (No such file or directory)', source: 'strace' },
+        { pid: 101, line: 'chdir("/work/pkg") = 0', source: 'strace' },
+        { pid: 101, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 102', source: 'strace' },
+        { pid: 101, line: 'chdir("/elsewhere") = 0', source: 'strace' },
+        { pid: 100, line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 101', source: 'strace' },
+      ];
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 100 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$REPO/pkg/secret.txt'],
+          roots: { repo: '/work', nodeModules: '/work/node_modules', home: '/home/user', tmp: '/tmp', cache: '/home/user/.cache/pnpm' },
+        }),
+      });
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const reads102 = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['pid'] === 102;
+      });
+      expect(reads102).toHaveLength(1);
+      expect((reads102[0]!['raw'] as Record<string, unknown>)['path']).toBe('/work/pkg/secret.txt');
+      // Never the post-clone /elsewhere value.
+      const wrong = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['pid'] === 102 && String(r['path']).startsWith('/elsewhere');
+      });
+      expect(wrong).toHaveLength(0);
     });
 
     // CONTEXT — PRE-EXISTING INLINE SILENT FALSE-NEGATIVE RESIDUAL (NOT the fix

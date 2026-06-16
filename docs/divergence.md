@@ -513,7 +513,15 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
       resolves under its stamped generation, preserving the accepted reaped-pid residual
       (MEMORY: `reaped-child-env-read-pid-reuse-residual`). A lineage with NO `CLONE_FS`
       ancestor AND no pid reuse (the real napi/plain-fork flake this fix targets)
-      completes a clean walk to the root and still resolves. Two **accepted
+      completes a clean walk to the root and still resolves — **including** the case
+      where a chain intermediate `chdir`s AFTER it clones the next hop: the intermediate's
+      chdir `lineTs` versus its clone-of-next-hop `lineTs` are both in that pid's OWN
+      per-pid file, a proven within-file happens-before, so the walk recognizes the child
+      inherited the intermediate's PRE-`chdir` cwd and keeps resolving (rather than failing
+      closed on the mere presence of a later chdir). This removes a real drain-order
+      divergence: ROOT-DOWN drain resolved the inherited cwd while LEAF-UP previously
+      fell to `<UNRESOLVED_PATH>` — the two now agree. Only a genuinely unprovable order
+      (an unobserved seeding clone, or a `CLONE_FS`/pid-reuse lineage) still fails closed. Two **accepted
       pre-existing SILENT false-negative residuals** (out of scope — verified to predate
       this fix on HEAD; the lineage walk does not change either): **(i) inline COPY
       staleness** — the INLINE (non-deferred) path takes a private COPY of the shared
