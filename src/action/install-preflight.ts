@@ -17,8 +17,10 @@
 // precondition block in main.ts.
 //
 // Manager coverage (empirically verified against pnpm 10.34/11.1 + yarn Berry 4.16):
-//   * pnpm — a repo `.pnpmfile.cjs` (and config-RELOCATED pnpmfiles) execute at
-//     `require` time during `pnpm install --frozen-lockfile --ignore-scripts`.
+//   * pnpm — a repo default pnpmfile (`.pnpmfile.mjs`, the preferred default on
+//     pnpm 11.x, tried first; or `.pnpmfile.cjs`, the fallback) and
+//     config-RELOCATED pnpmfiles execute at `require` time during
+//     `pnpm install --frozen-lockfile --ignore-scripts`.
 //     DEFENSE IN DEPTH: the host fetch ALSO passes `--ignore-pnpmfile`
 //     (host-install.ts), a robust catch-all with no path-enumeration gap that
 //     suppresses every pnpmfile variant; this static reject is the clean, early
@@ -156,8 +158,18 @@ function detectPnpmfile(repoDir: string, workspaceRoot?: string): string | null 
 
 /** The repoDir-only checks: pnpmfile variants + configDependencies + alt manifest. */
 function detectPnpmConfigInRepoDir(repoDir: string): string | null {
-  // Default pnpmfile.  Only `.pnpmfile.cjs` (leading dot) is a pnpm default;
-  // `pnpmfile.cjs` without the dot is NOT auto-loaded (verified) — do not flag it.
+  // Default pnpmfile.  pnpm auto-loads TWO default pnpmfiles (both leading-dot):
+  // `.pnpmfile.mjs` (the PREFERRED default on pnpm 11.x — tried first) and
+  // `.pnpmfile.cjs` (the fallback when no `.mjs` exists).  Verified against the
+  // pinned pnpm 11.1.2: under `if (!config.ignorePnpmfile)` it resolves
+  // `.pnpmfile.mjs` first and only falls back to `.pnpmfile.cjs` when the `.mjs`
+  // is absent — so a repo shipping ONLY a `.pnpmfile.mjs` is a live vector and
+  // must be flagged.  Dot-less `pnpmfile.cjs`/`pnpmfile.mjs` and a `.pnpmfile.js`
+  // (no .mjs/.cjs ext) are NOT pnpm defaults (verified) — do not flag them.
+  // Check `.mjs` first, mirroring pnpm's own resolution order.
+  if (existsSync(join(repoDir, '.pnpmfile.mjs'))) {
+    return 'a repo `.pnpmfile.mjs`' + PNPM_GUIDANCE;
+  }
   if (existsSync(join(repoDir, '.pnpmfile.cjs'))) {
     return 'a repo `.pnpmfile.cjs`' + PNPM_GUIDANCE;
   }

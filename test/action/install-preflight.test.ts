@@ -56,6 +56,16 @@ describe('detectPreTrustConfigExec — pnpm', () => {
     expect(detectPreTrustConfigExec(dir, 'pnpm')).toBeNull();
   });
 
+  it('blocks a default .pnpmfile.mjs (pnpm 11 prefers it over .cjs)', () => {
+    write('.pnpmfile.mjs', 'export const hooks = {}');
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/\.pnpmfile\.mjs/);
+  });
+
+  it('does NOT block a dot-less pnpmfile.mjs (not a pnpm default)', () => {
+    write('pnpmfile.mjs', 'export const hooks = {}');
+    expect(detectPreTrustConfigExec(dir, 'pnpm')).toBeNull();
+  });
+
   it('blocks a .npmrc pnpmfile= relocation', () => {
     write('.npmrc', 'pnpmfile=./evil.cjs\n');
     expect(detectPreTrustConfigExec(dir, 'pnpm')).toMatch(/pnpmfile/);

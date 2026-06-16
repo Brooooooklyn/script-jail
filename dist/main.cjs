@@ -26826,6 +26826,9 @@ function detectPnpmfile(repoDir, workspaceRoot) {
   return null;
 }
 function detectPnpmConfigInRepoDir(repoDir) {
+  if ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, ".pnpmfile.mjs"))) {
+    return "a repo `.pnpmfile.mjs`" + PNPM_GUIDANCE;
+  }
   if ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, ".pnpmfile.cjs"))) {
     return "a repo `.pnpmfile.cjs`" + PNPM_GUIDANCE;
   }
