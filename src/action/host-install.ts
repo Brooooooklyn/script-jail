@@ -25,7 +25,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { delimiter, isAbsolute, join, resolve, sep } from 'node:path';
 
 import {
   FETCH_CMD,
@@ -66,16 +66,62 @@ function trustedGitPath(): string {
 }
 
 /**
- * Scan `process.env.PATH` for the first executable named `git`/`git.exe` and
- * return its ABSOLUTE path.  Returns `undefined` when none is found (caller
- * falls back to the bare literal, which still overrides the repo `.npmrc`).
+ * Directories a PR author can write into (the checkout tree): `$GITHUB_WORKSPACE`
+ * (where actions/checkout places the PR), `$SCRIPT_JAIL_REPO_DIR` (an explicit
+ * repo root, possibly a subdir of the checkout), and the process cwd.  Resolved
+ * to absolute, de-duplicated implicitly by the containment test.
  */
-function resolveGitFromPath(): string | undefined {
+function checkoutRoots(): string[] {
+  const roots: string[] = [];
+  for (const v of [
+    process.env['GITHUB_WORKSPACE'],
+    process.env['SCRIPT_JAIL_REPO_DIR'],
+    process.cwd(),
+  ]) {
+    if (v !== undefined && v !== '') roots.push(resolve(v));
+  }
+  return roots;
+}
+
+/** True when `dir` is a checkout root or nested under one (PR-controlled). */
+function isUnderCheckout(dir: string, roots: ReadonlyArray<string>): boolean {
+  const abs = resolve(dir);
+  for (const root of roots) {
+    if (abs === root || abs.startsWith(root + sep)) return true;
+  }
+  return false;
+}
+
+/**
+ * Scan `process.env.PATH` for the first executable named `git`/`git.exe`
+ * OUTSIDE the checkout tree and return its ABSOLUTE path.  Returns `undefined`
+ * when none is found (caller falls back to the bare literal).
+ *
+ * SECURITY (pre-trust RCE defense): host part-1 runs BEFORE the audit trust gate
+ * and exports the resolved value as `npm_config_git`, which npm invokes to clone
+ * `git:` dependencies EVEN under `--ignore-scripts`.  A workflow that prepends a
+ * checkout-controlled dir to PATH (e.g. `echo "$GITHUB_WORKSPACE/bin" >> $GITHUB_PATH`)
+ * would otherwise let a PR-committed `bin/git` be picked as the "trusted" git and
+ * run on the runner before anything is gated.  So we SKIP every PATH entry inside
+ * the checkout (`isUnderCheckout`) and resolve git only from a runner-owned dir.
+ * The `isAbsolute` check additionally rejects a relative entry (e.g. `.`).
+ *
+ * RESIDUAL (pathological, documented): if NO git exists on PATH outside the
+ * checkout, the caller falls back to the bare literal `git`, which npm then
+ * resolves via the inherited PATH (could pick the checkout git).  This requires a
+ * runner with no system git anywhere on PATH — which cannot complete a git-dep
+ * install regardless — so it is self-defeating, not a usable vector.
+ */
+export function resolveGitFromPath(): string | undefined {
   const pathVar = process.env['PATH'];
   if (pathVar === undefined || pathVar === '') return undefined;
   const names = process.platform === 'win32' ? ['git.exe', 'git.cmd', 'git'] : ['git'];
+  const roots = checkoutRoots();
   for (const dir of pathVar.split(delimiter)) {
     if (dir === '') continue;
+    // SECURITY: never resolve the "trusted" git from a checkout-controlled PATH
+    // entry — see the function note above.
+    if (isUnderCheckout(dir, roots)) continue;
     for (const name of names) {
       const candidate = join(dir, name);
       // Only accept an ABSOLUTE candidate so a relative PATH entry (e.g. `.`)

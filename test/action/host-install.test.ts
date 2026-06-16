@@ -5,9 +5,17 @@
 // package manager runs.
 
 import { describe, it, expect } from 'vitest';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join, delimiter } from 'node:path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
-import { hostInstallNoScripts, hostRunScripts, type HostSpawn, type HostInstallIo } from '../../src/action/host-install.js';
+import {
+  hostInstallNoScripts,
+  hostRunScripts,
+  resolveGitFromPath,
+  type HostSpawn,
+  type HostInstallIo,
+} from '../../src/action/host-install.js';
 
 interface Recorder {
   io: HostInstallIo;
@@ -486,6 +494,39 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     const git = envs[0]!['npm_config_git'];
     expect(git).toBeDefined();
     expect(git === 'git' || isAbsolute(git!)).toBe(true);
+  });
+
+  it('SKIPS a checkout-controlled PATH dir when resolving git (pre-trust RCE defense)', () => {
+    // P1: a workflow may prepend a checkout dir to PATH; a PR-committed bin/git
+    // must NOT be picked as the "trusted" git (npm invokes npm_config_git for
+    // git: deps even under --ignore-scripts, BEFORE the audit gate).  git resolved
+    // from inside $GITHUB_WORKSPACE/$SCRIPT_JAIL_REPO_DIR/cwd is rejected.
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-checkout-'));
+    const binDir = join(checkout, 'bin');
+    mkdirSync(binDir);
+    const fakeGit = join(binDir, process.platform === 'win32' ? 'git.exe' : 'git');
+    writeFileSync(fakeGit, '#!/bin/sh\necho pwned\n', { mode: 0o755 });
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      // Checkout git FIRST on PATH — the pre-fix scan would have returned it.
+      process.env['PATH'] = `${binDir}${delimiter}${origPath ?? ''}`;
+      const resolved = resolveGitFromPath();
+      // Must never be the PR-controlled checkout binary…
+      expect(resolved).not.toBe(fakeGit);
+      // …and anything it DID resolve must live OUTSIDE the checkout tree.
+      if (resolved !== undefined) {
+        expect(resolved.startsWith(checkout)).toBe(false);
+        expect(isAbsolute(resolved)).toBe(true);
+      }
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+    }
   });
 
   it('preserves the inherited env (PATH/HOME etc.) by merging over process.env', () => {

@@ -199,6 +199,57 @@ describe('sanitizeInstallArgs', () => {
       droppedKeys: ['--mode'],
     });
   });
+
+  it('drops yarn lockfile-negating flags (--no-immutable / --immutable=false) — every spelling', () => {
+    // Regression for the P2: the fixed base `--immutable` pins the install to the
+    // committed yarn.lock; a trailing `--no-immutable` would win (last-flag) and
+    // unfreeze the install → unpinned tree.  All spellings canonicalize to
+    // `immutable` and must be dropped.
+    for (const arg of ['--no-immutable', '--immutable=false', '--config.immutable=false']) {
+      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
+      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--immutable']);
+    }
+    // The bare positive `--immutable` (redundant with the fixed flag) is also
+    // dropped — harmless, the base already pins it.
+    expect(sanitizeInstallArgs(['--immutable']).kept).toEqual([]);
+    // A DIFFERENT flag that merely shares the prefix survives (exact match).
+    expect(sanitizeInstallArgs(['--immutable-cache']).kept).toEqual(['--immutable-cache']);
+  });
+
+  it('drops pnpm lockfile-negating flags (--no-frozen-lockfile / --frozen-lockfile=false) — every spelling', () => {
+    // Regression for the P2: the fixed base `--frozen-lockfile` pins pnpm to the
+    // committed pnpm-lock.yaml; a trailing negation would unfreeze it.
+    for (const arg of [
+      '--no-frozen-lockfile',
+      '--frozen-lockfile=false',
+      '--config.frozen-lockfile=false',
+    ]) {
+      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
+      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--frozen-lockfile']);
+    }
+  });
+
+  it('drops pnpm ABBREVIATED frozen-lockfile negations (nopt prefix expansion)', () => {
+    // pnpm parses via nopt-style abbreviation (like npm), so an UNAMBIGUOUS
+    // prefix of `frozen-lockfile` unfreezes the install just like the full
+    // spelling — verified against real pnpm 10.34.x.  An exact-match denylist
+    // missed these (the P2 hole); the prefix-match must catch every abbreviation
+    // and still report the canonical `--frozen-lockfile` reason.
+    for (const arg of ['--no-frozen', '--no-froz', '--no-frozen-lock', '--no-frozen-lockfil']) {
+      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
+      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--frozen-lockfile']);
+    }
+  });
+
+  it('does NOT over-drop non-frozen flags that merely start with "f"', () => {
+    // Only prefixes of `frozenlockfile` resolve to --frozen-lockfile.  `--force`
+    // (force), `--filter` (filter), `--fix-lockfile` (fixlockfile) are NOT
+    // prefixes and must survive — confirms the prefix-match has no `f*` collision.
+    for (const arg of ['--force', '--filter', '--fix-lockfile', '--frozen-lockfile-extra']) {
+      expect(sanitizeInstallArgs([arg]).kept).toEqual([arg]);
+      expect(sanitizeInstallArgs([arg]).dropped).toEqual([]);
+    }
+  });
 });
 
 describe('splitInstallArgs', () => {

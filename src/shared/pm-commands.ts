@@ -152,6 +152,27 @@ function isForbiddenFlag(token: string): boolean {
   // `ig` is the SHORTEST unambiguous ignore-scripts prefix, so start there.
   if (key.length >= 2 && 'ignorescripts'.startsWith(key)) return true;
   if (key === 'mode') return true; // yarn build mode (exact)
+  // Lockfile-negating flags (yarn EXACT, pnpm PREFIX — see each below): the fixed
+  // base args pin the install to the COMMITTED manager lock (`--immutable` for yarn,
+  // `--frozen-lockfile` for pnpm).  A user arg is appended AFTER that fixed flag,
+  // and both managers are last-flag-wins, so a trailing `--no-immutable` /
+  // `--no-frozen-lockfile` (canonicalized here through the `no-`/`=false`/
+  // `config.` peel) would UNFREEZE the install and let it resolve a dependency
+  // graph NOT pinned by the committed lock — while the diff canonicalizes
+  // `manager_lockfile_sha256`, so a matching lifecycle lock could then authorize
+  // scripts for an unpinned tree.  Drop them so the fixed pin always wins.  npm
+  // is unaffected (`npm ci` re-validates lock↔package.json sync structurally).
+  if (key === 'immutable') return true; // yarn (--no-immutable / --immutable=false)
+  // pnpm parses via nopt-style abbreviation (the SAME reason `ignore-scripts` is
+  // prefix-matched above): `--no-frozen`, `--no-froz`, `--no-frozen-lock` all
+  // resolve to `--no-frozen-lockfile` and unfreeze the install (empirically
+  // confirmed against real pnpm 10.34.x).  An exact `frozenlockfile` would miss
+  // every abbreviation, so PREFIX-match it.  The only install option that is a
+  // prefix of `frozenlockfile` is `--frozen-lockfile` itself — `--force`
+  // (`force`), `--filter` (`filter`), `--fix-lockfile` (`fixlockfile`) are NOT
+  // prefixes and survive — so over-matching is the safe direction.  yarn stays
+  // EXACT above because clipanion rejects `--immut`/`--no-immut` (no abbrev).
+  if (key.length >= 2 && 'frozenlockfile'.startsWith(key)) return true; // pnpm
   return false;
 }
 
@@ -166,6 +187,11 @@ function isForbiddenFlag(token: string): boolean {
  *     the following non-flag value token is dropped too) both covered.
  *   * any yarn `--mode` (joined `--mode=X` or split `--mode X`) — we force
  *     `--mode=skip-build`; a user mode could turn builds back on.
+ *   * any lockfile-negating flag — yarn `--no-immutable` / `--immutable=false`
+ *     and pnpm `--no-frozen-lockfile` / `--frozen-lockfile=false` (all spellings
+ *     via the `no-`/`config.` peel) — they would unfreeze the install (last-flag-
+ *     wins over the fixed `--immutable`/`--frozen-lockfile`) and resolve a tree
+ *     not pinned by the committed manager lock.
  *
  * Returns the kept args (to append after the fixed flags) and the dropped args
  * (so the caller can warn).  Pure; no shell parsing — the input is already an
@@ -196,9 +222,12 @@ export function sanitizeInstallArgs(args: ReadonlyArray<string>): {
       // conventional kebab display name so the warning is human-readable.
       // Any prefix of "ignorescripts" (length ≥2) resolves to --ignore-scripts.
       const rawKey = canonicalFlagKey(a) ?? 'unknown';
-      const displayKey = 'ignorescripts'.startsWith(rawKey) && rawKey.length >= 2
-        ? 'ignore-scripts'
-        : rawKey;
+      const displayKey =
+        'ignorescripts'.startsWith(rawKey) && rawKey.length >= 2
+          ? 'ignore-scripts'
+          : 'frozenlockfile'.startsWith(rawKey) && rawKey.length >= 2
+            ? 'frozen-lockfile'
+            : rawKey;
       droppedKeys.push(`--${displayKey}`);
       // Bare form (no `=value`): the package manager would consume the NEXT
       // token as the value (`--ignore-scripts false`, `--mode update-lockfile`).
