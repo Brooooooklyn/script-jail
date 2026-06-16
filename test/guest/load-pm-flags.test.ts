@@ -59,13 +59,24 @@ describe('loadPmFlags — defense-in-depth sanitize', () => {
     expect(loadPmFlags(p)).toEqual({ extraInstallArgs: [], userInstallArgs: ['-P'] });
   });
 
-  it('strips re-enablers smuggled through extra_install_args too', () => {
+  it('re-sanitizes extra_install_args through the arch-hint allowlist (channel survives, steering smuggle dropped)', () => {
+    // BOTH array fields flow into the install argv, so both are re-sanitized at
+    // this untrusted-file boundary — sanitizing only `user_install_args` would
+    // just move the smuggling surface to `extra_install_args`.  This channel is
+    // the npm cross-arch hints (`--cpu/--os/--libc`, dormant today), so it has
+    // its OWN allowlist: the hints survive, but a steering flag smuggled here
+    // (`--dir`) is dropped.
     const p = writeFlags({
-      extra_install_args: ['--ignore-scripts=false', '--cpu=arm64'],
+      extra_install_args: ['--cpu=arm64', '--os=linux', '--libc=glibc', '--dir', '/tmp/alt'],
       user_install_args: [],
     });
-    // Arch hints pass through; the ignore-scripts re-enabler is dropped.
-    expect(loadPmFlags(p)).toEqual({ extraInstallArgs: ['--cpu=arm64'], userInstallArgs: [] });
+    expect(loadPmFlags(p)).toEqual({
+      extraInstallArgs: ['--cpu=arm64', '--os=linux', '--libc=glibc'],
+      userInstallArgs: [],
+    });
+    // The production path (empty channel) is unaffected — byte-identical no-op.
+    const empty = writeFlags({ extra_install_args: [], user_install_args: [] });
+    expect(loadPmFlags(empty)).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
   });
 
   it('keeps a clean, benign override untouched', () => {

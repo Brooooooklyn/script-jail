@@ -303,10 +303,12 @@ describe('runFetchPhase', () => {
     });
 
     it('appends user_install_args to yarn install', async () => {
-      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--inline-builds'] }));
+      // Use an allowlisted dependency-selection flag (`--prod`).  A non-dep
+      // flag like `--inline-builds` would be dropped by the fail-closed allowlist.
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--prod'] }));
       const { spawner, calls } = mockSpawner();
       await runFetchPhase({ manager: 'yarn', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
-      expect(calls[0]!.args).toEqual(['install', '--immutable', '--mode=skip-build', '--inline-builds']);
+      expect(calls[0]!.args).toEqual(['install', '--immutable', '--mode=skip-build', '--prod']);
     });
 
     it('applies BOTH npm arch hints and user args, in order (arch then user)', async () => {
@@ -338,15 +340,23 @@ describe('runFetchPhase', () => {
     // frame).  Those values are not in scope at the agent's failure site —
     // runFetchPhase loads + re-sanitizes them — so it MUST surface them in its
     // return object for the agent to derive the mask set (adversarial-review
-    // round-7 [high]).  Assert the loaded re-sanitized args are returned.
-    it('returns the re-sanitized userInstallArgs it loaded (for the failure-dump mask)', async () => {
+    // round-7 [high]).  Under the fail-closed allowlist a credential-bearing arg
+    // like `--registry=SECRET` is DROPPED entirely (never reaches the argv), so
+    // only the surviving allowlisted args are returned for masking; the secret
+    // can no longer leak via the install argv at all.
+    it('returns the surviving (allowlisted) userInstallArgs it loaded, dropping non-dep flags', async () => {
       writeFileSync(
         pmFlagsPath,
-        JSON.stringify({ extra_install_args: [], user_install_args: ['--registry=SECRET_TOKEN'] }),
+        JSON.stringify({
+          extra_install_args: [],
+          user_install_args: ['--registry=SECRET_TOKEN', '--omit=dev'],
+        }),
       );
       const { spawner } = mockSpawner();
       const result = await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
-      expect(result.userInstallArgs).toEqual(['--registry=SECRET_TOKEN']);
+      // `--registry=SECRET_TOKEN` dropped (source swap); only the allowlisted
+      // `--omit=dev` survives into the returned mask set.
+      expect(result.userInstallArgs).toEqual(['--omit=dev']);
     });
 
     it('returns an empty userInstallArgs array when none are staged', async () => {

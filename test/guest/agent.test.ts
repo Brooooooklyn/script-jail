@@ -718,25 +718,33 @@ describe('agent main()', () => {
       return { frameMsg: String(errFrame?.['message'] ?? ''), serial };
     }
 
-    it('masks an `--registry=SECRET_TOKEN` value echoed by the PM (=-form)', async () => {
+    it('a credential-bearing `--registry=SECRET_TOKEN` is DROPPED, so it never reaches the PM or the mask set', async () => {
+      // Under the fail-closed allowlist `--registry` is a source-swap flag and is
+      // dropped entirely — it never reaches the Phase-A fetch argv, so the PM can
+      // never echo it.  The mask set therefore has nothing to redact (the arg is
+      // gone, not merely masked), and the dump stays byte-identical to no-args.
       const { frameMsg, serial } = await runPhaseAFailure(
         ['--registry=SECRET_TOKEN'],
-        'npm warn invalid config registry="SECRET_TOKEN" set in command line options\n',
+        'npm error could not resolve registry offline\n',
       );
-      // BOTH sinks must be scrubbed and BOTH must carry the mask token.
-      expect(frameMsg).not.toContain('SECRET_TOKEN');
-      expect(serial).not.toContain('SECRET_TOKEN');
-      expect(frameMsg).toContain('<REDACTED:USER-ARG>');
-      expect(serial).toContain('<REDACTED:USER-ARG>');
+      // The secret never entered the argv, so the (simulated) PM output that the
+      // realistic install would produce contains no user-arg value to leak.  No
+      // user-arg mask token is injected because userInstallArgs is empty.
+      expect(frameMsg).not.toContain('<REDACTED:USER-ARG>');
+      expect(serial).not.toContain('<REDACTED:USER-ARG>');
+      expect(frameMsg).toContain('could not resolve registry offline');
     });
 
-    it('masks a split-pair `--registry SECRET_TOKEN` value (whole-token, len>=4)', async () => {
+    it('masks a KEPT allowlisted value-flag value echoed by the PM (whole-token, len>=4)', async () => {
+      // The user-arg-value redactor still guards the surviving allowlisted args:
+      // `--include=optionaldeps` is kept, and its value (len>=4) is masked whole
+      // if the PM echoes it on the failure path.  Proves the path is alive.
       const { frameMsg, serial } = await runPhaseAFailure(
-        ['--registry', 'SECRET_TOKEN'],
-        'npm error could not resolve registry SECRET_TOKEN offline\n',
+        ['--include=optionaldeps'],
+        'npm warn config: applied --include=optionaldeps in command line options\n',
       );
-      expect(frameMsg).not.toContain('SECRET_TOKEN');
-      expect(serial).not.toContain('SECRET_TOKEN');
+      expect(frameMsg).not.toContain('optionaldeps');
+      expect(serial).not.toContain('optionaldeps');
       expect(frameMsg).toContain('<REDACTED:USER-ARG>');
       expect(serial).toContain('<REDACTED:USER-ARG>');
     });

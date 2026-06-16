@@ -191,9 +191,11 @@ describe('hostInstallNoScripts (part 1)', () => {
     expect(() => hostInstallNoScripts('npm', '/repo', [], rec.io, errSpawn)).toThrow(/could not spawn/);
   });
 
-  it('does not echo credential-shaped user args to stdout, but still passes them to spawn', () => {
-    // Regression guard: a user arg such as --//registry.npmjs.org/:_authToken=SECRET123
-    // must NOT appear in the action log (GitHub masking only strips registered secrets).
+  it('a credential-shaped user arg is DROPPED (not on the allowlist), never logged, never spawned', () => {
+    // A user arg such as --//registry.npmjs.org/:_authToken=SECRET123 is not a
+    // dependency-selection flag, so the fail-closed allowlist drops it.  It must
+    // appear in NEITHER the action log NOR the spawn argv (strictly safer than the
+    // old keep-then-redact-the-log path — the credential never leaves the process).
     const credArg = '--//registry.npmjs.org/:_authToken=SECRET123';
     const rec = makeRecorder();
     hostInstallNoScripts('npm', '/repo', [credArg], rec.io, okSpawn(rec));
@@ -207,11 +209,19 @@ describe('hostInstallNoScripts (part 1)', () => {
     // 2. The command and fixed base args ARE still shown (diagnostic is useful).
     expect(logged).toContain('npm ci --ignore-scripts');
 
-    // 3. The count of suppressed user args is shown.
-    expect(logged).toMatch(/\+1 user install arg, not shown/);
+    // 3. No KEPT user args, so no "+N user install arg" suffix is emitted.
+    expect(logged).not.toContain('user install arg');
 
-    // 4. Spawn still received the full argv including the credential arg.
-    expect(rec.calls[0]!.args).toContain(credArg);
+    // 4. The dropped arg was reported in a warning by its grammar-derived key
+    //    (here the canonical key of the bare-name flag), never its raw text.
+    const warn = rec.warns.join('\n');
+    expect(warn).not.toContain('SECRET123');
+    expect(warn).not.toContain(credArg);
+    expect(warn).toMatch(/not on the allowlist/);
+
+    // 5. Spawn received ONLY the fixed base args — the credential never reached it.
+    expect(rec.calls[0]!.args).not.toContain(credArg);
+    expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts']);
   });
 
   it('shows plural "args" in the suffix when multiple user args are supplied', () => {
@@ -240,36 +250,41 @@ describe('hostInstallNoScripts (part 1)', () => {
     };
   }
 
-  it('redacts a PM warning that REFORMATS --registry=SECRET into registry="SECRET" out of captured stderr', () => {
-    // npm 11.x emits `npm warn invalid config registry="SECRET_TOKEN" set in
-    // command line options` — the value substring survives the reformat, so the
-    // value-substring derivation must catch it.  The arg is STILL passed verbatim.
+  it('a --registry=SECRET arg is DROPPED (not on the allowlist) so it never reaches spawn', () => {
+    // Under the fail-closed allowlist `--registry` is a source-swap flag and is
+    // dropped entirely — the credential never reaches spawn at all (strictly
+    // safer than the old keep-then-redact path).  Any PM diagnostic that still
+    // echoes the value substring is also redacted from the log defensively.
     const rec = makeRecorder();
     const spawn = captureSpawn(rec, {
       status: 0,
       stderr: 'npm warn invalid config registry="SECRET_TOKEN" set in command line options\n',
     });
     hostInstallNoScripts('npm', '/repo', ['--registry=SECRET_TOKEN'], rec.io, spawn);
-    const erred = rec.errs.join('');
-    expect(erred).not.toContain('SECRET_TOKEN');
-    // The diagnostic context survives (only the secret is masked).
-    expect(erred).toContain('npm warn invalid config registry=');
-    // The real arg reached spawn unchanged.
-    expect(rec.calls[0]!.args).toContain('--registry=SECRET_TOKEN');
+    // The credential arg was DROPPED — spawn got only the fixed base args.
+    expect(rec.calls[0]!.args).not.toContain('--registry=SECRET_TOKEN');
+    expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts']);
+    // The drop warning names only the safe canonical key, never the secret.
+    const warn = rec.warns.join('\n');
+    expect(warn).toMatch(/--registry/);
+    expect(warn).not.toContain('SECRET_TOKEN');
   });
 
-  it('masks a whole credential-shaped user-arg token echoed in captured stdout, still passes it to spawn', () => {
+  it('a credential-shaped user-arg is DROPPED (not on the allowlist) so it never reaches spawn', () => {
     const credArg = '--//registry.npmjs.org/:_authToken=SECRET123';
     const rec = makeRecorder();
     const spawn = captureSpawn(rec, {
       status: 0,
-      stdout: `using ${credArg} for auth\n`,
+      stdout: `using something for auth\n`,
     });
     hostInstallNoScripts('npm', '/repo', [credArg], rec.io, spawn);
-    const logged = rec.out.join('');
-    expect(logged).not.toContain('SECRET123');
-    expect(logged).not.toContain(credArg);
-    expect(rec.calls[0]!.args).toContain(credArg);
+    // Dropped — never passed to spawn.
+    expect(rec.calls[0]!.args).not.toContain(credArg);
+    expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts']);
+    // The warning never echoes the raw token (only its grammar-derived key).
+    const warn = rec.warns.join('\n');
+    expect(warn).not.toContain('SECRET123');
+    expect(warn).not.toContain(credArg);
   });
 
   it('redacts a credential SHAPE the PM emits that was NOT a user arg', () => {
@@ -292,19 +307,18 @@ describe('hostInstallNoScripts (part 1)', () => {
   });
 
   it('writes captured output even on failure (status !== 0) BEFORE throwing', () => {
-    const credArg = '--registry=SECRET_TOKEN';
     const rec = makeRecorder();
     const spawn = captureSpawn(rec, {
       status: 1,
       stdout: 'npm error something broke\n',
-      stderr: 'npm warn invalid config registry="SECRET_TOKEN"\n',
+      stderr: 'npm warn registry config issue\n',
     });
-    expect(() => hostInstallNoScripts('npm', '/repo', [credArg], rec.io, spawn)).toThrow(/exited with code 1/);
+    // No user args here — exercise the failure-still-flushes-output path with the
+    // fixed base install (credential args are dropped before spawn anyway).
+    expect(() => hostInstallNoScripts('npm', '/repo', [], rec.io, spawn)).toThrow(/exited with code 1/);
     // Output reached the sinks despite the throw.
     expect(rec.out.join('')).toContain('npm error something broke');
-    const erred = rec.errs.join('');
-    expect(erred).toContain('npm warn invalid config registry=');
-    expect(erred).not.toContain('SECRET_TOKEN');
+    expect(rec.errs.join('')).toContain('npm warn registry config issue');
   });
 
   it('does NOT mangle an unrelated word that contains a short user-arg value (minLen guard)', () => {
@@ -323,7 +337,7 @@ describe('hostInstallNoScripts (part 1)', () => {
 
   // ── Surface #6a: runOrThrow error messages must not leak argv credentials ──
 
-  it('#6a: non-zero exit error does not contain credential-shaped user args', () => {
+  it('#6a: non-zero exit error does not contain credential-shaped user args (which are dropped)', () => {
     const credArg = '--//registry.npmjs.org/:_authToken=SECRET123';
     const rec = makeRecorder();
     const failSpawn: HostSpawn = (cmd, args, cwd) => {
@@ -343,11 +357,12 @@ describe('hostInstallNoScripts (part 1)', () => {
     // Secret must NOT appear in the error message.
     expect(thrown!.message).not.toContain('SECRET123');
     expect(thrown!.message).not.toContain(credArg);
-    // Spawn still received the full real argv including the credential.
-    expect(rec.calls[0]!.args).toContain(credArg);
+    // Under the allowlist the credential arg is DROPPED — spawn never saw it.
+    expect(rec.calls[0]!.args).not.toContain(credArg);
+    expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts']);
   });
 
-  it('#6a: signal-killed error does not contain credential-shaped user args', () => {
+  it('#6a: signal-killed error does not contain credential-shaped user args (which are dropped)', () => {
     const credArg = '--registry=https://user:SECRET_PASS@private.registry.example/';
     const rec = makeRecorder();
     const sigSpawn: HostSpawn = (cmd, args, cwd) => {
@@ -366,8 +381,9 @@ describe('hostInstallNoScripts (part 1)', () => {
     // Secret must NOT appear in the error message.
     expect(thrown!.message).not.toContain('SECRET_PASS');
     expect(thrown!.message).not.toContain(credArg);
-    // Spawn still received the full real argv including the credential.
-    expect(rec.calls[0]!.args).toContain(credArg);
+    // Under the allowlist the credential arg is DROPPED — spawn never saw it.
+    expect(rec.calls[0]!.args).not.toContain(credArg);
+    expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts']);
   });
 
   // ── Surface #6b: dropped-arg warnings must not echo raw user tokens ──

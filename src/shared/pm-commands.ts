@@ -125,166 +125,239 @@ function canonicalFlagKey(token: string): string | null {
 }
 
 /**
- * True when `token` could set a script/build-enabling option.
- *
- * `ignore-scripts` is matched by PREFIX, not equality, because npm/nopt
- * resolves any UNAMBIGUOUS abbreviation of a config option to the full option:
- * `--ignore=false`, `--ignore-s=false`, even `--ig=false` all set
- * `ignore-scripts` and re-enable lifecycle scripts (empirically confirmed
- * against real npm 11.x).  A fixed-spelling denylist cannot cover abbreviation,
- * so we drop ANY non-empty prefix of `ignorescripts`.  Over-matching (e.g.
- * dropping a bare `-i`) is the safe direction — the only real option that is a
- * prefix of `ignorescripts` is `ignore-scripts` itself; `--include`, `--omit`,
- * `-D`, `--prod`, `--no-optional`, … are not prefixes and survive.
- *
- * yarn `--mode` is matched EXACTLY: yarn Berry's parser (clipanion) does not
- * abbreviate, so an exact key is enough and we avoid over-dropping a legitimate
- * short flag like `-m`/`-mo`.
+ * Rehydrate a separator-stripped canonical key (e.g. "ignorescripts",
+ * "lockfiledir", "modulesdir") to its conventional kebab spelling for the
+ * drop-group WARNING.  Input is always a grammar-derived canonical key — never
+ * raw user text — so the output is safe to log.  Covers the well-known steering
+ * keys explicitly; an unrecognized key (e.g. a one-off unknown flag) is returned
+ * verbatim — it is still a separator-stripped, lowercased option NAME, with no
+ * `=value` and no leading dashes, so it carries no credential payload.
  */
-function isForbiddenFlag(token: string): boolean {
-  const key = canonicalFlagKey(token);
-  if (key === null || key.length === 0) return false;
-  // npm/nopt prefix abbreviation — but require ≥2 chars.  The single letter `i`
-  // is AMBIGUOUS across npm options (include-*, init-*, install-*, if-present,
-  // ignore-scripts), so npm does NOT resolve `--i` to ignore-scripts — it
-  // expands to `--include-workspace-root` (verified on npm 11.13).  Dropping a
-  // bare `i` would silently omit root workspace deps from the install graph.
-  // `ig` is the SHORTEST unambiguous ignore-scripts prefix, so start there.
-  if (key.length >= 2 && 'ignorescripts'.startsWith(key)) return true;
-  if (key === 'mode') return true; // yarn build mode (exact)
-  // Lockfile-negating flags (yarn EXACT, pnpm PREFIX — see each below): the fixed
-  // base args pin the install to the COMMITTED manager lock (`--immutable` for yarn,
-  // `--frozen-lockfile` for pnpm).  A user arg is appended AFTER that fixed flag,
-  // and both managers are last-flag-wins, so a trailing `--no-immutable` /
-  // `--no-frozen-lockfile` (canonicalized here through the `no-`/`=false`/
-  // `config.` peel) would UNFREEZE the install and let it resolve a dependency
-  // graph NOT pinned by the committed lock — while the diff canonicalizes
-  // `manager_lockfile_sha256`, so a matching lifecycle lock could then authorize
-  // scripts for an unpinned tree.  Drop them so the fixed pin always wins.  npm
-  // is unaffected (`npm ci` re-validates lock↔package.json sync structurally).
-  if (key === 'immutable') return true; // yarn (--no-immutable / --immutable=false)
-  // pnpm parses via nopt-style abbreviation (the SAME reason `ignore-scripts` is
-  // prefix-matched above): `--no-frozen`, `--no-froz`, `--no-frozen-lock` all
-  // resolve to `--no-frozen-lockfile` and unfreeze the install (empirically
-  // confirmed against real pnpm 10.34.x).  An exact `frozenlockfile` would miss
-  // every abbreviation, so PREFIX-match it.  The only install option that is a
-  // prefix of `frozenlockfile` is `--frozen-lockfile` itself — `--force`
-  // (`force`), `--filter` (`filter`), `--fix-lockfile` (`fixlockfile`) are NOT
-  // prefixes and survive — so over-matching is the safe direction.  yarn stays
-  // EXACT above because clipanion rejects `--immut`/`--no-immut` (no abbrev).
-  if (key.length >= 2 && 'frozenlockfile'.startsWith(key)) return true; // pnpm
-  // pnpm `--fix-lockfile` is a SEPARATE unfreeze path: it does NOT negate
-  // `frozen-lockfile`, it OVERRIDES it — with the fixed `--frozen-lockfile` still
-  // present, `pnpm install --frozen-lockfile --fix-lockfile` re-resolves and
-  // REWRITES a missing/out-of-sync `pnpm-lock.yaml` and installs the unpinned
-  // tree (empirically: the bare `--frozen-lockfile` errors `ERR_PNPM_NO_LOCKFILE`,
-  // adding `--fix-lockfile` makes it install).  Same nopt abbreviation applies
-  // (`--fix` → `--fix-lockfile`), so PREFIX-match it too; `--filter` (`filter`)
-  // is NOT a prefix of `fixlockfile` and survives.
-  if (key.length >= 2 && 'fixlockfile'.startsWith(key)) return true; // pnpm
-  // pnpm lockfile-LOCATION / -ENFORCEMENT family.  `--lockfile-dir <alt>` does
-  // not unfreeze — it REDIRECTS pnpm to validate+install from `<alt>/pnpm-lock.yaml`
-  // instead of the committed root lock, so a stale root lock + a self-consistent
-  // alternate lock installs an UNPINNED tree while `--frozen-lockfile` stays
-  // "satisfied" and the audit still gates on the (unchanged) root-lock sha
-  // (reproduced on real pnpm: exit 0, deps installed, root lock untouched).
-  // `--lockfile-only` (write lock, skip install) and `--(no-)lockfile` are the
-  // same family and equally must not steer the pinned install.  Every pnpm-
-  // RESOLVABLE abbreviation of these has `lockfile` as a canonical-key prefix
-  // (shorter stems like `--lock`/`--lockf` are ambiguous across the family and
-  // pnpm refuses them), and NO legit npm/pnpm/yarn install flag's key starts
-  // with `lockfile` (npm's is `package-lock*`), so deny the whole family.
-  if (key.startsWith('lockfile')) return true; // pnpm --lockfile-dir/-only/(no-)lockfile
-  return false;
+function rehydrateKebab(key: string): string {
+  switch (key) {
+    case 'ignorescripts':
+      return 'ignore-scripts';
+    case 'frozenlockfile':
+      return 'frozen-lockfile';
+    case 'fixlockfile':
+      return 'fix-lockfile';
+    case 'lockfiledir':
+      return 'lockfile-dir';
+    case 'lockfileonly':
+      return 'lockfile-only';
+    case 'lockfile':
+      return 'lockfile';
+    case 'modulesdir':
+      return 'modules-dir';
+    case 'virtualstoredir':
+      return 'virtual-store-dir';
+    case 'storedir':
+      return 'store-dir';
+    case 'workspaceroot':
+      return 'workspace-root';
+    default:
+      return key; // dir, prefix, global, registry, filter, recursive, mode, immutable, c, g, r, w, … or any unknown flag
+  }
 }
 
 /**
- * Human-readable kebab option name for a dropped flag's canonical key, used only
- * for the drop-group WARNING.  Always returns a well-known constant derived from
- * the flag grammar (never raw user text), so it is safe to log.  Mirrors the
- * abbreviation logic in `isForbiddenFlag` so an abbreviated drop still names the
- * full option (e.g. `--ig` → `ignore-scripts`, `--no-frozen` → `frozen-lockfile`,
- * `--fix` → `fix-lockfile`, `--lockfile-dir` → `lockfile-dir`).
+ * FAIL-CLOSED ALLOWLIST of canonical flag keys that are proven-safe
+ * dependency-SELECTION options: they filter WHICH packages of the
+ * lockfile-pinned tree get installed, and CANNOT redirect which lockfile is
+ * read, where the install root / module output lives, whether lifecycle scripts
+ * run, or the resolution source (registry).  Everything not on this set —
+ * including all positionals and all unknown flags — is dropped (see
+ * `sanitizeInstallArgs`).
+ *
+ * Why an allowlist and not a denylist: a denylist was proven STRUCTURALLY
+ * UNSAFE here.  Three distinct pin-bypass families slipped past successive
+ * denylist rounds (latest: pnpm `--dir alt --modules-dir ../node_modules`,
+ * which materializes an ALTERNATE locked tree into the root node_modules at
+ * exit 0 while the committed root lock — the SHA the audit gates on — stays
+ * stale).  The safe surface (dependency-type filters) is small and stable; the
+ * unsafe surface (every steering flag, every abbreviation, every PM's aliases)
+ * is open-ended.  So we enumerate the safe set and refuse the rest.
+ *
+ * The map value is whether the flag TAKES A VALUE.  A value-taking flag in
+ * SPLIT form (`--omit dev`) consumes the following token as its value (kept
+ * together); a boolean flag never consumes the next token.  Joined `--omit=dev`
+ * is a single token regardless.
+ *
+ * The set is intentionally minimal and empirically grounded (npm 11.x, pnpm
+ * 10.34.x / 11.1.x, yarn Berry 4.x):
+ *   * omit / include  — npm & pnpm dependency-group filters (value-taking).
+ *   * prod / production / dev / optional — boolean dependency-group filters
+ *     (`--no-optional` canonicalizes to `optional`, still dep-selection).
+ *   * d / p  — the short flags `-D` / `-P`.  In pnpm these ARE `--dev` / `--prod`
+ *     (dependency-type selection, boolean); in npm they are `--save-dev` /
+ *     `--save-prod` (harmless save flags, inert under `npm ci`).  Crucially, in
+ *     NO package manager does `-d`/`-D`/`-p`/`-P` resolve to a location/dir/
+ *     prefix/global/source flag — the steering short flags are `-C` (`--dir`/
+ *     `--prefix`, key `c`), `-g` (`--global`), `-r`, `-w`, `-F`/`-f`, none of
+ *     which fold to `d` or `p` (verified empirically).  canonicalFlagKey
+ *     lowercases, so `-d`/`-p` (npm `--loglevel info` / `--parseable`) also map
+ *     here; both are harmless.  The documented action `args` example uses `-D`,
+ *     so keeping these keeps that example valid.
+ *
+ * NOTE on negations: `--no-<allowlisted>` folds to the base key (e.g.
+ * `--no-optional` → `optional`) and is itself dependency-selection, so it is
+ * allowed.  No DANGEROUS flag's `--no-` form folds to an allowlisted key —
+ * steering keys (`dir`, `prefix`, `modulesdir`, `global`, `registry`, `filter`,
+ * `recursive`, `lockfile*`, `frozenlockfile`, `fixlockfile`, `immutable`,
+ * `mode`, `ignorescripts`, …) are not in this set and never collapse into it.
  */
-function dropDisplayName(rawKey: string): string {
-  if (rawKey.length >= 2 && 'ignorescripts'.startsWith(rawKey)) return 'ignore-scripts';
-  if (rawKey.length >= 2 && 'frozenlockfile'.startsWith(rawKey)) return 'frozen-lockfile';
-  if (rawKey.length >= 2 && 'fixlockfile'.startsWith(rawKey)) return 'fix-lockfile';
-  if (rawKey === 'lockfiledir') return 'lockfile-dir';
-  if (rawKey === 'lockfileonly') return 'lockfile-only';
-  if (rawKey.startsWith('lockfile')) return 'lockfile';
-  return rawKey; // `mode`, `immutable` — already the conventional name
-}
+const ALLOWED_FLAG_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map([
+  ['omit', { takesValue: true }],
+  ['include', { takesValue: true }],
+  ['prod', { takesValue: false }],
+  ['production', { takesValue: false }],
+  ['dev', { takesValue: false }],
+  ['optional', { takesValue: false }],
+  ['p', { takesValue: false }], // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
+  ['d', { takesValue: false }], // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
+]);
 
 /**
- * Filter developer-supplied install args so they can never re-enable lifecycle
- * scripts in the no-scripts (Phase A / host part-1) install.
+ * FAIL-CLOSED ALLOWLIST for the SEPARATE `extra_install_args` channel — the
+ * (currently dormant) npm cross-arch hints `--cpu` / `--os` / `--libc`.  These
+ * select WHICH platform variant of the lockfile-pinned optionalDependencies gets
+ * materialized (same safety class as `--omit=optional`): they cannot redirect
+ * the lockfile, install root / module output, scripts, or the resolution source.
  *
- * Dropped (see `isForbiddenFlag` / `canonicalFlagKey`):
- *   * any token that resolves to `ignore-scripts` — every spelling, dash count,
- *     `no-`/`config.` prefix, AND every npm-accepted ABBREVIATION (`--ignore`,
- *     `--ig`, …).  JOINED (`…=false`) and SPLIT (`--ignore-scripts false`, where
- *     the following non-flag value token is dropped too) both covered.
- *   * any yarn `--mode` (joined `--mode=X` or split `--mode X`) — we force
- *     `--mode=skip-build`; a user mode could turn builds back on.
- *   * any lockfile-negating flag — yarn `--no-immutable` / `--immutable=false`
- *     and pnpm `--no-frozen-lockfile` / `--frozen-lockfile=false` (all spellings
- *     via the `no-`/`config.` peel) — they would unfreeze the install (last-flag-
- *     wins over the fixed `--immutable`/`--frozen-lockfile`) and resolve a tree
- *     not pinned by the committed manager lock.
- *   * pnpm `--fix-lockfile` (and its `--fix` abbreviation / `--config.` alias) —
- *     a SEPARATE unfreeze path that overrides the fixed `--frozen-lockfile` and
- *     rewrites + installs an unpinned lock even when one is absent/out-of-sync.
- *   * the pnpm lockfile-LOCATION / -ENFORCEMENT family — `--lockfile-dir <alt>`
- *     (redirects the pinned install to an alternate lock), `--lockfile-only`, and
- *     `--(no-)lockfile`.  `--lockfile-dir` (split `--lockfile-dir alt` value token
- *     dropped too, joined `=alt`, `--config.lockfile-dir`) lets a stale root lock
- *     pass `--frozen-lockfile` while installing the alternate tree.
+ * Why a separate set: arch hints are not dependency-GROUP filters, so they are
+ * not on `ALLOWED_FLAG_KEYS`.  But `extra_install_args` is read from the same
+ * repo-deliverable `pm-flags.json` as `user_install_args`, so it MUST be
+ * fail-closed at the guest boundary too — otherwise a steering flag (`--dir`,
+ * `--lockfile-dir`, …) smuggled through this channel would bypass the
+ * `user_install_args` sanitization.  Allowing exactly the arch hints keeps the
+ * channel functional if `buildArchFlagOverlay` is ever revived while refusing
+ * everything else.
+ */
+const ALLOWED_ARCH_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map([
+  ['cpu', { takesValue: true }],
+  ['os', { takesValue: true }],
+  ['libc', { takesValue: true }],
+]);
+
+/**
+ * FAIL-CLOSED ALLOWLIST filter for developer-supplied install args.
+ *
+ * KEEP only tokens whose canonical flag key (see `canonicalFlagKey`) is on
+ * `ALLOWED_FLAG_KEYS` — the proven-safe dependency-SELECTION flags that filter
+ * the lockfile-pinned tree without redirecting which lock is read, where the
+ * install root / module output lives, whether lifecycle scripts run, or the
+ * resolution source.  DROP (and report) EVERYTHING ELSE: every unknown flag and
+ * every positional.
+ *
+ * Why fail-closed: the materialized tree MUST be exactly the one pinned by the
+ * committed root manager lock the audit gates on.  A denylist was proven
+ * structurally unsafe — steering flags, abbreviations, and per-PM aliases form
+ * an open-ended surface, and three pin-bypass families slipped past it over
+ * successive rounds (latest: pnpm `--dir alt --modules-dir ../node_modules`,
+ * which installs an alternate locked tree into the root node_modules at exit 0
+ * while the root lock stays stale).  So everything that is not on the small,
+ * stable safe set is refused — including `--dir`/`-C`/`--prefix`/`--modules-dir`/
+ * `--virtual-store-dir`/`--store-dir` (root/output redirect), `--lockfile-dir`/
+ * `--lockfile-only`/`--(no-)lockfile`/`--(no-)frozen-lockfile`/`--fix-lockfile`/
+ * `--no-immutable` (lockfile location/enforcement), `--ignore-scripts` and its
+ * `--no-` negation (script re-enable), `--global`/`-g`/`--workspace-root`/`-w`/
+ * `--recursive`/`-r`/`--filter` (scope steering), `--registry`/`--config.registry`
+ * (source swap), and any bare package name / path positional.
+ *
+ * Value tokens: an allowlisted VALUE-taking flag in SPLIT form (`--omit dev`)
+ * keeps its following value token too (not dropped, not left dangling as a
+ * positional).  Joined `--omit=dev` is a single token.  Boolean allowlisted
+ * flags never consume a following token.
  *
  * Returns the kept args (to append after the fixed flags) and the dropped args
  * (so the caller can warn).  Pure; no shell parsing — the input is already an
  * argv array (the single split happens once at the input boundary).  MUST be
  * applied identically to the host install AND the sandbox fetch (it is called
  * from both `hostInstallNoScripts` and `runAudit`) so the two stay in parity.
+ * The no-args path returns `{ kept: [], dropped: [], droppedKeys: [] }`
+ * byte-identically (preserving all parity goldens).
  */
-export function sanitizeInstallArgs(args: ReadonlyArray<string>): {
+export interface SanitizeResult {
   kept: string[];
   dropped: string[];
-  /** Canonical option names (e.g. "ignore-scripts", "mode") for each DROP
-   *  GROUP.  One entry per LOGICAL drop: a bare flag + its consumed value token
-   *  count as a single entry.  These are always well-known constants derived
-   *  from the flag grammar — never raw user-supplied text — so they are safe to
-   *  log without leaking credentials. */
+  /** SAFE reasons for each DROP GROUP — one entry per LOGICAL drop (a flag plus
+   *  any consumed value token count as a single entry).  Each entry is a
+   *  constant derived from the flag GRAMMAR, never raw user text: a dropped
+   *  flag reports its canonical option name (e.g. "--dir", "--ignore-scripts"),
+   *  and a dropped positional reports the literal "<positional>".  Safe to log
+   *  without leaking credentials. */
   droppedKeys: string[];
-} {
+}
+
+/**
+ * Core fail-closed filter: KEEP only tokens whose canonical key is in `allow`
+ * (carrying its value token for split value-flags), DROP + report everything
+ * else.  `sanitizeInstallArgs` / `sanitizeArchInstallArgs` are the two public
+ * entry points, differing only in which allowlist they enforce.
+ */
+function filterAgainstAllowlist(
+  args: ReadonlyArray<string>,
+  allow: ReadonlyMap<string, { takesValue: boolean }>,
+): SanitizeResult {
   const kept: string[] = [];
   const dropped: string[] = [];
   const droppedKeys: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (isForbiddenFlag(a)) {
+    const key = canonicalFlagKey(a);
+    if (key !== null && key.length > 0) {
+      const allowed = allow.get(key);
+      if (allowed !== undefined) {
+        // KEEP the flag.  A value-taking allowlisted flag in SPLIT form
+        // (`--omit dev`) must keep its following non-flag value token too, so it
+        // does not dangle as a positional and get dropped on the next iteration.
+        kept.push(a);
+        if (
+          allowed.takesValue &&
+          isBareFlag(a) &&
+          i + 1 < args.length &&
+          !args[i + 1]!.startsWith('-')
+        ) {
+          kept.push(args[++i]!);
+        }
+        continue;
+      }
+      // A flag NOT on the allowlist — drop it.  Report its canonical option name
+      // (rehydrated to the conventional kebab spelling), never the raw token.
       dropped.push(a);
-      // Derive the SAFE canonical key for this drop group.  canonicalFlagKey
-      // returns the separator-stripped lowercase option name (e.g. "ignorescripts"
-      // or an unambiguous prefix like "ignorescript").  Rehydrate to the
-      // conventional kebab display name so the warning is human-readable.
-      // Any prefix of "ignorescripts" (length ≥2) resolves to --ignore-scripts.
-      const rawKey = canonicalFlagKey(a) ?? 'unknown';
-      droppedKeys.push(`--${dropDisplayName(rawKey)}`);
+      droppedKeys.push(`--${rehydrateKebab(key)}`);
       // Bare form (no `=value`): the package manager would consume the NEXT
-      // token as the value (`--ignore-scripts false`, `--mode update-lockfile`).
-      // Drop that value token too so a re-enabling value — or a dangling
-      // positional — can never reach the argv.
+      // token as this flag's value.  Drop it too so it cannot survive as a
+      // dangling positional (which we would drop anyway, but consuming it keeps
+      // the drop grouped under one reason and matches PM argv semantics).
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1]!.startsWith('-')) {
         dropped.push(args[++i]!);
-        // The consumed value belongs to the same logical drop group — do NOT
-        // add a second droppedKeys entry; the flag key already names the reason.
       }
       continue;
     }
-    kept.push(a);
+    // A positional (package name, path, or a value not consumed by an
+    // allowlisted flag) — fail-closed: DROP it and report a grammar-derived
+    // constant, never the raw value.
+    dropped.push(a);
+    droppedKeys.push('<positional>');
   }
   return { kept, dropped, droppedKeys };
+}
+
+/** Fail-closed allowlist of the developer `args` channel (dependency-selection
+ *  flags only — see `ALLOWED_FLAG_KEYS`).  Applied identically to the host
+ *  install and the sandbox fetch so the two stay in parity; the no-args path
+ *  returns `{ kept: [], dropped: [], droppedKeys: [] }` byte-identically. */
+export function sanitizeInstallArgs(args: ReadonlyArray<string>): SanitizeResult {
+  return filterAgainstAllowlist(args, ALLOWED_FLAG_KEYS);
+}
+
+/** Fail-closed allowlist of the `extra_install_args` channel (npm cross-arch
+ *  hints only — see `ALLOWED_ARCH_KEYS`).  Re-applied at the guest boundary so a
+ *  steering flag cannot ride in through this channel even if the repo-delivered
+ *  `pm-flags.json` is not overwritten by the host overlay. */
+export function sanitizeArchInstallArgs(args: ReadonlyArray<string>): SanitizeResult {
+  return filterAgainstAllowlist(args, ALLOWED_ARCH_KEYS);
 }
 
 /**

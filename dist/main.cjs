@@ -26474,44 +26474,74 @@ function canonicalFlagKey(token) {
   }
   return key;
 }
-function isForbiddenFlag(token) {
-  const key = canonicalFlagKey(token);
-  if (key === null || key.length === 0) return false;
-  if (key.length >= 2 && "ignorescripts".startsWith(key)) return true;
-  if (key === "mode") return true;
-  if (key === "immutable") return true;
-  if (key.length >= 2 && "frozenlockfile".startsWith(key)) return true;
-  if (key.length >= 2 && "fixlockfile".startsWith(key)) return true;
-  if (key.startsWith("lockfile")) return true;
-  return false;
+function rehydrateKebab(key) {
+  switch (key) {
+    case "ignorescripts":
+      return "ignore-scripts";
+    case "frozenlockfile":
+      return "frozen-lockfile";
+    case "fixlockfile":
+      return "fix-lockfile";
+    case "lockfiledir":
+      return "lockfile-dir";
+    case "lockfileonly":
+      return "lockfile-only";
+    case "lockfile":
+      return "lockfile";
+    case "modulesdir":
+      return "modules-dir";
+    case "virtualstoredir":
+      return "virtual-store-dir";
+    case "storedir":
+      return "store-dir";
+    case "workspaceroot":
+      return "workspace-root";
+    default:
+      return key;
+  }
 }
-function dropDisplayName(rawKey) {
-  if (rawKey.length >= 2 && "ignorescripts".startsWith(rawKey)) return "ignore-scripts";
-  if (rawKey.length >= 2 && "frozenlockfile".startsWith(rawKey)) return "frozen-lockfile";
-  if (rawKey.length >= 2 && "fixlockfile".startsWith(rawKey)) return "fix-lockfile";
-  if (rawKey === "lockfiledir") return "lockfile-dir";
-  if (rawKey === "lockfileonly") return "lockfile-only";
-  if (rawKey.startsWith("lockfile")) return "lockfile";
-  return rawKey;
-}
-function sanitizeInstallArgs(args) {
+var ALLOWED_FLAG_KEYS = /* @__PURE__ */ new Map([
+  ["omit", { takesValue: true }],
+  ["include", { takesValue: true }],
+  ["prod", { takesValue: false }],
+  ["production", { takesValue: false }],
+  ["dev", { takesValue: false }],
+  ["optional", { takesValue: false }],
+  ["p", { takesValue: false }],
+  // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
+  ["d", { takesValue: false }]
+  // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
+]);
+function filterAgainstAllowlist(args, allow) {
   const kept = [];
   const dropped = [];
   const droppedKeys = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (isForbiddenFlag(a)) {
+    const key = canonicalFlagKey(a);
+    if (key !== null && key.length > 0) {
+      const allowed = allow.get(key);
+      if (allowed !== void 0) {
+        kept.push(a);
+        if (allowed.takesValue && isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+          kept.push(args[++i]);
+        }
+        continue;
+      }
       dropped.push(a);
-      const rawKey = canonicalFlagKey(a) ?? "unknown";
-      droppedKeys.push(`--${dropDisplayName(rawKey)}`);
+      droppedKeys.push(`--${rehydrateKebab(key)}`);
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
         dropped.push(args[++i]);
       }
       continue;
     }
-    kept.push(a);
+    dropped.push(a);
+    droppedKeys.push("<positional>");
   }
   return { kept, dropped, droppedKeys };
+}
+function sanitizeInstallArgs(args) {
+  return filterAgainstAllowlist(args, ALLOWED_FLAG_KEYS);
 }
 function splitInstallArgs(raw) {
   const out = [];
@@ -26774,7 +26804,7 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn2 = captureSpawn) {
     const n = dropped.length;
     const keys = droppedKeys.join(", ");
     io.warn(
-      `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} matching ${keys} \u2014 it would re-enable lifecycle scripts in the no-scripts install (the sandbox is the only place scripts run unaudited).`
+      `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} (${keys}) \u2014 not on the allowlist of dependency-selection flags (only flags that filter the lockfile-pinned tree are passed through; anything that could redirect the lock/root/output/source or re-enable lifecycle scripts is dropped).`
     );
   }
   const base = FETCH_CMD[pm];

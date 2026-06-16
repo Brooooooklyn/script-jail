@@ -342,15 +342,18 @@ export function hostInstallNoScripts(
 ): void {
   const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
   // SECURITY: never log raw `dropped` tokens — they may carry credential values
-  // (e.g. `--ignore-scripts=SECRET`).  Log only the canonical flag names
-  // (droppedKeys) which are well-known constants, never user-supplied text.
+  // (e.g. `--registry=SECRET`, a positional path).  Log only the grammar-derived
+  // reasons (droppedKeys) — canonical flag names or the literal `<positional>` —
+  // which are well-known constants, never user-supplied text.
   if (droppedKeys.length > 0) {
     const n = dropped.length; // raw token count (flag + consumed value tokens)
     const keys = droppedKeys.join(', ');
     io.warn(
-      `script-jail: ignoring ${n} install arg${n === 1 ? '' : 's'} matching ${keys} — ` +
-        `it would re-enable lifecycle scripts in the no-scripts install ` +
-        `(the sandbox is the only place scripts run unaudited).`,
+      `script-jail: ignoring ${n} install arg${n === 1 ? '' : 's'} (${keys}) — ` +
+        `not on the allowlist of dependency-selection flags ` +
+        `(only flags that filter the lockfile-pinned tree are passed through; ` +
+        `anything that could redirect the lock/root/output/source or re-enable ` +
+        `lifecycle scripts is dropped).`,
     );
   }
   const base = FETCH_CMD[pm];

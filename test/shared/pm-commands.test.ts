@@ -41,266 +41,184 @@ describe('pnpmStoreDirArg', () => {
   });
 });
 
-describe('sanitizeInstallArgs', () => {
-  it('keeps ordinary install flags untouched', () => {
-    expect(sanitizeInstallArgs(['-D', '--omit=dev', '--prod'])).toEqual({
-      kept: ['-D', '--omit=dev', '--prod'],
+describe('sanitizeInstallArgs (fail-closed allowlist)', () => {
+  // The sanitizer is a FAIL-CLOSED ALLOWLIST: it keeps ONLY canonical flag keys
+  // on the proven-safe dependency-SELECTION set and drops everything else,
+  // including every unknown flag and every positional.  A denylist was proven
+  // structurally unsafe here (steering flags + abbreviations + per-PM aliases
+  // are an open-ended surface).  The empirical basis for the short-flag keys
+  // (`-D`/`-P` → `d`/`p`) and the steering keys is captured in pm-commands.ts.
+
+  it('empty input is byte-identical (preserves the no-args parity path)', () => {
+    expect(sanitizeInstallArgs([])).toEqual({ kept: [], dropped: [], droppedKeys: [] });
+  });
+
+  it('MUST-PASS: keeps every allowlisted dependency-selection flag verbatim', () => {
+    // Joined value form, boolean forms, the `--no-` negation that folds to an
+    // allowlisted key (`--no-optional` → `optional`), and the short flags
+    // (`-D`/`-P`, which are pnpm `--dev`/`--prod` and inert npm save flags).
+    for (const arg of [
+      '--omit=dev',
+      '--include=optional',
+      '--prod',
+      '--production',
+      '--dev',
+      '--no-optional',
+      '-D',
+      '-P',
+    ]) {
+      expect(sanitizeInstallArgs([arg])).toEqual({ kept: [arg], dropped: [], droppedKeys: [] });
+    }
+  });
+
+  it('MUST-PASS: a SPLIT value-taking allowlisted flag keeps its value token too', () => {
+    // `--omit dev` / `--include optional` — the following non-flag token is the
+    // value and must travel WITH the flag (not dropped, not left as a positional).
+    expect(sanitizeInstallArgs(['--omit', 'optional'])).toEqual({
+      kept: ['--omit', 'optional'],
+      dropped: [],
+      droppedKeys: [],
+    });
+    expect(sanitizeInstallArgs(['--include', 'optional', '-D'])).toEqual({
+      kept: ['--include', 'optional', '-D'],
       dropped: [],
       droppedKeys: [],
     });
   });
 
-  it('drops every joined ignore-scripts spelling (kebab/snake/camel, value, no- prefix)', () => {
-    const r = sanitizeInstallArgs([
-      '--no-ignore-scripts',
-      '--ignore-scripts=false',
-      '--ignore-scripts=true',
-      '--ignore_scripts=false',
-      '--ignoreScripts=false',
-      '-D',
-    ]);
-    expect(r.kept).toEqual(['-D']);
-    expect(r.dropped).toEqual([
-      '--no-ignore-scripts',
-      '--ignore-scripts=false',
-      '--ignore-scripts=true',
-      '--ignore_scripts=false',
-      '--ignoreScripts=false',
-    ]);
-  });
-
-  it('drops the SPLIT boolean form `--ignore-scripts false` WITH its value token', () => {
-    // Regression for the critical finding: `npm ci --ignore-scripts
-    // --ignore-scripts false` re-enables postinstall.  Both tokens must go.
-    expect(sanitizeInstallArgs(['--ignore-scripts', 'false', '-D'])).toEqual({
-      kept: ['-D'],
-      dropped: ['--ignore-scripts', 'false'],
-      droppedKeys: ['--ignore-scripts'],
+  it('MUST-PASS: the documented `-D --omit=dev` example survives intact', () => {
+    expect(sanitizeInstallArgs(['-D', '--omit=dev'])).toEqual({
+      kept: ['-D', '--omit=dev'],
+      dropped: [],
+      droppedKeys: [],
     });
   });
 
-  it('drops SINGLE-dash long forms (nopt normalizes them — verified against real npm)', () => {
-    // Regression for the re-review critical: npm/pnpm collapse any number of
-    // leading dashes to the canonical long option, so `-ignore-scripts=false`,
-    // `-ignore-scripts false`, and `-no-ignore-scripts` all re-enable scripts.
-    expect(sanitizeInstallArgs(['-ignore-scripts=false', '-D'])).toEqual({
-      kept: ['-D'],
-      dropped: ['-ignore-scripts=false'],
-      droppedKeys: ['--ignore-scripts'],
+  it('boolean allowlisted flags do NOT consume the following token', () => {
+    // `-D` / `--prod` are boolean; a following allowlisted flag stays separate,
+    // and a following positional is dropped on its OWN iteration (fail-closed).
+    expect(sanitizeInstallArgs(['-D', '--prod'])).toEqual({
+      kept: ['-D', '--prod'],
+      dropped: [],
+      droppedKeys: [],
     });
-    expect(sanitizeInstallArgs(['-ignore-scripts', 'false', '-D'])).toEqual({
-      kept: ['-D'],
-      dropped: ['-ignore-scripts', 'false'],
-      droppedKeys: ['--ignore-scripts'],
-    });
-    expect(sanitizeInstallArgs(['-no-ignore-scripts', '-D'])).toEqual({
-      kept: ['-D'],
-      dropped: ['-no-ignore-scripts'],
-      droppedKeys: ['--ignore-scripts'],
-    });
-    // Triple-dash (and a single-dash yarn --mode) are over-matched on purpose —
-    // dropping MORE is the safe direction.
-    expect(sanitizeInstallArgs(['---ignore-scripts=false']).dropped).toEqual([
-      '---ignore-scripts=false',
-    ]);
-    expect(sanitizeInstallArgs(['-mode', 'update-lockfile', '-P'])).toEqual({
-      kept: ['-P'],
-      dropped: ['-mode', 'update-lockfile'],
-      droppedKeys: ['--mode'],
-    });
-  });
-
-  it('drops npm/nopt ABBREVIATIONS of ignore-scripts (verified against real npm)', () => {
-    // Regression for the round-3 critical: nopt resolves any unambiguous prefix
-    // of a config option, so `--ignore=false`, `--ignore-s=false`, `--ig=false`,
-    // and the split `--ignore-script false` all set ignore-scripts.
-    expect(sanitizeInstallArgs(['--ignore=false', '-D']).kept).toEqual(['-D']);
-    expect(sanitizeInstallArgs(['--ignore-s=false', '-D']).kept).toEqual(['-D']);
-    expect(sanitizeInstallArgs(['--ig=false', '-D']).kept).toEqual(['-D']);
-    expect(sanitizeInstallArgs(['-ignore=false', '-D']).kept).toEqual(['-D']);
-    expect(sanitizeInstallArgs(['--config.ignore=false', '-P']).kept).toEqual(['-P']);
-    expect(sanitizeInstallArgs(['--no-ig', '-D']).kept).toEqual(['-D']);
-    expect(sanitizeInstallArgs(['--ignore-script', 'false', '-D'])).toEqual({
-      kept: ['-D'],
-      dropped: ['--ignore-script', 'false'],
-      droppedKeys: ['--ignore-scripts'],
-    });
-  });
-
-  it('preserves legit flags that merely share a leading letter (NOT a prefix of ignore-scripts)', () => {
-    // `--include`, `--omit`, `--no-optional`, `-D`, `-P` are not prefixes of
-    // "ignorescripts" and must survive.  Only `ignore`-prefixes are dropped.
-    for (const arg of ['--include=optional', '--omit=dev', '--no-optional', '-D', '-P', '--prod']) {
-      expect(sanitizeInstallArgs([arg]).kept).toEqual([arg]);
-    }
-  });
-
-  it('preserves the single-letter `--i` (npm expands it to include-workspace-root, NOT ignore-scripts)', () => {
-    // Regression for the round-5 medium false-positive: `i` is ambiguous across
-    // npm options, so npm resolves `--i` to `--include-workspace-root` (verified
-    // on npm 11.13).  Dropping it would silently omit root workspace deps.  The
-    // shortest UNAMBIGUOUS ignore-scripts prefix is `ig`, so the drop starts there.
-    for (const arg of ['--i', '--i=true', '-i', '--iwr', '--include-workspace-root']) {
-      expect(sanitizeInstallArgs([arg]).kept).toEqual([arg]);
-    }
-    // …but every prefix of length ≥ 2 is still dropped.
-    expect(sanitizeInstallArgs(['--ig=false']).kept).toEqual([]);
-    expect(sanitizeInstallArgs(['--ign=false']).kept).toEqual([]);
-    expect(sanitizeInstallArgs(['--ignore=false']).kept).toEqual([]);
-  });
-
-  it('drops pnpm `--config.ignore-scripts` aliases (joined and split)', () => {
-    expect(sanitizeInstallArgs(['--config.ignore-scripts=false', '-P']).kept).toEqual(['-P']);
-    expect(sanitizeInstallArgs(['--config.ignore_scripts=false']).dropped).toEqual([
-      '--config.ignore_scripts=false',
-    ]);
-    expect(sanitizeInstallArgs(['--config.ignore-scripts', 'false', '-P'])).toEqual({
-      kept: ['-P'],
-      dropped: ['--config.ignore-scripts', 'false'],
-      droppedKeys: ['--ignore-scripts'],
-    });
-  });
-
-  it('drops the pnpm DOTTED config alias `--config.ignore.scripts` (verified against real pnpm)', () => {
-    // Regression for the round-4 high: pnpm 11.x resolves the dotted form to
-    // ignore-scripts, so `.` is a separator just like `-`/`_`.
-    expect(sanitizeInstallArgs(['--config.ignore.scripts=false', '-P']).kept).toEqual(['-P']);
-    expect(sanitizeInstallArgs(['--config.ignore.scripts', 'false', '-P'])).toEqual({
-      kept: ['-P'],
-      dropped: ['--config.ignore.scripts', 'false'],
-      droppedKeys: ['--ignore-scripts'],
-    });
-    // A legit dotted pnpm config that is NOT a script control survives.
-    expect(sanitizeInstallArgs(['--config.store-dir=/tmp/x']).kept).toEqual([
-      '--config.store-dir=/tmp/x',
-    ]);
-  });
-
-  it('a bare ignore-scripts flag followed by another FLAG does not swallow it', () => {
-    expect(sanitizeInstallArgs(['--ignore-scripts', '--omit=dev'])).toEqual({
-      kept: ['--omit=dev'],
-      dropped: ['--ignore-scripts'],
-      droppedKeys: ['--ignore-scripts'],
-    });
-  });
-
-  it('drops yarn --mode in joined form', () => {
-    expect(sanitizeInstallArgs(['--mode=update-lockfile', '-P'])).toEqual({
-      kept: ['-P'],
-      dropped: ['--mode=update-lockfile'],
-      droppedKeys: ['--mode'],
-    });
-  });
-
-  it('drops yarn --mode in split form WITH its value token (no dangling positional)', () => {
-    expect(sanitizeInstallArgs(['--mode', 'update-lockfile', '--prod'])).toEqual({
+    expect(sanitizeInstallArgs(['--prod', 'some-package'])).toEqual({
       kept: ['--prod'],
-      dropped: ['--mode', 'update-lockfile'],
-      droppedKeys: ['--mode'],
+      dropped: ['some-package'],
+      droppedKeys: ['<positional>'],
     });
   });
 
-  it('drops yarn lockfile-negating flags (--no-immutable / --immutable=false) — every spelling', () => {
-    // Regression for the P2: the fixed base `--immutable` pins the install to the
-    // committed yarn.lock; a trailing `--no-immutable` would win (last-flag) and
-    // unfreeze the install → unpinned tree.  All spellings canonicalize to
-    // `immutable` and must be dropped.
-    for (const arg of ['--no-immutable', '--immutable=false', '--config.immutable=false']) {
-      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
-      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--immutable']);
-    }
-    // The bare positive `--immutable` (redundant with the fixed flag) is also
-    // dropped — harmless, the base already pins it.
-    expect(sanitizeInstallArgs(['--immutable']).kept).toEqual([]);
-    // A DIFFERENT flag that merely shares the prefix survives (exact match).
-    expect(sanitizeInstallArgs(['--immutable-cache']).kept).toEqual(['--immutable-cache']);
+  it('MUST-DROP: root/output redirect flags (dir/-C/prefix/modules-dir/virtual-store-dir/store-dir)', () => {
+    // These steer WHERE the tree materializes — the proven `--dir alt
+    // --modules-dir ../node_modules` bypass family.  Split value tokens consumed.
+    expect(sanitizeInstallArgs(['--dir', 'alt'])).toEqual({
+      kept: [],
+      dropped: ['--dir', 'alt'],
+      droppedKeys: ['--dir'],
+    });
+    expect(sanitizeInstallArgs(['-C', 'alt']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['-C', 'alt']).dropped).toEqual(['-C', 'alt']);
+    expect(sanitizeInstallArgs(['--prefix', '/x']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--prefix', '/x']).dropped).toEqual(['--prefix', '/x']);
+    expect(sanitizeInstallArgs(['--modules-dir', '../node_modules'])).toEqual({
+      kept: [],
+      dropped: ['--modules-dir', '../node_modules'],
+      droppedKeys: ['--modules-dir'],
+    });
+    expect(sanitizeInstallArgs(['--virtual-store-dir', 'x']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--virtual-store-dir', 'x']).droppedKeys).toEqual([
+      '--virtual-store-dir',
+    ]);
+    expect(sanitizeInstallArgs(['--store-dir', 'x']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--store-dir', 'x']).droppedKeys).toEqual(['--store-dir']);
   });
 
-  it('drops pnpm lockfile-negating flags (--no-frozen-lockfile / --frozen-lockfile=false) — every spelling', () => {
-    // Regression for the P2: the fixed base `--frozen-lockfile` pins pnpm to the
-    // committed pnpm-lock.yaml; a trailing negation would unfreeze it.
-    for (const arg of [
-      '--no-frozen-lockfile',
-      '--frozen-lockfile=false',
-      '--config.frozen-lockfile=false',
-    ]) {
-      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
-      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--frozen-lockfile']);
-    }
-  });
-
-  it('drops pnpm ABBREVIATED frozen-lockfile negations (nopt prefix expansion)', () => {
-    // pnpm parses via nopt-style abbreviation (like npm), so an UNAMBIGUOUS
-    // prefix of `frozen-lockfile` unfreezes the install just like the full
-    // spelling — verified against real pnpm 10.34.x.  An exact-match denylist
-    // missed these (the P2 hole); the prefix-match must catch every abbreviation
-    // and still report the canonical `--frozen-lockfile` reason.
-    for (const arg of ['--no-frozen', '--no-froz', '--no-frozen-lock', '--no-frozen-lockfil']) {
-      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
-      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--frozen-lockfile']);
-    }
-  });
-
-  it('drops pnpm --fix-lockfile (separate unfreeze path) — full, abbrev, =value, config.', () => {
-    // `--fix-lockfile` does NOT negate `frozen-lockfile`; it OVERRIDES it and
-    // rewrites + installs an unpinned lock even when one is missing — verified
-    // against real pnpm (bare `--frozen-lockfile` errors NO_LOCKFILE, adding
-    // `--fix-lockfile` OR its `--fix` abbreviation installs).  Drop every spelling.
-    for (const arg of [
-      '--fix-lockfile',
-      '--fix',
-      '--fixl',
-      '--fix-lockfile=true',
-      '--config.fix-lockfile=true',
-    ]) {
-      expect(sanitizeInstallArgs([arg, '-P']).kept).toEqual(['-P']);
-      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--fix-lockfile']);
-    }
-  });
-
-  it('drops the pnpm lockfile-LOCATION family (--lockfile-dir redirect + siblings)', () => {
-    // `--lockfile-dir <alt>` does NOT unfreeze — it REDIRECTS the pinned install
-    // to `<alt>/pnpm-lock.yaml`, so a stale root lock passes `--frozen-lockfile`
-    // while the alternate (unpinned) tree installs and the root-lock sha the audit
-    // gates on stays unchanged — reproduced on real pnpm (exit 0, deps installed).
-    // The split value token MUST be consumed so `<alt>` can't dangle as a position.
-    expect(sanitizeInstallArgs(['--lockfile-dir', '/tmp/alt', '-P'])).toEqual({
-      kept: ['-P'],
-      dropped: ['--lockfile-dir', '/tmp/alt'],
+  it('MUST-DROP: lockfile location / enforcement family', () => {
+    expect(sanitizeInstallArgs(['--lockfile-dir', 'alt'])).toEqual({
+      kept: [],
+      dropped: ['--lockfile-dir', 'alt'],
       droppedKeys: ['--lockfile-dir'],
     });
-    for (const arg of [
-      '--lockfile-dir=/tmp/alt',
-      '--config.lockfile-dir=/tmp/alt',
-      '--config.lockfileDir=/tmp/alt',
-    ]) {
-      expect(sanitizeInstallArgs([arg]).kept).toEqual([]);
-      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--lockfile-dir']);
-    }
-    // Siblings in the same family (write-only / disable) — also never steer the pin.
-    expect(sanitizeInstallArgs(['--lockfile-only']).droppedKeys).toEqual(['--lockfile-only']);
-    for (const arg of ['--no-lockfile', '--lockfile=false']) {
-      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--lockfile']);
-    }
+    expect(sanitizeInstallArgs(['--lockfile-only']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--no-lockfile']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--lockfile=false']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--fix-lockfile']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--fix']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--no-frozen-lockfile']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--no-frozen']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--no-immutable']).kept).toEqual([]);
   });
 
-  it('does NOT over-drop legit flags that merely start with "f"/"l"', () => {
-    // Only prefixes of `frozenlockfile` / `fixlockfile` resolve to those options,
-    // and only keys STARTING with `lockfile` hit the lockfile family.  `--force`,
-    // `--filter`, `--fetch-timeout`, `--loglevel`, `--link-workspace-packages` are
-    // none of those and must survive (with any value token).
-    for (const arg of ['--force', '--filter', '--fetch-timeout=60000', '--frozen-lockfile-extra']) {
-      expect(sanitizeInstallArgs([arg]).kept).toEqual([arg]);
-      expect(sanitizeInstallArgs([arg]).dropped).toEqual([]);
-    }
-    expect(sanitizeInstallArgs(['--loglevel', 'debug'])).toEqual({
-      kept: ['--loglevel', 'debug'],
-      dropped: [],
-      droppedKeys: [],
+  it('MUST-DROP: script re-enable (ignore-scripts + its --no- negation + abbreviation)', () => {
+    expect(sanitizeInstallArgs(['--ignore-scripts']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--ignore-scripts']).droppedKeys).toEqual(['--ignore-scripts']);
+    expect(sanitizeInstallArgs(['--no-ignore-scripts']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--no-ignore-scripts']).droppedKeys).toEqual(['--ignore-scripts']);
+    expect(sanitizeInstallArgs(['--ig']).kept).toEqual([]);
+  });
+
+  it('MUST-DROP: scope steering (global/-g/workspace-root/-w/recursive/-r/filter)', () => {
+    expect(sanitizeInstallArgs(['--global']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['-g']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--workspace-root']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['-w']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--recursive']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['-r']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--filter', 'pkg'])).toEqual({
+      kept: [],
+      dropped: ['--filter', 'pkg'],
+      droppedKeys: ['--filter'],
     });
-    expect(sanitizeInstallArgs(['--link-workspace-packages']).kept).toEqual([
-      '--link-workspace-packages',
+  });
+
+  it('MUST-DROP: source swap (registry / config.registry)', () => {
+    expect(sanitizeInstallArgs(['--registry=http://evil']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--registry=http://evil']).droppedKeys).toEqual(['--registry']);
+    expect(sanitizeInstallArgs(['--config.registry=http://evil']).kept).toEqual([]);
+    expect(sanitizeInstallArgs(['--config.registry=http://evil']).droppedKeys).toEqual([
+      '--registry',
     ]);
+  });
+
+  it('MUST-DROP: a bare positional fails closed and reports <positional> (never the raw token)', () => {
+    expect(sanitizeInstallArgs(['some-package'])).toEqual({
+      kept: [],
+      dropped: ['some-package'],
+      droppedKeys: ['<positional>'],
+    });
+    // A path-shaped positional with a secret-looking value is reported as the
+    // grammar constant, NOT the raw value.
+    expect(sanitizeInstallArgs(['/tmp/SECRET']).droppedKeys).toEqual(['<positional>']);
+  });
+
+  it('end-to-end bypass family is fully stripped (dir + modules-dir steering removed)', () => {
+    // The reproduced pin-bypass: with the OLD denylist this argv installed an
+    // alternate locked tree into the root node_modules at exit 0.  Under the
+    // allowlist NOTHING survives, so the executed install is just the fixed
+    // pinned `pnpm install --frozen-lockfile` (which fails closed on a stale
+    // lock with ERR_PNPM_OUTDATED_LOCKFILE — verified against real pnpm).
+    const r = sanitizeInstallArgs([
+      '--frozen-lockfile',
+      '--ignore-scripts',
+      '--dir',
+      'alt',
+      '--modules-dir',
+      '../node_modules',
+    ]);
+    expect(r.kept).toEqual([]);
+    expect(r.kept).not.toContain('--dir');
+    expect(r.kept).not.toContain('--modules-dir');
+  });
+
+  it('value-taking flag value is NOT misread as a value when the flag is dropped', () => {
+    // A dropped bare flag still consumes its following non-flag token so the
+    // value cannot dangle as a kept positional.  `--registry http://x` (split).
+    expect(sanitizeInstallArgs(['--registry', 'http://x', '--prod'])).toEqual({
+      kept: ['--prod'],
+      dropped: ['--registry', 'http://x'],
+      droppedKeys: ['--registry'],
+    });
   });
 });
 

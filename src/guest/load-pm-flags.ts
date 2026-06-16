@@ -25,7 +25,7 @@ import * as fs from 'node:fs';
 
 import { z } from 'zod';
 
-import { sanitizeInstallArgs } from '../shared/pm-commands.js';
+import { sanitizeArchInstallArgs, sanitizeInstallArgs } from '../shared/pm-commands.js';
 
 // `extra_install_args` carries npm-ONLY arch hints (`--cpu/--os/--libc`) and is
 // applied only to `npm ci` (pnpm/yarn reject those CLI flags — see
@@ -52,12 +52,20 @@ export function loadPmFlags(
     // repo-controlled staging namespace (`/work/etc/script-jail/pm-flags.json`
     // on Firecracker, the staged repo copy on Docker/bare).  The host overlay
     // always overwrites it with sanitized content, but a backend delivery gap
-    // must NEVER let a re-enabling flag survive into the network-on Phase A
-    // fetch — so we re-sanitize at the point of use, with the SAME denylist
-    // the host install applies.  `extra_install_args` (npm arch hints) carries
-    // no script controls, so sanitizing it is a no-op in the normal path.
+    // must NEVER let a tree-steering / script-re-enabling flag survive into the
+    // network-on Phase A fetch.  BOTH array fields flow into the install argv, so
+    // we re-sanitize BOTH at the point of use with the SAME fail-closed allowlist
+    // the host install applies — sanitizing only one channel would just move the
+    // smuggling surface to the other (an attacker who can influence the file
+    // would put `--dir`/`--lockfile-dir` in `extra_install_args` instead).
+    //
+    // `extra_install_args` is the npm cross-arch-hint channel (`--cpu/--os/--libc`)
+    // — a SEPARATE allowlist (`sanitizeArchInstallArgs`) so the hints survive if
+    // `buildArchFlagOverlay` is ever revived (it is dormant today, emitted EMPTY),
+    // while a steering flag smuggled through this channel is still dropped.  Both
+    // channels stay fail-closed by construction.
     return {
-      extraInstallArgs: sanitizeInstallArgs(parsed.data.extra_install_args).kept,
+      extraInstallArgs: sanitizeArchInstallArgs(parsed.data.extra_install_args).kept,
       userInstallArgs: sanitizeInstallArgs(parsed.data.user_install_args ?? []).kept,
     };
   } catch {
