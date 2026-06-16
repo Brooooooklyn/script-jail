@@ -147,7 +147,11 @@ function detectPnpmfile(repoDir: string, workspaceRoot?: string): string | null 
   // repoDir `configDependencies` reject up the ancestor chain, bounded to the
   // workspace.  (The other pnpm sources need no ancestor scan: pnpmfiles are
   // backstopped, and an alt root manifest only matters at the project root pnpm
-  // picks, already handled at repoDir.)
+  // picks, already handled at repoDir.)  The deeper reason ancestor pnpmfiles
+  // need no scan is that the sandbox stages ONLY repoDir (overlay.ts:170 /
+  // stage.ts:26) and runs pnpm at /work, so an ancestor pnpmfile above repoDir
+  // is never present in the guest and cannot rewrite the audited graph; if
+  // staging ever included workspaceRoot, ancestor pnpmfiles would need scanning.
   const ancestors = scanDirs(repoDir, workspaceRoot);
   for (let i = 1; i < ancestors.length; i++) {
     const reason = detectPnpmConfigDepsInDir(ancestors[i]!);
