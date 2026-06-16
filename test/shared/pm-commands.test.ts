@@ -258,14 +258,49 @@ describe('sanitizeInstallArgs', () => {
     }
   });
 
-  it('does NOT over-drop legit flags that merely start with "f"', () => {
-    // Only prefixes of `frozenlockfile` / `fixlockfile` resolve to those options.
-    // `--force` (force), `--filter` (filter), `--fetch-timeout` (fetchtimeout) are
-    // NOT prefixes of either and must survive — confirms no `f*` over-collision.
+  it('drops the pnpm lockfile-LOCATION family (--lockfile-dir redirect + siblings)', () => {
+    // `--lockfile-dir <alt>` does NOT unfreeze — it REDIRECTS the pinned install
+    // to `<alt>/pnpm-lock.yaml`, so a stale root lock passes `--frozen-lockfile`
+    // while the alternate (unpinned) tree installs and the root-lock sha the audit
+    // gates on stays unchanged — reproduced on real pnpm (exit 0, deps installed).
+    // The split value token MUST be consumed so `<alt>` can't dangle as a position.
+    expect(sanitizeInstallArgs(['--lockfile-dir', '/tmp/alt', '-P'])).toEqual({
+      kept: ['-P'],
+      dropped: ['--lockfile-dir', '/tmp/alt'],
+      droppedKeys: ['--lockfile-dir'],
+    });
+    for (const arg of [
+      '--lockfile-dir=/tmp/alt',
+      '--config.lockfile-dir=/tmp/alt',
+      '--config.lockfileDir=/tmp/alt',
+    ]) {
+      expect(sanitizeInstallArgs([arg]).kept).toEqual([]);
+      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--lockfile-dir']);
+    }
+    // Siblings in the same family (write-only / disable) — also never steer the pin.
+    expect(sanitizeInstallArgs(['--lockfile-only']).droppedKeys).toEqual(['--lockfile-only']);
+    for (const arg of ['--no-lockfile', '--lockfile=false']) {
+      expect(sanitizeInstallArgs([arg]).droppedKeys).toEqual(['--lockfile']);
+    }
+  });
+
+  it('does NOT over-drop legit flags that merely start with "f"/"l"', () => {
+    // Only prefixes of `frozenlockfile` / `fixlockfile` resolve to those options,
+    // and only keys STARTING with `lockfile` hit the lockfile family.  `--force`,
+    // `--filter`, `--fetch-timeout`, `--loglevel`, `--link-workspace-packages` are
+    // none of those and must survive (with any value token).
     for (const arg of ['--force', '--filter', '--fetch-timeout=60000', '--frozen-lockfile-extra']) {
       expect(sanitizeInstallArgs([arg]).kept).toEqual([arg]);
       expect(sanitizeInstallArgs([arg]).dropped).toEqual([]);
     }
+    expect(sanitizeInstallArgs(['--loglevel', 'debug'])).toEqual({
+      kept: ['--loglevel', 'debug'],
+      dropped: [],
+      droppedKeys: [],
+    });
+    expect(sanitizeInstallArgs(['--link-workspace-packages']).kept).toEqual([
+      '--link-workspace-packages',
+    ]);
   });
 });
 

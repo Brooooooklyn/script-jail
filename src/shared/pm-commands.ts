@@ -182,7 +182,38 @@ function isForbiddenFlag(token: string): boolean {
   // (`--fix` → `--fix-lockfile`), so PREFIX-match it too; `--filter` (`filter`)
   // is NOT a prefix of `fixlockfile` and survives.
   if (key.length >= 2 && 'fixlockfile'.startsWith(key)) return true; // pnpm
+  // pnpm lockfile-LOCATION / -ENFORCEMENT family.  `--lockfile-dir <alt>` does
+  // not unfreeze — it REDIRECTS pnpm to validate+install from `<alt>/pnpm-lock.yaml`
+  // instead of the committed root lock, so a stale root lock + a self-consistent
+  // alternate lock installs an UNPINNED tree while `--frozen-lockfile` stays
+  // "satisfied" and the audit still gates on the (unchanged) root-lock sha
+  // (reproduced on real pnpm: exit 0, deps installed, root lock untouched).
+  // `--lockfile-only` (write lock, skip install) and `--(no-)lockfile` are the
+  // same family and equally must not steer the pinned install.  Every pnpm-
+  // RESOLVABLE abbreviation of these has `lockfile` as a canonical-key prefix
+  // (shorter stems like `--lock`/`--lockf` are ambiguous across the family and
+  // pnpm refuses them), and NO legit npm/pnpm/yarn install flag's key starts
+  // with `lockfile` (npm's is `package-lock*`), so deny the whole family.
+  if (key.startsWith('lockfile')) return true; // pnpm --lockfile-dir/-only/(no-)lockfile
   return false;
+}
+
+/**
+ * Human-readable kebab option name for a dropped flag's canonical key, used only
+ * for the drop-group WARNING.  Always returns a well-known constant derived from
+ * the flag grammar (never raw user text), so it is safe to log.  Mirrors the
+ * abbreviation logic in `isForbiddenFlag` so an abbreviated drop still names the
+ * full option (e.g. `--ig` → `ignore-scripts`, `--no-frozen` → `frozen-lockfile`,
+ * `--fix` → `fix-lockfile`, `--lockfile-dir` → `lockfile-dir`).
+ */
+function dropDisplayName(rawKey: string): string {
+  if (rawKey.length >= 2 && 'ignorescripts'.startsWith(rawKey)) return 'ignore-scripts';
+  if (rawKey.length >= 2 && 'frozenlockfile'.startsWith(rawKey)) return 'frozen-lockfile';
+  if (rawKey.length >= 2 && 'fixlockfile'.startsWith(rawKey)) return 'fix-lockfile';
+  if (rawKey === 'lockfiledir') return 'lockfile-dir';
+  if (rawKey === 'lockfileonly') return 'lockfile-only';
+  if (rawKey.startsWith('lockfile')) return 'lockfile';
+  return rawKey; // `mode`, `immutable` — already the conventional name
 }
 
 /**
@@ -204,6 +235,11 @@ function isForbiddenFlag(token: string): boolean {
  *   * pnpm `--fix-lockfile` (and its `--fix` abbreviation / `--config.` alias) —
  *     a SEPARATE unfreeze path that overrides the fixed `--frozen-lockfile` and
  *     rewrites + installs an unpinned lock even when one is absent/out-of-sync.
+ *   * the pnpm lockfile-LOCATION / -ENFORCEMENT family — `--lockfile-dir <alt>`
+ *     (redirects the pinned install to an alternate lock), `--lockfile-only`, and
+ *     `--(no-)lockfile`.  `--lockfile-dir` (split `--lockfile-dir alt` value token
+ *     dropped too, joined `=alt`, `--config.lockfile-dir`) lets a stale root lock
+ *     pass `--frozen-lockfile` while installing the alternate tree.
  *
  * Returns the kept args (to append after the fixed flags) and the dropped args
  * (so the caller can warn).  Pure; no shell parsing — the input is already an
@@ -234,15 +270,7 @@ export function sanitizeInstallArgs(args: ReadonlyArray<string>): {
       // conventional kebab display name so the warning is human-readable.
       // Any prefix of "ignorescripts" (length ≥2) resolves to --ignore-scripts.
       const rawKey = canonicalFlagKey(a) ?? 'unknown';
-      const displayKey =
-        'ignorescripts'.startsWith(rawKey) && rawKey.length >= 2
-          ? 'ignore-scripts'
-          : 'frozenlockfile'.startsWith(rawKey) && rawKey.length >= 2
-            ? 'frozen-lockfile'
-            : 'fixlockfile'.startsWith(rawKey) && rawKey.length >= 2
-              ? 'fix-lockfile'
-              : rawKey;
-      droppedKeys.push(`--${displayKey}`);
+      droppedKeys.push(`--${dropDisplayName(rawKey)}`);
       // Bare form (no `=value`): the package manager would consume the NEXT
       // token as the value (`--ignore-scripts false`, `--mode update-lockfile`).
       // Drop that value token too so a re-enabling value — or a dangling
