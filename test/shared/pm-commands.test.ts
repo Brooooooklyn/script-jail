@@ -192,6 +192,29 @@ describe('sanitizeInstallArgs (fail-closed allowlist)', () => {
     expect(sanitizeInstallArgs(['/tmp/SECRET']).droppedKeys).toEqual(['<positional>']);
   });
 
+  it('MUST-DROP: an unknown flag NEVER echoes its raw key (log-injection / secret-leak safe)', () => {
+    // `canonicalFlagKey` strips dashes / `=value` / `no-` / `config.` / `-_.` but
+    // NOT newlines, `::`, `%`, or a flag NAME with no `=`.  A dropped unknown flag
+    // must report the fixed sentinel `<flag>` so a value like `\n::warning::owned`
+    // (GitHub-Actions workflow-command injection) or a credential embedded in the
+    // flag name can never reach `hostInstallNoScripts`'s warning log.
+    for (const arg of ['--x\n::warning::pwned', '--evilTOKENs3cret', '--%0Aset-output', '--🦝']) {
+      const r = sanitizeInstallArgs([arg]);
+      expect(r.kept).toEqual([]);
+      expect(r.droppedKeys).toEqual(['<flag>']);
+      // No entry may carry a newline, ':' command marker, or the secret text.
+      for (const k of r.droppedKeys) {
+        expect(k).not.toMatch(/[\n\r:%]/);
+        expect(k.toLowerCase()).not.toContain('s3cret');
+      }
+    }
+    // Known steering flags still report their FIXED conventional name (helpful,
+    // and injection-safe because the switch matches only clean canonical keys).
+    expect(sanitizeInstallArgs(['--dir', 'x']).droppedKeys).toEqual(['--dir']);
+    // …but an injected variant of a known key (extra chars) falls to <flag>.
+    expect(sanitizeInstallArgs(['--dir\n::warning::x']).droppedKeys).toEqual(['<flag>']);
+  });
+
   it('end-to-end bypass family is fully stripped (dir + modules-dir steering removed)', () => {
     // The reproduced pin-bypass: with the OLD denylist this argv installed an
     // alternate locked tree into the root node_modules at exit 0.  Under the

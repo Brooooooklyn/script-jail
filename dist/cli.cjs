@@ -7822,30 +7822,46 @@ function canonicalFlagKey(token) {
   }
   return key;
 }
-function rehydrateKebab(key) {
+function dropReason(key) {
   switch (key) {
     case "ignorescripts":
-      return "ignore-scripts";
+      return "--ignore-scripts";
     case "frozenlockfile":
-      return "frozen-lockfile";
+      return "--frozen-lockfile";
     case "fixlockfile":
-      return "fix-lockfile";
+      return "--fix-lockfile";
     case "lockfiledir":
-      return "lockfile-dir";
+      return "--lockfile-dir";
     case "lockfileonly":
-      return "lockfile-only";
+      return "--lockfile-only";
     case "lockfile":
-      return "lockfile";
+      return "--lockfile";
     case "modulesdir":
-      return "modules-dir";
+      return "--modules-dir";
     case "virtualstoredir":
-      return "virtual-store-dir";
+      return "--virtual-store-dir";
     case "storedir":
-      return "store-dir";
+      return "--store-dir";
     case "workspaceroot":
-      return "workspace-root";
+      return "--workspace-root";
+    case "dir":
+      return "--dir";
+    case "prefix":
+      return "--prefix";
+    case "global":
+      return "--global";
+    case "registry":
+      return "--registry";
+    case "filter":
+      return "--filter";
+    case "recursive":
+      return "--recursive";
+    case "mode":
+      return "--mode";
+    case "immutable":
+      return "--immutable";
     default:
-      return key;
+      return "<flag>";
   }
 }
 var ALLOWED_FLAG_KEYS = /* @__PURE__ */ new Map([
@@ -7877,7 +7893,7 @@ function filterAgainstAllowlist(args, allow) {
         continue;
       }
       dropped.push(a);
-      droppedKeys.push(`--${rehydrateKebab(key)}`);
+      droppedKeys.push(dropReason(key));
       if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
         dropped.push(args[++i]);
       }

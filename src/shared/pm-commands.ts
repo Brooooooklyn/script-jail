@@ -125,38 +125,61 @@ function canonicalFlagKey(token: string): string | null {
 }
 
 /**
- * Rehydrate a separator-stripped canonical key (e.g. "ignorescripts",
- * "lockfiledir", "modulesdir") to its conventional kebab spelling for the
- * drop-group WARNING.  Input is always a grammar-derived canonical key — never
- * raw user text — so the output is safe to log.  Covers the well-known steering
- * keys explicitly; an unrecognized key (e.g. a one-off unknown flag) is returned
- * verbatim — it is still a separator-stripped, lowercased option NAME, with no
- * `=value` and no leading dashes, so it carries no credential payload.
+ * Map a dropped flag's canonical key to the FIXED display token used in the
+ * drop-group WARNING.  EVERY return value is a hard-coded constant — the
+ * well-known steering keys get their conventional kebab name, and anything else
+ * (an unknown / one-off flag) gets the sentinel `<flag>`.
+ *
+ * SECURITY: this MUST NOT echo a derived key.  `canonicalFlagKey` strips only
+ * leading dashes, `=value`, `no-`/`config.`, and `-_.` separators — it does NOT
+ * strip newlines, `%`, `::`, or other characters, and a flag NAME with no `=`
+ * (e.g. `--<credential>`) survives intact as the key.  Logging that verbatim
+ * into `hostInstallNoScripts`'s GitHub-Actions warning would allow workflow-
+ * command injection (`\n::warning::…`) or a credential leak.  The switch only
+ * matches CLEAN known keys (an injected key like `dir\n::warning` never equals
+ * `case 'dir'`), so every dropped flag resolves to a constant.  No user text
+ * reaches the log, so no GH-command escaping is needed downstream.
  */
-function rehydrateKebab(key: string): string {
+function dropReason(key: string): string {
   switch (key) {
     case 'ignorescripts':
-      return 'ignore-scripts';
+      return '--ignore-scripts';
     case 'frozenlockfile':
-      return 'frozen-lockfile';
+      return '--frozen-lockfile';
     case 'fixlockfile':
-      return 'fix-lockfile';
+      return '--fix-lockfile';
     case 'lockfiledir':
-      return 'lockfile-dir';
+      return '--lockfile-dir';
     case 'lockfileonly':
-      return 'lockfile-only';
+      return '--lockfile-only';
     case 'lockfile':
-      return 'lockfile';
+      return '--lockfile';
     case 'modulesdir':
-      return 'modules-dir';
+      return '--modules-dir';
     case 'virtualstoredir':
-      return 'virtual-store-dir';
+      return '--virtual-store-dir';
     case 'storedir':
-      return 'store-dir';
+      return '--store-dir';
     case 'workspaceroot':
-      return 'workspace-root';
+      return '--workspace-root';
+    case 'dir':
+      return '--dir';
+    case 'prefix':
+      return '--prefix';
+    case 'global':
+      return '--global';
+    case 'registry':
+      return '--registry';
+    case 'filter':
+      return '--filter';
+    case 'recursive':
+      return '--recursive';
+    case 'mode':
+      return '--mode';
+    case 'immutable':
+      return '--immutable';
     default:
-      return key; // dir, prefix, global, registry, filter, recursive, mode, immutable, c, g, r, w, … or any unknown flag
+      return '<flag>'; // unknown / un-named flag — never echo the raw key (see note)
   }
 }
 
@@ -281,11 +304,11 @@ export interface SanitizeResult {
   kept: string[];
   dropped: string[];
   /** SAFE reasons for each DROP GROUP — one entry per LOGICAL drop (a flag plus
-   *  any consumed value token count as a single entry).  Each entry is a
-   *  constant derived from the flag GRAMMAR, never raw user text: a dropped
-   *  flag reports its canonical option name (e.g. "--dir", "--ignore-scripts"),
-   *  and a dropped positional reports the literal "<positional>".  Safe to log
-   *  without leaking credentials. */
+   *  any consumed value token count as a single entry).  Each entry is a FIXED
+   *  CONSTANT, never raw/derived user text: a known steering flag reports a
+   *  hard-coded name (e.g. "--dir", "--ignore-scripts"), an unknown flag reports
+   *  "<flag>", and a positional reports "<positional>" (see `dropReason`).  Safe
+   *  to log verbatim — no credential payload, no GH-command-injection surface. */
   droppedKeys: string[];
 }
 
@@ -322,10 +345,11 @@ function filterAgainstAllowlist(
         }
         continue;
       }
-      // A flag NOT on the allowlist — drop it.  Report its canonical option name
-      // (rehydrated to the conventional kebab spelling), never the raw token.
+      // A flag NOT on the allowlist — drop it.  Report a FIXED display token
+      // (`dropReason`): a hard-coded name for known steering flags, `<flag>` for
+      // anything else.  NEVER the raw/derived key — see `dropReason`'s note.
       dropped.push(a);
-      droppedKeys.push(`--${rehydrateKebab(key)}`);
+      droppedKeys.push(dropReason(key));
       // Bare form (no `=value`): the package manager would consume the NEXT
       // token as this flag's value.  Drop it too so it cannot survive as a
       // dangling positional (which we would drop anyway, but consuming it keeps
