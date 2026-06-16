@@ -26740,7 +26740,8 @@ function redactCaptured(text, sensitive) {
 }
 function hostRunScripts(pm, repoDir, io, spawn2 = inheritSpawn) {
   const cmd = INSTALL_CMD[pm];
-  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
+  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true"] : [];
+  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
 `);
   runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn2, "lifecycle-script run", io, finalArgs);
@@ -26787,6 +26788,20 @@ function detectPreTrustConfigExec(repoDir, manager, workspaceRoot) {
   if (manager === "pnpm") return detectPnpmfile(repoDir, workspaceRoot);
   if (manager === "yarn") return detectYarnStartupExec(repoDir, workspaceRoot);
   return null;
+}
+function detectInstallWorkDirDivergence(configPath) {
+  if (!(0, import_node_fs3.existsSync)(configPath)) return null;
+  let parsed;
+  try {
+    parsed = (0, import_yaml.parse)((0, import_node_fs3.readFileSync)(configPath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const wd = parsed["work_dir"];
+  if (wd === void 0) return null;
+  if (typeof wd !== "string" || wd === "/work") return null;
+  return `config sets work_dir to '${wd}', but \`install: true\` runs the host install/rebuild at the repository root (mounted as /work in the sandbox). The guest would audit '${wd}' while the runner installs and runs lifecycle scripts at the repo root, so a clean lock for that subdir would authorize unaudited repo-root scripts. Remove work_dir (or set it to '/work') when using \`install\`, or run script-jail at the subproject root via SCRIPT_JAIL_REPO_DIR.`;
 }
 function scanDirs(repoDir, workspaceRoot) {
   const repo = realpathOrResolve(repoDir);
@@ -44607,6 +44622,12 @@ async function main(deps = {}) {
         `::error::script-jail: \`install: true\` refused \u2014 ${configExecReason}
 `
       );
+      exitProcess(1);
+    }
+    const workDirDivergence = detectInstallWorkDirDivergence(inputs.configPath);
+    if (workDirDivergence !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${workDirDivergence}
+`);
       exitProcess(1);
     }
   }

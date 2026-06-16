@@ -23,7 +23,7 @@ import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
 import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
-import { detectPreTrustConfigExec } from './action/install-preflight.js';
+import { detectPreTrustConfigExec, detectInstallWorkDirDivergence } from './action/install-preflight.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
@@ -237,6 +237,16 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       process.stdout.write(
         `::error::script-jail: \`install: true\` refused — ${configExecReason}\n`,
       );
+      exitProcess(1);
+    }
+    // SECURITY: a consumer `work_dir` (config-file field, no clamp) that diverges
+    // from the host install cwd (always repoDir root / `/work`) lets the guest
+    // audit a benign SUBPROJECT clean while host part-2 runs UN-AUDITED repo-root
+    // lifecycle scripts on the runner (FC/docker; bare/mac-bare discard work_dir).
+    // Fail closed before the audit.  (install-preflight.ts:detectInstallWorkDirDivergence.)
+    const workDirDivergence = detectInstallWorkDirDivergence(inputs.configPath);
+    if (workDirDivergence !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused — ${workDirDivergence}\n`);
       exitProcess(1);
     }
   }

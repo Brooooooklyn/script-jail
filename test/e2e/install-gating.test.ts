@@ -12,7 +12,7 @@
 //   install: false (default)        → neither runs (audit only)
 
 import { describe, it, expect } from 'vitest';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { setUpConsumer, fakeVmFactory, runMain, type FixtureName } from './harness.js';
@@ -362,5 +362,67 @@ describe.sequential('e2e: drop-in install gating', () => {
     expect(result.exit).toBeNull();
     expect(cap.installCalls).toEqual([{ pm: 'pnpm', args: [] }]);
     expect(cap.runCalls).toEqual([{ pm: 'pnpm' }]);
+  });
+
+  // --- FIX 15: install + diverging config work_dir → fail closed ------------
+  // `work_dir` (consumer config field, no clamp) reaches the FC/docker guest
+  // verbatim, so the guest audits at cwd=work_dir (a subproject) while host
+  // install/rebuild always run at the repoDir ROOT (/work).  A benign subproject
+  // can audit clean while host part-2 runs UN-AUDITED repo-root scripts.  main()
+  // must refuse BEFORE any host install.
+
+  it('install + config work_dir pointing at a subproject → fail-closed before any install, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    // A subproject work_dir: the guest audits /work/packages/app, the runner
+    // installs + runs lifecycle scripts at the repo root (/work).
+    appendFileSync(consumer.configPath, '\nwork_dir: /work/packages/app\n', 'utf8');
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/work_dir/);
+    expect(result.stdout).toContain('/work/packages/app');
+    expect(cap.installCalls).toHaveLength(0); // exited before part 1
+    expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + config with no work_dir → allowed (default /work, both halves run)', async () => {
+    // No-over-fire: the default config (no work_dir) must still run normally.
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toBeNull();
+    expect(cap.installCalls).toEqual([{ pm: 'npm', args: [] }]);
+    expect(cap.runCalls).toEqual([{ pm: 'npm' }]);
+  });
+
+  it('install + explicit config work_dir of /work → allowed (aligned with staged root)', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    appendFileSync(consumer.configPath, '\nwork_dir: /work\n', 'utf8');
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toBeNull();
+    expect(cap.installCalls).toEqual([{ pm: 'npm', args: [] }]);
+    expect(cap.runCalls).toEqual([{ pm: 'npm' }]);
   });
 });

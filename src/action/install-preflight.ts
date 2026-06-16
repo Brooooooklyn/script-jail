@@ -71,6 +71,45 @@ export function detectPreTrustConfigExec(
 }
 
 /**
+ * Returns a human-readable reason when `install: true` must be REFUSED because
+ * the consumer config declares a `work_dir` that DIVERGES from the host install
+ * cwd; null when aligned (default `/work`, unset, or explicitly `/work`).
+ *
+ * SECURITY: `work_dir` is a consumer-settable config-FILE field with NO clamp
+ * (guest schema default `/work`).  For Firecracker/Docker the consumer's config
+ * (work_dir intact) reaches the guest verbatim, so the guest audits at
+ * `cwd=config.work_dir` (e.g. `/work/packages/app`) — while host part-1 install
+ * and host part-2 lifecycle rebuild ALWAYS run at the repoDir ROOT (mounted as
+ * `/work`).  The whole repoDir is staged at `/work`, so a benign SUBPROJECT can
+ * audit clean (trusted=true) while host part-2 then runs UN-AUDITED repo-ROOT
+ * lifecycle scripts on the runner.  Fail closed BEFORE the audit.  (bare /
+ * mac-bare are immune — `rewriteConfigWorkDir` discards work_dir there — but we
+ * cannot know the backend at this point and the FC/docker exposure is real, so
+ * refuse unconditionally; the fix for a real subproject is to point script-jail
+ * at the subproject root via SCRIPT_JAIL_REPO_DIR, not to set work_dir.)
+ */
+export function detectInstallWorkDirDivergence(configPath: string): string | null {
+  if (!existsSync(configPath)) return null; // absent config => default work_dir '/work'
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(readFileSync(configPath, 'utf8'));
+  } catch {
+    return null; // malformed config handled elsewhere
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const wd = (parsed as Record<string, unknown>)['work_dir'];
+  if (wd === undefined) return null; // unset => default '/work'
+  if (typeof wd !== 'string' || wd === '/work') return null; // staged repo root => aligned
+  return (
+    `config sets work_dir to '${wd}', but \`install: true\` runs the host install/rebuild at the ` +
+    `repository root (mounted as /work in the sandbox). The guest would audit '${wd}' while the ` +
+    `runner installs and runs lifecycle scripts at the repo root, so a clean lock for that subdir ` +
+    `would authorize unaudited repo-root scripts. Remove work_dir (or set it to '/work') when using \`install\`, ` +
+    `or run script-jail at the subproject root via SCRIPT_JAIL_REPO_DIR.`
+  );
+}
+
+/**
  * The list of directories to inspect for repo-controlled config, ordered from
  * `repoDir` UP to (and including) `workspaceRoot`.  Boundary rules:
  *   * `workspaceRoot` undefined/empty → only `repoDir` (non-action / local).
@@ -147,11 +186,16 @@ function detectPnpmfile(repoDir: string, workspaceRoot?: string): string | null 
   // repoDir `configDependencies` reject up the ancestor chain, bounded to the
   // workspace.  (The other pnpm sources need no ancestor scan: pnpmfiles are
   // backstopped, and an alt root manifest only matters at the project root pnpm
-  // picks, already handled at repoDir.)  The deeper reason ancestor pnpmfiles
-  // need no scan is that the sandbox stages ONLY repoDir (overlay.ts:170 /
-  // stage.ts:26) and runs pnpm at /work, so an ancestor pnpmfile above repoDir
-  // is never present in the guest and cannot rewrite the audited graph; if
-  // staging ever included workspaceRoot, ancestor pnpmfiles would need scanning.
+  // picks, already handled at repoDir.)  The reason ancestor pnpmfiles need no
+  // scan is twofold: (1) BOTH host halves suppress the pnpmfile on the runner —
+  // part-1 `--ignore-pnpmfile` and part-2 `pnpm rebuild --config.ignore-pnpmfile=true`
+  // (host-install.ts) — so an ancestor pnpmfile never EXECUTES on the runner;
+  // and (2) the sandbox stages ONLY repoDir (overlay.ts:170 / stage.ts:26) and
+  // runs pnpm at /work, so an ancestor pnpmfile above repoDir is never present
+  // in the guest and cannot rewrite the audited graph (nor be mis-audited).  An
+  // ancestor pnpmfile thus neither runs unaudited on the runner nor diverges the
+  // audit; if staging ever included workspaceRoot, ancestor pnpmfiles would need
+  // scanning.
   const ancestors = scanDirs(repoDir, workspaceRoot);
   for (let i = 1; i < ancestors.length; i++) {
     const reason = detectPnpmConfigDepsInDir(ancestors[i]!);

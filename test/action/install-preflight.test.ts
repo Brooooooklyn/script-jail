@@ -11,7 +11,10 @@ import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { detectPreTrustConfigExec } from '../../src/action/install-preflight.js';
+import {
+  detectPreTrustConfigExec,
+  detectInstallWorkDirDivergence,
+} from '../../src/action/install-preflight.js';
 
 let dir: string;
 beforeEach(() => {
@@ -396,5 +399,56 @@ describe('detectPreTrustConfigExec — pnpm ancestor configDependencies scan', (
     writeAt(join(ws, 'pnpm-workspace.yaml'), 'configDependencies:\n  cfg: "1.0.0+sha512-deadbeef"\n');
     writeAt(join(pkg, 'package.json'), '{"name":"app"}');
     expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toMatch(/configDependencies/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX 15: install + a diverging config `work_dir` → fail closed.
+// ---------------------------------------------------------------------------
+//
+// `work_dir` (consumer config field, NO clamp) reaches the FC/docker guest
+// verbatim, so the guest audits at `cwd=work_dir` (e.g. /work/packages/app)
+// while host install/rebuild ALWAYS run at the repoDir ROOT (/work).  A benign
+// subproject can then audit clean while host part-2 runs UN-AUDITED repo-root
+// lifecycle scripts.  detectInstallWorkDirDivergence fails closed pre-trust on
+// any work_dir that is not the staged repo root (`/work`).
+describe('detectInstallWorkDirDivergence', () => {
+  const configAt = (content: string): string => {
+    const p = join(dir, '.script-jail.yml');
+    writeFileSync(p, content);
+    return p;
+  };
+
+  it('rejects a work_dir pointing at a subproject', () => {
+    const reason = detectInstallWorkDirDivergence(configAt('work_dir: /work/packages/app\n'));
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/work_dir/);
+    expect(reason).toContain('/work/packages/app');
+    expect(reason).toMatch(/unaudited repo-root scripts/);
+  });
+
+  it('rejects any non-/work work_dir (even outside the staged tree)', () => {
+    expect(detectInstallWorkDirDivergence(configAt('work_dir: /elsewhere\n'))).not.toBeNull();
+  });
+
+  it('allows an explicit work_dir of /work (the staged repo root)', () => {
+    expect(detectInstallWorkDirDivergence(configAt('work_dir: /work\n'))).toBeNull();
+  });
+
+  it('allows an unset work_dir (defaults to /work)', () => {
+    expect(detectInstallWorkDirDivergence(configAt('node_version: 20\n'))).toBeNull();
+  });
+
+  it('allows an absent config file (default work_dir /work)', () => {
+    expect(detectInstallWorkDirDivergence(join(dir, 'does-not-exist.yml'))).toBeNull();
+  });
+
+  it('allows a malformed config (handled elsewhere)', () => {
+    // A scalar / non-mapping yaml declares no work_dir mapping → not our concern.
+    expect(detectInstallWorkDirDivergence(configAt('- just\n- a\n- list\n'))).toBeNull();
+  });
+
+  it('allows a non-string work_dir (e.g. numeric) — not a path divergence', () => {
+    expect(detectInstallWorkDirDivergence(configAt('work_dir: 42\n'))).toBeNull();
   });
 });

@@ -294,9 +294,20 @@ export function hostRunScripts(
   spawn: HostSpawn = inheritSpawn,
 ): void {
   const cmd = INSTALL_CMD[pm];
+  // SECURITY (host part-2, symmetric with part-1's --ignore-pnpmfile): `pnpm
+  // rebuild` LOADS + EXECUTES a (possibly ANCESTOR workspace-root) `.pnpmfile`'s
+  // top-level code on the runner, AFTER the trust gate, unaudited (the sandbox
+  // staged only repoDir, so an ancestor pnpmfile was never audited).  Part-2
+  // `pnpm rebuild` REJECTS the bare `--ignore-pnpmfile` flag ("Unknown option",
+  // exit 1 — would break every clean install), so suppress the pnpmfile via the
+  // config-namespaced form (same style as the existing
+  // `--config.side-effects-cache=false`).  HOST-ONLY: the guest Phase B keeps
+  // the pnpmfile so the hook is AUDITED at the enforcement boundary, so this
+  // lives here, NOT in the shared INSTALL_CMD.
+  const hostHardening = pm === 'pnpm' ? ['--config.ignore-pnpmfile=true'] : [];
   // Same store-dir pin as part 1 / the guest install phase: pnpm must relink
   // against the repo-local store, not the runner default (parity).
-  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir)];
+  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
   // hostRunScripts has no user args — finalArgs is credential-free, safe as displayArgs.
   runOrThrow(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn, 'lifecycle-script run', io, finalArgs);

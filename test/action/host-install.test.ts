@@ -410,12 +410,31 @@ describe('hostInstallNoScripts (part 1)', () => {
 describe('hostRunScripts (part 2)', () => {
   it.each([
     ['npm', ['rebuild', '--foreground-scripts']],
-    ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store']],
+    ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store', '--config.ignore-pnpmfile=true']],
     ['yarn', ['install', '--immutable']],
   ] as const)('runs the INSTALL_CMD for %s in repoDir', (pm, expected) => {
     const rec = makeRecorder();
     hostRunScripts(pm, '/repo', rec.io, okSpawn(rec));
     expect(rec.calls).toEqual([{ cmd: pm, args: expected, cwd: '/repo' }]);
+  });
+
+  it('hardens the pnpm host part-2 (`pnpm rebuild`) with --config.ignore-pnpmfile=true; npm/yarn get no such flag', () => {
+    // SECURITY (symmetric with part-1's --ignore-pnpmfile): `pnpm rebuild` loads
+    // + executes a (possibly ANCESTOR) pnpmfile's top-level code on the runner
+    // AFTER the trust gate, unaudited.  Part-2 rejects the bare `--ignore-pnpmfile`
+    // flag, so the config-namespaced form suppresses it.  Only pnpm gets it.
+    const rec = makeRecorder();
+    hostRunScripts('pnpm', '/repo', rec.io, okSpawn(rec));
+    expect(rec.calls[0]!.args).toContain('--config.ignore-pnpmfile=true');
+    // It is the LAST flag (appended after the store-dir pin).
+    expect(rec.calls[0]!.args.at(-1)).toBe('--config.ignore-pnpmfile=true');
+    // And NOT the bare flag, which `pnpm rebuild` rejects ("Unknown option").
+    expect(rec.calls[0]!.args).not.toContain('--ignore-pnpmfile');
+    for (const pm of ['npm', 'yarn'] as const) {
+      const r = makeRecorder();
+      hostRunScripts(pm, '/repo', r.io, okSpawn(r));
+      expect(r.calls[0]!.args).not.toContain('--config.ignore-pnpmfile=true');
+    }
   });
 
   it('throws on a non-zero exit', () => {
