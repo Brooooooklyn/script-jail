@@ -168,8 +168,6 @@ function dropReason(key: string): string {
       return '--prefix';
     case 'global':
       return '--global';
-    case 'registry':
-      return '--registry';
     case 'filter':
       return '--filter';
     case 'recursive':
@@ -184,13 +182,12 @@ function dropReason(key: string): string {
 }
 
 /**
- * FAIL-CLOSED ALLOWLIST of canonical flag keys that are proven-safe
- * dependency-SELECTION options: they filter WHICH packages of the
- * lockfile-pinned tree get installed, and CANNOT redirect which lockfile is
- * read, where the install root / module output lives, whether lifecycle scripts
- * run, or the resolution source (registry).  Everything not on this set —
- * including all positionals and all unknown flags — is dropped (see
- * `sanitizeInstallArgs`).
+ * FAIL-CLOSED ALLOWLIST of canonical flag keys that are proven-safe: they CANNOT
+ * redirect which lockfile is read, where the install root / module output lives,
+ * or whether lifecycle scripts run.  Most are dependency-SELECTION filters (they
+ * pick WHICH of the lockfile-pinned packages install); the one source knob is
+ * `registry` (see its note).  Everything not on this set — including all
+ * positionals and all unknown flags — is dropped (see `sanitizeInstallArgs`).
  *
  * Why an allowlist and not a denylist: a denylist was proven STRUCTURALLY
  * UNSAFE here.  Three distinct pin-bypass families slipped past successive
@@ -221,13 +218,21 @@ function dropReason(key: string): string {
  *     lowercases, so `-d`/`-p` (npm `--loglevel info` / `--parseable`) also map
  *     here; both are harmless.  The documented action `args` example uses `-D`,
  *     so keeping these keeps that example valid.
+ *   * registry — the resolution SOURCE (value-taking).  NOT a steering knob:
+ *     under the fixed `--frozen-lockfile` / `npm ci` it does NOT relax the
+ *     root-lock validation (a stale lock still errors `ERR_PNPM_OUTDATED_LOCKFILE`
+ *     even with `--registry` — verified on real pnpm), and the lockfile integrity
+ *     hashes reject any tarball whose bytes differ from the pinned content, so a
+ *     swapped registry can only serve byte-identical packages or fail closed.
+ *     Allowlisted by owner decision for private-registry consumers; registry AUTH
+ *     belongs in `.npmrc` / env (honored by the sandbox), not in CLI args.
  *
  * NOTE on negations: `--no-<allowlisted>` folds to the base key (e.g.
  * `--no-optional` → `optional`) and is itself dependency-selection, so it is
  * allowed.  No DANGEROUS flag's `--no-` form folds to an allowlisted key —
- * steering keys (`dir`, `prefix`, `modulesdir`, `global`, `registry`, `filter`,
- * `recursive`, `lockfile*`, `frozenlockfile`, `fixlockfile`, `immutable`,
- * `mode`, `ignorescripts`, …) are not in this set and never collapse into it.
+ * steering keys (`dir`, `prefix`, `modulesdir`, `global`, `filter`, `recursive`,
+ * `lockfile*`, `frozenlockfile`, `fixlockfile`, `immutable`, `mode`,
+ * `ignorescripts`, …) are not in this set and never collapse into it.
  */
 const ALLOWED_FLAG_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map([
   ['omit', { takesValue: true }],
@@ -238,6 +243,7 @@ const ALLOWED_FLAG_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map(
   ['optional', { takesValue: false }],
   ['p', { takesValue: false }], // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
   ['d', { takesValue: false }], // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
+  ['registry', { takesValue: true }], // private-registry SOURCE; content-protected by lock integrity, root-lock gate unaffected (see note)
 ]);
 
 /**
@@ -284,8 +290,10 @@ const ALLOWED_ARCH_KEYS: ReadonlyMap<string, { takesValue: boolean }> = new Map(
  * `--lockfile-only`/`--(no-)lockfile`/`--(no-)frozen-lockfile`/`--fix-lockfile`/
  * `--no-immutable` (lockfile location/enforcement), `--ignore-scripts` and its
  * `--no-` negation (script re-enable), `--global`/`-g`/`--workspace-root`/`-w`/
- * `--recursive`/`-r`/`--filter` (scope steering), `--registry`/`--config.registry`
- * (source swap), and any bare package name / path positional.
+ * `--recursive`/`-r`/`--filter` (scope steering), and any bare package name /
+ * path positional.  (`--registry` is the one allowed SOURCE flag — see
+ * `ALLOWED_FLAG_KEYS`; it is content-protected by lock integrity and does not
+ * relax the root-lock gate.)
  *
  * Value tokens: an allowlisted VALUE-taking flag in SPLIT form (`--omit dev`)
  * keeps its following value token too (not dropped, not left dangling as a

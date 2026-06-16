@@ -7850,8 +7850,6 @@ function dropReason(key) {
       return "--prefix";
     case "global":
       return "--global";
-    case "registry":
-      return "--registry";
     case "filter":
       return "--filter";
     case "recursive":
@@ -7873,8 +7871,10 @@ var ALLOWED_FLAG_KEYS = /* @__PURE__ */ new Map([
   ["optional", { takesValue: false }],
   ["p", { takesValue: false }],
   // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
-  ["d", { takesValue: false }]
+  ["d", { takesValue: false }],
   // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
+  ["registry", { takesValue: true }]
+  // private-registry SOURCE; content-protected by lock integrity, root-lock gate unaffected (see note)
 ]);
 function filterAgainstAllowlist(args, allow) {
   const kept = [];

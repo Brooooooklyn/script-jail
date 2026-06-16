@@ -107,9 +107,15 @@ Then your build steps can use `node_modules` directly — no second `install` st
 - On audit **drift or bypass**, the safe no-scripts `node_modules` is left in
   place but the lifecycle scripts are skipped and the job exits non-zero.
 - `args` is split into discrete argv items (quote values that contain spaces)
-  and passed to the package manager directly — never through a shell. Flags that
-  would re-enable scripts in step 1 (`--no-ignore-scripts`, yarn `--mode`, …) are
-  dropped with a warning.
+  and passed to the package manager directly — never through a shell. It is
+  filtered by a **fail-closed allowlist**: only dependency-selection flags
+  (`--omit`/`--include`/`--prod`/`--dev`/`--optional`/`-P`/`-D`) plus `--registry`
+  are forwarded; everything else — anything that could re-enable scripts or steer
+  which tree installs (`--ignore-scripts`, lockfile/`--lockfile-dir`/`--dir`/
+  `--modules-dir`/`--prefix`/`--global`/`--filter`, yarn `--mode`, …) — is dropped
+  with a warning. Pass flags **valid for your package manager** (the `--omit=dev`
+  example is npm; pnpm uses `--prod`; yarn-berry `install` takes none); a flag
+  your manager rejects fails the audit. Registry **auth** stays in `.npmrc`/env.
 - The Action **audits** your root project's `prepare` script in the sandbox but
   does **not run it on the runner** in step 3 for npm/yarn (they run only
   `rebuild`/`install --immutable`, which never invoke a root `prepare`; pnpm

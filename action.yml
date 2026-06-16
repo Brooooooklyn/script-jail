@@ -34,7 +34,7 @@ inputs:
     required: false
     default: "true"
   args:
-    description: "Extra package-manager install args (e.g. `-D --omit=dev`), applied identically to the sandbox audit and the host install. Quote-grouped; never run through a shell."
+    description: "Extra install args, applied identically to the sandbox audit and the host install. Quote-grouped; never run through a shell. Pass args VALID FOR YOUR PACKAGE MANAGER (npm: `--omit=dev`; pnpm: `--prod`; yarn-berry install takes none) — a flag your manager rejects fails the audit. Only a fail-closed allowlist of dependency-selection flags (omit/include/prod/dev/optional/-P/-D) plus `--registry` is forwarded; anything that could steer the install (lockfile/dir/output/scripts/global/workspace) is dropped with a warning. Registry AUTH goes in `.npmrc`/env, not here."
     required: false
     default: ""
   install:

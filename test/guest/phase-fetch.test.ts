@@ -341,7 +341,7 @@ describe('runFetchPhase', () => {
     // runFetchPhase loads + re-sanitizes them — so it MUST surface them in its
     // return object for the agent to derive the mask set (adversarial-review
     // round-7 [high]).  Under the fail-closed allowlist a credential-bearing arg
-    // like `--registry=SECRET` is DROPPED entirely (never reaches the argv), so
+    // like `--auth-token=SECRET` is DROPPED entirely (never reaches the argv), so
     // only the surviving allowlisted args are returned for masking; the secret
     // can no longer leak via the install argv at all.
     it('returns the surviving (allowlisted) userInstallArgs it loaded, dropping non-dep flags', async () => {
@@ -349,13 +349,13 @@ describe('runFetchPhase', () => {
         pmFlagsPath,
         JSON.stringify({
           extra_install_args: [],
-          user_install_args: ['--registry=SECRET_TOKEN', '--omit=dev'],
+          user_install_args: ['--auth-token=SECRET_TOKEN', '--omit=dev'],
         }),
       );
       const { spawner } = mockSpawner();
       const result = await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
-      // `--registry=SECRET_TOKEN` dropped (source swap); only the allowlisted
-      // `--omit=dev` survives into the returned mask set.
+      // `--auth-token=SECRET_TOKEN` dropped (not on the allowlist); only the
+      // allowlisted `--omit=dev` survives into the returned mask set.
       expect(result.userInstallArgs).toEqual(['--omit=dev']);
     });
 

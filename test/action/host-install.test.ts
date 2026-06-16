@@ -250,24 +250,31 @@ describe('hostInstallNoScripts (part 1)', () => {
     };
   }
 
-  it('a --registry=SECRET arg is DROPPED (not on the allowlist) so it never reaches spawn', () => {
-    // Under the fail-closed allowlist `--registry` is a source-swap flag and is
-    // dropped entirely — the credential never reaches spawn at all (strictly
-    // safer than the old keep-then-redact path).  Any PM diagnostic that still
-    // echoes the value substring is also redacted from the log defensively.
+  it('a kept --registry URL is forwarded to spawn but its embedded credentials are redacted from captured output', () => {
+    // Owner decision: `--registry` is allowlisted so private-registry consumers
+    // can point the install at their mirror.  It does NOT bypass the frozen-lock
+    // root gate (a stale lock still errors), so it is a SOURCE-only flag — safe
+    // to forward.  A consumer MAY embed credentials in the URL; those reach
+    // spawn (the PM needs them) but MUST NOT survive into the job log.  Two
+    // defenses cover the captured PM output: maskExactValues blanks the exact
+    // kept value, and redactCredentialShapes catches the URL-userinfo shape even
+    // when the PM reformats it.  (Error messages can't leak it either — they use
+    // safeDisplayArgs, which never includes user tokens.)
+    const credUrl = 'https://user:SECRET_PASS@npm.acme.internal/';
     const rec = makeRecorder();
     const spawn = captureSpawn(rec, {
       status: 0,
-      stderr: 'npm warn invalid config registry="SECRET_TOKEN" set in command line options\n',
+      stderr: `npm warn invalid config registry="${credUrl}" set in command line options\n`,
     });
-    hostInstallNoScripts('npm', '/repo', ['--registry=SECRET_TOKEN'], rec.io, spawn);
-    // The credential arg was DROPPED — spawn got only the fixed base args.
-    expect(rec.calls[0]!.args).not.toContain('--registry=SECRET_TOKEN');
-    expect(rec.calls[0]!.args).toEqual(['ci', '--ignore-scripts']);
-    // The drop warning names only the safe canonical key, never the secret.
-    const warn = rec.warns.join('\n');
-    expect(warn).toMatch(/--registry/);
-    expect(warn).not.toContain('SECRET_TOKEN');
+    hostInstallNoScripts('npm', '/repo', [`--registry=${credUrl}`], rec.io, spawn);
+    // The registry flag IS forwarded to spawn — consumers depend on it.
+    expect(rec.calls[0]!.args).toContain(`--registry=${credUrl}`);
+    // ...but the credential never survives into the captured/logged output.
+    const errd = rec.errs.join('');
+    expect(errd).not.toContain('SECRET_PASS');
+    expect(errd).toContain('<REDACTED');
+    // No drop warning — registry is on the allowlist.
+    expect(rec.warns.join('\n')).not.toMatch(/ignoring .* install arg/);
   });
 
   it('a credential-shaped user-arg is DROPPED (not on the allowlist) so it never reaches spawn', () => {
@@ -363,7 +370,10 @@ describe('hostInstallNoScripts (part 1)', () => {
   });
 
   it('#6a: signal-killed error does not contain credential-shaped user args (which are dropped)', () => {
-    const credArg = '--registry=https://user:SECRET_PASS@private.registry.example/';
+    // A non-allowlisted credential-bearing flag (here `--auth`, NOT `--registry`,
+    // which is now allowlisted) is dropped before spawn, so its URL-embedded
+    // secret can never surface in the signal-killed error message.
+    const credArg = '--auth=https://user:SECRET_PASS@private.registry.example/';
     const rec = makeRecorder();
     const sigSpawn: HostSpawn = (cmd, args, cwd) => {
       rec.calls.push({ cmd, args, cwd });

@@ -172,12 +172,23 @@ describe('sanitizeInstallArgs (fail-closed allowlist)', () => {
     });
   });
 
-  it('MUST-DROP: source swap (registry / config.registry)', () => {
-    expect(sanitizeInstallArgs(['--registry=http://evil']).kept).toEqual([]);
-    expect(sanitizeInstallArgs(['--registry=http://evil']).droppedKeys).toEqual(['--registry']);
-    expect(sanitizeInstallArgs(['--config.registry=http://evil']).kept).toEqual([]);
-    expect(sanitizeInstallArgs(['--config.registry=http://evil']).droppedKeys).toEqual([
-      '--registry',
+  it('MUST-PASS: --registry (private-registry SOURCE) is allowlisted, joined + split + config alias', () => {
+    // Owner decision: registry is kept so private-registry consumers can point
+    // the Phase-A fetch at their mirror.  It is NOT a steering knob — under the
+    // fixed --frozen-lockfile / npm ci it does not relax the root-lock validation
+    // (verified on real pnpm: a stale lock still errors), and lockfile integrity
+    // hashes reject any tarball whose bytes differ from the pinned content.
+    expect(sanitizeInstallArgs(['--registry=https://npm.acme.internal/']).kept).toEqual([
+      '--registry=https://npm.acme.internal/',
+    ]);
+    expect(sanitizeInstallArgs(['--registry', 'https://npm.acme.internal/'])).toEqual({
+      kept: ['--registry', 'https://npm.acme.internal/'],
+      dropped: [],
+      droppedKeys: [],
+    });
+    // `--config.registry=` (pnpm alias) folds to the same `registry` key → kept.
+    expect(sanitizeInstallArgs(['--config.registry=https://npm.acme.internal/']).kept).toEqual([
+      '--config.registry=https://npm.acme.internal/',
     ]);
   });
 
@@ -236,11 +247,12 @@ describe('sanitizeInstallArgs (fail-closed allowlist)', () => {
 
   it('value-taking flag value is NOT misread as a value when the flag is dropped', () => {
     // A dropped bare flag still consumes its following non-flag token so the
-    // value cannot dangle as a kept positional.  `--registry http://x` (split).
-    expect(sanitizeInstallArgs(['--registry', 'http://x', '--prod'])).toEqual({
+    // value cannot dangle as a kept positional.  `--modules-dir /tmp/x` (split):
+    // a steering flag that IS dropped (unlike the allowlisted `--registry`).
+    expect(sanitizeInstallArgs(['--modules-dir', '/tmp/x', '--prod'])).toEqual({
       kept: ['--prod'],
-      dropped: ['--registry', 'http://x'],
-      droppedKeys: ['--registry'],
+      dropped: ['--modules-dir', '/tmp/x'],
+      droppedKeys: ['--modules-dir'],
     });
   });
 });
