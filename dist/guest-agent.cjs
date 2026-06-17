@@ -10359,6 +10359,7 @@ __export(agent_exports, {
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
   createEventsFile: () => createEventsFile,
+  createSensitiveRedactor: () => createSensitiveRedactor,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
   readStraceChildPid: () => readStraceChildPid,
@@ -25305,16 +25306,14 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   return out;
 }
 var DEFAULT_MIN_FRAGMENT = 8;
-var FRAGMENT_MAX_GRAMS = 1 << 20;
-function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFAULT_MIN_FRAGMENT) {
-  if (text.length < minFragment) return text;
-  const replacement = `<${label}>`;
+var FRAGMENT_MAX_GRAMS = 1 << 22;
+function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
   const grams = /* @__PURE__ */ new Set();
   let capped = false;
   for (const v of values) {
     if (v.length <= minFragment) continue;
-    for (let i2 = 0; i2 + minFragment <= v.length; i2 += 1) {
-      grams.add(v.slice(i2, i2 + minFragment));
+    for (let i = 0; i + minFragment <= v.length; i += 1) {
+      grams.add(v.slice(i, i + minFragment));
       if (grams.size >= FRAGMENT_MAX_GRAMS) {
         capped = true;
         break;
@@ -25322,6 +25321,12 @@ function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFA
     }
     if (capped) break;
   }
+  return { grams, capped, minFragment };
+}
+function maskValueFragmentsWith(text, matcher, label = "REDACTED") {
+  const { grams, capped, minFragment } = matcher;
+  if (text.length < minFragment) return text;
+  const replacement = `<${label}>`;
   if (capped) return replacement;
   if (grams.size === 0) return text;
   const n = text.length;
@@ -30877,17 +30882,23 @@ function resolvePrepareCommand(manager, cwd) {
   }
   return null;
 }
-function redactSensitive(text, protectedEnvNames, env = process.env) {
-  let out = text;
+function createSensitiveRedactor(protectedEnvNames, env = process.env) {
   const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
     (e) => typeof e.value === "string" && e.value.length >= 1
   ).sort((a, b) => b.value.length - a.value.length);
-  for (const { name, value } of values) {
-    out = out.split(value).join(`<REDACTED:${name}>`);
-  }
-  out = maskValueFragments(out, values.map((e) => e.value), "REDACTED:SECRET");
-  out = redactCredentialShapes(out);
-  return out;
+  const fragMatcher = buildFragmentMatcher(values.map((e) => e.value));
+  return (text) => {
+    let out = text;
+    for (const { name, value } of values) {
+      out = out.split(value).join(`<REDACTED:${name}>`);
+    }
+    out = maskValueFragmentsWith(out, fragMatcher, "REDACTED:SECRET");
+    out = redactCredentialShapes(out);
+    return out;
+  };
+}
+function redactSensitive(text, protectedEnvNames, env = process.env) {
+  return createSensitiveRedactor(protectedEnvNames, env)(text);
 }
 async function main(input) {
   const configPath = input.configPath ?? "/etc/script-jail/config.yml";
@@ -30937,12 +30948,8 @@ async function main(input) {
     PHASE_B_STDOUT_TAIL_BYTES,
     4096 + maxProtectedValueBytes + 4096
   );
-  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile, (s) => redactSensitive(s, config2.protected.env)) : new LinuxStraceRunner(
-    void 0,
-    eventsFile,
-    (s) => redactSensitive(s, config2.protected.env),
-    stdoutTailBytes
-  ));
+  const lineRedactor = createSensitiveRedactor(config2.protected.env);
+  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile, lineRedactor) : new LinuxStraceRunner(void 0, eventsFile, lineRedactor, stdoutTailBytes));
   let rootPkgKeys = /* @__PURE__ */ new Set();
   let canonicalRootKey = null;
   let malformedRootName = false;
@@ -31174,12 +31181,7 @@ ${stdoutTail}`;
         return;
       }
       prepareEventsFilePath = pf.path;
-      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf, (s) => redactSensitive(s, config2.protected.env)) : new LinuxStraceRunner(
-        void 0,
-        pf,
-        (s) => redactSensitive(s, config2.protected.env),
-        stdoutTailBytes
-      );
+      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf, lineRedactor) : new LinuxStraceRunner(void 0, pf, lineRedactor, stdoutTailBytes);
     }
     const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
     const prepareEnv = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
@@ -31364,6 +31366,7 @@ if (isMain) {
   buildChildEnv,
   buildChildEnvMacos,
   createEventsFile,
+  createSensitiveRedactor,
   macosTokenizeRoots,
   main,
   readStraceChildPid,

@@ -24,7 +24,7 @@ import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
 
 import { Attribution, buildRootPkgKeys, ROOT_SENTINEL } from './attribution.js';
-import { deriveSensitiveValues, maskExactValues, maskValueFragments, redactCredentialShapes } from '../shared/redact.js';
+import { buildFragmentMatcher, deriveSensitiveValues, maskExactValues, maskValueFragmentsWith, redactCredentialShapes } from '../shared/redact.js';
 import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
@@ -2936,12 +2936,19 @@ export function resolvePrepareCommand(
  *
  * @internal Exported for unit tests.
  */
-export function redactSensitive(
-  text: string,
+/**
+ * Build a reusable redactor for a STABLE protected-env set.  Precomputes the
+ * sorted exact values AND the fragment gram matcher ONCE, then returns a
+ * `(text) => string` applied per line.  A per-line caller (install stderr
+ * forwarder, stdout-tail front-drop) MUST build this once and reuse it: calling
+ * `redactSensitive` per line would rebuild the O(sum |V|) gram set on every line
+ * and, for a large `protected.env`, both stall and (pre-fix) blackhole the log
+ * (adversarial-review review #7).
+ */
+export function createSensitiveRedactor(
   protectedEnvNames: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
-): string {
-  let out = text;
+): (text: string) => string {
   // Layer 1 — exact protected values.  Sort longest-first so a value that is a
   // substring of another is not partially pre-masked.  Floor is >=1 (mask every
   // NON-EMPTY declared value): a `protected.env` name is an EXPLICIT secret
@@ -2955,21 +2962,40 @@ export function redactSensitive(
       typeof e.value === 'string' && e.value.length >= 1,
     )
     .sort((a, b) => b.value.length - a.value.length);
-  for (const { name, value } of values) {
-    out = out.split(value).join(`<REDACTED:${name}>`); // exact whole value, per-name label
-  }
-  // Also mask a FRAGMENT (prefix/suffix/middle) of any declared value — e.g. a
-  // secret truncated by a concurrent newline on the shared pipe.  ONE cross-value
-  // pass (NOT per value): a per-value call would let a longer value's shared gram
-  // strand a shorter value's leaked fragment (adversarial-review F6 round-3).  A
-  // fragment can't be attributed to a single name, so it gets a generic label.
-  out = maskValueFragments(out, values.map((e) => e.value), 'REDACTED:SECRET');
-  // Layer 2 — credential SHAPES regardless of the protected list.  Relocated
-  // verbatim into the shared single-source redactor (see src/shared/redact.ts)
-  // so the host part-1 capture path applies the IDENTICAL shape chain.  The
-  // LINE-LOCAL CONTRACT (Codex round-9 [high] #1) is documented there.
-  out = redactCredentialShapes(out);
-  return out;
+  // Fragment gram matcher — built ONCE here, scanned per line below.
+  const fragMatcher = buildFragmentMatcher(values.map((e) => e.value));
+  return (text: string): string => {
+    let out = text;
+    for (const { name, value } of values) {
+      out = out.split(value).join(`<REDACTED:${name}>`); // exact whole value, per-name label
+    }
+    // Also mask a FRAGMENT (prefix/suffix/middle) of any declared value — e.g. a
+    // secret truncated by a concurrent newline on the shared pipe.  ONE
+    // cross-value pass (NOT per value): a per-value call would let a longer
+    // value's shared gram strand a shorter value's leaked fragment
+    // (adversarial-review F6 round-3).  A fragment can't be attributed to a
+    // single name, so it gets a generic label.
+    out = maskValueFragmentsWith(out, fragMatcher, 'REDACTED:SECRET');
+    // Layer 2 — credential SHAPES regardless of the protected list.  Relocated
+    // verbatim into the shared single-source redactor (see src/shared/redact.ts)
+    // so the host part-1 capture path applies the IDENTICAL shape chain.  The
+    // LINE-LOCAL CONTRACT (Codex round-9 [high] #1) is documented there.
+    out = redactCredentialShapes(out);
+    return out;
+  };
+}
+
+/**
+ * One-shot redactor for a per-BUFFER caller (Phase A failure dump, Phase B
+ * stdout tail) and the tests.  Per-LINE callers must use
+ * {@link createSensitiveRedactor} once and reuse it (see its note).
+ */
+export function redactSensitive(
+  text: string,
+  protectedEnvNames: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return createSensitiveRedactor(protectedEnvNames, env)(text);
 }
 
 export async function main(input: AgentInput): Promise<void> {
@@ -3088,16 +3114,15 @@ export async function main(input: AgentInput): Promise<void> {
     PHASE_B_STDOUT_TAIL_BYTES,
     4096 + maxProtectedValueBytes + 4096,
   );
+  // Build the per-line redactor ONCE (precomputes the fragment gram matcher) so
+  // a large `protected.env` does not pay an O(sum |V|) rebuild on every
+  // forwarded line (adversarial-review review #7).  Reused by the prepare pass.
+  const lineRedactor = createSensitiveRedactor(config.protected.env);
   const straceRunner: StraceRunner =
     input.strace ??
     (isMacosBare
-      ? new MacOSInstallRunner(undefined, eventsFile, (s) => redactSensitive(s, config.protected.env))
-      : new LinuxStraceRunner(
-          undefined,
-          eventsFile,
-          (s) => redactSensitive(s, config.protected.env),
-          stdoutTailBytes,
-        ));
+      ? new MacOSInstallRunner(undefined, eventsFile, lineRedactor)
+      : new LinuxStraceRunner(undefined, eventsFile, lineRedactor, stdoutTailBytes));
 
   // ROOT package keys, computed ONCE here so the Attribution ctor (below), BOTH
   // Phase-B passes (main install + the root-prepare pass) and the post-phase
@@ -3659,13 +3684,8 @@ export async function main(input: AgentInput): Promise<void> {
       }
       prepareEventsFilePath = pf.path;
       prepareRunner = isMacosBare
-        ? new MacOSInstallRunner(undefined, pf, (s) => redactSensitive(s, config.protected.env))
-        : new LinuxStraceRunner(
-            undefined,
-            pf,
-            (s) => redactSensitive(s, config.protected.env),
-            stdoutTailBytes,
-          );
+        ? new MacOSInstallRunner(undefined, pf, lineRedactor)
+        : new LinuxStraceRunner(undefined, pf, lineRedactor, stdoutTailBytes);
     }
     // Point the prepare child's audit sink at the events file the runner uses.
     const prepareChildEnv = isMacosBare

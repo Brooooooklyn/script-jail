@@ -36,7 +36,7 @@ import {
   sanitizeInstallArgs,
   type Manager,
 } from '../shared/pm-commands.js';
-import { deriveSensitiveValues, maskExactValues, maskValueFragments, redactCredentialShapes } from '../shared/redact.js';
+import { buildFragmentMatcher, deriveSensitiveValues, maskExactValues, maskValueFragmentsWith, redactCredentialShapes } from '../shared/redact.js';
 
 // ---------------------------------------------------------------------------
 // SECURITY: pin npm's `git` config to the trusted runner git
@@ -646,6 +646,10 @@ export async function hostRunScripts(
   const sensitive = protectedEnvNames
     .map((name) => process.env[name])
     .filter((v): v is string => typeof v === 'string');
+  // Build the fragment gram matcher ONCE, before streaming: a large
+  // `protected.env` would otherwise pay an O(sum |V|) rebuild on EVERY emitted
+  // line (and a reachable-large set would blackhole every line) — review #7.
+  const fragMatcher = buildFragmentMatcher(sensitive);
   const onLine = (stream: 'stdout' | 'stderr', line: string): void => {
     let safe = maskExactValues(line, sensitive, 'REDACTED:ENV', 1);
     // Also mask a declared secret that leaks as a FRAGMENT — a prefix/suffix
@@ -653,9 +657,9 @@ export async function hostRunScripts(
     // pipe) OR a middle slice (both ends torn).  Exact masking only matches the
     // whole value; the n-gram overlap design covers any fragment >= the
     // high-entropy floor (adversarial-review F6 round-3 hardening).  ONE
-    // cross-value pass so a longer value's shared gram can't strand a shorter
+    // cross-value matcher so a longer value's shared gram can't strand a shorter
     // value's leaked fragment.
-    safe = maskValueFragments(safe, sensitive, 'REDACTED:ENV');
+    safe = maskValueFragmentsWith(safe, fragMatcher, 'REDACTED:ENV');
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
   };

@@ -101,57 +101,47 @@ export function maskExactValues(
  * text.  A line span every one of whose `minFragment`-char windows is a
  * substring of a declared secret is treated as a leaked fragment and masked. */
 const DEFAULT_MIN_FRAGMENT = 8;
-/** FAIL-CLOSED memory backstop on the gram set (≈1M eight-char grams ≈ ~80 MB).
- * Sized far above a full OS-bounded environment's worth of distinct grams: a
- * single env var is capped at ~128 KiB and the whole environment at a couple
- * MiB, so a realistic 64-name `protected.env` yields orders of magnitude fewer
- * grams than this and gets FULL fragment coverage.  If a pathological declared
- * set ever exceeds the ceiling we do NOT silently stop adding later values'
- * grams — that would leak a LATER value's fragment purely by list order
- * (adversarial-review F6 round-3 #6) — we FAIL CLOSED and mask the whole text. */
-const FRAGMENT_MAX_GRAMS = 1 << 20;
+/** FAIL-CLOSED memory backstop on the gram set, set ABOVE any OS-reachable
+ * protected-value total.  The whole process environment — and thus the sum of
+ * ALL protected values — is bounded by `ARG_MAX` (~2 MiB on Linux: a single env
+ * var is capped near 128 KiB and the whole env at a couple MiB), so even 64
+ * large declared values yield well under 2^22 distinct grams and get FULL
+ * fragment coverage; a realistic `protected.env` is orders of magnitude smaller.
+ * A declared set that STILL exceeds this ceiling is only reachable by a non-env
+ * caller; rather than silently stop adding later values' grams — which would
+ * leak a LATER value's fragment purely by list order (adversarial-review F6
+ * round-3 #6) — we FAIL CLOSED and mask the whole text.  The ceiling sits above
+ * the OS env bound (not at ~1M) so a large-but-legitimate `protected.env` is NOT
+ * spuriously blackholed, and the matcher is built ONCE per redactor (see
+ * `buildFragmentMatcher`) so it is never rebuilt per line (review #7). */
+const FRAGMENT_MAX_GRAMS = 1 << 22;
 
 /**
- * Mask any span of `text` that is "secret-like" — i.e. every `minFragment`-char
- * window in the span is a substring of some declared secret value.
- *
- * `maskExactValues` only matches the WHOLE declared value, so a secret that
- * leaks as a FRAGMENT slips through — e.g. a concurrent writer's newline
- * truncates a secret mid-write on a SHARED stdout/stderr pipe, leaving only a
- * prefix on the line; a same-writer split leaves a prefix on one line and a
- * suffix on the next; or a middle slice survives (adversarial-review F6
- * round-3).  This catches all of those uniformly: build the set of every
- * `minFragment`-length substring (gram) of every declared value, then mask each
- * maximal run of positions whose gram is in that set.  A leaked prefix, suffix,
- * or middle fragment of length >= `minFragment` is fully covered by secret
- * grams, so the whole run is masked — there are NO per-value, longest-match,
- * occurrence-cap, or scan-window edges to leak past (the earlier extraction
- * approach regressed on every one of those).
- *
- * `minFragment` (default 8) is a high-entropy floor: a real token's 8-char
- * window coinciding with unrelated log text is vanishingly unlikely, so benign
- * output is not mass-masked; a CHAIN of coincidences (needed to extend a span)
- * is rarer still.  Over-masking (a benign span that happens to match) is
- * safe-side and the user explicitly declared the value secret.
- *
- * SCOPE: this is DEFENSE-IN-DEPTH; the PRIMARY protection is the env_read audit
- * gate (a script cannot obtain a value to leak — whole or fragmented — without a
- * recorded read that fails the PR pre-trust).  Bounded: O(sum |V|) to build the
- * gram set + O(|text| · minFragment) to scan, with no dependence on the number
- * or placement of occurrences.  The gram set carries a FAIL-CLOSED ceiling
- * (`FRAGMENT_MAX_GRAMS`): a declared set so large it exceeds the ceiling masks
- * the whole text rather than silently dropping a later value's coverage.
+ * A PREBUILT fragment matcher: the set of every `minFragment`-char gram of every
+ * declared value, plus a `capped` flag set when the declared set exceeded the
+ * memory ceiling (→ fail closed).  Build it ONCE for a stable set of declared
+ * values (see {@link buildFragmentMatcher}) and reuse it across many lines via
+ * {@link maskValueFragmentsWith} — a per-line redactor must not rebuild it.
  */
-export function maskValueFragments(
-  text: string,
+export interface FragmentMatcher {
+  readonly grams: ReadonlySet<string>;
+  readonly capped: boolean;
+  readonly minFragment: number;
+}
+
+/**
+ * Build a {@link FragmentMatcher} from `values` — the O(sum |V|) gram-set build
+ * done ONCE so a per-line redactor (host part-2 `onLine`, guest stderr
+ * forwarder / stdout tail) does not pay it on every forwarded line (review #7).
+ * Values at or below the floor are skipped (whole-masked exactly elsewhere).
+ * Cross-value in ONE pass — no per-value race.  If the gram set hits
+ * `FRAGMENT_MAX_GRAMS` it stops and marks `capped` (fail-closed at scan time)
+ * rather than silently dropping the LATER values' coverage.
+ */
+export function buildFragmentMatcher(
   values: readonly string[],
-  label = 'REDACTED',
   minFragment = DEFAULT_MIN_FRAGMENT,
-): string {
-  if (text.length < minFragment) return text;
-  const replacement = `<${label}>`;
-  // Build the gram set from EVERY declared value (cross-value in one pass — no
-  // per-value race).  Values at or below the floor are whole-masked elsewhere.
+): FragmentMatcher {
   const grams = new Set<string>();
   let capped = false;
   for (const v of values) {
@@ -162,11 +152,50 @@ export function maskValueFragments(
     }
     if (capped) break;
   }
-  // The declared set hit the memory ceiling before every value's grams were
-  // recorded → coverage can no longer be guaranteed for the LATER values, so
-  // fail closed (mask everything) rather than leak a later value's fragment by
-  // list order (adversarial-review F6 round-3 #6).
-  if (capped) return replacement;
+  return { grams, capped, minFragment };
+}
+
+/**
+ * Mask any span of `text` that is "secret-like" — i.e. every `minFragment`-char
+ * window in the span is a substring of some declared secret value — using a
+ * PREBUILT {@link FragmentMatcher}.
+ *
+ * `maskExactValues` only matches the WHOLE declared value, so a secret that
+ * leaks as a FRAGMENT slips through — e.g. a concurrent writer's newline
+ * truncates a secret mid-write on a SHARED stdout/stderr pipe, leaving only a
+ * prefix on the line; a same-writer split leaves a prefix on one line and a
+ * suffix on the next; or a middle slice survives (adversarial-review F6
+ * round-3).  This catches all of those uniformly: mask each maximal run of
+ * positions whose `minFragment`-window is in the matcher's gram set.  A leaked
+ * prefix, suffix, or middle fragment of length >= `minFragment` is fully covered
+ * by secret grams, so the whole run is masked — NO per-value, longest-match,
+ * occurrence-cap, or scan-window edges to leak past (the earlier extraction
+ * approach regressed on every one of those).
+ *
+ * `minFragment` (default 8) is a high-entropy floor: a real token's 8-char
+ * window coinciding with unrelated log text is vanishingly unlikely, so benign
+ * output is not mass-masked; a CHAIN of coincidences (needed to extend a span)
+ * is rarer still.  Over-masking (a benign span that happens to match) is
+ * safe-side and the user explicitly declared the value secret.
+ *
+ * If the matcher is `capped` (declared set exceeded the memory ceiling), fail
+ * closed by masking the whole text — except a line too short to hold any
+ * fragment, which is returned unchanged (nothing to leak).
+ *
+ * SCOPE: this is DEFENSE-IN-DEPTH; the PRIMARY protection is the env_read audit
+ * gate (a script cannot obtain a value to leak — whole or fragmented — without a
+ * recorded read that fails the PR pre-trust).  Bounded: O(|text| · minFragment)
+ * to scan, with no dependence on the number or placement of occurrences.
+ */
+export function maskValueFragmentsWith(
+  text: string,
+  matcher: FragmentMatcher,
+  label = 'REDACTED',
+): string {
+  const { grams, capped, minFragment } = matcher;
+  if (text.length < minFragment) return text; // too short to hold a >= floor fragment
+  const replacement = `<${label}>`;
+  if (capped) return replacement; // coverage not guaranteed → fail closed
   if (grams.size === 0) return text;
   const n = text.length;
   let out = '';
@@ -186,6 +215,21 @@ export function maskValueFragments(
   }
   out += text.slice(i); // trailing run shorter than minFragment cannot be a gram
   return out;
+}
+
+/**
+ * One-shot convenience: build the matcher and scan in a single call.  Use this
+ * for a per-BUFFER caller (or a test); a per-LINE caller MUST instead build the
+ * matcher once via {@link buildFragmentMatcher} and reuse {@link
+ * maskValueFragmentsWith}, or it rebuilds the O(sum |V|) gram set every line.
+ */
+export function maskValueFragments(
+  text: string,
+  values: readonly string[],
+  label = 'REDACTED',
+  minFragment = DEFAULT_MIN_FRAGMENT,
+): string {
+  return maskValueFragmentsWith(text, buildFragmentMatcher(values, minFragment), label);
 }
 
 /**

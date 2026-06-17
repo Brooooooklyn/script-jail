@@ -6,7 +6,14 @@
 
 import { describe, it, expect } from 'vitest';
 
-import { redactCredentialShapes, maskExactValues, maskValueFragments } from '../../src/shared/redact.js';
+import {
+  redactCredentialShapes,
+  maskExactValues,
+  maskValueFragments,
+  maskValueFragmentsWith,
+  buildFragmentMatcher,
+  type FragmentMatcher,
+} from '../../src/shared/redact.js';
 
 describe('redactCredentialShapes', () => {
   it('drops userinfo from a scheme://user:pass@host URL, keeping scheme + host', () => {
@@ -230,31 +237,40 @@ describe('maskValueFragments', () => {
     expect(performance.now() - start).toBeLessThan(2000);
   });
 
-  it('FAILS CLOSED (masks the whole text) when a declared set exceeds the gram ceiling (F6 round-3 #6)', () => {
-    // A pathological declared set whose EARLY values fill the gram ceiling must
-    // NOT silently stop covering LATER values — that would leak a later value's
-    // fragment purely by list order.  Instead the whole text is masked.
-    // Deterministic high-entropy filler (mulberry32) so the ceiling is reliably
-    // exceeded across runs (1.1M distinct 8-grams > the 2^20 ceiling).
-    const makeHuge = (len: number): string => {
-      let a = 0x9e3779b9 >>> 0;
+  it('does NOT blackhole a large but OS-bounded declared set — full coverage, not fail-closed (review #7)', () => {
+    // 64 declared values of 17 KB each ≈ 1.09 MiB total — a realistic upper bound
+    // for a CI `protected.env` (several base64 certs / kubeconfigs).  This is well
+    // under the 2^22 ceiling, so it must get FULL fragment coverage: a benign line
+    // is UNTOUCHED (not masked to `<R>`) and a real fragment of one value IS
+    // masked.  (Pre-fix the ~1M ceiling was reachable here and blackholed lines.)
+    const vals = Array.from({ length: 64 }, (_, v) => {
+      let a = (v * 2654435761) >>> 0;
       const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
       let s = '';
-      for (let i = 0; i < len; i += 1) {
+      for (let i = 0; i < 17_000; i += 1) {
         a = (a + 0x6d2b79f5) >>> 0;
         let t = Math.imul(a ^ (a >>> 15), 1 | a);
         t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
         s += alpha[((t ^ (t >>> 14)) >>> 0) % alpha.length];
       }
       return s;
-    };
-    const huge = makeHuge(1_100_000); // fills the ceiling before `later` is reached
-    const later = 'SECRET12LEAKTAILMOREDATA';
-    const out = maskValueFragments(`x ${later.slice(0, 14)} y`, [huge, later], 'R');
-    // fail-closed: `x <R> y` would mean the ceiling was NOT hit (later got covered
-    // normally); the bare `<R>` whole-text mask proves the fail-closed path ran
-    // and the later value's 14-char fragment did not survive.
-    expect(out).not.toContain('SECRET12LEAKTA');
-    expect(out).toBe('<R>');
+    });
+    const matcher = buildFragmentMatcher(vals);
+    expect(matcher.capped).toBe(false); // under the ceiling → NOT fail-closed
+    const benign = 'info: building project, installing devDependencies, done';
+    expect(maskValueFragmentsWith(benign, matcher, 'R')).toBe(benign); // not blackholed
+    const frag = vals[40]!.slice(100, 124); // a 24-char interior slice of a declared value
+    expect(maskValueFragmentsWith(`leak ${frag} end`, matcher, 'R')).toBe('leak <R> end');
+  });
+
+  it('FAILS CLOSED (whole-text mask) when the matcher is capped, but passes short lines through', () => {
+    // Direct test of the fail-closed behavior via a hand-built capped matcher —
+    // the 2^22 ceiling is unreachable by OS-bounded inputs, so exercise the path
+    // without allocating millions of grams.  A capped matcher masks the whole
+    // line rather than risk leaking a later value's uncovered fragment; a line
+    // too short to hold any fragment (< minFragment) is still returned unchanged.
+    const capped: FragmentMatcher = { grams: new Set<string>(), capped: true, minFragment: 8 };
+    expect(maskValueFragmentsWith('an ordinary diagnostic line', capped, 'R')).toBe('<R>');
+    expect(maskValueFragmentsWith('short', capped, 'R')).toBe('short'); // < 8 chars → nothing to leak
   });
 });

@@ -26727,16 +26727,14 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   return out;
 }
 var DEFAULT_MIN_FRAGMENT = 8;
-var FRAGMENT_MAX_GRAMS = 1 << 20;
-function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFAULT_MIN_FRAGMENT) {
-  if (text.length < minFragment) return text;
-  const replacement = `<${label}>`;
+var FRAGMENT_MAX_GRAMS = 1 << 22;
+function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
   const grams = /* @__PURE__ */ new Set();
   let capped = false;
   for (const v of values) {
     if (v.length <= minFragment) continue;
-    for (let i2 = 0; i2 + minFragment <= v.length; i2 += 1) {
-      grams.add(v.slice(i2, i2 + minFragment));
+    for (let i = 0; i + minFragment <= v.length; i += 1) {
+      grams.add(v.slice(i, i + minFragment));
       if (grams.size >= FRAGMENT_MAX_GRAMS) {
         capped = true;
         break;
@@ -26744,6 +26742,12 @@ function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFA
     }
     if (capped) break;
   }
+  return { grams, capped, minFragment };
+}
+function maskValueFragmentsWith(text, matcher, label = "REDACTED") {
+  const { grams, capped, minFragment } = matcher;
+  if (text.length < minFragment) return text;
+  const replacement = `<${label}>`;
   if (capped) return replacement;
   if (grams.size === 0) return text;
   const n = text.length;
@@ -27004,9 +27008,10 @@ async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = 
   io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
 `);
   const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
+  const fragMatcher = buildFragmentMatcher(sensitive);
   const onLine = (stream, line) => {
     let safe = maskExactValues(line, sensitive, "REDACTED:ENV", 1);
-    safe = maskValueFragments(safe, sensitive, "REDACTED:ENV");
+    safe = maskValueFragmentsWith(safe, fragMatcher, "REDACTED:ENV");
     safe = redactCredentialShapes(safe);
     (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
 `);
