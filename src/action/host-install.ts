@@ -491,6 +491,20 @@ const PM_CONFIG_AUTH_SCALARS = new Set([
   // host list), no exec.  npm treats both as "Unknown env config" (ignores — harmless).
   'http_proxy', // pnpm `http-proxy`
   'no_proxy', // pnpm `no-proxy`
+  // Network binding + fetch tuning — pure data (a validated IP, an int), never an
+  // exec/loader/config-FILE selector.  VERIFIED env-settable on npm 11.13.0 + pnpm
+  // 11.1.2 (pnpm_config_ form) + pnpm 10.34.3 (npm_config_ form): multi-homed /
+  // internal-registry / slow-registry installs legitimately need these to REACH the
+  // registry, and the clean-VM audit inherits none, so the host must be able to too.
+  // `network_concurrency` is pnpm-only (npm ignores as "Unknown env config" — no-op).
+  'local_address', // source IP for a multi-homed runner (npm validates it as an IP)
+  'maxsockets', // connection pool size
+  'fetch_timeout', // request timeout (ms)
+  'fetch_retries', // retry count for a flaky internal registry
+  'fetch_retry_factor',
+  'fetch_retry_mintimeout',
+  'fetch_retry_maxtimeout',
+  'network_concurrency', // pnpm-only request concurrency
 ]);
 
 /**
@@ -525,16 +539,38 @@ function isAllowedPmConfigKey(slice: string): boolean {
 }
 
 // The ONLY inherited `YARN_*` env kept on the host yarn child (allowlist — every
-// other YARN_* config is dropped; see hostInstallEnv).  These four are the scalar
-// auth/registry settings a private-registry install needs and that the env->config
-// transform can actually set (VERIFIED yarn 4.5.0: map settings npmScopes/
-// npmRegistries are NOT flat-env-settable, so per-scope auth lives in the rc, not
-// env).  None is a path/exec/inject vector.
+// other YARN_* config is dropped; see hostInstallEnv).  Yarn maps `YARN_<UPPER_SNAKE>`
+// -> camelCase config and ENV BEATS the rc, over an open-ended, per-release-growing
+// surface — so the keep-list is restricted to scalar auth/registry + pure-ROUTING
+// network settings a private/internal-registry or proxied install genuinely needs,
+// each VERIFIED (yarn 4.9.1) env-settable + pure data (string/int), never a
+// folder/plugin/constraints/env-file redirect or exec/inject vector.
+//   *_NPM_*            scalar auth/registry (map npmScopes/npmRegistries are NOT
+//                      flat-env-settable, so per-scope auth lives in the rc, not env).
+//   *_HTTP(S)_PROXY    proxy URLs — Yarn IGNORES unprefixed HTTP_PROXY/HTTPS_PROXY,
+//                      so these are the only way to proxy a host yarn install.
+//   *_HTTP_TIMEOUT/RETRY, *_NETWORK_CONCURRENCY  ints (got timeout/retry/concurrency).
+// DELIBERATELY EXCLUDED (kept dangerous):
+//   - YARN_NETWORK_SETTINGS — a per-host MAP carrying its own file-path + enableNetwork
+//     sub-keys (the config-parsed class).
+//   - YARN_UNSAFE_HTTP_WHITELIST / YARN_ENABLE_STRICT_SSL — pure data, but they WEAKEN
+//     the TLS/cleartext defaults the clean-VM audit ran with.
+//   - YARN_HTTPS_{CA,KEY,CERT}_FILE_PATH — read as PEM TLS MATERIAL only (no parse/
+//     require), BUT a PR-controllable CA is a TLS-TRUST surface, not routing; and a
+//     self-signed internal registry fails at AUDIT time too (the audit inherits no CA),
+//     so a host-only CA can't enable that scenario.  Kept out to match yarn's
+//     conservative drop and avoid widening trust.
+//   - every *Folder / constraintsPath / injectEnvironmentFiles / enableScripts.
 const YARN_ENV_ALLOW = new Set([
   'YARN_NPM_AUTH_TOKEN',
   'YARN_NPM_AUTH_IDENT',
   'YARN_NPM_REGISTRY_SERVER',
   'YARN_NPM_ALWAYS_AUTH',
+  'YARN_HTTP_PROXY', // -> httpProxy (URL)
+  'YARN_HTTPS_PROXY', // -> httpsProxy (URL)
+  'YARN_HTTP_TIMEOUT', // -> httpTimeout (int)
+  'YARN_HTTP_RETRY', // -> httpRetry (int)
+  'YARN_NETWORK_CONCURRENCY', // -> networkConcurrency (int)
 ]);
 
 /**

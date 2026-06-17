@@ -27003,8 +27003,27 @@ var PM_CONFIG_AUTH_SCALARS = /* @__PURE__ */ new Set([
   // host list), no exec.  npm treats both as "Unknown env config" (ignores — harmless).
   "http_proxy",
   // pnpm `http-proxy`
-  "no_proxy"
+  "no_proxy",
   // pnpm `no-proxy`
+  // Network binding + fetch tuning — pure data (a validated IP, an int), never an
+  // exec/loader/config-FILE selector.  VERIFIED env-settable on npm 11.13.0 + pnpm
+  // 11.1.2 (pnpm_config_ form) + pnpm 10.34.3 (npm_config_ form): multi-homed /
+  // internal-registry / slow-registry installs legitimately need these to REACH the
+  // registry, and the clean-VM audit inherits none, so the host must be able to too.
+  // `network_concurrency` is pnpm-only (npm ignores as "Unknown env config" — no-op).
+  "local_address",
+  // source IP for a multi-homed runner (npm validates it as an IP)
+  "maxsockets",
+  // connection pool size
+  "fetch_timeout",
+  // request timeout (ms)
+  "fetch_retries",
+  // retry count for a flaky internal registry
+  "fetch_retry_factor",
+  "fetch_retry_mintimeout",
+  "fetch_retry_maxtimeout",
+  "network_concurrency"
+  // pnpm-only request concurrency
 ]);
 function isAllowedPmConfigKey(slice) {
   if (slice.startsWith("//")) return true;
@@ -27015,7 +27034,17 @@ var YARN_ENV_ALLOW = /* @__PURE__ */ new Set([
   "YARN_NPM_AUTH_TOKEN",
   "YARN_NPM_AUTH_IDENT",
   "YARN_NPM_REGISTRY_SERVER",
-  "YARN_NPM_ALWAYS_AUTH"
+  "YARN_NPM_ALWAYS_AUTH",
+  "YARN_HTTP_PROXY",
+  // -> httpProxy (URL)
+  "YARN_HTTPS_PROXY",
+  // -> httpsProxy (URL)
+  "YARN_HTTP_TIMEOUT",
+  // -> httpTimeout (int)
+  "YARN_HTTP_RETRY",
+  // -> httpRetry (int)
+  "YARN_NETWORK_CONCURRENCY"
+  // -> networkConcurrency (int)
 ]);
 function isDangerousEnvName(name) {
   const lower = name.toLowerCase();

@@ -235,6 +235,43 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
+  it('keeps yarn pure-routing proxy/tuning env, still drops TLS-trust + weakening + config-map keys (round-13)', () => {
+    // VERIFIED yarn 4.9.1: YARN_HTTP_PROXY->httpProxy / YARN_HTTPS_PROXY->httpsProxy
+    // (yarn IGNORES unprefixed HTTP_PROXY), YARN_HTTP_TIMEOUT/RETRY + YARN_NETWORK_CONCURRENCY
+    // are ints — all pure routing, no exec/file.  Still DROPPED: YARN_NETWORK_SETTINGS
+    // (config MAP), YARN_ENABLE_STRICT_SSL / YARN_UNSAFE_HTTP_WHITELIST (weaken TLS),
+    // YARN_HTTPS_CA_FILE_PATH (TLS-trust surface), and exec/folder keys.
+    let seen: NodeJS.ProcessEnv = {};
+    const spawn: HostSpawn = (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; };
+    const keep = {
+      YARN_HTTP_PROXY: 'http://proxy.local:8080/',
+      YARN_HTTPS_PROXY: 'http://proxy.local:8443/',
+      YARN_HTTP_TIMEOUT: '120000',
+      YARN_HTTP_RETRY: '5',
+      YARN_NETWORK_CONCURRENCY: '8',
+    };
+    const drop = {
+      YARN_NETWORK_SETTINGS: '{"//host":{"enableNetwork":true}}', // config MAP
+      YARN_ENABLE_STRICT_SSL: 'false', // weakens TLS
+      YARN_UNSAFE_HTTP_WHITELIST: '*.evil.example', // weakens cleartext guard
+      YARN_HTTPS_CA_FILE_PATH: '/checkout/ca.pem', // TLS-trust surface — stays dropped
+      YARN_GLOBAL_FOLDER: '/checkout/.yarn', // folder redirect
+    };
+    const prior: Record<string, string | undefined> = {};
+    for (const k of [...Object.keys(keep), ...Object.keys(drop)]) prior[k] = process.env[k];
+    try {
+      Object.assign(process.env, keep, drop);
+      hostInstallNoScripts('yarn', '/repo', [], makeRecorder().io, spawn);
+      for (const [k, v] of Object.entries(keep)) expect(seen[k]).toBe(v); // routing keys survive
+      for (const k of Object.keys(drop)) expect(seen[k]).toBeUndefined(); // dangerous/weakening dropped
+    } finally {
+      for (const [k, v] of Object.entries(prior)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
   it('drops inherited COREPACK_* version-steering, re-pins only the download prompt (codex corepack skew)', () => {
     // SECURITY: COREPACK_ENABLE_PROJECT_SPEC=0 makes corepack IGNORE the repo's
     // packageManager field and run a DIFFERENT pm VERSION than the clean-VM audit
@@ -1521,6 +1558,38 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['npm_config_http-proxy']).toBe('http://proxy.local:8080/');
     expect(out['pnpm_config_no-proxy']).toBe('localhost,.internal');
     expect(out['pnpm_config_script_shell']).toBeUndefined(); // control: exec key still dropped
+  });
+
+  it('stripDangerousEnv preserves npm/pnpm network binding + fetch tuning (round-13 — local_address, maxsockets, fetch-*)', () => {
+    // VERIFIED npm 11.13.0 + pnpm 11.1.2/10.34.3: these are pure network DATA (a
+    // validated IP, ints) needed by multi-homed / internal / slow registries to REACH
+    // the registry; the clean-VM audit inherits none, so the host must be able to set
+    // them.  None selects an exec/loader/config-FILE.  network_concurrency is pnpm-only
+    // (npm ignores it as Unknown env config — harmless to keep).
+    const out = stripDangerousEnv({
+      npm_config_local_address: '10.0.0.5',
+      'npm_config_local-address': '10.0.0.5', // hyphen alias
+      pnpm_config_local_address: '10.0.0.5',
+      npm_config_maxsockets: '4',
+      npm_config_fetch_timeout: '60000',
+      npm_config_fetch_retries: '5',
+      'npm_config_fetch-retry-factor': '2',
+      npm_config_fetch_retry_mintimeout: '1000',
+      npm_config_fetch_retry_maxtimeout: '60000',
+      pnpm_config_network_concurrency: '8', // pnpm-only
+      npm_config_cache: '/checkout/.npm', // control: path redirect still dropped
+    });
+    expect(out['npm_config_local_address']).toBe('10.0.0.5');
+    expect(out['npm_config_local-address']).toBe('10.0.0.5');
+    expect(out['pnpm_config_local_address']).toBe('10.0.0.5');
+    expect(out['npm_config_maxsockets']).toBe('4');
+    expect(out['npm_config_fetch_timeout']).toBe('60000');
+    expect(out['npm_config_fetch_retries']).toBe('5');
+    expect(out['npm_config_fetch-retry-factor']).toBe('2');
+    expect(out['npm_config_fetch_retry_mintimeout']).toBe('1000');
+    expect(out['npm_config_fetch_retry_maxtimeout']).toBe('60000');
+    expect(out['pnpm_config_network_concurrency']).toBe('8');
+    expect(out['npm_config_cache']).toBeUndefined(); // control: non-network key still dropped
   });
 
   it('stripDangerousEnv npm_config_/pnpm_config_ is an ALLOWLIST: benign non-auth keys dropped, full auth surface preserved', () => {
