@@ -22,7 +22,7 @@ import {
   toJsonPayload,
   spawnVm,
   assertVmHelperEntitlement,
-  defaultCodesignEnv,
+  sanitizedHostEnv,
   VZ_ENTITLEMENT,
   MacOSVmBinaryNotFoundError,
   MacOSVmArtifactNotFoundError,
@@ -53,6 +53,17 @@ describe('resolveScriptJailVmBinary', () => {
     const envBin = touchExe(join(scratch, 'env-bin', 'script-jail-vm'));
     const found = resolveScriptJailVmBinary({ envOverride: envBin });
     expect(found).toBe(envBin);
+  });
+
+  it('FAILS CLOSED on a non-absolute SCRIPT_JAIL_VM_BIN (codex round-8 — checkout-relative override)', () => {
+    // A relative override would `existsSync` + spawn against the process cwd (the
+    // checkout), so a PR-committed `./script-jail-vm` must NOT be resolvable.
+    expect(() =>
+      resolveScriptJailVmBinary({ envOverride: './script-jail-vm' }),
+    ).toThrow(/must be an absolute path/);
+    expect(() =>
+      resolveScriptJailVmBinary({ envOverride: 'bin/script-jail-vm' }),
+    ).toThrow(/must be an absolute path/);
   });
 
   it('falls back to target/release/script-jail-vm when env override is absent', () => {
@@ -418,18 +429,18 @@ describe('spawnVm — preflights', () => {
 });
 
 // ---------------------------------------------------------------------------
-// defaultCodesignEnv — the env the default (non-injected) codesign runner spawns
+// sanitizedHostEnv — the env every pre-trust host exec in spawnVm uses (the
+// `codesign -d` entitlement preflight AND the VZ helper boot)
 // ---------------------------------------------------------------------------
 //
-// The entitlement preflight is a read-only `codesign -d`, but it is still a
-// pre-trust, BARE-NAME host exec (runs in spawnVm BEFORE the audit produces /
-// diffs the lock).  Pin that the default runner spawns it with the SAME
-// `stripDangerousEnv` policy the other backends use — a checkout-prepended PATH
-// cannot resolve a PR-committed `./codesign`, and no inherited loader var
-// (DYLD_*/LD_*/NODE_OPTIONS) can inject into it.
+// Both run in spawnVm BEFORE the audit produces / diffs the lock.  The codesign
+// preflight is a BARE-NAME exec (a checkout-prepended PATH cannot resolve a
+// PR-committed `./codesign`); the VZ helper is absolute-path but ad-hoc signed
+// and honours DYLD_*, so no inherited loader var (DYLD_*/LD_*/NODE_OPTIONS) may
+// reach it.  Pin the SAME `stripDangerousEnv` policy the other backends use.
 
-describe('defaultCodesignEnv — the default codesign runner uses a sanitized env', () => {
-  // defaultCodesignEnv() sanitizes the REAL process.env, so set the vars there
+describe('sanitizedHostEnv — pre-trust host execs (codesign + VZ helper) use a sanitized env', () => {
+  // sanitizedHostEnv() sanitizes the REAL process.env, so set the vars there
   // (mirrors test/action/backend/bare.test.ts's GITHUB_WORKSPACE save/restore).
   const SAVED = {
     GITHUB_WORKSPACE: process.env['GITHUB_WORKSPACE'],
@@ -463,7 +474,7 @@ describe('defaultCodesignEnv — the default codesign runner uses a sanitized en
   });
 
   it('strips DYLD_INSERT_LIBRARIES / NODE_OPTIONS and drops the checkout PATH dir', () => {
-    const env = defaultCodesignEnv();
+    const env = sanitizedHostEnv();
 
     // dangerous loader/config selectors dropped
     expect(env['DYLD_INSERT_LIBRARIES']).toBeUndefined();

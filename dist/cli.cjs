@@ -7957,6 +7957,11 @@ function resolveScriptJailVmBinary(opts) {
   const searched = [];
   const envBin = opts?.envOverride !== void 0 ? opts.envOverride : process.env["SCRIPT_JAIL_VM_BIN"];
   if (envBin !== void 0 && envBin !== "") {
+    if (!(0, import_node_path2.isAbsolute)(envBin)) {
+      throw new Error(
+        `script-jail: SCRIPT_JAIL_VM_BIN must be an absolute path (got ${JSON.stringify(envBin)}); a relative override would resolve the VZ helper against the checkout.`
+      );
+    }
     searched.push(`${envBin} (SCRIPT_JAIL_VM_BIN)`);
     if ((0, import_node_fs2.existsSync)(envBin)) return envBin;
   }
@@ -7989,13 +7994,13 @@ function checkArtifacts(cfg) {
   }
 }
 var VZ_ENTITLEMENT = "com.apple.security.virtualization";
-function defaultCodesignEnv() {
+function sanitizedHostEnv() {
   return stripDangerousEnv(process.env);
 }
 var defaultCodesignRunner = (args) => {
   const result = (0, import_node_child_process.spawnSync)("codesign", [...args], {
     encoding: "utf8",
-    env: defaultCodesignEnv()
+    env: sanitizedHostEnv()
   });
   return {
     status: result.status,
@@ -8071,7 +8076,8 @@ async function spawnVm(vmConfig, options = {}) {
   process.on("SIGTERM", onSignal);
   try {
     child = (0, import_node_child_process.spawn)(binary, ["boot", "--config", configJsonPath], {
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      env: sanitizedHostEnv()
     });
     child.stderr.on("data", (chunk) => {
       stderrTail.append(chunk);
