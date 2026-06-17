@@ -1150,6 +1150,25 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     GIT_CONFIG_SYSTEM: './ci/gitsystem',
     GIT_CONFIG_COUNT: '1',
     GIT_TEMPLATE_DIR: './ci/template',
+    // git EXEC selectors verified to run checkout code pre-trust (codex round 2).
+    GIT_EXEC_PATH: './core', // VERIFIED: runs checkout core/git-remote-https
+    GIT_CONFIG_PARAMETERS: "'core.sshCommand=./ci/ssh'", // VERIFIED: runs ./ci/ssh
+    GIT_PAGER: './ci/pager',
+    GIT_EDITOR: './ci/editor',
+    GIT_ASKPASS: './ci/askpass',
+    SSH_ASKPASS: './ci/askpass',
+    // node-gyp native-build selectors (codex round 2, verified checkout exec).
+    NODE_GYP_FORCE_PYTHON: './ci/fake-python', // node_gyp_ family prefix
+    PYTHONPATH: './ci/pypath', // python family prefix (sitecustomize exec)
+    PYTHONHOME: './ci/pyhome',
+    npm_config_make: './ci/fake-make', // npm_config_* canonical key `make`
+    npm_package_config_node_gyp_python: './ci/pkg-python', // npm_package_config_ family
+    // node module-search + shell/lang startup hooks.
+    NODE_PATH: './ci/nodepath',
+    BASH_ENV: './ci/bashenv',
+    ZDOTDIR: './ci/zdot',
+    PERL5LIB: './ci/perl',
+    RUBYOPT: '-r./ci/ruby',
     // TLS trust file (MITM the host fetch).
     NODE_EXTRA_CA_CERTS: './ci/ca.pem',
   };
@@ -1193,19 +1212,29 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     },
   );
 
-  it('does NOT strip GIT_ALLOW_PROTOCOL (a restricting var) or legit env (CI/NODE_AUTH_TOKEN)', () => {
-    process.env['GIT_ALLOW_PROTOCOL'] = 'https'; // restricts — must be preserved
-    process.env['CI'] = 'true';
-    process.env['NODE_AUTH_TOKEN'] = 'tok-keep-me';
-    process.env['MY_UNRELATED_VAR'] = 'value-keep-me';
+  it('does NOT strip legit env: git behaviour flags, registry/auth, NODE_ENV/ENV, build vars', () => {
+    // Family/enumerated stripping must not over-reach: restricting git flags, the
+    // registry + auth tokens the host legitimately ADDS over the audit, NODE_ENV
+    // (not a loader var), POSIX `ENV` (an env-NAME, not the sh startup hook for
+    // `sh -c`), and arbitrary build vars all survive.
+    const KEEP: Record<string, string> = {
+      GIT_ALLOW_PROTOCOL: 'https', // restricts, never weakens
+      GIT_TERMINAL_PROMPT: '0', // behaviour flag (blanket GIT_* would wrongly drop it)
+      CI: 'true',
+      NODE_ENV: 'production', // NOT NODE_OPTIONS/NODE_PATH — must be kept
+      ENV: 'production', // not the interactive-sh startup file for `sh -c`
+      NODE_AUTH_TOKEN: 'tok-keep-me',
+      npm_config_registry: 'https://registry.npmjs.org/',
+      'npm_config_//registry.npmjs.org/:_authToken': 'npm-auth-keep',
+      HTTPS_PROXY: 'http://proxy.internal:8080',
+      MY_UNRELATED_VAR: 'value-keep-me',
+    };
+    for (const [k, v] of Object.entries(KEEP)) process.env[k] = v;
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
     hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
     const env = envs[0]!;
-    expect(env['GIT_ALLOW_PROTOCOL']).toBe('https');
-    expect(env['CI']).toBe('true');
-    expect(env['NODE_AUTH_TOKEN']).toBe('tok-keep-me');
-    expect(env['MY_UNRELATED_VAR']).toBe('value-keep-me');
+    for (const [k, v] of Object.entries(KEEP)) expect(env[k]).toBe(v);
   });
 
   it('the git BINARY stays pinned (npm_config_git) even when GIT_SSH_COMMAND is stripped', () => {

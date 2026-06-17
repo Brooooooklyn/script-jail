@@ -286,68 +286,103 @@ const HOST_INSTALL_STRIP_ENV_NAMES = new Set([
 // lifecycle scripts with a realistic env, so arbitrary owner/workflow vars
 // (build flags, non-secret config, registry auth tokens) have to pass through;
 // an env allowlist would break legitimate native/build scripts.  The dangerous
-// surface is specifically binary/shell/library/config-FILE *selectors*, which is
-// enumerable — and the npm_config_* slice is now separator/case-canonicalized so
-// the hyphen-alias bypass is closed.  Residual: a future NOVEL npm config exec
-// key not yet in the set; the SANDBOX (the enforcement boundary, which audits
-// whatever it is given) is the real backstop.  Defense-in-depth, not a complete
-// oracle close — mirrors the npm_config_git pin rationale.
+// surface is specifically binary/shell/library/config-FILE *selectors*, matched
+// by whole FAMILY where possible (prefix) so future additions are covered without
+// name-enumeration, plus the canonicalized npm_config_* slice and an enumerated
+// git-exec set.  Residual: a NOVEL selector outside every family/set (or a future
+// npm exec key); the SANDBOX (the enforcement boundary, which audits whatever it
+// is given) is the real backstop.  Defense-in-depth, not a complete oracle close
+// — mirrors the npm_config_git pin rationale.
+//
+// PARITY MAKES FAMILY-STRIPPING SAFE: the Firecracker/Docker guest audits inside
+// a CLEAN VM env — `sanitizeLifecycleBaseEnv` (src/guest/agent.ts) runs over the
+// VM's own process.env, which never contains the runner's GIT_*/LD_*/PYTHON*/
+// NODE_OPTIONS.  So anything that PASSED the audit was built WITHOUT these vars;
+// dropping the whole family on the host only brings it to parity and cannot break
+// a build the audit approved.  The host legitimately ADDS only secrets/registry/
+// proxy (tokens, npm_config_//registry/:_authToken, HTTP(S)_PROXY) — none of which
+// are tool/loader/config-FILE *selectors* — so those keep flowing.  That lets us
+// match by PREFIX FAMILY (robust to future additions) instead of chasing every
+// individual name, plus an enumerated git-exec set (git's exec surface is stable
+// and documented; blanket GIT_* is avoided so behaviour flags like
+// GIT_TERMINAL_PROMPT can't be dropped and hang a clone).
+
+// Exact loader/tool/config-FILE SELECTOR names not already caught by a family
+// prefix below.  Lower-cased; matched case-insensitively.
 const HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
   [
-    // [13] Node loader hooks (Node-based PM child execs these pre-trust).
+    // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
     'NODE_OPTIONS',
     'NODE_REPL_EXTERNAL_MODULE',
-    // [17] ELF dynamic-loader preload/audit + lib search path.
-    'LD_PRELOAD',
-    'LD_AUDIT',
-    'LD_LIBRARY_PATH',
-    // [17] macOS dyld analogs (the host bare backend runs on macOS).
-    'DYLD_INSERT_LIBRARIES',
-    'DYLD_LIBRARY_PATH',
-    'DYLD_FORCE_FLAT_NAMESPACE',
-    // [19] Git transport-command overrides (git+ssh deps; --ignore-scripts does
-    // NOT stop git from being invoked).  GIT_ALLOW_PROTOCOL is NOT here — it
-    // restricts, never weakens.  The git BINARY stays pinned via npm_config_git.
+    'NODE_EXTRA_CA_CERTS',
+    'NODE_PATH', // adds require() search dirs → a checkout-relative one loads PR code
+    // [19] Git EXEC/config-FILE selectors (git+ssh|https deps; --ignore-scripts
+    // does NOT stop git being invoked).  Enumerated (not blanket GIT_*) so benign
+    // behaviour flags such as GIT_TERMINAL_PROMPT/GIT_ALLOW_PROTOCOL are preserved.
+    // The git BINARY itself stays pinned via npm_config_git.
     'GIT_SSH_COMMAND',
     'GIT_SSH',
     'GIT_PROXY_COMMAND',
     'GIT_EXTERNAL_DIFF',
-    // [19] Git config/template injection: an env-supplied global/system config
-    // or template dir lets a checkout-relative file set core.sshCommand /
-    // core.fsmonitor / a clone hook → exec under the pinned git.  GIT_CONFIG_COUNT
-    // enables the inline GIT_CONFIG_KEY_*/VALUE_* pairs, so dropping COUNT makes
-    // them inert.
+    'GIT_PAGER',
+    'GIT_EDITOR',
+    'GIT_ASKPASS', // verified-class: git invokes the askpass program by path
+    'SSH_ASKPASS',
+    'GIT_EXEC_PATH', // VERIFIED: GIT_EXEC_PATH=./core runs checkout core/git-remote-https
+    'GIT_TEMPLATE_DIR', // clone hooks dir
     'GIT_CONFIG_GLOBAL',
     'GIT_CONFIG_SYSTEM',
-    'GIT_CONFIG_COUNT',
-    'GIT_TEMPLATE_DIR',
-    // Native-build TOOL selectors honored by node-gyp/gyp/make: a checkout-
-    // relative interpreter/compiler/make runs during a native `npm rebuild`
-    // (verified: node-gyp reads process.env.PYTHON; npm_config_python /
-    // npm_config_node-gyp are handled by the canonicalized npm_config_* check
-    // below).  Stripping forces node-gyp's own auto-detect (the system
-    // toolchain), which is the safe default and rarely needed by a legit build.
-    'PYTHON',
+    'GIT_CONFIG_COUNT', // gates inline GIT_CONFIG_KEY_*/VALUE_*; dropping it makes them inert
+    'GIT_CONFIG_PARAMETERS', // VERIFIED: ='core.sshCommand=./ssh' runs ./ssh on ssh:// clone
+    // Native-build TOOL selectors honored by node-gyp/gyp/make (checkout-relative
+    // interpreter/compiler/linker runs during a native `npm rebuild`).  PYTHON* and
+    // node-gyp* are caught by the family prefixes below.  Stripping forces the
+    // system toolchain auto-detect — the same default the clean-VM audit used.
     'CC',
     'CXX',
+    'CPP',
+    'LINK',
+    'LD',
+    'AR',
+    'AS',
     'MAKE',
-    // Node TLS trust file (a PR-controlled CA could MITM the host fetch the audit
-    // never saw; lockfile integrity is the real backstop, this is belt-and-braces).
-    'NODE_EXTRA_CA_CERTS',
+    // Shell / interpreter startup hooks that run on a NON-interactive spawn.
+    // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
+    // common legit "environment name" var, so it is deliberately NOT stripped.)
+    'BASH_ENV', // bash -c sources it
+    'ZDOTDIR', // zsh startup dir
+    'PERL5LIB',
+    'RUBYOPT',
+    'RUBYLIB',
   ].map((n) => n.toLowerCase()),
 );
+
+// Whole env-var FAMILIES (matched by lower-cased prefix) that are pure loader /
+// path / interpreter selectors — none have a legit INHERITED-install use the
+// clean-VM audit lacked, so dropping the family is parity-safe and closes future
+// additions without name-enumeration.
+const HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
+  'ld_', // ELF dynamic loader: LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH / …
+  'dyld_', // macOS dyld analogs (the host bare backend runs on macOS)
+  'python', // PYTHON / PYTHONPATH / PYTHONHOME / PYTHONSTARTUP (sitecustomize exec)
+  'node_gyp_', // NODE_GYP_FORCE_PYTHON, … (VERIFIED node-gyp interpreter selector)
+  // npm re-derives npm_package_config_* from the AUDITED package.json; an INHERITED
+  // one for a key absent from package.json would pass through to node-gyp
+  // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
+  // the legit values from the package.json the sandbox already audited.
+  'npm_package_config_',
+];
 
 // npm honors its `npm_config_*` config via env in ANY case AND with EITHER
 // separator: `NPM_CONFIG_SCRIPT_SHELL`, `npm_config_script_shell`, and
 // `npm_config_script-shell` ALL set the `script-shell` config (verified, npm
 // 11.13.0).  An exact-name denylist misses the hyphen form, so the npm_config_*
 // family is matched by CANONICALIZING the key (lowercase + `-`→`_`) against the
-// dangerous config keys below — robust to case/separator aliases.  Keys
-// (canonical underscore form):
+// dangerous config keys below.  Keys (canonical underscore form):
 //   script_shell             [18] lifecycle script interpreter
 //   ignore_scripts           [16] skip the audited scripts (self-DoS / divergence)
 //   userconfig / globalconfig [22] load a PR-controlled npmrc
-//   node_gyp / python        native-build tool selectors (checkout-relative exec)
+//   node_gyp / python / make native-build tool selectors (checkout-relative exec)
 //   shell                    npm's exec/explore shell
 const DANGEROUS_NPM_CONFIG_KEYS = new Set([
   'script_shell',
@@ -356,25 +391,28 @@ const DANGEROUS_NPM_CONFIG_KEYS = new Set([
   'globalconfig',
   'node_gyp',
   'python',
+  'make',
   'shell',
 ]);
 
 /**
- * True when `name` is a dangerous loader/config env var to strip.  Matched on
- * the LOWERCASED name (npm reads `npm_config_*` case-insensitively, and folding
- * the OS loader vars too is a cheap defensive catch-all).  The npm_config_*
- * family is additionally canonicalized for SEPARATOR aliases (`-`→`_`) so the
- * hyphen form `npm_config_script-shell` is caught alongside the underscore and
- * upper-case spellings — an exact-name set alone would miss it.
+ * True when `name` is a dangerous loader/tool/config-FILE selector env var to
+ * strip from the host PM children.  Matched on the LOWERCASED name: (1) a whole
+ * dangerous FAMILY by prefix, (2) the canonicalized `npm_config_*` slice
+ * (separator/case-robust so the `npm_config_script-shell` hyphen alias is caught),
+ * (3) the enumerated exact set.  npm_config_* names NOT in the dangerous-key set
+ * (registry, auth tokens, …) fall through and are preserved.
  */
 function isDangerousEnvName(name: string): boolean {
   const lower = name.toLowerCase();
-  if (HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower)) return true;
+  for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
+    if (lower.startsWith(prefix)) return true;
+  }
   if (lower.startsWith('npm_config_')) {
     const key = lower.slice('npm_config_'.length).replace(/-/g, '_');
-    if (DANGEROUS_NPM_CONFIG_KEYS.has(key)) return true;
+    return DANGEROUS_NPM_CONFIG_KEYS.has(key);
   }
-  return false;
+  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
 }
 
 /**
