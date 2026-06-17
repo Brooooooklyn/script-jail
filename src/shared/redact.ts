@@ -101,9 +101,15 @@ export function maskExactValues(
  * text.  A line span every one of whose `minFragment`-char windows is a
  * substring of a declared secret is treated as a leaked fragment and masked. */
 const DEFAULT_MIN_FRAGMENT = 8;
-/** Backstop on the gram set size (memory bound for a pathological declared set;
- * 2^18 eight-char grams ≈ a few MB).  Far above any real protected.env. */
-const FRAGMENT_MAX_GRAMS = 1 << 18;
+/** FAIL-CLOSED memory backstop on the gram set (≈1M eight-char grams ≈ ~80 MB).
+ * Sized far above a full OS-bounded environment's worth of distinct grams: a
+ * single env var is capped at ~128 KiB and the whole environment at a couple
+ * MiB, so a realistic 64-name `protected.env` yields orders of magnitude fewer
+ * grams than this and gets FULL fragment coverage.  If a pathological declared
+ * set ever exceeds the ceiling we do NOT silently stop adding later values'
+ * grams — that would leak a LATER value's fragment purely by list order
+ * (adversarial-review F6 round-3 #6) — we FAIL CLOSED and mask the whole text. */
+const FRAGMENT_MAX_GRAMS = 1 << 20;
 
 /**
  * Mask any span of `text` that is "secret-like" — i.e. every `minFragment`-char
@@ -131,8 +137,10 @@ const FRAGMENT_MAX_GRAMS = 1 << 18;
  * SCOPE: this is DEFENSE-IN-DEPTH; the PRIMARY protection is the env_read audit
  * gate (a script cannot obtain a value to leak — whole or fragmented — without a
  * recorded read that fails the PR pre-trust).  Bounded: O(sum |V|) to build the
- * gram set (capped at `FRAGMENT_MAX_GRAMS`) + O(|text| · minFragment) to scan,
- * with no dependence on the number or placement of occurrences.
+ * gram set + O(|text| · minFragment) to scan, with no dependence on the number
+ * or placement of occurrences.  The gram set carries a FAIL-CLOSED ceiling
+ * (`FRAGMENT_MAX_GRAMS`): a declared set so large it exceeds the ceiling masks
+ * the whole text rather than silently dropping a later value's coverage.
  */
 export function maskValueFragments(
   text: string,
@@ -141,19 +149,25 @@ export function maskValueFragments(
   minFragment = DEFAULT_MIN_FRAGMENT,
 ): string {
   if (text.length < minFragment) return text;
+  const replacement = `<${label}>`;
   // Build the gram set from EVERY declared value (cross-value in one pass — no
   // per-value race).  Values at or below the floor are whole-masked elsewhere.
   const grams = new Set<string>();
+  let capped = false;
   for (const v of values) {
     if (v.length <= minFragment) continue;
     for (let i = 0; i + minFragment <= v.length; i += 1) {
       grams.add(v.slice(i, i + minFragment));
-      if (grams.size >= FRAGMENT_MAX_GRAMS) break;
+      if (grams.size >= FRAGMENT_MAX_GRAMS) { capped = true; break; }
     }
-    if (grams.size >= FRAGMENT_MAX_GRAMS) break;
+    if (capped) break;
   }
+  // The declared set hit the memory ceiling before every value's grams were
+  // recorded → coverage can no longer be guaranteed for the LATER values, so
+  // fail closed (mask everything) rather than leak a later value's fragment by
+  // list order (adversarial-review F6 round-3 #6).
+  if (capped) return replacement;
   if (grams.size === 0) return text;
-  const replacement = `<${label}>`;
   const n = text.length;
   let out = '';
   let i = 0;

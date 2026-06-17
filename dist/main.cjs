@@ -26727,20 +26727,25 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   return out;
 }
 var DEFAULT_MIN_FRAGMENT = 8;
-var FRAGMENT_MAX_GRAMS = 1 << 18;
+var FRAGMENT_MAX_GRAMS = 1 << 20;
 function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFAULT_MIN_FRAGMENT) {
   if (text.length < minFragment) return text;
+  const replacement = `<${label}>`;
   const grams = /* @__PURE__ */ new Set();
+  let capped = false;
   for (const v of values) {
     if (v.length <= minFragment) continue;
     for (let i2 = 0; i2 + minFragment <= v.length; i2 += 1) {
       grams.add(v.slice(i2, i2 + minFragment));
-      if (grams.size >= FRAGMENT_MAX_GRAMS) break;
+      if (grams.size >= FRAGMENT_MAX_GRAMS) {
+        capped = true;
+        break;
+      }
     }
-    if (grams.size >= FRAGMENT_MAX_GRAMS) break;
+    if (capped) break;
   }
+  if (capped) return replacement;
   if (grams.size === 0) return text;
-  const replacement = `<${label}>`;
   const n = text.length;
   let out = "";
   let i = 0;

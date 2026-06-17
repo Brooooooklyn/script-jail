@@ -229,4 +229,32 @@ describe('maskValueFragments', () => {
     maskValueFragments(line, vals, 'R');
     expect(performance.now() - start).toBeLessThan(2000);
   });
+
+  it('FAILS CLOSED (masks the whole text) when a declared set exceeds the gram ceiling (F6 round-3 #6)', () => {
+    // A pathological declared set whose EARLY values fill the gram ceiling must
+    // NOT silently stop covering LATER values — that would leak a later value's
+    // fragment purely by list order.  Instead the whole text is masked.
+    // Deterministic high-entropy filler (mulberry32) so the ceiling is reliably
+    // exceeded across runs (1.1M distinct 8-grams > the 2^20 ceiling).
+    const makeHuge = (len: number): string => {
+      let a = 0x9e3779b9 >>> 0;
+      const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+      let s = '';
+      for (let i = 0; i < len; i += 1) {
+        a = (a + 0x6d2b79f5) >>> 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        s += alpha[((t ^ (t >>> 14)) >>> 0) % alpha.length];
+      }
+      return s;
+    };
+    const huge = makeHuge(1_100_000); // fills the ceiling before `later` is reached
+    const later = 'SECRET12LEAKTAILMOREDATA';
+    const out = maskValueFragments(`x ${later.slice(0, 14)} y`, [huge, later], 'R');
+    // fail-closed: `x <R> y` would mean the ceiling was NOT hit (later got covered
+    // normally); the bare `<R>` whole-text mask proves the fail-closed path ran
+    // and the later value's 14-char fragment did not survive.
+    expect(out).not.toContain('SECRET12LEAKTA');
+    expect(out).toBe('<R>');
+  });
 });
