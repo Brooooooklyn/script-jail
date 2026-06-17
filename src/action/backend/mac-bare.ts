@@ -38,7 +38,7 @@ import { platform as hostPlatform } from 'node:process';
 import type { AuditExecutionInput, LauncherResult } from '../../shared/run-audit.js';
 import { runAgentProcess } from './process.js';
 import { rewriteConfigWorkDir, stageRepoDirectory } from './stage.js';
-import { sanitizePathValue } from '../host-install.js';
+import { sanitizePathValue, stripDangerousEnv } from '../host-install.js';
 import {
   provisionNodeMac,
   defaultProvisionCacheDir,
@@ -179,6 +179,14 @@ export function createMacBareExecute(
     const provisioned: ProvisionedNodeMac = await doProvision({
       arch: deps.arch,
       cacheDir: defaultProvisionCacheDir(baseEnv),
+      // SECURITY (codex round-5 [critical]): provisioning runs ON THE HOST and
+      // BEFORE the audit trust gate — it spawns bare-name `tar`/`codesign`/
+      // `xattr` + Node-based `vp`/`corepack`.  Hand it the SAME sanitized env the
+      // orchestrator gets (checkout dirs dropped from PATH + dangerous
+      // loader/config selectors stripped) so a workflow-prepended
+      // `$GITHUB_WORKSPACE/bin` can't shadow a system tool and an inherited
+      // NODE_OPTIONS/DYLD_* can't inject into a provisioning child pre-trust.
+      env: stripDangerousEnv(baseEnv),
       // The bundled plain-arm64 substitutes the shim's SIP redirect points at:
       // staged as <shellShimDir>/bash and <shellShimDir>/coreutils.
       macBashPath: runtime.bashPath,

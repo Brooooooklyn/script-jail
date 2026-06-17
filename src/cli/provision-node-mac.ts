@@ -50,7 +50,6 @@
 // Everything here is darwin-only; the bare backend is the sole caller.  No
 // Linux path imports this module.
 
-import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
   copyFileSync,
@@ -95,6 +94,20 @@ export interface ProvisionNodeMacInput {
   http?: { download: NodeHttpClient['download'] };
   /** Test seam: run an external command (default: `runCommand`). */
   runCommand?: typeof runCommand;
+  /**
+   * Base env for EVERY host process this module spawns (vp, corepack, and the
+   * bare-name `tar`/`codesign`/`xattr` system tools).  Defaults to `process.env`.
+   *
+   * SECURITY (codex round-5 [critical]): provisioning runs pre-trust on the
+   * host, so the mac-bare backend passes a SANITIZED env here (checkout dirs
+   * dropped from PATH via `sanitizePathValue`, dangerous loader/config selectors
+   * stripped via `stripDangerousEnv`).  Without it a workflow-prepended
+   * `$GITHUB_WORKSPACE/bin` could shadow a PR-committed `tar`/`codesign`/`xattr`
+   * (resolved by bare name) and an inherited `NODE_OPTIONS`/`DYLD_*` could inject
+   * into the Node-based `vp`/`corepack` children — all before any audit.  This
+   * module is policy-agnostic: it just spawns with whatever env it is handed.
+   */
+  env?: NodeJS.ProcessEnv;
   /**
    * Absolute path to the bundled `bash` binary (bash built from source, plain
    * arm64; `images/bash-arm64`) staged as `<shellShimDir>/bash`.  Both /bin/sh
@@ -184,6 +197,10 @@ export async function provisionNodeMac(
   const doRunCommand = input.runCommand ?? runCommand;
   const http = input.http ?? new NodeHttpClient();
   const { arch, cacheDir } = input;
+  // Sanitized (by the caller) base env for every host spawn below.  See the
+  // `env` field doc: bare-name system tools resolve against this PATH and the
+  // Node-based vp/corepack inherit only these (stripped) selectors.
+  const baseEnv = input.env ?? process.env;
 
   mkdirSync(cacheDir, { recursive: true });
 
@@ -221,9 +238,9 @@ export async function provisionNodeMac(
   const cached = readMarker(markerPath);
   if (cached !== undefined) {
     const nodePath = cached.nodePath;
-    if (existsSync(nodePath) && codesignVerifies(nodePath, doRunCommand)) {
+    if (existsSync(nodePath) && codesignVerifies(nodePath, doRunCommand, baseEnv)) {
       mkdirSync(shellShimDir, { recursive: true });
-      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand, baseEnv);
       return {
         nodeBinDir: cached.nodeBinDir,
         nodePath,
@@ -241,13 +258,13 @@ export async function provisionNodeMac(
   mkdirSync(shellShimDir, { recursive: true });
 
   // 1. Download + SHA-256-verify the darwin vp tarball, extract `package/vp`.
-  const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand });
+  const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand, env: baseEnv });
 
   // 2. `vp env install <NODE_VERSION>` into the per-run VP_HOME.  Mirrors the
   //    Linux init.sh: vp lays the toolchain out as the standard Node tarball
   //    tree under <VP_HOME>/js_runtime/node/<version>/bin.
   const vpEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...baseEnv,
     VP_HOME: vpHome,
     COREPACK_HOME: join(vpHome, 'corepack'),
     COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
@@ -284,13 +301,13 @@ export async function provisionNodeMac(
   //    shims are plain shell scripts (no code signature to strip) that re-exec
   //    this same node binary, so re-signing node alone is sufficient for
   //    DYLD_* to be honoured across the whole toolchain.
-  resignAdHoc(nodePath, doRunCommand);
+  resignAdHoc(nodePath, doRunCommand, baseEnv);
 
   // 7. Stage + re-sign the two bundled multi-call binaries (bash + coreutils)
   //    into shellShimDir.  Filenames MUST match the shim's sip_redirect_target.
   //    Deliberately untracked by the marker — the fast path restages them on
   //    every cache hit (see above).
-  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand, baseEnv);
 
   // 8. Write the resign-marker LAST — its presence is the "fully provisioned"
   //    signal the fast path keys on.
@@ -367,6 +384,7 @@ async function fetchVpBinary(input: {
   root: string;
   http: { download: NodeHttpClient['download'] };
   runCommand: typeof runCommand;
+  env: NodeJS.ProcessEnv;
 }): Promise<string> {
   const { arch, root, http } = input;
   const url = vitePlusTarballUrl(arch, 'darwin');
@@ -380,7 +398,9 @@ async function fetchVpBinary(input: {
   await http.download(url, tgzPath, expectedSha);
 
   // Extract `package/vp` (the npm tarball layout: everything under `package/`).
-  input.runCommand('tar', ['-xzf', tgzPath, '-C', extractDir]);
+  // Bare-name `tar` resolves against the sanitized PATH in `input.env` (checkout
+  // dirs dropped) so a PR-committed `bin/tar` cannot shadow `/usr/bin/tar`.
+  input.runCommand('tar', ['-xzf', tgzPath, '-C', extractDir], { env: input.env });
 
   const vpBin = join(extractDir, 'package', 'vp');
   if (!existsSync(vpBin)) {
@@ -447,10 +467,14 @@ function prependPath(dir: string, env: NodeJS.ProcessEnv): string {
 function resignAdHoc(
   binPath: string,
   doRunCommand: typeof runCommand,
+  env: NodeJS.ProcessEnv,
   identifier?: string,
 ): void {
+  // Every spawn here is bare-name (`codesign` / `xattr`) and runs pre-trust, so
+  // each gets the sanitized `env`: resolves the system tool against a
+  // checkout-stripped PATH and never inherits a dangerous loader selector.
   // 1. Strip the existing (notarized/hardened) signature.
-  doRunCommand('codesign', ['--remove-signature', binPath]);
+  doRunCommand('codesign', ['--remove-signature', binPath], { env });
   // 2. Re-sign ad-hoc.  CRITICAL: NO `--options=runtime` — the hardened runtime
   //    is exactly what strips DYLD_INSERT_LIBRARIES.
   doRunCommand(
@@ -458,12 +482,20 @@ function resignAdHoc(
     identifier === undefined
       ? ['--force', '--sign', '-', binPath]
       : ['--force', '--sign', '-', '--identifier', identifier, binPath],
+    { env },
   );
   // 3. Strip the quarantine xattr (Gatekeeper would otherwise re-add hardened
-  //    enforcement on first exec).  Best-effort: the attr may be absent.
-  spawnSync('xattr', ['-d', 'com.apple.quarantine', binPath], { stdio: 'ignore' });
+  //    enforcement on first exec).  Best-effort: the attr may be absent, so a
+  //    non-zero exit (runCommand throws) is swallowed.  Routed through the
+  //    runCommand seam (not a raw spawnSync) so it (a) gets the sanitized env
+  //    and (b) is observable/sanitizable in tests like the codesign calls.
+  try {
+    doRunCommand('xattr', ['-d', 'com.apple.quarantine', binPath], { env });
+  } catch {
+    // attr absent / xattr unavailable — Gatekeeper concern only, not fatal.
+  }
   // 4. Verify the ad-hoc signature is valid (fails loudly if the re-sign broke).
-  doRunCommand('codesign', ['--verify', binPath]);
+  doRunCommand('codesign', ['--verify', binPath], { env });
 }
 
 /**
@@ -472,9 +504,13 @@ function resignAdHoc(
  * unit-testable; the criterion — codesign --verify's exit status — is
  * unchanged.
  */
-function codesignVerifies(binPath: string, doRunCommand: typeof runCommand): boolean {
+function codesignVerifies(
+  binPath: string,
+  doRunCommand: typeof runCommand,
+  env: NodeJS.ProcessEnv,
+): boolean {
   try {
-    doRunCommand('codesign', ['--verify', binPath]);
+    doRunCommand('codesign', ['--verify', binPath], { env });
     return true;
   } catch {
     return false;
@@ -499,9 +535,10 @@ function materializeShellShims(
   macBashPath: string,
   macCoreutilsPath: string,
   doRunCommand: typeof runCommand,
+  env: NodeJS.ProcessEnv,
 ): void {
-  materializeOne(macBashPath, join(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
-  materializeOne(macCoreutilsPath, join(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
+  materializeOne(macBashPath, join(shellShimDir, SHELL_SHIM_BASH), doRunCommand, env);
+  materializeOne(macCoreutilsPath, join(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand, env);
 }
 
 /**
@@ -514,7 +551,12 @@ function materializeShellShims(
  * unsigned / mid-signature copy.  On ANY failure the temp file is removed and
  * `dest` is left untouched.  (Temp-name shape mirrors src/cli/rootfs-cache.ts.)
  */
-function materializeOne(src: string, dest: string, doRunCommand: typeof runCommand): void {
+function materializeOne(
+  src: string,
+  dest: string,
+  doRunCommand: typeof runCommand,
+  env: NodeJS.ProcessEnv,
+): void {
   requireShimSource(src);
   const tmp = join(dirname(dest), `.${basename(dest)}.${process.pid}.${Date.now()}.tmp`);
   try {
@@ -524,7 +566,7 @@ function materializeOne(src: string, dest: string, doRunCommand: typeof runComma
     // basename (`bash` / `coreutils`) — codesign would otherwise infer it from
     // the temp filename.  The signature survives the rename (CDHash covers
     // content, not path).
-    resignAdHoc(tmp, doRunCommand, basename(dest));
+    resignAdHoc(tmp, doRunCommand, env, basename(dest));
     renameSync(tmp, dest);
   } catch (err) {
     rmSync(tmp, { force: true });
