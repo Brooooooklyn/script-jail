@@ -7741,6 +7741,19 @@ var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     "NODE_EXTRA_CA_CERTS",
     "NODE_PATH",
     // adds require() search dirs → a checkout-relative one loads PR code
+    // npm's globalconfig is `{globalPrefix}/etc/npmrc`, and npm derives globalPrefix
+    // from PLAIN (non-npm_config_*) env in loadGlobalPrefix(): `PREFIX` sets it
+    // directly and `PREFIX`-less `DESTDIR` prepends to the node-derived prefix
+    // (@npmcli/config/lib/index.js:327-339).  VERIFIED npm 11.13.0: `PREFIX=<dir>`
+    // (or `DESTDIR=<dir>`) with `<dir>/etc/npmrc` (resp. `<dir>{nodePrefix}/etc/npmrc`)
+    // declaring `script-shell=<pwn>` makes `npm rebuild --foreground-scripts` exec the
+    // attacker shell — the SAME npmrc-redirect-then-exec class as the denied
+    // npm_config_prefix, but reached via plain env so the npm_config_* canon misses it.
+    // (HOME → `~/.npmrc` is the analogous userconfig vector, gated separately by
+    // install-preflight.ts:detectCheckoutRelativeHome; XDG_CONFIG_HOME is NOT an npmrc
+    // locator in npm 11.13.0 — verified inert.)
+    "PREFIX",
+    "DESTDIR",
     // [19] Git EXEC/config-FILE selectors (git+ssh|https deps; --ignore-scripts
     // does NOT stop git being invoked).  Enumerated (not blanket GIT_*) so benign
     // behaviour flags such as GIT_TERMINAL_PROMPT/GIT_ALLOW_PROTOCOL are preserved.

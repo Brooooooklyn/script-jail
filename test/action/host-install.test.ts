@@ -1423,6 +1423,28 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/'); // unrelated key survives
   });
 
+  it('stripDangerousEnv drops plain PREFIX/DESTDIR (round-5 — npm globalPrefix→npmrc redirect, no npm_config_)', () => {
+    // VERIFIED npm 11.13.0 (@npmcli/config loadGlobalPrefix): npm derives globalConfig =
+    // `{globalPrefix}/etc/npmrc` and reads PLAIN `PREFIX`/`DESTDIR` (NOT npm_config_*) to
+    // set globalPrefix.  `PREFIX=<dir>` + `<dir>/etc/npmrc` with `script-shell=<pwn>` (and
+    // `DESTDIR=<dir>` via `<dir>{nodePrefix}/etc/npmrc`) makes `npm rebuild
+    // --foreground-scripts` exec the attacker shell — the same redirect-then-exec class as
+    // the denied npm_config_prefix, but it bypasses the npm_config_* canon because these
+    // are bare env names.  Both must be dropped; unrelated plain env survives.
+    const out = stripDangerousEnv({
+      PREFIX: '/checkout/evil-prefix', // → {PREFIX}/etc/npmrc
+      DESTDIR: '/checkout', // → {DESTDIR}{nodePrefix}/etc/npmrc
+      npm_config_prefix: '/checkout/evil-prefix', // the npm_config alias (already covered)
+      npm_config_registry: 'https://registry.npmjs.org/',
+      CI: 'true', // unrelated benign plain env survives
+    });
+    expect(out['PREFIX']).toBeUndefined();
+    expect(out['DESTDIR']).toBeUndefined();
+    expect(out['npm_config_prefix']).toBeUndefined();
+    expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
+    expect(out['CI']).toBe('true');
+  });
+
   it('pins COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (overriding inherited), so stripping COREPACK_HOME cannot hang', () => {
     // We strip an inherited COREPACK_HOME (executable-cache attack); to ensure a
     // resulting cache re-download cannot block on a prompt, the prompt flag is
