@@ -1403,6 +1403,26 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/'); // unrelated key survives
   });
 
+  it('stripDangerousEnv drops NPM_CONFIG_NODE_OPTIONS (round-4 — node loader alias for NODE_OPTIONS)', () => {
+    // VERIFIED npm 11.13.0: npm passes the `node-options` config to the node that runs
+    // lifecycle scripts, so an inherited `NPM_CONFIG_NODE_OPTIONS='--require ./hook.js'`
+    // preloads hook.js in the script child — smuggling the SAME loader the raw
+    // NODE_OPTIONS strip blocks, just via the npm_config alias.  It must be dropped in
+    // EVERY npm_config alias form (case + `-`/`_` separator), like script-shell/prefix.
+    const out = stripDangerousEnv({
+      NODE_OPTIONS: '--require /checkout/raw-hook.js', // raw form (already covered)
+      NPM_CONFIG_NODE_OPTIONS: '--require /checkout/hook.js', // upper form (NPM_CONFIG_*)
+      npm_config_node_options: '--require /checkout/hook.js', // lower underscore form
+      'npm_config_node-options': '--require /checkout/hook.js', // lower hyphen form
+      npm_config_registry: 'https://registry.npmjs.org/',
+    });
+    expect(out['NODE_OPTIONS']).toBeUndefined();
+    expect(out['NPM_CONFIG_NODE_OPTIONS']).toBeUndefined();
+    expect(out['npm_config_node_options']).toBeUndefined();
+    expect(out['npm_config_node-options']).toBeUndefined();
+    expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/'); // unrelated key survives
+  });
+
   it('pins COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (overriding inherited), so stripping COREPACK_HOME cannot hang', () => {
     // We strip an inherited COREPACK_HOME (executable-cache attack); to ensure a
     // resulting cache re-download cannot block on a prompt, the prompt flag is

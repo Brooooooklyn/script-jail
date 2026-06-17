@@ -26943,6 +26943,7 @@ var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
   "userconfig",
   "globalconfig",
   "prefix",
+  "node_options",
   "node_gyp",
   "python",
   "make",

@@ -418,6 +418,13 @@ const HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
 //                            `npm rebuild --foreground-scripts` exec the attacker
 //                            shell), so an inherited prefix is a config-redirect to a
 //                            PR-controlled npmrc exactly like userconfig/globalconfig.
+//   node_options             a NODE LOADER alias for NODE_OPTIONS: npm passes the
+//                            `node-options` config to the node that runs lifecycle
+//                            scripts (VERIFIED npm 11.13.0: `NPM_CONFIG_NODE_OPTIONS=
+//                            '--require ./hook.js'` preloads hook.js in the script
+//                            child).  The raw NODE_OPTIONS name is stripped above, so
+//                            the npm_config alias must be too, or it smuggles the same
+//                            loader the audit never saw.
 //   node_gyp / python / make native-build tool selectors (checkout-relative exec)
 //   shell                    npm's exec/explore shell
 const DANGEROUS_NPM_CONFIG_KEYS = new Set([
@@ -426,6 +433,7 @@ const DANGEROUS_NPM_CONFIG_KEYS = new Set([
   'userconfig',
   'globalconfig',
   'prefix',
+  'node_options',
   'node_gyp',
   'python',
   'make',
