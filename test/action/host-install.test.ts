@@ -1445,6 +1445,32 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['CI']).toBe('true');
   });
 
+  it('stripDangerousEnv drops the XDG_* family + PNPM_HOME (pnpm config→scriptShell, round-8)', () => {
+    // VERIFIED pnpm 11.1.2: pnpm reads its GLOBAL config from `$XDG_CONFIG_HOME/pnpm/
+    // config.yaml`, so an inherited `XDG_CONFIG_HOME=<checkout>/.config` lets a PR commit
+    // `.config/pnpm/config.yaml` `scriptShell:` that the host `pnpm rebuild --pending` execs
+    // — unseen by the clean-VM audit (which inherits no XDG_*).  The whole XDG family is
+    // dropped for parity (npm/yarn don't read XDG; pnpm falls back to the HOME-based default
+    // the HOME gate keeps outside the checkout).  PNPM_HOME (pnpm's global bin/exec dir) is
+    // dropped too — the audit inherits none.  Unrelated env survives.
+    const out = stripDangerousEnv({
+      XDG_CONFIG_HOME: '/checkout/.config', // pnpm global config → scriptShell exec
+      XDG_DATA_HOME: '/checkout/.local/share', // store/data (family parity)
+      XDG_CACHE_HOME: '/checkout/.cache',
+      XDG_STATE_HOME: '/checkout/.local/state',
+      PNPM_HOME: '/checkout/.pnpm-home',
+      npm_config_registry: 'https://registry.npmjs.org/',
+      CI: 'true',
+    });
+    expect(out['XDG_CONFIG_HOME']).toBeUndefined();
+    expect(out['XDG_DATA_HOME']).toBeUndefined();
+    expect(out['XDG_CACHE_HOME']).toBeUndefined();
+    expect(out['XDG_STATE_HOME']).toBeUndefined();
+    expect(out['PNPM_HOME']).toBeUndefined();
+    expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
+    expect(out['CI']).toBe('true');
+  });
+
   it('pins COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (overriding inherited), so stripping COREPACK_HOME cannot hang', () => {
     // We strip an inherited COREPACK_HOME (executable-cache attack); to ensure a
     // resulting cache re-download cannot block on a prompt, the prompt flag is

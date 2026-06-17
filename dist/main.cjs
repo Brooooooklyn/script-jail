@@ -26923,6 +26923,13 @@ var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     "COREPACK_NPM_REGISTRY",
     "COREPACK_INTEGRITY_KEYS",
     "COREPACK_ROOT",
+    // pnpm's global bin / executable dir (also where `pnpm setup` puts pnpm on
+    // PATH).  Not a config-file locator and NOT auto-prepended to a lifecycle
+    // script's PATH (both VERIFIED pnpm 11.1.2 — only XDG_CONFIG_HOME relocates the
+    // readable config), but it IS passed verbatim to lifecycle children and the
+    // clean-VM audit inherits none, so drop it for parity: a checkout-relative
+    // PNPM_HOME never reaches the host pnpm or a script that reads it.
+    "PNPM_HOME",
     // Shell / interpreter startup hooks that run on a NON-interactive spawn.
     // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
     // common legit "environment name" var, so it is deliberately NOT stripped.)
@@ -26944,6 +26951,16 @@ var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
   // PYTHON / PYTHONPATH / PYTHONHOME / PYTHONSTARTUP (sitecustomize exec)
   "node_gyp_",
   // NODE_GYP_FORCE_PYTHON, … (VERIFIED node-gyp interpreter selector)
+  // XDG base-dir family.  pnpm locates its GLOBAL config at
+  // `$XDG_CONFIG_HOME/pnpm/{config.yaml,rc}` (VERIFIED pnpm 11.1.2: an inherited
+  // `XDG_CONFIG_HOME=<checkout>/.config` makes the host pnpm read a PR-committed
+  // `.config/pnpm/config.yaml` whose `scriptShell:` then runs an attacker shell on
+  // `pnpm rebuild --pending` — npm & yarn do NOT read XDG for config, verified).
+  // The clean-VM audit inherits NO XDG_*, so the host must run without them too;
+  // dropping the whole family is parity-safe (config/data/state/cache all default
+  // to the runner's real HOME, which the HOME gate keeps outside the checkout) and
+  // forecloses any future XDG-located PM config.
+  "xdg_",
   // npm re-derives npm_package_config_* from the AUDITED package.json; an INHERITED
   // one for a key absent from package.json would pass through to node-gyp
   // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
