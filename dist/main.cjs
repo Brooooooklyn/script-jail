@@ -26982,7 +26982,8 @@ var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
 var DANGEROUS_PNPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
   ...DANGEROUS_NPM_CONFIG_KEYS,
   "pnpmfile",
-  "global_pnpmfile"
+  "global_pnpmfile",
+  "shell_emulator"
 ]);
 var YARN_ENV_ALLOW = /* @__PURE__ */ new Set([
   "YARN_NPM_AUTH_TOKEN",

@@ -1457,6 +1457,8 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       pnpm_config_script_shell: '/checkout/evil-sh', // lower snake form
       'pnpm_config_script-shell': '/checkout/evil-sh', // lower hyphen form (canonicalized)
       pnpm_config_global_pnpmfile: '/checkout/evil.cjs', // pnpm hook file
+      PNPM_CONFIG_SHELL_EMULATOR: 'true', // interpreter switch (sh → JS emulator) — VERIFIED diverges
+      pnpm_config_shell_emulator: 'true',
       pnpm_config_registry: 'https://registry.npmjs.org/', // auth/registry — preserved
       'pnpm_config_//registry.npmjs.org/:_authToken': 'tok', // auth — preserved
     });
@@ -1464,6 +1466,8 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['pnpm_config_script_shell']).toBeUndefined();
     expect(out['pnpm_config_script-shell']).toBeUndefined();
     expect(out['pnpm_config_global_pnpmfile']).toBeUndefined();
+    expect(out['PNPM_CONFIG_SHELL_EMULATOR']).toBeUndefined();
+    expect(out['pnpm_config_shell_emulator']).toBeUndefined();
     expect(out['pnpm_config_registry']).toBe('https://registry.npmjs.org/');
     expect(out['pnpm_config_//registry.npmjs.org/:_authToken']).toBe('tok');
   });

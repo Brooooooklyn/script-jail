@@ -7867,7 +7867,8 @@ var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
 var DANGEROUS_PNPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
   ...DANGEROUS_NPM_CONFIG_KEYS,
   "pnpmfile",
-  "global_pnpmfile"
+  "global_pnpmfile",
+  "shell_emulator"
 ]);
 function isDangerousEnvName(name) {
   const lower = name.toLowerCase();

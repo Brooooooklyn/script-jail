@@ -480,14 +480,23 @@ const DANGEROUS_NPM_CONFIG_KEYS = new Set([
 // is ignored — VERIFIED), so a canonicalized-key denylist is sound, exactly like
 // npm.  Reuse the npm dangerous keys (script_shell / shell / node_options /
 // node_gyp / python / make / ignore_scripts / user|globalconfig / prefix) and add
-// pnpm's hook-file selectors `pnpmfile` / `global_pnpmfile` (the host
-// --ignore-pnpmfile flag already suppresses an env-set pnpmfile — VERIFIED — so
-// this is defense-in-depth + parity).  Auth/registry pnpm_config_* (registry,
-// `//host/:_authToken`, …) are NOT in the set, so they fall through and survive.
+// pnpm's own selectors:
+//   pnpmfile / global_pnpmfile — hook files (the host --ignore-pnpmfile flag
+//     already suppresses an env-set pnpmfile — VERIFIED — defense-in-depth + parity).
+//   shell_emulator             — pnpm's THIRD lifecycle-script interpreter knob
+//     (alongside script_shell=path and node_options=loader): it switches execution
+//     from POSIX `sh -c` to Yarn's JS shell emulator, which interprets the SAME
+//     audited script string with DIFFERENT semantics.  VERIFIED pnpm 11.1.2: a
+//     postinstall `echo {1..3} || node -e <write>` writes a marker under
+//     `PNPM_CONFIG_SHELL_EMULATOR=true` but NOT under default sh — a host-only
+//     execution branch the clean-VM audit (default sh) never recorded.
+// Auth/registry pnpm_config_* (registry, `//host/:_authToken`, …) are NOT in the
+// set, so they fall through and survive.
 const DANGEROUS_PNPM_CONFIG_KEYS = new Set([
   ...DANGEROUS_NPM_CONFIG_KEYS,
   'pnpmfile',
   'global_pnpmfile',
+  'shell_emulator',
 ]);
 
 // The ONLY inherited `YARN_*` env kept on the host yarn child (allowlist — every
