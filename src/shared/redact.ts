@@ -96,104 +96,43 @@ export function maskExactValues(
   return out;
 }
 
-/** High-entropy floor for fragment masking — a prefix/suffix shorter than this
- * is too short to distinguish a real (high-entropy) secret from benign text. */
+/** High-entropy floor for fragment masking — a shared substring shorter than
+ * this is too short to distinguish a real (high-entropy) secret from benign
+ * text.  A line span every one of whose `minFragment`-char windows is a
+ * substring of a declared secret is treated as a leaked fragment and masked. */
 const DEFAULT_MIN_FRAGMENT = 8;
-/** Per-affix scan-window cap (NOT an eligibility filter — a longer secret is
- * still protected at its first/last `FRAGMENT_SCAN_WINDOW` chars). */
-const FRAGMENT_SCAN_WINDOW = 512;
-/** Backstop on occurrences scanned per affix (a pathological line that repeats a
- * value's minimal prefix thousands of times can't force unbounded work). */
-const FRAGMENT_MAX_OCCURRENCES = 4096;
+/** Backstop on the gram set size (memory bound for a pathological declared set;
+ * 2^18 eight-char grams ≈ a few MB).  Far above any real protected.env. */
+const FRAGMENT_MAX_GRAMS = 1 << 18;
 
 /**
- * Longest prefix of `w` (>= `minFragment`, <= `w.length`) present anywhere in
- * `text`.  Returns 0 if none.  Finds the GLOBAL longest by extending every
- * occurrence of `w`'s minimal prefix, so a longer fragment at a later position
- * is not missed; early-breaks once a full-window match is found.
- */
-function longestPrefixPresent(text: string, w: string, minFragment: number): number {
-  if (w.length < minFragment) return 0;
-  const minP = w.slice(0, minFragment);
-  let best = 0;
-  let from = 0;
-  let seen = 0;
-  for (;;) {
-    const idx = text.indexOf(minP, from);
-    if (idx === -1) break;
-    let k = minFragment;
-    const max = Math.min(w.length, text.length - idx);
-    while (k < max && text.charCodeAt(idx + k) === w.charCodeAt(k)) k += 1;
-    if (k > best) best = k;
-    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
-    from = idx + 1;
-  }
-  return best;
-}
-
-/** Longest suffix of `w` present anywhere in `text` (mirror of the prefix scan,
- * extending each occurrence of `w`'s minimal SUFFIX backward). */
-function longestSuffixPresent(text: string, w: string, minFragment: number): number {
-  if (w.length < minFragment) return 0;
-  const minS = w.slice(w.length - minFragment);
-  let best = 0;
-  let from = 0;
-  let seen = 0;
-  for (;;) {
-    const idx = text.indexOf(minS, from); // minS occupies text[idx .. idx+minFragment)
-    if (idx === -1) break;
-    let k = minFragment;
-    // Extend backward: for suffix length k+1 the new leftmost char is
-    // w[w.length-k-1], aligning with text[idx-(k-minFragment)-1].
-    for (;;) {
-      if (k >= w.length) break;
-      const ti = idx - (k - minFragment) - 1;
-      const wi = w.length - k - 1;
-      if (ti < 0 || wi < 0 || text.charCodeAt(ti) !== w.charCodeAt(wi)) break;
-      k += 1;
-    }
-    if (k > best) best = k;
-    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
-    from = idx + 1;
-  }
-  return best;
-}
-
-/**
- * Mask a PREFIX or SUFFIX of each declared secret value that appears in `text`.
+ * Mask any span of `text` that is "secret-like" — i.e. every `minFragment`-char
+ * window in the span is a substring of some declared secret value.
  *
  * `maskExactValues` only matches the WHOLE declared value, so a secret that
- * leaks as a fragment slips through — e.g. when a concurrent writer's newline
- * truncates a secret mid-write on a SHARED stdout/stderr pipe, the line carries
- * only `V[0..k]` (a prefix), or a same-writer `V[0..k]\nV[k..]` split leaves a
- * prefix on one line and a suffix on the next (adversarial-review F6 round-3).
- * For each declared value `V`, this masks the LONGEST prefix and LONGEST suffix
- * of `V` present in `text`, each at least `minFragment` chars.  `minFragment` is
- * a high-entropy floor (default 8) so benign words are not mass-masked: a real
- * token's 8+ char prefix coinciding with unrelated log text is vanishingly
- * unlikely.
+ * leaks as a FRAGMENT slips through — e.g. a concurrent writer's newline
+ * truncates a secret mid-write on a SHARED stdout/stderr pipe, leaving only a
+ * prefix on the line; a same-writer split leaves a prefix on one line and a
+ * suffix on the next; or a middle slice survives (adversarial-review F6
+ * round-3).  This catches all of those uniformly: build the set of every
+ * `minFragment`-length substring (gram) of every declared value, then mask each
+ * maximal run of positions whose gram is in that set.  A leaked prefix, suffix,
+ * or middle fragment of length >= `minFragment` is fully covered by secret
+ * grams, so the whole run is masked — there are NO per-value, longest-match,
+ * occurrence-cap, or scan-window edges to leak past (the earlier extraction
+ * approach regressed on every one of those).
  *
- * Two correctness properties (adversarial-review F6 round-3, both regressed):
- *   * NON-DESTRUCTIVE discovery: every value's longest prefix/suffix is found
- *     against the ORIGINAL `text`, collected, then ALL fragments are masked once
- *     in LENGTH-DESCENDING order.  Mutating per value would let a longer value's
- *     short shared prefix consume the match gate, leaving a shorter value's
- *     longer leaked fragment's tail exposed.
- *   * SCAN WINDOW, not eligibility: a value longer than `FRAGMENT_SCAN_WINDOW` is
- *     NOT excluded — its first/last `FRAGMENT_SCAN_WINDOW` chars are scanned, so a
- *     prefix/suffix leak of a long secret (private key, service-account JSON,
- *     long opaque token) is still masked.
+ * `minFragment` (default 8) is a high-entropy floor: a real token's 8-char
+ * window coinciding with unrelated log text is vanishingly unlikely, so benign
+ * output is not mass-masked; a CHAIN of coincidences (needed to extend a span)
+ * is rarer still.  Over-masking (a benign span that happens to match) is
+ * safe-side and the user explicitly declared the value secret.
  *
- * SCOPE: this does NOT cover an arbitrary MIDDLE split (a deliberately
- * fragmented secret with neither end on a line) — the irreducible per-line
- * line-local residual, bounded by the PRIMARY env_read audit gate (a script
- * cannot obtain the value to fragment without a recorded read that fails the PR
- * pre-trust).  Fragment masking strengthens the defense-in-depth layer against
- * the realistic prefix/suffix truncation; it is not a trust boundary.
- *
- * Bounded: each affix scan is O(|text|) indexOf-amortized + bounded extension,
- * capped at `FRAGMENT_MAX_OCCURRENCES`, so a pathological line cannot force
- * unbounded work even with the full set of declared values.
+ * SCOPE: this is DEFENSE-IN-DEPTH; the PRIMARY protection is the env_read audit
+ * gate (a script cannot obtain a value to leak — whole or fragmented — without a
+ * recorded read that fails the PR pre-trust).  Bounded: O(sum |V|) to build the
+ * gram set (capped at `FRAGMENT_MAX_GRAMS`) + O(|text| · minFragment) to scan,
+ * with no dependence on the number or placement of occurrences.
  */
 export function maskValueFragments(
   text: string,
@@ -201,26 +140,37 @@ export function maskValueFragments(
   label = 'REDACTED',
   minFragment = DEFAULT_MIN_FRAGMENT,
 ): string {
+  if (text.length < minFragment) return text;
+  // Build the gram set from EVERY declared value (cross-value in one pass — no
+  // per-value race).  Values at or below the floor are whole-masked elsewhere.
+  const grams = new Set<string>();
+  for (const v of values) {
+    if (v.length <= minFragment) continue;
+    for (let i = 0; i + minFragment <= v.length; i += 1) {
+      grams.add(v.slice(i, i + minFragment));
+      if (grams.size >= FRAGMENT_MAX_GRAMS) break;
+    }
+    if (grams.size >= FRAGMENT_MAX_GRAMS) break;
+  }
+  if (grams.size === 0) return text;
   const replacement = `<${label}>`;
-  // 1. DISCOVER (non-destructive): collect every present prefix/suffix fragment
-  //    against the original text, so cross-value shared prefixes don't race.
-  const fragments: string[] = [];
-  for (const v of new Set(values)) {
-    if (v.length <= minFragment) continue; // whole value is exact-masked elsewhere
-    const preWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(0, FRAGMENT_SCAN_WINDOW) : v;
-    const pLen = longestPrefixPresent(text, preWin, minFragment);
-    if (pLen >= minFragment) fragments.push(preWin.slice(0, pLen));
-    const sufWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(v.length - FRAGMENT_SCAN_WINDOW) : v;
-    const sLen = longestSuffixPresent(text, sufWin, minFragment);
-    if (sLen >= minFragment) fragments.push(sufWin.slice(sufWin.length - sLen));
+  const n = text.length;
+  let out = '';
+  let i = 0;
+  while (i + minFragment <= n) {
+    if (grams.has(text.slice(i, i + minFragment))) {
+      // Start of a secret-like span at position i (covers text[i .. i+minFragment)).
+      // Extend while each next overlapping window is also a gram.
+      let j = i;
+      while (j + 1 + minFragment <= n && grams.has(text.slice(j + 1, j + 1 + minFragment))) j += 1;
+      out += replacement;
+      i = j + minFragment; // skip the whole covered span [i .. j+minFragment)
+    } else {
+      out += text[i];
+      i += 1;
+    }
   }
-  if (fragments.length === 0) return text;
-  // 2. APPLY longest-first so a longer fragment is masked before a shorter one
-  //    (possibly a shared prefix) can consume part of it.
-  let out = text;
-  for (const frag of Array.from(new Set(fragments)).sort((a, b) => b.length - a.length)) {
-    out = out.split(frag).join(replacement);
-  }
+  out += text.slice(i); // trailing run shorter than minFragment cannot be a gram
   return out;
 }
 

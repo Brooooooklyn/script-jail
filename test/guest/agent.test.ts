@@ -2759,14 +2759,36 @@ describe('redactSensitive (Phase A failure dump)', () => {
       .toBe('token <REDACTED:SECRET> here');
   });
 
-  it('MASKS a PREFIX/SUFFIX fragment of a declared value (F6 round-3 parity with host)', async () => {
+  it('MASKS a PREFIX/SUFFIX/MIDDLE fragment of a declared value (F6 round-3 parity with host)', async () => {
     // A secret truncated by a concurrent newline on the shared pipe leaks as a
-    // fragment; exact masking misses it, so layer-1 also runs maskValueFragments.
+    // fragment; exact (whole-value) masking misses it, so layer-1 also runs ONE
+    // cross-value maskValueFragments pass.  A fragment can't be attributed to a
+    // single env name, so it gets the generic `<REDACTED:SECRET>` label (NOT the
+    // per-name label the whole-value mask uses).
     const { redactSensitive } = await import('../../src/guest/agent.js');
     const SECRET = 'npm_AB12cd34EF56gh78IJ90klMNopQRstUVwx';
     const prefix = SECRET.slice(0, 20);
     expect(redactSensitive(`fetch with ${prefix} now`, ['NPM_TOKEN'], { NPM_TOKEN: SECRET }))
-      .toBe('fetch with <REDACTED:NPM_TOKEN> now');
+      .toBe('fetch with <REDACTED:SECRET> now');
+    // a MIDDLE slice (both ends torn) is now masked too (n-gram overlap design).
+    const middle = SECRET.slice(9, 31);
+    expect(redactSensitive(`x ${middle} y`, ['NPM_TOKEN'], { NPM_TOKEN: SECRET }))
+      .toBe('x <REDACTED:SECRET> y');
+  });
+
+  it('masks a fragment in ONE cross-value pass so a shared gate cannot strand a tail (F6 round-3 #1)', async () => {
+    // Two declared secrets share an 8-char prefix.  A per-value pass would mask
+    // the longer value's 8-char gram run first, mutate the text, and strand the
+    // shorter value's remaining tail (`SECRET`); ONE cross-value pass masks the
+    // whole leaked fragment.  This is why the fragment pass runs once over ALL
+    // values, not once per value.
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const v1 = 'PREFIX12' + 'z'.repeat(50);
+    const v2 = 'PREFIX12LEAKTAIL';
+    const leaked = v2.slice(0, 14); // 'PREFIX12LEAKTA' — prefix of v2, shares v1's 8-char gate
+    const out = redactSensitive(`run ${leaked} done`, ['A', 'B'], { A: v1, B: v2 });
+    expect(out).not.toContain('LEAKTA'); // the tail a per-value pass would strand past v1's gate
+    expect(out).toBe('run <REDACTED:SECRET> done');
   });
 
   it('redacts credential SHAPES not in the protected list', async () => {

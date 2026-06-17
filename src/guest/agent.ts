@@ -2956,12 +2956,14 @@ export function redactSensitive(
     )
     .sort((a, b) => b.value.length - a.value.length);
   for (const { name, value } of values) {
-    out = out.split(value).join(`<REDACTED:${name}>`); // exact whole value
-    // Also mask a PREFIX/SUFFIX fragment of the value (e.g. a secret truncated by
-    // a concurrent newline on the shared pipe) — parity with the host part-2
-    // hardening (adversarial-review F6 round-3).
-    out = maskValueFragments(out, [value], `REDACTED:${name}`);
+    out = out.split(value).join(`<REDACTED:${name}>`); // exact whole value, per-name label
   }
+  // Also mask a FRAGMENT (prefix/suffix/middle) of any declared value — e.g. a
+  // secret truncated by a concurrent newline on the shared pipe.  ONE cross-value
+  // pass (NOT per value): a per-value call would let a longer value's shared gram
+  // strand a shorter value's leaked fragment (adversarial-review F6 round-3).  A
+  // fragment can't be attributed to a single name, so it gets a generic label.
+  out = maskValueFragments(out, values.map((e) => e.value), 'REDACTED:SECRET');
   // Layer 2 — credential SHAPES regardless of the protected list.  Relocated
   // verbatim into the shared single-source redactor (see src/shared/redact.ts)
   // so the host part-1 capture path applies the IDENTICAL shape chain.  The

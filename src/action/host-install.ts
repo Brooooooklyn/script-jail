@@ -648,9 +648,13 @@ export async function hostRunScripts(
     .filter((v): v is string => typeof v === 'string');
   const onLine = (stream: 'stdout' | 'stderr', line: string): void => {
     let safe = maskExactValues(line, sensitive, 'REDACTED:ENV', 1);
-    // Also mask a declared secret that leaks as a PREFIX/SUFFIX (e.g. a concurrent
-    // writer's newline truncating it mid-write on the shared pipe) — exact masking
-    // only matches the whole value (adversarial-review F6 round-3 hardening).
+    // Also mask a declared secret that leaks as a FRAGMENT — a prefix/suffix
+    // (e.g. a concurrent writer's newline truncating it mid-write on the shared
+    // pipe) OR a middle slice (both ends torn).  Exact masking only matches the
+    // whole value; the n-gram overlap design covers any fragment >= the
+    // high-entropy floor (adversarial-review F6 round-3 hardening).  ONE
+    // cross-value pass so a longer value's shared gram can't strand a shorter
+    // value's leaked fragment.
     safe = maskValueFragments(safe, sensitive, 'REDACTED:ENV');
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);

@@ -25305,66 +25305,35 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   return out;
 }
 var DEFAULT_MIN_FRAGMENT = 8;
-var FRAGMENT_SCAN_WINDOW = 512;
-var FRAGMENT_MAX_OCCURRENCES = 4096;
-function longestPrefixPresent(text, w, minFragment) {
-  if (w.length < minFragment) return 0;
-  const minP = w.slice(0, minFragment);
-  let best = 0;
-  let from = 0;
-  let seen = 0;
-  for (; ; ) {
-    const idx = text.indexOf(minP, from);
-    if (idx === -1) break;
-    let k = minFragment;
-    const max = Math.min(w.length, text.length - idx);
-    while (k < max && text.charCodeAt(idx + k) === w.charCodeAt(k)) k += 1;
-    if (k > best) best = k;
-    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
-    from = idx + 1;
-  }
-  return best;
-}
-function longestSuffixPresent(text, w, minFragment) {
-  if (w.length < minFragment) return 0;
-  const minS = w.slice(w.length - minFragment);
-  let best = 0;
-  let from = 0;
-  let seen = 0;
-  for (; ; ) {
-    const idx = text.indexOf(minS, from);
-    if (idx === -1) break;
-    let k = minFragment;
-    for (; ; ) {
-      if (k >= w.length) break;
-      const ti = idx - (k - minFragment) - 1;
-      const wi = w.length - k - 1;
-      if (ti < 0 || wi < 0 || text.charCodeAt(ti) !== w.charCodeAt(wi)) break;
-      k += 1;
-    }
-    if (k > best) best = k;
-    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
-    from = idx + 1;
-  }
-  return best;
-}
+var FRAGMENT_MAX_GRAMS = 1 << 18;
 function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFAULT_MIN_FRAGMENT) {
-  const replacement = `<${label}>`;
-  const fragments = [];
-  for (const v of new Set(values)) {
+  if (text.length < minFragment) return text;
+  const grams = /* @__PURE__ */ new Set();
+  for (const v of values) {
     if (v.length <= minFragment) continue;
-    const preWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(0, FRAGMENT_SCAN_WINDOW) : v;
-    const pLen = longestPrefixPresent(text, preWin, minFragment);
-    if (pLen >= minFragment) fragments.push(preWin.slice(0, pLen));
-    const sufWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(v.length - FRAGMENT_SCAN_WINDOW) : v;
-    const sLen = longestSuffixPresent(text, sufWin, minFragment);
-    if (sLen >= minFragment) fragments.push(sufWin.slice(sufWin.length - sLen));
+    for (let i2 = 0; i2 + minFragment <= v.length; i2 += 1) {
+      grams.add(v.slice(i2, i2 + minFragment));
+      if (grams.size >= FRAGMENT_MAX_GRAMS) break;
+    }
+    if (grams.size >= FRAGMENT_MAX_GRAMS) break;
   }
-  if (fragments.length === 0) return text;
-  let out = text;
-  for (const frag of Array.from(new Set(fragments)).sort((a, b) => b.length - a.length)) {
-    out = out.split(frag).join(replacement);
+  if (grams.size === 0) return text;
+  const replacement = `<${label}>`;
+  const n = text.length;
+  let out = "";
+  let i = 0;
+  while (i + minFragment <= n) {
+    if (grams.has(text.slice(i, i + minFragment))) {
+      let j = i;
+      while (j + 1 + minFragment <= n && grams.has(text.slice(j + 1, j + 1 + minFragment))) j += 1;
+      out += replacement;
+      i = j + minFragment;
+    } else {
+      out += text[i];
+      i += 1;
+    }
   }
+  out += text.slice(i);
   return out;
 }
 function deriveSensitiveValues(args) {
@@ -30910,8 +30879,8 @@ function redactSensitive(text, protectedEnvNames, env = process.env) {
   ).sort((a, b) => b.value.length - a.value.length);
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);
-    out = maskValueFragments(out, [value], `REDACTED:${name}`);
   }
+  out = maskValueFragments(out, values.map((e) => e.value), "REDACTED:SECRET");
   out = redactCredentialShapes(out);
   return out;
 }

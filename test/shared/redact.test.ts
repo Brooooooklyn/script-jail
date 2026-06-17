@@ -175,11 +175,22 @@ describe('maskValueFragments', () => {
     expect(maskValueFragments('abcd1234 here', ['abcd1234'], 'R')).toBe('abcd1234 here');
   });
 
+  it('masks a MIDDLE slice (both ends torn) of a declared value (n-gram overlap)', () => {
+    // A slice from the interior of the secret — neither a prefix nor a suffix —
+    // is also fully covered by secret grams, so the whole run is masked.  This is
+    // what the earlier prefix/suffix-extraction approach could not do.
+    const middle = SECRET.slice(9, 31); // 22 interior chars
+    const out = maskValueFragments(`x ${middle} y`, [SECRET], 'R');
+    expect(out).not.toContain(middle);
+    expect(out).toBe('x <R> y');
+  });
+
   it('does NOT leak a shorter value tail when a longer value shares the gate prefix (F6 round-3 #1)', () => {
-    // Two declared secrets share the first 8 chars.  Discovery is NON-DESTRUCTIVE
-    // (collect against the original text, then mask longest-first), so the longer
-    // value's short shared prefix cannot consume the gate and strand the shorter
-    // value's longer leaked fragment.
+    // Two declared secrets share the first 8 chars.  The gram set is built from
+    // EVERY value in ONE pass (cross-value, not per-value), so the longer value's
+    // shared prefix grams can never consume a window and strand the shorter
+    // value's longer leaked fragment — every window of the leaked fragment is a
+    // gram of v2 and is masked.
     const v1 = 'abcdefgh' + 'X'.repeat(100);  // 108 chars
     const v2 = 'abcdefghSECRETTAILMORE';       // 22 chars, shares 'abcdefgh'
     const out = maskValueFragments('leak ' + v2.slice(0, 18), [v1, v2], 'R');
@@ -187,18 +198,30 @@ describe('maskValueFragments', () => {
     expect(out).toBe('leak <R>');
   });
 
-  it('masks a prefix AND suffix of a value LONGER than the scan window (F6 round-3 #2)', () => {
-    // A >512-char secret is NOT excluded; its first/last 512 chars are scanned,
-    // so a prefix or suffix leak of a long secret (key, JSON blob) is masked.
+  it('masks a prefix AND suffix of a value LONGER than any scan window (F6 round-3 #2)', () => {
+    // A >512-char secret is NOT excluded: every minFragment-window of the value
+    // is a gram (no eligibility length cap, no scan window), so a prefix or suffix
+    // leak of a long secret (key, JSON blob) is masked.
     const big = 'K'.repeat(600) + 'TAILTOKEN9'; // 610 chars
     expect(maskValueFragments('leak ' + big.slice(0, 20), [big], 'R')).toBe('leak <R>');
     expect(maskValueFragments('leak ' + big.slice(big.length - 20), [big], 'R')).toBe('leak <R>');
   });
 
+  it('masks a fragment regardless of how many times it occurs (no occurrence cap to leak past)', () => {
+    // The earlier extraction approach capped occurrences at 4096; the n-gram scan
+    // has no per-occurrence accounting, so a leaked fragment is masked whether it
+    // appears once or thousands of times — every occurrence is the same gram run.
+    const frag = SECRET.slice(0, 16);
+    const line = (frag + ' ').repeat(5000); // far past the old 4096 cap
+    const out = maskValueFragments(line, [SECRET], 'R');
+    expect(out).not.toContain(frag);
+    expect(out).toBe(('<R> ').repeat(5000)); // each 16-char frag → <R>, single spaces preserved
+  });
+
   it('is bounded on a pathological 1 MiB line repeating the gate prefix (no superlinear blowup)', () => {
     // 64 declared values (the protected.env cap), adversarial line repeating one
-    // value's 8-char minimal prefix with no longer extension.  The occurrence cap
-    // + early-break keep it well under a generous bound.
+    // value's 8-char window.  The scan is O(|text| * minFragment) with a bounded
+    // gram set — no dependence on occurrence count — so it stays well under bound.
     const vals = Array.from({ length: 64 }, (_, i) => (`V${i}_`).padEnd(8, 'z') + 'q'.repeat(504));
     const minP0 = vals[0]!.slice(0, 8);
     const line = (minP0 + ' ').repeat(Math.floor((1024 * 1024) / (minP0.length + 1)));
