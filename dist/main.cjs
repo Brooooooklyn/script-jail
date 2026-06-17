@@ -28008,8 +28008,9 @@ async function makeOverlay(input) {
 }
 async function buildOverlayInto(workDir, input) {
   const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
+  const env = input.env ?? process.env;
   const rootfsCopyPath = (0, import_node_path8.join)(workDir, "rootfs.ext4");
-  copyRootfs(baseRootfsPath, rootfsCopyPath);
+  copyRootfs(baseRootfsPath, rootfsCopyPath, env);
   const repoStageDir = (0, import_node_path8.join)(workDir, "repo-stage");
   (0, import_node_fs10.mkdirSync)(repoStageDir, { recursive: true });
   (0, import_node_fs10.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
@@ -28033,19 +28034,22 @@ async function buildOverlayInto(workDir, input) {
     srcDir: repoStageDir,
     label: "repo",
     sizeMB: estimateDiskSizeMB(repoStageDir),
-    outPath: repoDiskPath
+    outPath: repoDiskPath,
+    env
   });
   const scratchDiskPath = (0, import_node_path8.join)(workDir, "scratch.ext4");
   await buildExt4Disk({
     label: SCRATCH_DISK_LABEL,
     sizeMB: SCRATCH_DISK_MB,
-    outPath: scratchDiskPath
+    outPath: scratchDiskPath,
+    env
   });
   const sjtmpDiskPath = (0, import_node_path8.join)(workDir, "sjtmp.ext4");
   await buildExt4Disk({
     label: SJTMP_DISK_LABEL,
     sizeMB: SJTMP_DISK_MB,
-    outPath: sjtmpDiskPath
+    outPath: sjtmpDiskPath,
+    env
   });
   const cleanup = async () => {
     try {
@@ -28082,17 +28086,17 @@ function ensureRealDirectory(path) {
   (0, import_node_fs10.rmSync)(path, { recursive: true, force: true });
   (0, import_node_fs10.mkdirSync)(path, { recursive: true });
 }
-function copyRootfs(src, dest) {
+function copyRootfs(src, dest, env) {
   if (import_node_process.platform === "linux") {
-    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
+    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore", env });
     if (result.status === 0) return;
   }
   (0, import_node_fs10.cpSync)(src, dest);
 }
 async function buildExt4Disk(opts) {
-  const { srcDir, label, sizeMB, outPath } = opts;
+  const { srcDir, label, sizeMB, outPath, env } = opts;
   const sizeSpec = `${sizeMB}M`;
-  const mkfs = resolveMkfsExt4();
+  const mkfs = resolveMkfsExt4(env);
   if (mkfs !== null) {
     const result = (0, import_node_child_process2.spawnSync)(
       mkfs,
@@ -28107,7 +28111,9 @@ async function buildExt4Disk(opts) {
         outPath,
         sizeSpec
       ],
-      { stdio: "inherit" }
+      // SECURITY: bare `mkfs.ext4` on Linux is resolved via PATH pre-trust — the
+      // caller-sanitized `env` prevents a checkout-prepended PATH / loader var hijack.
+      { stdio: "inherit", env }
     );
     if (result.status !== 0) {
       throw new Error(
@@ -28122,10 +28128,12 @@ async function buildExt4Disk(opts) {
   const seedFlag = srcDir !== void 0 ? "-d /work " : "";
   (0, import_node_child_process2.execSync)(
     `docker run --rm ` + srcMount + `-v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
-    { stdio: "inherit" }
+    // SECURITY: `docker`/`sh` resolve by bare name pre-trust — use the
+    // caller-sanitized `env` so a checkout PATH / loader var can't hijack them.
+    { stdio: "inherit", env }
   );
 }
-function resolveMkfsExt4() {
+function resolveMkfsExt4(env) {
   if (import_node_process.platform === "linux") return "mkfs.ext4";
   if (import_node_process.platform !== "darwin") return null;
   for (const candidate of [
@@ -28134,7 +28142,7 @@ function resolveMkfsExt4() {
   ]) {
     if ((0, import_node_fs10.existsSync)(candidate)) return candidate;
   }
-  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
+  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8", env });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
   return null;
 }
@@ -28184,7 +28192,11 @@ async function launchVm(input) {
     vsockUdsPath,
     enableNetwork,
     socketPath,
-    bootArgs = DEFAULT_BOOT_ARGS
+    bootArgs = DEFAULT_BOOT_ARGS,
+    // SECURITY: the tap-setup `ip` spawns are bare-name + pre-trust — default to
+    // process.env only when the caller (e.g. the platform-gated direct test path)
+    // omits it; the Firecracker backend always threads its sanitized env down.
+    env = process.env
   } = input;
   if (!input.spawner) {
     if (import_node_process2.platform !== "linux") {
@@ -28250,7 +28262,7 @@ async function launchVm(input) {
       mem_size_mib: memMB
     });
     if (enableNetwork) {
-      await setupTapDevice(apiClient);
+      await setupTapDevice(apiClient, env);
     }
     await apiClient.put("/vsock", {
       guest_cid: vsockCid,
@@ -28276,14 +28288,16 @@ async function launchVm(input) {
     waitForExit: () => handle.waitForExit()
   };
 }
-async function setupTapDevice(api) {
+async function setupTapDevice(api, env) {
   const existing = (0, import_node_child_process3.spawnSync)("ip", ["link", "show", "tap0"], {
-    stdio: ["ignore", "ignore", "ignore"]
+    stdio: ["ignore", "ignore", "ignore"],
+    env
   });
   const alreadyExists = existing.status === 0;
   if (!alreadyExists) {
     const mkTap = (0, import_node_child_process3.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      env
     });
     if (mkTap.status !== 0) {
       const stderr = (mkTap.stderr?.toString() ?? "").trim();
@@ -28294,7 +28308,7 @@ async function setupTapDevice(api) {
       return;
     }
   }
-  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore" });
+  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore", env });
   await api.put("/network-interfaces/eth0", {
     iface_id: "eth0",
     guest_mac: "06:00:AC:10:00:02",
@@ -44285,7 +44299,8 @@ async function runAudit(input) {
         baseRootfsPath: input.baseRootfsPath,
         repoSrcPath: input.repoDir,
         configPath: effectiveConfig.configPath,
-        extraRepoOverlayFiles
+        extraRepoOverlayFiles,
+        env: stripDangerousEnv(process.env)
       });
       result = await input.launch(overlay);
     }
@@ -44480,8 +44495,10 @@ function createFirecrackerBackend(deps) {
   const doLaunchVm = deps.launchVm ?? launchVm;
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
   const checkExists = deps.existsSync ?? import_node_fs16.existsSync;
   const hostPlatform = deps.platform ?? import_node_process3.platform;
+  const safeEnv = stripDangerousEnv(deps.env ?? process.env);
   return {
     name: "firecracker",
     async run(ctx) {
@@ -44492,7 +44509,7 @@ function createFirecrackerBackend(deps) {
         if (!checkExists("/dev/kvm")) {
           throw new BackendUnavailableError("firecracker", "/dev/kvm is missing");
         }
-        if (!commandSucceeds("ip", ["link", "show", "tap0"])) {
+        if (!doCommandSucceeds("ip", ["link", "show", "tap0"], { env: safeEnv })) {
           throw new BackendUnavailableError("firecracker", "tap0 is not configured");
         }
       }
@@ -44525,7 +44542,10 @@ function createFirecrackerBackend(deps) {
         baseRootfsPath: (0, import_node_path12.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
         repoSrcPath: ctx.repoDir,
         configPath: ctx.configPath,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
+        // SECURITY: sanitized env for overlay's bare-name pre-trust host spawns
+        // (cp / mkfs.ext4 / command -v / macOS Docker fallback).
+        env: safeEnv
       });
       try {
         return await launchFirecracker({
@@ -44534,7 +44554,9 @@ function createFirecrackerBackend(deps) {
           launchVm: doLaunchVm,
           openVsockSession: doOpenVsockSession,
           teardown: doTeardown,
-          warn: deps.warn
+          warn: deps.warn,
+          // SECURITY: sanitized env for launch.ts's bare-name pre-trust tap `ip` spawns.
+          env: safeEnv
         });
       } finally {
         await overlay.cleanup();
@@ -44570,7 +44592,9 @@ async function launchFirecracker(input) {
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,
-      socketPath: apiSocketPath
+      socketPath: apiSocketPath,
+      // SECURITY: sanitized env for the tap-setup `ip` spawns (launch.ts).
+      env: input.env
     });
     vsock = await input.openVsockSession(vsockUdsPath, VSOCK_PORT);
     for await (const frame of vsock.events) {
@@ -44680,10 +44704,14 @@ function rewriteConfigWorkDir(input) {
 // src/action/backend/docker.ts
 function createDockerBackend(deps = {}) {
   const env = deps.env ?? process.env;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const doRunCommand = deps.runCommand ?? runCommand;
+  const safeEnv = stripDangerousEnv(env);
   return {
     name: "docker",
     async run(ctx) {
-      if (!commandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env })) {
+      if (!doCommandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env: safeEnv })) {
         throw new BackendUnavailableError("docker", "docker is not installed or the daemon is unavailable");
       }
       const { ref: imageRef, warning } = resolveDockerImageRef(ctx, {
@@ -44691,12 +44719,12 @@ function createDockerBackend(deps = {}) {
       });
       if (warning !== void 0) writeDockerWarning(deps.stderr, warning);
       if (ctx.selfTest) {
-        if (!commandSucceeds("docker", ["image", "inspect", imageRef], { env })) {
+        if (!doCommandSucceeds("docker", ["image", "inspect", imageRef], { env: safeEnv })) {
           throw new BackendUnavailableError("docker", `local image ${imageRef} is missing`);
         }
       } else {
         try {
-          runCommand("docker", ["pull", imageRef], { env });
+          doRunCommand("docker", ["pull", imageRef], { env: safeEnv });
         } catch (err) {
           throw new BackendUnavailableError(
             "docker",
@@ -44737,7 +44765,7 @@ function createDockerBackend(deps = {}) {
           `export SCRIPT_JAIL_PM_FLAGS_PATH=${workDir}/etc/script-jail/pm-flags.json`,
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
-        return await runAgentProcess({
+        return await doRunAgentProcess({
           cmd: "docker",
           args: [
             "run",
@@ -44757,22 +44785,23 @@ function createDockerBackend(deps = {}) {
             "-lc",
             script
           ],
-          env,
+          env: safeEnv,
           label: "docker",
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {},
           onFetchDone: async () => {
-            runCommand("docker", ["network", "disconnect", "bridge", containerName], { env });
+            doRunCommand("docker", ["network", "disconnect", "bridge", containerName], { env: safeEnv });
           }
         });
       } finally {
         try {
-          runCommand("docker", ["rm", "-f", containerName], { env });
+          doRunCommand("docker", ["rm", "-f", containerName], { env: safeEnv });
         } catch {
         }
         cleanupStagedDockerRepo({
           staged,
           imageRef,
-          env,
+          env: safeEnv,
+          run: doRunCommand,
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}
         });
       }

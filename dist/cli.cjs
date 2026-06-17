@@ -7451,9 +7451,9 @@ function platformPackageName(p) {
 
 // src/cli/spawn-vm.ts
 var import_node_child_process = require("node:child_process");
-var import_node_fs = require("node:fs");
+var import_node_fs2 = require("node:fs");
 var import_node_os2 = require("node:os");
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 var import_node_url = require("node:url");
 
 // src/shared/vsock-protocol.ts
@@ -7532,275 +7532,9 @@ function classifyFrame(obj) {
   }
 }
 
-// src/cli/spawn-vm.ts
-var import_meta = {};
-var MacOSVmBinaryNotFoundError = class extends Error {
-  constructor(searched) {
-    super(
-      `script-jail-vm binary not found. Checked:
-  - ${searched.join("\n  - ")}
-Run \`cargo build --release -p script-jail-host-mac\` to build it, or set SCRIPT_JAIL_VM_BIN to an explicit path.`
-    );
-    this.searched = searched;
-    this.name = "MacOSVmBinaryNotFoundError";
-  }
-  searched;
-};
-var MacOSVmArtifactNotFoundError = class extends Error {
-  constructor(artifact, path) {
-    super(
-      `${artifact} not found at ${path}. Run \`pnpm build\` for local artifacts or fetch the matching release artifact.`
-    );
-    this.artifact = artifact;
-    this.path = path;
-    this.name = "MacOSVmArtifactNotFoundError";
-  }
-  artifact;
-  path;
-};
-var MacOSVmEntitlementError = class extends Error {
-  constructor(binaryPath) {
-    super(
-      `script-jail-vm at ${binaryPath} is missing the '${VZ_ENTITLEMENT}' entitlement, so it cannot boot Virtualization.framework VMs (VZ would fail with a cryptic boot error). For dev builds, re-sign it with:
-  codesign --force --sign - --entitlements src/host-mac/script-jail-vm.entitlements ${binaryPath}`
-    );
-    this.binaryPath = binaryPath;
-    this.name = "MacOSVmEntitlementError";
-  }
-  binaryPath;
-};
-var MacOSVmConfigError = class extends Error {
-  constructor(stderrTail) {
-    super(
-      "script-jail-vm rejected the VmConfig (exit 64). " + (stderrTail.trim().length > 0 ? `stderr tail:
-${stderrTail}` : "No stderr captured.")
-    );
-    this.stderrTail = stderrTail;
-    this.name = "MacOSVmConfigError";
-  }
-  stderrTail;
-};
-var MacOSVmRuntimeError = class extends Error {
-  constructor(stderrTail) {
-    super(
-      "script-jail-vm reported a Virtualization.framework runtime error (exit 2). " + (stderrTail.trim().length > 0 ? `stderr tail:
-${stderrTail}` : "No stderr captured.")
-    );
-    this.stderrTail = stderrTail;
-    this.name = "MacOSVmRuntimeError";
-  }
-  stderrTail;
-};
-var MacOSVmUnknownError = class extends Error {
-  constructor(exitCode, signal) {
-    super(
-      `script-jail-vm exited unexpectedly (code=${exitCode ?? "null"}, signal=${signal ?? "null"}).`
-    );
-    this.exitCode = exitCode;
-    this.signal = signal;
-    this.name = "MacOSVmUnknownError";
-  }
-  exitCode;
-  signal;
-};
-function resolvePackageRoot() {
-  let here = "";
-  try {
-    const dn = typeof __filename !== "undefined" ? __filename : void 0;
-    if (typeof dn === "string") here = dn;
-  } catch {
-  }
-  if (here === "") {
-    try {
-      here = (0, import_node_url.fileURLToPath)(import_meta.url);
-    } catch {
-      here = process.argv[1] ?? process.cwd();
-    }
-  }
-  return (0, import_node_path.dirname)((0, import_node_path.dirname)(here));
-}
-function resolveScriptJailVmBinary(opts) {
-  const searched = [];
-  const envBin = opts?.envOverride !== void 0 ? opts.envOverride : process.env["SCRIPT_JAIL_VM_BIN"];
-  if (envBin !== void 0 && envBin !== "") {
-    searched.push(`${envBin} (SCRIPT_JAIL_VM_BIN)`);
-    if ((0, import_node_fs.existsSync)(envBin)) return envBin;
-  }
-  const repoRoot = opts?.repoRoot ?? resolvePackageRoot();
-  const localTarget = (0, import_node_path.join)(repoRoot, "target", "release", "script-jail-vm");
-  searched.push(localTarget);
-  if ((0, import_node_fs.existsSync)(localTarget)) return localTarget;
-  if (opts?.platformPackageDir !== void 0) {
-    const installedBin = (0, import_node_path.join)(opts.platformPackageDir, "script-jail-vm");
-    searched.push(installedBin);
-    if ((0, import_node_fs.existsSync)(installedBin)) return installedBin;
-  }
-  throw new MacOSVmBinaryNotFoundError(searched);
-}
-function checkArtifacts(cfg) {
-  if (!(0, import_node_fs.existsSync)(cfg.kernelPath)) {
-    throw new MacOSVmArtifactNotFoundError("kernel", cfg.kernelPath);
-  }
-  if (!(0, import_node_fs.existsSync)(cfg.rootfsDiskPath)) {
-    throw new MacOSVmArtifactNotFoundError("rootfs", cfg.rootfsDiskPath);
-  }
-  if (cfg.scratchDiskPath !== void 0 && cfg.scratchDiskPath !== "" && !(0, import_node_fs.existsSync)(cfg.scratchDiskPath)) {
-    throw new MacOSVmArtifactNotFoundError("scratch disk", cfg.scratchDiskPath);
-  }
-  if (cfg.sjtmpDiskPath !== void 0 && cfg.sjtmpDiskPath !== "" && !(0, import_node_fs.existsSync)(cfg.sjtmpDiskPath)) {
-    throw new MacOSVmArtifactNotFoundError("sjtmp disk", cfg.sjtmpDiskPath);
-  }
-  if (cfg.libscriptjailSoPath !== void 0 && cfg.libscriptjailSoPath !== "" && !(0, import_node_fs.existsSync)(cfg.libscriptjailSoPath)) {
-    throw new MacOSVmArtifactNotFoundError("libscriptjail.so", cfg.libscriptjailSoPath);
-  }
-}
-var VZ_ENTITLEMENT = "com.apple.security.virtualization";
-var defaultCodesignRunner = (args) => {
-  const result = (0, import_node_child_process.spawnSync)("codesign", [...args], { encoding: "utf8" });
-  return {
-    status: result.status,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-    error: result.error
-  };
-};
-function assertVmHelperEntitlement(binaryPath, run2) {
-  const doRun = run2 ?? defaultCodesignRunner;
-  const result = doRun(["-d", "--entitlements", "-", binaryPath]);
-  if (result.error !== void 0) return;
-  if (`${result.stdout}
-${result.stderr}`.includes(VZ_ENTITLEMENT)) return;
-  throw new MacOSVmEntitlementError(binaryPath);
-}
-function toJsonPayload(cfg) {
-  return {
-    kernel_path: cfg.kernelPath,
-    kernel_cmdline: cfg.kernelCmdline,
-    rootfs_disk_path: cfg.rootfsDiskPath,
-    repo_disk_path: cfg.repoDiskPath,
-    scratch_disk_path: cfg.scratchDiskPath,
-    sjtmp_disk_path: cfg.sjtmpDiskPath,
-    vsock_uds_path: cfg.vsockUdsPath,
-    vsock_port: cfg.vsockPort,
-    vcpu_count: cfg.vcpuCount,
-    memory_mb: cfg.memoryMb,
-    enable_network: cfg.enableNetwork
-  };
-}
-var STDERR_TAIL_BYTES = 4096;
-var StderrTail = class {
-  buf = Buffer.alloc(0);
-  append(chunk) {
-    this.buf = Buffer.concat([this.buf, chunk]);
-    if (this.buf.length > STDERR_TAIL_BYTES) {
-      this.buf = this.buf.subarray(this.buf.length - STDERR_TAIL_BYTES);
-    }
-  }
-  text() {
-    return this.buf.toString("utf8");
-  }
-};
-async function spawnVm(vmConfig, options = {}) {
-  const binary = options.binary ?? resolveScriptJailVmBinary({
-    ...options.repoRoot !== void 0 ? { repoRoot: options.repoRoot } : {},
-    ...options.platformPackageDir !== void 0 ? { platformPackageDir: options.platformPackageDir } : {}
-  });
-  const stderrSink = options.stderr ?? process.stderr;
-  checkArtifacts({
-    kernelPath: vmConfig.kernelPath,
-    rootfsDiskPath: vmConfig.rootfsDiskPath,
-    scratchDiskPath: vmConfig.scratchDiskPath,
-    sjtmpDiskPath: vmConfig.sjtmpDiskPath
-  });
-  assertVmHelperEntitlement(binary, options.codesignRunner);
-  const tmpDir = (0, import_node_fs.mkdtempSync)((0, import_node_path.join)((0, import_node_os2.tmpdir)(), "script-jail-vm-"));
-  const configJsonPath = (0, import_node_path.join)(tmpDir, "config.json");
-  (0, import_node_fs.writeFileSync)(configJsonPath, JSON.stringify(toJsonPayload(vmConfig), null, 2), "utf8");
-  let child = null;
-  const stderrTail = new StderrTail();
-  const warnings = [];
-  const onSignal = (sig) => {
-    if (child !== null && !child.killed) {
-      try {
-        child.kill(sig);
-      } catch {
-      }
-    }
-  };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
-  try {
-    child = (0, import_node_child_process.spawn)(binary, ["boot", "--config", configJsonPath], {
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    child.stderr.on("data", (chunk) => {
-      stderrTail.append(chunk);
-      stderrSink.write(chunk);
-    });
-    const exitPromise = new Promise((resolveExit) => {
-      child.once("exit", (code2, signal2) => resolveExit({ code: code2, signal: signal2 }));
-    });
-    let finalYaml = null;
-    let fatalError = null;
-    const frameStream = parseFrames(child.stdout);
-    for await (const frame of frameStream) {
-      if (frame.kind === "event") continue;
-      if (frame.kind === "handshake") {
-        if (frame.phase === "fetch_done") {
-          await new Promise((res, rej) => {
-            child.stdin.write("go\n", (err) => err ? rej(err) : res());
-          });
-          continue;
-        }
-        continue;
-      }
-      if (frame.kind === "error") {
-        if (frame.fatal) {
-          fatalError = new Error(`script-jail-vm guest fatal: ${frame.message}`);
-          break;
-        }
-        warnings.push(frame.message);
-        stderrSink.write(`script-jail-vm: ${frame.message}
-`);
-        continue;
-      }
-      if (frame.kind === "final") {
-        finalYaml = frame.yaml;
-        try {
-          child.stdin.end();
-        } catch {
-        }
-        break;
-      }
-    }
-    const { code, signal } = await exitPromise;
-    if (fatalError !== null) {
-      throw fatalError;
-    }
-    if (finalYaml === null) {
-      if (code === 64) throw new MacOSVmConfigError(stderrTail.text());
-      if (code === 2) throw new MacOSVmRuntimeError(stderrTail.text());
-      if (code === 0) {
-        throw new MacOSVmUnknownError(code, signal);
-      }
-      throw new MacOSVmUnknownError(code, signal);
-    }
-    return { finalYaml, warnings };
-  } finally {
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
-    if (child !== null && child.exitCode === null && !child.killed) {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-      }
-    }
-    try {
-      (0, import_node_fs.rmSync)(tmpDir, { recursive: true, force: true });
-    } catch {
-    }
-  }
-}
+// src/action/host-install.ts
+var import_node_fs = require("node:fs");
+var import_node_path = require("node:path");
 
 // src/shared/pm-commands.ts
 function isBareFlag(token) {
@@ -7963,6 +7697,451 @@ function splitInstallArgs(raw) {
   return out;
 }
 
+// src/shared/redact.ts
+var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
+var FRAGMENT_MAX_GRAMS = 1 << 22;
+
+// src/action/host-install.ts
+var CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+function canonicalForCompare(p) {
+  let abs;
+  try {
+    abs = (0, import_node_fs.realpathSync)((0, import_node_path.resolve)(p));
+  } catch {
+    abs = (0, import_node_path.resolve)(p);
+  }
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+function checkoutRoots() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
+  }
+  return roots;
+}
+function isUnderCheckout(p, roots) {
+  const abs = canonicalForCompare(p);
+  for (const root of roots) {
+    if (abs === root || abs.startsWith(root + import_node_path.sep)) return true;
+  }
+  return false;
+}
+var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
+  [
+    // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
+    "NODE_OPTIONS",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_PATH",
+    // adds require() search dirs → a checkout-relative one loads PR code
+    // [19] Git EXEC/config-FILE selectors (git+ssh|https deps; --ignore-scripts
+    // does NOT stop git being invoked).  Enumerated (not blanket GIT_*) so benign
+    // behaviour flags such as GIT_TERMINAL_PROMPT/GIT_ALLOW_PROTOCOL are preserved.
+    // The git BINARY itself stays pinned via npm_config_git.
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_ASKPASS",
+    // verified-class: git invokes the askpass program by path
+    "SSH_ASKPASS",
+    "GIT_EXEC_PATH",
+    // VERIFIED: GIT_EXEC_PATH=./core runs checkout core/git-remote-https
+    "GIT_TEMPLATE_DIR",
+    // clone hooks dir
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    // gates inline GIT_CONFIG_KEY_*/VALUE_*; dropping it makes them inert
+    "GIT_CONFIG_PARAMETERS",
+    // VERIFIED: ='core.sshCommand=./ssh' runs ./ssh on ssh:// clone
+    // Native-build TOOL selectors honored by node-gyp/gyp/make (checkout-relative
+    // interpreter/compiler/linker runs during a native `npm rebuild`).  PYTHON* and
+    // node-gyp* are caught by the family prefixes below.  Stripping forces the
+    // system toolchain auto-detect — the same default the clean-VM audit used.
+    "CC",
+    "CXX",
+    "CPP",
+    "LINK",
+    "LD",
+    "AR",
+    "AS",
+    "MAKE",
+    // GNU make startup/config env (consumed before any target): MAKEFLAGS
+    // ='--eval=$(shell …)' runs a command at make startup, MAKEFILES=/path
+    // evaluates a makefile pre-target (both VERIFIED).  node-gyp invokes make.
+    "MAKEFLAGS",
+    "GNUMAKEFLAGS",
+    "MAKEFILES",
+    // Corepack EXEC/config selectors: a pnpm/yarn bare command is commonly a
+    // corepack shim, and COREPACK_HOME is its executable CACHE — a checkout-
+    // relative one (VERIFIED with corepack 0.35.0) makes corepack run a PR-planted
+    // bin/pnpm.cjs in host part-1.  COREPACK_ENV_FILE loads env from a file;
+    // COREPACK_NPM_REGISTRY / COREPACK_INTEGRITY_KEYS / COREPACK_ROOT can redirect
+    // or unsign the downloaded PM.  Behaviour flags (COREPACK_ENABLE_*) are NOT
+    // here — they don't select an executable, and the download-prompt flag is
+    // re-pinned below so stripping the cache can't trigger an interactive hang.
+    "COREPACK_HOME",
+    "COREPACK_ENV_FILE",
+    "COREPACK_NPM_REGISTRY",
+    "COREPACK_INTEGRITY_KEYS",
+    "COREPACK_ROOT",
+    // Shell / interpreter startup hooks that run on a NON-interactive spawn.
+    // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
+    // common legit "environment name" var, so it is deliberately NOT stripped.)
+    "BASH_ENV",
+    // bash -c sources it
+    "ZDOTDIR",
+    // zsh startup dir
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB"
+  ].map((n) => n.toLowerCase())
+);
+var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
+  "ld_",
+  // ELF dynamic loader: LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH / …
+  "dyld_",
+  // macOS dyld analogs (the host bare backend runs on macOS)
+  "python",
+  // PYTHON / PYTHONPATH / PYTHONHOME / PYTHONSTARTUP (sitecustomize exec)
+  "node_gyp_",
+  // NODE_GYP_FORCE_PYTHON, … (VERIFIED node-gyp interpreter selector)
+  // npm re-derives npm_package_config_* from the AUDITED package.json; an INHERITED
+  // one for a key absent from package.json would pass through to node-gyp
+  // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
+  // the legit values from the package.json the sandbox already audited.
+  "npm_package_config_"
+];
+var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
+  "script_shell",
+  "ignore_scripts",
+  "userconfig",
+  "globalconfig",
+  "node_gyp",
+  "python",
+  "make",
+  "shell"
+]);
+function isDangerousEnvName(name) {
+  const lower = name.toLowerCase();
+  for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
+    if (lower.startsWith(prefix)) return true;
+  }
+  if (lower.startsWith("npm_config_")) {
+    const key = lower.slice("npm_config_".length).replace(/-/g, "_");
+    return DANGEROUS_NPM_CONFIG_KEYS.has(key);
+  }
+  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
+}
+var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+function sanitizePathValue(pathVar) {
+  if (pathVar === void 0) return void 0;
+  const roots = checkoutRoots();
+  const kept = [];
+  for (const dir of pathVar.split(import_node_path.delimiter)) {
+    if (!(0, import_node_path.isAbsolute)(dir)) continue;
+    if (isUnderCheckout(dir, roots)) continue;
+    kept.push(dir);
+  }
+  return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path.delimiter);
+}
+function stripDangerousEnv(srcEnv) {
+  const env = {};
+  for (const [name, value] of Object.entries(srcEnv)) {
+    if (value === void 0) continue;
+    if (isDangerousEnvName(name)) continue;
+    env[name] = value;
+  }
+  const sanitizedPath = sanitizePathValue(srcEnv["PATH"]);
+  if (sanitizedPath === void 0) delete env["PATH"];
+  else env["PATH"] = sanitizedPath;
+  return env;
+}
+var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
+
+// src/cli/spawn-vm.ts
+var import_meta = {};
+var MacOSVmBinaryNotFoundError = class extends Error {
+  constructor(searched) {
+    super(
+      `script-jail-vm binary not found. Checked:
+  - ${searched.join("\n  - ")}
+Run \`cargo build --release -p script-jail-host-mac\` to build it, or set SCRIPT_JAIL_VM_BIN to an explicit path.`
+    );
+    this.searched = searched;
+    this.name = "MacOSVmBinaryNotFoundError";
+  }
+  searched;
+};
+var MacOSVmArtifactNotFoundError = class extends Error {
+  constructor(artifact, path) {
+    super(
+      `${artifact} not found at ${path}. Run \`pnpm build\` for local artifacts or fetch the matching release artifact.`
+    );
+    this.artifact = artifact;
+    this.path = path;
+    this.name = "MacOSVmArtifactNotFoundError";
+  }
+  artifact;
+  path;
+};
+var MacOSVmEntitlementError = class extends Error {
+  constructor(binaryPath) {
+    super(
+      `script-jail-vm at ${binaryPath} is missing the '${VZ_ENTITLEMENT}' entitlement, so it cannot boot Virtualization.framework VMs (VZ would fail with a cryptic boot error). For dev builds, re-sign it with:
+  codesign --force --sign - --entitlements src/host-mac/script-jail-vm.entitlements ${binaryPath}`
+    );
+    this.binaryPath = binaryPath;
+    this.name = "MacOSVmEntitlementError";
+  }
+  binaryPath;
+};
+var MacOSVmConfigError = class extends Error {
+  constructor(stderrTail) {
+    super(
+      "script-jail-vm rejected the VmConfig (exit 64). " + (stderrTail.trim().length > 0 ? `stderr tail:
+${stderrTail}` : "No stderr captured.")
+    );
+    this.stderrTail = stderrTail;
+    this.name = "MacOSVmConfigError";
+  }
+  stderrTail;
+};
+var MacOSVmRuntimeError = class extends Error {
+  constructor(stderrTail) {
+    super(
+      "script-jail-vm reported a Virtualization.framework runtime error (exit 2). " + (stderrTail.trim().length > 0 ? `stderr tail:
+${stderrTail}` : "No stderr captured.")
+    );
+    this.stderrTail = stderrTail;
+    this.name = "MacOSVmRuntimeError";
+  }
+  stderrTail;
+};
+var MacOSVmUnknownError = class extends Error {
+  constructor(exitCode, signal) {
+    super(
+      `script-jail-vm exited unexpectedly (code=${exitCode ?? "null"}, signal=${signal ?? "null"}).`
+    );
+    this.exitCode = exitCode;
+    this.signal = signal;
+    this.name = "MacOSVmUnknownError";
+  }
+  exitCode;
+  signal;
+};
+function resolvePackageRoot() {
+  let here = "";
+  try {
+    const dn = typeof __filename !== "undefined" ? __filename : void 0;
+    if (typeof dn === "string") here = dn;
+  } catch {
+  }
+  if (here === "") {
+    try {
+      here = (0, import_node_url.fileURLToPath)(import_meta.url);
+    } catch {
+      here = process.argv[1] ?? process.cwd();
+    }
+  }
+  return (0, import_node_path2.dirname)((0, import_node_path2.dirname)(here));
+}
+function resolveScriptJailVmBinary(opts) {
+  const searched = [];
+  const envBin = opts?.envOverride !== void 0 ? opts.envOverride : process.env["SCRIPT_JAIL_VM_BIN"];
+  if (envBin !== void 0 && envBin !== "") {
+    searched.push(`${envBin} (SCRIPT_JAIL_VM_BIN)`);
+    if ((0, import_node_fs2.existsSync)(envBin)) return envBin;
+  }
+  const repoRoot = opts?.repoRoot ?? resolvePackageRoot();
+  const localTarget = (0, import_node_path2.join)(repoRoot, "target", "release", "script-jail-vm");
+  searched.push(localTarget);
+  if ((0, import_node_fs2.existsSync)(localTarget)) return localTarget;
+  if (opts?.platformPackageDir !== void 0) {
+    const installedBin = (0, import_node_path2.join)(opts.platformPackageDir, "script-jail-vm");
+    searched.push(installedBin);
+    if ((0, import_node_fs2.existsSync)(installedBin)) return installedBin;
+  }
+  throw new MacOSVmBinaryNotFoundError(searched);
+}
+function checkArtifacts(cfg) {
+  if (!(0, import_node_fs2.existsSync)(cfg.kernelPath)) {
+    throw new MacOSVmArtifactNotFoundError("kernel", cfg.kernelPath);
+  }
+  if (!(0, import_node_fs2.existsSync)(cfg.rootfsDiskPath)) {
+    throw new MacOSVmArtifactNotFoundError("rootfs", cfg.rootfsDiskPath);
+  }
+  if (cfg.scratchDiskPath !== void 0 && cfg.scratchDiskPath !== "" && !(0, import_node_fs2.existsSync)(cfg.scratchDiskPath)) {
+    throw new MacOSVmArtifactNotFoundError("scratch disk", cfg.scratchDiskPath);
+  }
+  if (cfg.sjtmpDiskPath !== void 0 && cfg.sjtmpDiskPath !== "" && !(0, import_node_fs2.existsSync)(cfg.sjtmpDiskPath)) {
+    throw new MacOSVmArtifactNotFoundError("sjtmp disk", cfg.sjtmpDiskPath);
+  }
+  if (cfg.libscriptjailSoPath !== void 0 && cfg.libscriptjailSoPath !== "" && !(0, import_node_fs2.existsSync)(cfg.libscriptjailSoPath)) {
+    throw new MacOSVmArtifactNotFoundError("libscriptjail.so", cfg.libscriptjailSoPath);
+  }
+}
+var VZ_ENTITLEMENT = "com.apple.security.virtualization";
+function defaultCodesignEnv() {
+  return stripDangerousEnv(process.env);
+}
+var defaultCodesignRunner = (args) => {
+  const result = (0, import_node_child_process.spawnSync)("codesign", [...args], {
+    encoding: "utf8",
+    env: defaultCodesignEnv()
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error
+  };
+};
+function assertVmHelperEntitlement(binaryPath, run2) {
+  const doRun = run2 ?? defaultCodesignRunner;
+  const result = doRun(["-d", "--entitlements", "-", binaryPath]);
+  if (result.error !== void 0) return;
+  if (`${result.stdout}
+${result.stderr}`.includes(VZ_ENTITLEMENT)) return;
+  throw new MacOSVmEntitlementError(binaryPath);
+}
+function toJsonPayload(cfg) {
+  return {
+    kernel_path: cfg.kernelPath,
+    kernel_cmdline: cfg.kernelCmdline,
+    rootfs_disk_path: cfg.rootfsDiskPath,
+    repo_disk_path: cfg.repoDiskPath,
+    scratch_disk_path: cfg.scratchDiskPath,
+    sjtmp_disk_path: cfg.sjtmpDiskPath,
+    vsock_uds_path: cfg.vsockUdsPath,
+    vsock_port: cfg.vsockPort,
+    vcpu_count: cfg.vcpuCount,
+    memory_mb: cfg.memoryMb,
+    enable_network: cfg.enableNetwork
+  };
+}
+var STDERR_TAIL_BYTES = 4096;
+var StderrTail = class {
+  buf = Buffer.alloc(0);
+  append(chunk) {
+    this.buf = Buffer.concat([this.buf, chunk]);
+    if (this.buf.length > STDERR_TAIL_BYTES) {
+      this.buf = this.buf.subarray(this.buf.length - STDERR_TAIL_BYTES);
+    }
+  }
+  text() {
+    return this.buf.toString("utf8");
+  }
+};
+async function spawnVm(vmConfig, options = {}) {
+  const binary = options.binary ?? resolveScriptJailVmBinary({
+    ...options.repoRoot !== void 0 ? { repoRoot: options.repoRoot } : {},
+    ...options.platformPackageDir !== void 0 ? { platformPackageDir: options.platformPackageDir } : {}
+  });
+  const stderrSink = options.stderr ?? process.stderr;
+  checkArtifacts({
+    kernelPath: vmConfig.kernelPath,
+    rootfsDiskPath: vmConfig.rootfsDiskPath,
+    scratchDiskPath: vmConfig.scratchDiskPath,
+    sjtmpDiskPath: vmConfig.sjtmpDiskPath
+  });
+  assertVmHelperEntitlement(binary, options.codesignRunner);
+  const tmpDir = (0, import_node_fs2.mkdtempSync)((0, import_node_path2.join)((0, import_node_os2.tmpdir)(), "script-jail-vm-"));
+  const configJsonPath = (0, import_node_path2.join)(tmpDir, "config.json");
+  (0, import_node_fs2.writeFileSync)(configJsonPath, JSON.stringify(toJsonPayload(vmConfig), null, 2), "utf8");
+  let child = null;
+  const stderrTail = new StderrTail();
+  const warnings = [];
+  const onSignal = (sig) => {
+    if (child !== null && !child.killed) {
+      try {
+        child.kill(sig);
+      } catch {
+      }
+    }
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    child = (0, import_node_child_process.spawn)(binary, ["boot", "--config", configJsonPath], {
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrTail.append(chunk);
+      stderrSink.write(chunk);
+    });
+    const exitPromise = new Promise((resolveExit) => {
+      child.once("exit", (code2, signal2) => resolveExit({ code: code2, signal: signal2 }));
+    });
+    let finalYaml = null;
+    let fatalError = null;
+    const frameStream = parseFrames(child.stdout);
+    for await (const frame of frameStream) {
+      if (frame.kind === "event") continue;
+      if (frame.kind === "handshake") {
+        if (frame.phase === "fetch_done") {
+          await new Promise((res, rej) => {
+            child.stdin.write("go\n", (err) => err ? rej(err) : res());
+          });
+          continue;
+        }
+        continue;
+      }
+      if (frame.kind === "error") {
+        if (frame.fatal) {
+          fatalError = new Error(`script-jail-vm guest fatal: ${frame.message}`);
+          break;
+        }
+        warnings.push(frame.message);
+        stderrSink.write(`script-jail-vm: ${frame.message}
+`);
+        continue;
+      }
+      if (frame.kind === "final") {
+        finalYaml = frame.yaml;
+        try {
+          child.stdin.end();
+        } catch {
+        }
+        break;
+      }
+    }
+    const { code, signal } = await exitPromise;
+    if (fatalError !== null) {
+      throw fatalError;
+    }
+    if (finalYaml === null) {
+      if (code === 64) throw new MacOSVmConfigError(stderrTail.text());
+      if (code === 2) throw new MacOSVmRuntimeError(stderrTail.text());
+      if (code === 0) {
+        throw new MacOSVmUnknownError(code, signal);
+      }
+      throw new MacOSVmUnknownError(code, signal);
+    }
+    return { finalYaml, warnings };
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    if (child !== null && child.exitCode === null && !child.killed) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+      }
+    }
+    try {
+      (0, import_node_fs2.rmSync)(tmpDir, { recursive: true, force: true });
+    } catch {
+    }
+  }
+}
+
 // src/cli/parse-args.ts
 var VALID_SUBCOMMANDS = /* @__PURE__ */ new Set(["init", "update", "check"]);
 var VALID_PLATFORMS = /* @__PURE__ */ new Set(["linux", "darwin", "win32"]);
@@ -8085,8 +8264,8 @@ function parseArgs(argv) {
 
 // src/shared/detect-pm.ts
 var import_node_crypto = require("node:crypto");
-var import_node_fs2 = require("node:fs");
-var import_node_path2 = require("node:path");
+var import_node_fs3 = require("node:fs");
+var import_node_path3 = require("node:path");
 
 // src/shared/log.ts
 function warn(msg, write = (s) => {
@@ -8112,16 +8291,16 @@ var LOCKFILE_PRIORITY = [
 var BUN_LOCKFILES = ["bun.lock", "bun.lockb"];
 function detectPm(input) {
   const fs = input.fs ?? {
-    existsSync: import_node_fs2.existsSync,
-    readFileSync: (p) => (0, import_node_fs2.readFileSync)(p)
+    existsSync: import_node_fs3.existsSync,
+    readFileSync: (p) => (0, import_node_fs3.readFileSync)(p)
   };
   const warn2 = input.warn ?? warn;
   const found = LOCKFILE_PRIORITY.filter(
-    (entry) => fs.existsSync((0, import_node_path2.join)(input.repoDir, entry.name))
+    (entry) => fs.existsSync((0, import_node_path3.join)(input.repoDir, entry.name))
   );
   if (found.length === 0) {
     const hasBun = BUN_LOCKFILES.some(
-      (name) => fs.existsSync((0, import_node_path2.join)(input.repoDir, name))
+      (name) => fs.existsSync((0, import_node_path3.join)(input.repoDir, name))
     );
     if (hasBun) throw new BunUnsupportedError();
     throw new Error(
@@ -8136,7 +8315,7 @@ function detectPm(input) {
       `[detect-pm] multiple lockfiles found; using ${chosen.name} (ignoring: ${otherNames})`
     );
   }
-  const lockfilePath = (0, import_node_path2.join)(input.repoDir, chosen.name);
+  const lockfilePath = (0, import_node_path3.join)(input.repoDir, chosen.name);
   const buf = fs.readFileSync(lockfilePath);
   const lockfileSha256 = (0, import_node_crypto.createHash)("sha256").update(buf).digest("hex");
   return {
@@ -8148,8 +8327,8 @@ function detectPm(input) {
 
 // src/shared/artifacts.ts
 var import_node_module = require("node:module");
-var import_node_fs3 = require("node:fs");
-var import_node_path3 = require("node:path");
+var import_node_fs4 = require("node:fs");
+var import_node_path4 = require("node:path");
 var import_meta2 = {};
 function resolveArtifacts(input) {
   const { repoRoot, hostArch, ubuntuMajor } = input;
@@ -8160,19 +8339,19 @@ function resolveArtifacts(input) {
       "resolveArtifacts: provide exactly one of { repoRoot, imagesDir }"
     );
   }
-  const imagesDir = hasImagesDir ? input.imagesDir : (0, import_node_path3.join)(repoRoot, "images");
+  const imagesDir = hasImagesDir ? input.imagesDir : (0, import_node_path4.join)(repoRoot, "images");
   const kernelArch = hostArch === "x64" ? "x86_64" : "arm64";
-  const kernelPath = (0, import_node_path3.join)(imagesDir, `vmlinux-vz-${kernelArch}`);
+  const kernelPath = (0, import_node_path4.join)(imagesDir, `vmlinux-vz-${kernelArch}`);
   const rootfsName = hostArch === "arm64" ? `rootfs-ubuntu-${ubuntuMajor}-arm64.ext4` : `rootfs-ubuntu-${ubuntuMajor}.ext4`;
-  const rootfsPath = (0, import_node_path3.join)(imagesDir, rootfsName);
+  const rootfsPath = (0, import_node_path4.join)(imagesDir, rootfsName);
   const compressedRootfsPath = `${rootfsPath}.gz`;
-  const libscriptjailSoPath = (0, import_node_path3.join)(
+  const libscriptjailSoPath = (0, import_node_path4.join)(
     imagesDir,
     hostArch === "x64" ? "libscriptjail.so" : "libscriptjail-arm64.so"
   );
-  const macShimDylibPath = (0, import_node_path3.join)(imagesDir, "libscriptjail-arm64.dylib");
-  const macCoreutilsPath = (0, import_node_path3.join)(imagesDir, "coreutils-arm64");
-  const macBashPath = (0, import_node_path3.join)(imagesDir, "bash-arm64");
+  const macShimDylibPath = (0, import_node_path4.join)(imagesDir, "libscriptjail-arm64.dylib");
+  const macCoreutilsPath = (0, import_node_path4.join)(imagesDir, "coreutils-arm64");
+  const macBashPath = (0, import_node_path4.join)(imagesDir, "bash-arm64");
   return {
     kernelPath,
     rootfsPath,
@@ -8196,46 +8375,46 @@ function resolvePlatformPackageDir(input) {
   const req = input.require ?? (typeof require !== "undefined" ? require : (0, import_node_module.createRequire)(import_meta2.url));
   try {
     const resolvedPkgJson = req.resolve(`${packageName}/package.json`);
-    return { imagesDir: (0, import_node_path3.dirname)(resolvedPkgJson), source: "package" };
+    return { imagesDir: (0, import_node_path4.dirname)(resolvedPkgJson), source: "package" };
   } catch {
   }
-  if (devImagesDir !== void 0 && (0, import_node_fs3.existsSync)(devImagesDir)) {
+  if (devImagesDir !== void 0 && (0, import_node_fs4.existsSync)(devImagesDir)) {
     return { imagesDir: devImagesDir, source: "dev" };
   }
   throw new PlatformPackageMissingError(packageName);
 }
 
 // src/cli/rootfs-cache.ts
-var import_node_fs4 = require("node:fs");
+var import_node_fs5 = require("node:fs");
 var import_node_crypto2 = require("node:crypto");
 var import_node_os3 = require("node:os");
-var import_node_path4 = require("node:path");
+var import_node_path5 = require("node:path");
 var import_node_zlib = require("node:zlib");
 async function ensureRootfs(input) {
-  if ((0, import_node_fs4.existsSync)(input.rootfsPath)) return input.rootfsPath;
-  if (!(0, import_node_fs4.existsSync)(input.compressedRootfsPath)) return input.rootfsPath;
+  if ((0, import_node_fs5.existsSync)(input.rootfsPath)) return input.rootfsPath;
+  if (!(0, import_node_fs5.existsSync)(input.compressedRootfsPath)) return input.rootfsPath;
   const cacheDir = input.cacheDir ?? defaultCacheDir();
-  (0, import_node_fs4.mkdirSync)(cacheDir, { recursive: true });
+  (0, import_node_fs5.mkdirSync)(cacheDir, { recursive: true });
   const digest = await sha256File(input.compressedRootfsPath);
-  const ext4Name = (0, import_node_path4.basename)(input.rootfsPath);
-  const cached2 = (0, import_node_path4.join)(cacheDir, `${stripExt4Suffix(ext4Name)}-${digest.slice(0, 16)}.ext4`);
+  const ext4Name = (0, import_node_path5.basename)(input.rootfsPath);
+  const cached2 = (0, import_node_path5.join)(cacheDir, `${stripExt4Suffix(ext4Name)}-${digest.slice(0, 16)}.ext4`);
   const metaPath = `${cached2}.json`;
   if (isReusableCachedRootfs(cached2, metaPath, digest)) return cached2;
-  (0, import_node_fs4.rmSync)(cached2, { force: true });
-  (0, import_node_fs4.rmSync)(metaPath, { force: true });
-  const tmp = (0, import_node_path4.join)(cacheDir, `.${(0, import_node_path4.basename)(cached2)}.${process.pid}.${Date.now()}.tmp`);
+  (0, import_node_fs5.rmSync)(cached2, { force: true });
+  (0, import_node_fs5.rmSync)(metaPath, { force: true });
+  const tmp = (0, import_node_path5.join)(cacheDir, `.${(0, import_node_path5.basename)(cached2)}.${process.pid}.${Date.now()}.tmp`);
   const tmpMeta = `${tmp}.json`;
   try {
     const logicalSize = await sparseGunzip(input.compressedRootfsPath, tmp);
-    (0, import_node_fs4.writeFileSync)(
+    (0, import_node_fs5.writeFileSync)(
       tmpMeta,
       JSON.stringify({ compressedSha256: digest, logicalSize }, null, 2) + "\n"
     );
-    (0, import_node_fs4.renameSync)(tmp, cached2);
-    (0, import_node_fs4.renameSync)(tmpMeta, metaPath);
+    (0, import_node_fs5.renameSync)(tmp, cached2);
+    (0, import_node_fs5.renameSync)(tmpMeta, metaPath);
   } catch (err) {
-    (0, import_node_fs4.rmSync)(tmp, { force: true });
-    (0, import_node_fs4.rmSync)(tmpMeta, { force: true });
+    (0, import_node_fs5.rmSync)(tmp, { force: true });
+    (0, import_node_fs5.rmSync)(tmpMeta, { force: true });
     throw err;
   }
   return cached2;
@@ -8244,32 +8423,32 @@ function defaultCacheDir() {
   const override = process.env["SCRIPT_JAIL_CACHE_DIR"];
   if (override !== void 0 && override !== "") return override;
   const home = (0, import_node_os3.homedir)();
-  if (home !== "") return (0, import_node_path4.join)(home, "Library", "Caches", "script-jail");
-  return (0, import_node_path4.join)((0, import_node_os3.tmpdir)(), "script-jail-cache");
+  if (home !== "") return (0, import_node_path5.join)(home, "Library", "Caches", "script-jail");
+  return (0, import_node_path5.join)((0, import_node_os3.tmpdir)(), "script-jail-cache");
 }
 async function sha256File(path) {
   const hash2 = (0, import_node_crypto2.createHash)("sha256");
-  for await (const chunk of (0, import_node_fs4.createReadStream)(path)) {
+  for await (const chunk of (0, import_node_fs5.createReadStream)(path)) {
     hash2.update(chunk);
   }
   return hash2.digest("hex");
 }
 async function sparseGunzip(source, dest) {
-  (0, import_node_fs4.mkdirSync)((0, import_node_path4.dirname)(dest), { recursive: true });
-  const fd = (0, import_node_fs4.openSync)(dest, "w", 420);
+  (0, import_node_fs5.mkdirSync)((0, import_node_path5.dirname)(dest), { recursive: true });
+  const fd = (0, import_node_fs5.openSync)(dest, "w", 420);
   let offset = 0;
   try {
-    const stream = (0, import_node_fs4.createReadStream)(source, { highWaterMark: 1024 * 1024 }).pipe((0, import_node_zlib.createGunzip)());
+    const stream = (0, import_node_fs5.createReadStream)(source, { highWaterMark: 1024 * 1024 }).pipe((0, import_node_zlib.createGunzip)());
     for await (const chunk of stream) {
       const buf = chunk;
       writeNonZeroRanges(fd, buf, offset);
       offset += buf.length;
     }
-    (0, import_node_fs4.ftruncateSync)(fd, offset);
+    (0, import_node_fs5.ftruncateSync)(fd, offset);
   } finally {
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
   }
-  (0, import_node_fs4.statSync)(dest);
+  (0, import_node_fs5.statSync)(dest);
   return offset;
 }
 function writeNonZeroRanges(fd, buf, baseOffset) {
@@ -8280,28 +8459,28 @@ function writeNonZeroRanges(fd, buf, baseOffset) {
       continue;
     }
     if (start !== -1) {
-      (0, import_node_fs4.writeSync)(fd, buf, start, i - start, baseOffset + start);
+      (0, import_node_fs5.writeSync)(fd, buf, start, i - start, baseOffset + start);
       start = -1;
     }
   }
   if (start !== -1) {
-    (0, import_node_fs4.writeSync)(fd, buf, start, buf.length - start, baseOffset + start);
+    (0, import_node_fs5.writeSync)(fd, buf, start, buf.length - start, baseOffset + start);
   }
 }
 function stripExt4Suffix(name) {
   return name.endsWith(".ext4") ? name.slice(0, -".ext4".length) : name;
 }
 function isReusableCachedRootfs(cached2, metaPath, digest) {
-  if (!(0, import_node_fs4.existsSync)(cached2) || !(0, import_node_fs4.existsSync)(metaPath)) return false;
+  if (!(0, import_node_fs5.existsSync)(cached2) || !(0, import_node_fs5.existsSync)(metaPath)) return false;
   const meta3 = readCacheMeta(metaPath);
   if (meta3 === void 0) return false;
   if (meta3.compressedSha256 !== digest) return false;
   if (!Number.isSafeInteger(meta3.logicalSize) || meta3.logicalSize < 0) return false;
-  return (0, import_node_fs4.statSync)(cached2).size === meta3.logicalSize;
+  return (0, import_node_fs5.statSync)(cached2).size === meta3.logicalSize;
 }
 function readCacheMeta(path) {
   try {
-    const parsed = JSON.parse((0, import_node_fs4.readFileSync)(path, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs5.readFileSync)(path, "utf8"));
     const { compressedSha256, logicalSize } = parsed;
     if (typeof compressedSha256 !== "string" || typeof logicalSize !== "number") return void 0;
     return { compressedSha256, logicalSize };
@@ -8311,15 +8490,15 @@ function readCacheMeta(path) {
 }
 
 // src/cli/local-artifacts.ts
-var import_node_fs5 = require("node:fs");
-var import_node_path5 = require("node:path");
+var import_node_fs6 = require("node:fs");
+var import_node_path6 = require("node:path");
 function createLocalPreFetchArtifacts(input) {
   const { packageImagesDir, hostArch, ubuntuMajor } = input;
   const ensureRootfs2 = input.ensureRootfs ?? ensureRootfs;
   return async function localPreFetchArtifacts(prefetch) {
     const { imagesDir, runnerImage } = prefetch;
     const arch = prefetch.arch ?? hostArch;
-    (0, import_node_fs5.mkdirSync)(imagesDir, { recursive: true });
+    (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
     await materializeRootfs({
       packageImagesDir,
       imagesDir,
@@ -8334,9 +8513,9 @@ function createLocalPreFetchArtifacts(input) {
 }
 async function materializeRootfs(args) {
   const wantedRootfs = rootfsAssetName(args.runnerImage, args.arch);
-  const dest = (0, import_node_path5.join)(args.imagesDir, wantedRootfs);
-  if ((0, import_node_fs5.existsSync)(dest)) return;
-  const packagedRootfs = (0, import_node_path5.join)(args.packageImagesDir, wantedRootfs);
+  const dest = (0, import_node_path6.join)(args.imagesDir, wantedRootfs);
+  if ((0, import_node_fs6.existsSync)(dest)) return;
+  const packagedRootfs = (0, import_node_path6.join)(args.packageImagesDir, wantedRootfs);
   const materialized = await args.ensureRootfs({
     rootfsPath: packagedRootfs,
     compressedRootfsPath: `${packagedRootfs}.gz`,
@@ -8344,24 +8523,24 @@ async function materializeRootfs(args) {
     // explicit `undefined` is not assignable to the optional field.
     ...args.cacheDir !== void 0 ? { cacheDir: args.cacheDir } : {}
   });
-  if ((0, import_node_fs5.existsSync)(dest) && (0, import_node_fs5.statSync)(dest).size === (0, import_node_fs5.statSync)(materialized).size) {
+  if ((0, import_node_fs6.existsSync)(dest) && (0, import_node_fs6.statSync)(dest).size === (0, import_node_fs6.statSync)(materialized).size) {
     return;
   }
   linkOrCopy(materialized, dest);
 }
 function materializeShim(args) {
   const soName = libscriptjailAssetName(args.arch);
-  const src = (0, import_node_path5.join)(args.packageImagesDir, soName);
-  const dest = (0, import_node_path5.join)(args.imagesDir, soName);
-  if ((0, import_node_fs5.existsSync)(dest) && (0, import_node_fs5.statSync)(dest).size === (0, import_node_fs5.statSync)(src).size) return;
-  (0, import_node_fs5.copyFileSync)(src, dest);
+  const src = (0, import_node_path6.join)(args.packageImagesDir, soName);
+  const dest = (0, import_node_path6.join)(args.imagesDir, soName);
+  if ((0, import_node_fs6.existsSync)(dest) && (0, import_node_fs6.statSync)(dest).size === (0, import_node_fs6.statSync)(src).size) return;
+  (0, import_node_fs6.copyFileSync)(src, dest);
 }
 function linkOrCopy(src, dest) {
   try {
-    (0, import_node_fs5.linkSync)(src, dest);
+    (0, import_node_fs6.linkSync)(src, dest);
   } catch (err) {
     if (err.code === "EXDEV") {
-      (0, import_node_fs5.copyFileSync)(src, dest);
+      (0, import_node_fs6.copyFileSync)(src, dest);
       return;
     }
     throw err;
@@ -8375,15 +8554,15 @@ function libscriptjailAssetName(arch) {
 }
 
 // src/action/firecracker/overlay.ts
-var import_node_fs6 = require("node:fs");
+var import_node_fs7 = require("node:fs");
 var import_promises = require("node:fs/promises");
-var import_node_path6 = require("node:path");
+var import_node_path7 = require("node:path");
 var import_node_os4 = require("node:os");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
-  const workDir = input.workDir ?? (0, import_node_fs6.mkdtempSync)((0, import_node_path6.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
-  (0, import_node_fs6.mkdirSync)(workDir, { recursive: true });
+  const workDir = input.workDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path7.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
+  (0, import_node_fs7.mkdirSync)(workDir, { recursive: true });
   try {
     return await buildOverlayInto(workDir, input);
   } catch (err) {
@@ -8397,18 +8576,19 @@ async function makeOverlay(input) {
 }
 async function buildOverlayInto(workDir, input) {
   const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
-  const rootfsCopyPath = (0, import_node_path6.join)(workDir, "rootfs.ext4");
-  copyRootfs(baseRootfsPath, rootfsCopyPath);
-  const repoStageDir = (0, import_node_path6.join)(workDir, "repo-stage");
-  (0, import_node_fs6.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs6.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
-  const configDestDir = (0, import_node_path6.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs6.mkdirSync)(configDestDir, { recursive: true });
-  (0, import_node_fs6.copyFileSync)(configPath, (0, import_node_path6.join)(configDestDir, "config.yml"));
+  const env = input.env ?? process.env;
+  const rootfsCopyPath = (0, import_node_path7.join)(workDir, "rootfs.ext4");
+  copyRootfs(baseRootfsPath, rootfsCopyPath, env);
+  const repoStageDir = (0, import_node_path7.join)(workDir, "repo-stage");
+  (0, import_node_fs7.mkdirSync)(repoStageDir, { recursive: true });
+  (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  const configDestDir = (0, import_node_path7.join)(repoStageDir, "etc", "script-jail");
+  (0, import_node_fs7.mkdirSync)(configDestDir, { recursive: true });
+  (0, import_node_fs7.copyFileSync)(configPath, (0, import_node_path7.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
-    const stageRoot = (0, import_node_path6.resolve)(repoStageDir);
+    const stageRoot = (0, import_node_path7.resolve)(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
-      const dest = (0, import_node_path6.resolve)(stageRoot, entry.relPath);
+      const dest = (0, import_node_path7.resolve)(stageRoot, entry.relPath);
       if (dest !== stageRoot && !dest.startsWith(stageRoot + "/")) {
         throw new Error(
           `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`
@@ -8417,24 +8597,27 @@ async function buildOverlayInto(workDir, input) {
       writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
-  const repoDiskPath = (0, import_node_path6.join)(workDir, "repo.ext4");
+  const repoDiskPath = (0, import_node_path7.join)(workDir, "repo.ext4");
   await buildExt4Disk({
     srcDir: repoStageDir,
     label: "repo",
     sizeMB: estimateDiskSizeMB(repoStageDir),
-    outPath: repoDiskPath
+    outPath: repoDiskPath,
+    env
   });
-  const scratchDiskPath = (0, import_node_path6.join)(workDir, "scratch.ext4");
+  const scratchDiskPath = (0, import_node_path7.join)(workDir, "scratch.ext4");
   await buildExt4Disk({
     label: SCRATCH_DISK_LABEL,
     sizeMB: SCRATCH_DISK_MB,
-    outPath: scratchDiskPath
+    outPath: scratchDiskPath,
+    env
   });
-  const sjtmpDiskPath = (0, import_node_path6.join)(workDir, "sjtmp.ext4");
+  const sjtmpDiskPath = (0, import_node_path7.join)(workDir, "sjtmp.ext4");
   await buildExt4Disk({
     label: SJTMP_DISK_LABEL,
     sizeMB: SJTMP_DISK_MB,
-    outPath: sjtmpDiskPath
+    outPath: sjtmpDiskPath,
+    env
   });
   const cleanup = async () => {
     try {
@@ -8454,34 +8637,34 @@ function writeOverlayFile(root, relPath, content) {
   }
   let dir = root;
   for (const part of parts.slice(0, -1)) {
-    dir = (0, import_node_path6.join)(dir, part);
+    dir = (0, import_node_path7.join)(dir, part);
     ensureRealDirectory(dir);
   }
-  const dest = (0, import_node_path6.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs6.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs6.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  const dest = (0, import_node_path7.join)(dir, parts[parts.length - 1]);
+  (0, import_node_fs7.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs7.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory(path) {
-  if (!(0, import_node_fs6.existsSync)(path)) {
-    (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+  if (!(0, import_node_fs7.existsSync)(path)) {
+    (0, import_node_fs7.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs6.lstatSync)(path);
+  const stat = (0, import_node_fs7.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs6.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+  (0, import_node_fs7.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs7.mkdirSync)(path, { recursive: true });
 }
-function copyRootfs(src, dest) {
+function copyRootfs(src, dest, env) {
   if (import_node_process.platform === "linux") {
-    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
+    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore", env });
     if (result.status === 0) return;
   }
-  (0, import_node_fs6.cpSync)(src, dest);
+  (0, import_node_fs7.cpSync)(src, dest);
 }
 async function buildExt4Disk(opts) {
-  const { srcDir, label, sizeMB, outPath } = opts;
+  const { srcDir, label, sizeMB, outPath, env } = opts;
   const sizeSpec = `${sizeMB}M`;
-  const mkfs = resolveMkfsExt4();
+  const mkfs = resolveMkfsExt4(env);
   if (mkfs !== null) {
     const result = (0, import_node_child_process2.spawnSync)(
       mkfs,
@@ -8496,7 +8679,9 @@ async function buildExt4Disk(opts) {
         outPath,
         sizeSpec
       ],
-      { stdio: "inherit" }
+      // SECURITY: bare `mkfs.ext4` on Linux is resolved via PATH pre-trust — the
+      // caller-sanitized `env` prevents a checkout-prepended PATH / loader var hijack.
+      { stdio: "inherit", env }
     );
     if (result.status !== 0) {
       throw new Error(
@@ -8505,25 +8690,27 @@ async function buildExt4Disk(opts) {
     }
     return;
   }
-  const outDir = (0, import_node_path6.join)(outPath, "..");
-  const imageName = (0, import_node_path6.basename)(outPath);
+  const outDir = (0, import_node_path7.join)(outPath, "..");
+  const imageName = (0, import_node_path7.basename)(outPath);
   const srcMount = srcDir !== void 0 ? `-v "${srcDir}:/work:ro" ` : "";
   const seedFlag = srcDir !== void 0 ? "-d /work " : "";
   (0, import_node_child_process2.execSync)(
     `docker run --rm ` + srcMount + `-v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
-    { stdio: "inherit" }
+    // SECURITY: `docker`/`sh` resolve by bare name pre-trust — use the
+    // caller-sanitized `env` so a checkout PATH / loader var can't hijack them.
+    { stdio: "inherit", env }
   );
 }
-function resolveMkfsExt4() {
+function resolveMkfsExt4(env) {
   if (import_node_process.platform === "linux") return "mkfs.ext4";
   if (import_node_process.platform !== "darwin") return null;
   for (const candidate of [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
     "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
   ]) {
-    if ((0, import_node_fs6.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs7.existsSync)(candidate)) return candidate;
   }
-  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
+  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8", env });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
   return null;
 }
@@ -8536,10 +8723,10 @@ function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat = (0, import_node_fs6.statSync)(p, { bigint: false });
+      const stat = (0, import_node_fs7.statSync)(p, { bigint: false });
       if (stat.isDirectory()) {
-        for (const child of (0, import_node_fs6.readdirSync)(p)) {
-          visit((0, import_node_path6.join)(p, child));
+        for (const child of (0, import_node_fs7.readdirSync)(p)) {
+          visit((0, import_node_path7.join)(p, child));
         }
       } else if (stat.isFile() || stat.isSymbolicLink()) {
         totalBytes += stat.size;
@@ -8547,15 +8734,15 @@ function estimateDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs6.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs7.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 
 // src/shared/run-audit.ts
-var import_node_fs8 = require("node:fs");
+var import_node_fs9 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
-var import_node_path8 = require("node:path");
+var import_node_path9 = require("node:path");
 
 // src/cli/arch-flags.ts
 function buildArchFlagOverlay(_input) {
@@ -23945,12 +24132,12 @@ function countLines(s) {
 }
 
 // src/action/config-override.ts
-var import_node_fs7 = require("node:fs");
+var import_node_fs8 = require("node:fs");
 var import_node_os5 = require("node:os");
-var import_node_path7 = require("node:path");
+var import_node_path8 = require("node:path");
 var import_yaml2 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
-  const text = (0, import_node_fs7.readFileSync)(input.userConfigPath, "utf8");
+  const text = (0, import_node_fs8.readFileSync)(input.userConfigPath, "utf8");
   const parsed = (0, import_yaml2.parse)(text);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   const existingSpoof = config2["spoof"] !== null && typeof config2["spoof"] === "object" && !Array.isArray(config2["spoof"]) ? config2["spoof"] : {};
@@ -23962,25 +24149,25 @@ function buildEffectiveConfig(input) {
   if (input.workDirOverride !== void 0) {
     config2["work_dir"] = input.workDirOverride;
   }
-  const outDir = input.workDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path7.join)((0, import_node_os5.tmpdir)(), "script-jail-config-"));
-  const configPath = (0, import_node_path7.join)(outDir, "config.yml");
-  (0, import_node_fs7.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  const outDir = input.workDir ?? (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)((0, import_node_os5.tmpdir)(), "script-jail-config-"));
+  const configPath = (0, import_node_path8.join)(outDir, "config.yml");
+  (0, import_node_fs8.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
   const result = { configPath };
   if (input.yarnrcOverlay !== void 0) {
-    const yarnrcPath = (0, import_node_path7.join)(outDir, ".yarnrc.yml");
-    (0, import_node_fs7.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    const yarnrcPath = (0, import_node_path8.join)(outDir, ".yarnrc.yml");
+    (0, import_node_fs8.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
     result.yarnrcPath = yarnrcPath;
   }
   if (input.pmFlagsJson !== void 0) {
-    const pmFlagsPath = (0, import_node_path7.join)(outDir, "etc", "script-jail", "pm-flags.json");
-    (0, import_node_fs7.mkdirSync)((0, import_node_path7.dirname)(pmFlagsPath), { recursive: true });
-    (0, import_node_fs7.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    const pmFlagsPath = (0, import_node_path8.join)(outDir, "etc", "script-jail", "pm-flags.json");
+    (0, import_node_fs8.mkdirSync)((0, import_node_path8.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs8.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
     result.pmFlagsPath = pmFlagsPath;
   }
   if (input.pnpmArchOverlay !== void 0) {
-    const pnpmArchPath = (0, import_node_path7.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
-    (0, import_node_fs7.mkdirSync)((0, import_node_path7.dirname)(pnpmArchPath), { recursive: true });
-    (0, import_node_fs7.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
+    const pnpmArchPath = (0, import_node_path8.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
+    (0, import_node_fs8.mkdirSync)((0, import_node_path8.dirname)(pnpmArchPath), { recursive: true });
+    (0, import_node_fs8.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
     result.pnpmArchPath = pnpmArchPath;
   }
   return result;
@@ -23997,7 +24184,7 @@ async function runAudit(input) {
     spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
-  const scratchDir = (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)(input.workDir, "script-jail-config-"));
+  const scratchDir = (0, import_node_fs9.mkdtempSync)((0, import_node_path9.join)(input.workDir, "script-jail-config-"));
   let result;
   let overlay = null;
   try {
@@ -24028,19 +24215,19 @@ async function runAudit(input) {
     if (effectiveConfig.yarnrcPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: ".yarnrc.yml",
-        content: (0, import_node_fs8.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
+        content: (0, import_node_fs9.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
       });
     }
     if (effectiveConfig.pmFlagsPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pm-flags.json",
-        content: (0, import_node_fs8.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+        content: (0, import_node_fs9.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
       });
     }
     if (effectiveConfig.pnpmArchPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pnpm-arch.json",
-        content: (0, import_node_fs8.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
+        content: (0, import_node_fs9.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
     if (input.execute !== void 0) {
@@ -24065,7 +24252,8 @@ async function runAudit(input) {
         baseRootfsPath: input.baseRootfsPath,
         repoSrcPath: input.repoDir,
         configPath: effectiveConfig.configPath,
-        extraRepoOverlayFiles
+        extraRepoOverlayFiles,
+        env: stripDangerousEnv(process.env)
       });
       result = await input.launch(overlay);
     }
@@ -24082,7 +24270,7 @@ async function runAudit(input) {
     }
   }
   if (input.mode === "update") {
-    (0, import_node_fs8.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
+    (0, import_node_fs9.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
     input.io.stderr.write(
       `[script-jail] wrote ${Buffer.byteLength(result.finalYaml, "utf8")} bytes to ${input.lockPath}
 `
@@ -24091,7 +24279,7 @@ async function runAudit(input) {
     input.io.setOutput?.("diff", "");
     return { exitCode: 0, trusted: false };
   }
-  const committed = (0, import_node_fs8.existsSync)(input.lockPath) ? (0, import_node_fs8.readFileSync)(input.lockPath, "utf8") : "";
+  const committed = (0, import_node_fs9.existsSync)(input.lockPath) ? (0, import_node_fs9.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
   const diff = renderDiff({
     lockPath: lockLabel,
@@ -24119,29 +24307,29 @@ async function runAudit(input) {
   return { exitCode: diff.match ? 0 : 1, trusted: diff.match, generatedLock: result.finalYaml };
 }
 function relativeForDisplay(absPath, repoDir) {
-  const rel = (0, import_node_path8.relative)(repoDir, absPath);
-  if (rel.startsWith("..") || (0, import_node_path8.isAbsolute)(rel)) return absPath;
+  const rel = (0, import_node_path9.relative)(repoDir, absPath);
+  if (rel.startsWith("..") || (0, import_node_path9.isAbsolute)(rel)) return absPath;
   return rel;
 }
 
 // src/action/firecracker/download.ts
-var import_node_fs10 = require("node:fs");
+var import_node_fs11 = require("node:fs");
 var import_promises4 = require("node:fs/promises");
-var import_node_path9 = require("node:path");
+var import_node_path10 = require("node:path");
 var import_node_os6 = require("node:os");
 var import_node_crypto4 = require("node:crypto");
 var import_node_zlib2 = require("node:zlib");
 
 // src/shared/http-download.ts
 var import_node_crypto3 = require("node:crypto");
-var import_node_fs9 = require("node:fs");
+var import_node_fs10 = require("node:fs");
 var import_promises3 = require("node:fs/promises");
 var import_node_https = require("node:https");
 var import_node_http = require("node:http");
 async function sha256File2(filePath) {
   return new Promise((resolve5, reject) => {
     const hash2 = (0, import_node_crypto3.createHash)("sha256");
-    const stream = (0, import_node_fs9.createReadStream)(filePath);
+    const stream = (0, import_node_fs10.createReadStream)(filePath);
     stream.on("data", (chunk) => hash2.update(chunk));
     stream.on("end", () => resolve5(hash2.digest("hex")));
     stream.on("error", reject);
@@ -24182,7 +24370,7 @@ async function downloadToFile(url2, destPath, redirects) {
         reject(new Error(`HTTP ${res.statusCode ?? "?"} fetching ${url2}`));
         return;
       }
-      const out = (0, import_node_fs9.createWriteStream)(destPath);
+      const out = (0, import_node_fs10.createWriteStream)(destPath);
       res.pipe(out);
       out.on("finish", () => resolve5());
       out.on("error", reject);
@@ -24214,16 +24402,16 @@ async function ensureBinaries(input) {
       `script-jail: unknown Firecracker version "${firecrackerVersion}" for ${arch}. Add it (with a pinned SHA-256) to KNOWN_TARBALL_SHA256 in src/action/firecracker/download.ts.`
     );
   }
-  (0, import_node_fs10.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs11.mkdirSync)(imagesDir, { recursive: true });
   const tarUrl = `https://github.com/firecracker-microvm/firecracker/releases/download/v${firecrackerVersion}/firecracker-v${firecrackerVersion}-${releaseArch}.tgz`;
-  const tarPath = (0, import_node_path9.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
-  const fcBinPath = (0, import_node_path9.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
-  const vmlinuxPath = (0, import_node_path9.join)(imagesDir, "vmlinux");
+  const tarPath = (0, import_node_path10.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
+  const fcBinPath = (0, import_node_path10.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
+  const vmlinuxPath = (0, import_node_path10.join)(imagesDir, "vmlinux");
   const [tarFresh] = await Promise.all([
     ensureFile(http, tarUrl, tarPath, expectedTarSha),
     ensureFile(http, kernelUrl, vmlinuxPath, kernelSha256)
   ]);
-  if ((0, import_node_fs10.existsSync)(fcBinPath)) {
+  if ((0, import_node_fs11.existsSync)(fcBinPath)) {
     await (0, import_promises4.unlink)(fcBinPath);
   }
   void tarFresh;
@@ -24231,7 +24419,7 @@ async function ensureBinaries(input) {
   return { firecrackerPath: fcBinPath, vmlinuxPath };
 }
 async function ensureFile(http, url2, destPath, expectedSha256) {
-  if ((0, import_node_fs10.existsSync)(destPath)) {
+  if ((0, import_node_fs11.existsSync)(destPath)) {
     const actual = await sha256File2(destPath);
     if (actual === expectedSha256) return false;
     console.warn(
@@ -24242,14 +24430,14 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
   return true;
 }
 async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch) {
-  const tmpOut = (0, import_node_path9.join)(
+  const tmpOut = (0, import_node_path10.join)(
     (0, import_node_os6.tmpdir)(),
     `script-jail-fc-${(0, import_node_crypto4.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version2}-${releaseArch}`;
   await new Promise((resolve5, reject) => {
     const gunzip = (0, import_node_zlib2.createGunzip)();
-    const input = (0, import_node_fs10.createReadStream)(tarPath);
+    const input = (0, import_node_fs11.createReadStream)(tarPath);
     const BLOCK = 512;
     let buf = Buffer.alloc(0);
     let state = "header";
@@ -24296,7 +24484,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
           if (name === targetEntry && declaredSize > 0) {
             capturing = true;
             foundEntry = true;
-            outStream = (0, import_node_fs10.createWriteStream)(tmpOut);
+            outStream = (0, import_node_fs11.createWriteStream)(tmpOut);
           } else {
             capturing = false;
           }
@@ -24378,39 +24566,39 @@ var PINNED_MANIFEST = {
 
 // src/action/backend/firecracker.ts
 var import_node_crypto6 = require("node:crypto");
-var import_node_fs16 = require("node:fs");
+var import_node_fs17 = require("node:fs");
 var import_node_os7 = require("node:os");
-var import_node_path12 = require("node:path");
+var import_node_path13 = require("node:path");
 var import_node_process3 = require("node:process");
 
 // src/action/cache.ts
-var import_node_fs11 = require("node:fs");
-var import_node_path10 = require("node:path");
+var import_node_fs12 = require("node:fs");
+var import_node_path11 = require("node:path");
 function maybeClearCache(input) {
   if (input.cacheFirecracker) return;
-  const fs = input.fs ?? { rmSync: import_node_fs11.rmSync };
+  const fs = input.fs ?? { rmSync: import_node_fs12.rmSync };
   const releaseArch = input.arch === "arm64" ? "aarch64" : "x86_64";
-  const tarPath = (0, import_node_path10.join)(
+  const tarPath = (0, import_node_path11.join)(
     input.imagesDir,
     `firecracker-v${input.firecrackerVersion}-${releaseArch}.tgz`
   );
-  const fcBinPath = (0, import_node_path10.join)(
+  const fcBinPath = (0, import_node_path11.join)(
     input.imagesDir,
     `firecracker-v${input.firecrackerVersion}`
   );
-  const vmlinuxPath = (0, import_node_path10.join)(input.imagesDir, "vmlinux");
+  const vmlinuxPath = (0, import_node_path11.join)(input.imagesDir, "vmlinux");
   fs.rmSync(tarPath, { force: true });
   fs.rmSync(fcBinPath, { force: true });
   fs.rmSync(vmlinuxPath, { force: true });
 }
 
 // src/action/pre-fetch-artifacts.ts
-var import_node_fs13 = require("node:fs");
-var import_node_path11 = require("node:path");
+var import_node_fs14 = require("node:fs");
+var import_node_path12 = require("node:path");
 
 // src/rootfs/repro-hash.ts
 var import_node_crypto5 = require("node:crypto");
-var import_node_fs12 = require("node:fs");
+var import_node_fs13 = require("node:fs");
 var EXT4_BLOCK_SIZE = 4096;
 var EXT4_BLOCKS_PER_GROUP = 8 * EXT4_BLOCK_SIZE;
 var EXT4_VOLATILE_SUPERBLOCK_FIELDS = [
@@ -24465,7 +24653,7 @@ function applyMaskToBuffer(buf, bufStart, ranges) {
 function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
   return new Promise((resolve5, reject) => {
     const hash2 = (0, import_node_crypto5.createHash)("sha256");
-    const stream = (0, import_node_fs12.createReadStream)(
+    const stream = (0, import_node_fs13.createReadStream)(
       filePath,
       chunkSize === void 0 ? void 0 : { highWaterMark: chunkSize }
     );
@@ -24480,7 +24668,7 @@ function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
   });
 }
 async function canonicalRootfsHash(filePath, chunkSize) {
-  const size = (0, import_node_fs12.statSync)(filePath).size;
+  const size = (0, import_node_fs13.statSync)(filePath).size;
   const ranges = ext4VolatileByteRanges(size);
   return hashFileWithMaskedRanges(filePath, ranges, chunkSize);
 }
@@ -24496,7 +24684,7 @@ async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
   const platform5 = input.platform ?? "linux";
   const arch = input.arch ?? "x64";
-  (0, import_node_fs13.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs14.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName2(runnerImage, arch);
   const wantedLibscriptjail = libscriptjailAssetName2(arch);
   const assets = [
@@ -24522,7 +24710,7 @@ async function preFetchArtifacts(input) {
       ({ name, expected, digest }) => ensureAsset({
         http,
         url: assetUrl(manifest, name),
-        destPath: (0, import_node_path11.join)(imagesDir, name),
+        destPath: (0, import_node_path12.join)(imagesDir, name),
         expectedDigest: expected,
         computeDigest: digest
       })
@@ -24549,7 +24737,7 @@ function requireExpected(manifest, platform5, asset) {
 }
 async function ensureAsset(args) {
   const { http, url: url2, destPath, expectedDigest, computeDigest } = args;
-  if ((0, import_node_fs13.existsSync)(destPath)) {
+  if ((0, import_node_fs14.existsSync)(destPath)) {
     const actual = await computeDigest(destPath);
     if (actual === expectedDigest) return;
     console.warn(
@@ -24561,7 +24749,7 @@ async function ensureAsset(args) {
 
 // src/action/firecracker/launch.ts
 var import_node_http2 = require("node:http");
-var import_node_fs14 = require("node:fs");
+var import_node_fs15 = require("node:fs");
 var import_promises5 = require("node:fs/promises");
 var import_node_child_process3 = require("node:child_process");
 var import_node_process2 = require("node:process");
@@ -24580,7 +24768,11 @@ async function launchVm(input) {
     vsockUdsPath,
     enableNetwork,
     socketPath,
-    bootArgs = DEFAULT_BOOT_ARGS
+    bootArgs = DEFAULT_BOOT_ARGS,
+    // SECURITY: the tap-setup `ip` spawns are bare-name + pre-trust — default to
+    // process.env only when the caller (e.g. the platform-gated direct test path)
+    // omits it; the Firecracker backend always threads its sanitized env down.
+    env = process.env
   } = input;
   if (!input.spawner) {
     if (import_node_process2.platform !== "linux") {
@@ -24588,7 +24780,7 @@ async function launchVm(input) {
         `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
-    if (!(0, import_node_fs14.existsSync)("/dev/kvm")) {
+    if (!(0, import_node_fs15.existsSync)("/dev/kvm")) {
       throw new Error(
         "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
@@ -24646,7 +24838,7 @@ async function launchVm(input) {
       mem_size_mib: memMB
     });
     if (enableNetwork) {
-      await setupTapDevice(apiClient);
+      await setupTapDevice(apiClient, env);
     }
     await apiClient.put("/vsock", {
       guest_cid: vsockCid,
@@ -24672,14 +24864,16 @@ async function launchVm(input) {
     waitForExit: () => handle.waitForExit()
   };
 }
-async function setupTapDevice(api) {
+async function setupTapDevice(api, env) {
   const existing = (0, import_node_child_process3.spawnSync)("ip", ["link", "show", "tap0"], {
-    stdio: ["ignore", "ignore", "ignore"]
+    stdio: ["ignore", "ignore", "ignore"],
+    env
   });
   const alreadyExists = existing.status === 0;
   if (!alreadyExists) {
     const mkTap = (0, import_node_child_process3.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      env
     });
     if (mkTap.status !== 0) {
       const stderr = (mkTap.stderr?.toString() ?? "").trim();
@@ -24690,7 +24884,7 @@ async function setupTapDevice(api) {
       return;
     }
   }
-  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore" });
+  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore", env });
   await api.put("/network-interfaces/eth0", {
     iface_id: "eth0",
     guest_mac: "06:00:AC:10:00:02",
@@ -24752,7 +24946,7 @@ var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((0, import_node_fs14.existsSync)(socketPath)) return;
+      if ((0, import_node_fs15.existsSync)(socketPath)) return;
       await sleep(50);
     }
     throw new Error(`Timeout waiting for socket: ${socketPath}`);
@@ -24957,7 +25151,7 @@ function socketToDuplex(sock) {
 
 // src/action/firecracker/teardown.ts
 var import_promises6 = require("node:fs/promises");
-var import_node_fs15 = require("node:fs");
+var import_node_fs16 = require("node:fs");
 async function teardown(handles) {
   if (handles.vsock !== null) {
     await safeRun("close vsock session", () => handles.vsock.close());
@@ -24998,7 +25192,7 @@ async function safeRun(label, fn) {
   }
 }
 async function removeIfExists(filePath) {
-  if (!(0, import_node_fs15.existsSync)(filePath)) return;
+  if (!(0, import_node_fs16.existsSync)(filePath)) return;
   try {
     await (0, import_promises6.unlink)(filePath);
   } catch (err) {
@@ -25117,8 +25311,10 @@ function createFirecrackerBackend(deps) {
   const doLaunchVm = deps.launchVm ?? launchVm;
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
-  const checkExists = deps.existsSync ?? import_node_fs16.existsSync;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const checkExists = deps.existsSync ?? import_node_fs17.existsSync;
   const hostPlatform2 = deps.platform ?? import_node_process3.platform;
+  const safeEnv = stripDangerousEnv(deps.env ?? process.env);
   return {
     name: "firecracker",
     async run(ctx) {
@@ -25129,7 +25325,7 @@ function createFirecrackerBackend(deps) {
         if (!checkExists("/dev/kvm")) {
           throw new BackendUnavailableError("firecracker", "/dev/kvm is missing");
         }
-        if (!commandSucceeds("ip", ["link", "show", "tap0"])) {
+        if (!doCommandSucceeds("ip", ["link", "show", "tap0"], { env: safeEnv })) {
           throw new BackendUnavailableError("firecracker", "tap0 is not configured");
         }
       }
@@ -25159,10 +25355,13 @@ function createFirecrackerBackend(deps) {
         http: ctx.http
       });
       const overlay = await doMakeOverlay({
-        baseRootfsPath: (0, import_node_path12.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
+        baseRootfsPath: (0, import_node_path13.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
         repoSrcPath: ctx.repoDir,
         configPath: ctx.configPath,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
+        // SECURITY: sanitized env for overlay's bare-name pre-trust host spawns
+        // (cp / mkfs.ext4 / command -v / macOS Docker fallback).
+        env: safeEnv
       });
       try {
         return await launchFirecracker({
@@ -25171,7 +25370,9 @@ function createFirecrackerBackend(deps) {
           launchVm: doLaunchVm,
           openVsockSession: doOpenVsockSession,
           teardown: doTeardown,
-          warn: deps.warn
+          warn: deps.warn,
+          // SECURITY: sanitized env for launch.ts's bare-name pre-trust tap `ip` spawns.
+          env: safeEnv
         });
       } finally {
         await overlay.cleanup();
@@ -25184,8 +25385,8 @@ function rootfsImageName(runnerImage, arch) {
 }
 async function launchFirecracker(input) {
   const runId = (0, import_node_crypto6.randomBytes)(4).toString("hex");
-  const apiSocketPath = (0, import_node_path12.join)((0, import_node_os7.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
-  const vsockUdsPath = (0, import_node_path12.join)((0, import_node_os7.tmpdir)(), `script-jail-vsock-${runId}`);
+  const apiSocketPath = (0, import_node_path13.join)((0, import_node_os7.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
+  const vsockUdsPath = (0, import_node_path13.join)((0, import_node_os7.tmpdir)(), `script-jail-vsock-${runId}`);
   let vm = null;
   let vsock = null;
   let finalYaml = null;
@@ -25207,7 +25408,9 @@ async function launchFirecracker(input) {
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,
-      socketPath: apiSocketPath
+      socketPath: apiSocketPath,
+      // SECURITY: sanitized env for the tap-setup `ip` spawns (launch.ts).
+      env: input.env
     });
     vsock = await input.openVsockSession(vsockUdsPath, VSOCK_PORT);
     for await (const frame of vsock.events) {
@@ -25251,25 +25454,25 @@ async function launchFirecracker(input) {
 var import_node_crypto7 = require("node:crypto");
 
 // src/action/backend/stage.ts
-var import_node_fs17 = require("node:fs");
-var import_node_path13 = require("node:path");
+var import_node_fs18 = require("node:fs");
+var import_node_path14 = require("node:path");
 var import_yaml3 = __toESM(require_dist(), 1);
 function stageRepoDirectory(input) {
-  const stageRoot = (0, import_node_fs17.mkdtempSync)((0, import_node_path13.join)(input.parentDir, "repo-stage-"));
-  const repoStage = (0, import_node_path13.join)(stageRoot, "work");
-  (0, import_node_fs17.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
+  const stageRoot = (0, import_node_fs18.mkdtempSync)((0, import_node_path14.join)(input.parentDir, "repo-stage-"));
+  const repoStage = (0, import_node_path14.join)(stageRoot, "work");
+  (0, import_node_fs18.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
   materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
   return {
     path: repoStage,
     cleanup: () => {
-      (0, import_node_fs17.rmSync)(stageRoot, { recursive: true, force: true });
+      (0, import_node_fs18.rmSync)(stageRoot, { recursive: true, force: true });
     }
   };
 }
 function materializeExtraFiles(rootDir, files) {
-  const root = (0, import_node_path13.resolve)(rootDir);
+  const root = (0, import_node_path14.resolve)(rootDir);
   for (const entry of files) {
-    const dest = (0, import_node_path13.resolve)(root, entry.relPath);
+    const dest = (0, import_node_path14.resolve)(root, entry.relPath);
     if (dest !== root && !dest.startsWith(root + "/")) {
       throw new Error(
         `[backend] extraRepoOverlayFiles entry '${entry.relPath}' escapes the staged repo`
@@ -25287,40 +25490,44 @@ function writeOverlayFile2(root, relPath, content) {
   }
   let dir = root;
   for (const part of parts.slice(0, -1)) {
-    dir = (0, import_node_path13.join)(dir, part);
+    dir = (0, import_node_path14.join)(dir, part);
     ensureRealDirectory2(dir);
   }
-  const dest = (0, import_node_path13.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs17.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs17.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  const dest = (0, import_node_path14.join)(dir, parts[parts.length - 1]);
+  (0, import_node_fs18.rmSync)(dest, { recursive: true, force: true });
+  (0, import_node_fs18.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory2(path) {
-  if (!(0, import_node_fs17.existsSync)(path)) {
-    (0, import_node_fs17.mkdirSync)(path, { recursive: true });
+  if (!(0, import_node_fs18.existsSync)(path)) {
+    (0, import_node_fs18.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs17.lstatSync)(path);
+  const stat = (0, import_node_fs18.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs17.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs17.mkdirSync)(path, { recursive: true });
+  (0, import_node_fs18.rmSync)(path, { recursive: true, force: true });
+  (0, import_node_fs18.mkdirSync)(path, { recursive: true });
 }
 function rewriteConfigWorkDir(input) {
-  const raw = (0, import_node_fs17.readFileSync)(input.configPath, "utf8");
+  const raw = (0, import_node_fs18.readFileSync)(input.configPath, "utf8");
   const parsed = (0, import_yaml3.parse)(raw);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   config2["work_dir"] = input.workDir;
-  const outPath = (0, import_node_path13.join)(input.outDir, "config.backend.yml");
-  (0, import_node_fs17.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
+  const outPath = (0, import_node_path14.join)(input.outDir, "config.backend.yml");
+  (0, import_node_fs18.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
   return outPath;
 }
 
 // src/action/backend/docker.ts
 function createDockerBackend(deps = {}) {
   const env = deps.env ?? process.env;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const doRunCommand = deps.runCommand ?? runCommand;
+  const safeEnv = stripDangerousEnv(env);
   return {
     name: "docker",
     async run(ctx) {
-      if (!commandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env })) {
+      if (!doCommandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env: safeEnv })) {
         throw new BackendUnavailableError("docker", "docker is not installed or the daemon is unavailable");
       }
       const { ref: imageRef, warning } = resolveDockerImageRef(ctx, {
@@ -25328,12 +25535,12 @@ function createDockerBackend(deps = {}) {
       });
       if (warning !== void 0) writeDockerWarning(deps.stderr, warning);
       if (ctx.selfTest) {
-        if (!commandSucceeds("docker", ["image", "inspect", imageRef], { env })) {
+        if (!doCommandSucceeds("docker", ["image", "inspect", imageRef], { env: safeEnv })) {
           throw new BackendUnavailableError("docker", `local image ${imageRef} is missing`);
         }
       } else {
         try {
-          runCommand("docker", ["pull", imageRef], { env });
+          doRunCommand("docker", ["pull", imageRef], { env: safeEnv });
         } catch (err) {
           throw new BackendUnavailableError(
             "docker",
@@ -25374,7 +25581,7 @@ function createDockerBackend(deps = {}) {
           `export SCRIPT_JAIL_PM_FLAGS_PATH=${workDir}/etc/script-jail/pm-flags.json`,
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
-        return await runAgentProcess({
+        return await doRunAgentProcess({
           cmd: "docker",
           args: [
             "run",
@@ -25394,22 +25601,23 @@ function createDockerBackend(deps = {}) {
             "-lc",
             script
           ],
-          env,
+          env: safeEnv,
           label: "docker",
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {},
           onFetchDone: async () => {
-            runCommand("docker", ["network", "disconnect", "bridge", containerName], { env });
+            doRunCommand("docker", ["network", "disconnect", "bridge", containerName], { env: safeEnv });
           }
         });
       } finally {
         try {
-          runCommand("docker", ["rm", "-f", containerName], { env });
+          doRunCommand("docker", ["rm", "-f", containerName], { env: safeEnv });
         } catch {
         }
         cleanupStagedDockerRepo({
           staged,
           imageRef,
-          env,
+          env: safeEnv,
+          run: doRunCommand,
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}
         });
       }
@@ -25495,181 +25703,6 @@ function resolveDockerImageRef(ctx, opts = {}) {
 var import_node_fs19 = require("node:fs");
 var import_node_path15 = require("node:path");
 var import_node_process4 = require("node:process");
-
-// src/action/host-install.ts
-var import_node_fs18 = require("node:fs");
-var import_node_path14 = require("node:path");
-
-// src/shared/redact.ts
-var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
-var FRAGMENT_MAX_GRAMS = 1 << 22;
-
-// src/action/host-install.ts
-var CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
-function canonicalForCompare(p) {
-  let abs;
-  try {
-    abs = (0, import_node_fs18.realpathSync)((0, import_node_path14.resolve)(p));
-  } catch {
-    abs = (0, import_node_path14.resolve)(p);
-  }
-  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
-}
-function checkoutRoots() {
-  const roots = [];
-  for (const v of [
-    process.env["GITHUB_WORKSPACE"],
-    process.env["SCRIPT_JAIL_REPO_DIR"],
-    process.cwd()
-  ]) {
-    if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
-  }
-  return roots;
-}
-function isUnderCheckout(p, roots) {
-  const abs = canonicalForCompare(p);
-  for (const root of roots) {
-    if (abs === root || abs.startsWith(root + import_node_path14.sep)) return true;
-  }
-  return false;
-}
-var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
-  [
-    // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
-    "NODE_OPTIONS",
-    "NODE_REPL_EXTERNAL_MODULE",
-    "NODE_EXTRA_CA_CERTS",
-    "NODE_PATH",
-    // adds require() search dirs → a checkout-relative one loads PR code
-    // [19] Git EXEC/config-FILE selectors (git+ssh|https deps; --ignore-scripts
-    // does NOT stop git being invoked).  Enumerated (not blanket GIT_*) so benign
-    // behaviour flags such as GIT_TERMINAL_PROMPT/GIT_ALLOW_PROTOCOL are preserved.
-    // The git BINARY itself stays pinned via npm_config_git.
-    "GIT_SSH_COMMAND",
-    "GIT_SSH",
-    "GIT_PROXY_COMMAND",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_PAGER",
-    "GIT_EDITOR",
-    "GIT_ASKPASS",
-    // verified-class: git invokes the askpass program by path
-    "SSH_ASKPASS",
-    "GIT_EXEC_PATH",
-    // VERIFIED: GIT_EXEC_PATH=./core runs checkout core/git-remote-https
-    "GIT_TEMPLATE_DIR",
-    // clone hooks dir
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_COUNT",
-    // gates inline GIT_CONFIG_KEY_*/VALUE_*; dropping it makes them inert
-    "GIT_CONFIG_PARAMETERS",
-    // VERIFIED: ='core.sshCommand=./ssh' runs ./ssh on ssh:// clone
-    // Native-build TOOL selectors honored by node-gyp/gyp/make (checkout-relative
-    // interpreter/compiler/linker runs during a native `npm rebuild`).  PYTHON* and
-    // node-gyp* are caught by the family prefixes below.  Stripping forces the
-    // system toolchain auto-detect — the same default the clean-VM audit used.
-    "CC",
-    "CXX",
-    "CPP",
-    "LINK",
-    "LD",
-    "AR",
-    "AS",
-    "MAKE",
-    // GNU make startup/config env (consumed before any target): MAKEFLAGS
-    // ='--eval=$(shell …)' runs a command at make startup, MAKEFILES=/path
-    // evaluates a makefile pre-target (both VERIFIED).  node-gyp invokes make.
-    "MAKEFLAGS",
-    "GNUMAKEFLAGS",
-    "MAKEFILES",
-    // Corepack EXEC/config selectors: a pnpm/yarn bare command is commonly a
-    // corepack shim, and COREPACK_HOME is its executable CACHE — a checkout-
-    // relative one (VERIFIED with corepack 0.35.0) makes corepack run a PR-planted
-    // bin/pnpm.cjs in host part-1.  COREPACK_ENV_FILE loads env from a file;
-    // COREPACK_NPM_REGISTRY / COREPACK_INTEGRITY_KEYS / COREPACK_ROOT can redirect
-    // or unsign the downloaded PM.  Behaviour flags (COREPACK_ENABLE_*) are NOT
-    // here — they don't select an executable, and the download-prompt flag is
-    // re-pinned below so stripping the cache can't trigger an interactive hang.
-    "COREPACK_HOME",
-    "COREPACK_ENV_FILE",
-    "COREPACK_NPM_REGISTRY",
-    "COREPACK_INTEGRITY_KEYS",
-    "COREPACK_ROOT",
-    // Shell / interpreter startup hooks that run on a NON-interactive spawn.
-    // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
-    // common legit "environment name" var, so it is deliberately NOT stripped.)
-    "BASH_ENV",
-    // bash -c sources it
-    "ZDOTDIR",
-    // zsh startup dir
-    "PERL5LIB",
-    "RUBYOPT",
-    "RUBYLIB"
-  ].map((n) => n.toLowerCase())
-);
-var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
-  "ld_",
-  // ELF dynamic loader: LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH / …
-  "dyld_",
-  // macOS dyld analogs (the host bare backend runs on macOS)
-  "python",
-  // PYTHON / PYTHONPATH / PYTHONHOME / PYTHONSTARTUP (sitecustomize exec)
-  "node_gyp_",
-  // NODE_GYP_FORCE_PYTHON, … (VERIFIED node-gyp interpreter selector)
-  // npm re-derives npm_package_config_* from the AUDITED package.json; an INHERITED
-  // one for a key absent from package.json would pass through to node-gyp
-  // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
-  // the legit values from the package.json the sandbox already audited.
-  "npm_package_config_"
-];
-var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
-  "script_shell",
-  "ignore_scripts",
-  "userconfig",
-  "globalconfig",
-  "node_gyp",
-  "python",
-  "make",
-  "shell"
-]);
-function isDangerousEnvName(name) {
-  const lower = name.toLowerCase();
-  for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
-    if (lower.startsWith(prefix)) return true;
-  }
-  if (lower.startsWith("npm_config_")) {
-    const key = lower.slice("npm_config_".length).replace(/-/g, "_");
-    return DANGEROUS_NPM_CONFIG_KEYS.has(key);
-  }
-  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
-}
-var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
-function sanitizePathValue(pathVar) {
-  if (pathVar === void 0) return void 0;
-  const roots = checkoutRoots();
-  const kept = [];
-  for (const dir of pathVar.split(import_node_path14.delimiter)) {
-    if (!(0, import_node_path14.isAbsolute)(dir)) continue;
-    if (isUnderCheckout(dir, roots)) continue;
-    kept.push(dir);
-  }
-  return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path14.delimiter);
-}
-function stripDangerousEnv(srcEnv) {
-  const env = {};
-  for (const [name, value] of Object.entries(srcEnv)) {
-    if (value === void 0) continue;
-    if (isDangerousEnvName(name)) continue;
-    env[name] = value;
-  }
-  const sanitizedPath = sanitizePathValue(srcEnv["PATH"]);
-  if (sanitizedPath === void 0) delete env["PATH"];
-  else env["PATH"] = sanitizedPath;
-  return env;
-}
-var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
-
-// src/action/backend/bare.ts
 function createBareBackend(deps = {}) {
   const hostPlatform2 = deps.platform ?? import_node_process4.platform;
   const env = deps.env ?? process.env;

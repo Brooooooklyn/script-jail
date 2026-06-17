@@ -53,6 +53,7 @@ import {
 } from '../action/diff.js';
 import { buildEffectiveConfig } from '../action/config-override.js';
 import { sanitizeInstallArgs } from './pm-commands.js';
+import { stripDangerousEnv } from '../action/host-install.js';
 import {
   makeOverlay,
   type OverlayResult,
@@ -343,11 +344,20 @@ export async function runAudit(
       }
 
       // 5. Build per-run overlay (rootfs + repo ext4 disks).
+      //
+      // SECURITY (codex round-7 host-exec sweep): this legacy launch path is the
+      // macOS VZ backend (the DEFAULT on Apple Silicon).  makeOverlay spawns
+      // bare-name host tools (`cp`, `mkfs.ext4`/`command -v`, a docker fallback)
+      // BEFORE the audit trust gate, so it must get a sanitized env — a
+      // checkout-prepended/empty PATH or an inherited loader var could otherwise
+      // hijack them on the host.  The `execute` backends sanitize internally;
+      // this is the one makeOverlay call runAudit owns directly.
       overlay = await doMakeOverlay({
         baseRootfsPath: input.baseRootfsPath,
         repoSrcPath: input.repoDir,
         configPath: effectiveConfig.configPath,
         extraRepoOverlayFiles,
+        env: stripDangerousEnv(process.env),
       });
 
       // 6. Launch the VM via the caller-supplied closure.  We own the

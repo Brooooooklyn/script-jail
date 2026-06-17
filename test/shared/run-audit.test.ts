@@ -383,6 +383,52 @@ describe('runAudit — arch-flag overlay fan-out', () => {
     expect(JSON.parse(pmEntry!.content)).toEqual({ extra_install_args: [] });
     expect(archEntry!.content).toBe(archJson);
   });
+
+  it('hands makeOverlay a SANITIZED env on the legacy launch path (macOS VZ, codex round-7)', async () => {
+    // The legacy launch path is the DEFAULT macOS VZ backend; makeOverlay spawns
+    // bare-name `cp`/`mkfs.ext4` pre-trust, so runAudit must sanitize the env it
+    // passes — checkout-prepended PATH dropped + loader selectors stripped.
+    const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
+    const capture = { calls, cleanups: 0 };
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+
+    // A real checkout whose bin dir is on PATH; checkoutRoots() reads process.env.
+    const checkout = mkdtempSync(join(tmpdir(), 'ra-checkout-'));
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    const saved = {
+      ws: process.env['GITHUB_WORKSPACE'],
+      path: process.env['PATH'],
+      nodeOpts: process.env['NODE_OPTIONS'],
+    };
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      process.env['PATH'] = `${checkoutBin}:/usr/bin:/bin`;
+      process.env['NODE_OPTIONS'] = '--require ./evil.js';
+      await runAudit({
+        repoDir, configPath, lockPath, workDir,
+        mode: 'update',
+        overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+        pm: 'pnpm', hostArch: 'arm64',
+        baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+        launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+        io: makeIo().io,
+        makeOverlay: stubOverlay(workDir, capture),
+      });
+    } finally {
+      for (const [k, v] of [['GITHUB_WORKSPACE', saved.ws], ['PATH', saved.path], ['NODE_OPTIONS', saved.nodeOpts]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      rmSync(checkout, { recursive: true, force: true });
+    }
+
+    expect(capture.calls).toHaveLength(1);
+    const env = capture.calls[0]!.env;
+    expect(env).toBeDefined();
+    expect(env!['NODE_OPTIONS']).toBeUndefined();
+    expect(env!['PATH']).toBe('/usr/bin:/bin');
+  });
 });
 
 describe('runAudit — overlay cleanup', () => {

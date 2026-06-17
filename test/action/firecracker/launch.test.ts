@@ -90,6 +90,10 @@ function makeInput(
     vsockUdsPath: '/tmp/vsock.sock',
     enableNetwork: false,
     socketPath: '/tmp/fc.sock',
+    // SECURITY: the Firecracker backend threads a `stripDangerousEnv`-sanitized
+    // env here for the (network-on) tap-setup `ip` spawns; harmless for the
+    // default enableNetwork:false tests (the `ip` spawns never fire).
+    env: { PATH: '/usr/sbin:/sbin' },
     apiClient: client,
     spawner,
     poller: makeFakePoller(),

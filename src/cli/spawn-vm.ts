@@ -37,6 +37,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseFrames, type GuestFrame } from '../shared/vsock-protocol.js';
+import { stripDangerousEnv } from '../action/host-install.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -352,8 +353,27 @@ export type CodesignRunner = (args: ReadonlyArray<string>) => {
   error?: Error | undefined;
 };
 
+/**
+ * Sanitized env for the default `codesign` preflight spawn.  EXPORTED only so
+ * the unit test can assert the policy without mocking `spawnSync`.
+ *
+ * SECURITY: the entitlement preflight is a read-only `codesign -d`, but it is
+ * still a pre-trust, BARE-NAME host exec (it runs in `spawnVm` BEFORE the audit
+ * produces/diffs the lock).  A checkout-prepended/empty PATH could resolve a
+ * PR-committed `./codesign`, and an inherited dangerous loader var
+ * (DYLD_INSERT_LIBRARIES, DYLD_*, LD_*, NODE_OPTIONS) could inject into it.  Apply
+ * the SAME `stripDangerousEnv` policy the other backends use (bare.ts,
+ * mac-bare.ts, firecracker.ts, docker.ts) — defense-in-depth + consistency.
+ */
+export function defaultCodesignEnv(): NodeJS.ProcessEnv {
+  return stripDangerousEnv(process.env);
+}
+
 const defaultCodesignRunner: CodesignRunner = (args) => {
-  const result = spawnSync('codesign', [...args], { encoding: 'utf8' });
+  const result = spawnSync('codesign', [...args], {
+    encoding: 'utf8',
+    env: defaultCodesignEnv(),
+  });
   return {
     status: result.status,
     stdout: result.stdout ?? '',

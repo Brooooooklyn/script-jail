@@ -368,4 +368,52 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       await result.cleanup();
     }
   });
+
+  // SECURITY (pre-trust bare-name host RCE): on Linux the disk-build spawns
+  // (`cp --reflink=auto`, bare `mkfs.ext4`) resolve via the PATH carried in the
+  // caller-supplied `env`.  The Firecracker backend threads its sanitized env
+  // down so a checkout-prepended PATH dir / inherited loader var can't hijack
+  // them.  These two tests pin that `input.env` is actually HONORED for tool
+  // resolution: a sanitized system PATH succeeds; a PATH with no `mkfs.ext4`
+  // (and `cp` unavailable for the reflink fast-path) fails — proving the spawns
+  // do NOT silently fall back to the ambient process.env.
+  it('honors a sanitized env PATH when building the disks (success)', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+      // A SAFE_SYSTEM_PATH-equivalent value: mkfs.ext4 lives in /usr/sbin|/sbin,
+      // cp in /usr/bin|/bin.  No checkout dir, no loader vars — the hardened shape.
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+    });
+
+    try {
+      expect(existsSync(result.scratchDiskPath)).toBe(true);
+      expect(existsSync(result.repoDiskPath)).toBe(true);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('fails when the threaded env PATH cannot resolve mkfs.ext4 (env is honored, not bypassed)', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+    // An empty-but-existing dir on PATH: neither `cp` (reflink fast-path) nor the
+    // bare `mkfs.ext4` resolve, so the build must throw.  If the spawns ignored
+    // `input.env` and used the ambient PATH, this would (wrongly) succeed.
+    const emptyBin = join(testDir, 'empty-bin');
+    mkdirSync(emptyBin, { recursive: true });
+
+    await expect(
+      makeOverlay({
+        baseRootfsPath,
+        repoSrcPath: repoDir,
+        configPath,
+        env: { PATH: emptyBin },
+      }),
+    ).rejects.toThrow(/mkfs\.ext4|ENOENT|spawn/i);
+  });
 });

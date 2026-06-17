@@ -22,6 +22,7 @@ import {
 } from '../firecracker/overlay.js';
 import { openVsockSession, type VsockSession } from '../firecracker/vsock.js';
 import { teardown } from '../firecracker/teardown.js';
+import { stripDangerousEnv } from '../host-install.js';
 import type { LauncherResult } from '../../shared/run-audit.js';
 import type { AuditBackend, BackendContext } from './types.js';
 import { BackendUnavailableError } from './types.js';
@@ -49,7 +50,16 @@ export interface FirecrackerBackendDeps {
   launchVm?: typeof launchVm;
   openVsockSession?: typeof openVsockSession;
   teardown?: typeof teardown;
+  /** Override the availability-probe runner (default: the real spawnSync wrapper). */
+  commandSucceeds?: typeof commandSucceeds;
   platform?: NodeJS.Platform;
+  /**
+   * Inherited runner env (default `process.env`).  Sanitized ONCE below into
+   * `safeEnv` and threaded into every bare-name pre-trust host spawn this backend
+   * reaches (the `ip` probe, overlay `cp`/`mkfs.ext4`/`command -v`, tap-setup
+   * `ip`).  Exposed as a dep so the seam is testable.
+   */
+  env?: NodeJS.ProcessEnv;
   existsSync?: (path: string) => boolean;
   skipAvailabilityCheck?: boolean;
   cacheFirecracker: boolean;
@@ -63,8 +73,23 @@ export function createFirecrackerBackend(deps: FirecrackerBackendDeps): AuditBac
   const doLaunchVm = deps.launchVm ?? launchVm;
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
   const checkExists = deps.existsSync ?? existsSync;
   const hostPlatform = deps.platform ?? platform;
+
+  // SECURITY (pre-trust bare-name host RCE): the Firecracker backend reaches a
+  // set of BARE-NAME host spawns BEFORE the audit trust gate — the `ip` tap0
+  // availability probe here, the `ip` tap-setup spawns in launch.ts, and the
+  // `cp`/`mkfs.ext4`/`command -v` (+ macOS Docker fallback) disk-build spawns in
+  // overlay.ts.  All resolve via PATH and honour inherited loader vars, so a
+  // checkout-prepended PATH dir (a PR-committed `./ip` / `bin/mkfs.ext4`), an
+  // empty/trailing-colon PATH entry, or an inherited LD_PRELOAD/LD_AUDIT/
+  // NODE_OPTIONS would be RCE.  Compute the sanitized env ONCE (dangerous
+  // loader/config selectors dropped, checkout-controlled + non-absolute PATH dirs
+  // dropped — never an empty PATH) and thread it into every one of those spawns,
+  // mirroring backend/bare.ts.  The firecracker binary + VZ helper are spawned by
+  // ABSOLUTE path, so they need no sanitization.
+  const safeEnv = stripDangerousEnv(deps.env ?? process.env);
 
   return {
     name: 'firecracker',
@@ -76,7 +101,7 @@ export function createFirecrackerBackend(deps: FirecrackerBackendDeps): AuditBac
         if (!checkExists('/dev/kvm')) {
           throw new BackendUnavailableError('firecracker', '/dev/kvm is missing');
         }
-        if (!commandSucceeds('ip', ['link', 'show', 'tap0'])) {
+        if (!doCommandSucceeds('ip', ['link', 'show', 'tap0'], { env: safeEnv })) {
           throw new BackendUnavailableError('firecracker', 'tap0 is not configured');
         }
       }
@@ -114,6 +139,9 @@ export function createFirecrackerBackend(deps: FirecrackerBackendDeps): AuditBac
         repoSrcPath: ctx.repoDir,
         configPath: ctx.configPath,
         extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
+        // SECURITY: sanitized env for overlay's bare-name pre-trust host spawns
+        // (cp / mkfs.ext4 / command -v / macOS Docker fallback).
+        env: safeEnv,
       });
       try {
         return await launchFirecracker({
@@ -123,6 +151,8 @@ export function createFirecrackerBackend(deps: FirecrackerBackendDeps): AuditBac
           openVsockSession: doOpenVsockSession,
           teardown: doTeardown,
           warn: deps.warn,
+          // SECURITY: sanitized env for launch.ts's bare-name pre-trust tap `ip` spawns.
+          env: safeEnv,
         });
       } finally {
         await overlay.cleanup();
@@ -144,6 +174,8 @@ async function launchFirecracker(input: {
   openVsockSession: typeof openVsockSession;
   teardown: typeof teardown;
   warn: (msg: string) => void;
+  /** Sanitized env threaded into launchVm's bare-name pre-trust tap `ip` spawns. */
+  env: NodeJS.ProcessEnv;
 }): Promise<LauncherResult> {
   const runId = randomBytes(4).toString('hex');
   const apiSocketPath = join(tmpdir(), `script-jail-fc-api-${runId}.sock`);
@@ -172,6 +204,8 @@ async function launchFirecracker(input: {
       vsockUdsPath,
       enableNetwork: true,
       socketPath: apiSocketPath,
+      // SECURITY: sanitized env for the tap-setup `ip` spawns (launch.ts).
+      env: input.env,
     });
 
     vsock = await input.openVsockSession(vsockUdsPath, VSOCK_PORT);

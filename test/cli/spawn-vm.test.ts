@@ -14,7 +14,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 import {
   resolveScriptJailVmBinary,
@@ -22,6 +22,7 @@ import {
   toJsonPayload,
   spawnVm,
   assertVmHelperEntitlement,
+  defaultCodesignEnv,
   VZ_ENTITLEMENT,
   MacOSVmBinaryNotFoundError,
   MacOSVmArtifactNotFoundError,
@@ -413,5 +414,63 @@ describe('spawnVm — preflights', () => {
     ).rejects.toThrow(MacOSVmEntitlementError);
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual(['-d', '--entitlements', '-', binary]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// defaultCodesignEnv — the env the default (non-injected) codesign runner spawns
+// ---------------------------------------------------------------------------
+//
+// The entitlement preflight is a read-only `codesign -d`, but it is still a
+// pre-trust, BARE-NAME host exec (runs in spawnVm BEFORE the audit produces /
+// diffs the lock).  Pin that the default runner spawns it with the SAME
+// `stripDangerousEnv` policy the other backends use — a checkout-prepended PATH
+// cannot resolve a PR-committed `./codesign`, and no inherited loader var
+// (DYLD_*/LD_*/NODE_OPTIONS) can inject into it.
+
+describe('defaultCodesignEnv — the default codesign runner uses a sanitized env', () => {
+  // defaultCodesignEnv() sanitizes the REAL process.env, so set the vars there
+  // (mirrors test/action/backend/bare.test.ts's GITHUB_WORKSPACE save/restore).
+  const SAVED = {
+    GITHUB_WORKSPACE: process.env['GITHUB_WORKSPACE'],
+    PATH: process.env['PATH'],
+    DYLD_INSERT_LIBRARIES: process.env['DYLD_INSERT_LIBRARIES'],
+    NODE_OPTIONS: process.env['NODE_OPTIONS'],
+  };
+  let checkout: string;
+
+  beforeEach(() => {
+    // A real checkout dir so realpath-based containment resolves (mac /tmp symlink).
+    checkout = mkdtempSync(join(tmpdir(), 'sj-codesign-env-'));
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    // `checkoutRoots()` reads the REAL process env, so the workflow checkout must
+    // be visible there for its bin dir to be recognised + dropped from PATH.
+    process.env['GITHUB_WORKSPACE'] = checkout;
+    // checkout-controlled dir prepended ahead of the system dirs.
+    process.env['PATH'] = `${checkoutBin}${delimiter}/usr/bin${delimiter}/bin`;
+    // dangerous loader selectors that must never reach the pre-trust codesign exec.
+    process.env['DYLD_INSERT_LIBRARIES'] = './evil.dylib';
+    process.env['NODE_OPTIONS'] = '--require ./evil.js';
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(SAVED)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try { rmSync(checkout, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('strips DYLD_INSERT_LIBRARIES / NODE_OPTIONS and drops the checkout PATH dir', () => {
+    const env = defaultCodesignEnv();
+
+    // dangerous loader/config selectors dropped
+    expect(env['DYLD_INSERT_LIBRARIES']).toBeUndefined();
+    expect(env['NODE_OPTIONS']).toBeUndefined();
+
+    // PATH: checkout bin dropped, system dirs kept in order, and never ''
+    expect(env['PATH']).toBe(`/usr/bin${delimiter}/bin`);
+    expect(env['PATH']).not.toBe('');
   });
 });
