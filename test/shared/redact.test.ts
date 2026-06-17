@@ -263,6 +263,20 @@ describe('maskValueFragments', () => {
     expect(maskValueFragmentsWith(`leak ${frag} end`, matcher, 'R')).toBe('leak <R> end');
   });
 
+  it('caps via the aggregate char budget (cheap, no giant gram set) when declared values exceed it (review #8)', () => {
+    // The cap is an aggregate VALUE-SIZE pre-check, not a gram-count count-up, so
+    // it triggers cheaply on repeated-char values (which would otherwise build a
+    // tiny gram set).  > 2 MiB of declared chars → capped WITHOUT building grams.
+    const vals = ['a'.repeat(1_000_000), 'b'.repeat(1_000_000), 'c'.repeat(1_000_000)]; // 3M chars
+    const m = buildFragmentMatcher(vals);
+    expect(m.capped).toBe(true);
+    expect(m.grams.size).toBe(0); // early return — no gram set built
+    expect(maskValueFragmentsWith('an ordinary diagnostic line', m, 'R')).toBe('<R>'); // fail closed
+    // a set under the budget is NOT capped and gets full coverage.
+    const under = buildFragmentMatcher(['d'.repeat(1_000_000), 'e'.repeat(1_000_000)]); // 2M chars, under 2 MiB
+    expect(under.capped).toBe(false);
+  });
+
   it('FAILS CLOSED (whole-text mask) when the matcher is capped, but passes short lines through', () => {
     // Direct test of the fail-closed behavior via a hand-built capped matcher —
     // the 2^22 ceiling is unreachable by OS-bounded inputs, so exercise the path

@@ -2944,6 +2944,14 @@ export function resolvePrepareCommand(
  * `redactSensitive` per line would rebuild the O(sum |V|) gram set on every line
  * and, for a large `protected.env`, both stall and (pre-fix) blackhole the log
  * (adversarial-review review #7).
+ *
+ * If `protected.env` is so large the fragment matcher caps (review #8 — only
+ * reachable with > 2 MiB of declared values on a high-`ulimit` runner), the
+ * fragment pass fail-closes and masks affected DIAGNOSTIC lines whole.  Exact
+ * whole-value masking still applies, and the audit LOCKFILE — built from
+ * structured events, never from this redacted text — is unaffected, so the
+ * audit still completes (the host part-2 path, where blanking the public job log
+ * is the real harm, instead throws a clear error up front).
  */
 export function createSensitiveRedactor(
   protectedEnvNames: readonly string[],

@@ -101,19 +101,23 @@ export function maskExactValues(
  * text.  A line span every one of whose `minFragment`-char windows is a
  * substring of a declared secret is treated as a leaked fragment and masked. */
 const DEFAULT_MIN_FRAGMENT = 8;
-/** FAIL-CLOSED memory backstop on the gram set, set ABOVE any OS-reachable
- * protected-value total.  The whole process environment — and thus the sum of
- * ALL protected values — is bounded by `ARG_MAX` (~2 MiB on Linux: a single env
- * var is capped near 128 KiB and the whole env at a couple MiB), so even 64
- * large declared values yield well under 2^22 distinct grams and get FULL
- * fragment coverage; a realistic `protected.env` is orders of magnitude smaller.
- * A declared set that STILL exceeds this ceiling is only reachable by a non-env
- * caller; rather than silently stop adding later values' grams — which would
- * leak a LATER value's fragment purely by list order (adversarial-review F6
- * round-3 #6) — we FAIL CLOSED and mask the whole text.  The ceiling sits above
- * the OS env bound (not at ~1M) so a large-but-legitimate `protected.env` is NOT
- * spuriously blackholed, and the matcher is built ONCE per redactor (see
- * `buildFragmentMatcher`) so it is never rebuilt per line (review #7). */
+/** Aggregate cap on the TOTAL chars of declared values the fragment matcher
+ * indexes — the REAL bound (a cheap O(values) pre-check).  The gram set holds
+ * ~one entry per value char, so capping total chars bounds memory: ~2M chars →
+ * ~2M grams ≈ ~150 MB, built ONCE, well within the 2 GiB guest VM.
+ *
+ * This is a MEMORY bound, NOT an OS-reachability proof.  Linux's argv+env limit
+ * is `RLIMIT_STACK / 4` (default ~2 MiB, but LARGER on a self-hosted runner with
+ * a raised stack `ulimit`), with a 128 KiB per-string `MAX_ARG_STRLEN`, so a
+ * sufficiently large `protected.env` CAN legitimately exceed this.  When it does
+ * the matcher is `capped` and callers FAIL LOUD — host `hostRunScripts` throws a
+ * clear config error BEFORE streaming (review #8) — rather than silently
+ * blackhole every redacted line; and we never silently DROP a later value's
+ * coverage (which would leak its fragment by list order — F6 round-3 #6).
+ * Realistic secrets are orders of magnitude under this. */
+const MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
+/** Hard backstop on the gram SET size (defense-in-depth behind the char cap;
+ * never reached first because the char cap already bounds the gram count). */
 const FRAGMENT_MAX_GRAMS = 1 << 22;
 
 /**
@@ -142,6 +146,16 @@ export function buildFragmentMatcher(
   values: readonly string[],
   minFragment = DEFAULT_MIN_FRAGMENT,
 ): FragmentMatcher {
+  // Cheap aggregate pre-check FIRST: if the declared values total more than the
+  // char budget, FAIL CLOSED without building a giant gram set (review #8 — this
+  // is the effective bound; the per-gram backstop below is defense-in-depth).
+  let totalChars = 0;
+  for (const v of values) {
+    totalChars += v.length;
+    if (totalChars > MAX_FRAGMENT_VALUE_CHARS) {
+      return { grams: new Set<string>(), capped: true, minFragment };
+    }
+  }
   const grams = new Set<string>();
   let capped = false;
   for (const v of values) {

@@ -593,6 +593,31 @@ describe('hostRunScripts (part 2)', () => {
       else process.env['MY_DEPLOY_TOKEN'] = prev;
     }
   });
+
+  it('FAILS LOUD (throws before streaming) when protected.env exceeds the redactor budget (review #8)', async () => {
+    // A protected.env so large the fragment matcher caps must NOT silently
+    // blackhole the job log: hostRunScripts throws an actionable config error
+    // up front, before any line is streamed.  (Only reachable with > 2 MiB of
+    // declared values on a high-`ulimit` runner; a single 2.1 MiB var here.)
+    const rec = makeRecorder();
+    let spawned = false;
+    const spySpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) => {
+      spawned = true;
+      return okStreamSpawn(rec)(cmd, args, cwd, env, onLine);
+    };
+    const prev = process.env['MY_DEPLOY_TOKEN'];
+    process.env['MY_DEPLOY_TOKEN'] = 'x'.repeat(2 * 1024 * 1024 + 100); // > 2 MiB chars
+    try {
+      await expect(
+        hostRunScripts('npm', '/repo', rec.io, ['MY_DEPLOY_TOKEN'], spySpawn),
+      ).rejects.toThrow(/more distinct secret material than the host lifecycle-log redactor/);
+      expect(spawned).toBe(false); // never entered streaming
+      expect(rec.out.join('') + rec.errs.join('')).not.toContain('xxxxxxxx'); // log not blanked/streamed
+    } finally {
+      if (prev === undefined) delete process.env['MY_DEPLOY_TOKEN'];
+      else process.env['MY_DEPLOY_TOKEN'] = prev;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

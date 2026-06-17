@@ -26727,8 +26727,16 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   return out;
 }
 var DEFAULT_MIN_FRAGMENT = 8;
+var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
 var FRAGMENT_MAX_GRAMS = 1 << 22;
 function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
+  let totalChars = 0;
+  for (const v of values) {
+    totalChars += v.length;
+    if (totalChars > MAX_FRAGMENT_VALUE_CHARS) {
+      return { grams: /* @__PURE__ */ new Set(), capped: true, minFragment };
+    }
+  }
   const grams = /* @__PURE__ */ new Set();
   let capped = false;
   for (const v of values) {
@@ -27009,6 +27017,11 @@ async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = 
 `);
   const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
   const fragMatcher = buildFragmentMatcher(sensitive);
+  if (fragMatcher.capped) {
+    throw new Error(
+      "script-jail: protected.env declares more distinct secret material than the host lifecycle-log redactor can safely index (> 2 MiB of values). Refusing to stream host lifecycle output \u2014 redacting per line against an incomplete secret index would either leak a torn secret fragment or blank every line. Reduce protected.env."
+    );
+  }
   const onLine = (stream, line) => {
     let safe = maskExactValues(line, sensitive, "REDACTED:ENV", 1);
     safe = maskValueFragmentsWith(safe, fragMatcher, "REDACTED:ENV");

@@ -650,6 +650,19 @@ export async function hostRunScripts(
   // `protected.env` would otherwise pay an O(sum |V|) rebuild on EVERY emitted
   // line (and a reachable-large set would blackhole every line) — review #7.
   const fragMatcher = buildFragmentMatcher(sensitive);
+  // FAIL LOUD, not silent: if the declared secret material exceeds what the
+  // redactor can index, a per-line capped matcher would mask EVERY line whole —
+  // blackholing the job log.  Refuse up front with an actionable error instead
+  // of silently streaming a blanked log (adversarial-review review #8).  This is
+  // only reachable with a very large `protected.env` on a high-`ulimit` runner.
+  if (fragMatcher.capped) {
+    throw new Error(
+      'script-jail: protected.env declares more distinct secret material than the host ' +
+        'lifecycle-log redactor can safely index (> 2 MiB of values). Refusing to stream ' +
+        'host lifecycle output — redacting per line against an incomplete secret index ' +
+        'would either leak a torn secret fragment or blank every line. Reduce protected.env.',
+    );
+  }
   const onLine = (stream: 'stdout' | 'stderr', line: string): void => {
     let safe = maskExactValues(line, sensitive, 'REDACTED:ENV', 1);
     // Also mask a declared secret that leaks as a FRAGMENT — a prefix/suffix

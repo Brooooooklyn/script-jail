@@ -25306,8 +25306,16 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   return out;
 }
 var DEFAULT_MIN_FRAGMENT = 8;
+var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
 var FRAGMENT_MAX_GRAMS = 1 << 22;
 function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
+  let totalChars = 0;
+  for (const v of values) {
+    totalChars += v.length;
+    if (totalChars > MAX_FRAGMENT_VALUE_CHARS) {
+      return { grams: /* @__PURE__ */ new Set(), capped: true, minFragment };
+    }
+  }
   const grams = /* @__PURE__ */ new Set();
   let capped = false;
   for (const v of values) {
