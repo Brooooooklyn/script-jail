@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
 import {
@@ -172,5 +172,51 @@ describe('createMacBareExecute — valid shim flows through', () => {
     expect(env['SCRIPT_JAIL_PHASE_B_UNSHARE_NET']).toBeUndefined();
     // Provisioned bin dir is PREPENDED so bare npm/pnpm/yarn resolve to it.
     expect((env['PATH'] ?? '').startsWith(PROVISIONED.nodeBinDir + ':')).toBe(true);
+  });
+
+  it('drops checkout-controlled + relative PATH entries before prepending the toolchain (codex round-4 [high])', async () => {
+    const repoDir = tmp('mb-repo-');
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}\n');
+    const scratchDir = tmp('mb-scratch-');
+    const configPath = join(scratchDir, 'config.yml');
+    writeFileSync(configPath, 'manager: npm\nwork_dir: /orig\n');
+
+    // A real checkout whose bin dir a workflow prepended to PATH; the PR could
+    // commit `bin/make` there.  `checkoutRoots()` reads the REAL process env, so
+    // the checkout must be visible there for its bin dir to be recognised.
+    const checkout = tmp('mb-checkout-');
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    const savedWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = checkout;
+
+    let capturedEnv: NodeJS.ProcessEnv | null = null;
+    try {
+      const exec = createMacBareExecute(
+        makeDeps({
+          env: {
+            // checkout-controlled dir + a relative entry, both ahead of system dirs
+            PATH: `${checkoutBin}${delimiter}./node_modules/.bin${delimiter}/usr/bin${delimiter}/bin`,
+          },
+          runAgentProcess: ((opts: { env: NodeJS.ProcessEnv }) => {
+            capturedEnv = opts.env;
+            return Promise.resolve(RESULT);
+          }) as unknown as NonNullable<MacBareExecuteDeps['runAgentProcess']>,
+        }),
+      );
+      await exec(makeInput({ repoDir, scratchDir, configPath }));
+    } finally {
+      if (savedWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+    }
+
+    const env = capturedEnv as unknown as NodeJS.ProcessEnv;
+    const path = env['PATH'] ?? '';
+    // toolchain prepended; checkout dir + relative entry dropped; system kept.
+    expect(path).toBe(
+      `${PROVISIONED.nodeBinDir}${delimiter}/usr/bin${delimiter}/bin`,
+    );
+    expect(path.includes(checkoutBin)).toBe(false);
+    expect(path.includes('node_modules/.bin')).toBe(false);
   });
 });

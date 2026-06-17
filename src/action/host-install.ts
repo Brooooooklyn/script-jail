@@ -458,7 +458,7 @@ function isDangerousEnvName(name: string): boolean {
  * checkout at exec time.  A CI runner PATH is all-absolute, so dropping relative
  * entries is safe and closes the cwd-mismatch hole outright.
  */
-function sanitizePathValue(pathVar: string | undefined): string | undefined {
+export function sanitizePathValue(pathVar: string | undefined): string | undefined {
   if (pathVar === undefined || pathVar === '') return pathVar;
   const roots = checkoutRoots();
   const kept: string[] = [];

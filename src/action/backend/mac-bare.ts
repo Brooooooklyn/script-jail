@@ -38,6 +38,7 @@ import { platform as hostPlatform } from 'node:process';
 import type { AuditExecutionInput, LauncherResult } from '../../shared/run-audit.js';
 import { runAgentProcess } from './process.js';
 import { rewriteConfigWorkDir, stageRepoDirectory } from './stage.js';
+import { sanitizePathValue } from '../host-install.js';
 import {
   provisionNodeMac,
   defaultProvisionCacheDir,
@@ -382,6 +383,11 @@ function firstExistingOrDefault(candidates: string[], doExists: typeof existsSyn
 
 /** Prepend `dir` to a PATH value, preserving the rest. */
 function prependPath(dir: string, env: NodeJS.ProcessEnv): string {
-  const existing = env['PATH'] ?? '/usr/bin:/bin:/usr/sbin:/sbin';
-  return `${dir}:${existing}`;
+  // SECURITY (codex round-4 [high]): sanitize the inherited PATH (drop checkout-
+  // controlled + non-absolute entries) BEFORE prepending the provisioned toolchain,
+  // so a workflow-prepended `$GITHUB_WORKSPACE/bin` cannot let the mac-bare AUDIT
+  // resolve a PR-provided `make`/tool that the hardened host install strips —
+  // matching `hostInstallEnv`'s PATH policy and keeping host==audit parity.
+  const existing = sanitizePathValue(env['PATH']) ?? '/usr/bin:/bin:/usr/sbin:/sbin';
+  return existing === '' ? dir : `${dir}:${existing}`;
 }
