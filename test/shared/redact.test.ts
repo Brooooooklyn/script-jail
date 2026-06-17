@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from 'vitest';
 
-import { redactCredentialShapes, maskExactValues } from '../../src/shared/redact.js';
+import { redactCredentialShapes, maskExactValues, maskValueFragments } from '../../src/shared/redact.js';
 
 describe('redactCredentialShapes', () => {
   it('drops userinfo from a scheme://user:pass@host URL, keeping scheme + host', () => {
@@ -133,5 +133,45 @@ describe('maskExactValues', () => {
   it('dedupes identical values (masked once, idempotent output)', () => {
     const out = maskExactValues('SECRETV SECRETV', ['SECRETV', 'SECRETV'], 'R');
     expect(out).toBe('<R> <R>');
+  });
+});
+
+describe('maskValueFragments', () => {
+  const SECRET = 'npm_AB12cd34EF56gh78IJ90klMNopQRstUVwx'; // 38 chars, high-entropy
+
+  it('masks a PREFIX of a declared value truncated mid-write (>= minFragment)', () => {
+    // A concurrent newline truncated the secret at a prefix; exact masking would
+    // miss it, fragment masking catches it.
+    const prefix = SECRET.slice(0, 20);
+    const out = maskValueFragments(`fetching with token ${prefix} now`, [SECRET], 'REDACTED:ENV');
+    expect(out).not.toContain(prefix);
+    expect(out).toBe('fetching with token <REDACTED:ENV> now');
+  });
+
+  it('masks a SUFFIX of a declared value (split on the previous line)', () => {
+    const suffix = SECRET.slice(SECRET.length - 18);
+    const out = maskValueFragments(`...${suffix} trailing`, [SECRET], 'REDACTED:ENV');
+    expect(out).not.toContain(suffix);
+    expect(out).toBe('...<REDACTED:ENV> trailing');
+  });
+
+  it('masks the WHOLE value too when called standalone', () => {
+    expect(maskValueFragments(`tok=${SECRET}`, [SECRET], 'R')).toBe('tok=<R>');
+  });
+
+  it('does NOT mask a fragment shorter than the minFragment floor (default 8)', () => {
+    const tiny = SECRET.slice(0, 7); // 7 < 8
+    const out = maskValueFragments(`x ${tiny} y`, [SECRET], 'R');
+    expect(out).toBe(`x ${tiny} y`); // too short to be a distinguishable secret fragment
+  });
+
+  it('does NOT mass-mask benign output when no fragment is present', () => {
+    const out = maskValueFragments('installing devDependencies and building', [SECRET], 'R');
+    expect(out).toBe('installing devDependencies and building');
+  });
+
+  it('skips values at or below the minFragment length (whole value is exact-masked elsewhere)', () => {
+    // length-8 value with minFragment 8 → filtered out (length must be > floor).
+    expect(maskValueFragments('abcd1234 here', ['abcd1234'], 'R')).toBe('abcd1234 here');
   });
 });

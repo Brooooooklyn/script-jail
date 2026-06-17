@@ -24,7 +24,7 @@ import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
 
 import { Attribution, buildRootPkgKeys, ROOT_SENTINEL } from './attribution.js';
-import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
+import { deriveSensitiveValues, maskExactValues, maskValueFragments, redactCredentialShapes } from '../shared/redact.js';
 import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
@@ -2956,7 +2956,11 @@ export function redactSensitive(
     )
     .sort((a, b) => b.value.length - a.value.length);
   for (const { name, value } of values) {
-    out = out.split(value).join(`<REDACTED:${name}>`);
+    out = out.split(value).join(`<REDACTED:${name}>`); // exact whole value
+    // Also mask a PREFIX/SUFFIX fragment of the value (e.g. a secret truncated by
+    // a concurrent newline on the shared pipe) — parity with the host part-2
+    // hardening (adversarial-review F6 round-3).
+    out = maskValueFragments(out, [value], `REDACTED:${name}`);
   }
   // Layer 2 — credential SHAPES regardless of the protected list.  Relocated
   // verbatim into the shared single-source redactor (see src/shared/redact.ts)

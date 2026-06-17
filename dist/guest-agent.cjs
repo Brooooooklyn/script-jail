@@ -25304,6 +25304,34 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   }
   return out;
 }
+var DEFAULT_MIN_FRAGMENT = 8;
+var FRAGMENT_SCAN_MAX_LEN = 512;
+function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFAULT_MIN_FRAGMENT) {
+  const replacement = `<${label}>`;
+  const unique = Array.from(new Set(values)).filter((v) => v.length > minFragment && v.length <= FRAGMENT_SCAN_MAX_LEN).sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const v of unique) {
+    if (out.includes(v.slice(0, minFragment))) {
+      for (let k = v.length; k >= minFragment; k--) {
+        const frag = v.slice(0, k);
+        if (out.includes(frag)) {
+          out = out.split(frag).join(replacement);
+          break;
+        }
+      }
+    }
+    if (out.includes(v.slice(v.length - minFragment))) {
+      for (let k = v.length; k >= minFragment; k--) {
+        const frag = v.slice(v.length - k);
+        if (out.includes(frag)) {
+          out = out.split(frag).join(replacement);
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
 function deriveSensitiveValues(args) {
   const values = [];
   for (const t of args) {
@@ -30847,6 +30875,7 @@ function redactSensitive(text, protectedEnvNames, env = process.env) {
   ).sort((a, b) => b.value.length - a.value.length);
   for (const { name, value } of values) {
     out = out.split(value).join(`<REDACTED:${name}>`);
+    out = maskValueFragments(out, [value], `REDACTED:${name}`);
   }
   out = redactCredentialShapes(out);
   return out;

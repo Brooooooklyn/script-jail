@@ -96,6 +96,71 @@ export function maskExactValues(
   return out;
 }
 
+/** High-entropy floor for fragment masking — a prefix/suffix shorter than this
+ * is too short to distinguish a real (high-entropy) secret from benign text. */
+const DEFAULT_MIN_FRAGMENT = 8;
+/** Perf cap: only declared values up to this length get the fragment scan. */
+const FRAGMENT_SCAN_MAX_LEN = 512;
+
+/**
+ * Mask a PREFIX or SUFFIX of each declared secret value that appears in `text`.
+ *
+ * `maskExactValues` only matches the WHOLE declared value, so a secret that
+ * leaks as a fragment slips through — e.g. when a concurrent writer's newline
+ * truncates a secret mid-write on a SHARED stdout/stderr pipe, the line carries
+ * only `V[0..k]` (a prefix), or a same-writer `V[0..k]\nV[k..]` split leaves a
+ * prefix on one line and a suffix on the next (adversarial-review F6 round-3).
+ * For each declared value `V` (length in `(minFragment, MAX]`), this masks the
+ * LONGEST prefix of `V` and the LONGEST suffix of `V` present in `text`, each at
+ * least `minFragment` chars.  `minFragment` is a high-entropy floor (default 8)
+ * so benign words are not mass-masked: a real token's 8+ char prefix coinciding
+ * with unrelated log text is vanishingly unlikely.
+ *
+ * SCOPE: this does NOT cover an arbitrary MIDDLE split (a deliberately
+ * fragmented secret with neither end on a line) — that is the irreducible
+ * per-line line-local residual, bounded by the PRIMARY env_read audit gate (a
+ * script cannot obtain the value to fragment without a recorded read that fails
+ * the PR pre-trust).  Fragment masking strengthens the defense-in-depth layer
+ * against the realistic prefix/suffix truncation; it is not a trust boundary.
+ *
+ * Linear-time-bounded: a cheap `minFragment`-length gate skips the per-value
+ * scan entirely when no fragment is present (the common case), so benign output
+ * costs O(values) substring checks, not O(values × |V|).
+ */
+export function maskValueFragments(
+  text: string,
+  values: readonly string[],
+  label = 'REDACTED',
+  minFragment = DEFAULT_MIN_FRAGMENT,
+): string {
+  const replacement = `<${label}>`;
+  const unique = Array.from(new Set(values))
+    .filter((v) => v.length > minFragment && v.length <= FRAGMENT_SCAN_MAX_LEN)
+    .sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const v of unique) {
+    // Longest PREFIX of v present (gate on the minimal prefix first — skips the
+    // scan entirely when no fragment is present).  k starts at v.length so a
+    // standalone call also masks a whole value cleanly; in the host/guest
+    // pipeline maskExactValues has already removed the whole value, so this
+    // catches the proper fragment.
+    if (out.includes(v.slice(0, minFragment))) {
+      for (let k = v.length; k >= minFragment; k--) {
+        const frag = v.slice(0, k);
+        if (out.includes(frag)) { out = out.split(frag).join(replacement); break; }
+      }
+    }
+    // Longest SUFFIX of v present (same gate-then-scan).
+    if (out.includes(v.slice(v.length - minFragment))) {
+      for (let k = v.length; k >= minFragment; k--) {
+        const frag = v.slice(v.length - k);
+        if (out.includes(frag)) { out = out.split(frag).join(replacement); break; }
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Derive the exact literal values that must be masked out of captured
  * package-manager output that took developer-supplied install `args`.  For each

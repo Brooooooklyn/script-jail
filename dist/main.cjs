@@ -26726,6 +26726,34 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   }
   return out;
 }
+var DEFAULT_MIN_FRAGMENT = 8;
+var FRAGMENT_SCAN_MAX_LEN = 512;
+function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFAULT_MIN_FRAGMENT) {
+  const replacement = `<${label}>`;
+  const unique = Array.from(new Set(values)).filter((v) => v.length > minFragment && v.length <= FRAGMENT_SCAN_MAX_LEN).sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const v of unique) {
+    if (out.includes(v.slice(0, minFragment))) {
+      for (let k = v.length; k >= minFragment; k--) {
+        const frag = v.slice(0, k);
+        if (out.includes(frag)) {
+          out = out.split(frag).join(replacement);
+          break;
+        }
+      }
+    }
+    if (out.includes(v.slice(v.length - minFragment))) {
+      for (let k = v.length; k >= minFragment; k--) {
+        const frag = v.slice(v.length - k);
+        if (out.includes(frag)) {
+          out = out.split(frag).join(replacement);
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
 function deriveSensitiveValues(args) {
   const values = [];
   for (const t of args) {
@@ -26969,6 +26997,7 @@ async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = 
   const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
   const onLine = (stream, line) => {
     let safe = maskExactValues(line, sensitive, "REDACTED:ENV", 1);
+    safe = maskValueFragments(safe, sensitive, "REDACTED:ENV");
     safe = redactCredentialShapes(safe);
     (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
 `);

@@ -570,6 +570,29 @@ describe('hostRunScripts (part 2)', () => {
       else process.env['MY_DEPLOY_TOKEN'] = prev;
     }
   });
+
+  it('REDACTS a PREFIX of a protected secret truncated mid-write on the shared pipe (F6 round-3)', async () => {
+    // A concurrent writer's newline can truncate a secret to a prefix on the
+    // shared pipe; exact masking misses a prefix, so the onLine redactor also
+    // runs maskValueFragments.  Assert a 20-char prefix of a declared secret is
+    // masked end-to-end through hostRunScripts.
+    const rec = makeRecorder();
+    const SECRET = 'npm_AB12cd34EF56gh78IJ90klMNopQRstUVwx'; // high-entropy, 38 chars
+    const PREFIX = SECRET.slice(0, 20);
+    const prev = process.env['MY_DEPLOY_TOKEN'];
+    process.env['MY_DEPLOY_TOKEN'] = SECRET;
+    try {
+      await hostRunScripts('npm', '/repo', rec.io, ['MY_DEPLOY_TOKEN'], okStreamSpawn(rec, [
+        { stream: 'stdout', line: `leaked fragment ${PREFIX} on a truncated line` },
+      ]));
+      const all = rec.out.join('') + rec.errs.join('');
+      expect(all).not.toContain(PREFIX);
+      expect(all).toContain('<REDACTED:ENV>');
+    } finally {
+      if (prev === undefined) delete process.env['MY_DEPLOY_TOKEN'];
+      else process.env['MY_DEPLOY_TOKEN'] = prev;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -885,23 +908,20 @@ describe('makeLineSink (part-2 bounded line splitter)', () => {
     expect(lines.map((l) => l.line)).toEqual(['one', 'two']); // no spurious marker
   });
 
-  it('DOCUMENTS the accepted line-local residual: a concurrent newline completes a held prefix (F6 round-3)', () => {
+  it('SPLITTER forwards a concurrent-newline-completed prefix (redaction is downstream) (F6 round-3)', () => {
     // stdout/stderr are ONE shared pipe; the sink cannot tell "writer A prefix +
-    // writer B newline" from "writer A whole line".  So a no-newline prefix that
-    // a SECOND writer's newline completes IS forwarded as a line — exact-value
-    // redaction (whole declared value) misses a prefix.  This is the SAME
-    // irreducible LINE-LOCAL residual the guest forwarders carry, and it is
-    // DEFENSE-IN-DEPTH: the PRIMARY env_read audit gate stops a script from
-    // obtaining a protected value to leak (recorded read → PR fails pre-trust).
-    // The grace-path drop covers only a fragment that STAYS pending (no second
-    // newline) — assert that scope honestly so a future change can't silently
-    // shift it without re-examining the threat model.
+    // writer B newline" from "writer A whole line", so it forwards the prefix as
+    // a line.  This is correct for the SPLITTER (it does not redact) — the line
+    // is redacted DOWNSTREAM in hostRunScripts.onLine, which now masks declared
+    // secret PREFIX/SUFFIX fragments (maskValueFragments, F6 round-3 hardening),
+    // not just the whole value.  Only an arbitrary-MIDDLE deliberate split
+    // remains the irreducible LINE-LOCAL residual (same as guest), bounded by the
+    // PRIMARY env_read audit gate.  Assert the splitter scope honestly so a
+    // future change can't silently shift it.
     const { lines, onLine } = collect();
     const sink = makeLineSink('stdout', onLine);
     sink.onData(Buffer.from('writerA-prefix'));       // writer A, no newline
     sink.onData(Buffer.from('\nwriterB-line\n'));     // writer B supplies the newline
-    // The prefix IS forwarded (documented residual — NOT a regression to "fix"
-    // here; it is gated by the env_read primary control, not the redactor).
     expect(lines.map((l) => l.line)).toEqual(['writerA-prefix', 'writerB-line']);
   });
 

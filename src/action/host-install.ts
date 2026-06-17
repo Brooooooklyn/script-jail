@@ -36,7 +36,7 @@ import {
   sanitizeInstallArgs,
   type Manager,
 } from '../shared/pm-commands.js';
-import { deriveSensitiveValues, maskExactValues, redactCredentialShapes } from '../shared/redact.js';
+import { deriveSensitiveValues, maskExactValues, maskValueFragments, redactCredentialShapes } from '../shared/redact.js';
 
 // ---------------------------------------------------------------------------
 // SECURITY: pin npm's `git` config to the trusted runner git
@@ -648,6 +648,10 @@ export async function hostRunScripts(
     .filter((v): v is string => typeof v === 'string');
   const onLine = (stream: 'stdout' | 'stderr', line: string): void => {
     let safe = maskExactValues(line, sensitive, 'REDACTED:ENV', 1);
+    // Also mask a declared secret that leaks as a PREFIX/SUFFIX (e.g. a concurrent
+    // writer's newline truncating it mid-write on the shared pipe) — exact masking
+    // only matches the whole value (adversarial-review F6 round-3 hardening).
+    safe = maskValueFragments(safe, sensitive, 'REDACTED:ENV');
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
   };

@@ -2759,6 +2759,16 @@ describe('redactSensitive (Phase A failure dump)', () => {
       .toBe('token <REDACTED:SECRET> here');
   });
 
+  it('MASKS a PREFIX/SUFFIX fragment of a declared value (F6 round-3 parity with host)', async () => {
+    // A secret truncated by a concurrent newline on the shared pipe leaks as a
+    // fragment; exact masking misses it, so layer-1 also runs maskValueFragments.
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const SECRET = 'npm_AB12cd34EF56gh78IJ90klMNopQRstUVwx';
+    const prefix = SECRET.slice(0, 20);
+    expect(redactSensitive(`fetch with ${prefix} now`, ['NPM_TOKEN'], { NPM_TOKEN: SECRET }))
+      .toBe('fetch with <REDACTED:NPM_TOKEN> now');
+  });
+
   it('redacts credential SHAPES not in the protected list', async () => {
     const { redactSensitive } = await import('../../src/guest/agent.js');
     const out = redactSensitive(
