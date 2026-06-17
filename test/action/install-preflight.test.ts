@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 import {
   detectPreTrustConfigExec,
   detectInstallWorkDirDivergence,
+  detectCheckoutRelativeHome,
 } from '../../src/action/install-preflight.js';
 
 let dir: string;
@@ -309,6 +310,28 @@ describe('detectPreTrustConfigExec — yarn ancestor .yarnrc.yml scan', () => {
     expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/enableConstraintsChecks/);
   });
 
+  it('blocks ancestor enableConstraintsChecks + a yarn.config.cjs at the INSTALL-CWD subdir (codex idx-11 bypass)', () => {
+    // The real Yarn behavior (VERIFIED 4.5.0): the `enableConstraintsChecks` FLAG
+    // cascades down from the ancestor rc, but yarn loads `yarn.config.cjs` from the
+    // INSTALL-CWD project root (the audited subdir), NOT the rc's dir.  The old gate
+    // checked only the rc's dir (ws), so this layout — flag at ws, config at the
+    // audited pkg — slipped through and let attacker code run IN-AUDIT.  Must block.
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'enableConstraintsChecks: true\n');
+    writeAt(join(pkg, 'yarn.config.cjs'), 'module.exports = {}'); // at the install cwd, NOT ws
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/enableConstraintsChecks/);
+  });
+
+  it('does NOT block ancestor enableConstraintsChecks with NO yarn.config.cjs anywhere (hook no-ops)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'enableConstraintsChecks: true\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toBeNull();
+  });
+
   it('fails closed on an unparseable ANCESTOR .yarnrc.yml', () => {
     const ws = dir;
     const pkg = join(ws, 'pkg');
@@ -450,5 +473,58 @@ describe('detectInstallWorkDirDivergence', () => {
 
   it('allows a non-string work_dir (e.g. numeric) — not a path divergence', () => {
     expect(detectInstallWorkDirDivergence(configAt('work_dir: 42\n'))).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Checkout-relative $HOME (codex idx-20): package managers load config from
+// $HOME at startup ($HOME/.yarnrc.yml plugins / $HOME/.npmrc script-shell), so a
+// $HOME that resolves UNDER the checkout lets a PR-committed home config run code
+// on the runner pre-trust — unseen by the sandbox (different HOME).  The
+// repoDir->workspaceRoot ancestor scan does NOT cover a sibling/non-ancestor
+// $HOME, so install must refuse when HOME is checkout-relative.
+// ---------------------------------------------------------------------------
+describe('detectCheckoutRelativeHome — refuse install on a checkout-relative $HOME', () => {
+  it('refuses when HOME is a sibling subdir of repoDir inside the workspace ($WS/.home)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    const home = join(ws, '.home'); // sibling of pkg, under the checkout — NOT on the repoDir->ws chain
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    writeAt(join(home, '.yarnrc.yml'), 'plugins:\n  - ./evil.cjs\n');
+    const reason = detectCheckoutRelativeHome(home, pkg, ws);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/HOME/);
+  });
+
+  it('refuses when HOME IS the workspace root (PR controls $WS/.yarnrc.yml)', () => {
+    const ws = dir;
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    expect(detectCheckoutRelativeHome(ws, ws, ws)).not.toBeNull();
+  });
+
+  it('refuses when HOME is under repoDir even with no workspaceRoot (local)', () => {
+    const repo = dir;
+    const home = join(repo, '.home');
+    writeAt(join(home, '.npmrc'), 'script-shell=./pwn.sh\n');
+    expect(detectCheckoutRelativeHome(home, repo)).not.toBeNull();
+  });
+
+  it('allows a HOME OUTSIDE the checkout (the normal runner home)', () => {
+    const ws = join(dir, 'ws');
+    const home = join(dir, 'runner-home'); // sibling of ws, NOT under it
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    expect(detectCheckoutRelativeHome(home, ws, ws)).toBeNull();
+  });
+
+  it('allows HOME as an ANCESTOR of repoDir (repoDir = $HOME/project — the common case)', () => {
+    const home = dir;
+    const repo = join(home, 'project'); // repo is INSIDE home, home is NOT inside the checkout
+    writeAt(join(repo, 'package.json'), '{"name":"p"}');
+    expect(detectCheckoutRelativeHome(home, repo)).toBeNull();
+  });
+
+  it('allows an unset/empty HOME (nothing to resolve)', () => {
+    expect(detectCheckoutRelativeHome(undefined, dir, dir)).toBeNull();
+    expect(detectCheckoutRelativeHome('', dir, dir)).toBeNull();
   });
 });

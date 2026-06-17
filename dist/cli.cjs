@@ -7827,6 +7827,7 @@ var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
   "ignore_scripts",
   "userconfig",
   "globalconfig",
+  "prefix",
   "node_gyp",
   "python",
   "make",

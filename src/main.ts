@@ -23,7 +23,7 @@ import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
 import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
-import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, readProtectedEnvNames } from './action/install-preflight.js';
+import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, detectCheckoutRelativeHome, readProtectedEnvNames } from './action/install-preflight.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
@@ -251,6 +251,16 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     const workDirDivergence = detectInstallWorkDirDivergence(inputs.configPath);
     if (workDirDivergence !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused — ${workDirDivergence}\n`);
+      exitProcess(1);
+    }
+    // SECURITY: a checkout-relative $HOME makes a PR-committed `$HOME/.yarnrc.yml`
+    // (plugins/yarnPath) or `$HOME/.npmrc` (script-shell) execute on the runner at
+    // package-manager config-load — pre-trust, unseen by the sandbox (different
+    // HOME).  hostInstallEnv preserves HOME, and the repoDir->workspaceRoot scan
+    // above misses a sibling/non-ancestor $HOME, so gate it here.  (install-preflight.ts:detectCheckoutRelativeHome.)
+    const homeReason = detectCheckoutRelativeHome(process.env['HOME'], repoDir, workspaceRoot);
+    if (homeReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused — ${homeReason}\n`);
       exitProcess(1);
     }
   }

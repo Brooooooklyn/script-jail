@@ -26942,6 +26942,7 @@ var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
   "ignore_scripts",
   "userconfig",
   "globalconfig",
+  "prefix",
   "node_gyp",
   "python",
   "make",
@@ -26996,6 +26997,7 @@ function hostInstallEnv(pm) {
     env["YARN_RC_FILENAME"] = ".yarnrc.yml";
     env["YARN_PLUGINS"] = "";
     env["YARN_ENABLE_CONSTRAINTS_CHECKS"] = "false";
+    delete env["YARN_ENABLE_SCRIPTS"];
   }
   return env;
 }
@@ -27232,6 +27234,18 @@ function detectPreTrustConfigExec(repoDir, manager, workspaceRoot) {
   if (manager === "yarn") return detectYarnStartupExec(repoDir, workspaceRoot);
   return null;
 }
+function detectCheckoutRelativeHome(homeDir, repoDir, workspaceRoot) {
+  if (homeDir === void 0 || homeDir === "") return null;
+  const home = realpathOrResolve(homeDir);
+  const roots = [realpathOrResolve(repoDir)];
+  if (workspaceRoot !== void 0 && workspaceRoot !== "") roots.push(realpathOrResolve(workspaceRoot));
+  for (const root of roots) {
+    if (isPathUnder(home, root)) {
+      return `HOME (\`${homeDir}\`) resolves under the checkout (\`${root}\`). Package managers load config from \`$HOME\` at startup (\`$HOME/.yarnrc.yml\` plugins / \`$HOME/.npmrc\` script-shell), so a PR-committed home config would execute on the runner BEFORE the audit decides anything \u2014 unseen by the sandbox, which uses a different HOME. Set HOME to a path OUTSIDE the checkout for the script-jail step, or audit without \`install\`.`;
+    }
+  }
+  return null;
+}
 function detectInstallWorkDirDivergence(configPath) {
   if (!(0, import_node_fs3.existsSync)(configPath)) return null;
   let parsed;
@@ -27271,6 +27285,12 @@ function realpathOrResolve(p) {
   } catch {
     return abs;
   }
+}
+function isPathUnder(child, root) {
+  if (child === root) return true;
+  const rel = (0, import_node_path4.relative)(root, child);
+  if (rel === "") return true;
+  return !(rel === ".." || rel.startsWith(".." + import_node_path4.sep) || (0, import_node_path4.isAbsolute)(rel));
 }
 var PNPM_GUIDANCE = " would run unaudited on the runner BEFORE the audit decides anything. `install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, or audit without `install` (the sandbox still records the pnpmfile there).";
 function detectPnpmfile(repoDir, workspaceRoot) {
@@ -27356,14 +27376,14 @@ function detectPnpmConfigDepsInDir(dir) {
 }
 var YARN_GUIDANCE = " executes repo-controlled code on the runner at `yarn install` startup, BEFORE the audit decides anything. `install: true` cannot run that pre-trust. Remove it, or audit without `install` (the sandbox still records it there).";
 function detectYarnStartupExec(repoDir, workspaceRoot) {
-  const repo = (0, import_node_path4.resolve)(repoDir);
+  const repo = realpathOrResolve(repoDir);
   for (const dir of scanDirs(repoDir, workspaceRoot)) {
-    const reason = detectYarnStartupExecInDir(dir, dir === repo);
+    const reason = detectYarnStartupExecInDir(dir, dir === repo, repo);
     if (reason !== null) return reason;
   }
   return null;
 }
-function detectYarnStartupExecInDir(dir, atRepoDir) {
+function detectYarnStartupExecInDir(dir, atRepoDir, repoDir) {
   const content = tryReadFile((0, import_node_path4.join)(dir, ".yarnrc.yml"));
   if (content === null) return null;
   const where = atRepoDir ? "a repo" : `an ancestor (\`${dir}\`)`;
@@ -27380,7 +27400,7 @@ function detectYarnStartupExecInDir(dir, atRepoDir) {
   if (Array.isArray(parsed["plugins"]) && parsed["plugins"].length > 0) {
     return `${where} \`.yarnrc.yml\` \`plugins\` entry` + YARN_GUIDANCE;
   }
-  if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && (0, import_node_fs3.existsSync)((0, import_node_path4.join)(dir, "yarn.config.cjs"))) {
+  if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, "yarn.config.cjs")) || (0, import_node_fs3.existsSync)((0, import_node_path4.join)(dir, "yarn.config.cjs")))) {
     return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
   }
   return null;
@@ -45118,6 +45138,12 @@ async function main(deps = {}) {
     const workDirDivergence = detectInstallWorkDirDivergence(inputs.configPath);
     if (workDirDivergence !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${workDirDivergence}
+`);
+      exitProcess(1);
+    }
+    const homeReason = detectCheckoutRelativeHome(process.env["HOME"], repoDir, workspaceRoot);
+    if (homeReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${homeReason}
 `);
       exitProcess(1);
     }

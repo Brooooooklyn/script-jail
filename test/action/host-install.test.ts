@@ -148,14 +148,21 @@ describe('hostInstallNoScripts (part 1)', () => {
 
     const prevAuth = process.env['YARN_NPM_AUTH_TOKEN'];
     process.env['YARN_NPM_AUTH_TOKEN'] = 'tok-preserve-me';
+    // SECURITY (codex idx-5): an INHERITED YARN_ENABLE_SCRIPTS=true beats a PR's
+    // `.yarnrc.yml` `enableScripts: false` (env > rc, VERIFIED yarn 4.5.0), so the
+    // clean-VM audit (no env) would record no scripts while the host runs them.
+    // The host yarn child must DELETE it so the rc governs identically to the audit.
+    const prevScripts = process.env['YARN_ENABLE_SCRIPTS'];
+    process.env['YARN_ENABLE_SCRIPTS'] = 'true';
     try {
-      // yarn part 1: all four neutralizers set, auth preserved.
+      // yarn part 1: all four neutralizers set, auth preserved, script-enable dropped.
       const y1 = envCapture();
       hostInstallNoScripts('yarn', '/repo', [], makeRecorder().io, y1.spawn);
       expect(y1.env()['YARN_IGNORE_PATH']).toBe('1');
       expect(y1.env()['YARN_RC_FILENAME']).toBe('.yarnrc.yml');
       expect(y1.env()['YARN_PLUGINS']).toBe('');
       expect(y1.env()['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBe('false');
+      expect(y1.env()['YARN_ENABLE_SCRIPTS']).toBeUndefined(); // inherited override dropped
       expect(y1.env()['YARN_NPM_AUTH_TOKEN']).toBe('tok-preserve-me'); // auth survives
 
       // yarn part 2 (run-scripts) is hardened identically.
@@ -163,6 +170,7 @@ describe('hostInstallNoScripts (part 1)', () => {
       await hostRunScripts('yarn', '/repo', makeRecorder().io, [], y2.streamSpawn);
       expect(y2.env()['YARN_IGNORE_PATH']).toBe('1');
       expect(y2.env()['YARN_PLUGINS']).toBe('');
+      expect(y2.env()['YARN_ENABLE_SCRIPTS']).toBeUndefined();
 
       // npm / pnpm never get the yarn neutralizers (these keys are our additions).
       for (const pm of ['npm', 'pnpm'] as const) {
@@ -175,6 +183,8 @@ describe('hostInstallNoScripts (part 1)', () => {
     } finally {
       if (prevAuth === undefined) delete process.env['YARN_NPM_AUTH_TOKEN'];
       else process.env['YARN_NPM_AUTH_TOKEN'] = prevAuth;
+      if (prevScripts === undefined) delete process.env['YARN_ENABLE_SCRIPTS'];
+      else process.env['YARN_ENABLE_SCRIPTS'] = prevScripts;
     }
   });
 
@@ -1293,6 +1303,26 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       else process.env['GITHUB_WORKSPACE'] = origWs;
       rmSync(checkout, { recursive: true, force: true });
     }
+  });
+
+  it('stripDangerousEnv drops NPM_CONFIG_PREFIX (codex idx-21 — prefix derives globalconfig)', () => {
+    // VERIFIED npm 11.13.0: npm derives `globalconfig` as `{prefix}/etc/npmrc`, so an
+    // inherited NPM_CONFIG_PREFIX pointing at a checkout dir whose `etc/npmrc` declares
+    // `script-shell=<pwn>` makes `npm rebuild --foreground-scripts` exec the attacker
+    // shell.  `prefix` must be dropped in EVERY npm_config alias form (case + separator),
+    // exactly like userconfig/globalconfig, while unrelated npm_config_* survive.
+    const out = stripDangerousEnv({
+      NPM_CONFIG_PREFIX: '/checkout/fakeprefix', // upper form (NPM_CONFIG_*)
+      npm_config_prefix: '/checkout/fakeprefix', // lower form (npm_config_*)
+      npm_config_registry: 'https://registry.npmjs.org/',
+      npm_config_userconfig: '/checkout/.npmrc',
+      npm_config_globalconfig: '/checkout/npmrc',
+    });
+    expect(out['NPM_CONFIG_PREFIX']).toBeUndefined();
+    expect(out['npm_config_prefix']).toBeUndefined();
+    expect(out['npm_config_userconfig']).toBeUndefined();
+    expect(out['npm_config_globalconfig']).toBeUndefined();
+    expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/'); // unrelated key survives
   });
 
   it('pins COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (overriding inherited), so stripping COREPACK_HOME cannot hang', () => {

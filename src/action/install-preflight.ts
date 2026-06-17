@@ -92,6 +92,47 @@ export function detectPreTrustConfigExec(
 }
 
 /**
+ * Returns a reason when `install: true` must be REFUSED because the runner's
+ * `$HOME` resolves UNDER the checkout (PR-controlled), null otherwise.
+ *
+ * SECURITY: every package manager loads config from `$HOME` at startup, BEFORE
+ * the trust gate and independent of `--ignore-scripts`/`--mode=skip-build`:
+ * `$HOME/.yarnrc.yml` `plugins:`/`yarnPath` run repo code at yarn config-load
+ * (VERIFIED yarn 4.5.0: a HOME-rc `plugins:` entry executes during
+ * `yarn install --immutable --mode=skip-build` even with the `YARN_PLUGINS=''` /
+ * `YARN_IGNORE_PATH=1` pins — those govern the ENV plugin source, not the rc-file
+ * cascade), and `$HOME/.npmrc` is npm's DEFAULT userconfig (a `script-shell=<pwn>`
+ * there runs on `npm rebuild`).  `hostInstallEnv` preserves `HOME` verbatim and
+ * the clean-VM audit uses a DIFFERENT `HOME`, so it never sees a PR-committed home
+ * config — unaudited host RCE.  The `repoDir`->`workspaceRoot` ancestor scan does
+ * NOT cover a `$HOME` that is a sibling/non-ancestor checkout path (e.g.
+ * `$GITHUB_WORKSPACE/.home`).  A checkout-relative `$HOME` has no legitimate
+ * install use (the runner's real home is outside the checkout), so fail closed.
+ */
+export function detectCheckoutRelativeHome(
+  homeDir: string | undefined,
+  repoDir: string,
+  workspaceRoot?: string,
+): string | null {
+  if (homeDir === undefined || homeDir === '') return null;
+  const home = realpathOrResolve(homeDir);
+  const roots = [realpathOrResolve(repoDir)];
+  if (workspaceRoot !== undefined && workspaceRoot !== '') roots.push(realpathOrResolve(workspaceRoot));
+  for (const root of roots) {
+    if (isPathUnder(home, root)) {
+      return (
+        `HOME (\`${homeDir}\`) resolves under the checkout (\`${root}\`). Package managers ` +
+        `load config from \`$HOME\` at startup (\`$HOME/.yarnrc.yml\` plugins / \`$HOME/.npmrc\` ` +
+        `script-shell), so a PR-committed home config would execute on the runner BEFORE the ` +
+        `audit decides anything — unseen by the sandbox, which uses a different HOME. Set HOME ` +
+        `to a path OUTSIDE the checkout for the script-jail step, or audit without \`install\`.`
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * Returns a human-readable reason when `install: true` must be REFUSED because
  * the consumer config declares a `work_dir` that DIVERGES from the host install
  * cwd; null when aligned (default `/work`, unset, or explicitly `/work`).
@@ -184,6 +225,20 @@ function realpathOrResolve(p: string): string {
   } catch {
     return abs;
   }
+}
+
+/**
+ * True when `child` IS `root` or is nested under it.  Both MUST already be
+ * realpath'd (so symlinks/case resolve identically on both sides).  Separator-aware
+ * (mirrors `scanDirs`' containment): a `relative()` of `''` means equal; a normal
+ * relative path means descendant; only `'..'`, a `'..'+sep` prefix, or an absolute
+ * result means `child` is genuinely OUTSIDE `root`.
+ */
+function isPathUnder(child: string, root: string): boolean {
+  if (child === root) return true;
+  const rel = relative(root, child);
+  if (rel === '') return true;
+  return !(rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel));
 }
 
 const PNPM_GUIDANCE =
@@ -350,9 +405,13 @@ function detectYarnStartupExec(repoDir: string, workspaceRoot?: string): string 
   // checkout executes repo code pre-trust even when repoDir's own rc is clean.
   // Scan every dir from repoDir up to (and including) the workspace root; the
   // common repoDir===workspaceRoot case scans exactly repoDir (unchanged).
-  const repo = resolve(repoDir);
+  // realpath (not lexical resolve) so `dir === repo` matches the realpath'd dirs
+  // scanDirs returns (a symlinked repoDir would otherwise never match and every
+  // dir would mislabel as an ancestor) AND so the install-root `yarn.config.cjs`
+  // lookup below resolves the same project root yarn reads on disk.
+  const repo = realpathOrResolve(repoDir);
   for (const dir of scanDirs(repoDir, workspaceRoot)) {
-    const reason = detectYarnStartupExecInDir(dir, dir === repo);
+    const reason = detectYarnStartupExecInDir(dir, dir === repo, repo);
     if (reason !== null) return reason;
   }
   return null;
@@ -361,9 +420,11 @@ function detectYarnStartupExec(repoDir: string, workspaceRoot?: string): string 
 /**
  * Apply the yarn startup-exec checks to a SINGLE directory's `.yarnrc.yml`.
  * `atRepoDir` controls whether the error message names the ancestor dir (for a
- * clear diagnostic when the offending rc is NOT the repo's own).
+ * clear diagnostic when the offending rc is NOT the repo's own).  `repoDir` is the
+ * realpath'd install-cwd project root — where yarn actually loads `yarn.config.cjs`
+ * from, regardless of which ancestor rc enabled the constraints hook.
  */
-function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean): string | null {
+function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, repoDir: string): string | null {
   // Berry reads ONLY `.yarnrc.yml`; classic `.yarnrc` `yarn-path` is ignored
   // under corepack/Berry (verified), so it is not a vector and is not checked.
   const content = tryReadFile(join(dir, '.yarnrc.yml'));
@@ -392,12 +453,21 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean): string | n
   // must not trip this gate.  Yarn coerces several representations to enabled
   // (true / "true" / 1 / "1"); rather than enumerate them, fail closed for
   // ANYTHING that is not DEFINITELY false (matches yarn's own behavior, which
-  // throws on unrecognized values — refusing is the safe direction).  Yarn
-  // resolves `yarn.config.cjs` from the rc's PROJECT ROOT (the dir holding the
-  // enabling rc), so check it in the SAME dir as the rc that enabled the hook.
+  // throws on unrecognized values — refusing is the safe direction).  The enabling
+  // FLAG cascades down from ANY ancestor `.yarnrc.yml` (Berry's rc cascade), but
+  // yarn loads the `yarn.config.cjs` it runs from its PROJECT ROOT, which is the
+  // INSTALL-CWD (`repoDir`) when that dir is its own project (own lockfile — the
+  // realistic audited case) OR a workspace root above it.  VERIFIED yarn 4.5.0: an
+  // ancestor rc `enableConstraintsChecks: true` + a `yarn.config.cjs` in the audited
+  // subdir runs the SUBDIR config (the old `join(dir, …)`-only check missed it, so a
+  // subdir audit bypassed the gate); the workspace-root shape instead loads the
+  // root's config.  Check BOTH `repoDir` (install-cwd project root) AND `dir` (the
+  // rc's own dir, which is the project root in the workspace-member shape) so the
+  // gate fails closed for either — over-refusing a stray ancestor config is the safe
+  // direction.
   if (
     isNotDefinitelyFalse(parsed['enableConstraintsChecks']) &&
-    existsSync(join(dir, 'yarn.config.cjs'))
+    (existsSync(join(repoDir, 'yarn.config.cjs')) || existsSync(join(dir, 'yarn.config.cjs')))
   ) {
     return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
   }

@@ -412,6 +412,12 @@ const HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
 //   script_shell             [18] lifecycle script interpreter
 //   ignore_scripts           [16] skip the audited scripts (self-DoS / divergence)
 //   userconfig / globalconfig [22] load a PR-controlled npmrc
+//   prefix                   [21] npm DERIVES globalconfig as `{prefix}/etc/npmrc`
+//                            (VERIFIED npm 11.13.0: `NPM_CONFIG_PREFIX=<dir>` with
+//                            `<dir>/etc/npmrc` declaring `script-shell=<pwn>` makes
+//                            `npm rebuild --foreground-scripts` exec the attacker
+//                            shell), so an inherited prefix is a config-redirect to a
+//                            PR-controlled npmrc exactly like userconfig/globalconfig.
 //   node_gyp / python / make native-build tool selectors (checkout-relative exec)
 //   shell                    npm's exec/explore shell
 const DANGEROUS_NPM_CONFIG_KEYS = new Set([
@@ -419,6 +425,7 @@ const DANGEROUS_NPM_CONFIG_KEYS = new Set([
   'ignore_scripts',
   'userconfig',
   'globalconfig',
+  'prefix',
   'node_gyp',
   'python',
   'make',
@@ -552,6 +559,15 @@ function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
     env['YARN_RC_FILENAME'] = '.yarnrc.yml';
     env['YARN_PLUGINS'] = '';
     env['YARN_ENABLE_CONSTRAINTS_CHECKS'] = 'false';
+    // SECURITY (parity): Yarn maps env -> config and ENV BEATS the rc file
+    // (VERIFIED yarn 4.5.0: `enableScripts` reads false from `.yarnrc.yml`
+    // `enableScripts: false` but TRUE under `YARN_ENABLE_SCRIPTS=true`).  The
+    // clean-VM audit never inherits the runner env, so it honours the rc; if the
+    // host kept an inherited `YARN_ENABLE_SCRIPTS=true` it would run lifecycle
+    // scripts a PR's `enableScripts: false` suppressed in the audit — host > audit,
+    // unrecorded RCE on the runner.  DELETE it (not force-false) so the rc governs
+    // host part-2 IDENTICALLY to the audit: rc-true still builds, rc-false still skips.
+    delete env['YARN_ENABLE_SCRIPTS'];
   }
   return env;
 }
