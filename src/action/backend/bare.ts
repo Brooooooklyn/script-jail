@@ -7,6 +7,7 @@ import type { AuditBackend, BackendContext } from './types.js';
 import { BackendUnavailableError } from './types.js';
 import { commandSucceeds, runAgentProcess } from './process.js';
 import { rewriteConfigWorkDir, stageRepoDirectory } from './stage.js';
+import { stripDangerousEnv } from '../host-install.js';
 
 export interface BareBackendDeps {
   preFetchArtifacts?: typeof preFetchArtifacts;
@@ -61,7 +62,12 @@ export function createBareBackend(deps: BareBackendDeps = {}): AuditBackend {
           cmd: process.execPath,
           args: [runtime.agentPath],
           env: {
-            ...env,
+            // PARITY: the bare agent runs ON THE HOST and inherits the runner env
+            // (unlike the clean-VM Firecracker/Docker guest).  Strip the dangerous
+            // loader/tool/config selectors + sanitize PATH so the bare AUDIT sees
+            // the same env the hardened host install does — and so an inherited
+            // NODE_OPTIONS can't inject into the agent process itself.
+            ...stripDangerousEnv(env),
             SCRIPT_JAIL_CONNECTION: 'stdio',
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
             // Bare mode runs the agent directly on the host (no container /etc),

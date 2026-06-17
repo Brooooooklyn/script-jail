@@ -346,6 +346,25 @@ const HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     'AR',
     'AS',
     'MAKE',
+    // GNU make startup/config env (consumed before any target): MAKEFLAGS
+    // ='--eval=$(shell …)' runs a command at make startup, MAKEFILES=/path
+    // evaluates a makefile pre-target (both VERIFIED).  node-gyp invokes make.
+    'MAKEFLAGS',
+    'GNUMAKEFLAGS',
+    'MAKEFILES',
+    // Corepack EXEC/config selectors: a pnpm/yarn bare command is commonly a
+    // corepack shim, and COREPACK_HOME is its executable CACHE — a checkout-
+    // relative one (VERIFIED with corepack 0.35.0) makes corepack run a PR-planted
+    // bin/pnpm.cjs in host part-1.  COREPACK_ENV_FILE loads env from a file;
+    // COREPACK_NPM_REGISTRY / COREPACK_INTEGRITY_KEYS / COREPACK_ROOT can redirect
+    // or unsign the downloaded PM.  Behaviour flags (COREPACK_ENABLE_*) are NOT
+    // here — they don't select an executable, and the download-prompt flag is
+    // re-pinned below so stripping the cache can't trigger an interactive hang.
+    'COREPACK_HOME',
+    'COREPACK_ENV_FILE',
+    'COREPACK_NPM_REGISTRY',
+    'COREPACK_INTEGRITY_KEYS',
+    'COREPACK_ROOT',
     // Shell / interpreter startup hooks that run on a NON-interactive spawn.
     // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
     // common legit "environment name" var, so it is deliberately NOT stripped.)
@@ -454,29 +473,54 @@ function sanitizePathValue(pathVar: string | undefined): string | undefined {
   return kept.join(delimiter);
 }
 
-function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
-  // Sanitize FIRST (drop sandbox tells + dangerous loader/config vars), THEN
-  // layer the security pins on top so a stripped name can never accidentally
-  // remove the git pin / yarn neutralizers.
+/**
+ * Drop the dangerous loader/tool/config-FILE selector env vars
+ * (`isDangerousEnvName`) and sanitize PATH.  EXPORTED so the Linux `bare` backend
+ * can apply the SAME policy to the env it spawns the audit AGENT with.
+ *
+ * Why the bare backend needs it: the Firecracker/Docker guest audits in a CLEAN VM
+ * env (it never inherits the runner env), but the bare backend runs the agent
+ * directly ON THE HOST with the inherited runner env.  Without this, the bare audit
+ * would honour a checkout-relative loader/config var (NODE_OPTIONS, GIT_, PYTHON,
+ * COREPACK_HOME, …) that the
+ * hardened host install no longer does — breaking the host==audit parity this
+ * hardening relies on (Codex round-3 finding), and an inherited NODE_OPTIONS could
+ * even inject code into the agent process itself before the audit envelope.  Does
+ * NOT drop the sandbox-tell noise or SCRIPT_JAIL_* (the agent reads some) and does
+ * NOT add the npm/yarn install pins (those are install-child specific).
+ */
+export function stripDangerousEnv(srcEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(process.env)) {
+  for (const [name, value] of Object.entries(srcEnv)) {
     if (value === undefined) continue;
-    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name)) continue;
-    // SECURITY: drop inherited loader/config vars that enable pre-trust code
-    // execution or host/audit config divergence (see the set above).
     if (isDangerousEnvName(name)) continue;
-    // Every SCRIPT_JAIL_* host knob (REPO_DIR, CACHE_DIR, ACTION_ROOT, …) is an
-    // audit-absent tell and is unused by the package manager — drop them all.
-    if (name.startsWith('SCRIPT_JAIL_')) continue;
     env[name] = value;
   }
   // SECURITY ([5]+[9]): sanitize PATH so a checkout-controlled dir cannot shadow
-  // the bare-name PM/tool resolution.  Done after the copy so it operates on the
-  // inherited value; applied here so BOTH host phases get the sanitized PATH.
-  const sanitizedPath = sanitizePathValue(process.env['PATH']);
+  // bare-name PM/tool resolution.
+  const sanitizedPath = sanitizePathValue(srcEnv['PATH']);
   if (sanitizedPath === undefined) delete env['PATH'];
   else env['PATH'] = sanitizedPath;
+  return env;
+}
+
+function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
+  // Drop dangerous selectors + sanitize PATH (shared with the bare backend), THEN
+  // drop the sandbox-tell noise + SCRIPT_JAIL_* knobs, THEN layer the security pins
+  // on top so a stripped name can never accidentally remove a pin.
+  const env = stripDangerousEnv(process.env);
+  for (const name of Object.keys(env)) {
+    // Sandbox-tell NOISE + every SCRIPT_JAIL_* host knob (REPO_DIR, CACHE_DIR,
+    // ACTION_ROOT, …): audit-absent tells, unused by the package manager.
+    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name) || name.startsWith('SCRIPT_JAIL_')) {
+      delete env[name];
+    }
+  }
   env['npm_config_git'] = trustedGitPath();
+  // Corepack must not block on an interactive download prompt (match the audit:
+  // docker.ts / init.sh / mac-bare set this) — especially since we strip an
+  // inherited COREPACK_HOME above, which could force a cache re-download.
+  env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
   if (pm === 'yarn') {
     env['YARN_IGNORE_PATH'] = '1';
     env['YARN_RC_FILENAME'] = '.yarnrc.yml';

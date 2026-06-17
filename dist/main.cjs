@@ -26891,6 +26891,25 @@ var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     "AR",
     "AS",
     "MAKE",
+    // GNU make startup/config env (consumed before any target): MAKEFLAGS
+    // ='--eval=$(shell …)' runs a command at make startup, MAKEFILES=/path
+    // evaluates a makefile pre-target (both VERIFIED).  node-gyp invokes make.
+    "MAKEFLAGS",
+    "GNUMAKEFLAGS",
+    "MAKEFILES",
+    // Corepack EXEC/config selectors: a pnpm/yarn bare command is commonly a
+    // corepack shim, and COREPACK_HOME is its executable CACHE — a checkout-
+    // relative one (VERIFIED with corepack 0.35.0) makes corepack run a PR-planted
+    // bin/pnpm.cjs in host part-1.  COREPACK_ENV_FILE loads env from a file;
+    // COREPACK_NPM_REGISTRY / COREPACK_INTEGRITY_KEYS / COREPACK_ROOT can redirect
+    // or unsign the downloaded PM.  Behaviour flags (COREPACK_ENABLE_*) are NOT
+    // here — they don't select an executable, and the download-prompt flag is
+    // re-pinned below so stripping the cache can't trigger an interactive hang.
+    "COREPACK_HOME",
+    "COREPACK_ENV_FILE",
+    "COREPACK_NPM_REGISTRY",
+    "COREPACK_INTEGRITY_KEYS",
+    "COREPACK_ROOT",
     // Shell / interpreter startup hooks that run on a NON-interactive spawn.
     // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
     // common legit "environment name" var, so it is deliberately NOT stripped.)
@@ -26950,19 +26969,27 @@ function sanitizePathValue(pathVar) {
   }
   return kept.join(import_node_path2.delimiter);
 }
-function hostInstallEnv(pm) {
+function stripDangerousEnv(srcEnv) {
   const env = {};
-  for (const [name, value] of Object.entries(process.env)) {
+  for (const [name, value] of Object.entries(srcEnv)) {
     if (value === void 0) continue;
-    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name)) continue;
     if (isDangerousEnvName(name)) continue;
-    if (name.startsWith("SCRIPT_JAIL_")) continue;
     env[name] = value;
   }
-  const sanitizedPath = sanitizePathValue(process.env["PATH"]);
+  const sanitizedPath = sanitizePathValue(srcEnv["PATH"]);
   if (sanitizedPath === void 0) delete env["PATH"];
   else env["PATH"] = sanitizedPath;
+  return env;
+}
+function hostInstallEnv(pm) {
+  const env = stripDangerousEnv(process.env);
+  for (const name of Object.keys(env)) {
+    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name) || name.startsWith("SCRIPT_JAIL_")) {
+      delete env[name];
+    }
+  }
   env["npm_config_git"] = trustedGitPath();
+  env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
   if (pm === "yarn") {
     env["YARN_IGNORE_PATH"] = "1";
     env["YARN_RC_FILENAME"] = ".yarnrc.yml";
@@ -44872,7 +44899,12 @@ function createBareBackend(deps = {}) {
           cmd: process.execPath,
           args: [runtime.agentPath],
           env: {
-            ...env,
+            // PARITY: the bare agent runs ON THE HOST and inherits the runner env
+            // (unlike the clean-VM Firecracker/Docker guest).  Strip the dangerous
+            // loader/tool/config selectors + sanitize PATH so the bare AUDIT sees
+            // the same env the hardened host install does — and so an inherited
+            // NODE_OPTIONS can't inject into the agent process itself.
+            ...stripDangerousEnv(env),
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
             // Bare mode runs the agent directly on the host (no container /etc),

@@ -3992,10 +3992,10 @@ var require_resolve_block_map = __commonJS({
       let offset = bm.offset;
       let commentEnd = null;
       for (const collItem of bm.items) {
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const keyProps = resolveProps.resolveProps(start, {
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: bm.indent,
@@ -4009,7 +4009,7 @@ var require_resolve_block_map = __commonJS({
             else if ("indent" in key && key.indent !== bm.indent)
               onError(offset, "BAD_INDENT", startColMsg);
           }
-          if (!keyProps.anchor && !keyProps.tag && !sep) {
+          if (!keyProps.anchor && !keyProps.tag && !sep2) {
             commentEnd = keyProps.end;
             if (keyProps.comment) {
               if (map2.comment)
@@ -4033,7 +4033,7 @@ var require_resolve_block_map = __commonJS({
         ctx.atKey = false;
         if (utilMapIncludes.mapIncludes(ctx, map2.items, keyNode))
           onError(keyStart, "DUPLICATE_KEY", "Map keys must be unique");
-        const valueProps = resolveProps.resolveProps(sep ?? [], {
+        const valueProps = resolveProps.resolveProps(sep2 ?? [], {
           indicator: "map-value-ind",
           next: value,
           offset: keyNode.range[2],
@@ -4049,7 +4049,7 @@ var require_resolve_block_map = __commonJS({
             if (ctx.options.strict && keyProps.start < valueProps.found.offset - 1024)
               onError(keyNode.range, "KEY_OVER_1024_CHARS", "The : indicator must be at most 1024 chars after the start of an implicit block mapping key");
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep, null, valueProps, onError);
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep2, null, valueProps, onError);
           if (ctx.schema.compat)
             utilFlowIndentCheck.flowIndentCheck(bm.indent, value, onError);
           offset = valueNode.range[2];
@@ -4140,7 +4140,7 @@ var require_resolve_end = __commonJS({
       let comment = "";
       if (end) {
         let hasSpace = false;
-        let sep = "";
+        let sep2 = "";
         for (const token of end) {
           const { source, type } = token;
           switch (type) {
@@ -4154,13 +4154,13 @@ var require_resolve_end = __commonJS({
               if (!comment)
                 comment = cb;
               else
-                comment += sep + cb;
-              sep = "";
+                comment += sep2 + cb;
+              sep2 = "";
               break;
             }
             case "newline":
               if (comment)
-                sep += source;
+                sep2 += source;
               hasSpace = true;
               break;
             default:
@@ -4203,18 +4203,18 @@ var require_resolve_flow_collection = __commonJS({
       let offset = fc.offset + fc.start.source.length;
       for (let i = 0; i < fc.items.length; ++i) {
         const collItem = fc.items[i];
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const props = resolveProps.resolveProps(start, {
           flow: fcName,
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: fc.indent,
           startOnNewline: false
         });
         if (!props.found) {
-          if (!props.anchor && !props.tag && !sep && !value) {
+          if (!props.anchor && !props.tag && !sep2 && !value) {
             if (i === 0 && props.comma)
               onError(props.comma, "UNEXPECTED_TOKEN", `Unexpected , in ${fcName}`);
             else if (i < fc.items.length - 1)
@@ -4268,8 +4268,8 @@ var require_resolve_flow_collection = __commonJS({
             }
           }
         }
-        if (!isMap && !sep && !props.found) {
-          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep, null, props, onError);
+        if (!isMap && !sep2 && !props.found) {
+          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep2, null, props, onError);
           coll.items.push(valueNode);
           offset = valueNode.range[2];
           if (isBlock(value))
@@ -4281,7 +4281,7 @@ var require_resolve_flow_collection = __commonJS({
           if (isBlock(key))
             onError(keyNode.range, "BLOCK_IN_FLOW", blockMsg);
           ctx.atKey = false;
-          const valueProps = resolveProps.resolveProps(sep ?? [], {
+          const valueProps = resolveProps.resolveProps(sep2 ?? [], {
             flow: fcName,
             indicator: "map-value-ind",
             next: value,
@@ -4292,8 +4292,8 @@ var require_resolve_flow_collection = __commonJS({
           });
           if (valueProps.found) {
             if (!isMap && !props.found && ctx.options.strict) {
-              if (sep)
-                for (const st of sep) {
+              if (sep2)
+                for (const st of sep2) {
                   if (st === valueProps.found)
                     break;
                   if (st.type === "newline") {
@@ -4310,7 +4310,7 @@ var require_resolve_flow_collection = __commonJS({
             else
               onError(valueProps.start, "MISSING_CHAR", `Missing , or : between ${fcName} items`);
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep, null, valueProps, onError) : null;
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep2, null, valueProps, onError) : null;
           if (valueNode) {
             if (isBlock(value))
               onError(valueNode.range, "BLOCK_IN_FLOW", blockMsg);
@@ -4490,7 +4490,7 @@ var require_resolve_block_scalar = __commonJS({
           chompStart = i + 1;
       }
       let value = "";
-      let sep = "";
+      let sep2 = "";
       let prevMoreIndented = false;
       for (let i = 0; i < contentStart; ++i)
         value += lines[i][0].slice(trimIndent) + "\n";
@@ -4507,24 +4507,24 @@ var require_resolve_block_scalar = __commonJS({
           indent = "";
         }
         if (type === Scalar.Scalar.BLOCK_LITERAL) {
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
         } else if (indent.length > trimIndent || content[0] === "	") {
-          if (sep === " ")
-            sep = "\n";
-          else if (!prevMoreIndented && sep === "\n")
-            sep = "\n\n";
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          if (sep2 === " ")
+            sep2 = "\n";
+          else if (!prevMoreIndented && sep2 === "\n")
+            sep2 = "\n\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
           prevMoreIndented = true;
         } else if (content === "") {
-          if (sep === "\n")
+          if (sep2 === "\n")
             value += "\n";
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          value += sep + content;
-          sep = " ";
+          value += sep2 + content;
+          sep2 = " ";
           prevMoreIndented = false;
         }
       }
@@ -4706,25 +4706,25 @@ var require_resolve_flow_scalar = __commonJS({
       if (!match)
         return source;
       let res = match[1];
-      let sep = " ";
+      let sep2 = " ";
       let pos = first.lastIndex;
       line.lastIndex = pos;
       while (match = line.exec(source)) {
         if (match[1] === "") {
-          if (sep === "\n")
-            res += sep;
+          if (sep2 === "\n")
+            res += sep2;
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          res += sep + match[1];
-          sep = " ";
+          res += sep2 + match[1];
+          sep2 = " ";
         }
         pos = line.lastIndex;
       }
       const last = /[ \t]*(.*)/sy;
       last.lastIndex = pos;
       match = last.exec(source);
-      return res + sep + (match?.[1] ?? "");
+      return res + sep2 + (match?.[1] ?? "");
     }
     function doubleQuotedValue(source, onError) {
       let res = "";
@@ -5534,14 +5534,14 @@ var require_cst_stringify = __commonJS({
         }
       }
     }
-    function stringifyItem({ start, key, sep, value }) {
+    function stringifyItem({ start, key, sep: sep2, value }) {
       let res = "";
       for (const st of start)
         res += st.source;
       if (key)
         res += stringifyToken(key);
-      if (sep)
-        for (const st of sep)
+      if (sep2)
+        for (const st of sep2)
           res += st.source;
       if (value)
         res += stringifyToken(value);
@@ -6708,18 +6708,18 @@ var require_parser = __commonJS({
         if (this.type === "map-value-ind") {
           const prev = getPrevProps(this.peek(2));
           const start = getFirstKeyStartProps(prev);
-          let sep;
+          let sep2;
           if (scalar.end) {
-            sep = scalar.end;
-            sep.push(this.sourceToken);
+            sep2 = scalar.end;
+            sep2.push(this.sourceToken);
             delete scalar.end;
           } else
-            sep = [this.sourceToken];
+            sep2 = [this.sourceToken];
           const map2 = {
             type: "block-map",
             offset: scalar.offset,
             indent: scalar.indent,
-            items: [{ start, key: scalar, sep }]
+            items: [{ start, key: scalar, sep: sep2 }]
           };
           this.onKeyLine = true;
           this.stack[this.stack.length - 1] = map2;
@@ -6872,15 +6872,15 @@ var require_parser = __commonJS({
                 } else if (isFlowToken(it.key) && !includesToken(it.sep, "newline")) {
                   const start2 = getFirstKeyStartProps(it.start);
                   const key = it.key;
-                  const sep = it.sep;
-                  sep.push(this.sourceToken);
+                  const sep2 = it.sep;
+                  sep2.push(this.sourceToken);
                   delete it.key;
                   delete it.sep;
                   this.stack.push({
                     type: "block-map",
                     offset: this.offset,
                     indent: this.indent,
-                    items: [{ start: start2, key, sep }]
+                    items: [{ start: start2, key, sep: sep2 }]
                   });
                 } else if (start.length > 0) {
                   it.sep = it.sep.concat(start, this.sourceToken);
@@ -7074,13 +7074,13 @@ var require_parser = __commonJS({
             const prev = getPrevProps(parent);
             const start = getFirstKeyStartProps(prev);
             fixFlowSeqItems(fc);
-            const sep = fc.end.splice(1, fc.end.length);
-            sep.push(this.sourceToken);
+            const sep2 = fc.end.splice(1, fc.end.length);
+            sep2.push(this.sourceToken);
             const map2 = {
               type: "block-map",
               offset: fc.offset,
               indent: fc.indent,
-              items: [{ start, key: fc, sep }]
+              items: [{ start, key: fc, sep: sep2 }]
             };
             this.onKeyLine = true;
             this.stack[this.stack.length - 1] = map2;
@@ -7364,9 +7364,9 @@ __export(index_exports, {
   run: () => run
 });
 module.exports = __toCommonJS(index_exports);
-var import_node_fs22 = require("node:fs");
+var import_node_fs23 = require("node:fs");
 var import_node_os9 = require("node:os");
-var import_node_path17 = require("node:path");
+var import_node_path18 = require("node:path");
 var import_node_url2 = require("node:url");
 
 // src/cli/detect-platform.ts
@@ -10688,8 +10688,8 @@ function emoji() {
 }
 var ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
 var ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
-var mac = (delimiter) => {
-  const escapedDelim = escapeRegex(delimiter ?? ":");
+var mac = (delimiter2) => {
+  const escapedDelim = escapeRegex(delimiter2 ?? ":");
   return new RegExp(`^(?:[0-9A-F]{2}${escapedDelim}){5}[0-9A-F]{2}$|^(?:[0-9a-f]{2}${escapedDelim}){5}[0-9a-f]{2}$`);
 };
 var cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
@@ -24139,11 +24139,11 @@ var import_promises3 = require("node:fs/promises");
 var import_node_https = require("node:https");
 var import_node_http = require("node:http");
 async function sha256File2(filePath) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const hash2 = (0, import_node_crypto3.createHash)("sha256");
     const stream = (0, import_node_fs9.createReadStream)(filePath);
     stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("end", () => resolve5(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
@@ -24171,11 +24171,11 @@ var NodeHttpClient = class {
 async function downloadToFile(url2, destPath, redirects) {
   if (redirects > 5) throw new Error(`Too many redirects fetching ${url2}`);
   const getter = url2.startsWith("https://") ? import_node_https.get : import_node_http.get;
-  await new Promise((resolve4, reject) => {
+  await new Promise((resolve5, reject) => {
     getter(url2, (res) => {
       if (res.statusCode !== void 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve4).catch(reject);
+        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve5).catch(reject);
         return;
       }
       if (res.statusCode !== 200) {
@@ -24184,7 +24184,7 @@ async function downloadToFile(url2, destPath, redirects) {
       }
       const out = (0, import_node_fs9.createWriteStream)(destPath);
       res.pipe(out);
-      out.on("finish", () => resolve4());
+      out.on("finish", () => resolve5());
       out.on("error", reject);
       res.on("error", reject);
     }).on("error", reject);
@@ -24247,7 +24247,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
     `script-jail-fc-${(0, import_node_crypto4.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version2}-${releaseArch}`;
-  await new Promise((resolve4, reject) => {
+  await new Promise((resolve5, reject) => {
     const gunzip = (0, import_node_zlib2.createGunzip)();
     const input = (0, import_node_fs10.createReadStream)(tarPath);
     const BLOCK = 512;
@@ -24262,7 +24262,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
       outStream?.close();
       outStream = null;
       if (err) reject(err);
-      else resolve4();
+      else resolve5();
     };
     gunzip.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -24276,7 +24276,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
         ));
         return;
       }
-      resolve4();
+      resolve5();
     });
     gunzip.on("error", cleanup);
     input.on("error", cleanup);
@@ -24463,7 +24463,7 @@ function applyMaskToBuffer(buf, bufStart, ranges) {
   }
 }
 function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const hash2 = (0, import_node_crypto5.createHash)("sha256");
     const stream = (0, import_node_fs12.createReadStream)(
       filePath,
@@ -24475,7 +24475,7 @@ function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
       offset += chunk.length;
       hash2.update(chunk);
     });
-    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("end", () => resolve5(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
@@ -24709,14 +24709,14 @@ var NodeSpawner = class {
       forwardStream(child.stderr, "[fc:err] ");
     }
     let exitCode;
-    const exitPromise = new Promise((resolve4) => {
+    const exitPromise = new Promise((resolve5) => {
       child.on("close", (code) => {
         exitCode = code ?? 1;
-        resolve4(exitCode);
+        resolve5(exitCode);
       });
       child.on("error", () => {
         exitCode = 1;
-        resolve4(1);
+        resolve5(1);
       });
     });
     return {
@@ -24759,7 +24759,7 @@ var FsSocketPoller = class {
   }
 };
 function sleep(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve5) => setTimeout(resolve5, ms));
 }
 var UnixSocketApiClient = class {
   constructor(socketPath) {
@@ -24773,7 +24773,7 @@ var UnixSocketApiClient = class {
     return this._request("PATCH", path, body);
   }
   _request(method, path, body) {
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve5, reject) => {
       const payload = JSON.stringify(body);
       const req = (0, import_node_http2.request)(
         {
@@ -24798,7 +24798,7 @@ var UnixSocketApiClient = class {
                 )
               );
             } else {
-              resolve4();
+              resolve5();
             }
           });
         }
@@ -24830,22 +24830,22 @@ async function openVsockSession(udsPath, port, options) {
   const session = {
     events,
     sendGo: () => {
-      return new Promise((resolve4, reject) => {
+      return new Promise((resolve5, reject) => {
         void reject;
         const ok = duplex.write("go\n");
         if (!ok) {
           const writeable = duplex;
           if (typeof writeable.once === "function") {
             writeable.once("drain", () => {
-              resolve4();
+              resolve5();
             });
           } else {
             setImmediate(() => {
-              resolve4();
+              resolve5();
             });
           }
         } else {
-          resolve4();
+          resolve5();
         }
       });
     },
@@ -24856,7 +24856,7 @@ async function openVsockSession(udsPath, port, options) {
   return session;
 }
 function connectUnixSocket(sockPath, timeoutMs) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const sock = (0, import_node_net.createConnection)(sockPath);
     const timer = setTimeout(() => {
       sock.destroy();
@@ -24864,7 +24864,7 @@ function connectUnixSocket(sockPath, timeoutMs) {
     }, timeoutMs);
     sock.once("connect", () => {
       clearTimeout(timer);
-      resolve4(sock);
+      resolve5(sock);
     });
     sock.once("error", (err) => {
       clearTimeout(timer);
@@ -24903,7 +24903,7 @@ async function dialVsockWithRetry(udsPath, port, totalTimeoutMs) {
   );
 }
 function waitForOkLine(sock, timeoutMs) {
-  return new Promise((resolve4) => {
+  return new Promise((resolve5) => {
     const chunks = [];
     let settled = false;
     const finish = (result) => {
@@ -24913,7 +24913,7 @@ function waitForOkLine(sock, timeoutMs) {
       sock.off("data", onData);
       sock.off("close", onClose);
       sock.off("error", onError);
-      resolve4(result);
+      resolve5(result);
     };
     const onData = (chunk) => {
       chunks.push(chunk);
@@ -24943,7 +24943,7 @@ function waitForOkLine(sock, timeoutMs) {
   });
 }
 function sleep2(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve5) => setTimeout(resolve5, ms));
 }
 function socketToDuplex(sock) {
   return {
@@ -25006,7 +25006,7 @@ async function removeIfExists(filePath) {
   }
 }
 function timeout(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve5) => setTimeout(resolve5, ms));
 }
 
 // src/action/backend/types.ts
@@ -25054,9 +25054,9 @@ async function runAgentProcess(input) {
   const nonFatalWarnings = [];
   let finalYaml = null;
   let fatalError = null;
-  const exitPromise = new Promise((resolve4) => {
-    child.on("close", (code) => resolve4(code ?? 1));
-    child.on("error", () => resolve4(1));
+  const exitPromise = new Promise((resolve5) => {
+    child.on("close", (code) => resolve5(code ?? 1));
+    child.on("error", () => resolve5(1));
   });
   try {
     for await (const frame of parseFrames(child.stdout)) {
@@ -25492,9 +25492,183 @@ function resolveDockerImageRef(ctx, opts = {}) {
 }
 
 // src/action/backend/bare.ts
+var import_node_fs19 = require("node:fs");
+var import_node_path15 = require("node:path");
+var import_node_process4 = require("node:process");
+
+// src/action/host-install.ts
 var import_node_fs18 = require("node:fs");
 var import_node_path14 = require("node:path");
-var import_node_process4 = require("node:process");
+
+// src/shared/redact.ts
+var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
+var FRAGMENT_MAX_GRAMS = 1 << 22;
+
+// src/action/host-install.ts
+var CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+function canonicalForCompare(p) {
+  let abs;
+  try {
+    abs = (0, import_node_fs18.realpathSync)((0, import_node_path14.resolve)(p));
+  } catch {
+    abs = (0, import_node_path14.resolve)(p);
+  }
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+function checkoutRoots() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
+  }
+  return roots;
+}
+function isUnderCheckout(p, roots) {
+  const abs = canonicalForCompare(p);
+  for (const root of roots) {
+    if (abs === root || abs.startsWith(root + import_node_path14.sep)) return true;
+  }
+  return false;
+}
+var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
+  [
+    // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
+    "NODE_OPTIONS",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_PATH",
+    // adds require() search dirs → a checkout-relative one loads PR code
+    // [19] Git EXEC/config-FILE selectors (git+ssh|https deps; --ignore-scripts
+    // does NOT stop git being invoked).  Enumerated (not blanket GIT_*) so benign
+    // behaviour flags such as GIT_TERMINAL_PROMPT/GIT_ALLOW_PROTOCOL are preserved.
+    // The git BINARY itself stays pinned via npm_config_git.
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_ASKPASS",
+    // verified-class: git invokes the askpass program by path
+    "SSH_ASKPASS",
+    "GIT_EXEC_PATH",
+    // VERIFIED: GIT_EXEC_PATH=./core runs checkout core/git-remote-https
+    "GIT_TEMPLATE_DIR",
+    // clone hooks dir
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    // gates inline GIT_CONFIG_KEY_*/VALUE_*; dropping it makes them inert
+    "GIT_CONFIG_PARAMETERS",
+    // VERIFIED: ='core.sshCommand=./ssh' runs ./ssh on ssh:// clone
+    // Native-build TOOL selectors honored by node-gyp/gyp/make (checkout-relative
+    // interpreter/compiler/linker runs during a native `npm rebuild`).  PYTHON* and
+    // node-gyp* are caught by the family prefixes below.  Stripping forces the
+    // system toolchain auto-detect — the same default the clean-VM audit used.
+    "CC",
+    "CXX",
+    "CPP",
+    "LINK",
+    "LD",
+    "AR",
+    "AS",
+    "MAKE",
+    // GNU make startup/config env (consumed before any target): MAKEFLAGS
+    // ='--eval=$(shell …)' runs a command at make startup, MAKEFILES=/path
+    // evaluates a makefile pre-target (both VERIFIED).  node-gyp invokes make.
+    "MAKEFLAGS",
+    "GNUMAKEFLAGS",
+    "MAKEFILES",
+    // Corepack EXEC/config selectors: a pnpm/yarn bare command is commonly a
+    // corepack shim, and COREPACK_HOME is its executable CACHE — a checkout-
+    // relative one (VERIFIED with corepack 0.35.0) makes corepack run a PR-planted
+    // bin/pnpm.cjs in host part-1.  COREPACK_ENV_FILE loads env from a file;
+    // COREPACK_NPM_REGISTRY / COREPACK_INTEGRITY_KEYS / COREPACK_ROOT can redirect
+    // or unsign the downloaded PM.  Behaviour flags (COREPACK_ENABLE_*) are NOT
+    // here — they don't select an executable, and the download-prompt flag is
+    // re-pinned below so stripping the cache can't trigger an interactive hang.
+    "COREPACK_HOME",
+    "COREPACK_ENV_FILE",
+    "COREPACK_NPM_REGISTRY",
+    "COREPACK_INTEGRITY_KEYS",
+    "COREPACK_ROOT",
+    // Shell / interpreter startup hooks that run on a NON-interactive spawn.
+    // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
+    // common legit "environment name" var, so it is deliberately NOT stripped.)
+    "BASH_ENV",
+    // bash -c sources it
+    "ZDOTDIR",
+    // zsh startup dir
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB"
+  ].map((n) => n.toLowerCase())
+);
+var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
+  "ld_",
+  // ELF dynamic loader: LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH / …
+  "dyld_",
+  // macOS dyld analogs (the host bare backend runs on macOS)
+  "python",
+  // PYTHON / PYTHONPATH / PYTHONHOME / PYTHONSTARTUP (sitecustomize exec)
+  "node_gyp_",
+  // NODE_GYP_FORCE_PYTHON, … (VERIFIED node-gyp interpreter selector)
+  // npm re-derives npm_package_config_* from the AUDITED package.json; an INHERITED
+  // one for a key absent from package.json would pass through to node-gyp
+  // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
+  // the legit values from the package.json the sandbox already audited.
+  "npm_package_config_"
+];
+var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
+  "script_shell",
+  "ignore_scripts",
+  "userconfig",
+  "globalconfig",
+  "node_gyp",
+  "python",
+  "make",
+  "shell"
+]);
+function isDangerousEnvName(name) {
+  const lower = name.toLowerCase();
+  for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
+    if (lower.startsWith(prefix)) return true;
+  }
+  if (lower.startsWith("npm_config_")) {
+    const key = lower.slice("npm_config_".length).replace(/-/g, "_");
+    return DANGEROUS_NPM_CONFIG_KEYS.has(key);
+  }
+  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
+}
+function sanitizePathValue(pathVar) {
+  if (pathVar === void 0 || pathVar === "") return pathVar;
+  const roots = checkoutRoots();
+  const kept = [];
+  for (const dir of pathVar.split(import_node_path14.delimiter)) {
+    if (!(0, import_node_path14.isAbsolute)(dir)) continue;
+    if (isUnderCheckout(dir, roots)) continue;
+    kept.push(dir);
+  }
+  return kept.join(import_node_path14.delimiter);
+}
+function stripDangerousEnv(srcEnv) {
+  const env = {};
+  for (const [name, value] of Object.entries(srcEnv)) {
+    if (value === void 0) continue;
+    if (isDangerousEnvName(name)) continue;
+    env[name] = value;
+  }
+  const sanitizedPath = sanitizePathValue(srcEnv["PATH"]);
+  if (sanitizedPath === void 0) delete env["PATH"];
+  else env["PATH"] = sanitizedPath;
+  return env;
+}
+var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
+
+// src/action/backend/bare.ts
 function createBareBackend(deps = {}) {
   const hostPlatform2 = deps.platform ?? import_node_process4.platform;
   const env = deps.env ?? process.env;
@@ -25537,7 +25711,12 @@ function createBareBackend(deps = {}) {
           cmd: process.execPath,
           args: [runtime.agentPath],
           env: {
-            ...env,
+            // PARITY: the bare agent runs ON THE HOST and inherits the runner env
+            // (unlike the clean-VM Firecracker/Docker guest).  Strip the dangerous
+            // loader/tool/config selectors + sanitize PATH so the bare AUDIT sees
+            // the same env the hardened host install does — and so an inherited
+            // NODE_OPTIONS can't inject into the agent process itself.
+            ...stripDangerousEnv(env),
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
             // Bare mode runs the agent directly on the host (no container /etc),
@@ -25545,7 +25724,7 @@ function createBareBackend(deps = {}) {
             // Point the guest at it so the sandbox fetch applies the SAME
             // install args as the host part-1 install.  loadPmFlags
             // re-sanitizes the file before use.
-            SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path14.join)(staged.path, "etc/script-jail/pm-flags.json"),
+            SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path15.join)(staged.path, "etc/script-jail/pm-flags.json"),
             SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
             SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
             SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -25566,28 +25745,28 @@ function resolveRuntimePaths(ctx) {
     process.env["SCRIPT_JAIL_ACTION_ROOT"],
     process.env["GITHUB_ACTION_PATH"],
     moduleDir,
-    (0, import_node_path14.join)(moduleDir, ".."),
-    (0, import_node_path14.join)(moduleDir, "..", ".."),
+    (0, import_node_path15.join)(moduleDir, ".."),
+    (0, import_node_path15.join)(moduleDir, "..", ".."),
     process.cwd()
   ].filter((p) => typeof p === "string" && p.length > 0);
   const agentPath = findFirst([
-    ...roots.map((root) => (0, import_node_path14.join)(root, "guest-agent.cjs")),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "guest-agent.cjs"))
+    ...roots.map((root) => (0, import_node_path15.join)(root, "guest-agent.cjs")),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "dist", "guest-agent.cjs"))
   ], "guest-agent.cjs");
   const platformPreloadPath = findFirst([
-    ...roots.map((root) => (0, import_node_path14.join)(root, "preloads", "platform-spoof.cjs")),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "preloads", "platform-spoof.cjs"))
+    ...roots.map((root) => (0, import_node_path15.join)(root, "preloads", "platform-spoof.cjs")),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "dist", "preloads", "platform-spoof.cjs"))
   ], "platform-spoof.cjs");
   const envSpyPreloadPath = findFirst([
-    ...roots.map((root) => (0, import_node_path14.join)(root, "preloads", "env-spy.cjs")),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "preloads", "env-spy.cjs"))
+    ...roots.map((root) => (0, import_node_path15.join)(root, "preloads", "env-spy.cjs")),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "dist", "preloads", "env-spy.cjs"))
   ], "env-spy.cjs");
   const libName = ctx.arch === "arm64" ? "libscriptjail-arm64.so" : "libscriptjail.so";
   const nativePreloadPath = findFirst([
-    (0, import_node_path14.join)(ctx.imagesDir, libName),
-    (0, import_node_path14.join)(ctx.imagesDir, "libscriptjail.so"),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "images", libName)),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "images", "libscriptjail.so"))
+    (0, import_node_path15.join)(ctx.imagesDir, libName),
+    (0, import_node_path15.join)(ctx.imagesDir, "libscriptjail.so"),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "images", libName)),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "images", "libscriptjail.so"))
   ], libName);
   return {
     agentPath,
@@ -25602,7 +25781,7 @@ function currentModuleDir() {
 }
 function findFirst(candidates, label) {
   for (const candidate of candidates) {
-    if ((0, import_node_fs18.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs19.existsSync)(candidate)) return candidate;
   }
   throw new BackendUnavailableError("bare", `${label} was not found`);
 }
@@ -25631,15 +25810,15 @@ async function runSelectedBackend(input) {
 }
 
 // src/action/backend/mac-bare.ts
-var import_node_fs21 = require("node:fs");
-var import_node_path16 = require("node:path");
+var import_node_fs22 = require("node:fs");
+var import_node_path17 = require("node:path");
 var import_node_process5 = require("node:process");
 
 // src/cli/provision-node-mac.ts
 var import_node_child_process5 = require("node:child_process");
-var import_node_fs19 = require("node:fs");
+var import_node_fs20 = require("node:fs");
 var import_node_os8 = require("node:os");
-var import_node_path15 = require("node:path");
+var import_node_path16 = require("node:path");
 
 // src/rootfs/vite-plus.ts
 var VITE_PLUS_VERSION = "0.1.22";
@@ -25658,7 +25837,7 @@ function vitePlusTarballUrl(arch, os = "linux") {
 function defaultProvisionCacheDir(env = process.env) {
   const override = env["SCRIPT_JAIL_CACHE_DIR"];
   if (override !== void 0 && override !== "") return override;
-  return (0, import_node_path15.join)((0, import_node_os8.tmpdir)(), "script-jail-cache");
+  return (0, import_node_path16.join)((0, import_node_os8.tmpdir)(), "script-jail-cache");
 }
 var SHELL_SHIM_BASH = "bash";
 var SHELL_SHIM_COREUTILS = "coreutils";
@@ -25666,20 +25845,20 @@ async function provisionNodeMac(input) {
   const doRunCommand = input.runCommand ?? runCommand;
   const http = input.http ?? new NodeHttpClient();
   const { arch, cacheDir } = input;
-  (0, import_node_fs19.mkdirSync)(cacheDir, { recursive: true });
-  const root = (0, import_node_path15.join)(
+  (0, import_node_fs20.mkdirSync)(cacheDir, { recursive: true });
+  const root = (0, import_node_path16.join)(
     cacheDir,
     "script-jail-node-mac",
     `node-${NODE_VERSION}-${arch}-vp${VITE_PLUS_VERSION}`
   );
-  const vpHome = (0, import_node_path15.join)(root, "vp-home");
-  const shellShimDir = (0, import_node_path15.join)(root, "shell-shim");
-  const markerPath = (0, import_node_path15.join)(root, "resign-marker.json");
+  const vpHome = (0, import_node_path16.join)(root, "vp-home");
+  const shellShimDir = (0, import_node_path16.join)(root, "shell-shim");
+  const markerPath = (0, import_node_path16.join)(root, "resign-marker.json");
   const cached2 = readMarker(markerPath);
   if (cached2 !== void 0) {
     const nodePath2 = cached2.nodePath;
-    if ((0, import_node_fs19.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand)) {
-      (0, import_node_fs19.mkdirSync)(shellShimDir, { recursive: true });
+    if ((0, import_node_fs20.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand)) {
+      (0, import_node_fs20.mkdirSync)(shellShimDir, { recursive: true });
       materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
       return {
         nodeBinDir: cached2.nodeBinDir,
@@ -25689,28 +25868,28 @@ async function provisionNodeMac(input) {
         preResignSha256: cached2.preResignSha256
       };
     }
-    (0, import_node_fs19.rmSync)(root, { recursive: true, force: true });
+    (0, import_node_fs20.rmSync)(root, { recursive: true, force: true });
   }
-  (0, import_node_fs19.rmSync)(root, { recursive: true, force: true });
-  (0, import_node_fs19.mkdirSync)(vpHome, { recursive: true });
-  (0, import_node_fs19.mkdirSync)(shellShimDir, { recursive: true });
+  (0, import_node_fs20.rmSync)(root, { recursive: true, force: true });
+  (0, import_node_fs20.mkdirSync)(vpHome, { recursive: true });
+  (0, import_node_fs20.mkdirSync)(shellShimDir, { recursive: true });
   const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand });
   const vpEnv = {
     ...process.env,
     VP_HOME: vpHome,
-    COREPACK_HOME: (0, import_node_path15.join)(vpHome, "corepack"),
+    COREPACK_HOME: (0, import_node_path16.join)(vpHome, "corepack"),
     COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
   };
   doRunCommand(vpBin, ["env", "install", NODE_VERSION], { env: vpEnv });
-  const nodeBinDir = findNodeBinDir((0, import_node_path15.join)(vpHome, "js_runtime"));
+  const nodeBinDir = findNodeBinDir((0, import_node_path16.join)(vpHome, "js_runtime"));
   if (nodeBinDir === null) {
     throw new Error(
-      `script-jail: vp produced no Node toolchain under ${(0, import_node_path15.join)(vpHome, "js_runtime")} (vp env install ${NODE_VERSION} succeeded but no bin/node found).`
+      `script-jail: vp produced no Node toolchain under ${(0, import_node_path16.join)(vpHome, "js_runtime")} (vp env install ${NODE_VERSION} succeeded but no bin/node found).`
     );
   }
-  const nodePath = (0, import_node_path15.join)(nodeBinDir, "node");
+  const nodePath = (0, import_node_path16.join)(nodeBinDir, "node");
   const preResignSha256 = await sha256File2(nodePath);
-  const corepackPath = (0, import_node_path15.join)(nodeBinDir, "corepack");
+  const corepackPath = (0, import_node_path16.join)(nodeBinDir, "corepack");
   doRunCommand(corepackPath, ["enable"], { env: { ...vpEnv, PATH: prependPath(nodeBinDir, vpEnv) } });
   resignAdHoc(nodePath, doRunCommand);
   materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
@@ -25731,7 +25910,7 @@ async function provisionNodeMac(input) {
 var RESIGN_MARKER_VERSION = 3;
 function readMarker(path) {
   try {
-    const parsed = JSON.parse((0, import_node_fs19.readFileSync)(path, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs20.readFileSync)(path, "utf8"));
     const { version: version2, nodeBinDir, nodePath, preResignSha256 } = parsed;
     if (version2 !== RESIGN_MARKER_VERSION || typeof nodeBinDir !== "string" || typeof nodePath !== "string" || typeof preResignSha256 !== "string") {
       return void 0;
@@ -25742,47 +25921,47 @@ function readMarker(path) {
   }
 }
 function writeMarker(path, marker) {
-  (0, import_node_fs19.writeFileSync)(path, JSON.stringify(marker, null, 2) + "\n", "utf8");
+  (0, import_node_fs20.writeFileSync)(path, JSON.stringify(marker, null, 2) + "\n", "utf8");
 }
 async function fetchVpBinary(input) {
   const { arch, root, http } = input;
   const url2 = vitePlusTarballUrl(arch, "darwin");
   const expectedSha = VITE_PLUS_DARWIN_SHA256[arch];
-  const tgzPath = (0, import_node_path15.join)(root, "vp.tgz");
-  const extractDir = (0, import_node_path15.join)(root, "vp-extract");
-  (0, import_node_fs19.mkdirSync)(extractDir, { recursive: true });
+  const tgzPath = (0, import_node_path16.join)(root, "vp.tgz");
+  const extractDir = (0, import_node_path16.join)(root, "vp-extract");
+  (0, import_node_fs20.mkdirSync)(extractDir, { recursive: true });
   await http.download(url2, tgzPath, expectedSha);
   input.runCommand("tar", ["-xzf", tgzPath, "-C", extractDir]);
-  const vpBin = (0, import_node_path15.join)(extractDir, "package", "vp");
-  if (!(0, import_node_fs19.existsSync)(vpBin)) {
+  const vpBin = (0, import_node_path16.join)(extractDir, "package", "vp");
+  if (!(0, import_node_fs20.existsSync)(vpBin)) {
     throw new Error(
       `script-jail: vp binary not found at ${vpBin} after extracting ${url2}.`
     );
   }
-  (0, import_node_fs19.chmodSync)(vpBin, 493);
+  (0, import_node_fs20.chmodSync)(vpBin, 493);
   return vpBin;
 }
 function findNodeBinDir(jsRuntimeDir) {
-  if (!(0, import_node_fs19.existsSync)(jsRuntimeDir)) return null;
+  if (!(0, import_node_fs20.existsSync)(jsRuntimeDir)) return null;
   const stack = [{ dir: jsRuntimeDir, depth: 0 }];
   while (stack.length > 0) {
     const { dir, depth } = stack.pop();
     let entries;
     try {
-      entries = (0, import_node_fs19.readdirSync)(dir);
+      entries = (0, import_node_fs20.readdirSync)(dir);
     } catch {
       continue;
     }
     for (const name of entries) {
-      const child = (0, import_node_path15.join)(dir, name);
+      const child = (0, import_node_path16.join)(dir, name);
       let isDir;
       try {
-        isDir = (0, import_node_fs19.statSync)(child).isDirectory();
+        isDir = (0, import_node_fs20.statSync)(child).isDirectory();
       } catch {
         continue;
       }
       if (!isDir) continue;
-      if (name === "bin" && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(child, "node"))) {
+      if (name === "bin" && (0, import_node_fs20.existsSync)((0, import_node_path16.join)(child, "node"))) {
         return child;
       }
       if (depth < 4) stack.push({ dir: child, depth: depth + 1 });
@@ -25812,24 +25991,24 @@ function codesignVerifies(binPath, doRunCommand) {
   }
 }
 function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand) {
-  materializeOne(macBashPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
-  materializeOne(macCoreutilsPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
+  materializeOne(macBashPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
+  materializeOne(macCoreutilsPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
 }
 function materializeOne(src, dest, doRunCommand) {
   requireShimSource(src);
-  const tmp = (0, import_node_path15.join)((0, import_node_path15.dirname)(dest), `.${(0, import_node_path15.basename)(dest)}.${process.pid}.${Date.now()}.tmp`);
+  const tmp = (0, import_node_path16.join)((0, import_node_path16.dirname)(dest), `.${(0, import_node_path16.basename)(dest)}.${process.pid}.${Date.now()}.tmp`);
   try {
-    (0, import_node_fs19.copyFileSync)(src, tmp);
-    (0, import_node_fs19.chmodSync)(tmp, 493);
-    resignAdHoc(tmp, doRunCommand, (0, import_node_path15.basename)(dest));
-    (0, import_node_fs19.renameSync)(tmp, dest);
+    (0, import_node_fs20.copyFileSync)(src, tmp);
+    (0, import_node_fs20.chmodSync)(tmp, 493);
+    resignAdHoc(tmp, doRunCommand, (0, import_node_path16.basename)(dest));
+    (0, import_node_fs20.renameSync)(tmp, dest);
   } catch (err) {
-    (0, import_node_fs19.rmSync)(tmp, { force: true });
+    (0, import_node_fs20.rmSync)(tmp, { force: true });
     throw err;
   }
 }
 function requireShimSource(src) {
-  if (!(0, import_node_fs19.existsSync)(src)) {
+  if (!(0, import_node_fs20.existsSync)(src)) {
     throw new Error(
       `script-jail: bundled shell-shim binary not found at ${src}. Build it with \`pnpm build\` on an Apple Silicon mac (or fetch the release artifact).`
     );
@@ -25837,7 +26016,7 @@ function requireShimSource(src) {
 }
 
 // src/rootfs/macho.ts
-var import_node_fs20 = require("node:fs");
+var import_node_fs21 = require("node:fs");
 function readU32LE(buf, off) {
   return (buf[off] | buf[off + 1] << 8 | buf[off + 2] << 16 | buf[off + 3] << 24) >>> 0;
 }
@@ -25874,19 +26053,19 @@ function machoNameEquals(buf, off, width, name) {
 function validateMachOShimFile(path, expectedCpuType) {
   let fd;
   try {
-    fd = (0, import_node_fs20.openSync)(path, "r");
+    fd = (0, import_node_fs21.openSync)(path, "r");
   } catch (err) {
     return `cannot open: ${err instanceof Error ? err.message : String(err)}`;
   }
   try {
     let fileSize;
     try {
-      fileSize = (0, import_node_fs20.statSync)(path).size;
+      fileSize = (0, import_node_fs21.statSync)(path).size;
     } catch (err) {
       return `cannot stat: ${err instanceof Error ? err.message : String(err)}`;
     }
     const prelude = Buffer.alloc(FAT_HEADER_SIZE);
-    if ((0, import_node_fs20.readSync)(fd, prelude, 0, FAT_HEADER_SIZE, 0) < FAT_HEADER_SIZE) {
+    if ((0, import_node_fs21.readSync)(fd, prelude, 0, FAT_HEADER_SIZE, 0) < FAT_HEADER_SIZE) {
       return `file too short (< ${FAT_HEADER_SIZE} bytes)`;
     }
     const magic = readU32LE(prelude, 0);
@@ -25897,7 +26076,7 @@ function validateMachOShimFile(path, expectedCpuType) {
       }
       const tableBytes = nfat * FAT_ARCH_SIZE;
       const table = Buffer.alloc(tableBytes);
-      if ((0, import_node_fs20.readSync)(fd, table, 0, tableBytes, FAT_HEADER_SIZE) < tableBytes) {
+      if ((0, import_node_fs21.readSync)(fd, table, 0, tableBytes, FAT_HEADER_SIZE) < tableBytes) {
         return `short read of fat_arch table (need ${tableBytes} bytes)`;
       }
       for (let i = 0; i < nfat; i++) {
@@ -25917,14 +26096,14 @@ function validateMachOShimFile(path, expectedCpuType) {
     return validateThinMachOAt(fd, 0, fileSize, expectedCpuType);
   } finally {
     try {
-      (0, import_node_fs20.closeSync)(fd);
+      (0, import_node_fs21.closeSync)(fd);
     } catch {
     }
   }
 }
 function validateThinMachOAt(fd, base, limit, expectedCpuType) {
   const hdr = Buffer.alloc(MACHO64_HEADER_SIZE);
-  const n = (0, import_node_fs20.readSync)(fd, hdr, 0, MACHO64_HEADER_SIZE, base);
+  const n = (0, import_node_fs21.readSync)(fd, hdr, 0, MACHO64_HEADER_SIZE, base);
   if (n < MACHO64_HEADER_SIZE) {
     return `header too short at offset ${base} (${n} bytes; need \u2265 ${MACHO64_HEADER_SIZE})`;
   }
@@ -25952,7 +26131,7 @@ function validateThinMachOAt(fd, base, limit, expectedCpuType) {
     return `load-command region runs past slice end (header ${MACHO64_HEADER_SIZE} + sizeofcmds ${sizeofcmds} > slice ${limit - base})`;
   }
   const cmds = Buffer.alloc(sizeofcmds);
-  const m = (0, import_node_fs20.readSync)(fd, cmds, 0, sizeofcmds, base + MACHO64_HEADER_SIZE);
+  const m = (0, import_node_fs21.readSync)(fd, cmds, 0, sizeofcmds, base + MACHO64_HEADER_SIZE);
   if (m < sizeofcmds) {
     return `short read of load commands (got ${m}; need ${sizeofcmds})`;
   }
@@ -26006,7 +26185,7 @@ function pickOrchestratorEnv(baseEnv) {
 }
 function createMacBareExecute(deps) {
   const platform5 = deps.platform ?? import_node_process5.platform;
-  const doExists = deps.existsSync ?? import_node_fs21.existsSync;
+  const doExists = deps.existsSync ?? import_node_fs22.existsSync;
   const doProvision = deps.provisionNodeMac ?? provisionNodeMac;
   const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
   const doValidateShim = deps.validateMachOShimFile ?? validateMachOShimFile;
@@ -26069,7 +26248,7 @@ function createMacBareExecute(deps) {
           // so the host-owned pm-flags sidecar lives in the staged repo tree.
           // Point the guest at it so the sandbox fetch applies the SAME install
           // args as the host part-1 install.  loadPmFlags re-sanitizes it.
-          SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path16.join)(staged.path, "etc/script-jail/pm-flags.json"),
+          SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path17.join)(staged.path, "etc/script-jail/pm-flags.json"),
           SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -26105,29 +26284,29 @@ function resolveRuntimePaths2(repoRoot, imagesDir, doExists) {
     process.env["SCRIPT_JAIL_ACTION_ROOT"],
     process.env["GITHUB_ACTION_PATH"],
     repoRoot,
-    (0, import_node_path16.join)(repoRoot, ".."),
+    (0, import_node_path17.join)(repoRoot, ".."),
     process.cwd()
   ].filter((p) => typeof p === "string" && p.length > 0);
   const agentPath = findFirst2(
     [
-      ...roots.map((root) => (0, import_node_path16.join)(root, "guest-agent.cjs")),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "guest-agent.cjs"))
+      ...roots.map((root) => (0, import_node_path17.join)(root, "guest-agent.cjs")),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "dist", "guest-agent.cjs"))
     ],
     "guest-agent.cjs",
     doExists
   );
   const platformPreloadPath = findFirst2(
     [
-      ...roots.map((root) => (0, import_node_path16.join)(root, "preloads", "platform-spoof.cjs")),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "preloads", "platform-spoof.cjs"))
+      ...roots.map((root) => (0, import_node_path17.join)(root, "preloads", "platform-spoof.cjs")),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "dist", "preloads", "platform-spoof.cjs"))
     ],
     "platform-spoof.cjs",
     doExists
   );
   const envSpyPreloadPath = findFirst2(
     [
-      ...roots.map((root) => (0, import_node_path16.join)(root, "preloads", "env-spy.cjs")),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "preloads", "env-spy.cjs"))
+      ...roots.map((root) => (0, import_node_path17.join)(root, "preloads", "env-spy.cjs")),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "dist", "preloads", "env-spy.cjs"))
     ],
     "env-spy.cjs",
     doExists
@@ -26135,22 +26314,22 @@ function resolveRuntimePaths2(repoRoot, imagesDir, doExists) {
   const dylibName = "libscriptjail-arm64.dylib";
   const nativePreloadPath = firstExistingOrDefault(
     [
-      (0, import_node_path16.join)(imagesDir, dylibName),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "images", dylibName))
+      (0, import_node_path17.join)(imagesDir, dylibName),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "images", dylibName))
     ],
     doExists
   );
   const bashPath = firstExistingOrDefault(
     [
-      (0, import_node_path16.join)(imagesDir, "bash-arm64"),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "bash-arm64"))
+      (0, import_node_path17.join)(imagesDir, "bash-arm64"),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "images", "bash-arm64"))
     ],
     doExists
   );
   const coreutilsPath = firstExistingOrDefault(
     [
-      (0, import_node_path16.join)(imagesDir, "coreutils-arm64"),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "coreutils-arm64"))
+      (0, import_node_path17.join)(imagesDir, "coreutils-arm64"),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "images", "coreutils-arm64"))
     ],
     doExists
   );
@@ -26259,10 +26438,10 @@ async function run(deps = {}) {
     }
     throw err;
   }
-  const configPath = (0, import_node_path17.resolve)(cwd, args.configPath);
-  const lockPath = (0, import_node_path17.resolve)(cwd, args.lockPath);
+  const configPath = (0, import_node_path18.resolve)(cwd, args.configPath);
+  const lockPath = (0, import_node_path18.resolve)(cwd, args.lockPath);
   const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : platform5.arch;
-  const subcommand = args.subcommand ?? ((0, import_node_fs22.existsSync)(lockPath) ? "check" : "init");
+  const subcommand = args.subcommand ?? ((0, import_node_fs23.existsSync)(lockPath) ? "check" : "init");
   const mode = subcommand === "check" ? "check" : "update";
   let pm;
   try {
@@ -26285,7 +26464,7 @@ async function run(deps = {}) {
   try {
     packageImagesDir = doResolvePlatformPackageDir({
       packageName: platformPackageName(platform5),
-      devImagesDir: (0, import_node_path17.join)(repoRoot, "images")
+      devImagesDir: (0, import_node_path18.join)(repoRoot, "images")
     }).imagesDir;
   } catch (err) {
     if (err instanceof PlatformPackageMissingError) {
@@ -26357,7 +26536,7 @@ async function run(deps = {}) {
       compressedRootfsPath: artifacts.compressedRootfsPath
     });
   }
-  if (deps.makeOverlay === void 0 && !(0, import_node_fs22.existsSync)(baseRootfsPath)) {
+  if (deps.makeOverlay === void 0 && !(0, import_node_fs23.existsSync)(baseRootfsPath)) {
     const buildHint = platform5.arch === "arm64" ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64` : `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR}`;
     stderr.write(
       `script-jail: rootfs not found at ${artifacts.rootfsPath}. Run \`${buildHint}\` (or fetch the release artifact) to produce it.
@@ -26385,7 +26564,7 @@ async function run(deps = {}) {
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs
       // distinguish it from any real UDS.
-      vsockUdsPath: (0, import_node_path17.resolve)(overlay.workDir, "vsock.sock"),
+      vsockUdsPath: (0, import_node_path18.resolve)(overlay.workDir, "vsock.sock"),
       vsockPort: VSOCK_PORT2,
       vcpuCount: DEFAULT_VCPU_COUNT,
       memoryMb: DEFAULT_MEMORY_MB,
@@ -26456,8 +26635,8 @@ async function run(deps = {}) {
 async function runLinux(input) {
   const { platform: platform5, stderr } = input;
   const arch = platform5.arch;
-  const imagesDir = process.env["SCRIPT_JAIL_CACHE_DIR"] ? (0, import_node_path17.join)(process.env["SCRIPT_JAIL_CACHE_DIR"], "script-jail-images") : (0, import_node_path17.join)((0, import_node_os9.tmpdir)(), "script-jail-images");
-  (0, import_node_fs22.mkdirSync)(imagesDir, { recursive: true });
+  const imagesDir = process.env["SCRIPT_JAIL_CACHE_DIR"] ? (0, import_node_path18.join)(process.env["SCRIPT_JAIL_CACHE_DIR"], "script-jail-images") : (0, import_node_path18.join)((0, import_node_os9.tmpdir)(), "script-jail-images");
+  (0, import_node_fs23.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
   const localPreFetch = createLocalPreFetchArtifacts({
     packageImagesDir: input.packageImagesDir,
@@ -26578,18 +26757,18 @@ function resolveScriptJailRoot(cwd) {
   }
   if (here === "") return cwd;
   const candidates = [
-    (0, import_node_path17.resolve)((0, import_node_path17.dirname)((0, import_node_path17.dirname)(here))),
-    (0, import_node_path17.resolve)((0, import_node_path17.dirname)((0, import_node_path17.dirname)((0, import_node_path17.dirname)(here))))
+    (0, import_node_path18.resolve)((0, import_node_path18.dirname)((0, import_node_path18.dirname)(here))),
+    (0, import_node_path18.resolve)((0, import_node_path18.dirname)((0, import_node_path18.dirname)((0, import_node_path18.dirname)(here))))
   ];
   for (const c of candidates) {
-    if ((0, import_node_fs22.existsSync)((0, import_node_path17.join)(c, "package.json"))) return c;
+    if ((0, import_node_fs23.existsSync)((0, import_node_path18.join)(c, "package.json"))) return c;
   }
   return cwd;
 }
 function readPackageVersion(cwd) {
-  const packageJsonPath = (0, import_node_path17.join)(resolveScriptJailRoot(cwd), "package.json");
+  const packageJsonPath = (0, import_node_path18.join)(resolveScriptJailRoot(cwd), "package.json");
   try {
-    const pkg = JSON.parse(String((0, import_node_fs22.readFileSync)(packageJsonPath, "utf8")));
+    const pkg = JSON.parse(String((0, import_node_fs23.readFileSync)(packageJsonPath, "utf8")));
     if (typeof pkg["version"] === "string") return pkg["version"];
   } catch {
   }

@@ -21,6 +21,7 @@ import {
   hostInstallNoScripts,
   hostRunScripts,
   resolveGitFromPath,
+  stripDangerousEnv,
   streamSpawn,
   makeLineSink,
   HOST_PART2_POISON_MARKER,
@@ -1169,6 +1170,16 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     ZDOTDIR: './ci/zdot',
     PERL5LIB: './ci/perl',
     RUBYOPT: '-r./ci/ruby',
+    // GNU make startup/config selectors (codex round 3, verified make exec).
+    MAKEFLAGS: '--eval=$(shell touch /tmp/evil)',
+    MAKEFILES: './ci/evil.mk',
+    GNUMAKEFLAGS: '--eval=$(info x)',
+    // corepack executable-cache + config selectors (codex round 3): a checkout
+    // COREPACK_HOME makes a pnpm/yarn corepack shim run a PR-planted PM binary.
+    COREPACK_HOME: './ci/.corepack',
+    COREPACK_ENV_FILE: './ci/corepack.env',
+    COREPACK_NPM_REGISTRY: 'http://evil.invalid',
+    COREPACK_INTEGRITY_KEYS: '{}',
     // TLS trust file (MITM the host fetch).
     NODE_EXTRA_CA_CERTS: './ci/ca.pem',
   };
@@ -1235,6 +1246,65 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
     const env = envs[0]!;
     for (const [k, v] of Object.entries(KEEP)) expect(env[k]).toBe(v);
+  });
+
+  it('stripDangerousEnv (shared with the bare backend agent spawn): drops selectors + sanitizes PATH, keeps SCRIPT_JAIL_/noise/legit', () => {
+    // The Linux bare backend applies this to the env it spawns the audit AGENT
+    // with (it inherits the runner env, unlike the clean-VM guest).  It must drop
+    // the dangerous selectors + sanitize PATH, but NOT strip SCRIPT_JAIL_* / noise
+    // (the agent reads some) and NOT add the npm/yarn install pins.
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-bare-'));
+    const binDir = join(checkout, 'bin');
+    mkdirSync(binDir);
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout; // makes binDir a checkout root
+      const out = stripDangerousEnv({
+        NODE_OPTIONS: '--require ./x',
+        GIT_SSH_COMMAND: './ssh',
+        GIT_EXEC_PATH: './core',
+        COREPACK_HOME: './cp',
+        LD_PRELOAD: './x.so',
+        PYTHONPATH: './py',
+        MAKEFLAGS: '--eval=$(shell x)',
+        'npm_config_script-shell': './sh',
+        // must be PRESERVED by stripDangerousEnv (handled elsewhere / agent needs):
+        SCRIPT_JAIL_CONFIG_PATH: '/cfg.yml',
+        HOSTNAME: 'runner-1',
+        NODE_ENV: 'production',
+        NODE_AUTH_TOKEN: 'tok',
+        npm_config_registry: 'https://registry.npmjs.org/',
+        PATH: `/usr/bin${delimiter}${binDir}`,
+      });
+      for (const k of ['NODE_OPTIONS', 'GIT_SSH_COMMAND', 'GIT_EXEC_PATH', 'COREPACK_HOME', 'LD_PRELOAD', 'PYTHONPATH', 'MAKEFLAGS', 'npm_config_script-shell']) {
+        expect(out[k]).toBeUndefined();
+      }
+      expect(out['SCRIPT_JAIL_CONFIG_PATH']).toBe('/cfg.yml'); // NOT dropped here
+      expect(out['HOSTNAME']).toBe('runner-1'); // noise handled by hostInstallEnv, not this
+      expect(out['NODE_ENV']).toBe('production');
+      expect(out['NODE_AUTH_TOKEN']).toBe('tok');
+      expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
+      expect(out['npm_config_git']).toBeUndefined(); // no install pins added
+      expect(out['PATH']).toBe('/usr/bin'); // checkout binDir dropped
+    } finally {
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+    }
+  });
+
+  it('pins COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (overriding inherited), so stripping COREPACK_HOME cannot hang', () => {
+    // We strip an inherited COREPACK_HOME (executable-cache attack); to ensure a
+    // resulting cache re-download cannot block on a prompt, the prompt flag is
+    // force-pinned off — overriding whatever the runner inherited.
+    process.env['COREPACK_HOME'] = './ci/.corepack';
+    process.env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '1'; // inherited "on"
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('pnpm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    const env = envs[0]!;
+    expect(env['COREPACK_HOME']).toBeUndefined();
+    expect(env['COREPACK_ENABLE_DOWNLOAD_PROMPT']).toBe('0');
   });
 
   it('the git BINARY stays pinned (npm_config_git) even when GIT_SSH_COMMAND is stripped', () => {
