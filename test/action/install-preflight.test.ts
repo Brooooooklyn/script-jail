@@ -537,9 +537,19 @@ describe('detectCheckoutRelativeHome — refuse install on a checkout-relative $
     expect(detectCheckoutRelativeHome(home, repo)).toBeNull();
   });
 
-  it('allows an unset/empty HOME (nothing to resolve)', () => {
+  it('allows an UNSET (undefined) HOME — PM falls back to the OS home (absolute, outside checkout)', () => {
+    // VERIFIED npm 11.13.0: with HOME unset, `npm config get userconfig` is the real
+    // user's `~/.npmrc` (absolute, outside the checkout) — not PR-controlled.
     expect(detectCheckoutRelativeHome(undefined, dir, dir)).toBeNull();
-    expect(detectCheckoutRelativeHome('', dir, dir)).toBeNull();
+  });
+
+  it('refuses an EMPTY-string HOME (npm reads a literal repoDir/~/.npmrc — round-7)', () => {
+    // VERIFIED npm 11.13.0: `HOME=` leaves `~` UN-expanded, so npm (cwd=repoDir) reads a
+    // LITERAL `repoDir/~/.npmrc` — a PR-committable `~` dir — and execs its script-shell on
+    // rebuild.  '' is non-absolute, so it must be refused (NOT treated as "nothing to resolve").
+    const reason = detectCheckoutRelativeHome('', dir, dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/absolute/i);
   });
 
   it('refuses a RELATIVE HOME (subdir repo + `../.home` bypass — round-6)', () => {
@@ -555,17 +565,18 @@ describe('detectCheckoutRelativeHome — refuse install on a checkout-relative $
     const reason = detectCheckoutRelativeHome('../.home', pkg, ws);
     expect(reason).not.toBeNull();
     expect(reason).toMatch(/HOME/);
-    expect(reason).toMatch(/RELATIVE|relative/);
+    expect(reason).toMatch(/absolute/i);
   });
 
-  it('refuses ALL relative HOME forms — even one that resolves outside from the action cwd', () => {
-    // Fail-closed: a relative HOME has no legit install use; we do not try to prove
-    // a particular cwd makes it safe. `.home`, `../../x`, and `~`-leading are all refused.
+  it('refuses ALL non-absolute HOME forms — even one that resolves outside from the action cwd', () => {
+    // Fail-closed: a non-absolute HOME has no legit install use; we do not try to prove
+    // a particular cwd makes it safe. `.home`, `../../x`, `~`-leading, and '' are all refused.
     const ws = dir;
     const pkg = join(ws, 'pkg');
     writeAt(join(pkg, 'package.json'), '{"name":"p"}');
     expect(detectCheckoutRelativeHome('.home', pkg, ws)).not.toBeNull();
     expect(detectCheckoutRelativeHome('../../elsewhere', pkg, ws)).not.toBeNull();
     expect(detectCheckoutRelativeHome('~/x', pkg, ws)).not.toBeNull(); // literal tilde is not absolute
+    expect(detectCheckoutRelativeHome('', pkg, ws)).not.toBeNull(); // empty string is not absolute
   });
 });
