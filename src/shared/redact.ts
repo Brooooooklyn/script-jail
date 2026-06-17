@@ -146,11 +146,16 @@ export function buildFragmentMatcher(
   values: readonly string[],
   minFragment = DEFAULT_MIN_FRAGMENT,
 ): FragmentMatcher {
-  // Cheap aggregate pre-check FIRST: if the declared values total more than the
+  // Dedupe FIRST: identical values (e.g. NPM_TOKEN and NODE_AUTH_TOKEN set to the
+  // SAME token — common in CI) contribute identical grams, so the gram set would
+  // store one copy regardless.  Counting duplicates toward the char budget would
+  // falsely cap a config whose real fragment index is tiny (review #9).
+  const unique = Array.from(new Set(values));
+  // Cheap aggregate pre-check on DISTINCT values: if they total more than the
   // char budget, FAIL CLOSED without building a giant gram set (review #8 — this
   // is the effective bound; the per-gram backstop below is defense-in-depth).
   let totalChars = 0;
-  for (const v of values) {
+  for (const v of unique) {
     totalChars += v.length;
     if (totalChars > MAX_FRAGMENT_VALUE_CHARS) {
       return { grams: new Set<string>(), capped: true, minFragment };
@@ -158,7 +163,7 @@ export function buildFragmentMatcher(
   }
   const grams = new Set<string>();
   let capped = false;
-  for (const v of values) {
+  for (const v of unique) {
     if (v.length <= minFragment) continue;
     for (let i = 0; i + minFragment <= v.length; i += 1) {
       grams.add(v.slice(i, i + minFragment));

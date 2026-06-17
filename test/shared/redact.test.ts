@@ -277,6 +277,19 @@ describe('maskValueFragments', () => {
     expect(under.capped).toBe(false);
   });
 
+  it('DEDUPES before the budget so duplicate values (one token under many names) do not falsely cap (review #9)', () => {
+    // NPM_TOKEN and NODE_AUTH_TOKEN set to the SAME value is common in CI; the
+    // gram set stores one copy, so duplicates must not count toward the budget.
+    const one = 'k'.repeat(40_000); // a single 40 KiB value
+    const dup64 = Array.from({ length: 64 }, () => one); // 64 names → SAME value (2.56 MiB if summed naively)
+    const m = buildFragmentMatcher(dup64);
+    expect(m.capped).toBe(false); // deduped to one 40 KiB value → tiny index, NOT capped
+    expect(maskValueFragmentsWith(`tok ${one.slice(0, 20)} end`, m, 'R')).toBe('tok <R> end'); // still covers it
+    // genuinely DISTINCT values over the budget still cap.
+    const distinct = Array.from({ length: 64 }, (_, i) => `v${i}_` + 'k'.repeat(40_000)); // 64 distinct ≈ 2.56 MiB
+    expect(buildFragmentMatcher(distinct).capped).toBe(true);
+  });
+
   it('FAILS CLOSED (whole-text mask) when the matcher is capped, but passes short lines through', () => {
     // Direct test of the fail-closed behavior via a hand-built capped matcher —
     // the 2^22 ceiling is unreachable by OS-bounded inputs, so exercise the path

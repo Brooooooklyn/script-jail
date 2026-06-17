@@ -25309,8 +25309,9 @@ var DEFAULT_MIN_FRAGMENT = 8;
 var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
 var FRAGMENT_MAX_GRAMS = 1 << 22;
 function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
+  const unique = Array.from(new Set(values));
   let totalChars = 0;
-  for (const v of values) {
+  for (const v of unique) {
     totalChars += v.length;
     if (totalChars > MAX_FRAGMENT_VALUE_CHARS) {
       return { grams: /* @__PURE__ */ new Set(), capped: true, minFragment };
@@ -25318,7 +25319,7 @@ function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
   }
   const grams = /* @__PURE__ */ new Set();
   let capped = false;
-  for (const v of values) {
+  for (const v of unique) {
     if (v.length <= minFragment) continue;
     for (let i = 0; i + minFragment <= v.length; i += 1) {
       grams.add(v.slice(i, i + minFragment));
