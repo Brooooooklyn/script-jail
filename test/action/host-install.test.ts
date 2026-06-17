@@ -201,25 +201,63 @@ describe('hostInstallNoScripts (part 1)', () => {
       YARN_GLOBAL_FOLDER: '/checkout/.yarn',
       YARN_CONSTRAINTS_PATH: '/checkout/c.cjs',
       YARN_HTTPS_CA_FILE_PATH: '/checkout/ca.pem',
+      // CASE-INSENSITIVE: yarn lower-cases the env key before matching `yarn_`
+      // (VERIFIED 4.5.0), so lowercase/mixed-case dangerous forms must ALSO be dropped.
+      yarn_enable_scripts: 'true',
+      yarn_inject_environment_files: '.env.evil',
+      Yarn_Global_Folder: '/checkout/.yarn',
     };
     const auth = {
       YARN_NPM_AUTH_TOKEN: 'tok',
       YARN_NPM_AUTH_IDENT: 'ident',
       YARN_NPM_REGISTRY_SERVER: 'https://reg.example/',
       YARN_NPM_ALWAYS_AUTH: 'true',
+      yarn_npm_auth_token: 'lower-tok', // lowercase auth: yarn honours it, so it must survive
     };
     const prior: Record<string, string | undefined> = {};
     for (const k of [...Object.keys(dangerous), ...Object.keys(auth)]) prior[k] = process.env[k];
     try {
       Object.assign(process.env, dangerous, auth);
       hostInstallNoScripts('yarn', '/repo', [], makeRecorder().io, spawn);
-      for (const k of Object.keys(dangerous)) expect(seen[k]).toBeUndefined(); // every non-auth YARN_* dropped
+      for (const k of Object.keys(dangerous)) expect(seen[k]).toBeUndefined(); // every non-auth YARN_* dropped (any case)
       expect(seen['YARN_NPM_AUTH_TOKEN']).toBe('tok'); // auth/registry preserved
       expect(seen['YARN_NPM_AUTH_IDENT']).toBe('ident');
       expect(seen['YARN_NPM_REGISTRY_SERVER']).toBe('https://reg.example/');
       expect(seen['YARN_NPM_ALWAYS_AUTH']).toBe('true');
+      expect(seen['yarn_npm_auth_token']).toBe('lower-tok'); // lowercase auth preserved (allowlist is case-insensitive)
       expect(seen['YARN_IGNORE_PATH']).toBe('1'); // pins re-applied on top of the sweep
       expect(seen['YARN_PLUGINS']).toBe('');
+    } finally {
+      for (const [k, v] of Object.entries(prior)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  it('drops inherited COREPACK_* version-steering, re-pins only the download prompt (codex corepack skew)', () => {
+    // SECURITY: COREPACK_ENABLE_PROJECT_SPEC=0 makes corepack IGNORE the repo's
+    // packageManager field and run a DIFFERENT pm VERSION than the clean-VM audit
+    // (VERIFIED corepack 0.35.0). The audit inherits no COREPACK_*, so the host must
+    // drop the whole family (any case) and re-pin only COREPACK_ENABLE_DOWNLOAD_PROMPT.
+    const inherited = {
+      COREPACK_ENABLE_PROJECT_SPEC: '0',
+      COREPACK_ENABLE_STRICT: '0',
+      COREPACK_DEFAULT_TO_LATEST: '1',
+      corepack_enable_project_spec: '0', // lowercase form also dropped
+    };
+    const prior: Record<string, string | undefined> = {};
+    for (const k of Object.keys(inherited)) prior[k] = process.env[k];
+    try {
+      Object.assign(process.env, inherited);
+      // Sweep is unconditional (corepack shims pnpm + yarn); npm ignores COREPACK_* anyway.
+      for (const pm of ['npm', 'pnpm', 'yarn'] as const) {
+        let seen: NodeJS.ProcessEnv = {};
+        const spawn: HostSpawn = (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; };
+        hostInstallNoScripts(pm, '/repo', [], makeRecorder().io, spawn);
+        for (const k of Object.keys(inherited)) expect(seen[k]).toBeUndefined();
+        expect(seen['COREPACK_ENABLE_DOWNLOAD_PROMPT']).toBe('0'); // re-pinned after the sweep
+      }
     } finally {
       for (const [k, v] of Object.entries(prior)) {
         if (v === undefined) delete process.env[k];

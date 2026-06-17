@@ -563,9 +563,20 @@ function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
     }
   }
   env['npm_config_git'] = trustedGitPath();
+  // SECURITY (parity): drop EVERY inherited COREPACK_* (case-insensitive), then
+  // re-pin only the download-prompt.  A behaviour flag like
+  // `COREPACK_ENABLE_PROJECT_SPEC=0` makes corepack IGNORE the repo's
+  // `packageManager` field and run a DIFFERENT pm VERSION than the clean-VM audit
+  // (VERIFIED corepack 0.35.0) — a host!=audit identity/semantics skew, not just the
+  // download/registry/cache knobs already in the dangerous-name list.  The audit
+  // inherits no COREPACK_*, so stripping the family keeps host==audit; the version
+  // is governed by the repo's `packageManager`, never by inherited env.
+  for (const name of Object.keys(env)) {
+    if (name.toUpperCase().startsWith('COREPACK_')) delete env[name];
+  }
   // Corepack must not block on an interactive download prompt (match the audit:
-  // docker.ts / init.sh / mac-bare set this) — especially since we strip an
-  // inherited COREPACK_HOME above, which could force a cache re-download.
+  // docker.ts / init.sh / mac-bare set this) — especially since we just stripped any
+  // inherited COREPACK_HOME, which could force a cache re-download.
   env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
   if (pm === 'yarn') {
     // SECURITY (parity, ALLOWLIST): Yarn maps env -> config (`YARN_<UPPER_SNAKE>` ->
@@ -580,9 +591,12 @@ function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
     // MAP settings, NOT flat-env-settable in 4.5.0 — yarn errors on them — so the
     // four scalars below are the entire env-settable auth surface; rc-file auth is
     // unaffected.)  Sweep FIRST, then layer the explicit pins so the sweep can't
-    // clobber them.
+    // clobber them.  CASE-INSENSITIVE: yarn lower-cases the env key before its
+    // `yarn_` match (VERIFIED 4.5.0: `yarn_enable_scripts`/`yarn_inject_environment_files`
+    // are honoured), so compare the upper-cased name against the (upper-cased) allowlist.
     for (const name of Object.keys(env)) {
-      if (name.startsWith('YARN_') && !YARN_ENV_ALLOW.has(name)) delete env[name];
+      const upper = name.toUpperCase();
+      if (upper.startsWith('YARN_') && !YARN_ENV_ALLOW.has(upper)) delete env[name];
     }
     env['YARN_IGNORE_PATH'] = '1';
     env['YARN_RC_FILENAME'] = '.yarnrc.yml';

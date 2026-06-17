@@ -26997,10 +26997,14 @@ function hostInstallEnv(pm) {
     }
   }
   env["npm_config_git"] = trustedGitPath();
+  for (const name of Object.keys(env)) {
+    if (name.toUpperCase().startsWith("COREPACK_")) delete env[name];
+  }
   env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
   if (pm === "yarn") {
     for (const name of Object.keys(env)) {
-      if (name.startsWith("YARN_") && !YARN_ENV_ALLOW.has(name)) delete env[name];
+      const upper = name.toUpperCase();
+      if (upper.startsWith("YARN_") && !YARN_ENV_ALLOW.has(upper)) delete env[name];
     }
     env["YARN_IGNORE_PATH"] = "1";
     env["YARN_RC_FILENAME"] = ".yarnrc.yml";
