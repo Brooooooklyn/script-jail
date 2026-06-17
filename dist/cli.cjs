@@ -7874,11 +7874,22 @@ var PM_CONFIG_AUTH_SCALARS = /* @__PURE__ */ new Set([
   "strict_ssl",
   // TLS verification toggle
   "proxy",
-  // HTTP(S) proxy URL
+  // HTTP(S) proxy URL (npm + pnpm)
   "https_proxy",
-  // HTTPS proxy URL
-  "noproxy"
-  // proxy-bypass host list (canonical key is `noproxy`)
+  // HTTPS proxy URL (npm + pnpm)
+  "noproxy",
+  // proxy-bypass host list — npm's canonical key
+  // pnpm's canonical proxy spellings are `http-proxy` / `no-proxy` (DISTINCT from
+  // npm's `proxy` / `noproxy`).  VERIFIED pnpm 11.1.2 reads `pnpm_config_http_proxy`
+  // -> `http-proxy` (feeds ProxyAgent) and `pnpm_config_no_proxy` -> `no-proxy`
+  // (feeds checkNoProxy); pnpm 10.34.3 reads the SAME via the `npm_config_` form.
+  // Without these a pnpm install behind an HTTP-only proxy (or needing a no-proxy
+  // bypass for an internal registry) fails on the host.  Pure network config (URL /
+  // host list), no exec.  npm treats both as "Unknown env config" (ignores — harmless).
+  "http_proxy",
+  // pnpm `http-proxy`
+  "no_proxy"
+  // pnpm `no-proxy`
 ]);
 function isAllowedPmConfigKey(slice) {
   if (slice.startsWith("//")) return true;

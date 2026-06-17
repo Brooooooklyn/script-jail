@@ -479,9 +479,18 @@ const PM_CONFIG_AUTH_SCALARS = new Set([
   'key', // inline PEM client key (deprecated → keyfile)
   'keyfile', // PEM client-key file path — TLS material
   'strict_ssl', // TLS verification toggle
-  'proxy', // HTTP(S) proxy URL
-  'https_proxy', // HTTPS proxy URL
-  'noproxy', // proxy-bypass host list (canonical key is `noproxy`)
+  'proxy', // HTTP(S) proxy URL (npm + pnpm)
+  'https_proxy', // HTTPS proxy URL (npm + pnpm)
+  'noproxy', // proxy-bypass host list — npm's canonical key
+  // pnpm's canonical proxy spellings are `http-proxy` / `no-proxy` (DISTINCT from
+  // npm's `proxy` / `noproxy`).  VERIFIED pnpm 11.1.2 reads `pnpm_config_http_proxy`
+  // -> `http-proxy` (feeds ProxyAgent) and `pnpm_config_no_proxy` -> `no-proxy`
+  // (feeds checkNoProxy); pnpm 10.34.3 reads the SAME via the `npm_config_` form.
+  // Without these a pnpm install behind an HTTP-only proxy (or needing a no-proxy
+  // bypass for an internal registry) fails on the host.  Pure network config (URL /
+  // host list), no exec.  npm treats both as "Unknown env config" (ignores — harmless).
+  'http_proxy', // pnpm `http-proxy`
+  'no_proxy', // pnpm `no-proxy`
 ]);
 
 /**
@@ -497,10 +506,19 @@ function isAllowedPmConfigKey(slice: string): boolean {
   // `//host/:certfile`, … — these ONLY carry per-registry credentials / registry
   // settings, never an exec.  The host segment + suffix can contain `-`/`.`, so
   // match the `//` prefix VERBATIM (do NOT canonicalize `-`→`_`).
+  // SOUNDNESS (VERIFIED npm 11.13.0 + pnpm 10.34.3/11.1.2): keeping these verbatim
+  // cannot smuggle an exec.  npm has NO tokenHelper; pnpm's `tokenHelper` and ALL
+  // per-registry (`//host/:KEY`) settings are read ONLY from the npmrc INI source,
+  // NEVER from the env namespace this gate filters (proven: `//host/:_authToken` via
+  // ENV → registry saw auth=null; via ~/.npmrc → Bearer token).  And a per-registry
+  // behaviour key like `//host/:script-shell` is INERT — the control
+  // `npm_config_script_shell` exec'd a lifecycle script, the `//host/:`/`@scope:`
+  // forms did NOT — the prefix genuinely scopes it.
   if (slice.startsWith('//')) return true;
   // Scoped registry / scoped auth: `@scope:registry`, `@scope:_authToken`, …  The
   // scope segment may contain `-` (VERIFIED: canonicalizing `-`→`_` mis-targets the
-  // scope — `@my-org:registry` ≠ `@my_org:registry`), so match the RAW key.
+  // scope — `@my-org:registry` ≠ `@my_org:registry`), so match the RAW key.  Scoped
+  // behaviour keys (`@scope:script-shell`/`:node-options`) are inert too (VERIFIED).
   if (slice.startsWith('@') && slice.includes(':')) return true;
   // Fixed scalar keys (canonicalize `-`→`_`; these contain no scope/host segment).
   return PM_CONFIG_AUTH_SCALARS.has(slice.replace(/-/g, '_'));

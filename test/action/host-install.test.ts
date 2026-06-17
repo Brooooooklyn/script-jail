@@ -1495,6 +1495,34 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
   });
 
+  it('stripDangerousEnv preserves pnpm proxy spellings http_proxy/no_proxy (round-12 — pnpm canonical http-proxy/no-proxy)', () => {
+    // VERIFIED pnpm 11.1.2 reads `pnpm_config_http_proxy` -> `http-proxy` / `pnpm_config_no_proxy`
+    // -> `no-proxy` (its canonical proxy keys, DISTINCT from npm's proxy/noproxy); pnpm 10.34.3
+    // reads the SAME via the `npm_config_` form.  Dropping them broke a pnpm install behind an
+    // HTTP-only proxy / needing a no-proxy bypass.  Both are pure network config (no exec), so
+    // the allowlist keeps them in BOTH namespaces + case forms; npm ignores them (harmless).
+    const out = stripDangerousEnv({
+      pnpm_config_http_proxy: 'http://proxy.local:8080/', // pnpm 11 form
+      PNPM_CONFIG_HTTP_PROXY: 'http://proxy.local:8080/',
+      pnpm_config_no_proxy: 'localhost,.internal',
+      PNPM_CONFIG_NO_PROXY: 'localhost,.internal',
+      npm_config_http_proxy: 'http://proxy.local:8080/', // pnpm 10 form (via npm_config_)
+      npm_config_no_proxy: 'localhost,.internal',
+      'npm_config_http-proxy': 'http://proxy.local:8080/', // hyphen alias
+      'pnpm_config_no-proxy': 'localhost,.internal',
+      pnpm_config_script_shell: '/checkout/evil', // still dropped (not auth) — control
+    });
+    expect(out['pnpm_config_http_proxy']).toBe('http://proxy.local:8080/');
+    expect(out['PNPM_CONFIG_HTTP_PROXY']).toBe('http://proxy.local:8080/');
+    expect(out['pnpm_config_no_proxy']).toBe('localhost,.internal');
+    expect(out['PNPM_CONFIG_NO_PROXY']).toBe('localhost,.internal');
+    expect(out['npm_config_http_proxy']).toBe('http://proxy.local:8080/');
+    expect(out['npm_config_no_proxy']).toBe('localhost,.internal');
+    expect(out['npm_config_http-proxy']).toBe('http://proxy.local:8080/');
+    expect(out['pnpm_config_no-proxy']).toBe('localhost,.internal');
+    expect(out['pnpm_config_script_shell']).toBeUndefined(); // control: exec key still dropped
+  });
+
   it('stripDangerousEnv npm_config_/pnpm_config_ is an ALLOWLIST: benign non-auth keys dropped, full auth surface preserved', () => {
     // The decisive posture shift (round-11): the config-via-env key space is an open,
     // per-release-growing set of exec/interpreter/loader/config-FILE selectors that a
