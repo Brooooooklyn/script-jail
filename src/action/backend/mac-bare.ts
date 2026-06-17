@@ -38,7 +38,7 @@ import { platform as hostPlatform } from 'node:process';
 import type { AuditExecutionInput, LauncherResult } from '../../shared/run-audit.js';
 import { runAgentProcess } from './process.js';
 import { rewriteConfigWorkDir, stageRepoDirectory } from './stage.js';
-import { sanitizePathValue, stripDangerousEnv } from '../host-install.js';
+import { SAFE_SYSTEM_PATH, sanitizePathValue, stripDangerousEnv } from '../host-install.js';
 import {
   provisionNodeMac,
   defaultProvisionCacheDir,
@@ -396,6 +396,9 @@ function prependPath(dir: string, env: NodeJS.ProcessEnv): string {
   // so a workflow-prepended `$GITHUB_WORKSPACE/bin` cannot let the mac-bare AUDIT
   // resolve a PR-provided `make`/tool that the hardened host install strips —
   // matching `hostInstallEnv`'s PATH policy and keeping host==audit parity.
-  const existing = sanitizePathValue(env['PATH']) ?? '/usr/bin:/bin:/usr/sbin:/sbin';
-  return existing === '' ? dir : `${dir}:${existing}`;
+  // sanitizePathValue never returns '' (it substitutes SAFE_SYSTEM_PATH when all
+  // segments drop), so `existing` is always a non-empty trusted PATH — no empty
+  // (cwd-searching) segment can sneak into the prepended result.
+  const existing = sanitizePathValue(env['PATH']) ?? SAFE_SYSTEM_PATH;
+  return `${dir}:${existing}`;
 }

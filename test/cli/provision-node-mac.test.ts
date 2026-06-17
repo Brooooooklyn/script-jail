@@ -577,4 +577,29 @@ describe('provisionNodeMac — threads the injected env to every host spawn', ()
     // the system dirs survive and no raw inherited PATH segment creeps in.
     expect(corepack[0]!.env?.['PATH']).toMatch(/:\/usr\/bin:\/bin$/);
   });
+
+  it('an empty inherited PATH never becomes a trailing cwd segment ([F3] codex round-6)', async () => {
+    const dir = tempDir();
+    const inner = makeFakeRunCommand();
+    const captured: Array<{ cmd: string; args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+    const run: NonNullable<ProvisionNodeMacInput['runCommand']> = (cmd, args, opts = {}) => {
+      captured.push({ cmd, args, env: opts.env });
+      return inner.run(cmd, args, opts);
+    };
+    // PATH='' is what stripDangerousEnv would never now emit, but provisioning
+    // must self-defend: corepack's PATH must NOT end with ':' (a zero-length
+    // entry = cwd search) — it falls back to a trusted system PATH instead.
+    const input = makeInput(dir, inner, { runCommand: run, env: { PATH: '' } });
+
+    await provisionNodeMac(input);
+
+    const corepack = captured.find((c) => c.args[0] === 'enable');
+    expect(corepack).toBeDefined();
+    const path = corepack!.env?.['PATH'] ?? '';
+    expect(path.endsWith(':')).toBe(false);
+    expect(path.endsWith('/usr/bin:/bin:/usr/sbin:/sbin')).toBe(true);
+    // nodeBinDir (== dirname of the corepack cmd) is prepended ahead of it.
+    const nodeBinDir = corepack!.cmd.slice(0, corepack!.cmd.lastIndexOf('/'));
+    expect(path.startsWith(`${nodeBinDir}:`)).toBe(true);
+  });
 });

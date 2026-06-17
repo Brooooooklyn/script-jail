@@ -435,6 +435,13 @@ function isDangerousEnvName(name: string): boolean {
 }
 
 /**
+ * Fixed trusted system PATH used whenever sanitization would otherwise yield an
+ * empty (cwd-searching) PATH.  Covers both Linux and macOS system tool
+ * locations; matches the literal both `prependPath` fallbacks already use.
+ */
+export const SAFE_SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+
+/**
  * SECURITY ([5]+[9]): rebuild a PATH value dropping every entry whose REAL path
  * (symlinks resolved, case-folded on a case-insensitive FS) is a checkout root
  * or nested under one (PR-controlled).  The PM is spawned by BARE NAME and
@@ -446,9 +453,10 @@ function isDangerousEnvName(name: string): boolean {
  * same canonicalForCompare/checkoutRoots/isUnderCheckout helpers as the
  * npm_config_git resolver so the containment test is symlink/case robust.
  *
- * Order of the surviving (system) entries is PRESERVED.  PATH is never EMPTIED:
- * dropping a checkout dir leaves the inherited system dirs (`/usr/bin`, …); only
- * when PATH had no usable value at all does the result stay unset.
+ * Order of the surviving (system) entries is PRESERVED.  The result is NEVER the
+ * empty string — see SAFE_SYSTEM_PATH below — and only `undefined` when the
+ * source had no PATH at all (caller then leaves PATH unset → execvp's built-in
+ * system default, which does NOT search the cwd).
  *
  * SECURITY ([F2], non-absolute entries): we drop EVERY non-absolute segment, not
  * just empties.  A relative PATH entry is resolved by the OS exec lookup against
@@ -459,7 +467,7 @@ function isDangerousEnvName(name: string): boolean {
  * entries is safe and closes the cwd-mismatch hole outright.
  */
 export function sanitizePathValue(pathVar: string | undefined): string | undefined {
-  if (pathVar === undefined || pathVar === '') return pathVar;
+  if (pathVar === undefined) return undefined;
   const roots = checkoutRoots();
   const kept: string[] = [];
   for (const dir of pathVar.split(delimiter)) {
@@ -470,7 +478,14 @@ export function sanitizePathValue(pathVar: string | undefined): string | undefin
     if (isUnderCheckout(dir, roots)) continue;
     kept.push(dir);
   }
-  return kept.join(delimiter);
+  // SECURITY ([F3], codex round-6): NEVER return ''.  A POSIX PATH of "" (and a
+  // trailing/empty segment) is a SINGLE zero-length entry, which execvp /
+  // spawnSync resolve against the CURRENT DIRECTORY — so a bare-name host exec
+  // (`git`/`tar`/`codesign`/…) would run a PR-committed `./tool` from the
+  // checkout cwd, re-opening the exact hole dropping checkout dirs is meant to
+  // close (verified empirically).  When every inherited segment was dropped (or
+  // the input was already ''), substitute a fixed trusted system PATH.
+  return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(delimiter);
 }
 
 /**

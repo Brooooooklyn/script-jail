@@ -25643,8 +25643,9 @@ function isDangerousEnvName(name) {
   }
   return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
 }
+var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 function sanitizePathValue(pathVar) {
-  if (pathVar === void 0 || pathVar === "") return pathVar;
+  if (pathVar === void 0) return void 0;
   const roots = checkoutRoots();
   const kept = [];
   for (const dir of pathVar.split(import_node_path14.delimiter)) {
@@ -25652,7 +25653,7 @@ function sanitizePathValue(pathVar) {
     if (isUnderCheckout(dir, roots)) continue;
     kept.push(dir);
   }
-  return kept.join(import_node_path14.delimiter);
+  return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path14.delimiter);
 }
 function stripDangerousEnv(srcEnv) {
   const env = {};
@@ -25974,8 +25975,9 @@ function findNodeBinDir(jsRuntimeDir) {
   return null;
 }
 function prependPath(dir, env) {
-  const existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin";
-  return `${dir}:${existing}`;
+  const existing = env["PATH"];
+  const base = existing === void 0 || existing === "" ? "/usr/bin:/bin:/usr/sbin:/sbin" : existing;
+  return `${dir}:${base}`;
 }
 function resignAdHoc(binPath, doRunCommand, env, identifier) {
   doRunCommand("codesign", ["--remove-signature", binPath], { env });
@@ -26371,8 +26373,8 @@ function firstExistingOrDefault(candidates, doExists) {
   return candidates[0];
 }
 function prependPath2(dir, env) {
-  const existing = sanitizePathValue(env["PATH"]) ?? "/usr/bin:/bin:/usr/sbin:/sbin";
-  return existing === "" ? dir : `${dir}:${existing}`;
+  const existing = sanitizePathValue(env["PATH"]) ?? SAFE_SYSTEM_PATH;
+  return `${dir}:${existing}`;
 }
 
 // src/cli/index.ts

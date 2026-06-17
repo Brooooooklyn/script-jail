@@ -22,6 +22,8 @@ import {
   hostRunScripts,
   resolveGitFromPath,
   stripDangerousEnv,
+  sanitizePathValue,
+  SAFE_SYSTEM_PATH,
   streamSpawn,
   makeLineSink,
   HOST_PART2_POISON_MARKER,
@@ -1379,6 +1381,38 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     } finally {
       if (origPath === undefined) delete process.env['PATH'];
       else process.env['PATH'] = origPath;
+    }
+  });
+
+  it('NEVER yields an empty PATH when every segment is dropped ([F3] cwd-search defense)', () => {
+    // An empty PATH ("") is a SINGLE zero-length entry → execvp/spawnSync resolve
+    // it against the CWD, so a bare-name host exec would run a PR-committed
+    // `./tool` from the checkout.  If EVERY inherited segment is checkout-relative
+    // (or non-absolute), the sanitized PATH must fall back to a trusted system
+    // PATH, never "".
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-allpath-'));
+    const binA = join(checkout, 'bin');
+    const binB = join(checkout, 'tools');
+    mkdirSync(binA);
+    mkdirSync(binB);
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      // every entry is either checkout-under or non-absolute (relative / empty)
+      const allDropped = `${binA}${delimiter}${binB}${delimiter}./node_modules/.bin${delimiter}`;
+      expect(sanitizePathValue(allDropped)).toBe(SAFE_SYSTEM_PATH);
+      const out = stripDangerousEnv({ PATH: allDropped, NODE_OPTIONS: './x' });
+      expect(out['PATH']).toBe(SAFE_SYSTEM_PATH);
+      expect(out['PATH']).not.toBe('');
+      // an already-empty inherited PATH also never passes '' through
+      expect(sanitizePathValue('')).toBe(SAFE_SYSTEM_PATH);
+      // a genuinely-absent PATH stays unset (caller deletes it → execvp's own
+      // system default, which does NOT search the cwd) — not synthesized.
+      expect(sanitizePathValue(undefined)).toBeUndefined();
+    } finally {
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
     }
   });
 

@@ -269,4 +269,49 @@ describe('createMacBareExecute — valid shim flows through', () => {
     expect(env['PATH']).toBe(`/usr/bin${delimiter}/bin`);
     expect(env['HOME']).toBe('/Users/runner');
   });
+
+  it('an ALL-checkout inherited PATH yields a trusted system PATH, never empty ([F3])', async () => {
+    const repoDir = tmp('mb-repo-');
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}\n');
+    const scratchDir = tmp('mb-scratch-');
+    const configPath = join(scratchDir, 'config.yml');
+    writeFileSync(configPath, 'manager: npm\nwork_dir: /orig\n');
+
+    const checkout = tmp('mb-checkout-');
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    const savedWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = checkout;
+
+    let provisionEnv: NodeJS.ProcessEnv | undefined;
+    let agentPath: string | undefined;
+    try {
+      const exec = createMacBareExecute(
+        makeDeps({
+          // EVERY inherited PATH segment is checkout-controlled → all dropped.
+          env: { PATH: checkoutBin },
+          provisionNodeMac: (async (inp: { env?: NodeJS.ProcessEnv }) => {
+            provisionEnv = inp.env;
+            return PROVISIONED;
+          }) as unknown as NonNullable<MacBareExecuteDeps['provisionNodeMac']>,
+          runAgentProcess: ((opts: { env: NodeJS.ProcessEnv }) => {
+            agentPath = opts.env['PATH'];
+            return Promise.resolve(RESULT);
+          }) as unknown as NonNullable<MacBareExecuteDeps['runAgentProcess']>,
+        }),
+      );
+      await exec(makeInput({ repoDir, scratchDir, configPath }));
+    } finally {
+      if (savedWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+    }
+
+    // provisioning env: never '' (would be a cwd search), substituted system PATH.
+    expect(provisionEnv?.['PATH']).toBe('/usr/bin:/bin:/usr/sbin:/sbin');
+    // orchestrator PATH: toolchain prepended to the trusted system PATH, no
+    // trailing empty (cwd) segment, and the checkout bin is gone.
+    expect(agentPath).toBe(`${PROVISIONED.nodeBinDir}:/usr/bin:/bin:/usr/sbin:/sbin`);
+    expect(agentPath!.endsWith(':')).toBe(false);
+    expect(agentPath!.includes(checkoutBin)).toBe(false);
+  });
 });

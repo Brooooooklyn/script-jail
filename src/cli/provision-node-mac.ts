@@ -448,8 +448,15 @@ function findNodeBinDir(jsRuntimeDir: string): string | null {
 
 /** Prepend `dir` to a PATH value, preserving the rest. */
 function prependPath(dir: string, env: NodeJS.ProcessEnv): string {
-  const existing = env['PATH'] ?? '/usr/bin:/bin:/usr/sbin:/sbin';
-  return `${dir}:${existing}`;
+  // SECURITY ([F3], codex round-6): treat '' like undefined.  An empty inherited
+  // PATH (or one that sanitized down to '') must NOT become a trailing empty
+  // segment — execvp resolves a zero-length PATH entry against the CWD, so
+  // corepack and its node descendants would search the checkout.  Fall back to a
+  // fixed trusted system PATH instead.
+  const existing = env['PATH'];
+  const base =
+    existing === undefined || existing === '' ? '/usr/bin:/bin:/usr/sbin:/sbin' : existing;
+  return `${dir}:${base}`;
 }
 
 /**

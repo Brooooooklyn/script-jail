@@ -26958,8 +26958,9 @@ function isDangerousEnvName(name) {
   }
   return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
 }
+var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 function sanitizePathValue(pathVar) {
-  if (pathVar === void 0 || pathVar === "") return pathVar;
+  if (pathVar === void 0) return void 0;
   const roots = checkoutRoots();
   const kept = [];
   for (const dir of pathVar.split(import_node_path2.delimiter)) {
@@ -26967,7 +26968,7 @@ function sanitizePathValue(pathVar) {
     if (isUnderCheckout(dir, roots)) continue;
     kept.push(dir);
   }
-  return kept.join(import_node_path2.delimiter);
+  return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path2.delimiter);
 }
 function stripDangerousEnv(srcEnv) {
   const env = {};
