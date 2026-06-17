@@ -378,19 +378,8 @@ const HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     'MAKEFLAGS',
     'GNUMAKEFLAGS',
     'MAKEFILES',
-    // Corepack EXEC/config selectors: a pnpm/yarn bare command is commonly a
-    // corepack shim, and COREPACK_HOME is its executable CACHE — a checkout-
-    // relative one (VERIFIED with corepack 0.35.0) makes corepack run a PR-planted
-    // bin/pnpm.cjs in host part-1.  COREPACK_ENV_FILE loads env from a file;
-    // COREPACK_NPM_REGISTRY / COREPACK_INTEGRITY_KEYS / COREPACK_ROOT can redirect
-    // or unsign the downloaded PM.  Behaviour flags (COREPACK_ENABLE_*) are NOT
-    // here — they don't select an executable, and the download-prompt flag is
-    // re-pinned below so stripping the cache can't trigger an interactive hang.
-    'COREPACK_HOME',
-    'COREPACK_ENV_FILE',
-    'COREPACK_NPM_REGISTRY',
-    'COREPACK_INTEGRITY_KEYS',
-    'COREPACK_ROOT',
+    // (Corepack EXEC/config selectors AND its version-steering behaviour flags are
+    // dropped by the `corepack_` FAMILY prefix below — see that entry.)
     // pnpm's global bin / executable dir (also where `pnpm setup` puts pnpm on
     // PATH).  Not a config-file locator and NOT auto-prepended to a lifecycle
     // script's PATH (both VERIFIED pnpm 11.1.2 — only XDG_CONFIG_HOME relocates the
@@ -433,6 +422,25 @@ const HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
   // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
   // the legit values from the package.json the sandbox already audited.
   'npm_package_config_',
+  // Corepack family — a pnpm/yarn bare command is commonly a corepack shim.  Two
+  // dangerous sub-classes, BOTH dropped here so the SHARED sanitizer (every backend
+  // AGENT spawn AND the host install) applies one parity policy:
+  //   EXEC/config selectors — COREPACK_HOME (executable CACHE; a checkout-relative
+  //     one makes corepack run a PR-planted bin/pnpm.cjs — VERIFIED corepack 0.35.0),
+  //     COREPACK_ENV_FILE (loads env from a file), COREPACK_NPM_REGISTRY /
+  //     COREPACK_INTEGRITY_KEYS / COREPACK_ROOT (redirect/unsign the downloaded PM).
+  //   VERSION-STEERING flags — COREPACK_ENABLE_PROJECT_SPEC=0 makes corepack IGNORE
+  //     the repo's `packageManager` and run a DIFFERENT pm VERSION (VERIFIED corepack
+  //     0.35.0: yarn 3.8.7 pin -> 4.5.0), a host-vs-audit (and bare-audit-vs-host)
+  //     SEMANTICS skew; COREPACK_DEFAULT_TO_LATEST / COREPACK_ENABLE_STRICT likewise.
+  // The clean-VM audit inherits NO COREPACK_*, so dropping the whole family keeps
+  // host==audit AND bare-audit==host.  The ONE flag a spawn legitimately needs,
+  // COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (avoid an interactive hang on an uncached PM
+  // download), is RE-PINNED by every corepack-running caller AFTER this strip
+  // (hostInstallEnv, backend/bare.ts, backend/mac-bare.ts, backend/docker.ts,
+  // rootfs/init.sh, cli/provision-node-mac.ts) — never relied on as an inherited
+  // pass-through.
+  'corepack_',
 ];
 
 // The `npm_config_*` AND `pnpm_config_*` env namespaces are governed by an
@@ -470,6 +478,15 @@ const HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
 // Fixed scalar keys (canonical underscore form; matched after `-`→`_`).
 const PM_CONFIG_AUTH_SCALARS = new Set([
   'registry', // default registry URL
+  // npm-only: rewrites the HOST of lockfile-pinned tarball URLs to the configured
+  // `registry` (VERIFIED npm 11.13.0 honors both separators, no Unknown-env warning).
+  // Needed for a mirror where the lockfile pins NON-default public hosts but an
+  // egress-locked runner must funnel all fetches through one internal registry, else
+  // the host install fails after a clean audit.  PURE routing — pacote/arborist
+  // rewrite only host/port/protocol/path and STILL verify the integrity hash against
+  // the fetched bytes (no exec/loader/config-FILE).  pnpm has no consumer (zero dist
+  // refs on 10.34.3/11.1.2) → harmless no-op there, like the other npm-only scalars.
+  'replace_registry_host',
   '_auth', // legacy single-registry base64 basic auth
   'email', // legacy auth identity
   'ca', // inline PEM CA (string/array) — data, not a path
@@ -550,16 +567,22 @@ function isAllowedPmConfigKey(slice: string): boolean {
 //   *_HTTP(S)_PROXY    proxy URLs — Yarn IGNORES unprefixed HTTP_PROXY/HTTPS_PROXY,
 //                      so these are the only way to proxy a host yarn install.
 //   *_HTTP_TIMEOUT/RETRY, *_NETWORK_CONCURRENCY  ints (got timeout/retry/concurrency).
+//   *_HTTPS_{CA,CERT,KEY}_FILE_PATH  PEM file paths read as TLS MATERIAL ONLY — yarn
+//     4.9.1 does `readFile -> got https.{certificateAuthority,certificate,key}`, NEVER
+//     parsed-as-config or required-as-module (VERIFIED: a `pwn.sh` at the path during a
+//     real `yarn add` was read as cert data, NOT executed).  Kept by NAME, matching the
+//     existing npm `cafile`/`certfile`/`keyfile` scalars (which are likewise kept by name
+//     with no containment) — internal-CA / mTLS registries need them.  Residual (same as
+//     npm's): an inherited path INTO the checkout is honored uncontained; acceptable
+//     because the material is data-only AND host installs are lockfile-frozen
+//     (npm ci / --frozen-lockfile / --immutable), so a PR-controlled CA cannot substitute
+//     package bytes (integrity hash aborts on mismatch; code-swap would also need a
+//     network MITM, which a CA alone does not grant).
 // DELIBERATELY EXCLUDED (kept dangerous):
 //   - YARN_NETWORK_SETTINGS — a per-host MAP carrying its own file-path + enableNetwork
 //     sub-keys (the config-parsed class).
 //   - YARN_UNSAFE_HTTP_WHITELIST / YARN_ENABLE_STRICT_SSL — pure data, but they WEAKEN
 //     the TLS/cleartext defaults the clean-VM audit ran with.
-//   - YARN_HTTPS_{CA,KEY,CERT}_FILE_PATH — read as PEM TLS MATERIAL only (no parse/
-//     require), BUT a PR-controllable CA is a TLS-TRUST surface, not routing; and a
-//     self-signed internal registry fails at AUDIT time too (the audit inherits no CA),
-//     so a host-only CA can't enable that scenario.  Kept out to match yarn's
-//     conservative drop and avoid widening trust.
 //   - every *Folder / constraintsPath / injectEnvironmentFiles / enableScripts.
 const YARN_ENV_ALLOW = new Set([
   'YARN_NPM_AUTH_TOKEN',
@@ -571,6 +594,9 @@ const YARN_ENV_ALLOW = new Set([
   'YARN_HTTP_TIMEOUT', // -> httpTimeout (int)
   'YARN_HTTP_RETRY', // -> httpRetry (int)
   'YARN_NETWORK_CONCURRENCY', // -> networkConcurrency (int)
+  'YARN_HTTPS_CA_FILE_PATH', // -> httpsCaFilePath (PEM CA, read as TLS material)
+  'YARN_HTTPS_CERT_FILE_PATH', // -> httpsCertFilePath (PEM client cert)
+  'YARN_HTTPS_KEY_FILE_PATH', // -> httpsKeyFilePath (PEM client key)
 ]);
 
 /**
@@ -596,6 +622,19 @@ function isDangerousEnvName(name: string): boolean {
   }
   if (lower.startsWith('npm_config_')) {
     return !isAllowedPmConfigKey(lower.slice('npm_config_'.length));
+  }
+  // YARN_* is an ALLOWLIST too: yarn maps `YARN_<UPPER_SNAKE>` -> config and ENV BEATS
+  // the rc over an open-ended surface that includes EXEC selectors (YARN_YARN_PATH
+  // re-execs a JS path — VERIFIED yarn 4.9.1; YARN_PLUGINS, YARN_RC_FILENAME,
+  // YARN_INJECT_ENVIRONMENT_FILES, the *Folder redirects, …), so a key is dangerous
+  // UNLESS in YARN_ENV_ALLOW.  Applied here in the SHARED gate (UNCONDITIONALLY, not
+  // gated on pm) so EVERY backend AGENT spawn gets it, not just the host yarn install —
+  // closing the bare/mac-bare audit-vs-host asymmetry where the audit honored a
+  // PR-controlled YARN_YARN_PATH before the trust gate.  Safe for npm/pnpm: they
+  // ignore YARN_* entirely (VERIFIED), so dropping non-allowlisted YARN_* never breaks
+  // them.  Case-insensitive (yarn lower-cases the env key before its `yarn_` match).
+  if (lower.startsWith('yarn_')) {
+    return !YARN_ENV_ALLOW.has(name.toUpperCase());
   }
   return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
 }
@@ -698,48 +737,25 @@ function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
     }
   }
   env['npm_config_git'] = trustedGitPath();
-  // SECURITY (parity): drop EVERY inherited COREPACK_* (case-insensitive), then
-  // re-pin only the download-prompt.  A behaviour flag like
-  // `COREPACK_ENABLE_PROJECT_SPEC=0` makes corepack IGNORE the repo's
-  // `packageManager` field and run a DIFFERENT pm VERSION than the clean-VM audit
-  // (VERIFIED corepack 0.35.0) — a host!=audit identity/semantics skew, not just the
-  // download/registry/cache knobs already in the dangerous-name list.  The audit
-  // inherits no COREPACK_*, so stripping the family keeps host==audit; the version
-  // is governed by the repo's `packageManager`, never by inherited env.
-  for (const name of Object.keys(env)) {
-    if (name.toUpperCase().startsWith('COREPACK_')) delete env[name];
-  }
+  // stripDangerousEnv already dropped EVERY inherited COREPACK_* (the `corepack_`
+  // family prefix) and EVERY non-allowlisted YARN_* (the shared YARN_ENV_ALLOW gate),
+  // so the parity drops are no longer re-done here — they apply to the backend AGENT
+  // spawns too.  All that remains is to layer the POSITIVE pins the host install needs
+  // on top of the now-clean env.
   // Corepack must not block on an interactive download prompt (match the audit:
-  // docker.ts / init.sh / mac-bare set this) — especially since we just stripped any
-  // inherited COREPACK_HOME, which could force a cache re-download.
+  // docker.ts / init.sh / mac-bare set this) — and stripDangerousEnv just dropped any
+  // inherited COREPACK_HOME, which could otherwise force a cache re-download.
   env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
   if (pm === 'yarn') {
-    // SECURITY (parity, ALLOWLIST): Yarn maps env -> config (`YARN_<UPPER_SNAKE>` ->
-    // camelCase flat key, VERIFIED yarn 4.5.0) and ENV BEATS the rc file.  That
-    // config surface is open-ended and grows per release — `injectEnvironmentFiles`
-    // (injects a .env, incl. NODE_OPTIONS, into lifecycle subprocesses), `*Folder`
-    // path redirects, `constraintsPath`, TLS/proxy paths, `enableScripts`, … — so
-    // enumerating dangerous names is whack-a-mole (each fix surfaces the next).  The
-    // clean-VM audit inherits NO runner env, so DROP EVERY inherited `YARN_*` except
-    // the scalar auth/registry keys a private-registry install genuinely needs; that
-    // keeps host==audit by construction.  (Per-scope `npmScopes`/`npmRegistries` are
-    // MAP settings, NOT flat-env-settable in 4.5.0 — yarn errors on them — so the
-    // four scalars below are the entire env-settable auth surface; rc-file auth is
-    // unaffected.)  Sweep FIRST, then layer the explicit pins so the sweep can't
-    // clobber them.  CASE-INSENSITIVE: yarn lower-cases the env key before its
-    // `yarn_` match (VERIFIED 4.5.0: `yarn_enable_scripts`/`yarn_inject_environment_files`
-    // are honoured), so compare the upper-cased name against the (upper-cased) allowlist.
-    for (const name of Object.keys(env)) {
-      const upper = name.toUpperCase();
-      if (upper.startsWith('YARN_') && !YARN_ENV_ALLOW.has(upper)) delete env[name];
-    }
+    // Positive yarn pins (install-child specific).  The negative YARN_* sweep now
+    // lives in stripDangerousEnv (the shared gate), so here we only SET the pins on
+    // top of the already-swept env.  YARN_ENABLE_SCRIPTS is intentionally NOT re-set:
+    // the sweep dropped any inherited value (not in the allowlist), so the rc governs
+    // host part-2 IDENTICALLY to the audit — rc-true still builds, rc-false still skips.
     env['YARN_IGNORE_PATH'] = '1';
     env['YARN_RC_FILENAME'] = '.yarnrc.yml';
     env['YARN_PLUGINS'] = '';
     env['YARN_ENABLE_CONSTRAINTS_CHECKS'] = 'false';
-    // YARN_ENABLE_SCRIPTS is intentionally NOT re-set: the sweep dropped any inherited
-    // value (it is not in the allowlist), so the rc governs host part-2 IDENTICALLY to
-    // the audit — rc-true still builds, rc-false still skips (env must not beat rc).
   }
   return env;
 }

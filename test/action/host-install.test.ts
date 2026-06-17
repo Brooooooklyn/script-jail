@@ -200,7 +200,9 @@ describe('hostInstallNoScripts (part 1)', () => {
       YARN_INJECT_ENVIRONMENT_FILES: '.env.evil',
       YARN_GLOBAL_FOLDER: '/checkout/.yarn',
       YARN_CONSTRAINTS_PATH: '/checkout/c.cjs',
-      YARN_HTTPS_CA_FILE_PATH: '/checkout/ca.pem',
+      YARN_YARN_PATH: '/checkout/evil.cjs', // yarnPath re-exec selector
+      YARN_NETWORK_SETTINGS: '{}', // per-host config MAP
+      YARN_ENABLE_STRICT_SSL: 'false', // weakens TLS
       // CASE-INSENSITIVE: yarn lower-cases the env key before matching `yarn_`
       // (VERIFIED 4.5.0), so lowercase/mixed-case dangerous forms must ALSO be dropped.
       yarn_enable_scripts: 'true',
@@ -235,12 +237,14 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
-  it('keeps yarn pure-routing proxy/tuning env, still drops TLS-trust + weakening + config-map keys (round-13)', () => {
+  it('keeps yarn pure-routing proxy/tuning + TLS-material env, still drops weakening + config-map keys (round-13/14)', () => {
     // VERIFIED yarn 4.9.1: YARN_HTTP_PROXY->httpProxy / YARN_HTTPS_PROXY->httpsProxy
     // (yarn IGNORES unprefixed HTTP_PROXY), YARN_HTTP_TIMEOUT/RETRY + YARN_NETWORK_CONCURRENCY
-    // are ints — all pure routing, no exec/file.  Still DROPPED: YARN_NETWORK_SETTINGS
-    // (config MAP), YARN_ENABLE_STRICT_SSL / YARN_UNSAFE_HTTP_WHITELIST (weaken TLS),
-    // YARN_HTTPS_CA_FILE_PATH (TLS-trust surface), and exec/folder keys.
+    // are ints, and YARN_HTTPS_{CA,CERT,KEY}_FILE_PATH are PEM file paths read as TLS
+    // MATERIAL only (readFile -> got, never exec) — all KEPT (the TLS file paths match
+    // npm's already-kept cafile/certfile/keyfile).  Still DROPPED: YARN_NETWORK_SETTINGS
+    // (config MAP), YARN_ENABLE_STRICT_SSL / YARN_UNSAFE_HTTP_WHITELIST (weaken TLS), and
+    // exec/folder keys.
     let seen: NodeJS.ProcessEnv = {};
     const spawn: HostSpawn = (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; };
     const keep = {
@@ -249,12 +253,15 @@ describe('hostInstallNoScripts (part 1)', () => {
       YARN_HTTP_TIMEOUT: '120000',
       YARN_HTTP_RETRY: '5',
       YARN_NETWORK_CONCURRENCY: '8',
+      YARN_HTTPS_CA_FILE_PATH: '/etc/ssl/ca.pem', // PEM CA, read as TLS material
+      YARN_HTTPS_CERT_FILE_PATH: '/etc/ssl/client.pem', // PEM client cert
+      YARN_HTTPS_KEY_FILE_PATH: '/etc/ssl/client.key', // PEM client key
     };
     const drop = {
       YARN_NETWORK_SETTINGS: '{"//host":{"enableNetwork":true}}', // config MAP
       YARN_ENABLE_STRICT_SSL: 'false', // weakens TLS
       YARN_UNSAFE_HTTP_WHITELIST: '*.evil.example', // weakens cleartext guard
-      YARN_HTTPS_CA_FILE_PATH: '/checkout/ca.pem', // TLS-trust surface — stays dropped
+      YARN_YARN_PATH: '/checkout/evil.cjs', // yarnPath re-exec selector
       YARN_GLOBAL_FOLDER: '/checkout/.yarn', // folder redirect
     };
     const prior: Record<string, string | undefined> = {};
@@ -1652,6 +1659,61 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['npm_config_//npm.pkg.github.com/:_password']).toBe('pw');
     expect(out['npm_config_//registry.example.com/:certfile']).toBe('/etc/ssl/c.pem');
     expect(out['npm_config_@my-org:registry']).toBe('https://npm.my-org.dev/');
+  });
+
+  it('stripDangerousEnv preserves npm replace_registry_host (round-14 — mirror host rewrite, pure routing)', () => {
+    // VERIFIED npm 11.13.0 honors both separators (no Unknown-env warning); pure registry
+    // routing (rewrites tarball host/port/protocol/path, integrity hash still pins bytes),
+    // needed for a mirror where the lockfile pins non-default public hosts.
+    const out = stripDangerousEnv({
+      npm_config_replace_registry_host: 'always',
+      'npm_config_replace-registry-host': 'always', // hyphen alias
+      pnpm_config_replace_registry_host: 'always', // pnpm: no consumer, harmless keep
+      npm_config_cache: '/checkout/.npm', // control: still dropped
+    });
+    expect(out['npm_config_replace_registry_host']).toBe('always');
+    expect(out['npm_config_replace-registry-host']).toBe('always');
+    expect(out['pnpm_config_replace_registry_host']).toBe('always');
+    expect(out['npm_config_cache']).toBeUndefined();
+  });
+
+  it('stripDangerousEnv (shared, no pm) applies the YARN_* + COREPACK_* policy — bare-agent==host parity (round-14 [high])', () => {
+    // The bare/mac-bare AUDIT agents spawn via stripDangerousEnv (NOT hostInstallEnv), so
+    // the YARN_* allowlist + COREPACK_* family drop MUST live in the shared sanitizer or
+    // the audit honors PR-controlled exec/version selectors the host install strips.
+    // VERIFIED: stripDangerousEnv now drops non-allowlisted YARN_* (incl. YARN_YARN_PATH
+    // re-exec selector) + EVERY COREPACK_* (incl. the version-steering flags), while
+    // keeping the yarn auth/routing/TLS allowlist.
+    const out = stripDangerousEnv({
+      // dangerous YARN_* — dropped by the shared sanitizer (no pm gate):
+      YARN_YARN_PATH: '/checkout/evil.cjs', // re-exec selector
+      YARN_PLUGINS: '/checkout/p.cjs',
+      YARN_RC_FILENAME: '/checkout/.yarnrc.yml',
+      YARN_INJECT_ENVIRONMENT_FILES: '.env.evil',
+      YARN_NETWORK_SETTINGS: '{}',
+      yarn_yarn_path: '/checkout/evil.cjs', // lowercase form also dropped
+      // COREPACK_* — entire family dropped (exec selectors + version steering):
+      COREPACK_HOME: '/checkout/.corepack',
+      COREPACK_ENABLE_PROJECT_SPEC: '0', // version-steering flag (was NOT dropped before)
+      COREPACK_DEFAULT_TO_LATEST: '1',
+      COREPACK_ENABLE_STRICT: '0',
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '1', // dropped here; callers re-pin =0 after
+      // allowlisted yarn keys — survive:
+      YARN_NPM_AUTH_TOKEN: 'tok',
+      YARN_HTTP_PROXY: 'http://proxy.local:8080/',
+      YARN_HTTPS_CA_FILE_PATH: '/etc/ssl/ca.pem',
+    });
+    for (const k of [
+      'YARN_YARN_PATH', 'YARN_PLUGINS', 'YARN_RC_FILENAME', 'YARN_INJECT_ENVIRONMENT_FILES',
+      'YARN_NETWORK_SETTINGS', 'yarn_yarn_path',
+      'COREPACK_HOME', 'COREPACK_ENABLE_PROJECT_SPEC', 'COREPACK_DEFAULT_TO_LATEST',
+      'COREPACK_ENABLE_STRICT', 'COREPACK_ENABLE_DOWNLOAD_PROMPT',
+    ]) {
+      expect(out[k]).toBeUndefined();
+    }
+    expect(out['YARN_NPM_AUTH_TOKEN']).toBe('tok');
+    expect(out['YARN_HTTP_PROXY']).toBe('http://proxy.local:8080/');
+    expect(out['YARN_HTTPS_CA_FILE_PATH']).toBe('/etc/ssl/ca.pem');
   });
 
   it('stripDangerousEnv drops the XDG_* family + PNPM_HOME (pnpm config→scriptShell, round-8)', () => {

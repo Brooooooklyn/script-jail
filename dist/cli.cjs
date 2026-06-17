@@ -7795,19 +7795,8 @@ var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     "MAKEFLAGS",
     "GNUMAKEFLAGS",
     "MAKEFILES",
-    // Corepack EXEC/config selectors: a pnpm/yarn bare command is commonly a
-    // corepack shim, and COREPACK_HOME is its executable CACHE — a checkout-
-    // relative one (VERIFIED with corepack 0.35.0) makes corepack run a PR-planted
-    // bin/pnpm.cjs in host part-1.  COREPACK_ENV_FILE loads env from a file;
-    // COREPACK_NPM_REGISTRY / COREPACK_INTEGRITY_KEYS / COREPACK_ROOT can redirect
-    // or unsign the downloaded PM.  Behaviour flags (COREPACK_ENABLE_*) are NOT
-    // here — they don't select an executable, and the download-prompt flag is
-    // re-pinned below so stripping the cache can't trigger an interactive hang.
-    "COREPACK_HOME",
-    "COREPACK_ENV_FILE",
-    "COREPACK_NPM_REGISTRY",
-    "COREPACK_INTEGRITY_KEYS",
-    "COREPACK_ROOT",
+    // (Corepack EXEC/config selectors AND its version-steering behaviour flags are
+    // dropped by the `corepack_` FAMILY prefix below — see that entry.)
     // pnpm's global bin / executable dir (also where `pnpm setup` puts pnpm on
     // PATH).  Not a config-file locator and NOT auto-prepended to a lifecycle
     // script's PATH (both VERIFIED pnpm 11.1.2 — only XDG_CONFIG_HOME relocates the
@@ -7850,11 +7839,39 @@ var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
   // one for a key absent from package.json would pass through to node-gyp
   // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
   // the legit values from the package.json the sandbox already audited.
-  "npm_package_config_"
+  "npm_package_config_",
+  // Corepack family — a pnpm/yarn bare command is commonly a corepack shim.  Two
+  // dangerous sub-classes, BOTH dropped here so the SHARED sanitizer (every backend
+  // AGENT spawn AND the host install) applies one parity policy:
+  //   EXEC/config selectors — COREPACK_HOME (executable CACHE; a checkout-relative
+  //     one makes corepack run a PR-planted bin/pnpm.cjs — VERIFIED corepack 0.35.0),
+  //     COREPACK_ENV_FILE (loads env from a file), COREPACK_NPM_REGISTRY /
+  //     COREPACK_INTEGRITY_KEYS / COREPACK_ROOT (redirect/unsign the downloaded PM).
+  //   VERSION-STEERING flags — COREPACK_ENABLE_PROJECT_SPEC=0 makes corepack IGNORE
+  //     the repo's `packageManager` and run a DIFFERENT pm VERSION (VERIFIED corepack
+  //     0.35.0: yarn 3.8.7 pin -> 4.5.0), a host-vs-audit (and bare-audit-vs-host)
+  //     SEMANTICS skew; COREPACK_DEFAULT_TO_LATEST / COREPACK_ENABLE_STRICT likewise.
+  // The clean-VM audit inherits NO COREPACK_*, so dropping the whole family keeps
+  // host==audit AND bare-audit==host.  The ONE flag a spawn legitimately needs,
+  // COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (avoid an interactive hang on an uncached PM
+  // download), is RE-PINNED by every corepack-running caller AFTER this strip
+  // (hostInstallEnv, backend/bare.ts, backend/mac-bare.ts, backend/docker.ts,
+  // rootfs/init.sh, cli/provision-node-mac.ts) — never relied on as an inherited
+  // pass-through.
+  "corepack_"
 ];
 var PM_CONFIG_AUTH_SCALARS = /* @__PURE__ */ new Set([
   "registry",
   // default registry URL
+  // npm-only: rewrites the HOST of lockfile-pinned tarball URLs to the configured
+  // `registry` (VERIFIED npm 11.13.0 honors both separators, no Unknown-env warning).
+  // Needed for a mirror where the lockfile pins NON-default public hosts but an
+  // egress-locked runner must funnel all fetches through one internal registry, else
+  // the host install fails after a clean audit.  PURE routing — pacote/arborist
+  // rewrite only host/port/protocol/path and STILL verify the integrity hash against
+  // the fetched bytes (no exec/loader/config-FILE).  pnpm has no consumer (zero dist
+  // refs on 10.34.3/11.1.2) → harmless no-op there, like the other npm-only scalars.
+  "replace_registry_host",
   "_auth",
   // legacy single-registry base64 basic auth
   "email",
@@ -7915,6 +7932,28 @@ function isAllowedPmConfigKey(slice) {
   if (slice.startsWith("@") && slice.includes(":")) return true;
   return PM_CONFIG_AUTH_SCALARS.has(slice.replace(/-/g, "_"));
 }
+var YARN_ENV_ALLOW = /* @__PURE__ */ new Set([
+  "YARN_NPM_AUTH_TOKEN",
+  "YARN_NPM_AUTH_IDENT",
+  "YARN_NPM_REGISTRY_SERVER",
+  "YARN_NPM_ALWAYS_AUTH",
+  "YARN_HTTP_PROXY",
+  // -> httpProxy (URL)
+  "YARN_HTTPS_PROXY",
+  // -> httpsProxy (URL)
+  "YARN_HTTP_TIMEOUT",
+  // -> httpTimeout (int)
+  "YARN_HTTP_RETRY",
+  // -> httpRetry (int)
+  "YARN_NETWORK_CONCURRENCY",
+  // -> networkConcurrency (int)
+  "YARN_HTTPS_CA_FILE_PATH",
+  // -> httpsCaFilePath (PEM CA, read as TLS material)
+  "YARN_HTTPS_CERT_FILE_PATH",
+  // -> httpsCertFilePath (PEM client cert)
+  "YARN_HTTPS_KEY_FILE_PATH"
+  // -> httpsKeyFilePath (PEM client key)
+]);
 function isDangerousEnvName(name) {
   const lower = name.toLowerCase();
   for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
@@ -7925,6 +7964,9 @@ function isDangerousEnvName(name) {
   }
   if (lower.startsWith("npm_config_")) {
     return !isAllowedPmConfigKey(lower.slice("npm_config_".length));
+  }
+  if (lower.startsWith("yarn_")) {
+    return !YARN_ENV_ALLOW.has(name.toUpperCase());
   }
   return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
 }
@@ -25855,6 +25897,11 @@ function createBareBackend(deps = {}) {
             // AUDIT sees the same env the hardened host install does and an
             // inherited NODE_OPTIONS can't inject into the agent process itself.
             ...safeEnv,
+            // stripDangerousEnv now drops the whole COREPACK_* family (incl. any
+            // inherited COREPACK_ENABLE_DOWNLOAD_PROMPT), so re-pin it here — corepack
+            // 0.35.0 defaults the prompt ON, and an uncached pm download would block
+            // the bare AUDIT otherwise (mac-bare/docker/init.sh re-pin it the same way).
+            COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
             // Bare mode runs the agent directly on the host (no container /etc),

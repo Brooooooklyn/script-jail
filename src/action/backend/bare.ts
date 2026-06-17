@@ -81,6 +81,11 @@ export function createBareBackend(deps: BareBackendDeps = {}): AuditBackend {
             // AUDIT sees the same env the hardened host install does and an
             // inherited NODE_OPTIONS can't inject into the agent process itself.
             ...safeEnv,
+            // stripDangerousEnv now drops the whole COREPACK_* family (incl. any
+            // inherited COREPACK_ENABLE_DOWNLOAD_PROMPT), so re-pin it here — corepack
+            // 0.35.0 defaults the prompt ON, and an uncached pm download would block
+            // the bare AUDIT otherwise (mac-bare/docker/init.sh re-pin it the same way).
+            COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
             SCRIPT_JAIL_CONNECTION: 'stdio',
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
             // Bare mode runs the agent directly on the host (no container /etc),
