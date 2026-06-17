@@ -51,7 +51,9 @@ describe('runFetchPhase', () => {
       const { spawner, calls } = mockSpawner();
       await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner });
       expect(calls[0]!.opts.cwd).toBe('/work');
-      expect(calls[0]!.opts.env).toBe(BASE_ENV);
+      // npm gets a CLONE of the base env carrying the npm_config_git pin (see
+      // the git-pin tests below); every other key is preserved verbatim.
+      expect(calls[0]!.opts.env).toEqual({ ...BASE_ENV, npm_config_git: expect.any(String) });
     });
 
     it('returns ok=false when exitCode != 0', async () => {
@@ -116,7 +118,23 @@ describe('runFetchPhase', () => {
   });
 
   describe('env passthrough', () => {
-    it('passes the full env dict unchanged', async () => {
+    it('passes the full env dict unchanged for pnpm/yarn (same reference)', async () => {
+      const env: NodeJS.ProcessEnv = {
+        PATH: '/usr/bin:/usr/local/bin',
+        HOME: '/root',
+        LD_PRELOAD: '/lib/libscriptjail.so',
+        SCRIPT_JAIL_SPOOF_PLATFORM: 'darwin',
+      };
+      // pnpm/yarn ignore npm_config_git, so their env is passed through by
+      // reference (no spurious env_read of an unread key, byte-stable lock).
+      for (const manager of ['pnpm', 'yarn'] as const) {
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager, cwd: '/work', env, spawner });
+        expect(calls[0]!.opts.env).toBe(env);
+      }
+    });
+
+    it('clones the env for npm and preserves every inherited key', async () => {
       const env: NodeJS.ProcessEnv = {
         PATH: '/usr/bin:/usr/local/bin',
         HOME: '/root',
@@ -125,7 +143,105 @@ describe('runFetchPhase', () => {
       };
       const { spawner, calls } = mockSpawner();
       await runFetchPhase({ manager: 'npm', cwd: '/work', env, spawner });
-      expect(calls[0]!.opts.env).toBe(env);
+      const passed = calls[0]!.opts.env;
+      // Cloned (the pin must not mutate the caller's childEnv shared with Phase B).
+      expect(passed).not.toBe(env);
+      expect(passed['PATH']).toBe('/usr/bin:/usr/local/bin');
+      expect(passed['HOME']).toBe('/root');
+      expect(passed['LD_PRELOAD']).toBe('/lib/libscriptjail.so');
+      expect(passed['SCRIPT_JAIL_SPOOF_PLATFORM']).toBe('darwin');
+      // The caller's env is NOT mutated (Phase B reuses the same childEnv object).
+      expect(env['npm_config_git']).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // git-binary pin (npm_config_git) — repo .npmrc git= override defense
+  // -------------------------------------------------------------------------
+  //
+  // The GUEST Phase-A fetch must clone the SAME (real) git-dep tree the host
+  // installs.  A repo `.npmrc git=./fake-git` would otherwise redirect npm to a
+  // checkout-resident fake git during the audit, recording a benign tree while
+  // the (already-pinned) host clones the real one — a clean lock that authorizes
+  // an un-audited dependency tree.  Mirror the host pin on the guest fetch.
+  describe('git-binary pin (npm_config_git)', () => {
+    it('pins npm_config_git on the npm fetch env to a guest git', async () => {
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner });
+      const git = calls[0]!.opts.env['npm_config_git'];
+      expect(typeof git).toBe('string');
+      expect(git!.length).toBeGreaterThan(0);
+      // Either an absolute guest git OUTSIDE the staged repo, or the bare literal
+      // fallback — both OVERRIDE the repo `.npmrc git=` value.
+      expect(git === 'git' || git!.startsWith('/')).toBe(true);
+      // Never a checkout-resident path.
+      expect(git === '/work' || git!.startsWith('/work/')).toBe(false);
+    });
+
+    it('the pin OVERRIDES an inherited npm_config_git (a repo .npmrc cannot win)', async () => {
+      // npm config precedence: an `npm_config_git` ENV var beats the project
+      // `.npmrc`.  Even if an ambient value somehow rode in, our pin (set last)
+      // replaces it — the repo `.npmrc git=./fake-git` can never take effect.
+      const env: NodeJS.ProcessEnv = { ...BASE_ENV, npm_config_git: './fake-git' };
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env, spawner });
+      expect(calls[0]!.opts.env['npm_config_git']).not.toBe('./fake-git');
+    });
+
+    it('resolves an absolute guest git OUTSIDE the staged repo when one is on PATH', async () => {
+      // Point PATH at a real dir holding a `git` file, OUTSIDE the cwd, and
+      // assert the pin resolves to that absolute path (not the bare literal).
+      const binDir = mkdtempSync(join(tmpdir(), 'script-jail-guest-git-'));
+      const gitPath = join(binDir, 'git');
+      writeFileSync(gitPath, '#!/bin/sh\n');
+      const prevPath = process.env['PATH'];
+      try {
+        process.env['PATH'] = binDir;
+        const { spawner, calls } = mockSpawner();
+        // cwd is a DIFFERENT temp dir so the resolved git is outside the repo.
+        const cwd = mkdtempSync(join(tmpdir(), 'script-jail-guest-repo-'));
+        try {
+          await runFetchPhase({ manager: 'npm', cwd, env: { PATH: binDir }, spawner });
+          expect(calls[0]!.opts.env['npm_config_git']).toBe(gitPath);
+        } finally {
+          rmSync(cwd, { recursive: true, force: true });
+        }
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+
+    it('SKIPS a checkout-resident git and falls back to the literal (no shadow git)', async () => {
+      // A repo that prepends its OWN dir to PATH and ships a `git` there must NOT
+      // be picked as the trusted git: the candidate is under cwd, so it is
+      // skipped and the pin falls back to the bare literal `git`.
+      const repoDir = mkdtempSync(join(tmpdir(), 'script-jail-guest-shadow-'));
+      const shadowGit = join(repoDir, 'git');
+      writeFileSync(shadowGit, '#!/bin/sh\necho pwned\n');
+      const prevPath = process.env['PATH'];
+      try {
+        // PATH contains ONLY the checkout dir → no trusted git outside it.
+        process.env['PATH'] = repoDir;
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager: 'npm', cwd: repoDir, env: { PATH: repoDir }, spawner });
+        const git = calls[0]!.opts.env['npm_config_git'];
+        expect(git).toBe('git'); // bare literal, NOT the checkout-resident shadow
+        expect(git).not.toBe(shadowGit);
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+
+    it('does NOT set npm_config_git on the pnpm or yarn fetch env', async () => {
+      for (const manager of ['pnpm', 'yarn'] as const) {
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager, cwd: '/work', env: BASE_ENV, spawner });
+        expect(calls[0]!.opts.env['npm_config_git']).toBeUndefined();
+      }
     });
   });
 

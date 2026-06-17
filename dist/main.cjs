@@ -26848,14 +26848,61 @@ var HOST_INSTALL_STRIP_ENV_NAMES = /* @__PURE__ */ new Set([
   "POSIXLY_CORRECT",
   "TERM"
 ]);
+var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
+  [
+    // [13] Node loader hooks (Node-based PM child execs these pre-trust).
+    "NODE_OPTIONS",
+    "NODE_REPL_EXTERNAL_MODULE",
+    // [17] ELF dynamic-loader preload/audit + lib search path.
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    // [17] macOS dyld analogs (the host bare backend runs on macOS).
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FORCE_FLAT_NAMESPACE",
+    // [19] Git transport-command overrides (git+ssh deps; --ignore-scripts does
+    // NOT stop git from being invoked).  GIT_ALLOW_PROTOCOL is NOT here — it
+    // restricts, never weakens.  The git BINARY stays pinned via npm_config_git.
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    // [18] npm script-shell wrapper (part-2 rebuild runs it).
+    "NPM_CONFIG_SCRIPT_SHELL",
+    // [22] npm config-locating redirects (load a PR-controlled npmrc).
+    "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_GLOBALCONFIG",
+    // [16] npm ignore-scripts self-DoS (skips the scripts the audit expects).
+    "NPM_CONFIG_IGNORE_SCRIPTS"
+  ].map((n) => n.toLowerCase())
+);
+function isDangerousEnvName(name) {
+  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(name.toLowerCase());
+}
+function sanitizePathValue(pathVar) {
+  if (pathVar === void 0 || pathVar === "") return pathVar;
+  const roots = checkoutRoots();
+  const kept = [];
+  for (const dir of pathVar.split(import_node_path2.delimiter)) {
+    if (dir === "") continue;
+    if (isUnderCheckout(dir, roots)) continue;
+    kept.push(dir);
+  }
+  return kept.join(import_node_path2.delimiter);
+}
 function hostInstallEnv(pm) {
   const env = {};
   for (const [name, value] of Object.entries(process.env)) {
     if (value === void 0) continue;
     if (HOST_INSTALL_STRIP_ENV_NAMES.has(name)) continue;
+    if (isDangerousEnvName(name)) continue;
     if (name.startsWith("SCRIPT_JAIL_")) continue;
     env[name] = value;
   }
+  const sanitizedPath = sanitizePathValue(process.env["PATH"]);
+  if (sanitizedPath === void 0) delete env["PATH"];
+  else env["PATH"] = sanitizedPath;
   env["npm_config_git"] = trustedGitPath();
   if (pm === "yarn") {
     env["YARN_IGNORE_PATH"] = "1";

@@ -40,6 +40,28 @@ determinism across hosts:
   sandbox guarantee — see the `install: true` trust model in
   [docs/design.md](./design.md#drop-in-install-trust-model-install-true).
 
+- **`install: true` host package-manager VERSION (defense-in-depth residual).**
+  The host lifecycle pass (`src/action/host-install.ts`) spawns the package
+  manager by **bare name**, resolved from the runner `PATH`, so it runs the
+  **runner's** installed `npm`/`pnpm`/`yarn` version — not the corepack-pinned
+  version the guest audit uses inside the sandbox. A lifecycle script that
+  branches on the PM version (`npm --version`, `process.env.npm_config_user_agent`,
+  a `packageManager`-gated code path) therefore sees the runner's version on the
+  host re-run and the corepack-pinned one in the audit, so its behaviour can
+  diverge. This is **low severity and not PR-controllable**: the runner PM
+  version is owner/runner-image controlled, not something a fork PR can set, and
+  it is bounded by the same trust model as the rest of the host pass — the host
+  only runs lifecycle scripts whose sandbox audit was already clean. We
+  deliberately do **not** invoke corepack on the host (a risky behaviour change
+  for a defense-in-depth gap); **Firecracker is the enforcement boundary**, and
+  this is an accepted residual rather than a parity bug. (The host child env is
+  otherwise hardened: `hostInstallEnv` strips inherited loader/config vars —
+  `NODE_OPTIONS`, `LD_PRELOAD`/`LD_AUDIT`/`DYLD_*`, `GIT_SSH_COMMAND` and the
+  other git transport overrides, `NPM_CONFIG_SCRIPT_SHELL`/`_USERCONFIG`/
+  `_GLOBALCONFIG`/`_IGNORE_SCRIPTS` — and sanitizes `PATH` of every
+  checkout-controlled dir, so a PR cannot inject pre-trust code or redirect
+  tool/config resolution that the audit never saw.)
+
 - **Native binaries the lifecycle script execs directly.** Some scripts
   shell out to a host-provided binary (`python`, `cc`, `make`). Whether the
   VM rootfs ships that binary is a property of the rootfs build, not of the

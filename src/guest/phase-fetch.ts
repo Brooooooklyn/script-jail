@@ -62,6 +62,9 @@
 //   All three overlay files are OPTIONAL. Absence is the normal action and
 //   CLI path after the switch to arm64 CI parity.
 
+import { existsSync } from 'node:fs';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
+
 import { FETCH_CMD, pnpmStoreDirArg } from '../shared/pm-commands.js';
 import { applyPnpmArchOverlay } from './apply-pnpm-arch.js';
 import { loadPmFlags } from './load-pm-flags.js';
@@ -95,6 +98,54 @@ export interface PhaseFetchInput {
 
 // FETCH_CMD lives in ../shared/pm-commands.ts so the host drop-in install
 // (src/action/host-install.ts part-1) uses the byte-identical command.
+
+// ---------------------------------------------------------------------------
+// SECURITY: pin npm's `git` config to the guest's OWN trusted git (Phase A)
+// ---------------------------------------------------------------------------
+//
+// npm's `git` CONFIG selects the git BINARY npm invokes to clone a non-GitHub
+// git dependency (git+https://gitlab.com/…, git+ssh://, git+file://; GitHub
+// deps use the codeload HTTPS tarball and never trigger git).  `npm ci
+// --ignore-scripts` INVOKES that configured git during Phase A — `--ignore-scripts`
+// only disables lifecycle SCRIPTS, which is orthogonal to which git binary runs.
+// A repo `.npmrc` can OVERRIDE the git binary (`git=./fake-git`), and the
+// sandbox stages the repo verbatim (including that `./fake-git`), so without a
+// pin the AUDIT would clone a fake/benign tree while the host (already pinned to
+// a trusted git via src/action/host-install.ts) clones the REAL tree — the lock
+// would match yet authorize an un-audited dependency tree.  Pin the guest fetch
+// to a trusted git so host==guest parity holds.
+//
+// npm config precedence: an `npm_config_git` ENV var BEATS the project `.npmrc`,
+// so injecting it into the fetch child env defeats the repo override.  The guest
+// PATH is curated and carries NO checkout dir, so resolving git on the guest
+// PATH (to an ABSOLUTE path, skipping any candidate under the staged repo `cwd`)
+// is safe; the bare literal `git` fallback still OVERRIDES (defeats) the repo
+// `.npmrc git=` entry and npm resolves it via the curated PATH.  The guest's git
+// can clone ANY url, including legit private git deps, so this does not break
+// them — it only stops a checkout-resident fake git from being honored.
+// npm-specific but harmless for pnpm/yarn (they ignore `npm_config_git`), so it
+// is applied ONLY on the npm fetch.  Phase B (`npm rebuild`) never clones, so the
+// pin belongs here on the fetch path.
+function trustedGuestGit(cwd: string): string {
+  const pathVar = process.env['PATH'];
+  if (pathVar !== undefined && pathVar !== '') {
+    const repo = resolve(cwd);
+    for (const dir of pathVar.split(delimiter)) {
+      if (dir === '') continue;
+      const candidate = join(dir, 'git');
+      // Only an ABSOLUTE candidate OUTSIDE the staged repo: a relative PATH
+      // entry (e.g. `.`) or one under the checkout could point npm at a
+      // repo-placed shadow `git`.
+      if (!isAbsolute(candidate)) continue;
+      if (candidate === repo || candidate.startsWith(repo + '/')) continue;
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  // No git outside the repo on PATH — fall back to the bare literal.  It still
+  // OVERRIDES the repo `.npmrc git=` value (defeating the redirect) and npm
+  // resolves it via the curated guest PATH (which has no checkout dir).
+  return 'git';
+}
 
 export async function runFetchPhase(
   input: PhaseFetchInput,
@@ -142,8 +193,19 @@ export async function runFetchPhase(
   // shared with the host install via pnpmStoreDirArg so the two cannot drift.
   args = [...args, ...pnpmStoreDirArg(input.manager, input.cwd)];
 
+  // SECURITY (npm only): pin the git binary to the guest's trusted git so the
+  // audit clones the SAME (real) tree the host does, defeating a repo
+  // `.npmrc git=./fake-git` redirect.  Set LAST so it overrides any inherited
+  // `npm_config_git` from `input.env`.  pnpm/yarn ignore this key, so a clone
+  // of `input.env` only for npm keeps their fetch env byte-identical (no spurious
+  // env_read of an unread key).  See trustedGuestGit() above.
+  const env =
+    input.manager === 'npm'
+      ? { ...input.env, npm_config_git: trustedGuestGit(input.cwd) }
+      : input.env;
+
   const result = await input.spawner.spawn(cmd, args, {
-    env: input.env,
+    env,
     cwd: input.cwd,
   });
 

@@ -10369,7 +10369,7 @@ __export(agent_exports, {
   scratchBaseDir: () => scratchBaseDir
 });
 module.exports = __toCommonJS(agent_exports);
-var import_node_fs4 = require("node:fs");
+var import_node_fs5 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_readline2 = require("node:readline");
 var import_node_net = require("node:net");
@@ -11992,8 +11992,8 @@ function emoji() {
 }
 var ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
 var ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
-var mac = (delimiter) => {
-  const escapedDelim = escapeRegex(delimiter ?? ":");
+var mac = (delimiter2) => {
+  const escapedDelim = escapeRegex(delimiter2 ?? ":");
   return new RegExp(`^(?:[0-9A-F]{2}${escapedDelim}){5}[0-9A-F]{2}$|^(?:[0-9a-f]{2}${escapedDelim}){5}[0-9a-f]{2}$`);
 };
 var cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
@@ -24893,7 +24893,7 @@ function date4(params) {
 config(en_default());
 
 // src/guest/agent.ts
-var import_node_path5 = require("node:path");
+var import_node_path6 = require("node:path");
 
 // src/lock/schema.ts
 var LifecycleStage = external_exports.enum(["preinstall", "install", "postinstall", "prepare"]);
@@ -25531,6 +25531,10 @@ var Emitter = class {
   }
 };
 
+// src/guest/phase-fetch.ts
+var import_node_fs3 = require("node:fs");
+var import_node_path2 = require("node:path");
+
 // src/shared/pm-commands.ts
 var FETCH_CMD = {
   npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
@@ -25756,6 +25760,20 @@ function loadPmFlags(filePath = PM_FLAGS_PATH) {
 }
 
 // src/guest/phase-fetch.ts
+function trustedGuestGit(cwd) {
+  const pathVar = process.env["PATH"];
+  if (pathVar !== void 0 && pathVar !== "") {
+    const repo = (0, import_node_path2.resolve)(cwd);
+    for (const dir of pathVar.split(import_node_path2.delimiter)) {
+      if (dir === "") continue;
+      const candidate = (0, import_node_path2.join)(dir, "git");
+      if (!(0, import_node_path2.isAbsolute)(candidate)) continue;
+      if (candidate === repo || candidate.startsWith(repo + "/")) continue;
+      if ((0, import_node_fs3.existsSync)(candidate)) return candidate;
+    }
+  }
+  return "git";
+}
 async function runFetchPhase(input) {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
   const { extraInstallArgs, userInstallArgs } = loadPmFlags(input.pmFlagsPath);
@@ -25770,8 +25788,9 @@ async function runFetchPhase(input) {
     applyPnpmArchOverlay({ cwd: input.cwd, ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {} });
   }
   args = [...args, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  const env = input.manager === "npm" ? { ...input.env, npm_config_git: trustedGuestGit(input.cwd) } : input.env;
   const result = await input.spawner.spawn(cmd, args, {
-    env: input.env,
+    env,
     cwd: input.cwd
   });
   return {
@@ -28744,7 +28763,7 @@ async function runInstallPhase(input) {
 }
 
 // src/guest/phase-install-macos.ts
-var import_node_path2 = require("node:path");
+var import_node_path3 = require("node:path");
 function parseMacosShimLine(line) {
   let obj;
   try {
@@ -28774,12 +28793,12 @@ var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
 ]);
 function macosManagerLaunch(manager, subArgs) {
   const node = process.execPath;
-  const toolchainRoot = (0, import_node_path2.dirname)((0, import_node_path2.dirname)(node));
+  const toolchainRoot = (0, import_node_path3.dirname)((0, import_node_path3.dirname)(node));
   if (manager === "npm") {
-    const npmCli = (0, import_node_path2.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    const npmCli = (0, import_node_path3.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
     return { cmd: node, args: [npmCli, ...subArgs] };
   }
-  const corepackCli = (0, import_node_path2.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
+  const corepackCli = (0, import_node_path3.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
   return { cmd: node, args: [corepackCli, manager, ...subArgs] };
 }
 function buildMacosInstallCommand(manager, cwd, commandOverride) {
@@ -29141,7 +29160,7 @@ async function runInstallPhaseMacos(input) {
 
 // src/guest/macos-install-runner.ts
 var import_node_child_process2 = require("node:child_process");
-var import_node_path3 = require("node:path");
+var import_node_path4 = require("node:path");
 var import_node_readline = require("node:readline");
 var MacOSInstallRunner = class {
   _exitCode = 0;
@@ -29222,18 +29241,18 @@ var MacOSInstallRunner = class {
       env: opts.env,
       stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
-    const exitPromise = new Promise((resolve2) => {
+    const exitPromise = new Promise((resolve3) => {
       child.on("close", (code) => {
         this._exitCode = code ?? 1;
-        resolve2();
+        resolve3();
       });
       child.on("error", () => {
         this._exitCode = 1;
-        resolve2();
+        resolve3();
       });
     });
-    const watchDir = (0, import_node_path3.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path3.basename)(opts.basePath);
+    const watchDir = (0, import_node_path4.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path4.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
@@ -29353,7 +29372,7 @@ function normalize(events, ctx) {
   const os = ctx.os ?? "linux";
   for (const ev of events) {
     const fsPath = (ev.raw.kind === "read" || ev.raw.kind === "write") && os === "darwin" ? canonicalizePrivateRealpath(ev.raw.path) : ev.raw.kind === "read" || ev.raw.kind === "write" ? ev.raw.path : void 0;
-    if (isSystemNoise(ev, fsPath, os)) continue;
+    if (isSystemNoise(ev, fsPath, os, ctx.roots)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
     const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
     const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "env_read" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_tamper") && ev.raw.root_anchored !== true;
@@ -29537,9 +29556,10 @@ function parseBlockedSpawn(entry) {
   if (!match) return null;
   return { command: match[1] };
 }
-function isSystemNoise(ev, fsPath, os) {
+function isSystemNoise(ev, fsPath, os, roots) {
   if (ev.raw.kind !== "read" && ev.raw.kind !== "write") return false;
   const p = fsPath ?? ev.raw.path;
+  if (isUnderRoot(p, roots.repo) || isUnderRoot(p, roots.nodeModules)) return false;
   if (SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix))) return true;
   if (os === "darwin") {
     if (SYSTEM_NOISE_PREFIXES_DARWIN.some((prefix) => p.startsWith(prefix))) return true;
@@ -29550,6 +29570,10 @@ function isSystemNoise(ev, fsPath, os) {
 }
 function basename3(path3) {
   return path3.slice(path3.lastIndexOf("/") + 1);
+}
+function isUnderRoot(path3, root) {
+  if (!path3.startsWith(root)) return false;
+  return path3.length === root.length || path3[root.length] === "/";
 }
 
 // src/lock/render.ts
@@ -29622,30 +29646,30 @@ function renderBlock(block) {
 }
 
 // src/guest/discover-pkg-dirs.ts
-var import_node_fs3 = require("node:fs");
-var import_node_path4 = require("node:path");
+var import_node_fs4 = require("node:fs");
+var import_node_path5 = require("node:path");
 function discoverPkgDirs(nodeModulesDir) {
   const result = /* @__PURE__ */ new Map();
   let entries;
   try {
-    entries = (0, import_node_fs3.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
+    entries = (0, import_node_fs4.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return result;
   }
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
-    const entryPath = (0, import_node_path4.join)(nodeModulesDir, entry.name);
+    const entryPath = (0, import_node_path5.join)(nodeModulesDir, entry.name);
     if (entry.name.startsWith("@")) {
       let scopeEntries;
       try {
-        scopeEntries = (0, import_node_fs3.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
+        scopeEntries = (0, import_node_fs4.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
       } catch {
         continue;
       }
       for (const scopeEntry of scopeEntries) {
         if (scopeEntry.name.startsWith(".")) continue;
         if (!scopeEntry.isDirectory() && !scopeEntry.isSymbolicLink()) continue;
-        const pkgPath = (0, import_node_path4.join)(entryPath, scopeEntry.name);
+        const pkgPath = (0, import_node_path5.join)(entryPath, scopeEntry.name);
         readAndRegister(pkgPath, result);
       }
     } else {
@@ -29653,22 +29677,22 @@ function discoverPkgDirs(nodeModulesDir) {
       readAndRegister(entryPath, result);
     }
   }
-  scanPnpmVirtualStore((0, import_node_path4.join)(nodeModulesDir, ".pnpm"), result);
+  scanPnpmVirtualStore((0, import_node_path5.join)(nodeModulesDir, ".pnpm"), result);
   return result;
 }
 function scanPnpmVirtualStore(pnpmDir, result) {
   let flatEntries;
   try {
-    flatEntries = (0, import_node_fs3.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
+    flatEntries = (0, import_node_fs4.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return;
   }
   for (const flat of flatEntries) {
     if (!flat.isDirectory()) continue;
-    const innerNm = (0, import_node_path4.join)(pnpmDir, flat.name, "node_modules");
+    const innerNm = (0, import_node_path5.join)(pnpmDir, flat.name, "node_modules");
     let innerEntries;
     try {
-      innerEntries = (0, import_node_fs3.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
+      innerEntries = (0, import_node_fs4.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
     } catch {
       continue;
     }
@@ -29676,29 +29700,29 @@ function scanPnpmVirtualStore(pnpmDir, result) {
       if (inner.name.startsWith(".")) continue;
       if (inner.isSymbolicLink() || !inner.isDirectory()) continue;
       if (inner.name.startsWith("@")) {
-        const scopeDir = (0, import_node_path4.join)(innerNm, inner.name);
+        const scopeDir = (0, import_node_path5.join)(innerNm, inner.name);
         let scopeEntries;
         try {
-          scopeEntries = (0, import_node_fs3.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
+          scopeEntries = (0, import_node_fs4.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
         } catch {
           continue;
         }
         for (const se of scopeEntries) {
           if (se.name.startsWith(".")) continue;
           if (se.isSymbolicLink() || !se.isDirectory()) continue;
-          readAndRegister((0, import_node_path4.join)(scopeDir, se.name), result);
+          readAndRegister((0, import_node_path5.join)(scopeDir, se.name), result);
         }
       } else {
-        readAndRegister((0, import_node_path4.join)(innerNm, inner.name), result);
+        readAndRegister((0, import_node_path5.join)(innerNm, inner.name), result);
       }
     }
   }
 }
 function readAndRegister(pkgPath, result) {
-  const manifestPath = (0, import_node_path4.join)(pkgPath, "package.json");
+  const manifestPath = (0, import_node_path5.join)(pkgPath, "package.json");
   let raw;
   try {
-    raw = (0, import_node_fs3.readFileSync)(manifestPath, "utf8");
+    raw = (0, import_node_fs4.readFileSync)(manifestPath, "utf8");
   } catch (err) {
     if (err.code !== "ENOENT") {
       process.stderr.write(
@@ -29784,7 +29808,7 @@ var LinuxVsockConnection = class _LinuxVsockConnection {
    */
   static async listen(port) {
     const server = (0, import_node_net.createServer)();
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       const onError = (err) => {
         server.removeListener("connection", onConnection);
         reject(err);
@@ -29792,7 +29816,7 @@ var LinuxVsockConnection = class _LinuxVsockConnection {
       const onConnection = (sock) => {
         server.removeListener("error", onError);
         server.close();
-        resolve2(new _LinuxVsockConnection(server, sock));
+        resolve3(new _LinuxVsockConnection(server, sock));
       };
       server.once("error", onError);
       server.once("connection", onConnection);
@@ -29847,7 +29871,7 @@ var StdioConnection = class {
 };
 var LinuxSpawner = class {
   async spawn(cmd, args, opts) {
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       const child = (0, import_node_child_process3.spawn)(cmd, args, {
         cwd: opts.cwd,
         env: opts.env,
@@ -29863,7 +29887,7 @@ var LinuxSpawner = class {
       });
       child.on("error", reject);
       child.on("close", (code) => {
-        resolve2({ exitCode: code ?? 1, stdout, stderr });
+        resolve3({ exitCode: code ?? 1, stdout, stderr });
       });
     });
   }
@@ -29879,8 +29903,8 @@ async function* runStraceTailer(opts) {
   const drainMs = opts.drainMs ?? 100;
   const settleHardCapMs = opts.settleHardCapMs ?? 2e3;
   const settleQuietPasses = opts.settleQuietPasses ?? 2;
-  const delay = (ms) => new Promise((resolve2) => {
-    const t = setTimeout(resolve2, ms);
+  const delay = (ms) => new Promise((resolve3) => {
+    const t = setTimeout(resolve3, ms);
     t.unref?.();
   });
   const queue = [];
@@ -29914,7 +29938,7 @@ async function* runStraceTailer(opts) {
     const pos = filePos.get(name) ?? 0;
     let size = 0;
     try {
-      size = (0, import_node_fs4.statSync)(fullPath).size;
+      size = (0, import_node_fs5.statSync)(fullPath).size;
     } catch {
       return;
     }
@@ -29924,18 +29948,18 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs4.openSync)(fullPath, "r");
-      bytesRead = (0, import_node_fs4.readSync)(fd, buf, 0, toRead, pos);
+      fd = (0, import_node_fs5.openSync)(fullPath, "r");
+      bytesRead = (0, import_node_fs5.readSync)(fd, buf, 0, toRead, pos);
     } catch {
       if (fd >= 0) {
         try {
-          (0, import_node_fs4.closeSync)(fd);
+          (0, import_node_fs5.closeSync)(fd);
         } catch {
         }
       }
       return;
     }
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
     filePos.set(name, pos + bytesRead);
     const chunk = (fileBuf.get(name) ?? "") + buf.slice(0, bytesRead).toString("utf8");
     const newlineIdx = chunk.lastIndexOf("\n");
@@ -29956,7 +29980,7 @@ async function* runStraceTailer(opts) {
   function pollDir() {
     let entries;
     try {
-      entries = (0, import_node_fs4.readdirSync)(opts.watchDir);
+      entries = (0, import_node_fs5.readdirSync)(opts.watchDir);
     } catch {
       return;
     }
@@ -29986,7 +30010,7 @@ async function* runStraceTailer(opts) {
     if (path3 === void 0 || path3 === "") return;
     let stat;
     try {
-      stat = (0, import_node_fs4.statSync)(path3, { bigint: true });
+      stat = (0, import_node_fs5.statSync)(path3, { bigint: true });
     } catch (err) {
       const code = err.code;
       if (code === "ENOENT") {
@@ -30058,22 +30082,22 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs4.openSync)(path3, "r");
+      fd = (0, import_node_fs5.openSync)(path3, "r");
       if (baseline !== void 0) {
-        const fdStat = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
+        const fdStat = (0, import_node_fs5.fstatSync)(fd, { bigint: true });
         if (fdStat.ino !== baseline.ino || fdStat.dev !== baseline.dev) {
-          (0, import_node_fs4.closeSync)(fd);
+          (0, import_node_fs5.closeSync)(fd);
           recordTamper(
             `events file fd-stat mismatch on open (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${fdStat.dev} ino=${fdStat.ino}): ${path3}`
           );
           return;
         }
       }
-      bytesRead = (0, import_node_fs4.readSync)(fd, buf, 0, toRead, eventsPos);
+      bytesRead = (0, import_node_fs5.readSync)(fd, buf, 0, toRead, eventsPos);
     } catch (err) {
       if (fd >= 0) {
         try {
-          (0, import_node_fs4.closeSync)(fd);
+          (0, import_node_fs5.closeSync)(fd);
         } catch {
         }
       }
@@ -30083,7 +30107,7 @@ async function* runStraceTailer(opts) {
       }
       return;
     }
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
     eventsPos += bytesRead;
     lastConsumedCtime = ctimeBig;
     const chunk = eventsBuf + buf.slice(0, bytesRead).toString("utf8");
@@ -30119,7 +30143,7 @@ async function* runStraceTailer(opts) {
   }
   let watcher = null;
   try {
-    watcher = (0, import_node_fs4.watch)(opts.watchDir, (_event, _filename) => {
+    watcher = (0, import_node_fs5.watch)(opts.watchDir, (_event, _filename) => {
       drainEventsFile();
       pollDir();
       wake();
@@ -30131,7 +30155,7 @@ async function* runStraceTailer(opts) {
   let eventsWatcher = null;
   if (opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     try {
-      eventsWatcher = (0, import_node_fs4.watch)(opts.eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = (0, import_node_fs5.watch)(opts.eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
         wake();
       });
@@ -30144,7 +30168,7 @@ async function* runStraceTailer(opts) {
   if (opts.eventsDirPath !== void 0 && opts.eventsDirPath !== "" && opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     const expectedBasename = opts.eventsFileBasename ?? opts.eventsFilePath.slice(opts.eventsFilePath.lastIndexOf("/") + 1);
     try {
-      eventsDirWatcher = (0, import_node_fs4.watch)(
+      eventsDirWatcher = (0, import_node_fs5.watch)(
         opts.eventsDirPath,
         { persistent: false },
         (event, filename) => {
@@ -30266,8 +30290,8 @@ async function* runStraceTailer(opts) {
         yield queue.shift();
       }
       if (done && fd3Done && queue.length === 0) break;
-      await new Promise((resolve2) => {
-        wakeResolve = resolve2;
+      await new Promise((resolve3) => {
+        wakeResolve = resolve3;
       });
     }
   } finally {
@@ -30311,7 +30335,7 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
     if (Date.now() - start >= deadlineMs) break;
     let raw;
     try {
-      raw = (0, import_node_fs4.readFileSync)(
+      raw = (0, import_node_fs5.readFileSync)(
         `/proc/${stracePid}/task/${stracePid}/children`,
         "utf8"
       ).trim();
@@ -30522,21 +30546,21 @@ var LinuxStraceRunner = class {
       code: null,
       signal: null
     };
-    const exitPromise = new Promise((resolve2) => {
+    const exitPromise = new Promise((resolve3) => {
       child.on("close", (code, signal) => {
         exitStatus.code = code;
         exitStatus.signal = signal;
         this._exitCode = code ?? 1;
-        resolve2();
+        resolve3();
       });
       child.on("error", () => {
         exitStatus.spawnError = true;
         this._exitCode = 1;
-        resolve2();
+        resolve3();
       });
     });
-    const watchDir = (0, import_node_path5.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path5.basename)(opts.basePath);
+    const watchDir = (0, import_node_path6.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path6.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
@@ -30556,7 +30580,7 @@ var LinuxStraceRunner = class {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
           eventsDirPath: this._eventsFile.dirPath,
-          eventsFileBasename: (0, import_node_path5.basename)(this._eventsFile.path),
+          eventsFileBasename: (0, import_node_path6.basename)(this._eventsFile.path),
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
@@ -30592,12 +30616,12 @@ var LinuxStraceRunner = class {
   }
 };
 function detectManager(cwd) {
-  if ((0, import_node_fs4.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
-  if ((0, import_node_fs4.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
+  if ((0, import_node_fs5.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
+  if ((0, import_node_fs5.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
   return "npm";
 }
 async function waitForGo(readable) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     const rl = (0, import_node_readline2.createInterface)({ input: readable, crlfDelay: Infinity });
     const cleanup = () => {
       rl.removeListener("line", onLine);
@@ -30608,7 +30632,7 @@ async function waitForGo(readable) {
       const trimmed = line.trim();
       if (trimmed === "go") {
         cleanup();
-        resolve2();
+        resolve3();
       } else {
         cleanup();
         reject(new Error(`script-jail agent: unexpected control signal from host: ${JSON.stringify(trimmed)}`));
@@ -30796,7 +30820,7 @@ function macosTokenizeRoots(workDir) {
   const rawTmp = (0, import_node_os.tmpdir)();
   let tmp;
   try {
-    tmp = (0, import_node_fs4.realpathSync)(rawTmp);
+    tmp = (0, import_node_fs5.realpathSync)(rawTmp);
   } catch {
     tmp = rawTmp;
   }
@@ -30814,36 +30838,36 @@ function scratchBaseDir(env = process.env) {
 }
 function createEventsFile(parentDir = scratchBaseDir()) {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
-  const dirPath = (0, import_node_fs4.mkdtempSync)((0, import_node_path5.join)(parentDir, `script-jail-events-${tag}-`));
-  (0, import_node_fs4.chmodSync)(dirPath, 448);
-  const path3 = (0, import_node_path5.join)(dirPath, `events-${tag}.jsonl`);
-  const fd = (0, import_node_fs4.openSync)(
+  const dirPath = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(parentDir, `script-jail-events-${tag}-`));
+  (0, import_node_fs5.chmodSync)(dirPath, 448);
+  const path3 = (0, import_node_path6.join)(dirPath, `events-${tag}.jsonl`);
+  const fd = (0, import_node_fs5.openSync)(
     path3,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition
-    import_node_fs4.constants.O_RDWR | import_node_fs4.constants.O_CREAT | import_node_fs4.constants.O_EXCL | import_node_fs4.constants.O_NOFOLLOW,
+    import_node_fs5.constants.O_RDWR | import_node_fs5.constants.O_CREAT | import_node_fs5.constants.O_EXCL | import_node_fs5.constants.O_NOFOLLOW,
     384
   );
   let baseline;
   try {
-    const s = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
+    const s = (0, import_node_fs5.fstatSync)(fd, { bigint: true });
     baseline = { ino: s.ino, dev: s.dev, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
   } finally {
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
   }
   return { path: path3, dirPath, baseline };
 }
 async function verifyOfflineWithTimeout(lookup, timeoutMs = 2e3) {
   let timer;
   return Promise.race([
-    new Promise((resolve2) => {
+    new Promise((resolve3) => {
       lookup("registry.npmjs.org", (err) => {
         if (timer !== void 0) clearTimeout(timer);
-        resolve2(err !== null);
+        resolve3(err !== null);
       });
     }),
-    new Promise((resolve2) => {
+    new Promise((resolve3) => {
       timer = setTimeout(() => {
-        resolve2(true);
+        resolve3(true);
       }, timeoutMs);
     })
   ]);
@@ -30878,7 +30902,7 @@ function resolvePrepareCommand(manager, cwd) {
   }
   if (manager === "yarn") {
     try {
-      const pkgRaw = (0, import_node_fs4.readFileSync)((0, import_node_path5.join)(cwd, "package.json"), "utf8");
+      const pkgRaw = (0, import_node_fs5.readFileSync)((0, import_node_path6.join)(cwd, "package.json"), "utf8");
       const pkg = JSON.parse(pkgRaw);
       const prepare = pkg.scripts?.["prepare"];
       if (typeof prepare === "string" && prepare.length > 0) {
@@ -30914,7 +30938,7 @@ async function main(input) {
   diag(input, `main(): configPath=${configPath}`);
   let rawConfig;
   try {
-    const text = (0, import_node_fs4.readFileSync)(configPath, "utf8");
+    const text = (0, import_node_fs5.readFileSync)(configPath, "utf8");
     rawConfig = (0, import_yaml2.parse)(text);
   } catch (err) {
     throw new Error(`script-jail agent: failed to read config at ${configPath}: ${String(err)}`);
@@ -30963,7 +30987,7 @@ async function main(input) {
   let canonicalRootKey = null;
   let malformedRootName = false;
   try {
-    const rootManifest = JSON.parse((0, import_node_fs4.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
+    const rootManifest = JSON.parse((0, import_node_fs5.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
     malformedRootName = rootManifest.name !== void 0 && typeof rootManifest.name !== "string";
     ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
   } catch {
@@ -31108,7 +31132,7 @@ ${fetchDetail}
   });
   const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
   try {
-    (0, import_node_fs4.mkdirSync)(straceBaseDir, { recursive: true });
+    (0, import_node_fs5.mkdirSync)(straceBaseDir, { recursive: true });
   } catch {
   }
   const installInput = {
@@ -31301,7 +31325,7 @@ ${stdoutTail}`;
     let sha256 = config2.manager_lockfile_sha256;
     if (!sha256 && config2.lockfile_path) {
       try {
-        const lockfileContent = (0, import_node_fs4.readFileSync)(config2.lockfile_path);
+        const lockfileContent = (0, import_node_fs5.readFileSync)(config2.lockfile_path);
         sha256 = (0, import_node_crypto.createHash)("sha256").update(lockfileContent).digest("hex");
       } catch {
         sha256 = "";

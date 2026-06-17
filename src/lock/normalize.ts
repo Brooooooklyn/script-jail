@@ -165,7 +165,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         : ev.raw.kind === 'read' || ev.raw.kind === 'write'
           ? ev.raw.path
           : undefined;
-    if (isSystemNoise(ev, fsPath, os)) continue;
+    if (isSystemNoise(ev, fsPath, os, ctx.roots)) continue;
 
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
 
@@ -561,11 +561,24 @@ function isSystemNoise(
   ev: AttributedEvent,
   fsPath: string | undefined,
   os: 'linux' | 'darwin',
+  roots: TokenizeRoots,
 ): boolean {
   if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') return false;
   // fsPath is always defined for read/write (computed by the caller): on
   // darwin it is the /private-canonicalized path, on linux it is ev.raw.path.
   const p = fsPath ?? ev.raw.path;
+  // The audited repo ALWAYS wins over every system-noise prefix.  The install:true
+  // M1 fix aligns the guest audit work_dir to the host repoDir, so on a SELF-HOSTED
+  // GitHub runner the checkout lives under /opt/actions-runner/_work/<repo>/<repo> —
+  // i.e. roots.repo is UNDER the bare `/opt` noise prefix.  Without this guard the
+  // `/opt` startsWith match would swallow EVERY repo fs read/write (escaped_writes
+  // and cross-package node_modules writes included — the lock's primary fs attack
+  // channel), so a malicious package's filesystem behaviour would silently vanish
+  // from the lock on those runners.  Checking roots.repo also covers roots.nodeModules
+  // (it lives under repo).  In the common case (repo NOT under /opt) this is a no-op:
+  // such a path would not have matched any noise prefix anyway.  The genuine /opt/vp
+  // toolchain reads are NOT under roots.repo, so they still drop below.
+  if (isUnderRoot(p, roots.repo) || isUnderRoot(p, roots.nodeModules)) return false;
   // Shared prefixes apply on BOTH platforms (macOS ships /usr/lib, /usr/share,
   // /dev too) so Linux output stays byte-identical regardless of os.
   if (SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix))) return true;
@@ -584,4 +597,13 @@ function isSystemNoise(
 
 function basename(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1);
+}
+
+// True when `path` is `root` itself or lies inside `root`, with a path-segment
+// boundary so `/work` matches `/work` and `/work/x` but NOT `/worker`.  Mirrors
+// tokenize.ts's (unexported) pathHasPrefix so the repo-wins exemption in
+// isSystemNoise honours the same prefix semantics tokenization later uses.
+function isUnderRoot(path: string, root: string): boolean {
+  if (!path.startsWith(root)) return false;
+  return path.length === root.length || path[root.length] === '/';
 }

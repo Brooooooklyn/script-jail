@@ -4,7 +4,7 @@
 // part 2: run lifecycle scripts).  A fake spawn is injected so no real
 // package manager runs.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { isAbsolute, join, delimiter } from 'node:path';
 import {
   mkdtempSync,
@@ -800,14 +800,37 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     }
   });
 
-  it('preserves the inherited env (PATH/HOME etc.) by merging over process.env', () => {
+  it('preserves the inherited env (HOME etc.) and the SYSTEM PATH entries by merging over process.env', () => {
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
     hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
-    // PATH (set in every test env) must survive the merge.
-    expect(envs[0]!['PATH']).toBe(process.env['PATH']);
+    // PATH survives the merge, but it is now SANITIZED ([5]+[9]): any entry whose
+    // real path is under a checkout root (process.cwd() is always one) is dropped
+    // so a checkout-placed bin/<tool> cannot shadow the bare-name PM/tool lookup.
+    // Under vitest, PATH is prefixed with `./node_modules/.bin` + `<cwd>/node_modules/.bin`
+    // (both under cwd) — those are correctly dropped; the system dirs survive in order.
+    const before = process.env['PATH']!.split(delimiter);
+    const after = envs[0]!['PATH']!.split(delimiter);
+    const cwd = realpathSync(process.cwd());
+    const survivors = before.filter(
+      (p) => p !== '' && !realpathSafe(p).startsWith(cwd),
+    );
+    expect(after).toEqual(survivors);
+    // The cwd-resident node_modules/.bin entries vitest injects ARE dropped.
+    expect(after.some((p) => realpathSafe(p).startsWith(cwd))).toBe(false);
+    // A genuine system dir survives.
+    expect(after).toContain('/usr/bin');
   });
 });
+
+/** realpath that falls back to the lexical path when the entry does not exist. */
+function realpathSafe(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
 
 describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true defense-in-depth)', () => {
   /** Run `body` with extra env vars set, restoring the prior values after. */
@@ -853,7 +876,12 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
           }
           // The security pins / inherited essentials still survive the strip.
           expect(env['npm_config_git']).toBeDefined();
-          expect(env['PATH']).toBe(process.env['PATH']);
+          // PATH survives but is SANITIZED ([5]+[9]): cwd-resident entries (the
+          // vitest node_modules/.bin prefixes) are dropped; system dirs survive.
+          expect(env['PATH']).toBeDefined();
+          expect(env['PATH']!.split(delimiter)).toContain('/usr/bin');
+          const cwd = realpathSync(process.cwd());
+          expect(env['PATH']!.split(delimiter).some((p) => realpathSafe(p).startsWith(cwd))).toBe(false);
         },
       );
     },
@@ -1056,4 +1084,186 @@ describe('streamSpawn (part-2 real-child integration)', () => {
     // The grace-truncation marker stands in for the dropped fragment.
     expect(lines).toContainEqual({ which: 'stdout', line: HOST_PART2_TRUNCATED_MARKER });
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// SECURITY: strip INHERITED loader/config env vars + sanitize PATH
+// ---------------------------------------------------------------------------
+//
+// The host PM child inherits the runner env; the Firecracker/Docker audit
+// reconstructs its env from scratch (it never inherits the runner env).  So an
+// inherited LOADER / TOOL-RESOLUTION / CONFIG-LOCATING var the host honours but
+// the audit never saw is a divergence — a clean trusted lock would authorize
+// unaudited host behaviour (pre-trust RCE in part-1, or host/audit config
+// drift).  hostInstallEnv() must drop these and sanitize PATH so a
+// checkout-controlled dir cannot shadow the bare-name PM/tool resolution.  Both
+// host phases build their env via hostInstallEnv(), so both are covered.
+describe('host env hardening — strip dangerous loader/config vars + sanitize PATH', () => {
+  // Snapshot/restore the whole env so a test that mutates process.env can't
+  // bleed into the next (the dangerous vars below would poison other suites).
+  const ENV_SNAPSHOT = { ...process.env };
+  afterEach(() => {
+    for (const k of Object.keys(process.env)) {
+      if (!(k in ENV_SNAPSHOT)) delete process.env[k];
+    }
+    for (const [k, v] of Object.entries(ENV_SNAPSHOT)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  // Every dangerous var, including a lowercase npm_config_* spelling (npm reads
+  // its config case-insensitively) and a UN-prefixed npm_config_* form.
+  const DANGEROUS_PRESENT: Record<string, string> = {
+    NODE_OPTIONS: '--require ./ci/evil.js',
+    NODE_REPL_EXTERNAL_MODULE: './ci/evil.js',
+    LD_PRELOAD: './ci/evil.so',
+    LD_AUDIT: './ci/audit.so',
+    LD_LIBRARY_PATH: './ci/lib',
+    DYLD_INSERT_LIBRARIES: './ci/evil.dylib',
+    DYLD_LIBRARY_PATH: './ci/lib',
+    DYLD_FORCE_FLAT_NAMESPACE: '1',
+    GIT_SSH_COMMAND: './ci/ssh',
+    GIT_SSH: './ci/ssh',
+    GIT_PROXY_COMMAND: './ci/proxy',
+    GIT_EXTERNAL_DIFF: './ci/diff',
+    NPM_CONFIG_SCRIPT_SHELL: './ci/shell',
+    NPM_CONFIG_USERCONFIG: './ci/.npmrc',
+    NPM_CONFIG_GLOBALCONFIG: './ci/global.npmrc',
+    NPM_CONFIG_IGNORE_SCRIPTS: 'true',
+    // case-insensitive npm_config_* matching: a lowercase spelling npm ALSO
+    // honours must be stripped too.
+    npm_config_script_shell: './ci/lower-shell',
+  };
+
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'strips EVERY dangerous loader/config var from the part-1 env (%s)',
+    (pm) => {
+      for (const [k, v] of Object.entries(DANGEROUS_PRESENT)) process.env[k] = v;
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], rec.io, envCapturingSpawn(envs));
+      const env = envs[0]!;
+      for (const k of Object.keys(DANGEROUS_PRESENT)) {
+        expect(env[k]).toBeUndefined();
+      }
+      // The security pins still survive the strip.
+      expect(env['npm_config_git']).toBeDefined();
+      if (pm === 'yarn') {
+        expect(env['YARN_IGNORE_PATH']).toBe('1');
+        expect(env['YARN_PLUGINS']).toBe('');
+      }
+    },
+  );
+
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'strips EVERY dangerous loader/config var from the part-2 lifecycle env (%s)',
+    async (pm) => {
+      for (const [k, v] of Object.entries(DANGEROUS_PRESENT)) process.env[k] = v;
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts(pm, '/repo', rec.io, [], envCapturingStreamSpawn(envs));
+      const env = envs[0]!;
+      for (const k of Object.keys(DANGEROUS_PRESENT)) {
+        expect(env[k]).toBeUndefined();
+      }
+      expect(env['npm_config_git']).toBeDefined();
+      if (pm === 'yarn') {
+        expect(env['YARN_IGNORE_PATH']).toBe('1');
+        expect(env['YARN_PLUGINS']).toBe('');
+      }
+    },
+  );
+
+  it('does NOT strip GIT_ALLOW_PROTOCOL (a restricting var) or legit env (CI/NODE_AUTH_TOKEN)', () => {
+    process.env['GIT_ALLOW_PROTOCOL'] = 'https'; // restricts — must be preserved
+    process.env['CI'] = 'true';
+    process.env['NODE_AUTH_TOKEN'] = 'tok-keep-me';
+    process.env['MY_UNRELATED_VAR'] = 'value-keep-me';
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    const env = envs[0]!;
+    expect(env['GIT_ALLOW_PROTOCOL']).toBe('https');
+    expect(env['CI']).toBe('true');
+    expect(env['NODE_AUTH_TOKEN']).toBe('tok-keep-me');
+    expect(env['MY_UNRELATED_VAR']).toBe('value-keep-me');
+  });
+
+  it('the git BINARY stays pinned (npm_config_git) even when GIT_SSH_COMMAND is stripped', () => {
+    // The transport-command override is removed, but the pinned git binary —
+    // set AFTER the strip loop — must remain (a value that OVERRIDES the repo
+    // .npmrc git= entry).
+    process.env['GIT_SSH_COMMAND'] = './ci/ssh';
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    const env = envs[0]!;
+    expect(env['GIT_SSH_COMMAND']).toBeUndefined();
+    const git = env['npm_config_git'];
+    expect(git).toBeDefined();
+    expect(git === 'git' || isAbsolute(git!)).toBe(true);
+  });
+
+  it('SANITIZES PATH: drops a checkout-under entry, keeps a system entry IN ORDER', () => {
+    // [5]+[9]: the workflow prepends a checkout dir to PATH and the PR commits
+    // bin/<tool> there; that PR-controlled dir must be dropped from the child
+    // PATH while the inherited system dirs survive — in their original order.
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-path-'));
+    const binDir = join(checkout, 'bin');
+    mkdirSync(binDir);
+    const sysA = '/usr/bin';
+    const sysB = '/bin';
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      // checkout bin FIRST, then two system dirs (preserve relative order),
+      // plus an empty segment (== cwd) which must also be dropped.
+      process.env['PATH'] = `${binDir}${delimiter}${sysA}${delimiter}${sysB}${delimiter}`;
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts('npm', checkout, [], rec.io, envCapturingSpawn(envs));
+      const resultPath = envs[0]!['PATH'];
+      expect(resultPath).toBeDefined();
+      const parts = resultPath!.split(delimiter);
+      // checkout dir dropped, empty segment dropped, system dirs survive in order.
+      expect(parts).toEqual([sysA, sysB]);
+      expect(parts.some((p) => p.startsWith(checkout))).toBe(false);
+      // PATH is NOT emptied — system entries remain.
+      expect(parts.length).toBeGreaterThan(0);
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+    }
+  });
+
+  it('SANITIZES PATH via SCRIPT_JAIL_REPO_DIR checkout root too (part-2 lifecycle env)', async () => {
+    // checkoutRoots() also honours $SCRIPT_JAIL_REPO_DIR (a repo root that can be
+    // a subdir of the checkout).  A PATH entry under it must drop in part-2 too.
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-'));
+    const binDir = join(repoDir, 'tools');
+    mkdirSync(binDir);
+    const origPath = process.env['PATH'];
+    const origRepo = process.env['SCRIPT_JAIL_REPO_DIR'];
+    try {
+      process.env['SCRIPT_JAIL_REPO_DIR'] = repoDir;
+      process.env['PATH'] = `${binDir}${delimiter}/usr/bin`;
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts('npm', repoDir, rec.io, [], envCapturingStreamSpawn(envs));
+      const parts = envs[0]!['PATH']!.split(delimiter);
+      expect(parts.some((p) => p.startsWith(repoDir))).toBe(false);
+      expect(parts).toContain('/usr/bin');
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origRepo === undefined) delete process.env['SCRIPT_JAIL_REPO_DIR'];
+      else process.env['SCRIPT_JAIL_REPO_DIR'] = origRepo;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
 });

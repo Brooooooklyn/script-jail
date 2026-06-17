@@ -230,6 +230,80 @@ describe('normalize', () => {
     }
   });
 
+  // Regression (finding #11): on a SELF-HOSTED GitHub runner the install:true M1
+  // fix aligns the guest audit work_dir to the host repoDir, so roots.repo lives
+  // under /opt/actions-runner/_work/<repo>/<repo> — i.e. UNDER the bare `/opt`
+  // system-noise prefix.  The repo must ALWAYS win over the noise prefix: a path
+  // inside roots.repo / roots.nodeModules must NEVER be dropped as noise, or a
+  // malicious package's fs behaviour (escaped_writes, cross-package writes) would
+  // silently vanish from the lock.  The genuine /opt/vp toolchain reads are NOT
+  // under roots.repo, so they still drop.
+  describe('self-hosted runner: repo under /opt (repo wins over /opt noise)', () => {
+    const selfHostedRepo = '/opt/actions-runner/_work/acme/acme';
+    const selfHostedNodeModules = `${selfHostedRepo}/node_modules`;
+    const selfHostedPkgId = 'esbuild@0.21.5';
+    const selfHostedPkgDir = `${selfHostedNodeModules}/esbuild`;
+    const selfHostedCtx: NormalizeContext = {
+      roots: {
+        repo: selfHostedRepo,
+        nodeModules: selfHostedNodeModules,
+        home: '/root',
+        tmp: '/tmp',
+        cache: '/root/.cache/pnpm',
+      },
+      pkgDirs: new Map([[selfHostedPkgId, selfHostedPkgDir]]),
+    };
+
+    function selfHostedWrite(path: string): AttributedEvent {
+      return { raw: { kind: 'write', path, pid: 1, ts: 0, hidden: false }, pkg: selfHostedPkgId, lifecycle: 'postinstall' };
+    }
+    function selfHostedRead(path: string): AttributedEvent {
+      return { raw: { kind: 'read', path, pid: 1, ts: 0, hidden: false }, pkg: selfHostedPkgId, lifecycle: 'postinstall' };
+    }
+
+    it('SURFACES an escaped_write into a sibling package node_modules (not dropped as /opt noise)', () => {
+      const events = [selfHostedWrite(`${selfHostedNodeModules}/debug/src/index.js`)];
+      const result = normalize(events, selfHostedCtx);
+      const block = getBlock(result, selfHostedPkgId);
+      expect(block?.escaped_writes).toContain('<CROSS_PACKAGE> $NODE_MODULES/debug/src/index.js');
+    });
+
+    it('SURFACES a repo-internal write outside node_modules (not dropped as /opt noise)', () => {
+      const events = [selfHostedWrite(`${selfHostedRepo}/.npmrc`)];
+      const result = normalize(events, selfHostedCtx);
+      const block = getBlock(result, selfHostedPkgId);
+      expect(block?.escaped_writes).toEqual(['$REPO/.npmrc']);
+    });
+
+    it('SURFACES a repo-internal external read outside $PKG (not dropped as /opt noise)', () => {
+      const events = [selfHostedRead(`${selfHostedRepo}/secrets.json`)];
+      const result = normalize(events, selfHostedCtx);
+      const block = getBlock(result, selfHostedPkgId);
+      expect(block?.external_reads).toEqual(['$REPO/secrets.json']);
+    });
+
+    it('STILL drops genuine /opt/vp toolchain reads (not under roots.repo) even when repo is under /opt', () => {
+      const events = [
+        selfHostedRead('/opt/vp/js_runtime/node/24.15.0/bin/node'),
+        selfHostedRead('/opt/vp'),
+        // a bare /opt parent stat() is still noise — it is NOT under the repo
+        selfHostedRead('/opt'),
+      ];
+      const result = normalize(events, selfHostedCtx);
+      const block = getBlock(result, selfHostedPkgId);
+      expect(block?.external_reads ?? []).toEqual([]);
+    });
+
+    it('does NOT confuse a sibling dir sharing the repo name prefix (/opt/.../acme-evil) for the repo', () => {
+      // roots.repo is .../acme; a path under .../acme-evil must NOT count as
+      // "under the repo" (segment-boundary check), so it stays /opt noise.
+      const events = [selfHostedRead('/opt/actions-runner/_work/acme/acme-evil/loot')];
+      const result = normalize(events, selfHostedCtx);
+      const block = getBlock(result, selfHostedPkgId);
+      expect(block?.external_reads ?? []).toEqual([]);
+    });
+  });
+
   describe('spawn events', () => {
     it('puts ok spawns in spawn_attempts', () => {
       const events = [spawnEv(['node', '/work/node_modules/esbuild/install.js'], 'ok')];

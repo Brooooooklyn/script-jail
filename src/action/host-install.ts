@@ -236,18 +236,146 @@ const HOST_INSTALL_STRIP_ENV_NAMES = new Set([
   'TERM',
 ]);
 
+// ---------------------------------------------------------------------------
+// SECURITY: strip INHERITED loader/config env vars that enable pre-trust code
+// execution or host-vs-audit config divergence
+// ---------------------------------------------------------------------------
+//
+// This is a SEPARATE category from HOST_INSTALL_STRIP_ENV_NAMES above (which is
+// sandbox-tell NOISE only).  The names below are LOADER / TOOL-RESOLUTION /
+// CONFIG-LOCATING env vars that the host package-manager child HONORS but the
+// Firecracker/Docker audit NEVER saw — the audit reconstructs its env from
+// scratch (it does NOT inherit the runner env) and injects only its own
+// instrumentation `LD_PRELOAD` / `NODE_OPTIONS`.  So any inherited var of this
+// shape is an ASYMMETRY: a clean, trusted lock would authorize unaudited host
+// behaviour.  Both host phases build their child env via hostInstallEnv(), so
+// stripping here covers part-1 (PRE-TRUST, no-scripts install) AND part-2
+// (POST-TRUST lifecycle scripts).
+//
+// Threat (fork pull_request): the owner's workflow `env:` block (base-branch,
+// trusted) legitimately sets a CHECKOUT-RELATIVE loader/config var, and the PR
+// author supplies the file it points at inside `$GITHUB_WORKSPACE`.  Examples:
+//   [13] NODE_OPTIONS=--require ./ci/x.js   → RCE in the Node-based PM child,
+//        part-1, BEFORE the trust gate.  NODE_REPL_EXTERNAL_MODULE same class.
+//   [17] LD_PRELOAD=./ci/x.so / LD_AUDIT    → native pre-trust RCE.  The guest
+//        never inherits these (it builds env from scratch), so this is the
+//        host/guest asymmetry.  DYLD_* analogs: the host `bare` backend runs on
+//        macOS too.
+//   [19] GIT_SSH_COMMAND=./ci/ssh           → pre-trust exec for git+ssh deps;
+//        `npm ci --ignore-scripts` STILL invokes git for git: dependencies.
+//        (GIT_ALLOW_PROTOCOL is deliberately NOT stripped — it RESTRICTS, never
+//        weakens; and the git BINARY stays pinned via npm_config_git, set AFTER
+//        this loop — we only drop the transport-COMMAND overrides here.)
+//   [18] NPM_CONFIG_SCRIPT_SHELL=./ci/shell → part-2 `npm rebuild` runs the
+//        wrapper shell.
+//   [22] NPM_CONFIG_USERCONFIG / _GLOBALCONFIG → host loads a PR-controlled
+//        npmrc the audit never read (config-locating redirect).
+//   [16] NPM_CONFIG_IGNORE_SCRIPTS=true     → part-2 skips the scripts the audit
+//        expects → an unbuilt tree (self-DoS / divergence).
+//
+// npm reads its `npm_config_*` config CASE-INSENSITIVELY (both
+// `NPM_CONFIG_SCRIPT_SHELL` and `npm_config_script_shell` work), so those are
+// matched by LOWERCASED name.  The OS loader vars (LD_*/DYLD_*/NODE_OPTIONS/
+// GIT_*) are case-SENSITIVE on Linux/macOS — exact-name match — though we also
+// fold case before the exact check, a cheap defensive catch-all that costs one
+// `.toLowerCase()` per env entry and cannot widen the match beyond these names.
+//
+// This mirrors the npm_config_git pin rationale (a config-redirect defense) and
+// is HOST-ONLY: the SANDBOX is the enforcement boundary and audits whatever it
+// is given.  Defense-in-depth, not a complete oracle close.
+const HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
+  [
+    // [13] Node loader hooks (Node-based PM child execs these pre-trust).
+    'NODE_OPTIONS',
+    'NODE_REPL_EXTERNAL_MODULE',
+    // [17] ELF dynamic-loader preload/audit + lib search path.
+    'LD_PRELOAD',
+    'LD_AUDIT',
+    'LD_LIBRARY_PATH',
+    // [17] macOS dyld analogs (the host bare backend runs on macOS).
+    'DYLD_INSERT_LIBRARIES',
+    'DYLD_LIBRARY_PATH',
+    'DYLD_FORCE_FLAT_NAMESPACE',
+    // [19] Git transport-command overrides (git+ssh deps; --ignore-scripts does
+    // NOT stop git from being invoked).  GIT_ALLOW_PROTOCOL is NOT here — it
+    // restricts, never weakens.  The git BINARY stays pinned via npm_config_git.
+    'GIT_SSH_COMMAND',
+    'GIT_SSH',
+    'GIT_PROXY_COMMAND',
+    'GIT_EXTERNAL_DIFF',
+    // [18] npm script-shell wrapper (part-2 rebuild runs it).
+    'NPM_CONFIG_SCRIPT_SHELL',
+    // [22] npm config-locating redirects (load a PR-controlled npmrc).
+    'NPM_CONFIG_USERCONFIG',
+    'NPM_CONFIG_GLOBALCONFIG',
+    // [16] npm ignore-scripts self-DoS (skips the scripts the audit expects).
+    'NPM_CONFIG_IGNORE_SCRIPTS',
+  ].map((n) => n.toLowerCase()),
+);
+
+/**
+ * True when `name` is a dangerous loader/config env var to strip.  Matched on
+ * the LOWERCASED name: npm reads `npm_config_*` case-insensitively, and folding
+ * the OS loader vars too is a cheap defensive catch-all (it cannot widen the
+ * match beyond the curated names in HOST_INSTALL_DANGEROUS_ENV_NAMES).
+ */
+function isDangerousEnvName(name: string): boolean {
+  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(name.toLowerCase());
+}
+
+/**
+ * SECURITY ([5]+[9]): rebuild a PATH value dropping every entry whose REAL path
+ * (symlinks resolved, case-folded on a case-insensitive FS) is a checkout root
+ * or nested under one (PR-controlled).  The PM is spawned by BARE NAME and
+ * lifecycle scripts spawn tools (`node`, `sh`, `make`, …) by bare name, so if
+ * the owner's workflow prepended a checkout dir to PATH (e.g.
+ * `echo "$GITHUB_WORKSPACE/bin" >> $GITHUB_PATH`) and the PR committed
+ * `bin/<tool>`, that PR-controlled binary would be resolved on the runner — and
+ * ONLY on the runner; the sandbox audit never inherits this PATH.  Reuses the
+ * same canonicalForCompare/checkoutRoots/isUnderCheckout helpers as the
+ * npm_config_git resolver so the containment test is symlink/case robust.
+ *
+ * Order of the surviving (system) entries is PRESERVED.  Empty path segments
+ * are dropped (a `''` element means "current dir", a relative entry).  PATH is
+ * never EMPTIED: dropping a checkout dir leaves the inherited system dirs
+ * (`/usr/bin`, …); only when PATH had no usable value at all does the result
+ * stay unset.
+ */
+function sanitizePathValue(pathVar: string | undefined): string | undefined {
+  if (pathVar === undefined || pathVar === '') return pathVar;
+  const roots = checkoutRoots();
+  const kept: string[] = [];
+  for (const dir of pathVar.split(delimiter)) {
+    // Drop an empty segment (resolves to cwd) and any checkout-controlled dir.
+    if (dir === '') continue;
+    if (isUnderCheckout(dir, roots)) continue;
+    kept.push(dir);
+  }
+  return kept.join(delimiter);
+}
+
 function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
-  // Sanitize FIRST (drop sandbox tells), THEN layer the security pins on top so
-  // a stripped name can never accidentally remove the git pin / yarn neutralizers.
+  // Sanitize FIRST (drop sandbox tells + dangerous loader/config vars), THEN
+  // layer the security pins on top so a stripped name can never accidentally
+  // remove the git pin / yarn neutralizers.
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
     if (HOST_INSTALL_STRIP_ENV_NAMES.has(name)) continue;
+    // SECURITY: drop inherited loader/config vars that enable pre-trust code
+    // execution or host/audit config divergence (see the set above).
+    if (isDangerousEnvName(name)) continue;
     // Every SCRIPT_JAIL_* host knob (REPO_DIR, CACHE_DIR, ACTION_ROOT, …) is an
     // audit-absent tell and is unused by the package manager — drop them all.
     if (name.startsWith('SCRIPT_JAIL_')) continue;
     env[name] = value;
   }
+  // SECURITY ([5]+[9]): sanitize PATH so a checkout-controlled dir cannot shadow
+  // the bare-name PM/tool resolution.  Done after the copy so it operates on the
+  // inherited value; applied here so BOTH host phases get the sanitized PATH.
+  const sanitizedPath = sanitizePathValue(process.env['PATH']);
+  if (sanitizedPath === undefined) delete env['PATH'];
+  else env['PATH'] = sanitizedPath;
   env['npm_config_git'] = trustedGitPath();
   if (pm === 'yarn') {
     env['YARN_IGNORE_PATH'] = '1';
