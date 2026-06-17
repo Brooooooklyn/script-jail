@@ -541,4 +541,31 @@ describe('detectCheckoutRelativeHome — refuse install on a checkout-relative $
     expect(detectCheckoutRelativeHome(undefined, dir, dir)).toBeNull();
     expect(detectCheckoutRelativeHome('', dir, dir)).toBeNull();
   });
+
+  it('refuses a RELATIVE HOME (subdir repo + `../.home` bypass — round-6)', () => {
+    // The PM expands `~/.npmrc` against ITS cwd (=repoDir). For repoDir=$WS/pkg, a
+    // relative HOME `../.home` lands at $WS/.home/.npmrc (PR-controlled, INSIDE the
+    // checkout) — VERIFIED npm 11.13.0 reads it and execs its script-shell. But this
+    // preflight runs in the action process whose cwd need not equal repoDir, so a
+    // value-based containment test on a relative HOME could resolve elsewhere and pass.
+    // Fail closed on ANY non-absolute HOME regardless of the action process cwd.
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    const reason = detectCheckoutRelativeHome('../.home', pkg, ws);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/HOME/);
+    expect(reason).toMatch(/RELATIVE|relative/);
+  });
+
+  it('refuses ALL relative HOME forms — even one that resolves outside from the action cwd', () => {
+    // Fail-closed: a relative HOME has no legit install use; we do not try to prove
+    // a particular cwd makes it safe. `.home`, `../../x`, and `~`-leading are all refused.
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectCheckoutRelativeHome('.home', pkg, ws)).not.toBeNull();
+    expect(detectCheckoutRelativeHome('../../elsewhere', pkg, ws)).not.toBeNull();
+    expect(detectCheckoutRelativeHome('~/x', pkg, ws)).not.toBeNull(); // literal tilde is not absolute
+  });
 });

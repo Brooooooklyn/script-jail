@@ -108,6 +108,18 @@ export function detectPreTrustConfigExec(
  * NOT cover a `$HOME` that is a sibling/non-ancestor checkout path (e.g.
  * `$GITHUB_WORKSPACE/.home`).  A checkout-relative `$HOME` has no legitimate
  * install use (the runner's real home is outside the checkout), so fail closed.
+ *
+ * A RELATIVE `$HOME` is refused outright (BEFORE the containment test).  The PM
+ * expands `~/.npmrc` against ITS OWN cwd — the host install/rebuild spawns the PM
+ * with `cwd=repoDir` — whereas this preflight runs in the action process whose
+ * `cwd` need NOT equal `repoDir` (subdir install: action at `$GITHUB_WORKSPACE`,
+ * `repoDir=$GITHUB_WORKSPACE/pkg`).  Resolving a relative `$HOME` here against the
+ * action `cwd` therefore lands on a DIFFERENT path than the PM sees, so the
+ * containment test can pass while npm reads `repoDir/../.home/.npmrc` =
+ * `$GITHUB_WORKSPACE/.home/.npmrc` (PR-controlled) and execs its `script-shell`
+ * (VERIFIED npm 11.13.0).  A real runner `$HOME` is always absolute, so failing
+ * closed on a non-absolute value closes the cwd-resolution mismatch with no
+ * legitimate loss.
  */
 export function detectCheckoutRelativeHome(
   homeDir: string | undefined,
@@ -115,6 +127,17 @@ export function detectCheckoutRelativeHome(
   workspaceRoot?: string,
 ): string | null {
   if (homeDir === undefined || homeDir === '') return null;
+  if (!isAbsolute(homeDir)) {
+    return (
+      `HOME (\`${homeDir}\`) is a RELATIVE path. Each package manager expands ` +
+      `\`~/.npmrc\` (and \`~/.yarnrc.yml\`) against ITS OWN working directory — the host ` +
+      `install runs the PM with \`cwd=repoDir\` — so a relative HOME can resolve INTO the ` +
+      `checkout (e.g. \`../.home\` -> \`$GITHUB_WORKSPACE/.home/.npmrc\` for a subdir repo) and ` +
+      `execute a PR-committed home config on the runner BEFORE the audit decides anything, ` +
+      `unseen by the sandbox. Set HOME to an ABSOLUTE path outside the checkout for the ` +
+      `script-jail step, or audit without \`install\`.`
+    );
+  }
   const home = realpathOrResolve(homeDir);
   const roots = [realpathOrResolve(repoDir)];
   if (workspaceRoot !== undefined && workspaceRoot !== '') roots.push(realpathOrResolve(workspaceRoot));

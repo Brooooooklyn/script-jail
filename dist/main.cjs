@@ -27262,6 +27262,9 @@ function detectPreTrustConfigExec(repoDir, manager, workspaceRoot) {
 }
 function detectCheckoutRelativeHome(homeDir, repoDir, workspaceRoot) {
   if (homeDir === void 0 || homeDir === "") return null;
+  if (!(0, import_node_path4.isAbsolute)(homeDir)) {
+    return `HOME (\`${homeDir}\`) is a RELATIVE path. Each package manager expands \`~/.npmrc\` (and \`~/.yarnrc.yml\`) against ITS OWN working directory \u2014 the host install runs the PM with \`cwd=repoDir\` \u2014 so a relative HOME can resolve INTO the checkout (e.g. \`../.home\` -> \`$GITHUB_WORKSPACE/.home/.npmrc\` for a subdir repo) and execute a PR-committed home config on the runner BEFORE the audit decides anything, unseen by the sandbox. Set HOME to an ABSOLUTE path outside the checkout for the script-jail step, or audit without \`install\`.`;
+  }
   const home = realpathOrResolve(homeDir);
   const roots = [realpathOrResolve(repoDir)];
   if (workspaceRoot !== void 0 && workspaceRoot !== "") roots.push(realpathOrResolve(workspaceRoot));
