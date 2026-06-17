@@ -7864,10 +7864,19 @@ var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
   "make",
   "shell"
 ]);
+var DANGEROUS_PNPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
+  ...DANGEROUS_NPM_CONFIG_KEYS,
+  "pnpmfile",
+  "global_pnpmfile"
+]);
 function isDangerousEnvName(name) {
   const lower = name.toLowerCase();
   for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
     if (lower.startsWith(prefix)) return true;
+  }
+  if (lower.startsWith("pnpm_config_")) {
+    const key = lower.slice("pnpm_config_".length).replace(/-/g, "_");
+    return DANGEROUS_PNPM_CONFIG_KEYS.has(key);
   }
   if (lower.startsWith("npm_config_")) {
     const key = lower.slice("npm_config_".length).replace(/-/g, "_");

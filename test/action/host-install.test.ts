@@ -1445,6 +1445,29 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['CI']).toBe('true');
   });
 
+  it('stripDangerousEnv drops dangerous pnpm_config_* (own namespace — round-9)', () => {
+    // VERIFIED pnpm 11.1.2: pnpm reads `scriptShell` from its OWN `pnpm_config_*` env
+    // namespace (NOT npm_config_*), so `PNPM_CONFIG_SCRIPT_SHELL` / `pnpm_config_script_shell`
+    // set the lifecycle-script interpreter and EXEC on `pnpm install`/`pnpm rebuild`
+    // (PWNED_PNPM_CFG_SHELL_RAN).  Canonicalized (case + `-`/`_`) against the pnpm
+    // dangerous-key set; auth/registry pnpm_config_* survive.  pnpmfile/global_pnpmfile
+    // are dropped too (defense-in-depth; the host --ignore-pnpmfile also covers them).
+    const out = stripDangerousEnv({
+      PNPM_CONFIG_SCRIPT_SHELL: '/checkout/evil-sh', // upper form
+      pnpm_config_script_shell: '/checkout/evil-sh', // lower snake form
+      'pnpm_config_script-shell': '/checkout/evil-sh', // lower hyphen form (canonicalized)
+      pnpm_config_global_pnpmfile: '/checkout/evil.cjs', // pnpm hook file
+      pnpm_config_registry: 'https://registry.npmjs.org/', // auth/registry — preserved
+      'pnpm_config_//registry.npmjs.org/:_authToken': 'tok', // auth — preserved
+    });
+    expect(out['PNPM_CONFIG_SCRIPT_SHELL']).toBeUndefined();
+    expect(out['pnpm_config_script_shell']).toBeUndefined();
+    expect(out['pnpm_config_script-shell']).toBeUndefined();
+    expect(out['pnpm_config_global_pnpmfile']).toBeUndefined();
+    expect(out['pnpm_config_registry']).toBe('https://registry.npmjs.org/');
+    expect(out['pnpm_config_//registry.npmjs.org/:_authToken']).toBe('tok');
+  });
+
   it('stripDangerousEnv drops the XDG_* family + PNPM_HOME (pnpm config→scriptShell, round-8)', () => {
     // VERIFIED pnpm 11.1.2: pnpm reads its GLOBAL config from `$XDG_CONFIG_HOME/pnpm/
     // config.yaml`, so an inherited `XDG_CONFIG_HOME=<checkout>/.config` lets a PR commit

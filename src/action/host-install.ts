@@ -470,6 +470,26 @@ const DANGEROUS_NPM_CONFIG_KEYS = new Set([
   'shell',
 ]);
 
+// pnpm reads config from its OWN `pnpm_config_*` env namespace (distinct from
+// npm_config_*) in addition to npm_config_* for npm-compatible keys.  VERIFIED
+// pnpm 11.1.2: `pnpm_config_script_shell` / `PNPM_CONFIG_SCRIPT_SHELL` set
+// `scriptShell` (the lifecycle-script interpreter) and EXEC on `pnpm install` /
+// `pnpm rebuild` (`PWNED…RAN argv=-c …`), while `npm_config_script_shell` does NOT
+// (pnpm reads scriptShell only from its own namespace), so the npm_config_* canon
+// above misses it.  pnpm's env->config map is BOUNDED (an unknown `pnpm_config_X`
+// is ignored — VERIFIED), so a canonicalized-key denylist is sound, exactly like
+// npm.  Reuse the npm dangerous keys (script_shell / shell / node_options /
+// node_gyp / python / make / ignore_scripts / user|globalconfig / prefix) and add
+// pnpm's hook-file selectors `pnpmfile` / `global_pnpmfile` (the host
+// --ignore-pnpmfile flag already suppresses an env-set pnpmfile — VERIFIED — so
+// this is defense-in-depth + parity).  Auth/registry pnpm_config_* (registry,
+// `//host/:_authToken`, …) are NOT in the set, so they fall through and survive.
+const DANGEROUS_PNPM_CONFIG_KEYS = new Set([
+  ...DANGEROUS_NPM_CONFIG_KEYS,
+  'pnpmfile',
+  'global_pnpmfile',
+]);
+
 // The ONLY inherited `YARN_*` env kept on the host yarn child (allowlist — every
 // other YARN_* config is dropped; see hostInstallEnv).  These four are the scalar
 // auth/registry settings a private-registry install needs and that the env->config
@@ -486,15 +506,22 @@ const YARN_ENV_ALLOW = new Set([
 /**
  * True when `name` is a dangerous loader/tool/config-FILE selector env var to
  * strip from the host PM children.  Matched on the LOWERCASED name: (1) a whole
- * dangerous FAMILY by prefix, (2) the canonicalized `npm_config_*` slice
- * (separator/case-robust so the `npm_config_script-shell` hyphen alias is caught),
- * (3) the enumerated exact set.  npm_config_* names NOT in the dangerous-key set
+ * dangerous FAMILY by prefix, (2) the canonicalized `pnpm_config_*` and
+ * `npm_config_*` slices (separator/case-robust so the `…_script-shell` hyphen
+ * alias is caught), each against its own dangerous-key set, (3) the enumerated
+ * exact set.  pnpm_config_* and npm_config_* names NOT in the dangerous-key sets
  * (registry, auth tokens, …) fall through and are preserved.
  */
 function isDangerousEnvName(name: string): boolean {
   const lower = name.toLowerCase();
   for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
     if (lower.startsWith(prefix)) return true;
+  }
+  // pnpm_config_* must be tested BEFORE npm_config_* — `pnpm_config_x` does not
+  // start with `npm_config_`, but keep them as distinct branches for clarity.
+  if (lower.startsWith('pnpm_config_')) {
+    const key = lower.slice('pnpm_config_'.length).replace(/-/g, '_');
+    return DANGEROUS_PNPM_CONFIG_KEYS.has(key);
   }
   if (lower.startsWith('npm_config_')) {
     const key = lower.slice('npm_config_'.length).replace(/-/g, '_');
