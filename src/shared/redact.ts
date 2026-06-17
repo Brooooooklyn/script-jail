@@ -99,8 +99,65 @@ export function maskExactValues(
 /** High-entropy floor for fragment masking — a prefix/suffix shorter than this
  * is too short to distinguish a real (high-entropy) secret from benign text. */
 const DEFAULT_MIN_FRAGMENT = 8;
-/** Perf cap: only declared values up to this length get the fragment scan. */
-const FRAGMENT_SCAN_MAX_LEN = 512;
+/** Per-affix scan-window cap (NOT an eligibility filter — a longer secret is
+ * still protected at its first/last `FRAGMENT_SCAN_WINDOW` chars). */
+const FRAGMENT_SCAN_WINDOW = 512;
+/** Backstop on occurrences scanned per affix (a pathological line that repeats a
+ * value's minimal prefix thousands of times can't force unbounded work). */
+const FRAGMENT_MAX_OCCURRENCES = 4096;
+
+/**
+ * Longest prefix of `w` (>= `minFragment`, <= `w.length`) present anywhere in
+ * `text`.  Returns 0 if none.  Finds the GLOBAL longest by extending every
+ * occurrence of `w`'s minimal prefix, so a longer fragment at a later position
+ * is not missed; early-breaks once a full-window match is found.
+ */
+function longestPrefixPresent(text: string, w: string, minFragment: number): number {
+  if (w.length < minFragment) return 0;
+  const minP = w.slice(0, minFragment);
+  let best = 0;
+  let from = 0;
+  let seen = 0;
+  for (;;) {
+    const idx = text.indexOf(minP, from);
+    if (idx === -1) break;
+    let k = minFragment;
+    const max = Math.min(w.length, text.length - idx);
+    while (k < max && text.charCodeAt(idx + k) === w.charCodeAt(k)) k += 1;
+    if (k > best) best = k;
+    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
+    from = idx + 1;
+  }
+  return best;
+}
+
+/** Longest suffix of `w` present anywhere in `text` (mirror of the prefix scan,
+ * extending each occurrence of `w`'s minimal SUFFIX backward). */
+function longestSuffixPresent(text: string, w: string, minFragment: number): number {
+  if (w.length < minFragment) return 0;
+  const minS = w.slice(w.length - minFragment);
+  let best = 0;
+  let from = 0;
+  let seen = 0;
+  for (;;) {
+    const idx = text.indexOf(minS, from); // minS occupies text[idx .. idx+minFragment)
+    if (idx === -1) break;
+    let k = minFragment;
+    // Extend backward: for suffix length k+1 the new leftmost char is
+    // w[w.length-k-1], aligning with text[idx-(k-minFragment)-1].
+    for (;;) {
+      if (k >= w.length) break;
+      const ti = idx - (k - minFragment) - 1;
+      const wi = w.length - k - 1;
+      if (ti < 0 || wi < 0 || text.charCodeAt(ti) !== w.charCodeAt(wi)) break;
+      k += 1;
+    }
+    if (k > best) best = k;
+    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
+    from = idx + 1;
+  }
+  return best;
+}
 
 /**
  * Mask a PREFIX or SUFFIX of each declared secret value that appears in `text`.
@@ -110,22 +167,33 @@ const FRAGMENT_SCAN_MAX_LEN = 512;
  * truncates a secret mid-write on a SHARED stdout/stderr pipe, the line carries
  * only `V[0..k]` (a prefix), or a same-writer `V[0..k]\nV[k..]` split leaves a
  * prefix on one line and a suffix on the next (adversarial-review F6 round-3).
- * For each declared value `V` (length in `(minFragment, MAX]`), this masks the
- * LONGEST prefix of `V` and the LONGEST suffix of `V` present in `text`, each at
- * least `minFragment` chars.  `minFragment` is a high-entropy floor (default 8)
- * so benign words are not mass-masked: a real token's 8+ char prefix coinciding
- * with unrelated log text is vanishingly unlikely.
+ * For each declared value `V`, this masks the LONGEST prefix and LONGEST suffix
+ * of `V` present in `text`, each at least `minFragment` chars.  `minFragment` is
+ * a high-entropy floor (default 8) so benign words are not mass-masked: a real
+ * token's 8+ char prefix coinciding with unrelated log text is vanishingly
+ * unlikely.
+ *
+ * Two correctness properties (adversarial-review F6 round-3, both regressed):
+ *   * NON-DESTRUCTIVE discovery: every value's longest prefix/suffix is found
+ *     against the ORIGINAL `text`, collected, then ALL fragments are masked once
+ *     in LENGTH-DESCENDING order.  Mutating per value would let a longer value's
+ *     short shared prefix consume the match gate, leaving a shorter value's
+ *     longer leaked fragment's tail exposed.
+ *   * SCAN WINDOW, not eligibility: a value longer than `FRAGMENT_SCAN_WINDOW` is
+ *     NOT excluded — its first/last `FRAGMENT_SCAN_WINDOW` chars are scanned, so a
+ *     prefix/suffix leak of a long secret (private key, service-account JSON,
+ *     long opaque token) is still masked.
  *
  * SCOPE: this does NOT cover an arbitrary MIDDLE split (a deliberately
- * fragmented secret with neither end on a line) — that is the irreducible
- * per-line line-local residual, bounded by the PRIMARY env_read audit gate (a
- * script cannot obtain the value to fragment without a recorded read that fails
- * the PR pre-trust).  Fragment masking strengthens the defense-in-depth layer
- * against the realistic prefix/suffix truncation; it is not a trust boundary.
+ * fragmented secret with neither end on a line) — the irreducible per-line
+ * line-local residual, bounded by the PRIMARY env_read audit gate (a script
+ * cannot obtain the value to fragment without a recorded read that fails the PR
+ * pre-trust).  Fragment masking strengthens the defense-in-depth layer against
+ * the realistic prefix/suffix truncation; it is not a trust boundary.
  *
- * Linear-time-bounded: a cheap `minFragment`-length gate skips the per-value
- * scan entirely when no fragment is present (the common case), so benign output
- * costs O(values) substring checks, not O(values × |V|).
+ * Bounded: each affix scan is O(|text|) indexOf-amortized + bounded extension,
+ * capped at `FRAGMENT_MAX_OCCURRENCES`, so a pathological line cannot force
+ * unbounded work even with the full set of declared values.
  */
 export function maskValueFragments(
   text: string,
@@ -134,29 +202,24 @@ export function maskValueFragments(
   minFragment = DEFAULT_MIN_FRAGMENT,
 ): string {
   const replacement = `<${label}>`;
-  const unique = Array.from(new Set(values))
-    .filter((v) => v.length > minFragment && v.length <= FRAGMENT_SCAN_MAX_LEN)
-    .sort((a, b) => b.length - a.length);
+  // 1. DISCOVER (non-destructive): collect every present prefix/suffix fragment
+  //    against the original text, so cross-value shared prefixes don't race.
+  const fragments: string[] = [];
+  for (const v of new Set(values)) {
+    if (v.length <= minFragment) continue; // whole value is exact-masked elsewhere
+    const preWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(0, FRAGMENT_SCAN_WINDOW) : v;
+    const pLen = longestPrefixPresent(text, preWin, minFragment);
+    if (pLen >= minFragment) fragments.push(preWin.slice(0, pLen));
+    const sufWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(v.length - FRAGMENT_SCAN_WINDOW) : v;
+    const sLen = longestSuffixPresent(text, sufWin, minFragment);
+    if (sLen >= minFragment) fragments.push(sufWin.slice(sufWin.length - sLen));
+  }
+  if (fragments.length === 0) return text;
+  // 2. APPLY longest-first so a longer fragment is masked before a shorter one
+  //    (possibly a shared prefix) can consume part of it.
   let out = text;
-  for (const v of unique) {
-    // Longest PREFIX of v present (gate on the minimal prefix first — skips the
-    // scan entirely when no fragment is present).  k starts at v.length so a
-    // standalone call also masks a whole value cleanly; in the host/guest
-    // pipeline maskExactValues has already removed the whole value, so this
-    // catches the proper fragment.
-    if (out.includes(v.slice(0, minFragment))) {
-      for (let k = v.length; k >= minFragment; k--) {
-        const frag = v.slice(0, k);
-        if (out.includes(frag)) { out = out.split(frag).join(replacement); break; }
-      }
-    }
-    // Longest SUFFIX of v present (same gate-then-scan).
-    if (out.includes(v.slice(v.length - minFragment))) {
-      for (let k = v.length; k >= minFragment; k--) {
-        const frag = v.slice(v.length - k);
-        if (out.includes(frag)) { out = out.split(frag).join(replacement); break; }
-      }
-    }
+  for (const frag of Array.from(new Set(fragments)).sort((a, b) => b.length - a.length)) {
+    out = out.split(frag).join(replacement);
   }
   return out;
 }

@@ -174,4 +174,36 @@ describe('maskValueFragments', () => {
     // length-8 value with minFragment 8 → filtered out (length must be > floor).
     expect(maskValueFragments('abcd1234 here', ['abcd1234'], 'R')).toBe('abcd1234 here');
   });
+
+  it('does NOT leak a shorter value tail when a longer value shares the gate prefix (F6 round-3 #1)', () => {
+    // Two declared secrets share the first 8 chars.  Discovery is NON-DESTRUCTIVE
+    // (collect against the original text, then mask longest-first), so the longer
+    // value's short shared prefix cannot consume the gate and strand the shorter
+    // value's longer leaked fragment.
+    const v1 = 'abcdefgh' + 'X'.repeat(100);  // 108 chars
+    const v2 = 'abcdefghSECRETTAILMORE';       // 22 chars, shares 'abcdefgh'
+    const out = maskValueFragments('leak ' + v2.slice(0, 18), [v1, v2], 'R');
+    expect(out).not.toContain('SECRETTAIL');
+    expect(out).toBe('leak <R>');
+  });
+
+  it('masks a prefix AND suffix of a value LONGER than the scan window (F6 round-3 #2)', () => {
+    // A >512-char secret is NOT excluded; its first/last 512 chars are scanned,
+    // so a prefix or suffix leak of a long secret (key, JSON blob) is masked.
+    const big = 'K'.repeat(600) + 'TAILTOKEN9'; // 610 chars
+    expect(maskValueFragments('leak ' + big.slice(0, 20), [big], 'R')).toBe('leak <R>');
+    expect(maskValueFragments('leak ' + big.slice(big.length - 20), [big], 'R')).toBe('leak <R>');
+  });
+
+  it('is bounded on a pathological 1 MiB line repeating the gate prefix (no superlinear blowup)', () => {
+    // 64 declared values (the protected.env cap), adversarial line repeating one
+    // value's 8-char minimal prefix with no longer extension.  The occurrence cap
+    // + early-break keep it well under a generous bound.
+    const vals = Array.from({ length: 64 }, (_, i) => (`V${i}_`).padEnd(8, 'z') + 'q'.repeat(504));
+    const minP0 = vals[0]!.slice(0, 8);
+    const line = (minP0 + ' ').repeat(Math.floor((1024 * 1024) / (minP0.length + 1)));
+    const start = performance.now();
+    maskValueFragments(line, vals, 'R');
+    expect(performance.now() - start).toBeLessThan(2000);
+  });
 });

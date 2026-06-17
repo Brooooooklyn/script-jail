@@ -26727,30 +26727,65 @@ function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   return out;
 }
 var DEFAULT_MIN_FRAGMENT = 8;
-var FRAGMENT_SCAN_MAX_LEN = 512;
+var FRAGMENT_SCAN_WINDOW = 512;
+var FRAGMENT_MAX_OCCURRENCES = 4096;
+function longestPrefixPresent(text, w, minFragment) {
+  if (w.length < minFragment) return 0;
+  const minP = w.slice(0, minFragment);
+  let best = 0;
+  let from = 0;
+  let seen = 0;
+  for (; ; ) {
+    const idx = text.indexOf(minP, from);
+    if (idx === -1) break;
+    let k = minFragment;
+    const max = Math.min(w.length, text.length - idx);
+    while (k < max && text.charCodeAt(idx + k) === w.charCodeAt(k)) k += 1;
+    if (k > best) best = k;
+    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
+    from = idx + 1;
+  }
+  return best;
+}
+function longestSuffixPresent(text, w, minFragment) {
+  if (w.length < minFragment) return 0;
+  const minS = w.slice(w.length - minFragment);
+  let best = 0;
+  let from = 0;
+  let seen = 0;
+  for (; ; ) {
+    const idx = text.indexOf(minS, from);
+    if (idx === -1) break;
+    let k = minFragment;
+    for (; ; ) {
+      if (k >= w.length) break;
+      const ti = idx - (k - minFragment) - 1;
+      const wi = w.length - k - 1;
+      if (ti < 0 || wi < 0 || text.charCodeAt(ti) !== w.charCodeAt(wi)) break;
+      k += 1;
+    }
+    if (k > best) best = k;
+    if (best >= w.length || (seen += 1) >= FRAGMENT_MAX_OCCURRENCES) break;
+    from = idx + 1;
+  }
+  return best;
+}
 function maskValueFragments(text, values, label = "REDACTED", minFragment = DEFAULT_MIN_FRAGMENT) {
   const replacement = `<${label}>`;
-  const unique = Array.from(new Set(values)).filter((v) => v.length > minFragment && v.length <= FRAGMENT_SCAN_MAX_LEN).sort((a, b) => b.length - a.length);
+  const fragments = [];
+  for (const v of new Set(values)) {
+    if (v.length <= minFragment) continue;
+    const preWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(0, FRAGMENT_SCAN_WINDOW) : v;
+    const pLen = longestPrefixPresent(text, preWin, minFragment);
+    if (pLen >= minFragment) fragments.push(preWin.slice(0, pLen));
+    const sufWin = v.length > FRAGMENT_SCAN_WINDOW ? v.slice(v.length - FRAGMENT_SCAN_WINDOW) : v;
+    const sLen = longestSuffixPresent(text, sufWin, minFragment);
+    if (sLen >= minFragment) fragments.push(sufWin.slice(sufWin.length - sLen));
+  }
+  if (fragments.length === 0) return text;
   let out = text;
-  for (const v of unique) {
-    if (out.includes(v.slice(0, minFragment))) {
-      for (let k = v.length; k >= minFragment; k--) {
-        const frag = v.slice(0, k);
-        if (out.includes(frag)) {
-          out = out.split(frag).join(replacement);
-          break;
-        }
-      }
-    }
-    if (out.includes(v.slice(v.length - minFragment))) {
-      for (let k = v.length; k >= minFragment; k--) {
-        const frag = v.slice(v.length - k);
-        if (out.includes(frag)) {
-          out = out.split(frag).join(replacement);
-          break;
-        }
-      }
-    }
+  for (const frag of Array.from(new Set(fragments)).sort((a, b) => b.length - a.length)) {
+    out = out.split(frag).join(replacement);
   }
   return out;
 }
