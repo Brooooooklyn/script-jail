@@ -26948,6 +26948,12 @@ var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
   "make",
   "shell"
 ]);
+var YARN_ENV_ALLOW = /* @__PURE__ */ new Set([
+  "YARN_NPM_AUTH_TOKEN",
+  "YARN_NPM_AUTH_IDENT",
+  "YARN_NPM_REGISTRY_SERVER",
+  "YARN_NPM_ALWAYS_AUTH"
+]);
 function isDangerousEnvName(name) {
   const lower = name.toLowerCase();
   for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
@@ -26993,11 +26999,13 @@ function hostInstallEnv(pm) {
   env["npm_config_git"] = trustedGitPath();
   env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
   if (pm === "yarn") {
+    for (const name of Object.keys(env)) {
+      if (name.startsWith("YARN_") && !YARN_ENV_ALLOW.has(name)) delete env[name];
+    }
     env["YARN_IGNORE_PATH"] = "1";
     env["YARN_RC_FILENAME"] = ".yarnrc.yml";
     env["YARN_PLUGINS"] = "";
     env["YARN_ENABLE_CONSTRAINTS_CHECKS"] = "false";
-    delete env["YARN_ENABLE_SCRIPTS"];
   }
   return env;
 }
@@ -27377,13 +27385,15 @@ function detectPnpmConfigDepsInDir(dir) {
 var YARN_GUIDANCE = " executes repo-controlled code on the runner at `yarn install` startup, BEFORE the audit decides anything. `install: true` cannot run that pre-trust. Remove it, or audit without `install` (the sandbox still records it there).";
 function detectYarnStartupExec(repoDir, workspaceRoot) {
   const repo = realpathOrResolve(repoDir);
-  for (const dir of scanDirs(repoDir, workspaceRoot)) {
-    const reason = detectYarnStartupExecInDir(dir, dir === repo, repo);
+  const chain = scanDirs(repoDir, workspaceRoot);
+  const hasYarnConfig = chain.some((d) => (0, import_node_fs3.existsSync)((0, import_node_path4.join)(d, "yarn.config.cjs")));
+  for (const dir of chain) {
+    const reason = detectYarnStartupExecInDir(dir, dir === repo, hasYarnConfig);
     if (reason !== null) return reason;
   }
   return null;
 }
-function detectYarnStartupExecInDir(dir, atRepoDir, repoDir) {
+function detectYarnStartupExecInDir(dir, atRepoDir, hasYarnConfig) {
   const content = tryReadFile((0, import_node_path4.join)(dir, ".yarnrc.yml"));
   if (content === null) return null;
   const where = atRepoDir ? "a repo" : `an ancestor (\`${dir}\`)`;
@@ -27400,7 +27410,7 @@ function detectYarnStartupExecInDir(dir, atRepoDir, repoDir) {
   if (Array.isArray(parsed["plugins"]) && parsed["plugins"].length > 0) {
     return `${where} \`.yarnrc.yml\` \`plugins\` entry` + YARN_GUIDANCE;
   }
-  if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, "yarn.config.cjs")) || (0, import_node_fs3.existsSync)((0, import_node_path4.join)(dir, "yarn.config.cjs")))) {
+  if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && hasYarnConfig) {
     return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
   }
   return null;

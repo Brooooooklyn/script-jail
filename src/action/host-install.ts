@@ -432,6 +432,19 @@ const DANGEROUS_NPM_CONFIG_KEYS = new Set([
   'shell',
 ]);
 
+// The ONLY inherited `YARN_*` env kept on the host yarn child (allowlist — every
+// other YARN_* config is dropped; see hostInstallEnv).  These four are the scalar
+// auth/registry settings a private-registry install needs and that the env->config
+// transform can actually set (VERIFIED yarn 4.5.0: map settings npmScopes/
+// npmRegistries are NOT flat-env-settable, so per-scope auth lives in the rc, not
+// env).  None is a path/exec/inject vector.
+const YARN_ENV_ALLOW = new Set([
+  'YARN_NPM_AUTH_TOKEN',
+  'YARN_NPM_AUTH_IDENT',
+  'YARN_NPM_REGISTRY_SERVER',
+  'YARN_NPM_ALWAYS_AUTH',
+]);
+
 /**
  * True when `name` is a dangerous loader/tool/config-FILE selector env var to
  * strip from the host PM children.  Matched on the LOWERCASED name: (1) a whole
@@ -555,19 +568,29 @@ function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
   // inherited COREPACK_HOME above, which could force a cache re-download.
   env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
   if (pm === 'yarn') {
+    // SECURITY (parity, ALLOWLIST): Yarn maps env -> config (`YARN_<UPPER_SNAKE>` ->
+    // camelCase flat key, VERIFIED yarn 4.5.0) and ENV BEATS the rc file.  That
+    // config surface is open-ended and grows per release — `injectEnvironmentFiles`
+    // (injects a .env, incl. NODE_OPTIONS, into lifecycle subprocesses), `*Folder`
+    // path redirects, `constraintsPath`, TLS/proxy paths, `enableScripts`, … — so
+    // enumerating dangerous names is whack-a-mole (each fix surfaces the next).  The
+    // clean-VM audit inherits NO runner env, so DROP EVERY inherited `YARN_*` except
+    // the scalar auth/registry keys a private-registry install genuinely needs; that
+    // keeps host==audit by construction.  (Per-scope `npmScopes`/`npmRegistries` are
+    // MAP settings, NOT flat-env-settable in 4.5.0 — yarn errors on them — so the
+    // four scalars below are the entire env-settable auth surface; rc-file auth is
+    // unaffected.)  Sweep FIRST, then layer the explicit pins so the sweep can't
+    // clobber them.
+    for (const name of Object.keys(env)) {
+      if (name.startsWith('YARN_') && !YARN_ENV_ALLOW.has(name)) delete env[name];
+    }
     env['YARN_IGNORE_PATH'] = '1';
     env['YARN_RC_FILENAME'] = '.yarnrc.yml';
     env['YARN_PLUGINS'] = '';
     env['YARN_ENABLE_CONSTRAINTS_CHECKS'] = 'false';
-    // SECURITY (parity): Yarn maps env -> config and ENV BEATS the rc file
-    // (VERIFIED yarn 4.5.0: `enableScripts` reads false from `.yarnrc.yml`
-    // `enableScripts: false` but TRUE under `YARN_ENABLE_SCRIPTS=true`).  The
-    // clean-VM audit never inherits the runner env, so it honours the rc; if the
-    // host kept an inherited `YARN_ENABLE_SCRIPTS=true` it would run lifecycle
-    // scripts a PR's `enableScripts: false` suppressed in the audit — host > audit,
-    // unrecorded RCE on the runner.  DELETE it (not force-false) so the rc governs
-    // host part-2 IDENTICALLY to the audit: rc-true still builds, rc-false still skips.
-    delete env['YARN_ENABLE_SCRIPTS'];
+    // YARN_ENABLE_SCRIPTS is intentionally NOT re-set: the sweep dropped any inherited
+    // value (it is not in the allowlist), so the rc governs host part-2 IDENTICALLY to
+    // the audit — rc-true still builds, rc-false still skips (env must not beat rc).
   }
   return env;
 }

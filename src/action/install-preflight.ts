@@ -407,11 +407,19 @@ function detectYarnStartupExec(repoDir: string, workspaceRoot?: string): string 
   // common repoDir===workspaceRoot case scans exactly repoDir (unchanged).
   // realpath (not lexical resolve) so `dir === repo` matches the realpath'd dirs
   // scanDirs returns (a symlinked repoDir would otherwise never match and every
-  // dir would mislabel as an ancestor) AND so the install-root `yarn.config.cjs`
-  // lookup below resolves the same project root yarn reads on disk.
+  // dir would mislabel as an ancestor).
   const repo = realpathOrResolve(repoDir);
-  for (const dir of scanDirs(repoDir, workspaceRoot)) {
-    const reason = detectYarnStartupExecInDir(dir, dir === repo, repo);
+  const chain = scanDirs(repoDir, workspaceRoot);
+  // The `enableConstraintsChecks` hook loads `yarn.config.cjs` from yarn's PROJECT
+  // ROOT, which can be repoDir, an INTERMEDIATE workspace root between repoDir and
+  // workspaceRoot, or the workspace root itself (VERIFIED yarn 4.5.0: running from a
+  // workspace member loads the intermediate project root's config — neither repoDir
+  // nor the enabling rc's dir).  Fail closed for every shape: when constraints are
+  // enabled at ANY scanned rc, refuse if a `yarn.config.cjs` exists ANYWHERE in the
+  // repoDir->workspaceRoot chain — a superset of yarn's real project root.
+  const hasYarnConfig = chain.some((d) => existsSync(join(d, 'yarn.config.cjs')));
+  for (const dir of chain) {
+    const reason = detectYarnStartupExecInDir(dir, dir === repo, hasYarnConfig);
     if (reason !== null) return reason;
   }
   return null;
@@ -420,11 +428,12 @@ function detectYarnStartupExec(repoDir: string, workspaceRoot?: string): string 
 /**
  * Apply the yarn startup-exec checks to a SINGLE directory's `.yarnrc.yml`.
  * `atRepoDir` controls whether the error message names the ancestor dir (for a
- * clear diagnostic when the offending rc is NOT the repo's own).  `repoDir` is the
- * realpath'd install-cwd project root — where yarn actually loads `yarn.config.cjs`
- * from, regardless of which ancestor rc enabled the constraints hook.
+ * clear diagnostic when the offending rc is NOT the repo's own).  `hasYarnConfig`
+ * is whether a `yarn.config.cjs` exists ANYWHERE in the repoDir->workspaceRoot
+ * chain — precomputed by the caller because yarn loads it from its project root,
+ * which may be any dir in that chain, not just the rc's own dir.
  */
-function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, repoDir: string): string | null {
+function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, hasYarnConfig: boolean): string | null {
   // Berry reads ONLY `.yarnrc.yml`; classic `.yarnrc` `yarn-path` is ignored
   // under corepack/Berry (verified), so it is not a vector and is not checked.
   const content = tryReadFile(join(dir, '.yarnrc.yml'));
@@ -454,21 +463,13 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, repoDir: st
   // (true / "true" / 1 / "1"); rather than enumerate them, fail closed for
   // ANYTHING that is not DEFINITELY false (matches yarn's own behavior, which
   // throws on unrecognized values — refusing is the safe direction).  The enabling
-  // FLAG cascades down from ANY ancestor `.yarnrc.yml` (Berry's rc cascade), but
-  // yarn loads the `yarn.config.cjs` it runs from its PROJECT ROOT, which is the
-  // INSTALL-CWD (`repoDir`) when that dir is its own project (own lockfile — the
-  // realistic audited case) OR a workspace root above it.  VERIFIED yarn 4.5.0: an
-  // ancestor rc `enableConstraintsChecks: true` + a `yarn.config.cjs` in the audited
-  // subdir runs the SUBDIR config (the old `join(dir, …)`-only check missed it, so a
-  // subdir audit bypassed the gate); the workspace-root shape instead loads the
-  // root's config.  Check BOTH `repoDir` (install-cwd project root) AND `dir` (the
-  // rc's own dir, which is the project root in the workspace-member shape) so the
-  // gate fails closed for either — over-refusing a stray ancestor config is the safe
-  // direction.
-  if (
-    isNotDefinitelyFalse(parsed['enableConstraintsChecks']) &&
-    (existsSync(join(repoDir, 'yarn.config.cjs')) || existsSync(join(dir, 'yarn.config.cjs')))
-  ) {
+  // FLAG cascades down from ANY ancestor `.yarnrc.yml` (Berry's rc cascade), and the
+  // `yarn.config.cjs` it runs is loaded from yarn's PROJECT ROOT — repoDir, an
+  // intermediate workspace root, or the workspace root.  `hasYarnConfig` (computed by
+  // the caller over the whole chain) is true when any of those dirs holds the file,
+  // so this fails closed for every shape.  (Requires the FLAG too: without a config
+  // file the hook no-ops, so flag-only must not over-fire.)
+  if (isNotDefinitelyFalse(parsed['enableConstraintsChecks']) && hasYarnConfig) {
     return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
   }
   return null;

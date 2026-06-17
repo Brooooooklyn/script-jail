@@ -332,6 +332,20 @@ describe('detectPreTrustConfigExec — yarn ancestor .yarnrc.yml scan', () => {
     expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toBeNull();
   });
 
+  it('blocks ancestor enableConstraintsChecks + yarn.config.cjs at an INTERMEDIATE project root (codex chain-check)', () => {
+    // repoDir = <ws>/project/packages/app (a workspace member, no own lock); yarn's
+    // actual project root is <ws>/project with <ws>/project/yarn.config.cjs; the
+    // enabling rc is the outer <ws>/.yarnrc.yml.  VERIFIED yarn 4.5.0: running from
+    // packages/app loads <ws>/project/yarn.config.cjs — NEITHER repoDir NOR the rc's
+    // dir — so the gate must scan the whole repoDir->workspaceRoot chain.
+    const ws = dir;
+    const app = join(ws, 'project', 'packages', 'app');
+    writeAt(join(ws, '.yarnrc.yml'), 'enableConstraintsChecks: true\n');
+    writeAt(join(ws, 'project', 'yarn.config.cjs'), 'module.exports = {}'); // intermediate root
+    writeAt(join(app, 'package.json'), '{"name":"app"}');
+    expect(detectPreTrustConfigExec(app, 'yarn', ws)).toMatch(/enableConstraintsChecks/);
+  });
+
   it('fails closed on an unparseable ANCESTOR .yarnrc.yml', () => {
     const ws = dir;
     const pkg = join(ws, 'pkg');

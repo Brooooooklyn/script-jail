@@ -188,6 +188,46 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
+  it('drops the WHOLE inherited YARN_* config surface except auth (codex allowlist — YARN_INJECT_ENVIRONMENT_FILES etc.)', () => {
+    // SECURITY: Yarn maps env->config and the surface is open-ended — enumerating
+    // dangerous names is whack-a-mole (YARN_INJECT_ENVIRONMENT_FILES injects a .env
+    // incl. NODE_OPTIONS into lifecycle subprocesses; *Folder/*Path redirects; ...).
+    // hostInstallEnv keeps ONLY the scalar auth/registry YARN_* and drops every other
+    // inherited YARN_*.  The clean-VM audit inherits no runner env, so this is parity-safe.
+    let seen: NodeJS.ProcessEnv = {};
+    const spawn: HostSpawn = (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; };
+    const dangerous = {
+      YARN_INJECT_ENVIRONMENT_FILES: '.env.evil',
+      YARN_GLOBAL_FOLDER: '/checkout/.yarn',
+      YARN_CONSTRAINTS_PATH: '/checkout/c.cjs',
+      YARN_HTTPS_CA_FILE_PATH: '/checkout/ca.pem',
+    };
+    const auth = {
+      YARN_NPM_AUTH_TOKEN: 'tok',
+      YARN_NPM_AUTH_IDENT: 'ident',
+      YARN_NPM_REGISTRY_SERVER: 'https://reg.example/',
+      YARN_NPM_ALWAYS_AUTH: 'true',
+    };
+    const prior: Record<string, string | undefined> = {};
+    for (const k of [...Object.keys(dangerous), ...Object.keys(auth)]) prior[k] = process.env[k];
+    try {
+      Object.assign(process.env, dangerous, auth);
+      hostInstallNoScripts('yarn', '/repo', [], makeRecorder().io, spawn);
+      for (const k of Object.keys(dangerous)) expect(seen[k]).toBeUndefined(); // every non-auth YARN_* dropped
+      expect(seen['YARN_NPM_AUTH_TOKEN']).toBe('tok'); // auth/registry preserved
+      expect(seen['YARN_NPM_AUTH_IDENT']).toBe('ident');
+      expect(seen['YARN_NPM_REGISTRY_SERVER']).toBe('https://reg.example/');
+      expect(seen['YARN_NPM_ALWAYS_AUTH']).toBe('true');
+      expect(seen['YARN_IGNORE_PATH']).toBe('1'); // pins re-applied on top of the sweep
+      expect(seen['YARN_PLUGINS']).toBe('');
+    } finally {
+      for (const [k, v] of Object.entries(prior)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
   it('hardens the pnpm host part-1 with --ignore-pnpmfile; npm/yarn get no such flag', () => {
     // SECURITY: pnpm executes a repo `.pnpmfile.cjs` (and relocated pnpmfiles) at
     // require-time during a no-scripts install, BEFORE the trust gate.
