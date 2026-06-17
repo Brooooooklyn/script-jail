@@ -7852,36 +7852,49 @@ var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
   // the legit values from the package.json the sandbox already audited.
   "npm_package_config_"
 ];
-var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
-  "script_shell",
-  "ignore_scripts",
-  "userconfig",
-  "globalconfig",
-  "prefix",
-  "node_options",
-  "node_gyp",
-  "python",
-  "make",
-  "shell"
+var PM_CONFIG_AUTH_SCALARS = /* @__PURE__ */ new Set([
+  "registry",
+  // default registry URL
+  "_auth",
+  // legacy single-registry base64 basic auth
+  "email",
+  // legacy auth identity
+  "ca",
+  // inline PEM CA (string/array) — data, not a path
+  "cafile",
+  // PEM CA file path — read as cert DATA, never interpreted
+  "cert",
+  // inline PEM client cert (deprecated → certfile)
+  "certfile",
+  // PEM client-cert file path — TLS material
+  "key",
+  // inline PEM client key (deprecated → keyfile)
+  "keyfile",
+  // PEM client-key file path — TLS material
+  "strict_ssl",
+  // TLS verification toggle
+  "proxy",
+  // HTTP(S) proxy URL
+  "https_proxy",
+  // HTTPS proxy URL
+  "noproxy"
+  // proxy-bypass host list (canonical key is `noproxy`)
 ]);
-var DANGEROUS_PNPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
-  ...DANGEROUS_NPM_CONFIG_KEYS,
-  "pnpmfile",
-  "global_pnpmfile",
-  "shell_emulator"
-]);
+function isAllowedPmConfigKey(slice) {
+  if (slice.startsWith("//")) return true;
+  if (slice.startsWith("@") && slice.includes(":")) return true;
+  return PM_CONFIG_AUTH_SCALARS.has(slice.replace(/-/g, "_"));
+}
 function isDangerousEnvName(name) {
   const lower = name.toLowerCase();
   for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
     if (lower.startsWith(prefix)) return true;
   }
   if (lower.startsWith("pnpm_config_")) {
-    const key = lower.slice("pnpm_config_".length).replace(/-/g, "_");
-    return DANGEROUS_PNPM_CONFIG_KEYS.has(key);
+    return !isAllowedPmConfigKey(lower.slice("pnpm_config_".length));
   }
   if (lower.startsWith("npm_config_")) {
-    const key = lower.slice("npm_config_".length).replace(/-/g, "_");
-    return DANGEROUS_NPM_CONFIG_KEYS.has(key);
+    return !isAllowedPmConfigKey(lower.slice("npm_config_".length));
   }
   return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
 }

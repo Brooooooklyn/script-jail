@@ -1445,13 +1445,14 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['CI']).toBe('true');
   });
 
-  it('stripDangerousEnv drops dangerous pnpm_config_* (own namespace — round-9)', () => {
+  it('stripDangerousEnv drops dangerous pnpm_config_* (own namespace — round-9, allowlist)', () => {
     // VERIFIED pnpm 11.1.2: pnpm reads `scriptShell` from its OWN `pnpm_config_*` env
     // namespace (NOT npm_config_*), so `PNPM_CONFIG_SCRIPT_SHELL` / `pnpm_config_script_shell`
     // set the lifecycle-script interpreter and EXEC on `pnpm install`/`pnpm rebuild`
-    // (PWNED_PNPM_CFG_SHELL_RAN).  Canonicalized (case + `-`/`_`) against the pnpm
-    // dangerous-key set; auth/registry pnpm_config_* survive.  pnpmfile/global_pnpmfile
-    // are dropped too (defense-in-depth; the host --ignore-pnpmfile also covers them).
+    // (PWNED_PNPM_CFG_SHELL_RAN).  pnpm_config_* is now an ALLOWLIST (registry/auth/TLS/
+    // proxy only — see PM_CONFIG_AUTH_SCALARS), so EVERY exec/interpreter/hook key is
+    // dropped (script_shell, shell_emulator, scripts_prepend_node_path, pnpmfile/
+    // global_pnpmfile) while registry + per-registry auth survive.
     const out = stripDangerousEnv({
       PNPM_CONFIG_SCRIPT_SHELL: '/checkout/evil-sh', // upper form
       pnpm_config_script_shell: '/checkout/evil-sh', // lower snake form
@@ -1459,6 +1460,7 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       pnpm_config_global_pnpmfile: '/checkout/evil.cjs', // pnpm hook file
       PNPM_CONFIG_SHELL_EMULATOR: 'true', // interpreter switch (sh → JS emulator) — VERIFIED diverges
       pnpm_config_shell_emulator: 'true',
+      pnpm_config_scripts_prepend_node_path: 'true', // round-11 PATH-node selector — dropped by allowlist
       pnpm_config_registry: 'https://registry.npmjs.org/', // auth/registry — preserved
       'pnpm_config_//registry.npmjs.org/:_authToken': 'tok', // auth — preserved
     });
@@ -1468,8 +1470,91 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['pnpm_config_global_pnpmfile']).toBeUndefined();
     expect(out['PNPM_CONFIG_SHELL_EMULATOR']).toBeUndefined();
     expect(out['pnpm_config_shell_emulator']).toBeUndefined();
+    expect(out['pnpm_config_scripts_prepend_node_path']).toBeUndefined();
     expect(out['pnpm_config_registry']).toBe('https://registry.npmjs.org/');
     expect(out['pnpm_config_//registry.npmjs.org/:_authToken']).toBe('tok');
+  });
+
+  it('stripDangerousEnv drops npm_config_/pnpm_config_ scripts_prepend_node_path (round-11 — pnpm honors npm_config_ form)', () => {
+    // VERIFIED pnpm 10.34.3/11.1.2: pnpm prepends the running-node dir to the
+    // lifecycle-script PATH when `scripts-prepend-node-path` is set, changing which
+    // bare-name `node` a script resolves — and it honors the `npm_config_` env FORM at
+    // install time (the `pnpm_config_`/`PNPM_CONFIG_` form is NOT read on install), so
+    // the WORKING attack var is `npm_config_scripts_prepend_node_path`.  npm 11 IGNORES
+    // the key ("Unknown env config"), so dropping it is a no-op on npm and closes the
+    // live pnpm vector.  The allowlist drops it in EVERY case/separator form.
+    const out = stripDangerousEnv({
+      npm_config_scripts_prepend_node_path: 'true', // the form pnpm actually honors
+      'npm_config_scripts-prepend-node-path': 'true', // hyphen alias
+      NPM_CONFIG_SCRIPTS_PREPEND_NODE_PATH: 'true', // upper form
+      npm_config_registry: 'https://registry.npmjs.org/', // auth — preserved
+    });
+    expect(out['npm_config_scripts_prepend_node_path']).toBeUndefined();
+    expect(out['npm_config_scripts-prepend-node-path']).toBeUndefined();
+    expect(out['NPM_CONFIG_SCRIPTS_PREPEND_NODE_PATH']).toBeUndefined();
+    expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
+  });
+
+  it('stripDangerousEnv npm_config_/pnpm_config_ is an ALLOWLIST: benign non-auth keys dropped, full auth surface preserved', () => {
+    // The decisive posture shift (round-11): the config-via-env key space is an open,
+    // per-release-growing set of exec/interpreter/loader/config-FILE selectors that a
+    // denylist could not bound (a new one surfaced each round).  We now KEEP only the
+    // small, stable registry/auth/TLS/proxy surface and DROP everything else — even a
+    // benign-looking config key (loglevel/cache/fund/…), because the clean-VM audit
+    // inherited NONE of them, so the host must run with PM defaults for parity.
+    const out = stripDangerousEnv({
+      // benign-but-non-auth npm config keys — DROPPED (would have survived the old denylist):
+      npm_config_loglevel: 'silly',
+      npm_config_cache: '/checkout/.npm-cache', // path redirect — definitely drop
+      npm_config_fund: 'false',
+      npm_config_audit: 'false',
+      'npm_config_save-exact': 'true',
+      // full auth/registry/TLS/proxy surface — PRESERVED:
+      npm_config_registry: 'https://registry.npmjs.org/',
+      npm_config_email: 'me@example.com',
+      npm_config__auth: 'YmFzZTY0', // legacy base64 basic auth
+      npm_config_ca: '-----BEGIN CERTIFICATE-----',
+      npm_config_cafile: '/etc/ssl/ca.pem',
+      npm_config_cert: '-----BEGIN CERTIFICATE-----',
+      npm_config_certfile: '/etc/ssl/client-cert.pem',
+      npm_config_key: '-----BEGIN PRIVATE KEY-----',
+      npm_config_keyfile: '/etc/ssl/client-key.pem',
+      'npm_config_strict-ssl': 'true', // hyphen alias of strict_ssl
+      npm_config_proxy: 'http://proxy.local:8080/',
+      'npm_config_https-proxy': 'http://proxy.local:8080/',
+      npm_config_noproxy: 'localhost,.internal',
+      // dynamic auth forms — PRESERVED VERBATIM (no -→_ canon):
+      'npm_config_//registry.npmjs.org/:_authToken': 'tok',
+      'npm_config_//npm.pkg.github.com/:_password': 'pw',
+      'npm_config_//registry.example.com/:certfile': '/etc/ssl/c.pem',
+      'npm_config_@my-org:registry': 'https://npm.my-org.dev/', // hyphen in scope — must NOT canon to @my_org
+    });
+    // dropped (allowlist excludes non-auth):
+    for (const k of [
+      'npm_config_loglevel', 'npm_config_cache', 'npm_config_fund',
+      'npm_config_audit', 'npm_config_save-exact',
+    ]) {
+      expect(out[k]).toBeUndefined();
+    }
+    // preserved scalars (incl. hyphen aliases):
+    expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
+    expect(out['npm_config_email']).toBe('me@example.com');
+    expect(out['npm_config__auth']).toBe('YmFzZTY0');
+    expect(out['npm_config_ca']).toBe('-----BEGIN CERTIFICATE-----');
+    expect(out['npm_config_cafile']).toBe('/etc/ssl/ca.pem');
+    expect(out['npm_config_cert']).toBe('-----BEGIN CERTIFICATE-----');
+    expect(out['npm_config_certfile']).toBe('/etc/ssl/client-cert.pem');
+    expect(out['npm_config_key']).toBe('-----BEGIN PRIVATE KEY-----');
+    expect(out['npm_config_keyfile']).toBe('/etc/ssl/client-key.pem');
+    expect(out['npm_config_strict-ssl']).toBe('true');
+    expect(out['npm_config_proxy']).toBe('http://proxy.local:8080/');
+    expect(out['npm_config_https-proxy']).toBe('http://proxy.local:8080/');
+    expect(out['npm_config_noproxy']).toBe('localhost,.internal');
+    // preserved dynamic forms (verbatim — hyphen in scope intact):
+    expect(out['npm_config_//registry.npmjs.org/:_authToken']).toBe('tok');
+    expect(out['npm_config_//npm.pkg.github.com/:_password']).toBe('pw');
+    expect(out['npm_config_//registry.example.com/:certfile']).toBe('/etc/ssl/c.pem');
+    expect(out['npm_config_@my-org:registry']).toBe('https://npm.my-org.dev/');
   });
 
   it('stripDangerousEnv drops the XDG_* family + PNPM_HOME (pnpm config→scriptShell, round-8)', () => {

@@ -284,14 +284,16 @@ const HOST_INSTALL_STRIP_ENV_NAMES = new Set([
 //   [16] NPM_CONFIG_IGNORE_SCRIPTS=true     → part-2 skips the scripts the audit
 //        expects → an unbuilt tree (self-DoS / divergence).
 //
-// npm reads its `npm_config_*` config CASE-INSENSITIVELY and with EITHER
-// separator (`NPM_CONFIG_SCRIPT_SHELL`, `npm_config_script_shell`, AND
-// `npm_config_script-shell` all work), so the npm_config_* family is matched by
-// the CANONICALIZED-key check in isDangerousEnvName (see DANGEROUS_NPM_CONFIG_KEYS
-// below), not by exact name.  The OS loader/tool vars (LD_*/DYLD_*/NODE_OPTIONS/
-// GIT_*/PYTHON/CC/…) are case-SENSITIVE on Linux/macOS — exact-name match — though
-// we also fold case, a cheap defensive catch-all that cannot widen the match
-// beyond these names.
+// npm AND pnpm read config via the `npm_config_*` / `pnpm_config_*` env namespaces
+// CASE-INSENSITIVELY and with EITHER separator (`NPM_CONFIG_SCRIPT_SHELL`,
+// `npm_config_script_shell`, `npm_config_script-shell` all set `script-shell`), so
+// these namespaces are matched by a CANONICALIZED-key check in isDangerousEnvName
+// (see isAllowedPmConfigKey below), not by exact name.  Those two namespaces use an
+// ALLOWLIST (keep registry/auth/TLS/proxy only; drop everything else) — see the
+// rationale on PM_CONFIG_AUTH_SCALARS.  The OS loader/tool vars (LD_*/DYLD_*/
+// NODE_OPTIONS/GIT_*/PYTHON/CC/…) are case-SENSITIVE on Linux/macOS — exact-name
+// match — though we also fold case, a cheap defensive catch-all that cannot widen
+// the match beyond these names.
 //
 // WHY A DENYLIST, NOT AN ALLOWLIST: the host MUST run the package's REAL
 // lifecycle scripts with a realistic env, so arbitrary owner/workflow vars
@@ -433,71 +435,76 @@ const HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
   'npm_package_config_',
 ];
 
-// npm honors its `npm_config_*` config via env in ANY case AND with EITHER
-// separator: `NPM_CONFIG_SCRIPT_SHELL`, `npm_config_script_shell`, and
-// `npm_config_script-shell` ALL set the `script-shell` config (verified, npm
-// 11.13.0).  An exact-name denylist misses the hyphen form, so the npm_config_*
-// family is matched by CANONICALIZING the key (lowercase + `-`→`_`) against the
-// dangerous config keys below.  Keys (canonical underscore form):
-//   script_shell             [18] lifecycle script interpreter
-//   ignore_scripts           [16] skip the audited scripts (self-DoS / divergence)
-//   userconfig / globalconfig [22] load a PR-controlled npmrc
-//   prefix                   [21] npm DERIVES globalconfig as `{prefix}/etc/npmrc`
-//                            (VERIFIED npm 11.13.0: `NPM_CONFIG_PREFIX=<dir>` with
-//                            `<dir>/etc/npmrc` declaring `script-shell=<pwn>` makes
-//                            `npm rebuild --foreground-scripts` exec the attacker
-//                            shell), so an inherited prefix is a config-redirect to a
-//                            PR-controlled npmrc exactly like userconfig/globalconfig.
-//   node_options             a NODE LOADER alias for NODE_OPTIONS: npm passes the
-//                            `node-options` config to the node that runs lifecycle
-//                            scripts (VERIFIED npm 11.13.0: `NPM_CONFIG_NODE_OPTIONS=
-//                            '--require ./hook.js'` preloads hook.js in the script
-//                            child).  The raw NODE_OPTIONS name is stripped above, so
-//                            the npm_config alias must be too, or it smuggles the same
-//                            loader the audit never saw.
-//   node_gyp / python / make native-build tool selectors (checkout-relative exec)
-//   shell                    npm's exec/explore shell
-const DANGEROUS_NPM_CONFIG_KEYS = new Set([
-  'script_shell',
-  'ignore_scripts',
-  'userconfig',
-  'globalconfig',
-  'prefix',
-  'node_options',
-  'node_gyp',
-  'python',
-  'make',
-  'shell',
+// The `npm_config_*` AND `pnpm_config_*` env namespaces are governed by an
+// ALLOWLIST: keep ONLY registry-location / auth / TLS-material / proxy keys, drop
+// EVERYTHING else.  Both PMs read these namespaces case-insensitively and with
+// either separator (`NPM_CONFIG_SCRIPT_SHELL` / `npm_config_script_shell` /
+// `npm_config_script-shell` all set `script-shell`), so the match canonicalizes
+// the key (lowercase + `-`→`_`) for the fixed scalar names below.
+//
+// WHY AN ALLOWLIST, NOT A DENYLIST: the config-via-env key space is an open,
+// per-release-growing set of exec / interpreter / loader / config-FILE selectors,
+// and a denylist of them was PROVEN LEAKY — adversarial review surfaced a new one
+// EACH round (`script_shell` → `shell_emulator` → `scripts_prepend_node_path`),
+// across BOTH namespaces.  `scripts_prepend_node_path` also showed the per-namespace
+// denylist was STRUCTURALLY wrong: pnpm honors that key at install time via the
+// `npm_config_` form (VERIFIED pnpm 10.34.3/11.1.2 — it prepends a chosen node dir
+// to the lifecycle-script PATH, changing which `node` runs scripts), so a
+// pnpm-namespace denylist entry never even covered the working vector.  npm 11
+// IGNORES it ("Unknown env config"), so the allowlist drop is a no-op on npm and
+// closes the live pnpm vector.  The auth/registry/TLS/proxy surface, by contrast,
+// is SMALL, STABLE, and contains no exec selector, so it can be enumerated soundly.
+// This mirrors the YARN_* allowlist posture in hostInstallEnv (yarn's env->config
+// space is likewise open-ended).
+//
+// PARITY MAKES DROP-THE-REST SAFE: the Firecracker/Docker guest audits in a CLEAN
+// VM env with NO inherited `npm_config_*`/`pnpm_config_*`, so whatever PASSED the
+// audit was built with PM defaults for every non-auth key; dropping them on the
+// host only brings it to parity.  The host legitimately ADDS only registry/auth/
+// TLS/proxy (registry URL, tokens, `//registry/:_authToken`, CA/cert), which the
+// allowlist keeps.  VERIFIED (npm 11.13.0 + pnpm): every key below is env-settable
+// and is registry/auth/TLS material — none selects an exec, loader, interpreter, or
+// a config FILE to discover-and-interpret.  ca/cafile/cert/certfile/key/keyfile are
+// PEM material read as TLS data, never executed.
+//
+// Fixed scalar keys (canonical underscore form; matched after `-`→`_`).
+const PM_CONFIG_AUTH_SCALARS = new Set([
+  'registry', // default registry URL
+  '_auth', // legacy single-registry base64 basic auth
+  'email', // legacy auth identity
+  'ca', // inline PEM CA (string/array) — data, not a path
+  'cafile', // PEM CA file path — read as cert DATA, never interpreted
+  'cert', // inline PEM client cert (deprecated → certfile)
+  'certfile', // PEM client-cert file path — TLS material
+  'key', // inline PEM client key (deprecated → keyfile)
+  'keyfile', // PEM client-key file path — TLS material
+  'strict_ssl', // TLS verification toggle
+  'proxy', // HTTP(S) proxy URL
+  'https_proxy', // HTTPS proxy URL
+  'noproxy', // proxy-bypass host list (canonical key is `noproxy`)
 ]);
 
-// pnpm reads config from its OWN `pnpm_config_*` env namespace (distinct from
-// npm_config_*) in addition to npm_config_* for npm-compatible keys.  VERIFIED
-// pnpm 11.1.2: `pnpm_config_script_shell` / `PNPM_CONFIG_SCRIPT_SHELL` set
-// `scriptShell` (the lifecycle-script interpreter) and EXEC on `pnpm install` /
-// `pnpm rebuild` (`PWNED…RAN argv=-c …`), while `npm_config_script_shell` does NOT
-// (pnpm reads scriptShell only from its own namespace), so the npm_config_* canon
-// above misses it.  pnpm's env->config map is BOUNDED (an unknown `pnpm_config_X`
-// is ignored — VERIFIED), so a canonicalized-key denylist is sound, exactly like
-// npm.  Reuse the npm dangerous keys (script_shell / shell / node_options /
-// node_gyp / python / make / ignore_scripts / user|globalconfig / prefix) and add
-// pnpm's own selectors:
-//   pnpmfile / global_pnpmfile — hook files (the host --ignore-pnpmfile flag
-//     already suppresses an env-set pnpmfile — VERIFIED — defense-in-depth + parity).
-//   shell_emulator             — pnpm's THIRD lifecycle-script interpreter knob
-//     (alongside script_shell=path and node_options=loader): it switches execution
-//     from POSIX `sh -c` to Yarn's JS shell emulator, which interprets the SAME
-//     audited script string with DIFFERENT semantics.  VERIFIED pnpm 11.1.2: a
-//     postinstall `echo {1..3} || node -e <write>` writes a marker under
-//     `PNPM_CONFIG_SHELL_EMULATOR=true` but NOT under default sh — a host-only
-//     execution branch the clean-VM audit (default sh) never recorded.
-// Auth/registry pnpm_config_* (registry, `//host/:_authToken`, …) are NOT in the
-// set, so they fall through and survive.
-const DANGEROUS_PNPM_CONFIG_KEYS = new Set([
-  ...DANGEROUS_NPM_CONFIG_KEYS,
-  'pnpmfile',
-  'global_pnpmfile',
-  'shell_emulator',
-]);
+/**
+ * True when an `npm_config_*` / `pnpm_config_*` key — the part AFTER the namespace
+ * prefix, already LOWERCASED — is an ALLOWED registry/auth/TLS/proxy key that must
+ * survive into the host PM child.  Everything else (exec / interpreter / loader /
+ * config-FILE / behaviour selectors: script_shell, shell_emulator,
+ * scripts_prepend_node_path, node_options, prefix, userconfig, ignore_scripts,
+ * pnpmfile, …) is dangerous (dropped).
+ */
+function isAllowedPmConfigKey(slice: string): boolean {
+  // Per-registry auth/TLS: `//host/:_authToken`, `//host/:_password`,
+  // `//host/:certfile`, … — these ONLY carry per-registry credentials / registry
+  // settings, never an exec.  The host segment + suffix can contain `-`/`.`, so
+  // match the `//` prefix VERBATIM (do NOT canonicalize `-`→`_`).
+  if (slice.startsWith('//')) return true;
+  // Scoped registry / scoped auth: `@scope:registry`, `@scope:_authToken`, …  The
+  // scope segment may contain `-` (VERIFIED: canonicalizing `-`→`_` mis-targets the
+  // scope — `@my-org:registry` ≠ `@my_org:registry`), so match the RAW key.
+  if (slice.startsWith('@') && slice.includes(':')) return true;
+  // Fixed scalar keys (canonicalize `-`→`_`; these contain no scope/host segment).
+  return PM_CONFIG_AUTH_SCALARS.has(slice.replace(/-/g, '_'));
+}
 
 // The ONLY inherited `YARN_*` env kept on the host yarn child (allowlist — every
 // other YARN_* config is dropped; see hostInstallEnv).  These four are the scalar
@@ -515,11 +522,11 @@ const YARN_ENV_ALLOW = new Set([
 /**
  * True when `name` is a dangerous loader/tool/config-FILE selector env var to
  * strip from the host PM children.  Matched on the LOWERCASED name: (1) a whole
- * dangerous FAMILY by prefix, (2) the canonicalized `pnpm_config_*` and
- * `npm_config_*` slices (separator/case-robust so the `…_script-shell` hyphen
- * alias is caught), each against its own dangerous-key set, (3) the enumerated
- * exact set.  pnpm_config_* and npm_config_* names NOT in the dangerous-key sets
- * (registry, auth tokens, …) fall through and are preserved.
+ * dangerous FAMILY by prefix, (2) the `pnpm_config_*` and `npm_config_*` namespaces
+ * by ALLOWLIST — dangerous UNLESS the key is registry/auth/TLS/proxy
+ * (isAllowedPmConfigKey), so any exec/interpreter/loader/config-FILE/behaviour key
+ * (script_shell, shell_emulator, scripts_prepend_node_path, prefix, …) is dropped
+ * while registry/auth tokens survive, (3) the enumerated exact set.
  */
 function isDangerousEnvName(name: string): boolean {
   const lower = name.toLowerCase();
@@ -528,13 +535,13 @@ function isDangerousEnvName(name: string): boolean {
   }
   // pnpm_config_* must be tested BEFORE npm_config_* — `pnpm_config_x` does not
   // start with `npm_config_`, but keep them as distinct branches for clarity.
+  // pnpm ALSO honors the `npm_config_` form at install time (e.g.
+  // npm_config_scripts_prepend_node_path), so BOTH namespaces use the same allowlist.
   if (lower.startsWith('pnpm_config_')) {
-    const key = lower.slice('pnpm_config_'.length).replace(/-/g, '_');
-    return DANGEROUS_PNPM_CONFIG_KEYS.has(key);
+    return !isAllowedPmConfigKey(lower.slice('pnpm_config_'.length));
   }
   if (lower.startsWith('npm_config_')) {
-    const key = lower.slice('npm_config_'.length).replace(/-/g, '_');
-    return DANGEROUS_NPM_CONFIG_KEYS.has(key);
+    return !isAllowedPmConfigKey(lower.slice('npm_config_'.length));
   }
   return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
 }
