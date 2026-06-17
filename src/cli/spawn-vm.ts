@@ -37,7 +37,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseFrames, type GuestFrame } from '../shared/vsock-protocol.js';
-import { stripDangerousEnv } from '../action/host-install.js';
+import { isPathUnderCheckout, stripDangerousEnv } from '../action/host-install.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -263,15 +263,24 @@ export function resolveScriptJailVmBinary(opts?: {
   const envBin =
     opts?.envOverride !== undefined ? opts.envOverride : process.env['SCRIPT_JAIL_VM_BIN'];
   if (envBin !== undefined && envBin !== '') {
-    // SECURITY (codex round-8): the override must be ABSOLUTE.  A relative value
-    // (e.g. `./script-jail-vm`) would `existsSync` + spawn against the process
-    // cwd (the checkout), letting a PR-committed binary become the "trusted" VZ
-    // helper pre-trust.  Fail closed on a non-absolute override rather than
-    // silently resolving it against the checkout.
+    // SECURITY (codex round-8/9): the override must be ABSOLUTE and OUTSIDE the
+    // checkout.  A relative value (e.g. `./script-jail-vm`) would resolve against
+    // the process cwd (the checkout); an absolute value under the checkout (e.g.
+    // `$GITHUB_WORKSPACE/bin/script-jail-vm`) is equally PR-controlled.  Either
+    // would let a PR-committed binary become the "trusted" VZ helper pre-trust —
+    // and the codesign preflight is NOT a provenance check (ad-hoc signing with
+    // the virtualization entitlement is the documented dev flow), so it can't
+    // catch this.  Fail closed rather than silently spawning checkout content.
     if (!isAbsolute(envBin)) {
       throw new Error(
         `script-jail: SCRIPT_JAIL_VM_BIN must be an absolute path (got ${JSON.stringify(envBin)}); ` +
           `a relative override would resolve the VZ helper against the checkout.`,
+      );
+    }
+    if (isPathUnderCheckout(envBin)) {
+      throw new Error(
+        `script-jail: SCRIPT_JAIL_VM_BIN (${JSON.stringify(envBin)}) is inside the checkout; ` +
+          `the VZ helper must not be a checkout-controlled binary (pre-trust RCE).`,
       );
     }
     searched.push(`${envBin} (SCRIPT_JAIL_VM_BIN)`);

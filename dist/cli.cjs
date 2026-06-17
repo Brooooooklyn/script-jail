@@ -7730,6 +7730,9 @@ function isUnderCheckout(p, roots) {
   }
   return false;
 }
+function isPathUnderCheckout(p) {
+  return isUnderCheckout(p, checkoutRoots());
+}
 var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
   [
     // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
@@ -7960,6 +7963,11 @@ function resolveScriptJailVmBinary(opts) {
     if (!(0, import_node_path2.isAbsolute)(envBin)) {
       throw new Error(
         `script-jail: SCRIPT_JAIL_VM_BIN must be an absolute path (got ${JSON.stringify(envBin)}); a relative override would resolve the VZ helper against the checkout.`
+      );
+    }
+    if (isPathUnderCheckout(envBin)) {
+      throw new Error(
+        `script-jail: SCRIPT_JAIL_VM_BIN (${JSON.stringify(envBin)}) is inside the checkout; the VZ helper must not be a checkout-controlled binary (pre-trust RCE).`
       );
     }
     searched.push(`${envBin} (SCRIPT_JAIL_VM_BIN)`);

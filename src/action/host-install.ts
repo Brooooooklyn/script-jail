@@ -129,6 +129,17 @@ function isUnderCheckout(p: string, roots: ReadonlyArray<string>): boolean {
 }
 
 /**
+ * True when `p`'s REAL path is a checkout root or nested under one
+ * (`$GITHUB_WORKSPACE` / `$SCRIPT_JAIL_REPO_DIR` / `process.cwd()`).  EXPORTED so
+ * other pre-trust host-exec sites (e.g. the VZ helper-binary override) can reject
+ * a checkout-controlled path with the SAME symlink/case-robust containment test
+ * the PATH/git sanitizers use, instead of re-implementing it.
+ */
+export function isPathUnderCheckout(p: string): boolean {
+  return isUnderCheckout(p, checkoutRoots());
+}
+
+/**
  * Scan `process.env.PATH` for the first executable named `git`/`git.exe`
  * OUTSIDE the checkout tree and return its ABSOLUTE path.  Returns `undefined`
  * when none is found (caller falls back to the bare literal).

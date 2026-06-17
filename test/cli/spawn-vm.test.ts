@@ -66,6 +66,28 @@ describe('resolveScriptJailVmBinary', () => {
     ).toThrow(/must be an absolute path/);
   });
 
+  it('FAILS CLOSED on an absolute SCRIPT_JAIL_VM_BIN UNDER the checkout (codex round-9 — checkout-controlled helper)', () => {
+    // Absolute is necessary but NOT sufficient: `$GITHUB_WORKSPACE/bin/script-jail-vm`
+    // is absolute yet still PR-authored, and the codesign preflight is NOT a provenance
+    // check (ad-hoc signing with the entitlement is the documented dev flow), so it can
+    // never catch a checkout-resident helper.  Treat `scratch` as the checkout root and
+    // point the override inside it: must fail closed before any spawn.  The helper file is
+    // created on purpose — the checkout-containment gate runs BEFORE `existsSync`, so the
+    // throw proves the gate (not a missing-file fallthrough) rejected it; creating it also
+    // keeps realpath canonicalization consistent on both sides of the containment test.
+    const prevWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = scratch;
+    try {
+      const envBin = touchExe(join(scratch, 'bin', 'script-jail-vm'));
+      expect(() =>
+        resolveScriptJailVmBinary({ envOverride: envBin }),
+      ).toThrow(/inside the checkout/);
+    } finally {
+      if (prevWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = prevWorkspace;
+    }
+  });
+
   it('falls back to target/release/script-jail-vm when env override is absent', () => {
     const repoRoot = join(scratch, 'repo');
     const cargoBin = touchExe(
