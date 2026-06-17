@@ -1134,6 +1134,24 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     // case-insensitive npm_config_* matching: a lowercase spelling npm ALSO
     // honours must be stripped too.
     npm_config_script_shell: './ci/lower-shell',
+    // SEPARATOR aliases ([F1], verified npm 11.13.0): npm honours the HYPHEN form
+    // of every config key too, which an exact-name set misses.
+    'npm_config_script-shell': './ci/hyphen-shell',
+    'npm_config_ignore-scripts': 'true',
+    // native-build tool selectors: npm config + bare toolchain env node-gyp reads.
+    npm_config_python: './ci/py',
+    'npm_config_node-gyp': './ci/gyp',
+    PYTHON: './ci/python',
+    CC: './ci/cc',
+    CXX: './ci/cxx',
+    MAKE: './ci/make',
+    // git config/template injection (exec under the pinned git).
+    GIT_CONFIG_GLOBAL: './ci/gitconfig',
+    GIT_CONFIG_SYSTEM: './ci/gitsystem',
+    GIT_CONFIG_COUNT: '1',
+    GIT_TEMPLATE_DIR: './ci/template',
+    // TLS trust file (MITM the host fetch).
+    NODE_EXTRA_CA_CERTS: './ci/ca.pem',
   };
 
   it.each(['npm', 'pnpm', 'yarn'] as const)(
@@ -1238,6 +1256,30 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
       else process.env['GITHUB_WORKSPACE'] = origWs;
       rmSync(checkout, { recursive: true, force: true });
+    }
+  });
+
+  it('SANITIZES PATH: drops EVERY non-absolute entry (cwd != repoDir oracle, [F2])', () => {
+    // A relative PATH entry is resolved by exec lookup against the CHILD cwd
+    // (=repoDir), not the action's process.cwd().  A `../evil` can look OUTSIDE
+    // the checkout at sanitize time yet resolve INTO repoDir at exec when they
+    // differ (e.g. SCRIPT_JAIL_REPO_DIR subdir).  We drop ALL non-absolute
+    // entries, so neither `../evil` nor a bare relative dir survives.
+    const sysA = '/usr/bin';
+    const origPath = process.env['PATH'];
+    try {
+      // repoDir (3rd arg) is a subdir; the relative entries are the attack.
+      process.env['PATH'] = `../evil${delimiter}relbin${delimiter}.${delimiter}${sysA}`;
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts('npm', '/repo/packages/app', [], rec.io, envCapturingSpawn(envs));
+      const parts = envs[0]!['PATH']!.split(delimiter);
+      // Only the absolute system dir survives; every relative entry is dropped.
+      expect(parts).toEqual([sysA]);
+      expect(parts.some((p) => !isAbsolute(p))).toBe(false);
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
     }
   });
 

@@ -273,16 +273,25 @@ const HOST_INSTALL_STRIP_ENV_NAMES = new Set([
 //   [16] NPM_CONFIG_IGNORE_SCRIPTS=true     → part-2 skips the scripts the audit
 //        expects → an unbuilt tree (self-DoS / divergence).
 //
-// npm reads its `npm_config_*` config CASE-INSENSITIVELY (both
-// `NPM_CONFIG_SCRIPT_SHELL` and `npm_config_script_shell` work), so those are
-// matched by LOWERCASED name.  The OS loader vars (LD_*/DYLD_*/NODE_OPTIONS/
-// GIT_*) are case-SENSITIVE on Linux/macOS — exact-name match — though we also
-// fold case before the exact check, a cheap defensive catch-all that costs one
-// `.toLowerCase()` per env entry and cannot widen the match beyond these names.
+// npm reads its `npm_config_*` config CASE-INSENSITIVELY and with EITHER
+// separator (`NPM_CONFIG_SCRIPT_SHELL`, `npm_config_script_shell`, AND
+// `npm_config_script-shell` all work), so the npm_config_* family is matched by
+// the CANONICALIZED-key check in isDangerousEnvName (see DANGEROUS_NPM_CONFIG_KEYS
+// below), not by exact name.  The OS loader/tool vars (LD_*/DYLD_*/NODE_OPTIONS/
+// GIT_*/PYTHON/CC/…) are case-SENSITIVE on Linux/macOS — exact-name match — though
+// we also fold case, a cheap defensive catch-all that cannot widen the match
+// beyond these names.
 //
-// This mirrors the npm_config_git pin rationale (a config-redirect defense) and
-// is HOST-ONLY: the SANDBOX is the enforcement boundary and audits whatever it
-// is given.  Defense-in-depth, not a complete oracle close.
+// WHY A DENYLIST, NOT AN ALLOWLIST: the host MUST run the package's REAL
+// lifecycle scripts with a realistic env, so arbitrary owner/workflow vars
+// (build flags, non-secret config, registry auth tokens) have to pass through;
+// an env allowlist would break legitimate native/build scripts.  The dangerous
+// surface is specifically binary/shell/library/config-FILE *selectors*, which is
+// enumerable — and the npm_config_* slice is now separator/case-canonicalized so
+// the hyphen-alias bypass is closed.  Residual: a future NOVEL npm config exec
+// key not yet in the set; the SANDBOX (the enforcement boundary, which audits
+// whatever it is given) is the real backstop.  Defense-in-depth, not a complete
+// oracle close — mirrors the npm_config_git pin rationale.
 const HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
   [
     // [13] Node loader hooks (Node-based PM child execs these pre-trust).
@@ -303,24 +312,69 @@ const HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     'GIT_SSH',
     'GIT_PROXY_COMMAND',
     'GIT_EXTERNAL_DIFF',
-    // [18] npm script-shell wrapper (part-2 rebuild runs it).
-    'NPM_CONFIG_SCRIPT_SHELL',
-    // [22] npm config-locating redirects (load a PR-controlled npmrc).
-    'NPM_CONFIG_USERCONFIG',
-    'NPM_CONFIG_GLOBALCONFIG',
-    // [16] npm ignore-scripts self-DoS (skips the scripts the audit expects).
-    'NPM_CONFIG_IGNORE_SCRIPTS',
+    // [19] Git config/template injection: an env-supplied global/system config
+    // or template dir lets a checkout-relative file set core.sshCommand /
+    // core.fsmonitor / a clone hook → exec under the pinned git.  GIT_CONFIG_COUNT
+    // enables the inline GIT_CONFIG_KEY_*/VALUE_* pairs, so dropping COUNT makes
+    // them inert.
+    'GIT_CONFIG_GLOBAL',
+    'GIT_CONFIG_SYSTEM',
+    'GIT_CONFIG_COUNT',
+    'GIT_TEMPLATE_DIR',
+    // Native-build TOOL selectors honored by node-gyp/gyp/make: a checkout-
+    // relative interpreter/compiler/make runs during a native `npm rebuild`
+    // (verified: node-gyp reads process.env.PYTHON; npm_config_python /
+    // npm_config_node-gyp are handled by the canonicalized npm_config_* check
+    // below).  Stripping forces node-gyp's own auto-detect (the system
+    // toolchain), which is the safe default and rarely needed by a legit build.
+    'PYTHON',
+    'CC',
+    'CXX',
+    'MAKE',
+    // Node TLS trust file (a PR-controlled CA could MITM the host fetch the audit
+    // never saw; lockfile integrity is the real backstop, this is belt-and-braces).
+    'NODE_EXTRA_CA_CERTS',
   ].map((n) => n.toLowerCase()),
 );
 
+// npm honors its `npm_config_*` config via env in ANY case AND with EITHER
+// separator: `NPM_CONFIG_SCRIPT_SHELL`, `npm_config_script_shell`, and
+// `npm_config_script-shell` ALL set the `script-shell` config (verified, npm
+// 11.13.0).  An exact-name denylist misses the hyphen form, so the npm_config_*
+// family is matched by CANONICALIZING the key (lowercase + `-`→`_`) against the
+// dangerous config keys below — robust to case/separator aliases.  Keys
+// (canonical underscore form):
+//   script_shell             [18] lifecycle script interpreter
+//   ignore_scripts           [16] skip the audited scripts (self-DoS / divergence)
+//   userconfig / globalconfig [22] load a PR-controlled npmrc
+//   node_gyp / python        native-build tool selectors (checkout-relative exec)
+//   shell                    npm's exec/explore shell
+const DANGEROUS_NPM_CONFIG_KEYS = new Set([
+  'script_shell',
+  'ignore_scripts',
+  'userconfig',
+  'globalconfig',
+  'node_gyp',
+  'python',
+  'shell',
+]);
+
 /**
  * True when `name` is a dangerous loader/config env var to strip.  Matched on
- * the LOWERCASED name: npm reads `npm_config_*` case-insensitively, and folding
- * the OS loader vars too is a cheap defensive catch-all (it cannot widen the
- * match beyond the curated names in HOST_INSTALL_DANGEROUS_ENV_NAMES).
+ * the LOWERCASED name (npm reads `npm_config_*` case-insensitively, and folding
+ * the OS loader vars too is a cheap defensive catch-all).  The npm_config_*
+ * family is additionally canonicalized for SEPARATOR aliases (`-`→`_`) so the
+ * hyphen form `npm_config_script-shell` is caught alongside the underscore and
+ * upper-case spellings — an exact-name set alone would miss it.
  */
 function isDangerousEnvName(name: string): boolean {
-  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(name.toLowerCase());
+  const lower = name.toLowerCase();
+  if (HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower)) return true;
+  if (lower.startsWith('npm_config_')) {
+    const key = lower.slice('npm_config_'.length).replace(/-/g, '_');
+    if (DANGEROUS_NPM_CONFIG_KEYS.has(key)) return true;
+  }
+  return false;
 }
 
 /**
@@ -335,19 +389,27 @@ function isDangerousEnvName(name: string): boolean {
  * same canonicalForCompare/checkoutRoots/isUnderCheckout helpers as the
  * npm_config_git resolver so the containment test is symlink/case robust.
  *
- * Order of the surviving (system) entries is PRESERVED.  Empty path segments
- * are dropped (a `''` element means "current dir", a relative entry).  PATH is
- * never EMPTIED: dropping a checkout dir leaves the inherited system dirs
- * (`/usr/bin`, …); only when PATH had no usable value at all does the result
- * stay unset.
+ * Order of the surviving (system) entries is PRESERVED.  PATH is never EMPTIED:
+ * dropping a checkout dir leaves the inherited system dirs (`/usr/bin`, …); only
+ * when PATH had no usable value at all does the result stay unset.
+ *
+ * SECURITY ([F2], non-absolute entries): we drop EVERY non-absolute segment, not
+ * just empties.  A relative PATH entry is resolved by the OS exec lookup against
+ * the CHILD's cwd (`=repoDir`), but our containment test resolves it against the
+ * action's `process.cwd()`.  When those differ (e.g. `SCRIPT_JAIL_REPO_DIR` is a
+ * subdir), a `../x` entry can look outside the checkout here yet resolve INTO the
+ * checkout at exec time.  A CI runner PATH is all-absolute, so dropping relative
+ * entries is safe and closes the cwd-mismatch hole outright.
  */
 function sanitizePathValue(pathVar: string | undefined): string | undefined {
   if (pathVar === undefined || pathVar === '') return pathVar;
   const roots = checkoutRoots();
   const kept: string[] = [];
   for (const dir of pathVar.split(delimiter)) {
-    // Drop an empty segment (resolves to cwd) and any checkout-controlled dir.
-    if (dir === '') continue;
+    // Drop empty ('' = cwd) and ANY non-absolute entry: it is resolved against
+    // the child's cwd (=repoDir) at exec, which our check can't model, and a
+    // `../x` can resolve into the checkout there.  Then drop checkout-under dirs.
+    if (!isAbsolute(dir)) continue;
     if (isUnderCheckout(dir, roots)) continue;
     kept.push(dir);
   }

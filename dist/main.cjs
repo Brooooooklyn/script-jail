@@ -26868,24 +26868,54 @@ var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     "GIT_SSH",
     "GIT_PROXY_COMMAND",
     "GIT_EXTERNAL_DIFF",
-    // [18] npm script-shell wrapper (part-2 rebuild runs it).
-    "NPM_CONFIG_SCRIPT_SHELL",
-    // [22] npm config-locating redirects (load a PR-controlled npmrc).
-    "NPM_CONFIG_USERCONFIG",
-    "NPM_CONFIG_GLOBALCONFIG",
-    // [16] npm ignore-scripts self-DoS (skips the scripts the audit expects).
-    "NPM_CONFIG_IGNORE_SCRIPTS"
+    // [19] Git config/template injection: an env-supplied global/system config
+    // or template dir lets a checkout-relative file set core.sshCommand /
+    // core.fsmonitor / a clone hook → exec under the pinned git.  GIT_CONFIG_COUNT
+    // enables the inline GIT_CONFIG_KEY_*/VALUE_* pairs, so dropping COUNT makes
+    // them inert.
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_TEMPLATE_DIR",
+    // Native-build TOOL selectors honored by node-gyp/gyp/make: a checkout-
+    // relative interpreter/compiler/make runs during a native `npm rebuild`
+    // (verified: node-gyp reads process.env.PYTHON; npm_config_python /
+    // npm_config_node-gyp are handled by the canonicalized npm_config_* check
+    // below).  Stripping forces node-gyp's own auto-detect (the system
+    // toolchain), which is the safe default and rarely needed by a legit build.
+    "PYTHON",
+    "CC",
+    "CXX",
+    "MAKE",
+    // Node TLS trust file (a PR-controlled CA could MITM the host fetch the audit
+    // never saw; lockfile integrity is the real backstop, this is belt-and-braces).
+    "NODE_EXTRA_CA_CERTS"
   ].map((n) => n.toLowerCase())
 );
+var DANGEROUS_NPM_CONFIG_KEYS = /* @__PURE__ */ new Set([
+  "script_shell",
+  "ignore_scripts",
+  "userconfig",
+  "globalconfig",
+  "node_gyp",
+  "python",
+  "shell"
+]);
 function isDangerousEnvName(name) {
-  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(name.toLowerCase());
+  const lower = name.toLowerCase();
+  if (HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower)) return true;
+  if (lower.startsWith("npm_config_")) {
+    const key = lower.slice("npm_config_".length).replace(/-/g, "_");
+    if (DANGEROUS_NPM_CONFIG_KEYS.has(key)) return true;
+  }
+  return false;
 }
 function sanitizePathValue(pathVar) {
   if (pathVar === void 0 || pathVar === "") return pathVar;
   const roots = checkoutRoots();
   const kept = [];
   for (const dir of pathVar.split(import_node_path2.delimiter)) {
-    if (dir === "") continue;
+    if (!(0, import_node_path2.isAbsolute)(dir)) continue;
     if (isUnderCheckout(dir, roots)) continue;
     kept.push(dir);
   }
