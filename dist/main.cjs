@@ -28216,7 +28216,7 @@ async function launchVm(input) {
   const handle = spawner.spawn(
     firecrackerPath,
     ["--api-sock", socketPath],
-    { stdio: "forward" }
+    { stdio: "forward", env }
   );
   try {
     await poller.waitForSocket(socketPath, 5e3);
@@ -28320,7 +28320,8 @@ var NodeSpawner = class {
     const childStdio = opts.stdio === "ignore" ? "ignore" : ["ignore", "pipe", "pipe"];
     const child = (0, import_node_child_process3.spawn)(cmd, [...args], {
       stdio: childStdio,
-      detached: false
+      detached: false,
+      ...opts.env !== void 0 ? { env: opts.env } : {}
     });
     if (opts.stdio === "forward") {
       forwardStream(child.stdout, "[fc:out] ");

@@ -45,7 +45,7 @@ export interface Spawner {
   spawn(
     cmd: string,
     args: ReadonlyArray<string>,
-    opts: { stdio: 'ignore' | 'forward' },
+    opts: { stdio: 'ignore' | 'forward'; env?: NodeJS.ProcessEnv | undefined },
   ): SpawnHandle;
 }
 
@@ -207,10 +207,16 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
   // to process.stderr with a `[fc]` prefix. Without this, VM boot
   // failures and init/agent crashes are invisible — the host only
   // sees the eventual "vsock session ended without a final frame".
+  // SECURITY (codex round-8 host-exec sweep): the firecracker binary is an
+  // absolute-path spawn (no PATH shadow), but it is a dynamically-linked ELF, so
+  // an inherited LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH could inject into the
+  // host firecracker process BEFORE the audit produces/diffs the lock.  Spawn it
+  // with the caller-sanitized env (dangerous loader selectors dropped) — the
+  // Firecracker backend threads its `safeEnv` down to here.
   const handle = spawner.spawn(
     firecrackerPath,
     ['--api-sock', socketPath],
-    { stdio: 'forward' },
+    { stdio: 'forward', env },
   );
 
   // 2. Wait for the API socket to be ready.
@@ -406,7 +412,7 @@ class NodeSpawner implements Spawner {
   spawn(
     cmd: string,
     args: ReadonlyArray<string>,
-    opts: { stdio: 'ignore' | 'forward' },
+    opts: { stdio: 'ignore' | 'forward'; env?: NodeJS.ProcessEnv | undefined },
   ): SpawnHandle {
     // 'ignore' wires both stdout and stderr to /dev/null at the OS level.
     // 'forward' pipes them so we can prefix each line and tee to our own
@@ -418,6 +424,7 @@ class NodeSpawner implements Spawner {
     const child = nodeSpawn(cmd, [...args], {
       stdio: childStdio,
       detached: false,
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
     });
 
     if (opts.stdio === 'forward') {
