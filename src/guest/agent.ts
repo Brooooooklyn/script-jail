@@ -2377,42 +2377,48 @@ export function buildChildEnv(
         : { npm_config_cache: `${config.work_dir}/.npm-cache` };
 
   // DROP-IN INSTALL PARITY (install: true): host part-2 runs the trusted pnpm
-  // rebuild with `--config.ignore-pnpmfile=true` (src/action/host-install.ts).
-  // On pnpm 10.x that flag is re-exported into EVERY lifecycle script's env as
-  // `npm_config_ignore_pnpmfile=true` (npm-compat config→env mapping), so a
-  // dependency script that branches on it
+  // rebuild with BOTH `--config.ignore-pnpmfile=true` AND
+  // `--config.script-shell=/bin/sh` (src/action/host-install.ts hostHardening).
+  // On pnpm 10.x EACH `--config.X` flag is re-exported into EVERY lifecycle
+  // script's env as `npm_config_X` (npm-compat config→env mapping), so a
+  // dependency script that branches on either value
   //   if (process.env.npm_config_ignore_pnpmfile === 'true') evil(); else benign();
+  //   if (process.env.npm_config_script_shell === '/bin/sh') evil(); else benign();
   // runs benign() in the no-flag sandbox but evil() on the trusted host — and
   // the lock can't catch it: env-spy records env_read NAMEs only (value-blind),
-  // so both runs log the identical `npm_config_ignore_pnpmfile` read and the
-  // diff matches.  Injecting the SAME env var into the guest Phase B child env
-  // makes the audited branch == the executed branch on pnpm 10.x.
+  // so both runs log the identical env_read and the diff matches.  Injecting the
+  // SAME env vars into the guest Phase B child env makes the audited value ==
+  // the executed value on pnpm 10.x.  BOTH host flags must be mirrored: missing
+  // either one re-opens the same value-blind-lock RCE for that key.
   //
   // EMPIRICALLY VERIFIED (2026-06-18, the EXACT `pnpm rebuild --pending` host
-  // command), version-DEPENDENT:
-  //   * pnpm 10.34.3 — host flag → child sees npm_config_ignore_pnpmfile=true;
-  //     guest (no flag) → ABSENT.  Real divergence.  This injection sets it on
-  //     the guest → child sees =true → MATCHES the host.  RCE closed.
+  // command, BOTH keys), version-DEPENDENT:
+  //   * pnpm 10.34.3 — host flags → child sees npm_config_ignore_pnpmfile=true
+  //     AND npm_config_script_shell=/bin/sh; guest (no flags) → ABSENT.  Real
+  //     divergence.  This injection sets both on the guest → child sees both →
+  //     MATCHES the host.  RCE closed for both keys.
   //   * pnpm 11.1.2  — pnpm uses the `pnpm_config_*` namespace internally and
-  //     STRIPS `npm_config_ignore_pnpmfile` from the lifecycle child on BOTH
-  //     the host (flag) and the guest (injection) paths → both ABSENT → no
+  //     STRIPS both `npm_config_*` keys from the lifecycle child on BOTH the
+  //     host (flags) and the guest (injection) paths → both ABSENT → no
   //     divergence, this injection is a harmless no-op.
   // The `npm_config_` prefix is REQUIRED (not `pnpm_config_`): on pnpm 11 a
-  // `pnpm_config_ignore_pnpmfile` survives into the guest child but the host
-  // flag does NOT expose it, so mirroring under that prefix would CREATE a new
-  // divergence.  npm_config_ matches the host on 10.x and is stripped in
-  // lockstep on 11.x.
+  // `pnpm_config_*` env var survives into the guest child but the host flag does
+  // NOT expose it, so mirroring under that prefix would CREATE a new divergence.
+  // npm_config_ matches the host on 10.x and is stripped in lockstep on 11.x.
+  // The script-shell value is hardcoded `/bin/sh` to mirror the host literally
+  // (guest backends are always Linux/macOS, never win32).
   //
   // No audit coverage is lost: install-preflight's detectPnpmfile REFUSES
   // install:true for ANY pnpmfile vector before host part-2, so there is no
   // repo pnpmfile left to audit on this path (and sandbox ancestor dirs are
   // clean, so the host-only ancestor-pnpmfile suppression has no guest analog
-  // to mirror).  GATED on install_mode (buildChildEnv is shared with pure-audit,
-  // install off) so pure-audit goldens stay byte-identical and the lock stays
-  // mode-consistent.  npm/yarn ignore the key → pnpm-only.
+  // to mirror); script-shell is forced to the fixed system shell on both sides.
+  // GATED on install_mode (buildChildEnv is shared with pure-audit, install off)
+  // so pure-audit goldens stay byte-identical and the lock stays mode-consistent.
+  // npm/yarn ignore the keys → pnpm-only.
   const installModeEnv: Record<string, string> =
     config.install_mode && resolvedManager === 'pnpm'
-      ? { npm_config_ignore_pnpmfile: 'true' }
+      ? { npm_config_ignore_pnpmfile: 'true', npm_config_script_shell: '/bin/sh' }
       : {};
 
   return {

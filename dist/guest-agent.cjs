@@ -30798,7 +30798,7 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
     YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`
   } : { npm_config_cache: `${config2.work_dir}/.npm-cache` };
-  const installModeEnv = config2.install_mode && resolvedManager === "pnpm" ? { npm_config_ignore_pnpmfile: "true" } : {};
+  const installModeEnv = config2.install_mode && resolvedManager === "pnpm" ? { npm_config_ignore_pnpmfile: "true", npm_config_script_shell: "/bin/sh" } : {};
   return {
     ...inheritedEnv,
     ...cacheRedirectEnv,

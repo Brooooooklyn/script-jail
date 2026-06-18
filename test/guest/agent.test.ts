@@ -2439,15 +2439,17 @@ describe('buildChildEnv protected-env-names length gate', () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildChildEnv install_mode — drop-in install pnpmfile-config parity (#22)
+// buildChildEnv install_mode — drop-in install pnpm config→env parity (#22 + sibling)
 //
-// Host part-2 (install: true, post-trust) runs `pnpm rebuild --pending
-// --config.ignore-pnpmfile=true`, which sets npm_config_ignore_pnpmfile=true in
-// every lifecycle script's env.  The guest Phase B audit must export the
-// IDENTICAL value (the lock is value-blind — env-spy records env_read NAMEs
-// only), or a dep script can branch differently on the trusted host than was
-// audited.  buildChildEnv mirrors it for pnpm GATED on install_mode so
-// pure-audit goldens stay byte-identical.
+// Host part-2 (install: true, post-trust) runs `pnpm rebuild --pending` with
+// BOTH `--config.ignore-pnpmfile=true` AND `--config.script-shell=/bin/sh`,
+// which on pnpm 10.x set npm_config_ignore_pnpmfile=true AND
+// npm_config_script_shell=/bin/sh in every lifecycle script's env.  The guest
+// Phase B audit must export the IDENTICAL values for BOTH keys (the lock is
+// value-blind — env-spy records env_read NAMEs only), or a dep script can
+// branch differently on the trusted host than was audited.  buildChildEnv
+// mirrors both for pnpm GATED on install_mode so pure-audit goldens stay
+// byte-identical.  Missing EITHER key re-opens the value-blind-lock RCE.
 // ---------------------------------------------------------------------------
 
 describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
@@ -2469,44 +2471,58 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     };
   }
 
-  it('install_mode + pnpm → injects npm_config_ignore_pnpmfile=true (matches host)', async () => {
+  it('install_mode + pnpm → injects BOTH npm_config_ignore_pnpmfile=true AND npm_config_script_shell=/bin/sh (matches host)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('pnpm', true), '/tmp/events.jsonl');
+    // Both host part-2 hostHardening flags (--config.ignore-pnpmfile=true,
+    // --config.script-shell=/bin/sh) must be mirrored: each is exposed to
+    // lifecycle children as npm_config_X on pnpm 10.x.
     expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
   });
 
-  it('install_mode + npm → NO injection (npm ignores the key, pnpm-only)', async () => {
+  it('install_mode + npm → NO injection of EITHER key (npm-incompatible, pnpm-only)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('npm', true), '/tmp/events.jsonl');
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+    // npm's own host script-shell pin lives in hostInstallEnv, NOT this builder;
+    // the guest npm Phase B must not inherit a pnpm-only mirror here.
+    expect(env['npm_config_script_shell']).toBeUndefined();
   });
 
-  it('install_mode + yarn → NO injection', async () => {
+  it('install_mode + yarn → NO injection of EITHER key', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('yarn', true), '/tmp/events.jsonl');
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+    expect(env['npm_config_script_shell']).toBeUndefined();
   });
 
-  it('pure-audit (install_mode false) + pnpm → NO injection (golden byte-stability)', async () => {
+  it('pure-audit (install_mode false) + pnpm → NO injection of EITHER key (golden byte-stability)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('pnpm', false), '/tmp/events.jsonl');
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+    expect(env['npm_config_script_shell']).toBeUndefined();
   });
 
-  it('injection OVERRIDES an inherited npm_config_ignore_pnpmfile (last-spread wins)', async () => {
+  it('injection OVERRIDES inherited npm_config_ignore_pnpmfile AND npm_config_script_shell (last-spread wins)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
-    // A host/runner that already exported the key with a DIFFERENT value must
+    // A host/runner that already exported either key with a DIFFERENT value must
     // not defeat the parity guarantee — the install-mode injection is spread
     // last, so it deterministically wins regardless of the inherited value.
     const env = buildChildEnv(
-      { PATH: '/usr/bin', npm_config_ignore_pnpmfile: 'false' },
+      {
+        PATH: '/usr/bin',
+        npm_config_ignore_pnpmfile: 'false',
+        npm_config_script_shell: '/bin/bash',
+      },
       cfg('pnpm', true),
       '/tmp/events.jsonl',
     );
     expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
   });
 
-  it('macOS install_mode + pnpm → injects (buildChildEnvMacos reuses the Linux builder)', async () => {
+  it('macOS install_mode + pnpm → injects BOTH keys (buildChildEnvMacos reuses the Linux builder)', async () => {
     const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
     const env = buildChildEnvMacos(
       { PATH: '/usr/bin' },
@@ -2514,6 +2530,7 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
       '/tmp/events.jsonl',
     );
     expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
   });
 });
 
