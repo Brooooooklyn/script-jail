@@ -294,4 +294,63 @@ describe('createDockerBackend — host docker spawns use the sanitized host env'
     rmSync(checkout, { recursive: true, force: true });
     rmSync(scratchDir, { recursive: true, force: true });
   });
+
+  it('#31 — delivers SCRIPT_JAIL_PM_FLAGS_PATH via container -e (literal argv), never an unquoted shell export', async () => {
+    // Under install:true auditWorkDir == the host repoDir, which can contain spaces /
+    // shell metachars (SCRIPT_JAIL_REPO_DIR / process.cwd() / GITHUB_WORKSPACE are
+    // never validated).  An `export SCRIPT_JAIL_PM_FLAGS_PATH=${workDir}/...`
+    // interpolated into `/bin/sh -lc` would split on a space ("export: not a valid
+    // identifier" under `set -eu`, aborting the audit) or shell-evaluate a `$(...)`.
+    // As a single `-e NAME=value` argv element the value stays literal regardless of
+    // content (mirrors how bare/mac-bare pass it via the process env object).
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-docker-pmflags-'));
+    process.env['GITHUB_WORKSPACE'] = checkout;
+    const repoDir = join(checkout, 'repo');
+    mkdirSync(repoDir);
+    const scratchDir = mkdtempSync(join(tmpdir(), 'sj-docker-scratch-'));
+    const workDirWithSpace = '/sandbox with space';
+
+    let agentArgs: ReadonlyArray<string> | undefined;
+    const backend = createDockerBackend({
+      env: { GITHUB_WORKSPACE: checkout, PATH: '/usr/bin', HOME: '/home/runner' },
+      commandSucceeds: () => true,
+      runAgentProcess: async (input) => {
+        agentArgs = input.args;
+        return { finalYaml: 'events: []\n', nonFatalWarnings: [] };
+      },
+      runCommand: () => {},
+    });
+
+    await backend.run({
+      selfTest: true,
+      arch: 'x64',
+      runnerImage: 'ubuntu-24.04',
+      repoDir,
+      scratchDir,
+      configPath: join(checkout, 'config.yml'),
+      extraRepoOverlayFiles: [],
+      auditWorkDir: workDirWithSpace,
+      manifest: {},
+    } as unknown as BackendContext);
+
+    expect(agentArgs).toBeDefined();
+    const args = agentArgs as readonly string[];
+    // The pm-flags path is one literal argv token, space intact, delivered as `-e <value>`.
+    const expectedVal = `SCRIPT_JAIL_PM_FLAGS_PATH=${workDirWithSpace}/etc/script-jail/pm-flags.json`;
+    const eIdx = args.indexOf(expectedVal);
+    expect(eIdx).toBeGreaterThan(0);
+    expect(args[eIdx - 1]).toBe('-e');
+    // The bind-mount target is also the spaced workDir as a single argv token (safe).
+    expect(args.some((a) => a.endsWith(`:${workDirWithSpace}`))).toBe(true);
+    // The in-container `-lc` script must NOT export it (no unquoted interpolation),
+    // and must not interpolate the spaced workDir into the shell at all.
+    const lcIdx = args.indexOf('-lc');
+    expect(lcIdx).toBeGreaterThan(0);
+    const script = args[lcIdx + 1] ?? '';
+    expect(script).not.toContain('export SCRIPT_JAIL_PM_FLAGS_PATH');
+    expect(script).not.toContain(workDirWithSpace);
+
+    rmSync(checkout, { recursive: true, force: true });
+    rmSync(scratchDir, { recursive: true, force: true });
+  });
 });

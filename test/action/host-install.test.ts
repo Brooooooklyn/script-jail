@@ -751,7 +751,7 @@ describe('hostInstallNoScripts (part 1)', () => {
 
 describe('hostRunScripts (part 2)', () => {
   it.each([
-    ['npm', ['rebuild', '--foreground-scripts']],
+    ['npm', ['rebuild', '--foreground-scripts', '--no-node-options']],
     ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store', '--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh']],
     ['yarn', ['install', '--immutable']],
   ] as const)('runs the INSTALL_CMD for %s in repoDir', async (pm, expected) => {
@@ -783,18 +783,19 @@ describe('hostRunScripts (part 2)', () => {
     it('npm part-2 splices the sanitized dep-selection args (after base, before store-dir)', async () => {
       const rec = makeRecorder();
       await hostRunScripts('npm', '/repo', ['--omit=dev', '-D'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
-      // npm has no store-dir / host-hardening, so finalArgs = base + kept.
-      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '-D']);
-      // Lockstep invariant: the spliced suffix is exactly sanitizeInstallArgs(args).kept.
+      // npm has no store-dir; host-hardening = `--no-node-options` (#43) at the end.
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '-D', '--no-node-options']);
+      // Lockstep invariant: the spliced suffix is exactly sanitizeInstallArgs(args).kept,
+      // sitting between the base (2 tokens) and the trailing --no-node-options hardening.
       const { kept } = sanitizeInstallArgs(['--omit=dev', '-D']);
-      expect(rec.calls[0]!.args.slice(2)).toEqual(kept);
+      expect(rec.calls[0]!.args.slice(2, 2 + kept.length)).toEqual(kept);
     });
 
     it('npm part-2 DROPS a script-re-enabling / unsafe arg (same allowlist as part-1)', async () => {
       const rec = makeRecorder();
       // `--ignore-scripts false` and a positional are NOT on the allowlist → dropped.
       await hostRunScripts('npm', '/repo', ['--ignore-scripts', 'false', '--omit=dev'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
-      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev']);
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '--no-node-options']);
       expect(rec.calls[0]!.args).not.toContain('--ignore-scripts');
     });
 
@@ -811,10 +812,10 @@ describe('hostRunScripts (part 2)', () => {
       }
     });
 
-    it('no-args npm part-2 is byte-identical to before (empty kept splices nothing)', async () => {
+    it('no-args npm part-2 splices no user args (base + the --no-node-options hardening only)', async () => {
       const rec = makeRecorder();
       await hostRunScripts('npm', '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
-      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
     });
 
     it('does NOT echo raw user tokens in the banner — count-only suffix', async () => {
@@ -1013,8 +1014,9 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     const call = rec.calls[0]!;
     expect(call.cmd).toBe(process.execPath);
     expect(call.args[0]).toBe(launch.entry);
-    // #19: npm part-2 keeps the sanitized dep-selection user args after the base.
-    expect(call.args.slice(1)).toEqual(['rebuild', '--foreground-scripts', '--omit=dev']);
+    // #19: npm part-2 keeps the sanitized dep-selection user args after the base;
+    // #43: the --no-node-options hardening trails them (direct-launch carries it too).
+    expect(call.args.slice(1)).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '--no-node-options']);
   });
 
   it('standalone PM (resolver → undefined) → bare-launch unchanged (regression guard)', async () => {
@@ -1771,6 +1773,67 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     }
   });
 
+  it('SKIPS a DIRECTORY named git earlier on PATH and continues to the real binary (#38, execvp file-type)', () => {
+    // A directory named `git` passes existsSync (and even access(X_OK) as a
+    // *searchable* dir), but execvp does NOT exec it — it keeps scanning PATH.
+    // resolveGitFromPath modeled only existence, so it returned the directory and
+    // pinned it as npm_config_git, breaking a git: dep install that would otherwise
+    // fall through to the real git later on PATH.  Mirrors resolveBareOnPath
+    // (round-17d).  Both candidate dirs live OUTSIDE the checkout (GITHUB_WORKSPACE
+    // points elsewhere) so the containment guards do not interfere.
+    const gitName = process.platform === 'win32' ? 'git.exe' : 'git';
+    const early = mkdtempSync(join(tmpdir(), 'sj-gitdir-'));
+    mkdirSync(join(early, gitName)); // a DIRECTORY, not a file
+    const real = mkdtempSync(join(tmpdir(), 'sj-realgit-'));
+    const realGit = join(real, gitName);
+    writeFileSync(realGit, '#!/bin/sh\necho real\n', { mode: 0o755 });
+    const ws = mkdtempSync(join(tmpdir(), 'sj-ws-'));
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = ws;
+      process.env['PATH'] = `${early}${delimiter}${real}`;
+      expect(resolveGitFromPath()).toBe(realGit);
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(early, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it('SKIPS a NON-EXECUTABLE git earlier on PATH and continues to the real binary (#38, execvp X_OK)', () => {
+    // A readable but non-executable `git` (mode 0644) is skipped by execvp, which
+    // keeps scanning PATH.  existsSync alone returned it; access(X_OK) (the exact
+    // predicate execvp uses) makes the scan fall through to the real git.  On win32
+    // X_OK degrades to existence, so this class is non-applicable there.
+    if (process.platform === 'win32') return;
+    const early = mkdtempSync(join(tmpdir(), 'sj-gitnox-'));
+    writeFileSync(join(early, 'git'), '#!/bin/sh\necho nope\n', { mode: 0o644 }); // NOT executable
+    const real = mkdtempSync(join(tmpdir(), 'sj-realgit-'));
+    const realGit = join(real, 'git');
+    writeFileSync(realGit, '#!/bin/sh\necho real\n', { mode: 0o755 });
+    const ws = mkdtempSync(join(tmpdir(), 'sj-ws-'));
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = ws;
+      process.env['PATH'] = `${early}${delimiter}${real}`;
+      expect(resolveGitFromPath()).toBe(realGit);
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(early, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it('REJECTS a case-variant spelling of the checkout dir on a case-insensitive FS', () => {
     // P1 (case-insensitive bypass): on macOS APFS/HFS+ (and Windows NTFS),
     // `/work/Repo` and `/work/repo` are the SAME dir.  A lexical containment
@@ -2006,6 +2069,28 @@ describe('home ~/.npmrc script-shell defense (#26)', () => {
       const rec = makeRecorder();
       await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
       expect(rec.calls[0]?.args).not.toContain('--config.script-shell=/bin/sh');
+    }
+  });
+
+  // #43 — npm sibling of the #26 home-npmrc class.  npm re-derives `node-options`
+  // from $HOME/.npmrc and re-exports NODE_OPTIONS into the lifecycle child; the
+  // clean-VM audit (HOME=/root) never honors it, so a `node-options=--require <path>`
+  // is an audit-blind host RCE post-trust.  `--no-node-options` (npm-native) clears
+  // it for the part-2 lifecycle run; empty env pins do NOT (the file wins).  npm-only
+  // (mirrors the npm-scoped script-shell pin); command-local so the guest is untouched.
+  it('part-2 npm rebuild appends --no-node-options (#43 home-npmrc node-options close)', async () => {
+    const rec = makeRecorder();
+    await hostRunScripts('npm', '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
+    expect(rec.calls[0]?.args).toContain('--no-node-options');
+    // Last token: the hardening trails the base (and any spliced user args).
+    expect(rec.calls[0]?.args.at(-1)).toBe('--no-node-options');
+  });
+
+  it('part-2 does NOT add --no-node-options for pnpm/yarn (npm-scoped)', async () => {
+    for (const pm of ['pnpm', 'yarn'] as const) {
+      const rec = makeRecorder();
+      await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
+      expect(rec.calls[0]?.args).not.toContain('--no-node-options');
     }
   });
 });

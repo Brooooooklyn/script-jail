@@ -26856,7 +26856,19 @@ function resolveGitFromPath() {
     if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
     for (const name of names) {
       const candidate = (0, import_node_path2.join)(dir, name);
-      if (!(0, import_node_path2.isAbsolute)(candidate) || !(0, import_node_fs.existsSync)(candidate)) continue;
+      if (!(0, import_node_path2.isAbsolute)(candidate)) continue;
+      let st;
+      try {
+        st = (0, import_node_fs.statSync)(candidate);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      try {
+        (0, import_node_fs.accessSync)(candidate, import_node_fs.constants.X_OK);
+      } catch {
+        continue;
+      }
       if (isUnderCheckout(candidate, roots)) continue;
       if (isLexicallyUnderCheckout(candidate, lexRoots)) continue;
       return candidate;
@@ -27469,7 +27481,7 @@ function resolveHostManagerLaunch(pm, repoDir, procEnv = process.env, execPath =
 }
 async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn, resolveLaunch = resolveHostManagerLaunch) {
   const cmd = INSTALL_CMD[pm];
-  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : [];
+  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : pm === "npm" ? ["--no-node-options"] : [];
   const { kept } = sanitizeInstallArgs(args);
   const userArgs = pm === "npm" ? kept : [];
   const finalArgs = [...cmd.args, ...userArgs, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
@@ -45111,6 +45123,7 @@ function createDockerBackend(deps = {}) {
       });
       const containerName = `script-jail-${(0, import_node_crypto6.randomBytes)(4).toString("hex")}`;
       const workDir = ctx.auditWorkDir ?? "/work";
+      const pmFlagsPath = `${workDir}/etc/script-jail/pm-flags.json`;
       try {
         const script = [
           "set -eu",
@@ -45134,14 +45147,8 @@ function createDockerBackend(deps = {}) {
           "mkdir -p /tmp/script-jail-strace",
           "export SCRIPT_JAIL_CONNECTION=stdio",
           "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
-          // The host-owned pm-flags sidecar is staged in the repo tree at
-          // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it
-          // into /etc the way Firecracker's init does).  Point the guest at it
-          // so the sandbox fetch applies the SAME install args as the host
-          // part-1 install — without it, Docker audits a different arg set than
-          // the host installs.  loadPmFlags re-sanitizes the file before use.
-          // Follows workDir so the cwd-parity mount (install:true) stays correct.
-          `export SCRIPT_JAIL_PM_FLAGS_PATH=${workDir}/etc/script-jail/pm-flags.json`,
+          // SCRIPT_JAIL_PM_FLAGS_PATH is delivered via the container `-e` env below,
+          // NOT exported here — see the note at the `-e` flag (#31).
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
         return await doRunAgentProcess({
@@ -45159,6 +45166,21 @@ function createDockerBackend(deps = {}) {
             `${staged.path}:${workDir}`,
             "-v",
             `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
+            // The host-owned pm-flags sidecar is staged in the repo tree at
+            // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it into
+            // /etc the way Firecracker's init does).  Point the guest at it so the
+            // sandbox fetch applies the SAME install args as the host part-1 install.
+            // Delivered via the container ENV (`-e`), NOT a shell `export` interpolated
+            // into `/bin/sh -lc` (#31): under install:true workDir IS the host repoDir
+            // (SCRIPT_JAIL_REPO_DIR / process.cwd() / GITHUB_WORKSPACE — never validated
+            // for spaces/metachars), so an unquoted `export SCRIPT_JAIL_PM_FLAGS_PATH=
+            // ${workDir}/...` would split on a space (`export: not a valid identifier`
+            // under `set -eu`, aborting the audit) or shell-evaluate a `$(...)`.  As a
+            // single `-e NAME=value` argv element the value is literal regardless of its
+            // content — mirroring how bare/mac-bare pass it via the process env object.
+            // loadPmFlags re-sanitizes the file before use.
+            "-e",
+            `SCRIPT_JAIL_PM_FLAGS_PATH=${pmFlagsPath}`,
             imageRef,
             "/bin/sh",
             "-lc",
