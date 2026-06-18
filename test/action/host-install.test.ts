@@ -920,7 +920,12 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     try {
       const rec = makeRecorder();
       const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
-        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+        // PATH:'' so "managed" is driven deterministically by the seeded cache
+        // (machine-independent): the real sanitized PATH would resolve THIS host's
+        // own pnpm/yarn, whose corepack-shim-vs-standalone status varies per runner
+        // (and a confirmed-standalone bin now correctly bare-launches, codex round-17).
+        // Shim-on-PATH → managed detection is covered by the `(b)`/`(b2)` tests.
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot, PATH: '' });
       await hostRunScripts('pnpm', repoDir, [], rec.io, [], okStreamSpawn(rec), resolver);
       const call = rec.calls[0]!;
       expect(call.cmd).toBe(process.execPath); // launched via node
@@ -943,7 +948,12 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     try {
       const rec = makeRecorder();
       const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
-        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+        // PATH:'' so "managed" is driven deterministically by the seeded cache
+        // (machine-independent): the real sanitized PATH would resolve THIS host's
+        // own pnpm/yarn, whose corepack-shim-vs-standalone status varies per runner
+        // (and a confirmed-standalone bin now correctly bare-launches, codex round-17).
+        // Shim-on-PATH → managed detection is covered by the `(b)`/`(b2)` tests.
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot, PATH: '' });
       await hostRunScripts('yarn', repoDir, [], rec.io, [], okStreamSpawn(rec), resolver);
       const call = rec.calls[0]!;
       expect(call.cmd).toBe(process.execPath);
@@ -1102,7 +1112,12 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     try {
       const envs: Array<NodeJS.ProcessEnv> = [];
       const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
-        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+        // PATH:'' so "managed" is driven deterministically by the seeded cache
+        // (machine-independent): the real sanitized PATH would resolve THIS host's
+        // own pnpm/yarn, whose corepack-shim-vs-standalone status varies per runner
+        // (and a confirmed-standalone bin now correctly bare-launches, codex round-17).
+        // Shim-on-PATH → managed detection is covered by the `(b)`/`(b2)` tests.
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot, PATH: '' });
       await hostRunScripts('pnpm', repoDir, [], makeRecorder().io, [], envCapturingStreamSpawn(envs), resolver);
       expect(envs[0]!['COREPACK_HOME']).toBeUndefined();
       expect(envs[0]!['COREPACK_ROOT']).toBeUndefined();
@@ -1121,7 +1136,12 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     try {
       const rec = makeRecorder();
       const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
-        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+        // PATH:'' so "managed" is driven deterministically by the seeded cache
+        // (machine-independent): the real sanitized PATH would resolve THIS host's
+        // own pnpm/yarn, whose corepack-shim-vs-standalone status varies per runner
+        // (and a confirmed-standalone bin now correctly bare-launches, codex round-17).
+        // Shim-on-PATH → managed detection is covered by the `(b)`/`(b2)` tests.
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot, PATH: '' });
       await hostRunScripts('pnpm', repoDir, [], rec.io, [], okStreamSpawn(rec), resolver);
       const banner = rec.out.join('');
       expect(banner).toContain('pnpm rebuild --pending');
@@ -1367,6 +1387,48 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
       ).toThrow(/expected exactly one pnpm version dir, found 0/);
     } finally {
       rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (f) codex round-17 [medium]: a CONFIRMED-standalone PM on the sanitized PATH must
+  // bare-launch (undefined) EVEN WHEN the runner's corepack cache holds a (stale)
+  // version of that PM — a leftover `~/.cache/node/corepack` entry from an unrelated
+  // prior job must NOT hijack (no-pin) a proven standalone install.  Before the fix
+  // `cacheHasAnyVersion` OR'd this to managed → returned node + the stale cached entry.
+  it('(f) standalone PM on PATH + stale cache version + NO pin → undefined (cache does not hijack)', () => {
+    const { cacheRoot, cleanup } = makeCache('pnpm', '10.34.3'); // stale cached corepack pnpm
+    const binDir = mkdtempSync(join(tmpdir(), 'sj-bin-standalone-stale-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-standalone-stale-'));
+    try {
+      // A standalone pnpm (NOT a corepack.cjs shim) on the PATH the child would use.
+      writeFileSync(join(binDir, 'pnpm'), '#!/usr/bin/env node\n// standalone pnpm, not a corepack shim\n');
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' })); // NO packageManager pin
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir });
+      expect(launch).toBeUndefined(); // bare-launch the standalone PM, NOT the stale cached entry
+    } finally {
+      cleanup();
+      rmSync(binDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (f) and a PINNED standalone consumer whose pin is NOT in the (stale) cache must
+  // also bare-launch, NOT fail closed — the PATH binary is a confirmed standalone PM,
+  // so the pin/throw path is never reached.
+  it('(f) standalone PM on PATH + pinned version absent from a stale cache → undefined (no fail-closed break)', () => {
+    const { cacheRoot, cleanup } = makeCache('pnpm', '10.34.3'); // cache holds 10.34.3 only
+    const binDir = mkdtempSync(join(tmpdir(), 'sj-bin-standalone-pin-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-standalone-pin-'));
+    try {
+      writeFileSync(join(binDir, 'pnpm'), '#!/usr/bin/env node\n// standalone pnpm, not a corepack shim\n');
+      // Pin a DIFFERENT version that is absent from the cache.
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@11.1.2' }));
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir });
+      expect(launch).toBeUndefined(); // standalone → bare-launch; never reaches the pinned-absent throw
+    } finally {
+      cleanup();
       rmSync(binDir, { recursive: true, force: true });
       rmSync(repoDir, { recursive: true, force: true });
     }

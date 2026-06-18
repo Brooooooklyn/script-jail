@@ -1432,14 +1432,17 @@ function readPackageManagerPin(repoDir: string): { name: string; version: string
  *          that sets COREPACK_ROOT (re-opening the oracle), and a node lacking
  *          bundled npm cannot run `npm rebuild` anyway, so the guest audit would fail
  *          identically → parity-correct to refuse here too.
- *   pnpm/yarn — corepackManaged = bare-on-PATH is a corepack shim OR the corepack
- *          cache already holds a version of this PM (any read error → treat as
- *          managed, fail-safe).  NOT managed → `undefined` (bare-launch; e.g.
- *          pnpm/action-setup standalone).  Managed → resolve the cached entry from
- *          the action's corepack cache, preferring the repo `packageManager` pin;
- *          ANY miss (pinned dir absent, ambiguous version, unreadable entry) →
- *          THROW.  A silent bare-launch of a corepack-managed-but-unresolvable PM
- *          would re-open the oracle, so fail closed loudly.
+ *   pnpm/yarn — inspect the bare PM the child would exec (first match on the SAME
+ *          sanitized PATH).  A corepack shim (or unreadable/suspicious bin) → MANAGED;
+ *          a readable NON-shim binary → CONFIRMED standalone → `undefined` (bare-launch;
+ *          e.g. pnpm/action-setup) even if a STALE corepack cache exists (it sets no
+ *          COREPACK_ROOT, so there is nothing to override); NO bin on PATH → fall back
+ *          to "cache holds a version" as the only managed signal.  Any read error →
+ *          managed, fail-safe.  MANAGED → resolve the cached entry from the action's
+ *          corepack cache, preferring the repo `packageManager` pin; ANY miss (pinned
+ *          dir absent, ambiguous version, unreadable entry) → THROW.  A silent
+ *          bare-launch of a corepack-managed-but-unresolvable PM would re-open the
+ *          oracle, so fail closed loudly.
  */
 export function resolveHostManagerLaunch(
   pm: Manager,
@@ -1472,15 +1475,29 @@ export function resolveHostManagerLaunch(
     return { node: execPath, entry };
   }
 
-  // pnpm / yarn.  Is the bare PM the action would otherwise spawn a corepack shim,
-  // OR has corepack already cached a version of it?  Either means going through the
-  // bare name would set COREPACK_ROOT in the lifecycle child.  Any detection
-  // read-error is treated as managed (fail-safe — never bare-launch on uncertainty).
+  // pnpm / yarn.  Decide whether going through the bare name would route the
+  // lifecycle child through corepack (which sets COREPACK_ROOT).  The bare PM the
+  // child would actually exec is the FIRST match on the SAME sanitized PATH the
+  // child runs under (procEnv is the child env) — so inspect EXACTLY that binary:
+  //   * a corepack shim (corepack.cjs) → MANAGED (resolve the cached entry below).
+  //   * an unreadable / suspicious bin → isCorepackShim fail-safes to true → MANAGED.
+  //   * a readable, NON-shim binary → CONFIRMED standalone PM: it sets no
+  //     COREPACK_ROOT, so bare-launch is safe REGARDLESS of any pre-existing corepack
+  //     cache.  A stale `~/.cache/node/corepack` entry from an unrelated prior job
+  //     must NOT hijack (no-pin) or fail-closed-break (pinned) a proven standalone
+  //     install — there is no COREPACK_ROOT risk to justify overriding it (codex
+  //     round-17 [medium]).
+  //   * NO bare PM on PATH → the child's bare-launch would ENOENT (as part-1's,
+  //     which also runs under this PATH, already would have); the corepack cache is
+  //     then the only "managed" signal we have, so fall back to it.
+  // Any detection read-error → managed (fail-safe; never bare-launch on uncertainty).
   let corepackManaged: boolean;
   try {
+    const bareBin = resolveBareOnPath(pm, procEnv['PATH']);
     corepackManaged =
-      isCorepackShim(resolveBareOnPath(pm, procEnv['PATH'])) ||
-      cacheHasAnyVersion(corepackCacheRoot(procEnv), pm);
+      bareBin !== undefined
+        ? isCorepackShim(bareBin)
+        : cacheHasAnyVersion(corepackCacheRoot(procEnv), pm);
   } catch {
     corepackManaged = true;
   }

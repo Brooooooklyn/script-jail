@@ -77,22 +77,28 @@ determinism across hosts:
   substrings were over-broad and could mis-flag a standalone PM).
 
   Residual: a **standalone (non-corepack) consumer** (e.g. `pnpm/action-setup`)
-  still bare-launches its own PM, which is safe — it sets no `COREPACK_ROOT`, so
-  the guest (no `COREPACK_ROOT`) and host already match. **npm** routes through the
-  node-bundled `npm-cli.js` directly; if that is absent (a node without bundled
-  npm, or one where bare `npm` is a `corepack enable npm` shim) the host **fails
-  closed** (throws) — the guest's `resolveLinuxManagerLaunch` throws on the same
-  layout, so this is parity-correct, not a new divergence. A corepack-managed PM
-  whose cached entry cannot be resolved **fails closed** (throws) rather than
-  bare-launching and re-opening the oracle. This includes the
-  **multi-version-no-pin** case: on a reused/self-hosted runner whose corepack
-  cache holds >1 version of the PM **and** the repo has no `packageManager` pin,
-  the resolver cannot disambiguate which version part-1 resolved (corepack does
-  **not** write a per-`COREPACK_HOME` `lastKnownGood.json` on the project-pin-driven
-  flow — verified corepack 0.35.0), so it fails closed; pin `"packageManager"` in
-  `package.json` to resolve it. A corepack-managed **yarn@1.x** pin fails closed on
-  **both** host and guest (the resolver expects a berry `yarn.js`), again no new
-  host/guest divergence. (The host child env is
+  bare-launches its own PM, which is safe — it sets no `COREPACK_ROOT`, so the
+  guest (no `COREPACK_ROOT`) and host already match. The resolver inspects the bare
+  PM the child would exec (first match on the sanitized `PATH`): a **readable,
+  non-shim** binary is a *confirmed* standalone PM and bare-launches **even if the
+  runner's corepack cache holds a (stale) version of that PM** — a leftover
+  `~/.cache/node/corepack` entry from an unrelated prior job must not hijack or
+  fail-closed-break a proven standalone install (there is no `COREPACK_ROOT` risk to
+  justify overriding it). **npm** routes through the node-bundled `npm-cli.js`
+  directly; if that is absent (a node without bundled npm, or one where bare `npm`
+  is a `corepack enable npm` shim) the host **fails closed** (throws) — the guest's
+  `resolveLinuxManagerLaunch` throws on the same layout, so this is parity-correct,
+  not a new divergence. A corepack-managed PM (the bare PM **is** a corepack shim,
+  or none is on `PATH`) whose cached entry cannot be resolved **fails closed**
+  (throws) rather than bare-launching and re-opening the oracle. This includes the
+  **multi-version-no-pin** case: when the bare PM is a corepack shim on a reused/
+  self-hosted runner whose corepack cache holds >1 version **and** the repo has no
+  `packageManager` pin, the resolver cannot disambiguate which version part-1
+  resolved (corepack does **not** write a per-`COREPACK_HOME` `lastKnownGood.json`
+  on the project-pin-driven flow — verified corepack 0.35.0), so it fails closed;
+  pin `"packageManager"` in `package.json` to resolve it. A corepack-managed
+  **yarn@1.x** pin fails closed on **both** host and guest (the resolver expects a
+  berry `yarn.js`), again no new host/guest divergence. (The host child env is
   otherwise hardened: `hostInstallEnv` strips inherited loader/config vars —
   `NODE_OPTIONS`, `LD_PRELOAD`/`LD_AUDIT`/`DYLD_*`, `GIT_SSH_COMMAND` and the
   other git transport overrides, `NPM_CONFIG_SCRIPT_SHELL`/`_USERCONFIG`/

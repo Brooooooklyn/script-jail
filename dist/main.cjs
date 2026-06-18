@@ -27394,7 +27394,8 @@ function resolveHostManagerLaunch(pm, repoDir, procEnv = process.env, execPath =
   }
   let corepackManaged;
   try {
-    corepackManaged = isCorepackShim(resolveBareOnPath(pm, procEnv["PATH"])) || cacheHasAnyVersion(corepackCacheRoot(procEnv), pm);
+    const bareBin = resolveBareOnPath(pm, procEnv["PATH"]);
+    corepackManaged = bareBin !== void 0 ? isCorepackShim(bareBin) : cacheHasAnyVersion(corepackCacheRoot(procEnv), pm);
   } catch {
     corepackManaged = true;
   }
