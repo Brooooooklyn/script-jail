@@ -26123,7 +26123,15 @@ async function provisionNodeMac(input) {
     ...baseEnv,
     VP_HOME: vpHome,
     COREPACK_HOME: (0, import_node_path16.join)(vpHome, "corepack"),
-    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+    // round-17f (codex [medium]): this is a PRE-agent corepack boundary — `vp env
+    // install` and the `corepack enable` below run at the checkout cwd, BEFORE the
+    // macOS-bare trust gate.  baseEnv was sanitized (corepack_ family stripped), so
+    // pin COREPACK_ENV_FILE=0 here too — otherwise a repo `.corepack.env` could still
+    // feed corepack startup flags on this path (COREPACK_HOME is set so the file can't
+    // steer the cache, but the uniform "never load a project .corepack.env" invariant
+    // must hold at EVERY corepack boundary, host + guest + provisioning).
+    COREPACK_ENV_FILE: "0"
   };
   doRunCommand(vpBin, ["env", "install", NODE_VERSION], { env: vpEnv });
   const nodeBinDir = findNodeBinDir((0, import_node_path16.join)(vpHome, "js_runtime"));

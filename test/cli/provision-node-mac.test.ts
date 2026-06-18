@@ -576,6 +576,13 @@ describe('provisionNodeMac — threads the injected env to every host spawn', ()
     // corepack PATH prepends nodeBinDir to the INJECTED PATH (/usr/bin:/bin), so
     // the system dirs survive and no raw inherited PATH segment creeps in.
     expect(corepack[0]!.env?.['PATH']).toMatch(/:\/usr\/bin:\/bin$/);
+    // round-17f (codex [medium]): the pre-agent corepack boundaries (`vp env install`
+    // + `corepack enable`, both run at the checkout cwd before the trust gate) must pin
+    // COREPACK_ENV_FILE=0 so a repo `.corepack.env` is never loaded — uniform with the
+    // host install + every backend.
+    for (const c of [...vp, ...corepack]) {
+      expect(c.env?.['COREPACK_ENV_FILE']).toBe('0');
+    }
   });
 
   it('an empty inherited PATH never becomes a trailing cwd segment ([F3] codex round-6)', async () => {
