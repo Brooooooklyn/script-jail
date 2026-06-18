@@ -7753,7 +7753,7 @@ function isUnderCheckout(p, roots) {
   return false;
 }
 function isPathUnderCheckout(p) {
-  return isUnderCheckout(p, checkoutRoots());
+  return isUnderCheckout(p, checkoutRoots()) || isLexicallyUnderCheckout(p, checkoutRootsLexical());
 }
 var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
   [

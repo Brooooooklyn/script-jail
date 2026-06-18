@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import {
   hostInstallNoScripts,
   hostRunScripts,
+  isPathUnderCheckout,
   resolveGitFromPath,
   stripDangerousEnv,
   sanitizePathValue,
@@ -1010,6 +1011,35 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     } finally {
       if (origPath === undefined) delete process.env['PATH'];
       else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('isPathUnderCheckout REJECTS a symlink-OUT path spelled under the checkout (round-12 #24 sibling: VZ-helper gate)', () => {
+    // The exported guard backs the pre-trust SCRIPT_JAIL_VM_BIN VZ-helper gate
+    // (resolveScriptJailVmBinary).  It MUST reject the same symlink-out class the
+    // PATH/git sanitizers do: `$GITHUB_WORKSPACE/tools -> <outside>` realpaths
+    // OUTSIDE the checkout, so a realpath-only guard wrongly ACCEPTS
+    // `$GITHUB_WORKSPACE/tools/script-jail-vm` even though the symlink is
+    // PR-controlled.  The lexical arm must drop it on its under-checkout spelling.
+    if (process.platform === 'win32') return;
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-vmco-'));
+    const outside = mkdtempSync(join(tmpdir(), 'sj-vmout-'));
+    const tools = join(checkout, 'tools');
+    symlinkSync(outside, tools); // checkout-lexical dir → outside-checkout REAL dir
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      // symlink-OUT path spelled under the checkout → rejected (lexical arm).
+      expect(isPathUnderCheckout(join(tools, 'script-jail-vm'))).toBe(true);
+      // a genuinely-outside path is still accepted (not over-broad).
+      expect(isPathUnderCheckout(join(outside, 'script-jail-vm'))).toBe(false);
+      // a plain checkout-resident path is rejected (realpath arm, unchanged).
+      expect(isPathUnderCheckout(join(checkout, 'bin', 'script-jail-vm'))).toBe(true);
+    } finally {
       if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
       else process.env['GITHUB_WORKSPACE'] = origWs;
       rmSync(checkout, { recursive: true, force: true });

@@ -12,7 +12,7 @@
 //     any child process is spawned)
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
@@ -85,6 +85,30 @@ describe('resolveScriptJailVmBinary', () => {
     } finally {
       if (prevWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
       else process.env['GITHUB_WORKSPACE'] = prevWorkspace;
+    }
+  });
+
+  it('FAILS CLOSED on a SCRIPT_JAIL_VM_BIN spelled under the checkout via a symlink-OUT dir (round-12 #24 sibling)', () => {
+    // `$GITHUB_WORKSPACE/tools -> <outside>` realpaths OUTSIDE the checkout, so the
+    // round-9 realpath-only gate KEEPS it — but the symlink is PR-committed, so the
+    // PR controls where `$GITHUB_WORKSPACE/tools/script-jail-vm` resolves = pre-trust
+    // RCE.  isPathUnderCheckout now also checks the LEXICAL spelling, so the override
+    // is rejected on its under-checkout path regardless of the link target.
+    if (process.platform === 'win32') return;
+    const outside = mkdtempSync(join(tmpdir(), 'sj-vmbin-out-'));
+    const tools = join(scratch, 'tools');
+    symlinkSync(outside, tools); // checkout-lexical dir → outside REAL dir
+    const envBin = touchExe(join(tools, 'script-jail-vm')); // creates under `outside`
+    const prevWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = scratch;
+    try {
+      expect(() =>
+        resolveScriptJailVmBinary({ envOverride: envBin }),
+      ).toThrow(/inside the checkout/);
+    } finally {
+      if (prevWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = prevWorkspace;
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 

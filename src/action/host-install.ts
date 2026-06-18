@@ -181,14 +181,27 @@ function isUnderCheckout(p: string, roots: ReadonlyArray<string>): boolean {
 }
 
 /**
- * True when `p`'s REAL path is a checkout root or nested under one
- * (`$GITHUB_WORKSPACE` / `$SCRIPT_JAIL_REPO_DIR` / `process.cwd()`).  EXPORTED so
- * other pre-trust host-exec sites (e.g. the VZ helper-binary override) can reject
- * a checkout-controlled path with the SAME symlink/case-robust containment test
- * the PATH/git sanitizers use, instead of re-implementing it.
+ * True when `p` is a checkout root or nested under one (`$GITHUB_WORKSPACE` /
+ * `$SCRIPT_JAIL_REPO_DIR` / `process.cwd()`).  EXPORTED so other pre-trust
+ * host-exec sites (e.g. the VZ helper-binary override in
+ * {@link resolveScriptJailVmBinary}) can reject a checkout-controlled path with
+ * the SAME symlink/case-robust containment test the PATH/git sanitizers use,
+ * instead of re-implementing it.
+ *
+ * Checks BOTH containment spaces, exactly like `resolveGitFromPath` /
+ * `sanitizePathValue` (round-12 finding #24): the REAL path (symlinks resolved)
+ * AND the LEXICAL spelling (resolve-only, no symlink follow).  The realpath test
+ * alone MISSES the symlink-OUT bypass — a path spelled under the checkout
+ * (`$GITHUB_WORKSPACE/tools/script-jail-vm`) via a committed symlink
+ * (`tools -> <outside>`) realpaths OUTSIDE the checkout, so a realpath-only guard
+ * would accept it even though the symlink itself is PR-controlled.  The lexical
+ * arm rejects it on the under-checkout SPELLING regardless of the link target.
  */
 export function isPathUnderCheckout(p: string): boolean {
-  return isUnderCheckout(p, checkoutRoots());
+  return (
+    isUnderCheckout(p, checkoutRoots()) ||
+    isLexicallyUnderCheckout(p, checkoutRootsLexical())
+  );
 }
 
 /**
