@@ -2550,10 +2550,17 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
   // exported by the backend boot (init.sh / docker.ts) into the guest's own
   // process.env but have NO host counterpart, so leaking them into the audited
   // lifecycle child is a value-blind-lock oracle (present-in-guest /
-  // absent-on-host).  VP_HOME is stripped (not read at runtime); COREPACK_HOME
-  // is the load-bearing exception (corepack shim needs it for the offline PM
-  // launch, network-off Phase B) and is an accepted documented residual.
-  it('strips VP_HOME from the lifecycle child but PRESERVES COREPACK_HOME (load-bearing)', async () => {
+  // absent-on-host).  VP_HOME is stripped HERE (in buildChildEnv) — it is never
+  // read at runtime.  COREPACK_HOME is intentionally PRESERVED by buildChildEnv
+  // because the SHARED child env is also Phase A's fetchEnv, and Phase A still
+  // launches the bare corepack shim (which needs COREPACK_HOME to populate the
+  // cache).  COREPACK_HOME is instead closed downstream, at the Phase-B
+  // install/prepare env seam: once the agent resolves the cached PM entry and
+  // launches `node <entry>` directly (resolveLinuxManagerLaunch), it strips
+  // COREPACK_HOME from the Phase-B child env only (envWithoutCorepackHome).  So
+  // it is NO LONGER an accepted residual — see the runInstallPhase managerLaunch
+  // tests in phase-install.test.ts for the direct-launch + strip coupling.
+  it('strips VP_HOME from the lifecycle child but PRESERVES COREPACK_HOME in buildChildEnv (stripped at the Phase-B seam, not here)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv(
       {
@@ -2567,8 +2574,8 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     // VP_HOME is a guest-only provisioning tell with no host counterpart and is
     // not read at runtime → stripped so the audited child matches the host child.
     expect(env['VP_HOME']).toBeUndefined();
-    // COREPACK_HOME MUST survive: the corepack shim reads it to locate the
-    // offline PM cache; stripping it would break the network-off Phase B launch.
+    // COREPACK_HOME survives buildChildEnv (Phase A's shim needs it); the Phase-B
+    // install/prepare seam strips it once direct-launch resolves the PM entry.
     expect(env['COREPACK_HOME']).toBe('/opt/vp/corepack');
   });
 

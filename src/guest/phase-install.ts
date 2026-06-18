@@ -263,6 +263,19 @@ export interface PhaseInstallInput {
    */
   commandOverride?: { cmd: string; args: string[] };
   /**
+   * Round-16 (PR #22): a resolved direct-launch for the package manager —
+   * `{ node: process.execPath, entry: <abs path to the cached PM JS entry> }` from
+   * {@link resolveLinuxManagerLaunch}.  When present, the phase launches
+   * `node <entry> <subcommand/flags>` instead of the bare manager name, bypassing
+   * the corepack shim so the Phase-B lifecycle child never inherits COREPACK_HOME
+   * (the agent strips COREPACK_HOME from `env` in lockstep — the two MUST be set
+   * together).  Omitted on the bare backend (no `/opt/vp`, COREPACK_* stripped) and
+   * in unit tests (which inject `strace` and never set COREPACK_HOME), where the
+   * bare-name launch is used unchanged.  macOS uses its own direct-launch via
+   * buildMacosInstallCommand / macosManagerLaunch.
+   */
+  managerLaunch?: { node: string; entry: string };
+  /**
    * The set of root-project package keys (bare `name` AND `name@version`).
    * When an fs read/write event attributes to one of these keys, the
    * dispatcher tags the emitted raw event with the NON-forgeable
@@ -616,6 +629,13 @@ export function isPackageManagerClientBasename(pathLike: string | undefined): bo
     base === 'npm-cli.js' ||
     base === 'pnpm' ||
     base === 'pnpm.cjs' ||
+    // pnpm 11.x's corepack-cached entry is `pnpm.mjs` (10.x is `pnpm.cjs`).
+    // Round-16 direct-launch execs `node <cache>/pnpm.mjs`, so the classifier
+    // (which keys on argv[1] for a `node <script>` spawn) must match it or the
+    // pnpm-11 driver pid is misclassified as a normal node → its env reads leak
+    // into the lock AND its bootstrap env-read names pollute the global
+    // nodeBootstrapEnvReads suppression set (over-suppressing real package reads).
+    base === 'pnpm.mjs' ||
     base === 'yarn' ||
     base === 'yarnpkg' ||
     base === 'yarn.js' ||
@@ -675,10 +695,135 @@ function cloneFlagsHaveUntraced(line: string): boolean {
   return false;
 }
 
+/**
+ * Read the relative entry path for a corepack-managed manager from the
+ * per-version `.corepack` JSON metadata (`bin.<manager>`), falling back to the
+ * cached package's `package.json` `bin` field.  Returns null when neither yields
+ * a usable string (caller fails closed).  Only meaningful for pnpm (npm is
+ * node-bundled, yarn's `.corepack` `bin` is an array of names with no path).
+ */
+function readManagerBinRel(verDir: string, manager: 'pnpm'): string | null {
+  for (const file of ['.corepack', 'package.json']) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(verDir, file), 'utf8')) as {
+        bin?: Record<string, string> | string[];
+      };
+      const bin = meta.bin;
+      if (bin !== undefined && !Array.isArray(bin)) {
+        const rel = bin[manager];
+        if (typeof rel === 'string' && rel.length > 0) return rel;
+      }
+    } catch {
+      // Unreadable / malformed — try the next source.
+    }
+  }
+  return null;
+}
+
+/**
+ * Round-16 (PR #22): resolve the OFFLINE-cached package-manager entry script so
+ * Phase B can launch it DIRECTLY via `node <entry>` instead of the bare corepack
+ * shim.  The bare shim (`npm`/`pnpm`/`yarn` on PATH after `corepack enable`) reads
+ * COREPACK_HOME at runtime to locate the cache; that read flows into every
+ * lifecycle child (shim → real PM → `/bin/sh -c`) and is a value-blind-lock oracle
+ * (COREPACK_HOME present-in-guest `/opt/vp/corepack` vs absent-on-host).  Resolving
+ * the cached entry HERE (from the agent's own COREPACK_HOME, before the Phase-B
+ * child env is built) lets the caller strip COREPACK_HOME from that child env: the
+ * directly-launched PM is found by absolute path and never re-reads it (empirically
+ * verified — neither the PM nor the `/bin/sh -c` child needs COREPACK_HOME).
+ *
+ * Mirrors {@link macosManagerLaunch} structurally (node + JS entry) but resolves
+ * the REAL cached entry rather than `corepack.js`, because on Linux `corepack.js`
+ * would itself still need COREPACK_HOME to find the offline cache.  npm is NOT
+ * corepack-managed (node-bundled) → resolved from the toolchain root the agent
+ * already runs under, exactly like macOS.  pnpm/yarn → the corepack cache at
+ * `$COREPACK_HOME/v1/<pm>/<version>/`; the pnpm entry path comes from the
+ * per-version `.corepack` metadata (10.x `./bin/pnpm.cjs`, 11.x `./pnpm.mjs` — read,
+ * never hard-coded), and yarn berry is a single bundled `yarn.js` at the
+ * version-dir root (its `.corepack` `bin` is an array of names, not a path map).
+ *
+ * FAIL-CLOSED on every miss (COREPACK_HOME unset, missing/zero/multiple version
+ * dir, unreadable `.corepack`+`package.json`, missing entry file): THROW.  A silent
+ * fallback to the bare corepack shim would re-open the oracle unnoticed; the caller
+ * turns a throw into an emit-error + non-zero exit so a broken resolve refuses the
+ * lock rather than shipping a leaky one.
+ */
+export function resolveLinuxManagerLaunch(
+  manager: 'npm' | 'pnpm' | 'yarn',
+  corepackHome: string | undefined,
+  execPath: string,
+): { node: string; entry: string } {
+  if (manager === 'npm') {
+    // npm is node-bundled (not corepack-managed): resolve from the toolchain root
+    // the agent already runs under — `process.execPath` is `.../node/<ver>/bin/node`.
+    const toolchainRoot = path.dirname(path.dirname(execPath));
+    const entry = path.join(toolchainRoot, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    if (!fs.existsSync(entry)) {
+      throw new Error(`resolveLinuxManagerLaunch: npm-cli.js not found at ${entry}`);
+    }
+    return { node: execPath, entry };
+  }
+
+  if (corepackHome === undefined || corepackHome.length === 0) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: COREPACK_HOME is unset; cannot resolve the offline ${manager} entry`,
+    );
+  }
+  const pmDir = path.join(corepackHome, 'v1', manager);
+  let versionDirs: string[];
+  try {
+    versionDirs = fs
+      .readdirSync(pmDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch (err) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: cannot read corepack cache dir ${pmDir}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (versionDirs.length !== 1) {
+    // Phase A provisions exactly ONE version per PM (the `packageManager` pin).
+    // 0 → not warmed; >1 → ambiguous (e.g. a stray pnpm self-update). Both fail
+    // closed rather than guessing: a wrong version under network-off Phase B would
+    // fail (and pnpm 10.x `manage-package-manager-versions` would self-redirect).
+    throw new Error(
+      `resolveLinuxManagerLaunch: expected exactly one ${manager} version dir under ${pmDir}, ` +
+        `found ${versionDirs.length}${versionDirs.length > 0 ? ` (${versionDirs.join(', ')})` : ''}`,
+    );
+  }
+  const verDir = path.join(pmDir, versionDirs[0] as string);
+
+  if (manager === 'yarn') {
+    // yarn berry's cache is a single bundled `yarn.js` at the version-dir root
+    // (its `.corepack` `bin` is an array of bare names, giving no path).
+    const entry = path.join(verDir, 'yarn.js');
+    if (!fs.existsSync(entry)) {
+      throw new Error(`resolveLinuxManagerLaunch: yarn.js not found at ${entry}`);
+    }
+    return { node: execPath, entry };
+  }
+
+  // pnpm: the entry path (./bin/pnpm.cjs on 10.x, ./pnpm.mjs on 11.x) comes from
+  // the per-version `.corepack` metadata (package.json `bin` as fallback).
+  const rel = readManagerBinRel(verDir, manager);
+  if (rel === null) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: could not read the ${manager} entry path from ` +
+        `${path.join(verDir, '.corepack')} or package.json bin`,
+    );
+  }
+  const entry = path.resolve(verDir, rel);
+  if (!fs.existsSync(entry)) {
+    throw new Error(`resolveLinuxManagerLaunch: ${manager} entry not found at ${entry}`);
+  }
+  return { node: execPath, entry };
+}
+
 export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
-  const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
+  const { cmd: baseCmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
   // pm-flags.json `extra_install_args` (npm arch hints) are spliced into Phase A
   // (fetch/resolve), not here — dependency resolution is already done by the
   // time Phase B runs.  But the DEVELOPER dep-selection args (`user_install_args`,
@@ -702,7 +847,19 @@ export async function runInstallPhase(
   // at an empty store on the cramped rootfs ext4.  The shared pnpmStoreDirArg
   // helper keeps all three call sites in lockstep via `input.cwd`.  Order
   // mirrors the host: <base> <user args> <store-dir>.
-  const args = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  const builtArgs = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
+
+  // Round-16 (PR #22): when a resolved direct-launch is supplied (Linux FC/Docker),
+  // bypass the bare corepack shim — launch `node <cached-entry>` so the lifecycle
+  // child never inherits COREPACK_HOME (the agent strips it from the Phase-B env in
+  // lockstep).  The resolved entry replaces the bare manager name (`baseCmd`, also
+  // the prepare pass's commandOverride `cmd`, which is intentionally discarded — the
+  // subcommand/flags in `builtArgs` are preserved verbatim).  macOS already
+  // direct-launches via buildMacosInstallCommand.  When absent (bare backend / unit
+  // tests, which never set COREPACK_HOME), the bare name is used unchanged.
+  const cmd = input.managerLaunch !== undefined ? input.managerLaunch.node : baseCmd;
+  const args =
+    input.managerLaunch !== undefined ? [input.managerLaunch.entry, ...builtArgs] : builtArgs;
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`

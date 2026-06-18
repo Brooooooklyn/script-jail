@@ -26594,7 +26594,13 @@ function isNodeBasename(pathLike) {
 function isPackageManagerClientBasename(pathLike) {
   if (pathLike === void 0 || pathLike.length === 0) return false;
   const base = pathBasename(pathLike);
-  return base === "npm" || base === "npx" || base === "npm-cli.js" || base === "pnpm" || base === "pnpm.cjs" || base === "yarn" || base === "yarnpkg" || base === "yarn.js" || base === "corepack";
+  return base === "npm" || base === "npx" || base === "npm-cli.js" || base === "pnpm" || base === "pnpm.cjs" || // pnpm 11.x's corepack-cached entry is `pnpm.mjs` (10.x is `pnpm.cjs`).
+  // Round-16 direct-launch execs `node <cache>/pnpm.mjs`, so the classifier
+  // (which keys on argv[1] for a `node <script>` spawn) must match it or the
+  // pnpm-11 driver pid is misclassified as a normal node → its env reads leak
+  // into the lock AND its bootstrap env-read names pollute the global
+  // nodeBootstrapEnvReads suppression set (over-suppressing real package reads).
+  base === "pnpm.mjs" || base === "yarn" || base === "yarnpkg" || base === "yarn.js" || base === "corepack";
 }
 function firstExecPathFromStraceLine(line) {
   let match = line.match(/^execve\("((?:\\.|[^"\\])*)"/);
@@ -26633,10 +26639,74 @@ function cloneFlagsHaveUntraced(line) {
   }
   return false;
 }
+function readManagerBinRel(verDir, manager) {
+  for (const file2 of [".corepack", "package.json"]) {
+    try {
+      const meta3 = JSON.parse(fs3.readFileSync(path2.join(verDir, file2), "utf8"));
+      const bin = meta3.bin;
+      if (bin !== void 0 && !Array.isArray(bin)) {
+        const rel = bin[manager];
+        if (typeof rel === "string" && rel.length > 0) return rel;
+      }
+    } catch {
+    }
+  }
+  return null;
+}
+function resolveLinuxManagerLaunch(manager, corepackHome, execPath) {
+  if (manager === "npm") {
+    const toolchainRoot = path2.dirname(path2.dirname(execPath));
+    const entry2 = path2.join(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    if (!fs3.existsSync(entry2)) {
+      throw new Error(`resolveLinuxManagerLaunch: npm-cli.js not found at ${entry2}`);
+    }
+    return { node: execPath, entry: entry2 };
+  }
+  if (corepackHome === void 0 || corepackHome.length === 0) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: COREPACK_HOME is unset; cannot resolve the offline ${manager} entry`
+    );
+  }
+  const pmDir = path2.join(corepackHome, "v1", manager);
+  let versionDirs;
+  try {
+    versionDirs = fs3.readdirSync(pmDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch (err) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: cannot read corepack cache dir ${pmDir}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (versionDirs.length !== 1) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: expected exactly one ${manager} version dir under ${pmDir}, found ${versionDirs.length}${versionDirs.length > 0 ? ` (${versionDirs.join(", ")})` : ""}`
+    );
+  }
+  const verDir = path2.join(pmDir, versionDirs[0]);
+  if (manager === "yarn") {
+    const entry2 = path2.join(verDir, "yarn.js");
+    if (!fs3.existsSync(entry2)) {
+      throw new Error(`resolveLinuxManagerLaunch: yarn.js not found at ${entry2}`);
+    }
+    return { node: execPath, entry: entry2 };
+  }
+  const rel = readManagerBinRel(verDir, manager);
+  if (rel === null) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: could not read the ${manager} entry path from ${path2.join(verDir, ".corepack")} or package.json bin`
+    );
+  }
+  const entry = path2.resolve(verDir, rel);
+  if (!fs3.existsSync(entry)) {
+    throw new Error(`resolveLinuxManagerLaunch: ${manager} entry not found at ${entry}`);
+  }
+  return { node: execPath, entry };
+}
 async function runInstallPhase(input) {
-  const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
+  const { cmd: baseCmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
   const userArgs = input.commandOverride === void 0 && input.manager === "npm" ? input.userInstallArgs ?? [] : [];
-  const args = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  const builtArgs = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  const cmd = input.managerLaunch !== void 0 ? input.managerLaunch.node : baseCmd;
+  const args = input.managerLaunch !== void 0 ? [input.managerLaunch.entry, ...builtArgs] : builtArgs;
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -30732,6 +30802,11 @@ var LIFECYCLE_HOST_NOISE_ENV_NAMES = /* @__PURE__ */ new Set([
   "TERM"
 ]);
 var LIFECYCLE_GUEST_PROVISION_ENV_NAMES = /* @__PURE__ */ new Set(["VP_HOME"]);
+function envWithoutCorepackHome(env) {
+  const stripped = { ...env };
+  delete stripped["COREPACK_HOME"];
+  return stripped;
+}
 function sanitizeLifecycleBaseEnv(baseEnv) {
   const sanitized = {};
   for (const [name, value] of Object.entries(baseEnv)) {
@@ -31182,10 +31257,25 @@ ${fetchDetail}
     (0, import_node_fs5.mkdirSync)(straceBaseDir, { recursive: true });
   } catch {
   }
+  const corepackHomeForLaunch = process.env["COREPACK_HOME"];
+  let managerLaunch;
+  try {
+    managerLaunch = !isMacosBare && corepackHomeForLaunch !== void 0 && corepackHomeForLaunch.length > 0 ? resolveLinuxManagerLaunch(manager, corepackHomeForLaunch, process.execPath) : void 0;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    emitter.emitError(
+      `script-jail agent: failed to resolve the offline package-manager entry for direct launch \u2014 ${reason}. Refusing to emit a lockfile: falling back to the bare corepack shim would re-open the COREPACK_HOME value-blind-lock oracle.`,
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+  const installPhaseEnv = managerLaunch !== void 0 ? envWithoutCorepackHome(installEnv) : installEnv;
   const installInput = {
     manager,
     cwd: config2.work_dir,
-    env: installEnv,
+    env: installPhaseEnv,
+    ...managerLaunch !== void 0 ? { managerLaunch } : {},
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
@@ -31311,10 +31401,12 @@ ${stdoutTail}`;
         }
       }()
     );
+    const preparePhaseEnv = managerLaunch !== void 0 ? envWithoutCorepackHome(prepareEnv) : prepareEnv;
     const prepareInput = {
       manager,
       cwd: config2.work_dir,
-      env: prepareEnv,
+      env: preparePhaseEnv,
+      ...managerLaunch !== void 0 ? { managerLaunch } : {},
       strace: prepareRunner,
       attribution,
       emitter: preparingEmitter,

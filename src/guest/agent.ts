@@ -30,7 +30,12 @@ import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
 import { runFetchPhase, type Spawner } from './phase-fetch.js';
-import { runInstallPhase, type LineSource, type StraceRunner } from './phase-install.js';
+import {
+  runInstallPhase,
+  resolveLinuxManagerLaunch,
+  type LineSource,
+  type StraceRunner,
+} from './phase-install.js';
 import { runInstallPhaseMacos, macosManagerLaunch } from './phase-install-macos.js';
 import { MacOSInstallRunner } from './macos-install-runner.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
@@ -2182,18 +2187,33 @@ const LIFECYCLE_HOST_NOISE_ENV_NAMES = new Set([
 // the PM-process env removes it from the WHOLE lifecycle subtree (node AND `/bin/sh`
 // children alike), with zero launch breakage.
 //
-// COREPACK_HOME is the deliberate EXCEPTION — NOT stripped here.  It is
-// LOAD-BEARING: the corepack shim (the bare `npm`/`pnpm`/`yarn` on PATH) reads it
-// to locate the offline PM cache, and Phase B runs network-OFF, so stripping it
-// breaks the PM launch.  There is no env seam to scrub it AFTER the corepack shim
-// but BEFORE the lifecycle child (the shim → real PM → child share one inherited
-// env, and the immediate lifecycle child is `/bin/sh -c`, not node, so a JS
-// preload can't reach it).  It is therefore an accepted, documented residual in
-// the same bucket as the other guest-only sandbox tells the audit MUST carry
-// (LD_PRELOAD, NODE_OPTIONS preloads, container marker files, os.hostname()) —
-// see src/action/host-install.ts ("DEFENSE-IN-DEPTH, NOT A COMPLETE ORACLE
-// CLOSE").  Unlike a secret, its value is a PUBLIC CONSTANT (/opt/vp/corepack).
+// COREPACK_HOME is DELIBERATELY NOT in this set — but it IS closed, at a different
+// seam (round-16, PR #22).  It cannot be stripped HERE because this set feeds the
+// SHARED childEnv, which is also Phase A's fetchEnv; Phase A still launches the bare
+// corepack shim (network-ON), which reads COREPACK_HOME to locate/populate the
+// `/opt/vp/corepack` cache, so stripping it from fetchEnv would break the fetch.
+// Instead, the agent (after Phase A) resolves the cached PM entry via
+// {@link resolveLinuxManagerLaunch} and launches BOTH Phase-B passes (main install
+// + root prepare) as `node <entry>` directly — bypassing the corepack shim — then
+// strips COREPACK_HOME from the Phase-B install/prepare child env ONLY.  Phase A
+// keeps it (it emits no audit events: network-on, no strace, so it is not an oracle
+// surface).  Once the shim is out of the Phase-B chain, COREPACK_HOME is no longer
+// load-bearing and nothing re-injects it (verified: corepack READS it but never
+// assigns it; it is NOT in the Rust shim STICKY_VARS).  See the Phase-B env build in
+// main() (`envWithoutCorepackHome`).  Its value is a PUBLIC CONSTANT, not a secret.
 const LIFECYCLE_GUEST_PROVISION_ENV_NAMES = new Set(['VP_HOME']);
+
+/**
+ * Strip COREPACK_HOME from a Phase-B child env (returns a NEW object so the shared
+ * childEnv/fetchEnv is never mutated).  Applied to the install + prepare envs ONLY
+ * when the round-16 direct-launch is active — see
+ * {@link LIFECYCLE_GUEST_PROVISION_ENV_NAMES}.
+ */
+function envWithoutCorepackHome(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const stripped = { ...env };
+  delete stripped['COREPACK_HOME'];
+  return stripped;
+}
 
 function sanitizeLifecycleBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const sanitized: NodeJS.ProcessEnv = {};
@@ -3597,10 +3617,47 @@ export async function main(input: AgentInput): Promise<void> {
     // the strace spawn failure described above.
   }
 
+  // Round-16 (PR #22): close the COREPACK_HOME value-blind-lock oracle.  On FC/
+  // Docker the bare corepack shim reads COREPACK_HOME and leaks it into every
+  // Phase-B lifecycle child (present-in-guest `/opt/vp/corepack` vs absent-on-host).
+  // Resolve the offline-cached PM entry NOW — after Phase A warmed the cache — so
+  // BOTH Phase-B passes (main install + root prepare) launch `node <entry>` directly
+  // (bypassing the shim), then strip COREPACK_HOME from the Phase-B child env.  Gated
+  // on COREPACK_HOME present: true on FC/Docker (init.sh / docker.ts), and naturally
+  // false on the bare backend (strips the COREPACK_* family; no `/opt/vp`) and in
+  // unit tests (inject `strace`, never set COREPACK_HOME) — both keep the bare-name
+  // launch unchanged.  macOS-bare already direct-launches via buildMacosInstallCommand.
+  // FAIL-CLOSED: a resolve miss emits an error + exits non-zero rather than silently
+  // falling back to the leaky shim (which would re-open the oracle unnoticed).
+  const corepackHomeForLaunch = process.env['COREPACK_HOME'];
+  let managerLaunch: { node: string; entry: string } | undefined;
+  try {
+    managerLaunch =
+      !isMacosBare && corepackHomeForLaunch !== undefined && corepackHomeForLaunch.length > 0
+        ? resolveLinuxManagerLaunch(manager, corepackHomeForLaunch, process.execPath)
+        : undefined;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    emitter.emitError(
+      'script-jail agent: failed to resolve the offline package-manager entry for ' +
+        `direct launch — ${reason}. Refusing to emit a lockfile: falling back to the ` +
+        'bare corepack shim would re-open the COREPACK_HOME value-blind-lock oracle.',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+  // Phase-B install env: COREPACK_HOME removed ONLY when direct-launching (it is no
+  // longer needed once the PM is found by absolute path).  Phase A's fetchEnv keeps
+  // it (still shim-based, and not an oracle surface).
+  const installPhaseEnv =
+    managerLaunch !== undefined ? envWithoutCorepackHome(installEnv) : installEnv;
+
   const installInput = {
     manager,
     cwd: config.work_dir,
-    env: installEnv,
+    env: installPhaseEnv,
+    ...(managerLaunch !== undefined ? { managerLaunch } : {}),
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
@@ -3925,10 +3982,19 @@ export async function main(input: AgentInput): Promise<void> {
         }
       })()
     );
+    // Round-16: the prepare pass is the SECOND Phase-B oracle surface — mirror the
+    // main install's direct-launch + COREPACK_HOME strip (resolvePrepareCommand
+    // returns a BARE `npm`/`yarn`; runInstallPhase rewrites it to `node <entry>`
+    // when managerLaunch is present).  pnpm has no prepare pass (its root prepare
+    // rides on the main install's `rebuild --pending`), so this only ever fires for
+    // npm/yarn — but the strip+launch are threaded uniformly.
+    const preparePhaseEnv =
+      managerLaunch !== undefined ? envWithoutCorepackHome(prepareEnv) : prepareEnv;
     const prepareInput = {
       manager,
       cwd: config.work_dir,
-      env: prepareEnv,
+      env: preparePhaseEnv,
+      ...(managerLaunch !== undefined ? { managerLaunch } : {}),
       strace: prepareRunner,
       attribution,
       emitter: preparingEmitter,

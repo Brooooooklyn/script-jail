@@ -266,6 +266,18 @@ const PARITY_ONLY_ENV_READS = new Set([
   'LD_PRELOAD',
   'VP_HOME',
   'COREPACK_HOME',
+  // Round-16 (PR #22): the Linux Phase-B passes now launch the cached PM entry
+  // DIRECTLY (`node <entry>`) instead of the bare corepack shim, to close the
+  // COREPACK_HOME value-blind-lock oracle.  With the shim out of the process tree,
+  // the corepack-shim-owned env reads disappear from the Linux lifecycle child:
+  // COREPACK_ROOT (only ever SET by the shim) and COREPACK_ENABLE_DOWNLOAD_PROMPT
+  // (read by the shim) no longer surface as env_read names on the Linux side.  The
+  // committed macOS-VZ baseline still carries them until it is regenerated on
+  // bare-metal Apple Silicon, so tolerate the one-sided absence here (same class as
+  // VP_HOME/COREPACK_HOME above; public constants, not secrets).  Harmless once the
+  // baseline is regenerated (the names then appear on neither side).
+  'COREPACK_ROOT',
+  'COREPACK_ENABLE_DOWNLOAD_PROMPT',
   'SCRIPT_JAIL_MACOS_AUDIT_OPS',
   'SCRIPT_JAIL_SHELL_SHIM_DIR',
   // The macOS-bare guest passes the per-install work dir to its provisioned

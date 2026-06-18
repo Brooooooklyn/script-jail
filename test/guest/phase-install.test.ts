@@ -2,7 +2,7 @@
 // Injects mock StraceRunner (which owns the install process); no real processes spawned.
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -11,6 +11,8 @@ import {
   runInstallPhase,
   loadPmFlags,
   shimExecAttribution,
+  isPackageManagerClientBasename,
+  resolveLinuxManagerLaunch,
   type StraceRunner,
 } from '../../src/guest/phase-install.js';
 import { Emitter } from '../../src/guest/emit.js';
@@ -278,6 +280,68 @@ describe('runInstallPhase', () => {
         commandOverride: { cmd: 'pnpm', args: ['run', 'prepare'] },
       });
       expect(calls[0]!.args).toEqual(['run', 'prepare', '--store-dir=/work/.pnpm-store']);
+    });
+
+    it('managerLaunch (round-16 direct-launch) rewrites the bare name → node <entry>, preserving subargs', async () => {
+      // Production FC/Docker resolves the cached PM entry and supplies managerLaunch
+      // so the bare corepack shim is bypassed (closing the COREPACK_HOME oracle). The
+      // resolved entry takes the place of the bare manager name; the subcommand/flags
+      // (incl. the pnpm store-dir splice) are preserved verbatim.
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const strace: StraceRunner = {
+        async *run(cmd, args) { calls.push({ cmd, args }); },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter } = makeEmitter();
+      await runInstallPhase({
+        manager: 'pnpm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(mockProcReader({})),
+        emitter,
+        managerLaunch: { node: '/opt/vp/node/bin/node', entry: '/opt/vp/corepack/v1/pnpm/10.34.3/bin/pnpm.cjs' },
+      });
+      expect(calls[0]!.cmd).toBe('/opt/vp/node/bin/node');
+      expect(calls[0]!.args).toEqual([
+        '/opt/vp/corepack/v1/pnpm/10.34.3/bin/pnpm.cjs',
+        'rebuild', '--pending', '--config.side-effects-cache=false',
+        '--store-dir=/work/.pnpm-store',
+      ]);
+      // The bare manager name must NOT be the executed cmd.
+      expect(calls[0]!.cmd).not.toBe('pnpm');
+    });
+
+    it('managerLaunch also rewrites a commandOverride (prepare pass) → node <entry> run prepare', async () => {
+      // The Linux prepare pass (the SECOND Phase-B oracle surface) arrives via
+      // commandOverride with a BARE `npm`/`yarn`; managerLaunch must rewrite it too.
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const strace: StraceRunner = {
+        async *run(cmd, args) { calls.push({ cmd, args }); },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(mockProcReader({})),
+        emitter,
+        commandOverride: { cmd: 'npm', args: ['run', 'prepare', '--if-present', '--foreground-scripts'] },
+        managerLaunch: { node: '/opt/vp/node/bin/node', entry: '/opt/vp/node/lib/node_modules/npm/bin/npm-cli.js' },
+      });
+      expect(calls[0]!.cmd).toBe('/opt/vp/node/bin/node');
+      expect(calls[0]!.args).toEqual([
+        '/opt/vp/node/lib/node_modules/npm/bin/npm-cli.js',
+        'run', 'prepare', '--if-present', '--foreground-scripts',
+      ]);
     });
 
     // ---- #19 npm-only userInstallArgs splice (Phase-B fidelity parity) -------
@@ -19733,5 +19797,179 @@ describe('loadPmFlags', () => {
       writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: ['--os=linux'] }));
       expect(loadPmFlags(pmFlagsPath)).toEqual({ extraInstallArgs: ['--os=linux'], userInstallArgs: [] });
     } finally { teardown(); }
+  });
+});
+
+// ===========================================================================
+// Round-16 (PR #22): resolveLinuxManagerLaunch + the pnpm.mjs classifier
+//
+// Option B closes the COREPACK_HOME value-blind-lock oracle by resolving the
+// offline-cached PM entry and launching `node <entry>` directly (bypassing the
+// bare corepack shim).  These cover the resolver's per-manager success paths,
+// its FAIL-CLOSED contract (a miss must THROW, never silently fall back to the
+// leaky shim), and the pnpm.mjs basename the direct-launch introduces.
+// ===========================================================================
+describe('resolveLinuxManagerLaunch (round-16 direct-launch resolver)', () => {
+  function makeCorepackHome(): { cph: string; teardown: () => void } {
+    const cph = mkdtempSync(join(tmpdir(), 'sj-cph-'));
+    return { cph, teardown: () => rmSync(cph, { recursive: true, force: true }) };
+  }
+
+  function writeVersion(
+    cph: string,
+    manager: string,
+    version: string,
+    files: Record<string, string>,
+  ): string {
+    const verDir = join(cph, 'v1', manager, version);
+    mkdirSync(verDir, { recursive: true });
+    for (const [rel, contents] of Object.entries(files)) {
+      const p = join(verDir, rel);
+      mkdirSync(join(p, '..'), { recursive: true });
+      writeFileSync(p, contents);
+    }
+    return verDir;
+  }
+
+  it('pnpm 10.x → reads .corepack bin.pnpm (./bin/pnpm.cjs) → node <abs cjs>', () => {
+    const { cph, teardown } = makeCorepackHome();
+    try {
+      const verDir = writeVersion(cph, 'pnpm', '10.34.3', {
+        '.corepack': JSON.stringify({ locator: { name: 'pnpm', reference: '10.34.3' }, bin: { pnpm: './bin/pnpm.cjs' } }),
+        'bin/pnpm.cjs': '// pnpm 10 entry',
+      });
+      const { node, entry } = resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node');
+      expect(node).toBe('/opt/vp/node/bin/node');
+      expect(entry).toBe(join(verDir, 'bin', 'pnpm.cjs'));
+    } finally { teardown(); }
+  });
+
+  it('pnpm 11.x → reads .corepack bin.pnpm (./pnpm.mjs) → node <abs mjs> (cjs/mjs split handled, not hard-coded)', () => {
+    const { cph, teardown } = makeCorepackHome();
+    try {
+      const verDir = writeVersion(cph, 'pnpm', '11.7.0', {
+        '.corepack': JSON.stringify({ locator: { name: 'pnpm', reference: '11.7.0' }, bin: { pnpm: './pnpm.mjs' } }),
+        'pnpm.mjs': '// pnpm 11 entry',
+      });
+      const { entry } = resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node');
+      expect(entry).toBe(join(verDir, 'pnpm.mjs'));
+    } finally { teardown(); }
+  });
+
+  it('pnpm → falls back to package.json bin when .corepack is absent (defense-in-depth)', () => {
+    const { cph, teardown } = makeCorepackHome();
+    try {
+      const verDir = writeVersion(cph, 'pnpm', '10.34.3', {
+        'package.json': JSON.stringify({ name: 'pnpm', bin: { pnpm: './bin/pnpm.cjs' } }),
+        'bin/pnpm.cjs': '// entry',
+      });
+      const { entry } = resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node');
+      expect(entry).toBe(join(verDir, 'bin', 'pnpm.cjs'));
+    } finally { teardown(); }
+  });
+
+  it('yarn → single bundled yarn.js at the version-dir root (bin is an array; resolved by convention)', () => {
+    const { cph, teardown } = makeCorepackHome();
+    try {
+      const verDir = writeVersion(cph, 'yarn', '4.9.1', {
+        '.corepack': JSON.stringify({ locator: { name: 'yarn', reference: '4.9.1' }, bin: ['yarn', 'yarnpkg'] }),
+        'yarn.js': '// yarn berry bundle',
+      });
+      const { entry } = resolveLinuxManagerLaunch('yarn', cph, '/opt/vp/node/bin/node');
+      expect(entry).toBe(join(verDir, 'yarn.js'));
+    } finally { teardown(); }
+  });
+
+  it('npm → resolved from the toolchain root (NOT corepack-managed), independent of COREPACK_HOME', () => {
+    // npm-cli.js lives under <toolchainRoot>/lib/node_modules/npm/bin; toolchainRoot
+    // = dirname(dirname(execPath)). Build a fake toolchain and point execPath at it.
+    const root = mkdtempSync(join(tmpdir(), 'sj-tc-'));
+    try {
+      const binDir = join(root, 'node', 'bin');
+      const npmCli = join(root, 'node', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      mkdirSync(binDir, { recursive: true });
+      mkdirSync(join(npmCli, '..'), { recursive: true });
+      writeFileSync(npmCli, '// npm-cli');
+      const execPath = join(binDir, 'node');
+      writeFileSync(execPath, '');
+      // COREPACK_HOME undefined → npm must still resolve (it does not consult it).
+      const { node, entry } = resolveLinuxManagerLaunch('npm', undefined, execPath);
+      expect(node).toBe(execPath);
+      expect(entry).toBe(npmCli);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  describe('FAIL-CLOSED (a miss must THROW, never silently use the bare shim)', () => {
+    it('pnpm: COREPACK_HOME unset → throws', () => {
+      expect(() => resolveLinuxManagerLaunch('pnpm', undefined, '/opt/vp/node/bin/node')).toThrow(/COREPACK_HOME/);
+    });
+
+    it('pnpm: v1/<pm> dir missing → throws', () => {
+      const { cph, teardown } = makeCorepackHome();
+      try {
+        expect(() => resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node')).toThrow(/cannot read corepack cache dir/);
+      } finally { teardown(); }
+    });
+
+    it('pnpm: ZERO version dirs → throws (not warmed)', () => {
+      const { cph, teardown } = makeCorepackHome();
+      try {
+        mkdirSync(join(cph, 'v1', 'pnpm'), { recursive: true });
+        expect(() => resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node')).toThrow(/exactly one pnpm version/);
+      } finally { teardown(); }
+    });
+
+    it('pnpm: MULTIPLE version dirs → throws (ambiguous, e.g. a stray self-update)', () => {
+      const { cph, teardown } = makeCorepackHome();
+      try {
+        writeVersion(cph, 'pnpm', '10.34.3', { '.corepack': JSON.stringify({ bin: { pnpm: './bin/pnpm.cjs' } }), 'bin/pnpm.cjs': '' });
+        writeVersion(cph, 'pnpm', '11.7.0', { '.corepack': JSON.stringify({ bin: { pnpm: './pnpm.mjs' } }), 'pnpm.mjs': '' });
+        expect(() => resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node')).toThrow(/expected exactly one pnpm version/);
+      } finally { teardown(); }
+    });
+
+    it('pnpm: .corepack AND package.json both missing → throws', () => {
+      const { cph, teardown } = makeCorepackHome();
+      try {
+        writeVersion(cph, 'pnpm', '10.34.3', { 'bin/pnpm.cjs': '// orphan entry, no metadata' });
+        expect(() => resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node')).toThrow(/could not read the pnpm entry path/);
+      } finally { teardown(); }
+    });
+
+    it('pnpm: .corepack points at a non-existent entry file → throws', () => {
+      const { cph, teardown } = makeCorepackHome();
+      try {
+        writeVersion(cph, 'pnpm', '10.34.3', { '.corepack': JSON.stringify({ bin: { pnpm: './bin/pnpm.cjs' } }) });
+        expect(() => resolveLinuxManagerLaunch('pnpm', cph, '/opt/vp/node/bin/node')).toThrow(/pnpm entry not found/);
+      } finally { teardown(); }
+    });
+
+    it('yarn: yarn.js missing → throws', () => {
+      const { cph, teardown } = makeCorepackHome();
+      try {
+        writeVersion(cph, 'yarn', '4.9.1', { '.corepack': JSON.stringify({ bin: ['yarn'] }) });
+        expect(() => resolveLinuxManagerLaunch('yarn', cph, '/opt/vp/node/bin/node')).toThrow(/yarn\.js not found/);
+      } finally { teardown(); }
+    });
+
+    it('npm: npm-cli.js missing under the toolchain → throws', () => {
+      expect(() => resolveLinuxManagerLaunch('npm', undefined, '/nonexistent/node/bin/node')).toThrow(/npm-cli\.js not found/);
+    });
+  });
+});
+
+describe('isPackageManagerClientBasename (round-16: pnpm.mjs)', () => {
+  it('matches pnpm 11.x cached entry basename pnpm.mjs', () => {
+    expect(isPackageManagerClientBasename('/opt/vp/corepack/v1/pnpm/11.7.0/pnpm.mjs')).toBe(true);
+  });
+  it('still matches the pre-existing direct-launch entry basenames', () => {
+    expect(isPackageManagerClientBasename('npm-cli.js')).toBe(true);
+    expect(isPackageManagerClientBasename('pnpm.cjs')).toBe(true);
+    expect(isPackageManagerClientBasename('yarn.js')).toBe(true);
+  });
+  it('does not match unrelated basenames', () => {
+    expect(isPackageManagerClientBasename('index.js')).toBe(false);
+    expect(isPackageManagerClientBasename('pnpm.txt')).toBe(false);
+    expect(isPackageManagerClientBasename(undefined)).toBe(false);
   });
 });
