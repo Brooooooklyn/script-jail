@@ -30731,11 +30731,13 @@ var LIFECYCLE_HOST_NOISE_ENV_NAMES = /* @__PURE__ */ new Set([
   "POSIXLY_CORRECT",
   "TERM"
 ]);
+var LIFECYCLE_GUEST_PROVISION_ENV_NAMES = /* @__PURE__ */ new Set(["VP_HOME"]);
 function sanitizeLifecycleBaseEnv(baseEnv) {
   const sanitized = {};
   for (const [name, value] of Object.entries(baseEnv)) {
     if (value === void 0) continue;
     if (LIFECYCLE_HOST_NOISE_ENV_NAMES.has(name)) continue;
+    if (LIFECYCLE_GUEST_PROVISION_ENV_NAMES.has(name)) continue;
     if (name.startsWith("SCRIPT_JAIL_") && !LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES.has(name)) {
       continue;
     }

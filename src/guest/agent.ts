@@ -2163,12 +2163,45 @@ const LIFECYCLE_HOST_NOISE_ENV_NAMES = new Set([
   'TERM',
 ]);
 
+// Guest-PROVISIONING env vars set by the backend boot (init.sh / docker.ts /
+// provision-node-mac) that have NO host counterpart.  The host runner never
+// provisions a `/opt/vp` toolchain, so a host part-2 lifecycle child sees these
+// ABSENT — but the guest exports them into its own process.env, so without this
+// strip the audited child sees them PRESENT.  That present-in-guest /
+// absent-on-host split is a value-blind-lock oracle (env-spy records env_read
+// NAMEs only — never the value, and a read is logged even for an ABSENT var), so
+// a dep can `if (process.env.VP_HOME) benign; else evil;` → benign in the audit
+// (lock matches) and evil on the trusted host.  Same class the round-15 sweep
+// closed for the npm/pnpm/yarn config pins; this closes the guest-provisioning
+// leg of it.
+//
+// VP_HOME is safe to strip outright: it is NOT read at runtime — corepack reads
+// COREPACK_HOME (a literal value, not derived from VP_HOME at orchestrate time),
+// and node/the PM resolve via PATH (docker.ts derives PATH from VP_HOME BEFORE
+// exec'ing orchestrate, after which the var is dead weight).  Stripping it from
+// the PM-process env removes it from the WHOLE lifecycle subtree (node AND `/bin/sh`
+// children alike), with zero launch breakage.
+//
+// COREPACK_HOME is the deliberate EXCEPTION — NOT stripped here.  It is
+// LOAD-BEARING: the corepack shim (the bare `npm`/`pnpm`/`yarn` on PATH) reads it
+// to locate the offline PM cache, and Phase B runs network-OFF, so stripping it
+// breaks the PM launch.  There is no env seam to scrub it AFTER the corepack shim
+// but BEFORE the lifecycle child (the shim → real PM → child share one inherited
+// env, and the immediate lifecycle child is `/bin/sh -c`, not node, so a JS
+// preload can't reach it).  It is therefore an accepted, documented residual in
+// the same bucket as the other guest-only sandbox tells the audit MUST carry
+// (LD_PRELOAD, NODE_OPTIONS preloads, container marker files, os.hostname()) —
+// see src/action/host-install.ts ("DEFENSE-IN-DEPTH, NOT A COMPLETE ORACLE
+// CLOSE").  Unlike a secret, its value is a PUBLIC CONSTANT (/opt/vp/corepack).
+const LIFECYCLE_GUEST_PROVISION_ENV_NAMES = new Set(['VP_HOME']);
+
 function sanitizeLifecycleBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const sanitized: NodeJS.ProcessEnv = {};
 
   for (const [name, value] of Object.entries(baseEnv)) {
     if (value === undefined) continue;
     if (LIFECYCLE_HOST_NOISE_ENV_NAMES.has(name)) continue;
+    if (LIFECYCLE_GUEST_PROVISION_ENV_NAMES.has(name)) continue;
     if (name.startsWith('SCRIPT_JAIL_') && !LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES.has(name)) {
       continue;
     }

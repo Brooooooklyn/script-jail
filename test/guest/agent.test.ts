@@ -2545,6 +2545,43 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     expect(env['npm_config_ignore_pnpmfile']).toBe('true');
     expect(env['npm_config_script_shell']).toBe('/bin/sh');
   });
+
+  // Guest-provisioning leak parity (round-16): VP_HOME / COREPACK_HOME are
+  // exported by the backend boot (init.sh / docker.ts) into the guest's own
+  // process.env but have NO host counterpart, so leaking them into the audited
+  // lifecycle child is a value-blind-lock oracle (present-in-guest /
+  // absent-on-host).  VP_HOME is stripped (not read at runtime); COREPACK_HOME
+  // is the load-bearing exception (corepack shim needs it for the offline PM
+  // launch, network-off Phase B) and is an accepted documented residual.
+  it('strips VP_HOME from the lifecycle child but PRESERVES COREPACK_HOME (load-bearing)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv(
+      {
+        PATH: '/usr/bin',
+        VP_HOME: '/opt/vp',
+        COREPACK_HOME: '/opt/vp/corepack',
+      },
+      cfg('pnpm', false),
+      '/tmp/events.jsonl',
+    );
+    // VP_HOME is a guest-only provisioning tell with no host counterpart and is
+    // not read at runtime → stripped so the audited child matches the host child.
+    expect(env['VP_HOME']).toBeUndefined();
+    // COREPACK_HOME MUST survive: the corepack shim reads it to locate the
+    // offline PM cache; stripping it would break the network-off Phase B launch.
+    expect(env['COREPACK_HOME']).toBe('/opt/vp/corepack');
+  });
+
+  it('strips VP_HOME regardless of install_mode (it is a sandbox tell, not an install pin)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // install_mode=true must NOT resurrect VP_HOME — the strip is unconditional.
+    const env = buildChildEnv(
+      { PATH: '/usr/bin', VP_HOME: '/opt/vp' },
+      cfg('pnpm', true),
+      '/tmp/events.jsonl',
+    );
+    expect(env['VP_HOME']).toBeUndefined();
+  });
 });
 
 describe('buildChildEnv protect-list entry-count and per-entry-length gates', () => {
