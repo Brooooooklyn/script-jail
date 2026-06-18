@@ -27350,7 +27350,13 @@ function resolveBareOnPath(pm, pathVar) {
     if (dir === "") continue;
     for (const name of names) {
       const candidate = (0, import_node_path2.join)(dir, name);
-      if ((0, import_node_path2.isAbsolute)(candidate) && (0, import_node_fs.existsSync)(candidate)) return candidate;
+      if (!(0, import_node_path2.isAbsolute)(candidate) || !(0, import_node_fs.existsSync)(candidate)) continue;
+      try {
+        (0, import_node_fs.accessSync)(candidate, import_node_fs.constants.X_OK);
+      } catch {
+        continue;
+      }
+      return candidate;
     }
   }
   return void 0;

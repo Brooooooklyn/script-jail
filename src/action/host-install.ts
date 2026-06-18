@@ -24,7 +24,7 @@
 //     derives from the reviewed lock, not from host isolation.  See docs.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -1375,7 +1375,20 @@ function resolveBareOnPath(pm: string, pathVar: string | undefined): string | un
     if (dir === '') continue;
     for (const name of names) {
       const candidate = join(dir, name);
-      if (isAbsolute(candidate) && existsSync(candidate)) return candidate;
+      if (!isAbsolute(candidate) || !existsSync(candidate)) continue;
+      // MODEL execvp: the OS skips a non-EXECUTABLE PATH hit and keeps scanning, so
+      // we must too — otherwise a readable but non-executable `pnpm` (mode 0644)
+      // earlier on PATH would be classified "confirmed standalone" while spawn
+      // actually execs a LATER executable corepack shim, re-opening the COREPACK_ROOT
+      // oracle (codex round-17c).  access(X_OK) is exactly the check execvp uses; on
+      // win32 (Linux-gated host) it degrades to existence, which the `.cmd/.exe`
+      // name list already covers.
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+      } catch {
+        continue;
+      }
+      return candidate;
     }
   }
   return undefined;

@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   mkdirSync,
   writeFileSync,
+  chmodSync,
   rmSync,
   symlinkSync,
   realpathSync,
@@ -1172,8 +1173,10 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
       const binDir = mkdtempSync(join(tmpdir(), `sj-bin-${pm}-`));
       const repoDir = mkdtempSync(join(tmpdir(), `sj-repo-standalone-${pm}-`));
       try {
-        // A standalone PM script whose bytes do NOT contain `corepack.cjs`.
+        // A standalone PM script whose bytes do NOT contain `corepack.cjs`.  Mode
+        // 0755 so resolveBareOnPath (which models execvp's X_OK) finds it on PATH.
         writeFileSync(join(binDir, pm), '#!/usr/bin/env node\n// standalone, not a corepack shim\n');
+        chmodSync(join(binDir, pm), 0o755);
         writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
         const launch = resolveHostManagerLaunch(pm, repoDir, { COREPACK_HOME: emptyCache, PATH: binDir });
         expect(launch).toBeUndefined();
@@ -1199,6 +1202,7 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
         join(binDir, 'pnpm'),
         "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm', ...process.argv.slice(2)]);\n",
       );
+      chmodSync(join(binDir, 'pnpm'), 0o755); // executable so resolveBareOnPath (X_OK) finds it
       writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
       // Empty cache + no pin → managed (shim) but unresolvable → throws.
       expect(() =>
@@ -1220,6 +1224,7 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
         join(binDir, 'pnpm'),
         "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm']);\n",
       );
+      chmodSync(join(binDir, 'pnpm'), 0o755); // executable so resolveBareOnPath (X_OK) finds it
       writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
       const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir });
       expect(launch!.entry).toBe(join(verDir, 'bin', 'pnpm.cjs'));
@@ -1334,6 +1339,7 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
         join(binDir, 'pnpm'),
         '#!/usr/bin/env node\n// standalone pnpm; mentions corepack in a help string and calls runMain()\nrunMain();\n',
       );
+      chmodSync(join(binDir, 'pnpm'), 0o755); // executable so resolveBareOnPath (X_OK) finds it
       writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
       const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: emptyCache, PATH: binDir });
       expect(launch).toBeUndefined();
@@ -1381,6 +1387,7 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
         join(binDir, 'pnpm'),
         "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm']);\n", // shim → managed
       );
+      chmodSync(join(binDir, 'pnpm'), 0o755); // executable so resolveBareOnPath (X_OK) finds the shim
       writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' })); // no packageManager pin
       expect(() =>
         resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir }),
@@ -1404,6 +1411,7 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     try {
       // A standalone pnpm (NOT a corepack.cjs shim) on the PATH the child would use.
       writeFileSync(join(binDir, 'pnpm'), '#!/usr/bin/env node\n// standalone pnpm, not a corepack shim\n');
+      chmodSync(join(binDir, 'pnpm'), 0o755); // executable so resolveBareOnPath (X_OK) finds it
       writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' })); // NO packageManager pin
       const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir });
       expect(launch).toBeUndefined(); // bare-launch the standalone PM, NOT the stale cached entry
@@ -1423,6 +1431,7 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-standalone-pin-'));
     try {
       writeFileSync(join(binDir, 'pnpm'), '#!/usr/bin/env node\n// standalone pnpm, not a corepack shim\n');
+      chmodSync(join(binDir, 'pnpm'), 0o755); // executable so resolveBareOnPath (X_OK) finds it
       // Pin a DIFFERENT version that is absent from the cache.
       writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@11.1.2' }));
       const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir });
@@ -1430,6 +1439,42 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     } finally {
       cleanup();
       rmSync(binDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (g) codex round-17c [medium]: a readable but NON-EXECUTABLE `pnpm` (mode 0644)
+  // earlier on PATH must NOT mask a LATER executable corepack shim.  execvp skips the
+  // non-exec hit and execs the later shim, so resolveBareOnPath must too (access X_OK)
+  // — otherwise the non-exec file would be classified "confirmed standalone" →
+  // bare-launch → the child execs the shim → COREPACK_ROOT re-opens.  With the fix the
+  // resolver inspects the executable shim → managed → fails closed on an empty cache
+  // (never bare-launch).  Before the fix this returned undefined (no throw).
+  it('(g) non-executable non-shim PM before an executable corepack shim on PATH → managed (X_OK precedence)', () => {
+    const emptyCache = mkdtempSync(join(tmpdir(), 'sj-empty-xok-'));
+    const dir1 = mkdtempSync(join(tmpdir(), 'sj-xok-nonexec-')); // first hit: 0644, non-shim
+    const dir2 = mkdtempSync(join(tmpdir(), 'sj-xok-shim-')); // later hit: executable shim
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-xok-'));
+    try {
+      const nonExec = join(dir1, 'pnpm');
+      writeFileSync(nonExec, '#!/usr/bin/env node\n// readable non-shim standalone, but NOT executable\n');
+      chmodSync(nonExec, 0o644); // no execute bit → execvp would skip it
+      const shim = join(dir2, 'pnpm');
+      writeFileSync(shim, "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm']);\n");
+      chmodSync(shim, 0o755); // executable corepack shim → what the child actually execs
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' })); // no pin
+      // The non-exec dir1/pnpm must NOT win: resolver skips it, finds the executable
+      // shim in dir2 → managed → empty cache → fails closed (NOT undefined/bare-launch).
+      expect(() =>
+        resolveHostManagerLaunch('pnpm', repoDir, {
+          COREPACK_HOME: emptyCache,
+          PATH: `${dir1}${delimiter}${dir2}`,
+        }),
+      ).toThrow(/corepack-managed pnpm/i);
+    } finally {
+      rmSync(emptyCache, { recursive: true, force: true });
+      rmSync(dir1, { recursive: true, force: true });
+      rmSync(dir2, { recursive: true, force: true });
       rmSync(repoDir, { recursive: true, force: true });
     }
   });
