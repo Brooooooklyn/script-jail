@@ -33,6 +33,7 @@ import {
   type HostStreamSpawn,
   type HostInstallIo,
 } from '../../src/action/host-install.js';
+import { sanitizeInstallArgs } from '../../src/shared/pm-commands.js';
 
 interface Recorder {
   io: HostInstallIo;
@@ -167,7 +168,7 @@ describe('hostInstallNoScripts (part 1)', () => {
 
       // yarn part 2 (run-scripts) is hardened identically.
       const y2 = envCapture();
-      await hostRunScripts('yarn', '/repo', makeRecorder().io, [], y2.streamSpawn);
+      await hostRunScripts('yarn', '/repo', [], makeRecorder().io, [], y2.streamSpawn);
       expect(y2.env()['YARN_IGNORE_PATH']).toBe('1');
       expect(y2.env()['YARN_PLUGINS']).toBe('');
       expect(y2.env()['YARN_ENABLE_SCRIPTS']).toBeUndefined();
@@ -634,11 +635,11 @@ describe('hostInstallNoScripts (part 1)', () => {
 describe('hostRunScripts (part 2)', () => {
   it.each([
     ['npm', ['rebuild', '--foreground-scripts']],
-    ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store', '--config.ignore-pnpmfile=true']],
+    ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store', '--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh']],
     ['yarn', ['install', '--immutable']],
   ] as const)('runs the INSTALL_CMD for %s in repoDir', async (pm, expected) => {
     const rec = makeRecorder();
-    await hostRunScripts(pm, '/repo', rec.io, [], okStreamSpawn(rec));
+    await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec));
     expect(rec.calls).toEqual([{ cmd: pm, args: expected, cwd: '/repo' }]);
   });
 
@@ -648,31 +649,79 @@ describe('hostRunScripts (part 2)', () => {
     // AFTER the trust gate, unaudited.  Part-2 rejects the bare `--ignore-pnpmfile`
     // flag, so the config-namespaced form suppresses it.  Only pnpm gets it.
     const rec = makeRecorder();
-    await hostRunScripts('pnpm', '/repo', rec.io, [], okStreamSpawn(rec));
+    await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec));
     expect(rec.calls[0]!.args).toContain('--config.ignore-pnpmfile=true');
-    // It is the LAST flag (appended after the store-dir pin).
-    expect(rec.calls[0]!.args.at(-1)).toBe('--config.ignore-pnpmfile=true');
+    // Appended after the store-dir pin, alongside the #26 script-shell pin (last).
+    expect(rec.calls[0]!.args.at(-1)).toBe('--config.script-shell=/bin/sh');
     // And NOT the bare flag, which `pnpm rebuild` rejects ("Unknown option").
     expect(rec.calls[0]!.args).not.toContain('--ignore-pnpmfile');
     for (const pm of ['npm', 'yarn'] as const) {
       const r = makeRecorder();
-      await hostRunScripts(pm, '/repo', r.io, [], okStreamSpawn(r));
+      await hostRunScripts(pm, '/repo', [], r.io, [], okStreamSpawn(r));
       expect(r.calls[0]!.args).not.toContain('--config.ignore-pnpmfile=true');
     }
+  });
+
+  describe('#19 npm-only user-arg splice (fidelity parity)', () => {
+    it('npm part-2 splices the sanitized dep-selection args (after base, before store-dir)', async () => {
+      const rec = makeRecorder();
+      await hostRunScripts('npm', '/repo', ['--omit=dev', '-D'], rec.io, [], okStreamSpawn(rec));
+      // npm has no store-dir / host-hardening, so finalArgs = base + kept.
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '-D']);
+      // Lockstep invariant: the spliced suffix is exactly sanitizeInstallArgs(args).kept.
+      const { kept } = sanitizeInstallArgs(['--omit=dev', '-D']);
+      expect(rec.calls[0]!.args.slice(2)).toEqual(kept);
+    });
+
+    it('npm part-2 DROPS a script-re-enabling / unsafe arg (same allowlist as part-1)', async () => {
+      const rec = makeRecorder();
+      // `--ignore-scripts false` and a positional are NOT on the allowlist → dropped.
+      await hostRunScripts('npm', '/repo', ['--ignore-scripts', 'false', '--omit=dev'], rec.io, [], okStreamSpawn(rec));
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev']);
+      expect(rec.calls[0]!.args).not.toContain('--ignore-scripts');
+    });
+
+    it('pnpm/yarn part-2 splice NO user args (rebuild rejects them; dep-group state lives in the tree)', async () => {
+      for (const [pm, expected] of [
+        ['pnpm', ['rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/repo/.pnpm-store', '--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh']],
+        ['yarn', ['install', '--immutable']],
+      ] as const) {
+        const rec = makeRecorder();
+        await hostRunScripts(pm, '/repo', ['--omit=dev', '--prod'], rec.io, [], okStreamSpawn(rec));
+        expect(rec.calls[0]!.args).toEqual(expected);
+        expect(rec.calls[0]!.args).not.toContain('--omit=dev');
+        expect(rec.calls[0]!.args).not.toContain('--prod');
+      }
+    });
+
+    it('no-args npm part-2 is byte-identical to before (empty kept splices nothing)', async () => {
+      const rec = makeRecorder();
+      await hostRunScripts('npm', '/repo', [], rec.io, [], okStreamSpawn(rec));
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
+    });
+
+    it('does NOT echo raw user tokens in the banner — count-only suffix', async () => {
+      const rec = makeRecorder();
+      await hostRunScripts('npm', '/repo', ['--omit=dev'], rec.io, [], okStreamSpawn(rec));
+      const banner = rec.out.join('');
+      // The args still go to spawn (asserted above); the BANNER must not echo them.
+      expect(banner).not.toContain('--omit=dev');
+      expect(banner).toMatch(/\+1 user install arg, not shown/);
+    });
   });
 
   it('throws on a non-zero exit', async () => {
     const rec = makeRecorder();
     const failSpawn: HostStreamSpawn = async () => ({ status: 7, signal: null });
-    await expect(hostRunScripts('pnpm', '/repo', rec.io, [], failSpawn)).rejects.toThrow(/exited with code 7/);
+    await expect(hostRunScripts('pnpm', '/repo', [], rec.io, [], failSpawn)).rejects.toThrow(/exited with code 7/);
   });
 
   it('throws (kill signal) and (spawn error), with credential-free args in the message', async () => {
     const rec = makeRecorder();
     const sigSpawn: HostStreamSpawn = async () => ({ status: null, signal: 'SIGKILL' });
-    await expect(hostRunScripts('npm', '/repo', rec.io, [], sigSpawn)).rejects.toThrow(/killed by SIGKILL/);
+    await expect(hostRunScripts('npm', '/repo', [], rec.io, [], sigSpawn)).rejects.toThrow(/killed by SIGKILL/);
     const errSpawn: HostStreamSpawn = async () => ({ status: null, signal: null, error: new Error('ENOENT npm') });
-    await expect(hostRunScripts('npm', '/repo', rec.io, [], errSpawn)).rejects.toThrow(/could not spawn "npm": ENOENT npm/);
+    await expect(hostRunScripts('npm', '/repo', [], rec.io, [], errSpawn)).rejects.toThrow(/could not spawn "npm": ENOENT npm/);
   });
 
   it('REDACTS streamed lifecycle output: protected-env values + credential shapes never reach the job log (F6)', async () => {
@@ -686,7 +735,7 @@ describe('hostRunScripts (part 2)', () => {
     const prev = process.env['MY_DEPLOY_TOKEN'];
     process.env['MY_DEPLOY_TOKEN'] = SECRET;
     try {
-      await hostRunScripts('npm', '/repo', rec.io, ['MY_DEPLOY_TOKEN'], okStreamSpawn(rec, [
+      await hostRunScripts('npm', '/repo', [], rec.io, ['MY_DEPLOY_TOKEN'], okStreamSpawn(rec, [
         { stream: 'stdout', line: `echoing the env value ${SECRET} here` },
         { stream: 'stderr', line: 'fetching //user:hunter2hunter2@npm.acme.internal/' },
         { stream: 'stdout', line: 'Authorization: Bearer ABCDEFGH01234567890123456789' },
@@ -717,7 +766,7 @@ describe('hostRunScripts (part 2)', () => {
     const prev = process.env['MY_DEPLOY_TOKEN'];
     process.env['MY_DEPLOY_TOKEN'] = SECRET;
     try {
-      await hostRunScripts('npm', '/repo', rec.io, ['MY_DEPLOY_TOKEN'], okStreamSpawn(rec, [
+      await hostRunScripts('npm', '/repo', [], rec.io, ['MY_DEPLOY_TOKEN'], okStreamSpawn(rec, [
         { stream: 'stdout', line: `leaked fragment ${PREFIX} on a truncated line` },
       ]));
       const all = rec.out.join('') + rec.errs.join('');
@@ -744,7 +793,7 @@ describe('hostRunScripts (part 2)', () => {
     process.env['MY_DEPLOY_TOKEN'] = 'x'.repeat(2 * 1024 * 1024 + 100); // > 2 MiB chars
     try {
       await expect(
-        hostRunScripts('npm', '/repo', rec.io, ['MY_DEPLOY_TOKEN'], spySpawn),
+        hostRunScripts('npm', '/repo', [], rec.io, ['MY_DEPLOY_TOKEN'], spySpawn),
       ).rejects.toThrow(/more distinct secret material than the host lifecycle-log redactor/);
       expect(spawned).toBe(false); // never entered streaming
       expect(rec.out.join('') + rec.errs.join('')).not.toContain('xxxxxxxx'); // log not blanked/streamed
@@ -792,7 +841,7 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
   it('part 2 (lifecycle scripts) ALSO sets npm_config_git (defense-in-depth)', async () => {
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
-    await hostRunScripts('npm', '/repo', rec.io, [], envCapturingStreamSpawn(envs));
+    await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
     expect(envs).toHaveLength(1);
     const git = envs[0]!['npm_config_git'];
     expect(git).toBeDefined();
@@ -935,6 +984,39 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     }
   });
 
+  it('REJECTS a checkout PATH dir that SYMLINKS OUT to a system dir (symlink-out / lexical defense, #24)', () => {
+    // P1 (#24): `$GITHUB_WORKSPACE/tools -> <outside dir>` has its REAL path OUTSIDE
+    // the checkout, so realpath-only containment KEEPS it — but the PR controls that
+    // symlink and can repoint it to a dir of malicious binaries in trusted host
+    // part-2.  The lexical-spelling check must drop it (its spelling is inside the
+    // checkout), in BOTH resolveGitFromPath and sanitizePathValue.
+    if (process.platform === 'win32') return;
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-co24-'));
+    const outside = mkdtempSync(join(tmpdir(), 'sj-sys24-'));
+    writeFileSync(join(outside, 'git'), '#!/bin/sh\necho hi\n', { mode: 0o755 });
+    const tools = join(checkout, 'tools');
+    symlinkSync(outside, tools); // checkout-lexical dir → outside-checkout REAL dir
+    const origPath = process.env['PATH'];
+    const origWs = process.env['GITHUB_WORKSPACE'];
+    try {
+      process.env['GITHUB_WORKSPACE'] = checkout;
+      // resolveGitFromPath must NOT trust the git in the symlink-out checkout dir
+      process.env['PATH'] = `${tools}${delimiter}/usr/bin${delimiter}/bin`;
+      expect(resolveGitFromPath()).not.toBe(join(tools, 'git'));
+      // sanitizePathValue must DROP the symlink-out checkout dir but keep system dirs
+      expect(sanitizePathValue(`${tools}${delimiter}/usr/bin${delimiter}/bin`)).toBe(
+        `/usr/bin${delimiter}/bin`,
+      );
+    } finally {
+      if (origPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = origPath;
+      if (origWs === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = origWs;
+      rmSync(checkout, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('preserves the inherited env (HOME etc.) and the SYSTEM PATH entries by merging over process.env', () => {
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
@@ -966,6 +1048,48 @@ function realpathSafe(p: string): string {
     return p;
   }
 }
+
+describe('home ~/.npmrc script-shell defense (#26)', () => {
+  const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
+
+  it('part-1 pins npm_config_script_shell to the system shell for npm', () => {
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    expect(envs[0]?.['npm_config_script_shell']).toBe(shell);
+  });
+
+  it('part-2 npm rebuild env also pins npm_config_script_shell (the post-trust path)', async () => {
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
+    expect(envs[0]?.['npm_config_script_shell']).toBe(shell);
+  });
+
+  it('does NOT pin npm_config_script_shell for pnpm/yarn (npm-scoped)', () => {
+    for (const pm of ['pnpm', 'yarn'] as const) {
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], rec.io, envCapturingSpawn(envs));
+      expect(envs[0]?.['npm_config_script_shell']).toBeUndefined();
+    }
+  });
+
+  it('part-2 pnpm rebuild appends --config.script-shell=/bin/sh (sibling, kept with ignore-pnpmfile)', async () => {
+    const rec = makeRecorder();
+    await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec));
+    expect(rec.calls[0]?.args).toContain('--config.script-shell=/bin/sh');
+    expect(rec.calls[0]?.args).toContain('--config.ignore-pnpmfile=true');
+  });
+
+  it('part-2 does NOT add the pnpm script-shell flag for npm/yarn', async () => {
+    for (const pm of ['npm', 'yarn'] as const) {
+      const rec = makeRecorder();
+      await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec));
+      expect(rec.calls[0]?.args).not.toContain('--config.script-shell=/bin/sh');
+    }
+  });
+});
 
 describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true defense-in-depth)', () => {
   /** Run `body` with extra env vars set, restoring the prior values after. */
@@ -1000,7 +1124,7 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
         async () => {
           const rec = makeRecorder();
           const envs: Array<NodeJS.ProcessEnv> = [];
-          await hostRunScripts(pm, '/repo', rec.io, [], envCapturingStreamSpawn(envs));
+          await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
           const env = envs[0]!;
           // Sandbox tells that an env-sensitive payload could branch on are gone.
           expect(env['HOSTNAME']).toBeUndefined();
@@ -1038,7 +1162,7 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
     await withEnv({ SCRIPT_JAIL_REPO_DIR: '/x' }, async () => {
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
-      await hostRunScripts('yarn', '/repo', rec.io, [], envCapturingStreamSpawn(envs));
+      await hostRunScripts('yarn', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
       const env = envs[0]!;
       expect(env['YARN_IGNORE_PATH']).toBe('1');
       expect(env['YARN_PLUGINS']).toBe('');
@@ -1327,7 +1451,19 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       hostInstallNoScripts(pm, '/repo', [], rec.io, envCapturingSpawn(envs));
       const env = envs[0]!;
       for (const k of Object.keys(DANGEROUS_PRESENT)) {
+        // npm_config_script_shell is REPLACED by the #26 safe pin for npm (the
+        // inherited dangerous value is defeated by OVERRIDE, not deletion); the
+        // uppercase + hyphen spellings and every other dangerous var are still
+        // dropped outright.
+        if (k === 'npm_config_script_shell') continue;
         expect(env[k]).toBeUndefined();
+      }
+      if (pm === 'npm') {
+        expect(env['npm_config_script_shell']).toBe(
+          process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
+        );
+      } else {
+        expect(env['npm_config_script_shell']).toBeUndefined();
       }
       // The security pins still survive the strip.
       expect(env['npm_config_git']).toBeDefined();
@@ -1344,10 +1480,20 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       for (const [k, v] of Object.entries(DANGEROUS_PRESENT)) process.env[k] = v;
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
-      await hostRunScripts(pm, '/repo', rec.io, [], envCapturingStreamSpawn(envs));
+      await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
       const env = envs[0]!;
       for (const k of Object.keys(DANGEROUS_PRESENT)) {
+        // See part-1: npm_config_script_shell is OVERRIDDEN by the #26 safe pin for
+        // npm, not deleted; other spellings + vars are dropped outright.
+        if (k === 'npm_config_script_shell') continue;
         expect(env[k]).toBeUndefined();
+      }
+      if (pm === 'npm') {
+        expect(env['npm_config_script_shell']).toBe(
+          process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
+        );
+      } else {
+        expect(env['npm_config_script_shell']).toBeUndefined();
       }
       expect(env['npm_config_git']).toBeDefined();
       if (pm === 'yarn') {
@@ -1876,7 +2022,7 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       process.env['PATH'] = `${binDir}${delimiter}/usr/bin`;
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
-      await hostRunScripts('npm', repoDir, rec.io, [], envCapturingStreamSpawn(envs));
+      await hostRunScripts('npm', repoDir, [], rec.io, [], envCapturingStreamSpawn(envs));
       const parts = envs[0]!['PATH']!.split(delimiter);
       expect(parts.some((p) => p.startsWith(repoDir))).toBe(false);
       expect(parts).toContain('/usr/bin');

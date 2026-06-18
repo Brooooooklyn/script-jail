@@ -137,6 +137,39 @@ describe('buildEffectiveConfig', () => {
     expect(withOverride['node_version']).toBe(20);
   });
 
+  it('sets install_mode:true only when installMode is passed (#22 pnpmfile parity)', () => {
+    writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
+
+    // Pure-audit (no installMode) -> the key is ABSENT so the guest schema
+    // default (false) stands and pure-audit goldens are byte-unchanged.
+    const without = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(without['install_mode']).toBeUndefined();
+
+    // install:true -> install_mode:true so buildChildEnv mirrors the host
+    // install's pnpm --config.ignore-pnpmfile=true into the lifecycle env.
+    const withMode = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+          installMode: true,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(withMode['install_mode']).toBe(true);
+  });
+
   it('never mutates the user source file', () => {
     writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
     const before = readFileSync(userConfigPath, 'utf8');

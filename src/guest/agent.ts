@@ -77,6 +77,17 @@ const AgentConfig = z.object({
   pkg_dirs: z.record(z.string(), z.string()).default({}),
   /** Package manager override. Auto-detected from lockfile if not set. */
   manager: z.enum(['npm', 'pnpm', 'yarn']).optional(),
+  /**
+   * Drop-in install (`install: true`) mode.  When set, the host runs the REAL
+   * lifecycle install post-trust (src/action/host-install.ts), so the guest
+   * audit must run with the SAME post-trust config the host applies — otherwise
+   * a lifecycle script can branch on a config value that diverges between the
+   * audited sandbox and the trusted host run (the lock is value-blind: env-spy
+   * records env_read NAMEs only).  Currently this mirrors the host's pnpm
+   * `--config.ignore-pnpmfile=true` into the Phase B child env (see
+   * buildChildEnv).  Defaults false → pure-audit goldens are byte-unchanged.
+   */
+  install_mode: z.boolean().default(false),
 });
 
 export type AgentConfig = z.infer<typeof AgentConfig>;
@@ -2365,9 +2376,49 @@ export function buildChildEnv(
           }
         : { npm_config_cache: `${config.work_dir}/.npm-cache` };
 
+  // DROP-IN INSTALL PARITY (install: true): host part-2 runs the trusted pnpm
+  // rebuild with `--config.ignore-pnpmfile=true` (src/action/host-install.ts).
+  // On pnpm 10.x that flag is re-exported into EVERY lifecycle script's env as
+  // `npm_config_ignore_pnpmfile=true` (npm-compat config→env mapping), so a
+  // dependency script that branches on it
+  //   if (process.env.npm_config_ignore_pnpmfile === 'true') evil(); else benign();
+  // runs benign() in the no-flag sandbox but evil() on the trusted host — and
+  // the lock can't catch it: env-spy records env_read NAMEs only (value-blind),
+  // so both runs log the identical `npm_config_ignore_pnpmfile` read and the
+  // diff matches.  Injecting the SAME env var into the guest Phase B child env
+  // makes the audited branch == the executed branch on pnpm 10.x.
+  //
+  // EMPIRICALLY VERIFIED (2026-06-18, the EXACT `pnpm rebuild --pending` host
+  // command), version-DEPENDENT:
+  //   * pnpm 10.34.3 — host flag → child sees npm_config_ignore_pnpmfile=true;
+  //     guest (no flag) → ABSENT.  Real divergence.  This injection sets it on
+  //     the guest → child sees =true → MATCHES the host.  RCE closed.
+  //   * pnpm 11.1.2  — pnpm uses the `pnpm_config_*` namespace internally and
+  //     STRIPS `npm_config_ignore_pnpmfile` from the lifecycle child on BOTH
+  //     the host (flag) and the guest (injection) paths → both ABSENT → no
+  //     divergence, this injection is a harmless no-op.
+  // The `npm_config_` prefix is REQUIRED (not `pnpm_config_`): on pnpm 11 a
+  // `pnpm_config_ignore_pnpmfile` survives into the guest child but the host
+  // flag does NOT expose it, so mirroring under that prefix would CREATE a new
+  // divergence.  npm_config_ matches the host on 10.x and is stripped in
+  // lockstep on 11.x.
+  //
+  // No audit coverage is lost: install-preflight's detectPnpmfile REFUSES
+  // install:true for ANY pnpmfile vector before host part-2, so there is no
+  // repo pnpmfile left to audit on this path (and sandbox ancestor dirs are
+  // clean, so the host-only ancestor-pnpmfile suppression has no guest analog
+  // to mirror).  GATED on install_mode (buildChildEnv is shared with pure-audit,
+  // install off) so pure-audit goldens stay byte-identical and the lock stays
+  // mode-consistent.  npm/yarn ignore the key → pnpm-only.
+  const installModeEnv: Record<string, string> =
+    config.install_mode && resolvedManager === 'pnpm'
+      ? { npm_config_ignore_pnpmfile: 'true' }
+      : {};
+
   return {
     ...inheritedEnv,
     ...cacheRedirectEnv,
+    ...installModeEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -3204,6 +3255,7 @@ export async function main(input: AgentInput): Promise<void> {
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader(),
     canonicalRootKey === ROOT_SENTINEL ? ROOT_SENTINEL : undefined,
+    rootPkgKeys,
   );
 
   // 8. Phase A: fetch (network on, no strace)
@@ -3493,6 +3545,13 @@ export async function main(input: AgentInput): Promise<void> {
     straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
     rootPkgKeys,
+    // #19 fidelity (npm-only): re-pass the sanitized developer install args to
+    // Phase B so `npm rebuild` runs lifecycle scripts with the same dep-selection
+    // env (NODE_ENV/omit) the single-phase `npm ci <args>` would — in lockstep
+    // with the host part-2 splice.  Already sanitized by loadPmFlags; runInstall
+    // Phase ignores it for pnpm/yarn and for the prepare-pass commandOverride.
+    // Empty (no-args default) → byte-identical lock + goldens.
+    userInstallArgs: fetchResult.userInstallArgs,
     // Nameless root → the root's OWN lifecycle pids have empty npm_package_name
     // but a canonical npm_lifecycle_event.  The ATTRIBUTION LAYER (Attribution
     // ctor's rootSentinel on the /proc walk + shimNpmAttribution on the shim

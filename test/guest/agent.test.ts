@@ -2341,6 +2341,7 @@ describe('buildChildEnv protected-env-names length gate', () => {
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -2437,6 +2438,85 @@ describe('buildChildEnv protected-env-names length gate', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// buildChildEnv install_mode — drop-in install pnpmfile-config parity (#22)
+//
+// Host part-2 (install: true, post-trust) runs `pnpm rebuild --pending
+// --config.ignore-pnpmfile=true`, which sets npm_config_ignore_pnpmfile=true in
+// every lifecycle script's env.  The guest Phase B audit must export the
+// IDENTICAL value (the lock is value-blind — env-spy records env_read NAMEs
+// only), or a dep script can branch differently on the trusted host than was
+// audited.  buildChildEnv mirrors it for pnpm GATED on install_mode so
+// pure-audit goldens stay byte-identical.
+// ---------------------------------------------------------------------------
+
+describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
+  function cfg(
+    manager: 'npm' | 'pnpm' | 'yarn',
+    installMode: boolean,
+  ): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: [] },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+      manager,
+      install_mode: installMode,
+    };
+  }
+
+  it('install_mode + pnpm → injects npm_config_ignore_pnpmfile=true (matches host)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('pnpm', true), '/tmp/events.jsonl');
+    expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+  });
+
+  it('install_mode + npm → NO injection (npm ignores the key, pnpm-only)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('npm', true), '/tmp/events.jsonl');
+    expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+  });
+
+  it('install_mode + yarn → NO injection', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('yarn', true), '/tmp/events.jsonl');
+    expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+  });
+
+  it('pure-audit (install_mode false) + pnpm → NO injection (golden byte-stability)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('pnpm', false), '/tmp/events.jsonl');
+    expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+  });
+
+  it('injection OVERRIDES an inherited npm_config_ignore_pnpmfile (last-spread wins)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // A host/runner that already exported the key with a DIFFERENT value must
+    // not defeat the parity guarantee — the install-mode injection is spread
+    // last, so it deterministically wins regardless of the inherited value.
+    const env = buildChildEnv(
+      { PATH: '/usr/bin', npm_config_ignore_pnpmfile: 'false' },
+      cfg('pnpm', true),
+      '/tmp/events.jsonl',
+    );
+    expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+  });
+
+  it('macOS install_mode + pnpm → injects (buildChildEnvMacos reuses the Linux builder)', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+    const env = buildChildEnvMacos(
+      { PATH: '/usr/bin' },
+      cfg('pnpm', true),
+      '/tmp/events.jsonl',
+    );
+    expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+  });
+});
+
 describe('buildChildEnv protect-list entry-count and per-entry-length gates', () => {
   // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list
   // table holds `MAX_PROTECTED = 64` entries of at most `NAME_MAX_LEN - 1
@@ -2457,6 +2537,7 @@ describe('buildChildEnv protect-list entry-count and per-entry-length gates', ()
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -2586,6 +2667,7 @@ describe('buildChildEnv protect-list strict env-var name gate (Finding 5)', () =
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -2674,6 +2756,7 @@ describe('buildChildEnv lifecycle env sanitization', () => {
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -2863,6 +2946,7 @@ describe('buildChildEnv package-manager cache/store redirects', () => {
       work_dir: workDir,
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
       ...(manager !== undefined ? { manager } : {}),
     };
   }
@@ -3076,6 +3160,7 @@ describe('buildChildEnvMacos macOS sticky env contract', () => {
       work_dir: workDir,
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 

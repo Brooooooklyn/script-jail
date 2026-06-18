@@ -411,7 +411,11 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       // the job log: the consumer-declared protected.env values (exact) + credential
       // shapes (F6).  Names default to [] when no config / field — shapes still apply.
       const protectedEnvNames = readProtectedEnvNames(inputs.configPath);
-      await doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
+      // #19 fidelity (npm-only): part-2 re-passes the developer dep-selection
+      // args (same `inputs.args` part-1 took) so `npm rebuild` runs lifecycle
+      // scripts with the same NODE_ENV/omit env as the single-phase `npm ci
+      // <args>` — in lockstep with the guest Phase B audit.
+      await doHostRunScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
     }
   }
 

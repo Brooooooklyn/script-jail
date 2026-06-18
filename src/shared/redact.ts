@@ -37,20 +37,28 @@
  */
 export function redactCredentialShapes(text: string): string {
   return text
-    // scheme://user:pass@host → keep scheme + host, drop userinfo.  The schemeful
+    // scheme://userinfo@host → keep scheme + host, drop userinfo.  The schemeful
     // form may appear mid-string (e.g. `proxy=https://user:pass@host`), so it
     // stays broad.  Scheme length is RFC-bounded ({0,31}) so the prefix can't
     // backtrack: an unbounded `*` here is O(N) per start position → O(N²) ReDoS
     // on long contiguous [a-z0-9+.-] runs (integrity hashes, long resolved URLs).
     // No real URI scheme exceeds 32 chars, so this is output-preserving.
-    .replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
-    // scheme-RELATIVE //user:pass@host → same masking (parity with pm-commands'
+    // Userinfo is ANY non-empty run of non-`/`/non-space/non-`@` chars before the
+    // `@` — so a PASSWORD-LESS token (`https://TOKEN@host/`, as npm echoes from an
+    // env-provided NPM_CONFIG_REGISTRY) is masked too, consistent with
+    // `registryUrlHasCredentials` (any non-empty username/password = creds).
+    // Excluding `/` keeps it from crossing into a path, so a `//a@b` deeper in a
+    // path stays the F7 case below; the class is a single non-overlapping
+    // quantifier → linear-time, no backtracking.
+    .replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
+    // scheme-RELATIVE //userinfo@host → same masking (parity with pm-commands'
     // credential rejector, adversarial-review F3), but ANCHORED to start-of-
     // string or a safe delimiter (whitespace / = / quote / paren / backtick) so a
     // `//` INSIDE a path (e.g. `https://host/p//a:b@c`, where `new URL` reports an
     // empty username) is NOT mistaken for userinfo and benign diagnostics are not
-    // corrupted (adversarial-review F7).  Linear-time (bounded userinfo classes).
-    .replace(/(^|[\s='"(`])\/\/[^/\s:@]+:[^/\s@]+@/g, '$1//<REDACTED:URL-CREDENTIALS>@')
+    // corrupted (adversarial-review F7).  Same password-less broadening as above;
+    // linear-time (single bounded userinfo class, cannot cross a `/`).
+    .replace(/(^|[\s='"(`])\/\/[^/\s@]+@/g, '$1//<REDACTED:URL-CREDENTIALS>@')
     // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
     .replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, '$1<REDACTED>')
     // Bearer <token>

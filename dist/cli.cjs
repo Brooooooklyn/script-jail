@@ -7712,6 +7712,10 @@ function canonicalForCompare(p) {
   }
   return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
 }
+function lexicalForCompare(p) {
+  const abs = (0, import_node_path.resolve)(p);
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
 function checkoutRoots() {
   const roots = [];
   for (const v of [
@@ -7722,6 +7726,24 @@ function checkoutRoots() {
     if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
   }
   return roots;
+}
+function checkoutRootsLexical() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(lexicalForCompare(v));
+  }
+  return roots;
+}
+function isLexicallyUnderCheckout(p, lexRoots) {
+  const abs = lexicalForCompare(p);
+  for (const root of lexRoots) {
+    if (abs === root || abs.startsWith(root + import_node_path.sep)) return true;
+  }
+  return false;
 }
 function isUnderCheckout(p, roots) {
   const abs = canonicalForCompare(p);
@@ -7974,10 +7996,12 @@ var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 function sanitizePathValue(pathVar) {
   if (pathVar === void 0) return void 0;
   const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
   const kept = [];
   for (const dir of pathVar.split(import_node_path.delimiter)) {
     if (!(0, import_node_path.isAbsolute)(dir)) continue;
     if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
     kept.push(dir);
   }
   return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path.delimiter);
@@ -24290,6 +24314,9 @@ function buildEffectiveConfig(input) {
   if (input.workDirOverride !== void 0) {
     config2["work_dir"] = input.workDirOverride;
   }
+  if (input.installMode === true) {
+    config2["install_mode"] = true;
+  }
   const outDir = input.workDir ?? (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)((0, import_node_os5.tmpdir)(), "script-jail-config-"));
   const configPath = (0, import_node_path8.join)(outDir, "config.yml");
   (0, import_node_fs8.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
@@ -24347,7 +24374,12 @@ async function runAudit(input) {
       workDir: scratchDir,
       // install:true cwd parity — pin the guest audit work_dir to the host
       // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
-      ...input.installWorkDir !== void 0 ? { workDirOverride: input.installWorkDir } : {},
+      // installMode also flips on here so the guest audit mirrors the host
+      // install's post-trust pnpm config (--config.ignore-pnpmfile=true) into
+      // the Phase B lifecycle env — closing the value-blind config-asymmetry
+      // (env-spy records env_read NAMEs only).  `installWorkDir` is the
+      // canonical install:true signal (set ONLY on that path).
+      ...input.installWorkDir !== void 0 ? { workDirOverride: input.installWorkDir, installMode: true } : {},
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
       pmFlagsJson,
       ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}

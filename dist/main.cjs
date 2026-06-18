@@ -26715,7 +26715,7 @@ var import_node_string_decoder = require("node:string_decoder");
 
 // src/shared/redact.ts
 function redactCredentialShapes(text) {
-  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/(^|[\s='"(`])\/\/[^/\s:@]+:[^/\s@]+@/g, "$1//<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/(^|[\s='"(`])\/\/[^/\s@]+@/g, "$1//<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
 }
 function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
@@ -26803,6 +26803,10 @@ function canonicalForCompare(p) {
   }
   return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
 }
+function lexicalForCompare(p) {
+  const abs = (0, import_node_path2.resolve)(p);
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
 function checkoutRoots() {
   const roots = [];
   for (const v of [
@@ -26813,6 +26817,24 @@ function checkoutRoots() {
     if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
   }
   return roots;
+}
+function checkoutRootsLexical() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(lexicalForCompare(v));
+  }
+  return roots;
+}
+function isLexicallyUnderCheckout(p, lexRoots) {
+  const abs = lexicalForCompare(p);
+  for (const root of lexRoots) {
+    if (abs === root || abs.startsWith(root + import_node_path2.sep)) return true;
+  }
+  return false;
 }
 function isUnderCheckout(p, roots) {
   const abs = canonicalForCompare(p);
@@ -26826,13 +26848,16 @@ function resolveGitFromPath() {
   if (pathVar === void 0 || pathVar === "") return void 0;
   const names = process.platform === "win32" ? ["git.exe", "git.cmd", "git"] : ["git"];
   const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
   for (const dir of pathVar.split(import_node_path2.delimiter)) {
     if (dir === "") continue;
     if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
     for (const name of names) {
       const candidate = (0, import_node_path2.join)(dir, name);
       if (!(0, import_node_path2.isAbsolute)(candidate) || !(0, import_node_fs.existsSync)(candidate)) continue;
       if (isUnderCheckout(candidate, roots)) continue;
+      if (isLexicallyUnderCheckout(candidate, lexRoots)) continue;
       return candidate;
     }
   }
@@ -27089,10 +27114,12 @@ var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 function sanitizePathValue(pathVar) {
   if (pathVar === void 0) return void 0;
   const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
   const kept = [];
   for (const dir of pathVar.split(import_node_path2.delimiter)) {
     if (!(0, import_node_path2.isAbsolute)(dir)) continue;
     if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
     kept.push(dir);
   }
   return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path2.delimiter);
@@ -27118,6 +27145,9 @@ function hostInstallEnv(pm) {
   }
   env["npm_config_git"] = trustedGitPath();
   env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
+  if (pm === "npm") {
+    env["npm_config_script_shell"] = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
+  }
   if (pm === "yarn") {
     env["YARN_IGNORE_PATH"] = "1";
     env["YARN_RC_FILENAME"] = ".yarnrc.yml";
@@ -27271,13 +27301,20 @@ var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
     }
   });
 });
-async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = streamSpawn) {
+async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn) {
   const cmd = INSTALL_CMD[pm];
-  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true"] : [];
-  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
-  io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(" ")}
-`);
+  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : [];
+  const { kept } = sanitizeInstallArgs(args);
+  const userArgs = pm === "npm" ? kept : [];
+  const finalArgs = [...cmd.args, ...userArgs, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  const safeFinalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  const userArgSuffix = userArgs.length > 0 ? ` (+${userArgs.length} user install arg${userArgs.length === 1 ? "" : "s"}, not shown)` : "";
+  io.stdout.write(
+    `[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${safeFinalArgs.join(" ")}${userArgSuffix}
+`
+  );
   const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
+  const userArgValues = deriveSensitiveValues(userArgs);
   const fragMatcher = buildFragmentMatcher(sensitive);
   if (fragMatcher.capped) {
     throw new Error(
@@ -27287,20 +27324,22 @@ async function hostRunScripts(pm, repoDir, io, protectedEnvNames = [], spawn3 = 
   const onLine = (stream, line) => {
     let safe = maskExactValues(line, sensitive, "REDACTED:ENV", 1);
     safe = maskValueFragmentsWith(safe, fragMatcher, "REDACTED:ENV");
+    safe = maskExactValues(safe, userArgValues, "REDACTED:USER-ARG");
     safe = redactCredentialShapes(safe);
     (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
 `);
   };
   const r = await spawn3(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), onLine);
+  const safeErrArgs = `${safeFinalArgs.join(" ")}${userArgSuffix}`;
   if (r.error !== void 0) {
     throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);
   }
   if (r.signal != null) {
-    throw new Error(`script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(" ")}\`) was killed by ${r.signal}`);
+    throw new Error(`script-jail: host lifecycle-script run (\`${cmd.cmd} ${safeErrArgs}\`) was killed by ${r.signal}`);
   }
   if (r.status !== 0) {
     throw new Error(
-      `script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(" ")}\`) exited with code ${r.status ?? "null"}`
+      `script-jail: host lifecycle-script run (\`${cmd.cmd} ${safeErrArgs}\`) exited with code ${r.status ?? "null"}`
     );
   }
   io.stdout.write(`[script-jail] host lifecycle-script run complete
@@ -44347,6 +44386,9 @@ function buildEffectiveConfig(input) {
   if (input.workDirOverride !== void 0) {
     config2["work_dir"] = input.workDirOverride;
   }
+  if (input.installMode === true) {
+    config2["install_mode"] = true;
+  }
   const outDir = input.workDir ?? (0, import_node_fs13.mkdtempSync)((0, import_node_path9.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
   const configPath = (0, import_node_path9.join)(outDir, "config.yml");
   (0, import_node_fs13.writeFileSync)(configPath, (0, import_yaml3.stringify)(config2), "utf8");
@@ -44404,7 +44446,12 @@ async function runAudit(input) {
       workDir: scratchDir,
       // install:true cwd parity — pin the guest audit work_dir to the host
       // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
-      ...input.installWorkDir !== void 0 ? { workDirOverride: input.installWorkDir } : {},
+      // installMode also flips on here so the guest audit mirrors the host
+      // install's post-trust pnpm config (--config.ignore-pnpmfile=true) into
+      // the Phase B lifecycle env — closing the value-blind config-asymmetry
+      // (env-spy records env_read NAMEs only).  `installWorkDir` is the
+      // canonical install:true signal (set ONLY on that path).
+      ...input.installWorkDir !== void 0 ? { workDirOverride: input.installWorkDir, installMode: true } : {},
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
       pmFlagsJson,
       ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}
@@ -45380,7 +45427,7 @@ async function main(deps = {}) {
         process.stdout.write(detail);
       }
       const protectedEnvNames = readProtectedEnvNames(inputs.configPath);
-      await doHostRunScripts(pm.manager, repoDir, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
+      await doHostRunScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
     }
   }
   if (result.exitCode !== 0) exitProcess(result.exitCode);

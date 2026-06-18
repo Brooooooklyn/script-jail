@@ -34,6 +34,19 @@ describe('redactCredentialShapes', () => {
       .toContain('//<REDACTED:URL-CREDENTIALS>@host');
   });
 
+  it('drops PASSWORD-LESS (token-only) userinfo from both URL forms (P2: registryUrlHasCredentials parity)', () => {
+    // npm 11.x echoes an env-provided NPM_CONFIG_REGISTRY=https://TOKEN@host/ in
+    // diagnostics; the userinfo is a bare token (no `:pass`).  Treat any non-empty
+    // userinfo before `@` as credentials, consistent with registryUrlHasCredentials.
+    const tok = 'TOKENabcdef123456';
+    expect(redactCredentialShapes(`NPM_CONFIG_REGISTRY=https://${tok}@npm.example/`))
+      .toBe('NPM_CONFIG_REGISTRY=https://<REDACTED:URL-CREDENTIALS>@npm.example/');
+    expect(redactCredentialShapes(`registry=//${tok}@npm.example/`)) // scheme-relative
+      .toBe('registry=//<REDACTED:URL-CREDENTIALS>@npm.example/');
+    expect(redactCredentialShapes(`see https://${tok}@registry.npmjs.org/foo here`))
+      .not.toContain(tok);
+  });
+
   it('does NOT mask a // that appears INSIDE a URL path (F7 false-positive guard)', () => {
     // A `//foo:bar@baz` deeper in a path is NOT userinfo (`new URL` reports an
     // empty username), so the scheme-relative rule — anchored to start / a safe

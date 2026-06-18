@@ -287,8 +287,13 @@ export async function runAudit(
       workDir: scratchDir,
       // install:true cwd parity — pin the guest audit work_dir to the host
       // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
+      // installMode also flips on here so the guest audit mirrors the host
+      // install's post-trust pnpm config (--config.ignore-pnpmfile=true) into
+      // the Phase B lifecycle env — closing the value-blind config-asymmetry
+      // (env-spy records env_read NAMEs only).  `installWorkDir` is the
+      // canonical install:true signal (set ONLY on that path).
       ...(input.installWorkDir !== undefined
-        ? { workDirOverride: input.installWorkDir }
+        ? { workDirOverride: input.installWorkDir, installMode: true }
         : {}),
       ...(archOverlay.yarnrcOverlay !== undefined
         ? { yarnrcOverlay: archOverlay.yarnrcOverlay }

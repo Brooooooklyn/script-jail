@@ -96,6 +96,25 @@ function canonicalForCompare(p: string): string {
 }
 
 /**
+ * LEXICAL canonicalization for containment: resolve to absolute + case-fold on a
+ * case-insensitive FS, but DO **NOT** follow symlinks.  Pairs with
+ * `canonicalForCompare` (which realpaths) to close the symlink-OUT bypass: a PATH
+ * entry whose LEXICAL spelling is inside the checkout but whose symlink TARGET is a
+ * system dir (e.g. `$GITHUB_WORKSPACE/tools -> /usr/bin`) passes the realpath-only
+ * containment test (its real path is outside the checkout) yet is PR-controlled —
+ * the PR can repoint that symlink to a dir of malicious binaries in trusted host
+ * part-2, AFTER the audit.  Comparing the lexical spelling against a LEXICAL roots
+ * set (both resolved without realpath, same case space) catches it; comparing a
+ * lexical entry against the realpath roots would miss when a checkout-root ancestor
+ * is itself a symlink (e.g. macOS `/tmp -> /private/tmp`), so the two sets are kept
+ * separate.
+ */
+function lexicalForCompare(p: string): string {
+  const abs = resolve(p);
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+
+/**
  * Directories a PR author can write into (the checkout tree): `$GITHUB_WORKSPACE`
  * (where actions/checkout places the PR), `$SCRIPT_JAIL_REPO_DIR` (an explicit
  * repo root, possibly a subdir of the checkout), and the process cwd.
@@ -112,6 +131,39 @@ function checkoutRoots(): string[] {
     if (v !== undefined && v !== '') roots.push(canonicalForCompare(v));
   }
   return roots;
+}
+
+/**
+ * The same checkout roots as `checkoutRoots`, but canonicalized LEXICALLY (no
+ * realpath) so a symlink-OUT PATH entry (lexically inside the checkout, target
+ * outside) is caught.  Kept as a SEPARATE set from the realpath roots — see
+ * `lexicalForCompare`.
+ */
+function checkoutRootsLexical(): string[] {
+  const roots: string[] = [];
+  for (const v of [
+    process.env['GITHUB_WORKSPACE'],
+    process.env['SCRIPT_JAIL_REPO_DIR'],
+    process.cwd(),
+  ]) {
+    if (v !== undefined && v !== '') roots.push(lexicalForCompare(v));
+  }
+  return roots;
+}
+
+/**
+ * True when `p`'s LEXICAL spelling (resolve only, NO symlink follow, case-folded
+ * on case-insensitive FS) is a checkout root or nested under one.  `lexRoots` MUST
+ * be `checkoutRootsLexical()` (lexically canonicalized) so both sides compare in
+ * the same space.  Catches the symlink-OUT bypass that `isUnderCheckout` (realpath)
+ * misses.
+ */
+function isLexicallyUnderCheckout(p: string, lexRoots: ReadonlyArray<string>): boolean {
+  const abs = lexicalForCompare(p);
+  for (const root of lexRoots) {
+    if (abs === root || abs.startsWith(root + sep)) return true;
+  }
+  return false;
 }
 
 /**
@@ -168,11 +220,15 @@ export function resolveGitFromPath(): string | undefined {
   if (pathVar === undefined || pathVar === '') return undefined;
   const names = process.platform === 'win32' ? ['git.exe', 'git.cmd', 'git'] : ['git'];
   const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
   for (const dir of pathVar.split(delimiter)) {
     if (dir === '') continue;
     // SECURITY: never resolve the "trusted" git from a checkout-controlled PATH
-    // entry (cheap dir-level reject) — see the function note above.
+    // entry (cheap dir-level reject) — see the function note above.  Reject by BOTH
+    // the realpath (symlink-IN) and the lexical spelling (symlink-OUT: a
+    // `$GITHUB_WORKSPACE/tools -> /usr/bin` dir is PR-controlled and repointable).
     if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
     for (const name of names) {
       const candidate = join(dir, name);
       // Only accept an ABSOLUTE candidate so a relative PATH entry (e.g. `.`)
@@ -180,8 +236,10 @@ export function resolveGitFromPath(): string | undefined {
       if (!isAbsolute(candidate) || !existsSync(candidate)) continue;
       // SECURITY: the git BINARY itself may be a symlink whose real target lives
       // in the checkout even when its PATH dir does not — re-check the resolved
-      // candidate's real path before trusting it.
+      // candidate's real path (symlink-IN) AND its lexical spelling (symlink-OUT)
+      // before trusting it.
       if (isUnderCheckout(candidate, roots)) continue;
+      if (isLexicallyUnderCheckout(candidate, lexRoots)) continue;
       return candidate;
     }
   }
@@ -674,13 +732,18 @@ export const SAFE_SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 export function sanitizePathValue(pathVar: string | undefined): string | undefined {
   if (pathVar === undefined) return undefined;
   const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
   const kept: string[] = [];
   for (const dir of pathVar.split(delimiter)) {
     // Drop empty ('' = cwd) and ANY non-absolute entry: it is resolved against
     // the child's cwd (=repoDir) at exec, which our check can't model, and a
-    // `../x` can resolve into the checkout there.  Then drop checkout-under dirs.
+    // `../x` can resolve into the checkout there.  Then drop checkout-under dirs by
+    // BOTH the realpath (symlink-IN) and the lexical spelling (symlink-OUT: an entry
+    // like `$GITHUB_WORKSPACE/tools -> /usr/bin` is PR-controlled and repointable in
+    // trusted host part-2, so the system realpath must not let it survive).
     if (!isAbsolute(dir)) continue;
     if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
     kept.push(dir);
   }
   // SECURITY ([F3], codex round-6): NEVER return ''.  A POSIX PATH of "" (and a
@@ -746,6 +809,24 @@ function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
   // docker.ts / init.sh / mac-bare set this) — and stripDangerousEnv just dropped any
   // inherited COREPACK_HOME, which could otherwise force a cache re-download.
   env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
+  if (pm === 'npm') {
+    // SECURITY (home-npmrc script-shell, #26): `$HOME/.npmrc` is npm's DEFAULT
+    // userconfig; a `script-shell=<pwn>` there makes `npm rebuild --foreground-scripts`
+    // (host part-2) run lifecycle scripts via that shell.  An ABSOLUTE, outside-checkout
+    // runner `$HOME` passes detectCheckoutRelativeHome (which only refuses a HOME *under*
+    // the checkout, never inspects the npmrc CONTENTS), yet the clean-VM audit uses a
+    // DIFFERENT HOME (/root tmpfs) and never reads it — so the redirect is audit-BLIND
+    // and a clean lock would authorize an unaudited host shell.  npm config precedence
+    // makes the `npm_config_*` ENV BEAT userconfig (VERIFIED npm 11.13.0:
+    // `npm_config_script_shell=/bin/sh` → `npm config get script-shell` = /bin/sh, marker
+    // NOT written), exactly as the `npm_config_git` pin defeats a repo `.npmrc git=`.  The
+    // clean-VM audit runs `npm rebuild` with the default /bin/sh, so this is PARITY-CORRECT.
+    // Accepted collateral (mirrors the npm_config_git pin): it also overrides a benign
+    // AUDITED `.npmrc script-shell=/bin/bash` — house-style, non-security; the fixed system
+    // shell is strictly safer.  npm-scoped (pnpm uses the host part-2 --config.script-shell
+    // flag; yarn berry has no script-shell config).
+    env['npm_config_script_shell'] = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
+  }
   if (pm === 'yarn') {
     // Positive yarn pins (install-child specific).  The negative YARN_* sweep now
     // lives in stripDangerousEnv (the shared gate), so here we only SET the pins on
@@ -1116,6 +1197,7 @@ export const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
 export async function hostRunScripts(
   pm: Manager,
   repoDir: string,
+  args: ReadonlyArray<string>,
   io: HostInstallIo,
   protectedEnvNames: readonly string[] = [],
   spawn: HostStreamSpawn = streamSpawn,
@@ -1131,11 +1213,49 @@ export async function hostRunScripts(
   // `--config.side-effects-cache=false`).  HOST-ONLY: the guest Phase B keeps
   // the pnpmfile so the hook is AUDITED at the enforcement boundary, so this
   // lives here, NOT in the shared INSTALL_CMD.
-  const hostHardening = pm === 'pnpm' ? ['--config.ignore-pnpmfile=true'] : [];
+  // SECURITY (home-npmrc script-shell, #26 pnpm sibling): pnpm reads `script-shell`
+  // from `~/.npmrc` (npm-compatible config source) on pnpm <= 10 (VERIFIED pnpm 10.34.3:
+  // a runner `$HOME/.npmrc script-shell=<pwn>` runs the attacker shell on a pnpm install
+  // that fires a lifecycle script).  The clean-VM audit uses a different HOME (/root), so
+  // the redirect is audit-BLIND — the same class as the npm `npm_config_script_shell` pin.
+  // pnpm does NOT honor its own `pnpm_config_*` env form for this key, but the CLI
+  // `--config.script-shell` flag DOES win over the rc on every tested version (VERIFIED
+  // 10.34.3 + 11.1.2: defeats the `~/.npmrc` redirect, build still runs; bare
+  // `--script-shell` is REJECTED "Unknown option").  HOST-ONLY + host-command-local (same
+  // posture as `--config.ignore-pnpmfile`): the guest Phase B is unaffected, and the audit
+  // already runs with the default /bin/sh + /root HOME, so this is parity-correct.  (The
+  // repo-pinned pnpm 11.1.2 ignores the rc key entirely and `pnpm rebuild` never honored it
+  // even on pnpm 10 — this is defense-in-depth for a consumer pinning pnpm <= 10.)
+  const hostHardening =
+    pm === 'pnpm' ? ['--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh'] : [];
+  // #19 FIDELITY (npm-only): re-pass the developer dep-selection args to part-2
+  // so a lifecycle script run by `npm rebuild` sees the SAME NODE_ENV/omit env it
+  // would under the single-phase `npm ci --omit=dev` this two-phase model
+  // replaces (part-1 already splices them at hostInstallNoScripts).  `npm rebuild`
+  // accepts the allowlisted flags (--omit/--include/--prod/-D/-P/--registry);
+  // `pnpm rebuild --pending`/`yarn install` REJECT --omit/--prod and carry
+  // dep-group state in the resolved tree, so they get nothing.  Same
+  // `sanitizeInstallArgs` as part-1 → identical `kept`, in LOCKSTEP with the guest
+  // Phase B (src/guest/phase-install.ts runInstallPhase) so the host argv equals
+  // the audited argv.  Empty `kept` (the no-args default) splices nothing.
+  const { kept } = sanitizeInstallArgs(args);
+  const userArgs = pm === 'npm' ? kept : [];
   // Same store-dir pin as part 1 / the guest install phase: pnpm must relink
-  // against the repo-local store, not the runner default (parity).
-  const finalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
-  io.stdout.write(`[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${finalArgs.join(' ')}\n`);
+  // against the repo-local store, not the runner default (parity).  Order mirrors
+  // part-1 / the guest: <base> <user args> <store-dir> <host hardening>.
+  const finalArgs = [...cmd.args, ...userArgs, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  // SECURITY: never echo raw user tokens (a kept `--registry` is credential-free
+  // per sanitizeInstallArgs, but stay consistent with part-1's safe display and
+  // fail safe).  Banner + error messages use the user-token-free args + a
+  // count-only suffix.
+  const safeFinalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  const userArgSuffix =
+    userArgs.length > 0
+      ? ` (+${userArgs.length} user install arg${userArgs.length === 1 ? '' : 's'}, not shown)`
+      : '';
+  io.stdout.write(
+    `[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${safeFinalArgs.join(' ')}${userArgSuffix}\n`,
+  );
   // Exact secret values to mask: the declared protected.env names' values in the
   // host env.  minLen=1 (mask every NON-EMPTY declared value, longest-first):
   // the `maskExactValues` default >=4-char floor is a heuristic for the
@@ -1148,6 +1268,12 @@ export async function hostRunScripts(
   const sensitive = protectedEnvNames
     .map((name) => process.env[name])
     .filter((v): v is string => typeof v === 'string');
+  // #19: the npm user args we now splice into part-2 can be echoed back by npm
+  // (e.g. `npm warn ... registry="…"`).  Mask their literal values too — same
+  // derivation + label as the part-1 capture path (default minLen >= 4, so a
+  // short benign value like `dev` from `--omit=dev` is not blanked; the whole
+  // token is).  [] for pnpm/yarn and for no-args installs → identity.
+  const userArgValues = deriveSensitiveValues(userArgs);
   // Build the fragment gram matcher ONCE, before streaming: a large
   // `protected.env` would otherwise pay an O(sum |V|) rebuild on EVERY emitted
   // line (and a reachable-large set would blackhole every line) — review #7.
@@ -1175,20 +1301,23 @@ export async function hostRunScripts(
     // cross-value matcher so a longer value's shared gram can't strand a shorter
     // value's leaked fragment.
     safe = maskValueFragmentsWith(safe, fragMatcher, 'REDACTED:ENV');
+    safe = maskExactValues(safe, userArgValues, 'REDACTED:USER-ARG');
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
   };
   const r = await spawn(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), onLine);
-  // finalArgs is credential-free (no user args), so it is safe to show in errors.
+  // safeFinalArgs omits the user tokens (count-only suffix), so it is safe to
+  // show in errors even though finalArgs now carries the npm user args (#19).
+  const safeErrArgs = `${safeFinalArgs.join(' ')}${userArgSuffix}`;
   if (r.error !== undefined) {
     throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);
   }
   if (r.signal != null) {
-    throw new Error(`script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(' ')}\`) was killed by ${r.signal}`);
+    throw new Error(`script-jail: host lifecycle-script run (\`${cmd.cmd} ${safeErrArgs}\`) was killed by ${r.signal}`);
   }
   if (r.status !== 0) {
     throw new Error(
-      `script-jail: host lifecycle-script run (\`${cmd.cmd} ${finalArgs.join(' ')}\`) exited with code ${r.status ?? 'null'}`,
+      `script-jail: host lifecycle-script run (\`${cmd.cmd} ${safeErrArgs}\`) exited with code ${r.status ?? 'null'}`,
     );
   }
   io.stdout.write(`[script-jail] host lifecycle-script run complete\n`);

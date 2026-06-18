@@ -228,9 +228,18 @@ export function buildRootPkgKeys(manifest: { name?: unknown; version?: unknown }
  * dropped — that is what stops the driver's bulk store/cache I/O from flooding
  * `<repo-root>`. Returns null when neither case matches.
  *
- * The rebuild-hook widening is scoped to the sentinel case ONLY: a NAMED package
- * keeps the strict 4-stage gate above, so this never changes named-package
- * attribution or the rendered lifecycle of any non-root event.
+ * NAMED-ROOT case (5th param `rootKeys`, #27): the SAME rebuild-class /
+ * prepare-wrapper hooks also fire on a NAMED root (pnpm `rebuild --pending` runs
+ * the root project's own prepublish/prerebuild/rebuild/postrebuild with the
+ * root's `npm_package_name` SET but a non-canonical event). When `rootKeys`
+ * contains `buildPkg(name, version)` they fold IDENTICALLY (rebuild-class →
+ * `install`, prepare-wrapper → `prepare`) so the named root's hooks are audited
+ * rather than dropped — host part-2 (`pnpm rebuild --pending`) runs them
+ * post-trust, so a dropped hook would be an install:true RCE. The fold is SCOPED
+ * to `rootKeys` membership: a NAMED dependency (not in `rootKeys`) keeps the
+ * strict 4-stage gate, so this never changes non-root attribution or the
+ * rendered lifecycle of any non-root event. A dependency forging the root name is
+ * caught by the non-forgeable `root_anchored` stamp at the emit chokepoint.
  *
  * FORGEABLE-ENV RESIDUAL (now CLOSED for all kinds): a dependency that UNSETS
  * `npm_package_name` while keeping a recognised `npm_lifecycle_event` (a canonical
@@ -274,6 +283,7 @@ export function attributionFromEnvVars(
   version: string | undefined,
   event: string | undefined,
   rootSentinel?: string,
+  rootKeys?: ReadonlySet<string>,
 ): AttributionResult | null {
   if (
     name !== undefined &&
@@ -282,6 +292,35 @@ export function attributionFromEnvVars(
     isCanonicalStage(event)
   ) {
     return { pkg: buildPkg(name, version), lifecycle: event };
+  }
+  // NAMED-ROOT rebuild-class / prepare-wrapper hooks (#27): pnpm's main-pass
+  // `pnpm rebuild --pending` runs the root project's OWN
+  // prepublish/prerebuild/rebuild/postrebuild with the root's npm_package_name SET
+  // but a NON-canonical npm_lifecycle_event — so they miss the strict 4-stage gate
+  // above and would attribute to null → be DROPPED from the audit, yet host part-2
+  // (`pnpm rebuild --pending`) RUNS them post-trust on the real runner = an
+  // install:true RCE (the lock omits their fs/connect/env_read, so it still matches
+  // the committed copy and the trust gate passes).  Fold them the SAME way the
+  // nameless root does (below), but SCOPED to the actual root via `rootKeys`
+  // membership so a NON-root NAMED dependency keeps the strict gate — deps run
+  // canonical install/postinstall, never these rebuild-class hooks non-canonically,
+  // and a dep forging the root name is caught by the non-forgeable `root_anchored`
+  // stamping at the emit chokepoint.  The folded {pkg:name@version} lands in
+  // `rootPkgKeys` there → deferred + root-anchored exactly like a canonical root
+  // install event.
+  if (
+    name !== undefined &&
+    name.length > 0 &&
+    event !== undefined &&
+    rootKeys !== undefined &&
+    rootKeys.has(buildPkg(name, version))
+  ) {
+    if (PNPM_ROOT_REBUILD_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version), lifecycle: 'install' };
+    }
+    if (NPM_ROOT_PREPARE_WRAPPER_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version), lifecycle: 'prepare' };
+    }
   }
   // Nameless-root lifecycle: the root has no `name`, so npm_package_name is
   // empty/unset, but the package manager STILL sets a lifecycle event when
@@ -345,9 +384,21 @@ export class Attribution {
    */
   private readonly rootSentinel: string | undefined;
 
-  constructor(reader: ProcReader, rootSentinel?: string) {
+  /**
+   * The root package keys (`name` + `name@version`, or `<repo-root>` for a
+   * nameless root) — `buildRootPkgKeys`.  Threaded into every
+   * {@link attributionFromEnvVars} call inside {@link _walk} so a /proc-observed
+   * pid running the NAMED root's OWN non-canonical rebuild-class hook
+   * (prepublish/prerebuild/rebuild/postrebuild) folds to the root instead of null
+   * (#27).  Membership-scoped, so a non-root named dependency keeps the strict
+   * 4-stage gate. Inert when undefined.
+   */
+  private readonly rootKeys: ReadonlySet<string> | undefined;
+
+  constructor(reader: ProcReader, rootSentinel?: string, rootKeys?: ReadonlySet<string>) {
     this.reader = reader;
     this.rootSentinel = rootSentinel;
+    this.rootKeys = rootKeys;
   }
 
   /**
@@ -437,6 +488,7 @@ export class Attribution {
           env.get('npm_package_version'),
           env.get('npm_lifecycle_event'),
           this.rootSentinel,
+          this.rootKeys,
         );
         if (attrib !== null) {
           return attrib;

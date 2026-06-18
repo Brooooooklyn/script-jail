@@ -297,6 +297,22 @@ export interface PhaseInstallInput {
    * then undefined.
    */
   rootSentinel?: string;
+  /**
+   * Developer-supplied install args (the action `args` input), ALREADY sanitized
+   * to the dep-selection allowlist (`sanitizeInstallArgs(...).kept`, applied by
+   * run-audit when writing pm-flags.json and again by loadPmFlags on read, both
+   * idempotent).  Spliced into the Phase B command for npm ONLY (#19 fidelity):
+   * the two-phase model replaces a single `npm ci --omit=dev` with `npm ci
+   * --ignore-scripts --omit=dev` (Phase A) + `npm rebuild` (Phase B); without
+   * re-passing the args to `npm rebuild`, a lifecycle script sees NODE_ENV/omit
+   * UNSET — a different env than the command being replaced.  `npm rebuild`
+   * accepts these flags; pnpm/yarn `rebuild` REJECT them and carry dep-group
+   * state in the resolved tree, so they get nothing (npm-only).  Empty (the
+   * no-args default) → splices nothing → byte-identical lock + goldens.  Kept in
+   * LOCKSTEP with the host part-2 splice (src/action/host-install.ts
+   * hostRunScripts) so the audited argv equals the trusted host re-run's argv.
+   */
+  userInstallArgs?: ReadonlyArray<string>;
 }
 
 export interface PhaseInstallResult {
@@ -447,8 +463,9 @@ export function parseShimLine(line: string): ShimLineEvent | null {
 export function shimExecAttribution(
   line: string,
   rootSentinel?: string,
+  rootKeys?: ReadonlySet<string>,
 ): AttributionResult | null {
-  return shimNpmAttribution(line, 'exec', rootSentinel);
+  return shimNpmAttribution(line, 'exec', rootSentinel, rootKeys);
 }
 
 /**
@@ -473,8 +490,9 @@ export function shimExecAttribution(
 export function shimNodeStartupAttribution(
   line: string,
   rootSentinel?: string,
+  rootKeys?: ReadonlySet<string>,
 ): AttributionResult | null {
-  return shimNpmAttribution(line, 'node_startup_done', rootSentinel);
+  return shimNpmAttribution(line, 'node_startup_done', rootSentinel, rootKeys);
 }
 
 /**
@@ -535,10 +553,11 @@ function shimNpmAttribution(
   line: string,
   kind: 'exec' | 'node_startup_done',
   rootSentinel?: string,
+  rootKeys?: ReadonlySet<string>,
 ): AttributionResult | null {
   const fields = shimNpmFields(line, kind);
   if (fields === null || fields.pathological) return null;
-  return attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel);
+  return attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel, rootKeys);
 }
 
 /**
@@ -561,6 +580,7 @@ function shimNpmAttribution(
 export function classifyShimNodeStartupMarker(
   line: string,
   rootSentinel?: string,
+  rootKeys?: ReadonlySet<string>,
 ): {
   attribution: AttributionResult | null;
   pathological: boolean;
@@ -569,7 +589,7 @@ export function classifyShimNodeStartupMarker(
   if (fields === null) return { attribution: null, pathological: false };
   if (fields.pathological) return { attribution: null, pathological: true };
   return {
-    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel),
+    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel, rootKeys),
     pathological: false,
   };
 }
@@ -659,16 +679,30 @@ export async function runInstallPhase(
   input: PhaseInstallInput,
 ): Promise<PhaseInstallResult> {
   const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
-  // pm-flags.json extras are spliced into Phase A (fetch/resolve), not here —
-  // dependency resolution is already done by the time Phase B runs.
+  // pm-flags.json `extra_install_args` (npm arch hints) are spliced into Phase A
+  // (fetch/resolve), not here — dependency resolution is already done by the
+  // time Phase B runs.  But the DEVELOPER dep-selection args (`user_install_args`,
+  // the action `args` input) MUST also reach Phase B for npm (#19 fidelity): the
+  // host part-2 (`npm rebuild` + kept) re-passes them, so a lifecycle script sees
+  // the SAME NODE_ENV/omit env it would under the single-phase `npm ci --omit=dev`
+  // this two-phase model replaces.  npm-ONLY: `npm rebuild` accepts these flags;
+  // `pnpm rebuild --pending`/`yarn install` REJECT --omit/--prod and carry
+  // dep-group state in the resolved tree.  A commandOverride (the prepare-only
+  // second pass) is NOT a dep-selection install, so it gets no user args.  Empty
+  // (no-args default) → byte-identical lock.  LOCKSTEP with host hostRunScripts.
+  const userArgs =
+    input.commandOverride === undefined && input.manager === 'npm'
+      ? (input.userInstallArgs ?? [])
+      : [];
 
   // For pnpm: pin the store-dir to the repo overlay disk — IDENTICAL to
   // the value spliced in phase-fetch.ts (and the host install).  `pnpm
   // rebuild` operates on the node_modules tree Phase A materialised, but
   // still resolves store config; a mismatched --store-dir would point pnpm
   // at an empty store on the cramped rootfs ext4.  The shared pnpmStoreDirArg
-  // helper keeps all three call sites in lockstep via `input.cwd`.
-  const args = [...baseArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  // helper keeps all three call sites in lockstep via `input.cwd`.  Order
+  // mirrors the host: <base> <user args> <store-dir>.
+  const args = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`
@@ -3253,7 +3287,7 @@ export async function runInstallPhase(
         // site would fall through to it and the overlong-name fail-closed guard
         // would not actually fail closed (audit-trust re-review, 2026-06-04).
         const { attribution: startupAttrib, pathological: startupPathological } =
-          classifyShimNodeStartupMarker(line, input.rootSentinel);
+          classifyShimNodeStartupMarker(line, input.rootSentinel, input.rootPkgKeys);
         nodeStartupMarkerByPid.set(shimEvent.pid, {
           ts: lineTs,
           pathological: startupPathological,
@@ -3280,7 +3314,7 @@ export async function runInstallPhase(
       // the macOS-VZ-vs-Docker capture race for short-lived `.bin` shell-shim
       // helpers.  Non-exec shim records / unshimmed processes yield null here
       // and fall back to /proc exactly as before.
-      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel, input.rootPkgKeys);
       // Audit-trust Finding 1: track the shim's exec events per pid so
       // the post-loop cross-check can pair each strace execve with a
       // shim exec.  We count regardless of whether attribution succeeded

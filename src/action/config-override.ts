@@ -98,6 +98,16 @@ export interface BuildEffectiveConfigInput {
    * Written verbatim to `<workDir>/etc/script-jail/pnpm-arch.json`.
    */
   pnpmArchOverlay?: string;
+  /**
+   * Drop-in install (`install: true`) marker.  When true the guest audit runs
+   * with the SAME post-trust config the host install applies (currently: pnpm
+   * `--config.ignore-pnpmfile=true` mirrored into the Phase B lifecycle env), so
+   * a lifecycle script can't branch on a config value that diverges between the
+   * audited sandbox and the trusted host re-run.  Sets `install_mode: true` in
+   * the guest config (consumed by `buildChildEnv`).  Omitted for pure-audit so
+   * goldens stay byte-identical.
+   */
+  installMode?: boolean;
 }
 
 export interface BuildEffectiveConfigResult {
@@ -156,6 +166,17 @@ export function buildEffectiveConfig(
   // to `$REPO` in the lock, so the runner-specific value is byte-stable.
   if (input.workDirOverride !== undefined) {
     config['work_dir'] = input.workDirOverride;
+  }
+
+  // `install: true` post-trust config parity: tell the guest it is running in
+  // drop-in install mode so buildChildEnv mirrors the host install's
+  // pnpm-only `--config.ignore-pnpmfile=true` into the Phase B lifecycle env
+  // (the lock is value-blind, so a divergent config value would otherwise let a
+  // dependency script run a different branch on the trusted host than was
+  // audited).  Only set when true so pure-audit config (and goldens) are
+  // byte-unchanged.
+  if (input.installMode === true) {
+    config['install_mode'] = true;
   }
 
   const outDir =

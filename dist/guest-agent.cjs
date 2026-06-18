@@ -25169,9 +25169,17 @@ function buildRootPkgKeys(manifest) {
   }
   return { keys, canonical: name };
 }
-function attributionFromEnvVars(name, version2, event, rootSentinel) {
+function attributionFromEnvVars(name, version2, event, rootSentinel, rootKeys) {
   if (name !== void 0 && name.length > 0 && event !== void 0 && isCanonicalStage(event)) {
     return { pkg: buildPkg(name, version2), lifecycle: event };
+  }
+  if (name !== void 0 && name.length > 0 && event !== void 0 && rootKeys !== void 0 && rootKeys.has(buildPkg(name, version2))) {
+    if (PNPM_ROOT_REBUILD_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version2), lifecycle: "install" };
+    }
+    if (NPM_ROOT_PREPARE_WRAPPER_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version2), lifecycle: "prepare" };
+    }
   }
   if (rootSentinel !== void 0 && (name === void 0 || name.length === 0) && event !== void 0) {
     if (isCanonicalStage(event)) {
@@ -25208,9 +25216,20 @@ var Attribution = class {
    * they still attribute to null → dropped (no flood). Inert when undefined.
    */
   rootSentinel;
-  constructor(reader, rootSentinel) {
+  /**
+   * The root package keys (`name` + `name@version`, or `<repo-root>` for a
+   * nameless root) — `buildRootPkgKeys`.  Threaded into every
+   * {@link attributionFromEnvVars} call inside {@link _walk} so a /proc-observed
+   * pid running the NAMED root's OWN non-canonical rebuild-class hook
+   * (prepublish/prerebuild/rebuild/postrebuild) folds to the root instead of null
+   * (#27).  Membership-scoped, so a non-root named dependency keeps the strict
+   * 4-stage gate. Inert when undefined.
+   */
+  rootKeys;
+  constructor(reader, rootSentinel, rootKeys) {
     this.reader = reader;
     this.rootSentinel = rootSentinel;
+    this.rootKeys = rootKeys;
   }
   /**
    * Walk pid → ppid → ppid' … until we find the process itself or its nearest
@@ -25276,7 +25295,8 @@ var Attribution = class {
           env.get("npm_package_name"),
           env.get("npm_package_version"),
           env.get("npm_lifecycle_event"),
-          this.rootSentinel
+          this.rootSentinel,
+          this.rootKeys
         );
         if (attrib !== null) {
           return attrib;
@@ -25294,7 +25314,7 @@ var Attribution = class {
 
 // src/shared/redact.ts
 function redactCredentialShapes(text) {
-  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/(^|[\s='"(`])\/\/[^/\s:@]+:[^/\s@]+@/g, "$1//<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/(^|[\s='"(`])\/\/[^/\s@]+@/g, "$1//<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
 }
 function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
   const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
@@ -26525,8 +26545,8 @@ function parseShimLine(line) {
     return null;
   }
 }
-function shimExecAttribution(line, rootSentinel) {
-  return shimNpmAttribution(line, "exec", rootSentinel);
+function shimExecAttribution(line, rootSentinel, rootKeys) {
+  return shimNpmAttribution(line, "exec", rootSentinel, rootKeys);
 }
 function shimNpmFields(line, kind) {
   try {
@@ -26546,17 +26566,17 @@ function shimNpmFields(line, kind) {
     return null;
   }
 }
-function shimNpmAttribution(line, kind, rootSentinel) {
+function shimNpmAttribution(line, kind, rootSentinel, rootKeys) {
   const fields = shimNpmFields(line, kind);
   if (fields === null || fields.pathological) return null;
-  return attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel);
+  return attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel, rootKeys);
 }
-function classifyShimNodeStartupMarker(line, rootSentinel) {
+function classifyShimNodeStartupMarker(line, rootSentinel, rootKeys) {
   const fields = shimNpmFields(line, "node_startup_done");
   if (fields === null) return { attribution: null, pathological: false };
   if (fields.pathological) return { attribution: null, pathological: true };
   return {
-    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel),
+    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel, rootKeys),
     pathological: false
   };
 }
@@ -26615,7 +26635,8 @@ function cloneFlagsHaveUntraced(line) {
 }
 async function runInstallPhase(input) {
   const { cmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
-  const args = [...baseArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  const userArgs = input.commandOverride === void 0 && input.manager === "npm" ? input.userInstallArgs ?? [] : [];
+  const args = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -27427,7 +27448,7 @@ async function runInstallPhase(input) {
           completedPackageManagerClientPids.delete(shimEvent.pid);
           packageManagerClientPids.add(shimEvent.pid);
         }
-        const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel);
+        const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel, input.rootPkgKeys);
         nodeStartupMarkerByPid.set(shimEvent.pid, {
           ts: lineTs,
           pathological: startupPathological
@@ -27445,7 +27466,7 @@ async function runInstallPhase(input) {
         continue;
       }
       const result = input.attribution.attribute(shimEvent.pid);
-      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel, input.rootPkgKeys);
       if (shimEvent.kind === "exec") {
         const current = shimExecCountByPid.get(shimEvent.pid) ?? 0;
         const next = shimEvent.result === "failed" ? current > 0 ? current - 1 : 0 : current + 1;
@@ -28801,12 +28822,13 @@ function macosManagerLaunch(manager, subArgs) {
   const corepackCli = (0, import_node_path3.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
   return { cmd: node, args: [corepackCli, manager, ...subArgs] };
 }
-function buildMacosInstallCommand(manager, cwd, commandOverride) {
+function buildMacosInstallCommand(manager, cwd, commandOverride, userInstallArgs) {
   if (commandOverride !== void 0) {
     return macosManagerLaunch(manager, commandOverride.args);
   }
   const base = INSTALL_CMD[manager];
-  const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
+  const userArgs = manager === "npm" ? userInstallArgs ?? [] : [];
+  const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : [...base.args, ...userArgs];
   return macosManagerLaunch(manager, managerArgs);
 }
 function pathBasename2(pathLike) {
@@ -28816,7 +28838,12 @@ function pathBasename2(pathLike) {
   return slash === -1 ? value : value.slice(slash + 1);
 }
 async function runInstallPhaseMacos(input) {
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd, input.commandOverride);
+  const { cmd, args } = buildMacosInstallCommand(
+    input.manager,
+    input.cwd,
+    input.commandOverride,
+    input.userInstallArgs
+  );
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -29048,7 +29075,7 @@ async function runInstallPhaseMacos(input) {
       continue;
     }
     if (shimEvent.kind === "node_startup_done") {
-      const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel);
+      const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel, input.rootPkgKeys);
       nodeStartupMarkerByPid.set(shimEvent.pid, { ts: lineTs, pathological: startupPathological });
       if (startupAttrib !== null) {
         nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
@@ -29062,7 +29089,7 @@ async function runInstallPhaseMacos(input) {
       continue;
     }
     if (shimEvent.kind === "exec") {
-      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel, input.rootPkgKeys);
       if (shimAttrib !== null) recordAttribution(shimEvent.pid, shimAttrib, lineTs);
       if (shimEvent.envp_alloc_failed) {
         const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
@@ -29788,7 +29815,18 @@ var AgentConfig = external_exports.object({
   /** Per-package dirs for normalize context, keyed by pkg@version */
   pkg_dirs: external_exports.record(external_exports.string(), external_exports.string()).default({}),
   /** Package manager override. Auto-detected from lockfile if not set. */
-  manager: external_exports.enum(["npm", "pnpm", "yarn"]).optional()
+  manager: external_exports.enum(["npm", "pnpm", "yarn"]).optional(),
+  /**
+   * Drop-in install (`install: true`) mode.  When set, the host runs the REAL
+   * lifecycle install post-trust (src/action/host-install.ts), so the guest
+   * audit must run with the SAME post-trust config the host applies — otherwise
+   * a lifecycle script can branch on a config value that diverges between the
+   * audited sandbox and the trusted host run (the lock is value-blind: env-spy
+   * records env_read NAMEs only).  Currently this mirrors the host's pnpm
+   * `--config.ignore-pnpmfile=true` into the Phase B child env (see
+   * buildChildEnv).  Defaults false → pure-audit goldens are byte-unchanged.
+   */
+  install_mode: external_exports.boolean().default(false)
 });
 var LinuxVsockConnection = class _LinuxVsockConnection {
   readable;
@@ -30760,9 +30798,11 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
     YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`
   } : { npm_config_cache: `${config2.work_dir}/.npm-cache` };
+  const installModeEnv = config2.install_mode && resolvedManager === "pnpm" ? { npm_config_ignore_pnpmfile: "true" } : {};
   return {
     ...inheritedEnv,
     ...cacheRedirectEnv,
+    ...installModeEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -31002,7 +31042,8 @@ async function main(input) {
   }
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader(),
-    canonicalRootKey === ROOT_SENTINEL ? ROOT_SENTINEL : void 0
+    canonicalRootKey === ROOT_SENTINEL ? ROOT_SENTINEL : void 0,
+    rootPkgKeys
   );
   diag(input, `Phase A starting: ${manager} fetch in ${config2.work_dir}`);
   const fetchResult = await runFetchPhase({
@@ -31151,6 +31192,13 @@ ${fetchDetail}
     straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
     rootPkgKeys,
+    // #19 fidelity (npm-only): re-pass the sanitized developer install args to
+    // Phase B so `npm rebuild` runs lifecycle scripts with the same dep-selection
+    // env (NODE_ENV/omit) the single-phase `npm ci <args>` would — in lockstep
+    // with the host part-2 splice.  Already sanitized by loadPmFlags; runInstall
+    // Phase ignores it for pnpm/yarn and for the prepare-pass commandOverride.
+    // Empty (no-args default) → byte-identical lock + goldens.
+    userInstallArgs: fetchResult.userInstallArgs,
     // Nameless root → the root's OWN lifecycle pids have empty npm_package_name
     // but a canonical npm_lifecycle_event.  The ATTRIBUTION LAYER (Attribution
     // ctor's rootSentinel on the /proc walk + shimNpmAttribution on the shim

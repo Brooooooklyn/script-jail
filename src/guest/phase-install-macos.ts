@@ -185,13 +185,22 @@ function buildMacosInstallCommand(
   manager: 'npm' | 'pnpm' | 'yarn',
   cwd: string,
   commandOverride?: { cmd: string; args: string[] },
+  userInstallArgs?: ReadonlyArray<string>,
 ): { cmd: string; args: string[] } {
   if (commandOverride !== undefined) {
     return macosManagerLaunch(manager, commandOverride.args);
   }
   const base = INSTALL_CMD[manager];
+  // #19 fidelity (npm-only): mirror the Linux runInstallPhase / host part-2
+  // splice so a repo passing `args` produces the SAME Phase B argv (and lock)
+  // on macOS-bare as on Linux — required for cross-backend parity.  npm-only;
+  // empty (no-args) → byte-identical.  Order mirrors the host: <base> <user
+  // args> <store-dir>.
+  const userArgs = manager === 'npm' ? (userInstallArgs ?? []) : [];
   const managerArgs =
-    manager === 'pnpm' ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
+    manager === 'pnpm'
+      ? [...base.args, `--store-dir=${cwd}/.pnpm-store`]
+      : [...base.args, ...userArgs];
   return macosManagerLaunch(manager, managerArgs);
 }
 
@@ -209,7 +218,12 @@ export async function runInstallPhaseMacos(
   // Launch as `<re-signed node> <manager-cli.js> …` so DYLD survives the first
   // exec (see buildMacosInstallCommand).  pnpm's store-dir pin is folded in
   // there, IDENTICAL to the value the fetch phase splices.
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd, input.commandOverride);
+  const { cmd, args } = buildMacosInstallCommand(
+    input.manager,
+    input.cwd,
+    input.commandOverride,
+    input.userInstallArgs,
+  );
   // No per-pid strace files on macOS; the basePath still gives runStraceTailer
   // a watchDir.  Default to a macOS tmp path when the caller didn't supply one.
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
@@ -551,7 +565,7 @@ export async function runInstallPhaseMacos(
       // REPLACE the attribution entry (set for valid, DELETE for bare /
       // non-canonical / overlong so a recycled pid fails closed).
       const { attribution: startupAttrib, pathological: startupPathological } =
-        classifyShimNodeStartupMarker(line, input.rootSentinel);
+        classifyShimNodeStartupMarker(line, input.rootSentinel, input.rootPkgKeys);
       nodeStartupMarkerByPid.set(shimEvent.pid, { ts: lineTs, pathological: startupPathological });
       if (startupAttrib !== null) {
         nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
@@ -579,7 +593,7 @@ export async function runInstallPhaseMacos(
       // the macOS path's only attribution source (MacOSProcReader has no environ,
       // so the /proc walk is inert; the dispatcher rescue that used to live here
       // is deleted, attribution now flows entirely through this shim seed).
-      const shimAttrib = shimExecAttribution(line, input.rootSentinel);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel, input.rootPkgKeys);
       if (shimAttrib !== null) recordAttribution(shimEvent.pid, shimAttrib, lineTs);
 
       // <EXEC_FAIL_OPEN>: the shim could not allocate the re-injected envp, so

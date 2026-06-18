@@ -279,6 +279,61 @@ describe('runInstallPhase', () => {
       });
       expect(calls[0]!.args).toEqual(['run', 'prepare', '--store-dir=/work/.pnpm-store']);
     });
+
+    // ---- #19 npm-only userInstallArgs splice (Phase-B fidelity parity) -------
+    const runWithUserArgs = async (
+      manager: 'npm' | 'pnpm' | 'yarn',
+      userInstallArgs: string[],
+      commandOverride?: { cmd: string; args: string[] },
+    ): Promise<string[]> => {
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const strace: StraceRunner = {
+        async *run(cmd, args) { calls.push({ cmd, args }); },
+        getExitCode() { return 0; },
+        getTamperReason() { return null; },
+        recordTamper(_reason: string) { /* no-op */ },
+        getRootPid() { return null; },
+      };
+      const { emitter } = makeEmitter();
+      await runInstallPhase({
+        manager,
+        cwd: '/work',
+        env: BASE_ENV,
+        strace,
+        attribution: new Attribution(mockProcReader({})),
+        emitter,
+        userInstallArgs,
+        ...(commandOverride !== undefined ? { commandOverride } : {}),
+      });
+      return calls[0]!.args;
+    };
+
+    it('npm Phase B splices userInstallArgs (after base, before store-dir) — host part-2 parity', async () => {
+      // npm has no store-dir, so args = base + userInstallArgs.
+      expect(await runWithUserArgs('npm', ['--omit=dev', '-D'])).toEqual([
+        'rebuild', '--foreground-scripts', '--omit=dev', '-D',
+      ]);
+    });
+
+    it('pnpm Phase B IGNORES userInstallArgs (rebuild rejects them)', async () => {
+      expect(await runWithUserArgs('pnpm', ['--omit=dev', '--prod'])).toEqual([
+        'rebuild', '--pending', '--config.side-effects-cache=false', '--store-dir=/work/.pnpm-store',
+      ]);
+    });
+
+    it('yarn Phase B IGNORES userInstallArgs', async () => {
+      expect(await runWithUserArgs('yarn', ['--omit=dev'])).toEqual(['install', '--immutable']);
+    });
+
+    it('npm commandOverride (prepare pass) IGNORES userInstallArgs (not a dep-selection install)', async () => {
+      expect(
+        await runWithUserArgs('npm', ['--omit=dev'], { cmd: 'npm', args: ['run', 'prepare', '--if-present'] }),
+      ).toEqual(['run', 'prepare', '--if-present']);
+    });
+
+    it('npm Phase B with empty userInstallArgs is byte-identical to before', async () => {
+      expect(await runWithUserArgs('npm', [])).toEqual(['rebuild', '--foreground-scripts']);
+    });
   });
 
   describe('strace line processing', () => {
