@@ -2416,10 +2416,39 @@ export function buildChildEnv(
   // GATED on install_mode (buildChildEnv is shared with pure-audit, install off)
   // so pure-audit goldens stay byte-identical and the lock stays mode-consistent.
   // npm/yarn ignore the keys → pnpm-only.
-  const installModeEnv: Record<string, string> =
-    config.install_mode && resolvedManager === 'pnpm'
+  // INSTALL:TRUE LIFECYCLE-ENV PARITY (value-blind-lock close).  The host part-2
+  // (hostInstallEnv, 'scripts') pins a manager-specific set of env that reaches
+  // every lifecycle child; the guest Phase B must expose the IDENTICAL set or a
+  // dep branching on a value (env-spy is value-blind — NAMEs only, and it records
+  // a read even for an ABSENT var) runs a different branch on the trusted host
+  // than was audited.  Each entry mirrors the host EXACTLY (keep in lockstep with
+  // hostInstallEnv / its hostHardening flags):
+  //   pnpm — host passes `--config.ignore-pnpmfile=true` + `--config.script-shell=
+  //          /bin/sh`, which pnpm 10.x re-exports to children as `npm_config_*`.
+  //   npm  — host pins `npm_config_script_shell=/bin/sh` (#26 home-npmrc defense).
+  //   yarn — host pins YARN_RC_FILENAME/YARN_PLUGINS/YARN_ENABLE_CONSTRAINTS_CHECKS
+  //          (yarn re-exports these three to the child; VERIFIED yarn 4.9.1).
+  //          YARN_IGNORE_PATH is DELIBERATELY EXCLUDED: yarn consumes it and never
+  //          re-exports it, so the host child never sees it — mirroring it here
+  //          would put a value in the guest child the host child lacks, CREATING a
+  //          new divergence.  (preflight detectYarnStartupExec refuses install:true
+  //          for a repo yarnPath, so the audit-fidelity angle is already covered.)
+  // npm_config_git is NOT mirrored: the host scopes it to the FETCH phase only
+  // (part-1), so the host part-2 child — like the guest Phase B — never sees it.
+  // Hardcoded literals match the host (guest is always Linux/macOS, never win32).
+  const installModeEnv: Record<string, string> = !config.install_mode
+    ? {}
+    : resolvedManager === 'pnpm'
       ? { npm_config_ignore_pnpmfile: 'true', npm_config_script_shell: '/bin/sh' }
-      : {};
+      : resolvedManager === 'npm'
+        ? { npm_config_script_shell: '/bin/sh' }
+        : resolvedManager === 'yarn'
+          ? {
+              YARN_RC_FILENAME: '.yarnrc.yml',
+              YARN_PLUGINS: '',
+              YARN_ENABLE_CONSTRAINTS_CHECKS: 'false',
+            }
+          : {};
 
   return {
     ...inheritedEnv,

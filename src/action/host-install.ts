@@ -845,7 +845,11 @@ function lifecycleCacheParityEnv(pm: Manager, repoDir: string): Record<string, s
   return {}; // pnpm: store_dir handled by the --store-dir flag (pnpmStoreDirArg)
 }
 
-function hostInstallEnv(pm: Manager, repoDir: string): NodeJS.ProcessEnv {
+function hostInstallEnv(
+  pm: Manager,
+  repoDir: string,
+  phase: 'fetch' | 'scripts',
+): NodeJS.ProcessEnv {
   // Drop dangerous selectors + sanitize PATH (shared with the bare backend), THEN
   // drop the sandbox-tell noise + SCRIPT_JAIL_* knobs, THEN layer the security pins
   // on top so a stripped name can never accidentally remove a pin.
@@ -857,7 +861,16 @@ function hostInstallEnv(pm: Manager, repoDir: string): NodeJS.ProcessEnv {
       delete env[name];
     }
   }
-  env['npm_config_git'] = trustedGitPath();
+  // VALUE-BLIND-LOCK PARITY (round-15): `npm_config_git` defeats a repo `.npmrc
+  // git=<pwn>` during git-DEPENDENCY CLONE, which happens ONLY in the FETCH phase
+  // (part-1, `--ignore-scripts`).  `npm rebuild` (part-2) never clones, so the pin
+  // is irrelevant there — and leaving it in part-2 was a value-blind oracle: the
+  // host part-2 lifecycle child saw `npm_config_git=<abs>` while the guest Phase B
+  // child (which never pins git) saw it ABSENT, so a dep could branch on the value
+  // (env-spy is value-blind) and run the host-only branch after trust.  Scoping it
+  // to the fetch phase makes host part-2 == guest Phase B (both ABSENT) → oracle
+  // closed; the fetch-phase divergence is harmless (no lifecycle child reads it).
+  if (phase === 'fetch') env['npm_config_git'] = trustedGitPath();
   // stripDangerousEnv already dropped EVERY inherited COREPACK_* (the `corepack_`
   // family prefix) and EVERY non-allowlisted YARN_* (the shared YARN_ENV_ALLOW gate),
   // so the parity drops are no longer re-done here — they apply to the backend AGENT
@@ -1036,7 +1049,7 @@ export function hostInstallNoScripts(
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, 'fetch'), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
 }
 
 /** Mask user-arg values first (exact), then catch credential SHAPES. */
@@ -1367,7 +1380,7 @@ export async function hostRunScripts(
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
   };
-  const r = await spawn(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), onLine);
+  const r = await spawn(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, 'scripts'), onLine);
   // safeFinalArgs omits the user tokens (count-only suffix), so it is safe to
   // show in errors even though finalArgs now carries the npm user args (#19).
   const safeErrArgs = `${safeFinalArgs.join(' ')}${userArgSuffix}`;

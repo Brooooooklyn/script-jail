@@ -2481,18 +2481,31 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     expect(env['npm_config_script_shell']).toBe('/bin/sh');
   });
 
-  it('install_mode + npm → NO injection of EITHER key (npm-incompatible, pnpm-only)', async () => {
+  it('install_mode + npm → mirrors npm_config_script_shell=/bin/sh (matches host part-2), NOT ignore_pnpmfile/git', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('npm', true), '/tmp/events.jsonl');
+    // npm host part-2 pins npm_config_script_shell=/bin/sh (#26); the guest Phase B
+    // must mirror the SAME value or a dep can branch on it host-vs-audit.
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
+    // ignore_pnpmfile is pnpm-only (npm ignores it) — not injected for npm.
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
-    // npm's own host script-shell pin lives in hostInstallEnv, NOT this builder;
-    // the guest npm Phase B must not inherit a pnpm-only mirror here.
-    expect(env['npm_config_script_shell']).toBeUndefined();
+    // npm_config_git is NOT mirrored: the host scopes it to fetch/part-1 only, so
+    // the host part-2 child (like the guest Phase B) never sees it (round-15).
+    expect(env['npm_config_git']).toBeUndefined();
   });
 
-  it('install_mode + yarn → NO injection of EITHER key', async () => {
+  it('install_mode + yarn → mirrors the 3 child-reaching host yarn pins, NOT npm_config_* or YARN_IGNORE_PATH', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('yarn', true), '/tmp/events.jsonl');
+    // Host part-2 yarn pins these three and yarn re-exports them to the child
+    // (VERIFIED yarn 4.9.1); the guest must mirror EXACTLY to match the child env.
+    expect(env['YARN_RC_FILENAME']).toBe('.yarnrc.yml');
+    expect(env['YARN_PLUGINS']).toBe('');
+    expect(env['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBe('false');
+    // YARN_IGNORE_PATH is excluded: yarn never re-exports it → host child lacks it,
+    // so mirroring it would CREATE a guest-only value the host child doesn't have.
+    expect(env['YARN_IGNORE_PATH']).toBeUndefined();
+    // npm/pnpm-only keys never injected for yarn.
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
     expect(env['npm_config_script_shell']).toBeUndefined();
   });

@@ -27145,14 +27145,14 @@ function lifecycleCacheParityEnv(pm, repoDir) {
     };
   return {};
 }
-function hostInstallEnv(pm, repoDir) {
+function hostInstallEnv(pm, repoDir, phase) {
   const env = stripDangerousEnv(process.env);
   for (const name of Object.keys(env)) {
     if (HOST_INSTALL_STRIP_ENV_NAMES.has(name) || name.startsWith("SCRIPT_JAIL_")) {
       delete env[name];
     }
   }
-  env["npm_config_git"] = trustedGitPath();
+  if (phase === "fetch") env["npm_config_git"] = trustedGitPath();
   env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
   if (pm === "npm") {
     env["npm_config_script_shell"] = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
@@ -27211,7 +27211,7 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn3 = captureSpawn) {
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, "fetch"), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
 }
 function redactCaptured(text, sensitive) {
   let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");
@@ -27339,7 +27339,7 @@ async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spa
     (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
 `);
   };
-  const r = await spawn3(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), onLine);
+  const r = await spawn3(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, "scripts"), onLine);
   const safeErrArgs = `${safeFinalArgs.join(" ")}${userArgSuffix}`;
   if (r.error !== void 0) {
     throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);

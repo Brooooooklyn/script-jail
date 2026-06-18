@@ -216,9 +216,13 @@ describe('hostInstallNoScripts (part 1)', () => {
     const n1 = envCapture();
     hostInstallNoScripts('npm', REPO, [], makeRecorder().io, n1.spawn);
     expect(n1.env()['npm_config_cache']).toBe(`${REPO}/.npm-cache`);
+    // npm_config_git is FETCH-phase only (part-1 clones git deps); present here,
+    // ABSENT in part-2 below (== guest Phase B) — round-15 value-blind close.
+    expect(n1.env()['npm_config_git']).toBeDefined();
     const n2 = envCapture();
     await hostRunScripts('npm', REPO, [], makeRecorder().io, [], n2.streamSpawn);
     expect(n2.env()['npm_config_cache']).toBe(`${REPO}/.npm-cache`);
+    expect(n2.env()['npm_config_git']).toBeUndefined(); // fetch-only: no part-2 oracle
     expect(n2.env()['YARN_CACHE_FOLDER']).toBeUndefined();
 
     // yarn: both phases set the two folder redirects (matches the guest yarn branch).
@@ -906,14 +910,18 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     expect(git).not.toBe('');
   });
 
-  it('part 2 (lifecycle scripts) ALSO sets npm_config_git (defense-in-depth)', async () => {
+  it('part 2 (lifecycle scripts) does NOT set npm_config_git (value-blind-lock close, round-15)', async () => {
+    // npm_config_git defeats a repo `.npmrc git=<pwn>` during git-DEPENDENCY CLONE,
+    // which happens ONLY in part-1 (fetch).  `npm rebuild` (part-2) never clones, so
+    // the pin is irrelevant — and SETTING it in part-2 was a value-blind oracle: the
+    // host lifecycle child saw npm_config_git=<abs> while the guest Phase B child
+    // (never pins git) saw it ABSENT, letting a dep branch host-vs-audit while the
+    // value-blind lock matched.  Part-2 must now leave it ABSENT == guest Phase B.
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
     await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
     expect(envs).toHaveLength(1);
-    const git = envs[0]!['npm_config_git'];
-    expect(git).toBeDefined();
-    expect(git === 'git' || isAbsolute(git!)).toBe(true);
+    expect(envs[0]!['npm_config_git']).toBeUndefined();
   });
 
   it('SKIPS a checkout-controlled PATH dir when resolving git (pre-trust RCE defense)', () => {
@@ -1231,7 +1239,10 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
             expect(k.startsWith('SCRIPT_JAIL_')).toBe(false);
           }
           // The security pins / inherited essentials still survive the strip.
-          expect(env['npm_config_git']).toBeDefined();
+          // (npm_config_git is now fetch/part-1 only — round-15 value-blind close —
+          // so part-2 asserts a phase-stable pin instead.)
+          expect(env['COREPACK_ENABLE_DOWNLOAD_PROMPT']).toBe('0');
+          expect(env['npm_config_git']).toBeUndefined();
           // PATH survives but is SANITIZED ([5]+[9]): cwd-resident entries (the
           // vitest node_modules/.bin prefixes) are dropped; system dirs survive.
           expect(env['PATH']).toBeDefined();
@@ -1592,7 +1603,9 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       } else {
         expect(env['npm_config_script_shell']).toBeUndefined();
       }
-      expect(env['npm_config_git']).toBeDefined();
+      // npm_config_git is fetch/part-1 only (round-15 value-blind close): part-2
+      // lifecycle children must NOT see it (== guest Phase B, which never pins git).
+      expect(env['npm_config_git']).toBeUndefined();
       if (pm === 'yarn') {
         expect(env['YARN_IGNORE_PATH']).toBe('1');
         expect(env['YARN_PLUGINS']).toBe('');
