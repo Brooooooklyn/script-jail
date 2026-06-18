@@ -395,6 +395,39 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
+  it('round-17f [critical]: host pins COREPACK_ENV_FILE=0 (part-1 AND part-2) so a repo .corepack.env cannot reintroduce COREPACK_HOME', async () => {
+    // corepack loads a PROJECT `.corepack.env` (cwd=repoDir) at startup unless
+    // COREPACK_ENV_FILE=0; its loader spreads `...process.env` LAST so process.env WINS
+    // over the file (VERIFIED corepack 0.35.0 corepack.cjs:13556).  stripDangerousEnv
+    // drops the inherited COREPACK_HOME (corepack_ family) → UNSET → a repo `.corepack.env`
+    // with COREPACK_HOME=<checkout>/evil would REPOPULATE it inside the bare corepack shim,
+    // and host part-1 (`hostInstallNoScripts`, cwd=repoDir, BEFORE the trust gate) would
+    // exec a PR-planted cache entry.  Pinning =0 makes the host ignore the file.  An
+    // INHERITED COREPACK_ENV_FILE (attacker-chosen filename) is ALSO overridden to '0' (it
+    // is in the corepack_ family → stripped → re-pinned), and part-2 stays in lockstep.
+    const prevEnvFile = process.env['COREPACK_ENV_FILE'];
+    try {
+      process.env['COREPACK_ENV_FILE'] = '.corepack.env.evil'; // attacker-chosen filename, must be overridden
+      for (const pm of ['npm', 'pnpm', 'yarn'] as const) {
+        // part-1 (fetch): the [critical] surface — bare corepack shim at cwd=repoDir.
+        let fetchEnv: NodeJS.ProcessEnv = {};
+        const spawn: HostSpawn = (_c, _a, _cwd, env) => {
+          fetchEnv = env;
+          return { status: 0 };
+        };
+        hostInstallNoScripts(pm, '/repo', [], makeRecorder().io, spawn);
+        expect(fetchEnv['COREPACK_ENV_FILE']).toBe('0');
+        // part-2 (scripts): host==audit lockstep.
+        const spawnEnvs: Array<NodeJS.ProcessEnv> = [];
+        await hostRunScripts(pm, '/repo', [], makeRecorder().io, [], envCapturingStreamSpawn(spawnEnvs), bareLaunchResolver);
+        expect(spawnEnvs[0]?.['COREPACK_ENV_FILE']).toBe('0');
+      }
+    } finally {
+      if (prevEnvFile === undefined) delete process.env['COREPACK_ENV_FILE'];
+      else process.env['COREPACK_ENV_FILE'] = prevEnvFile;
+    }
+  });
+
   it('hardens the pnpm host part-1 with --ignore-pnpmfile; npm/yarn get no such flag', () => {
     // SECURITY: pnpm executes a repo `.pnpmfile.cjs` (and relocated pnpmfiles) at
     // require-time during a no-scripts install, BEFORE the trust gate.
@@ -2343,10 +2376,15 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
         // npm_config_script_shell is REPLACED by the #26 safe pin for npm (the
         // inherited dangerous value is defeated by OVERRIDE, not deletion); the
         // uppercase + hyphen spellings and every other dangerous var are still
-        // dropped outright.
-        if (k === 'npm_config_script_shell') continue;
+        // dropped outright.  COREPACK_ENV_FILE is likewise defeated by OVERRIDE
+        // (re-pinned to '0', round-17f) — an inherited custom filename can't make
+        // corepack load a repo `.corepack.env`; asserted below.
+        if (k === 'npm_config_script_shell' || k === 'COREPACK_ENV_FILE') continue;
         expect(env[k]).toBeUndefined();
       }
+      // round-17f: the inherited dangerous COREPACK_ENV_FILE is OVERRIDDEN to '0'
+      // (process.env wins over the file → corepack never loads repo `.corepack.env`).
+      expect(env['COREPACK_ENV_FILE']).toBe('0');
       if (pm === 'npm') {
         expect(env['npm_config_script_shell']).toBe(
           process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
@@ -2372,11 +2410,14 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
       const env = envs[0]!;
       for (const k of Object.keys(DANGEROUS_PRESENT)) {
-        // See part-1: npm_config_script_shell is OVERRIDDEN by the #26 safe pin for
-        // npm, not deleted; other spellings + vars are dropped outright.
-        if (k === 'npm_config_script_shell') continue;
+        // See part-1: npm_config_script_shell + COREPACK_ENV_FILE are OVERRIDDEN
+        // (the #26 safe pin / the round-17f '0' pin), not deleted; other spellings +
+        // vars are dropped outright.
+        if (k === 'npm_config_script_shell' || k === 'COREPACK_ENV_FILE') continue;
         expect(env[k]).toBeUndefined();
       }
+      // round-17f: part-2 keeps COREPACK_ENV_FILE='0' in lockstep with part-1.
+      expect(env['COREPACK_ENV_FILE']).toBe('0');
       if (pm === 'npm') {
         expect(env['npm_config_script_shell']).toBe(
           process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',

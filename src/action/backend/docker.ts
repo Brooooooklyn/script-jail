@@ -98,6 +98,13 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
           'export VP_HOME=/opt/vp',
           'export COREPACK_HOME=/opt/vp/corepack',
           'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
+          // round-17f (codex [critical], uniform policy): never load a PROJECT
+          // `.corepack.env` (cwd=repoDir).  Docker already sets COREPACK_HOME (so the
+          // file can't steer it — process.env wins, corepack.cjs:13556) and Phase B
+          // direct-launches, so this is defense-in-depth, but pinning it on EVERY
+          // backend + the host keeps one "ignore .corepack.env" policy (mirrors how
+          // COREPACK_ENABLE_DOWNLOAD_PROMPT is pinned everywhere).
+          'export COREPACK_ENV_FILE=0',
           'mkdir -p "${VP_HOME}" "${COREPACK_HOME}"',
           'NODE_VERSION="$(cat /etc/script-jail/node-version)"',
           'vp env install "${NODE_VERSION}" >&2',

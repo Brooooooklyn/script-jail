@@ -899,6 +899,20 @@ function hostInstallEnv(
   // docker.ts / init.sh / mac-bare set this) — and stripDangerousEnv just dropped any
   // inherited COREPACK_HOME, which could otherwise force a cache re-download.
   env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0';
+  // round-17f (codex [critical]): corepack loads a PROJECT-controlled `.corepack.env`
+  // from its cwd (= repoDir) at startup unless COREPACK_ENV_FILE=0.  Its loader merges
+  // the file's COREPACK_* keys but spreads `...process.env` LAST, so process.env WINS
+  // (verified corepack 0.35.0 corepack.cjs:13556).  stripDangerousEnv just dropped the
+  // inherited COREPACK_HOME (corepack_ family) — leaving it UNSET — so without this a
+  // repo `.corepack.env` setting `COREPACK_HOME=<checkout>/evil` REPOPULATES it inside
+  // corepack and host part-1 (`hostInstallNoScripts`, a bare corepack shim at cwd=repoDir,
+  // BEFORE the trust gate) execs a PR-planted `…/v1/<pm>/<ver>/<entry>` (VERIFIED: planted
+  // pnpm.cjs ran).  The clean-VM (FC/Docker) guest keeps COREPACK_HOME SET so the file
+  // never steers it → host-vs-audit divergence = RCE.  Pinning COREPACK_ENV_FILE=0 makes
+  // the host ignore the file entirely (part-1 AND part-2), matching the guest.  It is
+  // re-pinned AFTER stripDangerousEnv (which drops the corepack_ family) exactly like the
+  // download-prompt flag above.
+  env['COREPACK_ENV_FILE'] = '0';
   if (pm === 'npm') {
     // SECURITY (home-npmrc script-shell, #26): `$HOME/.npmrc` is npm's DEFAULT
     // userconfig; a `script-shell=<pwn>` there makes `npm rebuild --foreground-scripts`

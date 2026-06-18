@@ -25746,6 +25746,13 @@ function createDockerBackend(deps = {}) {
           "export VP_HOME=/opt/vp",
           "export COREPACK_HOME=/opt/vp/corepack",
           "export COREPACK_ENABLE_DOWNLOAD_PROMPT=0",
+          // round-17f (codex [critical], uniform policy): never load a PROJECT
+          // `.corepack.env` (cwd=repoDir).  Docker already sets COREPACK_HOME (so the
+          // file can't steer it — process.env wins, corepack.cjs:13556) and Phase B
+          // direct-launches, so this is defense-in-depth, but pinning it on EVERY
+          // backend + the host keeps one "ignore .corepack.env" policy (mirrors how
+          // COREPACK_ENABLE_DOWNLOAD_PROMPT is pinned everywhere).
+          "export COREPACK_ENV_FILE=0",
           'mkdir -p "${VP_HOME}" "${COREPACK_HOME}"',
           'NODE_VERSION="$(cat /etc/script-jail/node-version)"',
           'vp env install "${NODE_VERSION}" >&2',
@@ -25945,6 +25952,16 @@ function createBareBackend(deps = {}) {
             // 0.35.0 defaults the prompt ON, and an uncached pm download would block
             // the bare AUDIT otherwise (mac-bare/docker/init.sh re-pin it the same way).
             COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+            // round-17f (codex [critical]): corepack loads a PROJECT `.corepack.env`
+            // (cwd=repoDir) at startup unless COREPACK_ENV_FILE=0; process.env WINS over
+            // the file (corepack.cjs:13556).  The bare AUDIT has NO COREPACK_HOME set, so
+            // a repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would steer
+            // both Phase A AND the bare-launched Phase B corepack shim to a planted cache
+            // (Phase B is straced → it would even diverge from the host part-2, which now
+            // pins COREPACK_ENV_FILE=0).  Pin it here so the bare audit ignores the file,
+            // matching the host install.  (Set as a literal AFTER the safeEnv strip, like
+            // the download-prompt flag — survives into the agent's PM children.)
+            COREPACK_ENV_FILE: "0",
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
             // Bare mode runs the agent directly on the host (no container /etc),
@@ -26481,6 +26498,15 @@ function createMacBareExecute(deps) {
           ...pickOrchestratorEnv(baseEnv),
           // Mirror init.sh / docker.ts: corepack must not prompt offline.
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+          // round-17f (codex [critical]): macOS-bare has NO COREPACK_HOME set, and its
+          // Phase B launches pnpm/yarn via `node corepack.js` (a real corepack invocation,
+          // straced).  Corepack loads a PROJECT `.corepack.env` (cwd=repoDir) unless
+          // COREPACK_ENV_FILE=0; process.env WINS over the file (corepack.cjs:13556).  A
+          // repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would otherwise
+          // steer corepack to a planted cache AND diverge from the host part-2 (which now
+          // pins COREPACK_ENV_FILE=0).  Pin it so macOS-bare ignores the file, matching
+          // the host install.
+          COREPACK_ENV_FILE: "0",
           PATH: prependPath2(provisioned.nodeBinDir, baseEnv),
           SCRIPT_JAIL_CONNECTION: "stdio",
           SCRIPT_JAIL_BACKEND: "macos-bare",

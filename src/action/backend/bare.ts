@@ -86,6 +86,16 @@ export function createBareBackend(deps: BareBackendDeps = {}): AuditBackend {
             // 0.35.0 defaults the prompt ON, and an uncached pm download would block
             // the bare AUDIT otherwise (mac-bare/docker/init.sh re-pin it the same way).
             COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+            // round-17f (codex [critical]): corepack loads a PROJECT `.corepack.env`
+            // (cwd=repoDir) at startup unless COREPACK_ENV_FILE=0; process.env WINS over
+            // the file (corepack.cjs:13556).  The bare AUDIT has NO COREPACK_HOME set, so
+            // a repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would steer
+            // both Phase A AND the bare-launched Phase B corepack shim to a planted cache
+            // (Phase B is straced → it would even diverge from the host part-2, which now
+            // pins COREPACK_ENV_FILE=0).  Pin it here so the bare audit ignores the file,
+            // matching the host install.  (Set as a literal AFTER the safeEnv strip, like
+            // the download-prompt flag — survives into the agent's PM children.)
+            COREPACK_ENV_FILE: '0',
             SCRIPT_JAIL_CONNECTION: 'stdio',
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
             // Bare mode runs the agent directly on the host (no container /etc),

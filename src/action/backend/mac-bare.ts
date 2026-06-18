@@ -222,6 +222,15 @@ export function createMacBareExecute(
           ...pickOrchestratorEnv(baseEnv),
           // Mirror init.sh / docker.ts: corepack must not prompt offline.
           COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+          // round-17f (codex [critical]): macOS-bare has NO COREPACK_HOME set, and its
+          // Phase B launches pnpm/yarn via `node corepack.js` (a real corepack invocation,
+          // straced).  Corepack loads a PROJECT `.corepack.env` (cwd=repoDir) unless
+          // COREPACK_ENV_FILE=0; process.env WINS over the file (corepack.cjs:13556).  A
+          // repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would otherwise
+          // steer corepack to a planted cache AND diverge from the host part-2 (which now
+          // pins COREPACK_ENV_FILE=0).  Pin it so macOS-bare ignores the file, matching
+          // the host install.
+          COREPACK_ENV_FILE: '0',
           PATH: prependPath(provisioned.nodeBinDir, baseEnv),
           SCRIPT_JAIL_CONNECTION: 'stdio',
           SCRIPT_JAIL_BACKEND: 'macos-bare',
