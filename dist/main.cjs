@@ -26938,6 +26938,16 @@ var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     "MAKEFILES",
     // (Corepack EXEC/config selectors AND its version-steering behaviour flags are
     // dropped by the `corepack_` FAMILY prefix below — see that entry.)
+    // LOCALAPPDATA is corepack's win32-ONLY cache-root selector (= the COREPACK_HOME
+    // executable-cache class, just platform-scoped).  The action only runs on
+    // Linux/macOS runners (never win32), where neither corepack nor any PM reads it,
+    // so dropping it is functionally inert on every real host AND closes two things:
+    // (a) round-17e — a PR/runner-set LOCALAPPDATA must never steer corepackCacheRoot
+    // to a planted cache (corepackCacheRoot now also ignores it off-win32), and
+    // (b) the value-blind env_read parity — the clean-VM/guest audit never carries
+    // LOCALAPPDATA, so the host lifecycle child must not either (else a dep reading
+    // process.env.LOCALAPPDATA gets a host-present/audit-absent oracle NAME).
+    "LOCALAPPDATA",
     // pnpm's global bin / executable dir (also where `pnpm setup` puts pnpm on
     // PATH).  Not a config-file locator and NOT auto-prepended to a lifecycle
     // script's PATH (both VERIFIED pnpm 11.1.2 — only XDG_CONFIG_HOME relocates the
@@ -27315,8 +27325,7 @@ var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
 function corepackCacheRoot(procEnv) {
   const home = procEnv["COREPACK_HOME"];
   if (home !== void 0 && home.length > 0) return home;
-  const homeFallback = (0, import_node_path2.join)((0, import_node_os.homedir)(), process.platform === "win32" ? "AppData/Local" : ".cache");
-  const base = procEnv["XDG_CACHE_HOME"] ?? procEnv["LOCALAPPDATA"] ?? homeFallback;
+  const base = process.platform === "win32" ? procEnv["LOCALAPPDATA"] ?? (0, import_node_path2.join)((0, import_node_os.homedir)(), "AppData", "Local") : procEnv["XDG_CACHE_HOME"] ?? (0, import_node_path2.join)((0, import_node_os.homedir)(), ".cache");
   return (0, import_node_path2.join)(base, "node", "corepack");
 }
 function readHostPnpmBinRel(verDir) {

@@ -1539,6 +1539,44 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     }
   });
 
+  // (i) codex round-17e [high]: an injected LOCALAPPDATA must NOT steer corepackCacheRoot
+  // on a non-win32 host.  corepack consults LOCALAPPDATA ONLY on win32; the action runs
+  // only on Linux/macOS, so the resolver must ignore it there (else a PR/runner-set
+  // LOCALAPPDATA pointing at a checkout-controlled cache makes host part-2 direct-launch a
+  // planted entry).  Plant a v1/pnpm/99.99.99 cache under LOCALAPPDATA and pin 99.99.99
+  // (a version never in the real ~/.cache) with NO XDG_CACHE_HOME: pre-fix the resolver
+  // used LOCALAPPDATA and returned the planted entry; post-fix it uses ~/.cache, misses,
+  // and fails closed.  (win32 is never a host for this action, so skip there.)
+  it.skipIf(process.platform === 'win32')(
+    '(i) injected LOCALAPPDATA does NOT steer corepackCacheRoot on a non-win32 host (fail-closed, planted cache ignored)',
+    () => {
+      const laaCache = mkdtempSync(join(tmpdir(), 'sj-laa-cache-'));
+      const repoDir = mkdtempSync(join(tmpdir(), 'sj-laa-repo-'));
+      try {
+        const vd = join(laaCache, 'node', 'corepack', 'v1', 'pnpm', '99.99.99');
+        mkdirSync(join(vd, 'bin'), { recursive: true });
+        writeFileSync(join(vd, 'package.json'), JSON.stringify({ name: 'pnpm', bin: { pnpm: './bin/pnpm.cjs' } }));
+        writeFileSync(join(vd, 'bin', 'pnpm.cjs'), '// PLANTED pnpm entry under LOCALAPPDATA\n');
+        writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@99.99.99' }));
+        let entry: string | undefined;
+        let threw = false;
+        try {
+          // NO XDG_CACHE_HOME, empty PATH → the only PM signal is the planted LOCALAPPDATA cache.
+          const launch = resolveHostManagerLaunch('pnpm', repoDir, { LOCALAPPDATA: laaCache, PATH: '' });
+          entry = launch?.entry;
+        } catch {
+          threw = true; // ~/.cache has no pnpm@99.99.99 → pinned-absent fail-closed throw
+        }
+        // Either way, the planted LOCALAPPDATA entry must NEVER be the resolved launch.
+        expect(entry?.startsWith(laaCache)).not.toBe(true);
+        expect(threw || entry === undefined).toBe(true);
+      } finally {
+        rmSync(laaCache, { recursive: true, force: true });
+        rmSync(repoDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   // (e) Fix-1 wiring: hostRunScripts feeds the resolver the CHILD env (sanitized
   // PATH, COREPACK_HOME/XDG_CACHE_HOME stripped), NOT raw process.env.
   it('(e) hostRunScripts passes the resolver the sanitized child env (no checkout PATH, no COREPACK_HOME/XDG_CACHE_HOME)', async () => {
@@ -2484,6 +2522,24 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     expect(out['PREFIX']).toBeUndefined();
     expect(out['DESTDIR']).toBeUndefined();
     expect(out['npm_config_prefix']).toBeUndefined();
+    expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
+    expect(out['CI']).toBe('true');
+  });
+
+  it('stripDangerousEnv drops LOCALAPPDATA (round-17e — corepack win32 cache selector, COREPACK_HOME class)', () => {
+    // codex round-17e [high]: LOCALAPPDATA is corepack's win32-ONLY executable-cache-root
+    // selector (= the COREPACK_HOME class).  The action runs only on Linux/macOS runners
+    // (never win32), where no PM reads it, so dropping it is inert on every real host AND
+    // closes (a) a planted-cache redirect of corepackCacheRoot and (b) the value-blind
+    // env_read parity (the clean-VM/guest audit never carries LOCALAPPDATA).
+    const out = stripDangerousEnv({
+      LOCALAPPDATA: '/checkout/evil-cache', // → would steer corepackCacheRoot to a planted v1/<pm>/…
+      COREPACK_HOME: '/checkout/evil-cache', // its already-dropped sibling (corepack_ family)
+      npm_config_registry: 'https://registry.npmjs.org/',
+      CI: 'true', // unrelated benign plain env survives
+    });
+    expect(out['LOCALAPPDATA']).toBeUndefined();
+    expect(out['COREPACK_HOME']).toBeUndefined();
     expect(out['npm_config_registry']).toBe('https://registry.npmjs.org/');
     expect(out['CI']).toBe('true');
   });

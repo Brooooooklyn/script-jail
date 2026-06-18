@@ -460,6 +460,16 @@ const HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
     'MAKEFILES',
     // (Corepack EXEC/config selectors AND its version-steering behaviour flags are
     // dropped by the `corepack_` FAMILY prefix below — see that entry.)
+    // LOCALAPPDATA is corepack's win32-ONLY cache-root selector (= the COREPACK_HOME
+    // executable-cache class, just platform-scoped).  The action only runs on
+    // Linux/macOS runners (never win32), where neither corepack nor any PM reads it,
+    // so dropping it is functionally inert on every real host AND closes two things:
+    // (a) round-17e — a PR/runner-set LOCALAPPDATA must never steer corepackCacheRoot
+    // to a planted cache (corepackCacheRoot now also ignores it off-win32), and
+    // (b) the value-blind env_read parity — the clean-VM/guest audit never carries
+    // LOCALAPPDATA, so the host lifecycle child must not either (else a dep reading
+    // process.env.LOCALAPPDATA gets a host-present/audit-absent oracle NAME).
+    'LOCALAPPDATA',
     // pnpm's global bin / executable dir (also where `pnpm setup` puts pnpm on
     // PATH).  Not a config-file locator and NOT auto-prepended to a lifecycle
     // script's PATH (both VERIFIED pnpm 11.1.2 — only XDG_CONFIG_HOME relocates the
@@ -1294,26 +1304,44 @@ export interface HostManagerLaunch {
 
 /**
  * Mirror corepack's `getCorepackHomeFolder`: the executable cache root corepack
- * reads/writes managed PM tarballs under.  `COREPACK_HOME` wins; otherwise it is
- * `<XDG_CACHE_HOME | LOCALAPPDATA | <home>/{AppData/Local|.cache}>/node/corepack`.
+ * reads/writes managed PM tarballs under.  `COREPACK_HOME` wins; otherwise corepack
+ * branches by PLATFORM — `<LOCALAPPDATA | <home>/AppData/Local>/node/corepack` on
+ * win32, `<XDG_CACHE_HOME | <home>/.cache>/node/corepack` elsewhere.  The selectors
+ * do NOT cross platforms: LOCALAPPDATA is consulted ONLY on win32, XDG_CACHE_HOME
+ * ONLY on non-win32 (verified against corepack 0.35.0 `folderUtils.ts`).
  *
  * Fix-1 NOTE: `procEnv` here is the SAME env the lifecycle child runs under
  * (`hostInstallEnv(...,'scripts')`), which `stripDangerousEnv` has already cleared
- * of `COREPACK_HOME` / `XDG_CACHE_HOME` (the corepack_/xdg_ families).  So with the
- * child env this resolves to the DEFAULT `<home>/.cache/node/corepack` — exactly
- * where part-1 (`hostInstallNoScripts`, also run under `hostInstallEnv`, also
- * stripped) warmed the cache.  Reading the RAW `process.env` here would honour an
- * inherited `COREPACK_HOME`/`XDG_CACHE_HOME` that part-1's corepack never used,
- * voiding the cache backstop AND failing a legit corepack consumer closed.
+ * of `COREPACK_HOME` / `XDG_CACHE_HOME` (the corepack_/xdg_ families) AND of the
+ * win32 cache selector `LOCALAPPDATA`.  So with the child env this resolves to the
+ * DEFAULT `<home>/.cache/node/corepack` — exactly where part-1
+ * (`hostInstallNoScripts`, also run under `hostInstallEnv`, also stripped) warmed
+ * the cache.  Reading the RAW `process.env` here would honour an inherited
+ * `COREPACK_HOME`/`XDG_CACHE_HOME` that part-1's corepack never used, voiding the
+ * cache backstop AND failing a legit corepack consumer closed.
+ *
+ * round-17e (codex [high]): the earlier `XDG_CACHE_HOME ?? LOCALAPPDATA ?? fallback`
+ * MIXED the two platform selectors, so a non-win32 host (the action only runs on
+ * Linux/macOS runners — darwin-x64 is out of scope, win32 is never a host) honoured
+ * an inherited `LOCALAPPDATA`.  That re-opened the COREPACK_HOME executable-cache
+ * selector class for a DIFFERENT name: a PR/runner-set `LOCALAPPDATA` pointing at a
+ * checkout-controlled cache made host part-2 direct-launch a planted
+ * `…/v1/<pm>/<ver>/<entry>`, AND diverged from where part-1's corepack (which uses
+ * the non-win32 path) actually warmed the cache.  Branching by platform mirrors
+ * corepack and ignores LOCALAPPDATA on the real (non-win32) host; the
+ * `stripDangerousEnv` LOCALAPPDATA drop is the defense-in-depth second layer.
  */
 function corepackCacheRoot(procEnv: NodeJS.ProcessEnv): string {
   const home = procEnv['COREPACK_HOME'];
   if (home !== undefined && home.length > 0) return home;
-  // Mirror corepack's getCorepackHomeFolder EXACTLY: the homedir fallback is
-  // `<home>/AppData/Local` on win32 and `<home>/.cache` elsewhere (NOT `.cache`
-  // unconditionally).  `XDG_CACHE_HOME`/`LOCALAPPDATA` still win when set.
-  const homeFallback = join(homedir(), process.platform === 'win32' ? 'AppData/Local' : '.cache');
-  const base = procEnv['XDG_CACHE_HOME'] ?? procEnv['LOCALAPPDATA'] ?? homeFallback;
+  // Mirror corepack's getCorepackHomeFolder per-platform: win32 uses LOCALAPPDATA
+  // (fallback `<home>/AppData/Local`), every other platform uses XDG_CACHE_HOME
+  // (fallback `<home>/.cache`).  The selectors NEVER cross platforms — consulting
+  // LOCALAPPDATA on a non-win32 host (the only host kind) was the round-17e hole.
+  const base =
+    process.platform === 'win32'
+      ? (procEnv['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'))
+      : (procEnv['XDG_CACHE_HOME'] ?? join(homedir(), '.cache'));
   return join(base, 'node', 'corepack');
 }
 
