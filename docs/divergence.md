@@ -41,20 +41,58 @@ determinism across hosts:
   [docs/design.md](./design.md#drop-in-install-trust-model-install-true).
 
 - **`install: true` host package-manager VERSION (defense-in-depth residual).**
-  The host lifecycle pass (`src/action/host-install.ts`) spawns the package
-  manager by **bare name**, resolved from the runner `PATH`, so it runs the
-  **runner's** installed `npm`/`pnpm`/`yarn` version — not the corepack-pinned
-  version the guest audit uses inside the sandbox. A lifecycle script that
-  branches on the PM version (`npm --version`, `process.env.npm_config_user_agent`,
-  a `packageManager`-gated code path) therefore sees the runner's version on the
-  host re-run and the corepack-pinned one in the audit, so its behaviour can
-  diverge. This is **low severity and not PR-controllable**: the runner PM
-  version is owner/runner-image controlled, not something a fork PR can set, and
-  it is bounded by the same trust model as the rest of the host pass — the host
-  only runs lifecycle scripts whose sandbox audit was already clean. We
-  deliberately do **not** invoke corepack on the host (a risky behaviour change
-  for a defense-in-depth gap); **Firecracker is the enforcement boundary**, and
-  this is an accepted residual rather than a parity bug. (The host child env is
+  The host lifecycle pass (`src/action/host-install.ts`) runs the
+  **runner's** installed `npm`/`pnpm`/`yarn` version — not necessarily the
+  corepack-pinned version the guest audit uses inside the sandbox. A lifecycle
+  script that branches on the PM version (`npm --version`,
+  `process.env.npm_config_user_agent`, a `packageManager`-gated code path)
+  therefore sees the runner's version on the host re-run and the corepack-pinned
+  one in the audit, so its behaviour can diverge. This is **low severity and not
+  PR-controllable**: the runner PM version is owner/runner-image controlled, not
+  something a fork PR can set, and it is bounded by the same trust model as the
+  rest of the host pass — the host only runs lifecycle scripts whose sandbox
+  audit was already clean. **Firecracker is the enforcement boundary**, and this
+  is an accepted residual rather than a parity bug.
+
+  The host **bypasses corepack** by direct-launching `node <cached-entry>`
+  exactly like the guest (commit 81a0747 / `resolveLinuxManagerLaunch`): when the
+  bare `pnpm`/`yarn` on the runner is a corepack shim (or corepack has cached a
+  version), `hostRunScripts` resolves the offline-cached PM entry from the
+  action's corepack cache and spawns `node <entry> …` instead. This keeps
+  `COREPACK_ROOT`/`COREPACK_HOME` **absent on both sides** — corepack sets
+  `COREPACK_ROOT` *unconditionally* in the lifecycle child before launching a
+  managed bin, and env-stripping alone cannot close it (corepack re-sets it inside
+  its own process), so the only lever is to not go through corepack. That closes
+  the **value-blind oracle** where a dep does `if (process.env.COREPACK_ROOT)
+  evil(); else benign();` — benign in the audit (clean lock) but evil on the host.
+
+  The launch resolver inspects the **same sanitized `PATH` and the same default
+  corepack cache** the part-1 fetch warmed: `hostRunScripts` builds the child env
+  once (`hostInstallEnv(…,'scripts')`) and feeds it to *both* the resolver and the
+  spawn, so the corepack-shim probe reads exactly the binary the child execs and
+  the cache-root probe reads the stripped default `~/.cache/node/corepack` (part-1
+  ran corepack under the same stripped env), not an inherited
+  `COREPACK_HOME`/`XDG_CACHE_HOME`. The shim probe matches the verified
+  `corepack.cjs` require-target signature only (the bare `corepack`/`runMain`
+  substrings were over-broad and could mis-flag a standalone PM).
+
+  Residual: a **standalone (non-corepack) consumer** (e.g. `pnpm/action-setup`)
+  still bare-launches its own PM, which is safe — it sets no `COREPACK_ROOT`, so
+  the guest (no `COREPACK_ROOT`) and host already match. **npm** routes through the
+  node-bundled `npm-cli.js` directly; if that is absent (a node without bundled
+  npm, or one where bare `npm` is a `corepack enable npm` shim) the host **fails
+  closed** (throws) — the guest's `resolveLinuxManagerLaunch` throws on the same
+  layout, so this is parity-correct, not a new divergence. A corepack-managed PM
+  whose cached entry cannot be resolved **fails closed** (throws) rather than
+  bare-launching and re-opening the oracle. This includes the
+  **multi-version-no-pin** case: on a reused/self-hosted runner whose corepack
+  cache holds >1 version of the PM **and** the repo has no `packageManager` pin,
+  the resolver cannot disambiguate which version part-1 resolved (corepack does
+  **not** write a per-`COREPACK_HOME` `lastKnownGood.json` on the project-pin-driven
+  flow — verified corepack 0.35.0), so it fails closed; pin `"packageManager"` in
+  `package.json` to resolve it. A corepack-managed **yarn@1.x** pin fails closed on
+  **both** host and guest (the resolver expects a berry `yarn.js`), again no new
+  host/guest divergence. (The host child env is
   otherwise hardened: `hostInstallEnv` strips inherited loader/config vars —
   `NODE_OPTIONS`, `LD_PRELOAD`/`LD_AUDIT`/`DYLD_*`, `GIT_SSH_COMMAND` and the
   other git transport overrides, `NPM_CONFIG_SCRIPT_SHELL`/`_USERCONFIG`/

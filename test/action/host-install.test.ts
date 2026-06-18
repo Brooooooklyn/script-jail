@@ -30,9 +30,12 @@ import {
   HOST_PART2_POISON_MARKER,
   HOST_PART2_TRUNCATED_MARKER,
   HOST_PART2_DRAIN_GRACE_MS,
+  resolveHostManagerLaunch,
   type HostSpawn,
   type HostStreamSpawn,
   type HostInstallIo,
+  type HostManagerLaunch,
+  type HostManagerLaunchResolver,
 } from '../../src/action/host-install.js';
 import { sanitizeInstallArgs } from '../../src/shared/pm-commands.js';
 
@@ -92,6 +95,14 @@ function envCapturingStreamSpawn(captured: Array<NodeJS.ProcessEnv>): HostStream
     return { status: 0, signal: null };
   };
 }
+
+/**
+ * Part-2 launch resolver that always returns `undefined` (= "standalone PM, bare-
+ * launch is safe").  Injected into existing part-2 tests so they remain hermetic
+ * regardless of the dev/CI machine's corepack cache: the COREPACK_ROOT-oracle
+ * direct-launch is exercised by its OWN dedicated tests below.
+ */
+const bareLaunchResolver: HostManagerLaunchResolver = () => undefined;
 
 describe('hostInstallNoScripts (part 1)', () => {
   it('runs the FETCH_CMD with disable flags + sanitized user args, in repoDir', () => {
@@ -169,7 +180,7 @@ describe('hostInstallNoScripts (part 1)', () => {
 
       // yarn part 2 (run-scripts) is hardened identically.
       const y2 = envCapture();
-      await hostRunScripts('yarn', '/repo', [], makeRecorder().io, [], y2.streamSpawn);
+      await hostRunScripts('yarn', '/repo', [], makeRecorder().io, [], y2.streamSpawn, bareLaunchResolver);
       expect(y2.env()['YARN_IGNORE_PATH']).toBe('1');
       expect(y2.env()['YARN_PLUGINS']).toBe('');
       expect(y2.env()['YARN_ENABLE_SCRIPTS']).toBeUndefined();
@@ -220,7 +231,7 @@ describe('hostInstallNoScripts (part 1)', () => {
     // ABSENT in part-2 below (== guest Phase B) — round-15 value-blind close.
     expect(n1.env()['npm_config_git']).toBeDefined();
     const n2 = envCapture();
-    await hostRunScripts('npm', REPO, [], makeRecorder().io, [], n2.streamSpawn);
+    await hostRunScripts('npm', REPO, [], makeRecorder().io, [], n2.streamSpawn, bareLaunchResolver);
     expect(n2.env()['npm_config_cache']).toBe(`${REPO}/.npm-cache`);
     expect(n2.env()['npm_config_git']).toBeUndefined(); // fetch-only: no part-2 oracle
     expect(n2.env()['YARN_CACHE_FOLDER']).toBeUndefined();
@@ -231,7 +242,7 @@ describe('hostInstallNoScripts (part 1)', () => {
     expect(yA.env()['YARN_CACHE_FOLDER']).toBe(`${REPO}/.yarn-cache`);
     expect(yA.env()['YARN_GLOBAL_FOLDER']).toBe(`${REPO}/.yarn-global`);
     const yB = envCapture();
-    await hostRunScripts('yarn', REPO, [], makeRecorder().io, [], yB.streamSpawn);
+    await hostRunScripts('yarn', REPO, [], makeRecorder().io, [], yB.streamSpawn, bareLaunchResolver);
     expect(yB.env()['YARN_CACHE_FOLDER']).toBe(`${REPO}/.yarn-cache`);
     expect(yB.env()['YARN_GLOBAL_FOLDER']).toBe(`${REPO}/.yarn-global`);
     expect(yB.env()['npm_config_cache']).toBeUndefined();
@@ -239,7 +250,7 @@ describe('hostInstallNoScripts (part 1)', () => {
     // pnpm: NO env cache key here — store_dir parity is carried by the
     // --store-dir <repoDir>/.pnpm-store ARGUMENT (pnpmStoreDirArg), not env.
     const pB = envCapture();
-    await hostRunScripts('pnpm', REPO, [], makeRecorder().io, [], pB.streamSpawn);
+    await hostRunScripts('pnpm', REPO, [], makeRecorder().io, [], pB.streamSpawn, bareLaunchResolver);
     expect(pB.env()['npm_config_cache']).toBeUndefined();
     expect(pB.env()['YARN_CACHE_FOLDER']).toBeUndefined();
   });
@@ -711,7 +722,7 @@ describe('hostRunScripts (part 2)', () => {
     ['yarn', ['install', '--immutable']],
   ] as const)('runs the INSTALL_CMD for %s in repoDir', async (pm, expected) => {
     const rec = makeRecorder();
-    await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec));
+    await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
     expect(rec.calls).toEqual([{ cmd: pm, args: expected, cwd: '/repo' }]);
   });
 
@@ -721,7 +732,7 @@ describe('hostRunScripts (part 2)', () => {
     // AFTER the trust gate, unaudited.  Part-2 rejects the bare `--ignore-pnpmfile`
     // flag, so the config-namespaced form suppresses it.  Only pnpm gets it.
     const rec = makeRecorder();
-    await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec));
+    await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
     expect(rec.calls[0]!.args).toContain('--config.ignore-pnpmfile=true');
     // Appended after the store-dir pin, alongside the #26 script-shell pin (last).
     expect(rec.calls[0]!.args.at(-1)).toBe('--config.script-shell=/bin/sh');
@@ -729,7 +740,7 @@ describe('hostRunScripts (part 2)', () => {
     expect(rec.calls[0]!.args).not.toContain('--ignore-pnpmfile');
     for (const pm of ['npm', 'yarn'] as const) {
       const r = makeRecorder();
-      await hostRunScripts(pm, '/repo', [], r.io, [], okStreamSpawn(r));
+      await hostRunScripts(pm, '/repo', [], r.io, [], okStreamSpawn(r), bareLaunchResolver);
       expect(r.calls[0]!.args).not.toContain('--config.ignore-pnpmfile=true');
     }
   });
@@ -737,7 +748,7 @@ describe('hostRunScripts (part 2)', () => {
   describe('#19 npm-only user-arg splice (fidelity parity)', () => {
     it('npm part-2 splices the sanitized dep-selection args (after base, before store-dir)', async () => {
       const rec = makeRecorder();
-      await hostRunScripts('npm', '/repo', ['--omit=dev', '-D'], rec.io, [], okStreamSpawn(rec));
+      await hostRunScripts('npm', '/repo', ['--omit=dev', '-D'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
       // npm has no store-dir / host-hardening, so finalArgs = base + kept.
       expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '-D']);
       // Lockstep invariant: the spliced suffix is exactly sanitizeInstallArgs(args).kept.
@@ -748,7 +759,7 @@ describe('hostRunScripts (part 2)', () => {
     it('npm part-2 DROPS a script-re-enabling / unsafe arg (same allowlist as part-1)', async () => {
       const rec = makeRecorder();
       // `--ignore-scripts false` and a positional are NOT on the allowlist → dropped.
-      await hostRunScripts('npm', '/repo', ['--ignore-scripts', 'false', '--omit=dev'], rec.io, [], okStreamSpawn(rec));
+      await hostRunScripts('npm', '/repo', ['--ignore-scripts', 'false', '--omit=dev'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
       expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev']);
       expect(rec.calls[0]!.args).not.toContain('--ignore-scripts');
     });
@@ -759,7 +770,7 @@ describe('hostRunScripts (part 2)', () => {
         ['yarn', ['install', '--immutable']],
       ] as const) {
         const rec = makeRecorder();
-        await hostRunScripts(pm, '/repo', ['--omit=dev', '--prod'], rec.io, [], okStreamSpawn(rec));
+        await hostRunScripts(pm, '/repo', ['--omit=dev', '--prod'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
         expect(rec.calls[0]!.args).toEqual(expected);
         expect(rec.calls[0]!.args).not.toContain('--omit=dev');
         expect(rec.calls[0]!.args).not.toContain('--prod');
@@ -768,13 +779,13 @@ describe('hostRunScripts (part 2)', () => {
 
     it('no-args npm part-2 is byte-identical to before (empty kept splices nothing)', async () => {
       const rec = makeRecorder();
-      await hostRunScripts('npm', '/repo', [], rec.io, [], okStreamSpawn(rec));
+      await hostRunScripts('npm', '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
       expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
     });
 
     it('does NOT echo raw user tokens in the banner — count-only suffix', async () => {
       const rec = makeRecorder();
-      await hostRunScripts('npm', '/repo', ['--omit=dev'], rec.io, [], okStreamSpawn(rec));
+      await hostRunScripts('npm', '/repo', ['--omit=dev'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
       const banner = rec.out.join('');
       // The args still go to spawn (asserted above); the BANNER must not echo them.
       expect(banner).not.toContain('--omit=dev');
@@ -785,15 +796,15 @@ describe('hostRunScripts (part 2)', () => {
   it('throws on a non-zero exit', async () => {
     const rec = makeRecorder();
     const failSpawn: HostStreamSpawn = async () => ({ status: 7, signal: null });
-    await expect(hostRunScripts('pnpm', '/repo', [], rec.io, [], failSpawn)).rejects.toThrow(/exited with code 7/);
+    await expect(hostRunScripts('pnpm', '/repo', [], rec.io, [], failSpawn, bareLaunchResolver)).rejects.toThrow(/exited with code 7/);
   });
 
   it('throws (kill signal) and (spawn error), with credential-free args in the message', async () => {
     const rec = makeRecorder();
     const sigSpawn: HostStreamSpawn = async () => ({ status: null, signal: 'SIGKILL' });
-    await expect(hostRunScripts('npm', '/repo', [], rec.io, [], sigSpawn)).rejects.toThrow(/killed by SIGKILL/);
+    await expect(hostRunScripts('npm', '/repo', [], rec.io, [], sigSpawn, bareLaunchResolver)).rejects.toThrow(/killed by SIGKILL/);
     const errSpawn: HostStreamSpawn = async () => ({ status: null, signal: null, error: new Error('ENOENT npm') });
-    await expect(hostRunScripts('npm', '/repo', [], rec.io, [], errSpawn)).rejects.toThrow(/could not spawn "npm": ENOENT npm/);
+    await expect(hostRunScripts('npm', '/repo', [], rec.io, [], errSpawn, bareLaunchResolver)).rejects.toThrow(/could not spawn "npm": ENOENT npm/);
   });
 
   it('REDACTS streamed lifecycle output: protected-env values + credential shapes never reach the job log (F6)', async () => {
@@ -811,7 +822,7 @@ describe('hostRunScripts (part 2)', () => {
         { stream: 'stdout', line: `echoing the env value ${SECRET} here` },
         { stream: 'stderr', line: 'fetching //user:hunter2hunter2@npm.acme.internal/' },
         { stream: 'stdout', line: 'Authorization: Bearer ABCDEFGH01234567890123456789' },
-      ]));
+      ]), bareLaunchResolver);
       const all = rec.out.join('') + rec.errs.join('');
       // (a) the exact protected-env value is masked.
       expect(all).not.toContain(SECRET);
@@ -840,7 +851,7 @@ describe('hostRunScripts (part 2)', () => {
     try {
       await hostRunScripts('npm', '/repo', [], rec.io, ['MY_DEPLOY_TOKEN'], okStreamSpawn(rec, [
         { stream: 'stdout', line: `leaked fragment ${PREFIX} on a truncated line` },
-      ]));
+      ]), bareLaunchResolver);
       const all = rec.out.join('') + rec.errs.join('');
       expect(all).not.toContain(PREFIX);
       expect(all).toContain('<REDACTED:ENV>');
@@ -865,13 +876,578 @@ describe('hostRunScripts (part 2)', () => {
     process.env['MY_DEPLOY_TOKEN'] = 'x'.repeat(2 * 1024 * 1024 + 100); // > 2 MiB chars
     try {
       await expect(
-        hostRunScripts('npm', '/repo', [], rec.io, ['MY_DEPLOY_TOKEN'], spySpawn),
+        hostRunScripts('npm', '/repo', [], rec.io, ['MY_DEPLOY_TOKEN'], spySpawn, bareLaunchResolver),
       ).rejects.toThrow(/more distinct secret material than the host lifecycle-log redactor/);
       expect(spawned).toBe(false); // never entered streaming
       expect(rec.out.join('') + rec.errs.join('')).not.toContain('xxxxxxxx'); // log not blanked/streamed
     } finally {
       if (prev === undefined) delete process.env['MY_DEPLOY_TOKEN'];
       else process.env['MY_DEPLOY_TOKEN'] = prev;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SECURITY: host part-2 direct-launch closes the COREPACK_ROOT value-blind oracle
+// ---------------------------------------------------------------------------
+//
+// The guest audit runs `node <cached-entry>` (no COREPACK_ROOT in the lifecycle
+// child); host part-2 must do the SAME, or a corepack shim on the runner sets
+// COREPACK_ROOT and a dep can branch benign-in-audit / evil-on-host (env-spy is
+// value-blind).  These tests cover the rewrite (resolver → node+entry launch) and
+// the self-contained resolveHostManagerLaunch decision tree.
+describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
+  // Build a temp corepack cache with one version dir for a PM and the entry file.
+  function makeCache(pm: 'pnpm' | 'yarn', version: string): { cacheRoot: string; verDir: string; cleanup: () => void } {
+    const cacheRoot = mkdtempSync(join(tmpdir(), `sj-corepack-${pm}-`));
+    const verDir = join(cacheRoot, 'v1', pm, version);
+    mkdirSync(verDir, { recursive: true });
+    if (pm === 'pnpm') {
+      writeFileSync(join(verDir, '.corepack'), JSON.stringify({ bin: { pnpm: './bin/pnpm.cjs' } }));
+      mkdirSync(join(verDir, 'bin'), { recursive: true });
+      writeFileSync(join(verDir, 'bin', 'pnpm.cjs'), '// pnpm entry\n');
+    } else {
+      writeFileSync(join(verDir, '.corepack'), JSON.stringify({ bin: ['yarn', 'yarnpkg'] }));
+      writeFileSync(join(verDir, 'yarn.js'), '// yarn entry\n');
+    }
+    return { cacheRoot, verDir, cleanup: () => rmSync(cacheRoot, { recursive: true, force: true }) };
+  }
+
+  it('corepack-managed pnpm → direct-launch (node + cached pnpm.cjs entry, finalArgs unchanged)', async () => {
+    const { cacheRoot, verDir, cleanup } = makeCache('pnpm', '10.34.3');
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-pnpm-'));
+    writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.3+sha512.abc' }));
+    try {
+      const rec = makeRecorder();
+      const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+      await hostRunScripts('pnpm', repoDir, [], rec.io, [], okStreamSpawn(rec), resolver);
+      const call = rec.calls[0]!;
+      expect(call.cmd).toBe(process.execPath); // launched via node
+      // argv = [entry, ...finalArgs]; finalArgs is the SAME audited pnpm rebuild argv.
+      expect(call.args[0]).toBe(join(verDir, 'bin', 'pnpm.cjs'));
+      expect(call.args.slice(1)).toEqual([
+        'rebuild', '--pending', '--config.side-effects-cache=false',
+        `--store-dir=${repoDir}/.pnpm-store`, '--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh',
+      ]);
+    } finally {
+      cleanup();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('corepack-managed yarn → direct-launch (node + cached yarn.js, yarn install --immutable)', async () => {
+    const { cacheRoot, verDir, cleanup } = makeCache('yarn', '4.9.1');
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-yarn-'));
+    writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'yarn@4.9.1' }));
+    try {
+      const rec = makeRecorder();
+      const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+      await hostRunScripts('yarn', repoDir, [], rec.io, [], okStreamSpawn(rec), resolver);
+      const call = rec.calls[0]!;
+      expect(call.cmd).toBe(process.execPath);
+      expect(call.args).toEqual([join(verDir, 'yarn.js'), 'install', '--immutable']);
+    } finally {
+      cleanup();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('npm → direct-launch (node + node-bundled npm-cli.js) with kept user args (#19)', async () => {
+    // The real resolver resolves node-bundled npm-cli.js from process.execPath; on
+    // a normal node toolchain it exists → direct-launch.  We assert against the
+    // real resolveHostManagerLaunch (npm path is self-contained, no cache needed).
+    const launch = resolveHostManagerLaunch('npm', '/repo', process.env);
+    if (launch === undefined) {
+      // Unusual node layout (no bundled npm-cli.js) — npm falls back to bare, which
+      // sets no COREPACK_ROOT.  Skip the direct-launch assertion on such a runner.
+      return;
+    }
+    const rec = makeRecorder();
+    await hostRunScripts('npm', '/repo', ['--omit=dev'], rec.io, [], okStreamSpawn(rec));
+    const call = rec.calls[0]!;
+    expect(call.cmd).toBe(process.execPath);
+    expect(call.args[0]).toBe(launch.entry);
+    // #19: npm part-2 keeps the sanitized dep-selection user args after the base.
+    expect(call.args.slice(1)).toEqual(['rebuild', '--foreground-scripts', '--omit=dev']);
+  });
+
+  it('standalone PM (resolver → undefined) → bare-launch unchanged (regression guard)', async () => {
+    const rec = makeRecorder();
+    const resolver: HostManagerLaunchResolver = () => undefined;
+    await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec), resolver);
+    const call = rec.calls[0]!;
+    expect(call.cmd).toBe('pnpm'); // bare name, NOT node
+    expect(call.args).toEqual([
+      'rebuild', '--pending', '--config.side-effects-cache=false',
+      '--store-dir=/repo/.pnpm-store', '--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh',
+    ]);
+    // No direct-launch note in the banner when bare-launching.
+    expect(rec.out.join('')).not.toContain('launched directly via node');
+  });
+
+  it('corepack-managed-but-unresolvable → hostRunScripts REJECTS (fail closed, mentions corepack)', async () => {
+    // Managed is driven HERE by the CACHE (an unrelated version dir present), NOT
+    // the shim probe (PATH:'' makes that a no-op); the PINNED dir is absent → must
+    // THROW, never bare-launch (re-opening the oracle).  The shim-probe arm is
+    // exercised on its own by 'isCorepackShim arm alone' below.
+    const rec = makeRecorder();
+    let spawned = false;
+    const spy: HostStreamSpawn = async (cmd, args, cwd, env, onLine) => {
+      spawned = true;
+      return okStreamSpawn(rec)(cmd, args, cwd, env, onLine);
+    };
+    const emptyCache = mkdtempSync(join(tmpdir(), 'sj-empty-cache-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-unres-'));
+    writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@99.0.0' }));
+    try {
+      // Seed one UNRELATED version dir so the cache "has a version"
+      // (corepackManaged=true) while the PINNED dir (pnpm@99.0.0) is absent → the
+      // resolver must fail closed, never bare-launch.  PATH:'' so the shim probe is
+      // a no-op and managed is driven purely by cacheHasAnyVersion.
+      mkdirSync(join(emptyCache, 'v1', 'pnpm', '1.2.3'), { recursive: true });
+      const resolver: HostManagerLaunchResolver = (pm, rd) =>
+        resolveHostManagerLaunch(pm, rd, { COREPACK_HOME: emptyCache, PATH: '' });
+      await expect(
+        hostRunScripts('pnpm', repoDir, [], rec.io, [], spy, resolver),
+      ).rejects.toThrow(/corepack/i);
+      expect(spawned).toBe(false); // never spawned anything
+    } finally {
+      rmSync(emptyCache, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveHostManagerLaunch unit: pinned version wins over a second cache dir', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-multi-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-multi-'));
+    try {
+      // Two pnpm version dirs in the cache.
+      for (const v of ['10.34.3', '11.1.2']) {
+        const vd = join(cacheRoot, 'v1', 'pnpm', v);
+        mkdirSync(join(vd, 'bin'), { recursive: true });
+        writeFileSync(join(vd, '.corepack'), JSON.stringify({ bin: { pnpm: './bin/pnpm.cjs' } }));
+        writeFileSync(join(vd, 'bin', 'pnpm.cjs'), '// entry\n');
+      }
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@11.1.2' }));
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot });
+      expect(launch).toBeDefined();
+      expect(launch!.entry).toBe(join(cacheRoot, 'v1', 'pnpm', '11.1.2', 'bin', 'pnpm.cjs'));
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveHostManagerLaunch unit: pinned-absent + managed → throws', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-absent-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-absent-'));
+    try {
+      // Cache HAS a version (managed) but NOT the pinned one.
+      mkdirSync(join(cacheRoot, 'v1', 'pnpm', '10.34.3'), { recursive: true });
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@11.1.2' }));
+      expect(() => resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot })).toThrow(
+        /pinned version dir .* is absent/,
+      );
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveHostManagerLaunch unit: no pin + single cache dir → that dir', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-single-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-nopin-'));
+    try {
+      const vd = join(cacheRoot, 'v1', 'pnpm', '10.34.3');
+      mkdirSync(join(vd, 'bin'), { recursive: true });
+      writeFileSync(join(vd, '.corepack'), JSON.stringify({ bin: { pnpm: './bin/pnpm.cjs' } }));
+      writeFileSync(join(vd, 'bin', 'pnpm.cjs'), '// entry\n');
+      // package.json without a packageManager pin.
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot });
+      expect(launch!.entry).toBe(join(vd, 'bin', 'pnpm.cjs'));
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveHostManagerLaunch unit: no pin + multiple cache dirs → throws (ambiguous)', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-ambig-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-ambig-'));
+    try {
+      for (const v of ['10.34.3', '11.1.2']) mkdirSync(join(cacheRoot, 'v1', 'pnpm', v), { recursive: true });
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
+      expect(() => resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot })).toThrow(
+        /expected exactly one pnpm version dir, found 2/,
+      );
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('direct-launched child env carries NO COREPACK_HOME / COREPACK_ROOT (env parity)', async () => {
+    // stripDangerousEnv drops the corepack_ family; assert the directly-launched
+    // lifecycle child env has neither var even when both are set on the action.
+    const { cacheRoot, cleanup } = makeCache('pnpm', '10.34.3');
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-envparity-'));
+    writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.3' }));
+    const prevRoot = process.env['COREPACK_ROOT'];
+    const prevHome = process.env['COREPACK_HOME'];
+    process.env['COREPACK_ROOT'] = '/opt/corepack';
+    process.env['COREPACK_HOME'] = cacheRoot;
+    try {
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+      await hostRunScripts('pnpm', repoDir, [], makeRecorder().io, [], envCapturingStreamSpawn(envs), resolver);
+      expect(envs[0]!['COREPACK_HOME']).toBeUndefined();
+      expect(envs[0]!['COREPACK_ROOT']).toBeUndefined();
+    } finally {
+      if (prevRoot === undefined) delete process.env['COREPACK_ROOT']; else process.env['COREPACK_ROOT'] = prevRoot;
+      if (prevHome === undefined) delete process.env['COREPACK_HOME']; else process.env['COREPACK_HOME'] = prevHome;
+      cleanup();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('banner shows the LOGICAL pm (pnpm rebuild ...), not the node/entry path', async () => {
+    const { cacheRoot, cleanup } = makeCache('pnpm', '10.34.3');
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-banner-'));
+    writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.3' }));
+    try {
+      const rec = makeRecorder();
+      const resolver: HostManagerLaunchResolver = (pm, rd, env) =>
+        resolveHostManagerLaunch(pm, rd, { ...env, COREPACK_HOME: cacheRoot });
+      await hostRunScripts('pnpm', repoDir, [], rec.io, [], okStreamSpawn(rec), resolver);
+      const banner = rec.out.join('');
+      expect(banner).toContain('pnpm rebuild --pending');
+      expect(banner).not.toContain(process.execPath); // no node path
+      expect(banner).not.toContain('pnpm.cjs'); // no entry path
+      expect(banner).toContain('launched directly via node to bypass corepack');
+    } finally {
+      cleanup();
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('HostManagerLaunch type is shaped {node,entry}', () => {
+    const l: HostManagerLaunch = { node: '/n', entry: '/e' };
+    expect(l).toEqual({ node: '/n', entry: '/e' });
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX 6: REAL-resolver coverage (round-1 gap: branches were only simulated
+  // with a `() => undefined` stub).  These drive resolveHostManagerLaunch's
+  // arms directly with on-disk temp fixtures.
+  // -------------------------------------------------------------------------
+
+  // (a) standalone (non-shim PM on PATH + EMPTY corepack cache) → undefined.
+  for (const pm of ['pnpm', 'yarn'] as const) {
+    it(`(a) standalone ${pm}: empty cache + a non-shim ${pm} on PATH → resolves to undefined (bare-launch safe)`, () => {
+      const emptyCache = mkdtempSync(join(tmpdir(), `sj-empty-${pm}-`));
+      const binDir = mkdtempSync(join(tmpdir(), `sj-bin-${pm}-`));
+      const repoDir = mkdtempSync(join(tmpdir(), `sj-repo-standalone-${pm}-`));
+      try {
+        // A standalone PM script whose bytes do NOT contain `corepack.cjs`.
+        writeFileSync(join(binDir, pm), '#!/usr/bin/env node\n// standalone, not a corepack shim\n');
+        writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
+        const launch = resolveHostManagerLaunch(pm, repoDir, { COREPACK_HOME: emptyCache, PATH: binDir });
+        expect(launch).toBeUndefined();
+      } finally {
+        rmSync(emptyCache, { recursive: true, force: true });
+        rmSync(binDir, { recursive: true, force: true });
+        rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  // (b) shim-driven managed: empty cache + a `pnpm` whose content contains
+  // `corepack.cjs` on PATH → the isCorepackShim arm ALONE flips managed=true, so
+  // with an empty cache the resolver fails closed (not undefined).  This proves the
+  // shim probe is what flips it (the cache is empty), unlike the cache-driven tests.
+  it('(b) shim on PATH (corepack.cjs signature) + empty cache → managed → fails closed (shim arm alone)', () => {
+    const emptyCache = mkdtempSync(join(tmpdir(), 'sj-empty-shim-'));
+    const binDir = mkdtempSync(join(tmpdir(), 'sj-bin-shim-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-shim-'));
+    try {
+      // The verified corepack shim signature: require('./lib/corepack.cjs').runMain
+      writeFileSync(
+        join(binDir, 'pnpm'),
+        "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm', ...process.argv.slice(2)]);\n",
+      );
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
+      // Empty cache + no pin → managed (shim) but unresolvable → throws.
+      expect(() =>
+        resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: emptyCache, PATH: binDir }),
+      ).toThrow(/corepack-managed pnpm/i);
+    } finally {
+      rmSync(emptyCache, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('(b2) shim on PATH + seeded single cache version → resolves (managed, shim arm + cache)', () => {
+    const { cacheRoot, verDir, cleanup } = makeCache('pnpm', '10.34.3');
+    const binDir = mkdtempSync(join(tmpdir(), 'sj-bin-shim2-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-shim2-'));
+    try {
+      writeFileSync(
+        join(binDir, 'pnpm'),
+        "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm']);\n",
+      );
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir });
+      expect(launch!.entry).toBe(join(verDir, 'bin', 'pnpm.cjs'));
+    } finally {
+      cleanup();
+      rmSync(binDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (c) npm fail-closed via the new execPath seam (Fix 2).
+  it('(c) npm fail-closed: a fake toolchain with no npm-cli.js → THROWS (mirrors the guest)', () => {
+    const fakeToolchain = mkdtempSync(join(tmpdir(), 'sj-fake-node-'));
+    // execPath layout is <root>/bin/node; toolchainRoot = dirname(dirname(execPath)).
+    const fakeBin = join(fakeToolchain, 'bin');
+    mkdirSync(fakeBin, { recursive: true });
+    const fakeExecPath = join(fakeBin, 'node');
+    writeFileSync(fakeExecPath, '#!/bin/sh\n'); // exists but lib/node_modules/npm absent
+    try {
+      expect(() => resolveHostManagerLaunch('npm', '/repo', {}, fakeExecPath)).toThrow(
+        /refuses to bare-launch npm.*npm-cli\.js not found/s,
+      );
+    } finally {
+      rmSync(fakeToolchain, { recursive: true, force: true });
+    }
+  });
+
+  it('(c2) npm direct-launch: a fake toolchain WITH npm-cli.js → {node,entry} (execPath seam)', () => {
+    const fakeToolchain = mkdtempSync(join(tmpdir(), 'sj-fake-node-ok-'));
+    const fakeBin = join(fakeToolchain, 'bin');
+    const npmDir = join(fakeToolchain, 'lib', 'node_modules', 'npm', 'bin');
+    mkdirSync(fakeBin, { recursive: true });
+    mkdirSync(npmDir, { recursive: true });
+    const fakeExecPath = join(fakeBin, 'node');
+    writeFileSync(fakeExecPath, '#!/bin/sh\n');
+    const cli = join(npmDir, 'npm-cli.js');
+    writeFileSync(cli, '// npm-cli\n');
+    try {
+      const launch = resolveHostManagerLaunch('npm', '/repo', {}, fakeExecPath);
+      expect(launch).toEqual({ node: fakeExecPath, entry: cli });
+    } finally {
+      rmSync(fakeToolchain, { recursive: true, force: true });
+    }
+  });
+
+  // (d) the failClosed sub-branches.
+  it('(d) yarn version dir present but no yarn.js → throws', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-noyarnjs-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-noyarnjs-'));
+    try {
+      mkdirSync(join(cacheRoot, 'v1', 'yarn', '4.9.1'), { recursive: true }); // no yarn.js
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'yarn@4.9.1' }));
+      expect(() => resolveHostManagerLaunch('yarn', repoDir, { COREPACK_HOME: cacheRoot })).toThrow(
+        /yarn\.js not found at/,
+      );
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('(d) pnpm .corepack bin is an ARRAY + no package.json bin → readHostPnpmBinRel null → throws', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-arrbin-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-arrbin-'));
+    try {
+      const vd = join(cacheRoot, 'v1', 'pnpm', '10.34.3');
+      mkdirSync(vd, { recursive: true });
+      // .corepack bin is an ARRAY (no path map) and package.json has NO bin map.
+      writeFileSync(join(vd, '.corepack'), JSON.stringify({ bin: ['pnpm'] }));
+      writeFileSync(join(vd, 'package.json'), JSON.stringify({ name: 'pnpm' }));
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.3' }));
+      expect(() => resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot })).toThrow(
+        /could not read the pnpm entry path/,
+      );
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('(d) pnpm .corepack rel points at a MISSING file → throws (pnpm entry not found)', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-missrel-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-missrel-'));
+    try {
+      const vd = join(cacheRoot, 'v1', 'pnpm', '10.34.3');
+      mkdirSync(vd, { recursive: true });
+      // rel is readable but the file it points at does not exist.
+      writeFileSync(join(vd, '.corepack'), JSON.stringify({ bin: { pnpm: './bin/pnpm.cjs' } }));
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.3' }));
+      expect(() => resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot })).toThrow(
+        /pnpm entry not found at/,
+      );
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (e) REGRESSION-LOCK the isCorepackShim tightening: a standalone PM whose bytes
+  // contain the bare `corepack` substring AND `runMain` (the two OLD over-broad
+  // tokens) but NOT `corepack.cjs` must NOT be classified a shim — so with an empty
+  // cache + no pin it resolves to undefined (bare-launch), NOT a fail-closed throw.
+  // If a future edit re-broadens isCorepackShim to match `corepack`/`runMain`, this
+  // flips to a throw and the test fails — guarding a legit standalone consumer.
+  it('(e) standalone PM whose bytes contain bare `corepack`/`runMain` (not `corepack.cjs`) → undefined (tightening locked)', () => {
+    const emptyCache = mkdtempSync(join(tmpdir(), 'sj-empty-tighten-'));
+    const binDir = mkdtempSync(join(tmpdir(), 'sj-bin-tighten-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-tighten-'));
+    try {
+      // Contains 'corepack' and 'runMain' but NOT the literal 'corepack.cjs'.
+      writeFileSync(
+        join(binDir, 'pnpm'),
+        '#!/usr/bin/env node\n// standalone pnpm; mentions corepack in a help string and calls runMain()\nrunMain();\n',
+      );
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: emptyCache, PATH: binDir });
+      expect(launch).toBeUndefined();
+    } finally {
+      rmSync(emptyCache, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (e) readHostPnpmBinRel package.json-bin FALLBACK success path (no `.corepack`):
+  // a version dir with NO `.corepack` but a `package.json` bin.pnpm + the entry on
+  // disk → resolves via the fallback (the round-1 tests only hit the `.corepack`
+  // source or the null-miss branch, never the package.json SUCCESS).
+  it('(e) pnpm no `.corepack` but package.json bin.pnpm present → resolves via fallback', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-pkgbin-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-pkgbin-'));
+    try {
+      const vd = join(cacheRoot, 'v1', 'pnpm', '10.34.3');
+      mkdirSync(join(vd, 'bin'), { recursive: true });
+      // NO .corepack file — only package.json carries the bin map.
+      writeFileSync(join(vd, 'package.json'), JSON.stringify({ name: 'pnpm', bin: { pnpm: './bin/pnpm.cjs' } }));
+      writeFileSync(join(vd, 'bin', 'pnpm.cjs'), '// pnpm entry\n');
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.3' }));
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot });
+      expect(launch!.entry).toBe(join(vd, 'bin', 'pnpm.cjs'));
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (e) no-pin + the `v1/<pm>/` dir EXISTS but is EMPTY (zero version subdirs) →
+  // fail closed with "found 0".  Distinct from the readdir-ERROR branch (where
+  // `v1/<pm>/` is absent): here managed is driven by the shim probe (the empty dir
+  // makes cacheHasAnyVersion false), and the zero-length versionDirs hits the
+  // `!== 1` throw.
+  it('(e) no pin + empty `v1/<pm>/` dir (shim-driven managed) → throws (found 0)', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-zerodir-'));
+    const binDir = mkdtempSync(join(tmpdir(), 'sj-bin-zerodir-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-zerodir-'));
+    try {
+      mkdirSync(join(cacheRoot, 'v1', 'pnpm'), { recursive: true }); // exists, EMPTY (zero version dirs)
+      writeFileSync(
+        join(binDir, 'pnpm'),
+        "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm']);\n", // shim → managed
+      );
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' })); // no packageManager pin
+      expect(() =>
+        resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot, PATH: binDir }),
+      ).toThrow(/expected exactly one pnpm version dir, found 0/);
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (e) Fix-1 wiring: hostRunScripts feeds the resolver the CHILD env (sanitized
+  // PATH, COREPACK_HOME/XDG_CACHE_HOME stripped), NOT raw process.env.
+  it('(e) hostRunScripts passes the resolver the sanitized child env (no checkout PATH, no COREPACK_HOME/XDG_CACHE_HOME)', async () => {
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-fix1-'));
+    // A checkout-controlled dir + a benign system dir on PATH; sanitizePathValue
+    // must drop the checkout dir from the env the resolver sees.
+    const checkoutDir = join(repoDir, 'evil-bin');
+    mkdirSync(checkoutDir, { recursive: true });
+    const prevPath = process.env['PATH'];
+    const prevCk = process.env['COREPACK_HOME'];
+    const prevXdg = process.env['XDG_CACHE_HOME'];
+    const prevRepoDir = process.env['SCRIPT_JAIL_REPO_DIR'];
+    // checkoutRoots() derives the checkout tree from SCRIPT_JAIL_REPO_DIR /
+    // GITHUB_WORKSPACE / cwd (NOT the repoDir arg), so mark repoDir as the checkout
+    // root for sanitizePathValue to drop `checkoutDir` under it.
+    process.env['SCRIPT_JAIL_REPO_DIR'] = repoDir;
+    process.env['PATH'] = `${checkoutDir}${delimiter}/usr/bin`;
+    process.env['COREPACK_HOME'] = '/tmp/raw-corepack-home';
+    process.env['XDG_CACHE_HOME'] = '/tmp/raw-xdg-cache';
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const capturingResolver: HostManagerLaunchResolver = (_pm, _rd, env) => {
+      capturedEnv = env;
+      return undefined; // bare-launch (don't care about the launch here)
+    };
+    try {
+      const rec = makeRecorder();
+      await hostRunScripts('pnpm', repoDir, [], rec.io, [], okStreamSpawn(rec), capturingResolver);
+      expect(capturedEnv).toBeDefined();
+      // PATH sanitized: the checkout dir is gone, the system dir survives.
+      const seenPath = capturedEnv!['PATH'] ?? '';
+      expect(seenPath.split(delimiter)).not.toContain(checkoutDir);
+      expect(seenPath.split(delimiter)).toContain('/usr/bin');
+      // corepack_/xdg_ families stripped → resolver reads the DEFAULT cache root.
+      expect(capturedEnv!['COREPACK_HOME']).toBeUndefined();
+      expect(capturedEnv!['XDG_CACHE_HOME']).toBeUndefined();
+    } finally {
+      if (prevPath === undefined) delete process.env['PATH']; else process.env['PATH'] = prevPath;
+      if (prevCk === undefined) delete process.env['COREPACK_HOME']; else process.env['COREPACK_HOME'] = prevCk;
+      if (prevXdg === undefined) delete process.env['XDG_CACHE_HOME']; else process.env['XDG_CACHE_HOME'] = prevXdg;
+      if (prevRepoDir === undefined) delete process.env['SCRIPT_JAIL_REPO_DIR']; else process.env['SCRIPT_JAIL_REPO_DIR'] = prevRepoDir;
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('(e2) Fix-1: the resolver env and the spawn env are the SAME object (one childEnv)', async () => {
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-fix1b-'));
+    try {
+      let resolverEnv: NodeJS.ProcessEnv | undefined;
+      const capturingResolver: HostManagerLaunchResolver = (_pm, _rd, env) => {
+        resolverEnv = env;
+        return undefined;
+      };
+      const spawnEnvs: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts(
+        'pnpm', repoDir, [], makeRecorder().io, [], envCapturingStreamSpawn(spawnEnvs), capturingResolver,
+      );
+      expect(resolverEnv).toBeDefined();
+      expect(spawnEnvs[0]).toBe(resolverEnv); // identical reference → inspected == executed
+    } finally {
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (f) Fix-5: the no-pin multi-version throw recommends pinning packageManager.
+  it('(f) no-pin + multiple cache dirs → throw message recommends pinning "packageManager"', () => {
+    const cacheRoot = mkdtempSync(join(tmpdir(), 'sj-cache-multinopin-'));
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-multinopin-'));
+    try {
+      for (const v of ['10.34.3', '11.1.2']) mkdirSync(join(cacheRoot, 'v1', 'pnpm', v), { recursive: true });
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' }));
+      expect(() => resolveHostManagerLaunch('pnpm', repoDir, { COREPACK_HOME: cacheRoot })).toThrow(
+        /found 2 .*pin "packageManager"/s,
+      );
+    } finally {
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
     }
   });
 });
@@ -919,7 +1495,7 @@ describe('git-binary pin (npm_config_git) — repo .npmrc git= override defense'
     // value-blind lock matched.  Part-2 must now leave it ABSENT == guest Phase B.
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
-    await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
+    await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
     expect(envs).toHaveLength(1);
     expect(envs[0]!['npm_config_git']).toBeUndefined();
   });
@@ -1167,7 +1743,7 @@ describe('home ~/.npmrc script-shell defense (#26)', () => {
   it('part-2 npm rebuild env also pins npm_config_script_shell (the post-trust path)', async () => {
     const rec = makeRecorder();
     const envs: Array<NodeJS.ProcessEnv> = [];
-    await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
+    await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
     expect(envs[0]?.['npm_config_script_shell']).toBe(shell);
   });
 
@@ -1182,7 +1758,7 @@ describe('home ~/.npmrc script-shell defense (#26)', () => {
 
   it('part-2 pnpm rebuild appends --config.script-shell=/bin/sh (sibling, kept with ignore-pnpmfile)', async () => {
     const rec = makeRecorder();
-    await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec));
+    await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
     expect(rec.calls[0]?.args).toContain('--config.script-shell=/bin/sh');
     expect(rec.calls[0]?.args).toContain('--config.ignore-pnpmfile=true');
   });
@@ -1190,7 +1766,7 @@ describe('home ~/.npmrc script-shell defense (#26)', () => {
   it('part-2 does NOT add the pnpm script-shell flag for npm/yarn', async () => {
     for (const pm of ['npm', 'yarn'] as const) {
       const rec = makeRecorder();
-      await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec));
+      await hostRunScripts(pm, '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
       expect(rec.calls[0]?.args).not.toContain('--config.script-shell=/bin/sh');
     }
   });
@@ -1229,7 +1805,7 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
         async () => {
           const rec = makeRecorder();
           const envs: Array<NodeJS.ProcessEnv> = [];
-          await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
+          await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
           const env = envs[0]!;
           // Sandbox tells that an env-sensitive payload could branch on are gone.
           expect(env['HOSTNAME']).toBeUndefined();
@@ -1270,7 +1846,7 @@ describe('host re-run env hygiene — drop sandbox-vs-host tells (install:true d
     await withEnv({ SCRIPT_JAIL_REPO_DIR: '/x' }, async () => {
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
-      await hostRunScripts('yarn', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
+      await hostRunScripts('yarn', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
       const env = envs[0]!;
       expect(env['YARN_IGNORE_PATH']).toBe('1');
       expect(env['YARN_PLUGINS']).toBe('');
@@ -1588,7 +2164,7 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       for (const [k, v] of Object.entries(DANGEROUS_PRESENT)) process.env[k] = v;
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
-      await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs));
+      await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
       const env = envs[0]!;
       for (const k of Object.keys(DANGEROUS_PRESENT)) {
         // See part-1: npm_config_script_shell is OVERRIDDEN by the #26 safe pin for
@@ -2132,7 +2708,7 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
       process.env['PATH'] = `${binDir}${delimiter}/usr/bin`;
       const rec = makeRecorder();
       const envs: Array<NodeJS.ProcessEnv> = [];
-      await hostRunScripts('npm', repoDir, [], rec.io, [], envCapturingStreamSpawn(envs));
+      await hostRunScripts('npm', repoDir, [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
       const parts = envs[0]!['PATH']!.split(delimiter);
       expect(parts.some((p) => p.startsWith(repoDir))).toBe(false);
       expect(parts).toContain('/usr/bin');

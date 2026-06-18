@@ -26429,7 +26429,7 @@ function setOutput(name, value) {
 
 // src/main.ts
 var import_node_fs19 = require("node:fs");
-var import_node_os5 = require("node:os");
+var import_node_os6 = require("node:os");
 var import_node_path15 = require("node:path");
 
 // src/action/inputs.ts
@@ -26710,6 +26710,7 @@ function defaultGetInput(name) {
 // src/action/host-install.ts
 var import_node_child_process = require("node:child_process");
 var import_node_fs = require("node:fs");
+var import_node_os = require("node:os");
 var import_node_path2 = require("node:path");
 var import_node_string_decoder = require("node:string_decoder");
 
@@ -27311,7 +27312,138 @@ var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
     }
   });
 });
-async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn) {
+function corepackCacheRoot(procEnv) {
+  const home = procEnv["COREPACK_HOME"];
+  if (home !== void 0 && home.length > 0) return home;
+  const homeFallback = (0, import_node_path2.join)((0, import_node_os.homedir)(), process.platform === "win32" ? "AppData/Local" : ".cache");
+  const base = procEnv["XDG_CACHE_HOME"] ?? procEnv["LOCALAPPDATA"] ?? homeFallback;
+  return (0, import_node_path2.join)(base, "node", "corepack");
+}
+function readHostPnpmBinRel(verDir) {
+  for (const file2 of [".corepack", "package.json"]) {
+    try {
+      const meta3 = JSON.parse((0, import_node_fs.readFileSync)((0, import_node_path2.join)(verDir, file2), "utf8"));
+      const bin = meta3.bin;
+      if (bin !== void 0 && !Array.isArray(bin)) {
+        const rel = bin["pnpm"];
+        if (typeof rel === "string" && rel.length > 0) return rel;
+      }
+    } catch {
+    }
+  }
+  return null;
+}
+function isCorepackShim(binPath) {
+  if (binPath === void 0 || binPath.length === 0) return false;
+  try {
+    const real = (0, import_node_fs.realpathSync)(binPath);
+    const content = (0, import_node_fs.readFileSync)(real, "utf8");
+    return content.includes("corepack.cjs");
+  } catch {
+    return true;
+  }
+}
+function resolveBareOnPath(pm, pathVar) {
+  if (pathVar === void 0 || pathVar === "") return void 0;
+  const names = process.platform === "win32" ? [`${pm}.cmd`, `${pm}.exe`, pm] : [pm];
+  for (const dir of pathVar.split(import_node_path2.delimiter)) {
+    if (dir === "") continue;
+    for (const name of names) {
+      const candidate = (0, import_node_path2.join)(dir, name);
+      if ((0, import_node_path2.isAbsolute)(candidate) && (0, import_node_fs.existsSync)(candidate)) return candidate;
+    }
+  }
+  return void 0;
+}
+function cacheHasAnyVersion(cacheRoot, pm) {
+  try {
+    return (0, import_node_fs.readdirSync)((0, import_node_path2.join)(cacheRoot, "v1", pm), { withFileTypes: true }).some(
+      (d) => d.isDirectory()
+    );
+  } catch {
+    return false;
+  }
+}
+function readPackageManagerPin(repoDir) {
+  try {
+    const pkg = JSON.parse((0, import_node_fs.readFileSync)((0, import_node_path2.join)(repoDir, "package.json"), "utf8"));
+    const pm = pkg.packageManager;
+    if (typeof pm !== "string" || pm.length === 0) return void 0;
+    const at = pm.lastIndexOf("@");
+    if (at <= 0) return void 0;
+    const name = pm.slice(0, at);
+    let version2 = pm.slice(at + 1);
+    const plus = version2.indexOf("+");
+    if (plus !== -1) version2 = version2.slice(0, plus);
+    if (version2.length === 0) return void 0;
+    return { name, version: version2 };
+  } catch {
+    return void 0;
+  }
+}
+function resolveHostManagerLaunch(pm, repoDir, procEnv = process.env, execPath = process.execPath) {
+  if (pm === "npm") {
+    const toolchainRoot = (0, import_node_path2.dirname)((0, import_node_path2.dirname)(execPath));
+    const entry2 = (0, import_node_path2.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    if (!(0, import_node_fs.existsSync)(entry2)) {
+      throw new Error(
+        `script-jail: host lifecycle install refuses to bare-launch npm (value-blind COREPACK_ROOT oracle): node-bundled npm-cli.js not found at ${entry2}. A bare \`npm\` may be a \`corepack enable npm\` shim that sets COREPACK_ROOT; the clean-VM audit also fails on a node without bundled npm, so this fails closed to match.`
+      );
+    }
+    return { node: execPath, entry: entry2 };
+  }
+  let corepackManaged;
+  try {
+    corepackManaged = isCorepackShim(resolveBareOnPath(pm, procEnv["PATH"])) || cacheHasAnyVersion(corepackCacheRoot(procEnv), pm);
+  } catch {
+    corepackManaged = true;
+  }
+  if (!corepackManaged) {
+    return void 0;
+  }
+  const cacheRoot = corepackCacheRoot(procEnv);
+  const pmDir = (0, import_node_path2.join)(cacheRoot, "v1", pm);
+  const pin = readPackageManagerPin(repoDir);
+  const failClosed = (detail) => {
+    throw new Error(
+      `script-jail: host lifecycle install refuses to bare-launch the corepack-managed ${pm} (value-blind COREPACK_ROOT oracle): ${detail}. Expected the corepack-cached ${pm}${pin && pin.name === pm ? ` ${pin.version}` : ""} under ${pmDir}. Run the action's part-1 install (which warms the corepack cache) first, or pin "packageManager" in package.json so the version can be resolved.`
+    );
+  };
+  let verDir;
+  if (pin !== void 0 && pin.name === pm) {
+    const pinnedDir = (0, import_node_path2.join)(pmDir, pin.version);
+    if (!(0, import_node_fs.existsSync)(pinnedDir)) {
+      failClosed(`the pinned version dir ${pinnedDir} is absent`);
+    }
+    verDir = pinnedDir;
+  } else {
+    let versionDirs;
+    try {
+      versionDirs = (0, import_node_fs.readdirSync)(pmDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch (err) {
+      return failClosed(`cannot read the corepack cache dir ${pmDir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (versionDirs.length !== 1) {
+      return failClosed(
+        `expected exactly one ${pm} version dir, found ${versionDirs.length}${versionDirs.length > 0 ? ` (${versionDirs.join(", ")})` : ""}; with no "packageManager" pin the version is ambiguous on a multi-version corepack cache \u2014 pin "packageManager" in package.json to disambiguate`
+      );
+    }
+    verDir = (0, import_node_path2.join)(pmDir, versionDirs[0]);
+  }
+  if (pm === "yarn") {
+    const entry2 = (0, import_node_path2.join)(verDir, "yarn.js");
+    if (!(0, import_node_fs.existsSync)(entry2)) failClosed(`yarn.js not found at ${entry2}`);
+    return { node: execPath, entry: entry2 };
+  }
+  const rel = readHostPnpmBinRel(verDir);
+  if (rel === null) {
+    failClosed(`could not read the pnpm entry path from ${(0, import_node_path2.join)(verDir, ".corepack")} or package.json bin`);
+  }
+  const entry = (0, import_node_path2.resolve)(verDir, rel);
+  if (!(0, import_node_fs.existsSync)(entry)) failClosed(`pnpm entry not found at ${entry}`);
+  return { node: execPath, entry };
+}
+async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn, resolveLaunch = resolveHostManagerLaunch) {
   const cmd = INSTALL_CMD[pm];
   const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : [];
   const { kept } = sanitizeInstallArgs(args);
@@ -27319,10 +27451,17 @@ async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spa
   const finalArgs = [...cmd.args, ...userArgs, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   const safeFinalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   const userArgSuffix = userArgs.length > 0 ? ` (+${userArgs.length} user install arg${userArgs.length === 1 ? "" : "s"}, not shown)` : "";
+  const childEnv = hostInstallEnv(pm, repoDir, "scripts");
+  const launch = resolveLaunch(pm, repoDir, childEnv);
+  const spawnCmd = launch ? launch.node : cmd.cmd;
+  const spawnArgs = launch ? [launch.entry, ...finalArgs] : finalArgs;
   io.stdout.write(
     `[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${safeFinalArgs.join(" ")}${userArgSuffix}
 `
   );
+  if (launch !== void 0) {
+    io.stdout.write("[script-jail] (launched directly via node to bypass corepack)\n");
+  }
   const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
   const userArgValues = deriveSensitiveValues(userArgs);
   const fragMatcher = buildFragmentMatcher(sensitive);
@@ -27339,7 +27478,7 @@ async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spa
     (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
 `);
   };
-  const r = await spawn3(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, "scripts"), onLine);
+  const r = await spawn3(spawnCmd, spawnArgs, repoDir, childEnv, onLine);
   const safeErrArgs = `${safeFinalArgs.join(" ")}${userArgSuffix}`;
   if (r.error !== void 0) {
     throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);
@@ -27745,7 +27884,7 @@ function parseOsRelease(raw) {
 var import_node_fs7 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
 var import_node_path6 = require("node:path");
-var import_node_os = require("node:os");
+var import_node_os2 = require("node:os");
 var import_node_crypto3 = require("node:crypto");
 var import_node_zlib = require("node:zlib");
 
@@ -27860,7 +27999,7 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
 }
 async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch) {
   const tmpOut = (0, import_node_path6.join)(
-    (0, import_node_os.tmpdir)(),
+    (0, import_node_os2.tmpdir)(),
     `script-jail-fc-${(0, import_node_crypto3.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version2}-${releaseArch}`;
@@ -28188,11 +28327,11 @@ function validateManifest(manifest) {
 var import_node_fs10 = require("node:fs");
 var import_promises3 = require("node:fs/promises");
 var import_node_path8 = require("node:path");
-var import_node_os2 = require("node:os");
+var import_node_os3 = require("node:os");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
-  const workDir = input.workDir ?? (0, import_node_fs10.mkdtempSync)((0, import_node_path8.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
+  const workDir = input.workDir ?? (0, import_node_fs10.mkdtempSync)((0, import_node_path8.join)((0, import_node_os3.tmpdir)(), "script-jail-run-"));
   (0, import_node_fs10.mkdirSync)(workDir, { recursive: true });
   try {
     return await buildOverlayInto(workDir, input);
@@ -44380,7 +44519,7 @@ function countLines(s) {
 
 // src/action/config-override.ts
 var import_node_fs13 = require("node:fs");
-var import_node_os3 = require("node:os");
+var import_node_os4 = require("node:os");
 var import_node_path9 = require("node:path");
 var import_yaml3 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
@@ -44400,7 +44539,7 @@ function buildEffectiveConfig(input) {
   if (input.installMode === true) {
     config2["install_mode"] = true;
   }
-  const outDir = input.workDir ?? (0, import_node_fs13.mkdtempSync)((0, import_node_path9.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
+  const outDir = input.workDir ?? (0, import_node_fs13.mkdtempSync)((0, import_node_path9.join)((0, import_node_os4.tmpdir)(), "script-jail-config-"));
   const configPath = (0, import_node_path9.join)(outDir, "config.yml");
   (0, import_node_fs13.writeFileSync)(configPath, (0, import_yaml3.stringify)(config2), "utf8");
   const result = { configPath };
@@ -44571,7 +44710,7 @@ function relativeForDisplay(absPath, repoDir) {
 // src/action/backend/firecracker.ts
 var import_node_crypto5 = require("node:crypto");
 var import_node_fs16 = require("node:fs");
-var import_node_os4 = require("node:os");
+var import_node_os5 = require("node:os");
 var import_node_path12 = require("node:path");
 var import_node_process3 = require("node:process");
 
@@ -44778,8 +44917,8 @@ function rootfsImageName(runnerImage, arch2) {
 }
 async function launchFirecracker(input) {
   const runId = (0, import_node_crypto5.randomBytes)(4).toString("hex");
-  const apiSocketPath = (0, import_node_path12.join)((0, import_node_os4.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
-  const vsockUdsPath = (0, import_node_path12.join)((0, import_node_os4.tmpdir)(), `script-jail-vsock-${runId}`);
+  const apiSocketPath = (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
+  const vsockUdsPath = (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), `script-jail-vsock-${runId}`);
   let vm = null;
   let vsock = null;
   let finalYaml = null;
@@ -45342,7 +45481,7 @@ async function main(deps = {}) {
     }
   }
   const runnerImage = detectRunnerImage();
-  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path15.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path15.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
+  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path15.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path15.join)((0, import_node_os6.tmpdir)(), "script-jail-images");
   (0, import_node_fs19.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
   const backends = {

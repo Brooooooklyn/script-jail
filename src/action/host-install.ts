@@ -24,8 +24,9 @@
 //     derives from the reviewed lock, not from host isolation.  See docs.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
-import { delimiter, isAbsolute, join, resolve, sep } from 'node:path';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -1246,6 +1247,332 @@ export const streamSpawn: HostStreamSpawn = (cmd, args, cwd, env, onLine) =>
     });
   });
 
+// ---------------------------------------------------------------------------
+// SECURITY: host part-2 direct-launch (close the COREPACK_ROOT value-blind oracle)
+// ---------------------------------------------------------------------------
+//
+// THREAT.  With `install: true` the action runs dependency lifecycle scripts on
+// the trusted host (part-2, `hostRunScripts`).  The GUEST audit (commit 81a0747 /
+// resolveLinuxManagerLaunch) resolves the PM's offline-cached JS entry and runs
+// `node <entry>` DIRECTLY, BYPASSING the corepack shim — so the guest lifecycle
+// child has NO `process.env.COREPACK_ROOT`.  If host part-2 spawned the PM by BARE
+// name and that bare `pnpm`/`yarn` (or a `corepack enable npm` `npm`) is a corepack
+// shim, corepack sets `COREPACK_ROOT` UNCONDITIONALLY in the lifecycle child before
+// launching the managed bin.  env-spy is value-BLIND (it records env_read NAMES
+// only), so a dep that does `if (process.env.COREPACK_ROOT) evil(); else benign();`
+// is benign in the audit (clean lock) and evil on the host = post-trust RCE.
+//
+// FIX.  Make host part-2 ALSO direct-launch (`node <cached-entry>`), exactly like
+// the guest, so `COREPACK_ROOT` is ABSENT on BOTH sides.  `COREPACK_HOME`/
+// `COREPACK_ROOT` were already dropped from the child ENV by stripDangerousEnv (the
+// `corepack_` family), but corepack RE-SETS `COREPACK_ROOT` inside its OWN process
+// AFTER hostInstallEnv is built — so env-stripping alone cannot close it; not going
+// through corepack (direct-launch) is the only lever.
+//
+// This is HOST-ONLY: it changes nothing the guest/lock sees (the audited argv stays
+// `finalArgs`; we only change the *launcher* from `<pm>` to `node <entry>`), so it
+// has ZERO lockfile/golden impact and dist/guest-agent.cjs is byte-unchanged.
+//
+// The per-version entry-read mechanics below DUPLICATE the guest's
+// resolveLinuxManagerLaunch (src/guest/phase-install.ts) deliberately — the host
+// resolver is self-contained (it reads the ACTION's corepack cache, not the guest's
+// COREPACK_HOME) and the duplication keeps the two paths decoupled.
+
+/** A direct-launch decision: spawn `node entry ...finalArgs` instead of bare PM. */
+export interface HostManagerLaunch {
+  node: string;
+  entry: string;
+}
+
+/**
+ * Mirror corepack's `getCorepackHomeFolder`: the executable cache root corepack
+ * reads/writes managed PM tarballs under.  `COREPACK_HOME` wins; otherwise it is
+ * `<XDG_CACHE_HOME | LOCALAPPDATA | <home>/{AppData/Local|.cache}>/node/corepack`.
+ *
+ * Fix-1 NOTE: `procEnv` here is the SAME env the lifecycle child runs under
+ * (`hostInstallEnv(...,'scripts')`), which `stripDangerousEnv` has already cleared
+ * of `COREPACK_HOME` / `XDG_CACHE_HOME` (the corepack_/xdg_ families).  So with the
+ * child env this resolves to the DEFAULT `<home>/.cache/node/corepack` — exactly
+ * where part-1 (`hostInstallNoScripts`, also run under `hostInstallEnv`, also
+ * stripped) warmed the cache.  Reading the RAW `process.env` here would honour an
+ * inherited `COREPACK_HOME`/`XDG_CACHE_HOME` that part-1's corepack never used,
+ * voiding the cache backstop AND failing a legit corepack consumer closed.
+ */
+function corepackCacheRoot(procEnv: NodeJS.ProcessEnv): string {
+  const home = procEnv['COREPACK_HOME'];
+  if (home !== undefined && home.length > 0) return home;
+  // Mirror corepack's getCorepackHomeFolder EXACTLY: the homedir fallback is
+  // `<home>/AppData/Local` on win32 and `<home>/.cache` elsewhere (NOT `.cache`
+  // unconditionally).  `XDG_CACHE_HOME`/`LOCALAPPDATA` still win when set.
+  const homeFallback = join(homedir(), process.platform === 'win32' ? 'AppData/Local' : '.cache');
+  const base = procEnv['XDG_CACHE_HOME'] ?? procEnv['LOCALAPPDATA'] ?? homeFallback;
+  return join(base, 'node', 'corepack');
+}
+
+/**
+ * Read the relative entry path for a corepack-managed pnpm from the per-version
+ * `.corepack` JSON (`bin.pnpm`, e.g. `./bin/pnpm.cjs` on 10.x / `./pnpm.mjs` on
+ * 11.x), falling back to the cached `package.json` `bin.pnpm`.  ALWAYS read (never
+ * hard-code .cjs vs .mjs — it varies per tarball).  Returns null on every miss so
+ * the caller fails closed.  DUPLICATES guest readManagerBinRel (intentional).
+ */
+function readHostPnpmBinRel(verDir: string): string | null {
+  for (const file of ['.corepack', 'package.json']) {
+    try {
+      const meta = JSON.parse(readFileSync(join(verDir, file), 'utf8')) as {
+        bin?: Record<string, string> | string[];
+      };
+      const bin = meta.bin;
+      if (bin !== undefined && !Array.isArray(bin)) {
+        const rel = bin['pnpm'];
+        if (typeof rel === 'string' && rel.length > 0) return rel;
+      }
+    } catch {
+      // unreadable / malformed — try the next source
+    }
+  }
+  return null;
+}
+
+/**
+ * True when the resolved on-disk binary at `binPath` is a corepack SHIM.  The
+ * EMPIRICALLY-VERIFIED signature is the literal `corepack.cjs` require target:
+ * EVERY corepack shim (npm/pnpm/yarn) across corepack 0.24.1 / 0.30.0 / 0.31.0 /
+ * 0.35.0 is `require('./lib/corepack.cjs').runMain([...])` — the `corepack.cjs`
+ * substring is reliably present.  A standalone `pnpm` (`pnpm/bin/pnpm.cjs`) and
+ * node-bundled `npm` contain ZERO `corepack.cjs` / `corepack` / `runMain` mentions
+ * (verified: `npm pack pnpm@10` bin has 0 hits for all three) and set no
+ * COREPACK_ROOT.  We match `corepack.cjs` ONLY — the bare `corepack` substring and
+ * the broad `runMain` were over-broad (a standalone PM whose bytes happen to
+ * contain either would be misclassified → fail-closed refusal of a legit
+ * consumer).  This shim check is DEFENSE-IN-DEPTH: in the normal install:true flow
+ * `cacheHasAnyVersion` is the PRIMARY corepack signal (part-1 warms the cache for
+ * the same PM), so tightening here is low-risk for false-negatives.  Any read
+ * error → treat as a shim (fail-safe: caller then resolves the cached entry / fails
+ * closed).
+ */
+function isCorepackShim(binPath: string | undefined): boolean {
+  if (binPath === undefined || binPath.length === 0) return false;
+  try {
+    const real = realpathSync(binPath);
+    const content = readFileSync(real, 'utf8');
+    return content.includes('corepack.cjs');
+  } catch {
+    // an unreadable resolved bin is suspicious → fail-safe to "managed"
+    return true;
+  }
+}
+
+/**
+ * Resolve the first executable named `pm` on `pathVar`, following the lexical PATH
+ * order.  Returns the absolute candidate (NOT realpath'd — `isCorepackShim`
+ * realpaths it).  `undefined` when none found.
+ */
+function resolveBareOnPath(pm: string, pathVar: string | undefined): string | undefined {
+  if (pathVar === undefined || pathVar === '') return undefined;
+  const names = process.platform === 'win32' ? [`${pm}.cmd`, `${pm}.exe`, pm] : [pm];
+  for (const dir of pathVar.split(delimiter)) {
+    if (dir === '') continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      if (isAbsolute(candidate) && existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/** True when `<cacheRoot>/v1/<pm>/` has at least one version subdir. */
+function cacheHasAnyVersion(cacheRoot: string, pm: Manager): boolean {
+  try {
+    return readdirSync(join(cacheRoot, 'v1', pm), { withFileTypes: true }).some((d) =>
+      d.isDirectory(),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Read the `packageManager` pin from `<repoDir>/package.json`, stripping the
+ *  `+<hash>` integrity suffix.  Returns `{ name, version }` or undefined. */
+function readPackageManagerPin(repoDir: string): { name: string; version: string } | undefined {
+  try {
+    const pkg = JSON.parse(readFileSync(join(repoDir, 'package.json'), 'utf8')) as {
+      packageManager?: unknown;
+    };
+    const pm = pkg.packageManager;
+    if (typeof pm !== 'string' || pm.length === 0) return undefined;
+    const at = pm.lastIndexOf('@');
+    if (at <= 0) return undefined;
+    const name = pm.slice(0, at);
+    let version = pm.slice(at + 1);
+    const plus = version.indexOf('+');
+    if (plus !== -1) version = version.slice(0, plus);
+    if (version.length === 0) return undefined;
+    return { name, version };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve how host part-2 should LAUNCH the package manager, mirroring the guest's
+ * direct-launch so `COREPACK_ROOT` is ABSENT on both sides (close the value-blind
+ * oracle — see the section header above).
+ *
+ *   * Returns `{ node, entry }` → spawn `node entry ...finalArgs` (bypass corepack).
+ *   * Returns `undefined`       → bare-launch is SAFE (standalone PM sets no
+ *                                 COREPACK_ROOT); preserve standalone consumers.
+ *
+ * Decision tree:
+ *   npm  — ALWAYS resolve node-bundled `npm-cli.js` from the toolchain root of
+ *          `execPath` (matches the guest, and ignores a `corepack enable npm` shim by
+ *          using node-bundled npm directly).  Exists → direct-launch.  ABSENT →
+ *          THROW (fail closed), mirroring the guest (resolveLinuxManagerLaunch also
+ *          throws): a bare `npm` on a `corepack enable npm` runner is a corepack shim
+ *          that sets COREPACK_ROOT (re-opening the oracle), and a node lacking
+ *          bundled npm cannot run `npm rebuild` anyway, so the guest audit would fail
+ *          identically → parity-correct to refuse here too.
+ *   pnpm/yarn — corepackManaged = bare-on-PATH is a corepack shim OR the corepack
+ *          cache already holds a version of this PM (any read error → treat as
+ *          managed, fail-safe).  NOT managed → `undefined` (bare-launch; e.g.
+ *          pnpm/action-setup standalone).  Managed → resolve the cached entry from
+ *          the action's corepack cache, preferring the repo `packageManager` pin;
+ *          ANY miss (pinned dir absent, ambiguous version, unreadable entry) →
+ *          THROW.  A silent bare-launch of a corepack-managed-but-unresolvable PM
+ *          would re-open the oracle, so fail closed loudly.
+ */
+export function resolveHostManagerLaunch(
+  pm: Manager,
+  repoDir: string,
+  procEnv: NodeJS.ProcessEnv = process.env,
+  execPath: string = process.execPath,
+): HostManagerLaunch | undefined {
+  if (pm === 'npm') {
+    // npm is node-bundled (NOT corepack-managed): resolve from the toolchain root
+    // the action runs under — `execPath` is `.../node/<ver>/bin/node`, so the
+    // toolchain root is `dirname(dirname(execPath))`.  This deliberately ignores any
+    // `corepack enable npm` shim (which WOULD set COREPACK_ROOT) by launching
+    // node-bundled npm directly, matching the guest.
+    const toolchainRoot = dirname(dirname(execPath));
+    const entry = join(toolchainRoot, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    // FAIL CLOSED when node-bundled npm-cli.js is absent (mirrors the guest's
+    // resolveLinuxManagerLaunch, which throws): a bare `npm` on a `corepack enable
+    // npm` runner is a corepack shim that sets COREPACK_ROOT, re-opening the
+    // value-blind oracle.  A node lacking bundled npm cannot run `npm rebuild`
+    // anyway, and the guest audit already throws on the same layout, so refusing
+    // here is parity-correct (never silently bare-launch npm).
+    if (!existsSync(entry)) {
+      throw new Error(
+        `script-jail: host lifecycle install refuses to bare-launch npm ` +
+          `(value-blind COREPACK_ROOT oracle): node-bundled npm-cli.js not found at ${entry}. ` +
+          `A bare \`npm\` may be a \`corepack enable npm\` shim that sets COREPACK_ROOT; the ` +
+          `clean-VM audit also fails on a node without bundled npm, so this fails closed to match.`,
+      );
+    }
+    return { node: execPath, entry };
+  }
+
+  // pnpm / yarn.  Is the bare PM the action would otherwise spawn a corepack shim,
+  // OR has corepack already cached a version of it?  Either means going through the
+  // bare name would set COREPACK_ROOT in the lifecycle child.  Any detection
+  // read-error is treated as managed (fail-safe — never bare-launch on uncertainty).
+  let corepackManaged: boolean;
+  try {
+    corepackManaged =
+      isCorepackShim(resolveBareOnPath(pm, procEnv['PATH'])) ||
+      cacheHasAnyVersion(corepackCacheRoot(procEnv), pm);
+  } catch {
+    corepackManaged = true;
+  }
+  if (!corepackManaged) {
+    // Standalone PM (e.g. pnpm installed via pnpm/action-setup): bare-launch is
+    // safe — it sets no COREPACK_ROOT, so the guest (no COREPACK_ROOT) and the host
+    // already match.  Preserve standalone consumers.
+    return undefined;
+  }
+
+  // Corepack-managed → resolve the cached entry.  FAIL CLOSED on every miss: a
+  // bare-launch here would re-open the oracle.
+  const cacheRoot = corepackCacheRoot(procEnv);
+  const pmDir = join(cacheRoot, 'v1', pm);
+  const pin = readPackageManagerPin(repoDir);
+  const failClosed = (detail: string): never => {
+    throw new Error(
+      `script-jail: host lifecycle install refuses to bare-launch the corepack-managed ${pm} ` +
+        `(value-blind COREPACK_ROOT oracle): ${detail}. ` +
+        `Expected the corepack-cached ${pm}${pin && pin.name === pm ? ` ${pin.version}` : ''} ` +
+        `under ${pmDir}. Run the action's part-1 install (which warms the corepack cache) first, ` +
+        `or pin "packageManager" in package.json so the version can be resolved.`,
+    );
+  };
+
+  let verDir: string;
+  if (pin !== undefined && pin.name === pm) {
+    // A pin exists: prefer its version dir.  If the pin's dir is ABSENT, fail
+    // closed (do NOT bare-launch / do NOT guess another version).
+    const pinnedDir = join(pmDir, pin.version);
+    if (!existsSync(pinnedDir)) {
+      failClosed(`the pinned version dir ${pinnedDir} is absent`);
+    }
+    verDir = pinnedDir;
+  } else {
+    // No usable pin: accept the cache ONLY when it holds exactly one version dir
+    // (Phase A / part-1 provisions exactly one).  Zero or >1 → ambiguous → throw.
+    let versionDirs: string[];
+    try {
+      versionDirs = readdirSync(pmDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name);
+    } catch (err) {
+      return failClosed(`cannot read the corepack cache dir ${pmDir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (versionDirs.length !== 1) {
+      // Fix-5 decision: NO lastKnownGood.json disambiguation.  Empirically (corepack
+      // 0.35.0) the no-pin flow does NOT write `<cacheRoot>/lastKnownGood.json` —
+      // it is only written by `corepack use`/`corepack install --activate` or an
+      // in-major upgrade when a prior entry already exists, and it records a GLOBAL
+      // default, not the version part-1 resolved for THIS repo.  Relying on it would
+      // be a version-fragile false-negative oracle, so we KEEP exactly-one-dir and
+      // fail closed (SAFE — never bare-launches).  On a dirty multi-version (reused/
+      // self-hosted) runner with no `packageManager` pin this fails closed; the fix
+      // is to pin "packageManager" so the version is unambiguous (see divergence.md).
+      return failClosed(
+        `expected exactly one ${pm} version dir, found ${versionDirs.length}` +
+          `${versionDirs.length > 0 ? ` (${versionDirs.join(', ')})` : ''}; ` +
+          `with no "packageManager" pin the version is ambiguous on a multi-version corepack cache — ` +
+          `pin "packageManager" in package.json to disambiguate`,
+      );
+    }
+    verDir = join(pmDir, versionDirs[0] as string);
+  }
+
+  if (pm === 'yarn') {
+    // yarn berry's cache is a single bundled `yarn.js` at the version-dir root (its
+    // `.corepack` `bin` is an ARRAY of names, giving no path).
+    const entry = join(verDir, 'yarn.js');
+    if (!existsSync(entry)) failClosed(`yarn.js not found at ${entry}`);
+    return { node: execPath, entry };
+  }
+
+  // pnpm: the entry path (10.x `./bin/pnpm.cjs`, 11.x `./pnpm.mjs`) comes from the
+  // per-version `.corepack` metadata (package.json `bin` as fallback) — never
+  // hard-coded.
+  const rel = readHostPnpmBinRel(verDir);
+  if (rel === null) {
+    failClosed(`could not read the pnpm entry path from ${join(verDir, '.corepack')} or package.json bin`);
+  }
+  const entry = resolve(verDir, rel as string);
+  if (!existsSync(entry)) failClosed(`pnpm entry not found at ${entry}`);
+  return { node: execPath, entry };
+}
+
+/** Injectable resolver seam (tests pass a fake), mirroring the HostStreamSpawn seam. */
+export type HostManagerLaunchResolver = (
+  pm: Manager,
+  repoDir: string,
+  procEnv: NodeJS.ProcessEnv,
+) => HostManagerLaunch | undefined;
+
 /**
  * Part 2 — run the lifecycle scripts part 1 deferred.  The caller MUST have
  * confirmed the audit is `trusted` before calling this.  Throws on failure.
@@ -1276,6 +1603,7 @@ export async function hostRunScripts(
   io: HostInstallIo,
   protectedEnvNames: readonly string[] = [],
   spawn: HostStreamSpawn = streamSpawn,
+  resolveLaunch: HostManagerLaunchResolver = resolveHostManagerLaunch,
 ): Promise<void> {
   const cmd = INSTALL_CMD[pm];
   // SECURITY (host part-2, symmetric with part-1's --ignore-pnpmfile): `pnpm
@@ -1328,9 +1656,41 @@ export async function hostRunScripts(
     userArgs.length > 0
       ? ` (+${userArgs.length} user install arg${userArgs.length === 1 ? '' : 's'}, not shown)`
       : '';
+  // Fix-1: compute the child env ONCE and feed it to BOTH the launch resolver AND
+  // the spawn, so detection inspects EXACTLY the env (PATH + corepack cache root)
+  // the lifecycle child runs under.  Two divergences this closes:
+  //   * RAW-vs-SANITIZED PATH — `hostInstallEnv` sanitizes PATH (drops every
+  //     checkout-controlled dir).  If the resolver read the RAW `process.env.PATH`,
+  //     a checkout-shadow standalone PM could flip a real system corepack shim to
+  //     "standalone" → bare-launch → the child then execs the (sanitized-PATH) shim
+  //     and COREPACK_ROOT re-opens.  Passing the child env makes
+  //     `resolveBareOnPath`/`isCorepackShim` inspect the same binary the child runs.
+  //   * RAW-vs-STRIPPED corepack cache root — `stripDangerousEnv` drops
+  //     COREPACK_HOME/XDG_CACHE_HOME, so part-1 (also run under `hostInstallEnv`)
+  //     warmed the DEFAULT `~/.cache/node/corepack`.  Reading raw `process.env` here
+  //     would point `corepackCacheRoot` at an inherited dir part-1 never used,
+  //     voiding the cache backstop AND failing a legit corepack consumer closed.
+  const childEnv = hostInstallEnv(pm, repoDir, 'scripts');
+  // SECURITY (COREPACK_ROOT value-blind oracle): resolve HOW to launch the PM.
+  // `undefined` → bare-launch is safe (standalone PM sets no COREPACK_ROOT); a
+  // `{node,entry}` → direct-launch `node <entry> ...finalArgs`, BYPASSING corepack
+  // so the lifecycle child has no COREPACK_ROOT — matching the guest Phase B
+  // (resolveLinuxManagerLaunch).  Only the LAUNCHER changes; the audited argv
+  // (`finalArgs`) is in LOCKSTEP with the guest (zero lockfile impact).  A
+  // corepack-managed-but-unresolvable PM THROWS here (fail closed) rather than
+  // silently bare-launching and re-opening the oracle.
+  const launch = resolveLaunch(pm, repoDir, childEnv);
+  const spawnCmd = launch ? launch.node : cmd.cmd;
+  const spawnArgs = launch ? [launch.entry, ...finalArgs] : finalArgs;
   io.stdout.write(
     `[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${safeFinalArgs.join(' ')}${userArgSuffix}\n`,
   );
+  // Keep the banner/error messages on the LOGICAL pm (cmd.cmd + safe args), never
+  // the node/entry absolute path (noise + leaks an internal path).  Just note the
+  // direct-launch so the log explains why corepack is absent.
+  if (launch !== undefined) {
+    io.stdout.write('[script-jail] (launched directly via node to bypass corepack)\n');
+  }
   // Exact secret values to mask: the declared protected.env names' values in the
   // host env.  minLen=1 (mask every NON-EMPTY declared value, longest-first):
   // the `maskExactValues` default >=4-char floor is a heuristic for the
@@ -1380,7 +1740,7 @@ export async function hostRunScripts(
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
   };
-  const r = await spawn(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, 'scripts'), onLine);
+  const r = await spawn(spawnCmd, spawnArgs, repoDir, childEnv, onLine);
   // safeFinalArgs omits the user tokens (count-only suffix), so it is safe to
   // show in errors even though finalArgs now carries the npm user args (#19).
   const safeErrArgs = `${safeFinalArgs.join(' ')}${userArgSuffix}`;
