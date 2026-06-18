@@ -1479,6 +1479,66 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     }
   });
 
+  // (h) codex round-17d [medium]: a DIRECTORY named `pnpm` earlier on PATH passes
+  // both existence and access(X_OK) (a dir is "searchable"), but execvp does NOT exec
+  // it — it keeps scanning and runs the LATER standalone.  resolveBareOnPath must
+  // model that (statSync().isFile()) and skip the directory; otherwise the dir is
+  // returned, isCorepackShim readFileSync's it → EISDIR → fail-safe "managed", and a
+  // confirmed-standalone install is wrongly refused (empty cache → throw) or hijacked
+  // (stale cache → direct-launch the cached PM) while spawn actually runs the
+  // standalone.  Verified empirically: spawn('pnpm') with PATH=dir:standalone runs the
+  // standalone.
+  it('(h) executable DIRECTORY named pnpm before a standalone PM on PATH → undefined (dir skipped, bare-launch)', () => {
+    const emptyCache = mkdtempSync(join(tmpdir(), 'sj-empty-dir-'));
+    const dir1 = mkdtempSync(join(tmpdir(), 'sj-dir-hit-')); // first hit: a DIRECTORY named pnpm
+    const dir2 = mkdtempSync(join(tmpdir(), 'sj-dir-standalone-')); // later hit: standalone file
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-dir-'));
+    try {
+      mkdirSync(join(dir1, 'pnpm')); // a directory named pnpm (mode 0755 by default → X_OK passes)
+      const standalone = join(dir2, 'pnpm');
+      writeFileSync(standalone, '#!/usr/bin/env node\n// standalone pnpm, not a corepack shim\n');
+      chmodSync(standalone, 0o755);
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' })); // no pin
+      const launch = resolveHostManagerLaunch('pnpm', repoDir, {
+        COREPACK_HOME: emptyCache,
+        PATH: `${dir1}${delimiter}${dir2}`,
+      });
+      expect(launch).toBeUndefined(); // dir skipped → standalone confirmed → bare-launch
+    } finally {
+      rmSync(emptyCache, { recursive: true, force: true });
+      rmSync(dir1, { recursive: true, force: true });
+      rmSync(dir2, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  // (h) mirror: a DIRECTORY named pnpm before an executable corepack shim must NOT mask
+  // the shim — the resolver skips the dir, finds the shim → managed → fails closed.
+  it('(h) executable DIRECTORY named pnpm before a corepack shim on PATH → managed (shim still detected)', () => {
+    const emptyCache = mkdtempSync(join(tmpdir(), 'sj-empty-dirshim-'));
+    const dir1 = mkdtempSync(join(tmpdir(), 'sj-dirshim-hit-')); // first hit: a DIRECTORY named pnpm
+    const dir2 = mkdtempSync(join(tmpdir(), 'sj-dirshim-shim-')); // later hit: executable shim
+    const repoDir = mkdtempSync(join(tmpdir(), 'sj-repo-dirshim-'));
+    try {
+      mkdirSync(join(dir1, 'pnpm'));
+      const shim = join(dir2, 'pnpm');
+      writeFileSync(shim, "#!/usr/bin/env node\nrequire('./lib/corepack.cjs').runMain(['pnpm']);\n");
+      chmodSync(shim, 0o755);
+      writeFileSync(join(repoDir, 'package.json'), JSON.stringify({ name: 'x' })); // no pin
+      expect(() =>
+        resolveHostManagerLaunch('pnpm', repoDir, {
+          COREPACK_HOME: emptyCache,
+          PATH: `${dir1}${delimiter}${dir2}`,
+        }),
+      ).toThrow(/corepack-managed pnpm/i);
+    } finally {
+      rmSync(emptyCache, { recursive: true, force: true });
+      rmSync(dir1, { recursive: true, force: true });
+      rmSync(dir2, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
   // (e) Fix-1 wiring: hostRunScripts feeds the resolver the CHILD env (sanitized
   // PATH, COREPACK_HOME/XDG_CACHE_HOME stripped), NOT raw process.env.
   it('(e) hostRunScripts passes the resolver the sanitized child env (no checkout PATH, no COREPACK_HOME/XDG_CACHE_HOME)', async () => {

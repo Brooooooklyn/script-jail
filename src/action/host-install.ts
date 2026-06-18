@@ -24,7 +24,15 @@
 //     derives from the reviewed lock, not from host isolation.  See docs.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, constants as fsConstants, existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -1375,14 +1383,30 @@ function resolveBareOnPath(pm: string, pathVar: string | undefined): string | un
     if (dir === '') continue;
     for (const name of names) {
       const candidate = join(dir, name);
-      if (!isAbsolute(candidate) || !existsSync(candidate)) continue;
-      // MODEL execvp: the OS skips a non-EXECUTABLE PATH hit and keeps scanning, so
-      // we must too — otherwise a readable but non-executable `pnpm` (mode 0644)
-      // earlier on PATH would be classified "confirmed standalone" while spawn
-      // actually execs a LATER executable corepack shim, re-opening the COREPACK_ROOT
-      // oracle (codex round-17c).  access(X_OK) is exactly the check execvp uses; on
-      // win32 (Linux-gated host) it degrades to existence, which the `.cmd/.exe`
-      // name list already covers.
+      if (!isAbsolute(candidate)) continue;
+      // MODEL execvp #1 — only a regular FILE is exec'd.  A directory (or symlink to
+      // one) named `pnpm` passes both existence and access(X_OK) as a *searchable*
+      // dir, but execvp does NOT exec it: it fails (EACCES/EISDIR) and keeps scanning
+      // PATH.  We must skip it too — else a `<dir>/pnpm` before the real binary is
+      // returned, `isCorepackShim` readFileSync's it → EISDIR → fail-safe "managed",
+      // and a confirmed-standalone install is wrongly hijacked/refused while spawn
+      // actually runs the LATER standalone (codex round-17d).  statSync follows
+      // symlinks, so a symlink-to-file is kept and a symlink-to-dir is skipped; a
+      // missing/broken candidate throws → skip.
+      let st;
+      try {
+        st = statSync(candidate);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      // MODEL execvp #2 — the OS skips a non-EXECUTABLE PATH hit and keeps scanning,
+      // so we must too: a readable but non-executable `pnpm` (mode 0644) earlier on
+      // PATH would otherwise be classified "confirmed standalone" while spawn actually
+      // execs a LATER executable corepack shim, re-opening the COREPACK_ROOT oracle
+      // (codex round-17c).  access(X_OK) is exactly the check execvp uses; on win32
+      // (Linux-gated host) it degrades to existence, which the `.cmd/.exe` name list
+      // already covers.
       try {
         accessSync(candidate, fsConstants.X_OK);
       } catch {
