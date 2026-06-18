@@ -169,12 +169,22 @@ export function buildEffectiveConfig(
   }
 
   // `install: true` post-trust config parity: tell the guest it is running in
-  // drop-in install mode so buildChildEnv mirrors the host install's
-  // pnpm-only `--config.ignore-pnpmfile=true` into the Phase B lifecycle env
-  // (the lock is value-blind, so a divergent config value would otherwise let a
-  // dependency script run a different branch on the trusted host than was
-  // audited).  Only set when true so pure-audit config (and goldens) are
-  // byte-unchanged.
+  // drop-in install mode so buildChildEnv mirrors the host install's pnpm-only
+  // `--config.ignore-pnpmfile=true` / `--config.script-shell=/bin/sh` into the
+  // Phase B lifecycle env (the lock is value-blind, so a divergent config value
+  // would otherwise let a dependency script run a different branch on the
+  // trusted host than was audited).
+  //
+  // SECURITY: `install_mode` is HOST-OWNED state, NEVER repo-controllable.  The
+  // config object above is seeded from the user's `.script-jail.yml`, so a PR
+  // that writes `install_mode: true` would otherwise survive into a PURE-AUDIT
+  // run (where `input.installMode` is undefined) and flip the guest into the
+  // install-mode parity env — injecting the pnpm `npm_config_*` keys, changing
+  // pure-audit pnpm goldens, and bypassing the genuine `install: true` gate.
+  // Scrub any repo-supplied value FIRST, then set it ONLY from the trusted host
+  // input.  Deleting an absent key is a no-op, so non-pnpm / non-install repos
+  // stay byte-identical.
+  delete config['install_mode'];
   if (input.installMode === true) {
     config['install_mode'] = true;
   }

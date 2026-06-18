@@ -170,6 +170,41 @@ describe('buildEffectiveConfig', () => {
     expect(withMode['install_mode']).toBe(true);
   });
 
+  it('scrubs a repo-supplied install_mode:true on the pure-audit path (host-owned bit)', () => {
+    // SECURITY: a PR `.script-jail.yml` must NOT be able to flip the guest into
+    // install-mode parity (which injects pnpm npm_config_* env, changes pnpm
+    // goldens, and bypasses the install:true gate).  install_mode is host-owned:
+    // when the trusted host does NOT pass installMode, any repo value is dropped.
+    writeFileSync(userConfigPath, 'install_mode: true\nnode_version: 20\n', 'utf8');
+
+    const without = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(without['install_mode']).toBeUndefined();
+
+    // And the trusted host input still wins regardless of (mismatched) repo value.
+    writeFileSync(userConfigPath, 'install_mode: false\nnode_version: 20\n', 'utf8');
+    const withMode = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+          installMode: true,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(withMode['install_mode']).toBe(true);
+  });
+
   it('never mutates the user source file', () => {
     writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
     const before = readFileSync(userConfigPath, 'utf8');

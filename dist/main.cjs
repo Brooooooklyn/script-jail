@@ -27136,7 +27136,16 @@ function stripDangerousEnv(srcEnv) {
   else env["PATH"] = sanitizedPath;
   return env;
 }
-function hostInstallEnv(pm) {
+function lifecycleCacheParityEnv(pm, repoDir) {
+  if (pm === "npm") return { npm_config_cache: `${repoDir}/.npm-cache` };
+  if (pm === "yarn")
+    return {
+      YARN_GLOBAL_FOLDER: `${repoDir}/.yarn-global`,
+      YARN_CACHE_FOLDER: `${repoDir}/.yarn-cache`
+    };
+  return {};
+}
+function hostInstallEnv(pm, repoDir) {
   const env = stripDangerousEnv(process.env);
   for (const name of Object.keys(env)) {
     if (HOST_INSTALL_STRIP_ENV_NAMES.has(name) || name.startsWith("SCRIPT_JAIL_")) {
@@ -27154,6 +27163,7 @@ function hostInstallEnv(pm) {
     env["YARN_PLUGINS"] = "";
     env["YARN_ENABLE_CONSTRAINTS_CHECKS"] = "false";
   }
+  Object.assign(env, lifecycleCacheParityEnv(pm, repoDir));
   return env;
 }
 var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
@@ -27201,7 +27211,7 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn3 = captureSpawn) {
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
 }
 function redactCaptured(text, sensitive) {
   let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");
@@ -27329,7 +27339,7 @@ async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spa
     (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
 `);
   };
-  const r = await spawn3(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), onLine);
+  const r = await spawn3(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), onLine);
   const safeErrArgs = `${safeFinalArgs.join(" ")}${userArgSuffix}`;
   if (r.error !== void 0) {
     throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);
@@ -44386,6 +44396,7 @@ function buildEffectiveConfig(input) {
   if (input.workDirOverride !== void 0) {
     config2["work_dir"] = input.workDirOverride;
   }
+  delete config2["install_mode"];
   if (input.installMode === true) {
     config2["install_mode"] = true;
   }

@@ -800,7 +800,52 @@ export function stripDangerousEnv(srcEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
   return env;
 }
 
-function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
+/**
+ * Drop-in install cache/store-redirect PARITY (value-blind-lock close — sibling
+ * of the pnpm config→env mirror in buildChildEnv).
+ *
+ * buildChildEnv (src/guest/agent.ts cacheRedirectEnv) injects a manager-specific
+ * cache/store redirect into EVERY Phase-B lifecycle child to keep the package
+ * manager's cache off the VM's /root tmpfs (ENOSPC on ~1000-package monorepos),
+ * e.g. `npm_config_cache=<work_dir>/.npm-cache`.  The host install does not need
+ * that redirect (real runner disk) — but if it simply OMITS the var, the trusted
+ * host lifecycle child sees a DIFFERENT value (npm's default `~/.npm`) than the
+ * audited guest child (`<work_dir>/.npm-cache`).  The lock is value-blind
+ * (env-spy records env_read NAMEs only), so a dependency that branches on the
+ * value — `process.env.npm_config_cache.endsWith('.npm-cache') ? benign : evil`
+ * (or yarn: `process.env.YARN_CACHE_FOLDER ? benign : evil`) — runs benign() in
+ * the audit and evil() on the trusted host while the committed lock still
+ * matches.  Same class as the `npm_config_ignore_pnpmfile`/`script_shell` mirror.
+ *
+ * On the install:true FC/docker path the guest work_dir is pinned to the host
+ * `repoDir` (M1 cwd alignment, config-override workDirOverride), so mirroring the
+ * SAME repoDir-relative paths makes host child == guest child and closes the
+ * oracle.  Applied to BOTH host phases so the part-1 fetch and part-2
+ * rebuild/install share one cache dir (no double-download) — exactly like the
+ * guest's Phase A fetch + Phase B run.  This REPLACES any PR-inherited
+ * `npm_config_cache`/`YARN_*_FOLDER` (already stripped by stripDangerousEnv) with
+ * a trusted, checkout-relative value, so the PR can never redirect the cache.
+ *
+ * pnpm's store_dir is already mirrored via the `--store-dir <repoDir>/.pnpm-store`
+ * argument (pnpmStoreDirArg), which pnpm 10.x re-exports to the child as
+ * `npm_config_store_dir` and 11.x strips on both sides — so pnpm needs nothing here.
+ *
+ * RESIDUAL (documented, accepted — same bucket as the M1 os.hostname/marker/cwd
+ * residuals): on the bare / mac-bare backends the guest work_dir is a STAGED temp
+ * path != repoDir, so these values still diverge there.  Firecracker is the
+ * enforcement boundary; bare/mac-bare are best-effort/observe-only.
+ */
+function lifecycleCacheParityEnv(pm: Manager, repoDir: string): Record<string, string> {
+  if (pm === 'npm') return { npm_config_cache: `${repoDir}/.npm-cache` };
+  if (pm === 'yarn')
+    return {
+      YARN_GLOBAL_FOLDER: `${repoDir}/.yarn-global`,
+      YARN_CACHE_FOLDER: `${repoDir}/.yarn-cache`,
+    };
+  return {}; // pnpm: store_dir handled by the --store-dir flag (pnpmStoreDirArg)
+}
+
+function hostInstallEnv(pm: Manager, repoDir: string): NodeJS.ProcessEnv {
   // Drop dangerous selectors + sanitize PATH (shared with the bare backend), THEN
   // drop the sandbox-tell noise + SCRIPT_JAIL_* knobs, THEN layer the security pins
   // on top so a stripped name can never accidentally remove a pin.
@@ -851,6 +896,10 @@ function hostInstallEnv(pm: Manager): NodeJS.ProcessEnv {
     env['YARN_PLUGINS'] = '';
     env['YARN_ENABLE_CONSTRAINTS_CHECKS'] = 'false';
   }
+  // Drop-in install cache/store-redirect parity (value-blind-lock close): set the
+  // SAME repoDir-relative cache the guest injects, REPLACING any PR-inherited
+  // (already-stripped) value with a trusted one.  See lifecycleCacheParityEnv.
+  Object.assign(env, lifecycleCacheParityEnv(pm, repoDir));
   return env;
 }
 
@@ -987,7 +1036,7 @@ export function hostInstallNoScripts(
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
 }
 
 /** Mask user-arg values first (exact), then catch credential SHAPES. */
@@ -1318,7 +1367,7 @@ export async function hostRunScripts(
     safe = redactCredentialShapes(safe);
     (stream === 'stdout' ? io.stdout : io.stderr).write(`${safe}\n`);
   };
-  const r = await spawn(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm), onLine);
+  const r = await spawn(cmd.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir), onLine);
   // safeFinalArgs omits the user tokens (count-only suffix), so it is safe to
   // show in errors even though finalArgs now carries the npm user args (#19).
   const safeErrArgs = `${safeFinalArgs.join(' ')}${userArgSuffix}`;

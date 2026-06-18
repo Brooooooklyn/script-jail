@@ -24314,6 +24314,7 @@ function buildEffectiveConfig(input) {
   if (input.workDirOverride !== void 0) {
     config2["work_dir"] = input.workDirOverride;
   }
+  delete config2["install_mode"];
   if (input.installMode === true) {
     config2["install_mode"] = true;
   }

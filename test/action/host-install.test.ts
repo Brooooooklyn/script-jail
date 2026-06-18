@@ -190,6 +190,56 @@ describe('hostInstallNoScripts (part 1)', () => {
     }
   });
 
+  it('mirrors the guest cache/store redirect into the host lifecycle child (value-blind-lock close)', async () => {
+    // buildChildEnv (guest) injects npm_config_cache=<work_dir>/.npm-cache (npm) /
+    // YARN_CACHE_FOLDER+YARN_GLOBAL_FOLDER=<work_dir>/.yarn-* (yarn) into EVERY
+    // Phase-B lifecycle child.  On install:true FC/docker the guest work_dir is
+    // pinned to repoDir, so the host install must set the SAME repoDir-relative
+    // values — else a dep branching on the value (env-spy is value-blind) runs a
+    // different branch on the trusted host than was audited.  Both host phases.
+    function envCapture(): {
+      spawn: HostSpawn;
+      streamSpawn: HostStreamSpawn;
+      env: () => NodeJS.ProcessEnv;
+    } {
+      let seen: NodeJS.ProcessEnv = {};
+      return {
+        spawn: (_c, _a, _cwd, env) => { seen = env; return { status: 0 }; },
+        streamSpawn: async (_c, _a, _cwd, env) => { seen = env; return { status: 0, signal: null }; },
+        env: () => seen,
+      };
+    }
+    const REPO = '/work/checkout';
+
+    // npm: both phases set npm_config_cache=<repoDir>/.npm-cache (matches the guest
+    // cacheRedirectEnv npm branch); yarn/pnpm keys NOT present for npm.
+    const n1 = envCapture();
+    hostInstallNoScripts('npm', REPO, [], makeRecorder().io, n1.spawn);
+    expect(n1.env()['npm_config_cache']).toBe(`${REPO}/.npm-cache`);
+    const n2 = envCapture();
+    await hostRunScripts('npm', REPO, [], makeRecorder().io, [], n2.streamSpawn);
+    expect(n2.env()['npm_config_cache']).toBe(`${REPO}/.npm-cache`);
+    expect(n2.env()['YARN_CACHE_FOLDER']).toBeUndefined();
+
+    // yarn: both phases set the two folder redirects (matches the guest yarn branch).
+    const yA = envCapture();
+    hostInstallNoScripts('yarn', REPO, [], makeRecorder().io, yA.spawn);
+    expect(yA.env()['YARN_CACHE_FOLDER']).toBe(`${REPO}/.yarn-cache`);
+    expect(yA.env()['YARN_GLOBAL_FOLDER']).toBe(`${REPO}/.yarn-global`);
+    const yB = envCapture();
+    await hostRunScripts('yarn', REPO, [], makeRecorder().io, [], yB.streamSpawn);
+    expect(yB.env()['YARN_CACHE_FOLDER']).toBe(`${REPO}/.yarn-cache`);
+    expect(yB.env()['YARN_GLOBAL_FOLDER']).toBe(`${REPO}/.yarn-global`);
+    expect(yB.env()['npm_config_cache']).toBeUndefined();
+
+    // pnpm: NO env cache key here — store_dir parity is carried by the
+    // --store-dir <repoDir>/.pnpm-store ARGUMENT (pnpmStoreDirArg), not env.
+    const pB = envCapture();
+    await hostRunScripts('pnpm', REPO, [], makeRecorder().io, [], pB.streamSpawn);
+    expect(pB.env()['npm_config_cache']).toBeUndefined();
+    expect(pB.env()['YARN_CACHE_FOLDER']).toBeUndefined();
+  });
+
   it('drops the WHOLE inherited YARN_* config surface except auth (codex allowlist — YARN_INJECT_ENVIRONMENT_FILES etc.)', () => {
     // SECURITY: Yarn maps env->config and the surface is open-ended — enumerating
     // dangerous names is whack-a-mole (YARN_INJECT_ENVIRONMENT_FILES injects a .env
@@ -223,7 +273,17 @@ describe('hostInstallNoScripts (part 1)', () => {
     try {
       Object.assign(process.env, dangerous, auth);
       hostInstallNoScripts('yarn', '/repo', [], makeRecorder().io, spawn);
-      for (const k of Object.keys(dangerous)) expect(seen[k]).toBeUndefined(); // every non-auth YARN_* dropped (any case)
+      // Every non-auth inherited YARN_* dropped (any case).  EXCEPTION: the
+      // canonical YARN_GLOBAL_FOLDER is RE-SET to a trusted repoDir-relative
+      // cache-parity pin (value-blind-lock close, lifecycleCacheParityEnv), so it
+      // is no longer undefined — the PR's /checkout value is still NOT honored
+      // (trusted value wins), and the mixed-case inherited form stays dropped.
+      for (const k of Object.keys(dangerous)) {
+        if (k === 'YARN_GLOBAL_FOLDER') continue;
+        expect(seen[k]).toBeUndefined();
+      }
+      expect(seen['YARN_GLOBAL_FOLDER']).toBe('/repo/.yarn-global'); // trusted pin, NOT PR /checkout/.yarn
+      expect(seen['YARN_CACHE_FOLDER']).toBe('/repo/.yarn-cache'); // trusted cache-parity pin
       expect(seen['YARN_NPM_AUTH_TOKEN']).toBe('tok'); // auth/registry preserved
       expect(seen['YARN_NPM_AUTH_IDENT']).toBe('ident');
       expect(seen['YARN_NPM_REGISTRY_SERVER']).toBe('https://reg.example/');
@@ -272,7 +332,14 @@ describe('hostInstallNoScripts (part 1)', () => {
       Object.assign(process.env, keep, drop);
       hostInstallNoScripts('yarn', '/repo', [], makeRecorder().io, spawn);
       for (const [k, v] of Object.entries(keep)) expect(seen[k]).toBe(v); // routing keys survive
-      for (const k of Object.keys(drop)) expect(seen[k]).toBeUndefined(); // dangerous/weakening dropped
+      // dangerous/weakening dropped — EXCEPT YARN_GLOBAL_FOLDER, which is re-set to
+      // a trusted repoDir-relative cache-parity pin (the PR's /checkout/.yarn is
+      // still rejected; the trusted value wins).  See lifecycleCacheParityEnv.
+      for (const k of Object.keys(drop)) {
+        if (k === 'YARN_GLOBAL_FOLDER') continue;
+        expect(seen[k]).toBeUndefined();
+      }
+      expect(seen['YARN_GLOBAL_FOLDER']).toBe('/repo/.yarn-global'); // trusted pin, NOT PR /checkout/.yarn
     } finally {
       for (const [k, v] of Object.entries(prior)) {
         if (v === undefined) delete process.env[k];
