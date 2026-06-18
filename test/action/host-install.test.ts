@@ -783,19 +783,20 @@ describe('hostRunScripts (part 2)', () => {
     it('npm part-2 splices the sanitized dep-selection args (after base, before store-dir)', async () => {
       const rec = makeRecorder();
       await hostRunScripts('npm', '/repo', ['--omit=dev', '-D'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
-      // npm has no store-dir; host-hardening = `--no-node-options` (#43) at the end.
-      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '-D', '--no-node-options']);
-      // Lockstep invariant: the spliced suffix is exactly sanitizeInstallArgs(args).kept,
-      // sitting between the base (2 tokens) and the trailing --no-node-options hardening.
+      // npm has no store-dir; the base carries --no-node-options (#43, shared
+      // INSTALL_CMD) before the spliced user args.
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options', '--omit=dev', '-D']);
+      // Lockstep invariant: the spliced suffix is exactly sanitizeInstallArgs(args).kept
+      // (the trailing tokens — store-dir/host-hardening are empty for npm).
       const { kept } = sanitizeInstallArgs(['--omit=dev', '-D']);
-      expect(rec.calls[0]!.args.slice(2, 2 + kept.length)).toEqual(kept);
+      expect(rec.calls[0]!.args.slice(-kept.length)).toEqual(kept);
     });
 
     it('npm part-2 DROPS a script-re-enabling / unsafe arg (same allowlist as part-1)', async () => {
       const rec = makeRecorder();
       // `--ignore-scripts false` and a positional are NOT on the allowlist → dropped.
       await hostRunScripts('npm', '/repo', ['--ignore-scripts', 'false', '--omit=dev'], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
-      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '--no-node-options']);
+      expect(rec.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options', '--omit=dev']);
       expect(rec.calls[0]!.args).not.toContain('--ignore-scripts');
     });
 
@@ -1015,8 +1016,8 @@ describe('host part-2 direct-launch (COREPACK_ROOT oracle close)', () => {
     expect(call.cmd).toBe(process.execPath);
     expect(call.args[0]).toBe(launch.entry);
     // #19: npm part-2 keeps the sanitized dep-selection user args after the base;
-    // #43: the --no-node-options hardening trails them (direct-launch carries it too).
-    expect(call.args.slice(1)).toEqual(['rebuild', '--foreground-scripts', '--omit=dev', '--no-node-options']);
+    // #43: --no-node-options is in the shared base (direct-launch carries it too).
+    expect(call.args.slice(1)).toEqual(['rebuild', '--foreground-scripts', '--no-node-options', '--omit=dev']);
   });
 
   it('standalone PM (resolver → undefined) → bare-launch unchanged (regression guard)', async () => {
@@ -2072,18 +2073,19 @@ describe('home ~/.npmrc script-shell defense (#26)', () => {
     }
   });
 
-  // #43 — npm sibling of the #26 home-npmrc class.  npm re-derives `node-options`
-  // from $HOME/.npmrc and re-exports NODE_OPTIONS into the lifecycle child; the
-  // clean-VM audit (HOME=/root) never honors it, so a `node-options=--require <path>`
-  // is an audit-blind host RCE post-trust.  `--no-node-options` (npm-native) clears
-  // it for the part-2 lifecycle run; empty env pins do NOT (the file wins).  npm-only
-  // (mirrors the npm-scoped script-shell pin); command-local so the guest is untouched.
-  it('part-2 npm rebuild appends --no-node-options (#43 home-npmrc node-options close)', async () => {
+  // #43 — npm re-derives `node-options` from the home AND project npmrc and exports
+  // it to lifecycle scripts as the child NODE_OPTIONS *and* the npm_config_node_options
+  // env value.  --no-node-options neutralizes both.  It rides the SHARED INSTALL_CMD.npm
+  // (NOT a host-only flag) so host part-2 and guest Phase B carry it byte-identically —
+  // a host-only flag would diverge npm_config_node_options (value-blind oracle).  Here
+  // we assert the host part-2 path surfaces it right after the base; guest lockstep is
+  // covered by the INSTALL_CMD + phase-install tests.
+  it('part-2 npm rebuild carries --no-node-options from the shared base (#43 node-options close)', async () => {
     const rec = makeRecorder();
     await hostRunScripts('npm', '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
     expect(rec.calls[0]?.args).toContain('--no-node-options');
-    // Last token: the hardening trails the base (and any spliced user args).
-    expect(rec.calls[0]?.args.at(-1)).toBe('--no-node-options');
+    // In the base, immediately after --foreground-scripts (before any user args).
+    expect(rec.calls[0]?.args.slice(0, 3)).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
   });
 
   it('part-2 does NOT add --no-node-options for pnpm/yarn (npm-scoped)', async () => {

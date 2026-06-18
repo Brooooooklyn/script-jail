@@ -2,9 +2,9 @@
 // Injects a mock Spawner; no real processes are spawned.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 import { runFetchPhase, type Spawner, type PhaseFetchInput } from '../../src/guest/phase-fetch.js';
 
@@ -193,7 +193,8 @@ describe('runFetchPhase', () => {
       // assert the pin resolves to that absolute path (not the bare literal).
       const binDir = mkdtempSync(join(tmpdir(), 'script-jail-guest-git-'));
       const gitPath = join(binDir, 'git');
-      writeFileSync(gitPath, '#!/bin/sh\n');
+      // Executable: #45 models execvp, so only a regular EXECUTABLE file resolves.
+      writeFileSync(gitPath, '#!/bin/sh\n', { mode: 0o755 });
       const prevPath = process.env['PATH'];
       try {
         process.env['PATH'] = binDir;
@@ -210,6 +211,54 @@ describe('runFetchPhase', () => {
         if (prevPath === undefined) delete process.env['PATH'];
         else process.env['PATH'] = prevPath;
         rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+
+    it('SKIPS a DIRECTORY named git and continues to the real binary (#45, execvp file-type)', async () => {
+      // A directory named `git` passes existence but execvp does not exec it — keep
+      // scanning PATH.  Without the isFile() guard it was returned and pinned.
+      const early = mkdtempSync(join(tmpdir(), 'script-jail-guest-gitdir-'));
+      mkdirSync(join(early, 'git')); // a DIRECTORY, not a file
+      const real = mkdtempSync(join(tmpdir(), 'script-jail-guest-realgit-'));
+      const realGit = join(real, 'git');
+      writeFileSync(realGit, '#!/bin/sh\n', { mode: 0o755 });
+      const prevPath = process.env['PATH'];
+      const cwd = mkdtempSync(join(tmpdir(), 'script-jail-guest-repo-'));
+      try {
+        process.env['PATH'] = `${early}${delimiter}${real}`;
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager: 'npm', cwd, env: { PATH: `${early}${delimiter}${real}` }, spawner });
+        expect(calls[0]!.opts.env['npm_config_git']).toBe(realGit);
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(early, { recursive: true, force: true });
+        rmSync(real, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('SKIPS a NON-EXECUTABLE git and continues to the real binary (#45, execvp X_OK)', async () => {
+      // mode 0644 git is skipped by execvp; access(X_OK) makes the scan fall through.
+      if (process.platform === 'win32') return; // X_OK degrades to existence on win32
+      const early = mkdtempSync(join(tmpdir(), 'script-jail-guest-gitnox-'));
+      writeFileSync(join(early, 'git'), '#!/bin/sh\n', { mode: 0o644 }); // NOT executable
+      const real = mkdtempSync(join(tmpdir(), 'script-jail-guest-realgit-'));
+      const realGit = join(real, 'git');
+      writeFileSync(realGit, '#!/bin/sh\n', { mode: 0o755 });
+      const prevPath = process.env['PATH'];
+      const cwd = mkdtempSync(join(tmpdir(), 'script-jail-guest-repo-'));
+      try {
+        process.env['PATH'] = `${early}${delimiter}${real}`;
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager: 'npm', cwd, env: { PATH: `${early}${delimiter}${real}` }, spawner });
+        expect(calls[0]!.opts.env['npm_config_git']).toBe(realGit);
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(early, { recursive: true, force: true });
+        rmSync(real, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
       }
     });
 

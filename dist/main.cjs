@@ -26445,7 +26445,23 @@ var FETCH_CMD = {
   yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
 };
 var INSTALL_CMD = {
-  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
+  // SECURITY (#43, home/project-npmrc node-options): npm re-derives `node-options`
+  // from the EFFECTIVE npm config (userconfig $HOME/.npmrc AND the project
+  // repoDir/.npmrc, the latter PR-controlled + staged into the sandbox) and exports
+  // it to lifecycle scripts as both the child `NODE_OPTIONS` and the
+  // `npm_config_node_options` env value.  `--no-node-options` neutralizes BOTH on
+  // EVERY Phase-B site at once (this is the shared, lockstep source): the trusted
+  // host never honors an audit-blind home-npmrc `--require <path>` (the host has no
+  // shim to overwrite NODE_OPTIONS), and host+guest export an IDENTICAL empty
+  // `npm_config_node_options` so a script branching on that env value cannot diverge
+  // (env-spy records the NAME only — a host-only flag would be a value-blind oracle).
+  // It MUST live here, not in a host-only hardening list, precisely to keep the host
+  // and guest argv byte-identical.  Guest instrumentation is unaffected: the JS
+  // preloads ride the LD_PRELOAD shim's exec-time NODE_OPTIONS rewrite, not npm's
+  // node-options passthrough.  Verified npm 11.13.0: an empty NODE_OPTIONS /
+  // npm_config_node_options ENV pin does NOT override the npmrc file, but
+  // `--no-node-options` does, and it preserves the npmrc's registry/auth.
+  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts", "--no-node-options"] },
   pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
   // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
   // exit 1, zero events). Offline is enforced by the Phase-B network-namespace
@@ -27481,7 +27497,7 @@ function resolveHostManagerLaunch(pm, repoDir, procEnv = process.env, execPath =
 }
 async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn, resolveLaunch = resolveHostManagerLaunch) {
   const cmd = INSTALL_CMD[pm];
-  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : pm === "npm" ? ["--no-node-options"] : [];
+  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : [];
   const { kept } = sanitizeInstallArgs(args);
   const userArgs = pm === "npm" ? kept : [];
   const finalArgs = [...cmd.args, ...userArgs, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];

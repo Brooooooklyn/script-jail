@@ -158,7 +158,9 @@ describe('runInstallPhase', () => {
 
       expect(calls).toHaveLength(1);
       expect(calls[0]!.cmd).toBe('npm');
-      expect(calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
+      // #43: --no-node-options rides the shared INSTALL_CMD.npm — the guest Phase B
+      // carries it byte-identically with host part-2 (npm_config_node_options parity).
+      expect(calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
     });
 
     it('pnpm → pnpm rebuild --pending --config.side-effects-cache=false --store-dir=<cwd>/.pnpm-store', async () => {
@@ -253,8 +255,8 @@ describe('runInstallPhase', () => {
       expect(calls).toHaveLength(1);
       expect(calls[0]!.cmd).toBe('npm');
       expect(calls[0]!.args).toEqual(['run', 'prepare', '--if-present', '--foreground-scripts']);
-      // Crucially NOT the install command.
-      expect(calls[0]!.args).not.toEqual(['rebuild', '--foreground-scripts']);
+      // Crucially NOT the install command (the shared base, incl. --no-node-options).
+      expect(calls[0]!.args).not.toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
     });
 
     it('commandOverride still splices the pnpm store-dir (manager-keyed, not command-keyed)', async () => {
@@ -375,7 +377,7 @@ describe('runInstallPhase', () => {
     it('npm Phase B splices userInstallArgs (after base, before store-dir) — host part-2 parity', async () => {
       // npm has no store-dir, so args = base + userInstallArgs.
       expect(await runWithUserArgs('npm', ['--omit=dev', '-D'])).toEqual([
-        'rebuild', '--foreground-scripts', '--omit=dev', '-D',
+        'rebuild', '--foreground-scripts', '--no-node-options', '--omit=dev', '-D',
       ]);
     });
 
@@ -395,8 +397,8 @@ describe('runInstallPhase', () => {
       ).toEqual(['run', 'prepare', '--if-present']);
     });
 
-    it('npm Phase B with empty userInstallArgs is byte-identical to before', async () => {
-      expect(await runWithUserArgs('npm', [])).toEqual(['rebuild', '--foreground-scripts']);
+    it('npm Phase B with empty userInstallArgs is the base command (incl. --no-node-options)', async () => {
+      expect(await runWithUserArgs('npm', [])).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
     });
   });
 

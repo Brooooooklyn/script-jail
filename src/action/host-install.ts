@@ -1747,31 +1747,16 @@ export async function hostRunScripts(
   // already runs with the default /bin/sh + /root HOME, so this is parity-correct.  (The
   // repo-pinned pnpm 11.1.2 ignores the rc key entirely and `pnpm rebuild` never honored it
   // even on pnpm 10 — this is defense-in-depth for a consumer pinning pnpm <= 10.)
-  // SECURITY (home-npmrc node-options, #43 — npm sibling of the #26 script-shell
-  // class): npm re-derives `node-options` from the runner's `$HOME/.npmrc`
-  // userconfig and re-exports it as `NODE_OPTIONS` into the lifecycle child
-  // `npm rebuild --foreground-scripts` spawns.  A `node-options=--require <path>`
-  // there runs attacker-chosen code on the HOST post-trust, while the clean-VM
-  // audit uses HOME=/root (no such rc) and force-sets its own NODE_OPTIONS for
-  // instrumentation — so the redirect is audit-BLIND (clean lock, host RCE),
-  // exactly the #26 home-npmrc divergence for a different key.  The env-level pins
-  // this file already applies do NOT close it: npm treats an EMPTY env value
-  // (`NODE_OPTIONS=''` / `npm_config_node_options=''`) as LOWER precedence than the
-  // userconfig FILE, so an empty pin silently leaves the file value effective
-  // (VERIFIED npm 11.13.0).  The npm-native `--no-node-options` flag DOES win (child
-  // `NODE_OPTIONS` unset) and PRESERVES the home npmrc's registry/auth/TLS (VERIFIED:
-  // `@scope:registry` + `_authToken` still read), so it is parity-correct (the host
-  // child ends with no NODE_OPTIONS; the guest child's `--require=<preload>` is the
-  // already-documented irreducible instrument residual, not a new divergence) and
-  // breaks no legit consumer.  HOST-ONLY + command-local (same posture as the pnpm
-  // `--config.script-shell` pin): the guest Phase B is unaffected, so this lives here,
-  // NOT in the shared INSTALL_CMD.
+  // NOTE (#43 home/project-npmrc node-options): the npm-side neutralizer
+  // `--no-node-options` is NOT here — it lives in the SHARED `INSTALL_CMD.npm`
+  // (src/shared/pm-commands.ts) so the host part-2 and the guest Phase B carry it
+  // byte-identically.  A host-ONLY flag would change `npm_config_node_options`
+  // for lifecycle scripts on the host but not the audit, re-opening a value-blind
+  // oracle (env-spy records the env NAME only) — see the INSTALL_CMD comment.
+  // Only the genuinely host-vs-audit-ASYMMETRIC pnpm pins stay command-local here
+  // (the guest MUST keep the pnpmfile/script-shell so it AUDITS them).
   const hostHardening =
-    pm === 'pnpm'
-      ? ['--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh']
-      : pm === 'npm'
-        ? ['--no-node-options']
-        : [];
+    pm === 'pnpm' ? ['--config.ignore-pnpmfile=true', '--config.script-shell=/bin/sh'] : [];
   // #19 FIDELITY (npm-only): re-pass the developer dep-selection args to part-2
   // so a lifecycle script run by `npm rebuild` sees the SAME NODE_ENV/omit env it
   // would under the single-phase `npm ci --omit=dev` this two-phase model

@@ -1268,9 +1268,9 @@ describe('agent main() root-prepare second pass', () => {
     expect(prep.calls).toHaveLength(1);
     expect(prep.calls[0]!.cmd).toBe('npm');
     expect(prep.calls[0]!.args).toEqual(['run', 'prepare', '--if-present', '--foreground-scripts']);
-    // The main install runner ran the install command.
+    // The main install runner ran the install command (#43: shared base carries --no-node-options).
     expect(main_.calls).toHaveLength(1);
-    expect(main_.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts']);
+    expect(main_.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
 
     const lines = getOutput().split('\n').filter((l) => l.trim());
     const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);

@@ -62,7 +62,7 @@
 //   All three overlay files are OPTIONAL. Absence is the normal action and
 //   CLI path after the switch to arm64 CI parity.
 
-import { existsSync } from 'node:fs';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
 import { FETCH_CMD, pnpmStoreDirArg } from '../shared/pm-commands.js';
@@ -138,7 +138,27 @@ function trustedGuestGit(cwd: string): string {
       // repo-placed shadow `git`.
       if (!isAbsolute(candidate)) continue;
       if (candidate === repo || candidate.startsWith(repo + '/')) continue;
-      if (existsSync(candidate)) return candidate;
+      // MODEL execvp (#45, mirror the host twin resolveGitFromPath + resolveBareOnPath,
+      // round-17c/17d): npm execs npm_config_git as a bare-name resolution, so only a
+      // regular, EXECUTABLE file is a real hit.  A DIRECTORY or NON-EXECUTABLE file named
+      // `git` earlier on PATH is skipped by execvp (it keeps scanning); existsSync alone
+      // returned it and pinned it, failing a git: dep clone that would otherwise fall
+      // through to the real git.  statSync follows symlinks; a missing candidate throws →
+      // skip.  Robustness only: the guest PATH is curated (no checkout dir), and the host
+      // twin fails identically, so there is no audit-vs-host divergence.
+      let st;
+      try {
+        st = statSync(candidate);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+      } catch {
+        continue;
+      }
+      return candidate;
     }
   }
   // No git outside the repo on PATH — fall back to the bare literal.  It still

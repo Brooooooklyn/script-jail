@@ -20,7 +20,10 @@ describe('FETCH_CMD / INSTALL_CMD tables', () => {
   });
 
   it('INSTALL_CMD runs the deferred scripts and yarn has no --offline', () => {
-    expect(INSTALL_CMD.npm).toEqual({ cmd: 'npm', args: ['rebuild', '--foreground-scripts'] });
+    // #43: --no-node-options rides the shared base so host + guest Phase B carry it
+    // byte-identically (neutralizes home/project-npmrc node-options on both sides).
+    expect(INSTALL_CMD.npm).toEqual({ cmd: 'npm', args: ['rebuild', '--foreground-scripts', '--no-node-options'] });
+    expect(INSTALL_CMD.npm.args).toContain('--no-node-options');
     expect(INSTALL_CMD.pnpm.args).toContain('--pending');
     expect(INSTALL_CMD.yarn.args).toEqual(['install', '--immutable']);
     expect(INSTALL_CMD.yarn.args).not.toContain('--offline');
