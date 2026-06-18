@@ -31047,7 +31047,39 @@ function diag(input, msg) {
 }
 function resolvePrepareCommand(manager, cwd) {
   if (manager === "npm") {
-    return { cmd: "npm", args: ["run", "prepare", "--if-present", "--foreground-scripts"] };
+    const single = {
+      cmd: "npm",
+      args: ["run", "prepare", "--if-present", "--foreground-scripts"]
+    };
+    let scripts;
+    try {
+      const pkgRaw = (0, import_node_fs5.readFileSync)((0, import_node_path6.join)(cwd, "package.json"), "utf8");
+      const pkg = JSON.parse(pkgRaw);
+      scripts = pkg.scripts;
+    } catch {
+      return [single];
+    }
+    const hasScript = (name) => {
+      const v = scripts?.[name];
+      return typeof v === "string" && v.length > 0;
+    };
+    if (hasScript("prepare")) {
+      return [single];
+    }
+    const cmds = [single];
+    if (hasScript("preprepare")) {
+      cmds.push({
+        cmd: "npm",
+        args: ["run", "preprepare", "--if-present", "--foreground-scripts"]
+      });
+    }
+    if (hasScript("postprepare")) {
+      cmds.push({
+        cmd: "npm",
+        args: ["run", "postprepare", "--if-present", "--foreground-scripts"]
+      });
+    }
+    return cmds;
   }
   if (manager === "yarn") {
     try {
@@ -31055,14 +31087,14 @@ function resolvePrepareCommand(manager, cwd) {
       const pkg = JSON.parse(pkgRaw);
       const prepare = pkg.scripts?.["prepare"];
       if (typeof prepare === "string" && prepare.length > 0) {
-        return { cmd: "yarn", args: ["run", "prepare"] };
+        return [{ cmd: "yarn", args: ["run", "prepare"] }];
       }
     } catch {
-      return null;
+      return [];
     }
-    return null;
+    return [];
   }
-  return null;
+  return [];
 }
 function createSensitiveRedactor(protectedEnvNames, env = process.env) {
   const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
@@ -31365,116 +31397,120 @@ ${stdoutTail}`;
       false
     );
   }
-  const prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
-  if (prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true)) {
-    diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
-    let prepareRunner;
-    let prepareEventsFilePath = eventsFilePath;
-    if (input.prepareStrace !== void 0) {
-      prepareRunner = input.prepareStrace;
-    } else {
-      let pf;
-      try {
-        pf = makeEventsFile();
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
+  const prepareCommands = resolvePrepareCommand(manager, config2.work_dir);
+  if (prepareCommands.length > 0 && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true)) {
+    for (let prepareIdx = 0; prepareIdx < prepareCommands.length; prepareIdx++) {
+      const prepareCommand = prepareCommands[prepareIdx];
+      diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
+      let prepareRunner;
+      let prepareEventsFilePath = eventsFilePath;
+      if (input.prepareStrace !== void 0) {
+        prepareRunner = input.prepareStrace;
+      } else {
+        let pf;
+        try {
+          pf = makeEventsFile();
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          emitter.emitError(
+            `script-jail agent: failed to create the audit-events file for the root-prepare pass \u2014 ${reason}. Refusing to emit a lockfile: the root \`prepare\` script would otherwise run UNAUDITED and a clean diff against it would be untrustworthy.`,
+            true
+          );
+          flushAndExit(input.connection.writable, 1);
+          return;
+        }
+        prepareEventsFilePath = pf.path;
+        prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf, lineRedactor) : new LinuxStraceRunner(void 0, pf, lineRedactor, stdoutTailBytes);
+      }
+      const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
+      const prepareEnv = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
+      const preparingEmitter = new Emitter(
+        new class extends import_node_stream.Writable {
+          _write(chunk, _enc, cb) {
+            const line = chunk.toString();
+            let frame;
+            try {
+              frame = JSON.parse(line);
+            } catch {
+              cb();
+              return;
+            }
+            if (frame["kind"] === "event") {
+              const raw = frame["raw"];
+              const forcedPkg = canonicalRootKey ?? frame["pkg"];
+              const forcedLifecycle = "prepare";
+              if (canonicalRootKey !== null && (raw.kind === "read" || raw.kind === "write" || raw.kind === "spawn" || raw.kind === "connect" || raw.kind === "env_read" || raw.kind === "env_tamper")) {
+                raw.root_anchored = true;
+              }
+              const forcedFrame = {
+                ...frame,
+                pkg: forcedPkg,
+                lifecycle: forcedLifecycle,
+                raw
+              };
+              const forcedLine = `${JSON.stringify(forcedFrame)}
+`;
+              input.connection.writable.write(forcedLine);
+              collectedEvents.push({
+                raw,
+                pkg: forcedPkg,
+                lifecycle: forcedLifecycle
+              });
+            } else {
+              input.connection.writable.write(line);
+            }
+            cb();
+          }
+        }()
+      );
+      const preparePhaseEnv = managerLaunch !== void 0 ? envWithoutCorepackHome(prepareEnv) : prepareEnv;
+      const prepareInput = {
+        manager,
+        cwd: config2.work_dir,
+        env: preparePhaseEnv,
+        ...managerLaunch !== void 0 ? { managerLaunch } : {},
+        strace: prepareRunner,
+        attribution,
+        emitter: preparingEmitter,
+        // A DIFFERENT strace base path per pass so per-pid `-ff` logs don't collide
+        // with the main install's files NOR with a sibling wrapper pass's files on
+        // the scratch disk.
+        straceBasePath: `${straceBaseDir}/strace-prepare-${prepareIdx}.out`,
+        protectedPaths,
+        rootPkgKeys,
+        // Nameless root: its prepare-pass lifecycle pids surface under `<repo-root>`
+        // via the attribution layer (shim fast-path threaded with this sentinel; on
+        // Linux the shared Attribution instance already carries it).  The
+        // preparingEmitter then re-stamps lifecycle = 'prepare' + root_anchored.
+        // Conditionally spread (omitted, not undefined) for a named/absent root —
+        // see the installInput note above.
+        ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {},
+        commandOverride: prepareCommand
+      };
+      const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
+      diag(
+        input,
+        `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
+      );
+      if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
         emitter.emitError(
-          `script-jail agent: failed to create the audit-events file for the root-prepare pass \u2014 ${reason}. Refusing to emit a lockfile: the root \`prepare\` script would otherwise run UNAUDITED and a clean diff against it would be untrustworthy.`,
+          `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) and produced no audit events \u2014 the root \`prepare\` script likely ran untraced (strace could not attach) or the package manager aborted before spawning it. Refusing to emit a lockfile: the root \`prepare\` would be unaudited and a clean diff against it would be untrustworthy.`,
           true
         );
         flushAndExit(input.connection.writable, 1);
         return;
       }
-      prepareEventsFilePath = pf.path;
-      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf, lineRedactor) : new LinuxStraceRunner(void 0, pf, lineRedactor, stdoutTailBytes);
-    }
-    const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
-    const prepareEnv = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
-    const preparingEmitter = new Emitter(
-      new class extends import_node_stream.Writable {
-        _write(chunk, _enc, cb) {
-          const line = chunk.toString();
-          let frame;
-          try {
-            frame = JSON.parse(line);
-          } catch {
-            cb();
-            return;
-          }
-          if (frame["kind"] === "event") {
-            const raw = frame["raw"];
-            const forcedPkg = canonicalRootKey ?? frame["pkg"];
-            const forcedLifecycle = "prepare";
-            if (canonicalRootKey !== null && (raw.kind === "read" || raw.kind === "write" || raw.kind === "spawn" || raw.kind === "connect" || raw.kind === "env_read" || raw.kind === "env_tamper")) {
-              raw.root_anchored = true;
-            }
-            const forcedFrame = {
-              ...frame,
-              pkg: forcedPkg,
-              lifecycle: forcedLifecycle,
-              raw
-            };
-            const forcedLine = `${JSON.stringify(forcedFrame)}
-`;
-            input.connection.writable.write(forcedLine);
-            collectedEvents.push({
-              raw,
-              pkg: forcedPkg,
-              lifecycle: forcedLifecycle
-            });
-          } else {
-            input.connection.writable.write(line);
-          }
-          cb();
-        }
-      }()
-    );
-    const preparePhaseEnv = managerLaunch !== void 0 ? envWithoutCorepackHome(prepareEnv) : prepareEnv;
-    const prepareInput = {
-      manager,
-      cwd: config2.work_dir,
-      env: preparePhaseEnv,
-      ...managerLaunch !== void 0 ? { managerLaunch } : {},
-      strace: prepareRunner,
-      attribution,
-      emitter: preparingEmitter,
-      // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
-      // the main install's files on the scratch disk.
-      straceBasePath: `${straceBaseDir}/strace-prepare.out`,
-      protectedPaths,
-      rootPkgKeys,
-      // Nameless root: its prepare-pass lifecycle pids surface under `<repo-root>`
-      // via the attribution layer (shim fast-path threaded with this sentinel; on
-      // Linux the shared Attribution instance already carries it).  The
-      // preparingEmitter then re-stamps lifecycle = 'prepare' + root_anchored.
-      // Conditionally spread (omitted, not undefined) for a named/absent root —
-      // see the installInput note above.
-      ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {},
-      commandOverride: prepareCommand
-    };
-    const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
-    diag(
-      input,
-      `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
-    );
-    if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
-      emitter.emitError(
-        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) and produced no audit events \u2014 the root \`prepare\` script likely ran untraced (strace could not attach) or the package manager aborted before spawning it. Refusing to emit a lockfile: the root \`prepare\` would be unaudited and a clean diff against it would be untrustworthy.`,
-        true
-      );
-      flushAndExit(input.connection.writable, 1);
-      return;
-    }
-    if (prepareResult.exitCode !== 0) {
-      emitter.emitError(
-        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) \u2014 the root \`prepare\` script failed under audit. This is recorded in the lockfile, not treated as a fatal error.`,
-        false
-      );
-    }
-    installResult.eventCount += prepareResult.eventCount;
-    const prepareTamper = prepareResult.tamperReason ?? prepareRunner.getTamperReason();
-    if (installResult.tamperReason === null) {
-      installResult.tamperReason = prepareTamper;
+      if (prepareResult.exitCode !== 0) {
+        emitter.emitError(
+          `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) \u2014 the root \`prepare\` script failed under audit. This is recorded in the lockfile, not treated as a fatal error.`,
+          false
+        );
+      }
+      installResult.eventCount += prepareResult.eventCount;
+      const prepareTamper = prepareResult.tamperReason ?? prepareRunner.getTamperReason();
+      if (installResult.tamperReason === null) {
+        installResult.tamperReason = prepareTamper;
+      }
     }
   }
   const tamperReason = installResult.tamperReason ?? straceRunner.getTamperReason();
