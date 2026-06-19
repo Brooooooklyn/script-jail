@@ -45167,7 +45167,6 @@ function createDockerBackend(deps = {}) {
           // NOT exported here — see the note at the `-e` flag (#31).
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
-        const debugDeferredOpenArgs = env["SCRIPT_JAIL_DEBUG_DEFERRED_OPEN"] === "1" ? ["-e", "SCRIPT_JAIL_DEBUG_DEFERRED_OPEN=1"] : [];
         return await doRunAgentProcess({
           cmd: "docker",
           args: [
@@ -45183,7 +45182,6 @@ function createDockerBackend(deps = {}) {
             `${staged.path}:${workDir}`,
             "-v",
             `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
-            ...debugDeferredOpenArgs,
             // The host-owned pm-flags sidecar is staged in the repo tree at
             // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it into
             // /etc the way Firecracker's init does).  Point the guest at it so the

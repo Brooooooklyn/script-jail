@@ -27221,8 +27221,6 @@ async function runInstallPhase(input) {
   const pidCloneTimeCwd = /* @__PURE__ */ new Map();
   const childSeedCloneTs = /* @__PURE__ */ new Map();
   const deferredRelOpens = [];
-  const debugCapture = process.env["SCRIPT_JAIL_DEBUG_DEFERRED_OPEN"] === "1";
-  const debugPkgJsonReads = [];
   const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
   function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
     const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
@@ -28498,16 +28496,6 @@ async function runInstallPhase(input) {
           continue;
         }
         const result = input.attribution.attribute(rawEvent.pid);
-        if (debugCapture && (rawEvent.kind === "read" || rawEvent.kind === "write") && /(^|\/)package\.json$/.test(rawEvent.path)) {
-          debugPkgJsonReads.push({
-            pid: rawEvent.pid,
-            path: rawEvent.path,
-            ts: rawEvent.ts,
-            kind: rawEvent.kind,
-            pkg: result?.pkg ?? null,
-            lifecycle: result?.lifecycle ?? null
-          });
-        }
         if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.errno === void 0 && rawEvent.retFd !== void 0) {
           const canonicalForFd = canonicalizeOpenTarget(
             rawEvent.pid,
@@ -28804,54 +28792,6 @@ async function runInstallPhase(input) {
         canonical = path2.resolve(initial, d.rawEvent.path);
       }
     }
-    if (process.env["SCRIPT_JAIL_DEBUG_DEFERRED_OPEN"] === "1" && /(^|\/)package\.json$/.test(d.rawEvent.path)) {
-      const dchain = [];
-      let dprev = P;
-      let da = d.seedParentPid;
-      let dguard = 0;
-      const dseen = /* @__PURE__ */ new Set();
-      while (da !== void 0 && dguard++ < 64 && !dseen.has(da)) {
-        dseen.add(da);
-        dchain.push({
-          a: da,
-          cloneOf: dprev,
-          firstMut: firstCwdMutationTs.get(da) ?? null,
-          lastMut: lastCwdMutationTs.get(da) ?? null,
-          seedTs: childSeedCloneTs.get(dprev) ?? null,
-          cloneCwd: pidCloneTimeCwd.get(da) ?? null,
-          curCwd: cwdGet(da) ?? null,
-          everShared: everCwdShared.has(da),
-          reused: childParentReused.has(da)
-        });
-        dprev = da;
-        da = childParent.get(da);
-      }
-      try {
-        process.stderr.write(
-          "[sj-deferred-open] " + JSON.stringify({
-            pid: P,
-            path: d.rawEvent.path,
-            ts: d.rawEvent.ts,
-            kind: d.rawEvent.kind,
-            pkg,
-            lifecycle,
-            stamped: d.stamped === true,
-            seedParentPid: d.seedParentPid ?? null,
-            initialCwdStamped: d.initialCwd ?? null,
-            initialAfterWalk: initial ?? null,
-            cloneFsSeed: d.cloneFsSeed === true,
-            dSharedAtRead: d.sharedAtRead === true,
-            childPidReuseHidCloneFs,
-            lineageEverCwdShared: d.seedParentPid !== void 0 ? lineageEverCwdShared(d.seedParentPid) : null,
-            sharedAtRead,
-            willResolve: canonical !== null,
-            chainReachedEnd: da === void 0,
-            chain: dchain
-          }) + "\n"
-        );
-      } catch {
-      }
-    }
     if (canonical !== null) {
       if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
         continue;
@@ -28893,84 +28833,6 @@ async function runInstallPhase(input) {
     }
   }
   deferredRelOpens.length = 0;
-  if (debugCapture) {
-    const distinctPkgs = /* @__PURE__ */ new Set();
-    for (const r of debugPkgJsonReads) distinctPkgs.add(r.pkg ?? "<null>");
-    try {
-      process.stderr.write(
-        "[sj-pkgjson-summary] " + JSON.stringify({
-          total: debugPkgJsonReads.length,
-          distinctPkgs: Array.from(distinctPkgs).sort()
-        }) + "\n"
-      );
-    } catch {
-    }
-    let dumped = 0;
-    let skipped = 0;
-    for (const r of debugPkgJsonReads) {
-      if (!/unrs|napi|resolver|postinstall/i.test(r.pkg ?? "") && r.pkg !== null) {
-        skipped++;
-        continue;
-      }
-      if (dumped >= 80) {
-        skipped++;
-        continue;
-      }
-      dumped++;
-      const chain = [];
-      let prev = r.pid;
-      let a = childParent.get(r.pid);
-      let guard = 0;
-      const seen = /* @__PURE__ */ new Set();
-      while (a !== void 0 && guard++ < 64 && !seen.has(a)) {
-        seen.add(a);
-        chain.push({
-          a,
-          cloneOf: prev,
-          firstMut: firstCwdMutationTs.get(a) ?? null,
-          lastMut: lastCwdMutationTs.get(a) ?? null,
-          seedTs: childSeedCloneTs.get(prev) ?? null,
-          cloneCwd: pidCloneTimeCwd.get(a) ?? null,
-          curCwd: cwdGet(a) ?? null,
-          everShared: everCwdShared.has(a),
-          reused: childParentReused.has(a)
-        });
-        prev = a;
-        a = childParent.get(a);
-      }
-      try {
-        process.stderr.write(
-          "[sj-pkgjson-topo] " + JSON.stringify({
-            pid: r.pid,
-            path: r.path,
-            ts: r.ts,
-            kind: r.kind,
-            pkg: r.pkg,
-            lifecycle: r.lifecycle,
-            leaf: {
-              parent: childParent.get(r.pid) ?? null,
-              firstMut: firstCwdMutationTs.get(r.pid) ?? null,
-              lastMut: lastCwdMutationTs.get(r.pid) ?? null,
-              cloneCwd: pidCloneTimeCwd.get(r.pid) ?? null,
-              curCwd: cwdGet(r.pid) ?? null,
-              seedCloneTs: childSeedCloneTs.get(r.pid) ?? null,
-              everShared: everCwdShared.has(r.pid),
-              reused: childParentReused.has(r.pid)
-            },
-            chainReachedRoot: a === void 0,
-            chain
-          }) + "\n"
-        );
-      } catch {
-      }
-    }
-    try {
-      process.stderr.write(
-        "[sj-pkgjson-topo-done] " + JSON.stringify({ dumped, skipped }) + "\n"
-      );
-    } catch {
-    }
-  }
   flushAllNodeBootstrapCandidates();
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
