@@ -2404,6 +2404,34 @@ export async function runInstallPhase(
   //     A pid in this set NEVER had a purely-private cwd, so a deferred open from
   //     it cannot be soundly proven via the single-file ts gate → fail closed.
   const everCwdShared = new Set<number>();
+  //   cloneFsEdges: add-only undirected adjacency of CLONE_FS-shared pid PAIRS,
+  //     recorded at the clone CLONE_FS branch (the birth of fs_struct sharing — the
+  //     SAME site that pair-adds to `everCwdShared`). Used at replay to reconstruct
+  //     the FULL fs_struct group (connected component) of a shared ancestor so the
+  //     deferred-replay veto can be RELAXED when that group NEVER mutated its cwd: a
+  //     CLONE_FS group with zero chdir/fchdir among its members has an IMMUTABLE
+  //     shared cwd, so an inherited value through it is provable and carries NO
+  //     cross-file non-causal chdir hazard (the real unrs-resolver flake — a
+  //     grandparent CLONE_FS group that never chdir'd was vetoing a provable read).
+  //     MUST be built add-only from clone-time edges, NOT derived from `cwdParent`
+  //     at replay: `detachCwdGroup` REMOVES `cwdParent` edges, so a member that
+  //     later detached would be dropped from the component and its pre-detach chdir
+  //     missed → a protected-path FALSE NEGATIVE. Add-only never drops a member.
+  const cloneFsEdges = new Map<number, Set<number>>();
+  const addCloneFsEdge = (a: number, b: number): void => {
+    let sa = cloneFsEdges.get(a);
+    if (sa === undefined) {
+      sa = new Set<number>();
+      cloneFsEdges.set(a, sa);
+    }
+    sa.add(b);
+    let sb = cloneFsEdges.get(b);
+    if (sb === undefined) {
+      sb = new Set<number>();
+      cloneFsEdges.set(b, sb);
+    }
+    sb.add(a);
+  };
   //   pidCloneTimeCwd: for each child pid, the PARENT's clone-time cwd captured at
   //     the seeding clone (the value clone(2) copied into the child's INITIAL cwd),
   //     first-write-wins by numeric child pid (binds to the FIRST seeding
@@ -4110,6 +4138,12 @@ export async function runInstallPhase(
             if (cloneFs) {
               everCwdShared.add(pid);
               everCwdShared.add(childPid);
+              // Record the fs_struct-sharing edge (add-only) so replay can rebuild
+              // this CLONE_FS group's full membership and check whether it ever
+              // mutated its cwd. Captured HERE (every CLONE_FS clone, incl. the
+              // pending-detach COPY path that skips `unionCwd`) — the superset of
+              // sharing births — so no member is ever missed at replay.
+              addCloneFsEdge(pid, childPid);
             }
 
             // --- cwd group: union if CLONE_FS, else copy. -----------
@@ -6906,6 +6940,53 @@ export async function runInstallPhase(
     }
     return false; // clean, unambiguous walk to the root → lineage never shared
   };
+  // Determinism (defer-and-re-resolve) MUTATION-AWARE CLONE_FS provenance (unrs-resolver
+  // flake, 2026-06-19, captured from real CI topology). `cloneFsGroupEverMutated(pid)`
+  // returns true iff ANY member of `pid`'s CLONE_FS fs_struct group (the connected
+  // component over the add-only `cloneFsEdges`) ever performed a cwd mutation
+  // (chdir/fchdir → a `firstCwdMutationTs` key). A mutation-free shared group has an
+  // IMMUTABLE shared cwd: every member holds the constant the group was seeded with, so
+  // an inherited value through it is provable and there is NO cross-file non-causal
+  // chdir to be ambiguous about. Only a MUTATED shared group carries the stale-snapshot
+  // hazard the sticky `everCwdShared` veto guards. SOUND scope = the FULL fs_struct group
+  // (a sibling/cousin chdir mutates the shared cwd too), NOT the lineage alone — hence the
+  // component walk over `cloneFsEdges`, not a lineage-only mutation probe. Drain-
+  // independent: edges + `firstCwdMutationTs` are add-only / complete at end-of-drain.
+  const cloneFsGroupEverMutated = (pid: number): boolean => {
+    const stack: number[] = [pid];
+    const seen = new Set<number>();
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (cur === undefined || seen.has(cur)) continue;
+      seen.add(cur);
+      if (firstCwdMutationTs.has(cur)) return true; // a group member chdir'd → hazard
+      const adj = cloneFsEdges.get(cur);
+      if (adj !== undefined) for (const n of adj) if (!seen.has(n)) stack.push(n);
+    }
+    return false; // no member of the whole fs_struct group ever mutated cwd → immutable
+  };
+  // Mutation-aware refinement of `lineageEverCwdShared` for the seed-level veto: walk UP
+  // `childParent` and fail closed ONLY when a shared ancestor's CLONE_FS group EVER
+  // mutated its cwd. A shared-but-never-mutated ancestor group is benign (immutable
+  // shared cwd) and must NOT veto an otherwise-provable deferred re-resolve — that
+  // spurious veto is the captured unrs-resolver `<UNRESOLVED_PATH>` flake (grandparent
+  // group {66,74-77} never chdir'd, yet vetoed pid 110's provable intra-package read).
+  // The cap / cycle / reused-edge cases STILL fail closed verbatim (lineage unverifiable
+  // → cannot trust the component reconstruction either), exactly as `lineageEverCwdShared`.
+  const lineageSharedGroupMutated = (startPid: number): boolean => {
+    let a: number | undefined = startPid;
+    let guard = 0;
+    const seen = new Set<number>();
+    while (a !== undefined) {
+      if (guard++ >= 100000) return true; // cap exhaustion → ambiguous → fail closed
+      if (seen.has(a)) return true; // cycle (only via pid-reuse) → fail closed
+      if (childParentReused.has(a)) return true; // reused edge → lineage unverifiable
+      if (everCwdShared.has(a) && cloneFsGroupEverMutated(a)) return true; // real hazard
+      seen.add(a);
+      a = childParent.get(a);
+    }
+    return false; // no shared-AND-mutated ancestor → benign (resolve is provable)
+  };
   for (const d of deferredRelOpens) {
     const P = d.rawEvent.pid;
     // Resolve attribution (5th-pass F6 + follow-up): an entry deferred at the
@@ -7083,7 +7164,12 @@ export async function runInstallPhase(
       d.sharedAtRead ||
       d.cloneFsSeed === true ||
       childPidReuseHidCloneFs ||
-      (d.seedParentPid !== undefined && lineageEverCwdShared(d.seedParentPid));
+      // Mutation-aware (was `lineageEverCwdShared`): a shared ANCESTOR group only
+      // taints the inherited cwd if SOME member of that fs_struct group mutated it
+      // (a non-causal cross-file chdir). A never-mutated shared group is immutable →
+      // the inherited value is provable → resolve. The leaf-side `d.sharedAtRead`,
+      // `d.cloneFsSeed`, and `childPidReuseHidCloneFs` veto terms stay STRICT.
+      (d.seedParentPid !== undefined && lineageSharedGroupMutated(d.seedParentPid));
     let canonical: string | null = null;
     if (d.stamped === true && typeof initial === 'string' && !sharedAtRead) {
       const firstMut = firstCwdMutationTs.get(P);

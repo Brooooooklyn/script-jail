@@ -7335,6 +7335,158 @@ describe('runInstallPhase', () => {
       expect(unresolved).toHaveLength(1);
     });
 
+    // Determinism (defer-and-re-resolve) MUTATION-AWARE CLONE_FS — the COMPLEMENT of
+    // the two TRANSITIVE-CLONE_FS fail-closed tests above, and the REAL unrs-resolver
+    // `<UNRESOLVED_PATH> read:package.json` parity flake (captured from CI on
+    // 2026-06-19; vuejs/core fixture, Docker backend, ~30% of runs). Exact topology:
+    //
+    //   pid 66  (CLONE_FS group root, cwd /work)  ── clone(CLONE_FS) ─→ 74 [,75,76,77]
+    //      │  (66 ∈ everCwdShared; the WHOLE group NEVER chdir's → immutable shared cwd)
+    //      └─ clone(COPY) ─→ 105 (inherits /work; 105 ∉ everCwdShared)
+    //                          └─ chdir(.../unrs-resolver)  then  clone(COPY) ─→ 110
+    //   pid 110 (leaf, ∉ everCwdShared at read): openat(AT_FDCWD,"package.json")
+    //
+    // The leaf's cwd is FULLY PROVABLE: /work is stable (no member of 66's CLONE_FS
+    // group ever chdir'd), 105 chdir'd to the unrs dir BEFORE cloning 110, 110 inherited
+    // it via a private COPY. Resolving gives .../unrs-resolver/package.json — an
+    // intra-package read (dropped downstream by normalize → matches macOS). PRE-FIX, the
+    // seed-level veto `lineageEverCwdShared(seedParentPid=105)` walked 105→66 and fired
+    // on 66∈everCwdShared ALONE, synthesising `<UNRESOLVED_PATH>` under the leaf-up drain
+    // order while the root-down order resolved inline → the DRAIN-ORDER-DEPENDENT flake.
+    // The mutation-aware refinement only fails closed when a shared ancestor's fs_struct
+    // GROUP actually mutated its cwd (the two tests above: GP/R chdir the SHARED cwd → still
+    // synth). 66's group never chdir'd → benign → BOTH drain orders now resolve identically.
+    // This test pins BOTH orders to the SAME output (it FAILS on HEAD: the leaf-up order
+    // synthesises while root-down resolves).
+    it('deferred re-resolve RESOLVES (both drain orders, no synth) when the shared ancestor CLONE_FS group never mutated cwd (unrs-resolver flake)', async () => {
+      const UNRS_DIR =
+        '/work/node_modules/.pnpm/unrs-resolver@1.11.1/node_modules/unrs-resolver';
+      const env = {
+        npm_package_name: 'unrs-resolver',
+        npm_package_version: '1.11.1',
+        npm_lifecycle_event: 'postinstall',
+      };
+      const proc = mockProcReader({
+        66: { ppid: 1, env },
+        74: { ppid: 66, env },
+        105: { ppid: 66, env },
+        110: { ppid: 105, env },
+      });
+      // The causally-correct event set. Only the LEAF's read is reordered between the
+      // two runs to model the strace -ff drain race.
+      const seed = {
+        pid: 66,
+        line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3',
+        source: 'strace' as const,
+      };
+      // 66 clones a CLONE_FS sibling (74) → 66 ∈ everCwdShared, group {66,74} IMMUTABLE
+      // (neither ever chdir's). Models the real {66,74,75,76,77} resolver-spawn group.
+      const cloneFsSibling = {
+        pid: 66,
+        line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 74',
+        source: 'strace' as const,
+      };
+      // 66 plain-forks 105 (COPY) → childParent[105]=66; 105 ∉ everCwdShared.
+      const clone105 = {
+        pid: 66,
+        line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 105',
+        source: 'strace' as const,
+      };
+      // 105 chdir's to the unrs dir (absolute) BEFORE cloning 110.
+      const chdir105 = {
+        pid: 105,
+        line: `chdir("${UNRS_DIR}") = 0`,
+        source: 'strace' as const,
+      };
+      // 105 plain-forks 110 (COPY) AFTER its chdir → 110 inherits the unrs dir.
+      const clone110 = {
+        pid: 105,
+        line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 110',
+        source: 'strace' as const,
+      };
+      // The leaf's AT_FDCWD-relative read of its own package.json — faithful to the
+      // real flake (the `<UNRESOLVED_PATH> read:package.json` synth). package.json is
+      // node-bootstrap noise post-resolve (dropped at the guest, matching the green
+      // root-down path), so it carries the NO-SYNTH half of the assertion.
+      const leafReadPkgJson = {
+        pid: 110,
+        line: 'openat(AT_FDCWD, "package.json", O_RDONLY) = 7',
+        source: 'strace' as const,
+      };
+      // A WITNESS WRITE in the SAME leaf — an AT_FDCWD-relative write (NOT subject to
+      // node-bootstrap read filtering, so it IS emitted when resolved) — proves the
+      // deferred open genuinely RESOLVED against the recovered cwd (not silently
+      // dropped / synth-suppressed). Pre-fix it synthesises `<UNRESOLVED_PATH>`; post-fix
+      // it emits a write to the absolute `${UNRS_DIR}/prebuild.log`. It rides the exact
+      // SAME deferred-replay + CLONE_FS-veto path as the package.json read.
+      const leafWriteWitness = {
+        pid: 110,
+        line: 'openat(AT_FDCWD, "prebuild.log", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 8',
+        source: 'strace' as const,
+      };
+
+      const runOrder = async (
+        records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }>,
+      ) => {
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'npm',
+          cwd: '/work',
+          env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+          strace: cannedStraceRunner(records, 0, { rootPid: 66 }),
+          attribution: new Attribution(proc),
+          emitter,
+          protectedPaths: new ProtectedPathsMatcher({
+            patterns: ['$HOME/.ssh/**'],
+            roots: {
+              repo: '/work',
+              nodeModules: '/work/node_modules',
+              home: '/root',
+              tmp: '/tmp',
+              cache: '/root/.cache/pnpm',
+            },
+          }),
+        });
+        const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+        const witnessWrites = events.filter((e) => {
+          const r = e['raw'] as Record<string, unknown>;
+          return r['kind'] === 'write' && r['path'] === `${UNRS_DIR}/prebuild.log`;
+        });
+        const unresolved = events.filter((e) => {
+          const r = e['raw'] as Record<string, unknown>;
+          return r['kind'] === 'exec' && r['unresolved_path'] === true;
+        });
+        return { witnessWrites: witnessWrites.length, unresolved: unresolved.length };
+      };
+
+      // LEAF-UP drain: the leaf's reads drain BEFORE their seeding clone → DEFERRED,
+      // then re-resolved at end-of-drain. PRE-FIX this synthesised `<UNRESOLVED_PATH>`.
+      const leafUp = await runOrder([
+        seed,
+        cloneFsSibling,
+        leafReadPkgJson, // <-- the leaf's own opens race ahead of its seeding clone
+        leafWriteWitness,
+        clone105,
+        chdir105,
+        clone110,
+      ]);
+      // ROOT-DOWN drain: the leaf's opens drain LAST → resolved inline (cwd known).
+      const rootDown = await runOrder([
+        seed,
+        cloneFsSibling,
+        clone105,
+        chdir105,
+        clone110,
+        leafReadPkgJson,
+        leafWriteWitness,
+      ]);
+
+      // DETERMINISM: both orders agree, neither synthesises, and the witness write
+      // genuinely RESOLVED to the recovered cwd (proves resolution, not silent drop).
+      expect(rootDown).toEqual({ witnessWrites: 1, unresolved: 0 });
+      expect(leafUp).toEqual(rootDown);
+    });
+
     // Determinism (defer-and-re-resolve) FIX #1 TRANSITIVE PID-REUSE (codex round-3
     // [high] follow-up, 2026-06-16). The lineage walk reads the FINAL `childParent`
     // map. If an INTERMEDIATE ancestor pid on the deferred read's lineage is RECYCLED

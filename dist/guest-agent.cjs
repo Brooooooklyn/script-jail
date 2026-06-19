@@ -27203,6 +27203,21 @@ async function runInstallPhase(input) {
   const firstCwdMutationTs = /* @__PURE__ */ new Map();
   const lastCwdMutationTs = /* @__PURE__ */ new Map();
   const everCwdShared = /* @__PURE__ */ new Set();
+  const cloneFsEdges = /* @__PURE__ */ new Map();
+  const addCloneFsEdge = (a, b) => {
+    let sa = cloneFsEdges.get(a);
+    if (sa === void 0) {
+      sa = /* @__PURE__ */ new Set();
+      cloneFsEdges.set(a, sa);
+    }
+    sa.add(b);
+    let sb = cloneFsEdges.get(b);
+    if (sb === void 0) {
+      sb = /* @__PURE__ */ new Set();
+      cloneFsEdges.set(b, sb);
+    }
+    sb.add(a);
+  };
   const pidCloneTimeCwd = /* @__PURE__ */ new Map();
   const childSeedCloneTs = /* @__PURE__ */ new Map();
   const deferredRelOpens = [];
@@ -27697,6 +27712,7 @@ async function runInstallPhase(input) {
             if (cloneFs) {
               everCwdShared.add(pid);
               everCwdShared.add(childPid);
+              addCloneFsEdge(pid, childPid);
             }
             const childCwdSnap = pendingCwdDetach.get(childPid);
             pendingCwdDetach.delete(childPid);
@@ -28680,6 +28696,35 @@ async function runInstallPhase(input) {
     }
     return false;
   };
+  const cloneFsGroupEverMutated = (pid) => {
+    const stack = [pid];
+    const seen = /* @__PURE__ */ new Set();
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (cur === void 0 || seen.has(cur)) continue;
+      seen.add(cur);
+      if (firstCwdMutationTs.has(cur)) return true;
+      const adj = cloneFsEdges.get(cur);
+      if (adj !== void 0) {
+        for (const n of adj) if (!seen.has(n)) stack.push(n);
+      }
+    }
+    return false;
+  };
+  const lineageSharedGroupMutated = (startPid) => {
+    let a = startPid;
+    let guard = 0;
+    const seen = /* @__PURE__ */ new Set();
+    while (a !== void 0) {
+      if (guard++ >= 1e5) return true;
+      if (seen.has(a)) return true;
+      if (childParentReused.has(a)) return true;
+      if (everCwdShared.has(a) && cloneFsGroupEverMutated(a)) return true;
+      seen.add(a);
+      a = childParent.get(a);
+    }
+    return false;
+  };
   for (const d of deferredRelOpens) {
     const P = d.rawEvent.pid;
     let pkg = d.pkg;
@@ -28745,7 +28790,12 @@ async function runInstallPhase(input) {
         a = childParent.get(a);
       }
     }
-    const sharedAtRead = d.sharedAtRead || d.cloneFsSeed === true || childPidReuseHidCloneFs || d.seedParentPid !== void 0 && lineageEverCwdShared(d.seedParentPid);
+    const sharedAtRead = d.sharedAtRead || d.cloneFsSeed === true || childPidReuseHidCloneFs || // Mutation-aware (was `lineageEverCwdShared`): a shared ANCESTOR group only
+    // taints the inherited cwd if SOME member of that fs_struct group mutated it
+    // (a non-causal cross-file chdir). A never-mutated shared group is immutable →
+    // the inherited value is provable → resolve. The leaf-side `d.sharedAtRead`,
+    // `d.cloneFsSeed`, and `childPidReuseHidCloneFs` veto terms stay STRICT.
+    d.seedParentPid !== void 0 && lineageSharedGroupMutated(d.seedParentPid);
     let canonical = null;
     if (d.stamped === true && typeof initial === "string" && !sharedAtRead) {
       const firstMut = firstCwdMutationTs.get(P);
