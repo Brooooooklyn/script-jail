@@ -4,14 +4,14 @@
 // script, because `npm rebuild --foreground-scripts` and `yarn install
 // --immutable` never run a root `prepare`. resolvePrepareCommand decides what
 // (if anything) that second pass traces:
-//   - npm WITH a runner (npmPrepare) → `npm exec --offline --node-options= -c
-//            '<node> <runner>'` — the runner drives the whole prepare lifecycle
-//            (preprepare/prepare/postprepare) via @npmcli/run-script: faithful
-//            run-order, no wrapper recursion, full npm_config_* env, node-options
-//            neutralized. (#44)
-//   - npm WITHOUT a runner (write failed) → fallback `npm run prepare
-//            --if-present --foreground-scripts --node-options=` (--if-present
-//            makes it a clean exit-0 no-op when absent).
+//   - npm WITH a runner (npmPrepare) → `npm exec --offline --no-workspaces
+//            --node-options= -c '<node> <runner>'` — the runner drives the whole
+//            prepare lifecycle (preprepare/prepare/postprepare) via @npmcli/run-script:
+//            faithful run-order, no wrapper recursion, full npm_config_* env,
+//            node-options + workspaces neutralized. (#44 + round-18)
+//   - npm WITHOUT a runner → fallback `npm run prepare --if-present
+//            --foreground-scripts --no-workspaces --node-options=` (the orchestrator
+//            fails closed rather than use this; reached only by direct unit callers).
 //   - yarn → only when ${cwd}/package.json has a non-empty `scripts.prepare`
 //            (yarn-berry has no --if-present; a missing prepare exits 1).
 //   - pnpm → null (already covered by `pnpm rebuild --pending`).
@@ -51,6 +51,7 @@ describe('resolvePrepareCommand', () => {
       args: [
         'exec',
         '--offline',
+        '--no-workspaces',
         '--node-options=',
         '-c',
         '/opt/node/bin/node /sjtmp/script-jail-strace/sj-prepare-runner.cjs',
@@ -58,14 +59,23 @@ describe('resolvePrepareCommand', () => {
     });
   });
 
-  it('npm WITHOUT a runner → fallback single pass with node-options neutralized', () => {
+  it('npm WITHOUT a runner → fallback single pass with workspaces + node-options neutralized', () => {
     // npm does not read package.json — --if-present is the no-op guard.  The
     // empty --node-options= restores parity with the main install's --no-node-
-    // options that the prepare pass commandOverride would otherwise bypass.
+    // options that the prepare pass commandOverride would otherwise bypass, and
+    // --no-workspaces pins it to the root cwd (a PR .npmrc workspaces=true would
+    // otherwise fan out into workspaces and skip the root).
     const cmd = resolvePrepareCommand('npm', '/nonexistent-dir');
     expect(cmd).toEqual({
       cmd: 'npm',
-      args: ['run', 'prepare', '--if-present', '--foreground-scripts', '--node-options='],
+      args: [
+        'run',
+        'prepare',
+        '--if-present',
+        '--foreground-scripts',
+        '--no-workspaces',
+        '--node-options=',
+      ],
     });
   });
 

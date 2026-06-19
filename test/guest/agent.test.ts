@@ -1264,15 +1264,21 @@ describe('agent main() root-prepare second pass', () => {
       diag: (m) => diagMsgs.push(m),
     });
 
-    // The prepare runner WAS invoked, with the #44 npm-exec lifecycle-runner
-    // command (NOT rebuild): `npm exec --offline --node-options= -c '<node> <runner>'`.
-    // The runner path is script-jail-owned (under straceBaseDir), so we match its
-    // shape rather than the non-deterministic absolute path.
+    // The prepare runner WAS invoked, with the #44 npm-exec lifecycle-runner command
+    // (NOT rebuild): `npm exec --offline --no-workspaces --node-options= -c '<node> <runner>'`.
+    // The runner path is script-jail-owned (a random mkdtemp dir under straceBaseDir),
+    // so we match its shape rather than the non-deterministic absolute path.
     expect(prep.calls).toHaveLength(1);
     expect(prep.calls[0]!.cmd).toBe('npm');
-    expect(prep.calls[0]!.args.slice(0, 4)).toEqual(['exec', '--offline', '--node-options=', '-c']);
-    expect(prep.calls[0]!.args).toHaveLength(5);
-    expect(prep.calls[0]!.args[4]).toMatch(/ .*sj-prepare-runner\.cjs$/);
+    expect(prep.calls[0]!.args.slice(0, 5)).toEqual([
+      'exec',
+      '--offline',
+      '--no-workspaces',
+      '--node-options=',
+      '-c',
+    ]);
+    expect(prep.calls[0]!.args).toHaveLength(6);
+    expect(prep.calls[0]!.args[5]).toMatch(/ .*[/\\]runner\.cjs$/);
     // The main install runner ran the install command (#43: shared base carries --no-node-options).
     expect(main_.calls).toHaveLength(1);
     expect(main_.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
@@ -1672,6 +1678,65 @@ describe('agent main() root-prepare second pass', () => {
     expect(String(fatal!['message'])).toMatch(/root-prepare pass/);
     expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
     // The main install ran, but NO final lockfile ships (fail closed).
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('FAILS CLOSED (no lockfile) when the npm prepare runner cannot be materialized (no silent fallback, round-18)', async () => {
+    // adversarial-review round-18 CONCERN 2: the #44 runner audits the ROOT prepare
+    // lifecycle. If it can't be written, we must NOT silently fall back to a single
+    // `npm run prepare` (which misses wrapper-only preprepare/postprepare — the #44
+    // gap, and an attacker who sabotages the runner path could force that fallback).
+    // Force the runner's mkdtemp to fail by pointing the scratch base at a regular
+    // FILE; assert a fatal error mentioning the runner + no lockfile.
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+    const main_ = recordingEventStrace('MAINPROG');
+
+    // A regular file as the scratch base → mkdtempSync(<file>/script-jail-strace/…) throws.
+    const scratchFile = join(testDir, 'not-a-dir');
+    writeFileSync(scratchFile, 'x', 'utf8');
+    const goodTmp = join(testDir, 'good-ev');
+    mkdirSync(goodTmp, { recursive: true });
+
+    const prevScratch = process.env['SCRIPT_JAIL_SCRATCH_DIR'];
+    process.env['SCRIPT_JAIL_SCRATCH_DIR'] = scratchFile;
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        forcePreparePass: true, // make the prepare pass run with an injected main runner
+        // Main events file under a GOOD dir so only the prepare runner's mkdtemp fails.
+        createEventsFile: () => createEventsFile(goodTmp),
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+      if (prevScratch === undefined) delete process.env['SCRIPT_JAIL_SCRATCH_DIR'];
+      else process.env['SCRIPT_JAIL_SCRATCH_DIR'] = prevScratch;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/root-prepare runner/);
+    expect(String(fatal!['message'])).toMatch(/UNAUDITED/);
+    // The main install ran, but NO final lockfile ships (fail closed — not a fallback).
     expect(main_.calls).toHaveLength(1);
     expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
     expect(exitedWith).toBe(1);

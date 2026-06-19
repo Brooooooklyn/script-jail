@@ -3083,17 +3083,21 @@ export const NPM_PREPARE_RUNNER_SOURCE = [
  *
  * Per manager:
  *   - npm  → run the WHOLE prepare lifecycle via the {@link NPM_PREPARE_RUNNER_SOURCE}
- *            runner under `npm exec` (see that doc).  `--node-options=` (the VALUE
- *            form, NOT boolean `--no-node-options`) neutralizes a PR-controlled
- *            `.npmrc node-options` `--require` hook AND clears
- *            `npm_config_node_options` — restoring parity with the main install's
- *            INSTALL_CMD `--no-node-options`, which the prepare pass's
- *            `commandOverride` would otherwise bypass.  `--offline` keeps Phase B
- *            network-free.  `npmPrepare` carries the runner + node paths (both
- *            script-jail-owned); when it is absent (the runner file could not be
- *            written) we fall back to the historical single `npm run prepare
- *            --if-present` (node-options neutralized) — faithful for a base
- *            `prepare`, the wrapper-only case degrades to the pre-#44 gap.
+ *            runner under `npm exec` (see that doc).  `--no-workspaces` pins the run
+ *            to the repo-root cwd: a PR `.npmrc workspaces=true` would otherwise make
+ *            `npm exec -c` fan out into workspace dirs, running WORKSPACE prepares
+ *            (force-attributed to root) and SKIPPING the root lifecycle (the #44 gap
+ *            re-opens; verified npm 11.13.0).  `--node-options=` (the VALUE form, NOT
+ *            boolean `--no-node-options`) neutralizes a PR-controlled `.npmrc
+ *            node-options` `--require` hook AND clears `npm_config_node_options` —
+ *            restoring parity with the main install's INSTALL_CMD `--no-node-options`,
+ *            which the prepare pass's `commandOverride` would otherwise bypass.
+ *            `--offline` keeps Phase B network-free.  `npmPrepare` carries the runner
+ *            + node paths (both script-jail-owned).  When it is absent this returns a
+ *            single-pass fallback shape, but the ORCHESTRATOR fails closed instead of
+ *            using it (a single `npm run prepare` misses wrapper-only preprepare/
+ *            postprepare → a silent #44 false-negative); the fallback is reached only
+ *            by direct unit callers.
  *   - yarn → yarn-berry has NO `--if-present`; `yarn run prepare` exits 1 when
  *            there is no `prepare` script, which would be a wasted (and
  *            confusingly nonzero) pass.  So we READ `${cwd}/package.json` and
@@ -3117,18 +3121,35 @@ export function resolvePrepareCommand(
         args: [
           'exec',
           '--offline',
+          // `--no-workspaces` (adversarial-review round-18): a PR-controlled
+          // `.npmrc workspaces=true` makes `npm exec -c` FAN OUT into each workspace
+          // cwd — running the WORKSPACE `prepare` (force-attributed to root) while
+          // SKIPPING the ROOT preprepare/prepare/postprepare entirely (verified
+          // npm 11.13.0).  That re-opens the #44 root-prepare gap AND breaks the
+          // force-attribution invariant.  `--no-workspaces` pins execution to the
+          // repo-root cwd regardless of `.npmrc`; the prepare pass audits ONLY the
+          // root prepare (workspace lifecycles ride the main install pass).
+          '--no-workspaces',
           '--node-options=',
           '-c',
           `${npmPrepare.nodePath} ${npmPrepare.runnerPath}`,
         ],
       };
     }
-    // Fallback: the runner file could not be written.  Historical single pass
-    // (faithful for a base `prepare`; wrapper-only degrades to the pre-#44 gap),
-    // with node-options neutralized so Finding B never re-opens here either.
+    // Fallback shape (npm WITHOUT a runner).  In production the orchestrator FAILS
+    // CLOSED rather than use this (a single `npm run prepare` misses wrapper-only
+    // preprepare/postprepare — the #44 gap), so this is reached only by direct unit
+    // callers.  Still kept workspace- + node-options-neutralized for correctness.
     return {
       cmd: 'npm',
-      args: ['run', 'prepare', '--if-present', '--foreground-scripts', '--node-options='],
+      args: [
+        'run',
+        'prepare',
+        '--if-present',
+        '--foreground-scripts',
+        '--no-workspaces',
+        '--node-options=',
+      ],
     };
   }
   if (manager === 'yarn') {
@@ -3919,41 +3940,64 @@ export async function main(input: AgentInput): Promise<void> {
   //      prepare pass if `input.prepareStrace` was ALSO injected.  Every
   //      existing test injects only `input.strace`, so this keeps them
   //      byte-for-byte unaffected (no prepare pass, no golden drift).
-  // #44: materialize the npm prepare-lifecycle runner (NPM_PREPARE_RUNNER_SOURCE)
-  // to a script-jail-owned temp file under straceBaseDir.  resolvePrepareCommand
-  // then launches it via `npm exec -c 'node <runner>'`, so the WHOLE root prepare
-  // lifecycle (preprepare/prepare/postprepare) runs through `@npmcli/run-script`
-  // — faithful run-order, NO wrapper recursion (run-script adds no pre/post),
-  // ONLY the root's own scripts (no dependency reify → force-attribution invariant
-  // holds), full `npm_config_*` env (env-faithful), node-options neutralized.
-  // npm-only (yarn/pnpm ignore npmPrepare).  The runner file holds NO PR data
-  // (the path + node are script-jail-owned).  If the write fails, npmPrepare stays
-  // undefined and resolvePrepareCommand falls back to the single `npm run prepare
-  // --if-present` (faithful for a base `prepare`; wrapper-only degrades to pre-#44).
-  let npmPrepare: { runnerPath: string; nodePath: string } | undefined;
-  if (manager === 'npm') {
-    try {
-      const runnerPath = joinPath(straceBaseDir, 'sj-prepare-runner.cjs');
-      writeFileSync(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: 'utf8', mode: 0o644 });
-      npmPrepare = { runnerPath, nodePath: process.execPath };
-    } catch {
-      // EROFS/EACCES/ENOSPC on the strace base — fall back to the single pass.
-      npmPrepare = undefined;
-    }
-  }
-  const prepareCommand = resolvePrepareCommand(manager, config.work_dir, npmPrepare);
-  // Run the prepare pass when a command is resolved AND we have (or can build)
-  // a runner.  TEST SEAM: the existing suite injects only `input.strace`; those
-  // tests must neither run a prepare pass NOR fail closed, so we run only when a
-  // prepare runner was injected (`input.prepareStrace`), or we are in production
+  // Whether a prepare pass runs at all — independent of the npm runner.  npm is
+  // always non-null (the pass always runs); yarn is non-null iff `scripts.prepare`
+  // exists; pnpm is null.  TEST SEAM: the existing suite injects only `input.strace`;
+  // those tests must neither run a prepare pass NOR fail closed, so we run only when
+  // a prepare runner was injected (`input.prepareStrace`), or we are in production
   // (`input.strace === undefined`), or a test explicitly opts in
   // (`input.forcePreparePass`, used purely to exercise the fail-closed path).
-  if (
+  let prepareCommand = resolvePrepareCommand(manager, config.work_dir);
+  const willRunPreparePass =
     prepareCommand !== null &&
     (input.prepareStrace !== undefined ||
       input.strace === undefined ||
-      input.forcePreparePass === true)
-  ) {
+      input.forcePreparePass === true);
+  // #44: materialize the npm prepare-lifecycle runner (NPM_PREPARE_RUNNER_SOURCE),
+  // then upgrade `prepareCommand` to launch it via `npm exec -c 'node <runner>'` so
+  // the WHOLE root prepare lifecycle (preprepare/prepare/postprepare) runs through
+  // `@npmcli/run-script` — faithful run-order, NO wrapper recursion (run-script adds
+  // no pre/post), ONLY the root's own scripts (no dependency reify → force-attribution
+  // invariant holds), full `npm_config_*` env (env-faithful), node-options + workspaces
+  // neutralized (see resolvePrepareCommand).  The runner holds NO PR data.
+  //
+  // SECURITY (adversarial-review round-18):
+  //   - UNPREDICTABLE path via mkdtempSync (0700 dir).  The main install pass — where
+  //     a malicious dependency runs — has ALREADY completed by here, AND the random
+  //     name is unknowable to it, so it cannot pre-create the path to a non-writable
+  //     file/dir to force a degraded fallback.
+  //   - FAIL CLOSED on any setup failure.  We do NOT silently fall back to a single
+  //     `npm run prepare --if-present`: that misses wrapper-only preprepare/postprepare
+  //     (the exact #44 gap), so a degraded fallback would be a SILENT false-negative.
+  //     A write failure to script-jail's own scratch (where strace just wrote per-pid
+  //     logs) is anomalous — refuse to emit a lockfile, mirroring the prepare-events-
+  //     file gate below.  npm-only; yarn/pnpm never reach this.
+  if (willRunPreparePass && manager === 'npm') {
+    try {
+      const runnerDir = mkdtempSync(joinPath(straceBaseDir, 'sj-prep-'));
+      const runnerPath = joinPath(runnerDir, 'runner.cjs');
+      writeFileSync(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: 'utf8', mode: 0o600 });
+      prepareCommand = resolvePrepareCommand('npm', config.work_dir, {
+        runnerPath,
+        nodePath: process.execPath,
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      emitter.emitError(
+        'script-jail agent: failed to materialize the npm root-prepare runner — ' +
+          `${reason}. Refusing to emit a lockfile: falling back to a single ` +
+          '`npm run prepare` would leave wrapper-only preprepare/postprepare ' +
+          'UNAUDITED (a silent #44 false-negative).',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+  }
+  // `prepareCommand !== null` re-narrows the type after the `let` reassignment above;
+  // it is always true when `willRunPreparePass` (npm re-resolves to a non-null command,
+  // yarn kept its non-null base) — a pure type guard, never false at runtime.
+  if (willRunPreparePass && prepareCommand !== null) {
     // (The nameless-root prepare fail-closed gate that used to live here is
     // REMOVED — superseded by root anchoring.  A nameless root now force-attributes
     // its prepare events under the `<repo-root>` sentinel via the prepare emitter

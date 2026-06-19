@@ -31089,6 +31089,15 @@ function resolvePrepareCommand(manager, cwd, npmPrepare) {
         args: [
           "exec",
           "--offline",
+          // `--no-workspaces` (adversarial-review round-18): a PR-controlled
+          // `.npmrc workspaces=true` makes `npm exec -c` FAN OUT into each workspace
+          // cwd — running the WORKSPACE `prepare` (force-attributed to root) while
+          // SKIPPING the ROOT preprepare/prepare/postprepare entirely (verified
+          // npm 11.13.0).  That re-opens the #44 root-prepare gap AND breaks the
+          // force-attribution invariant.  `--no-workspaces` pins execution to the
+          // repo-root cwd regardless of `.npmrc`; the prepare pass audits ONLY the
+          // root prepare (workspace lifecycles ride the main install pass).
+          "--no-workspaces",
           "--node-options=",
           "-c",
           `${npmPrepare.nodePath} ${npmPrepare.runnerPath}`
@@ -31097,7 +31106,14 @@ function resolvePrepareCommand(manager, cwd, npmPrepare) {
     }
     return {
       cmd: "npm",
-      args: ["run", "prepare", "--if-present", "--foreground-scripts", "--node-options="]
+      args: [
+        "run",
+        "prepare",
+        "--if-present",
+        "--foreground-scripts",
+        "--no-workspaces",
+        "--node-options="
+      ]
     };
   }
   if (manager === "yarn") {
@@ -31416,18 +31432,28 @@ ${stdoutTail}`;
       false
     );
   }
-  let npmPrepare;
-  if (manager === "npm") {
+  let prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
+  const willRunPreparePass = prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true);
+  if (willRunPreparePass && manager === "npm") {
     try {
-      const runnerPath = (0, import_node_path6.join)(straceBaseDir, "sj-prepare-runner.cjs");
-      (0, import_node_fs5.writeFileSync)(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: "utf8", mode: 420 });
-      npmPrepare = { runnerPath, nodePath: process.execPath };
-    } catch {
-      npmPrepare = void 0;
+      const runnerDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(straceBaseDir, "sj-prep-"));
+      const runnerPath = (0, import_node_path6.join)(runnerDir, "runner.cjs");
+      (0, import_node_fs5.writeFileSync)(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: "utf8", mode: 384 });
+      prepareCommand = resolvePrepareCommand("npm", config2.work_dir, {
+        runnerPath,
+        nodePath: process.execPath
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      emitter.emitError(
+        `script-jail agent: failed to materialize the npm root-prepare runner \u2014 ${reason}. Refusing to emit a lockfile: falling back to a single \`npm run prepare\` would leave wrapper-only preprepare/postprepare UNAUDITED (a silent #44 false-negative).`,
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
     }
   }
-  const prepareCommand = resolvePrepareCommand(manager, config2.work_dir, npmPrepare);
-  if (prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true)) {
+  if (willRunPreparePass && prepareCommand !== null) {
     diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
     let prepareRunner;
     let prepareEventsFilePath = eventsFilePath;
