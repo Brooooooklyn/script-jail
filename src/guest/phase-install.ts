@@ -2500,6 +2500,25 @@ export async function runInstallPhase(
     stamped?: boolean;
   }
   const deferredRelOpens: DeferredRelOpen[] = [];
+  // TEMPORARY (flake capture) — DRAIN-ORDER-INDEPENDENT topology collector. The
+  // per-deferral lineage dump below only fires when a package.json read actually
+  // DEFERS (leaf-up drain, ~30%/run); two green CI runs produced zero deferrals.
+  // The topology that makes the unrs-resolver leaf SYNTH (childParent edges +
+  // clone/chdir lineTs + CLONE_FS flags) is COMPLETE and IDENTICAL at end-of-drain
+  // regardless of drain order, so we record every package.json read here and dump
+  // the resolver subtree's full lineage at end-of-drain — capturing the real shape
+  // on EVERY run. A unit test then replays that exact topology in BOTH drain orders
+  // to reproduce the synth deterministically. Gated; stderr-only; zero lock impact.
+  // REMOVE with the dumps once the deferred-replay walk fix is validated.
+  const debugCapture = process.env['SCRIPT_JAIL_DEBUG_DEFERRED_OPEN'] === '1';
+  const debugPkgJsonReads: Array<{
+    pid: number;
+    path: string;
+    ts: number;
+    kind: string;
+    pkg: string | null;
+    lifecycle: string | null;
+  }> = [];
   //   nodeBootstrapFileEndedTs: ts of a pid's OWN node-startup-done marker (the
   //     strace open of NODE_STARTUP_DONE_STRACE_PATH or its shim event), first-
   //     writer-wins. Same per-pid file as the pid's reads → causal ts. Used at
@@ -6190,6 +6209,25 @@ export async function runInstallPhase(
         // dropped at the null-attribution gate below. See the NOTE there.
         const result = input.attribution.attribute(rawEvent.pid);
 
+        // TEMPORARY (flake capture): record every package.json read/write so the
+        // end-of-drain topology dump can print the resolver subtree's lineage even
+        // when the read RESOLVED inline (root-down drain → never entered
+        // deferredRelOpens). Drain-order-independent; gated; stderr at dump time.
+        if (
+          debugCapture &&
+          (rawEvent.kind === 'read' || rawEvent.kind === 'write') &&
+          /(^|\/)package\.json$/.test(rawEvent.path)
+        ) {
+          debugPkgJsonReads.push({
+            pid: rawEvent.pid,
+            path: rawEvent.path,
+            ts: rawEvent.ts,
+            kind: rawEvent.kind,
+            pkg: result?.pkg ?? null,
+            lifecycle: result?.lifecycle ?? null,
+          });
+        }
+
         // Audit-trust Finding A (high, 2026-05-18): kernel-observed
         // openat trust signals — these run BEFORE the attribution gate
         // (and BEFORE the spawn-bookkeeping below) so we can build the
@@ -7225,6 +7263,103 @@ export async function runInstallPhase(
     }
   }
   deferredRelOpens.length = 0;
+
+  // TEMPORARY (flake capture) — DRAIN-ORDER-INDEPENDENT topology dump. Fires on
+  // EVERY run (not just the ~30% that defer): for each package.json read in the
+  // resolver subtree, print the reading pid's FULL lineage UP childParent with the
+  // per-hop clone/chdir lineTs + clone-time cwd + CLONE_FS/pid-reuse flags. These
+  // are complete at end-of-drain and identical across drain orders, so a unit test
+  // can replay this exact topology in BOTH orders to reproduce the <UNRESOLVED_PATH>
+  // synth deterministically. The `[sj-pkgjson-summary]` line exposes the real pkg
+  // labels so the subtree filter can be widened if it misses. REMOVE with the dumps.
+  if (debugCapture) {
+    const distinctPkgs = new Set<string>();
+    for (const r of debugPkgJsonReads) distinctPkgs.add(r.pkg ?? '<null>');
+    try {
+      process.stderr.write(
+        '[sj-pkgjson-summary] ' +
+          JSON.stringify({
+            total: debugPkgJsonReads.length,
+            distinctPkgs: Array.from(distinctPkgs).sort(),
+          }) +
+          '\n',
+      );
+    } catch {
+      /* best-effort diagnostic */
+    }
+    let dumped = 0;
+    let skipped = 0;
+    for (const r of debugPkgJsonReads) {
+      // Bound the log: dump lineage for the resolver subtree (unrs-resolver /
+      // napi-postinstall) OR reaped-helper reads (null pkg — the leaf may be a
+      // reaped short-lived clone child). The summary above catches a missed label.
+      if (!/unrs|napi|resolver|postinstall/i.test(r.pkg ?? '') && r.pkg !== null) {
+        skipped++;
+        continue;
+      }
+      if (dumped >= 80) {
+        skipped++;
+        continue;
+      }
+      dumped++;
+      const chain: Array<Record<string, unknown>> = [];
+      let prev: number = r.pid;
+      let a: number | undefined = childParent.get(r.pid);
+      let guard = 0;
+      const seen = new Set<number>();
+      while (a !== undefined && guard++ < 64 && !seen.has(a)) {
+        seen.add(a);
+        chain.push({
+          a,
+          cloneOf: prev,
+          firstMut: firstCwdMutationTs.get(a) ?? null,
+          lastMut: lastCwdMutationTs.get(a) ?? null,
+          seedTs: childSeedCloneTs.get(prev) ?? null,
+          cloneCwd: pidCloneTimeCwd.get(a) ?? null,
+          curCwd: cwdGet(a) ?? null,
+          everShared: everCwdShared.has(a),
+          reused: childParentReused.has(a),
+        });
+        prev = a;
+        a = childParent.get(a);
+      }
+      try {
+        process.stderr.write(
+          '[sj-pkgjson-topo] ' +
+            JSON.stringify({
+              pid: r.pid,
+              path: r.path,
+              ts: r.ts,
+              kind: r.kind,
+              pkg: r.pkg,
+              lifecycle: r.lifecycle,
+              leaf: {
+                parent: childParent.get(r.pid) ?? null,
+                firstMut: firstCwdMutationTs.get(r.pid) ?? null,
+                lastMut: lastCwdMutationTs.get(r.pid) ?? null,
+                cloneCwd: pidCloneTimeCwd.get(r.pid) ?? null,
+                curCwd: cwdGet(r.pid) ?? null,
+                seedCloneTs: childSeedCloneTs.get(r.pid) ?? null,
+                everShared: everCwdShared.has(r.pid),
+                reused: childParentReused.has(r.pid),
+              },
+              chainReachedRoot: a === undefined,
+              chain,
+            }) +
+            '\n',
+        );
+      } catch {
+        /* best-effort diagnostic */
+      }
+    }
+    try {
+      process.stderr.write(
+        '[sj-pkgjson-topo-done] ' + JSON.stringify({ dumped, skipped }) + '\n',
+      );
+    } catch {
+      /* best-effort diagnostic */
+    }
+  }
 
   flushAllNodeBootstrapCandidates();
 

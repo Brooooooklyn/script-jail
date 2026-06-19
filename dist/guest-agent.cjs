@@ -27206,6 +27206,8 @@ async function runInstallPhase(input) {
   const pidCloneTimeCwd = /* @__PURE__ */ new Map();
   const childSeedCloneTs = /* @__PURE__ */ new Map();
   const deferredRelOpens = [];
+  const debugCapture = process.env["SCRIPT_JAIL_DEBUG_DEFERRED_OPEN"] === "1";
+  const debugPkgJsonReads = [];
   const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
   function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
     const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
@@ -28480,6 +28482,16 @@ async function runInstallPhase(input) {
           continue;
         }
         const result = input.attribution.attribute(rawEvent.pid);
+        if (debugCapture && (rawEvent.kind === "read" || rawEvent.kind === "write") && /(^|\/)package\.json$/.test(rawEvent.path)) {
+          debugPkgJsonReads.push({
+            pid: rawEvent.pid,
+            path: rawEvent.path,
+            ts: rawEvent.ts,
+            kind: rawEvent.kind,
+            pkg: result?.pkg ?? null,
+            lifecycle: result?.lifecycle ?? null
+          });
+        }
         if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.errno === void 0 && rawEvent.retFd !== void 0) {
           const canonicalForFd = canonicalizeOpenTarget(
             rawEvent.pid,
@@ -28831,6 +28843,84 @@ async function runInstallPhase(input) {
     }
   }
   deferredRelOpens.length = 0;
+  if (debugCapture) {
+    const distinctPkgs = /* @__PURE__ */ new Set();
+    for (const r of debugPkgJsonReads) distinctPkgs.add(r.pkg ?? "<null>");
+    try {
+      process.stderr.write(
+        "[sj-pkgjson-summary] " + JSON.stringify({
+          total: debugPkgJsonReads.length,
+          distinctPkgs: Array.from(distinctPkgs).sort()
+        }) + "\n"
+      );
+    } catch {
+    }
+    let dumped = 0;
+    let skipped = 0;
+    for (const r of debugPkgJsonReads) {
+      if (!/unrs|napi|resolver|postinstall/i.test(r.pkg ?? "") && r.pkg !== null) {
+        skipped++;
+        continue;
+      }
+      if (dumped >= 80) {
+        skipped++;
+        continue;
+      }
+      dumped++;
+      const chain = [];
+      let prev = r.pid;
+      let a = childParent.get(r.pid);
+      let guard = 0;
+      const seen = /* @__PURE__ */ new Set();
+      while (a !== void 0 && guard++ < 64 && !seen.has(a)) {
+        seen.add(a);
+        chain.push({
+          a,
+          cloneOf: prev,
+          firstMut: firstCwdMutationTs.get(a) ?? null,
+          lastMut: lastCwdMutationTs.get(a) ?? null,
+          seedTs: childSeedCloneTs.get(prev) ?? null,
+          cloneCwd: pidCloneTimeCwd.get(a) ?? null,
+          curCwd: cwdGet(a) ?? null,
+          everShared: everCwdShared.has(a),
+          reused: childParentReused.has(a)
+        });
+        prev = a;
+        a = childParent.get(a);
+      }
+      try {
+        process.stderr.write(
+          "[sj-pkgjson-topo] " + JSON.stringify({
+            pid: r.pid,
+            path: r.path,
+            ts: r.ts,
+            kind: r.kind,
+            pkg: r.pkg,
+            lifecycle: r.lifecycle,
+            leaf: {
+              parent: childParent.get(r.pid) ?? null,
+              firstMut: firstCwdMutationTs.get(r.pid) ?? null,
+              lastMut: lastCwdMutationTs.get(r.pid) ?? null,
+              cloneCwd: pidCloneTimeCwd.get(r.pid) ?? null,
+              curCwd: cwdGet(r.pid) ?? null,
+              seedCloneTs: childSeedCloneTs.get(r.pid) ?? null,
+              everShared: everCwdShared.has(r.pid),
+              reused: childParentReused.has(r.pid)
+            },
+            chainReachedRoot: a === void 0,
+            chain
+          }) + "\n"
+        );
+      } catch {
+      }
+    }
+    try {
+      process.stderr.write(
+        "[sj-pkgjson-topo-done] " + JSON.stringify({ dumped, skipped }) + "\n"
+      );
+    } catch {
+    }
+  }
   flushAllNodeBootstrapCandidates();
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
