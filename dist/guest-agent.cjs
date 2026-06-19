@@ -31174,6 +31174,7 @@ require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0
     delete baseEnv["LD_PRELOAD"];
     delete baseEnv["DYLD_INSERT_LIBRARIES"];
     delete baseEnv["DYLD_LIBRARY_PATH"];
+    delete baseEnv["NODE_OPTIONS"];
     (0, import_node_child_process3.spawnSync)(
       node,
       [
@@ -31183,7 +31184,7 @@ require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0
         "--offline",
         "--node-options=",
         "-c",
-        '"$SJ_NODE" "$SJ_DUMP"'
+        '"$SJ_NODE" -- "$SJ_DUMP"'
       ],
       {
         cwd,

@@ -172,6 +172,45 @@ describe.skipIf(!HAVE_NPM)('realCaptureNpmPrepareEnv (real npm)', () => {
     expect(existsSync(pwn)).toBe(false);
   });
 
+  // adversarial-review round-22 [high]: shell-quoting the dump path is not enough — the
+  // value is still passed as node's first ARGV.  A RELATIVE TMPDIR that starts with a
+  // node option (e.g. `--eval=<code>` / `--import=data:...`) makes dumpScriptPath start
+  // with `--`, so without a `--` end-of-options terminator node parses it as a CLI
+  // OPTION and runs the attacker code with the agent's real env BEFORE dump.cjs.  The
+  // fix is `node -- <dump>`; this pins that the option never executes.
+  it('is immune to node ARGV option-injection via a relative TMPDIR starting with --', () => {
+    const pwn = join(repo, 'PWNED.txt');
+    // Slash-free, single-component relative dir name that, as `--eval=<code>`, would
+    // run writeFileSync(PWN_OUT) BEFORE the trailing path text is parsed (left-to-right
+    // eval; the writeFileSync executes, then `undefined / .../dump.cjs` is harmless NaN).
+    const evilRelTmp = "--eval=require('fs').writeFileSync(process.env.PWN_OUT,'OPTINJECT')";
+    // mkdtemp resolves a relative tmpdir against process.cwd(); chdir to a throwaway
+    // sandbox so the weird dir never touches the repo working tree.
+    const sandbox = mkdtempSync(join(tmpdir(), 'sj-optinj-'));
+    writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ name: 'r', version: '1.0.0' }), 'utf8');
+    mkdirSync(join(sandbox, evilRelTmp), { recursive: true });
+
+    const cwdSaved = process.cwd();
+    const savedTmp = process.env.TMPDIR;
+    process.chdir(sandbox);
+    process.env.TMPDIR = evilRelTmp; // relative → dump dir + dump.cjs land under sandbox.
+    try {
+      realCaptureNpmPrepareEnv({
+        node: process.execPath,
+        npmCli: NPM_CLI,
+        cwd: sandbox,
+        env: { ...process.env, NPM_TOKEN: 'SJ_OPTINJECT_CANARY', PWN_OUT: pwn },
+      });
+    } finally {
+      process.chdir(cwdSaved);
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+      try { rmSync(sandbox, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    // The `--eval` option never executed → the canary file was never written.
+    expect(existsSync(pwn)).toBe(false);
+  });
+
   it('returns null when the npm-cli path does not exist (dump cannot run → fail closed)', () => {
     writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'r', version: '1.0.0' }), 'utf8');
     const cap = realCaptureNpmPrepareEnv({

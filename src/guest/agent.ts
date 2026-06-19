@@ -3315,10 +3315,19 @@ export function realCaptureNpmPrepareEnv(ctx: {
       return null;
     }
     // Non-audited base env: drop the preload instrumentation so npm/node run clean.
+    // NODE_OPTIONS is dropped too: the dump's outer (`node <npmCli> exec`) and inner
+    // (`node -- <dump>`) processes both honour an inherited NODE_OPTIONS at startup
+    // REGARDLESS of the `--` argv terminator, so a `--require`/`--import` in it would
+    // run code with the agent's real env (the env-side twin of the round-22 argv
+    // option-injection).  The agent launch already strips NODE_OPTIONS before the agent
+    // starts (host-install stripDangerousEnv; clean FC/Docker guest), but the dump must
+    // not DEPEND on that distant invariant — strip it here too (it is never an
+    // npm_config_ key, so the capture is unaffected).
     const baseEnv: NodeJS.ProcessEnv = { ...env };
     delete baseEnv['LD_PRELOAD'];
     delete baseEnv['DYLD_INSERT_LIBRARIES'];
     delete baseEnv['DYLD_LIBRARY_PATH'];
+    delete baseEnv['NODE_OPTIONS'];
     // 1. DUMP (forced trusted shell → un-hijackable env capture).
     //
     // The `-c` body is parsed by the forced /bin/sh.  NEVER interpolate the node or
@@ -3330,6 +3339,14 @@ export function realCaptureNpmPrepareEnv(ctx: {
     // paths via env and reference them with double-quoted expansions instead: in POSIX
     // sh `"$X"` expands to the value LITERALLY (no word-split, no glob, no re-parse of
     // metacharacters), so a hostile path can never break out of the two-word command.
+    //
+    // The `--` end-of-options terminator is REQUIRED before the script path: without
+    // it, a `dumpScriptPath` that begins with `-` (e.g. a relative TMPDIR like
+    // `--import=data:text/javascript,<code>`) is parsed by node as a CLI OPTION and
+    // executes attacker code with the agent's real env before dump.cjs ever runs —
+    // argv option-injection, the same secret-bearing impact, NOT closed by the shell
+    // quoting (adversarial-review round-22 [high]).  After `--`, node treats the value
+    // as the positional script path verbatim, even when it starts with `-`.
     spawnSync(
       node,
       [
@@ -3339,7 +3356,7 @@ export function realCaptureNpmPrepareEnv(ctx: {
         '--offline',
         '--node-options=',
         '-c',
-        '"$SJ_NODE" "$SJ_DUMP"',
+        '"$SJ_NODE" -- "$SJ_DUMP"',
       ],
       {
         cwd,
