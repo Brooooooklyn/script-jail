@@ -10363,6 +10363,7 @@ __export(agent_exports, {
   createSensitiveRedactor: () => createSensitiveRedactor,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
+  npmrcPinsWorkspaceSelector: () => npmrcPinsWorkspaceSelector,
   readStraceChildPid: () => readStraceChildPid,
   redactSensitive: () => redactSensitive,
   resolvePrepareCommand: () => resolvePrepareCommand,
@@ -31081,6 +31082,23 @@ var NPM_PREPARE_RUNNER_SOURCE = [
   "});",
   ""
 ].join("\n");
+function npmrcPinsWorkspaceSelector(workDir) {
+  let content;
+  try {
+    content = (0, import_node_fs5.readFileSync)((0, import_node_path6.join)(workDir, ".npmrc"), "utf8");
+  } catch {
+    return false;
+  }
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim().toLowerCase().replace(/\[\]$/, "");
+    if (key === "workspace") return true;
+  }
+  return false;
+}
 function resolvePrepareCommand(manager, cwd, npmPrepare) {
   if (manager === "npm") {
     if (npmPrepare !== void 0) {
@@ -31435,6 +31453,14 @@ ${stdoutTail}`;
   let prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
   const willRunPreparePass = prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true);
   if (willRunPreparePass && manager === "npm") {
+    if (npmrcPinsWorkspaceSelector(config2.work_dir)) {
+      emitter.emitError(
+        "script-jail agent: the repo `.npmrc` pins an npm `workspace` selector, which is incompatible with auditing the root `prepare` lifecycle \u2014 npm refuses `--no-workspaces` alongside a `workspace` selector, so the prepare pass would fail after startup and the root `prepare` could ship UNAUDITED. Refusing to emit a lockfile: remove the `workspace=` selector from the repo `.npmrc` (its workspace packages are already audited by the main install pass).",
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
     try {
       const runnerDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(straceBaseDir, "sj-prep-"));
       const runnerPath = (0, import_node_path6.join)(runnerDir, "runner.cjs");
@@ -31664,6 +31690,7 @@ if (isMain) {
   createSensitiveRedactor,
   macosTokenizeRoots,
   main,
+  npmrcPinsWorkspaceSelector,
   readStraceChildPid,
   redactSensitive,
   resolvePrepareCommand,

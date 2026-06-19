@@ -1742,6 +1742,83 @@ describe('agent main() root-prepare second pass', () => {
     expect(exitedWith).toBe(1);
   });
 
+  it('FAILS CLOSED (npm) when the repo .npmrc pins a workspace SELECTOR (round-18 CONCERN 1)', async () => {
+    // A `.npmrc workspace=<name>` selector is mutually exclusive with the
+    // --no-workspaces we pass, so `npm exec` would exit nonzero AFTER startup
+    // (events emitted → non-fatal gate → root prepare could ship UNAUDITED).
+    // Reject it up front: fatal, no lockfile, prepare runner never invoked.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+    writeFileSync(join(testDir, '.npmrc'), 'workspace=a\n', 'utf8');
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prep.runner,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/workspace/);
+    // Main install ran; the prepare runner was NEVER invoked; no lockfile.
+    expect(main_.calls).toHaveLength(1);
+    expect(prep.calls).toHaveLength(0);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('does NOT fail closed for `.npmrc workspaces=true` (the TOGGLE) — prepare runs with --no-workspaces', async () => {
+    // The boolean fan-out toggle is neutralized by --no-workspaces (not a selector);
+    // the prepare pass must still run and a lockfile must ship.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+    writeFileSync(join(testDir, '.npmrc'), 'workspaces=true\n', 'utf8');
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // No fatal: the prepare pass ran (with --no-workspaces) and a lockfile shipped.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(prep.calls).toHaveLength(1);
+    expect(prep.calls[0]!.args).toContain('--no-workspaces');
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
   it('FAILS CLOSED (no lockfile) when prepare exits nonzero with ZERO events (untraced-prepare audit-bypass)', async () => {
     // The prepare PASS always launches a process (npm exec / yarn run), so a
     // traced run must produce events (startup fs reads).  Zero events + nonzero

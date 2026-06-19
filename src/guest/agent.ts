@@ -3070,6 +3070,51 @@ export const NPM_PREPARE_RUNNER_SOURCE = [
 ].join('\n');
 
 /**
+ * Does the repo's project `.npmrc` pin an npm WORKSPACE SELECTOR (`workspace=…`
+ * or `workspace[]=…`)?
+ *
+ * adversarial-review round-18 (CONCERN 1, selector form): npm treats a configured
+ * `workspace` selector as MUTUALLY EXCLUSIVE with `--no-workspaces` (verified npm
+ * 11.13.0: `npm exec --no-workspaces …` exits 1 with "Cannot use --no-workspaces
+ * and --workspace at the same time").  The npm root-prepare pass passes
+ * `--no-workspaces` (to neutralize a `workspaces=true` fan-out), so a pinned
+ * selector would make `npm exec` exit nonzero AFTER npm startup — by which point
+ * the process has emitted env/fs events, so the prepare-pass gate sees
+ * `eventCount > 0` and treats it as NON-fatal → a lockfile could ship with the
+ * root `prepare` UNAUDITED (a silent false-negative).  The orchestrator therefore
+ * REJECTS a pinned selector up front with a targeted fatal diagnostic.
+ *
+ * Matches `workspace` (optionally `[]`) but NOT `workspaces=<bool>` (the fan-out
+ * toggle, which `--no-workspaces` neutralizes cleanly).  Scans the repo `.npmrc`
+ * only — the PR-controlled vector.  An ambient env `npm_config_workspace` is not
+ * PR-controlled (the PR controls repo files, not the runner env), and a
+ * user/global `.npmrc` selector is the operator's own machine config; both are
+ * documented residuals outside the PR threat model.
+ *
+ * @internal Exported for unit tests.
+ */
+export function npmrcPinsWorkspaceSelector(workDir: string): boolean {
+  let content: string;
+  try {
+    content = readFileSync(joinPath(workDir, '.npmrc'), 'utf8');
+  } catch {
+    return false; // no/unreadable .npmrc → no selector
+  }
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === '' || line.startsWith('#') || line.startsWith(';')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    // ini key = the part before the first '='.  npm's selector key is `workspace`
+    // (or the array form `workspace[]`); lowercased so a `Workspace=` form also
+    // trips (errs toward the safe fail-closed).
+    const key = line.slice(0, eq).trim().toLowerCase().replace(/\[\]$/, '');
+    if (key === 'workspace') return true;
+  }
+  return false;
+}
+
+/**
  * Resolve the command for the second Phase-B pass that audits the ROOT
  * project's `prepare` lifecycle script(s).
  *
@@ -3087,7 +3132,11 @@ export const NPM_PREPARE_RUNNER_SOURCE = [
  *            to the repo-root cwd: a PR `.npmrc workspaces=true` would otherwise make
  *            `npm exec -c` fan out into workspace dirs, running WORKSPACE prepares
  *            (force-attributed to root) and SKIPPING the root lifecycle (the #44 gap
- *            re-opens; verified npm 11.13.0).  `--node-options=` (the VALUE form, NOT
+ *            re-opens; verified npm 11.13.0).  (The mutually-exclusive `.npmrc
+ *            workspace=<name>` SELECTOR form — which npm refuses to combine with
+ *            `--no-workspaces` — is rejected up front by the orchestrator's
+ *            {@link npmrcPinsWorkspaceSelector} fail-closed gate, not here.)
+ *            `--node-options=` (the VALUE form, NOT
  *            boolean `--no-node-options`) neutralizes a PR-controlled `.npmrc
  *            node-options` `--require` hook AND clears `npm_config_node_options` —
  *            restoring parity with the main install's INSTALL_CMD `--no-node-options`,
@@ -3973,6 +4022,24 @@ export async function main(input: AgentInput): Promise<void> {
   //     logs) is anomalous — refuse to emit a lockfile, mirroring the prepare-events-
   //     file gate below.  npm-only; yarn/pnpm never reach this.
   if (willRunPreparePass && manager === 'npm') {
+    // CONCERN 1 (selector form): a repo `.npmrc workspace=<name>` selector is
+    // mutually exclusive with the `--no-workspaces` we pass, so `npm exec` would
+    // exit nonzero AFTER startup (events emitted → non-fatal gate → a lockfile
+    // could ship with the root `prepare` UNAUDITED).  Reject it up front with a
+    // targeted fatal diagnostic (see npmrcPinsWorkspaceSelector).
+    if (npmrcPinsWorkspaceSelector(config.work_dir)) {
+      emitter.emitError(
+        'script-jail agent: the repo `.npmrc` pins an npm `workspace` selector, which is ' +
+          'incompatible with auditing the root `prepare` lifecycle — npm refuses ' +
+          '`--no-workspaces` alongside a `workspace` selector, so the prepare pass would ' +
+          'fail after startup and the root `prepare` could ship UNAUDITED. Refusing to ' +
+          'emit a lockfile: remove the `workspace=` selector from the repo `.npmrc` (its ' +
+          'workspace packages are already audited by the main install pass).',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
     try {
       const runnerDir = mkdtempSync(joinPath(straceBaseDir, 'sj-prep-'));
       const runnerPath = joinPath(runnerDir, 'runner.cjs');

@@ -21,7 +21,7 @@ import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { resolvePrepareCommand } from '../../src/guest/agent.js';
+import { resolvePrepareCommand, npmrcPinsWorkspaceSelector } from '../../src/guest/agent.js';
 
 let dir: string;
 
@@ -117,5 +117,50 @@ describe('resolvePrepareCommand', () => {
   it('pnpm → null (root prepare already covered by pnpm rebuild --pending)', () => {
     writePkg({ prepare: 'tsc -p .' });
     expect(resolvePrepareCommand('pnpm', dir)).toBeNull();
+  });
+});
+
+describe('npmrcPinsWorkspaceSelector (round-18 CONCERN 1, selector form)', () => {
+  function writeNpmrc(body: string): void {
+    writeFileSync(join(dir, '.npmrc'), body, 'utf8');
+  }
+
+  it('no .npmrc → false', () => {
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(false);
+  });
+
+  it('workspace=<name> selector → true (fails closed; --no-workspaces conflict)', () => {
+    writeNpmrc('workspace=a\n');
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(true);
+  });
+
+  it('workspace = <name> (spaces) → true', () => {
+    writeNpmrc('workspace = a\n');
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(true);
+  });
+
+  it('workspace[]=<name> (array form) → true', () => {
+    writeNpmrc('workspace[]=a\nworkspace[]=b\n');
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(true);
+  });
+
+  it('workspaces=true (the fan-out TOGGLE, not a selector) → false (handled by --no-workspaces)', () => {
+    writeNpmrc('workspaces=true\n');
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(false);
+  });
+
+  it('a commented-out selector → false', () => {
+    writeNpmrc('# workspace=a\n; workspace=b\n');
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(false);
+  });
+
+  it('unrelated keys (registry, include-workspace-root, workspace-foo) → false', () => {
+    writeNpmrc('registry=https://r.example/\ninclude-workspace-root=true\nworkspace-foo=1\n');
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(false);
+  });
+
+  it('selector among other keys → true', () => {
+    writeNpmrc('registry=https://r.example/\nworkspaces=true\nworkspace=a\n');
+    expect(npmrcPinsWorkspaceSelector(dir)).toBe(true);
   });
 });
