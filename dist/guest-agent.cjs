@@ -28742,6 +28742,54 @@ async function runInstallPhase(input) {
         canonical = path2.resolve(initial, d.rawEvent.path);
       }
     }
+    if (process.env["SCRIPT_JAIL_DEBUG_DEFERRED_OPEN"] === "1" && /(^|\/)package\.json$/.test(d.rawEvent.path)) {
+      const dchain = [];
+      let dprev = P;
+      let da = d.seedParentPid;
+      let dguard = 0;
+      const dseen = /* @__PURE__ */ new Set();
+      while (da !== void 0 && dguard++ < 64 && !dseen.has(da)) {
+        dseen.add(da);
+        dchain.push({
+          a: da,
+          cloneOf: dprev,
+          firstMut: firstCwdMutationTs.get(da) ?? null,
+          lastMut: lastCwdMutationTs.get(da) ?? null,
+          seedTs: childSeedCloneTs.get(dprev) ?? null,
+          cloneCwd: pidCloneTimeCwd.get(da) ?? null,
+          curCwd: cwdGet(da) ?? null,
+          everShared: everCwdShared.has(da),
+          reused: childParentReused.has(da)
+        });
+        dprev = da;
+        da = childParent.get(da);
+      }
+      try {
+        process.stderr.write(
+          "[sj-deferred-open] " + JSON.stringify({
+            pid: P,
+            path: d.rawEvent.path,
+            ts: d.rawEvent.ts,
+            kind: d.rawEvent.kind,
+            pkg,
+            lifecycle,
+            stamped: d.stamped === true,
+            seedParentPid: d.seedParentPid ?? null,
+            initialCwdStamped: d.initialCwd ?? null,
+            initialAfterWalk: initial ?? null,
+            cloneFsSeed: d.cloneFsSeed === true,
+            dSharedAtRead: d.sharedAtRead === true,
+            childPidReuseHidCloneFs,
+            lineageEverCwdShared: d.seedParentPid !== void 0 ? lineageEverCwdShared(d.seedParentPid) : null,
+            sharedAtRead,
+            willResolve: canonical !== null,
+            chainReachedEnd: da === void 0,
+            chain: dchain
+          }) + "\n"
+        );
+      } catch {
+      }
+    }
     if (canonical !== null) {
       if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
         continue;

@@ -142,6 +142,12 @@ jobs:
       # works on the very tag that publishes the artifacts.  Same convention
       # as e2e.yml.
       SCRIPT_JAIL_E2E_SELF_TEST: '1'
+      # TEMPORARY (flake capture): emit the deferred-relative-open lineage of any
+      # package.json read to the guest stderr (forwarded to this CI log) so the real
+      # unrs-resolver <UNRESOLVED_PATH> deep-chain topology can be captured. The dump
+      # is stderr-only and CANNOT affect the lockfile — it does not change parity.
+      # REMOVE once the deferred-replay walk fix is validated.
+      SCRIPT_JAIL_DEBUG_DEFERRED_OPEN: '1'
     steps:
       - name: Checkout script-jail
         uses: actions/checkout@v6

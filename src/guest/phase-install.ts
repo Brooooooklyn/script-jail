@@ -7054,6 +7054,69 @@ export async function runInstallPhase(
         canonical = path.resolve(initial, d.rawEvent.path);
       }
     }
+    // DEBUG-GATED lineage dump (off in production — env unset → zero behavioural/
+    // byte impact; it ONLY writes to stderr, never to the events file or any emit).
+    // Used to capture the REAL unrs-resolver deep-chain topology that makes a leaf
+    // `openat(AT_FDCWD,"package.json")` SYNTH `<UNRESOLVED_PATH>` under leaf-up drain
+    // order, so the deferred-replay walk fix is evidence-driven (not another
+    // synthetic patch). The Docker backend forwards the guest agent's stderr to the
+    // CI log; grep `[sj-deferred-open]`. Gated to the package.json basename to avoid
+    // flooding. Safe to keep: it cannot affect the lockfile.
+    if (
+      process.env['SCRIPT_JAIL_DEBUG_DEFERRED_OPEN'] === '1' &&
+      /(^|\/)package\.json$/.test(d.rawEvent.path)
+    ) {
+      const dchain: Array<Record<string, unknown>> = [];
+      let dprev: number = P;
+      let da: number | undefined = d.seedParentPid;
+      let dguard = 0;
+      const dseen = new Set<number>();
+      while (da !== undefined && dguard++ < 64 && !dseen.has(da)) {
+        dseen.add(da);
+        dchain.push({
+          a: da,
+          cloneOf: dprev,
+          firstMut: firstCwdMutationTs.get(da) ?? null,
+          lastMut: lastCwdMutationTs.get(da) ?? null,
+          seedTs: childSeedCloneTs.get(dprev) ?? null,
+          cloneCwd: pidCloneTimeCwd.get(da) ?? null,
+          curCwd: cwdGet(da) ?? null,
+          everShared: everCwdShared.has(da),
+          reused: childParentReused.has(da),
+        });
+        dprev = da;
+        da = childParent.get(da);
+      }
+      try {
+        process.stderr.write(
+          '[sj-deferred-open] ' +
+            JSON.stringify({
+              pid: P,
+              path: d.rawEvent.path,
+              ts: d.rawEvent.ts,
+              kind: d.rawEvent.kind,
+              pkg,
+              lifecycle,
+              stamped: d.stamped === true,
+              seedParentPid: d.seedParentPid ?? null,
+              initialCwdStamped: d.initialCwd ?? null,
+              initialAfterWalk: initial ?? null,
+              cloneFsSeed: d.cloneFsSeed === true,
+              dSharedAtRead: d.sharedAtRead === true,
+              childPidReuseHidCloneFs,
+              lineageEverCwdShared:
+                d.seedParentPid !== undefined ? lineageEverCwdShared(d.seedParentPid) : null,
+              sharedAtRead,
+              willResolve: canonical !== null,
+              chainReachedEnd: da === undefined,
+              chain: dchain,
+            }) +
+            '\n',
+        );
+      } catch {
+        /* best-effort diagnostic */
+      }
+    }
     if (canonical !== null) {
       // Mirror the inline resolved-read emit path EXACTLY: producer-write drop →
       // node-bootstrap filter → node-bootstrap candidate buffering → emit.
