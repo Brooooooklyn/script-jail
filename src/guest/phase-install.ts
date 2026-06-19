@@ -263,6 +263,29 @@ export interface PhaseInstallInput {
    */
   commandOverride?: { cmd: string; args: string[] };
   /**
+   * Optional script-jail-internal file whose WRITES the dispatcher drops by
+   * EXACT canonical-path match — the SAME mechanism as the SCRIPT_JAIL_LOG_FILE
+   * events-file write drop below.
+   *
+   * The npm root-prepare pass (round-18b) uses this for the runner's GROUND-TRUTH
+   * execution sentinel: the {@link NPM_PREPARE_RUNNER_SOURCE} runner writes this
+   * file at startup — right after it resolves `@npmcli/run-script` and reads the
+   * root `package.json`, BEFORE it runs any prepare script — purely so the
+   * orchestrator can prove the runner actually executed at the repo root.  If a
+   * `.npmrc` workspace SELECTOR (in ANY form/source — quoted, redirected via
+   * userconfig/globalconfig/prefix, or env) made `npm exec --no-workspaces` exit
+   * before the `-c` body ran, the file is ABSENT → the orchestrator fails closed.
+   * Observing EXECUTION makes the gate immune to every `.npmrc` config-resolution
+   * trick (no config parsing).
+   *
+   * The write is audit infrastructure, not package behavior, so it must never
+   * surface as an `escaped_writes` entry (and on the FC/VZ scratch disk, which is
+   * under no tokenize prefix, an un-dropped write would also be byte-UNSTABLE).
+   * Keyed on the exact canonical path (script-jail-owned, NOT PR-controllable), so
+   * a genuine escaped write to any OTHER path is never dropped.
+   */
+  internalWriteDropPath?: string;
+  /**
    * Round-16 (PR #22): a resolved direct-launch for the package manager —
    * `{ node: process.execPath, entry: <abs path to the cached PM JS entry> }` from
    * {@link resolveLinuxManagerLaunch}.  When present, the phase launches
@@ -1082,6 +1105,30 @@ export async function runInstallPhase(
   // events-file write is recognised either way.
   const eventsFilePathResolved: string | null =
     eventsFilePath === null ? null : path.resolve(eventsFilePath);
+
+  // Round-18b: an ADDITIONAL script-jail-internal write-drop path (the npm
+  // root-prepare runner's execution sentinel — see PhaseInstallInput.
+  // internalWriteDropPath).  Canonicalized like the events file: the sentinel
+  // file does NOT exist yet when the phase starts (the runner writes it), so
+  // realpath its PARENT (which does exist — the mkdtemp runner dir) and re-join
+  // the basename, robust to a symlinked scratch dir; lexical-resolve companion
+  // for the symlinked-$TMPDIR-differs case.  Both null when no path is supplied
+  // (every non-prepare caller) → zero behavior change.
+  const internalWriteDropResolved: string | null =
+    typeof input.internalWriteDropPath === 'string' && input.internalWriteDropPath.length > 0
+      ? path.resolve(input.internalWriteDropPath)
+      : null;
+  const internalWriteDropCanonical: string | null = (() => {
+    if (internalWriteDropResolved === null) return null;
+    try {
+      return path.join(
+        fs.realpathSync(path.dirname(internalWriteDropResolved)),
+        path.basename(internalWriteDropResolved),
+      );
+    } catch {
+      return internalWriteDropResolved;
+    }
+  })();
 
   // Audit-trust Finding (high, 2026-05-19): basename of the canonical
   // events file, used as a Layer-1 safety net for the cwd-relative
@@ -6692,9 +6739,14 @@ export async function runInstallPhase(
           // round 9; this exact-full-path producer drop is not.)
           if (
             rawEvent.kind === 'write' &&
-            eventsFilePathCanonical !== null &&
-            (canonical === eventsFilePathCanonical ||
-              canonical === eventsFilePathResolved)
+            ((eventsFilePathCanonical !== null &&
+              (canonical === eventsFilePathCanonical ||
+                canonical === eventsFilePathResolved)) ||
+              // Round-18b: the prepare runner's execution sentinel — same
+              // exact-canonical-path drop, so it never surfaces / destabilizes.
+              (internalWriteDropCanonical !== null &&
+                (canonical === internalWriteDropCanonical ||
+                  canonical === internalWriteDropResolved)))
           ) {
             continue;
           }
@@ -7035,8 +7087,11 @@ export async function runInstallPhase(
       // node-bootstrap filter → node-bootstrap candidate buffering → emit.
       if (
         d.rawEvent.kind === 'write' &&
-        eventsFilePathCanonical !== null &&
-        (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)
+        ((eventsFilePathCanonical !== null &&
+          (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) ||
+          // Round-18b: prepare-runner execution sentinel (see inline path above).
+          (internalWriteDropCanonical !== null &&
+            (canonical === internalWriteDropCanonical || canonical === internalWriteDropResolved)))
       ) {
         continue;
       }

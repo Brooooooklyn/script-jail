@@ -10363,7 +10363,6 @@ __export(agent_exports, {
   createSensitiveRedactor: () => createSensitiveRedactor,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
-  npmrcPinsWorkspaceSelector: () => npmrcPinsWorkspaceSelector,
   readStraceChildPid: () => readStraceChildPid,
   redactSensitive: () => redactSensitive,
   resolvePrepareCommand: () => resolvePrepareCommand,
@@ -26776,6 +26775,18 @@ async function runInstallPhase(input) {
     }
   })();
   const eventsFilePathResolved = eventsFilePath === null ? null : path2.resolve(eventsFilePath);
+  const internalWriteDropResolved = typeof input.internalWriteDropPath === "string" && input.internalWriteDropPath.length > 0 ? path2.resolve(input.internalWriteDropPath) : null;
+  const internalWriteDropCanonical = (() => {
+    if (internalWriteDropResolved === null) return null;
+    try {
+      return path2.join(
+        fs3.realpathSync(path2.dirname(internalWriteDropResolved)),
+        path2.basename(internalWriteDropResolved)
+      );
+    } catch {
+      return internalWriteDropResolved;
+    }
+  })();
   const eventsFileBasename = eventsFilePathCanonical !== null ? path2.basename(eventsFilePathCanonical) : null;
   const cwdParent = /* @__PURE__ */ new Map();
   const fdParent = /* @__PURE__ */ new Map();
@@ -28620,7 +28631,9 @@ async function runInstallPhase(input) {
             }
             continue;
           }
-          if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
+          if (rawEvent.kind === "write" && (eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved) || // Round-18b: the prepare runner's execution sentinel — same
+          // exact-canonical-path drop, so it never surfaces / destabilizes.
+          internalWriteDropCanonical !== null && (canonical === internalWriteDropCanonical || canonical === internalWriteDropResolved))) {
             continue;
           }
           const resolved = {
@@ -28741,7 +28754,8 @@ async function runInstallPhase(input) {
       }
     }
     if (canonical !== null) {
-      if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
+      if (d.rawEvent.kind === "write" && (eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved) || // Round-18b: prepare-runner execution sentinel (see inline path above).
+      internalWriteDropCanonical !== null && (canonical === internalWriteDropCanonical || canonical === internalWriteDropResolved))) {
         continue;
       }
       const resolved = { ...d.rawEvent, path: canonical };
@@ -31069,6 +31083,18 @@ var NPM_PREPARE_RUNNER_SOURCE = [
   "catch (e) { process.exit(0); }",
   // no/unreadable package.json → nothing to audit
   "const scripts = (pkg && pkg.scripts) || {};",
+  // GROUND-TRUTH execution sentinel (adversarial-review round-18b): mark, in our
+  // OWN mkdtemp dir, that we have resolved @npmcli/run-script AND read the root
+  // package.json — i.e. `npm exec --no-workspaces` ran THIS `-c` body at the repo
+  // root.  The orchestrator checks it after the pass: a `.npmrc` workspace SELECTOR
+  // (ANY form/source — quoted, redirected via userconfig/globalconfig/prefix, or
+  // env) makes `npm exec --no-workspaces` exit BEFORE this body runs (verified npm
+  // 11.13.0), so the marker is ABSENT → fail closed.  Observing EXECUTION is immune
+  // to every .npmrc config-resolution trick (no parsing).  __dirname is the
+  // (realpath'd) runner dir; the dispatcher drops this exact write so it never
+  // pollutes the lock.  Written AFTER resolve+pkg-read, so an exit-3 (run-script
+  // unresolved) or exit-0 (no/unreadable root package.json) also leaves it absent.
+  "fs.writeFileSync(path.join(__dirname, 'ran.marker'), '');",
   "(async () => {",
   "  for (const event of ['preprepare', 'prepare', 'postprepare']) {",
   "    const s = scripts[event];",
@@ -31082,23 +31108,6 @@ var NPM_PREPARE_RUNNER_SOURCE = [
   "});",
   ""
 ].join("\n");
-function npmrcPinsWorkspaceSelector(workDir) {
-  let content;
-  try {
-    content = (0, import_node_fs5.readFileSync)((0, import_node_path6.join)(workDir, ".npmrc"), "utf8");
-  } catch {
-    return false;
-  }
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue;
-    const eq = line.indexOf("=");
-    if (eq === -1) continue;
-    const key = line.slice(0, eq).trim().toLowerCase().replace(/\[\]$/, "");
-    if (key === "workspace") return true;
-  }
-  return false;
-}
 function resolvePrepareCommand(manager, cwd, npmPrepare) {
   if (manager === "npm") {
     if (npmPrepare !== void 0) {
@@ -31452,19 +31461,13 @@ ${stdoutTail}`;
   }
   let prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
   const willRunPreparePass = prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true);
+  let prepareSentinelPath = null;
   if (willRunPreparePass && manager === "npm") {
-    if (npmrcPinsWorkspaceSelector(config2.work_dir)) {
-      emitter.emitError(
-        "script-jail agent: the repo `.npmrc` pins an npm `workspace` selector, which is incompatible with auditing the root `prepare` lifecycle \u2014 npm refuses `--no-workspaces` alongside a `workspace` selector, so the prepare pass would fail after startup and the root `prepare` could ship UNAUDITED. Refusing to emit a lockfile: remove the `workspace=` selector from the repo `.npmrc` (its workspace packages are already audited by the main install pass).",
-        true
-      );
-      flushAndExit(input.connection.writable, 1);
-      return;
-    }
     try {
       const runnerDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(straceBaseDir, "sj-prep-"));
       const runnerPath = (0, import_node_path6.join)(runnerDir, "runner.cjs");
       (0, import_node_fs5.writeFileSync)(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: "utf8", mode: 384 });
+      prepareSentinelPath = (0, import_node_path6.join)((0, import_node_fs5.realpathSync)(runnerDir), "ran.marker");
       prepareCommand = resolvePrepareCommand("npm", config2.work_dir, {
         runnerPath,
         nodePath: process.execPath
@@ -31563,6 +31566,11 @@ ${stdoutTail}`;
       // Conditionally spread (omitted, not undefined) for a named/absent root —
       // see the installInput note above.
       ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {},
+      // Drop the npm runner's execution-sentinel WRITE by exact path so it never
+      // surfaces as an escaped_writes entry (and never destabilizes the FC/VZ
+      // scratch path).  Omitted (no drop) for yarn/pnpm, where prepareSentinelPath
+      // is null.
+      ...prepareSentinelPath !== null ? { internalWriteDropPath: prepareSentinelPath } : {},
       commandOverride: prepareCommand
     };
     const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
@@ -31570,6 +31578,17 @@ ${stdoutTail}`;
       input,
       `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
     );
+    if (prepareSentinelPath !== null) {
+      const runnerExecuted = input.prepareStrace !== void 0 ? input.simulatePrepareRunnerSkipped !== true : (0, import_node_fs5.existsSync)(prepareSentinelPath);
+      if (!runnerExecuted) {
+        emitter.emitError(
+          "script-jail agent: the npm root-prepare runner did not execute \u2014 `npm exec --no-workspaces` aborted before running it. The usual cause is a repo `.npmrc` that pins an npm `workspace` selector (npm refuses `--no-workspaces` alongside a `workspace`/`workspace[]` selector, in any quoting or via a userconfig/globalconfig/prefix redirect). Refusing to emit a lockfile: the root `prepare` lifecycle would otherwise ship UNAUDITED. Remove the `workspace` selector from the repo `.npmrc` (its workspace packages are already audited by the main install pass).",
+          true
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+    }
     if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
       emitter.emitError(
         `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) and produced no audit events \u2014 the root \`prepare\` script likely ran untraced (strace could not attach) or the package manager aborted before spawning it. Refusing to emit a lockfile: the root \`prepare\` would be unaudited and a clean diff against it would be untrustworthy.`,
@@ -31690,7 +31709,6 @@ if (isMain) {
   createSensitiveRedactor,
   macosTokenizeRoots,
   main,
-  npmrcPinsWorkspaceSelector,
   readStraceChildPid,
   redactSensitive,
   resolvePrepareCommand,

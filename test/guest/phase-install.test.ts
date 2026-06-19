@@ -6042,6 +6042,61 @@ describe('runInstallPhase', () => {
       expect(unresolved).toHaveLength(0);
     });
 
+    it('drops the prepare-runner execution sentinel write by EXACT path; a sibling write survives (round-18b)', async () => {
+      // The npm root-prepare RUNNER writes its ground-truth `ran.marker` (an
+      // ABSOLUTE __dirname path) in its own scratch mkdtemp dir.  That write is
+      // audit infrastructure — it must NEVER surface as an escaped_writes entry
+      // (and on the FC/VZ scratch disk, under no tokenize prefix, an un-dropped
+      // write would be byte-UNSTABLE).  `internalWriteDropPath` drops it via the
+      // SAME exact-canonical-path mechanism as the events file — and ONLY that
+      // exact path, so a SIBLING write in the same dir still surfaces (proving the
+      // drop is not a blanket scratch-dir suppression that could mask a real
+      // escape).
+      const proc = mockProcReader({
+        910: {
+          ppid: 1,
+          env: {
+            npm_package_name: 'helper-pkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'prepare',
+          },
+        },
+      });
+      // FC/VZ-shaped scratch path (under /scratch, NOT under any tokenize prefix).
+      const SENTINEL = '/scratch/script-jail-strace/sj-prep-abc123/ran.marker';
+      const SIBLING = '/scratch/script-jail-strace/sj-prep-abc123/other.txt';
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        {
+          pid: 910,
+          line: `openat(AT_FDCWD, "${SENTINEL}", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 11`,
+          source: 'strace',
+        },
+        {
+          pid: 910,
+          line: `openat(AT_FDCWD, "${SIBLING}", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 12`,
+          source: 'strace',
+        },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records),
+        attribution: new Attribution(proc),
+        emitter,
+        internalWriteDropPath: SENTINEL,
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const writePaths = events
+        .filter((e) => (e['raw'] as Record<string, unknown>)['kind'] === 'write')
+        .map((e) => (e['raw'] as Record<string, unknown>)['path']);
+      expect(writePaths).not.toContain(SENTINEL);
+      expect(writePaths).toContain(SIBLING);
+    });
+
     // Case 2: AT_FDCWD-relative read of a protected file after chdir.
     // Pre-fix, `openat(AT_FDCWD, ".ssh/id_rsa", …)` was emitted with
     // path=".ssh/id_rsa" and the protected-paths matcher

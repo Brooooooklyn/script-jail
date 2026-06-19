@@ -2869,6 +2869,19 @@ export interface AgentInput {
    */
   forcePreparePass?: boolean;
   /**
+   * TEST-ONLY seam for the npm root-prepare RUNNER execution-sentinel gate
+   * (round-18b).  In production the gate checks whether the runner wrote its
+   * ground-truth `ran.marker` (present ⇒ the runner executed at the repo root;
+   * absent ⇒ a `.npmrc` workspace selector — any form/source — made `npm exec
+   * --no-workspaces` exit before it ran ⇒ fail closed).  With an INJECTED
+   * `prepareStrace` the real runner never runs, so no real marker exists; the
+   * gate therefore treats the injected pass as "the runner ran" by default —
+   * UNLESS this flag is set, which simulates the runner NOT executing so the
+   * fail-closed path can be unit-tested.  Ignored in production (`prepareStrace`
+   * undefined ⇒ the real `existsSync(marker)` ground truth is used).
+   */
+  simulatePrepareRunnerSkipped?: boolean;
+  /**
    * Override for the running Node's version string.  Defaults to
    * `process.version` (e.g. "v20.11.0").  The leading "v" is stripped before
    * being written into the rendered lockfile so the field contains a plain
@@ -3055,6 +3068,18 @@ export const NPM_PREPARE_RUNNER_SOURCE = [
   "try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')); }",
   'catch (e) { process.exit(0); }', // no/unreadable package.json → nothing to audit
   'const scripts = (pkg && pkg.scripts) || {};',
+  // GROUND-TRUTH execution sentinel (adversarial-review round-18b): mark, in our
+  // OWN mkdtemp dir, that we have resolved @npmcli/run-script AND read the root
+  // package.json — i.e. `npm exec --no-workspaces` ran THIS `-c` body at the repo
+  // root.  The orchestrator checks it after the pass: a `.npmrc` workspace SELECTOR
+  // (ANY form/source — quoted, redirected via userconfig/globalconfig/prefix, or
+  // env) makes `npm exec --no-workspaces` exit BEFORE this body runs (verified npm
+  // 11.13.0), so the marker is ABSENT → fail closed.  Observing EXECUTION is immune
+  // to every .npmrc config-resolution trick (no parsing).  __dirname is the
+  // (realpath'd) runner dir; the dispatcher drops this exact write so it never
+  // pollutes the lock.  Written AFTER resolve+pkg-read, so an exit-3 (run-script
+  // unresolved) or exit-0 (no/unreadable root package.json) also leaves it absent.
+  "fs.writeFileSync(path.join(__dirname, 'ran.marker'), '');",
   '(async () => {',
   "  for (const event of ['preprepare', 'prepare', 'postprepare']) {",
   '    const s = scripts[event];',
@@ -3068,51 +3093,6 @@ export const NPM_PREPARE_RUNNER_SOURCE = [
   '});',
   '',
 ].join('\n');
-
-/**
- * Does the repo's project `.npmrc` pin an npm WORKSPACE SELECTOR (`workspace=…`
- * or `workspace[]=…`)?
- *
- * adversarial-review round-18 (CONCERN 1, selector form): npm treats a configured
- * `workspace` selector as MUTUALLY EXCLUSIVE with `--no-workspaces` (verified npm
- * 11.13.0: `npm exec --no-workspaces …` exits 1 with "Cannot use --no-workspaces
- * and --workspace at the same time").  The npm root-prepare pass passes
- * `--no-workspaces` (to neutralize a `workspaces=true` fan-out), so a pinned
- * selector would make `npm exec` exit nonzero AFTER npm startup — by which point
- * the process has emitted env/fs events, so the prepare-pass gate sees
- * `eventCount > 0` and treats it as NON-fatal → a lockfile could ship with the
- * root `prepare` UNAUDITED (a silent false-negative).  The orchestrator therefore
- * REJECTS a pinned selector up front with a targeted fatal diagnostic.
- *
- * Matches `workspace` (optionally `[]`) but NOT `workspaces=<bool>` (the fan-out
- * toggle, which `--no-workspaces` neutralizes cleanly).  Scans the repo `.npmrc`
- * only — the PR-controlled vector.  An ambient env `npm_config_workspace` is not
- * PR-controlled (the PR controls repo files, not the runner env), and a
- * user/global `.npmrc` selector is the operator's own machine config; both are
- * documented residuals outside the PR threat model.
- *
- * @internal Exported for unit tests.
- */
-export function npmrcPinsWorkspaceSelector(workDir: string): boolean {
-  let content: string;
-  try {
-    content = readFileSync(joinPath(workDir, '.npmrc'), 'utf8');
-  } catch {
-    return false; // no/unreadable .npmrc → no selector
-  }
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === '' || line.startsWith('#') || line.startsWith(';')) continue;
-    const eq = line.indexOf('=');
-    if (eq === -1) continue;
-    // ini key = the part before the first '='.  npm's selector key is `workspace`
-    // (or the array form `workspace[]`); lowercased so a `Workspace=` form also
-    // trips (errs toward the safe fail-closed).
-    const key = line.slice(0, eq).trim().toLowerCase().replace(/\[\]$/, '');
-    if (key === 'workspace') return true;
-  }
-  return false;
-}
 
 /**
  * Resolve the command for the second Phase-B pass that audits the ROOT
@@ -3134,8 +3114,11 @@ export function npmrcPinsWorkspaceSelector(workDir: string): boolean {
  *            (force-attributed to root) and SKIPPING the root lifecycle (the #44 gap
  *            re-opens; verified npm 11.13.0).  (The mutually-exclusive `.npmrc
  *            workspace=<name>` SELECTOR form — which npm refuses to combine with
- *            `--no-workspaces` — is rejected up front by the orchestrator's
- *            {@link npmrcPinsWorkspaceSelector} fail-closed gate, not here.)
+ *            `--no-workspaces`, so `npm exec` exits BEFORE running the runner — is
+ *            caught by the orchestrator's GROUND-TRUTH execution sentinel: the
+ *            runner writes a marker only once it actually runs at the repo root, so
+ *            its ABSENCE (selector in any form/source — quoted, redirected, or env)
+ *            fails closed, no `.npmrc` parsing.)
  *            `--node-options=` (the VALUE form, NOT
  *            boolean `--no-node-options`) neutralizes a PR-controlled `.npmrc
  *            node-options` `--require` hook AND clears `npm_config_node_options` —
@@ -4021,29 +4004,21 @@ export async function main(input: AgentInput): Promise<void> {
   //     A write failure to script-jail's own scratch (where strace just wrote per-pid
   //     logs) is anomalous — refuse to emit a lockfile, mirroring the prepare-events-
   //     file gate below.  npm-only; yarn/pnpm never reach this.
+  // GROUND-TRUTH execution sentinel path (round-18b).  Set ONLY for the npm
+  // runner pass: the runner writes `ran.marker` in its own mkdtemp dir once it
+  // actually runs at the repo root; absence after the pass ⇒ a `.npmrc` workspace
+  // selector (any form/source) made `npm exec --no-workspaces` exit first ⇒ fail
+  // closed.  null for yarn/pnpm (no runner) ⇒ the gate below is skipped.
+  let prepareSentinelPath: string | null = null;
   if (willRunPreparePass && manager === 'npm') {
-    // CONCERN 1 (selector form): a repo `.npmrc workspace=<name>` selector is
-    // mutually exclusive with the `--no-workspaces` we pass, so `npm exec` would
-    // exit nonzero AFTER startup (events emitted → non-fatal gate → a lockfile
-    // could ship with the root `prepare` UNAUDITED).  Reject it up front with a
-    // targeted fatal diagnostic (see npmrcPinsWorkspaceSelector).
-    if (npmrcPinsWorkspaceSelector(config.work_dir)) {
-      emitter.emitError(
-        'script-jail agent: the repo `.npmrc` pins an npm `workspace` selector, which is ' +
-          'incompatible with auditing the root `prepare` lifecycle — npm refuses ' +
-          '`--no-workspaces` alongside a `workspace` selector, so the prepare pass would ' +
-          'fail after startup and the root `prepare` could ship UNAUDITED. Refusing to ' +
-          'emit a lockfile: remove the `workspace=` selector from the repo `.npmrc` (its ' +
-          'workspace packages are already audited by the main install pass).',
-        true,
-      );
-      flushAndExit(input.connection.writable, 1);
-      return;
-    }
     try {
       const runnerDir = mkdtempSync(joinPath(straceBaseDir, 'sj-prep-'));
       const runnerPath = joinPath(runnerDir, 'runner.cjs');
       writeFileSync(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: 'utf8', mode: 0o600 });
+      // Canonicalize via the runner dir's realpath (it exists; the marker does
+      // not yet) so it equals __dirname inside the runner (node realpaths the
+      // main module) AND the dispatcher's exact-path write-drop.
+      prepareSentinelPath = joinPath(realpathSync(runnerDir), 'ran.marker');
       prepareCommand = resolvePrepareCommand('npm', config.work_dir, {
         runnerPath,
         nodePath: process.execPath,
@@ -4241,6 +4216,11 @@ export async function main(input: AgentInput): Promise<void> {
       // Conditionally spread (omitted, not undefined) for a named/absent root —
       // see the installInput note above.
       ...(canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {}),
+      // Drop the npm runner's execution-sentinel WRITE by exact path so it never
+      // surfaces as an escaped_writes entry (and never destabilizes the FC/VZ
+      // scratch path).  Omitted (no drop) for yarn/pnpm, where prepareSentinelPath
+      // is null.
+      ...(prepareSentinelPath !== null ? { internalWriteDropPath: prepareSentinelPath } : {}),
       commandOverride: prepareCommand,
     };
     const prepareResult = isMacosBare
@@ -4250,6 +4230,42 @@ export async function main(input: AgentInput): Promise<void> {
       input,
       `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`,
     );
+    // GROUND-TRUTH execution gate (round-18b, CONCERN 1 selector form).  The npm
+    // runner writes `prepareSentinelPath` the instant it runs at the repo root
+    // (after resolving @npmcli/run-script + reading the root package.json, before
+    // any prepare script).  A `.npmrc` workspace SELECTOR — in ANY form or source
+    // (quoted `"workspace"=a`, redirected via userconfig/globalconfig/prefix, or an
+    // ambient `npm_config_workspace`) — makes `npm exec --no-workspaces` exit BEFORE
+    // that `-c` body runs (verified npm 11.13.0), so the marker is ABSENT even though
+    // npm's startup emitted events (eventCount > 0 ⇒ the non-fatal gate below would
+    // otherwise SHIP a lockfile with the root `prepare` UNAUDITED).  Observing
+    // EXECUTION makes this immune to every `.npmrc` config-resolution trick — no
+    // parsing — and also catches an exit-3 (run-script unresolved) / exit-0 (no root
+    // package.json) runner abort.  Runs BEFORE the merge gates so it wins.
+    //   TEST SEAM: with an injected `prepareStrace` the real runner never runs (no
+    //   real marker), so treat the pass as "ran" unless a test opts into the skipped
+    //   path via `simulatePrepareRunnerSkipped`.  Production (`prepareStrace`
+    //   undefined) uses the real `existsSync(marker)` ground truth.
+    if (prepareSentinelPath !== null) {
+      const runnerExecuted =
+        input.prepareStrace !== undefined
+          ? input.simulatePrepareRunnerSkipped !== true
+          : existsSync(prepareSentinelPath);
+      if (!runnerExecuted) {
+        emitter.emitError(
+          'script-jail agent: the npm root-prepare runner did not execute — `npm exec ' +
+            '--no-workspaces` aborted before running it. The usual cause is a repo `.npmrc` ' +
+            'that pins an npm `workspace` selector (npm refuses `--no-workspaces` alongside a ' +
+            '`workspace`/`workspace[]` selector, in any quoting or via a userconfig/globalconfig/' +
+            'prefix redirect). Refusing to emit a lockfile: the root `prepare` lifecycle would ' +
+            'otherwise ship UNAUDITED. Remove the `workspace` selector from the repo `.npmrc` ' +
+            '(its workspace packages are already audited by the main install pass).',
+          true,
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+    }
     // MERGE.  Mirrors the main-path fail-closed gate (~3402-3452):
     //
     //   - prepareResult.exitCode !== 0 && prepareResult.eventCount === 0:

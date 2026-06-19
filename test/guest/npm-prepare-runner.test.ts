@@ -30,6 +30,7 @@ let projDir: string;
 let runnerPath: string;
 let recordFile: string;
 let npmExecPath: string;
+let markerPath: string;
 
 // A stub `@npmcli/run-script`: appends the event it was asked to run to
 // SJ_RECORD, and throws when SJ_FAIL names that event (to drive the fail path).
@@ -70,6 +71,9 @@ beforeEach(() => {
   runnerPath = join(dir, 'sj-prepare-runner.cjs');
   writeFileSync(runnerPath, NPM_PREPARE_RUNNER_SOURCE, 'utf8');
   recordFile = join(dir, 'record.txt');
+  // The runner writes its ground-truth execution sentinel at __dirname/ran.marker
+  // (round-18b).  runnerPath lives directly in `dir`, so the marker lands there.
+  markerPath = join(dir, 'ran.marker');
 });
 
 afterEach(() => {
@@ -85,7 +89,9 @@ function writeProjPkg(scripts: Record<string, unknown> | undefined): void {
 
 // Run the runner with cwd=projDir; returns {status, events}.  When the runner
 // exits nonzero, execFileSync throws — we capture status from the thrown error.
-function runRunner(extraEnv: Record<string, string> = {}): { status: number; events: string[] } {
+function runRunner(
+  extraEnv: Record<string, string> = {},
+): { status: number; events: string[]; marker: boolean } {
   let status = 0;
   try {
     execFileSync(process.execPath, [runnerPath], {
@@ -99,7 +105,7 @@ function runRunner(extraEnv: Record<string, string> = {}): { status: number; eve
   const events = existsSync(recordFile)
     ? readFileSync(recordFile, 'utf8').split('\n').filter((l) => l.length > 0)
     : [];
-  return { status, events };
+  return { status, events, marker: existsSync(markerPath) };
 }
 
 describe('NPM_PREPARE_RUNNER_SOURCE', () => {
@@ -121,9 +127,11 @@ describe('NPM_PREPARE_RUNNER_SOURCE', () => {
       build: "node -e ''", // unrelated — must NOT run
       postinstall: "node -e ''", // unrelated — must NOT run
     });
-    const { status, events } = runRunner();
+    const { status, events, marker } = runRunner();
     expect(status).toBe(0);
     expect(events).toEqual(['preprepare', 'prepare', 'postprepare']);
+    // Ground-truth sentinel written (the runner ran at the repo root) — round-18b.
+    expect(marker).toBe(true);
   });
 
   it('runs only the present subset, preserving order (prepare + postprepare, no preprepare)', () => {
@@ -149,16 +157,48 @@ describe('NPM_PREPARE_RUNNER_SOURCE', () => {
 
   it('exits 0 with no events when there is no package.json (nothing to audit)', () => {
     // projDir intentionally has no package.json.
-    const { status, events } = runRunner();
+    const { status, events, marker } = runRunner();
     expect(status).toBe(0);
     expect(events).toEqual([]);
+    // No root package.json → exit BEFORE the sentinel write → marker absent (the
+    // orchestrator then fails closed; the repo root always HAS a package.json, so
+    // this is an anomaly, not the benign no-prepare case below).
+    expect(marker).toBe(false);
   });
 
-  it('exits nonzero (fail-loud) when a prepare-class script fails', () => {
+  it('writes the sentinel even with NO prepare scripts (benign no-op) — marker present, exit 0', () => {
+    // The benign case: a parseable root package.json with no prepare-class script.
+    // The runner reaches "about to run the lifecycle" (pkg read OK) → writes the
+    // marker → finds nothing → exits 0.  Distinguishes "ran, nothing to do" (marker
+    // present, NOT fail-closed) from "never ran" (marker absent, fail-closed).
+    writeProjPkg({ build: "node -e ''" });
+    const { status, events, marker } = runRunner();
+    expect(status).toBe(0);
+    expect(events).toEqual([]);
+    expect(marker).toBe(true);
+  });
+
+  it('exits nonzero (fail-loud) when a prepare-class script fails — sentinel still present', () => {
     writeProjPkg({ preprepare: "node -e ''", prepare: "node -e ''" });
-    const { status, events } = runRunner({ SJ_FAIL: 'prepare' });
+    const { status, events, marker } = runRunner({ SJ_FAIL: 'prepare' });
     expect(status).not.toBe(0);
     // preprepare ran (recorded) before prepare failed.
     expect(events).toEqual(['preprepare', 'prepare']);
+    // The marker is written BEFORE the lifecycle loop, so a failing prepare is a
+    // recorded (non-fatal) run, NOT a "runner never executed" fail-closed.
+    expect(marker).toBe(true);
+  });
+
+  it('exits 3 with NO sentinel when @npmcli/run-script cannot be resolved', () => {
+    // Point npm_execpath at a dir with no resolvable run-script (and the bare
+    // `require` fallback also fails from the runner's /tmp location) → exit 3,
+    // BEFORE the pkg read + sentinel write.  The orchestrator treats the absent
+    // marker as fail-closed, so an unresolvable run-script can never silently ship.
+    writeProjPkg({ prepare: "node -e ''" });
+    const badCli = join(dir, 'no-such-npm', 'bin', 'npm-cli.js');
+    const { status, events, marker } = runRunner({ npm_execpath: badCli });
+    expect(status).toBe(3);
+    expect(events).toEqual([]);
+    expect(marker).toBe(false);
   });
 });

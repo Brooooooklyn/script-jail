@@ -1742,15 +1742,20 @@ describe('agent main() root-prepare second pass', () => {
     expect(exitedWith).toBe(1);
   });
 
-  it('FAILS CLOSED (npm) when the repo .npmrc pins a workspace SELECTOR (round-18 CONCERN 1)', async () => {
-    // A `.npmrc workspace=<name>` selector is mutually exclusive with the
-    // --no-workspaces we pass, so `npm exec` would exit nonzero AFTER startup
-    // (events emitted → non-fatal gate → root prepare could ship UNAUDITED).
-    // Reject it up front: fatal, no lockfile, prepare runner never invoked.
+  it('FAILS CLOSED (npm) when the root-prepare runner did not execute (sentinel absent — workspace-selector evasion, round-18b)', async () => {
+    // Ground-truth replacement for the old `.npmrc`-parsing selector gate.  A
+    // `.npmrc` workspace SELECTOR — in ANY form/source (quoted `"workspace"=a`,
+    // a userconfig/globalconfig/prefix redirect, or an ambient
+    // `npm_config_workspace`) — makes `npm exec --no-workspaces` exit BEFORE
+    // running the runner, so the runner never writes its `ran.marker`.  The
+    // orchestrator observes EXECUTION (not config), so it is immune to every
+    // `.npmrc` config-resolution trick.  Under the injected-strace harness the
+    // real runner never runs, so `simulatePrepareRunnerSkipped` reproduces
+    // "the runner never wrote its marker"; the pass still LAUNCHES (npm exec
+    // emits startup events) before the sentinel gate fires.
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
     writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
-    writeFileSync(join(testDir, '.npmrc'), 'workspace=a\n', 'utf8');
 
     const main_ = recordingEventStrace('MAINPROG');
     const prep = recordingEventStrace('PREPPROG');
@@ -1768,6 +1773,7 @@ describe('agent main() root-prepare second pass', () => {
         spawner: mockSpawner().spawner,
         strace: main_.runner,
         prepareStrace: prep.runner,
+        simulatePrepareRunnerSkipped: true,
         dnsLookup: offlineLookup,
       });
       await new Promise<void>((r) => setImmediate(r));
@@ -1780,10 +1786,12 @@ describe('agent main() root-prepare second pass', () => {
 
     const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
     expect(fatal).toBeDefined();
-    expect(String(fatal!['message'])).toMatch(/workspace/);
-    // Main install ran; the prepare runner was NEVER invoked; no lockfile.
+    expect(String(fatal!['message'])).toMatch(/did not execute/);
+    expect(String(fatal!['message'])).toMatch(/UNAUDITED/);
+    // The prepare pass DID launch (npm exec runs, exits before the runner) — prep
+    // ran once — but the sentinel gate fires afterward: no lockfile ships.
     expect(main_.calls).toHaveLength(1);
-    expect(prep.calls).toHaveLength(0);
+    expect(prep.calls).toHaveLength(1);
     expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
     expect(exitedWith).toBe(1);
   });
