@@ -31154,61 +31154,72 @@ function realCaptureNpmPrepareEnv(ctx) {
   } catch {
     return null;
   }
-  const envOutPath = (0, import_node_path6.join)(dumpDir, "env.json");
-  const dumpScriptPath = (0, import_node_path6.join)(dumpDir, "dump.cjs");
   try {
-    (0, import_node_fs5.writeFileSync)(
-      dumpScriptPath,
-      "'use strict';\nrequire('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(process.env));\n",
-      { encoding: "utf8", mode: 384 }
+    const envOutPath = (0, import_node_path6.join)(dumpDir, "env.json");
+    const dumpScriptPath = (0, import_node_path6.join)(dumpDir, "dump.cjs");
+    try {
+      (0, import_node_fs5.writeFileSync)(
+        dumpScriptPath,
+        `'use strict';
+var e = process.env, o = {}, k;
+for (k in e) { if (/^npm_config_/i.test(k) && typeof e[k] === "string") o[k] = e[k]; }
+require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0o600 });
+`,
+        { encoding: "utf8", mode: 384 }
+      );
+    } catch {
+      return null;
+    }
+    const baseEnv = { ...env };
+    delete baseEnv["LD_PRELOAD"];
+    delete baseEnv["DYLD_INSERT_LIBRARIES"];
+    delete baseEnv["DYLD_LIBRARY_PATH"];
+    (0, import_node_child_process3.spawnSync)(
+      node,
+      [
+        npmCli,
+        "exec",
+        "--script-shell=/bin/sh",
+        "--offline",
+        "--node-options=",
+        "-c",
+        `${node} ${dumpScriptPath}`
+      ],
+      { cwd, env: { ...baseEnv, SJ_ENV_OUT: envOutPath }, stdio: "ignore", timeout: 12e4 }
     );
-  } catch {
-    return null;
+    let dumped;
+    try {
+      dumped = JSON.parse((0, import_node_fs5.readFileSync)(envOutPath, "utf8"));
+    } catch {
+      dumped = null;
+    }
+    if (dumped === null) return null;
+    const npmConfig = {};
+    for (const [k, v] of Object.entries(dumped)) {
+      if (typeof v !== "string") continue;
+      if (!/^npm_config_/i.test(k)) continue;
+      const lower = k.toLowerCase();
+      if (lower === "npm_config_call" || lower === "npm_config_script_shell") continue;
+      npmConfig[k] = v;
+    }
+    let scriptShell = null;
+    const shResult = (0, import_node_child_process3.spawnSync)(node, [npmCli, "config", "get", "script-shell"], {
+      cwd,
+      env: baseEnv,
+      encoding: "utf8",
+      timeout: 6e4
+    });
+    if (shResult.status === 0 && typeof shResult.stdout === "string") {
+      const val = shResult.stdout.trim();
+      scriptShell = val.length > 0 && val !== "null" && val !== "undefined" ? val : null;
+    }
+    return { npmConfig, scriptShell };
+  } finally {
+    try {
+      (0, import_node_fs5.rmSync)(dumpDir, { recursive: true, force: true });
+    } catch {
+    }
   }
-  const baseEnv = { ...env };
-  delete baseEnv["LD_PRELOAD"];
-  delete baseEnv["DYLD_INSERT_LIBRARIES"];
-  delete baseEnv["DYLD_LIBRARY_PATH"];
-  (0, import_node_child_process3.spawnSync)(
-    node,
-    [
-      npmCli,
-      "exec",
-      "--script-shell=/bin/sh",
-      "--offline",
-      "--node-options=",
-      "-c",
-      `${node} ${dumpScriptPath}`
-    ],
-    { cwd, env: { ...baseEnv, SJ_ENV_OUT: envOutPath }, stdio: "ignore", timeout: 12e4 }
-  );
-  let dumped;
-  try {
-    dumped = JSON.parse((0, import_node_fs5.readFileSync)(envOutPath, "utf8"));
-  } catch {
-    dumped = null;
-  }
-  if (dumped === null) return null;
-  const npmConfig = {};
-  for (const [k, v] of Object.entries(dumped)) {
-    if (typeof v !== "string") continue;
-    if (!/^npm_config_/i.test(k)) continue;
-    const lower = k.toLowerCase();
-    if (lower === "npm_config_call" || lower === "npm_config_script_shell") continue;
-    npmConfig[k] = v;
-  }
-  let scriptShell = null;
-  const shResult = (0, import_node_child_process3.spawnSync)(node, [npmCli, "config", "get", "script-shell"], {
-    cwd,
-    env: baseEnv,
-    encoding: "utf8",
-    timeout: 6e4
-  });
-  if (shResult.status === 0 && typeof shResult.stdout === "string") {
-    const val = shResult.stdout.trim();
-    scriptShell = val.length > 0 && val !== "null" && val !== "undefined" ? val : null;
-  }
-  return { npmConfig, scriptShell };
 }
 function createSensitiveRedactor(protectedEnvNames, env = process.env) {
   const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(

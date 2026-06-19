@@ -17,7 +17,7 @@
 // a particular npm layout.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -87,6 +87,55 @@ describe.skipIf(!HAVE_NPM)('realCaptureNpmPrepareEnv (real npm)', () => {
     });
     expect(cap).not.toBeNull();
     expect(cap!.scriptShell).toBeNull();
+  });
+
+  // adversarial-review round-20 [critical]: the dump child runs with the agent's
+  // REAL env (which holds protected secrets), but it must NOT spill a non-config
+  // secret to disk where the later untrusted prepare (same UID, same tmpdir) could
+  // read it via a plain file read (invisible to the env-read audit).  Two layers:
+  // the dump emits ONLY npm_config_*, and the whole dump dir is removed in a finally.
+  it('never spills a non-config secret (NPM_TOKEN) to disk, and cleans up its dump dir', () => {
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'r', version: '1.0.0' }), 'utf8');
+    writeFileSync(join(repo, '.npmrc'), 'sj-custom-key=KEEPVAL\n', 'utf8');
+
+    // This file is the ONLY caller of realCaptureNpmPrepareEnv, and tests within a
+    // file run sequentially → any sj-prep-cap dir appearing across the call is OURS.
+    const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith('sj-prep-cap-')));
+    const SECRET = 'SJ_SPILL_CANARY_9f3a2b1c';
+
+    const cap = realCaptureNpmPrepareEnv({
+      node: process.execPath,
+      npmCli: NPM_CLI,
+      cwd: repo,
+      // Inject a non-config protected-shaped secret into the dump env (the agent's
+      // real env holds exactly this kind of value in production).
+      env: { ...process.env, NPM_TOKEN: SECRET, GITHUB_TOKEN: SECRET },
+    });
+    expect(cap).not.toBeNull();
+
+    // The faithful custom config key still rides through (no faithfulness regression).
+    expect(cap!.npmConfig['npm_config_sj_custom_key']).toBe('KEEPVAL');
+    // The secret never reaches the returned config (it is not an npm_config_ key).
+    expect(Object.values(cap!.npmConfig).join('\n')).not.toContain(SECRET);
+
+    // CLEANUP: the call left NO new sj-prep-cap dir behind — nothing for the later
+    // prepare to enumerate and read.
+    const after = readdirSync(tmpdir()).filter((n) => n.startsWith('sj-prep-cap-'));
+    const leftBehind = after.filter((n) => !before.has(n));
+    expect(leftBehind).toEqual([]);
+
+    // Belt-and-suspenders: even scanning EVERY surviving sj-prep-cap dir (e.g. a
+    // stale one from a crashed run) finds the canary nowhere on disk.
+    for (const d of after) {
+      const dir = join(tmpdir(), d);
+      let names: string[] = [];
+      try { names = statSync(dir).isDirectory() ? readdirSync(dir) : []; } catch { names = []; }
+      for (const f of names) {
+        let body = '';
+        try { body = readFileSync(join(dir, f), 'utf8'); } catch { body = ''; }
+        expect(body).not.toContain(SECRET);
+      }
+    }
   });
 
   it('returns null when the npm-cli path does not exist (dump cannot run → fail closed)', () => {

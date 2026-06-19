@@ -12,7 +12,7 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, rmSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
@@ -3268,6 +3268,20 @@ export function npmCliEntryPath(execPath: string): string {
  * be self-instrumented, and the captured `npm_config_*` must reflect the real
  * config, not script-jail's injected child vars.
  *
+ * CREDENTIAL-SPILL DEFENCE (adversarial-review round-20 [critical]): the agent's
+ * own `process.env` holds the REAL protected secrets (NPM_TOKEN, registry auth, CI
+ * secrets) — the shim only hides those from lifecycle CHILDREN, it does not scrub
+ * the agent. The dump child runs with that real env (so npm projects FAITHFUL
+ * config), but it MUST NOT serialize the whole env to disk: the dump file is NOT
+ * audited, and the (untrusted, PR-controllable) root prepare runs LATER as the same
+ * UID in the same tmpdir, so it could `readdir(tmpdir)` → read the dump file via a
+ * plain file read (NOT a `process.env` read → invisible to env-spy/shim) and
+ * exfiltrate. Two layers close this:
+ *   - the dump child writes ONLY its `npm_config_*` keys (0600), never the full env,
+ *     so a non-config secret like `NPM_TOKEN` never hits disk even transiently;
+ *   - the whole dump dir is `rmSync`'d in a `finally`, so nothing survives this
+ *     function — by the time the prepare pass runs there is no file to read.
+ *
  * @internal Exported for unit tests.
  */
 export function realCaptureNpmPrepareEnv(ctx: {
@@ -3283,65 +3297,79 @@ export function realCaptureNpmPrepareEnv(ctx: {
   } catch {
     return null;
   }
-  const envOutPath = joinPath(dumpDir, 'env.json');
-  const dumpScriptPath = joinPath(dumpDir, 'dump.cjs');
   try {
-    writeFileSync(
-      dumpScriptPath,
-      "'use strict';\n" +
-        "require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(process.env));\n",
-      { encoding: 'utf8', mode: 0o600 },
+    const envOutPath = joinPath(dumpDir, 'env.json');
+    const dumpScriptPath = joinPath(dumpDir, 'dump.cjs');
+    try {
+      // The dump emits ONLY npm_config_* (the sole keys this function keeps) so the
+      // file never contains non-config secrets; written 0600 as defence in depth.
+      writeFileSync(
+        dumpScriptPath,
+        "'use strict';\n" +
+          'var e = process.env, o = {}, k;\n' +
+          'for (k in e) { if (/^npm_config_/i.test(k) && typeof e[k] === "string") o[k] = e[k]; }\n' +
+          "require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0o600 });\n",
+        { encoding: 'utf8', mode: 0o600 },
+      );
+    } catch {
+      return null;
+    }
+    // Non-audited base env: drop the preload instrumentation so npm/node run clean.
+    const baseEnv: NodeJS.ProcessEnv = { ...env };
+    delete baseEnv['LD_PRELOAD'];
+    delete baseEnv['DYLD_INSERT_LIBRARIES'];
+    delete baseEnv['DYLD_LIBRARY_PATH'];
+    // 1. DUMP (forced trusted shell → un-hijackable env capture).
+    spawnSync(
+      node,
+      [
+        npmCli,
+        'exec',
+        '--script-shell=/bin/sh',
+        '--offline',
+        '--node-options=',
+        '-c',
+        `${node} ${dumpScriptPath}`,
+      ],
+      { cwd, env: { ...baseEnv, SJ_ENV_OUT: envOutPath }, stdio: 'ignore', timeout: 120_000 },
     );
-  } catch {
-    return null;
+    let dumped: Record<string, unknown> | null;
+    try {
+      dumped = JSON.parse(readFileSync(envOutPath, 'utf8')) as Record<string, unknown>;
+    } catch {
+      dumped = null;
+    }
+    if (dumped === null) return null; // npm exec aborted / -c body never ran → no faithful env.
+    const npmConfig: Record<string, string> = {};
+    for (const [k, v] of Object.entries(dumped)) {
+      if (typeof v !== 'string') continue;
+      if (!/^npm_config_/i.test(k)) continue;
+      const lower = k.toLowerCase();
+      if (lower === 'npm_config_call' || lower === 'npm_config_script_shell') continue;
+      npmConfig[k] = v;
+    }
+    // 2. SCRIPT-SHELL (no force → faithful repo value; prints config, runs nothing).
+    let scriptShell: string | null = null;
+    const shResult = spawnSync(node, [npmCli, 'config', 'get', 'script-shell'], {
+      cwd,
+      env: baseEnv,
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
+    if (shResult.status === 0 && typeof shResult.stdout === 'string') {
+      const val = shResult.stdout.trim();
+      scriptShell = val.length > 0 && val !== 'null' && val !== 'undefined' ? val : null;
+    }
+    return { npmConfig, scriptShell };
+  } finally {
+    // Never leave the dump (or the script) on disk for the later untrusted prepare
+    // to read — the file-read side-channel bypasses the env-read audit.
+    try {
+      rmSync(dumpDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup; the dir is a 0700 random-named tmpdir entry */
+    }
   }
-  // Non-audited base env: drop the preload instrumentation so npm/node run clean.
-  const baseEnv: NodeJS.ProcessEnv = { ...env };
-  delete baseEnv['LD_PRELOAD'];
-  delete baseEnv['DYLD_INSERT_LIBRARIES'];
-  delete baseEnv['DYLD_LIBRARY_PATH'];
-  // 1. DUMP (forced trusted shell → un-hijackable env capture).
-  spawnSync(
-    node,
-    [
-      npmCli,
-      'exec',
-      '--script-shell=/bin/sh',
-      '--offline',
-      '--node-options=',
-      '-c',
-      `${node} ${dumpScriptPath}`,
-    ],
-    { cwd, env: { ...baseEnv, SJ_ENV_OUT: envOutPath }, stdio: 'ignore', timeout: 120_000 },
-  );
-  let dumped: Record<string, unknown> | null;
-  try {
-    dumped = JSON.parse(readFileSync(envOutPath, 'utf8')) as Record<string, unknown>;
-  } catch {
-    dumped = null;
-  }
-  if (dumped === null) return null; // npm exec aborted / -c body never ran → no faithful env.
-  const npmConfig: Record<string, string> = {};
-  for (const [k, v] of Object.entries(dumped)) {
-    if (typeof v !== 'string') continue;
-    if (!/^npm_config_/i.test(k)) continue;
-    const lower = k.toLowerCase();
-    if (lower === 'npm_config_call' || lower === 'npm_config_script_shell') continue;
-    npmConfig[k] = v;
-  }
-  // 2. SCRIPT-SHELL (no force → faithful repo value; prints config, runs nothing).
-  let scriptShell: string | null = null;
-  const shResult = spawnSync(node, [npmCli, 'config', 'get', 'script-shell'], {
-    cwd,
-    env: baseEnv,
-    encoding: 'utf8',
-    timeout: 60_000,
-  });
-  if (shResult.status === 0 && typeof shResult.stdout === 'string') {
-    const val = shResult.stdout.trim();
-    scriptShell = val.length > 0 && val !== 'null' && val !== 'undefined' ? val : null;
-  }
-  return { npmConfig, scriptShell };
 }
 
 /**
