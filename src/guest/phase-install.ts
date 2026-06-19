@@ -3912,6 +3912,35 @@ export async function runInstallPhase(
         continue;
       }
 
+      // SECURITY (Codex adversarial-review [high], 2026-06-19): a chdir/fchdir that
+      // strace renders as an unfinished/resumed SPLIT is dropped WHOLE — strace-parser
+      // discards each half, and the `) = 0`-anchored regexes above match NEITHER half —
+      // so the cwd mutation never lands in `firstCwdMutationTs`.  The mutation-aware
+      // CLONE_FS veto (`cloneFsGroupEverMutated` / `lineageSharedGroupMutated`) then reads
+      // the pid's fs_struct group as never-mutated and can RESOLVE a deferred AT_FDCWD
+      // open against a STALE inherited cwd instead of failing closed — a fail-closed
+      // regression vs the pre-mutation-aware veto (which fired on group membership alone).
+      //
+      // Checked HERE on the RAW line, mirroring the CLONE_UNTRACED raw-line defense below
+      // (the syscall name — and chdir's path / fchdir's fd — all sit in the unfinished
+      // half).  We can't know the post-chdir cwd, so we record a CONSERVATIVE mutation and
+      // mark the cwd unknown.  Over-recording is uniformly the FAIL-CLOSED direction: a
+      // spurious `firstCwdMutationTs` entry only forces a `<UNRESOLVED_PATH>` synth, never
+      // a stale resolve (a complete `chdir(...) = -1` failure has no `<unfinished ...>`
+      // token, so it does NOT match here and is correctly left as a non-mutation).
+      const splitCwdMutation =
+        ((line.startsWith('chdir(') || line.startsWith('fchdir(')) &&
+          line.includes('<unfinished ...>')) ||
+        (line.startsWith('<...') &&
+          (line.includes('chdir resumed') || line.includes('fchdir resumed')));
+      if (splitCwdMutation) {
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs);
+        cwdUnknownAdd(pid);
+        cwdDelete(pid);
+        continue;
+      }
+
       // Codex follow-up #1 (high, 2026-05-19) + refinement (bugs #2 & #3,
       // 2026-05-19): pre-parse fork/clone/vfork/clone3 to propagate
       // per-pid state to the new child pid.  Strace wire formats

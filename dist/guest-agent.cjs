@@ -27668,6 +27668,14 @@ async function runInstallPhase(input) {
         }
         continue;
       }
+      const splitCwdMutation = (line.startsWith("chdir(") || line.startsWith("fchdir(")) && line.includes("<unfinished ...>") || line.startsWith("<...") && (line.includes("chdir resumed") || line.includes("fchdir resumed"));
+      if (splitCwdMutation) {
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs);
+        cwdUnknownAdd(pid);
+        cwdDelete(pid);
+        continue;
+      }
       const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
       if (cloneMatch !== null) {
         const syscallName = cloneMatch[1] ?? "";

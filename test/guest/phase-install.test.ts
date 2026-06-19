@@ -7487,6 +7487,108 @@ describe('runInstallPhase', () => {
       expect(leafUp).toEqual(rootDown);
     });
 
+    // Determinism (defer-and-re-resolve) MUTATION-AWARE CLONE_FS — SPLIT chdir/fchdir
+    // fail-closed (Codex adversarial-review [high], 2026-06-19). The mutation-aware veto
+    // reads a CLONE_FS group as IMMUTABLE when no member has a `firstCwdMutationTs` entry.
+    // But a chdir/fchdir that strace renders as an unfinished/resumed SPLIT is dropped
+    // WHOLE — `strace-parser.ts` discards each half AND the `) = 0`-anchored inline regexes
+    // (phase-install.ts:3841/3886) match NEITHER half — so a REAL cwd mutation never lands
+    // in `firstCwdMutationTs` (its only writers are those two success handlers). Pre-fix the
+    // group then looked immutable, the seed-ancestor veto `lineageSharedGroupMutated` did
+    // NOT fire, and the leaf RESOLVED the stale inherited /work instead of failing closed
+    // for the TRUE /root probe — a fail-closed REGRESSION vs the old `lineageEverCwdShared`
+    // veto, which fired on group MEMBERSHIP alone (the split could not hide from it).
+    //
+    // This is byte-for-byte the COMPLETE-chdir fail-closed test above, with R's single
+    // `chdir("/root") = 0` replaced by its split halves
+    //   `chdir("/root" <unfinished ...>`  /  `<... chdir resumed>) = 0`.
+    // Fix: detect the split on the RAW line (mirrors the CLONE_UNTRACED raw-line defense at
+    // phase-install.ts:3995) and record a CONSERVATIVE mutation → group looks mutated → fail
+    // closed. FAILS on HEAD (no synth for the leaf → silent false negative); PASSES post-fix.
+    it('deferred re-resolve FAILS CLOSED when a shared CLONE_FS ancestor mutated cwd via a SPLIT (unfinished/resumed) chdir (Codex 2026-06-19 [high])', async () => {
+      const env = {
+        npm_package_name: 'transitive-pkg',
+        npm_package_version: '1.0.0',
+        npm_lifecycle_event: 'postinstall',
+      };
+      const proc = mockProcReader({
+        2401: { ppid: 1, env },
+        2402: { ppid: 2401, env },
+        2403: { ppid: 2402, env },
+        2404: { ppid: 2403, env },
+      });
+      const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+        // R (root 2401) seeds the shared cwd at /work.
+        { pid: 2401, line: 'openat(AT_FDCWD, "/usr/bin/node", O_RDONLY|O_CLOEXEC) = 3', source: 'strace' },
+        // R clone(CLONE_FS) S (2402) → unions R+S, marks BOTH sticky everCwdShared.
+        {
+          pid: 2401,
+          line: 'clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS|CLONE_FILES|SIGCHLD, child_tidptr=0x7f...) = 2402',
+          source: 'strace',
+        },
+        // S plain-forks P (2403) — COPY of the (stale) /work. P ∉ everCwdShared.
+        {
+          pid: 2402,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2403',
+          source: 'strace',
+        },
+        // RACE: PLAIN grandchild C (2404) relative protected read drains FIRST → deferred.
+        {
+          pid: 2404,
+          line: 'openat(AT_FDCWD, ".ssh/id_rsa", O_RDONLY) = -1 ENOENT (No such file or directory)',
+          source: 'strace',
+        },
+        // P plain-forks C (2404) — COPY of the stale /work. seedParentPid=2403 ∉ everCwdShared.
+        {
+          pid: 2403,
+          line: 'clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, child_tidptr=0x7f...) = 2404',
+          source: 'strace',
+        },
+        // R chdir's the SHARED group cwd to /root — but strace SPLITS it across an
+        // unfinished/resumed pair (a signal landed mid-syscall). BOTH halves are dropped by
+        // the parser and the `) = 0` regexes → pre-fix NO `firstCwdMutationTs` entry for the
+        // group, so the mutation-aware veto wrongly sees {2401,2402} as immutable.
+        { pid: 2401, line: 'chdir("/root" <unfinished ...>', source: 'strace' },
+        { pid: 2401, line: '<... chdir resumed>) = 0', source: 'strace' },
+      ];
+
+      const { emitter, lines } = makeEmitter();
+      await runInstallPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: { ...BASE_ENV, SCRIPT_JAIL_LOG_FILE: EVENTS_FILE },
+        strace: cannedStraceRunner(records, 0, { rootPid: 2401 }),
+        attribution: new Attribution(proc),
+        emitter,
+        protectedPaths: new ProtectedPathsMatcher({
+          patterns: ['$HOME/.ssh/**'],
+          roots: {
+            repo: '/work',
+            nodeModules: '/work/node_modules',
+            home: '/root',
+            tmp: '/tmp',
+            cache: '/root/.cache/pnpm',
+          },
+        }),
+      });
+
+      const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // SECURITY: MUST NOT certify the read against the stale inherited /work (a non-
+      // protected path → silently dropped = the false negative this fix closes).
+      const stale = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'read' && r['path'] === '/work/.ssh/id_rsa';
+      });
+      expect(stale).toHaveLength(0);
+      // It MUST fail closed to <UNRESOLVED_PATH> for the racing grandchild C (FAILS on HEAD,
+      // where the dropped split chdir lets the leaf resolve the stale /work and vanish).
+      const unresolved = events.filter((e) => {
+        const r = e['raw'] as Record<string, unknown>;
+        return r['kind'] === 'exec' && r['unresolved_path'] === true && r['pid'] === 2404;
+      });
+      expect(unresolved).toHaveLength(1);
+    });
+
     // Determinism (defer-and-re-resolve) FIX #1 TRANSITIVE PID-REUSE (codex round-3
     // [high] follow-up, 2026-06-16). The lineage walk reads the FINAL `childParent`
     // map. If an INTERMEDIATE ancestor pid on the deferred read's lineage is RECYCLED
