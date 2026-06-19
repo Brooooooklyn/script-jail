@@ -1264,10 +1264,15 @@ describe('agent main() root-prepare second pass', () => {
       diag: (m) => diagMsgs.push(m),
     });
 
-    // The prepare runner WAS invoked, with the npm prepare command (NOT rebuild).
+    // The prepare runner WAS invoked, with the #44 npm-exec lifecycle-runner
+    // command (NOT rebuild): `npm exec --offline --node-options= -c '<node> <runner>'`.
+    // The runner path is script-jail-owned (under straceBaseDir), so we match its
+    // shape rather than the non-deterministic absolute path.
     expect(prep.calls).toHaveLength(1);
     expect(prep.calls[0]!.cmd).toBe('npm');
-    expect(prep.calls[0]!.args).toEqual(['run', 'prepare', '--if-present', '--foreground-scripts']);
+    expect(prep.calls[0]!.args.slice(0, 4)).toEqual(['exec', '--offline', '--node-options=', '-c']);
+    expect(prep.calls[0]!.args).toHaveLength(5);
+    expect(prep.calls[0]!.args[4]).toMatch(/ .*sj-prepare-runner\.cjs$/);
     // The main install runner ran the install command (#43: shared base carries --no-node-options).
     expect(main_.calls).toHaveLength(1);
     expect(main_.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
@@ -1285,58 +1290,6 @@ describe('agent main() root-prepare second pass', () => {
 
     // A diag breadcrumb confirms the prepare pass fired.
     expect(diagMsgs.some((m) => m.includes('prepare pass'))).toBe(true);
-  });
-
-  // #44: a root that defines `preprepare`/`postprepare` but NO base `prepare`.
-  // A real `npm install` STILL runs both wrappers (verified: npm 11.13.0), yet
-  // `npm run prepare --if-present` no-ops and MISSES them — so the audit must run
-  // an extra pass per wrapper. resolvePrepareCommand('npm') therefore returns
-  // [single, preprepare, postprepare] and the orchestration LOOPS, running one
-  // prepare pass per command. Against the OLD single-pass code this assertion
-  // FAILS (prep.calls would be 1, the wrappers unaudited → a malicious root
-  // wrapper escapes the diff gate).
-  it('#44: npm wrapper-only root (preprepare+postprepare, NO base prepare) runs a pass per wrapper', async () => {
-    const { conn, hostSend, getOutput } = makeConn();
-    const configPath = writeConfig(testDir, { manager: 'npm' });
-    writeRootPkg(testDir, {
-      name: 'rootpkg',
-      version: '1.0.0',
-      scripts: { preprepare: 'node pre.js', postprepare: 'node post.js' },
-    });
-
-    const main_ = recordingEventStrace('MAINPROG');
-    const prep = recordingEventStrace('PREPPROG');
-
-    setTimeout(() => hostSend('go\n'), 10);
-    await main({
-      configPath,
-      connection: conn,
-      spawner: mockSpawner().spawner,
-      strace: main_.runner,
-      prepareStrace: prep.runner,
-      dnsLookup: offlineLookup,
-    });
-
-    // THREE prepare passes ran: the always-present single (no-op for an absent
-    // base prepare) + one per present wrapper, in package.json-independent order
-    // (single → preprepare → postprepare).
-    expect(prep.calls).toHaveLength(3);
-    expect(prep.calls.map((c) => c.args)).toEqual([
-      ['run', 'prepare', '--if-present', '--foreground-scripts'],
-      ['run', 'preprepare', '--if-present', '--foreground-scripts'],
-      ['run', 'postprepare', '--if-present', '--foreground-scripts'],
-    ]);
-    expect(prep.calls.every((c) => c.cmd === 'npm')).toBe(true);
-    expect(main_.calls).toHaveLength(1);
-
-    // No fatal abort; a final lockfile is emitted (all passes merged into the
-    // shared collectedEvents).
-    const frames = getOutput()
-      .split('\n')
-      .filter((l) => l.trim())
-      .map((l) => JSON.parse(l) as Record<string, unknown>);
-    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
-    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
   });
 
   // REGRESSION (prepare-wrapper non-fs anchoring): the prepare-pass force-
@@ -1548,8 +1501,8 @@ describe('agent main() root-prepare second pass', () => {
       dnsLookup: offlineLookup,
     });
 
-    // resolvePrepareCommand('pnpm', …) → [] (empty), so the prepare runner is
-    // never invoked even though it was injected.
+    // resolvePrepareCommand('pnpm', …) → null, so the prepare runner is never
+    // invoked even though it was injected.
     expect(prep.calls).toHaveLength(0);
     expect(main_.calls).toHaveLength(1);
   });
@@ -1725,11 +1678,11 @@ describe('agent main() root-prepare second pass', () => {
   });
 
   it('FAILS CLOSED (no lockfile) when prepare exits nonzero with ZERO events (untraced-prepare audit-bypass)', async () => {
-    // The prepare pass is KNOWN to exist (prepareCommand !== null), so a
-    // traced run must produce events.  Zero events + nonzero exit = strace
-    // couldn't attach or the PM aborted before spawning the prepare script —
-    // the root `prepare` ran UNAUDITED.  A clean diff against the resulting
-    // lockfile would pass silently.  The gate must fail closed.
+    // The prepare PASS always launches a process (npm exec / yarn run), so a
+    // traced run must produce events (startup fs reads).  Zero events + nonzero
+    // exit = strace couldn't attach or the PM aborted before instrumentation —
+    // the root `prepare` may have run UNAUDITED.  A clean diff against the
+    // resulting lockfile would pass silently.  The gate must fail closed.
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
     // Named root so we reach the zero-event prepare gate this test targets.
@@ -1886,9 +1839,8 @@ describe('agent main() root-prepare second pass', () => {
   });
 
   it('NAMELESS root WITHOUT a prepare script → still produces a lockfile (no false trip)', async () => {
-    // Regression guard: for npm, resolvePrepareCommand is ALWAYS non-empty — it
-    // always includes the single `npm run prepare --if-present` (which no-ops
-    // when there is no prepare script; #44 only APPENDS wrapper passes).
+    // Regression guard: for npm, resolvePrepareCommand is ALWAYS non-null
+    // (the #44 exec runner finds no prepare-lifecycle scripts and exits 0).
     // A benign nameless npm root with no prepare must still produce a lockfile —
     // the run is never blocked (the old nameless-root fail-closed gate is gone;
     // a nameless root now anchors to `<repo-root>` either way).
@@ -1948,7 +1900,7 @@ describe('agent main() root-prepare second pass', () => {
   });
 
   // --- pnpm main-pass variant: nameless root + prepare → audits under <repo-root> --
-  // resolvePrepareCommand('pnpm') is ALWAYS [] (empty), so the dedicated prepare pass
+  // resolvePrepareCommand('pnpm') is ALWAYS null, so the dedicated prepare pass
   // never runs for pnpm.  pnpm's MAIN Phase-B command (`pnpm rebuild --pending`)
   // RUNS the root `prepare`; on a nameless root npm_package_name is UNSET, so the
   // events used to be dropped at the null-attribution gate → a deceptively-clean
