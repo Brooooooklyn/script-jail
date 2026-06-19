@@ -10363,7 +10363,9 @@ __export(agent_exports, {
   createSensitiveRedactor: () => createSensitiveRedactor,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
+  npmCliEntryPath: () => npmCliEntryPath,
   readStraceChildPid: () => readStraceChildPid,
+  realCaptureNpmPrepareEnv: () => realCaptureNpmPrepareEnv,
   redactSensitive: () => redactSensitive,
   resolvePrepareCommand: () => resolvePrepareCommand,
   runStraceTailer: () => runStraceTailer,
@@ -26734,8 +26736,9 @@ async function runInstallPhase(input) {
   const { cmd: baseCmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
   const userArgs = input.commandOverride === void 0 && input.manager === "npm" ? input.userInstallArgs ?? [] : [];
   const builtArgs = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
-  const cmd = input.managerLaunch !== void 0 ? input.managerLaunch.node : baseCmd;
-  const args = input.managerLaunch !== void 0 ? [input.managerLaunch.entry, ...builtArgs] : builtArgs;
+  const rawLaunch = input.commandOverride?.raw === true;
+  const cmd = rawLaunch ? baseCmd : input.managerLaunch !== void 0 ? input.managerLaunch.node : baseCmd;
+  const args = rawLaunch ? baseArgs : input.managerLaunch !== void 0 ? [input.managerLaunch.entry, ...builtArgs] : builtArgs;
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -26775,18 +26778,6 @@ async function runInstallPhase(input) {
     }
   })();
   const eventsFilePathResolved = eventsFilePath === null ? null : path2.resolve(eventsFilePath);
-  const internalWriteDropResolved = typeof input.internalWriteDropPath === "string" && input.internalWriteDropPath.length > 0 ? path2.resolve(input.internalWriteDropPath) : null;
-  const internalWriteDropCanonical = (() => {
-    if (internalWriteDropResolved === null) return null;
-    try {
-      return path2.join(
-        fs3.realpathSync(path2.dirname(internalWriteDropResolved)),
-        path2.basename(internalWriteDropResolved)
-      );
-    } catch {
-      return internalWriteDropResolved;
-    }
-  })();
   const eventsFileBasename = eventsFilePathCanonical !== null ? path2.basename(eventsFilePathCanonical) : null;
   const cwdParent = /* @__PURE__ */ new Map();
   const fdParent = /* @__PURE__ */ new Map();
@@ -28631,9 +28622,7 @@ async function runInstallPhase(input) {
             }
             continue;
           }
-          if (rawEvent.kind === "write" && (eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved) || // Round-18b: the prepare runner's execution sentinel — same
-          // exact-canonical-path drop, so it never surfaces / destabilizes.
-          internalWriteDropCanonical !== null && (canonical === internalWriteDropCanonical || canonical === internalWriteDropResolved))) {
+          if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
             continue;
           }
           const resolved = {
@@ -28754,8 +28743,7 @@ async function runInstallPhase(input) {
       }
     }
     if (canonical !== null) {
-      if (d.rawEvent.kind === "write" && (eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved) || // Round-18b: prepare-runner execution sentinel (see inline path above).
-      internalWriteDropCanonical !== null && (canonical === internalWriteDropCanonical || canonical === internalWriteDropResolved))) {
+      if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
         continue;
       }
       const resolved = { ...d.rawEvent, path: canonical };
@@ -28938,6 +28926,9 @@ function macosManagerLaunch(manager, subArgs) {
 }
 function buildMacosInstallCommand(manager, cwd, commandOverride, userInstallArgs) {
   if (commandOverride !== void 0) {
+    if (commandOverride.raw === true) {
+      return { cmd: commandOverride.cmd, args: commandOverride.args };
+    }
     return macosManagerLaunch(manager, commandOverride.args);
   }
   const base = INSTALL_CMD[manager];
@@ -31066,7 +31057,13 @@ var NPM_PREPARE_RUNNER_SOURCE = [
   "const path = require('path');",
   "const fs = require('fs');",
   "const cwd = process.cwd();",
-  "const npmCli = process.env.npm_execpath || process.env.SCRIPT_JAIL_NPM_CLI || '';",
+  // npm-cli.js path comes from ARGV (process.argv[2]), NOT process.env — the
+  // runner runs UNDER env-spy (the NODE_OPTIONS preloads), so a `process.env`
+  // read would be recorded as a (force-attributed-to-root) env_read and pollute
+  // the lock.  argv is not audited.  The env fallback is only for the unit
+  // harness (which launches the runner directly with npm_execpath set) and is
+  // short-circuited away whenever argv[2] is present (so no env read in prod).
+  "const npmCli = process.argv[2] || process.env.npm_execpath || process.env.SCRIPT_JAIL_NPM_CLI || '';",
   "let runScript;",
   "try {",
   "  const paths = npmCli ? [path.dirname(npmCli)] : [cwd];",
@@ -31083,23 +31080,25 @@ var NPM_PREPARE_RUNNER_SOURCE = [
   "catch (e) { process.exit(0); }",
   // no/unreadable package.json → nothing to audit
   "const scripts = (pkg && pkg.scripts) || {};",
-  // GROUND-TRUTH execution sentinel (adversarial-review round-18b): mark, in our
-  // OWN mkdtemp dir, that we have resolved @npmcli/run-script AND read the root
-  // package.json — i.e. `npm exec --no-workspaces` ran THIS `-c` body at the repo
-  // root.  The orchestrator checks it after the pass: a `.npmrc` workspace SELECTOR
-  // (ANY form/source — quoted, redirected via userconfig/globalconfig/prefix, or
-  // env) makes `npm exec --no-workspaces` exit BEFORE this body runs (verified npm
-  // 11.13.0), so the marker is ABSENT → fail closed.  Observing EXECUTION is immune
-  // to every .npmrc config-resolution trick (no parsing).  __dirname is the
-  // (realpath'd) runner dir; the dispatcher drops this exact write so it never
-  // pollutes the lock.  Written AFTER resolve+pkg-read, so an exit-3 (run-script
-  // unresolved) or exit-0 (no/unreadable root package.json) also leaves it absent.
-  "fs.writeFileSync(path.join(__dirname, 'ran.marker'), '');",
+  // The repo's RESOLVED script-shell, forwarded as run-script's `scriptShell`
+  // option.  @npmcli/run-script reads `scriptShell` from its OPTIONS object, NOT
+  // from `npm_config_script_shell` env — npm's CLI passes the resolved
+  // `script-shell` config to run-script the same way.  The guest reads it via
+  // `npm config get script-shell` (un-hijackable: prints config, executes nothing)
+  // and threads it via ARGV (process.argv[3]), NOT env — like npmCli, a
+  // `process.env` read here would be a (force-attributed-to-root) env_read under
+  // env-spy and pollute the lock.  Empty / 'null' / absent → undefined →
+  // run-script's own default (sh / cmd.exe).  Running the prepare under the repo's
+  // real (PR-controllable) shell is INTENTIONAL: a malicious `script-shell`'s own
+  // reads/writes/connects MUST be audited, exactly as a real install runs them
+  // (forcing a trusted /bin/sh here would HIDE an evil-shell escape).
+  "const sjShell = process.argv[3];",
+  "const scriptShell = (typeof sjShell === 'string' && sjShell.length > 0 && sjShell !== 'null') ? sjShell : undefined;",
   "(async () => {",
   "  for (const event of ['preprepare', 'prepare', 'postprepare']) {",
   "    const s = scripts[event];",
   "    if (typeof s === 'string' && s.length > 0) {",
-  "      await runScript({ event: event, path: cwd, pkg: pkg, stdio: 'inherit' });",
+  "      await runScript({ event: event, path: cwd, pkg: pkg, stdio: 'inherit', scriptShell: scriptShell });",
   "    }",
   "  }",
   "})().catch((e) => {",
@@ -31112,23 +31111,9 @@ function resolvePrepareCommand(manager, cwd, npmPrepare) {
   if (manager === "npm") {
     if (npmPrepare !== void 0) {
       return {
-        cmd: "npm",
-        args: [
-          "exec",
-          "--offline",
-          // `--no-workspaces` (adversarial-review round-18): a PR-controlled
-          // `.npmrc workspaces=true` makes `npm exec -c` FAN OUT into each workspace
-          // cwd — running the WORKSPACE `prepare` (force-attributed to root) while
-          // SKIPPING the ROOT preprepare/prepare/postprepare entirely (verified
-          // npm 11.13.0).  That re-opens the #44 root-prepare gap AND breaks the
-          // force-attribution invariant.  `--no-workspaces` pins execution to the
-          // repo-root cwd regardless of `.npmrc`; the prepare pass audits ONLY the
-          // root prepare (workspace lifecycles ride the main install pass).
-          "--no-workspaces",
-          "--node-options=",
-          "-c",
-          `${npmPrepare.nodePath} ${npmPrepare.runnerPath}`
-        ]
+        cmd: npmPrepare.nodePath,
+        args: [npmPrepare.runnerPath, npmPrepare.npmCli, npmPrepare.scriptShell ?? ""],
+        raw: true
       };
     }
     return {
@@ -31157,6 +31142,73 @@ function resolvePrepareCommand(manager, cwd, npmPrepare) {
     return null;
   }
   return null;
+}
+function npmCliEntryPath(execPath) {
+  return (0, import_node_path6.join)((0, import_node_path6.dirname)((0, import_node_path6.dirname)(execPath)), "lib", "node_modules", "npm", "bin", "npm-cli.js");
+}
+function realCaptureNpmPrepareEnv(ctx) {
+  const { node, npmCli, cwd, env } = ctx;
+  let dumpDir;
+  try {
+    dumpDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)((0, import_node_os.tmpdir)(), "sj-prep-cap-"));
+  } catch {
+    return null;
+  }
+  const envOutPath = (0, import_node_path6.join)(dumpDir, "env.json");
+  const dumpScriptPath = (0, import_node_path6.join)(dumpDir, "dump.cjs");
+  try {
+    (0, import_node_fs5.writeFileSync)(
+      dumpScriptPath,
+      "'use strict';\nrequire('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(process.env));\n",
+      { encoding: "utf8", mode: 384 }
+    );
+  } catch {
+    return null;
+  }
+  const baseEnv = { ...env };
+  delete baseEnv["LD_PRELOAD"];
+  delete baseEnv["DYLD_INSERT_LIBRARIES"];
+  delete baseEnv["DYLD_LIBRARY_PATH"];
+  (0, import_node_child_process3.spawnSync)(
+    node,
+    [
+      npmCli,
+      "exec",
+      "--script-shell=/bin/sh",
+      "--offline",
+      "--node-options=",
+      "-c",
+      `${node} ${dumpScriptPath}`
+    ],
+    { cwd, env: { ...baseEnv, SJ_ENV_OUT: envOutPath }, stdio: "ignore", timeout: 12e4 }
+  );
+  let dumped;
+  try {
+    dumped = JSON.parse((0, import_node_fs5.readFileSync)(envOutPath, "utf8"));
+  } catch {
+    dumped = null;
+  }
+  if (dumped === null) return null;
+  const npmConfig = {};
+  for (const [k, v] of Object.entries(dumped)) {
+    if (typeof v !== "string") continue;
+    if (!/^npm_config_/i.test(k)) continue;
+    const lower = k.toLowerCase();
+    if (lower === "npm_config_call" || lower === "npm_config_script_shell") continue;
+    npmConfig[k] = v;
+  }
+  let scriptShell = null;
+  const shResult = (0, import_node_child_process3.spawnSync)(node, [npmCli, "config", "get", "script-shell"], {
+    cwd,
+    env: baseEnv,
+    encoding: "utf8",
+    timeout: 6e4
+  });
+  if (shResult.status === 0 && typeof shResult.stdout === "string") {
+    const val = shResult.stdout.trim();
+    scriptShell = val.length > 0 && val !== "null" && val !== "undefined" ? val : null;
+  }
+  return { npmConfig, scriptShell };
 }
 function createSensitiveRedactor(protectedEnvNames, env = process.env) {
   const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
@@ -31461,17 +31513,15 @@ ${stdoutTail}`;
   }
   let prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
   const willRunPreparePass = prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true);
-  let prepareSentinelPath = null;
+  let capturedNpmConfig = {};
+  let capturedScriptShell = null;
+  let prepareNpmExecpath = "";
   if (willRunPreparePass && manager === "npm") {
+    let runnerPath;
     try {
       const runnerDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(straceBaseDir, "sj-prep-"));
-      const runnerPath = (0, import_node_path6.join)(runnerDir, "runner.cjs");
+      runnerPath = (0, import_node_path6.join)(runnerDir, "runner.cjs");
       (0, import_node_fs5.writeFileSync)(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: "utf8", mode: 384 });
-      prepareSentinelPath = (0, import_node_path6.join)((0, import_node_fs5.realpathSync)(runnerDir), "ran.marker");
-      prepareCommand = resolvePrepareCommand("npm", config2.work_dir, {
-        runnerPath,
-        nodePath: process.execPath
-      });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       emitter.emitError(
@@ -31481,6 +31531,33 @@ ${stdoutTail}`;
       flushAndExit(input.connection.writable, 1);
       return;
     }
+    prepareNpmExecpath = managerLaunch?.entry ?? npmCliEntryPath(process.execPath);
+    const captureCtx = {
+      node: process.execPath,
+      npmCli: prepareNpmExecpath,
+      cwd: config2.work_dir,
+      env: process.env
+    };
+    const capture = input.captureNpmPrepareEnv !== void 0 ? input.captureNpmPrepareEnv(captureCtx) : input.strace !== void 0 ? { npmConfig: {}, scriptShell: null } : realCaptureNpmPrepareEnv(captureCtx);
+    if (capture === null) {
+      emitter.emitError(
+        "script-jail agent: failed to capture the npm root-prepare environment \u2014 the forced-shell `npm exec` env dump produced no result (npm aborted, or the dump could not be written/read). Refusing to emit a lockfile: running the root `prepare` with a degraded env could silently diverge from a real install (a prepare branching on a missing npm_config_* would take a different path).",
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    capturedNpmConfig = capture.npmConfig;
+    capturedScriptShell = capture.scriptShell;
+    prepareCommand = resolvePrepareCommand("npm", config2.work_dir, {
+      runnerPath,
+      nodePath: process.execPath,
+      // Passed as ARGV (not env) so the runner reads neither from process.env
+      // under env-spy (which would pollute the lock with force-attributed-to-root
+      // env_reads of npm_execpath / the script-shell var).
+      npmCli: prepareNpmExecpath,
+      scriptShell: capturedScriptShell
+    });
   }
   if (willRunPreparePass && prepareCommand !== null) {
     diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
@@ -31505,7 +31582,19 @@ ${stdoutTail}`;
       prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf, lineRedactor) : new LinuxStraceRunner(void 0, pf, lineRedactor, stdoutTailBytes);
     }
     const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
-    const prepareEnv = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
+    const prepareEnvBase = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
+    let prepareEnv = prepareEnvBase;
+    if (manager === "npm") {
+      const merged = {};
+      for (const [k, v] of Object.entries(prepareEnvBase)) {
+        if (/^npm_config_/i.test(k)) continue;
+        merged[k] = v;
+      }
+      Object.assign(merged, capturedNpmConfig);
+      merged["npm_execpath"] = prepareNpmExecpath;
+      merged["npm_node_execpath"] = process.execPath;
+      prepareEnv = merged;
+    }
     const preparingEmitter = new Emitter(
       new class extends import_node_stream.Writable {
         _write(chunk, _enc, cb) {
@@ -31566,11 +31655,6 @@ ${stdoutTail}`;
       // Conditionally spread (omitted, not undefined) for a named/absent root —
       // see the installInput note above.
       ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {},
-      // Drop the npm runner's execution-sentinel WRITE by exact path so it never
-      // surfaces as an escaped_writes entry (and never destabilizes the FC/VZ
-      // scratch path).  Omitted (no drop) for yarn/pnpm, where prepareSentinelPath
-      // is null.
-      ...prepareSentinelPath !== null ? { internalWriteDropPath: prepareSentinelPath } : {},
       commandOverride: prepareCommand
     };
     const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
@@ -31578,17 +31662,6 @@ ${stdoutTail}`;
       input,
       `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
     );
-    if (prepareSentinelPath !== null) {
-      const runnerExecuted = input.prepareStrace !== void 0 ? input.simulatePrepareRunnerSkipped !== true : (0, import_node_fs5.existsSync)(prepareSentinelPath);
-      if (!runnerExecuted) {
-        emitter.emitError(
-          "script-jail agent: the npm root-prepare runner did not execute \u2014 `npm exec --no-workspaces` aborted before running it. The usual cause is a repo `.npmrc` that pins an npm `workspace` selector (npm refuses `--no-workspaces` alongside a `workspace`/`workspace[]` selector, in any quoting or via a userconfig/globalconfig/prefix redirect). Refusing to emit a lockfile: the root `prepare` lifecycle would otherwise ship UNAUDITED. Remove the `workspace` selector from the repo `.npmrc` (its workspace packages are already audited by the main install pass).",
-          true
-        );
-        flushAndExit(input.connection.writable, 1);
-        return;
-      }
-    }
     if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
       emitter.emitError(
         `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) and produced no audit events \u2014 the root \`prepare\` script likely ran untraced (strace could not attach) or the package manager aborted before spawning it. Refusing to emit a lockfile: the root \`prepare\` would be unaudited and a clean diff against it would be untrustworthy.`,
@@ -31709,7 +31782,9 @@ if (isMain) {
   createSensitiveRedactor,
   macosTokenizeRoots,
   main,
+  npmCliEntryPath,
   readStraceChildPid,
+  realCaptureNpmPrepareEnv,
   redactSensitive,
   resolvePrepareCommand,
   runStraceTailer,

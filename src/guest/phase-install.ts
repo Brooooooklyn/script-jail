@@ -254,37 +254,24 @@ export interface PhaseInstallInput {
   /**
    * Optional override for the traced command.  When omitted, the phase traces
    * `INSTALL_CMD[manager]` (the canonical Phase-B install).  The agent supplies
-   * this for the second, prepare-only audit pass (`npm run prepare …` /
-   * `yarn run prepare`) — npm's `rebuild --foreground-scripts` and yarn's
-   * `install --immutable` do NOT run the ROOT project's `prepare` script, so a
-   * malicious root `prepare` would otherwise never be audited.  Everything else
-   * about the dispatch (the security loop, synthesis, pnpm store-dir splice) is
-   * IDENTICAL — only the command/args at the head of the trace change.
-   */
-  commandOverride?: { cmd: string; args: string[] };
-  /**
-   * Optional script-jail-internal file whose WRITES the dispatcher drops by
-   * EXACT canonical-path match — the SAME mechanism as the SCRIPT_JAIL_LOG_FILE
-   * events-file write drop below.
+   * this for the second, prepare-only audit pass — npm's `rebuild
+   * --foreground-scripts` and yarn's `install --immutable` do NOT run the ROOT
+   * project's `prepare` script, so a malicious root `prepare` would otherwise
+   * never be audited.  Everything else about the dispatch (the security loop,
+   * synthesis, pnpm store-dir splice) is IDENTICAL — only the command/args at the
+   * head of the trace change.
    *
-   * The npm root-prepare pass (round-18b) uses this for the runner's GROUND-TRUTH
-   * execution sentinel: the {@link NPM_PREPARE_RUNNER_SOURCE} runner writes this
-   * file at startup — right after it resolves `@npmcli/run-script` and reads the
-   * root `package.json`, BEFORE it runs any prepare script — purely so the
-   * orchestrator can prove the runner actually executed at the repo root.  If a
-   * `.npmrc` workspace SELECTOR (in ANY form/source — quoted, redirected via
-   * userconfig/globalconfig/prefix, or env) made `npm exec --no-workspaces` exit
-   * before the `-c` body ran, the file is ABSENT → the orchestrator fails closed.
-   * Observing EXECUTION makes the gate immune to every `.npmrc` config-resolution
-   * trick (no config parsing).
-   *
-   * The write is audit infrastructure, not package behavior, so it must never
-   * surface as an `escaped_writes` entry (and on the FC/VZ scratch disk, which is
-   * under no tokenize prefix, an un-dropped write would also be byte-UNSTABLE).
-   * Keyed on the exact canonical path (script-jail-owned, NOT PR-controllable), so
-   * a genuine escaped write to any OTHER path is never dropped.
+   * `raw` (round-20): launch `cmd`/`args` VERBATIM, bypassing the managerLaunch
+   * (Linux) / macosManagerLaunch (macOS) rewrite that otherwise discards `cmd` and
+   * prepends the cached npm-cli.js entry.  The npm root-prepare pass sets this to
+   * DIRECT-LAUNCH its `@npmcli/run-script` runner as `node <runner>` (cmd =
+   * process.execPath, the instrumented node → LD_PRELOAD/DYLD survive); without
+   * `raw` the rewrite would turn it into the wrong `node npm-cli.js <runner>`.
+   * Direct-launch (vs `npm exec -c`) makes the GUEST the runner's parent, closing
+   * the repo-`.npmrc`-`script-shell` hijack.  yarn's prepare pass leaves `raw`
+   * unset so it still routes through the PM launch.
    */
-  internalWriteDropPath?: string;
+  commandOverride?: { cmd: string; args: string[]; raw?: boolean };
   /**
    * Round-16 (PR #22): a resolved direct-launch for the package manager —
    * `{ node: process.execPath, entry: <abs path to the cached PM JS entry> }` from
@@ -872,6 +859,13 @@ export async function runInstallPhase(
   // mirrors the host: <base> <user args> <store-dir>.
   const builtArgs = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
 
+  // Round-20: a `raw` commandOverride (the npm root-prepare DIRECT-LAUNCH —
+  // `node <runner>`) is launched VERBATIM, bypassing the managerLaunch rewrite
+  // below.  `baseCmd` is the instrumented `process.execPath`, so LD_PRELOAD
+  // survives and strace attaches; prepending the npm-cli.js entry would turn it
+  // into the wrong `node npm-cli.js <runner>`.  No userArgs/store-dir splice
+  // applies (commandOverride present → both empty), so `baseArgs` is verbatim.
+  const rawLaunch = input.commandOverride?.raw === true;
   // Round-16 (PR #22): when a resolved direct-launch is supplied (Linux FC/Docker),
   // bypass the bare corepack shim — launch `node <cached-entry>` so the lifecycle
   // child never inherits COREPACK_HOME (the agent strips it from the Phase-B env in
@@ -880,9 +874,16 @@ export async function runInstallPhase(
   // subcommand/flags in `builtArgs` are preserved verbatim).  macOS already
   // direct-launches via buildMacosInstallCommand.  When absent (bare backend / unit
   // tests, which never set COREPACK_HOME), the bare name is used unchanged.
-  const cmd = input.managerLaunch !== undefined ? input.managerLaunch.node : baseCmd;
-  const args =
-    input.managerLaunch !== undefined ? [input.managerLaunch.entry, ...builtArgs] : builtArgs;
+  const cmd = rawLaunch
+    ? baseCmd
+    : input.managerLaunch !== undefined
+      ? input.managerLaunch.node
+      : baseCmd;
+  const args = rawLaunch
+    ? baseArgs
+    : input.managerLaunch !== undefined
+      ? [input.managerLaunch.entry, ...builtArgs]
+      : builtArgs;
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
 
   // No-op matcher when the caller didn't supply one. Its `isProtected()`
@@ -1105,30 +1106,6 @@ export async function runInstallPhase(
   // events-file write is recognised either way.
   const eventsFilePathResolved: string | null =
     eventsFilePath === null ? null : path.resolve(eventsFilePath);
-
-  // Round-18b: an ADDITIONAL script-jail-internal write-drop path (the npm
-  // root-prepare runner's execution sentinel — see PhaseInstallInput.
-  // internalWriteDropPath).  Canonicalized like the events file: the sentinel
-  // file does NOT exist yet when the phase starts (the runner writes it), so
-  // realpath its PARENT (which does exist — the mkdtemp runner dir) and re-join
-  // the basename, robust to a symlinked scratch dir; lexical-resolve companion
-  // for the symlinked-$TMPDIR-differs case.  Both null when no path is supplied
-  // (every non-prepare caller) → zero behavior change.
-  const internalWriteDropResolved: string | null =
-    typeof input.internalWriteDropPath === 'string' && input.internalWriteDropPath.length > 0
-      ? path.resolve(input.internalWriteDropPath)
-      : null;
-  const internalWriteDropCanonical: string | null = (() => {
-    if (internalWriteDropResolved === null) return null;
-    try {
-      return path.join(
-        fs.realpathSync(path.dirname(internalWriteDropResolved)),
-        path.basename(internalWriteDropResolved),
-      );
-    } catch {
-      return internalWriteDropResolved;
-    }
-  })();
 
   // Audit-trust Finding (high, 2026-05-19): basename of the canonical
   // events file, used as a Layer-1 safety net for the cwd-relative
@@ -6739,14 +6716,9 @@ export async function runInstallPhase(
           // round 9; this exact-full-path producer drop is not.)
           if (
             rawEvent.kind === 'write' &&
-            ((eventsFilePathCanonical !== null &&
-              (canonical === eventsFilePathCanonical ||
-                canonical === eventsFilePathResolved)) ||
-              // Round-18b: the prepare runner's execution sentinel — same
-              // exact-canonical-path drop, so it never surfaces / destabilizes.
-              (internalWriteDropCanonical !== null &&
-                (canonical === internalWriteDropCanonical ||
-                  canonical === internalWriteDropResolved)))
+            eventsFilePathCanonical !== null &&
+            (canonical === eventsFilePathCanonical ||
+              canonical === eventsFilePathResolved)
           ) {
             continue;
           }
@@ -7087,11 +7059,8 @@ export async function runInstallPhase(
       // node-bootstrap filter → node-bootstrap candidate buffering → emit.
       if (
         d.rawEvent.kind === 'write' &&
-        ((eventsFilePathCanonical !== null &&
-          (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) ||
-          // Round-18b: prepare-runner execution sentinel (see inline path above).
-          (internalWriteDropCanonical !== null &&
-            (canonical === internalWriteDropCanonical || canonical === internalWriteDropResolved)))
+        eventsFilePathCanonical !== null &&
+        (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)
       ) {
         continue;
       }

@@ -1,9 +1,12 @@
 // Tests for NPM_PREPARE_RUNNER_SOURCE (src/guest/agent.ts).
 //
 // The #44 fix runs the ROOT project's prepare lifecycle through this runner,
-// launched as `npm exec --offline --node-options= -c '<node> <runner>'`.  The
-// runner resolves `@npmcli/run-script` (npm's OWN lifecycle runner) relative to
-// `npm_execpath` and calls it once per present prepare-class event.
+// DIRECT-LAUNCHED by the guest as `node <runner> <npmCli> <scriptShell>` (round-20
+// — NOT via `npm exec`).  The runner resolves `@npmcli/run-script` (npm's OWN
+// lifecycle runner) relative to the npm-cli.js path in argv[2] and calls it once
+// per present prepare-class event, forwarding the repo's resolved `script-shell`
+// (argv[3]) as run-script's `scriptShell` option.  Both ride in ARGV (not env) so
+// the runner emits NO env_reads of its own under env-spy.
 //
 // What these tests pin (the adversarial-review concerns):
 //   - Finding A (NO wrapper recursion): the runner only ever drives the fixed
@@ -13,6 +16,8 @@
 //   - It runs ONLY those three (never `build`/`postinstall`/etc.), in order.
 //   - Absent / empty scripts and a missing package.json are clean exit-0 no-ops.
 //   - A failing prepare script propagates as a nonzero exit (fail-loud).
+//   - It FORWARDS the repo's script-shell as run-script's `scriptShell` option
+//     (round-20) — empty/'null'/absent → undefined (run-script default).
 //
 // `@npmcli/run-script` is STUBBED (a recorder) so the test pins the RUNNER's
 // behavior, not npm's; the real run-script's no-pre/post contract is npm's.
@@ -30,15 +35,16 @@ let projDir: string;
 let runnerPath: string;
 let recordFile: string;
 let npmExecPath: string;
-let markerPath: string;
 
-// A stub `@npmcli/run-script`: appends the event it was asked to run to
-// SJ_RECORD, and throws when SJ_FAIL names that event (to drive the fail path).
+// A stub `@npmcli/run-script`: appends `<event>\t<scriptShell>` per call to
+// SJ_RECORD (so the test can assert both run-order AND scriptShell forwarding),
+// and throws when SJ_FAIL names that event (to drive the fail path).
 const RUN_SCRIPT_STUB = [
   "'use strict';",
   "const fs = require('fs');",
   'module.exports = async function runScript(opts) {',
-  "  fs.appendFileSync(process.env.SJ_RECORD, opts.event + '\\n');",
+  "  const shell = Object.prototype.hasOwnProperty.call(opts, 'scriptShell') ? String(opts.scriptShell) : '<absent>';",
+  "  fs.appendFileSync(process.env.SJ_RECORD, opts.event + '\\t' + shell + '\\n');",
   '  if (process.env.SJ_FAIL && process.env.SJ_FAIL === opts.event) {',
   "    throw new Error('stub run-script forced failure for ' + opts.event);",
   '  }',
@@ -71,9 +77,6 @@ beforeEach(() => {
   runnerPath = join(dir, 'sj-prepare-runner.cjs');
   writeFileSync(runnerPath, NPM_PREPARE_RUNNER_SOURCE, 'utf8');
   recordFile = join(dir, 'record.txt');
-  // The runner writes its ground-truth execution sentinel at __dirname/ran.marker
-  // (round-18b).  runnerPath lives directly in `dir`, so the marker lands there.
-  markerPath = join(dir, 'ran.marker');
 });
 
 afterEach(() => {
@@ -87,25 +90,41 @@ function writeProjPkg(scripts: Record<string, unknown> | undefined): void {
   writeFileSync(join(projDir, 'package.json'), JSON.stringify(pkg), 'utf8');
 }
 
-// Run the runner with cwd=projDir; returns {status, events}.  When the runner
+interface RunRecord {
+  event: string;
+  shell: string;
+}
+
+// Run the runner with cwd=projDir; returns {status, records}.  When the runner
 // exits nonzero, execFileSync throws — we capture status from the thrown error.
+// round-20: npmCli is argv[2] (defaults to the fake npm-cli.js), scriptShell is
+// argv[3] (omitted unless provided).  The runner reads BOTH from argv, not env, so
+// it emits no env_reads of its own under env-spy.
 function runRunner(
-  extraEnv: Record<string, string> = {},
-): { status: number; events: string[]; marker: boolean } {
+  opts: { npmCli?: string; scriptShell?: string; extraEnv?: Record<string, string> } = {},
+): { status: number; records: RunRecord[] } {
+  const argv = [runnerPath, opts.npmCli ?? npmExecPath];
+  if (opts.scriptShell !== undefined) argv.push(opts.scriptShell);
   let status = 0;
   try {
-    execFileSync(process.execPath, [runnerPath], {
+    execFileSync(process.execPath, argv, {
       cwd: projDir,
-      env: { ...process.env, npm_execpath: npmExecPath, SJ_RECORD: recordFile, ...extraEnv },
+      env: { ...process.env, SJ_RECORD: recordFile, ...(opts.extraEnv ?? {}) },
       stdio: 'pipe',
     });
   } catch (err) {
     status = (err as { status?: number }).status ?? 1;
   }
-  const events = existsSync(recordFile)
-    ? readFileSync(recordFile, 'utf8').split('\n').filter((l) => l.length > 0)
+  const records = existsSync(recordFile)
+    ? readFileSync(recordFile, 'utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => {
+          const [event, shell] = l.split('\t');
+          return { event: event as string, shell: shell as string };
+        })
     : [];
-  return { status, events, marker: existsSync(markerPath) };
+  return { status, records };
 }
 
 describe('NPM_PREPARE_RUNNER_SOURCE', () => {
@@ -127,78 +146,91 @@ describe('NPM_PREPARE_RUNNER_SOURCE', () => {
       build: "node -e ''", // unrelated — must NOT run
       postinstall: "node -e ''", // unrelated — must NOT run
     });
-    const { status, events, marker } = runRunner();
+    const { status, records } = runRunner();
     expect(status).toBe(0);
-    expect(events).toEqual(['preprepare', 'prepare', 'postprepare']);
-    // Ground-truth sentinel written (the runner ran at the repo root) — round-18b.
-    expect(marker).toBe(true);
+    expect(records.map((r) => r.event)).toEqual(['preprepare', 'prepare', 'postprepare']);
   });
 
   it('runs only the present subset, preserving order (prepare + postprepare, no preprepare)', () => {
     writeProjPkg({ prepare: "node -e ''", postprepare: "node -e ''" });
-    const { status, events } = runRunner();
+    const { status, records } = runRunner();
     expect(status).toBe(0);
-    expect(events).toEqual(['prepare', 'postprepare']);
+    expect(records.map((r) => r.event)).toEqual(['prepare', 'postprepare']);
   });
 
   it('skips empty-string and non-string scripts', () => {
     writeProjPkg({ preprepare: '', prepare: 42, postprepare: "node -e ''" });
-    const { status, events } = runRunner();
+    const { status, records } = runRunner();
     expect(status).toBe(0);
-    expect(events).toEqual(['postprepare']);
+    expect(records.map((r) => r.event)).toEqual(['postprepare']);
   });
 
   it('exits 0 with no events when there is no scripts block', () => {
     writeProjPkg(undefined);
-    const { status, events } = runRunner();
+    const { status, records } = runRunner();
     expect(status).toBe(0);
-    expect(events).toEqual([]);
+    expect(records).toEqual([]);
   });
 
   it('exits 0 with no events when there is no package.json (nothing to audit)', () => {
     // projDir intentionally has no package.json.
-    const { status, events, marker } = runRunner();
+    const { status, records } = runRunner();
     expect(status).toBe(0);
-    expect(events).toEqual([]);
-    // No root package.json → exit BEFORE the sentinel write → marker absent (the
-    // orchestrator then fails closed; the repo root always HAS a package.json, so
-    // this is an anomaly, not the benign no-prepare case below).
-    expect(marker).toBe(false);
+    expect(records).toEqual([]);
   });
 
-  it('writes the sentinel even with NO prepare scripts (benign no-op) — marker present, exit 0', () => {
-    // The benign case: a parseable root package.json with no prepare-class script.
-    // The runner reaches "about to run the lifecycle" (pkg read OK) → writes the
-    // marker → finds nothing → exits 0.  Distinguishes "ran, nothing to do" (marker
-    // present, NOT fail-closed) from "never ran" (marker absent, fail-closed).
-    writeProjPkg({ build: "node -e ''" });
-    const { status, events, marker } = runRunner();
-    expect(status).toBe(0);
-    expect(events).toEqual([]);
-    expect(marker).toBe(true);
-  });
-
-  it('exits nonzero (fail-loud) when a prepare-class script fails — sentinel still present', () => {
+  it('exits nonzero (fail-loud) when a prepare-class script fails', () => {
     writeProjPkg({ preprepare: "node -e ''", prepare: "node -e ''" });
-    const { status, events, marker } = runRunner({ SJ_FAIL: 'prepare' });
+    const { status, records } = runRunner({ extraEnv: { SJ_FAIL: 'prepare' } });
     expect(status).not.toBe(0);
     // preprepare ran (recorded) before prepare failed.
-    expect(events).toEqual(['preprepare', 'prepare']);
-    // The marker is written BEFORE the lifecycle loop, so a failing prepare is a
-    // recorded (non-fatal) run, NOT a "runner never executed" fail-closed.
-    expect(marker).toBe(true);
+    expect(records.map((r) => r.event)).toEqual(['preprepare', 'prepare']);
   });
 
-  it('exits 3 with NO sentinel when @npmcli/run-script cannot be resolved', () => {
+  it('exits 3 when @npmcli/run-script cannot be resolved', () => {
     // Point npm_execpath at a dir with no resolvable run-script (and the bare
-    // `require` fallback also fails from the runner's /tmp location) → exit 3,
-    // BEFORE the pkg read + sentinel write.  The orchestrator treats the absent
-    // marker as fail-closed, so an unresolvable run-script can never silently ship.
+    // `require` fallback also fails from the runner's /tmp location) → exit 3.
+    // The orchestrator treats a nonzero exit with zero events as fail-closed, so
+    // an unresolvable run-script can never silently ship.
     writeProjPkg({ prepare: "node -e ''" });
     const badCli = join(dir, 'no-such-npm', 'bin', 'npm-cli.js');
-    const { status, events, marker } = runRunner({ npm_execpath: badCli });
+    const { status, records } = runRunner({ npmCli: badCli });
     expect(status).toBe(3);
-    expect(events).toEqual([]);
-    expect(marker).toBe(false);
+    expect(records).toEqual([]);
+  });
+
+  // round-20: scriptShell forwarding.  @npmcli/run-script reads `scriptShell` from
+  // its OPTIONS (NOT npm_config_script_shell env); npm's CLI passes the resolved
+  // `script-shell` config the same way.  The runner reads the repo value from ARGV
+  // (process.argv[3] — NOT env, so it emits no env_read under env-spy) and forwards
+  // it — so a custom (even malicious) repo shell is used for the prepare scripts,
+  // exactly as a real install would (and is audited).
+  it('forwards the argv[3] script-shell as run-script `scriptShell`', () => {
+    writeProjPkg({ prepare: "node -e ''", postprepare: "node -e ''" });
+    const { status, records } = runRunner({ scriptShell: '/usr/bin/repo-shell' });
+    expect(status).toBe(0);
+    expect(records).toEqual([
+      { event: 'prepare', shell: '/usr/bin/repo-shell' },
+      { event: 'postprepare', shell: '/usr/bin/repo-shell' },
+    ]);
+  });
+
+  it.each(['', 'null'])(
+    'passes scriptShell=undefined (run-script default) when argv[3] is %j',
+    (val) => {
+      writeProjPkg({ prepare: "node -e ''" });
+      const { status, records } = runRunner({ scriptShell: val });
+      expect(status).toBe(0);
+      // `scriptShell: undefined` is an OWN property of the opts object, so the
+      // stub stringifies it to 'undefined' (NOT '<absent>').
+      expect(records).toEqual([{ event: 'prepare', shell: 'undefined' }]);
+    },
+  );
+
+  it('passes scriptShell=undefined when argv[3] is absent', () => {
+    writeProjPkg({ prepare: "node -e ''" });
+    const { status, records } = runRunner();
+    expect(status).toBe(0);
+    expect(records).toEqual([{ event: 'prepare', shell: 'undefined' }]);
   });
 });

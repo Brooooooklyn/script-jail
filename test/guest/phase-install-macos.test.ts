@@ -165,6 +165,35 @@ describe('runInstallPhaseMacos — shim-only dispatch', () => {
     expect(calls[0]!.args).toContain('rebuild');
   });
 
+  it('a `raw` commandOverride is launched VERBATIM — no npm-cli.js prepend (round-20 npm prepare direct-launch)', async () => {
+    // The npm root-prepare DIRECT-LAUNCH (`node <runner>`) sets `raw:true`.  On
+    // macOS the override must be launched VERBATIM, NOT routed through
+    // macosManagerLaunch (which would prepend npm-cli.js → the wrong
+    // `node npm-cli.js <runner>`).  `cmd` is already the re-signed process.execPath
+    // in production, so DYLD survives the first exec without the indirection.
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const strace: StraceRunner = {
+      async *run(cmd, args) { calls.push({ cmd, args }); },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper() { /* no-op */ },
+      getRootPid() { return null; },
+    };
+    await runInstallPhaseMacos({
+      manager: 'npm',
+      cwd: '/work',
+      env: { PATH: '/usr/bin' },
+      strace,
+      attribution: new Attribution(NULL_PROC_READER),
+      emitter: new Emitter(new PassThrough()),
+      commandOverride: { cmd: '/opt/node/bin/node', args: ['/scratch/sj-prep-xyz/runner.cjs'], raw: true },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.cmd).toBe('/opt/node/bin/node');
+    expect(calls[0]!.args).toEqual(['/scratch/sj-prep-xyz/runner.cjs']);
+    expect(calls[0]!.args.some((a) => a.endsWith('npm-cli.js'))).toBe(false);
+  });
+
   it('parses a shim `write` JSONL line and attributes it to the exec-seeded package', async () => {
     // REGRESSION: the shared parseShimLine does NOT handle `write` (on Linux it
     // comes from strace), so without the macOS-specific parse this line would

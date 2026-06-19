@@ -173,21 +173,30 @@ export function macosManagerLaunch(
  * (IDENTICAL store-dir value to the one the fetch phase splices).
  *
  * When `commandOverride` is supplied (the agent's prepare-only second pass —
- * e.g. `{cmd:'npm', args:['run','prepare',…]}`), we route the OVERRIDE'S ARGS
- * through `macosManagerLaunch` exactly the same way: the override's `cmd`
- * (`npm`/`yarn`) is intentionally discarded — `macosManagerLaunch` always
- * launches via the provisioned, re-signed `process.execPath` + the manager's
- * JS entry so DYLD_INSERT_LIBRARIES survives the first exec.  No pnpm
- * store-dir splice is added for an override (prepare passes are npm/yarn only;
- * the resolver returns null for pnpm).
+ * e.g. yarn's `{cmd:'yarn', args:['run','prepare']}`), we route the OVERRIDE'S
+ * ARGS through `macosManagerLaunch` exactly the same way: the override's `cmd`
+ * (`yarn`) is intentionally discarded — `macosManagerLaunch` always launches via
+ * the provisioned, re-signed `process.execPath` + the manager's JS entry so
+ * DYLD_INSERT_LIBRARIES survives the first exec.  No pnpm store-dir splice is
+ * added for an override (prepare passes are npm/yarn only; the resolver returns
+ * null for pnpm).
+ *
+ * `commandOverride.raw` (round-20): the npm root-prepare DIRECT-LAUNCH
+ * (`{cmd: process.execPath, args:[<runner>], raw:true}`).  Launch it VERBATIM —
+ * `cmd` is ALREADY the provisioned, re-signed `process.execPath`, so DYLD survives
+ * the first exec without going through `macosManagerLaunch` (which would wrongly
+ * prepend npm-cli.js, turning `node <runner>` into `node npm-cli.js <runner>`).
  */
 function buildMacosInstallCommand(
   manager: 'npm' | 'pnpm' | 'yarn',
   cwd: string,
-  commandOverride?: { cmd: string; args: string[] },
+  commandOverride?: { cmd: string; args: string[]; raw?: boolean },
   userInstallArgs?: ReadonlyArray<string>,
 ): { cmd: string; args: string[] } {
   if (commandOverride !== undefined) {
+    if (commandOverride.raw === true) {
+      return { cmd: commandOverride.cmd, args: commandOverride.args };
+    }
     return macosManagerLaunch(manager, commandOverride.args);
   }
   const base = INSTALL_CMD[manager];

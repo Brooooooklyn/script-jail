@@ -1264,21 +1264,18 @@ describe('agent main() root-prepare second pass', () => {
       diag: (m) => diagMsgs.push(m),
     });
 
-    // The prepare runner WAS invoked, with the #44 npm-exec lifecycle-runner command
-    // (NOT rebuild): `npm exec --offline --no-workspaces --node-options= -c '<node> <runner>'`.
-    // The runner path is script-jail-owned (a random mkdtemp dir under straceBaseDir),
-    // so we match its shape rather than the non-deterministic absolute path.
+    // The prepare runner WAS invoked via the #44 round-20 DIRECT-LAUNCH:
+    // `{cmd: <node>, args: [<runner>, <npmCli>, <scriptShell>], raw:true}` (NOT
+    // `npm exec`, NOT rebuild).  No managerLaunch is set in tests, so the `raw`
+    // launch passes cmd+args verbatim: cmd is process.execPath; args is the runner
+    // path (random mkdtemp under straceBaseDir → match its shape), the derived
+    // npm-cli.js path, and the script-shell ('' — the default empty capture's null).
     expect(prep.calls).toHaveLength(1);
-    expect(prep.calls[0]!.cmd).toBe('npm');
-    expect(prep.calls[0]!.args.slice(0, 5)).toEqual([
-      'exec',
-      '--offline',
-      '--no-workspaces',
-      '--node-options=',
-      '-c',
-    ]);
-    expect(prep.calls[0]!.args).toHaveLength(6);
-    expect(prep.calls[0]!.args[5]).toMatch(/ .*[/\\]runner\.cjs$/);
+    expect(prep.calls[0]!.cmd).toBe(process.execPath);
+    expect(prep.calls[0]!.args).toHaveLength(3);
+    expect(prep.calls[0]!.args[0]).toMatch(/[/\\]runner\.cjs$/);
+    expect(prep.calls[0]!.args[1]).toMatch(/[/\\]npm-cli\.js$/);
+    expect(prep.calls[0]!.args[2]).toBe('');
     // The main install runner ran the install command (#43: shared base carries --no-node-options).
     expect(main_.calls).toHaveLength(1);
     expect(main_.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
@@ -1742,17 +1739,15 @@ describe('agent main() root-prepare second pass', () => {
     expect(exitedWith).toBe(1);
   });
 
-  it('FAILS CLOSED (npm) when the root-prepare runner did not execute (sentinel absent — workspace-selector evasion, round-18b)', async () => {
-    // Ground-truth replacement for the old `.npmrc`-parsing selector gate.  A
-    // `.npmrc` workspace SELECTOR — in ANY form/source (quoted `"workspace"=a`,
-    // a userconfig/globalconfig/prefix redirect, or an ambient
-    // `npm_config_workspace`) — makes `npm exec --no-workspaces` exit BEFORE
-    // running the runner, so the runner never writes its `ran.marker`.  The
-    // orchestrator observes EXECUTION (not config), so it is immune to every
-    // `.npmrc` config-resolution trick.  Under the injected-strace harness the
-    // real runner never runs, so `simulatePrepareRunnerSkipped` reproduces
-    // "the runner never wrote its marker"; the pass still LAUNCHES (npm exec
-    // emits startup events) before the sentinel gate fires.
+  it('FAILS CLOSED (npm) when the root-prepare env capture returns null (forced-shell dump failed, round-20)', async () => {
+    // round-20: the runner is DIRECT-LAUNCHED (`node <runner>`), so a `.npmrc`
+    // workspace selector / `workspaces=true` can no longer skip it (no `npm exec`
+    // to fan out or abort) — the old sentinel/selector gates are gone.  The
+    // remaining fail-closed gate is the ENV CAPTURE: if the forced-shell `npm exec`
+    // env dump produces no result (npm aborted / the dump file is unwritable), we
+    // must NOT run the prepare with a degraded env — a prepare branching on a
+    // missing npm_config_* would silently diverge from a real install.  The capture
+    // runs BEFORE the pass launches, so the prepare runner never runs.
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
     writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
@@ -1773,7 +1768,7 @@ describe('agent main() root-prepare second pass', () => {
         spawner: mockSpawner().spawner,
         strace: main_.runner,
         prepareStrace: prep.runner,
-        simulatePrepareRunnerSkipped: true,
+        captureNpmPrepareEnv: () => null, // simulate a failed forced-shell dump
         dnsLookup: offlineLookup,
       });
       await new Promise<void>((r) => setImmediate(r));
@@ -1786,26 +1781,27 @@ describe('agent main() root-prepare second pass', () => {
 
     const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
     expect(fatal).toBeDefined();
-    expect(String(fatal!['message'])).toMatch(/did not execute/);
-    expect(String(fatal!['message'])).toMatch(/UNAUDITED/);
-    // The prepare pass DID launch (npm exec runs, exits before the runner) — prep
-    // ran once — but the sentinel gate fires afterward: no lockfile ships.
+    expect(String(fatal!['message'])).toMatch(/capture the npm root-prepare environment/);
+    // The main install ran; the capture failed BEFORE the prepare pass launched, so
+    // the prepare runner never ran and no lockfile ships.
     expect(main_.calls).toHaveLength(1);
-    expect(prep.calls).toHaveLength(1);
+    expect(prep.calls).toHaveLength(0);
     expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
     expect(exitedWith).toBe(1);
   });
 
-  it('does NOT fail closed for `.npmrc workspaces=true` (the TOGGLE) — prepare runs with --no-workspaces', async () => {
-    // The boolean fan-out toggle is neutralized by --no-workspaces (not a selector);
-    // the prepare pass must still run and a lockfile must ship.
+  it('sources the prepare env via captureNpmPrepareEnv (node + npm-cli.js + work_dir), then runs the pass', async () => {
+    // The orchestrator calls the capture seam ONCE with the instrumented node, the
+    // derived npm-cli.js path, and the repo-root cwd; on success the pass runs and a
+    // lockfile ships.  (Production does the real forced-shell dump + `config get`;
+    // the seam stands in for it under the no-real-npm unit harness.)
     const { conn, hostSend, getOutput } = makeConn();
     const configPath = writeConfig(testDir, { manager: 'npm' });
     writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
-    writeFileSync(join(testDir, '.npmrc'), 'workspaces=true\n', 'utf8');
 
     const main_ = recordingEventStrace('MAINPROG');
     const prep = recordingEventStrace('PREPPROG');
+    const captureCalls: Array<{ node: string; npmCli: string; cwd: string }> = [];
 
     setTimeout(() => hostSend('go\n'), 10);
     await main({
@@ -1814,16 +1810,24 @@ describe('agent main() root-prepare second pass', () => {
       spawner: mockSpawner().spawner,
       strace: main_.runner,
       prepareStrace: prep.runner,
+      captureNpmPrepareEnv: (ctx) => {
+        captureCalls.push({ node: ctx.node, npmCli: ctx.npmCli, cwd: ctx.cwd });
+        return { npmConfig: { npm_config_registry: 'https://r.example/' }, scriptShell: '/bin/dash' };
+      },
       dnsLookup: offlineLookup,
     });
 
-    const lines = getOutput().split('\n').filter((l) => l.trim());
-    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(captureCalls).toHaveLength(1);
+    expect(captureCalls[0]!.node).toBe(process.execPath);
+    expect(captureCalls[0]!.npmCli).toMatch(/[/\\]npm-cli\.js$/);
+    expect(captureCalls[0]!.cwd).toBe(testDir);
 
-    // No fatal: the prepare pass ran (with --no-workspaces) and a lockfile shipped.
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
     expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
     expect(prep.calls).toHaveLength(1);
-    expect(prep.calls[0]!.args).toContain('--no-workspaces');
     expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
   });
 
