@@ -124,6 +124,18 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
           'exec node /usr/local/lib/script-jail/guest-agent.cjs',
         ].join('; ');
 
+        // TEMPORARY (flake capture): the guest container env is otherwise isolated
+        // (only the explicit `export`s in `script` + the `-e` below reach it), so the
+        // host job env's SCRIPT_JAIL_DEBUG_DEFERRED_OPEN never reaches the guest's
+        // process.env.  Forward it via `-e` so phase-install.ts's deferred-open lineage
+        // dump (stderr-only, cannot affect the lockfile) fires inside the audit.  Gated
+        // on the host having it set to '1', so production AND the unit tests (env unset)
+        // see the identical argv as before.  REMOVE with the dump itself once the
+        // deferred-replay walk fix is validated.
+        const debugDeferredOpenArgs =
+          env['SCRIPT_JAIL_DEBUG_DEFERRED_OPEN'] === '1'
+            ? ['-e', 'SCRIPT_JAIL_DEBUG_DEFERRED_OPEN=1']
+            : [];
         return await doRunAgentProcess({
           cmd: 'docker',
           args: [
@@ -135,6 +147,7 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
             '--security-opt', 'seccomp=unconfined',
             '-v', `${staged.path}:${workDir}`,
             '-v', `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
+            ...debugDeferredOpenArgs,
             // The host-owned pm-flags sidecar is staged in the repo tree at
             // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it into
             // /etc the way Firecracker's init does).  Point the guest at it so the
