@@ -3320,6 +3320,16 @@ export function realCaptureNpmPrepareEnv(ctx: {
     delete baseEnv['DYLD_INSERT_LIBRARIES'];
     delete baseEnv['DYLD_LIBRARY_PATH'];
     // 1. DUMP (forced trusted shell → un-hijackable env capture).
+    //
+    // The `-c` body is parsed by the forced /bin/sh.  NEVER interpolate the node or
+    // dump-script PATHS into it: those come from `tmpdir()` (and `process.execPath`,
+    // which on macOS may be under an env-selected provision/cache path), so a TMPDIR /
+    // node path containing shell metacharacters would inject arbitrary commands that
+    // run with the agent's REAL env (secrets) BEFORE the npm_config_-only dump.cjs or
+    // the `finally` cleanup can help (adversarial-review round-21 [high]).  Pass the
+    // paths via env and reference them with double-quoted expansions instead: in POSIX
+    // sh `"$X"` expands to the value LITERALLY (no word-split, no glob, no re-parse of
+    // metacharacters), so a hostile path can never break out of the two-word command.
     spawnSync(
       node,
       [
@@ -3329,9 +3339,14 @@ export function realCaptureNpmPrepareEnv(ctx: {
         '--offline',
         '--node-options=',
         '-c',
-        `${node} ${dumpScriptPath}`,
+        '"$SJ_NODE" "$SJ_DUMP"',
       ],
-      { cwd, env: { ...baseEnv, SJ_ENV_OUT: envOutPath }, stdio: 'ignore', timeout: 120_000 },
+      {
+        cwd,
+        env: { ...baseEnv, SJ_NODE: node, SJ_DUMP: dumpScriptPath, SJ_ENV_OUT: envOutPath },
+        stdio: 'ignore',
+        timeout: 120_000,
+      },
     );
     let dumped: Record<string, unknown> | null;
     try {

@@ -17,7 +17,7 @@
 // a particular npm layout.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -136,6 +136,40 @@ describe.skipIf(!HAVE_NPM)('realCaptureNpmPrepareEnv (real npm)', () => {
         expect(body).not.toContain(SECRET);
       }
     }
+  });
+
+  // adversarial-review round-21 [high]: the forced-shell dump `-c` body is parsed by
+  // /bin/sh.  The node + dump-script paths (derived from os.tmpdir(), and on macOS
+  // process.execPath may sit under an env-selected provision path) MUST ride in env
+  // and be referenced as double-quoted `"$X"` expansions — interpolating them into the
+  // command string lets a TMPDIR with shell metacharacters inject commands that run
+  // with the agent's REAL env (secrets) BEFORE the npm_config_-only dump or cleanup.
+  it('is immune to shell injection via a TMPDIR containing shell metacharacters', () => {
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'r', version: '1.0.0' }), 'utf8');
+    const pwn = join(repo, 'PWNED.txt');
+    // A tmp dir whose NAME embeds an injection: if the `-c` body interpolated the path
+    // unquoted, /bin/sh would run `node -e <write the canary token to PWN_OUT>`.
+    const evilTmp = join(
+      repo,
+      'x; node -e "require(\'fs\').writeFileSync(process.env.PWN_OUT, process.env.NPM_TOKEN)" ; #',
+    );
+    mkdirSync(evilTmp, { recursive: true });
+
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = evilTmp; // os.tmpdir() reads this fresh → the dump dir lands here.
+    try {
+      realCaptureNpmPrepareEnv({
+        node: process.execPath,
+        npmCli: NPM_CLI,
+        cwd: repo,
+        env: { ...process.env, NPM_TOKEN: 'SJ_INJECT_CANARY_b41f', PWN_OUT: pwn },
+      });
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+    }
+    // No injected command ran → the canary file was never written.
+    expect(existsSync(pwn)).toBe(false);
   });
 
   it('returns null when the npm-cli path does not exist (dump cannot run → fail closed)', () => {

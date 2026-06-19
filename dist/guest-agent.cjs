@@ -31183,9 +31183,14 @@ require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0
         "--offline",
         "--node-options=",
         "-c",
-        `${node} ${dumpScriptPath}`
+        '"$SJ_NODE" "$SJ_DUMP"'
       ],
-      { cwd, env: { ...baseEnv, SJ_ENV_OUT: envOutPath }, stdio: "ignore", timeout: 12e4 }
+      {
+        cwd,
+        env: { ...baseEnv, SJ_NODE: node, SJ_DUMP: dumpScriptPath, SJ_ENV_OUT: envOutPath },
+        stdio: "ignore",
+        timeout: 12e4
+      }
     );
     let dumped;
     try {
