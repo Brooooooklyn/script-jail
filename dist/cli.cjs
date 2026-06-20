@@ -8785,25 +8785,32 @@ async function buildOverlayInto(workDir, input) {
       writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
+  const repoContentBytes = sumContentBytes(repoStageDir);
   const repoDiskPath = (0, import_node_path7.join)(workDir, "repo.ext4");
   await buildExt4Disk({
     srcDir: repoStageDir,
     label: "repo",
-    sizeMB: estimateDiskSizeMB(repoStageDir),
+    sizeMB: diskSizeMB(repoContentBytes, REPO_DISK_MIN_MB),
     outPath: repoDiskPath,
     env
   });
   const scratchDiskPath = (0, import_node_path7.join)(workDir, "scratch.ext4");
   await buildExt4Disk({
     label: SCRATCH_DISK_LABEL,
-    sizeMB: SCRATCH_DISK_MB,
+    sizeMB: Math.max(
+      diskSizeMB(repoContentBytes, SCRATCH_DISK_MIN_MB),
+      envFloorMB(env, "SCRIPT_JAIL_SCRATCH_DISK_MB")
+    ),
     outPath: scratchDiskPath,
     env
   });
   const sjtmpDiskPath = (0, import_node_path7.join)(workDir, "sjtmp.ext4");
   await buildExt4Disk({
     label: SJTMP_DISK_LABEL,
-    sizeMB: SJTMP_DISK_MB,
+    sizeMB: Math.max(
+      diskSizeMB(repoContentBytes, SJTMP_DISK_MIN_MB),
+      envFloorMB(env, "SCRIPT_JAIL_SJTMP_DISK_MB")
+    ),
     outPath: sjtmpDiskPath,
     env
   });
@@ -8918,14 +8925,14 @@ function resolveMkfsExt4(env) {
 }
 var REPO_DISK_MIN_MB = 4096;
 var SCRATCH_DISK_LABEL = "scratch";
-var SCRATCH_DISK_MB = 4096;
+var SCRATCH_DISK_MIN_MB = 4096;
 var SJTMP_DISK_LABEL = "sjtmp";
-var SJTMP_DISK_MB = 4096;
-function estimateDiskSizeMB(dir) {
+var SJTMP_DISK_MIN_MB = 4096;
+function sumContentBytes(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat = (0, import_node_fs7.statSync)(p, { bigint: false });
+      const stat = (0, import_node_fs7.lstatSync)(p, { bigint: false });
       if (stat.isDirectory()) {
         for (const child of (0, import_node_fs7.readdirSync)(p)) {
           visit((0, import_node_path7.join)(p, child));
@@ -8937,8 +8944,18 @@ function estimateDiskSizeMB(dir) {
     }
   };
   if ((0, import_node_fs7.existsSync)(dir)) visit(dir);
-  const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
-  return Math.max(REPO_DISK_MIN_MB, estimatedMB);
+  return totalBytes;
+}
+function diskSizeMB(contentBytes, minMB) {
+  const scaledMB = Math.ceil(contentBytes * 2 / (1024 * 1024));
+  return Math.max(minMB, scaledMB);
+}
+function envFloorMB(env, name) {
+  const raw = env[name];
+  if (raw === void 0 || raw === "") return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.floor(parsed);
 }
 
 // src/shared/run-audit.ts

@@ -23,7 +23,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { platform } from 'node:process';
 
-import { makeOverlay } from '../../../src/action/firecracker/overlay.js';
+import {
+  diskSizeMB,
+  envFloorMB,
+  makeOverlay,
+  sumContentBytes,
+} from '../../../src/action/firecracker/overlay.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -269,7 +274,7 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
     }
   });
 
-  it('scratch.ext4 is an ext4 labeled exactly `scratch`, 4096 MiB logical', async () => {
+  it('scratch.ext4 is an ext4 labeled exactly `scratch`, ≥ floor (4096 MiB for a tiny repo)', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);
     const configPath = fakeConfig(testDir);
 
@@ -280,8 +285,9 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
     });
 
     try {
-      // Logical size: exactly 4096 MiB.  (Sparse on the host, so allocated
-      // blocks are far fewer — we only assert the logical length.)
+      // Logical size: the floor (4096 MiB) holds for this tiny repo.  (Sparse
+      // on the host, so allocated blocks are far fewer — we only assert the
+      // logical length.)  Large repos scale ABOVE the floor (see below).
       const { statSync } = await import('node:fs');
       expect(statSync(result.scratchDiskPath).size).toBe(4096 * 1024 * 1024);
 
@@ -309,7 +315,7 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
     }
   });
 
-  it('sjtmp.ext4 is an ext4 labeled exactly `sjtmp`, 4096 MiB logical', async () => {
+  it('sjtmp.ext4 is an ext4 labeled exactly `sjtmp`, ≥ floor (4096 MiB for a tiny repo)', async () => {
     const baseRootfsPath = fakeBaseRootfs(testDir);
     const configPath = fakeConfig(testDir);
 
@@ -320,6 +326,7 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
     });
 
     try {
+      // The floor (4096 MiB) holds for this tiny repo; large repos scale above.
       const { statSync } = await import('node:fs');
       expect(statSync(result.sjtmpDiskPath).size).toBe(4096 * 1024 * 1024);
 
@@ -338,6 +345,82 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
       const label = sb.subarray(0x78, 0x78 + 16);
       const labelStr = label.subarray(0, label.indexOf(0)).toString('utf8');
       expect(labelStr).toBe('sjtmp');
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  // NOTE: the CONTENT-scaling-ABOVE-floor arithmetic (2× content beats the 4096
+  // MiB floor, and a lower knob cannot shrink it) is covered by the fast,
+  // platform-agnostic `diskSizeMB / envFloorMB` block at the bottom of this file.
+  // Proving it through the full mkfs path would need >2 GiB of real content
+  // staged + copied (the only way to cross the 4 GiB floor), which is far too
+  // slow for the 5 s test budget.  The full-mkfs tests below still exercise the
+  // ENTIRE `max(diskSizeMB(sumContentBytes(stage), MIN), envFloorMB(env, name))`
+  // expression end-to-end — they just land on the floor / knob value.
+
+  it('SCRIPT_JAIL_SCRATCH_DISK_MB raises the floor (tiny repo, knob > scaled need)', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+
+    // Tiny repo → content-scaled need is the 4096 floor; the 8192 knob wins.
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', SCRIPT_JAIL_SCRATCH_DISK_MB: '8192' },
+    });
+
+    try {
+      const { statSync } = await import('node:fs');
+      expect(statSync(result.scratchDiskPath).size).toBe(8192 * 1024 * 1024);
+      // sjtmp (no knob) stays at its floor.
+      expect(statSync(result.sjtmpDiskPath).size).toBe(4096 * 1024 * 1024);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('SCRIPT_JAIL_SJTMP_DISK_MB raises the floor (tiny repo, knob > scaled need)', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', SCRIPT_JAIL_SJTMP_DISK_MB: '8192' },
+    });
+
+    try {
+      const { statSync } = await import('node:fs');
+      expect(statSync(result.sjtmpDiskPath).size).toBe(8192 * 1024 * 1024);
+      expect(statSync(result.scratchDiskPath).size).toBe(4096 * 1024 * 1024);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('garbage disk knobs are ignored (no throw; falls back to scaled/floor)', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+
+    // Empty string and non-numeric garbage → envFloorMB returns 0 → floor holds.
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+      env: {
+        PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+        SCRIPT_JAIL_SCRATCH_DISK_MB: '',
+        SCRIPT_JAIL_SJTMP_DISK_MB: 'abc',
+      },
+    });
+
+    try {
+      const { statSync } = await import('node:fs');
+      expect(statSync(result.scratchDiskPath).size).toBe(4096 * 1024 * 1024);
+      expect(statSync(result.sjtmpDiskPath).size).toBe(4096 * 1024 * 1024);
     } finally {
       await result.cleanup();
     }
@@ -444,5 +527,128 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
         env: { PATH: emptyBin },
       }),
     ).rejects.toThrow(/mkfs\.ext4|ENOENT|spawn/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sumContentBytes — symlink safety (platform-agnostic; no mkfs needed)
+// ---------------------------------------------------------------------------
+//
+// The sizing walk must NEVER follow symlinks: the staged repo preserves repo
+// symlinks verbatim, and that single byte total now sizes all three disks.
+// A `loop -> .` (ELOOP recursion) or `escape -> /` (host-root walk) by an
+// attacker-controlled repo entry must not hang or inflate the metric.
+describe('sumContentBytes — does not follow symlinks', () => {
+  let walkDir: string;
+
+  beforeEach(() => {
+    walkDir = mkdtempSync(join(tmpdir(), 'script-jail-walk-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(walkDir, { recursive: true, force: true });
+  });
+
+  it('counts real files but never recurses into symlinks (self-loop + escape-to-host-root)', async () => {
+    const { symlinkSync, mkdirSync: mkdir } = await import('node:fs');
+
+    // One real 4096-byte file + a real nested dir with another real file.
+    const REAL_BYTES = 4096;
+    writeFileSync(join(walkDir, 'real.bin'), Buffer.alloc(REAL_BYTES, 0x61));
+    mkdir(join(walkDir, 'sub'), { recursive: true });
+    writeFileSync(join(walkDir, 'sub', 'nested.bin'), Buffer.alloc(REAL_BYTES, 0x62));
+
+    // Hostile symlinks: a self-loop and an escape to the host filesystem root.
+    // If the walk followed these it would either ELOOP-spin or sum the entire
+    // host tree (millions of bytes) — instead each is counted as a tiny link.
+    symlinkSync('.', join(walkDir, 'loop')); // loop -> . (would recurse forever)
+    symlinkSync('/', join(walkDir, 'escape')); // escape -> / (would walk host root)
+    symlinkSync(join(walkDir, 'sub'), join(walkDir, 'dirlink')); // symlink to a real dir
+
+    const start = Date.now();
+    const total = sumContentBytes(walkDir);
+    const elapsedMs = Date.now() - start;
+
+    // The two real files are counted; the symlinks add only their tiny link
+    // sizes (target-path length), never the dirs/host tree they point at.
+    expect(total).toBeGreaterThanOrEqual(2 * REAL_BYTES);
+    // A small ceiling proves no symlink target was traversed (host root alone
+    // would be many MiB).  2 real files + a handful of tiny link entries.
+    expect(total).toBeLessThan(2 * REAL_BYTES + 4096);
+    // And it returned promptly — no ELOOP spin.
+    expect(elapsedMs).toBeLessThan(5000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// diskSizeMB / envFloorMB — disk sizing arithmetic (platform-agnostic, no mkfs)
+//
+// These cover the CONTENT-scaling-above-floor + knob-raise-only + knob-can't-
+// shrink + garbage-knob behavior that previously needed a multi-GiB mkfs path
+// (the only way to cross the 4 GiB floor end-to-end is to stage >2 GiB of real
+// content, which blows the test budget).  The full-mkfs tests above still run
+// the whole `max(diskSizeMB(sumContentBytes(stage), MIN), envFloorMB(env, name))`
+// expression; here we prove the arithmetic branches the floor/knob cases don't reach.
+// ---------------------------------------------------------------------------
+
+describe('diskSizeMB — content scaling vs floor', () => {
+  const FLOOR = 4096; // SCRATCH_DISK_MIN_MB / SJTMP_DISK_MIN_MB
+
+  const GIB = 1024 * 1024 * 1024;
+
+  it('returns the floor for empty / tiny content (2× content < floor)', () => {
+    expect(diskSizeMB(0, FLOOR)).toBe(FLOOR);
+    expect(diskSizeMB(1, FLOOR)).toBe(FLOOR);
+    // 1 GiB content → 2× = 2048 MiB, still below the 4096 floor.
+    expect(diskSizeMB(1 * GIB, FLOOR)).toBe(FLOOR);
+    // Exactly at the floor boundary: 2 GiB content → 2× = 4096 MiB == floor.
+    expect(diskSizeMB(2 * GIB, FLOOR)).toBe(FLOOR);
+  });
+
+  it('scales to ceil(2× content / MiB) once that exceeds the floor', () => {
+    // 3 GiB content → 2× = 6 GiB = 6144 MiB, above the 4096 floor (the napi-rs
+    // ENOSPC case the v0.2.6 fix addresses).
+    expect(diskSizeMB(3 * GIB, FLOOR)).toBe(6144);
+    expect(diskSizeMB(3 * GIB, FLOOR)).toBeGreaterThan(FLOOR);
+    // A genuinely large monorepo: 20 GiB content → 40 GiB = 40960 MiB.
+    expect(diskSizeMB(20 * GIB, FLOOR)).toBe(40960);
+  });
+
+  it('rounds the scaled size UP (ceil), never truncating below the need', () => {
+    // 2 GiB + 1 byte of content → 2× just over 4096 MiB → ceil to 4097.
+    expect(diskSizeMB(2 * GIB + 1, FLOOR)).toBe(4097);
+    // A non-MiB-aligned content total ceils up, not down.
+    expect(diskSizeMB(3 * GIB + 1, FLOOR)).toBe(6145);
+  });
+});
+
+describe('envFloorMB — knob parsing + raise-only composition', () => {
+  const FLOOR = 4096;
+  const GIB = 1024 * 1024 * 1024;
+  const KEY = 'SCRIPT_JAIL_SCRATCH_DISK_MB';
+
+  it('parses a valid positive integer MiB override', () => {
+    expect(envFloorMB({ [KEY]: '8192' }, KEY)).toBe(8192);
+    expect(envFloorMB({ [KEY]: '5120' }, KEY)).toBe(5120);
+    // Fractional → floored.
+    expect(envFloorMB({ [KEY]: '12.9' }, KEY)).toBe(12);
+  });
+
+  it('returns 0 (no override) for unset / empty / non-numeric / ≤0 / non-finite', () => {
+    expect(envFloorMB({}, KEY)).toBe(0);
+    expect(envFloorMB({ [KEY]: '' }, KEY)).toBe(0);
+    expect(envFloorMB({ [KEY]: 'abc' }, KEY)).toBe(0);
+    expect(envFloorMB({ [KEY]: '0' }, KEY)).toBe(0);
+    expect(envFloorMB({ [KEY]: '-5' }, KEY)).toBe(0);
+    expect(envFloorMB({ [KEY]: 'Infinity' }, KEY)).toBe(0);
+  });
+
+  it('composes as a RAISED floor only: max(scaled, override)', () => {
+    // Tiny repo (floor 4096) + 8192 knob → knob wins (raises).
+    expect(Math.max(diskSizeMB(0, FLOOR), envFloorMB({ [KEY]: '8192' }, KEY))).toBe(8192);
+    // Large repo (scaled 6144) + 5120 knob → scaled wins (knob CANNOT shrink it).
+    expect(Math.max(diskSizeMB(3 * GIB, FLOOR), envFloorMB({ [KEY]: '5120' }, KEY))).toBe(6144);
+    // Garbage knob → 0 → floor/scaled holds.
+    expect(Math.max(diskSizeMB(0, FLOOR), envFloorMB({ [KEY]: 'abc' }, KEY))).toBe(FLOOR);
   });
 });

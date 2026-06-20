@@ -54,7 +54,6 @@ import {
   mkdtempSync,
   readdirSync,
   copyFileSync,
-  statSync,
   existsSync,
   lstatSync,
   writeFileSync,
@@ -112,13 +111,17 @@ export interface OverlayResult {
   /** Small ext4 containing the user's repo + script-jail config, mounted at /work. */
   repoDiskPath: string;
   /**
-   * EMPTY per-run ext4 (filesystem label `scratch`, 4096 MiB logical, sparse)
-   * the guest mounts read-write for strace logs + the events JSONL.
+   * EMPTY per-run ext4 (filesystem label `scratch`, sparse) the guest mounts
+   * read-write for strace logs + the events JSONL.  Logical size scales with
+   * the repo content (`max(SCRATCH_DISK_MIN_MB, 2× content)`, floor 4096 MiB),
+   * raisable via the SCRIPT_JAIL_SCRATCH_DISK_MB env knob.
    */
   scratchDiskPath: string;
   /**
-   * EMPTY per-run ext4 (filesystem label `sjtmp`, 4096 MiB logical, sparse)
-   * the guest mounts read-write at /sjtmp and exports as TMPDIR.  A dedicated
+   * EMPTY per-run ext4 (filesystem label `sjtmp`, sparse) the guest mounts
+   * read-write at /sjtmp and exports as TMPDIR.  Logical size scales with the
+   * repo content (`max(SJTMP_DISK_MIN_MB, 2× content)`, floor 4096 MiB),
+   * raisable via the SCRIPT_JAIL_SJTMP_DISK_MB env knob.  A dedicated
    * disk (not /work, not /scratch): yarn Berry's tarball→zip staging needs
    * gigabytes of tmp on large monorepos, and a MOUNTPOINT cannot be symlink-
    * swapped by a Phase-A lifecycle script — init.sh drops CAP_SYS_ADMIN before
@@ -225,23 +228,34 @@ async function buildOverlayInto(
     }
   }
 
-  // 4. Build the repo disk ext4.
+  // 4. Build the repo disk ext4.  Walk the staged content ONCE here and reuse
+  //    the byte total for all three disks — repo, scratch, and sjtmp all scale
+  //    with the same metric (strace/event spill and tmp churn grow with the
+  //    install size, so a fixed side-disk size ENOSPCs on a huge monorepo while
+  //    the repo disk scales).  The images are sparse, so a larger logical size
+  //    costs only ext4 metadata on the host.
+  const repoContentBytes = sumContentBytes(repoStageDir);
   const repoDiskPath = join(workDir, 'repo.ext4');
   await buildExt4Disk({
     srcDir: repoStageDir,
     label: 'repo',
-    sizeMB: estimateDiskSizeMB(repoStageDir),
+    sizeMB: diskSizeMB(repoContentBytes, REPO_DISK_MIN_MB),
     outPath: repoDiskPath,
     env,
   });
 
   // 5. Build the EMPTY scratch disk ext4.  Same creation mechanism as
   //    repo.ext4, just no content seed.  The guest resolves it via
-  //    `blkid -L scratch`, so the label must be exactly `scratch`.
+  //    `blkid -L scratch`, so the label must be exactly `scratch`.  Scales with
+  //    repo content (floor SCRATCH_DISK_MIN_MB); the SCRIPT_JAIL_SCRATCH_DISK_MB
+  //    env knob can only RAISE the floor (max with the scaled need).
   const scratchDiskPath = join(workDir, 'scratch.ext4');
   await buildExt4Disk({
     label: SCRATCH_DISK_LABEL,
-    sizeMB: SCRATCH_DISK_MB,
+    sizeMB: Math.max(
+      diskSizeMB(repoContentBytes, SCRATCH_DISK_MIN_MB),
+      envFloorMB(env, 'SCRIPT_JAIL_SCRATCH_DISK_MB'),
+    ),
     outPath: scratchDiskPath,
     env,
   });
@@ -250,11 +264,16 @@ async function buildOverlayInto(
   //    filesystem from /work (repo) and /scratch (audit), so a large-repo
   //    install's tmp churn can't ENOSPC either, and — being a MOUNTPOINT —
   //    cannot be symlink-redirected by Phase-A repo code.  Guest resolves it
-  //    via `blkid -L sjtmp`, so the label must be exactly `sjtmp`.
+  //    via `blkid -L sjtmp`, so the label must be exactly `sjtmp`.  Scales with
+  //    repo content (floor SJTMP_DISK_MIN_MB); the SCRIPT_JAIL_SJTMP_DISK_MB env
+  //    knob can only RAISE the floor (max with the scaled need).
   const sjtmpDiskPath = join(workDir, 'sjtmp.ext4');
   await buildExt4Disk({
     label: SJTMP_DISK_LABEL,
-    sizeMB: SJTMP_DISK_MB,
+    sizeMB: Math.max(
+      diskSizeMB(repoContentBytes, SJTMP_DISK_MIN_MB),
+      envFloorMB(env, 'SCRIPT_JAIL_SJTMP_DISK_MB'),
+    ),
     outPath: sjtmpDiskPath,
     env,
   });
@@ -491,11 +510,15 @@ const REPO_DISK_MIN_MB = 4096;
 const SCRATCH_DISK_LABEL = 'scratch';
 
 /**
- * Logical size of the empty scratch disk (MiB).  Sized so strace -ff logs and
- * the events JSONL of large monorepo installs fit comfortably; sparse on the
- * host, so the actual footprint is just ext4 metadata.
+ * FLOOR for the empty scratch disk (MiB).  The scratch disk now SCALES with
+ * the repo content the same way the repo disk does (`max(floor, 2× content)`):
+ * strace -ff logs + the events JSONL grow roughly with the size of the install,
+ * so a fixed 4 GiB would ENOSPC on a very large monorepo (napi-rs) while the
+ * repo disk scaled.  The image is sparse, so a larger logical size costs only
+ * ext4 metadata on the host.  Raise the floor (never shrink below the
+ * content-derived need) via the `SCRIPT_JAIL_SCRATCH_DISK_MB` env knob.
  */
-const SCRATCH_DISK_MB = 4096;
+const SCRATCH_DISK_MIN_MB = 4096;
 
 /**
  * Filesystem label of the sjtmp disk.  LOAD-BEARING: the guest resolves the
@@ -505,23 +528,36 @@ const SCRATCH_DISK_MB = 4096;
 const SJTMP_DISK_LABEL = 'sjtmp';
 
 /**
- * Logical size of the empty sjtmp disk (MiB).  Sized so a large monorepo's
- * package-manager tmp churn (yarn Berry stages every tarball→zip conversion
- * in TMPDIR — ~488 MiB for napi-rs) fits comfortably; sparse on the host, so
- * the actual footprint is just ext4 metadata.
+ * FLOOR for the empty sjtmp disk (MiB).  Like the scratch disk, sjtmp now
+ * SCALES with the repo content (`max(floor, 2× content)`): a large monorepo's
+ * package-manager tmp churn (yarn Berry stages every tarball→zip conversion in
+ * TMPDIR — ~488 MiB for napi-rs) grows with the install, so a fixed 4 GiB would
+ * ENOSPC where the repo disk scaled.  Sparse on the host, so a larger logical
+ * size costs only ext4 metadata.  Raise the floor (never shrink below the
+ * content-derived need) via the `SCRIPT_JAIL_SJTMP_DISK_MB` env knob.
  */
-const SJTMP_DISK_MB = 4096;
+const SJTMP_DISK_MIN_MB = 4096;
 
 /**
- * Recursively sum the size of files under `dir` and return a size in MB
- * (`max(REPO_DISK_MIN_MB, 2× content)` — headroom for node_modules writes).
+ * Recursively sum the logical size (`stat.size`) of files under `dir`.  Uses
+ * the LOGICAL length, so a sparse seed file inflates the metric with ~0 real
+ * bytes.  Shared by all three side disks via {@link diskSizeMB}.
  */
-function estimateDiskSizeMB(dir: string): number {
+export function sumContentBytes(dir: string): number {
   let totalBytes = 0;
 
   const visit = (p: string): void => {
     try {
-      const stat = statSync(p, { bigint: false });
+      // lstat (NOT stat): never follow symlinks.  The staged tree preserves
+      // repo symlinks verbatim (`dereference: false`), so a malicious repo
+      // entry like `loop -> .` (ELOOP recursion) or `escape -> /` (walking the
+      // host root) must NOT be followed — that single byte total now sizes all
+      // three disks, so following symlinks would let an attacker-controlled
+      // entry inflate every image or burn host I/O before the audit runs.  A
+      // symlink is counted as a link only (its own tiny on-disk size), never
+      // recursed into; the real targets are counted iff they live inside the
+      // staged tree and are reached directly.
+      const stat = lstatSync(p, { bigint: false });
       if (stat.isDirectory()) {
         for (const child of readdirSync(p)) {
           visit(join(p, child));
@@ -534,6 +570,31 @@ function estimateDiskSizeMB(dir: string): number {
 
   if (existsSync(dir)) visit(dir);
 
-  const estimatedMB = Math.ceil((totalBytes * 2) / (1024 * 1024));
-  return Math.max(REPO_DISK_MIN_MB, estimatedMB);
+  return totalBytes;
+}
+
+/**
+ * Convert a content-byte total into a disk size in MiB:
+ * `max(minMB, ceil(2× content / MiB))` — 2× content gives headroom for the
+ * install's own writes (node_modules, pnpm store, tmp/strace spill).  Shared by
+ * the repo, scratch, and sjtmp disks so they all scale with the same metric.
+ */
+export function diskSizeMB(contentBytes: number, minMB: number): number {
+  const scaledMB = Math.ceil((contentBytes * 2) / (1024 * 1024));
+  return Math.max(minMB, scaledMB);
+}
+
+/**
+ * Parse a `SCRIPT_JAIL_*_DISK_MB` env override into a non-negative integer MiB
+ * floor.  Empty string / unset / non-numeric / ≤0 ⇒ `0` (no override) so the
+ * caller falls back to the content-scaled value.  Semantics at the call site
+ * are a RAISED floor only: `max(scaledMB, envFloorMB(...))` — an override can
+ * only add headroom, never shrink below the content-derived need.
+ */
+export function envFloorMB(env: NodeJS.ProcessEnv, name: string): number {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.floor(parsed);
 }
