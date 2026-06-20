@@ -11,12 +11,23 @@
 //   mode: update + install          → neither runs (forbidden),   exit 1
 //   install: false (default)        → neither runs (audit only)
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { setUpConsumer, fakeVmFactory, runMain, type FixtureName } from './harness.js';
 import type { MainDeps } from '../../src/main.js';
+import { NODE_VERSION } from '../../src/rootfs/vite-plus.js';
+
+// The drop-in-install Node-MAJOR parity gate (src/main.ts thread [42]) fails closed
+// unless the runner's Node major equals the audited toolchain major (NODE_VERSION).
+// The CI matrix runs this suite under node 22/24/26, so on the non-audited legs the
+// gate would (correctly) fire for every test that exercises post-gate behavior. These
+// tests are not about the parity gate, so the suite pins the HOST Node major to the
+// audited major (mirrors HOST_SPOOF for the spoof gate). Derived from NODE_VERSION so a
+// toolchain bump can't desync it. The two tests that DO exercise the gate override
+// process.version themselves; afterEach restores the true runner version regardless.
+const AUDIT_NODE_MAJOR = Number(NODE_VERSION.replace(/^v/, '').split('.')[0]);
 
 const FIXTURES: ReadonlyArray<FixtureName> = ['spawns-gcc', 'writes-into-repo'];
 
@@ -56,6 +67,23 @@ function makeHostCaptures(): HostCaptures {
 }
 
 describe.sequential('e2e: drop-in install gating', () => {
+  // Pin the host Node major to the audited major so the [42] parity gate passes
+  // deterministically on every CI node leg (22/24/26). Restore the true runner
+  // version after each test. Tests that assert the gate's own behavior set
+  // process.version to a specific value inside the test (this default is harmless
+  // to them — they override it before running main()).
+  let trueNodeVersion: string;
+  beforeEach(() => {
+    trueNodeVersion = process.version;
+    Object.defineProperty(process, 'version', {
+      value: `v${AUDIT_NODE_MAJOR}.0.0`,
+      configurable: true,
+    });
+  });
+  afterEach(() => {
+    Object.defineProperty(process, 'version', { value: trueNodeVersion, configurable: true });
+  });
+
   it('match → runs part 1 (no-scripts) AND part 2 (scripts), exits clean', async () => {
     const factory = fakeVmFactory({ fixtures: FIXTURES });
     const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
