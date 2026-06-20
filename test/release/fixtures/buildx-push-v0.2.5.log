@@ -1,0 +1,17 @@
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa done
+#15 exporting config sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb done
+#15 exporting attestation manifest sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc done
+#15 pushing layers
+#15 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04@sha256:f5b9b3062398a449553ecc566a4827f05cbbf301b45617ee9cd287cda110586c done
+#15 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-v0.2.5@sha256:f5b9b3062398a449553ecc566a4827f05cbbf301b45617ee9cd287cda110586c done
+#16 exporting manifest sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd done
+#16 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04@sha256:f02c7a0820a24d316246abdbcfae2606e8923a760ac620d3bdb10125fb4629ce done
+#16 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-v0.2.5@sha256:f02c7a0820a24d316246abdbcfae2606e8923a760ac620d3bdb10125fb4629ce done
+#17 exporting config sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee done
+#17 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64@sha256:6f5452e5f38d28f1a21b03130acb8d58348876adbf0d4c5f03a58cb709ab05d6 done
+#17 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-22.04-arm64-v0.2.5@sha256:6f5452e5f38d28f1a21b03130acb8d58348876adbf0d4c5f03a58cb709ab05d6 done
+#18 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64@sha256:4f7197d1867d230fe4c8b055816a016af370a6a7bb422be9ce69d6ff519d58f8 done
+#18 pushing manifest for ghcr.io/brooooooklyn/script-jail-rootfs:ubuntu-24.04-arm64-v0.2.5@sha256:4f7197d1867d230fe4c8b055816a016af370a6a7bb422be9ce69d6ff519d58f8 done
+#18 exporting attestation manifest sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff done
