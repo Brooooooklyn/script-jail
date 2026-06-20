@@ -226,41 +226,65 @@ export function detectReservedScriptJailPaths(repoDir: string): string | null {
     }
     // real directory → descend to the next segment
   }
-  // `etc/script-jail` exists as a REAL directory: refuse any committed file under it.
+  // We reached the end of the segment walk: `etc/script-jail` EXISTS as a real directory
+  // in the checkout.  script-jail OWNS this path and creates it ONLY in the STAGED copy,
+  // so its presence in the REAL checkout is ALWAYS a consumer artifact — committed entries
+  // under it, OR a gitlink/submodule (git index mode 160000) AT `etc/script-jail` itself,
+  // which checks out as an EMPTY real directory when the submodule isn't initialized.
   const reservedDir = cur;
-  const committed: string[] = [];
   let entries: string[] = [];
   try {
     entries = readdirSync(reservedDir, { recursive: true }) as string[];
   } catch {
     entries = [];
   }
-  for (const rel of entries) {
-    let st: ReturnType<typeof lstatSync>;
-    try {
-      st = lstatSync(join(reservedDir, rel));
-    } catch {
-      continue; // raced removal — ignore.
-    }
-    // Count files AND symlinks (a committed symlink under the dir is a vector too);
-    // skip intermediate directory entries readdir(recursive) also returns.
-    if (!st.isDirectory()) committed.push(`${RESERVED_SIDECAR_DIR}/${rel}`);
+  // SECURITY (Codex re-review, gitlink at the reserved dir ITSELF): refuse even when the
+  // dir is EMPTY.  Plain git cannot commit an empty directory, so an empty
+  // `etc/script-jail` on a fresh checkout is itself the gitlink/submodule tell — the
+  // earlier `if (entries.length === 0) return null` was the gap.  Left unrefused, install
+  // proceeds, FC stages the sidecars into it, init.sh's install-mode
+  // `rm -rf /work/etc/script-jail` makes the audit's `existsSync('etc/script-jail')`
+  // return false, while host part-2 keeps the gitlink directory → presence divergence.
+  if (entries.length === 0) {
+    return (
+      `the checkout commits \`${RESERVED_SIDECAR_DIR}\` as an empty directory (a ` +
+      `gitlink/submodule, git index mode 160000) — but script-jail OWNS that directory ` +
+      `and creates it in the sandboxed copy of the repo. The host install re-runs ` +
+      `lifecycle scripts against the REAL checkout, where this directory persists while ` +
+      `the audit (after the in-VM sidecar cleanup) does not — a host-vs-sandbox presence ` +
+      `divergence the value-blind lock cannot capture. Remove \`${RESERVED_SIDECAR_DIR}\` ` +
+      `from the checkout, or audit without \`install\`.`
+    );
   }
-  if (committed.length === 0) return null; // an empty dir is not git-committable; be safe.
-  committed.sort();
+  // SECURITY (Codex re-review, gitlink leaf gap): refuse DIRECTORY entries too, not just
+  // files/symlinks.  A committed gitlink/submodule (git index mode 160000) at e.g.
+  // `etc/script-jail/pm-flags.json` checks out as a real (empty) DIRECTORY — even with
+  // `actions/checkout` default `submodules: false`, a raw index entry materializes as an
+  // empty dir.  The old `if (!st.isDirectory())` filter skipped it, so the gate returned
+  // null while the overlay materializer silently replaced that dir with our sidecar in
+  // the staged copy only (host keeps the dir → host-vs-audit divergence).  script-jail
+  // OWNS this whole directory (the comment above says so), so ANY committed entry is a
+  // refusal — git cannot commit an empty directory, so an on-disk entry means content.
+  // Show LEAF paths only (drop the intermediate-dir entries readdir(recursive) also
+  // returns) so the message is precise.
+  const committed = entries
+    .filter((rel) => !entries.some((other) => other !== rel && other.startsWith(`${rel}/`)))
+    .map((rel) => `${RESERVED_SIDECAR_DIR}/${rel}`)
+    .sort();
   const shown = committed
     .slice(0, 5)
     .map((p) => `\`${p}\``)
     .join(', ');
   const more = committed.length > 5 ? ` (and ${committed.length - 5} more)` : '';
   return (
-    `the checkout commits ${committed.length} file${committed.length === 1 ? '' : 's'} under ` +
+    `the checkout commits ${committed.length} entr${committed.length === 1 ? 'y' : 'ies'} under ` +
     `\`${RESERVED_SIDECAR_DIR}/\` (${shown}${more}) — a directory script-jail owns and ` +
     `overwrites in the sandboxed copy of the repo (config.yml / pm-flags.json / ` +
     `pnpm-arch.json). The host install re-runs lifecycle scripts against the REAL ` +
-    `checkout, where these files keep their committed content while the audit saw ` +
-    `script-jail's — a host-vs-sandbox content divergence the value-blind lock cannot ` +
-    `capture. Remove \`${RESERVED_SIDECAR_DIR}/\` from the checkout, or audit without \`install\`.`
+    `checkout, where these entries keep their committed content/type while the audit saw ` +
+    `script-jail's — a host-vs-sandbox divergence the value-blind lock cannot ` +
+    `capture (a committed gitlink/submodule directory hits this too). Remove ` +
+    `\`${RESERVED_SIDECAR_DIR}/\` from the checkout, or audit without \`install\`.`
   );
 }
 

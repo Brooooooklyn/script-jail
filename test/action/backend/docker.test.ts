@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
@@ -295,20 +295,22 @@ describe('createDockerBackend — host docker spawns use the sanitized host env'
     rmSync(scratchDir, { recursive: true, force: true });
   });
 
-  it('#31 — delivers SCRIPT_JAIL_PM_FLAGS_PATH via container -e (literal argv), never an unquoted shell export', async () => {
-    // Under install:true auditWorkDir == the host repoDir, which can contain spaces /
-    // shell metachars (SCRIPT_JAIL_REPO_DIR / process.cwd() / GITHUB_WORKSPACE are
-    // never validated).  An `export SCRIPT_JAIL_PM_FLAGS_PATH=${workDir}/...`
-    // interpolated into `/bin/sh -lc` would split on a space ("export: not a valid
-    // identifier" under `set -eu`, aborting the audit) or shell-evaluate a `$(...)`.
-    // As a single `-e NAME=value` argv element the value stays literal regardless of
-    // content (mirrors how bare/mac-bare pass it via the process env object).
+  it('#31 — delivers pm-flags content via container -e (literal argv), never an unquoted shell export', async () => {
+    // The pm-flags sidecar is now delivered as env CONTENT
+    // (SCRIPT_JAIL_PM_FLAGS_CONTENT) — never a file at any path (audit-only sidecar
+    // oracle fix).  The JSON value (braces/quotes/spaces) MUST reach docker as a single
+    // `-e NAME=value` argv element, never an `export` interpolated into `/bin/sh -lc`.
+    // The repo bind-mount STILL uses the (possibly spaced) workDir, so this also pins
+    // that the spaced workDir reaches docker only as a single argv token.
     const checkout = mkdtempSync(join(tmpdir(), 'sj-docker-pmflags-'));
     process.env['GITHUB_WORKSPACE'] = checkout;
     const repoDir = join(checkout, 'repo');
     mkdirSync(repoDir);
     const scratchDir = mkdtempSync(join(tmpdir(), 'sj-docker-scratch-'));
     const workDirWithSpace = '/sandbox with space';
+    // Content that includes a space + shell-significant chars, to prove it is never
+    // re-parsed by a shell.
+    const pmContent = '{"extra_install_args":[],"user_install_args":["--foo=bar baz"]}';
 
     let agentArgs: ReadonlyArray<string> | undefined;
     const backend = createDockerBackend({
@@ -328,27 +330,97 @@ describe('createDockerBackend — host docker spawns use the sanitized host env'
       repoDir,
       scratchDir,
       configPath: join(checkout, 'config.yml'),
-      extraRepoOverlayFiles: [],
+      extraRepoOverlayFiles: [
+        { relPath: 'etc/script-jail/pm-flags.json', content: pmContent },
+      ],
       auditWorkDir: workDirWithSpace,
       manifest: {},
     } as unknown as BackendContext);
 
     expect(agentArgs).toBeDefined();
     const args = agentArgs as readonly string[];
-    // The pm-flags path is one literal argv token, space intact, delivered as `-e <value>`.
-    const expectedVal = `SCRIPT_JAIL_PM_FLAGS_PATH=${workDirWithSpace}/etc/script-jail/pm-flags.json`;
+    // The pm-flags content is delivered as a single `-e NAME=value` argv element.
+    const expectedVal = `SCRIPT_JAIL_PM_FLAGS_CONTENT=${pmContent}`;
     const eIdx = args.indexOf(expectedVal);
     expect(eIdx).toBeGreaterThan(0);
     expect(args[eIdx - 1]).toBe('-e');
     // The bind-mount target is also the spaced workDir as a single argv token (safe).
     expect(args.some((a) => a.endsWith(`:${workDirWithSpace}`))).toBe(true);
     // The in-container `-lc` script must NOT export it (no unquoted interpolation),
-    // and must not interpolate the spaced workDir into the shell at all.
+    // must not interpolate the content, and must not interpolate the spaced workDir.
     const lcIdx = args.indexOf('-lc');
     expect(lcIdx).toBeGreaterThan(0);
     const script = args[lcIdx + 1] ?? '';
-    expect(script).not.toContain('export SCRIPT_JAIL_PM_FLAGS_PATH');
+    expect(script).not.toContain('SCRIPT_JAIL_PM_FLAGS_CONTENT');
+    expect(script).not.toContain('bar baz');
     expect(script).not.toContain(workDirWithSpace);
+
+    rmSync(checkout, { recursive: true, force: true });
+    rmSync(scratchDir, { recursive: true, force: true });
+  });
+
+  it('delivers control sidecars as env CONTENT, never a file at any path (no bind, not in /work)', async () => {
+    // Audit-only sidecar oracle (Codex re-review): script-jail's pm-flags.json /
+    // pnpm-arch.json must NOT appear at ANY lifecycle-visible path — not the audited
+    // repo tree (where the host re-run's absent etc/script-jail/ would diverge) and not
+    // an absolute /etc bind (same divergence under install:true).  They are delivered as
+    // env CONTENT.  `.yarnrc.yml` (genuine repo config the host also reads at the repo
+    // root) STAYS in the staged tree.
+    const checkout = mkdtempSync(join(tmpdir(), 'sj-docker-ctrl-'));
+    process.env['GITHUB_WORKSPACE'] = checkout;
+    const repoDir = join(checkout, 'repo');
+    mkdirSync(repoDir);
+    const scratchDir = mkdtempSync(join(tmpdir(), 'sj-docker-scratch-'));
+
+    let agentArgs: ReadonlyArray<string> | undefined;
+    let pmInStaged: boolean | undefined;
+    let yarnrcInStaged: boolean | undefined;
+    const backend = createDockerBackend({
+      env: { GITHUB_WORKSPACE: checkout, PATH: '/usr/bin', HOME: '/home/runner' },
+      commandSucceeds: () => true,
+      runAgentProcess: async (input) => {
+        agentArgs = input.args;
+        // Inspect the staged repo WHILE it still exists (the finally cleans it up).
+        const repoBind = input.args.find((a) => a.endsWith(':/work'));
+        const stagedPath = repoBind!.slice(0, -':/work'.length);
+        pmInStaged = existsSync(join(stagedPath, 'etc', 'script-jail', 'pm-flags.json'));
+        yarnrcInStaged = existsSync(join(stagedPath, '.yarnrc.yml'));
+        return { finalYaml: 'events: []\n', nonFatalWarnings: [] };
+      },
+      runCommand: () => {},
+    });
+
+    await backend.run({
+      selfTest: true,
+      arch: 'x64',
+      runnerImage: 'ubuntu-24.04',
+      repoDir,
+      scratchDir,
+      configPath: join(checkout, 'config.yml'),
+      extraRepoOverlayFiles: [
+        { relPath: '.yarnrc.yml', content: 'nodeLinker: node-modules\n' },
+        { relPath: 'etc/script-jail/pm-flags.json', content: '{"extra_install_args":[]}' },
+        { relPath: 'etc/script-jail/pnpm-arch.json', content: '{"supportedArchitectures":{}}' },
+      ],
+      auditWorkDir: '/work',
+      manifest: {},
+    } as unknown as BackendContext);
+
+    const args = agentArgs as readonly string[];
+    // Content delivered via env, both sidecars.
+    expect(args).toContain('SCRIPT_JAIL_PM_FLAGS_CONTENT={"extra_install_args":[]}');
+    expect(args).toContain('SCRIPT_JAIL_PNPM_ARCH_CONTENT={"supportedArchitectures":{}}');
+    // NO bind ever places a control sidecar at any path — not /etc, not /work, not scratch.
+    expect(args.some((a) => a.endsWith(':/etc/script-jail/pm-flags.json:ro'))).toBe(false);
+    expect(args.some((a) => a.includes('/etc/script-jail/pm-flags.json'))).toBe(false);
+    expect(args.some((a) => a.includes('/work/etc/script-jail'))).toBe(false);
+    expect(args.some((a) => a.includes('sj-control'))).toBe(false);
+    // config.yml is the ONE control file still delivered as a (read-only) bind.
+    expect(args.some((a) => a.endsWith(':/etc/script-jail/config.yml:ro'))).toBe(true);
+    // The staged repo did NOT contain the control sidecar…
+    expect(pmInStaged).toBe(false);
+    // …but DID contain the genuine repo-relative overlay.
+    expect(yarnrcInStaged).toBe(true);
 
     rmSync(checkout, { recursive: true, force: true });
     rmSync(scratchDir, { recursive: true, force: true });

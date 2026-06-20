@@ -97,6 +97,35 @@ describe('makeOverlay — partial-build failure removes the workDir', () => {
     // repo — must be gone.
     expect(existsSync(workDir)).toBe(false);
   });
+
+  it('FAILS CLOSED when an overlay LEAF pre-exists as a directory (gitlink/submodule leaf gap)', async () => {
+    // Codex re-review: a committed gitlink/submodule (git index mode 160000) at
+    // etc/script-jail/pm-flags.json checks out as a real (empty) DIRECTORY.  The old
+    // `rmSync(dest, {recursive}); writeFileSync` would delete it and write our sidecar
+    // into the repo-disk copy ONLY, while the host's real checkout keeps the dir — a
+    // host-vs-audit divergence the value-blind lock can't capture.  writeOverlayFile
+    // must throw (before mkfs, so this runs on every platform).  A real empty dir at the
+    // leaf reproduces the checked-out gitlink's filesystem state without needing git.
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+    const workDir = mkdtempSync(join(tmpdir(), 'script-jail-leaf-gap-'));
+    const repoSrc = mkdtempSync(join(tmpdir(), 'script-jail-leaf-repo-'));
+    writeFileSync(join(repoSrc, 'package.json'), '{"name":"x"}');
+    mkdirSync(join(repoSrc, 'etc', 'script-jail', 'pm-flags.json'), { recursive: true });
+
+    await expect(
+      makeOverlay({
+        baseRootfsPath,
+        repoSrcPath: repoSrc,
+        configPath,
+        workDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).rejects.toThrow(/already has a directory .* writes its own sidecar/);
+
+    expect(existsSync(workDir)).toBe(false); // makeOverlay's try/catch cleaned up.
+    rmSync(repoSrc, { recursive: true, force: true });
+  });
 });
 
 describe('makeOverlay — staging (no ext4 build)', () => {

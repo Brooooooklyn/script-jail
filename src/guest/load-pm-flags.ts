@@ -41,19 +41,40 @@ const PmFlagsSchema = z.object({
 /** Absolute path inside the VM where the CLI lands the override file. */
 export const PM_FLAGS_PATH = '/etc/script-jail/pm-flags.json';
 
+/**
+ * Load the npm/developer install-arg flags.
+ *
+ * Two delivery channels, content first:
+ *   - `content` — the pm-flags.json JSON delivered DIRECTLY via the
+ *     `SCRIPT_JAIL_PM_FLAGS_CONTENT` env var (threaded by the agent).  This is
+ *     the production channel on every backend: it keeps script-jail's OWN
+ *     control sidecar OFF any lifecycle-visible filesystem path, so a clean-repo
+ *     `fs.existsSync('/etc/script-jail/pm-flags.json')` is false in BOTH the
+ *     audit and the host re-run (Codex re-review, audit-only sidecar oracle).
+ *     The content rides the AGENT's process env, which `buildChildEnv` strips
+ *     from every lifecycle child, so a child's own `process.env` never sees it.
+ *   - `filePath` — fallback file read (the `/etc` default, or a unit-test temp
+ *     file).  Retained for defense in depth and tests; no backend stages a file
+ *     here in production any more.
+ *
+ * `content` wins when present, even if empty-string (an empty override is still
+ * an explicit "no args", not a reason to fall back to a stale file).
+ */
 export function loadPmFlags(
   filePath: string = PM_FLAGS_PATH,
+  content?: string,
 ): { extraInstallArgs: string[]; userInstallArgs: string[] } {
   try {
-    const raw = fs.readFileSync(filePath, 'utf8');
+    const raw = content !== undefined ? content : fs.readFileSync(filePath, 'utf8');
     const parsed = PmFlagsSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) return { extraInstallArgs: [], userInstallArgs: [] };
-    // SECURITY (defense in depth): this file is delivered through the
-    // repo-controlled staging namespace (`/work/etc/script-jail/pm-flags.json`
-    // on Firecracker, the staged repo copy on Docker/bare).  The host overlay
-    // always overwrites it with sanitized content, but a backend delivery gap
-    // must NEVER let a tree-steering / script-re-enabling flag survive into the
-    // network-on Phase A fetch.  BOTH array fields flow into the install argv, so
+    // SECURITY (defense in depth): this content is delivered through the
+    // repo-controlled staging namespace (it originates from a file the host
+    // writes from the action config, then rides `SCRIPT_JAIL_PM_FLAGS_CONTENT`
+    // env or, as a fallback, a file path).  The host overlay always produces
+    // sanitized content, but a backend delivery gap must NEVER let a
+    // tree-steering / script-re-enabling flag survive into the network-on Phase A
+    // fetch.  BOTH array fields flow into the install argv, so
     // we re-sanitize BOTH at the point of use with the SAME fail-closed allowlist
     // the host install applies — sanitizing only one channel would just move the
     // smuggling surface to the other (an attacker who can influence the file

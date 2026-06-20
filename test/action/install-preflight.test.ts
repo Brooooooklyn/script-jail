@@ -679,7 +679,35 @@ describe('detectReservedScriptJailPaths — install reserved-sidecar gate (threa
     expect(reason).not.toBeNull();
     expect(reason).toMatch(/config\.yml/);
     expect(reason).toMatch(/pm-flags\.json/);
-    expect(reason).toMatch(/commits 2 files/);
+    expect(reason).toMatch(/commits 2 entries/);
+  });
+
+  it('blocks a committed DIRECTORY entry under etc/script-jail (gitlink/submodule leaf gap)', () => {
+    // A committed gitlink/submodule (git index mode 160000) at
+    // etc/script-jail/pm-flags.json checks out as a real (empty) directory.  The old
+    // `!isDirectory()` filter skipped directory entries, so the gate returned null while
+    // the overlay materializer silently replaced that dir with our sidecar in the staged
+    // copy only — a host-vs-audit divergence (Codex re-review).  A real empty dir at the
+    // leaf reproduces the checked-out gitlink's filesystem state without needing git.
+    mkdirSync(join(dir, 'etc', 'script-jail', 'pm-flags.json'), { recursive: true });
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/pm-flags\.json/);
+    expect(reason).toMatch(/gitlink|submodule|directory/i);
+  });
+
+  it('blocks a gitlink/submodule committed AT etc/script-jail ITSELF (empty-dir leaf gap)', () => {
+    // Codex re-review (round-12): a gitlink (git index mode 160000) AT etc/script-jail
+    // itself checks out as an EMPTY real directory when the submodule isn't initialized.
+    // The segment walk accepts it as a real dir and the empty recursive readdir used to
+    // `return null` → install proceeded, FC staged sidecars into it, init.sh removed the
+    // /work copy, and host part-2 kept the gitlink dir → existsSync('etc/script-jail')
+    // diverges.  An empty real dir reproduces the checked-out gitlink without git.
+    mkdirSync(join(dir, 'etc', 'script-jail'), { recursive: true });
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/etc\/script-jail/);
+    expect(reason).toMatch(/gitlink|submodule|empty directory/i);
   });
 
   it('returns null for a clean checkout (no reserved sidecars)', () => {

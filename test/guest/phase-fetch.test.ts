@@ -535,6 +535,23 @@ describe('runFetchPhase', () => {
       });
       expect(result.userInstallArgs).toEqual([]);
     });
+
+    it('threads pmFlagsContent (env channel) through to npm ci, preferring it over the path', async () => {
+      // The production delivery channel: content arrives via SCRIPT_JAIL_PM_FLAGS_CONTENT
+      // (agent → input.pmFlagsContent), no file at any path.  Even when a stale file also
+      // exists, the content wins (and is re-sanitized).
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--from-file'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        spawner,
+        pmFlagsPath,
+        pmFlagsContent: JSON.stringify({ extra_install_args: ['--cpu=arm64'], user_install_args: ['--omit=dev'] }),
+      });
+      expect(calls[0]!.args).toEqual(['ci', '--ignore-scripts', '--cpu=arm64', '--omit=dev']);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -598,6 +615,35 @@ describe('runFetchPhase', () => {
       // Sibling keys preserved.
       expect(pkg['name']).toBe('demo');
       expect(pkg['version']).toBe('1.0.0');
+    });
+
+    it('merges supportedArchitectures from pnpmArchContent (env channel), preferring it over the path', async () => {
+      writeFileSync(
+        join(repoDir, 'package.json'),
+        JSON.stringify({ name: 'demo', version: '1.0.0' }, null, 2) + '\n',
+      );
+      // A stale file exists, but the env content (production channel) wins.
+      writeFileSync(
+        pnpmArchPath,
+        '{"supportedArchitectures":{"os":["darwin"],"cpu":["arm64"],"libc":["unknown"]}}',
+      );
+
+      const { spawner } = mockSpawner();
+      await runFetchPhase({
+        manager: 'pnpm',
+        cwd: repoDir,
+        env: BASE_ENV,
+        spawner,
+        pnpmArchPath,
+        pnpmArchContent: ARCH_OVERLAY,
+      });
+
+      const pkg = JSON.parse(
+        readFileSync(join(repoDir, 'package.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(pkg['pnpm']).toEqual({
+        supportedArchitectures: { os: ['linux'], cpu: ['x64'], libc: ['glibc'] },
+      });
     });
 
     it('leaves package.json untouched when pnpm-arch.json is absent', async () => {

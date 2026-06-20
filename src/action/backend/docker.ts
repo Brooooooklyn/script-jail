@@ -3,7 +3,11 @@ import { randomBytes } from 'node:crypto';
 import type { AuditBackend, BackendContext } from './types.js';
 import { BackendUnavailableError } from './types.js';
 import { commandSucceeds, runAgentProcess, runCommand } from './process.js';
-import { stageRepoDirectory } from './stage.js';
+import {
+  controlSidecarEnv,
+  partitionControlSidecars,
+  stageRepoDirectory,
+} from './stage.js';
 import type { StagedRepo } from './stage.js';
 import { stripDangerousEnv } from '../host-install.js';
 
@@ -79,11 +83,30 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
         }
       }
 
+      // SECURITY (audit-only sidecar oracle): keep script-jail's control sidecars off
+      // EVERY lifecycle-visible filesystem path.  `.yarnrc.yml` is genuine repo config the
+      // host install also reads at the repo root, so it stays in the stage; the
+      // `etc/script-jail/*` control files (pm-flags.json / pnpm-arch.json) are delivered as
+      // env CONTENT via `-e` below — never a file the audit has and the host's real
+      // checkout lacks.  (`config.yml` is the one control file delivered as a read-only
+      // bind, a documented irreducible residual.)
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles,
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
+        extraRepoOverlayFiles: repoOverlay,
       });
+      // pm-flags.json / pnpm-arch.json content → `SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT`
+      // env (empty dict when absent → no `-e`, guest degrades to "no override").  The guest
+      // reads these from the agent's process env, which buildChildEnv strips from every
+      // lifecycle child.
+      const controlEnv = controlSidecarEnv(controlSidecars);
+      const controlEnvFlags = Object.entries(controlEnv).flatMap(([name, value]) => [
+        '-e',
+        `${name}=${value}`,
+      ]);
       const containerName = `script-jail-${randomBytes(4).toString('hex')}`;
       // install:true cwd parity — mount the staged repo at the SAME absolute
       // path the host re-run uses (ctx.repoDir, threaded via auditWorkDir) so
@@ -92,10 +115,6 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
       // matches (set by buildEffectiveConfig from installWorkDir), so the
       // agent cd's here.
       const workDir = ctx.auditWorkDir ?? '/work';
-      // Container-side path of the host-owned pm-flags sidecar.  Passed to the guest
-      // via the container ENV (`-e` below), NOT a shell `export` (#31) — see the note
-      // at the `-e` flag for why interpolating workDir into `/bin/sh -lc` is unsafe.
-      const pmFlagsPath = `${workDir}/etc/script-jail/pm-flags.json`;
       try {
         const script = [
           'set -eu',
@@ -119,8 +138,8 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
           'mkdir -p /tmp/script-jail-strace',
           'export SCRIPT_JAIL_CONNECTION=stdio',
           'export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml',
-          // SCRIPT_JAIL_PM_FLAGS_PATH is delivered via the container `-e` env below,
-          // NOT exported here — see the note at the `-e` flag (#31).
+          // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT are delivered via the container `-e`
+          // env (already in this shell's env), NOT exported here — `exec` preserves them.
           'exec node /usr/local/lib/script-jail/guest-agent.cjs',
         ].join('; ');
 
@@ -135,20 +154,15 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
             '--security-opt', 'seccomp=unconfined',
             '-v', `${staged.path}:${workDir}`,
             '-v', `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
-            // The host-owned pm-flags sidecar is staged in the repo tree at
-            // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it into
-            // /etc the way Firecracker's init does).  Point the guest at it so the
-            // sandbox fetch applies the SAME install args as the host part-1 install.
-            // Delivered via the container ENV (`-e`), NOT a shell `export` interpolated
-            // into `/bin/sh -lc` (#31): under install:true workDir IS the host repoDir
-            // (SCRIPT_JAIL_REPO_DIR / process.cwd() / GITHUB_WORKSPACE — never validated
-            // for spaces/metachars), so an unquoted `export SCRIPT_JAIL_PM_FLAGS_PATH=
-            // ${workDir}/...` would split on a space (`export: not a valid identifier`
-            // under `set -eu`, aborting the audit) or shell-evaluate a `$(...)`.  As a
-            // single `-e NAME=value` argv element the value is literal regardless of its
-            // content — mirroring how bare/mac-bare pass it via the process env object.
-            // loadPmFlags re-sanitizes the file before use.
-            '-e', `SCRIPT_JAIL_PM_FLAGS_PATH=${pmFlagsPath}`,
+            // Control sidecars (pm-flags.json / pnpm-arch.json) delivered as env CONTENT,
+            // NOT a file at any path (audit-only sidecar oracle): the guest reads
+            // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT from the agent env so the sandbox
+            // fetch applies the SAME install args as the host part-1 install.  Each is a
+            // single `-e NAME=value` argv element (#31): literal regardless of content
+            // (JSON braces/quotes/newlines), never re-parsed by a shell.  loadPmFlags /
+            // applyPnpmArchOverlay re-sanitize the content.  Empty when no sidecar →
+            // no `-e` → guest degrades to "no override".
+            ...controlEnvFlags,
             imageRef,
             '/bin/sh',
             '-lc',

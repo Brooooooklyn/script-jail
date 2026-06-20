@@ -84,3 +84,61 @@ describe('init.sh — CAP_SYS_ADMIN drop before repo-controlled code', () => {
     expect(dropIdx).toBeGreaterThan(sjtmpMountIdx);
   });
 });
+
+describe('init.sh — install:true control-sidecar + cwd-parity hardening (Codex re-review)', () => {
+  it('reads install_mode from the host-owned config (not a repo-supplied value)', () => {
+    expect(INIT_SH).toMatch(
+      /SJ_INSTALL="\$\(sed -n 's\/\^install_mode:\[\[:space:\]\]\*\/\/p' \/etc\/script-jail\/config\.yml \| head -n1\)"/,
+    );
+  });
+
+  it('delivers pm-flags/pnpm-arch as env CONTENT, never copies them to /etc (audit-only sidecar oracle)', () => {
+    // The control sidecars must not land at /etc/script-jail/* (a clean-repo
+    // existsSync there must be false in the audit too).  init.sh exports their CONTENT
+    // from the /work copies; the agent reads it from the (setpriv-preserved) env.
+    expect(INIT_SH).toMatch(
+      /export SCRIPT_JAIL_PM_FLAGS_CONTENT="\$\(cat \/work\/etc\/script-jail\/pm-flags\.json\)"/,
+    );
+    expect(INIT_SH).toMatch(
+      /export SCRIPT_JAIL_PNPM_ARCH_CONTENT="\$\(cat \/work\/etc\/script-jail\/pnpm-arch\.json\)"/,
+    );
+    // The old copy-to-/etc lines are GONE (only config.yml is copied to /etc now).
+    expect(INIT_SH).not.toContain('cp /work/etc/script-jail/pm-flags.json /etc/script-jail/pm-flags.json');
+    expect(INIT_SH).not.toContain('cp /work/etc/script-jail/pnpm-arch.json /etc/script-jail/pnpm-arch.json');
+  });
+
+  it('reads the sidecar content BEFORE the install_mode removal (export precedes rm)', () => {
+    const exportIdx = INIT_SH.indexOf('export SCRIPT_JAIL_PM_FLAGS_CONTENT=');
+    const rmIdx = INIT_SH.indexOf('rm -rf /work/etc/script-jail');
+    expect(exportIdx).toBeGreaterThan(-1);
+    expect(rmIdx).toBeGreaterThan(exportIdx);
+  });
+
+  it('removes the repo-disk sidecar copies under install_mode (audit-only sidecar oracle)', () => {
+    // The control files are copied to /etc/script-jail/*; leaving the /work copies (which
+    // mount --move carries to repoDir) lets a lifecycle script branch on an
+    // etc/script-jail/ present in the audit but absent on the host.  Remove them, gated on
+    // install_mode so it can never touch a non-install consumer's tree.
+    expect(INIT_SH).toMatch(/if \[ "\$SJ_INSTALL" = "true" \]; then\s+rm -rf \/work\/etc\/script-jail/);
+    expect(INIT_SH).toMatch(/rmdir \/work\/etc 2>\/dev\/null \|\| true/);
+  });
+
+  it('removes the /work sidecar copies AFTER copying them to /etc and BEFORE mount --move', () => {
+    const copyIdx = INIT_SH.indexOf('cp /work/etc/script-jail/config.yml /etc/script-jail/config.yml');
+    const rmIdx = INIT_SH.indexOf('rm -rf /work/etc/script-jail');
+    const moveIdx = INIT_SH.indexOf('mount --move /work');
+    expect(copyIdx).toBeGreaterThan(-1);
+    expect(rmIdx).toBeGreaterThan(copyIdx);
+    expect(moveIdx).toBeGreaterThan(rmIdx);
+  });
+
+  it('fail-closes (fatal) when mount --move fails under install_mode (no silent /work fallback)', () => {
+    // Auditing at /work while the host re-runs at repoDir would silently diverge the cwd
+    // (getcwd is untraced) — fatal instead of the silent downgrade in install mode.
+    expect(INIT_SH).toMatch(
+      /if \[ "\$SJ_INSTALL" = "true" \]; then\s+fatal "install:true requires the repo mount/,
+    );
+    // The non-install path keeps the benign downgrade (rewrite work_dir back to /work).
+    expect(INIT_SH).toMatch(/auditing at \/work \(install cwd parity skipped\)/);
+  });
+});

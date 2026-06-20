@@ -91,3 +91,40 @@ describe('loadPmFlags — defense-in-depth sanitize', () => {
     });
   });
 });
+
+describe('loadPmFlags — env CONTENT channel (audit-only sidecar oracle)', () => {
+  it('reads from the content arg and re-sanitizes it (same allowlist as the file path)', () => {
+    const content = JSON.stringify({
+      extra_install_args: [],
+      user_install_args: ['--ignore-scripts', 'false', '-D'],
+    });
+    // No file path involved at all — content delivered directly (the production channel).
+    expect(loadPmFlags(undefined, content)).toEqual({
+      extraInstallArgs: [],
+      userInstallArgs: ['-D'],
+    });
+  });
+
+  it('prefers content over the file path (content wins even when a file also exists)', () => {
+    const p = writeFlags({ extra_install_args: [], user_install_args: ['--from-file'] });
+    const content = JSON.stringify({ extra_install_args: [], user_install_args: ['--omit=dev'] });
+    expect(loadPmFlags(p, content)).toEqual({
+      extraInstallArgs: [],
+      userInstallArgs: ['--omit=dev'],
+    });
+  });
+
+  it('honors an empty-string content as an explicit malformed override (degrades, never falls back to file)', () => {
+    const p = writeFlags({ extra_install_args: [], user_install_args: ['--from-file'] });
+    // Empty string is "present but unparseable" → degrade to empty; the file is NOT read.
+    expect(loadPmFlags(p, '')).toEqual({ extraInstallArgs: [], userInstallArgs: [] });
+  });
+
+  it('parses multi-line (pretty-printed) JSON content', () => {
+    const content = '{\n  "extra_install_args": [],\n  "user_install_args": ["-P"]\n}\n';
+    expect(loadPmFlags(undefined, content)).toEqual({
+      extraInstallArgs: [],
+      userInstallArgs: ['-P'],
+    });
+  });
+});

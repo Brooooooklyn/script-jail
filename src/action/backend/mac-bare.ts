@@ -37,7 +37,12 @@ import { platform as hostPlatform } from 'node:process';
 
 import type { AuditExecutionInput, LauncherResult } from '../../shared/run-audit.js';
 import { runAgentProcess } from './process.js';
-import { rewriteConfigWorkDir, stageRepoDirectory } from './stage.js';
+import {
+  controlSidecarEnv,
+  partitionControlSidecars,
+  rewriteConfigWorkDir,
+  stageRepoDirectory,
+} from './stage.js';
 import { SAFE_SYSTEM_PATH, sanitizePathValue, stripDangerousEnv } from '../host-install.js';
 import {
   provisionNodeMac,
@@ -199,11 +204,23 @@ export function createMacBareExecute(
     }
 
     // --- Stage the repo + rewrite config work_dir -------------------------
+    // SECURITY (audit-only sidecar oracle): deliver script-jail's control sidecars
+    // (pm-flags.json / pnpm-arch.json) as env CONTENT, NOT a file in the staged repo tree;
+    // `.yarnrc.yml` stays (genuine repo config).  The guest reads pm-flags from
+    // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT (set below), so the audited repo root no
+    // longer holds an `etc/script-jail/` the host checkout lacks.  (mac-bare is
+    // observe-only / not install-aligned — no host re-run to diverge from — but this keeps
+    // one delivery policy uniform with docker/Firecracker and removes the pure-audit
+    // surface pollution.)
+    const { repoOverlay, controlSidecars } = partitionControlSidecars(
+      input.extraRepoOverlayFiles,
+    );
     const staged = stageRepoDirectory({
       repoDir: input.repoDir,
       parentDir: input.scratchDir,
-      extraRepoOverlayFiles: input.extraRepoOverlayFiles,
+      extraRepoOverlayFiles: repoOverlay,
     });
+    const controlEnv = controlSidecarEnv(controlSidecars);
     const backendConfigPath = rewriteConfigWorkDir({
       configPath: input.configPath,
       outDir: input.scratchDir,
@@ -235,11 +252,12 @@ export function createMacBareExecute(
           SCRIPT_JAIL_CONNECTION: 'stdio',
           SCRIPT_JAIL_BACKEND: 'macos-bare',
           SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
-          // macOS-bare runs the agent directly on the host (no container /etc),
-          // so the host-owned pm-flags sidecar lives in the staged repo tree.
-          // Point the guest at it so the sandbox fetch applies the SAME install
-          // args as the host part-1 install.  loadPmFlags re-sanitizes it.
-          SCRIPT_JAIL_PM_FLAGS_PATH: join(staged.path, 'etc/script-jail/pm-flags.json'),
+          // macOS-bare runs the agent directly on the host (no container /etc).  Deliver
+          // the pm-flags / pnpm-arch control sidecars as env CONTENT (no file at any path),
+          // keeping `etc/script-jail/` out of the audited repo root (audit-only sidecar
+          // oracle).  Empty dict when no sidecar → guest degrades to "no override".
+          // loadPmFlags / applyPnpmArchOverlay re-sanitize the content.
+          ...controlEnv,
           SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,

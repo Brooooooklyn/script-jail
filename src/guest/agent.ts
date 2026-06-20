@@ -3726,14 +3726,29 @@ export async function main(input: AgentInput): Promise<void> {
     cwd: config.work_dir,
     env: fetchEnv,
     spawner,
-    // Backends that cannot land the host-owned pm-flags sidecar at the default
-    // absolute `/etc/script-jail/pm-flags.json` (Docker, bare, macOS-bare —
-    // only Firecracker's init copies it into /etc) point us at the staged copy
-    // via this env var.  Unset on Firecracker → loadPmFlags() reads the /etc
-    // default.  loadPmFlags re-sanitizes whatever it reads, so this is safe
-    // even though the staged copy lives in the repo-controlled namespace.
-    ...(process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] !== undefined
-      ? { pmFlagsPath: process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] }
+    // SECURITY (Codex re-review, audit-only sidecar oracle): the pm-flags /
+    // pnpm-arch control sidecars are delivered DIRECTLY as env CONTENT on every
+    // backend (Docker `-e`, bare/mac-bare process env, Firecracker init.sh
+    // `export` from the repo-disk copy) — NEVER as a file at a
+    // lifecycle-visible path.  This keeps a clean-repo
+    // `fs.existsSync('/etc/script-jail/pm-flags.json')` false in BOTH the audit
+    // and the host re-run (it used to be present-in-audit / absent-on-host).
+    // We (the agent) read the content here from our OWN process env (un-audited:
+    // env-spy only instruments lifecycle children) and pass it down; the same
+    // SCRIPT_JAIL_* vars are stripped from every lifecycle child by
+    // buildChildEnv (not on the allowlist), so the content rides only the
+    // agent's /proc/self/environ — the same irreducible "the agent process is
+    // detectable" class as LD_PRELOAD / config.yml, not a new fs oracle.
+    // loadPmFlags / applyPnpmArchOverlay re-sanitize whatever they receive, so
+    // this is safe even though the content originates in the repo-controlled
+    // staging namespace.  `config.yml` remains the one control file at /etc (the
+    // agent must read it; on Docker it is a read-only bind it cannot unlink) —
+    // a documented irreducible residual.
+    ...(process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] !== undefined
+      ? { pmFlagsContent: process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] }
+      : {}),
+    ...(process.env['SCRIPT_JAIL_PNPM_ARCH_CONTENT'] !== undefined
+      ? { pnpmArchContent: process.env['SCRIPT_JAIL_PNPM_ARCH_CONTENT'] }
       : {}),
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);

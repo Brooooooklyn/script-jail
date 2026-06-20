@@ -245,8 +245,14 @@ fix)**:
   `work_dir`), so the audited cwd equals the host re-run's: Docker mounts the
   staged repo at `${repoDir}` (`-v staged:${repoDir}`); Firecracker `mount --move`s
   the repo disk from `/work` to `${repoDir}` in `init.sh` while still privileged
-  (before the `setpriv` cap-drop), falling back to a `/work` audit if the move
-  fails. The literal path never reaches the lock — it tokenizes to `$REPO`.
+  (before the `setpriv` cap-drop). The literal path never reaches the lock — it
+  tokenizes to `$REPO`. Under `install_mode` a failed relocate is **fatal**, not a
+  silent `/work` fallback: auditing at `/work` while the host re-runs at `${repoDir}`
+  would diverge the cwd undetectably (and the fallback's `work_dir:/work` rewrite even
+  makes a path divergence tokenize as `$REPO` on both sides). `init.sh` reads the
+  host-owned `install_mode` from the config and `fatal`s the run instead. (In a
+  well-formed microVM the move never fails — `repoDir` is always a nested checkout path
+  and `mount --make-private` clears the lone realistic blocker first.)
 - **env hygiene.** The host re-run drops the env-var tells the sandbox does not
   carry (`HOSTNAME`, `PWD`, every `SCRIPT_JAIL_*` host knob), aligning the env-var
   view with what the audit saw.
@@ -281,13 +287,43 @@ fix)**:
   an ancestor of a script-jail overlay path (`etc`, `etc/script-jail`) is a committed
   symlink/file — it must never replace it with a real dir in the staged copy only,
   which would let the host resolve `etc/x` through the committed symlink to content the
-  audit never saw. The preflight refuses the same shape early for a clean message.
-  Residual: a committed symlink whose target *escapes* the repo (relative `../x` or
-  absolute `/etc/x`). The PR-controllable escape (a subdir `repoDir` whose parent is
-  inside the checkout) is already refused by the strict-subdir gate above; for a
-  root-level `repoDir` the escape lands in the runner-owned parent (not PR-content),
-  and an absolute target resolves against the sandbox's own filesystem — the same
-  host/guest content divergence as the marker-file row below.
+  audit never saw. The materializer also fails closed on the overlay **leaf** itself:
+  `writeOverlayFile` lstats the destination before writing and throws on ANY pre-existing
+  entry (a committed gitlink/submodule — git index mode `160000`, which checks out as a
+  real empty directory — a plain directory, a symlink, or a file). The old code
+  `rmSync`+wrote it, replacing it in the staged copy only while the host kept the
+  committed gitlink dir → divergence. The preflight `detectReservedScriptJailPaths` gate
+  refuses the same shape early (clean message): it now rejects **any** committed entry
+  under `etc/script-jail/`, including directory entries (the gitlink leaf the old
+  `!isDirectory()` filter skipped), AND refuses `etc/script-jail` even when it checks out
+  **empty** — a gitlink/submodule (mode 160000) AT the reserved directory itself
+  materializes as an empty real dir when the submodule isn't initialized, which the old
+  empty-readdir `return null` let through. Plain git cannot commit an empty directory, so
+  an empty `etc/script-jail` is itself the gitlink tell. This matches the gate's own
+  "script-jail owns this directory" intent.
+- **control sidecars delivered as env content, never a file.** script-jail's own
+  `pm-flags.json` / `pnpm-arch.json` carry only data the guest needs to *read*, so their
+  bytes are delivered as env **content** (`SCRIPT_JAIL_PM_FLAGS_CONTENT` /
+  `SCRIPT_JAIL_PNPM_ARCH_CONTENT`) — never a file at any lifecycle-visible path. Docker
+  passes each as a single `-e NAME=value` argv element; bare/mac-bare set them in the
+  agent's process env; Firecracker rides the repo disk as its only channel but `init.sh`
+  `export`s the content from the `/work/etc/script-jail/*` copies (the `export` survives
+  the `setpriv`/`dumb-init`/`orchestrate` handoff) and then removes those copies (gated on
+  `install_mode`, after which the reserved-path gate guarantees the dir is script-jail's
+  own). The agent reads the content from its **own** process env (un-audited: env-spy
+  instruments only lifecycle children) and `buildChildEnv` strips every `SCRIPT_JAIL_*`
+  var from the lifecycle children it spawns — so the content is invisible to a child's
+  `process.env`. This closes the specific oracle a lifecycle script could otherwise key on:
+  `fs.existsSync('/etc/script-jail/pm-flags.json')` — present in the audit, absent on the
+  host's real checkout — on a clean repo with default config. `.yarnrc.yml` stays in the
+  staged tree (genuine PM config the host install also reads at the root). *Residual (same
+  irreducible class as the instrument itself):* the content does ride the **agent's**
+  `/proc/self/environ`; a lifecycle script that scans `/proc` for the agent and reads its
+  environ can still detect it — but that script can already detect script-jail via the
+  agent process + the `LD_PRELOAD` on its own children, so this adds no new oracle class.
+  And `config.yml` remains the one control file that must stay a real file (the agent must
+  read it; on Docker it is a read-only bind it cannot unlink) — see the marker-files row
+  below.
 
 What this CANNOT close (irreducible while host part 2 runs uninstrumented):
 

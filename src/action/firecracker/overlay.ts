@@ -57,7 +57,6 @@ import {
   statSync,
   existsSync,
   lstatSync,
-  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
@@ -290,7 +289,32 @@ function writeOverlayFile(root: string, relPath: string, content: string): void 
   }
 
   const dest = join(dir, parts[parts.length - 1]!);
-  rmSync(dest, { recursive: true, force: true });
+  // SECURITY (Codex re-review, gitlink leaf gap — mirror of stage.ts): the LEAF must
+  // not already exist.  A committed gitlink/submodule (git index mode 160000) at e.g.
+  // `etc/script-jail/pm-flags.json` checks out as a real (empty) DIRECTORY; the old
+  // `rmSync(dest, {recursive}); writeFileSync` deleted it and wrote our sidecar in the
+  // repo-disk copy ONLY, while the host's real checkout keeps the dir — a host-vs-audit
+  // divergence the value-blind lock can't capture.  Fail closed: lstat (no-follow) and
+  // throw on ANY pre-existing entry (gitlink dir, plain directory, symlink, or file).
+  let leaf: ReturnType<typeof lstatSync> | undefined;
+  try {
+    leaf = lstatSync(dest);
+  } catch {
+    leaf = undefined; // absent — the normal case.
+  }
+  if (leaf !== undefined) {
+    const kind = leaf.isSymbolicLink()
+      ? 'symlink'
+      : leaf.isDirectory()
+        ? 'directory (a committed gitlink/submodule or plain directory)'
+        : 'file';
+    throw new Error(
+      `[overlay] cannot stage script-jail overlay: the checkout already has a ${kind} at ` +
+        `'${dest}' — script-jail OWNS this path and writes its own sidecar here. It refuses ` +
+        `to replace committed checkout content (under install:true that would also diverge ` +
+        `the audit from the host re-run). Remove it from the checkout.`,
+    );
+  }
   writeFileSync(dest, content, { encoding: 'utf8', flag: 'wx' });
 }
 

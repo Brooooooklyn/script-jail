@@ -671,16 +671,14 @@ describe('agent main()', () => {
       const { conn, getOutput } = makeConn();
       const configPath = writeConfig(testDir);
 
-      // Stage user_install_args; the agent points runFetchPhase at this copy
-      // via SCRIPT_JAIL_PM_FLAGS_PATH (the non-Firecracker staged-copy path).
-      const pmFlagsPath = join(testDir, 'pm-flags.json');
-      writeFileSync(
-        pmFlagsPath,
-        JSON.stringify({ extra_install_args: [], user_install_args: userArgs }),
-      );
-
-      const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
-      process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = pmFlagsPath;
+      // Stage user_install_args via the env CONTENT channel (the production delivery on
+      // every backend — audit-only sidecar oracle): the agent reads
+      // SCRIPT_JAIL_PM_FLAGS_CONTENT and threads it into runFetchPhase.
+      const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+      process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = JSON.stringify({
+        extra_install_args: [],
+        user_install_args: userArgs,
+      });
 
       // Capture the serial-console sink (process.stderr.write).
       let serial = '';
@@ -706,8 +704,8 @@ describe('agent main()', () => {
       } finally {
         process.exit = origExit;
         process.stderr.write = origWrite;
-        if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
-        else process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = oldPmFlags;
+        if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+        else process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = oldPmFlags;
       }
 
       const frames = getOutput()
@@ -1839,13 +1837,11 @@ describe('agent main() root-prepare second pass', () => {
     const configPath = writeConfig(testDir, { manager: 'npm' });
     writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
 
-    const pmFlagsPath = join(testDir, 'pm-flags.json');
-    writeFileSync(
-      pmFlagsPath,
-      JSON.stringify({ extra_install_args: [], user_install_args: ['--omit=dev'] }),
-    );
-    const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
-    process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = pmFlagsPath;
+    const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+    process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = JSON.stringify({
+      extra_install_args: [],
+      user_install_args: ['--omit=dev'],
+    });
 
     const main_ = recordingEventStrace('MAINPROG');
     const prep = recordingEventStrace('PREPPROG');
@@ -1866,8 +1862,8 @@ describe('agent main() root-prepare second pass', () => {
         dnsLookup: offlineLookup,
       });
     } finally {
-      if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
-      else process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = oldPmFlags;
+      if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+      else process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = oldPmFlags;
     }
 
     expect(captureArgs).toHaveLength(1);
@@ -2562,6 +2558,28 @@ describe('buildChildEnv protected-env-names length gate', () => {
     // spurious env_read perturbing the byte-stable lock).
     expect(env['SCRIPT_JAIL_MACOS_AUDIT_OPS']).toBeUndefined();
     expect(env['SCRIPT_JAIL_BOGUS']).toBeUndefined();
+  });
+
+  it('strips the control-sidecar CONTENT vars from the lifecycle child env (audit-only sidecar oracle)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // The agent reads SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT from its OWN env, but they
+    // must NEVER reach a lifecycle child's process.env — otherwise the child could branch
+    // on the control content directly, re-opening the very oracle the env-delivery closes.
+    // They are not on LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES, so the generic
+    // "strip unknown SCRIPT_JAIL_*" rule drops them.
+    const env = buildChildEnv(
+      {
+        SCRIPT_JAIL_PM_FLAGS_CONTENT: '{"extra_install_args":[],"user_install_args":["-D"]}',
+        SCRIPT_JAIL_PNPM_ARCH_CONTENT: '{"supportedArchitectures":{}}',
+        PATH: '/usr/bin:/bin',
+      },
+      makeConfig([]),
+      '/tmp/events.jsonl',
+    );
+    expect(env['SCRIPT_JAIL_PM_FLAGS_CONTENT']).toBeUndefined();
+    expect(env['SCRIPT_JAIL_PNPM_ARCH_CONTENT']).toBeUndefined();
+    // The benign PATH still passes through (only SCRIPT_JAIL_* are gated).
+    expect(env['PATH']).toBe('/usr/bin:/bin');
   });
 
   it('accepts a protect list that fits within the CanonBuf payload (<= 1023 bytes)', async () => {

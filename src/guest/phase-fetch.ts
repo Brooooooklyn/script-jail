@@ -89,11 +89,25 @@ export interface PhaseFetchInput {
    */
   pmFlagsPath?: string;
   /**
+   * The pm-flags.json content delivered DIRECTLY via env
+   * (`SCRIPT_JAIL_PM_FLAGS_CONTENT`).  Preferred over `pmFlagsPath` so the
+   * control sidecar never lands at a lifecycle-visible filesystem path
+   * (audit-only sidecar oracle).  The production delivery channel on every
+   * backend; the path is the fallback / test seam.
+   */
+  pmFlagsContent?: string;
+  /**
    * Optional override for the pnpm-arch.json path (pnpm only).  Defaults to
    * `/etc/script-jail/pnpm-arch.json` via `applyPnpmArchOverlay()`.  Exposed
    * so unit tests can stub the file location.
    */
   pnpmArchPath?: string;
+  /**
+   * The pnpm-arch.json content delivered DIRECTLY via env
+   * (`SCRIPT_JAIL_PNPM_ARCH_CONTENT`).  Preferred over `pnpmArchPath` — same
+   * audit-only sidecar oracle close as `pmFlagsContent`.
+   */
+  pnpmArchContent?: string;
 }
 
 // FETCH_CMD lives in ../shared/pm-commands.ts so the host drop-in install
@@ -182,7 +196,10 @@ export async function runFetchPhase(
   //     (src/action/host-install.ts) or the byte-stable lock drifts.
   // Order: <cmd> <fixed baseArgs> <npm arch hints> <user args>.  User args go
   // last (after the fixed flags) but BEFORE the pnpm `--store-dir` splice below.
-  const { extraInstallArgs, userInstallArgs } = loadPmFlags(input.pmFlagsPath);
+  const { extraInstallArgs, userInstallArgs } = loadPmFlags(
+    input.pmFlagsPath,
+    input.pmFlagsContent,
+  );
   let args = baseArgs;
   if (input.manager === 'npm' && extraInstallArgs.length > 0) {
     args = [...args, ...extraInstallArgs];
@@ -197,7 +214,11 @@ export async function runFetchPhase(
   // platform variants to resolve and download).  No-op when the overlay file
   // is absent (the normal action path) — see apply-pnpm-arch.ts.
   if (input.manager === 'pnpm') {
-    applyPnpmArchOverlay({ cwd: input.cwd, ...(input.pnpmArchPath !== undefined ? { overlayPath: input.pnpmArchPath } : {}) });
+    applyPnpmArchOverlay({
+      cwd: input.cwd,
+      ...(input.pnpmArchPath !== undefined ? { overlayPath: input.pnpmArchPath } : {}),
+      ...(input.pnpmArchContent !== undefined ? { content: input.pnpmArchContent } : {}),
+    });
   }
 
   // For pnpm: force the content-addressed store onto the repo overlay

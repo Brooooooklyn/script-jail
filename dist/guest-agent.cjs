@@ -25747,7 +25747,7 @@ function applyPnpmArchOverlay(input) {
   const overlayPath = input.overlayPath ?? PNPM_ARCH_PATH;
   let supportedArchitectures;
   try {
-    const raw = fs.readFileSync(overlayPath, "utf8");
+    const raw = input.content !== void 0 ? input.content : fs.readFileSync(overlayPath, "utf8");
     const parsed = PnpmArchSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) return { applied: false };
     supportedArchitectures = parsed.data.supportedArchitectures;
@@ -25784,9 +25784,9 @@ var PmFlagsSchema = external_exports.object({
   user_install_args: external_exports.array(external_exports.string()).optional()
 });
 var PM_FLAGS_PATH = "/etc/script-jail/pm-flags.json";
-function loadPmFlags(filePath = PM_FLAGS_PATH) {
+function loadPmFlags(filePath = PM_FLAGS_PATH, content) {
   try {
-    const raw = fs2.readFileSync(filePath, "utf8");
+    const raw = content !== void 0 ? content : fs2.readFileSync(filePath, "utf8");
     const parsed = PmFlagsSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) return { extraInstallArgs: [], userInstallArgs: [] };
     return {
@@ -25827,7 +25827,10 @@ function trustedGuestGit(cwd) {
 }
 async function runFetchPhase(input) {
   const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
-  const { extraInstallArgs, userInstallArgs } = loadPmFlags(input.pmFlagsPath);
+  const { extraInstallArgs, userInstallArgs } = loadPmFlags(
+    input.pmFlagsPath,
+    input.pmFlagsContent
+  );
   let args = baseArgs;
   if (input.manager === "npm" && extraInstallArgs.length > 0) {
     args = [...args, ...extraInstallArgs];
@@ -25836,7 +25839,11 @@ async function runFetchPhase(input) {
     args = [...args, ...userInstallArgs];
   }
   if (input.manager === "pnpm") {
-    applyPnpmArchOverlay({ cwd: input.cwd, ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {} });
+    applyPnpmArchOverlay({
+      cwd: input.cwd,
+      ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {},
+      ...input.pnpmArchContent !== void 0 ? { content: input.pnpmArchContent } : {}
+    });
   }
   args = [...args, ...pnpmStoreDirArg(input.manager, input.cwd)];
   const env = input.manager === "npm" ? { ...input.env, npm_config_git: trustedGuestGit(input.cwd) } : input.env;
@@ -31387,13 +31394,26 @@ async function main(input) {
     cwd: config2.work_dir,
     env: fetchEnv,
     spawner,
-    // Backends that cannot land the host-owned pm-flags sidecar at the default
-    // absolute `/etc/script-jail/pm-flags.json` (Docker, bare, macOS-bare —
-    // only Firecracker's init copies it into /etc) point us at the staged copy
-    // via this env var.  Unset on Firecracker → loadPmFlags() reads the /etc
-    // default.  loadPmFlags re-sanitizes whatever it reads, so this is safe
-    // even though the staged copy lives in the repo-controlled namespace.
-    ...process.env["SCRIPT_JAIL_PM_FLAGS_PATH"] !== void 0 ? { pmFlagsPath: process.env["SCRIPT_JAIL_PM_FLAGS_PATH"] } : {}
+    // SECURITY (Codex re-review, audit-only sidecar oracle): the pm-flags /
+    // pnpm-arch control sidecars are delivered DIRECTLY as env CONTENT on every
+    // backend (Docker `-e`, bare/mac-bare process env, Firecracker init.sh
+    // `export` from the repo-disk copy) — NEVER as a file at a
+    // lifecycle-visible path.  This keeps a clean-repo
+    // `fs.existsSync('/etc/script-jail/pm-flags.json')` false in BOTH the audit
+    // and the host re-run (it used to be present-in-audit / absent-on-host).
+    // We (the agent) read the content here from our OWN process env (un-audited:
+    // env-spy only instruments lifecycle children) and pass it down; the same
+    // SCRIPT_JAIL_* vars are stripped from every lifecycle child by
+    // buildChildEnv (not on the allowlist), so the content rides only the
+    // agent's /proc/self/environ — the same irreducible "the agent process is
+    // detectable" class as LD_PRELOAD / config.yml, not a new fs oracle.
+    // loadPmFlags / applyPnpmArchOverlay re-sanitize whatever they receive, so
+    // this is safe even though the content originates in the repo-controlled
+    // staging namespace.  `config.yml` remains the one control file at /etc (the
+    // agent must read it; on Docker it is a read-only bind it cannot unlink) —
+    // a documented irreducible residual.
+    ...process.env["SCRIPT_JAIL_PM_FLAGS_CONTENT"] !== void 0 ? { pmFlagsContent: process.env["SCRIPT_JAIL_PM_FLAGS_CONTENT"] } : {},
+    ...process.env["SCRIPT_JAIL_PNPM_ARCH_CONTENT"] !== void 0 ? { pnpmArchContent: process.env["SCRIPT_JAIL_PNPM_ARCH_CONTENT"] } : {}
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
   if (!fetchResult.ok) {

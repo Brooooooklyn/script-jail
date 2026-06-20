@@ -17,7 +17,11 @@ import {
 import { isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { stageRepoDirectory } from '../../../src/action/backend/stage.js';
+import {
+  controlSidecarEnv,
+  partitionControlSidecars,
+  stageRepoDirectory,
+} from '../../../src/action/backend/stage.js';
 
 let testDir: string;
 
@@ -200,6 +204,42 @@ describe('stageRepoDirectory', () => {
     }
   });
 
+  // Codex re-review (gitlink leaf gap): a committed gitlink/submodule (git index mode
+  // 160000) at the overlay LEAF checks out as a real (empty) DIRECTORY.  The old
+  // `rmSync(dest, {recursive}); writeFileSync` would delete it and write our sidecar in
+  // the staged copy ONLY, while the host keeps the dir — host-vs-audit divergence.  The
+  // materializer must FAIL CLOSED on ANY pre-existing leaf.  A real empty dir at the leaf
+  // reproduces the checked-out gitlink's filesystem state without needing git.
+  it('THROWS when the overlay LEAF pre-exists as a directory (gitlink/submodule leaf)', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'etc', 'script-jail', 'pm-flags.json'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/already has a directory .* writes its own sidecar/);
+  });
+
+  it('THROWS when the overlay LEAF pre-exists as a committed symlink', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'etc', 'script-jail'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(repoDir, 'outside.json'), 'attacker');
+    symlinkSync('../../outside.json', join(repoDir, 'etc', 'script-jail', 'pm-flags.json'));
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/already has a symlink .* writes its own sidecar/);
+  });
+
   // The symlinked-ancestor repoDir variant: even when repoDir is reached via a
   // symlinked spelling, verbatim staging keeps the link relative so it never
   // rewrites to the realpath spelling (which would land outside the audit mount).
@@ -222,5 +262,64 @@ describe('stageRepoDirectory', () => {
     } finally {
       staged.cleanup();
     }
+  });
+});
+
+// Codex re-review (audit-only sidecar oracle): script-jail's control sidecars must be
+// deliverable OUT of the repo tree so the audited repo root never holds an
+// `etc/script-jail/` the host's real checkout lacks.  These pure helpers back the
+// docker/bare/mac-bare out-of-repo delivery.
+describe('partitionControlSidecars', () => {
+  it('routes etc/script-jail/* to controlSidecars and keeps .yarnrc.yml as a repo overlay', () => {
+    const { repoOverlay, controlSidecars } = partitionControlSidecars([
+      { relPath: '.yarnrc.yml', content: 'nodeLinker: node-modules\n' },
+      { relPath: 'etc/script-jail/pm-flags.json', content: '{}' },
+      { relPath: 'etc/script-jail/pnpm-arch.json', content: '{}' },
+    ]);
+    expect(repoOverlay.map((f) => f.relPath)).toEqual(['.yarnrc.yml']);
+    expect(controlSidecars.map((f) => f.relPath).sort()).toEqual([
+      'etc/script-jail/pm-flags.json',
+      'etc/script-jail/pnpm-arch.json',
+    ]);
+  });
+
+  it('returns empty partitions for an empty input', () => {
+    const { repoOverlay, controlSidecars } = partitionControlSidecars([]);
+    expect(repoOverlay).toEqual([]);
+    expect(controlSidecars).toEqual([]);
+  });
+});
+
+describe('controlSidecarEnv', () => {
+  it('maps each known control sidecar basename to its CONTENT env var (no file written)', () => {
+    const env = controlSidecarEnv([
+      { relPath: 'etc/script-jail/pm-flags.json', content: '{"extra_install_args":[]}' },
+      { relPath: 'etc/script-jail/pnpm-arch.json', content: '{"a":1}' },
+    ]);
+    expect(env).toEqual({
+      SCRIPT_JAIL_PM_FLAGS_CONTENT: '{"extra_install_args":[]}',
+      SCRIPT_JAIL_PNPM_ARCH_CONTENT: '{"a":1}',
+    });
+    // Crucially: this is a pure content→env map.  No file is written anywhere — the
+    // audit-only sidecar oracle close depends on NO sidecar landing at any fs path.
+    expect(existsSync(join(testDir, 'sj-control'))).toBe(false);
+  });
+
+  it('preserves multi-line (pretty-printed) JSON content verbatim', () => {
+    const pretty = '{\n  "extra_install_args": [],\n  "user_install_args": ["-D"]\n}\n';
+    const env = controlSidecarEnv([{ relPath: 'etc/script-jail/pm-flags.json', content: pretty }]);
+    expect(env['SCRIPT_JAIL_PM_FLAGS_CONTENT']).toBe(pretty);
+  });
+
+  it('returns an empty dict when there are no control sidecars', () => {
+    expect(controlSidecarEnv([])).toEqual({});
+  });
+
+  it('ignores a sidecar with an unrecognized basename (no reader exists for it)', () => {
+    const env = controlSidecarEnv([
+      { relPath: 'etc/script-jail/unknown.json', content: '{}' },
+      { relPath: 'etc/script-jail/pm-flags.json', content: '{"extra_install_args":[]}' },
+    ]);
+    expect(env).toEqual({ SCRIPT_JAIL_PM_FLAGS_CONTENT: '{"extra_install_args":[]}' });
   });
 });

@@ -8817,7 +8817,18 @@ function writeOverlayFile(root, relPath, content) {
     ensureRealDirectory(dir);
   }
   const dest = (0, import_node_path7.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs7.rmSync)(dest, { recursive: true, force: true });
+  let leaf;
+  try {
+    leaf = (0, import_node_fs7.lstatSync)(dest);
+  } catch {
+    leaf = void 0;
+  }
+  if (leaf !== void 0) {
+    const kind = leaf.isSymbolicLink() ? "symlink" : leaf.isDirectory() ? "directory (a committed gitlink/submodule or plain directory)" : "file";
+    throw new Error(
+      `[overlay] cannot stage script-jail overlay: the checkout already has a ${kind} at '${dest}' \u2014 script-jail OWNS this path and writes its own sidecar here. It refuses to replace committed checkout content (under install:true that would also diverge the audit from the host re-run). Remove it from the checkout.`
+    );
+  }
   (0, import_node_fs7.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory(path) {
@@ -25692,7 +25703,18 @@ function writeOverlayFile2(root, relPath, content) {
     ensureRealDirectory2(dir);
   }
   const dest = (0, import_node_path14.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs18.rmSync)(dest, { recursive: true, force: true });
+  let leaf;
+  try {
+    leaf = (0, import_node_fs18.lstatSync)(dest);
+  } catch {
+    leaf = void 0;
+  }
+  if (leaf !== void 0) {
+    const kind = leaf.isSymbolicLink() ? "symlink" : leaf.isDirectory() ? "directory (a committed gitlink/submodule or plain directory)" : "file";
+    throw new Error(
+      `[backend] cannot stage script-jail overlay: the checkout already has a ${kind} at '${dest}' \u2014 script-jail OWNS this path and writes its own sidecar here. It refuses to replace committed checkout content (under install:true that would also diverge the audit from the host re-run). Remove it from the checkout.`
+    );
+  }
   (0, import_node_fs18.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory2(path) {
@@ -25716,6 +25738,32 @@ function rewriteConfigWorkDir(input) {
   const outPath = (0, import_node_path14.join)(input.outDir, "config.backend.yml");
   (0, import_node_fs18.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
   return outPath;
+}
+var RESERVED_SIDECAR_DIR = "etc/script-jail";
+var CONTROL_SIDECAR_ENV_BY_NAME = {
+  "pm-flags.json": "SCRIPT_JAIL_PM_FLAGS_CONTENT",
+  "pnpm-arch.json": "SCRIPT_JAIL_PNPM_ARCH_CONTENT"
+};
+function partitionControlSidecars(files) {
+  const repoOverlay = [];
+  const controlSidecars = [];
+  for (const f of files) {
+    if (f.relPath === RESERVED_SIDECAR_DIR || f.relPath.startsWith(`${RESERVED_SIDECAR_DIR}/`)) {
+      controlSidecars.push(f);
+    } else {
+      repoOverlay.push(f);
+    }
+  }
+  return { repoOverlay, controlSidecars };
+}
+function controlSidecarEnv(controlSidecars) {
+  const env = {};
+  for (const entry of controlSidecars) {
+    const name = entry.relPath.split("/").filter((p) => p.length > 0).pop();
+    const envName = name !== void 0 ? CONTROL_SIDECAR_ENV_BY_NAME[name] : void 0;
+    if (envName !== void 0) env[envName] = entry.content;
+  }
+  return env;
 }
 
 // src/action/backend/docker.ts
@@ -25749,14 +25797,21 @@ function createDockerBackend(deps = {}) {
           );
         }
       }
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: repoOverlay
       });
+      const controlEnv = controlSidecarEnv(controlSidecars);
+      const controlEnvFlags = Object.entries(controlEnv).flatMap(([name, value]) => [
+        "-e",
+        `${name}=${value}`
+      ]);
       const containerName = `script-jail-${(0, import_node_crypto7.randomBytes)(4).toString("hex")}`;
       const workDir = ctx.auditWorkDir ?? "/work";
-      const pmFlagsPath = `${workDir}/etc/script-jail/pm-flags.json`;
       try {
         const script = [
           "set -eu",
@@ -25780,8 +25835,8 @@ function createDockerBackend(deps = {}) {
           "mkdir -p /tmp/script-jail-strace",
           "export SCRIPT_JAIL_CONNECTION=stdio",
           "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
-          // SCRIPT_JAIL_PM_FLAGS_PATH is delivered via the container `-e` env below,
-          // NOT exported here — see the note at the `-e` flag (#31).
+          // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT are delivered via the container `-e`
+          // env (already in this shell's env), NOT exported here — `exec` preserves them.
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
         return await doRunAgentProcess({
@@ -25799,21 +25854,15 @@ function createDockerBackend(deps = {}) {
             `${staged.path}:${workDir}`,
             "-v",
             `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
-            // The host-owned pm-flags sidecar is staged in the repo tree at
-            // <workDir>/etc/script-jail/pm-flags.json (Docker does not copy it into
-            // /etc the way Firecracker's init does).  Point the guest at it so the
-            // sandbox fetch applies the SAME install args as the host part-1 install.
-            // Delivered via the container ENV (`-e`), NOT a shell `export` interpolated
-            // into `/bin/sh -lc` (#31): under install:true workDir IS the host repoDir
-            // (SCRIPT_JAIL_REPO_DIR / process.cwd() / GITHUB_WORKSPACE — never validated
-            // for spaces/metachars), so an unquoted `export SCRIPT_JAIL_PM_FLAGS_PATH=
-            // ${workDir}/...` would split on a space (`export: not a valid identifier`
-            // under `set -eu`, aborting the audit) or shell-evaluate a `$(...)`.  As a
-            // single `-e NAME=value` argv element the value is literal regardless of its
-            // content — mirroring how bare/mac-bare pass it via the process env object.
-            // loadPmFlags re-sanitizes the file before use.
-            "-e",
-            `SCRIPT_JAIL_PM_FLAGS_PATH=${pmFlagsPath}`,
+            // Control sidecars (pm-flags.json / pnpm-arch.json) delivered as env CONTENT,
+            // NOT a file at any path (audit-only sidecar oracle): the guest reads
+            // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT from the agent env so the sandbox
+            // fetch applies the SAME install args as the host part-1 install.  Each is a
+            // single `-e NAME=value` argv element (#31): literal regardless of content
+            // (JSON braces/quotes/newlines), never re-parsed by a shell.  loadPmFlags /
+            // applyPnpmArchOverlay re-sanitize the content.  Empty when no sidecar →
+            // no `-e` → guest degrades to "no override".
+            ...controlEnvFlags,
             imageRef,
             "/bin/sh",
             "-lc",
@@ -25951,11 +26000,15 @@ function createBareBackend(deps = {}) {
         });
       }
       const runtime = resolveRuntimePaths(ctx);
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: repoOverlay
       });
+      const controlEnv = controlSidecarEnv(controlSidecars);
       const backendConfigPath = rewriteConfigWorkDir({
         configPath: ctx.configPath,
         outDir: ctx.scratchDir,
@@ -25990,12 +26043,12 @@ function createBareBackend(deps = {}) {
             COREPACK_ENV_FILE: "0",
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
-            // Bare mode runs the agent directly on the host (no container /etc),
-            // so the host-owned pm-flags sidecar lives in the staged repo tree.
-            // Point the guest at it so the sandbox fetch applies the SAME
-            // install args as the host part-1 install.  loadPmFlags
-            // re-sanitizes the file before use.
-            SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path15.join)(staged.path, "etc/script-jail/pm-flags.json"),
+            // Bare mode runs the agent directly on the host (no container /etc).  Deliver
+            // the pm-flags / pnpm-arch control sidecars as env CONTENT (no file at any
+            // path), keeping `etc/script-jail/` out of the audited repo root (audit-only
+            // sidecar oracle).  Empty dict when no sidecar → guest degrades to "no
+            // override".  loadPmFlags / applyPnpmArchOverlay re-sanitize the content.
+            ...controlEnv,
             SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
             SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
             SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -26525,11 +26578,15 @@ function createMacBareExecute(deps) {
         `re-signed node not found at ${provisioned.nodePath} after provisioning.`
       );
     }
+    const { repoOverlay, controlSidecars } = partitionControlSidecars(
+      input.extraRepoOverlayFiles
+    );
     const staged = stageRepoDirectory({
       repoDir: input.repoDir,
       parentDir: input.scratchDir,
-      extraRepoOverlayFiles: input.extraRepoOverlayFiles
+      extraRepoOverlayFiles: repoOverlay
     });
+    const controlEnv = controlSidecarEnv(controlSidecars);
     const backendConfigPath = rewriteConfigWorkDir({
       configPath: input.configPath,
       outDir: input.scratchDir,
@@ -26556,11 +26613,12 @@ function createMacBareExecute(deps) {
           SCRIPT_JAIL_CONNECTION: "stdio",
           SCRIPT_JAIL_BACKEND: "macos-bare",
           SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
-          // macOS-bare runs the agent directly on the host (no container /etc),
-          // so the host-owned pm-flags sidecar lives in the staged repo tree.
-          // Point the guest at it so the sandbox fetch applies the SAME install
-          // args as the host part-1 install.  loadPmFlags re-sanitizes it.
-          SCRIPT_JAIL_PM_FLAGS_PATH: (0, import_node_path17.join)(staged.path, "etc/script-jail/pm-flags.json"),
+          // macOS-bare runs the agent directly on the host (no container /etc).  Deliver
+          // the pm-flags / pnpm-arch control sidecars as env CONTENT (no file at any path),
+          // keeping `etc/script-jail/` out of the audited repo root (audit-only sidecar
+          // oracle).  Empty dict when no sidecar → guest degrades to "no override".
+          // loadPmFlags / applyPnpmArchOverlay re-sanitize the content.
+          ...controlEnv,
           SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
