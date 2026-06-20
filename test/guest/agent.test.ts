@@ -1831,6 +1831,49 @@ describe('agent main() root-prepare second pass', () => {
     expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
   });
 
+  // Thread [47]: the developer dep-selection args (--omit=dev/--prod) staged in
+  // pm-flags.json must be threaded into the prepare-env capture ctx, so the captured
+  // npm_config_omit/include + NODE_ENV match the main `npm rebuild <args>` install.
+  it('threads staged userInstallArgs into the prepare-env capture ctx', async () => {
+    const { conn, hostSend } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const pmFlagsPath = join(testDir, 'pm-flags.json');
+    writeFileSync(
+      pmFlagsPath,
+      JSON.stringify({ extra_install_args: [], user_install_args: ['--omit=dev'] }),
+    );
+    const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
+    process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = pmFlagsPath;
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+    const captureArgs: Array<string[] | undefined> = [];
+
+    try {
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prep.runner,
+        captureNpmPrepareEnv: (ctx) => {
+          captureArgs.push(ctx.userInstallArgs);
+          return { npmConfig: { npm_config_omit: 'dev' }, scriptShell: null };
+        },
+        dnsLookup: offlineLookup,
+      });
+    } finally {
+      if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_PATH'];
+      else process.env['SCRIPT_JAIL_PM_FLAGS_PATH'] = oldPmFlags;
+    }
+
+    expect(captureArgs).toHaveLength(1);
+    expect(captureArgs[0]).toEqual(['--omit=dev']);
+  });
+
   it('FAILS CLOSED (no lockfile) when prepare exits nonzero with ZERO events (untraced-prepare audit-bypass)', async () => {
     // The prepare PASS always launches a process (npm exec / yarn run), so a
     // traced run must produce events (startup fs reads).  Zero events + nonzero
@@ -2646,6 +2689,10 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     // npm host part-2 pins npm_config_script_shell=/bin/sh (#26); the guest Phase B
     // must mirror the SAME value or a dep can branch on it host-vs-audit.
     expect(env['npm_config_script_shell']).toBe('/bin/sh');
+    // Thread [53]: host part-2 also pins npm_config_ignore_scripts=false (defeats a
+    // runner home-npmrc ignore-scripts=true); npm re-exports it to the child, so the
+    // guest must mirror the SAME value in lockstep.
+    expect(env['npm_config_ignore_scripts']).toBe('false');
     // ignore_pnpmfile is pnpm-only (npm ignores it) — not injected for npm.
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
     // npm_config_git is NOT mirrored: the host scopes it to fetch/part-1 only, so
@@ -2667,12 +2714,20 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     // npm/pnpm-only keys never injected for yarn.
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
     expect(env['npm_config_script_shell']).toBeUndefined();
+    expect(env['npm_config_ignore_scripts']).toBeUndefined(); // npm-only (thread [53])
   });
 
   it('pure-audit (install_mode false) + pnpm → NO injection of EITHER key (golden byte-stability)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('pnpm', false), '/tmp/events.jsonl');
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+    expect(env['npm_config_script_shell']).toBeUndefined();
+  });
+
+  it('pure-audit (install_mode false) + npm → NO npm_config_ignore_scripts (golden byte-stability, thread [53])', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('npm', false), '/tmp/events.jsonl');
+    expect(env['npm_config_ignore_scripts']).toBeUndefined();
     expect(env['npm_config_script_shell']).toBeUndefined();
   });
 

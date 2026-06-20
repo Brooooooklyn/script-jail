@@ -2478,7 +2478,10 @@ export function buildChildEnv(
   // hostInstallEnv / its hostHardening flags):
   //   pnpm — host passes `--config.ignore-pnpmfile=true` + `--config.script-shell=
   //          /bin/sh`, which pnpm 10.x re-exports to children as `npm_config_*`.
-  //   npm  — host pins `npm_config_script_shell=/bin/sh` (#26 home-npmrc defense).
+  //   npm  — host pins `npm_config_script_shell=/bin/sh` (#26 home-npmrc defense)
+  //          and `npm_config_ignore_scripts=false` (thread [53]: a runner
+  //          `$HOME/.npmrc ignore-scripts=true` would skip host part-2 dep scripts
+  //          the audit ran; npm re-exports both to the lifecycle child).
   //   yarn — host pins YARN_RC_FILENAME/YARN_PLUGINS/YARN_ENABLE_CONSTRAINTS_CHECKS
   //          (yarn re-exports these three to the child; VERIFIED yarn 4.9.1).
   //          YARN_IGNORE_PATH is DELIBERATELY EXCLUDED: yarn consumes it and never
@@ -2494,7 +2497,7 @@ export function buildChildEnv(
     : resolvedManager === 'pnpm'
       ? { npm_config_ignore_pnpmfile: 'true', npm_config_script_shell: '/bin/sh' }
       : resolvedManager === 'npm'
-        ? { npm_config_script_shell: '/bin/sh' }
+        ? { npm_config_script_shell: '/bin/sh', npm_config_ignore_scripts: 'false' }
         : resolvedManager === 'yarn'
           ? {
               YARN_RC_FILENAME: '.yarnrc.yml',
@@ -2886,6 +2889,7 @@ export interface AgentInput {
     npmCli: string;
     cwd: string;
     env: NodeJS.ProcessEnv;
+    userInstallArgs?: string[];
   }) => { npmConfig: Record<string, string>; scriptShell: string | null } | null;
   /**
    * Override for the running Node's version string.  Defaults to
@@ -3289,8 +3293,19 @@ export function realCaptureNpmPrepareEnv(ctx: {
   npmCli: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
+  /**
+   * Thread [47]: the sanitized developer dep-selection args (e.g. `--omit=dev`,
+   * `--prod`, `--include=optional`). The MAIN install runs `npm rebuild <these>`
+   * (phase-install.ts) which projects npm_config_omit/include + NODE_ENV into
+   * every lifecycle child; the root-prepare pass must capture the IDENTICAL
+   * projection or a prepare branching on those values diverges from the install
+   * the args requested. These come from sanitizeInstallArgs.kept — an allowlist of
+   * FLAGS only (positionals dropped), so they are safe to pass as argv elements
+   * (no shell parse; spliced before `-c`).
+   */
+  userInstallArgs?: string[];
 }): { npmConfig: Record<string, string>; scriptShell: string | null } | null {
-  const { node, npmCli, cwd, env } = ctx;
+  const { node, npmCli, cwd, env, userInstallArgs } = ctx;
   let dumpDir: string;
   try {
     dumpDir = mkdtempSync(joinPath(tmpdir(), 'sj-prep-cap-'));
@@ -3355,6 +3370,12 @@ export function realCaptureNpmPrepareEnv(ctx: {
         '--script-shell=/bin/sh',
         '--offline',
         '--node-options=',
+        // Thread [47]: project the SAME npm_config_* (omit/include) + NODE_ENV the
+        // main `npm rebuild <userInstallArgs>` install sets, so the captured prepare
+        // env is in lockstep. These are allowlist-sanitized FLAGS (no positionals,
+        // no value-injection), passed as argv elements (not into the `-c` shell
+        // string), so the round-21/22 shell+argv-injection guarantees are unaffected.
+        ...(userInstallArgs ?? []),
         '-c',
         '"$SJ_NODE" -- "$SJ_DUMP"',
       ],
@@ -4250,6 +4271,9 @@ export async function main(input: AgentInput): Promise<void> {
       npmCli: prepareNpmExecpath,
       cwd: config.work_dir,
       env: process.env,
+      // Thread [47]: project the developer dep-selection args (--omit=dev/--prod/…)
+      // into the capture so the root-prepare env matches `npm rebuild <args>`.
+      userInstallArgs: fetchResult.userInstallArgs,
     };
     const capture =
       input.captureNpmPrepareEnv !== undefined

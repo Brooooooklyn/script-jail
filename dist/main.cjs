@@ -27196,6 +27196,7 @@ function hostInstallEnv(pm, repoDir, phase) {
   env["COREPACK_ENV_FILE"] = "0";
   if (pm === "npm") {
     env["npm_config_script_shell"] = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
+    env["npm_config_ignore_scripts"] = "false";
   }
   if (pm === "yarn") {
     env["YARN_IGNORE_PATH"] = "1";
@@ -27614,6 +27615,18 @@ function detectCheckoutRelativeHome(homeDir, repoDir, workspaceRoot) {
   }
   return null;
 }
+var RESERVED_SIDECAR_RELPATHS = [
+  "etc/script-jail/pm-flags.json",
+  "etc/script-jail/pnpm-arch.json"
+];
+function detectReservedScriptJailPaths(repoDir) {
+  for (const rel of RESERVED_SIDECAR_RELPATHS) {
+    if ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, rel))) {
+      return `the checkout commits a file at \`${rel}\`, a path script-jail owns and overwrites in the sandboxed copy of the repo. The host install re-runs lifecycle scripts against the REAL checkout, where this file keeps its committed content while the audit saw script-jail's \u2014 a host-vs-sandbox content divergence the value-blind lock cannot capture. Remove the \`etc/script-jail/\` files from the checkout, or audit without \`install\`.`;
+    }
+  }
+  return null;
+}
 function detectInstallWorkDirDivergence(configPath) {
   if (!(0, import_node_fs3.existsSync)(configPath)) return null;
   let parsed;
@@ -27740,6 +27753,10 @@ function detectPnpmConfigDepsInDir(dir) {
       return `an ancestor (\`${dir}\`) \`package.json\` \`pnpm.configDependencies\`` + PNPM_GUIDANCE;
     }
   }
+  const altManifest = unsupportedAltRootManifest(dir);
+  if (altManifest !== null) {
+    return `an ancestor (\`${dir}\`) \`${altManifest}\` root manifest with no \`package.json\` (pnpm reads its \`pnpm.configDependencies\` from an ancestor workspace root and fetches it pre-trust, which script-jail cannot vet); \`install: true\` requires a \`package.json\` at every workspace root above the install dir. Audit without \`install\`, or convert the ancestor root manifest to \`package.json\`.`;
+  }
   return null;
 }
 var YARN_GUIDANCE = " executes repo-controlled code on the runner at `yarn install` startup, BEFORE the audit decides anything. `install: true` cannot run that pre-trust. Remove it, or audit without `install` (the sandbox still records it there).";
@@ -27862,6 +27879,9 @@ function detectPm(input) {
     lockfileSha256
   };
 }
+
+// src/rootfs/vite-plus.ts
+var NODE_VERSION = "24.15.0";
 
 // src/action/runner-image.ts
 var import_node_fs5 = require("node:fs");
@@ -44630,7 +44650,16 @@ async function runAudit(input) {
   let result;
   let overlay = null;
   try {
-    const userInstallArgs = sanitizeInstallArgs(input.args ?? []).kept;
+    const { kept: userInstallArgs, dropped, droppedKeys } = sanitizeInstallArgs(
+      input.args ?? []
+    );
+    if (droppedKeys.length > 0) {
+      const n = dropped.length;
+      const keys = droppedKeys.join(", ");
+      input.io.warn(
+        `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} (${keys}) \u2014 not on the allowlist of dependency-selection flags, or carrying an unsafe value (e.g. an inline-credential --registry URL). Only flags that filter the lockfile-pinned tree (plus a credential-free --registry) are forwarded; anything that could redirect the lock/root/output/source, re-enable lifecycle scripts, or carry an inline credential is dropped.`
+      );
+    }
     const archPmFlags = archOverlay.pmFlagsJson;
     const pmFlagsJson = {
       extra_install_args: archPmFlags?.extra_install_args ?? [],
@@ -45484,6 +45513,10 @@ function buildRootPkgKeys(manifest) {
 }
 
 // src/main.ts
+function nodeMajorOf(version2) {
+  const m = version2.replace(/^v/, "").match(/^(\d+)/);
+  return m === null ? NaN : parseInt(m[1], 10);
+}
 async function main(deps = {}) {
   const {
     validateManifest: doValidateManifest = validateManifest,
@@ -45537,6 +45570,15 @@ async function main(deps = {}) {
       );
       exitProcess(1);
     }
+    const auditNodeMajor = nodeMajorOf(NODE_VERSION);
+    const hostNodeMajor = nodeMajorOf(process.version);
+    if (hostNodeMajor !== auditNodeMajor) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires the runner's Node major to match the audited toolchain. The sandbox audits under Node ${NODE_VERSION} (major ${auditNodeMajor}), but this runner executes host lifecycle scripts under ${process.version} (major ${Number.isFinite(hostNodeMajor) ? hostNodeMajor : "unknown"}); a package can branch on process.version / native ABI so the audited branch differs from what the runner builds and runs, and the trusted lock would not describe it. Align the runner's Node (e.g. actions/setup-node with node-version ${auditNodeMajor}) with the audited major, or audit without \`install\`.
+`
+      );
+      exitProcess(1);
+    }
     const workspaceRoot = process.env["GITHUB_WORKSPACE"];
     const configExecReason = detectPreTrustConfigExec(repoDir, pm.manager, workspaceRoot);
     if (configExecReason !== null) {
@@ -45555,6 +45597,12 @@ async function main(deps = {}) {
     const homeReason = detectCheckoutRelativeHome(process.env["HOME"], repoDir, workspaceRoot);
     if (homeReason !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${homeReason}
+`);
+      exitProcess(1);
+    }
+    const reservedPathReason = detectReservedScriptJailPaths(repoDir);
+    if (reservedPathReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${reservedPathReason}
 `);
       exitProcess(1);
     }

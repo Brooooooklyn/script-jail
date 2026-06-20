@@ -952,6 +952,20 @@ function hostInstallEnv(
     // shell is strictly safer.  npm-scoped (pnpm uses the host part-2 --config.script-shell
     // flag; yarn berry has no script-shell config).
     env['npm_config_script_shell'] = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
+    // SECURITY (Codex review thread [53]): `$HOME/.npmrc` `ignore-scripts=true` is
+    // npm's DEFAULT userconfig; with it set, host part-2 `npm rebuild
+    // --foreground-scripts` SKIPS dependency lifecycle scripts (VERIFIED npm
+    // 11.13.0: marker NOT written), while the clean-VM audit (HOME=/root, no such
+    // npmrc) RAN them — so the host leaves audited-safe deps unbuilt, breaking the
+    // "host reproduces the audited tree" invariant. An absolute outside-checkout
+    // HOME passes detectCheckoutRelativeHome (which never inspects npmrc CONTENTS).
+    // The `npm_config_*` ENV beats userconfig (VERIFIED: env false overrides
+    // ignore-scripts=true), exactly like the script_shell pin above, so this is
+    // parity-correct. npm re-exports `npm_config_ignore_scripts` to the lifecycle
+    // child, so it is mirrored in the guest install-mode env (agent.ts) in lockstep
+    // to keep the value-blind env_read identical on both sides. npm-scoped (pnpm's
+    // rebuild governs its own scripts; yarn has no equivalent userconfig key).
+    env['npm_config_ignore_scripts'] = 'false';
   }
   if (pm === 'yarn') {
     // Positive yarn pins (install-child specific).  The negative YARN_* sweep now

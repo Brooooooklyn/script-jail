@@ -282,6 +282,53 @@ describe.sequential('e2e: drop-in install gating', () => {
     expect(cap.runCalls).toHaveLength(0);
   });
 
+  // Thread [42]: the host part-2 re-run uses the action's Node runtime; the audit
+  // uses the pinned guest Node. A Node-MAJOR mismatch lets the runner build/run a
+  // different branch than was audited, so fail closed before any install. Stub
+  // process.version to a different major than the audited NODE_VERSION (24.x).
+  it('install + host Node MAJOR != audited major → fail-closed before any install, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const realVersion = process.version;
+    Object.defineProperty(process, 'version', { value: 'v20.11.0', configurable: true });
+    try {
+      const result = await runMain({
+        consumerDir: consumer.consumerDir,
+        inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+        deps: { ...factory.deps, ...cap.hostSeams },
+      });
+      expect(result.exit).toEqual({ code: 1 });
+      expect(result.stdout).toMatch(/runner's Node major to match the audited toolchain/);
+      expect(cap.installCalls).toHaveLength(0); // exited before part 1
+      expect(cap.runCalls).toHaveLength(0);
+    } finally {
+      Object.defineProperty(process, 'version', { value: realVersion, configurable: true });
+    }
+  });
+
+  it('install + host Node MAJOR == audited major → not blocked by the Node-parity gate', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    // Same major (24), different patch — must NOT over-fire (GitHub bumps node24 patches).
+    const realVersion = process.version;
+    Object.defineProperty(process, 'version', { value: 'v24.99.0', configurable: true });
+    try {
+      const result = await runMain({
+        consumerDir: consumer.consumerDir,
+        inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+        deps: { ...factory.deps, ...cap.hostSeams },
+      });
+      expect(result.stdout).not.toMatch(/runner's Node major to match the audited toolchain/);
+      expect(result.exit).toBeNull(); // clean match → both halves run, no gate fire
+    } finally {
+      Object.defineProperty(process, 'version', { value: realVersion, configurable: true });
+    }
+  });
+
   it('install + spoof MATCHING the runner → allowed (both halves run)', async () => {
     const factory = fakeVmFactory({ fixtures: FIXTURES });
     const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });

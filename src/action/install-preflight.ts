@@ -163,6 +163,50 @@ export function detectCheckoutRelativeHome(
 }
 
 /**
+ * The repo-overlay sidecar paths script-jail OWNS and overwrites in the STAGED
+ * copy of the repo (run-audit.ts emits `etc/script-jail/pm-flags.json` ALWAYS,
+ * and `etc/script-jail/pnpm-arch.json` under an arch overlay). `etc/script-jail/`
+ * is not a consumer-facing path (the consumer config is `.script-jail.yml` at the
+ * repo root), so a checkout never legitimately commits one of these.
+ */
+const RESERVED_SIDECAR_RELPATHS = [
+  'etc/script-jail/pm-flags.json',
+  'etc/script-jail/pnpm-arch.json',
+] as const;
+
+/**
+ * Returns a reason when `install: true` must be REFUSED because the checkout
+ * commits a file at a script-jail-OWNED overlay sidecar path.
+ *
+ * SECURITY (Codex review thread [39]): run-audit.ts ALWAYS writes
+ * `etc/script-jail/pm-flags.json` into the STAGED repo copy (stage.ts / overlay.ts
+ * rm+write), so the AUDIT sees host-owned (benign, fixed) content there. But the
+ * `install: true` host part-2 re-run executes the REAL lifecycle scripts in the
+ * REAL repoDir (main.ts doHostRunScripts), OUTSIDE every sandbox, where a
+ * PR-committed file at that path keeps its attacker content. Reads are value-blind
+ * in the lock (schema external_reads = paths only), so a script branching on the
+ * file's CONTENT is audited against the benign host copy but runs a different
+ * branch on the runner — a host-vs-sandbox distinguisher. The overlay's
+ * overwrite-don't-refuse posture silently accepted such a file; this gate converts
+ * it to fail-closed. Host-static check only; no lockfile/byte-stability impact.
+ */
+export function detectReservedScriptJailPaths(repoDir: string): string | null {
+  for (const rel of RESERVED_SIDECAR_RELPATHS) {
+    if (existsSync(join(repoDir, rel))) {
+      return (
+        `the checkout commits a file at \`${rel}\`, a path script-jail owns and ` +
+        `overwrites in the sandboxed copy of the repo. The host install re-runs ` +
+        `lifecycle scripts against the REAL checkout, where this file keeps its ` +
+        `committed content while the audit saw script-jail's — a host-vs-sandbox ` +
+        `content divergence the value-blind lock cannot capture. Remove the ` +
+        `\`etc/script-jail/\` files from the checkout, or audit without \`install\`.`
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * Returns a human-readable reason when `install: true` must be REFUSED because
  * the consumer config declares a `work_dir` that DIVERGES from the host install
  * cwd; null when aligned (default `/work`, unset, or explicitly `/work`).
@@ -420,6 +464,24 @@ function detectPnpmConfigDepsInDir(dir: string): string | null {
     if (isRecord(parsed) && isRecord(parsed['pnpm']) && 'configDependencies' in parsed['pnpm']) {
       return `an ancestor (\`${dir}\`) \`package.json\` \`pnpm.configDependencies\`` + PNPM_GUIDANCE;
     }
+  }
+  // Codex review thread [52]: an ANCESTOR alt root manifest (`package.yaml` /
+  // `package.json5` with NO ancestor `package.json`) carries the SAME pre-trust
+  // `pnpm.configDependencies` fetch the repoDir branch (line 381) already
+  // refuses — pnpm walks UP to the workspace root and, on pnpm 10, reads that
+  // root's `pnpm.configDependencies` from the alt manifest and fetches/extracts
+  // it during config bootstrap (outside `--ignore-scripts`/`--ignore-pnpmfile`).
+  // The repoDir-only alt-manifest check could not see it. `unsupportedAltRootManifest`
+  // short-circuits to null when the dir has a `package.json`, so this fires ONLY
+  // on the exploitable shape and never over-flags a normal ancestor with a
+  // `package.json`.
+  const altManifest = unsupportedAltRootManifest(dir);
+  if (altManifest !== null) {
+    return `an ancestor (\`${dir}\`) \`${altManifest}\` root manifest with no \`package.json\` ` +
+      '(pnpm reads its `pnpm.configDependencies` from an ancestor workspace root and ' +
+      'fetches it pre-trust, which script-jail cannot vet); `install: true` requires a ' +
+      '`package.json` at every workspace root above the install dir. Audit without `install`, ' +
+      'or convert the ancestor root manifest to `package.json`.';
   }
   return null;
 }

@@ -24367,7 +24367,16 @@ async function runAudit(input) {
   let result;
   let overlay = null;
   try {
-    const userInstallArgs = sanitizeInstallArgs(input.args ?? []).kept;
+    const { kept: userInstallArgs, dropped, droppedKeys } = sanitizeInstallArgs(
+      input.args ?? []
+    );
+    if (droppedKeys.length > 0) {
+      const n = dropped.length;
+      const keys = droppedKeys.join(", ");
+      input.io.warn(
+        `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} (${keys}) \u2014 not on the allowlist of dependency-selection flags, or carrying an unsafe value (e.g. an inline-credential --registry URL). Only flags that filter the lockfile-pinned tree (plus a credential-free --registry) are forwarded; anything that could redirect the lock/root/output/source, re-enable lifecycle scripts, or carry an inline credential is dropped.`
+      );
+    }
     const archPmFlags = archOverlay.pmFlagsJson;
     const pmFlagsJson = {
       extra_install_args: archPmFlags?.extra_install_args ?? [],

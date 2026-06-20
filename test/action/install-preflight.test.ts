@@ -15,6 +15,7 @@ import {
   detectPreTrustConfigExec,
   detectInstallWorkDirDivergence,
   detectCheckoutRelativeHome,
+  detectReservedScriptJailPaths,
 } from '../../src/action/install-preflight.js';
 
 let dir: string;
@@ -437,6 +438,44 @@ describe('detectPreTrustConfigExec — pnpm ancestor configDependencies scan', (
     writeAt(join(pkg, 'package.json'), '{"name":"app"}');
     expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toMatch(/configDependencies/);
   });
+
+  // Thread [52]: an ANCESTOR alt root manifest (package.yaml / package.json5 with
+  // NO ancestor package.json) carries the same pre-trust pnpm.configDependencies
+  // fetch the repoDir branch already refuses; pnpm 10 reads it from the ancestor
+  // workspace root. The repoDir-only alt-manifest check could not see it.
+  it('blocks an ANCESTOR package.yaml root manifest with no ancestor package.json', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, 'pnpm-workspace.yaml'), 'packages:\n  - pkg\n');
+    writeAt(join(ws, 'package.yaml'), 'name: x\npnpm:\n  configDependencies:\n    cfg: "1.0.0+sha512-deadbeef"\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toMatch(/package\.yaml/);
+  });
+
+  it('blocks an ANCESTOR package.json5 root manifest with no ancestor package.json', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, 'package.json5'), '{ name: "x", /* json5 */ }');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toMatch(/package\.json5/);
+  });
+
+  it('does NOT block an ancestor package.yaml when that ancestor also has a package.json', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    writeAt(join(ws, 'package.yaml'), 'pnpm:\n  configDependencies:\n    cfg: "1.0.0+sha512-x"\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'pnpm', ws)).toBeNull();
+  });
+
+  it('does NOT scan an ancestor alt manifest ABOVE the workspace root', () => {
+    const root = dir;
+    const ws = join(root, 'ws');
+    writeAt(join(root, 'package.yaml'), 'pnpm:\n  configDependencies:\n    cfg: "1.0.0+sha512-x"\n');
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    expect(detectPreTrustConfigExec(ws, 'pnpm', ws)).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -578,5 +617,28 @@ describe('detectCheckoutRelativeHome — refuse install on a checkout-relative $
     expect(detectCheckoutRelativeHome('../../elsewhere', pkg, ws)).not.toBeNull();
     expect(detectCheckoutRelativeHome('~/x', pkg, ws)).not.toBeNull(); // literal tilde is not absolute
     expect(detectCheckoutRelativeHome('', pkg, ws)).not.toBeNull(); // empty string is not absolute
+  });
+});
+
+describe('detectReservedScriptJailPaths — install reserved-sidecar gate (thread [39])', () => {
+  it('blocks a checkout-committed etc/script-jail/pm-flags.json', () => {
+    write('etc/script-jail/pm-flags.json', '{"extra_install_args":["--registry=https://evil"]}');
+    expect(detectReservedScriptJailPaths(dir)).toMatch(/pm-flags\.json/);
+  });
+
+  it('blocks a checkout-committed etc/script-jail/pnpm-arch.json', () => {
+    write('etc/script-jail/pnpm-arch.json', '{}');
+    expect(detectReservedScriptJailPaths(dir)).toMatch(/pnpm-arch\.json/);
+  });
+
+  it('returns null for a clean checkout (no reserved sidecars)', () => {
+    write('package.json', '{"name":"p"}');
+    write('.script-jail.yml', 'manager: npm\n');
+    expect(detectReservedScriptJailPaths(dir)).toBeNull();
+  });
+
+  it('does NOT flag an unrelated file under etc/ outside the script-jail namespace', () => {
+    write('etc/other/config.json', '{}');
+    expect(detectReservedScriptJailPaths(dir)).toBeNull();
   });
 });

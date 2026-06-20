@@ -23,8 +23,9 @@ import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
 import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
-import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, detectCheckoutRelativeHome, readProtectedEnvNames } from './action/install-preflight.js';
+import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, detectCheckoutRelativeHome, detectReservedScriptJailPaths, readProtectedEnvNames } from './action/install-preflight.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
+import { NODE_VERSION } from './rootfs/vite-plus.js';
 import { detectRunnerImage } from './action/runner-image.js';
 import { warn } from './action/log.js';
 import {
@@ -69,6 +70,16 @@ export interface MainDeps {
   /** Host drop-in install seams — injectable so tests need not spawn a real PM. */
   hostInstallNoScripts?: typeof hostInstallNoScripts;
   hostRunScripts?: typeof hostRunScripts;
+}
+
+/**
+ * Parse the leading major from a Node version string (`v24.15.0` or `24.15.0`).
+ * Returns NaN when unparseable, which the install:true Node-parity gate treats as
+ * a mismatch (fail closed). See thread [42].
+ */
+function nodeMajorOf(version: string): number {
+  const m = version.replace(/^v/, '').match(/^(\d+)/);
+  return m === null ? NaN : parseInt(m[1]!, 10);
 }
 
 export async function main(deps: MainDeps = {}): Promise<void> {
@@ -216,6 +227,33 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       );
       exitProcess(1);
     }
+    // SECURITY (Codex review thread [42]): the host part-2 re-run executes the REAL
+    // lifecycle scripts under the GitHub Action's bundled Node runtime (action.yml
+    // `using: node24`), while the AUDIT runs under the pinned guest Node
+    // (vite-plus.ts NODE_VERSION). A native addon (`npm`/`pnpm rebuild`) compiles
+    // against the host's native ABI, and a script can branch on process.version /
+    // process.versions.modules; the lock's node_version is the audit pin (host-blind)
+    // and is byte-stable, so a host-vs-audit Node-MAJOR mismatch lets the runner
+    // build/run a different branch than was audited — the same audit-vs-host execution
+    // divergence the platform/arch spoof gate above closes. Gate on MAJOR (not exact
+    // x.y.z): a shared major implies a shared native module ABI (NODE_MODULE_VERSION),
+    // so this catches a real toolchain mismatch without over-firing on GitHub's
+    // node24 patch bumps.
+    const auditNodeMajor = nodeMajorOf(NODE_VERSION);
+    const hostNodeMajor = nodeMajorOf(process.version);
+    if (hostNodeMajor !== auditNodeMajor) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires the runner's Node major to match the ` +
+          `audited toolchain. The sandbox audits under Node ${NODE_VERSION} (major ${auditNodeMajor}), ` +
+          `but this runner executes host lifecycle scripts under ${process.version} ` +
+          `(major ${Number.isFinite(hostNodeMajor) ? hostNodeMajor : 'unknown'}); a package can branch ` +
+          `on process.version / native ABI so the audited branch differs from what the runner builds and ` +
+          `runs, and the trusted lock would not describe it. Align the runner's Node (e.g. ` +
+          `actions/setup-node with node-version ${auditNodeMajor}) with the audited major, or audit ` +
+          `without \`install\`.\n`,
+      );
+      exitProcess(1);
+    }
     // SECURITY: refuse install when the repo declares package-manager CONFIG
     // that EXECUTES repo-controlled code on the runner during the pre-trust
     // no-scripts host install (pnpm `.pnpmfile.cjs` / relocated pnpmfiles; yarn
@@ -261,6 +299,17 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     const homeReason = detectCheckoutRelativeHome(process.env['HOME'], repoDir, workspaceRoot);
     if (homeReason !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused — ${homeReason}\n`);
+      exitProcess(1);
+    }
+    // SECURITY: refuse a checkout that commits a file at a script-jail-owned overlay
+    // sidecar path (etc/script-jail/pm-flags.json|pnpm-arch.json). The audit sees
+    // script-jail's host-written content there (overlay overwrites the staged copy),
+    // but host part-2 re-runs lifecycle scripts against the REAL checkout where the
+    // committed file persists — a host-vs-sandbox content distinguisher the
+    // value-blind lock cannot capture. (install-preflight.ts:detectReservedScriptJailPaths.)
+    const reservedPathReason = detectReservedScriptJailPaths(repoDir);
+    if (reservedPathReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused — ${reservedPathReason}\n`);
       exitProcess(1);
     }
   }

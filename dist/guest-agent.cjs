@@ -30968,7 +30968,7 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
     YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`
   } : { npm_config_cache: `${config2.work_dir}/.npm-cache` };
-  const installModeEnv = !config2.install_mode ? {} : resolvedManager === "pnpm" ? { npm_config_ignore_pnpmfile: "true", npm_config_script_shell: "/bin/sh" } : resolvedManager === "npm" ? { npm_config_script_shell: "/bin/sh" } : resolvedManager === "yarn" ? {
+  const installModeEnv = !config2.install_mode ? {} : resolvedManager === "pnpm" ? { npm_config_ignore_pnpmfile: "true", npm_config_script_shell: "/bin/sh" } : resolvedManager === "npm" ? { npm_config_script_shell: "/bin/sh", npm_config_ignore_scripts: "false" } : resolvedManager === "yarn" ? {
     YARN_RC_FILENAME: ".yarnrc.yml",
     YARN_PLUGINS: "",
     YARN_ENABLE_CONSTRAINTS_CHECKS: "false"
@@ -31205,7 +31205,7 @@ function npmCliEntryPath(execPath) {
   return (0, import_node_path6.join)((0, import_node_path6.dirname)((0, import_node_path6.dirname)(execPath)), "lib", "node_modules", "npm", "bin", "npm-cli.js");
 }
 function realCaptureNpmPrepareEnv(ctx) {
-  const { node, npmCli, cwd, env } = ctx;
+  const { node, npmCli, cwd, env, userInstallArgs } = ctx;
   let dumpDir;
   try {
     dumpDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)((0, import_node_os.tmpdir)(), "sj-prep-cap-"));
@@ -31241,6 +31241,12 @@ require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0
         "--script-shell=/bin/sh",
         "--offline",
         "--node-options=",
+        // Thread [47]: project the SAME npm_config_* (omit/include) + NODE_ENV the
+        // main `npm rebuild <userInstallArgs>` install sets, so the captured prepare
+        // env is in lockstep. These are allowlist-sanitized FLAGS (no positionals,
+        // no value-injection), passed as argv elements (not into the `-c` shell
+        // string), so the round-21/22 shell+argv-injection guarantees are unaffected.
+        ...userInstallArgs ?? [],
         "-c",
         '"$SJ_NODE" -- "$SJ_DUMP"'
       ],
@@ -31611,7 +31617,10 @@ ${stdoutTail}`;
       node: process.execPath,
       npmCli: prepareNpmExecpath,
       cwd: config2.work_dir,
-      env: process.env
+      env: process.env,
+      // Thread [47]: project the developer dep-selection args (--omit=dev/--prod/…)
+      // into the capture so the root-prepare env matches `npm rebuild <args>`.
+      userInstallArgs: fetchResult.userInstallArgs
     };
     const capture = input.captureNpmPrepareEnv !== void 0 ? input.captureNpmPrepareEnv(captureCtx) : input.strace !== void 0 ? { npmConfig: {}, scriptShell: null } : realCaptureNpmPrepareEnv(captureCtx);
     if (capture === null) {

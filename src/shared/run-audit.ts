@@ -257,7 +257,32 @@ export async function runAudit(
     // audited tree is built from the identical argv as the host no-scripts
     // install.  Without this the sandbox fetch would receive RAW args and could
     // diverge from — or be more permissive than — the host part-1 install.
-    const userInstallArgs = sanitizeInstallArgs(input.args ?? []).kept;
+    const { kept: userInstallArgs, dropped, droppedKeys } = sanitizeInstallArgs(
+      input.args ?? [],
+    );
+    // OBSERVABILITY (Codex review, thread [49]): the host no-scripts install
+    // warns about dropped args, but that path only runs under `install: true`
+    // (main.ts gates `doHostInstallNoScripts` on it).  In audit-only Action mode
+    // and on every CLI run the host install never executes, so a user passing
+    // `--filter`/`--dir`/an inline-credential `--registry` got silently ignored
+    // here.  Surface it via the same seam used for arch-overlay warnings above.
+    // Log ONLY droppedKeys (canonical flag names / `<positional>` constants from
+    // `dropReason`), never the raw `dropped` tokens — those can carry a secret
+    // (e.g. `--registry=https://user:TOKEN@host`).  No lockfile impact: the
+    // no-args path yields droppedKeys=[] → no warning → byte-stable parity.
+    if (droppedKeys.length > 0) {
+      const n = dropped.length;
+      const keys = droppedKeys.join(', ');
+      input.io.warn(
+        `script-jail: ignoring ${n} install arg${n === 1 ? '' : 's'} (${keys}) — ` +
+          `not on the allowlist of dependency-selection flags, or carrying an ` +
+          `unsafe value (e.g. an inline-credential --registry URL). Only flags ` +
+          `that filter the lockfile-pinned tree (plus a credential-free ` +
+          `--registry) are forwarded; anything that could redirect the ` +
+          `lock/root/output/source, re-enable lifecycle scripts, or carry an ` +
+          `inline credential is dropped.`,
+      );
+    }
     const archPmFlags = archOverlay.pmFlagsJson;
     // SECURITY (host-owned sidecar): ALWAYS emit pm-flags.json — even when both
     // channels are empty.  The overlay writer (`materializeExtraFiles` /

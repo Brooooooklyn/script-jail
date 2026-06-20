@@ -696,6 +696,7 @@ describe('runAudit — args threading (user_install_args)', () => {
     // the host tree). Only the clean `-D` survives into user_install_args.
     const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
     const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    const { io, warnings } = makeIo();
     await runAudit({
       repoDir, configPath, lockPath, workDir,
       mode: 'update',
@@ -704,11 +705,38 @@ describe('runAudit — args threading (user_install_args)', () => {
       args: ['--ignore-scripts', 'false', '--mode=update-lockfile', '-D'],
       baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
       launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
-      io: makeIo().io,
+      io,
       makeOverlay: stubOverlay(workDir, { calls, cleanups: 0 }),
     });
     const parsed = JSON.parse(pmFlagsContent(calls)!) as { user_install_args?: string[] };
     expect(parsed.user_install_args).toEqual(['-D']);
+    // Thread [49]: the dropped args (`--ignore-scripts`, `--mode`) are surfaced on
+    // the audit side too (this path runs in audit-only Action + every CLI run,
+    // where the host-install warning never fires). Only canonical droppedKeys are
+    // logged, never the raw token values.
+    const dropWarn = warnings.find((w) => w.includes('ignoring') && w.includes('install arg'));
+    expect(dropWarn).toBeDefined();
+    expect(dropWarn).toContain('--ignore-scripts');
+    expect(dropWarn).toContain('--mode');
+    // The raw value token `false` must NOT leak into the warning.
+    expect(dropWarn).not.toMatch(/\bfalse\b/);
+  });
+
+  it('does NOT warn on the no-args path (byte-stable parity preserved)', async () => {
+    const calls: Array<Parameters<NonNullable<RunAuditInput['makeOverlay']>>[0]> = [];
+    const { repoDir, configPath, lockPath, workDir } = setupRepo();
+    const { io, warnings } = makeIo();
+    await runAudit({
+      repoDir, configPath, lockPath, workDir,
+      mode: 'update',
+      overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+      pm: 'npm', hostArch: 'x64',
+      baseRootfsPath: join(testDir, 'rootfs-base.ext4'),
+      launch: async () => ({ finalYaml: 'x: 1\n', nonFatalWarnings: [] }),
+      io,
+      makeOverlay: stubOverlay(workDir, { calls, cleanups: 0 }),
+    });
+    expect(warnings.some((w) => w.includes('ignoring') && w.includes('install arg'))).toBe(false);
   });
 });
 

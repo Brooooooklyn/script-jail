@@ -2058,6 +2058,32 @@ describe('home ~/.npmrc script-shell defense (#26)', () => {
     }
   });
 
+  // Thread [53]: a runner $HOME/.npmrc `ignore-scripts=true` would make host
+  // part-2 `npm rebuild` skip dep lifecycle scripts the audit ran. Pin =false so
+  // the env overrides userconfig (npm-only). Part-1 and part-2 both carry it.
+  it('part-2 npm rebuild env pins npm_config_ignore_scripts=false (overrides home npmrc)', async () => {
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    await hostRunScripts('npm', '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
+    expect(envs[0]?.['npm_config_ignore_scripts']).toBe('false');
+  });
+
+  it('part-1 npm install env pins npm_config_ignore_scripts=false', () => {
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    expect(envs[0]?.['npm_config_ignore_scripts']).toBe('false');
+  });
+
+  it('does NOT pin npm_config_ignore_scripts for pnpm/yarn (npm-scoped)', () => {
+    for (const pm of ['pnpm', 'yarn'] as const) {
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], rec.io, envCapturingSpawn(envs));
+      expect(envs[0]?.['npm_config_ignore_scripts']).toBeUndefined();
+    }
+  });
+
   it('part-2 pnpm rebuild appends --config.script-shell=/bin/sh (sibling, kept with ignore-pnpmfile)', async () => {
     const rec = makeRecorder();
     await hostRunScripts('pnpm', '/repo', [], rec.io, [], okStreamSpawn(rec), bareLaunchResolver);
