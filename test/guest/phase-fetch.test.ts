@@ -2,9 +2,9 @@
 // Injects a mock Spawner; no real processes are spawned.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 import { runFetchPhase, type Spawner, type PhaseFetchInput } from '../../src/guest/phase-fetch.js';
 
@@ -51,7 +51,9 @@ describe('runFetchPhase', () => {
       const { spawner, calls } = mockSpawner();
       await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner });
       expect(calls[0]!.opts.cwd).toBe('/work');
-      expect(calls[0]!.opts.env).toBe(BASE_ENV);
+      // npm gets a CLONE of the base env carrying the npm_config_git pin (see
+      // the git-pin tests below); every other key is preserved verbatim.
+      expect(calls[0]!.opts.env).toEqual({ ...BASE_ENV, npm_config_git: expect.any(String) });
     });
 
     it('returns ok=false when exitCode != 0', async () => {
@@ -116,7 +118,23 @@ describe('runFetchPhase', () => {
   });
 
   describe('env passthrough', () => {
-    it('passes the full env dict unchanged', async () => {
+    it('passes the full env dict unchanged for pnpm/yarn (same reference)', async () => {
+      const env: NodeJS.ProcessEnv = {
+        PATH: '/usr/bin:/usr/local/bin',
+        HOME: '/root',
+        LD_PRELOAD: '/lib/libscriptjail.so',
+        SCRIPT_JAIL_SPOOF_PLATFORM: 'darwin',
+      };
+      // pnpm/yarn ignore npm_config_git, so their env is passed through by
+      // reference (no spurious env_read of an unread key, byte-stable lock).
+      for (const manager of ['pnpm', 'yarn'] as const) {
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager, cwd: '/work', env, spawner });
+        expect(calls[0]!.opts.env).toBe(env);
+      }
+    });
+
+    it('clones the env for npm and preserves every inherited key', async () => {
       const env: NodeJS.ProcessEnv = {
         PATH: '/usr/bin:/usr/local/bin',
         HOME: '/root',
@@ -125,7 +143,154 @@ describe('runFetchPhase', () => {
       };
       const { spawner, calls } = mockSpawner();
       await runFetchPhase({ manager: 'npm', cwd: '/work', env, spawner });
-      expect(calls[0]!.opts.env).toBe(env);
+      const passed = calls[0]!.opts.env;
+      // Cloned (the pin must not mutate the caller's childEnv shared with Phase B).
+      expect(passed).not.toBe(env);
+      expect(passed['PATH']).toBe('/usr/bin:/usr/local/bin');
+      expect(passed['HOME']).toBe('/root');
+      expect(passed['LD_PRELOAD']).toBe('/lib/libscriptjail.so');
+      expect(passed['SCRIPT_JAIL_SPOOF_PLATFORM']).toBe('darwin');
+      // The caller's env is NOT mutated (Phase B reuses the same childEnv object).
+      expect(env['npm_config_git']).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // git-binary pin (npm_config_git) — repo .npmrc git= override defense
+  // -------------------------------------------------------------------------
+  //
+  // The GUEST Phase-A fetch must clone the SAME (real) git-dep tree the host
+  // installs.  A repo `.npmrc git=./fake-git` would otherwise redirect npm to a
+  // checkout-resident fake git during the audit, recording a benign tree while
+  // the (already-pinned) host clones the real one — a clean lock that authorizes
+  // an un-audited dependency tree.  Mirror the host pin on the guest fetch.
+  describe('git-binary pin (npm_config_git)', () => {
+    it('pins npm_config_git on the npm fetch env to a guest git', async () => {
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner });
+      const git = calls[0]!.opts.env['npm_config_git'];
+      expect(typeof git).toBe('string');
+      expect(git!.length).toBeGreaterThan(0);
+      // Either an absolute guest git OUTSIDE the staged repo, or the bare literal
+      // fallback — both OVERRIDE the repo `.npmrc git=` value.
+      expect(git === 'git' || git!.startsWith('/')).toBe(true);
+      // Never a checkout-resident path.
+      expect(git === '/work' || git!.startsWith('/work/')).toBe(false);
+    });
+
+    it('the pin OVERRIDES an inherited npm_config_git (a repo .npmrc cannot win)', async () => {
+      // npm config precedence: an `npm_config_git` ENV var beats the project
+      // `.npmrc`.  Even if an ambient value somehow rode in, our pin (set last)
+      // replaces it — the repo `.npmrc git=./fake-git` can never take effect.
+      const env: NodeJS.ProcessEnv = { ...BASE_ENV, npm_config_git: './fake-git' };
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env, spawner });
+      expect(calls[0]!.opts.env['npm_config_git']).not.toBe('./fake-git');
+    });
+
+    it('resolves an absolute guest git OUTSIDE the staged repo when one is on PATH', async () => {
+      // Point PATH at a real dir holding a `git` file, OUTSIDE the cwd, and
+      // assert the pin resolves to that absolute path (not the bare literal).
+      const binDir = mkdtempSync(join(tmpdir(), 'script-jail-guest-git-'));
+      const gitPath = join(binDir, 'git');
+      // Executable: #45 models execvp, so only a regular EXECUTABLE file resolves.
+      writeFileSync(gitPath, '#!/bin/sh\n', { mode: 0o755 });
+      const prevPath = process.env['PATH'];
+      try {
+        process.env['PATH'] = binDir;
+        const { spawner, calls } = mockSpawner();
+        // cwd is a DIFFERENT temp dir so the resolved git is outside the repo.
+        const cwd = mkdtempSync(join(tmpdir(), 'script-jail-guest-repo-'));
+        try {
+          await runFetchPhase({ manager: 'npm', cwd, env: { PATH: binDir }, spawner });
+          expect(calls[0]!.opts.env['npm_config_git']).toBe(gitPath);
+        } finally {
+          rmSync(cwd, { recursive: true, force: true });
+        }
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+
+    it('SKIPS a DIRECTORY named git and continues to the real binary (#45, execvp file-type)', async () => {
+      // A directory named `git` passes existence but execvp does not exec it — keep
+      // scanning PATH.  Without the isFile() guard it was returned and pinned.
+      const early = mkdtempSync(join(tmpdir(), 'script-jail-guest-gitdir-'));
+      mkdirSync(join(early, 'git')); // a DIRECTORY, not a file
+      const real = mkdtempSync(join(tmpdir(), 'script-jail-guest-realgit-'));
+      const realGit = join(real, 'git');
+      writeFileSync(realGit, '#!/bin/sh\n', { mode: 0o755 });
+      const prevPath = process.env['PATH'];
+      const cwd = mkdtempSync(join(tmpdir(), 'script-jail-guest-repo-'));
+      try {
+        process.env['PATH'] = `${early}${delimiter}${real}`;
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager: 'npm', cwd, env: { PATH: `${early}${delimiter}${real}` }, spawner });
+        expect(calls[0]!.opts.env['npm_config_git']).toBe(realGit);
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(early, { recursive: true, force: true });
+        rmSync(real, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('SKIPS a NON-EXECUTABLE git and continues to the real binary (#45, execvp X_OK)', async () => {
+      // mode 0644 git is skipped by execvp; access(X_OK) makes the scan fall through.
+      if (process.platform === 'win32') return; // X_OK degrades to existence on win32
+      const early = mkdtempSync(join(tmpdir(), 'script-jail-guest-gitnox-'));
+      writeFileSync(join(early, 'git'), '#!/bin/sh\n', { mode: 0o644 }); // NOT executable
+      const real = mkdtempSync(join(tmpdir(), 'script-jail-guest-realgit-'));
+      const realGit = join(real, 'git');
+      writeFileSync(realGit, '#!/bin/sh\n', { mode: 0o755 });
+      const prevPath = process.env['PATH'];
+      const cwd = mkdtempSync(join(tmpdir(), 'script-jail-guest-repo-'));
+      try {
+        process.env['PATH'] = `${early}${delimiter}${real}`;
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager: 'npm', cwd, env: { PATH: `${early}${delimiter}${real}` }, spawner });
+        expect(calls[0]!.opts.env['npm_config_git']).toBe(realGit);
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(early, { recursive: true, force: true });
+        rmSync(real, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('SKIPS a checkout-resident git and falls back to the literal (no shadow git)', async () => {
+      // A repo that prepends its OWN dir to PATH and ships a `git` there must NOT
+      // be picked as the trusted git: the candidate is under cwd, so it is
+      // skipped and the pin falls back to the bare literal `git`.
+      const repoDir = mkdtempSync(join(tmpdir(), 'script-jail-guest-shadow-'));
+      const shadowGit = join(repoDir, 'git');
+      writeFileSync(shadowGit, '#!/bin/sh\necho pwned\n');
+      const prevPath = process.env['PATH'];
+      try {
+        // PATH contains ONLY the checkout dir → no trusted git outside it.
+        process.env['PATH'] = repoDir;
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager: 'npm', cwd: repoDir, env: { PATH: repoDir }, spawner });
+        const git = calls[0]!.opts.env['npm_config_git'];
+        expect(git).toBe('git'); // bare literal, NOT the checkout-resident shadow
+        expect(git).not.toBe(shadowGit);
+      } finally {
+        if (prevPath === undefined) delete process.env['PATH'];
+        else process.env['PATH'] = prevPath;
+        rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+
+    it('does NOT set npm_config_git on the pnpm or yarn fetch env', async () => {
+      for (const manager of ['pnpm', 'yarn'] as const) {
+        const { spawner, calls } = mockSpawner();
+        await runFetchPhase({ manager, cwd: '/work', env: BASE_ENV, spawner });
+        expect(calls[0]!.opts.env['npm_config_git']).toBeUndefined();
+      }
     });
   });
 
@@ -265,6 +430,131 @@ describe('runFetchPhase', () => {
   });
 
   // -------------------------------------------------------------------------
+  // user_install_args integration (the action `args` input)
+  // -------------------------------------------------------------------------
+  //
+  // Unlike `extra_install_args` (npm-only arch hints), `user_install_args`
+  // carries developer install flags and MUST be appended to ALL THREE managers'
+  // fetch command, after the fixed flags.  These flags must be applied
+  // identically here and in the host part-1 install or the byte-stable lock
+  // drifts.
+  describe('user_install_args integration', () => {
+    let testDir: string;
+    let pmFlagsPath: string;
+
+    beforeEach(() => {
+      testDir = mkdtempSync(join(tmpdir(), 'script-jail-fetch-user-args-'));
+      pmFlagsPath = join(testDir, 'pm-flags.json');
+    });
+    afterEach(() => {
+      try { rmSync(testDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    });
+
+    it('appends user_install_args to npm ci (after the fixed flags)', async () => {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--omit=dev'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual(['ci', '--ignore-scripts', '--omit=dev']);
+    });
+
+    it('appends user_install_args to pnpm install (before the --store-dir splice)', async () => {
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--prod'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'pnpm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual([
+        'install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false',
+        '--prod', '--store-dir=/work/.pnpm-store',
+      ]);
+    });
+
+    it('appends user_install_args to yarn install', async () => {
+      // Use an allowlisted dependency-selection flag (`--prod`).  A non-dep
+      // flag like `--inline-builds` would be dropped by the fail-closed allowlist.
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--prod'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'yarn', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual(['install', '--immutable', '--mode=skip-build', '--prod']);
+    });
+
+    it('applies BOTH npm arch hints and user args, in order (arch then user)', async () => {
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: ['--cpu=x64'], user_install_args: ['--omit=dev'] }),
+      );
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual(['ci', '--ignore-scripts', '--cpu=x64', '--omit=dev']);
+    });
+
+    it('does NOT leak npm arch hints into pnpm but DOES apply user args', async () => {
+      // extra_install_args stays npm-only; user_install_args reaches pnpm.
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({ extra_install_args: ['--cpu=x64'], user_install_args: ['--prod'] }),
+      );
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({ manager: 'pnpm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      expect(calls[0]!.args).toEqual([
+        'install', '--frozen-lockfile', '--ignore-scripts', '--config.side-effects-cache=false',
+        '--prod', '--store-dir=/work/.pnpm-store',
+      ]);
+    });
+
+    // The agent's Phase-A FAILURE path masks the exact user-arg VALUES out of
+    // the redacted PM output before it reaches the host (serial console + fatal
+    // frame).  Those values are not in scope at the agent's failure site —
+    // runFetchPhase loads + re-sanitizes them — so it MUST surface them in its
+    // return object for the agent to derive the mask set (adversarial-review
+    // round-7 [high]).  Under the fail-closed allowlist a credential-bearing arg
+    // like `--auth-token=SECRET` is DROPPED entirely (never reaches the argv), so
+    // only the surviving allowlisted args are returned for masking; the secret
+    // can no longer leak via the install argv at all.
+    it('returns the surviving (allowlisted) userInstallArgs it loaded, dropping non-dep flags', async () => {
+      writeFileSync(
+        pmFlagsPath,
+        JSON.stringify({
+          extra_install_args: [],
+          user_install_args: ['--auth-token=SECRET_TOKEN', '--omit=dev'],
+        }),
+      );
+      const { spawner } = mockSpawner();
+      const result = await runFetchPhase({ manager: 'npm', cwd: '/work', env: BASE_ENV, spawner, pmFlagsPath });
+      // `--auth-token=SECRET_TOKEN` dropped (not on the allowlist); only the
+      // allowlisted `--omit=dev` survives into the returned mask set.
+      expect(result.userInstallArgs).toEqual(['--omit=dev']);
+    });
+
+    it('returns an empty userInstallArgs array when none are staged', async () => {
+      const { spawner } = mockSpawner();
+      const result = await runFetchPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        spawner,
+        pmFlagsPath: join(testDir, 'absent.json'),
+      });
+      expect(result.userInstallArgs).toEqual([]);
+    });
+
+    it('threads pmFlagsContent (env channel) through to npm ci, preferring it over the path', async () => {
+      // The production delivery channel: content arrives via SCRIPT_JAIL_PM_FLAGS_CONTENT
+      // (agent → input.pmFlagsContent), no file at any path.  Even when a stale file also
+      // exists, the content wins (and is re-sanitized).
+      writeFileSync(pmFlagsPath, JSON.stringify({ extra_install_args: [], user_install_args: ['--from-file'] }));
+      const { spawner, calls } = mockSpawner();
+      await runFetchPhase({
+        manager: 'npm',
+        cwd: '/work',
+        env: BASE_ENV,
+        spawner,
+        pmFlagsPath,
+        pmFlagsContent: JSON.stringify({ extra_install_args: ['--cpu=arm64'], user_install_args: ['--omit=dev'] }),
+      });
+      expect(calls[0]!.args).toEqual(['ci', '--ignore-scripts', '--cpu=arm64', '--omit=dev']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // pnpm-arch.json integration (cross-arch parity for pnpm)
   // -------------------------------------------------------------------------
   //
@@ -325,6 +615,35 @@ describe('runFetchPhase', () => {
       // Sibling keys preserved.
       expect(pkg['name']).toBe('demo');
       expect(pkg['version']).toBe('1.0.0');
+    });
+
+    it('merges supportedArchitectures from pnpmArchContent (env channel), preferring it over the path', async () => {
+      writeFileSync(
+        join(repoDir, 'package.json'),
+        JSON.stringify({ name: 'demo', version: '1.0.0' }, null, 2) + '\n',
+      );
+      // A stale file exists, but the env content (production channel) wins.
+      writeFileSync(
+        pnpmArchPath,
+        '{"supportedArchitectures":{"os":["darwin"],"cpu":["arm64"],"libc":["unknown"]}}',
+      );
+
+      const { spawner } = mockSpawner();
+      await runFetchPhase({
+        manager: 'pnpm',
+        cwd: repoDir,
+        env: BASE_ENV,
+        spawner,
+        pnpmArchPath,
+        pnpmArchContent: ARCH_OVERLAY,
+      });
+
+      const pkg = JSON.parse(
+        readFileSync(join(repoDir, 'package.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(pkg['pnpm']).toEqual({
+        supportedArchitectures: { os: ['linux'], cpu: ['x64'], libc: ['glibc'] },
+      });
     });
 
     it('leaves package.json untouched when pnpm-arch.json is absent', async () => {

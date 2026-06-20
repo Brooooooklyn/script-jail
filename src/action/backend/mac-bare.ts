@@ -37,7 +37,13 @@ import { platform as hostPlatform } from 'node:process';
 
 import type { AuditExecutionInput, LauncherResult } from '../../shared/run-audit.js';
 import { runAgentProcess } from './process.js';
-import { rewriteConfigWorkDir, stageRepoDirectory } from './stage.js';
+import {
+  controlSidecarEnv,
+  partitionControlSidecars,
+  rewriteConfigWorkDir,
+  stageRepoDirectory,
+} from './stage.js';
+import { SAFE_SYSTEM_PATH, sanitizePathValue, stripDangerousEnv } from '../host-install.js';
 import {
   provisionNodeMac,
   defaultProvisionCacheDir,
@@ -178,6 +184,14 @@ export function createMacBareExecute(
     const provisioned: ProvisionedNodeMac = await doProvision({
       arch: deps.arch,
       cacheDir: defaultProvisionCacheDir(baseEnv),
+      // SECURITY (codex round-5 [critical]): provisioning runs ON THE HOST and
+      // BEFORE the audit trust gate — it spawns bare-name `tar`/`codesign`/
+      // `xattr` + Node-based `vp`/`corepack`.  Hand it the SAME sanitized env the
+      // orchestrator gets (checkout dirs dropped from PATH + dangerous
+      // loader/config selectors stripped) so a workflow-prepended
+      // `$GITHUB_WORKSPACE/bin` can't shadow a system tool and an inherited
+      // NODE_OPTIONS/DYLD_* can't inject into a provisioning child pre-trust.
+      env: stripDangerousEnv(baseEnv),
       // The bundled plain-arm64 substitutes the shim's SIP redirect points at:
       // staged as <shellShimDir>/bash and <shellShimDir>/coreutils.
       macBashPath: runtime.bashPath,
@@ -190,11 +204,23 @@ export function createMacBareExecute(
     }
 
     // --- Stage the repo + rewrite config work_dir -------------------------
+    // SECURITY (audit-only sidecar oracle): deliver script-jail's control sidecars
+    // (pm-flags.json / pnpm-arch.json) as env CONTENT, NOT a file in the staged repo tree;
+    // `.yarnrc.yml` stays (genuine repo config).  The guest reads pm-flags from
+    // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT (set below), so the audited repo root no
+    // longer holds an `etc/script-jail/` the host checkout lacks.  (mac-bare is
+    // observe-only / not install-aligned — no host re-run to diverge from — but this keeps
+    // one delivery policy uniform with docker/Firecracker and removes the pure-audit
+    // surface pollution.)
+    const { repoOverlay, controlSidecars } = partitionControlSidecars(
+      input.extraRepoOverlayFiles,
+    );
     const staged = stageRepoDirectory({
       repoDir: input.repoDir,
       parentDir: input.scratchDir,
-      extraRepoOverlayFiles: input.extraRepoOverlayFiles,
+      extraRepoOverlayFiles: repoOverlay,
     });
+    const controlEnv = controlSidecarEnv(controlSidecars);
     const backendConfigPath = rewriteConfigWorkDir({
       configPath: input.configPath,
       outDir: input.scratchDir,
@@ -213,10 +239,25 @@ export function createMacBareExecute(
           ...pickOrchestratorEnv(baseEnv),
           // Mirror init.sh / docker.ts: corepack must not prompt offline.
           COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+          // round-17f (codex [critical]): macOS-bare has NO COREPACK_HOME set, and its
+          // Phase B launches pnpm/yarn via `node corepack.js` (a real corepack invocation,
+          // straced).  Corepack loads a PROJECT `.corepack.env` (cwd=repoDir) unless
+          // COREPACK_ENV_FILE=0; process.env WINS over the file (corepack.cjs:13556).  A
+          // repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would otherwise
+          // steer corepack to a planted cache AND diverge from the host part-2 (which now
+          // pins COREPACK_ENV_FILE=0).  Pin it so macOS-bare ignores the file, matching
+          // the host install.
+          COREPACK_ENV_FILE: '0',
           PATH: prependPath(provisioned.nodeBinDir, baseEnv),
           SCRIPT_JAIL_CONNECTION: 'stdio',
           SCRIPT_JAIL_BACKEND: 'macos-bare',
           SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+          // macOS-bare runs the agent directly on the host (no container /etc).  Deliver
+          // the pm-flags / pnpm-arch control sidecars as env CONTENT (no file at any path),
+          // keeping `etc/script-jail/` out of the audited repo root (audit-only sidecar
+          // oracle).  Empty dict when no sidecar → guest degrades to "no override".
+          // loadPmFlags / applyPnpmArchOverlay re-sanitize the content.
+          ...controlEnv,
           SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -377,6 +418,14 @@ function firstExistingOrDefault(candidates: string[], doExists: typeof existsSyn
 
 /** Prepend `dir` to a PATH value, preserving the rest. */
 function prependPath(dir: string, env: NodeJS.ProcessEnv): string {
-  const existing = env['PATH'] ?? '/usr/bin:/bin:/usr/sbin:/sbin';
+  // SECURITY (codex round-4 [high]): sanitize the inherited PATH (drop checkout-
+  // controlled + non-absolute entries) BEFORE prepending the provisioned toolchain,
+  // so a workflow-prepended `$GITHUB_WORKSPACE/bin` cannot let the mac-bare AUDIT
+  // resolve a PR-provided `make`/tool that the hardened host install strips —
+  // matching `hostInstallEnv`'s PATH policy and keeping host==audit parity.
+  // sanitizePathValue never returns '' (it substitutes SAFE_SYSTEM_PATH when all
+  // segments drop), so `existing` is always a non-empty trusted PATH — no empty
+  // (cwd-searching) segment can sneak into the prepended result.
+  const existing = sanitizePathValue(env['PATH']) ?? SAFE_SYSTEM_PATH;
   return `${dir}:${existing}`;
 }

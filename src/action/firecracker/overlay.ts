@@ -57,7 +57,6 @@ import {
   statSync,
   existsSync,
   lstatSync,
-  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
@@ -93,6 +92,18 @@ export interface OverlayInput {
    * action surface leaves this undefined.
    */
   extraRepoOverlayFiles?: ReadonlyArray<{ relPath: string; content: string }>;
+  /**
+   * SECURITY (pre-trust bare-name host RCE): env handed to the host disk-build
+   * spawns below (`cp --reflink=auto`, `mkfs.ext4`, the `command -v` probe, and
+   * the macOS Docker-Alpine fallback).  These resolve by BARE NAME on the host
+   * BEFORE the audit trust gate, so the caller MUST pass an env whose dangerous
+   * loader/config selectors are stripped and whose PATH has checkout-controlled
+   * dirs dropped — the Firecracker backend threads its ONE `stripDangerousEnv`
+   * result down (see backend/firecracker.ts).  Omitted ⇒ `process.env` (the
+   * legacy macOS CLI / VZ launch path keeps its prior behaviour; this module
+   * never derives the sanitized env itself — it only receives it).
+   */
+  env?: NodeJS.ProcessEnv | undefined;
 }
 
 export interface OverlayResult {
@@ -156,18 +167,26 @@ async function buildOverlayInto(
   input: OverlayInput,
 ): Promise<OverlayResult> {
   const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
+  // SECURITY: the host disk-build spawns below are bare-name + pre-trust — use the
+  // caller-sanitized env (Firecracker backend threads `stripDangerousEnv` down).
+  // Default to process.env only for the legacy macOS CLI / VZ path that omits it.
+  const env = input.env ?? process.env;
 
   // 2. Copy the base rootfs (CoW where supported, plain copy otherwise).
   const rootfsCopyPath = join(workDir, 'rootfs.ext4');
-  copyRootfs(baseRootfsPath, rootfsCopyPath);
+  copyRootfs(baseRootfsPath, rootfsCopyPath, env);
 
   // 3. Stage the repo + config into a temp directory tree that will become
   //    the content of repo.ext4.
   const repoStageDir = join(workDir, 'repo-stage');
   mkdirSync(repoStageDir, { recursive: true });
 
-  // Copy repository files.
-  cpSync(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  // Copy repository files.  `verbatimSymlinks` keeps a committed RELATIVE symlink
+  // relative (cpSync would otherwise rewrite it to its realpath absolute target),
+  // so the audit and the host part-2 re-run resolve it identically — closing the
+  // staged-symlink escape (Codex re-review; mirror of stage.ts).  No-op for current
+  // fixtures (none commit a symlink).
+  cpSync(repoSrcPath, repoStageDir, { recursive: true, dereference: false, verbatimSymlinks: true });
 
   // Overlay the script-jail config at the path the guest agent expects:
   //   /etc/script-jail/config.yml  →  inside the repo stage dir we write it at
@@ -178,8 +197,13 @@ async function buildOverlayInto(
   // the disk are relative to /work.  The agent reads config from
   // /etc/script-jail/config.yml which is on the rootfs; the init.sh copies it
   // from /work/etc/script-jail/config.yml into /etc/script-jail/ at boot.
+  // Create the overlay dirs through the same fail-closed helper writeOverlayFile
+  // uses, per-segment, so a committed symlink/file at `etc` or `etc/script-jail`
+  // aborts the audit instead of being silently replaced in the staged copy only
+  // (Codex re-review, overlay-ancestor-symlink escape).
+  ensureRealDirectory(join(repoStageDir, 'etc'));
   const configDestDir = join(repoStageDir, 'etc', 'script-jail');
-  mkdirSync(configDestDir, { recursive: true });
+  ensureRealDirectory(configDestDir);
   copyFileSync(configPath, join(configDestDir, 'config.yml'));
 
   // 3b. Layer any caller-supplied extra files onto the repo stage dir.
@@ -208,6 +232,7 @@ async function buildOverlayInto(
     label: 'repo',
     sizeMB: estimateDiskSizeMB(repoStageDir),
     outPath: repoDiskPath,
+    env,
   });
 
   // 5. Build the EMPTY scratch disk ext4.  Same creation mechanism as
@@ -218,6 +243,7 @@ async function buildOverlayInto(
     label: SCRATCH_DISK_LABEL,
     sizeMB: SCRATCH_DISK_MB,
     outPath: scratchDiskPath,
+    env,
   });
 
   // 6. Build the EMPTY sjtmp disk ext4.  Dedicated TMPDIR space: a separate
@@ -230,6 +256,7 @@ async function buildOverlayInto(
     label: SJTMP_DISK_LABEL,
     sizeMB: SJTMP_DISK_MB,
     outPath: sjtmpDiskPath,
+    env,
   });
 
   const cleanup = async (): Promise<void> => {
@@ -262,19 +289,59 @@ function writeOverlayFile(root: string, relPath: string, content: string): void 
   }
 
   const dest = join(dir, parts[parts.length - 1]!);
-  rmSync(dest, { recursive: true, force: true });
+  // SECURITY (Codex re-review, gitlink leaf gap — mirror of stage.ts): the LEAF must
+  // not already exist.  A committed gitlink/submodule (git index mode 160000) at e.g.
+  // `etc/script-jail/pm-flags.json` checks out as a real (empty) DIRECTORY; the old
+  // `rmSync(dest, {recursive}); writeFileSync` deleted it and wrote our sidecar in the
+  // repo-disk copy ONLY, while the host's real checkout keeps the dir — a host-vs-audit
+  // divergence the value-blind lock can't capture.  Fail closed: lstat (no-follow) and
+  // throw on ANY pre-existing entry (gitlink dir, plain directory, symlink, or file).
+  let leaf: ReturnType<typeof lstatSync> | undefined;
+  try {
+    leaf = lstatSync(dest);
+  } catch {
+    leaf = undefined; // absent — the normal case.
+  }
+  if (leaf !== undefined) {
+    const kind = leaf.isSymbolicLink()
+      ? 'symlink'
+      : leaf.isDirectory()
+        ? 'directory (a committed gitlink/submodule or plain directory)'
+        : 'file';
+    throw new Error(
+      `[overlay] cannot stage script-jail overlay: the checkout already has a ${kind} at ` +
+        `'${dest}' — script-jail OWNS this path and writes its own sidecar here. It refuses ` +
+        `to replace committed checkout content (under install:true that would also diverge ` +
+        `the audit from the host re-run). Remove it from the checkout.`,
+    );
+  }
   writeFileSync(dest, content, { encoding: 'utf8', flag: 'wx' });
 }
 
 function ensureRealDirectory(path: string): void {
-  if (!existsSync(path)) {
-    mkdirSync(path, { recursive: true });
+  let stat;
+  try {
+    // lstat (no-follow on the FINAL component): inspect THIS ancestor segment
+    // itself, called per-segment so a symlinked `etc` is seen as a symlink here.
+    stat = lstatSync(path);
+  } catch {
+    mkdirSync(path, { recursive: true }); // absent → create a real dir
     return;
   }
-  const stat = lstatSync(path);
-  if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  rmSync(path, { recursive: true, force: true });
-  mkdirSync(path, { recursive: true });
+  if (stat.isDirectory() && !stat.isSymbolicLink()) return; // already a real dir
+  // SECURITY (Codex re-review, overlay-ancestor-symlink escape): the segment EXISTS
+  // but is NOT a real directory (a committed SYMLINK incl. dangling/symlink-to-dir, or
+  // a regular FILE).  Replacing it would mutate the staged copy ONLY — the host's real
+  // checkout keeps the committed symlink/file, so host part-2 resolves a path through it
+  // to PR content the audit (seeing a fresh real dir) never resolved, executing it under
+  // a trusted lock.  Fail closed: throw aborts the audit (untrusted ⇒ no host install).
+  // Single chokepoint over every overlay path × ancestor segment.  (Mirror of stage.ts.)
+  throw new Error(
+    `[overlay] cannot stage script-jail overlay: the checkout has a non-directory at ` +
+      `'${path}' (a committed symlink or file) where script-jail needs a real directory. ` +
+      `install:true refuses to replace it — that would make the audit diverge from the ` +
+      `host checkout. Remove it from the checkout, or audit without 'install'.`,
+  );
 }
 
 /**
@@ -283,9 +350,11 @@ function ensureRealDirectory(path: string): void {
  * On Linux we attempt `cp --reflink=auto` for a CoW clone (fast on btrfs/xfs).
  * Falls back to a regular copy on any error or on macOS.
  */
-function copyRootfs(src: string, dest: string): void {
+function copyRootfs(src: string, dest: string, env: NodeJS.ProcessEnv): void {
   if (platform === 'linux') {
-    const result = spawnSync('cp', ['--reflink=auto', src, dest], { stdio: 'ignore' });
+    // SECURITY: `cp` is bare-name + pre-trust — the caller-sanitized `env`
+    // ensures a checkout-prepended PATH or inherited loader var can't hijack it.
+    const result = spawnSync('cp', ['--reflink=auto', src, dest], { stdio: 'ignore', env });
     if (result.status === 0) return;
     // Fallback: plain cp (e.g. ext4 host fs that doesn't support reflink).
   }
@@ -319,11 +388,17 @@ async function buildExt4Disk(opts: {
   /** Logical image size in MiB. */
   sizeMB: number;
   outPath: string;
+  /**
+   * SECURITY: env for the bare-name + pre-trust host spawns (`mkfs.ext4`, the
+   * `command -v` probe, the macOS Docker fallback).  Caller-sanitized — see
+   * OverlayInput.env.
+   */
+  env: NodeJS.ProcessEnv;
 }): Promise<void> {
-  const { srcDir, label, sizeMB, outPath } = opts;
+  const { srcDir, label, sizeMB, outPath, env } = opts;
   const sizeSpec = `${sizeMB}M`;
 
-  const mkfs = resolveMkfsExt4();
+  const mkfs = resolveMkfsExt4(env);
   if (mkfs !== null) {
     const result = spawnSync(
       mkfs,
@@ -335,7 +410,9 @@ async function buildExt4Disk(opts: {
         outPath,
         sizeSpec,
       ],
-      { stdio: 'inherit' },
+      // SECURITY: bare `mkfs.ext4` on Linux is resolved via PATH pre-trust — the
+      // caller-sanitized `env` prevents a checkout-prepended PATH / loader var hijack.
+      { stdio: 'inherit', env },
     );
     if (result.status !== 0) {
       throw new Error(
@@ -359,7 +436,9 @@ async function buildExt4Disk(opts: {
     `sh -c ` +
     `"apk add --no-cache e2fsprogs && ` +
     ` mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
-    { stdio: 'inherit' },
+    // SECURITY: `docker`/`sh` resolve by bare name pre-trust — use the
+    // caller-sanitized `env` so a checkout PATH / loader var can't hijack them.
+    { stdio: 'inherit', env },
   );
 }
 
@@ -375,7 +454,7 @@ async function buildExt4Disk(opts: {
  *   Returns `null` when nothing was found so the caller can fall back to the
  *   docker helper.
  */
-function resolveMkfsExt4(): string | null {
+function resolveMkfsExt4(env: NodeJS.ProcessEnv): string | null {
   if (platform === 'linux') return 'mkfs.ext4';
   if (platform !== 'darwin') return null;
   for (const candidate of [
@@ -385,7 +464,10 @@ function resolveMkfsExt4(): string | null {
     if (existsSync(candidate)) return candidate;
   }
   // Try PATH lookup via `command -v`; cheap and avoids hard-coding more paths.
-  const lookup = spawnSync('command', ['-v', 'mkfs.ext4'], { shell: '/bin/sh', encoding: 'utf8' });
+  // SECURITY: the `command -v` probe (and the `mkfs.ext4` it resolves) run
+  // bare-name + pre-trust — pass the caller-sanitized `env` so a checkout PATH
+  // entry can't surface a PR-planted `mkfs.ext4` here.
+  const lookup = spawnSync('command', ['-v', 'mkfs.ext4'], { shell: '/bin/sh', encoding: 'utf8', env });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
   return null;
 }

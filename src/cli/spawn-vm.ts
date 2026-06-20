@@ -33,10 +33,11 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseFrames, type GuestFrame } from '../shared/vsock-protocol.js';
+import { isPathUnderCheckout, stripDangerousEnv } from '../action/host-install.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -262,6 +263,26 @@ export function resolveScriptJailVmBinary(opts?: {
   const envBin =
     opts?.envOverride !== undefined ? opts.envOverride : process.env['SCRIPT_JAIL_VM_BIN'];
   if (envBin !== undefined && envBin !== '') {
+    // SECURITY (codex round-8/9): the override must be ABSOLUTE and OUTSIDE the
+    // checkout.  A relative value (e.g. `./script-jail-vm`) would resolve against
+    // the process cwd (the checkout); an absolute value under the checkout (e.g.
+    // `$GITHUB_WORKSPACE/bin/script-jail-vm`) is equally PR-controlled.  Either
+    // would let a PR-committed binary become the "trusted" VZ helper pre-trust —
+    // and the codesign preflight is NOT a provenance check (ad-hoc signing with
+    // the virtualization entitlement is the documented dev flow), so it can't
+    // catch this.  Fail closed rather than silently spawning checkout content.
+    if (!isAbsolute(envBin)) {
+      throw new Error(
+        `script-jail: SCRIPT_JAIL_VM_BIN must be an absolute path (got ${JSON.stringify(envBin)}); ` +
+          `a relative override would resolve the VZ helper against the checkout.`,
+      );
+    }
+    if (isPathUnderCheckout(envBin)) {
+      throw new Error(
+        `script-jail: SCRIPT_JAIL_VM_BIN (${JSON.stringify(envBin)}) is inside the checkout; ` +
+          `the VZ helper must not be a checkout-controlled binary (pre-trust RCE).`,
+      );
+    }
     searched.push(`${envBin} (SCRIPT_JAIL_VM_BIN)`);
     if (existsSync(envBin)) return envBin;
   }
@@ -352,8 +373,28 @@ export type CodesignRunner = (args: ReadonlyArray<string>) => {
   error?: Error | undefined;
 };
 
+/**
+ * Sanitized env for every pre-trust host exec `spawnVm` performs — the
+ * `codesign -d` entitlement preflight AND the VZ helper boot.  EXPORTED only so
+ * the unit test can assert the policy without mocking `spawnSync`/`spawn`.
+ *
+ * SECURITY: both run BEFORE the audit produces/diffs the lock.  The `codesign`
+ * preflight is a BARE-NAME exec (a checkout-prepended/empty PATH could resolve a
+ * PR-committed `./codesign`); the helper is absolute-path but ad-hoc signed and
+ * HONOURS DYLD_*, so an inherited DYLD_INSERT_LIBRARIES / DYLD_* / LD_* /
+ * NODE_OPTIONS could inject into it.  Apply the SAME `stripDangerousEnv` policy
+ * the other backends use (bare.ts, mac-bare.ts, firecracker.ts, docker.ts) —
+ * defense-in-depth + consistency.
+ */
+export function sanitizedHostEnv(): NodeJS.ProcessEnv {
+  return stripDangerousEnv(process.env);
+}
+
 const defaultCodesignRunner: CodesignRunner = (args) => {
-  const result = spawnSync('codesign', [...args], { encoding: 'utf8' });
+  const result = spawnSync('codesign', [...args], {
+    encoding: 'utf8',
+    env: sanitizedHostEnv(),
+  });
   return {
     status: result.status,
     stdout: result.stdout ?? '',
@@ -536,8 +577,16 @@ export async function spawnVm(
   process.on('SIGTERM', onSignal);
 
   try {
+    // SECURITY (codex round-8 [critical]): the VZ helper is spawned by ABSOLUTE
+    // path (no PATH shadow), but it is ad-hoc signed and HONOURS DYLD_* — that is
+    // the whole point of the macOS signing model — so an inherited
+    // DYLD_INSERT_LIBRARIES / DYLD_* (or LD_*/NODE_OPTIONS) could inject into the
+    // helper on the host BEFORE the audit produces/diffs the lock.  Spawn it with
+    // the SAME sanitized env policy the other backends use (dangerous loader
+    // selectors dropped + PATH sanitized) instead of the raw inherited env.
     child = spawn(binary, ['boot', '--config', configJsonPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: sanitizedHostEnv(),
     });
 
     // Forward + capture stderr.

@@ -10351,6 +10351,7 @@ __export(agent_exports, {
   LinuxVsockConnection: () => LinuxVsockConnection,
   MacOSSpawner: () => MacOSSpawner,
   MemoryConnection: () => MemoryConnection,
+  NPM_PREPARE_RUNNER_SOURCE: () => NPM_PREPARE_RUNNER_SOURCE,
   PHASE_B_STDOUT_PENDING_MAX_BYTES: () => PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES: () => PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough: () => import_node_stream.PassThrough,
@@ -10359,15 +10360,19 @@ __export(agent_exports, {
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
   createEventsFile: () => createEventsFile,
+  createSensitiveRedactor: () => createSensitiveRedactor,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
+  npmCliEntryPath: () => npmCliEntryPath,
   readStraceChildPid: () => readStraceChildPid,
+  realCaptureNpmPrepareEnv: () => realCaptureNpmPrepareEnv,
   redactSensitive: () => redactSensitive,
+  resolvePrepareCommand: () => resolvePrepareCommand,
   runStraceTailer: () => runStraceTailer,
   scratchBaseDir: () => scratchBaseDir
 });
 module.exports = __toCommonJS(agent_exports);
-var import_node_fs3 = require("node:fs");
+var import_node_fs5 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_readline2 = require("node:readline");
 var import_node_net = require("node:net");
@@ -11990,8 +11995,8 @@ function emoji() {
 }
 var ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
 var ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
-var mac = (delimiter) => {
-  const escapedDelim = escapeRegex(delimiter ?? ":");
+var mac = (delimiter2) => {
+  const escapedDelim = escapeRegex(delimiter2 ?? ":");
   return new RegExp(`^(?:[0-9A-F]{2}${escapedDelim}){5}[0-9A-F]{2}$|^(?:[0-9a-f]{2}${escapedDelim}){5}[0-9a-f]{2}$`);
 };
 var cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
@@ -24891,7 +24896,7 @@ function date4(params) {
 config(en_default());
 
 // src/guest/agent.ts
-var import_node_path4 = require("node:path");
+var import_node_path6 = require("node:path");
 
 // src/lock/schema.ts
 var LifecycleStage = external_exports.enum(["preinstall", "install", "postinstall", "prepare"]);
@@ -24903,7 +24908,8 @@ var FsReadEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -24913,14 +24919,21 @@ var FsWriteEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
   name: external_exports.string(),
   pid: external_exports.number(),
   ts: external_exports.number(),
-  hidden: external_exports.boolean()
+  hidden: external_exports.boolean(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_read events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed env_read). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var SpawnEvent = external_exports.object({
   kind: external_exports.literal("spawn"),
@@ -24942,7 +24955,13 @@ var SpawnEvent = external_exports.object({
   // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
   // benign find/sed use stays green; a reviewer just sees the marker). Omitted
   // (never `false`) so existing/non-blind records stay byte-identical.
-  audit_blind: external_exports.boolean().optional()
+  audit_blind: external_exports.boolean().optional(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on spawn events that
+  // attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed spawn). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -24960,7 +24979,15 @@ var NetworkEvent = external_exports.object({
   // 'ok' = phase A (fetch with network on). 'blocked' = phase B (offline).
   result: external_exports.enum(["ok", "blocked"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on connect events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed connect). Closes the unmarked-non-fs gap and
+  // the drop-in-install egress-misclassification (a forged root prepare connect
+  // is no longer mistaken for the genuine root's host-safe prepare).
+  root_anchored: external_exports.boolean().optional()
 });
 var ExecEvent = external_exports.object({
   kind: external_exports.literal("exec"),
@@ -25049,7 +25076,16 @@ var EnvTamperEvent = external_exports.object({
   reason: external_exports.string().optional(),
   refused: external_exports.literal(true),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_tamper events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed `<REFUSED>` env_tamper). Closes the last
+  // unmarked root-claimable + rendered + deduped kind. Does NOT apply to the
+  // `audit_fd_lost` variant — that routes to audit_bypass and is hard-failed
+  // independently by findAuditBypass, so dedupe-collapse cannot hide it.
+  root_anchored: external_exports.boolean().optional()
 });
 var RawEvent = external_exports.discriminatedUnion("kind", [
   FsReadEvent,
@@ -25109,12 +25145,55 @@ var CANONICAL_STAGES = new Set(LifecycleStage.options);
 function isCanonicalStage(s) {
   return CANONICAL_STAGES.has(s);
 }
+var PNPM_ROOT_REBUILD_HOOKS = /* @__PURE__ */ new Set([
+  "prepublish",
+  "prerebuild",
+  "rebuild",
+  "postrebuild"
+]);
+var NPM_ROOT_PREPARE_WRAPPER_HOOKS = /* @__PURE__ */ new Set(["preprepare", "postprepare"]);
 function buildPkg(name, version2) {
   return version2 !== void 0 ? `${name}@${version2}` : name;
 }
-function attributionFromEnvVars(name, version2, event) {
+var ROOT_SENTINEL = "<repo-root>";
+function buildRootPkgKeys(manifest) {
+  const keys = /* @__PURE__ */ new Set();
+  if (manifest.name !== void 0 && typeof manifest.name !== "string") {
+    return { keys, canonical: null };
+  }
+  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+    return { keys: /* @__PURE__ */ new Set([ROOT_SENTINEL]), canonical: ROOT_SENTINEL };
+  }
+  const name = manifest.name;
+  keys.add(name);
+  if (typeof manifest.version === "string") {
+    keys.add(`${name}@${manifest.version}`);
+    return { keys, canonical: `${name}@${manifest.version}` };
+  }
+  return { keys, canonical: name };
+}
+function attributionFromEnvVars(name, version2, event, rootSentinel, rootKeys) {
   if (name !== void 0 && name.length > 0 && event !== void 0 && isCanonicalStage(event)) {
     return { pkg: buildPkg(name, version2), lifecycle: event };
+  }
+  if (name !== void 0 && name.length > 0 && event !== void 0 && rootKeys !== void 0 && rootKeys.has(buildPkg(name, version2))) {
+    if (PNPM_ROOT_REBUILD_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version2), lifecycle: "install" };
+    }
+    if (NPM_ROOT_PREPARE_WRAPPER_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version2), lifecycle: "prepare" };
+    }
+  }
+  if (rootSentinel !== void 0 && (name === void 0 || name.length === 0) && event !== void 0) {
+    if (isCanonicalStage(event)) {
+      return { pkg: rootSentinel, lifecycle: event };
+    }
+    if (PNPM_ROOT_REBUILD_HOOKS.has(event)) {
+      return { pkg: rootSentinel, lifecycle: "install" };
+    }
+    if (NPM_ROOT_PREPARE_WRAPPER_HOOKS.has(event)) {
+      return { pkg: rootSentinel, lifecycle: "prepare" };
+    }
   }
   return null;
 }
@@ -25130,14 +25209,43 @@ var Attribution = class {
   // recycled pid re-reads /proc instead of returning the dead generation's
   // result.
   cache = /* @__PURE__ */ new Map();
-  constructor(reader) {
+  /**
+   * Synthetic root key for a NAMELESS-but-parseable root manifest, or undefined
+   * when the root is named or absent. Threaded into every
+   * {@link attributionFromEnvVars} call inside {@link _walk}, so a /proc-observed
+   * pid running the nameless root's OWN lifecycle (empty npm_package_name +
+   * canonical npm_lifecycle_event) attributes to this sentinel instead of null.
+   * The PM driver and its non-lifecycle workers carry NO canonical lifecycle, so
+   * they still attribute to null → dropped (no flood). Inert when undefined.
+   */
+  rootSentinel;
+  /**
+   * The root package keys (`name` + `name@version`, or `<repo-root>` for a
+   * nameless root) — `buildRootPkgKeys`.  Threaded into every
+   * {@link attributionFromEnvVars} call inside {@link _walk} so a /proc-observed
+   * pid running the NAMED root's OWN non-canonical rebuild-class hook
+   * (prepublish/prerebuild/rebuild/postrebuild) folds to the root instead of null
+   * (#27).  Membership-scoped, so a non-root named dependency keeps the strict
+   * 4-stage gate. Inert when undefined.
+   */
+  rootKeys;
+  constructor(reader, rootSentinel, rootKeys) {
     this.reader = reader;
+    this.rootSentinel = rootSentinel;
+    this.rootKeys = rootKeys;
   }
   /**
    * Walk pid → ppid → ppid' … until we find the process itself or its nearest
    * ancestor whose environ has `npm_package_name` (non-empty) AND
    * `npm_lifecycle_event` is one of the four canonical LifecycleStage values.
    * Return that pkg + lifecycle pair.
+   *
+   * When this instance was constructed with a {@link rootSentinel} (nameless
+   * root), an ancestor with EMPTY `npm_package_name` but a canonical
+   * `npm_lifecycle_event` also matches — attributing to the sentinel. This is
+   * how the nameless root's OWN lifecycle pids (and env-inheriting descendants)
+   * surface for ALL event kinds; the PM driver carries no canonical lifecycle
+   * and still walks to null.
    *
    * Returns null when:
    *   - The walk reaches pid 0 or 1 without finding a match.
@@ -25147,6 +25255,10 @@ var Attribution = class {
    * Results are cached per starting pid. A second call with the same pid will
    * return the cached value without any additional /proc reads — unless
    * {@link invalidate} has been called for the pid in between.
+   *
+   * When this instance carries a {@link rootSentinel}, a nameless root's own
+   * lifecycle pid (empty npm_package_name + canonical npm_lifecycle_event)
+   * attributes to that sentinel rather than null; see {@link _walk}.
    */
   attribute(pid) {
     if (this.cache.has(pid)) {
@@ -25175,8 +25287,8 @@ var Attribution = class {
   }
   _walk(startPid) {
     let current = startPid;
-    const MAX_DEPTH = 1024;
-    for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    const MAX_DEPTH2 = 1024;
+    for (let depth = 0; depth < MAX_DEPTH2; depth++) {
       if (current === 0 || current === 1) {
         return null;
       }
@@ -25185,7 +25297,9 @@ var Attribution = class {
         const attrib = attributionFromEnvVars(
           env.get("npm_package_name"),
           env.get("npm_package_version"),
-          env.get("npm_lifecycle_event")
+          env.get("npm_lifecycle_event"),
+          this.rootSentinel,
+          this.rootKeys
         );
         if (attrib !== null) {
           return attrib;
@@ -25201,8 +25315,93 @@ var Attribution = class {
   }
 };
 
-// src/guest/proc-reader.ts
+// src/shared/redact.ts
+function redactCredentialShapes(text) {
+  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/(^|[\s='"(`])\/\/[^/\s@]+@/g, "$1//<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+}
+function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
+  const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
+  let out = text;
+  const replacement = `<${label}>`;
+  for (const value of unique) {
+    out = out.split(value).join(replacement);
+  }
+  return out;
+}
+var DEFAULT_MIN_FRAGMENT = 8;
+var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
+var FRAGMENT_MAX_GRAMS = 1 << 22;
+function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
+  const unique = Array.from(new Set(values));
+  let totalChars = 0;
+  for (const v of unique) {
+    totalChars += v.length;
+    if (totalChars > MAX_FRAGMENT_VALUE_CHARS) {
+      return { grams: /* @__PURE__ */ new Set(), capped: true, minFragment };
+    }
+  }
+  const grams = /* @__PURE__ */ new Set();
+  let capped = false;
+  for (const v of unique) {
+    if (v.length <= minFragment) continue;
+    for (let i = 0; i + minFragment <= v.length; i += 1) {
+      grams.add(v.slice(i, i + minFragment));
+      if (grams.size >= FRAGMENT_MAX_GRAMS) {
+        capped = true;
+        break;
+      }
+    }
+    if (capped) break;
+  }
+  return { grams, capped, minFragment };
+}
+function maskValueFragmentsWith(text, matcher, label = "REDACTED") {
+  const { grams, capped, minFragment } = matcher;
+  if (text.length < minFragment) return text;
+  const replacement = `<${label}>`;
+  if (capped) return replacement;
+  if (grams.size === 0) return text;
+  const n = text.length;
+  let out = "";
+  let i = 0;
+  while (i + minFragment <= n) {
+    if (grams.has(text.slice(i, i + minFragment))) {
+      let j = i;
+      while (j + 1 + minFragment <= n && grams.has(text.slice(j + 1, j + 1 + minFragment))) j += 1;
+      out += replacement;
+      i = j + minFragment;
+    } else {
+      out += text[i];
+      i += 1;
+    }
+  }
+  out += text.slice(i);
+  return out;
+}
+function deriveSensitiveValues(args) {
+  const values = [];
+  for (const t of args) {
+    values.push(t);
+    const eq = t.indexOf("=");
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}
+
+// src/shared/root-manifest.ts
 var import_node_fs = require("node:fs");
+var import_node_path = require("node:path");
+var ALT_ROOT_MANIFESTS = ["package.yaml", "package.json5"];
+function unsupportedAltRootManifest(repoDir) {
+  if ((0, import_node_fs.existsSync)((0, import_node_path.join)(repoDir, "package.json"))) return null;
+  for (const name of ALT_ROOT_MANIFESTS) {
+    if ((0, import_node_fs.existsSync)((0, import_node_path.join)(repoDir, name))) return name;
+  }
+  return null;
+}
+
+// src/guest/proc-reader.ts
+var import_node_fs2 = require("node:fs");
 var LinuxProcReader = class {
   root;
   /**
@@ -25218,7 +25417,7 @@ var LinuxProcReader = class {
    */
   readPpid(pid) {
     try {
-      const text = (0, import_node_fs.readFileSync)(`${this.root}/${pid}/status`, "utf8");
+      const text = (0, import_node_fs2.readFileSync)(`${this.root}/${pid}/status`, "utf8");
       const match = text.match(/^PPid:\s*(\d+)/m);
       if (match === null) return null;
       const raw = match[1];
@@ -25238,7 +25437,7 @@ var LinuxProcReader = class {
    */
   readEnviron(pid) {
     try {
-      const buf = (0, import_node_fs.readFileSync)(`${this.root}/${pid}/environ`);
+      const buf = (0, import_node_fs2.readFileSync)(`${this.root}/${pid}/environ`);
       const text = buf.toString("utf8");
       const map2 = /* @__PURE__ */ new Map();
       for (const token of text.split("\0")) {
@@ -25355,6 +25554,184 @@ var Emitter = class {
   }
 };
 
+// src/guest/phase-fetch.ts
+var import_node_fs3 = require("node:fs");
+var import_node_path2 = require("node:path");
+
+// src/shared/pm-commands.ts
+var FETCH_CMD = {
+  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
+  pnpm: {
+    cmd: "pnpm",
+    args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"]
+  },
+  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
+};
+var INSTALL_CMD = {
+  // SECURITY (#43, home/project-npmrc node-options): npm re-derives `node-options`
+  // from the EFFECTIVE npm config (userconfig $HOME/.npmrc AND the project
+  // repoDir/.npmrc, the latter PR-controlled + staged into the sandbox) and exports
+  // it to lifecycle scripts as both the child `NODE_OPTIONS` and the
+  // `npm_config_node_options` env value.  `--no-node-options` neutralizes BOTH on
+  // EVERY Phase-B site at once (this is the shared, lockstep source): the trusted
+  // host never honors an audit-blind home-npmrc `--require <path>` (the host has no
+  // shim to overwrite NODE_OPTIONS), and host+guest export an IDENTICAL empty
+  // `npm_config_node_options` so a script branching on that env value cannot diverge
+  // (env-spy records the NAME only — a host-only flag would be a value-blind oracle).
+  // It MUST live here, not in a host-only hardening list, precisely to keep the host
+  // and guest argv byte-identical.  Guest instrumentation is unaffected: the JS
+  // preloads ride the LD_PRELOAD shim's exec-time NODE_OPTIONS rewrite, not npm's
+  // node-options passthrough.  Verified npm 11.13.0: an empty NODE_OPTIONS /
+  // npm_config_node_options ENV pin does NOT override the npmrc file, but
+  // `--no-node-options` does, and it preserves the npmrc's registry/auth.
+  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts", "--no-node-options"] },
+  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events). Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
+};
+function pnpmStoreDirArg(pm, cwd) {
+  return pm === "pnpm" ? [`--store-dir=${cwd}/.pnpm-store`] : [];
+}
+function isBareFlag(token) {
+  return !token.includes("=");
+}
+function registryUrlHasCredentials(value) {
+  try {
+    const u = new URL(value);
+    if (u.username.length > 0 || u.password.length > 0) return true;
+  } catch {
+  }
+  let s = value.trim();
+  const scheme = /^[a-z][a-z0-9+.-]{0,31}:/i.exec(s);
+  if (scheme !== null) s = s.slice(scheme[0].length);
+  if (s.startsWith("//")) s = s.slice(2);
+  const authority = s.split(/[/?#]/, 1)[0] ?? "";
+  return authority.includes("@");
+}
+function canonicalFlagKey(token) {
+  if (token.length === 0 || token[0] !== "-") return null;
+  let i = 0;
+  while (i < token.length && token[i] === "-") i += 1;
+  let body = token.slice(i);
+  const eq = body.indexOf("=");
+  if (eq !== -1) body = body.slice(0, eq);
+  body = body.toLowerCase();
+  if (body.startsWith("no-")) body = body.slice("no-".length);
+  if (body.startsWith("config.")) body = body.slice("config.".length);
+  let key = "";
+  for (const ch of body) {
+    if (ch !== "-" && ch !== "_" && ch !== ".") key += ch;
+  }
+  return key;
+}
+function dropReason(key) {
+  switch (key) {
+    case "ignorescripts":
+      return "--ignore-scripts";
+    case "frozenlockfile":
+      return "--frozen-lockfile";
+    case "fixlockfile":
+      return "--fix-lockfile";
+    case "lockfiledir":
+      return "--lockfile-dir";
+    case "lockfileonly":
+      return "--lockfile-only";
+    case "lockfile":
+      return "--lockfile";
+    case "modulesdir":
+      return "--modules-dir";
+    case "virtualstoredir":
+      return "--virtual-store-dir";
+    case "storedir":
+      return "--store-dir";
+    case "workspaceroot":
+      return "--workspace-root";
+    case "dir":
+      return "--dir";
+    case "prefix":
+      return "--prefix";
+    case "global":
+      return "--global";
+    case "filter":
+      return "--filter";
+    case "recursive":
+      return "--recursive";
+    case "mode":
+      return "--mode";
+    case "immutable":
+      return "--immutable";
+    case "registry":
+      return "--registry (inline credentials \u2014 set registry auth in .npmrc/env)";
+    default:
+      return "<flag>";
+  }
+}
+var ALLOWED_FLAG_KEYS = /* @__PURE__ */ new Map([
+  ["omit", { takesValue: true }],
+  ["include", { takesValue: true }],
+  ["prod", { takesValue: false }],
+  ["production", { takesValue: false }],
+  ["dev", { takesValue: false }],
+  ["optional", { takesValue: false }],
+  ["p", { takesValue: false }],
+  // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
+  ["d", { takesValue: false }],
+  // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
+  // private-registry SOURCE; root-lock gate unaffected (see note).  AUTH must go
+  // in .npmrc/env — an inline-credential URL value is rejected (F1).
+  ["registry", { takesValue: true, rejectValue: registryUrlHasCredentials }]
+]);
+var ALLOWED_ARCH_KEYS = /* @__PURE__ */ new Map([
+  ["cpu", { takesValue: true }],
+  ["os", { takesValue: true }],
+  ["libc", { takesValue: true }]
+]);
+function filterAgainstAllowlist(args, allow) {
+  const kept = [];
+  const dropped = [];
+  const droppedKeys = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const key = canonicalFlagKey(a);
+    if (key !== null && key.length > 0) {
+      const allowed = allow.get(key);
+      if (allowed !== void 0) {
+        const eq = a.indexOf("=");
+        const splitValue = allowed.takesValue && isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-") ? args[i + 1] : void 0;
+        const value = eq >= 0 ? a.slice(eq + 1) : splitValue;
+        if (allowed.rejectValue !== void 0 && value !== void 0 && allowed.rejectValue(value)) {
+          dropped.push(a);
+          droppedKeys.push(dropReason(key));
+          if (splitValue !== void 0) dropped.push(args[++i]);
+          continue;
+        }
+        kept.push(a);
+        if (splitValue !== void 0) {
+          kept.push(args[++i]);
+        }
+        continue;
+      }
+      dropped.push(a);
+      droppedKeys.push(dropReason(key));
+      if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        dropped.push(args[++i]);
+      }
+      continue;
+    }
+    dropped.push(a);
+    droppedKeys.push("<positional>");
+  }
+  return { kept, dropped, droppedKeys };
+}
+function sanitizeInstallArgs(args) {
+  return filterAgainstAllowlist(args, ALLOWED_FLAG_KEYS);
+}
+function sanitizeArchInstallArgs(args) {
+  return filterAgainstAllowlist(args, ALLOWED_ARCH_KEYS);
+}
+
 // src/guest/apply-pnpm-arch.ts
 var fs = __toESM(require("node:fs"), 1);
 var path = __toESM(require("node:path"), 1);
@@ -25370,7 +25747,7 @@ function applyPnpmArchOverlay(input) {
   const overlayPath = input.overlayPath ?? PNPM_ARCH_PATH;
   let supportedArchitectures;
   try {
-    const raw = fs.readFileSync(overlayPath, "utf8");
+    const raw = input.content !== void 0 ? input.content : fs.readFileSync(overlayPath, "utf8");
     const parsed = PnpmArchSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) return { applied: false };
     supportedArchitectures = parsed.data.supportedArchitectures;
@@ -25403,43 +25780,75 @@ function applyPnpmArchOverlay(input) {
 // src/guest/load-pm-flags.ts
 var fs2 = __toESM(require("node:fs"), 1);
 var PmFlagsSchema = external_exports.object({
-  extra_install_args: external_exports.array(external_exports.string())
+  extra_install_args: external_exports.array(external_exports.string()),
+  user_install_args: external_exports.array(external_exports.string()).optional()
 });
 var PM_FLAGS_PATH = "/etc/script-jail/pm-flags.json";
-function loadPmFlags(filePath = PM_FLAGS_PATH) {
+function loadPmFlags(filePath = PM_FLAGS_PATH, content) {
   try {
-    const raw = fs2.readFileSync(filePath, "utf8");
+    const raw = content !== void 0 ? content : fs2.readFileSync(filePath, "utf8");
     const parsed = PmFlagsSchema.safeParse(JSON.parse(raw));
-    if (!parsed.success) return { extraInstallArgs: [] };
-    return { extraInstallArgs: parsed.data.extra_install_args };
+    if (!parsed.success) return { extraInstallArgs: [], userInstallArgs: [] };
+    return {
+      extraInstallArgs: sanitizeArchInstallArgs(parsed.data.extra_install_args).kept,
+      userInstallArgs: sanitizeInstallArgs(parsed.data.user_install_args ?? []).kept
+    };
   } catch {
-    return { extraInstallArgs: [] };
+    return { extraInstallArgs: [], userInstallArgs: [] };
   }
 }
 
 // src/guest/phase-fetch.ts
-var FETCH_CMD = {
-  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"] },
-  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
-};
-async function runFetchPhase(input) {
-  const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
-  let args = baseArgs;
-  if (input.manager === "npm") {
-    const { extraInstallArgs } = loadPmFlags(input.pmFlagsPath);
-    if (extraInstallArgs.length > 0) {
-      args = [...baseArgs, ...extraInstallArgs];
+function trustedGuestGit(cwd) {
+  const pathVar = process.env["PATH"];
+  if (pathVar !== void 0 && pathVar !== "") {
+    const repo = (0, import_node_path2.resolve)(cwd);
+    for (const dir of pathVar.split(import_node_path2.delimiter)) {
+      if (dir === "") continue;
+      const candidate = (0, import_node_path2.join)(dir, "git");
+      if (!(0, import_node_path2.isAbsolute)(candidate)) continue;
+      if (candidate === repo || candidate.startsWith(repo + "/")) continue;
+      let st;
+      try {
+        st = (0, import_node_fs3.statSync)(candidate);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      try {
+        (0, import_node_fs3.accessSync)(candidate, import_node_fs3.constants.X_OK);
+      } catch {
+        continue;
+      }
+      return candidate;
     }
   }
-  if (input.manager === "pnpm") {
-    applyPnpmArchOverlay({ cwd: input.cwd, ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {} });
+  return "git";
+}
+async function runFetchPhase(input) {
+  const { cmd, args: baseArgs } = FETCH_CMD[input.manager];
+  const { extraInstallArgs, userInstallArgs } = loadPmFlags(
+    input.pmFlagsPath,
+    input.pmFlagsContent
+  );
+  let args = baseArgs;
+  if (input.manager === "npm" && extraInstallArgs.length > 0) {
+    args = [...args, ...extraInstallArgs];
+  }
+  if (userInstallArgs.length > 0) {
+    args = [...args, ...userInstallArgs];
   }
   if (input.manager === "pnpm") {
-    args = [...args, `--store-dir=${input.cwd}/.pnpm-store`];
+    applyPnpmArchOverlay({
+      cwd: input.cwd,
+      ...input.pnpmArchPath !== void 0 ? { overlayPath: input.pnpmArchPath } : {},
+      ...input.pnpmArchContent !== void 0 ? { content: input.pnpmArchContent } : {}
+    });
   }
+  args = [...args, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  const env = input.manager === "npm" ? { ...input.env, npm_config_git: trustedGuestGit(input.cwd) } : input.env;
   const result = await input.spawner.spawn(cmd, args, {
-    env: input.env,
+    env,
     cwd: input.cwd
   });
   return {
@@ -25449,7 +25858,15 @@ async function runFetchPhase(input) {
     // resolution failures, …) to STDOUT; stderr is typically empty.  Return
     // stdout too so the agent's Phase A failure dump can include it — an
     // empty fatal message hides the actual cause (found dogfooding napi-rs).
-    stdout: result.stdout
+    stdout: result.stdout,
+    // Surface the (already re-sanitized) developer install args spliced into
+    // the fetch argv above.  On the Phase-A FAILURE path the agent masks these
+    // exact values out of the redacted detail BEFORE it reaches either sink
+    // (serial console + fatal frame) — a PM error like
+    // `npm warn invalid config registry="SECRET"` echoes a user-arg value that
+    // matches no credential SHAPE and no protected-ENV value, so without this
+    // it would leak to the public Actions log (adversarial-review round-7).
+    userInstallArgs
   };
 }
 
@@ -26100,15 +26517,35 @@ function normalizePattern(p) {
   return p;
 }
 
+// src/guest/root-anchor.ts
+var MAX_DEPTH = 1024;
+function isRepoRootAnchored(input) {
+  const { childParent, execCwd, workDir, rootPid } = input;
+  let cur = input.pid;
+  for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    if (cur === rootPid) {
+      return true;
+    }
+    if (input.cwdUnknown(cur)) {
+      return false;
+    }
+    const ec = execCwd.get(cur);
+    if (ec === null) {
+      return false;
+    }
+    if (ec !== void 0 && ec !== workDir) {
+      return false;
+    }
+    const parent = childParent.get(cur);
+    if (parent === void 0) {
+      return false;
+    }
+    cur = parent;
+  }
+  return false;
+}
+
 // src/guest/phase-install.ts
-var INSTALL_CMD = {
-  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
-  // exit 1, zero events).  Offline is enforced by the Phase-B network-namespace
-  // sever; the cache Phase A populated makes this a zero-network relink+build.
-  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
-};
 var NODE_STARTUP_DONE_STRACE_PATH = "/tmp/script-jail-node-startup-done";
 function parseShimLine(line) {
   try {
@@ -26146,8 +26583,8 @@ function parseShimLine(line) {
     return null;
   }
 }
-function shimExecAttribution(line) {
-  return shimNpmAttribution(line, "exec");
+function shimExecAttribution(line, rootSentinel, rootKeys) {
+  return shimNpmAttribution(line, "exec", rootSentinel, rootKeys);
 }
 function shimNpmFields(line, kind) {
   try {
@@ -26167,17 +26604,17 @@ function shimNpmFields(line, kind) {
     return null;
   }
 }
-function shimNpmAttribution(line, kind) {
+function shimNpmAttribution(line, kind, rootSentinel, rootKeys) {
   const fields = shimNpmFields(line, kind);
   if (fields === null || fields.pathological) return null;
-  return attributionFromEnvVars(fields.name, fields.version, fields.event);
+  return attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel, rootKeys);
 }
-function classifyShimNodeStartupMarker(line) {
+function classifyShimNodeStartupMarker(line, rootSentinel, rootKeys) {
   const fields = shimNpmFields(line, "node_startup_done");
   if (fields === null) return { attribution: null, pathological: false };
   if (fields.pathological) return { attribution: null, pathological: true };
   return {
-    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event),
+    attribution: attributionFromEnvVars(fields.name, fields.version, fields.event, rootSentinel, rootKeys),
     pathological: false
   };
 }
@@ -26195,7 +26632,13 @@ function isNodeBasename(pathLike) {
 function isPackageManagerClientBasename(pathLike) {
   if (pathLike === void 0 || pathLike.length === 0) return false;
   const base = pathBasename(pathLike);
-  return base === "npm" || base === "npx" || base === "npm-cli.js" || base === "pnpm" || base === "pnpm.cjs" || base === "yarn" || base === "yarnpkg" || base === "yarn.js" || base === "corepack";
+  return base === "npm" || base === "npx" || base === "npm-cli.js" || base === "pnpm" || base === "pnpm.cjs" || // pnpm 11.x's corepack-cached entry is `pnpm.mjs` (10.x is `pnpm.cjs`).
+  // Round-16 direct-launch execs `node <cache>/pnpm.mjs`, so the classifier
+  // (which keys on argv[1] for a `node <script>` spawn) must match it or the
+  // pnpm-11 driver pid is misclassified as a normal node → its env reads leak
+  // into the lock AND its bootstrap env-read names pollute the global
+  // nodeBootstrapEnvReads suppression set (over-suppressing real package reads).
+  base === "pnpm.mjs" || base === "yarn" || base === "yarnpkg" || base === "yarn.js" || base === "corepack";
 }
 function firstExecPathFromStraceLine(line) {
   let match = line.match(/^execve\("((?:\\.|[^"\\])*)"/);
@@ -26234,9 +26677,75 @@ function cloneFlagsHaveUntraced(line) {
   }
   return false;
 }
+function readManagerBinRel(verDir, manager) {
+  for (const file2 of [".corepack", "package.json"]) {
+    try {
+      const meta3 = JSON.parse(fs3.readFileSync(path2.join(verDir, file2), "utf8"));
+      const bin = meta3.bin;
+      if (bin !== void 0 && !Array.isArray(bin)) {
+        const rel = bin[manager];
+        if (typeof rel === "string" && rel.length > 0) return rel;
+      }
+    } catch {
+    }
+  }
+  return null;
+}
+function resolveLinuxManagerLaunch(manager, corepackHome, execPath) {
+  if (manager === "npm") {
+    const toolchainRoot = path2.dirname(path2.dirname(execPath));
+    const entry2 = path2.join(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    if (!fs3.existsSync(entry2)) {
+      throw new Error(`resolveLinuxManagerLaunch: npm-cli.js not found at ${entry2}`);
+    }
+    return { node: execPath, entry: entry2 };
+  }
+  if (corepackHome === void 0 || corepackHome.length === 0) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: COREPACK_HOME is unset; cannot resolve the offline ${manager} entry`
+    );
+  }
+  const pmDir = path2.join(corepackHome, "v1", manager);
+  let versionDirs;
+  try {
+    versionDirs = fs3.readdirSync(pmDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch (err) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: cannot read corepack cache dir ${pmDir}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (versionDirs.length !== 1) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: expected exactly one ${manager} version dir under ${pmDir}, found ${versionDirs.length}${versionDirs.length > 0 ? ` (${versionDirs.join(", ")})` : ""}`
+    );
+  }
+  const verDir = path2.join(pmDir, versionDirs[0]);
+  if (manager === "yarn") {
+    const entry2 = path2.join(verDir, "yarn.js");
+    if (!fs3.existsSync(entry2)) {
+      throw new Error(`resolveLinuxManagerLaunch: yarn.js not found at ${entry2}`);
+    }
+    return { node: execPath, entry: entry2 };
+  }
+  const rel = readManagerBinRel(verDir, manager);
+  if (rel === null) {
+    throw new Error(
+      `resolveLinuxManagerLaunch: could not read the ${manager} entry path from ${path2.join(verDir, ".corepack")} or package.json bin`
+    );
+  }
+  const entry = path2.resolve(verDir, rel);
+  if (!fs3.existsSync(entry)) {
+    throw new Error(`resolveLinuxManagerLaunch: ${manager} entry not found at ${entry}`);
+  }
+  return { node: execPath, entry };
+}
 async function runInstallPhase(input) {
-  const { cmd, args: baseArgs } = INSTALL_CMD[input.manager];
-  const args = input.manager === "pnpm" ? [...baseArgs, `--store-dir=${input.cwd}/.pnpm-store`] : baseArgs;
+  const { cmd: baseCmd, args: baseArgs } = input.commandOverride ?? INSTALL_CMD[input.manager];
+  const userArgs = input.commandOverride === void 0 && input.manager === "npm" ? input.userInstallArgs ?? [] : [];
+  const builtArgs = [...baseArgs, ...userArgs, ...pnpmStoreDirArg(input.manager, input.cwd)];
+  const rawLaunch = input.commandOverride?.raw === true;
+  const cmd = rawLaunch ? baseCmd : input.managerLaunch !== void 0 ? input.managerLaunch.node : baseCmd;
+  const args = rawLaunch ? baseArgs : input.managerLaunch !== void 0 ? [input.managerLaunch.entry, ...builtArgs] : builtArgs;
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -26248,11 +26757,19 @@ async function runInstallPhase(input) {
     if (phaseTamperReason === null) phaseTamperReason = reason;
     input.strace.recordTamper(reason);
   };
-  const emit = (ev) => {
+  const emitFinal = (ev) => {
     const filtered = applyProtectedPathsPolicy(ev, matcher);
     if (filtered === null) return;
     input.emitter.emitEvent(filtered);
     eventCount++;
+  };
+  const deferredRootEvents = [];
+  const emit = (ev) => {
+    if (input.rootPkgKeys !== void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_read" || ev.raw.kind === "env_tamper") && input.rootPkgKeys.has(ev.pkg) && ev.raw.root_anchored === void 0) {
+      deferredRootEvents.push(ev);
+      return;
+    }
+    emitFinal(ev);
   };
   const straceExecsByPid = /* @__PURE__ */ new Map();
   const shimExecCountByPid = /* @__PURE__ */ new Map();
@@ -26516,6 +27033,8 @@ async function runInstallPhase(input) {
     return r;
   }
   function unionCwd(parentPid, childPid) {
+    everCwdShared.add(parentPid);
+    everCwdShared.add(childPid);
     const pr = rootedCwd(parentPid);
     const cr = rootedCwd(childPid);
     if (pr === cr) return;
@@ -26645,6 +27164,7 @@ async function runInstallPhase(input) {
     const sharedCwd = pidCwd.get(sharedRoot);
     const sharedUnknown = pidCwdUnknown.has(sharedRoot);
     if (sharedRoot !== pid) {
+      everCwdShared.add(pid);
       cwdParent.delete(pid);
       if (sharedCwd !== void 0) pidCwd.set(pid, sharedCwd);
       if (sharedUnknown) pidCwdUnknown.add(pid);
@@ -26660,6 +27180,7 @@ async function runInstallPhase(input) {
     if (otherMembers.length === 0) {
       return;
     }
+    everCwdShared.add(pid);
     otherMembers.sort((a, b) => a - b);
     const newRoot = otherMembers[0];
     cwdParent.delete(newRoot);
@@ -26681,6 +27202,48 @@ async function runInstallPhase(input) {
   const dirfdTable = /* @__PURE__ */ new Map();
   const fdKey = (pid, fd) => `${rootedFd(pid)}:${fd}`;
   const pidCwd = /* @__PURE__ */ new Map();
+  const childParent = /* @__PURE__ */ new Map();
+  const childParentReused = /* @__PURE__ */ new Set();
+  const childAllParents = /* @__PURE__ */ new Map();
+  const execCwd = /* @__PURE__ */ new Map();
+  const pendingExecCwd = /* @__PURE__ */ new Set();
+  const firstCwdMutationTs = /* @__PURE__ */ new Map();
+  const lastCwdMutationTs = /* @__PURE__ */ new Map();
+  const everCwdShared = /* @__PURE__ */ new Set();
+  const cloneFsEdges = /* @__PURE__ */ new Map();
+  const addCloneFsEdge = (a, b) => {
+    let sa = cloneFsEdges.get(a);
+    if (sa === void 0) {
+      sa = /* @__PURE__ */ new Set();
+      cloneFsEdges.set(a, sa);
+    }
+    sa.add(b);
+    let sb = cloneFsEdges.get(b);
+    if (sb === void 0) {
+      sb = /* @__PURE__ */ new Set();
+      cloneFsEdges.set(b, sb);
+    }
+    sb.add(a);
+  };
+  const pidCloneTimeCwd = /* @__PURE__ */ new Map();
+  const childSeedCloneTs = /* @__PURE__ */ new Map();
+  const deferredRelOpens = [];
+  const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
+  function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
+    const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
+    for (const d of deferredRelOpens) {
+      if (d.stamped) continue;
+      if (d.rawEvent.pid !== childPid) continue;
+      if (d.pkg === null || d.lifecycle === null) {
+        d.inheritedAttrib = parentAttrib;
+      }
+      d.initialCwd = inheritedCwd;
+      d.cloneFsSeed = cloneFsSeed;
+      d.seedParentPid = parentPid;
+      d.bootstrapPendingInherited = bootstrapPendingInherited;
+      d.stamped = true;
+    }
+  }
   const pidCwdUnknown = /* @__PURE__ */ new Set();
   function cwdGet(pid) {
     return pidCwd.get(rootedCwd(pid));
@@ -26699,6 +27262,22 @@ async function runInstallPhase(input) {
   }
   function cwdUnknownDelete(pid) {
     pidCwdUnknown.delete(rootedCwd(pid));
+  }
+  function rootAnchored(pid) {
+    const rootPid = installRootPid;
+    if (rootPid === null) return false;
+    return isRepoRootAnchored({
+      pid,
+      childParent,
+      execCwd,
+      // Group-aware: `pidCwdUnknown` is keyed by cwd-group root (CLONE_FS), so
+      // querying the raw pid would miss a pid marked unknown via a sibling.
+      // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
+      // walker's fail-closed disqualifier sees the real unknown state.
+      cwdUnknown: cwdUnknownHas,
+      workDir: path2.resolve(input.cwd),
+      rootPid
+    });
   }
   const dirfdStateUnknown = /* @__PURE__ */ new Set();
   function fdUnknownHas(pid) {
@@ -26975,6 +27554,7 @@ async function runInstallPhase(input) {
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path2.resolve(input.cwd));
+        execCwd.set(pid, path2.resolve(input.cwd));
       }
     }
     if (source === "shim") {
@@ -26992,7 +27572,7 @@ async function runInstallPhase(input) {
           completedPackageManagerClientPids.delete(shimEvent.pid);
           packageManagerClientPids.add(shimEvent.pid);
         }
-        const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line);
+        const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel, input.rootPkgKeys);
         nodeStartupMarkerByPid.set(shimEvent.pid, {
           ts: lineTs,
           pathological: startupPathological
@@ -27010,7 +27590,7 @@ async function runInstallPhase(input) {
         continue;
       }
       const result = input.attribution.attribute(shimEvent.pid);
-      const shimAttrib = shimExecAttribution(line);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel, input.rootPkgKeys);
       if (shimEvent.kind === "exec") {
         const current = shimExecCountByPid.get(shimEvent.pid) ?? 0;
         const next = shimEvent.result === "failed" ? current > 0 ? current - 1 : 0 : current + 1;
@@ -27061,6 +27641,8 @@ async function runInstallPhase(input) {
       }
       const chdirMatch = line.match(/^chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0\b/);
       if (chdirMatch !== null) {
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs);
         const rawTarget = chdirMatch[1] ?? "";
         const decoded = unescapeStraceString(rawTarget);
         if (path2.isAbsolute(decoded)) {
@@ -27078,6 +27660,8 @@ async function runInstallPhase(input) {
       }
       const fchdirMatch = line.match(/^fchdir\((-?\d+)\)\s*=\s*0\b/);
       if (fchdirMatch !== null) {
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs);
         const fd = parseInt(fchdirMatch[1] ?? "", 10);
         if (Number.isFinite(fd)) {
           const dirEntry = dirfdTable.get(fdKey(pid, fd));
@@ -27089,6 +27673,14 @@ async function runInstallPhase(input) {
             cwdDelete(pid);
           }
         }
+        continue;
+      }
+      const splitCwdMutation = (line.startsWith("chdir(") || line.startsWith("fchdir(")) && line.includes("<unfinished ...>") || line.startsWith("<...") && (line.includes("chdir resumed") || line.includes("fchdir resumed"));
+      if (splitCwdMutation) {
+        if (!firstCwdMutationTs.has(pid)) firstCwdMutationTs.set(pid, lineTs);
+        lastCwdMutationTs.set(pid, lineTs);
+        cwdUnknownAdd(pid);
+        cwdDelete(pid);
         continue;
       }
       const cloneMatch = line.match(/^(clone3?|vfork|fork)\b/);
@@ -27104,6 +27696,20 @@ async function runInstallPhase(input) {
           const childPid = parseInt(rcMatch[1] ?? "", 10);
           if (Number.isFinite(childPid) && childPid > 0) {
             propagateNodeBootstrap(pid, childPid);
+            const priorParent = childParent.get(childPid);
+            if (priorParent !== void 0 && priorParent !== pid) {
+              childParentReused.add(childPid);
+            }
+            childParent.set(childPid, pid);
+            let allParents = childAllParents.get(childPid);
+            if (allParents === void 0) {
+              allParents = /* @__PURE__ */ new Set();
+              childAllParents.set(childPid, allParents);
+            }
+            allParents.add(pid);
+            const parentCloneTimeCwd = cwdUnknownHas(pid) ? null : cwdGet(pid) ?? null;
+            if (!pidCloneTimeCwd.has(childPid)) pidCloneTimeCwd.set(childPid, parentCloneTimeCwd);
+            if (!childSeedCloneTs.has(childPid)) childSeedCloneTs.set(childPid, lineTs);
             let cloneFs = false;
             let cloneFiles = false;
             if (syscallName === "clone" || syscallName === "clone3") {
@@ -27115,6 +27721,11 @@ async function runInstallPhase(input) {
                   else if (tok === "CLONE_FILES") cloneFiles = true;
                 }
               }
+            }
+            if (cloneFs) {
+              everCwdShared.add(pid);
+              everCwdShared.add(childPid);
+              addCloneFsEdge(pid, childPid);
             }
             const childCwdSnap = pendingCwdDetach.get(childPid);
             pendingCwdDetach.delete(childPid);
@@ -27165,6 +27776,27 @@ async function runInstallPhase(input) {
                 cwdSet(childPid, parentCwd);
               }
             }
+            if (pendingExecCwd.has(childPid)) {
+              execCwd.set(
+                childPid,
+                cwdUnknownHas(childPid) ? null : cwdGet(childPid) ?? null
+              );
+              pendingExecCwd.delete(childPid);
+            }
+            let parentAttribForStamp = freshSnapshotAttribution(pid);
+            if (parentAttribForStamp === null) {
+              const sampled = input.attribution.attribute(pid);
+              if (sampled !== null) {
+                parentAttribForStamp = { pkg: sampled.pkg, lifecycle: sampled.lifecycle };
+              }
+            }
+            stampDeferredRelOpens(
+              childPid,
+              parentCloneTimeCwd,
+              cloneFs,
+              parentAttribForStamp,
+              pid
+            );
             if (cloneFiles && !childHadPendingFdDetach) {
               unionFd(pid, childPid);
               if (standaloneFdTombstones !== void 0 && standaloneFdTombstones.length > 0) {
@@ -27812,6 +28444,18 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          if (!execCwd.has(rawEvent.pid)) {
+            if (cwdUnknownHas(rawEvent.pid)) {
+              execCwd.set(rawEvent.pid, null);
+            } else {
+              const cwd = cwdGet(rawEvent.pid);
+              if (cwd !== void 0) {
+                execCwd.set(rawEvent.pid, cwd);
+              } else {
+                pendingExecCwd.add(rawEvent.pid);
+              }
+            }
+          }
           const isPackageManagerClient = isPackageManagerClientSpawn(rawEvent, line);
           flushNodeBootstrapCandidate(rawEvent.pid);
           packageManagerClientPids.delete(rawEvent.pid);
@@ -27860,6 +28504,9 @@ async function runInstallPhase(input) {
         if (rawEvent.kind === "read" && rawEvent.path === NODE_STARTUP_DONE_STRACE_PATH) {
           completeNodeBootstrapCandidateFileMarker(rawEvent.pid);
           nodeBootstrapFileCompletedPids.add(rawEvent.pid);
+          if (!nodeBootstrapFileEndedTs.has(rawEvent.pid)) {
+            nodeBootstrapFileEndedTs.set(rawEvent.pid, rawEvent.ts);
+          }
           clearNodeBootstrapFile(rawEvent.pid);
           continue;
         }
@@ -27968,6 +28615,15 @@ async function runInstallPhase(input) {
                 lifecycle: isStale ? "install" : spawnSnapshot.lifecycle
               });
             }
+            continue;
+          }
+          if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.dirfd === void 0 && !path2.isAbsolute(rawEvent.path) && canonicalizeForEmit(rawEvent.pid, rawEvent.path, rawEvent.dirfd) === null) {
+            deferredRelOpens.push({
+              rawEvent,
+              pkg: null,
+              lifecycle: null,
+              sharedAtRead: everCwdShared.has(rawEvent.pid)
+            });
           }
           continue;
         }
@@ -27978,20 +28634,32 @@ async function runInstallPhase(input) {
             rawEvent.dirfd
           );
           if (canonical === null) {
-            unresolvedPathSamples.push({
-              pid: rawEvent.pid,
-              ts: rawEvent.ts,
-              path: rawEvent.path,
-              kind: rawEvent.kind,
-              pkg: result.pkg,
-              lifecycle: result.lifecycle
-            });
+            if (rawEvent.dirfd === void 0 && !path2.isAbsolute(rawEvent.path)) {
+              deferredRelOpens.push({
+                rawEvent,
+                pkg: result.pkg,
+                lifecycle: result.lifecycle,
+                sharedAtRead: everCwdShared.has(rawEvent.pid)
+              });
+            } else {
+              unresolvedPathSamples.push({
+                pid: rawEvent.pid,
+                ts: rawEvent.ts,
+                path: rawEvent.path,
+                kind: rawEvent.kind,
+                pkg: result.pkg,
+                lifecycle: result.lifecycle
+              });
+            }
             continue;
           }
           if (rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
             continue;
           }
-          const resolved = rawEvent.kind === "read" ? { ...rawEvent, path: canonical } : { ...rawEvent, path: canonical };
+          const resolved = {
+            ...rawEvent,
+            path: canonical
+          };
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
@@ -28017,6 +28685,169 @@ async function runInstallPhase(input) {
       `unknown LineSource (pid=${pid}, source=${JSON.stringify(sourceForReason)}). Audit-pipeline contract requires source \u2208 {"shim","strace"}.`
     );
   }
+  const lineageEverCwdShared = (startPid) => {
+    let a = startPid;
+    let guard = 0;
+    const seen = /* @__PURE__ */ new Set();
+    while (a !== void 0) {
+      if (guard++ >= 1e5) return true;
+      if (seen.has(a)) return true;
+      if (everCwdShared.has(a)) return true;
+      if (childParentReused.has(a)) return true;
+      seen.add(a);
+      a = childParent.get(a);
+    }
+    return false;
+  };
+  const cloneFsGroupEverMutated = (pid) => {
+    const stack = [pid];
+    const seen = /* @__PURE__ */ new Set();
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (cur === void 0 || seen.has(cur)) continue;
+      seen.add(cur);
+      if (firstCwdMutationTs.has(cur)) return true;
+      const adj = cloneFsEdges.get(cur);
+      if (adj !== void 0) {
+        for (const n of adj) if (!seen.has(n)) stack.push(n);
+      }
+    }
+    return false;
+  };
+  const lineageSharedGroupMutated = (startPid) => {
+    let a = startPid;
+    let guard = 0;
+    const seen = /* @__PURE__ */ new Set();
+    while (a !== void 0) {
+      if (guard++ >= 1e5) return true;
+      if (seen.has(a)) return true;
+      if (childParentReused.has(a)) return true;
+      if (everCwdShared.has(a) && cloneFsGroupEverMutated(a)) return true;
+      seen.add(a);
+      a = childParent.get(a);
+    }
+    return false;
+  };
+  for (const d of deferredRelOpens) {
+    const P = d.rawEvent.pid;
+    let pkg = d.pkg;
+    let lifecycle = d.lifecycle;
+    if (pkg === null || lifecycle === null) {
+      const inh = d.inheritedAttrib;
+      if (inh === null || inh === void 0) {
+        continue;
+      }
+      pkg = inh.pkg;
+      lifecycle = inh.lifecycle;
+    }
+    let initial = d.initialCwd;
+    let childPidReuseHidCloneFs = false;
+    if (childParentReused.has(P)) {
+      const parents = childAllParents.get(P);
+      if (parents !== void 0) {
+        for (const pp of parents) {
+          if (lineageEverCwdShared(pp)) {
+            childPidReuseHidCloneFs = true;
+            break;
+          }
+        }
+      }
+    }
+    if ((initial === null || initial === void 0) && d.stamped === true) {
+      let prev = P;
+      let a = d.seedParentPid;
+      let guard = 0;
+      const seen = /* @__PURE__ */ new Set();
+      while (a !== void 0) {
+        if (guard++ >= 1e5) break;
+        if (seen.has(a)) break;
+        if (firstCwdMutationTs.has(a)) {
+          const seedTs = childSeedCloneTs.get(prev);
+          const firstMut = firstCwdMutationTs.get(a);
+          if (seedTs === void 0 || firstMut === void 0) break;
+          if (firstMut > seedTs) {
+            const acwd2 = pidCloneTimeCwd.get(a);
+            if (typeof acwd2 === "string") {
+              initial = acwd2;
+              break;
+            }
+            seen.add(a);
+            prev = a;
+            a = childParent.get(a);
+            continue;
+          }
+          const lastMut = lastCwdMutationTs.get(a);
+          if (lastMut !== void 0 && lastMut < seedTs) {
+            const afinal = cwdGet(a);
+            if (typeof afinal === "string") initial = afinal;
+          }
+          break;
+        }
+        const acwd = pidCloneTimeCwd.get(a);
+        if (typeof acwd === "string") {
+          initial = acwd;
+          break;
+        }
+        seen.add(a);
+        prev = a;
+        a = childParent.get(a);
+      }
+    }
+    const sharedAtRead = d.sharedAtRead || d.cloneFsSeed === true || childPidReuseHidCloneFs || // Mutation-aware (was `lineageEverCwdShared`): a shared ANCESTOR group only
+    // taints the inherited cwd if SOME member of that fs_struct group mutated it
+    // (a non-causal cross-file chdir). A never-mutated shared group is immutable →
+    // the inherited value is provable → resolve. The leaf-side `d.sharedAtRead`,
+    // `d.cloneFsSeed`, and `childPidReuseHidCloneFs` veto terms stay STRICT.
+    d.seedParentPid !== void 0 && lineageSharedGroupMutated(d.seedParentPid);
+    let canonical = null;
+    if (d.stamped === true && typeof initial === "string" && !sharedAtRead) {
+      const firstMut = firstCwdMutationTs.get(P);
+      const provable = firstMut === void 0 || d.rawEvent.ts < firstMut;
+      if (provable) {
+        canonical = path2.resolve(initial, d.rawEvent.path);
+      }
+    }
+    if (canonical !== null) {
+      if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
+        continue;
+      }
+      const resolved = { ...d.rawEvent, path: canonical };
+      if (resolved.kind === "read" && !resolved.hidden && !matcher.isProtected(resolved.path)) {
+        const endedTs = nodeBootstrapFileEndedTs.get(P);
+        const childOwnWindowAtRead = endedTs !== void 0 && d.rawEvent.ts < endedTs;
+        const inheritedPending = d.bootstrapPendingInherited === true;
+        const readTimePending = inheritedPending && (endedTs === void 0 || d.rawEvent.ts < endedTs) || childOwnWindowAtRead;
+        if (readTimePending) {
+          nodeBootstrapFileReads.add(resolved.path);
+          continue;
+        }
+        if (nodeBootstrapFileReads.has(resolved.path)) {
+          continue;
+        }
+      } else if (shouldFilterNodeBootstrapFileRead(resolved)) {
+        continue;
+      }
+      const attributed = {
+        raw: resolved,
+        pkg,
+        lifecycle
+      };
+      if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+        continue;
+      }
+      emit(attributed);
+    } else {
+      unresolvedPathSamples.push({
+        pid: P,
+        ts: d.rawEvent.ts,
+        path: d.rawEvent.path,
+        kind: d.rawEvent.kind,
+        pkg,
+        lifecycle
+      });
+    }
+  }
+  deferredRelOpens.length = 0;
   flushAllNodeBootstrapCandidates();
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
@@ -28089,13 +28920,38 @@ async function runInstallPhase(input) {
       lifecycle: sample.lifecycle
     });
   }
+  for (const pid of pendingExecCwd) execCwd.set(pid, null);
+  pendingExecCwd.clear();
+  for (const pid of straceExecsByPid.keys()) {
+    if (!execCwd.has(pid)) execCwd.set(pid, null);
+  }
+  for (const [pid, count] of shimExecCountByPid) {
+    if (count > 0 && !execCwd.has(pid)) execCwd.set(pid, null);
+  }
+  for (const ev of deferredRootEvents) {
+    const anchored = rootAnchored(ev.raw.pid);
+    switch (ev.raw.kind) {
+      case "read":
+      case "write":
+      case "spawn":
+      case "connect":
+      case "env_read":
+      case "env_tamper":
+        emitFinal({ ...ev, raw: { ...ev.raw, root_anchored: anchored } });
+        break;
+      default:
+        emitFinal(ev);
+        break;
+    }
+  }
+  deferredRootEvents.length = 0;
   const exitCode = input.strace.getExitCode();
   const installStdoutTail = input.strace.getStdoutTail?.() ?? "";
   return { exitCode, eventCount, tamperReason: phaseTamperReason, installStdoutTail };
 }
 
 // src/guest/phase-install-macos.ts
-var import_node_path = require("node:path");
+var import_node_path3 = require("node:path");
 function parseMacosShimLine(line) {
   let obj;
   try {
@@ -28118,16 +28974,6 @@ function parseMacosShimLine(line) {
   }
   return parseShimLine(line);
 }
-var INSTALL_CMD2 = {
-  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts"] },
-  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
-  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
-  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
-  // rationale.  The macOS-bare backend is observe-only and does not sever the
-  // network, but the cache Phase A populated still makes this a relink+build
-  // with no required registry traffic.
-  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
-};
 var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
   "npm_package_name",
   "npm_package_version",
@@ -28135,17 +28981,24 @@ var STARTUP_MARKER_NPM_FIELDS = /* @__PURE__ */ new Set([
 ]);
 function macosManagerLaunch(manager, subArgs) {
   const node = process.execPath;
-  const toolchainRoot = (0, import_node_path.dirname)((0, import_node_path.dirname)(node));
+  const toolchainRoot = (0, import_node_path3.dirname)((0, import_node_path3.dirname)(node));
   if (manager === "npm") {
-    const npmCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    const npmCli = (0, import_node_path3.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
     return { cmd: node, args: [npmCli, ...subArgs] };
   }
-  const corepackCli = (0, import_node_path.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
+  const corepackCli = (0, import_node_path3.join)(toolchainRoot, "lib", "node_modules", "corepack", "dist", "corepack.js");
   return { cmd: node, args: [corepackCli, manager, ...subArgs] };
 }
-function buildMacosInstallCommand(manager, cwd) {
-  const base = INSTALL_CMD2[manager];
-  const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
+function buildMacosInstallCommand(manager, cwd, commandOverride, userInstallArgs) {
+  if (commandOverride !== void 0) {
+    if (commandOverride.raw === true) {
+      return { cmd: commandOverride.cmd, args: commandOverride.args };
+    }
+    return macosManagerLaunch(manager, commandOverride.args);
+  }
+  const base = INSTALL_CMD[manager];
+  const userArgs = manager === "npm" ? userInstallArgs ?? [] : [];
+  const managerArgs = manager === "pnpm" ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : [...base.args, ...userArgs];
   return macosManagerLaunch(manager, managerArgs);
 }
 function pathBasename2(pathLike) {
@@ -28155,7 +29008,12 @@ function pathBasename2(pathLike) {
   return slash === -1 ? value : value.slice(slash + 1);
 }
 async function runInstallPhaseMacos(input) {
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
+  const { cmd, args } = buildMacosInstallCommand(
+    input.manager,
+    input.cwd,
+    input.commandOverride,
+    input.userInstallArgs
+  );
   const basePath = input.straceBasePath ?? "/tmp/script-jail-strace/strace.out";
   const matcher = input.protectedPaths ?? new ProtectedPathsMatcher({
     patterns: [],
@@ -28387,7 +29245,7 @@ async function runInstallPhaseMacos(input) {
       continue;
     }
     if (shimEvent.kind === "node_startup_done") {
-      const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line);
+      const { attribution: startupAttrib, pathological: startupPathological } = classifyShimNodeStartupMarker(line, input.rootSentinel, input.rootPkgKeys);
       nodeStartupMarkerByPid.set(shimEvent.pid, { ts: lineTs, pathological: startupPathological });
       if (startupAttrib !== null) {
         nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
@@ -28401,7 +29259,7 @@ async function runInstallPhaseMacos(input) {
       continue;
     }
     if (shimEvent.kind === "exec") {
-      const shimAttrib = shimExecAttribution(line);
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel, input.rootPkgKeys);
       if (shimAttrib !== null) recordAttribution(shimEvent.pid, shimAttrib, lineTs);
       if (shimEvent.envp_alloc_failed) {
         const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
@@ -28437,7 +29295,8 @@ async function runInstallPhaseMacos(input) {
         };
         const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
         if (attribution2 !== null) {
-          emit({ raw: spawnRaw, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+          const raw2 = input.rootPkgKeys?.has(attribution2.pkg) === true ? { ...spawnRaw, root_anchored: true } : spawnRaw;
+          emit({ raw: raw2, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
         }
       } else {
         const failedResult = shimEvent.exec_errno === "ENOENT" ? "enoent" : shimEvent.exec_errno === "EACCES" ? "eacces" : null;
@@ -28452,7 +29311,8 @@ async function runInstallPhaseMacos(input) {
           };
           const attribution2 = shimAttrib ?? freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
           if (attribution2 !== null) {
-            emit({ raw: spawnRaw, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
+            const raw2 = input.rootPkgKeys?.has(attribution2.pkg) === true ? { ...spawnRaw, root_anchored: true } : spawnRaw;
+            emit({ raw: raw2, pkg: attribution2.pkg, lifecycle: attribution2.lifecycle });
           }
         }
       }
@@ -28462,9 +29322,13 @@ async function runInstallPhaseMacos(input) {
       if (shouldFilterNodeBootstrapEnvRead(shimEvent)) continue;
     }
     const attribution = freshSnapshotAttribution(shimEvent.pid) ?? nodeStartupAttribution(shimEvent.pid) ?? snapshotAttribution(shimEvent.pid);
-    if (attribution === null) continue;
+    if (attribution === null) {
+      continue;
+    }
+    const isRootAttributedAnchorableEvent = (shimEvent.kind === "read" || shimEvent.kind === "write" || shimEvent.kind === "connect" || shimEvent.kind === "env_read" || shimEvent.kind === "env_tamper") && input.rootPkgKeys?.has(attribution.pkg) === true;
+    const raw = isRootAttributedAnchorableEvent ? { ...shimEvent, root_anchored: true } : shimEvent;
     const attributed = {
-      raw: shimEvent,
+      raw,
       pkg: attribution.pkg,
       lifecycle: attribution.lifecycle
     };
@@ -28493,12 +29357,13 @@ async function runInstallPhaseMacos(input) {
 
 // src/guest/macos-install-runner.ts
 var import_node_child_process2 = require("node:child_process");
-var import_node_path2 = require("node:path");
+var import_node_path4 = require("node:path");
 var import_node_readline = require("node:readline");
 var MacOSInstallRunner = class {
   _exitCode = 0;
   _spawnImpl;
   _eventsFile;
+  _redactStderr;
   _tamperRef = { reason: null };
   /**
    * @param spawnImpl  Injection seam for tests.  Production passes through to
@@ -28508,10 +29373,17 @@ var MacOSInstallRunner = class {
    *                   `null`, the runner does not tail a shared events file
    *                   (used by tests that supply a pre-set environment via the
    *                   `opts.env` passed to `run()`).
+   * @param redactStderr Optional redactor applied to each forwarded install
+   *                   stderr line (SAME contract as LinuxStraceRunner's stdout
+   *                   redactor: exact protected-env values + credential SHAPES).
+   *                   The macOS-bare runner forwards the install's STDERR to the
+   *                   console, so without this a lifecycle script could leak a
+   *                   secret there while the Linux path masks it (F1/F4).
    */
-  constructor(spawnImpl, eventsFile) {
+  constructor(spawnImpl, eventsFile, redactStderr) {
     this._spawnImpl = spawnImpl ?? import_node_child_process2.spawn;
     this._eventsFile = eventsFile ?? null;
+    this._redactStderr = redactStderr;
   }
   getExitCode() {
     return this._exitCode;
@@ -28566,24 +29438,25 @@ var MacOSInstallRunner = class {
       env: opts.env,
       stdio: ["ignore", "ignore", "pipe", "pipe"]
     });
-    const exitPromise = new Promise((resolve2) => {
+    const exitPromise = new Promise((resolve3) => {
       child.on("close", (code) => {
         this._exitCode = code ?? 1;
-        resolve2();
+        resolve3();
       });
       child.on("error", () => {
         this._exitCode = 1;
-        resolve2();
+        resolve3();
       });
     });
-    const watchDir = (0, import_node_path2.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path2.basename)(opts.basePath);
+    const watchDir = (0, import_node_path4.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path4.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
       stderrRl = (0, import_node_readline.createInterface)({ input: child.stderr, crlfDelay: Infinity });
       stderrRl.on("line", (line) => {
-        process.stderr.write(`[macos] ${line}
+        const safe = this._redactStderr ? this._redactStderr(line) : line;
+        process.stderr.write(`[macos] ${safe}
 `);
       });
     }
@@ -28696,20 +29569,23 @@ function normalize(events, ctx) {
   const os = ctx.os ?? "linux";
   for (const ev of events) {
     const fsPath = (ev.raw.kind === "read" || ev.raw.kind === "write") && os === "darwin" ? canonicalizePrivateRealpath(ev.raw.path) : ev.raw.kind === "read" || ev.raw.kind === "write" ? ev.raw.path : void 0;
-    if (isSystemNoise(ev, fsPath, os)) continue;
+    if (isSystemNoise(ev, fsPath, os, ctx.roots)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
-    if (pkgDir === void 0 && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
+    const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
+    const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "env_read" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_tamper") && ev.raw.root_anchored !== true;
+    if (pkgDir === void 0 && !claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`
       );
     }
+    const forgedPrefix = isForgedRoot ? "<FORGED_ROOT> " : "";
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
     switch (ev.raw.kind) {
       case "read": {
         const tokenized = normalizeVolatilePath(tokenize(fsPath, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
-        const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
-        block.external_reads.push(tagged);
+        const hiddenTag = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
+        block.external_reads.push(`${forgedPrefix}${hiddenTag}`);
         break;
       }
       case "write": {
@@ -28717,12 +29593,12 @@ function normalize(events, ctx) {
         if (isInsidePkg(tokenized)) continue;
         const hiddenPrefix = ev.raw.hidden ? "<HIDDEN> " : "";
         const crossPrefix = isCrossPackage(tokenized) ? "<CROSS_PACKAGE> " : "";
-        block.escaped_writes.push(`${hiddenPrefix}${crossPrefix}${tokenized}`);
+        block.escaped_writes.push(`${forgedPrefix}${hiddenPrefix}${crossPrefix}${tokenized}`);
         break;
       }
       case "env_read": {
         const tagged = ev.raw.hidden ? `<HIDDEN> ${ev.raw.name}` : ev.raw.name;
-        block.env_read.push(tagged);
+        block.env_read.push(`${forgedPrefix}${tagged}`);
         break;
       }
       case "spawn": {
@@ -28737,8 +29613,11 @@ function normalize(events, ctx) {
         });
         const cmd = tokenizedArgv.join(" ");
         const auditBlind = ev.raw.audit_blind === true ? "<AUDIT_BLIND> " : "";
-        if (ev.raw.result === "ok") block.spawn_attempts.push(`${auditBlind}${cmd}`);
-        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`);
+        if (ev.raw.result === "ok") block.spawn_attempts.push(`${forgedPrefix}${auditBlind}${cmd}`);
+        else
+          block.spawn_blocked.push(
+            `${forgedPrefix}<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`
+          );
         break;
       }
       case "dlopen": {
@@ -28748,7 +29627,7 @@ function normalize(events, ctx) {
       }
       case "connect": {
         const tag = ev.raw.result === "blocked" ? "<BLOCKED> " : "";
-        block.network_attempts.push(`${tag}connect ${ev.raw.host}:${ev.raw.port}`);
+        block.network_attempts.push(`${forgedPrefix}${tag}connect ${ev.raw.host}:${ev.raw.port}`);
         break;
       }
       case "exec": {
@@ -28780,7 +29659,7 @@ function normalize(events, ctx) {
         }
         const name = ev.raw.name;
         const entry = name !== void 0 ? `<REFUSED> ${ev.raw.op} ${name}` : `<REFUSED> ${ev.raw.op}`;
-        block.env_tamper.push(entry);
+        block.env_tamper.push(`${forgedPrefix}${entry}`);
         break;
       }
     }
@@ -28874,9 +29753,10 @@ function parseBlockedSpawn(entry) {
   if (!match) return null;
   return { command: match[1] };
 }
-function isSystemNoise(ev, fsPath, os) {
+function isSystemNoise(ev, fsPath, os, roots) {
   if (ev.raw.kind !== "read" && ev.raw.kind !== "write") return false;
   const p = fsPath ?? ev.raw.path;
+  if (isUnderRoot(p, roots.repo) || isUnderRoot(p, roots.nodeModules)) return false;
   if (SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix))) return true;
   if (os === "darwin") {
     if (SYSTEM_NOISE_PREFIXES_DARWIN.some((prefix) => p.startsWith(prefix))) return true;
@@ -28887,6 +29767,10 @@ function isSystemNoise(ev, fsPath, os) {
 }
 function basename3(path3) {
   return path3.slice(path3.lastIndexOf("/") + 1);
+}
+function isUnderRoot(path3, root) {
+  if (!path3.startsWith(root)) return false;
+  return path3.length === root.length || path3[root.length] === "/";
 }
 
 // src/lock/render.ts
@@ -28959,30 +29843,30 @@ function renderBlock(block) {
 }
 
 // src/guest/discover-pkg-dirs.ts
-var import_node_fs2 = require("node:fs");
-var import_node_path3 = require("node:path");
+var import_node_fs4 = require("node:fs");
+var import_node_path5 = require("node:path");
 function discoverPkgDirs(nodeModulesDir) {
   const result = /* @__PURE__ */ new Map();
   let entries;
   try {
-    entries = (0, import_node_fs2.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
+    entries = (0, import_node_fs4.readdirSync)(nodeModulesDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return result;
   }
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
-    const entryPath = (0, import_node_path3.join)(nodeModulesDir, entry.name);
+    const entryPath = (0, import_node_path5.join)(nodeModulesDir, entry.name);
     if (entry.name.startsWith("@")) {
       let scopeEntries;
       try {
-        scopeEntries = (0, import_node_fs2.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
+        scopeEntries = (0, import_node_fs4.readdirSync)(entryPath, { withFileTypes: true, encoding: "utf8" });
       } catch {
         continue;
       }
       for (const scopeEntry of scopeEntries) {
         if (scopeEntry.name.startsWith(".")) continue;
         if (!scopeEntry.isDirectory() && !scopeEntry.isSymbolicLink()) continue;
-        const pkgPath = (0, import_node_path3.join)(entryPath, scopeEntry.name);
+        const pkgPath = (0, import_node_path5.join)(entryPath, scopeEntry.name);
         readAndRegister(pkgPath, result);
       }
     } else {
@@ -28990,22 +29874,22 @@ function discoverPkgDirs(nodeModulesDir) {
       readAndRegister(entryPath, result);
     }
   }
-  scanPnpmVirtualStore((0, import_node_path3.join)(nodeModulesDir, ".pnpm"), result);
+  scanPnpmVirtualStore((0, import_node_path5.join)(nodeModulesDir, ".pnpm"), result);
   return result;
 }
 function scanPnpmVirtualStore(pnpmDir, result) {
   let flatEntries;
   try {
-    flatEntries = (0, import_node_fs2.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
+    flatEntries = (0, import_node_fs4.readdirSync)(pnpmDir, { withFileTypes: true, encoding: "utf8" });
   } catch {
     return;
   }
   for (const flat of flatEntries) {
     if (!flat.isDirectory()) continue;
-    const innerNm = (0, import_node_path3.join)(pnpmDir, flat.name, "node_modules");
+    const innerNm = (0, import_node_path5.join)(pnpmDir, flat.name, "node_modules");
     let innerEntries;
     try {
-      innerEntries = (0, import_node_fs2.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
+      innerEntries = (0, import_node_fs4.readdirSync)(innerNm, { withFileTypes: true, encoding: "utf8" });
     } catch {
       continue;
     }
@@ -29013,29 +29897,29 @@ function scanPnpmVirtualStore(pnpmDir, result) {
       if (inner.name.startsWith(".")) continue;
       if (inner.isSymbolicLink() || !inner.isDirectory()) continue;
       if (inner.name.startsWith("@")) {
-        const scopeDir = (0, import_node_path3.join)(innerNm, inner.name);
+        const scopeDir = (0, import_node_path5.join)(innerNm, inner.name);
         let scopeEntries;
         try {
-          scopeEntries = (0, import_node_fs2.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
+          scopeEntries = (0, import_node_fs4.readdirSync)(scopeDir, { withFileTypes: true, encoding: "utf8" });
         } catch {
           continue;
         }
         for (const se of scopeEntries) {
           if (se.name.startsWith(".")) continue;
           if (se.isSymbolicLink() || !se.isDirectory()) continue;
-          readAndRegister((0, import_node_path3.join)(scopeDir, se.name), result);
+          readAndRegister((0, import_node_path5.join)(scopeDir, se.name), result);
         }
       } else {
-        readAndRegister((0, import_node_path3.join)(innerNm, inner.name), result);
+        readAndRegister((0, import_node_path5.join)(innerNm, inner.name), result);
       }
     }
   }
 }
 function readAndRegister(pkgPath, result) {
-  const manifestPath = (0, import_node_path3.join)(pkgPath, "package.json");
+  const manifestPath = (0, import_node_path5.join)(pkgPath, "package.json");
   let raw;
   try {
-    raw = (0, import_node_fs2.readFileSync)(manifestPath, "utf8");
+    raw = (0, import_node_fs4.readFileSync)(manifestPath, "utf8");
   } catch (err) {
     if (err.code !== "ENOENT") {
       process.stderr.write(
@@ -29101,7 +29985,18 @@ var AgentConfig = external_exports.object({
   /** Per-package dirs for normalize context, keyed by pkg@version */
   pkg_dirs: external_exports.record(external_exports.string(), external_exports.string()).default({}),
   /** Package manager override. Auto-detected from lockfile if not set. */
-  manager: external_exports.enum(["npm", "pnpm", "yarn"]).optional()
+  manager: external_exports.enum(["npm", "pnpm", "yarn"]).optional(),
+  /**
+   * Drop-in install (`install: true`) mode.  When set, the host runs the REAL
+   * lifecycle install post-trust (src/action/host-install.ts), so the guest
+   * audit must run with the SAME post-trust config the host applies — otherwise
+   * a lifecycle script can branch on a config value that diverges between the
+   * audited sandbox and the trusted host run (the lock is value-blind: env-spy
+   * records env_read NAMEs only).  Currently this mirrors the host's pnpm
+   * `--config.ignore-pnpmfile=true` into the Phase B child env (see
+   * buildChildEnv).  Defaults false → pure-audit goldens are byte-unchanged.
+   */
+  install_mode: external_exports.boolean().default(false)
 });
 var LinuxVsockConnection = class _LinuxVsockConnection {
   readable;
@@ -29121,7 +30016,7 @@ var LinuxVsockConnection = class _LinuxVsockConnection {
    */
   static async listen(port) {
     const server = (0, import_node_net.createServer)();
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       const onError = (err) => {
         server.removeListener("connection", onConnection);
         reject(err);
@@ -29129,7 +30024,7 @@ var LinuxVsockConnection = class _LinuxVsockConnection {
       const onConnection = (sock) => {
         server.removeListener("error", onError);
         server.close();
-        resolve2(new _LinuxVsockConnection(server, sock));
+        resolve3(new _LinuxVsockConnection(server, sock));
       };
       server.once("error", onError);
       server.once("connection", onConnection);
@@ -29184,7 +30079,7 @@ var StdioConnection = class {
 };
 var LinuxSpawner = class {
   async spawn(cmd, args, opts) {
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       const child = (0, import_node_child_process3.spawn)(cmd, args, {
         cwd: opts.cwd,
         env: opts.env,
@@ -29200,7 +30095,7 @@ var LinuxSpawner = class {
       });
       child.on("error", reject);
       child.on("close", (code) => {
-        resolve2({ exitCode: code ?? 1, stdout, stderr });
+        resolve3({ exitCode: code ?? 1, stdout, stderr });
       });
     });
   }
@@ -29216,8 +30111,8 @@ async function* runStraceTailer(opts) {
   const drainMs = opts.drainMs ?? 100;
   const settleHardCapMs = opts.settleHardCapMs ?? 2e3;
   const settleQuietPasses = opts.settleQuietPasses ?? 2;
-  const delay = (ms) => new Promise((resolve2) => {
-    const t = setTimeout(resolve2, ms);
+  const delay = (ms) => new Promise((resolve3) => {
+    const t = setTimeout(resolve3, ms);
     t.unref?.();
   });
   const queue = [];
@@ -29251,7 +30146,7 @@ async function* runStraceTailer(opts) {
     const pos = filePos.get(name) ?? 0;
     let size = 0;
     try {
-      size = (0, import_node_fs3.statSync)(fullPath).size;
+      size = (0, import_node_fs5.statSync)(fullPath).size;
     } catch {
       return;
     }
@@ -29261,18 +30156,18 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs3.openSync)(fullPath, "r");
-      bytesRead = (0, import_node_fs3.readSync)(fd, buf, 0, toRead, pos);
+      fd = (0, import_node_fs5.openSync)(fullPath, "r");
+      bytesRead = (0, import_node_fs5.readSync)(fd, buf, 0, toRead, pos);
     } catch {
       if (fd >= 0) {
         try {
-          (0, import_node_fs3.closeSync)(fd);
+          (0, import_node_fs5.closeSync)(fd);
         } catch {
         }
       }
       return;
     }
-    (0, import_node_fs3.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
     filePos.set(name, pos + bytesRead);
     const chunk = (fileBuf.get(name) ?? "") + buf.slice(0, bytesRead).toString("utf8");
     const newlineIdx = chunk.lastIndexOf("\n");
@@ -29293,7 +30188,7 @@ async function* runStraceTailer(opts) {
   function pollDir() {
     let entries;
     try {
-      entries = (0, import_node_fs3.readdirSync)(opts.watchDir);
+      entries = (0, import_node_fs5.readdirSync)(opts.watchDir);
     } catch {
       return;
     }
@@ -29323,7 +30218,7 @@ async function* runStraceTailer(opts) {
     if (path3 === void 0 || path3 === "") return;
     let stat;
     try {
-      stat = (0, import_node_fs3.statSync)(path3, { bigint: true });
+      stat = (0, import_node_fs5.statSync)(path3, { bigint: true });
     } catch (err) {
       const code = err.code;
       if (code === "ENOENT") {
@@ -29395,22 +30290,22 @@ async function* runStraceTailer(opts) {
     let fd = -1;
     let bytesRead = 0;
     try {
-      fd = (0, import_node_fs3.openSync)(path3, "r");
+      fd = (0, import_node_fs5.openSync)(path3, "r");
       if (baseline !== void 0) {
-        const fdStat = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+        const fdStat = (0, import_node_fs5.fstatSync)(fd, { bigint: true });
         if (fdStat.ino !== baseline.ino || fdStat.dev !== baseline.dev) {
-          (0, import_node_fs3.closeSync)(fd);
+          (0, import_node_fs5.closeSync)(fd);
           recordTamper(
             `events file fd-stat mismatch on open (expected dev=${baseline.dev} ino=${baseline.ino}, got dev=${fdStat.dev} ino=${fdStat.ino}): ${path3}`
           );
           return;
         }
       }
-      bytesRead = (0, import_node_fs3.readSync)(fd, buf, 0, toRead, eventsPos);
+      bytesRead = (0, import_node_fs5.readSync)(fd, buf, 0, toRead, eventsPos);
     } catch (err) {
       if (fd >= 0) {
         try {
-          (0, import_node_fs3.closeSync)(fd);
+          (0, import_node_fs5.closeSync)(fd);
         } catch {
         }
       }
@@ -29420,7 +30315,7 @@ async function* runStraceTailer(opts) {
       }
       return;
     }
-    (0, import_node_fs3.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
     eventsPos += bytesRead;
     lastConsumedCtime = ctimeBig;
     const chunk = eventsBuf + buf.slice(0, bytesRead).toString("utf8");
@@ -29456,7 +30351,7 @@ async function* runStraceTailer(opts) {
   }
   let watcher = null;
   try {
-    watcher = (0, import_node_fs3.watch)(opts.watchDir, (_event, _filename) => {
+    watcher = (0, import_node_fs5.watch)(opts.watchDir, (_event, _filename) => {
       drainEventsFile();
       pollDir();
       wake();
@@ -29468,7 +30363,7 @@ async function* runStraceTailer(opts) {
   let eventsWatcher = null;
   if (opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     try {
-      eventsWatcher = (0, import_node_fs3.watch)(opts.eventsFilePath, { persistent: false }, () => {
+      eventsWatcher = (0, import_node_fs5.watch)(opts.eventsFilePath, { persistent: false }, () => {
         drainEventsFile();
         wake();
       });
@@ -29481,7 +30376,7 @@ async function* runStraceTailer(opts) {
   if (opts.eventsDirPath !== void 0 && opts.eventsDirPath !== "" && opts.eventsFilePath !== void 0 && opts.eventsFilePath !== "") {
     const expectedBasename = opts.eventsFileBasename ?? opts.eventsFilePath.slice(opts.eventsFilePath.lastIndexOf("/") + 1);
     try {
-      eventsDirWatcher = (0, import_node_fs3.watch)(
+      eventsDirWatcher = (0, import_node_fs5.watch)(
         opts.eventsDirPath,
         { persistent: false },
         (event, filename) => {
@@ -29603,8 +30498,8 @@ async function* runStraceTailer(opts) {
         yield queue.shift();
       }
       if (done && fd3Done && queue.length === 0) break;
-      await new Promise((resolve2) => {
-        wakeResolve = resolve2;
+      await new Promise((resolve3) => {
+        wakeResolve = resolve3;
       });
     }
   } finally {
@@ -29648,7 +30543,7 @@ function readStraceChildPid(stracePid, deadlineMs = 50) {
     if (Date.now() - start >= deadlineMs) break;
     let raw;
     try {
-      raw = (0, import_node_fs3.readFileSync)(
+      raw = (0, import_node_fs5.readFileSync)(
         `/proc/${stracePid}/task/${stracePid}/children`,
         "utf8"
       ).trim();
@@ -29859,27 +30754,28 @@ var LinuxStraceRunner = class {
       code: null,
       signal: null
     };
-    const exitPromise = new Promise((resolve2) => {
+    const exitPromise = new Promise((resolve3) => {
       child.on("close", (code, signal) => {
         exitStatus.code = code;
         exitStatus.signal = signal;
         this._exitCode = code ?? 1;
-        resolve2();
+        resolve3();
       });
       child.on("error", () => {
         exitStatus.spawnError = true;
         this._exitCode = 1;
-        resolve2();
+        resolve3();
       });
     });
-    const watchDir = (0, import_node_path4.dirname)(opts.basePath);
-    const basePrefix = (0, import_node_path4.basename)(opts.basePath);
+    const watchDir = (0, import_node_path6.dirname)(opts.basePath);
+    const basePrefix = (0, import_node_path6.basename)(opts.basePath);
     const fd3Stream = child.stdio[3];
     let stderrRl = null;
     if (child.stderr) {
       stderrRl = (0, import_node_readline2.createInterface)({ input: child.stderr, crlfDelay: Infinity });
       stderrRl.on("line", (line) => {
-        process.stderr.write(`[strace] ${line}
+        const safe = this._redactStdout ? this._redactStdout(line) : line;
+        process.stderr.write(`[strace] ${safe}
 `);
       });
     }
@@ -29892,7 +30788,7 @@ var LinuxStraceRunner = class {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
           eventsDirPath: this._eventsFile.dirPath,
-          eventsFileBasename: (0, import_node_path4.basename)(this._eventsFile.path),
+          eventsFileBasename: (0, import_node_path6.basename)(this._eventsFile.path),
           tamperRef: this._tamperRef
         } : {},
         exitPromise,
@@ -29928,12 +30824,12 @@ var LinuxStraceRunner = class {
   }
 };
 function detectManager(cwd) {
-  if ((0, import_node_fs3.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
-  if ((0, import_node_fs3.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
+  if ((0, import_node_fs5.existsSync)(`${cwd}/pnpm-lock.yaml`)) return "pnpm";
+  if ((0, import_node_fs5.existsSync)(`${cwd}/yarn.lock`)) return "yarn";
   return "npm";
 }
 async function waitForGo(readable) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     const rl = (0, import_node_readline2.createInterface)({ input: readable, crlfDelay: Infinity });
     const cleanup = () => {
       rl.removeListener("line", onLine);
@@ -29944,7 +30840,7 @@ async function waitForGo(readable) {
       const trimmed = line.trim();
       if (trimmed === "go") {
         cleanup();
-        resolve2();
+        resolve3();
       } else {
         cleanup();
         reject(new Error(`script-jail agent: unexpected control signal from host: ${JSON.stringify(trimmed)}`));
@@ -30005,11 +30901,18 @@ var LIFECYCLE_HOST_NOISE_ENV_NAMES = /* @__PURE__ */ new Set([
   "POSIXLY_CORRECT",
   "TERM"
 ]);
+var LIFECYCLE_GUEST_PROVISION_ENV_NAMES = /* @__PURE__ */ new Set(["VP_HOME"]);
+function envWithoutCorepackHome(env) {
+  const stripped = { ...env };
+  delete stripped["COREPACK_HOME"];
+  return stripped;
+}
 function sanitizeLifecycleBaseEnv(baseEnv) {
   const sanitized = {};
   for (const [name, value] of Object.entries(baseEnv)) {
     if (value === void 0) continue;
     if (LIFECYCLE_HOST_NOISE_ENV_NAMES.has(name)) continue;
+    if (LIFECYCLE_GUEST_PROVISION_ENV_NAMES.has(name)) continue;
     if (name.startsWith("SCRIPT_JAIL_") && !LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES.has(name)) {
       continue;
     }
@@ -30072,9 +30975,15 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
     YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`
   } : { npm_config_cache: `${config2.work_dir}/.npm-cache` };
+  const installModeEnv = !config2.install_mode ? {} : resolvedManager === "pnpm" ? { npm_config_ignore_pnpmfile: "true", npm_config_script_shell: "/bin/sh" } : resolvedManager === "npm" ? { npm_config_script_shell: "/bin/sh", npm_config_ignore_scripts: "false" } : resolvedManager === "yarn" ? {
+    YARN_RC_FILENAME: ".yarnrc.yml",
+    YARN_PLUGINS: "",
+    YARN_ENABLE_CONSTRAINTS_CHECKS: "false"
+  } : {};
   return {
     ...inheritedEnv,
     ...cacheRedirectEnv,
+    ...installModeEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -30132,7 +31041,7 @@ function macosTokenizeRoots(workDir) {
   const rawTmp = (0, import_node_os.tmpdir)();
   let tmp;
   try {
-    tmp = (0, import_node_fs3.realpathSync)(rawTmp);
+    tmp = (0, import_node_fs5.realpathSync)(rawTmp);
   } catch {
     tmp = rawTmp;
   }
@@ -30150,36 +31059,36 @@ function scratchBaseDir(env = process.env) {
 }
 function createEventsFile(parentDir = scratchBaseDir()) {
   const tag = (0, import_node_crypto.randomBytes)(16).toString("hex");
-  const dirPath = (0, import_node_fs3.mkdtempSync)((0, import_node_path4.join)(parentDir, `script-jail-events-${tag}-`));
-  (0, import_node_fs3.chmodSync)(dirPath, 448);
-  const path3 = (0, import_node_path4.join)(dirPath, `events-${tag}.jsonl`);
-  const fd = (0, import_node_fs3.openSync)(
+  const dirPath = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(parentDir, `script-jail-events-${tag}-`));
+  (0, import_node_fs5.chmodSync)(dirPath, 448);
+  const path3 = (0, import_node_path6.join)(dirPath, `events-${tag}.jsonl`);
+  const fd = (0, import_node_fs5.openSync)(
     path3,
     // eslint-disable-next-line no-bitwise -- POSIX open flag composition
-    import_node_fs3.constants.O_RDWR | import_node_fs3.constants.O_CREAT | import_node_fs3.constants.O_EXCL | import_node_fs3.constants.O_NOFOLLOW,
+    import_node_fs5.constants.O_RDWR | import_node_fs5.constants.O_CREAT | import_node_fs5.constants.O_EXCL | import_node_fs5.constants.O_NOFOLLOW,
     384
   );
   let baseline;
   try {
-    const s = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+    const s = (0, import_node_fs5.fstatSync)(fd, { bigint: true });
     baseline = { ino: s.ino, dev: s.dev, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
   } finally {
-    (0, import_node_fs3.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
   }
   return { path: path3, dirPath, baseline };
 }
 async function verifyOfflineWithTimeout(lookup, timeoutMs = 2e3) {
   let timer;
   return Promise.race([
-    new Promise((resolve2) => {
+    new Promise((resolve3) => {
       lookup("registry.npmjs.org", (err) => {
         if (timer !== void 0) clearTimeout(timer);
-        resolve2(err !== null);
+        resolve3(err !== null);
       });
     }),
-    new Promise((resolve2) => {
+    new Promise((resolve3) => {
       timer = setTimeout(() => {
-        resolve2(true);
+        resolve3(true);
       }, timeoutMs);
     })
   ]);
@@ -30208,23 +31117,211 @@ function diag(input, msg) {
   else process.stderr.write(`[agent] ${msg}
 `);
 }
-function redactSensitive(text, protectedEnvNames, env = process.env) {
-  let out = text;
-  const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
-    (e) => typeof e.value === "string" && e.value.length >= 4
-  ).sort((a, b) => b.value.length - a.value.length);
-  for (const { name, value } of values) {
-    out = out.split(value).join(`<REDACTED:${name}>`);
+var NPM_PREPARE_RUNNER_SOURCE = [
+  "'use strict';",
+  "const path = require('path');",
+  "const fs = require('fs');",
+  "const cwd = process.cwd();",
+  // npm-cli.js path comes from ARGV (process.argv[2]), NOT process.env — the
+  // runner runs UNDER env-spy (the NODE_OPTIONS preloads), so a `process.env`
+  // read would be recorded as a (force-attributed-to-root) env_read and pollute
+  // the lock.  argv is not audited.  The env fallback is only for the unit
+  // harness (which launches the runner directly with npm_execpath set) and is
+  // short-circuited away whenever argv[2] is present (so no env read in prod).
+  "const npmCli = process.argv[2] || process.env.npm_execpath || process.env.SCRIPT_JAIL_NPM_CLI || '';",
+  "let runScript;",
+  "try {",
+  "  const paths = npmCli ? [path.dirname(npmCli)] : [cwd];",
+  "  runScript = require(require.resolve('@npmcli/run-script', { paths }));",
+  "} catch (e) {",
+  "  try { runScript = require('@npmcli/run-script'); }",
+  "  catch (e2) {",
+  "    console.error('script-jail prepare-runner: cannot resolve @npmcli/run-script: ' + ((e && e.message) || e));",
+  "    process.exit(3);",
+  "  }",
+  "}",
+  "let pkg;",
+  "try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')); }",
+  "catch (e) { process.exit(0); }",
+  // no/unreadable package.json → nothing to audit
+  "const scripts = (pkg && pkg.scripts) || {};",
+  // The repo's RESOLVED script-shell, forwarded as run-script's `scriptShell`
+  // option.  @npmcli/run-script reads `scriptShell` from its OPTIONS object, NOT
+  // from `npm_config_script_shell` env — npm's CLI passes the resolved
+  // `script-shell` config to run-script the same way.  The guest reads it via
+  // `npm config get script-shell` (un-hijackable: prints config, executes nothing)
+  // and threads it via ARGV (process.argv[3]), NOT env — like npmCli, a
+  // `process.env` read here would be a (force-attributed-to-root) env_read under
+  // env-spy and pollute the lock.  Empty / 'null' / absent → undefined →
+  // run-script's own default (sh / cmd.exe).  Running the prepare under the repo's
+  // real (PR-controllable) shell is INTENTIONAL: a malicious `script-shell`'s own
+  // reads/writes/connects MUST be audited, exactly as a real install runs them
+  // (forcing a trusted /bin/sh here would HIDE an evil-shell escape).
+  "const sjShell = process.argv[3];",
+  "const scriptShell = (typeof sjShell === 'string' && sjShell.length > 0 && sjShell !== 'null') ? sjShell : undefined;",
+  "(async () => {",
+  "  for (const event of ['preprepare', 'prepare', 'postprepare']) {",
+  "    const s = scripts[event];",
+  "    if (typeof s === 'string' && s.length > 0) {",
+  "      await runScript({ event: event, path: cwd, pkg: pkg, stdio: 'inherit', scriptShell: scriptShell });",
+  "    }",
+  "  }",
+  "})().catch((e) => {",
+  "  console.error('script-jail prepare-runner: ' + ((e && e.message) || e));",
+  "  process.exit(1);",
+  "});",
+  ""
+].join("\n");
+function resolvePrepareCommand(manager, cwd, npmPrepare) {
+  if (manager === "npm") {
+    if (npmPrepare !== void 0) {
+      return {
+        cmd: npmPrepare.nodePath,
+        args: [npmPrepare.runnerPath, npmPrepare.npmCli, npmPrepare.scriptShell ?? ""],
+        raw: true
+      };
+    }
+    return {
+      cmd: "npm",
+      args: [
+        "run",
+        "prepare",
+        "--if-present",
+        "--foreground-scripts",
+        "--no-workspaces",
+        "--node-options="
+      ]
+    };
   }
-  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
-  return out;
+  if (manager === "yarn") {
+    try {
+      const pkgRaw = (0, import_node_fs5.readFileSync)((0, import_node_path6.join)(cwd, "package.json"), "utf8");
+      const pkg = JSON.parse(pkgRaw);
+      const prepare = pkg.scripts?.["prepare"];
+      if (typeof prepare === "string" && prepare.length > 0) {
+        return { cmd: "yarn", args: ["run", "prepare"] };
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+  return null;
+}
+function npmCliEntryPath(execPath) {
+  return (0, import_node_path6.join)((0, import_node_path6.dirname)((0, import_node_path6.dirname)(execPath)), "lib", "node_modules", "npm", "bin", "npm-cli.js");
+}
+function realCaptureNpmPrepareEnv(ctx) {
+  const { node, npmCli, cwd, env, userInstallArgs } = ctx;
+  let dumpDir;
+  try {
+    dumpDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)((0, import_node_os.tmpdir)(), "sj-prep-cap-"));
+  } catch {
+    return null;
+  }
+  try {
+    const envOutPath = (0, import_node_path6.join)(dumpDir, "env.json");
+    const dumpScriptPath = (0, import_node_path6.join)(dumpDir, "dump.cjs");
+    try {
+      (0, import_node_fs5.writeFileSync)(
+        dumpScriptPath,
+        `'use strict';
+var e = process.env, o = {}, k;
+for (k in e) { if (/^npm_config_/i.test(k) && typeof e[k] === "string") o[k] = e[k]; }
+require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0o600 });
+`,
+        { encoding: "utf8", mode: 384 }
+      );
+    } catch {
+      return null;
+    }
+    const baseEnv = { ...env };
+    delete baseEnv["LD_PRELOAD"];
+    delete baseEnv["DYLD_INSERT_LIBRARIES"];
+    delete baseEnv["DYLD_LIBRARY_PATH"];
+    delete baseEnv["NODE_OPTIONS"];
+    (0, import_node_child_process3.spawnSync)(
+      node,
+      [
+        npmCli,
+        "exec",
+        "--script-shell=/bin/sh",
+        "--offline",
+        "--node-options=",
+        // Thread [47]: project the SAME npm_config_* (omit/include) + NODE_ENV the
+        // main `npm rebuild <userInstallArgs>` install sets, so the captured prepare
+        // env is in lockstep. These are allowlist-sanitized FLAGS (no positionals,
+        // no value-injection), passed as argv elements (not into the `-c` shell
+        // string), so the round-21/22 shell+argv-injection guarantees are unaffected.
+        ...userInstallArgs ?? [],
+        "-c",
+        '"$SJ_NODE" -- "$SJ_DUMP"'
+      ],
+      {
+        cwd,
+        env: { ...baseEnv, SJ_NODE: node, SJ_DUMP: dumpScriptPath, SJ_ENV_OUT: envOutPath },
+        stdio: "ignore",
+        timeout: 12e4
+      }
+    );
+    let dumped;
+    try {
+      dumped = JSON.parse((0, import_node_fs5.readFileSync)(envOutPath, "utf8"));
+    } catch {
+      dumped = null;
+    }
+    if (dumped === null) return null;
+    const npmConfig = {};
+    for (const [k, v] of Object.entries(dumped)) {
+      if (typeof v !== "string") continue;
+      if (!/^npm_config_/i.test(k)) continue;
+      const lower = k.toLowerCase();
+      if (lower === "npm_config_call" || lower === "npm_config_script_shell") continue;
+      npmConfig[k] = v;
+    }
+    let scriptShell = null;
+    const shResult = (0, import_node_child_process3.spawnSync)(node, [npmCli, "config", "get", "script-shell"], {
+      cwd,
+      env: baseEnv,
+      encoding: "utf8",
+      timeout: 6e4
+    });
+    if (shResult.status === 0 && typeof shResult.stdout === "string") {
+      const val = shResult.stdout.trim();
+      scriptShell = val.length > 0 && val !== "null" && val !== "undefined" ? val : null;
+    }
+    return { npmConfig, scriptShell };
+  } finally {
+    try {
+      (0, import_node_fs5.rmSync)(dumpDir, { recursive: true, force: true });
+    } catch {
+    }
+  }
+}
+function createSensitiveRedactor(protectedEnvNames, env = process.env) {
+  const values = protectedEnvNames.map((name) => ({ name, value: env[name] })).filter(
+    (e) => typeof e.value === "string" && e.value.length >= 1
+  ).sort((a, b) => b.value.length - a.value.length);
+  const fragMatcher = buildFragmentMatcher(values.map((e) => e.value));
+  return (text) => {
+    let out = text;
+    for (const { name, value } of values) {
+      out = out.split(value).join(`<REDACTED:${name}>`);
+    }
+    out = maskValueFragmentsWith(out, fragMatcher, "REDACTED:SECRET");
+    out = redactCredentialShapes(out);
+    return out;
+  };
+}
+function redactSensitive(text, protectedEnvNames, env = process.env) {
+  return createSensitiveRedactor(protectedEnvNames, env)(text);
 }
 async function main(input) {
   const configPath = input.configPath ?? "/etc/script-jail/config.yml";
   diag(input, `main(): configPath=${configPath}`);
   let rawConfig;
   try {
-    const text = (0, import_node_fs3.readFileSync)(configPath, "utf8");
+    const text = (0, import_node_fs5.readFileSync)(configPath, "utf8");
     rawConfig = (0, import_yaml2.parse)(text);
   } catch (err) {
     throw new Error(`script-jail agent: failed to read config at ${configPath}: ${String(err)}`);
@@ -30267,26 +31364,63 @@ async function main(input) {
     PHASE_B_STDOUT_TAIL_BYTES,
     4096 + maxProtectedValueBytes + 4096
   );
-  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile) : new LinuxStraceRunner(
-    void 0,
-    eventsFile,
-    (s) => redactSensitive(s, config2.protected.env),
-    stdoutTailBytes
-  ));
+  const lineRedactor = createSensitiveRedactor(config2.protected.env);
+  const straceRunner = input.strace ?? (isMacosBare ? new MacOSInstallRunner(void 0, eventsFile, lineRedactor) : new LinuxStraceRunner(void 0, eventsFile, lineRedactor, stdoutTailBytes));
+  let rootPkgKeys = /* @__PURE__ */ new Set();
+  let canonicalRootKey = null;
+  let malformedRootName = false;
+  try {
+    const rootManifest = JSON.parse((0, import_node_fs5.readFileSync)(`${config2.work_dir}/package.json`, "utf8"));
+    malformedRootName = rootManifest.name !== void 0 && typeof rootManifest.name !== "string";
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+  } catch {
+  }
+  if (malformedRootName) {
+    emitter.emitError(
+      "Root `package.json` has a non-string `name` (e.g. a number/object/array). The package manager coerces it to a string it runs the root lifecycle under, which script-jail cannot portably attribute to the repo root \u2014 the root would run effectively unaudited and produce a deceptively clean lock. Refusing to emit a lockfile (give the root a string `name`, or remove it for a nameless root).",
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
   const attribution = new Attribution(
-    isMacosBare ? new MacOSProcReader() : new LinuxProcReader()
+    isMacosBare ? new MacOSProcReader() : new LinuxProcReader(),
+    canonicalRootKey === ROOT_SENTINEL ? ROOT_SENTINEL : void 0,
+    rootPkgKeys
   );
   diag(input, `Phase A starting: ${manager} fetch in ${config2.work_dir}`);
   const fetchResult = await runFetchPhase({
     manager,
     cwd: config2.work_dir,
     env: fetchEnv,
-    spawner
+    spawner,
+    // SECURITY (Codex re-review, audit-only sidecar oracle): the pm-flags /
+    // pnpm-arch control sidecars are delivered DIRECTLY as env CONTENT on every
+    // backend (Docker `-e`, bare/mac-bare process env, Firecracker init.sh
+    // `export` from the repo-disk copy) — NEVER as a file at a
+    // lifecycle-visible path.  This keeps a clean-repo
+    // `fs.existsSync('/etc/script-jail/pm-flags.json')` false in BOTH the audit
+    // and the host re-run (it used to be present-in-audit / absent-on-host).
+    // We (the agent) read the content here from our OWN process env (un-audited:
+    // env-spy only instruments lifecycle children) and pass it down; the same
+    // SCRIPT_JAIL_* vars are stripped from every lifecycle child by
+    // buildChildEnv (not on the allowlist), so the content rides only the
+    // agent's /proc/self/environ — the same irreducible "the agent process is
+    // detectable" class as LD_PRELOAD / config.yml, not a new fs oracle.
+    // loadPmFlags / applyPnpmArchOverlay re-sanitize whatever they receive, so
+    // this is safe even though the content originates in the repo-controlled
+    // staging namespace.  `config.yml` remains the one control file at /etc (the
+    // agent must read it; on Docker it is a read-only bind it cannot unlink) —
+    // a documented irreducible residual.
+    ...process.env["SCRIPT_JAIL_PM_FLAGS_CONTENT"] !== void 0 ? { pmFlagsContent: process.env["SCRIPT_JAIL_PM_FLAGS_CONTENT"] } : {},
+    ...process.env["SCRIPT_JAIL_PNPM_ARCH_CONTENT"] !== void 0 ? { pnpmArchContent: process.env["SCRIPT_JAIL_PNPM_ARCH_CONTENT"] } : {}
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
   if (!fetchResult.ok) {
-    const stderrRedacted = redactSensitive(fetchResult.stderr, config2.protected.env).trim();
-    const stdoutRedacted = redactSensitive(fetchResult.stdout, config2.protected.env).trim();
+    const userArgValues = deriveSensitiveValues(fetchResult.userInstallArgs);
+    const maskUserArgs = (text) => maskExactValues(text, userArgValues, "REDACTED:USER-ARG");
+    const stderrRedacted = redactSensitive(maskUserArgs(fetchResult.stderr), config2.protected.env).trim();
+    const stdoutRedacted = redactSensitive(maskUserArgs(fetchResult.stdout), config2.protected.env).trim();
     const stdoutTail = stdoutRedacted.length > 4e3 ? `\u2026${stdoutRedacted.slice(-4e3)}` : stdoutRedacted;
     const fetchDetail = [
       stderrRedacted,
@@ -30342,6 +31476,15 @@ ${fetchDetail}
     }
   }
   const collectedEvents = [];
+  const altRootManifest = unsupportedAltRootManifest(config2.work_dir);
+  if (altRootManifest !== null) {
+    emitter.emitError(
+      `Root manifest is \`${altRootManifest}\` with no \`package.json\` \u2014 script-jail reads root identity and lifecycle scripts from package.json only, so an alternate-manifest root would run its lifecycle unaudited (events unattributable) and produce a deceptively clean lock. Refusing to emit a lockfile (use a \`package.json\` root manifest).`,
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
   const collectingEmitter = new Emitter(
     new class extends import_node_stream.Writable {
       _write(chunk, _enc, cb) {
@@ -30386,13 +31529,28 @@ ${fetchDetail}
   });
   const straceBaseDir = `${scratchBaseDir()}/script-jail-strace`;
   try {
-    (0, import_node_fs3.mkdirSync)(straceBaseDir, { recursive: true });
+    (0, import_node_fs5.mkdirSync)(straceBaseDir, { recursive: true });
   } catch {
   }
+  const corepackHomeForLaunch = process.env["COREPACK_HOME"];
+  let managerLaunch;
+  try {
+    managerLaunch = !isMacosBare && corepackHomeForLaunch !== void 0 && corepackHomeForLaunch.length > 0 ? resolveLinuxManagerLaunch(manager, corepackHomeForLaunch, process.execPath) : void 0;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    emitter.emitError(
+      `script-jail agent: failed to resolve the offline package-manager entry for direct launch \u2014 ${reason}. Refusing to emit a lockfile: falling back to the bare corepack shim would re-open the COREPACK_HOME value-blind-lock oracle.`,
+      true
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+  const installPhaseEnv = managerLaunch !== void 0 ? envWithoutCorepackHome(installEnv) : installEnv;
   const installInput = {
     manager,
     cwd: config2.work_dir,
-    env: installEnv,
+    env: installPhaseEnv,
+    ...managerLaunch !== void 0 ? { managerLaunch } : {},
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
@@ -30403,7 +31561,27 @@ ${fetchDetail}
     // tailer's always-empty watchDir).  Per-pid `strace -ff` logs for a large
     // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
     straceBasePath: `${straceBaseDir}/strace.out`,
-    protectedPaths
+    protectedPaths,
+    rootPkgKeys,
+    // #19 fidelity (npm-only): re-pass the sanitized developer install args to
+    // Phase B so `npm rebuild` runs lifecycle scripts with the same dep-selection
+    // env (NODE_ENV/omit) the single-phase `npm ci <args>` would — in lockstep
+    // with the host part-2 splice.  Already sanitized by loadPmFlags; runInstall
+    // Phase ignores it for pnpm/yarn and for the prepare-pass commandOverride.
+    // Empty (no-args default) → byte-identical lock + goldens.
+    userInstallArgs: fetchResult.userInstallArgs,
+    // Nameless root → the root's OWN lifecycle pids have empty npm_package_name
+    // but a canonical npm_lifecycle_event.  The ATTRIBUTION LAYER (Attribution
+    // ctor's rootSentinel on the /proc walk + shimNpmAttribution on the shim
+    // fast-path) attributes them to the `<repo-root>` sentinel for ALL event
+    // kinds; the dispatcher then defers fs events (pkg ∈ rootPkgKeys) and stamps
+    // the non-forgeable `root_anchored` verdict.  rootSentinel is threaded here
+    // ONLY so the shim fast-path (shimExecAttribution / classifyShimNodeStartup
+    // Marker) sees it — REQUIRED on macOS, where MacOSProcReader has no environ
+    // and attribution flows entirely through the shim seed.  Conditionally spread
+    // so the field is OMITTED (not set to undefined — PhaseInstallInput uses
+    // exactOptionalPropertyTypes) for a named/absent root, keeping it inert.
+    ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {}
   };
   const installResult = isMacosBare ? await runInstallPhaseMacos(installInput) : await runInstallPhase(installInput);
   if (installResult.exitCode !== 0) {
@@ -30434,6 +31612,180 @@ ${stdoutTail}`;
       false
     );
   }
+  let prepareCommand = resolvePrepareCommand(manager, config2.work_dir);
+  const willRunPreparePass = prepareCommand !== null && (input.prepareStrace !== void 0 || input.strace === void 0 || input.forcePreparePass === true);
+  let capturedNpmConfig = {};
+  let capturedScriptShell = null;
+  let prepareNpmExecpath = "";
+  if (willRunPreparePass && manager === "npm") {
+    let runnerPath;
+    try {
+      const runnerDir = (0, import_node_fs5.mkdtempSync)((0, import_node_path6.join)(straceBaseDir, "sj-prep-"));
+      runnerPath = (0, import_node_path6.join)(runnerDir, "runner.cjs");
+      (0, import_node_fs5.writeFileSync)(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: "utf8", mode: 384 });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      emitter.emitError(
+        `script-jail agent: failed to materialize the npm root-prepare runner \u2014 ${reason}. Refusing to emit a lockfile: falling back to a single \`npm run prepare\` would leave wrapper-only preprepare/postprepare UNAUDITED (a silent #44 false-negative).`,
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    prepareNpmExecpath = managerLaunch?.entry ?? npmCliEntryPath(process.execPath);
+    const captureCtx = {
+      node: process.execPath,
+      npmCli: prepareNpmExecpath,
+      cwd: config2.work_dir,
+      env: process.env,
+      // Thread [47]: project the developer dep-selection args (--omit=dev/--prod/…)
+      // into the capture so the root-prepare env matches `npm rebuild <args>`.
+      userInstallArgs: fetchResult.userInstallArgs
+    };
+    const capture = input.captureNpmPrepareEnv !== void 0 ? input.captureNpmPrepareEnv(captureCtx) : input.strace !== void 0 ? { npmConfig: {}, scriptShell: null } : realCaptureNpmPrepareEnv(captureCtx);
+    if (capture === null) {
+      emitter.emitError(
+        "script-jail agent: failed to capture the npm root-prepare environment \u2014 the forced-shell `npm exec` env dump produced no result (npm aborted, or the dump could not be written/read). Refusing to emit a lockfile: running the root `prepare` with a degraded env could silently diverge from a real install (a prepare branching on a missing npm_config_* would take a different path).",
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    capturedNpmConfig = capture.npmConfig;
+    capturedScriptShell = capture.scriptShell;
+    prepareCommand = resolvePrepareCommand("npm", config2.work_dir, {
+      runnerPath,
+      nodePath: process.execPath,
+      // Passed as ARGV (not env) so the runner reads neither from process.env
+      // under env-spy (which would pollute the lock with force-attributed-to-root
+      // env_reads of npm_execpath / the script-shell var).
+      npmCli: prepareNpmExecpath,
+      scriptShell: capturedScriptShell
+    });
+  }
+  if (willRunPreparePass && prepareCommand !== null) {
+    diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(" ")}`);
+    let prepareRunner;
+    let prepareEventsFilePath = eventsFilePath;
+    if (input.prepareStrace !== void 0) {
+      prepareRunner = input.prepareStrace;
+    } else {
+      let pf;
+      try {
+        pf = makeEventsFile();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        emitter.emitError(
+          `script-jail agent: failed to create the audit-events file for the root-prepare pass \u2014 ${reason}. Refusing to emit a lockfile: the root \`prepare\` script would otherwise run UNAUDITED and a clean diff against it would be untrustworthy.`,
+          true
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+      prepareEventsFilePath = pf.path;
+      prepareRunner = isMacosBare ? new MacOSInstallRunner(void 0, pf, lineRedactor) : new LinuxStraceRunner(void 0, pf, lineRedactor, stdoutTailBytes);
+    }
+    const prepareChildEnv = isMacosBare ? buildChildEnvMacos(process.env, config2, prepareEventsFilePath, input.preloadPaths) : buildChildEnv(process.env, config2, prepareEventsFilePath, input.preloadPaths);
+    const prepareEnvBase = isMacosBare ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: "1" } : prepareChildEnv;
+    let prepareEnv = prepareEnvBase;
+    if (manager === "npm") {
+      const merged = {};
+      for (const [k, v] of Object.entries(prepareEnvBase)) {
+        if (/^npm_config_/i.test(k)) continue;
+        merged[k] = v;
+      }
+      Object.assign(merged, capturedNpmConfig);
+      merged["npm_execpath"] = prepareNpmExecpath;
+      merged["npm_node_execpath"] = process.execPath;
+      prepareEnv = merged;
+    }
+    const preparingEmitter = new Emitter(
+      new class extends import_node_stream.Writable {
+        _write(chunk, _enc, cb) {
+          const line = chunk.toString();
+          let frame;
+          try {
+            frame = JSON.parse(line);
+          } catch {
+            cb();
+            return;
+          }
+          if (frame["kind"] === "event") {
+            const raw = frame["raw"];
+            const forcedPkg = canonicalRootKey ?? frame["pkg"];
+            const forcedLifecycle = "prepare";
+            if (canonicalRootKey !== null && (raw.kind === "read" || raw.kind === "write" || raw.kind === "spawn" || raw.kind === "connect" || raw.kind === "env_read" || raw.kind === "env_tamper")) {
+              raw.root_anchored = true;
+            }
+            const forcedFrame = {
+              ...frame,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+              raw
+            };
+            const forcedLine = `${JSON.stringify(forcedFrame)}
+`;
+            input.connection.writable.write(forcedLine);
+            collectedEvents.push({
+              raw,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle
+            });
+          } else {
+            input.connection.writable.write(line);
+          }
+          cb();
+        }
+      }()
+    );
+    const preparePhaseEnv = managerLaunch !== void 0 ? envWithoutCorepackHome(prepareEnv) : prepareEnv;
+    const prepareInput = {
+      manager,
+      cwd: config2.work_dir,
+      env: preparePhaseEnv,
+      ...managerLaunch !== void 0 ? { managerLaunch } : {},
+      strace: prepareRunner,
+      attribution,
+      emitter: preparingEmitter,
+      // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
+      // the main install's files on the scratch disk.
+      straceBasePath: `${straceBaseDir}/strace-prepare.out`,
+      protectedPaths,
+      rootPkgKeys,
+      // Nameless root: its prepare-pass lifecycle pids surface under `<repo-root>`
+      // via the attribution layer (shim fast-path threaded with this sentinel; on
+      // Linux the shared Attribution instance already carries it).  The
+      // preparingEmitter then re-stamps lifecycle = 'prepare' + root_anchored.
+      // Conditionally spread (omitted, not undefined) for a named/absent root —
+      // see the installInput note above.
+      ...canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {},
+      commandOverride: prepareCommand
+    };
+    const prepareResult = isMacosBare ? await runInstallPhaseMacos(prepareInput) : await runInstallPhase(prepareInput);
+    diag(
+      input,
+      `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`
+    );
+    if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) and produced no audit events \u2014 the root \`prepare\` script likely ran untraced (strace could not attach) or the package manager aborted before spawning it. Refusing to emit a lockfile: the root \`prepare\` would be unaudited and a clean diff against it would be untrustworthy.`,
+        true
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    if (prepareResult.exitCode !== 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) \u2014 the root \`prepare\` script failed under audit. This is recorded in the lockfile, not treated as a fatal error.`,
+        false
+      );
+    }
+    installResult.eventCount += prepareResult.eventCount;
+    const prepareTamper = prepareResult.tamperReason ?? prepareRunner.getTamperReason();
+    if (installResult.tamperReason === null) {
+      installResult.tamperReason = prepareTamper;
+    }
+  }
   const tamperReason = installResult.tamperReason ?? straceRunner.getTamperReason();
   if (tamperReason !== null) {
     emitter.emitError(
@@ -30449,14 +31801,14 @@ ${stdoutTail}`;
   diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
   const pkgDirs = new Map(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
-  const ctx = isMacosBare ? { roots, pkgDirs, os: "darwin" } : { roots, pkgDirs };
+  const ctx = isMacosBare ? { roots, pkgDirs, rootPkgKeys, os: "darwin" } : { roots, pkgDirs, rootPkgKeys };
   let yaml;
   try {
     const packages = normalize(collectedEvents, ctx);
     let sha256 = config2.manager_lockfile_sha256;
     if (!sha256 && config2.lockfile_path) {
       try {
-        const lockfileContent = (0, import_node_fs3.readFileSync)(config2.lockfile_path);
+        const lockfileContent = (0, import_node_fs5.readFileSync)(config2.lockfile_path);
         sha256 = (0, import_node_crypto.createHash)("sha256").update(lockfileContent).digest("hex");
       } catch {
         sha256 = "";
@@ -30522,6 +31874,7 @@ if (isMain) {
   LinuxVsockConnection,
   MacOSSpawner,
   MemoryConnection,
+  NPM_PREPARE_RUNNER_SOURCE,
   PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough,
@@ -30530,10 +31883,14 @@ if (isMain) {
   buildChildEnv,
   buildChildEnvMacos,
   createEventsFile,
+  createSensitiveRedactor,
   macosTokenizeRoots,
   main,
+  npmCliEntryPath,
   readStraceChildPid,
+  realCaptureNpmPrepareEnv,
   redactSensitive,
+  resolvePrepareCommand,
   runStraceTailer,
   scratchBaseDir
 });

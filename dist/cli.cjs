@@ -3992,10 +3992,10 @@ var require_resolve_block_map = __commonJS({
       let offset = bm.offset;
       let commentEnd = null;
       for (const collItem of bm.items) {
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const keyProps = resolveProps.resolveProps(start, {
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: bm.indent,
@@ -4009,7 +4009,7 @@ var require_resolve_block_map = __commonJS({
             else if ("indent" in key && key.indent !== bm.indent)
               onError(offset, "BAD_INDENT", startColMsg);
           }
-          if (!keyProps.anchor && !keyProps.tag && !sep) {
+          if (!keyProps.anchor && !keyProps.tag && !sep2) {
             commentEnd = keyProps.end;
             if (keyProps.comment) {
               if (map2.comment)
@@ -4033,7 +4033,7 @@ var require_resolve_block_map = __commonJS({
         ctx.atKey = false;
         if (utilMapIncludes.mapIncludes(ctx, map2.items, keyNode))
           onError(keyStart, "DUPLICATE_KEY", "Map keys must be unique");
-        const valueProps = resolveProps.resolveProps(sep ?? [], {
+        const valueProps = resolveProps.resolveProps(sep2 ?? [], {
           indicator: "map-value-ind",
           next: value,
           offset: keyNode.range[2],
@@ -4049,7 +4049,7 @@ var require_resolve_block_map = __commonJS({
             if (ctx.options.strict && keyProps.start < valueProps.found.offset - 1024)
               onError(keyNode.range, "KEY_OVER_1024_CHARS", "The : indicator must be at most 1024 chars after the start of an implicit block mapping key");
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep, null, valueProps, onError);
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep2, null, valueProps, onError);
           if (ctx.schema.compat)
             utilFlowIndentCheck.flowIndentCheck(bm.indent, value, onError);
           offset = valueNode.range[2];
@@ -4140,7 +4140,7 @@ var require_resolve_end = __commonJS({
       let comment = "";
       if (end) {
         let hasSpace = false;
-        let sep = "";
+        let sep2 = "";
         for (const token of end) {
           const { source, type } = token;
           switch (type) {
@@ -4154,13 +4154,13 @@ var require_resolve_end = __commonJS({
               if (!comment)
                 comment = cb;
               else
-                comment += sep + cb;
-              sep = "";
+                comment += sep2 + cb;
+              sep2 = "";
               break;
             }
             case "newline":
               if (comment)
-                sep += source;
+                sep2 += source;
               hasSpace = true;
               break;
             default:
@@ -4203,18 +4203,18 @@ var require_resolve_flow_collection = __commonJS({
       let offset = fc.offset + fc.start.source.length;
       for (let i = 0; i < fc.items.length; ++i) {
         const collItem = fc.items[i];
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const props = resolveProps.resolveProps(start, {
           flow: fcName,
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: fc.indent,
           startOnNewline: false
         });
         if (!props.found) {
-          if (!props.anchor && !props.tag && !sep && !value) {
+          if (!props.anchor && !props.tag && !sep2 && !value) {
             if (i === 0 && props.comma)
               onError(props.comma, "UNEXPECTED_TOKEN", `Unexpected , in ${fcName}`);
             else if (i < fc.items.length - 1)
@@ -4268,8 +4268,8 @@ var require_resolve_flow_collection = __commonJS({
             }
           }
         }
-        if (!isMap && !sep && !props.found) {
-          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep, null, props, onError);
+        if (!isMap && !sep2 && !props.found) {
+          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep2, null, props, onError);
           coll.items.push(valueNode);
           offset = valueNode.range[2];
           if (isBlock(value))
@@ -4281,7 +4281,7 @@ var require_resolve_flow_collection = __commonJS({
           if (isBlock(key))
             onError(keyNode.range, "BLOCK_IN_FLOW", blockMsg);
           ctx.atKey = false;
-          const valueProps = resolveProps.resolveProps(sep ?? [], {
+          const valueProps = resolveProps.resolveProps(sep2 ?? [], {
             flow: fcName,
             indicator: "map-value-ind",
             next: value,
@@ -4292,8 +4292,8 @@ var require_resolve_flow_collection = __commonJS({
           });
           if (valueProps.found) {
             if (!isMap && !props.found && ctx.options.strict) {
-              if (sep)
-                for (const st of sep) {
+              if (sep2)
+                for (const st of sep2) {
                   if (st === valueProps.found)
                     break;
                   if (st.type === "newline") {
@@ -4310,7 +4310,7 @@ var require_resolve_flow_collection = __commonJS({
             else
               onError(valueProps.start, "MISSING_CHAR", `Missing , or : between ${fcName} items`);
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep, null, valueProps, onError) : null;
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep2, null, valueProps, onError) : null;
           if (valueNode) {
             if (isBlock(value))
               onError(valueNode.range, "BLOCK_IN_FLOW", blockMsg);
@@ -4490,7 +4490,7 @@ var require_resolve_block_scalar = __commonJS({
           chompStart = i + 1;
       }
       let value = "";
-      let sep = "";
+      let sep2 = "";
       let prevMoreIndented = false;
       for (let i = 0; i < contentStart; ++i)
         value += lines[i][0].slice(trimIndent) + "\n";
@@ -4507,24 +4507,24 @@ var require_resolve_block_scalar = __commonJS({
           indent = "";
         }
         if (type === Scalar.Scalar.BLOCK_LITERAL) {
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
         } else if (indent.length > trimIndent || content[0] === "	") {
-          if (sep === " ")
-            sep = "\n";
-          else if (!prevMoreIndented && sep === "\n")
-            sep = "\n\n";
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          if (sep2 === " ")
+            sep2 = "\n";
+          else if (!prevMoreIndented && sep2 === "\n")
+            sep2 = "\n\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
           prevMoreIndented = true;
         } else if (content === "") {
-          if (sep === "\n")
+          if (sep2 === "\n")
             value += "\n";
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          value += sep + content;
-          sep = " ";
+          value += sep2 + content;
+          sep2 = " ";
           prevMoreIndented = false;
         }
       }
@@ -4706,25 +4706,25 @@ var require_resolve_flow_scalar = __commonJS({
       if (!match)
         return source;
       let res = match[1];
-      let sep = " ";
+      let sep2 = " ";
       let pos = first.lastIndex;
       line.lastIndex = pos;
       while (match = line.exec(source)) {
         if (match[1] === "") {
-          if (sep === "\n")
-            res += sep;
+          if (sep2 === "\n")
+            res += sep2;
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          res += sep + match[1];
-          sep = " ";
+          res += sep2 + match[1];
+          sep2 = " ";
         }
         pos = line.lastIndex;
       }
       const last = /[ \t]*(.*)/sy;
       last.lastIndex = pos;
       match = last.exec(source);
-      return res + sep + (match?.[1] ?? "");
+      return res + sep2 + (match?.[1] ?? "");
     }
     function doubleQuotedValue(source, onError) {
       let res = "";
@@ -5534,14 +5534,14 @@ var require_cst_stringify = __commonJS({
         }
       }
     }
-    function stringifyItem({ start, key, sep, value }) {
+    function stringifyItem({ start, key, sep: sep2, value }) {
       let res = "";
       for (const st of start)
         res += st.source;
       if (key)
         res += stringifyToken(key);
-      if (sep)
-        for (const st of sep)
+      if (sep2)
+        for (const st of sep2)
           res += st.source;
       if (value)
         res += stringifyToken(value);
@@ -6708,18 +6708,18 @@ var require_parser = __commonJS({
         if (this.type === "map-value-ind") {
           const prev = getPrevProps(this.peek(2));
           const start = getFirstKeyStartProps(prev);
-          let sep;
+          let sep2;
           if (scalar.end) {
-            sep = scalar.end;
-            sep.push(this.sourceToken);
+            sep2 = scalar.end;
+            sep2.push(this.sourceToken);
             delete scalar.end;
           } else
-            sep = [this.sourceToken];
+            sep2 = [this.sourceToken];
           const map2 = {
             type: "block-map",
             offset: scalar.offset,
             indent: scalar.indent,
-            items: [{ start, key: scalar, sep }]
+            items: [{ start, key: scalar, sep: sep2 }]
           };
           this.onKeyLine = true;
           this.stack[this.stack.length - 1] = map2;
@@ -6872,15 +6872,15 @@ var require_parser = __commonJS({
                 } else if (isFlowToken(it.key) && !includesToken(it.sep, "newline")) {
                   const start2 = getFirstKeyStartProps(it.start);
                   const key = it.key;
-                  const sep = it.sep;
-                  sep.push(this.sourceToken);
+                  const sep2 = it.sep;
+                  sep2.push(this.sourceToken);
                   delete it.key;
                   delete it.sep;
                   this.stack.push({
                     type: "block-map",
                     offset: this.offset,
                     indent: this.indent,
-                    items: [{ start: start2, key, sep }]
+                    items: [{ start: start2, key, sep: sep2 }]
                   });
                 } else if (start.length > 0) {
                   it.sep = it.sep.concat(start, this.sourceToken);
@@ -7074,13 +7074,13 @@ var require_parser = __commonJS({
             const prev = getPrevProps(parent);
             const start = getFirstKeyStartProps(prev);
             fixFlowSeqItems(fc);
-            const sep = fc.end.splice(1, fc.end.length);
-            sep.push(this.sourceToken);
+            const sep2 = fc.end.splice(1, fc.end.length);
+            sep2.push(this.sourceToken);
             const map2 = {
               type: "block-map",
               offset: fc.offset,
               indent: fc.indent,
-              items: [{ start, key: fc, sep }]
+              items: [{ start, key: fc, sep: sep2 }]
             };
             this.onKeyLine = true;
             this.stack[this.stack.length - 1] = map2;
@@ -7364,9 +7364,9 @@ __export(index_exports, {
   run: () => run
 });
 module.exports = __toCommonJS(index_exports);
-var import_node_fs22 = require("node:fs");
+var import_node_fs23 = require("node:fs");
 var import_node_os9 = require("node:os");
-var import_node_path17 = require("node:path");
+var import_node_path18 = require("node:path");
 var import_node_url2 = require("node:url");
 
 // src/cli/detect-platform.ts
@@ -7451,9 +7451,9 @@ function platformPackageName(p) {
 
 // src/cli/spawn-vm.ts
 var import_node_child_process = require("node:child_process");
-var import_node_fs = require("node:fs");
+var import_node_fs2 = require("node:fs");
 var import_node_os2 = require("node:os");
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 var import_node_url = require("node:url");
 
 // src/shared/vsock-protocol.ts
@@ -7531,6 +7531,516 @@ function classifyFrame(obj) {
     }
   }
 }
+
+// src/action/host-install.ts
+var import_node_fs = require("node:fs");
+var import_node_path = require("node:path");
+
+// src/shared/pm-commands.ts
+function isBareFlag(token) {
+  return !token.includes("=");
+}
+function registryUrlHasCredentials(value) {
+  try {
+    const u = new URL(value);
+    if (u.username.length > 0 || u.password.length > 0) return true;
+  } catch {
+  }
+  let s = value.trim();
+  const scheme = /^[a-z][a-z0-9+.-]{0,31}:/i.exec(s);
+  if (scheme !== null) s = s.slice(scheme[0].length);
+  if (s.startsWith("//")) s = s.slice(2);
+  const authority = s.split(/[/?#]/, 1)[0] ?? "";
+  return authority.includes("@");
+}
+function canonicalFlagKey(token) {
+  if (token.length === 0 || token[0] !== "-") return null;
+  let i = 0;
+  while (i < token.length && token[i] === "-") i += 1;
+  let body = token.slice(i);
+  const eq = body.indexOf("=");
+  if (eq !== -1) body = body.slice(0, eq);
+  body = body.toLowerCase();
+  if (body.startsWith("no-")) body = body.slice("no-".length);
+  if (body.startsWith("config.")) body = body.slice("config.".length);
+  let key = "";
+  for (const ch of body) {
+    if (ch !== "-" && ch !== "_" && ch !== ".") key += ch;
+  }
+  return key;
+}
+function dropReason(key) {
+  switch (key) {
+    case "ignorescripts":
+      return "--ignore-scripts";
+    case "frozenlockfile":
+      return "--frozen-lockfile";
+    case "fixlockfile":
+      return "--fix-lockfile";
+    case "lockfiledir":
+      return "--lockfile-dir";
+    case "lockfileonly":
+      return "--lockfile-only";
+    case "lockfile":
+      return "--lockfile";
+    case "modulesdir":
+      return "--modules-dir";
+    case "virtualstoredir":
+      return "--virtual-store-dir";
+    case "storedir":
+      return "--store-dir";
+    case "workspaceroot":
+      return "--workspace-root";
+    case "dir":
+      return "--dir";
+    case "prefix":
+      return "--prefix";
+    case "global":
+      return "--global";
+    case "filter":
+      return "--filter";
+    case "recursive":
+      return "--recursive";
+    case "mode":
+      return "--mode";
+    case "immutable":
+      return "--immutable";
+    case "registry":
+      return "--registry (inline credentials \u2014 set registry auth in .npmrc/env)";
+    default:
+      return "<flag>";
+  }
+}
+var ALLOWED_FLAG_KEYS = /* @__PURE__ */ new Map([
+  ["omit", { takesValue: true }],
+  ["include", { takesValue: true }],
+  ["prod", { takesValue: false }],
+  ["production", { takesValue: false }],
+  ["dev", { takesValue: false }],
+  ["optional", { takesValue: false }],
+  ["p", { takesValue: false }],
+  // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
+  ["d", { takesValue: false }],
+  // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
+  // private-registry SOURCE; root-lock gate unaffected (see note).  AUTH must go
+  // in .npmrc/env — an inline-credential URL value is rejected (F1).
+  ["registry", { takesValue: true, rejectValue: registryUrlHasCredentials }]
+]);
+function filterAgainstAllowlist(args, allow) {
+  const kept = [];
+  const dropped = [];
+  const droppedKeys = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const key = canonicalFlagKey(a);
+    if (key !== null && key.length > 0) {
+      const allowed = allow.get(key);
+      if (allowed !== void 0) {
+        const eq = a.indexOf("=");
+        const splitValue = allowed.takesValue && isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-") ? args[i + 1] : void 0;
+        const value = eq >= 0 ? a.slice(eq + 1) : splitValue;
+        if (allowed.rejectValue !== void 0 && value !== void 0 && allowed.rejectValue(value)) {
+          dropped.push(a);
+          droppedKeys.push(dropReason(key));
+          if (splitValue !== void 0) dropped.push(args[++i]);
+          continue;
+        }
+        kept.push(a);
+        if (splitValue !== void 0) {
+          kept.push(args[++i]);
+        }
+        continue;
+      }
+      dropped.push(a);
+      droppedKeys.push(dropReason(key));
+      if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        dropped.push(args[++i]);
+      }
+      continue;
+    }
+    dropped.push(a);
+    droppedKeys.push("<positional>");
+  }
+  return { kept, dropped, droppedKeys };
+}
+function sanitizeInstallArgs(args) {
+  return filterAgainstAllowlist(args, ALLOWED_FLAG_KEYS);
+}
+function splitInstallArgs(raw) {
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let started = false;
+  for (const ch of raw) {
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === " " || ch === "	" || ch === "\n" || ch === "\r") {
+      if (started) {
+        out.push(cur);
+        cur = "";
+        started = false;
+      }
+      continue;
+    }
+    cur += ch;
+    started = true;
+  }
+  if (started) out.push(cur);
+  return out;
+}
+
+// src/shared/redact.ts
+var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
+var FRAGMENT_MAX_GRAMS = 1 << 22;
+
+// src/action/host-install.ts
+var CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+function canonicalForCompare(p) {
+  let abs;
+  try {
+    abs = (0, import_node_fs.realpathSync)((0, import_node_path.resolve)(p));
+  } catch {
+    abs = (0, import_node_path.resolve)(p);
+  }
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+function lexicalForCompare(p) {
+  const abs = (0, import_node_path.resolve)(p);
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+function checkoutRoots() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
+  }
+  return roots;
+}
+function checkoutRootsLexical() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(lexicalForCompare(v));
+  }
+  return roots;
+}
+function isLexicallyUnderCheckout(p, lexRoots) {
+  const abs = lexicalForCompare(p);
+  for (const root of lexRoots) {
+    if (abs === root || abs.startsWith(root + import_node_path.sep)) return true;
+  }
+  return false;
+}
+function isUnderCheckout(p, roots) {
+  const abs = canonicalForCompare(p);
+  for (const root of roots) {
+    if (abs === root || abs.startsWith(root + import_node_path.sep)) return true;
+  }
+  return false;
+}
+function isPathUnderCheckout(p) {
+  return isUnderCheckout(p, checkoutRoots()) || isLexicallyUnderCheckout(p, checkoutRootsLexical());
+}
+var HOST_INSTALL_KEEP_AUTH_ENV_NAMES = new Set(
+  [
+    "NODE_AUTH_TOKEN",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "GIT_ALLOW_PROTOCOL",
+    // restricts the git transport set, never weakens
+    "GIT_TERMINAL_PROMPT"
+    // behaviour flag (prevents an interactive clone hang)
+  ].map((n) => n.toLowerCase())
+);
+var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
+  [
+    // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
+    "NODE_OPTIONS",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_PATH",
+    // adds require() search dirs → a checkout-relative one loads PR code
+    // npm's globalconfig is `{globalPrefix}/etc/npmrc`, and npm derives globalPrefix
+    // from PLAIN (non-npm_config_*) env in loadGlobalPrefix(): `PREFIX` sets it
+    // directly and `PREFIX`-less `DESTDIR` prepends to the node-derived prefix
+    // (@npmcli/config/lib/index.js:327-339).  VERIFIED npm 11.13.0: `PREFIX=<dir>`
+    // (or `DESTDIR=<dir>`) with `<dir>/etc/npmrc` (resp. `<dir>{nodePrefix}/etc/npmrc`)
+    // declaring `script-shell=<pwn>` makes `npm rebuild --foreground-scripts` exec the
+    // attacker shell — the SAME npmrc-redirect-then-exec class as the denied
+    // npm_config_prefix, but reached via plain env so the npm_config_* canon misses it.
+    // (HOME → `~/.npmrc` is the analogous userconfig vector, gated separately by
+    // install-preflight.ts:detectCheckoutRelativeHome; XDG_CONFIG_HOME is NOT an npmrc
+    // locator in npm 11.13.0 — verified inert.)
+    "PREFIX",
+    "DESTDIR",
+    // [19] Git EXEC/config-FILE selectors (git+ssh|https deps; --ignore-scripts
+    // does NOT stop git being invoked).  Enumerated (not blanket GIT_*) so benign
+    // behaviour flags such as GIT_TERMINAL_PROMPT/GIT_ALLOW_PROTOCOL are preserved.
+    // The git BINARY itself stays pinned via npm_config_git.
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_ASKPASS",
+    // verified-class: git invokes the askpass program by path
+    "SSH_ASKPASS",
+    "GIT_EXEC_PATH",
+    // VERIFIED: GIT_EXEC_PATH=./core runs checkout core/git-remote-https
+    "GIT_TEMPLATE_DIR",
+    // clone hooks dir
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    // gates inline GIT_CONFIG_KEY_*/VALUE_*; dropping it makes them inert
+    "GIT_CONFIG_PARAMETERS",
+    // VERIFIED: ='core.sshCommand=./ssh' runs ./ssh on ssh:// clone
+    // Native-build TOOL selectors honored by node-gyp/gyp/make (checkout-relative
+    // interpreter/compiler/linker runs during a native `npm rebuild`).  PYTHON* and
+    // node-gyp* are caught by the family prefixes below.  Stripping forces the
+    // system toolchain auto-detect — the same default the clean-VM audit used.
+    "CC",
+    "CXX",
+    "CPP",
+    "LINK",
+    "LD",
+    "AR",
+    "AS",
+    "MAKE",
+    // GNU make startup/config env (consumed before any target): MAKEFLAGS
+    // ='--eval=$(shell …)' runs a command at make startup, MAKEFILES=/path
+    // evaluates a makefile pre-target (both VERIFIED).  node-gyp invokes make.
+    "MAKEFLAGS",
+    "GNUMAKEFLAGS",
+    "MAKEFILES",
+    // (Corepack EXEC/config selectors AND its version-steering behaviour flags are
+    // dropped by the `corepack_` FAMILY prefix below — see that entry.)
+    // LOCALAPPDATA is corepack's win32-ONLY cache-root selector (= the COREPACK_HOME
+    // executable-cache class, just platform-scoped).  The action only runs on
+    // Linux/macOS runners (never win32), where neither corepack nor any PM reads it,
+    // so dropping it is functionally inert on every real host AND closes two things:
+    // (a) round-17e — a PR/runner-set LOCALAPPDATA must never steer corepackCacheRoot
+    // to a planted cache (corepackCacheRoot now also ignores it off-win32), and
+    // (b) the value-blind env_read parity — the clean-VM/guest audit never carries
+    // LOCALAPPDATA, so the host lifecycle child must not either (else a dep reading
+    // process.env.LOCALAPPDATA gets a host-present/audit-absent oracle NAME).
+    "LOCALAPPDATA",
+    // pnpm's global bin / executable dir (also where `pnpm setup` puts pnpm on
+    // PATH).  Not a config-file locator and NOT auto-prepended to a lifecycle
+    // script's PATH (both VERIFIED pnpm 11.1.2 — only XDG_CONFIG_HOME relocates the
+    // readable config), but it IS passed verbatim to lifecycle children and the
+    // clean-VM audit inherits none, so drop it for parity: a checkout-relative
+    // PNPM_HOME never reaches the host pnpm or a script that reads it.
+    "PNPM_HOME",
+    // Shell / interpreter startup hooks that run on a NON-interactive spawn.
+    // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
+    // common legit "environment name" var, so it is deliberately NOT stripped.)
+    "BASH_ENV",
+    // bash -c sources it
+    "ZDOTDIR",
+    // zsh startup dir
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB"
+  ].map((n) => n.toLowerCase())
+);
+var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
+  "ld_",
+  // ELF dynamic loader: LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH / …
+  "dyld_",
+  // macOS dyld analogs (the host bare backend runs on macOS)
+  "python",
+  // PYTHON / PYTHONPATH / PYTHONHOME / PYTHONSTARTUP (sitecustomize exec)
+  "node_gyp_",
+  // NODE_GYP_FORCE_PYTHON, … (VERIFIED node-gyp interpreter selector)
+  // XDG base-dir family.  pnpm locates its GLOBAL config at
+  // `$XDG_CONFIG_HOME/pnpm/{config.yaml,rc}` (VERIFIED pnpm 11.1.2: an inherited
+  // `XDG_CONFIG_HOME=<checkout>/.config` makes the host pnpm read a PR-committed
+  // `.config/pnpm/config.yaml` whose `scriptShell:` then runs an attacker shell on
+  // `pnpm rebuild --pending` — npm & yarn do NOT read XDG for config, verified).
+  // The clean-VM audit inherits NO XDG_*, so the host must run without them too;
+  // dropping the whole family is parity-safe (config/data/state/cache all default
+  // to the runner's real HOME, which the HOME gate keeps outside the checkout) and
+  // forecloses any future XDG-located PM config.
+  "xdg_",
+  // npm re-derives npm_package_config_* from the AUDITED package.json; an INHERITED
+  // one for a key absent from package.json would pass through to node-gyp
+  // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
+  // the legit values from the package.json the sandbox already audited.
+  "npm_package_config_",
+  // Corepack family — a pnpm/yarn bare command is commonly a corepack shim.  Two
+  // dangerous sub-classes, BOTH dropped here so the SHARED sanitizer (every backend
+  // AGENT spawn AND the host install) applies one parity policy:
+  //   EXEC/config selectors — COREPACK_HOME (executable CACHE; a checkout-relative
+  //     one makes corepack run a PR-planted bin/pnpm.cjs — VERIFIED corepack 0.35.0),
+  //     COREPACK_ENV_FILE (loads env from a file), COREPACK_NPM_REGISTRY /
+  //     COREPACK_INTEGRITY_KEYS / COREPACK_ROOT (redirect/unsign the downloaded PM).
+  //   VERSION-STEERING flags — COREPACK_ENABLE_PROJECT_SPEC=0 makes corepack IGNORE
+  //     the repo's `packageManager` and run a DIFFERENT pm VERSION (VERIFIED corepack
+  //     0.35.0: yarn 3.8.7 pin -> 4.5.0), a host-vs-audit (and bare-audit-vs-host)
+  //     SEMANTICS skew; COREPACK_DEFAULT_TO_LATEST / COREPACK_ENABLE_STRICT likewise.
+  // The clean-VM audit inherits NO COREPACK_*, so dropping the whole family keeps
+  // host==audit AND bare-audit==host.  The ONE flag a spawn legitimately needs,
+  // COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (avoid an interactive hang on an uncached PM
+  // download), is RE-PINNED by every corepack-running caller AFTER this strip
+  // (hostInstallEnv, backend/bare.ts, backend/mac-bare.ts, backend/docker.ts,
+  // rootfs/init.sh, cli/provision-node-mac.ts) — never relied on as an inherited
+  // pass-through.
+  "corepack_"
+];
+var PM_CONFIG_AUTH_SCALARS = /* @__PURE__ */ new Set([
+  "registry",
+  // default registry URL
+  // npm-only: rewrites the HOST of lockfile-pinned tarball URLs to the configured
+  // `registry` (VERIFIED npm 11.13.0 honors both separators, no Unknown-env warning).
+  // Needed for a mirror where the lockfile pins NON-default public hosts but an
+  // egress-locked runner must funnel all fetches through one internal registry, else
+  // the host install fails after a clean audit.  PURE routing — pacote/arborist
+  // rewrite only host/port/protocol/path and STILL verify the integrity hash against
+  // the fetched bytes (no exec/loader/config-FILE).  pnpm has no consumer (zero dist
+  // refs on 10.34.3/11.1.2) → harmless no-op there, like the other npm-only scalars.
+  "replace_registry_host",
+  "_auth",
+  // legacy single-registry base64 basic auth
+  "email",
+  // legacy auth identity
+  "ca",
+  // inline PEM CA (string/array) — data, not a path
+  "cafile",
+  // PEM CA file path — read as cert DATA, never interpreted
+  "cert",
+  // inline PEM client cert (deprecated → certfile)
+  "certfile",
+  // PEM client-cert file path — TLS material
+  "key",
+  // inline PEM client key (deprecated → keyfile)
+  "keyfile",
+  // PEM client-key file path — TLS material
+  "strict_ssl",
+  // TLS verification toggle
+  "proxy",
+  // HTTP(S) proxy URL (npm + pnpm)
+  "https_proxy",
+  // HTTPS proxy URL (npm + pnpm)
+  "noproxy",
+  // proxy-bypass host list — npm's canonical key
+  // pnpm's canonical proxy spellings are `http-proxy` / `no-proxy` (DISTINCT from
+  // npm's `proxy` / `noproxy`).  VERIFIED pnpm 11.1.2 reads `pnpm_config_http_proxy`
+  // -> `http-proxy` (feeds ProxyAgent) and `pnpm_config_no_proxy` -> `no-proxy`
+  // (feeds checkNoProxy); pnpm 10.34.3 reads the SAME via the `npm_config_` form.
+  // Without these a pnpm install behind an HTTP-only proxy (or needing a no-proxy
+  // bypass for an internal registry) fails on the host.  Pure network config (URL /
+  // host list), no exec.  npm treats both as "Unknown env config" (ignores — harmless).
+  "http_proxy",
+  // pnpm `http-proxy`
+  "no_proxy",
+  // pnpm `no-proxy`
+  // Network binding + fetch tuning — pure data (a validated IP, an int), never an
+  // exec/loader/config-FILE selector.  VERIFIED env-settable on npm 11.13.0 + pnpm
+  // 11.1.2 (pnpm_config_ form) + pnpm 10.34.3 (npm_config_ form): multi-homed /
+  // internal-registry / slow-registry installs legitimately need these to REACH the
+  // registry, and the clean-VM audit inherits none, so the host must be able to too.
+  // `network_concurrency` is pnpm-only (npm ignores as "Unknown env config" — no-op).
+  "local_address",
+  // source IP for a multi-homed runner (npm validates it as an IP)
+  "maxsockets",
+  // connection pool size
+  "fetch_timeout",
+  // request timeout (ms)
+  "fetch_retries",
+  // retry count for a flaky internal registry
+  "fetch_retry_factor",
+  "fetch_retry_mintimeout",
+  "fetch_retry_maxtimeout",
+  "network_concurrency"
+  // pnpm-only request concurrency
+]);
+function isAllowedPmConfigKey(slice) {
+  if (slice.startsWith("//")) return true;
+  if (slice.startsWith("@") && slice.includes(":")) return true;
+  return PM_CONFIG_AUTH_SCALARS.has(slice.replace(/-/g, "_"));
+}
+var YARN_ENV_ALLOW = /* @__PURE__ */ new Set([
+  "YARN_NPM_AUTH_TOKEN",
+  "YARN_NPM_AUTH_IDENT",
+  "YARN_NPM_REGISTRY_SERVER",
+  "YARN_NPM_ALWAYS_AUTH",
+  "YARN_HTTP_PROXY",
+  // -> httpProxy (URL)
+  "YARN_HTTPS_PROXY",
+  // -> httpsProxy (URL)
+  "YARN_HTTP_TIMEOUT",
+  // -> httpTimeout (int)
+  "YARN_HTTP_RETRY",
+  // -> httpRetry (int)
+  "YARN_NETWORK_CONCURRENCY",
+  // -> networkConcurrency (int)
+  "YARN_HTTPS_CA_FILE_PATH",
+  // -> httpsCaFilePath (PEM CA, read as TLS material)
+  "YARN_HTTPS_CERT_FILE_PATH",
+  // -> httpsCertFilePath (PEM client cert)
+  "YARN_HTTPS_KEY_FILE_PATH"
+  // -> httpsKeyFilePath (PEM client key)
+]);
+function isDangerousEnvName(name) {
+  const lower = name.toLowerCase();
+  for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
+    if (lower.startsWith(prefix)) return true;
+  }
+  if (lower.startsWith("pnpm_config_")) {
+    return !isAllowedPmConfigKey(lower.slice("pnpm_config_".length));
+  }
+  if (lower.startsWith("npm_config_")) {
+    return !isAllowedPmConfigKey(lower.slice("npm_config_".length));
+  }
+  if (lower.startsWith("yarn_")) {
+    return !YARN_ENV_ALLOW.has(name.toUpperCase());
+  }
+  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
+}
+var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+function sanitizePathValue(pathVar) {
+  if (pathVar === void 0) return void 0;
+  const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
+  const kept = [];
+  for (const dir of pathVar.split(import_node_path.delimiter)) {
+    if (!(0, import_node_path.isAbsolute)(dir)) continue;
+    if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
+    kept.push(dir);
+  }
+  return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path.delimiter);
+}
+function stripDangerousEnv(srcEnv) {
+  const env = {};
+  for (const [name, value] of Object.entries(srcEnv)) {
+    if (value === void 0) continue;
+    if (isDangerousEnvName(name)) continue;
+    env[name] = value;
+  }
+  const sanitizedPath = sanitizePathValue(srcEnv["PATH"]);
+  if (sanitizedPath === void 0) delete env["PATH"];
+  else env["PATH"] = sanitizedPath;
+  return env;
+}
+var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
 
 // src/cli/spawn-vm.ts
 var import_meta = {};
@@ -7617,46 +8127,62 @@ function resolvePackageRoot() {
       here = process.argv[1] ?? process.cwd();
     }
   }
-  return (0, import_node_path.dirname)((0, import_node_path.dirname)(here));
+  return (0, import_node_path2.dirname)((0, import_node_path2.dirname)(here));
 }
 function resolveScriptJailVmBinary(opts) {
   const searched = [];
   const envBin = opts?.envOverride !== void 0 ? opts.envOverride : process.env["SCRIPT_JAIL_VM_BIN"];
   if (envBin !== void 0 && envBin !== "") {
+    if (!(0, import_node_path2.isAbsolute)(envBin)) {
+      throw new Error(
+        `script-jail: SCRIPT_JAIL_VM_BIN must be an absolute path (got ${JSON.stringify(envBin)}); a relative override would resolve the VZ helper against the checkout.`
+      );
+    }
+    if (isPathUnderCheckout(envBin)) {
+      throw new Error(
+        `script-jail: SCRIPT_JAIL_VM_BIN (${JSON.stringify(envBin)}) is inside the checkout; the VZ helper must not be a checkout-controlled binary (pre-trust RCE).`
+      );
+    }
     searched.push(`${envBin} (SCRIPT_JAIL_VM_BIN)`);
-    if ((0, import_node_fs.existsSync)(envBin)) return envBin;
+    if ((0, import_node_fs2.existsSync)(envBin)) return envBin;
   }
   const repoRoot = opts?.repoRoot ?? resolvePackageRoot();
-  const localTarget = (0, import_node_path.join)(repoRoot, "target", "release", "script-jail-vm");
+  const localTarget = (0, import_node_path2.join)(repoRoot, "target", "release", "script-jail-vm");
   searched.push(localTarget);
-  if ((0, import_node_fs.existsSync)(localTarget)) return localTarget;
+  if ((0, import_node_fs2.existsSync)(localTarget)) return localTarget;
   if (opts?.platformPackageDir !== void 0) {
-    const installedBin = (0, import_node_path.join)(opts.platformPackageDir, "script-jail-vm");
+    const installedBin = (0, import_node_path2.join)(opts.platformPackageDir, "script-jail-vm");
     searched.push(installedBin);
-    if ((0, import_node_fs.existsSync)(installedBin)) return installedBin;
+    if ((0, import_node_fs2.existsSync)(installedBin)) return installedBin;
   }
   throw new MacOSVmBinaryNotFoundError(searched);
 }
 function checkArtifacts(cfg) {
-  if (!(0, import_node_fs.existsSync)(cfg.kernelPath)) {
+  if (!(0, import_node_fs2.existsSync)(cfg.kernelPath)) {
     throw new MacOSVmArtifactNotFoundError("kernel", cfg.kernelPath);
   }
-  if (!(0, import_node_fs.existsSync)(cfg.rootfsDiskPath)) {
+  if (!(0, import_node_fs2.existsSync)(cfg.rootfsDiskPath)) {
     throw new MacOSVmArtifactNotFoundError("rootfs", cfg.rootfsDiskPath);
   }
-  if (cfg.scratchDiskPath !== void 0 && cfg.scratchDiskPath !== "" && !(0, import_node_fs.existsSync)(cfg.scratchDiskPath)) {
+  if (cfg.scratchDiskPath !== void 0 && cfg.scratchDiskPath !== "" && !(0, import_node_fs2.existsSync)(cfg.scratchDiskPath)) {
     throw new MacOSVmArtifactNotFoundError("scratch disk", cfg.scratchDiskPath);
   }
-  if (cfg.sjtmpDiskPath !== void 0 && cfg.sjtmpDiskPath !== "" && !(0, import_node_fs.existsSync)(cfg.sjtmpDiskPath)) {
+  if (cfg.sjtmpDiskPath !== void 0 && cfg.sjtmpDiskPath !== "" && !(0, import_node_fs2.existsSync)(cfg.sjtmpDiskPath)) {
     throw new MacOSVmArtifactNotFoundError("sjtmp disk", cfg.sjtmpDiskPath);
   }
-  if (cfg.libscriptjailSoPath !== void 0 && cfg.libscriptjailSoPath !== "" && !(0, import_node_fs.existsSync)(cfg.libscriptjailSoPath)) {
+  if (cfg.libscriptjailSoPath !== void 0 && cfg.libscriptjailSoPath !== "" && !(0, import_node_fs2.existsSync)(cfg.libscriptjailSoPath)) {
     throw new MacOSVmArtifactNotFoundError("libscriptjail.so", cfg.libscriptjailSoPath);
   }
 }
 var VZ_ENTITLEMENT = "com.apple.security.virtualization";
+function sanitizedHostEnv() {
+  return stripDangerousEnv(process.env);
+}
 var defaultCodesignRunner = (args) => {
-  const result = (0, import_node_child_process.spawnSync)("codesign", [...args], { encoding: "utf8" });
+  const result = (0, import_node_child_process.spawnSync)("codesign", [...args], {
+    encoding: "utf8",
+    env: sanitizedHostEnv()
+  });
   return {
     status: result.status,
     stdout: result.stdout ?? "",
@@ -7713,9 +8239,9 @@ async function spawnVm(vmConfig, options = {}) {
     sjtmpDiskPath: vmConfig.sjtmpDiskPath
   });
   assertVmHelperEntitlement(binary, options.codesignRunner);
-  const tmpDir = (0, import_node_fs.mkdtempSync)((0, import_node_path.join)((0, import_node_os2.tmpdir)(), "script-jail-vm-"));
-  const configJsonPath = (0, import_node_path.join)(tmpDir, "config.json");
-  (0, import_node_fs.writeFileSync)(configJsonPath, JSON.stringify(toJsonPayload(vmConfig), null, 2), "utf8");
+  const tmpDir = (0, import_node_fs2.mkdtempSync)((0, import_node_path2.join)((0, import_node_os2.tmpdir)(), "script-jail-vm-"));
+  const configJsonPath = (0, import_node_path2.join)(tmpDir, "config.json");
+  (0, import_node_fs2.writeFileSync)(configJsonPath, JSON.stringify(toJsonPayload(vmConfig), null, 2), "utf8");
   let child = null;
   const stderrTail = new StderrTail();
   const warnings = [];
@@ -7731,7 +8257,8 @@ async function spawnVm(vmConfig, options = {}) {
   process.on("SIGTERM", onSignal);
   try {
     child = (0, import_node_child_process.spawn)(binary, ["boot", "--config", configJsonPath], {
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      env: sanitizedHostEnv()
     });
     child.stderr.on("data", (chunk) => {
       stderrTail.append(chunk);
@@ -7796,7 +8323,7 @@ async function spawnVm(vmConfig, options = {}) {
       }
     }
     try {
-      (0, import_node_fs.rmSync)(tmpDir, { recursive: true, force: true });
+      (0, import_node_fs2.rmSync)(tmpDir, { recursive: true, force: true });
     } catch {
     }
   }
@@ -7820,6 +8347,7 @@ function parseArgs(argv) {
     // `null` until the user passes --backend.  `src/cli/index.ts` resolves the
     // effective backend per host (darwin: vz on arm64, bare otherwise).
     backend: null,
+    args: [],
     help: false,
     version: false,
     errors: []
@@ -7889,6 +8417,20 @@ function parseArgs(argv) {
       out.backend = v;
       continue;
     }
+    if (a.startsWith("--args=")) {
+      out.args = splitInstallArgs(a.slice("--args=".length));
+      continue;
+    }
+    if (a === "--args") {
+      const next = argv[i + 1];
+      if (next === void 0) {
+        out.errors.push("--args requires a value");
+        continue;
+      }
+      i++;
+      out.args = splitInstallArgs(next);
+      continue;
+    }
     if (a.startsWith("-")) {
       out.errors.push(`unknown flag: ${a}`);
       continue;
@@ -7909,8 +8451,8 @@ function parseArgs(argv) {
 
 // src/shared/detect-pm.ts
 var import_node_crypto = require("node:crypto");
-var import_node_fs2 = require("node:fs");
-var import_node_path2 = require("node:path");
+var import_node_fs3 = require("node:fs");
+var import_node_path3 = require("node:path");
 
 // src/shared/log.ts
 function warn(msg, write = (s) => {
@@ -7936,16 +8478,16 @@ var LOCKFILE_PRIORITY = [
 var BUN_LOCKFILES = ["bun.lock", "bun.lockb"];
 function detectPm(input) {
   const fs = input.fs ?? {
-    existsSync: import_node_fs2.existsSync,
-    readFileSync: (p) => (0, import_node_fs2.readFileSync)(p)
+    existsSync: import_node_fs3.existsSync,
+    readFileSync: (p) => (0, import_node_fs3.readFileSync)(p)
   };
   const warn2 = input.warn ?? warn;
   const found = LOCKFILE_PRIORITY.filter(
-    (entry) => fs.existsSync((0, import_node_path2.join)(input.repoDir, entry.name))
+    (entry) => fs.existsSync((0, import_node_path3.join)(input.repoDir, entry.name))
   );
   if (found.length === 0) {
     const hasBun = BUN_LOCKFILES.some(
-      (name) => fs.existsSync((0, import_node_path2.join)(input.repoDir, name))
+      (name) => fs.existsSync((0, import_node_path3.join)(input.repoDir, name))
     );
     if (hasBun) throw new BunUnsupportedError();
     throw new Error(
@@ -7960,7 +8502,7 @@ function detectPm(input) {
       `[detect-pm] multiple lockfiles found; using ${chosen.name} (ignoring: ${otherNames})`
     );
   }
-  const lockfilePath = (0, import_node_path2.join)(input.repoDir, chosen.name);
+  const lockfilePath = (0, import_node_path3.join)(input.repoDir, chosen.name);
   const buf = fs.readFileSync(lockfilePath);
   const lockfileSha256 = (0, import_node_crypto.createHash)("sha256").update(buf).digest("hex");
   return {
@@ -7972,8 +8514,8 @@ function detectPm(input) {
 
 // src/shared/artifacts.ts
 var import_node_module = require("node:module");
-var import_node_fs3 = require("node:fs");
-var import_node_path3 = require("node:path");
+var import_node_fs4 = require("node:fs");
+var import_node_path4 = require("node:path");
 var import_meta2 = {};
 function resolveArtifacts(input) {
   const { repoRoot, hostArch, ubuntuMajor } = input;
@@ -7984,19 +8526,19 @@ function resolveArtifacts(input) {
       "resolveArtifacts: provide exactly one of { repoRoot, imagesDir }"
     );
   }
-  const imagesDir = hasImagesDir ? input.imagesDir : (0, import_node_path3.join)(repoRoot, "images");
+  const imagesDir = hasImagesDir ? input.imagesDir : (0, import_node_path4.join)(repoRoot, "images");
   const kernelArch = hostArch === "x64" ? "x86_64" : "arm64";
-  const kernelPath = (0, import_node_path3.join)(imagesDir, `vmlinux-vz-${kernelArch}`);
+  const kernelPath = (0, import_node_path4.join)(imagesDir, `vmlinux-vz-${kernelArch}`);
   const rootfsName = hostArch === "arm64" ? `rootfs-ubuntu-${ubuntuMajor}-arm64.ext4` : `rootfs-ubuntu-${ubuntuMajor}.ext4`;
-  const rootfsPath = (0, import_node_path3.join)(imagesDir, rootfsName);
+  const rootfsPath = (0, import_node_path4.join)(imagesDir, rootfsName);
   const compressedRootfsPath = `${rootfsPath}.gz`;
-  const libscriptjailSoPath = (0, import_node_path3.join)(
+  const libscriptjailSoPath = (0, import_node_path4.join)(
     imagesDir,
     hostArch === "x64" ? "libscriptjail.so" : "libscriptjail-arm64.so"
   );
-  const macShimDylibPath = (0, import_node_path3.join)(imagesDir, "libscriptjail-arm64.dylib");
-  const macCoreutilsPath = (0, import_node_path3.join)(imagesDir, "coreutils-arm64");
-  const macBashPath = (0, import_node_path3.join)(imagesDir, "bash-arm64");
+  const macShimDylibPath = (0, import_node_path4.join)(imagesDir, "libscriptjail-arm64.dylib");
+  const macCoreutilsPath = (0, import_node_path4.join)(imagesDir, "coreutils-arm64");
+  const macBashPath = (0, import_node_path4.join)(imagesDir, "bash-arm64");
   return {
     kernelPath,
     rootfsPath,
@@ -8020,46 +8562,46 @@ function resolvePlatformPackageDir(input) {
   const req = input.require ?? (typeof require !== "undefined" ? require : (0, import_node_module.createRequire)(import_meta2.url));
   try {
     const resolvedPkgJson = req.resolve(`${packageName}/package.json`);
-    return { imagesDir: (0, import_node_path3.dirname)(resolvedPkgJson), source: "package" };
+    return { imagesDir: (0, import_node_path4.dirname)(resolvedPkgJson), source: "package" };
   } catch {
   }
-  if (devImagesDir !== void 0 && (0, import_node_fs3.existsSync)(devImagesDir)) {
+  if (devImagesDir !== void 0 && (0, import_node_fs4.existsSync)(devImagesDir)) {
     return { imagesDir: devImagesDir, source: "dev" };
   }
   throw new PlatformPackageMissingError(packageName);
 }
 
 // src/cli/rootfs-cache.ts
-var import_node_fs4 = require("node:fs");
+var import_node_fs5 = require("node:fs");
 var import_node_crypto2 = require("node:crypto");
 var import_node_os3 = require("node:os");
-var import_node_path4 = require("node:path");
+var import_node_path5 = require("node:path");
 var import_node_zlib = require("node:zlib");
 async function ensureRootfs(input) {
-  if ((0, import_node_fs4.existsSync)(input.rootfsPath)) return input.rootfsPath;
-  if (!(0, import_node_fs4.existsSync)(input.compressedRootfsPath)) return input.rootfsPath;
+  if ((0, import_node_fs5.existsSync)(input.rootfsPath)) return input.rootfsPath;
+  if (!(0, import_node_fs5.existsSync)(input.compressedRootfsPath)) return input.rootfsPath;
   const cacheDir = input.cacheDir ?? defaultCacheDir();
-  (0, import_node_fs4.mkdirSync)(cacheDir, { recursive: true });
+  (0, import_node_fs5.mkdirSync)(cacheDir, { recursive: true });
   const digest = await sha256File(input.compressedRootfsPath);
-  const ext4Name = (0, import_node_path4.basename)(input.rootfsPath);
-  const cached2 = (0, import_node_path4.join)(cacheDir, `${stripExt4Suffix(ext4Name)}-${digest.slice(0, 16)}.ext4`);
+  const ext4Name = (0, import_node_path5.basename)(input.rootfsPath);
+  const cached2 = (0, import_node_path5.join)(cacheDir, `${stripExt4Suffix(ext4Name)}-${digest.slice(0, 16)}.ext4`);
   const metaPath = `${cached2}.json`;
   if (isReusableCachedRootfs(cached2, metaPath, digest)) return cached2;
-  (0, import_node_fs4.rmSync)(cached2, { force: true });
-  (0, import_node_fs4.rmSync)(metaPath, { force: true });
-  const tmp = (0, import_node_path4.join)(cacheDir, `.${(0, import_node_path4.basename)(cached2)}.${process.pid}.${Date.now()}.tmp`);
+  (0, import_node_fs5.rmSync)(cached2, { force: true });
+  (0, import_node_fs5.rmSync)(metaPath, { force: true });
+  const tmp = (0, import_node_path5.join)(cacheDir, `.${(0, import_node_path5.basename)(cached2)}.${process.pid}.${Date.now()}.tmp`);
   const tmpMeta = `${tmp}.json`;
   try {
     const logicalSize = await sparseGunzip(input.compressedRootfsPath, tmp);
-    (0, import_node_fs4.writeFileSync)(
+    (0, import_node_fs5.writeFileSync)(
       tmpMeta,
       JSON.stringify({ compressedSha256: digest, logicalSize }, null, 2) + "\n"
     );
-    (0, import_node_fs4.renameSync)(tmp, cached2);
-    (0, import_node_fs4.renameSync)(tmpMeta, metaPath);
+    (0, import_node_fs5.renameSync)(tmp, cached2);
+    (0, import_node_fs5.renameSync)(tmpMeta, metaPath);
   } catch (err) {
-    (0, import_node_fs4.rmSync)(tmp, { force: true });
-    (0, import_node_fs4.rmSync)(tmpMeta, { force: true });
+    (0, import_node_fs5.rmSync)(tmp, { force: true });
+    (0, import_node_fs5.rmSync)(tmpMeta, { force: true });
     throw err;
   }
   return cached2;
@@ -8068,32 +8610,32 @@ function defaultCacheDir() {
   const override = process.env["SCRIPT_JAIL_CACHE_DIR"];
   if (override !== void 0 && override !== "") return override;
   const home = (0, import_node_os3.homedir)();
-  if (home !== "") return (0, import_node_path4.join)(home, "Library", "Caches", "script-jail");
-  return (0, import_node_path4.join)((0, import_node_os3.tmpdir)(), "script-jail-cache");
+  if (home !== "") return (0, import_node_path5.join)(home, "Library", "Caches", "script-jail");
+  return (0, import_node_path5.join)((0, import_node_os3.tmpdir)(), "script-jail-cache");
 }
 async function sha256File(path) {
   const hash2 = (0, import_node_crypto2.createHash)("sha256");
-  for await (const chunk of (0, import_node_fs4.createReadStream)(path)) {
+  for await (const chunk of (0, import_node_fs5.createReadStream)(path)) {
     hash2.update(chunk);
   }
   return hash2.digest("hex");
 }
 async function sparseGunzip(source, dest) {
-  (0, import_node_fs4.mkdirSync)((0, import_node_path4.dirname)(dest), { recursive: true });
-  const fd = (0, import_node_fs4.openSync)(dest, "w", 420);
+  (0, import_node_fs5.mkdirSync)((0, import_node_path5.dirname)(dest), { recursive: true });
+  const fd = (0, import_node_fs5.openSync)(dest, "w", 420);
   let offset = 0;
   try {
-    const stream = (0, import_node_fs4.createReadStream)(source, { highWaterMark: 1024 * 1024 }).pipe((0, import_node_zlib.createGunzip)());
+    const stream = (0, import_node_fs5.createReadStream)(source, { highWaterMark: 1024 * 1024 }).pipe((0, import_node_zlib.createGunzip)());
     for await (const chunk of stream) {
       const buf = chunk;
       writeNonZeroRanges(fd, buf, offset);
       offset += buf.length;
     }
-    (0, import_node_fs4.ftruncateSync)(fd, offset);
+    (0, import_node_fs5.ftruncateSync)(fd, offset);
   } finally {
-    (0, import_node_fs4.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
   }
-  (0, import_node_fs4.statSync)(dest);
+  (0, import_node_fs5.statSync)(dest);
   return offset;
 }
 function writeNonZeroRanges(fd, buf, baseOffset) {
@@ -8104,28 +8646,28 @@ function writeNonZeroRanges(fd, buf, baseOffset) {
       continue;
     }
     if (start !== -1) {
-      (0, import_node_fs4.writeSync)(fd, buf, start, i - start, baseOffset + start);
+      (0, import_node_fs5.writeSync)(fd, buf, start, i - start, baseOffset + start);
       start = -1;
     }
   }
   if (start !== -1) {
-    (0, import_node_fs4.writeSync)(fd, buf, start, buf.length - start, baseOffset + start);
+    (0, import_node_fs5.writeSync)(fd, buf, start, buf.length - start, baseOffset + start);
   }
 }
 function stripExt4Suffix(name) {
   return name.endsWith(".ext4") ? name.slice(0, -".ext4".length) : name;
 }
 function isReusableCachedRootfs(cached2, metaPath, digest) {
-  if (!(0, import_node_fs4.existsSync)(cached2) || !(0, import_node_fs4.existsSync)(metaPath)) return false;
+  if (!(0, import_node_fs5.existsSync)(cached2) || !(0, import_node_fs5.existsSync)(metaPath)) return false;
   const meta3 = readCacheMeta(metaPath);
   if (meta3 === void 0) return false;
   if (meta3.compressedSha256 !== digest) return false;
   if (!Number.isSafeInteger(meta3.logicalSize) || meta3.logicalSize < 0) return false;
-  return (0, import_node_fs4.statSync)(cached2).size === meta3.logicalSize;
+  return (0, import_node_fs5.statSync)(cached2).size === meta3.logicalSize;
 }
 function readCacheMeta(path) {
   try {
-    const parsed = JSON.parse((0, import_node_fs4.readFileSync)(path, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs5.readFileSync)(path, "utf8"));
     const { compressedSha256, logicalSize } = parsed;
     if (typeof compressedSha256 !== "string" || typeof logicalSize !== "number") return void 0;
     return { compressedSha256, logicalSize };
@@ -8135,15 +8677,15 @@ function readCacheMeta(path) {
 }
 
 // src/cli/local-artifacts.ts
-var import_node_fs5 = require("node:fs");
-var import_node_path5 = require("node:path");
+var import_node_fs6 = require("node:fs");
+var import_node_path6 = require("node:path");
 function createLocalPreFetchArtifacts(input) {
   const { packageImagesDir, hostArch, ubuntuMajor } = input;
   const ensureRootfs2 = input.ensureRootfs ?? ensureRootfs;
   return async function localPreFetchArtifacts(prefetch) {
     const { imagesDir, runnerImage } = prefetch;
     const arch = prefetch.arch ?? hostArch;
-    (0, import_node_fs5.mkdirSync)(imagesDir, { recursive: true });
+    (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
     await materializeRootfs({
       packageImagesDir,
       imagesDir,
@@ -8158,9 +8700,9 @@ function createLocalPreFetchArtifacts(input) {
 }
 async function materializeRootfs(args) {
   const wantedRootfs = rootfsAssetName(args.runnerImage, args.arch);
-  const dest = (0, import_node_path5.join)(args.imagesDir, wantedRootfs);
-  if ((0, import_node_fs5.existsSync)(dest)) return;
-  const packagedRootfs = (0, import_node_path5.join)(args.packageImagesDir, wantedRootfs);
+  const dest = (0, import_node_path6.join)(args.imagesDir, wantedRootfs);
+  if ((0, import_node_fs6.existsSync)(dest)) return;
+  const packagedRootfs = (0, import_node_path6.join)(args.packageImagesDir, wantedRootfs);
   const materialized = await args.ensureRootfs({
     rootfsPath: packagedRootfs,
     compressedRootfsPath: `${packagedRootfs}.gz`,
@@ -8168,24 +8710,24 @@ async function materializeRootfs(args) {
     // explicit `undefined` is not assignable to the optional field.
     ...args.cacheDir !== void 0 ? { cacheDir: args.cacheDir } : {}
   });
-  if ((0, import_node_fs5.existsSync)(dest) && (0, import_node_fs5.statSync)(dest).size === (0, import_node_fs5.statSync)(materialized).size) {
+  if ((0, import_node_fs6.existsSync)(dest) && (0, import_node_fs6.statSync)(dest).size === (0, import_node_fs6.statSync)(materialized).size) {
     return;
   }
   linkOrCopy(materialized, dest);
 }
 function materializeShim(args) {
   const soName = libscriptjailAssetName(args.arch);
-  const src = (0, import_node_path5.join)(args.packageImagesDir, soName);
-  const dest = (0, import_node_path5.join)(args.imagesDir, soName);
-  if ((0, import_node_fs5.existsSync)(dest) && (0, import_node_fs5.statSync)(dest).size === (0, import_node_fs5.statSync)(src).size) return;
-  (0, import_node_fs5.copyFileSync)(src, dest);
+  const src = (0, import_node_path6.join)(args.packageImagesDir, soName);
+  const dest = (0, import_node_path6.join)(args.imagesDir, soName);
+  if ((0, import_node_fs6.existsSync)(dest) && (0, import_node_fs6.statSync)(dest).size === (0, import_node_fs6.statSync)(src).size) return;
+  (0, import_node_fs6.copyFileSync)(src, dest);
 }
 function linkOrCopy(src, dest) {
   try {
-    (0, import_node_fs5.linkSync)(src, dest);
+    (0, import_node_fs6.linkSync)(src, dest);
   } catch (err) {
     if (err.code === "EXDEV") {
-      (0, import_node_fs5.copyFileSync)(src, dest);
+      (0, import_node_fs6.copyFileSync)(src, dest);
       return;
     }
     throw err;
@@ -8199,15 +8741,15 @@ function libscriptjailAssetName(arch) {
 }
 
 // src/action/firecracker/overlay.ts
-var import_node_fs6 = require("node:fs");
+var import_node_fs7 = require("node:fs");
 var import_promises = require("node:fs/promises");
-var import_node_path6 = require("node:path");
+var import_node_path7 = require("node:path");
 var import_node_os4 = require("node:os");
 var import_node_child_process2 = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
-  const workDir = input.workDir ?? (0, import_node_fs6.mkdtempSync)((0, import_node_path6.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
-  (0, import_node_fs6.mkdirSync)(workDir, { recursive: true });
+  const workDir = input.workDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path7.join)((0, import_node_os4.tmpdir)(), "script-jail-run-"));
+  (0, import_node_fs7.mkdirSync)(workDir, { recursive: true });
   try {
     return await buildOverlayInto(workDir, input);
   } catch (err) {
@@ -8221,18 +8763,20 @@ async function makeOverlay(input) {
 }
 async function buildOverlayInto(workDir, input) {
   const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
-  const rootfsCopyPath = (0, import_node_path6.join)(workDir, "rootfs.ext4");
-  copyRootfs(baseRootfsPath, rootfsCopyPath);
-  const repoStageDir = (0, import_node_path6.join)(workDir, "repo-stage");
-  (0, import_node_fs6.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs6.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
-  const configDestDir = (0, import_node_path6.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs6.mkdirSync)(configDestDir, { recursive: true });
-  (0, import_node_fs6.copyFileSync)(configPath, (0, import_node_path6.join)(configDestDir, "config.yml"));
+  const env = input.env ?? process.env;
+  const rootfsCopyPath = (0, import_node_path7.join)(workDir, "rootfs.ext4");
+  copyRootfs(baseRootfsPath, rootfsCopyPath, env);
+  const repoStageDir = (0, import_node_path7.join)(workDir, "repo-stage");
+  (0, import_node_fs7.mkdirSync)(repoStageDir, { recursive: true });
+  (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false, verbatimSymlinks: true });
+  ensureRealDirectory((0, import_node_path7.join)(repoStageDir, "etc"));
+  const configDestDir = (0, import_node_path7.join)(repoStageDir, "etc", "script-jail");
+  ensureRealDirectory(configDestDir);
+  (0, import_node_fs7.copyFileSync)(configPath, (0, import_node_path7.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
-    const stageRoot = (0, import_node_path6.resolve)(repoStageDir);
+    const stageRoot = (0, import_node_path7.resolve)(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
-      const dest = (0, import_node_path6.resolve)(stageRoot, entry.relPath);
+      const dest = (0, import_node_path7.resolve)(stageRoot, entry.relPath);
       if (dest !== stageRoot && !dest.startsWith(stageRoot + "/")) {
         throw new Error(
           `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`
@@ -8241,24 +8785,27 @@ async function buildOverlayInto(workDir, input) {
       writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
-  const repoDiskPath = (0, import_node_path6.join)(workDir, "repo.ext4");
+  const repoDiskPath = (0, import_node_path7.join)(workDir, "repo.ext4");
   await buildExt4Disk({
     srcDir: repoStageDir,
     label: "repo",
     sizeMB: estimateDiskSizeMB(repoStageDir),
-    outPath: repoDiskPath
+    outPath: repoDiskPath,
+    env
   });
-  const scratchDiskPath = (0, import_node_path6.join)(workDir, "scratch.ext4");
+  const scratchDiskPath = (0, import_node_path7.join)(workDir, "scratch.ext4");
   await buildExt4Disk({
     label: SCRATCH_DISK_LABEL,
     sizeMB: SCRATCH_DISK_MB,
-    outPath: scratchDiskPath
+    outPath: scratchDiskPath,
+    env
   });
-  const sjtmpDiskPath = (0, import_node_path6.join)(workDir, "sjtmp.ext4");
+  const sjtmpDiskPath = (0, import_node_path7.join)(workDir, "sjtmp.ext4");
   await buildExt4Disk({
     label: SJTMP_DISK_LABEL,
     sizeMB: SJTMP_DISK_MB,
-    outPath: sjtmpDiskPath
+    outPath: sjtmpDiskPath,
+    env
   });
   const cleanup = async () => {
     try {
@@ -8278,34 +8825,48 @@ function writeOverlayFile(root, relPath, content) {
   }
   let dir = root;
   for (const part of parts.slice(0, -1)) {
-    dir = (0, import_node_path6.join)(dir, part);
+    dir = (0, import_node_path7.join)(dir, part);
     ensureRealDirectory(dir);
   }
-  const dest = (0, import_node_path6.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs6.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs6.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  const dest = (0, import_node_path7.join)(dir, parts[parts.length - 1]);
+  let leaf;
+  try {
+    leaf = (0, import_node_fs7.lstatSync)(dest);
+  } catch {
+    leaf = void 0;
+  }
+  if (leaf !== void 0) {
+    const kind = leaf.isSymbolicLink() ? "symlink" : leaf.isDirectory() ? "directory (a committed gitlink/submodule or plain directory)" : "file";
+    throw new Error(
+      `[overlay] cannot stage script-jail overlay: the checkout already has a ${kind} at '${dest}' \u2014 script-jail OWNS this path and writes its own sidecar here. It refuses to replace committed checkout content (under install:true that would also diverge the audit from the host re-run). Remove it from the checkout.`
+    );
+  }
+  (0, import_node_fs7.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory(path) {
-  if (!(0, import_node_fs6.existsSync)(path)) {
-    (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+  let stat;
+  try {
+    stat = (0, import_node_fs7.lstatSync)(path);
+  } catch {
+    (0, import_node_fs7.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs6.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs6.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs6.mkdirSync)(path, { recursive: true });
+  throw new Error(
+    `[overlay] cannot stage script-jail overlay: the checkout has a non-directory at '${path}' (a committed symlink or file) where script-jail needs a real directory. install:true refuses to replace it \u2014 that would make the audit diverge from the host checkout. Remove it from the checkout, or audit without 'install'.`
+  );
 }
-function copyRootfs(src, dest) {
+function copyRootfs(src, dest, env) {
   if (import_node_process.platform === "linux") {
-    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
+    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore", env });
     if (result.status === 0) return;
   }
-  (0, import_node_fs6.cpSync)(src, dest);
+  (0, import_node_fs7.cpSync)(src, dest);
 }
 async function buildExt4Disk(opts) {
-  const { srcDir, label, sizeMB, outPath } = opts;
+  const { srcDir, label, sizeMB, outPath, env } = opts;
   const sizeSpec = `${sizeMB}M`;
-  const mkfs = resolveMkfsExt4();
+  const mkfs = resolveMkfsExt4(env);
   if (mkfs !== null) {
     const result = (0, import_node_child_process2.spawnSync)(
       mkfs,
@@ -8320,7 +8881,9 @@ async function buildExt4Disk(opts) {
         outPath,
         sizeSpec
       ],
-      { stdio: "inherit" }
+      // SECURITY: bare `mkfs.ext4` on Linux is resolved via PATH pre-trust — the
+      // caller-sanitized `env` prevents a checkout-prepended PATH / loader var hijack.
+      { stdio: "inherit", env }
     );
     if (result.status !== 0) {
       throw new Error(
@@ -8329,25 +8892,27 @@ async function buildExt4Disk(opts) {
     }
     return;
   }
-  const outDir = (0, import_node_path6.join)(outPath, "..");
-  const imageName = (0, import_node_path6.basename)(outPath);
+  const outDir = (0, import_node_path7.join)(outPath, "..");
+  const imageName = (0, import_node_path7.basename)(outPath);
   const srcMount = srcDir !== void 0 ? `-v "${srcDir}:/work:ro" ` : "";
   const seedFlag = srcDir !== void 0 ? "-d /work " : "";
   (0, import_node_child_process2.execSync)(
     `docker run --rm ` + srcMount + `-v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
-    { stdio: "inherit" }
+    // SECURITY: `docker`/`sh` resolve by bare name pre-trust — use the
+    // caller-sanitized `env` so a checkout PATH / loader var can't hijack them.
+    { stdio: "inherit", env }
   );
 }
-function resolveMkfsExt4() {
+function resolveMkfsExt4(env) {
   if (import_node_process.platform === "linux") return "mkfs.ext4";
   if (import_node_process.platform !== "darwin") return null;
   for (const candidate of [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
     "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
   ]) {
-    if ((0, import_node_fs6.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs7.existsSync)(candidate)) return candidate;
   }
-  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
+  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8", env });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
   return null;
 }
@@ -8360,10 +8925,10 @@ function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat = (0, import_node_fs6.statSync)(p, { bigint: false });
+      const stat = (0, import_node_fs7.statSync)(p, { bigint: false });
       if (stat.isDirectory()) {
-        for (const child of (0, import_node_fs6.readdirSync)(p)) {
-          visit((0, import_node_path6.join)(p, child));
+        for (const child of (0, import_node_fs7.readdirSync)(p)) {
+          visit((0, import_node_path7.join)(p, child));
         }
       } else if (stat.isFile() || stat.isSymbolicLink()) {
         totalBytes += stat.size;
@@ -8371,15 +8936,15 @@ function estimateDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs6.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs7.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 
 // src/shared/run-audit.ts
-var import_node_fs8 = require("node:fs");
+var import_node_fs9 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
-var import_node_path8 = require("node:path");
+var import_node_path9 = require("node:path");
 
 // src/cli/arch-flags.ts
 function buildArchFlagOverlay(_input) {
@@ -10512,8 +11077,8 @@ function emoji() {
 }
 var ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
 var ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
-var mac = (delimiter) => {
-  const escapedDelim = escapeRegex(delimiter ?? ":");
+var mac = (delimiter2) => {
+  const escapedDelim = escapeRegex(delimiter2 ?? ":");
   return new RegExp(`^(?:[0-9A-F]{2}${escapedDelim}){5}[0-9A-F]{2}$|^(?:[0-9a-f]{2}${escapedDelim}){5}[0-9a-f]{2}$`);
 };
 var cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
@@ -23422,7 +23987,8 @@ var FsReadEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -23432,14 +23998,21 @@ var FsWriteEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
   name: external_exports.string(),
   pid: external_exports.number(),
   ts: external_exports.number(),
-  hidden: external_exports.boolean()
+  hidden: external_exports.boolean(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_read events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed env_read). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var SpawnEvent = external_exports.object({
   kind: external_exports.literal("spawn"),
@@ -23461,7 +24034,13 @@ var SpawnEvent = external_exports.object({
   // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
   // benign find/sed use stays green; a reviewer just sees the marker). Omitted
   // (never `false`) so existing/non-blind records stay byte-identical.
-  audit_blind: external_exports.boolean().optional()
+  audit_blind: external_exports.boolean().optional(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on spawn events that
+  // attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed spawn). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -23479,7 +24058,15 @@ var NetworkEvent = external_exports.object({
   // 'ok' = phase A (fetch with network on). 'blocked' = phase B (offline).
   result: external_exports.enum(["ok", "blocked"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on connect events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed connect). Closes the unmarked-non-fs gap and
+  // the drop-in-install egress-misclassification (a forged root prepare connect
+  // is no longer mistaken for the genuine root's host-safe prepare).
+  root_anchored: external_exports.boolean().optional()
 });
 var ExecEvent = external_exports.object({
   kind: external_exports.literal("exec"),
@@ -23568,7 +24155,16 @@ var EnvTamperEvent = external_exports.object({
   reason: external_exports.string().optional(),
   refused: external_exports.literal(true),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_tamper events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed `<REFUSED>` env_tamper). Closes the last
+  // unmarked root-claimable + rendered + deduped kind. Does NOT apply to the
+  // `audit_fd_lost` variant — that routes to audit_bypass and is hard-failed
+  // independently by findAuditBypass, so dedupe-collapse cannot hide it.
+  root_anchored: external_exports.boolean().optional()
 });
 var RawEvent = external_exports.discriminatedUnion("kind", [
   FsReadEvent,
@@ -23738,12 +24334,12 @@ function countLines(s) {
 }
 
 // src/action/config-override.ts
-var import_node_fs7 = require("node:fs");
+var import_node_fs8 = require("node:fs");
 var import_node_os5 = require("node:os");
-var import_node_path7 = require("node:path");
+var import_node_path8 = require("node:path");
 var import_yaml2 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
-  const text = (0, import_node_fs7.readFileSync)(input.userConfigPath, "utf8");
+  const text = (0, import_node_fs8.readFileSync)(input.userConfigPath, "utf8");
   const parsed = (0, import_yaml2.parse)(text);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   const existingSpoof = config2["spoof"] !== null && typeof config2["spoof"] === "object" && !Array.isArray(config2["spoof"]) ? config2["spoof"] : {};
@@ -23752,25 +24348,32 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
-  const outDir = input.workDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path7.join)((0, import_node_os5.tmpdir)(), "script-jail-config-"));
-  const configPath = (0, import_node_path7.join)(outDir, "config.yml");
-  (0, import_node_fs7.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  if (input.workDirOverride !== void 0) {
+    config2["work_dir"] = input.workDirOverride;
+  }
+  delete config2["install_mode"];
+  if (input.installMode === true) {
+    config2["install_mode"] = true;
+  }
+  const outDir = input.workDir ?? (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)((0, import_node_os5.tmpdir)(), "script-jail-config-"));
+  const configPath = (0, import_node_path8.join)(outDir, "config.yml");
+  (0, import_node_fs8.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
   const result = { configPath };
   if (input.yarnrcOverlay !== void 0) {
-    const yarnrcPath = (0, import_node_path7.join)(outDir, ".yarnrc.yml");
-    (0, import_node_fs7.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    const yarnrcPath = (0, import_node_path8.join)(outDir, ".yarnrc.yml");
+    (0, import_node_fs8.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
     result.yarnrcPath = yarnrcPath;
   }
   if (input.pmFlagsJson !== void 0) {
-    const pmFlagsPath = (0, import_node_path7.join)(outDir, "etc", "script-jail", "pm-flags.json");
-    (0, import_node_fs7.mkdirSync)((0, import_node_path7.dirname)(pmFlagsPath), { recursive: true });
-    (0, import_node_fs7.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    const pmFlagsPath = (0, import_node_path8.join)(outDir, "etc", "script-jail", "pm-flags.json");
+    (0, import_node_fs8.mkdirSync)((0, import_node_path8.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs8.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
     result.pmFlagsPath = pmFlagsPath;
   }
   if (input.pnpmArchOverlay !== void 0) {
-    const pnpmArchPath = (0, import_node_path7.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
-    (0, import_node_fs7.mkdirSync)((0, import_node_path7.dirname)(pnpmArchPath), { recursive: true });
-    (0, import_node_fs7.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
+    const pnpmArchPath = (0, import_node_path8.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
+    (0, import_node_fs8.mkdirSync)((0, import_node_path8.dirname)(pnpmArchPath), { recursive: true });
+    (0, import_node_fs8.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
     result.pnpmArchPath = pnpmArchPath;
   }
   return result;
@@ -23787,10 +24390,25 @@ async function runAudit(input) {
     spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
-  const scratchDir = (0, import_node_fs8.mkdtempSync)((0, import_node_path8.join)(input.workDir, "script-jail-config-"));
+  const scratchDir = (0, import_node_fs9.mkdtempSync)((0, import_node_path9.join)(input.workDir, "script-jail-config-"));
   let result;
   let overlay = null;
   try {
+    const { kept: userInstallArgs, dropped, droppedKeys } = sanitizeInstallArgs(
+      input.args ?? []
+    );
+    if (droppedKeys.length > 0) {
+      const n = dropped.length;
+      const keys = droppedKeys.join(", ");
+      input.io.warn(
+        `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} (${keys}) \u2014 not on the allowlist of dependency-selection flags, or carrying an unsafe value (e.g. an inline-credential --registry URL). Only flags that filter the lockfile-pinned tree (plus a credential-free --registry) are forwarded; anything that could redirect the lock/root/output/source, re-enable lifecycle scripts, or carry an inline credential is dropped.`
+      );
+    }
+    const archPmFlags = archOverlay.pmFlagsJson;
+    const pmFlagsJson = {
+      extra_install_args: archPmFlags?.extra_install_args ?? [],
+      ...userInstallArgs.length > 0 ? { user_install_args: userInstallArgs } : {}
+    };
     const effectiveConfig = buildEffectiveConfig({
       userConfigPath: input.configPath,
       overrides: {
@@ -23801,27 +24419,35 @@ async function runAudit(input) {
         spoofArch: input.overrides.spoofArch ?? input.hostArch
       },
       workDir: scratchDir,
+      // install:true cwd parity — pin the guest audit work_dir to the host
+      // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
+      // installMode also flips on here so the guest audit mirrors the host
+      // install's post-trust pnpm config (--config.ignore-pnpmfile=true) into
+      // the Phase B lifecycle env — closing the value-blind config-asymmetry
+      // (env-spy records env_read NAMEs only).  `installWorkDir` is the
+      // canonical install:true signal (set ONLY on that path).
+      ...input.installWorkDir !== void 0 ? { workDirOverride: input.installWorkDir, installMode: true } : {},
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
-      ...archOverlay.pmFlagsJson !== void 0 ? { pmFlagsJson: archOverlay.pmFlagsJson } : {},
+      pmFlagsJson,
       ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}
     });
     const extraRepoOverlayFiles = [];
     if (effectiveConfig.yarnrcPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: ".yarnrc.yml",
-        content: (0, import_node_fs8.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
+        content: (0, import_node_fs9.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
       });
     }
     if (effectiveConfig.pmFlagsPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pm-flags.json",
-        content: (0, import_node_fs8.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+        content: (0, import_node_fs9.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
       });
     }
     if (effectiveConfig.pnpmArchPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pnpm-arch.json",
-        content: (0, import_node_fs8.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
+        content: (0, import_node_fs9.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
     if (input.execute !== void 0) {
@@ -23832,7 +24458,8 @@ async function runAudit(input) {
         scratchDir,
         pm: input.pm,
         hostArch: input.hostArch,
-        mode: input.mode
+        mode: input.mode,
+        auditWorkDir: input.installWorkDir ?? "/work"
       });
     } else {
       if (input.launch === void 0) {
@@ -23845,7 +24472,8 @@ async function runAudit(input) {
         baseRootfsPath: input.baseRootfsPath,
         repoSrcPath: input.repoDir,
         configPath: effectiveConfig.configPath,
-        extraRepoOverlayFiles
+        extraRepoOverlayFiles,
+        env: stripDangerousEnv(process.env)
       });
       result = await input.launch(overlay);
     }
@@ -23862,16 +24490,16 @@ async function runAudit(input) {
     }
   }
   if (input.mode === "update") {
-    (0, import_node_fs8.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
+    (0, import_node_fs9.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
     input.io.stderr.write(
       `[script-jail] wrote ${Buffer.byteLength(result.finalYaml, "utf8")} bytes to ${input.lockPath}
 `
     );
     input.io.setOutput?.("lockfile", input.lockPath);
     input.io.setOutput?.("diff", "");
-    return { exitCode: 0 };
+    return { exitCode: 0, trusted: false };
   }
-  const committed = (0, import_node_fs8.existsSync)(input.lockPath) ? (0, import_node_fs8.readFileSync)(input.lockPath, "utf8") : "";
+  const committed = (0, import_node_fs9.existsSync)(input.lockPath) ? (0, import_node_fs9.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
   const diff = renderDiff({
     lockPath: lockLabel,
@@ -23894,36 +24522,36 @@ async function runAudit(input) {
     input.io.stderr.write(`${msg}
 `);
     input.io.emitAuditBypassAnnotation?.(lockLabel, msg);
-    return { exitCode: 1 };
+    return { exitCode: 1, trusted: false };
   }
-  return { exitCode: diff.match ? 0 : 1 };
+  return { exitCode: diff.match ? 0 : 1, trusted: diff.match, generatedLock: result.finalYaml };
 }
 function relativeForDisplay(absPath, repoDir) {
-  const rel = (0, import_node_path8.relative)(repoDir, absPath);
-  if (rel.startsWith("..") || (0, import_node_path8.isAbsolute)(rel)) return absPath;
+  const rel = (0, import_node_path9.relative)(repoDir, absPath);
+  if (rel.startsWith("..") || (0, import_node_path9.isAbsolute)(rel)) return absPath;
   return rel;
 }
 
 // src/action/firecracker/download.ts
-var import_node_fs10 = require("node:fs");
+var import_node_fs11 = require("node:fs");
 var import_promises4 = require("node:fs/promises");
-var import_node_path9 = require("node:path");
+var import_node_path10 = require("node:path");
 var import_node_os6 = require("node:os");
 var import_node_crypto4 = require("node:crypto");
 var import_node_zlib2 = require("node:zlib");
 
 // src/shared/http-download.ts
 var import_node_crypto3 = require("node:crypto");
-var import_node_fs9 = require("node:fs");
+var import_node_fs10 = require("node:fs");
 var import_promises3 = require("node:fs/promises");
 var import_node_https = require("node:https");
 var import_node_http = require("node:http");
 async function sha256File2(filePath) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const hash2 = (0, import_node_crypto3.createHash)("sha256");
-    const stream = (0, import_node_fs9.createReadStream)(filePath);
+    const stream = (0, import_node_fs10.createReadStream)(filePath);
     stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("end", () => resolve5(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
@@ -23951,20 +24579,20 @@ var NodeHttpClient = class {
 async function downloadToFile(url2, destPath, redirects) {
   if (redirects > 5) throw new Error(`Too many redirects fetching ${url2}`);
   const getter = url2.startsWith("https://") ? import_node_https.get : import_node_http.get;
-  await new Promise((resolve4, reject) => {
+  await new Promise((resolve5, reject) => {
     getter(url2, (res) => {
       if (res.statusCode !== void 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve4).catch(reject);
+        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve5).catch(reject);
         return;
       }
       if (res.statusCode !== 200) {
         reject(new Error(`HTTP ${res.statusCode ?? "?"} fetching ${url2}`));
         return;
       }
-      const out = (0, import_node_fs9.createWriteStream)(destPath);
+      const out = (0, import_node_fs10.createWriteStream)(destPath);
       res.pipe(out);
-      out.on("finish", () => resolve4());
+      out.on("finish", () => resolve5());
       out.on("error", reject);
       res.on("error", reject);
     }).on("error", reject);
@@ -23994,16 +24622,16 @@ async function ensureBinaries(input) {
       `script-jail: unknown Firecracker version "${firecrackerVersion}" for ${arch}. Add it (with a pinned SHA-256) to KNOWN_TARBALL_SHA256 in src/action/firecracker/download.ts.`
     );
   }
-  (0, import_node_fs10.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs11.mkdirSync)(imagesDir, { recursive: true });
   const tarUrl = `https://github.com/firecracker-microvm/firecracker/releases/download/v${firecrackerVersion}/firecracker-v${firecrackerVersion}-${releaseArch}.tgz`;
-  const tarPath = (0, import_node_path9.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
-  const fcBinPath = (0, import_node_path9.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
-  const vmlinuxPath = (0, import_node_path9.join)(imagesDir, "vmlinux");
+  const tarPath = (0, import_node_path10.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
+  const fcBinPath = (0, import_node_path10.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
+  const vmlinuxPath = (0, import_node_path10.join)(imagesDir, "vmlinux");
   const [tarFresh] = await Promise.all([
     ensureFile(http, tarUrl, tarPath, expectedTarSha),
     ensureFile(http, kernelUrl, vmlinuxPath, kernelSha256)
   ]);
-  if ((0, import_node_fs10.existsSync)(fcBinPath)) {
+  if ((0, import_node_fs11.existsSync)(fcBinPath)) {
     await (0, import_promises4.unlink)(fcBinPath);
   }
   void tarFresh;
@@ -24011,7 +24639,7 @@ async function ensureBinaries(input) {
   return { firecrackerPath: fcBinPath, vmlinuxPath };
 }
 async function ensureFile(http, url2, destPath, expectedSha256) {
-  if ((0, import_node_fs10.existsSync)(destPath)) {
+  if ((0, import_node_fs11.existsSync)(destPath)) {
     const actual = await sha256File2(destPath);
     if (actual === expectedSha256) return false;
     console.warn(
@@ -24022,14 +24650,14 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
   return true;
 }
 async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch) {
-  const tmpOut = (0, import_node_path9.join)(
+  const tmpOut = (0, import_node_path10.join)(
     (0, import_node_os6.tmpdir)(),
     `script-jail-fc-${(0, import_node_crypto4.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version2}-${releaseArch}`;
-  await new Promise((resolve4, reject) => {
+  await new Promise((resolve5, reject) => {
     const gunzip = (0, import_node_zlib2.createGunzip)();
-    const input = (0, import_node_fs10.createReadStream)(tarPath);
+    const input = (0, import_node_fs11.createReadStream)(tarPath);
     const BLOCK = 512;
     let buf = Buffer.alloc(0);
     let state = "header";
@@ -24042,7 +24670,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
       outStream?.close();
       outStream = null;
       if (err) reject(err);
-      else resolve4();
+      else resolve5();
     };
     gunzip.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -24056,7 +24684,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
         ));
         return;
       }
-      resolve4();
+      resolve5();
     });
     gunzip.on("error", cleanup);
     input.on("error", cleanup);
@@ -24076,7 +24704,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
           if (name === targetEntry && declaredSize > 0) {
             capturing = true;
             foundEntry = true;
-            outStream = (0, import_node_fs10.createWriteStream)(tmpOut);
+            outStream = (0, import_node_fs11.createWriteStream)(tmpOut);
           } else {
             capturing = false;
           }
@@ -24158,39 +24786,39 @@ var PINNED_MANIFEST = {
 
 // src/action/backend/firecracker.ts
 var import_node_crypto6 = require("node:crypto");
-var import_node_fs16 = require("node:fs");
+var import_node_fs17 = require("node:fs");
 var import_node_os7 = require("node:os");
-var import_node_path12 = require("node:path");
+var import_node_path13 = require("node:path");
 var import_node_process3 = require("node:process");
 
 // src/action/cache.ts
-var import_node_fs11 = require("node:fs");
-var import_node_path10 = require("node:path");
+var import_node_fs12 = require("node:fs");
+var import_node_path11 = require("node:path");
 function maybeClearCache(input) {
   if (input.cacheFirecracker) return;
-  const fs = input.fs ?? { rmSync: import_node_fs11.rmSync };
+  const fs = input.fs ?? { rmSync: import_node_fs12.rmSync };
   const releaseArch = input.arch === "arm64" ? "aarch64" : "x86_64";
-  const tarPath = (0, import_node_path10.join)(
+  const tarPath = (0, import_node_path11.join)(
     input.imagesDir,
     `firecracker-v${input.firecrackerVersion}-${releaseArch}.tgz`
   );
-  const fcBinPath = (0, import_node_path10.join)(
+  const fcBinPath = (0, import_node_path11.join)(
     input.imagesDir,
     `firecracker-v${input.firecrackerVersion}`
   );
-  const vmlinuxPath = (0, import_node_path10.join)(input.imagesDir, "vmlinux");
+  const vmlinuxPath = (0, import_node_path11.join)(input.imagesDir, "vmlinux");
   fs.rmSync(tarPath, { force: true });
   fs.rmSync(fcBinPath, { force: true });
   fs.rmSync(vmlinuxPath, { force: true });
 }
 
 // src/action/pre-fetch-artifacts.ts
-var import_node_fs13 = require("node:fs");
-var import_node_path11 = require("node:path");
+var import_node_fs14 = require("node:fs");
+var import_node_path12 = require("node:path");
 
 // src/rootfs/repro-hash.ts
 var import_node_crypto5 = require("node:crypto");
-var import_node_fs12 = require("node:fs");
+var import_node_fs13 = require("node:fs");
 var EXT4_BLOCK_SIZE = 4096;
 var EXT4_BLOCKS_PER_GROUP = 8 * EXT4_BLOCK_SIZE;
 var EXT4_VOLATILE_SUPERBLOCK_FIELDS = [
@@ -24243,9 +24871,9 @@ function applyMaskToBuffer(buf, bufStart, ranges) {
   }
 }
 function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const hash2 = (0, import_node_crypto5.createHash)("sha256");
-    const stream = (0, import_node_fs12.createReadStream)(
+    const stream = (0, import_node_fs13.createReadStream)(
       filePath,
       chunkSize === void 0 ? void 0 : { highWaterMark: chunkSize }
     );
@@ -24255,12 +24883,12 @@ function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
       offset += chunk.length;
       hash2.update(chunk);
     });
-    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("end", () => resolve5(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
 async function canonicalRootfsHash(filePath, chunkSize) {
-  const size = (0, import_node_fs12.statSync)(filePath).size;
+  const size = (0, import_node_fs13.statSync)(filePath).size;
   const ranges = ext4VolatileByteRanges(size);
   return hashFileWithMaskedRanges(filePath, ranges, chunkSize);
 }
@@ -24276,7 +24904,7 @@ async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
   const platform5 = input.platform ?? "linux";
   const arch = input.arch ?? "x64";
-  (0, import_node_fs13.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs14.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName2(runnerImage, arch);
   const wantedLibscriptjail = libscriptjailAssetName2(arch);
   const assets = [
@@ -24302,7 +24930,7 @@ async function preFetchArtifacts(input) {
       ({ name, expected, digest }) => ensureAsset({
         http,
         url: assetUrl(manifest, name),
-        destPath: (0, import_node_path11.join)(imagesDir, name),
+        destPath: (0, import_node_path12.join)(imagesDir, name),
         expectedDigest: expected,
         computeDigest: digest
       })
@@ -24329,7 +24957,7 @@ function requireExpected(manifest, platform5, asset) {
 }
 async function ensureAsset(args) {
   const { http, url: url2, destPath, expectedDigest, computeDigest } = args;
-  if ((0, import_node_fs13.existsSync)(destPath)) {
+  if ((0, import_node_fs14.existsSync)(destPath)) {
     const actual = await computeDigest(destPath);
     if (actual === expectedDigest) return;
     console.warn(
@@ -24341,7 +24969,7 @@ async function ensureAsset(args) {
 
 // src/action/firecracker/launch.ts
 var import_node_http2 = require("node:http");
-var import_node_fs14 = require("node:fs");
+var import_node_fs15 = require("node:fs");
 var import_promises5 = require("node:fs/promises");
 var import_node_child_process3 = require("node:child_process");
 var import_node_process2 = require("node:process");
@@ -24360,7 +24988,11 @@ async function launchVm(input) {
     vsockUdsPath,
     enableNetwork,
     socketPath,
-    bootArgs = DEFAULT_BOOT_ARGS
+    bootArgs = DEFAULT_BOOT_ARGS,
+    // SECURITY: the tap-setup `ip` spawns are bare-name + pre-trust — default to
+    // process.env only when the caller (e.g. the platform-gated direct test path)
+    // omits it; the Firecracker backend always threads its sanitized env down.
+    env = process.env
   } = input;
   if (!input.spawner) {
     if (import_node_process2.platform !== "linux") {
@@ -24368,7 +25000,7 @@ async function launchVm(input) {
         `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
-    if (!(0, import_node_fs14.existsSync)("/dev/kvm")) {
+    if (!(0, import_node_fs15.existsSync)("/dev/kvm")) {
       throw new Error(
         "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
@@ -24380,7 +25012,7 @@ async function launchVm(input) {
   const handle = spawner.spawn(
     firecrackerPath,
     ["--api-sock", socketPath],
-    { stdio: "forward" }
+    { stdio: "forward", env }
   );
   try {
     await poller.waitForSocket(socketPath, 5e3);
@@ -24426,7 +25058,7 @@ async function launchVm(input) {
       mem_size_mib: memMB
     });
     if (enableNetwork) {
-      await setupTapDevice(apiClient);
+      await setupTapDevice(apiClient, env);
     }
     await apiClient.put("/vsock", {
       guest_cid: vsockCid,
@@ -24452,14 +25084,16 @@ async function launchVm(input) {
     waitForExit: () => handle.waitForExit()
   };
 }
-async function setupTapDevice(api) {
+async function setupTapDevice(api, env) {
   const existing = (0, import_node_child_process3.spawnSync)("ip", ["link", "show", "tap0"], {
-    stdio: ["ignore", "ignore", "ignore"]
+    stdio: ["ignore", "ignore", "ignore"],
+    env
   });
   const alreadyExists = existing.status === 0;
   if (!alreadyExists) {
     const mkTap = (0, import_node_child_process3.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      env
     });
     if (mkTap.status !== 0) {
       const stderr = (mkTap.stderr?.toString() ?? "").trim();
@@ -24470,7 +25104,7 @@ async function setupTapDevice(api) {
       return;
     }
   }
-  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore" });
+  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore", env });
   await api.put("/network-interfaces/eth0", {
     iface_id: "eth0",
     guest_mac: "06:00:AC:10:00:02",
@@ -24482,21 +25116,22 @@ var NodeSpawner = class {
     const childStdio = opts.stdio === "ignore" ? "ignore" : ["ignore", "pipe", "pipe"];
     const child = (0, import_node_child_process3.spawn)(cmd, [...args], {
       stdio: childStdio,
-      detached: false
+      detached: false,
+      ...opts.env !== void 0 ? { env: opts.env } : {}
     });
     if (opts.stdio === "forward") {
       forwardStream(child.stdout, "[fc:out] ");
       forwardStream(child.stderr, "[fc:err] ");
     }
     let exitCode;
-    const exitPromise = new Promise((resolve4) => {
+    const exitPromise = new Promise((resolve5) => {
       child.on("close", (code) => {
         exitCode = code ?? 1;
-        resolve4(exitCode);
+        resolve5(exitCode);
       });
       child.on("error", () => {
         exitCode = 1;
-        resolve4(1);
+        resolve5(1);
       });
     });
     return {
@@ -24532,14 +25167,14 @@ var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((0, import_node_fs14.existsSync)(socketPath)) return;
+      if ((0, import_node_fs15.existsSync)(socketPath)) return;
       await sleep(50);
     }
     throw new Error(`Timeout waiting for socket: ${socketPath}`);
   }
 };
 function sleep(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve5) => setTimeout(resolve5, ms));
 }
 var UnixSocketApiClient = class {
   constructor(socketPath) {
@@ -24553,7 +25188,7 @@ var UnixSocketApiClient = class {
     return this._request("PATCH", path, body);
   }
   _request(method, path, body) {
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve5, reject) => {
       const payload = JSON.stringify(body);
       const req = (0, import_node_http2.request)(
         {
@@ -24578,7 +25213,7 @@ var UnixSocketApiClient = class {
                 )
               );
             } else {
-              resolve4();
+              resolve5();
             }
           });
         }
@@ -24610,22 +25245,22 @@ async function openVsockSession(udsPath, port, options) {
   const session = {
     events,
     sendGo: () => {
-      return new Promise((resolve4, reject) => {
+      return new Promise((resolve5, reject) => {
         void reject;
         const ok = duplex.write("go\n");
         if (!ok) {
           const writeable = duplex;
           if (typeof writeable.once === "function") {
             writeable.once("drain", () => {
-              resolve4();
+              resolve5();
             });
           } else {
             setImmediate(() => {
-              resolve4();
+              resolve5();
             });
           }
         } else {
-          resolve4();
+          resolve5();
         }
       });
     },
@@ -24636,7 +25271,7 @@ async function openVsockSession(udsPath, port, options) {
   return session;
 }
 function connectUnixSocket(sockPath, timeoutMs) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve5, reject) => {
     const sock = (0, import_node_net.createConnection)(sockPath);
     const timer = setTimeout(() => {
       sock.destroy();
@@ -24644,7 +25279,7 @@ function connectUnixSocket(sockPath, timeoutMs) {
     }, timeoutMs);
     sock.once("connect", () => {
       clearTimeout(timer);
-      resolve4(sock);
+      resolve5(sock);
     });
     sock.once("error", (err) => {
       clearTimeout(timer);
@@ -24683,7 +25318,7 @@ async function dialVsockWithRetry(udsPath, port, totalTimeoutMs) {
   );
 }
 function waitForOkLine(sock, timeoutMs) {
-  return new Promise((resolve4) => {
+  return new Promise((resolve5) => {
     const chunks = [];
     let settled = false;
     const finish = (result) => {
@@ -24693,7 +25328,7 @@ function waitForOkLine(sock, timeoutMs) {
       sock.off("data", onData);
       sock.off("close", onClose);
       sock.off("error", onError);
-      resolve4(result);
+      resolve5(result);
     };
     const onData = (chunk) => {
       chunks.push(chunk);
@@ -24723,7 +25358,7 @@ function waitForOkLine(sock, timeoutMs) {
   });
 }
 function sleep2(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve5) => setTimeout(resolve5, ms));
 }
 function socketToDuplex(sock) {
   return {
@@ -24737,7 +25372,7 @@ function socketToDuplex(sock) {
 
 // src/action/firecracker/teardown.ts
 var import_promises6 = require("node:fs/promises");
-var import_node_fs15 = require("node:fs");
+var import_node_fs16 = require("node:fs");
 async function teardown(handles) {
   if (handles.vsock !== null) {
     await safeRun("close vsock session", () => handles.vsock.close());
@@ -24778,7 +25413,7 @@ async function safeRun(label, fn) {
   }
 }
 async function removeIfExists(filePath) {
-  if (!(0, import_node_fs15.existsSync)(filePath)) return;
+  if (!(0, import_node_fs16.existsSync)(filePath)) return;
   try {
     await (0, import_promises6.unlink)(filePath);
   } catch (err) {
@@ -24786,7 +25421,7 @@ async function removeIfExists(filePath) {
   }
 }
 function timeout(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve5) => setTimeout(resolve5, ms));
 }
 
 // src/action/backend/types.ts
@@ -24834,9 +25469,9 @@ async function runAgentProcess(input) {
   const nonFatalWarnings = [];
   let finalYaml = null;
   let fatalError = null;
-  const exitPromise = new Promise((resolve4) => {
-    child.on("close", (code) => resolve4(code ?? 1));
-    child.on("error", () => resolve4(1));
+  const exitPromise = new Promise((resolve5) => {
+    child.on("close", (code) => resolve5(code ?? 1));
+    child.on("error", () => resolve5(1));
   });
   try {
     for await (const frame of parseFrames(child.stdout)) {
@@ -24897,8 +25532,10 @@ function createFirecrackerBackend(deps) {
   const doLaunchVm = deps.launchVm ?? launchVm;
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
-  const checkExists = deps.existsSync ?? import_node_fs16.existsSync;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const checkExists = deps.existsSync ?? import_node_fs17.existsSync;
   const hostPlatform2 = deps.platform ?? import_node_process3.platform;
+  const safeEnv = stripDangerousEnv(deps.env ?? process.env);
   return {
     name: "firecracker",
     async run(ctx) {
@@ -24909,7 +25546,7 @@ function createFirecrackerBackend(deps) {
         if (!checkExists("/dev/kvm")) {
           throw new BackendUnavailableError("firecracker", "/dev/kvm is missing");
         }
-        if (!commandSucceeds("ip", ["link", "show", "tap0"])) {
+        if (!doCommandSucceeds("ip", ["link", "show", "tap0"], { env: safeEnv })) {
           throw new BackendUnavailableError("firecracker", "tap0 is not configured");
         }
       }
@@ -24939,10 +25576,13 @@ function createFirecrackerBackend(deps) {
         http: ctx.http
       });
       const overlay = await doMakeOverlay({
-        baseRootfsPath: (0, import_node_path12.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
+        baseRootfsPath: (0, import_node_path13.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
         repoSrcPath: ctx.repoDir,
         configPath: ctx.configPath,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
+        // SECURITY: sanitized env for overlay's bare-name pre-trust host spawns
+        // (cp / mkfs.ext4 / command -v / macOS Docker fallback).
+        env: safeEnv
       });
       try {
         return await launchFirecracker({
@@ -24951,7 +25591,9 @@ function createFirecrackerBackend(deps) {
           launchVm: doLaunchVm,
           openVsockSession: doOpenVsockSession,
           teardown: doTeardown,
-          warn: deps.warn
+          warn: deps.warn,
+          // SECURITY: sanitized env for launch.ts's bare-name pre-trust tap `ip` spawns.
+          env: safeEnv
         });
       } finally {
         await overlay.cleanup();
@@ -24964,8 +25606,8 @@ function rootfsImageName(runnerImage, arch) {
 }
 async function launchFirecracker(input) {
   const runId = (0, import_node_crypto6.randomBytes)(4).toString("hex");
-  const apiSocketPath = (0, import_node_path12.join)((0, import_node_os7.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
-  const vsockUdsPath = (0, import_node_path12.join)((0, import_node_os7.tmpdir)(), `script-jail-vsock-${runId}`);
+  const apiSocketPath = (0, import_node_path13.join)((0, import_node_os7.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
+  const vsockUdsPath = (0, import_node_path13.join)((0, import_node_os7.tmpdir)(), `script-jail-vsock-${runId}`);
   let vm = null;
   let vsock = null;
   let finalYaml = null;
@@ -24987,7 +25629,9 @@ async function launchFirecracker(input) {
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,
-      socketPath: apiSocketPath
+      socketPath: apiSocketPath,
+      // SECURITY: sanitized env for the tap-setup `ip` spawns (launch.ts).
+      env: input.env
     });
     vsock = await input.openVsockSession(vsockUdsPath, VSOCK_PORT);
     for await (const frame of vsock.events) {
@@ -25031,25 +25675,25 @@ async function launchFirecracker(input) {
 var import_node_crypto7 = require("node:crypto");
 
 // src/action/backend/stage.ts
-var import_node_fs17 = require("node:fs");
-var import_node_path13 = require("node:path");
+var import_node_fs18 = require("node:fs");
+var import_node_path14 = require("node:path");
 var import_yaml3 = __toESM(require_dist(), 1);
 function stageRepoDirectory(input) {
-  const stageRoot = (0, import_node_fs17.mkdtempSync)((0, import_node_path13.join)(input.parentDir, "repo-stage-"));
-  const repoStage = (0, import_node_path13.join)(stageRoot, "work");
-  (0, import_node_fs17.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
+  const stageRoot = (0, import_node_fs18.mkdtempSync)((0, import_node_path14.join)(input.parentDir, "repo-stage-"));
+  const repoStage = (0, import_node_path14.join)(stageRoot, "work");
+  (0, import_node_fs18.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false, verbatimSymlinks: true });
   materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
   return {
     path: repoStage,
     cleanup: () => {
-      (0, import_node_fs17.rmSync)(stageRoot, { recursive: true, force: true });
+      (0, import_node_fs18.rmSync)(stageRoot, { recursive: true, force: true });
     }
   };
 }
 function materializeExtraFiles(rootDir, files) {
-  const root = (0, import_node_path13.resolve)(rootDir);
+  const root = (0, import_node_path14.resolve)(rootDir);
   for (const entry of files) {
-    const dest = (0, import_node_path13.resolve)(root, entry.relPath);
+    const dest = (0, import_node_path14.resolve)(root, entry.relPath);
     if (dest !== root && !dest.startsWith(root + "/")) {
       throw new Error(
         `[backend] extraRepoOverlayFiles entry '${entry.relPath}' escapes the staged repo`
@@ -25067,40 +25711,84 @@ function writeOverlayFile2(root, relPath, content) {
   }
   let dir = root;
   for (const part of parts.slice(0, -1)) {
-    dir = (0, import_node_path13.join)(dir, part);
+    dir = (0, import_node_path14.join)(dir, part);
     ensureRealDirectory2(dir);
   }
-  const dest = (0, import_node_path13.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs17.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs17.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  const dest = (0, import_node_path14.join)(dir, parts[parts.length - 1]);
+  let leaf;
+  try {
+    leaf = (0, import_node_fs18.lstatSync)(dest);
+  } catch {
+    leaf = void 0;
+  }
+  if (leaf !== void 0) {
+    const kind = leaf.isSymbolicLink() ? "symlink" : leaf.isDirectory() ? "directory (a committed gitlink/submodule or plain directory)" : "file";
+    throw new Error(
+      `[backend] cannot stage script-jail overlay: the checkout already has a ${kind} at '${dest}' \u2014 script-jail OWNS this path and writes its own sidecar here. It refuses to replace committed checkout content (under install:true that would also diverge the audit from the host re-run). Remove it from the checkout.`
+    );
+  }
+  (0, import_node_fs18.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory2(path) {
-  if (!(0, import_node_fs17.existsSync)(path)) {
-    (0, import_node_fs17.mkdirSync)(path, { recursive: true });
+  let stat;
+  try {
+    stat = (0, import_node_fs18.lstatSync)(path);
+  } catch {
+    (0, import_node_fs18.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs17.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs17.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs17.mkdirSync)(path, { recursive: true });
+  throw new Error(
+    `[backend] cannot stage script-jail overlay: the checkout has a non-directory at '${path}' (a committed symlink or file) where script-jail needs a real directory. install:true refuses to replace it \u2014 that would make the audit diverge from the host checkout. Remove it from the checkout, or audit without 'install'.`
+  );
 }
 function rewriteConfigWorkDir(input) {
-  const raw = (0, import_node_fs17.readFileSync)(input.configPath, "utf8");
+  const raw = (0, import_node_fs18.readFileSync)(input.configPath, "utf8");
   const parsed = (0, import_yaml3.parse)(raw);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   config2["work_dir"] = input.workDir;
-  const outPath = (0, import_node_path13.join)(input.outDir, "config.backend.yml");
-  (0, import_node_fs17.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
+  const outPath = (0, import_node_path14.join)(input.outDir, "config.backend.yml");
+  (0, import_node_fs18.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
   return outPath;
+}
+var RESERVED_SIDECAR_DIR = "etc/script-jail";
+var CONTROL_SIDECAR_ENV_BY_NAME = {
+  "pm-flags.json": "SCRIPT_JAIL_PM_FLAGS_CONTENT",
+  "pnpm-arch.json": "SCRIPT_JAIL_PNPM_ARCH_CONTENT"
+};
+function partitionControlSidecars(files) {
+  const repoOverlay = [];
+  const controlSidecars = [];
+  for (const f of files) {
+    if (f.relPath === RESERVED_SIDECAR_DIR || f.relPath.startsWith(`${RESERVED_SIDECAR_DIR}/`)) {
+      controlSidecars.push(f);
+    } else {
+      repoOverlay.push(f);
+    }
+  }
+  return { repoOverlay, controlSidecars };
+}
+function controlSidecarEnv(controlSidecars) {
+  const env = {};
+  for (const entry of controlSidecars) {
+    const name = entry.relPath.split("/").filter((p) => p.length > 0).pop();
+    const envName = name !== void 0 ? CONTROL_SIDECAR_ENV_BY_NAME[name] : void 0;
+    if (envName !== void 0) env[envName] = entry.content;
+  }
+  return env;
 }
 
 // src/action/backend/docker.ts
 function createDockerBackend(deps = {}) {
   const env = deps.env ?? process.env;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const doRunCommand = deps.runCommand ?? runCommand;
+  const safeEnv = stripDangerousEnv(env);
   return {
     name: "docker",
     async run(ctx) {
-      if (!commandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env })) {
+      if (!doCommandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env: safeEnv })) {
         throw new BackendUnavailableError("docker", "docker is not installed or the daemon is unavailable");
       }
       const { ref: imageRef, warning } = resolveDockerImageRef(ctx, {
@@ -25108,12 +25796,12 @@ function createDockerBackend(deps = {}) {
       });
       if (warning !== void 0) writeDockerWarning(deps.stderr, warning);
       if (ctx.selfTest) {
-        if (!commandSucceeds("docker", ["image", "inspect", imageRef], { env })) {
+        if (!doCommandSucceeds("docker", ["image", "inspect", imageRef], { env: safeEnv })) {
           throw new BackendUnavailableError("docker", `local image ${imageRef} is missing`);
         }
       } else {
         try {
-          runCommand("docker", ["pull", imageRef], { env });
+          doRunCommand("docker", ["pull", imageRef], { env: safeEnv });
         } catch (err) {
           throw new BackendUnavailableError(
             "docker",
@@ -25121,18 +25809,34 @@ function createDockerBackend(deps = {}) {
           );
         }
       }
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: repoOverlay
       });
+      const controlEnv = controlSidecarEnv(controlSidecars);
+      const controlEnvFlags = Object.entries(controlEnv).flatMap(([name, value]) => [
+        "-e",
+        `${name}=${value}`
+      ]);
       const containerName = `script-jail-${(0, import_node_crypto7.randomBytes)(4).toString("hex")}`;
+      const workDir = ctx.auditWorkDir ?? "/work";
       try {
         const script = [
           "set -eu",
           "export VP_HOME=/opt/vp",
           "export COREPACK_HOME=/opt/vp/corepack",
           "export COREPACK_ENABLE_DOWNLOAD_PROMPT=0",
+          // round-17f (codex [critical], uniform policy): never load a PROJECT
+          // `.corepack.env` (cwd=repoDir).  Docker already sets COREPACK_HOME (so the
+          // file can't steer it — process.env wins, corepack.cjs:13556) and Phase B
+          // direct-launches, so this is defense-in-depth, but pinning it on EVERY
+          // backend + the host keeps one "ignore .corepack.env" policy (mirrors how
+          // COREPACK_ENABLE_DOWNLOAD_PROMPT is pinned everywhere).
+          "export COREPACK_ENV_FILE=0",
           'mkdir -p "${VP_HOME}" "${COREPACK_HOME}"',
           'NODE_VERSION="$(cat /etc/script-jail/node-version)"',
           'vp env install "${NODE_VERSION}" >&2',
@@ -25143,9 +25847,11 @@ function createDockerBackend(deps = {}) {
           "mkdir -p /tmp/script-jail-strace",
           "export SCRIPT_JAIL_CONNECTION=stdio",
           "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
+          // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT are delivered via the container `-e`
+          // env (already in this shell's env), NOT exported here — `exec` preserves them.
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
-        return await runAgentProcess({
+        return await doRunAgentProcess({
           cmd: "docker",
           args: [
             "run",
@@ -25157,30 +25863,40 @@ function createDockerBackend(deps = {}) {
             "--security-opt",
             "seccomp=unconfined",
             "-v",
-            `${staged.path}:/work`,
+            `${staged.path}:${workDir}`,
             "-v",
             `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
+            // Control sidecars (pm-flags.json / pnpm-arch.json) delivered as env CONTENT,
+            // NOT a file at any path (audit-only sidecar oracle): the guest reads
+            // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT from the agent env so the sandbox
+            // fetch applies the SAME install args as the host part-1 install.  Each is a
+            // single `-e NAME=value` argv element (#31): literal regardless of content
+            // (JSON braces/quotes/newlines), never re-parsed by a shell.  loadPmFlags /
+            // applyPnpmArchOverlay re-sanitize the content.  Empty when no sidecar →
+            // no `-e` → guest degrades to "no override".
+            ...controlEnvFlags,
             imageRef,
             "/bin/sh",
             "-lc",
             script
           ],
-          env,
+          env: safeEnv,
           label: "docker",
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {},
           onFetchDone: async () => {
-            runCommand("docker", ["network", "disconnect", "bridge", containerName], { env });
+            doRunCommand("docker", ["network", "disconnect", "bridge", containerName], { env: safeEnv });
           }
         });
       } finally {
         try {
-          runCommand("docker", ["rm", "-f", containerName], { env });
+          doRunCommand("docker", ["rm", "-f", containerName], { env: safeEnv });
         } catch {
         }
         cleanupStagedDockerRepo({
           staged,
           imageRef,
-          env,
+          env: safeEnv,
+          run: doRunCommand,
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}
         });
       }
@@ -25263,23 +25979,26 @@ function resolveDockerImageRef(ctx, opts = {}) {
 }
 
 // src/action/backend/bare.ts
-var import_node_fs18 = require("node:fs");
-var import_node_path14 = require("node:path");
+var import_node_fs19 = require("node:fs");
+var import_node_path15 = require("node:path");
 var import_node_process4 = require("node:process");
 function createBareBackend(deps = {}) {
   const hostPlatform2 = deps.platform ?? import_node_process4.platform;
   const env = deps.env ?? process.env;
   const doPreFetchArtifacts = deps.preFetchArtifacts ?? preFetchArtifacts;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const safeEnv = stripDangerousEnv(env);
   return {
     name: "bare",
     async run(ctx) {
       if (hostPlatform2 !== "linux") {
         throw new BackendUnavailableError("bare", `requires Linux (detected ${hostPlatform2})`);
       }
-      if (!commandSucceeds("strace", ["-V"], { env })) {
+      if (!doCommandSucceeds("strace", ["-V"], { env: safeEnv })) {
         throw new BackendUnavailableError("bare", "strace is not available");
       }
-      if (!commandSucceeds("unshare", ["-n", "--", "true"], { env })) {
+      if (!doCommandSucceeds("unshare", ["-n", "--", "true"], { env: safeEnv })) {
         throw new BackendUnavailableError("bare", "unshare -n is not available");
       }
       if (!ctx.selfTest) {
@@ -25293,24 +26012,55 @@ function createBareBackend(deps = {}) {
         });
       }
       const runtime = resolveRuntimePaths(ctx);
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: repoOverlay
       });
+      const controlEnv = controlSidecarEnv(controlSidecars);
       const backendConfigPath = rewriteConfigWorkDir({
         configPath: ctx.configPath,
         outDir: ctx.scratchDir,
         workDir: staged.path
       });
       try {
-        return await runAgentProcess({
+        return await doRunAgentProcess({
           cmd: process.execPath,
           args: [runtime.agentPath],
           env: {
-            ...env,
+            // PARITY: the bare agent runs ON THE HOST and inherits the runner env
+            // (unlike the clean-VM Firecracker/Docker guest).  `safeEnv` already
+            // stripped the dangerous loader/tool/config selectors + sanitized PATH
+            // (same policy as the host install + the probes above), so the bare
+            // AUDIT sees the same env the hardened host install does and an
+            // inherited NODE_OPTIONS can't inject into the agent process itself.
+            ...safeEnv,
+            // stripDangerousEnv now drops the whole COREPACK_* family (incl. any
+            // inherited COREPACK_ENABLE_DOWNLOAD_PROMPT), so re-pin it here — corepack
+            // 0.35.0 defaults the prompt ON, and an uncached pm download would block
+            // the bare AUDIT otherwise (mac-bare/docker/init.sh re-pin it the same way).
+            COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+            // round-17f (codex [critical]): corepack loads a PROJECT `.corepack.env`
+            // (cwd=repoDir) at startup unless COREPACK_ENV_FILE=0; process.env WINS over
+            // the file (corepack.cjs:13556).  The bare AUDIT has NO COREPACK_HOME set, so
+            // a repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would steer
+            // both Phase A AND the bare-launched Phase B corepack shim to a planted cache
+            // (Phase B is straced → it would even diverge from the host part-2, which now
+            // pins COREPACK_ENV_FILE=0).  Pin it here so the bare audit ignores the file,
+            // matching the host install.  (Set as a literal AFTER the safeEnv strip, like
+            // the download-prompt flag — survives into the agent's PM children.)
+            COREPACK_ENV_FILE: "0",
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+            // Bare mode runs the agent directly on the host (no container /etc).  Deliver
+            // the pm-flags / pnpm-arch control sidecars as env CONTENT (no file at any
+            // path), keeping `etc/script-jail/` out of the audited repo root (audit-only
+            // sidecar oracle).  Empty dict when no sidecar → guest degrades to "no
+            // override".  loadPmFlags / applyPnpmArchOverlay re-sanitize the content.
+            ...controlEnv,
             SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
             SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
             SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -25331,28 +26081,28 @@ function resolveRuntimePaths(ctx) {
     process.env["SCRIPT_JAIL_ACTION_ROOT"],
     process.env["GITHUB_ACTION_PATH"],
     moduleDir,
-    (0, import_node_path14.join)(moduleDir, ".."),
-    (0, import_node_path14.join)(moduleDir, "..", ".."),
+    (0, import_node_path15.join)(moduleDir, ".."),
+    (0, import_node_path15.join)(moduleDir, "..", ".."),
     process.cwd()
   ].filter((p) => typeof p === "string" && p.length > 0);
   const agentPath = findFirst([
-    ...roots.map((root) => (0, import_node_path14.join)(root, "guest-agent.cjs")),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "guest-agent.cjs"))
+    ...roots.map((root) => (0, import_node_path15.join)(root, "guest-agent.cjs")),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "dist", "guest-agent.cjs"))
   ], "guest-agent.cjs");
   const platformPreloadPath = findFirst([
-    ...roots.map((root) => (0, import_node_path14.join)(root, "preloads", "platform-spoof.cjs")),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "preloads", "platform-spoof.cjs"))
+    ...roots.map((root) => (0, import_node_path15.join)(root, "preloads", "platform-spoof.cjs")),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "dist", "preloads", "platform-spoof.cjs"))
   ], "platform-spoof.cjs");
   const envSpyPreloadPath = findFirst([
-    ...roots.map((root) => (0, import_node_path14.join)(root, "preloads", "env-spy.cjs")),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "preloads", "env-spy.cjs"))
+    ...roots.map((root) => (0, import_node_path15.join)(root, "preloads", "env-spy.cjs")),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "dist", "preloads", "env-spy.cjs"))
   ], "env-spy.cjs");
   const libName = ctx.arch === "arm64" ? "libscriptjail-arm64.so" : "libscriptjail.so";
   const nativePreloadPath = findFirst([
-    (0, import_node_path14.join)(ctx.imagesDir, libName),
-    (0, import_node_path14.join)(ctx.imagesDir, "libscriptjail.so"),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "images", libName)),
-    ...roots.map((root) => (0, import_node_path14.join)(root, "images", "libscriptjail.so"))
+    (0, import_node_path15.join)(ctx.imagesDir, libName),
+    (0, import_node_path15.join)(ctx.imagesDir, "libscriptjail.so"),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "images", libName)),
+    ...roots.map((root) => (0, import_node_path15.join)(root, "images", "libscriptjail.so"))
   ], libName);
   return {
     agentPath,
@@ -25367,18 +26117,30 @@ function currentModuleDir() {
 }
 function findFirst(candidates, label) {
   for (const candidate of candidates) {
-    if ((0, import_node_fs18.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs19.existsSync)(candidate)) return candidate;
   }
   throw new BackendUnavailableError("bare", `${label} was not found`);
 }
 
 // src/action/backend/select.ts
 var AUTO_ORDER = ["firecracker", "docker", "bare"];
+var INSTALL_ALIGNED_BACKENDS = /* @__PURE__ */ new Set([
+  "firecracker",
+  "docker"
+]);
 async function runSelectedBackend(input) {
-  const order = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const aligned = input.requireRepoDirAligned === true;
+  if (aligned && input.requested !== "auto" && !INSTALL_ALIGNED_BACKENDS.has(input.requested)) {
+    throw new Error(
+      `script-jail: \`install: true\` requires a repoDir-aligned backend (firecracker or docker); the "${input.requested}" backend audits in a temporary staged copy and cannot safely re-run host lifecycle scripts.`
+    );
+  }
+  const baseOrder = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const order = aligned ? baseOrder.filter((b) => INSTALL_ALIGNED_BACKENDS.has(b)) : baseOrder;
   const unavailable = [];
   for (const name of order) {
     try {
+      input.onBackendSelected?.(name);
       return await input.backends[name].run(input.ctx);
     } catch (err) {
       if (err instanceof BackendUnavailableError) {
@@ -25396,15 +26158,14 @@ async function runSelectedBackend(input) {
 }
 
 // src/action/backend/mac-bare.ts
-var import_node_fs21 = require("node:fs");
-var import_node_path16 = require("node:path");
+var import_node_fs22 = require("node:fs");
+var import_node_path17 = require("node:path");
 var import_node_process5 = require("node:process");
 
 // src/cli/provision-node-mac.ts
-var import_node_child_process5 = require("node:child_process");
-var import_node_fs19 = require("node:fs");
+var import_node_fs20 = require("node:fs");
 var import_node_os8 = require("node:os");
-var import_node_path15 = require("node:path");
+var import_node_path16 = require("node:path");
 
 // src/rootfs/vite-plus.ts
 var VITE_PLUS_VERSION = "0.1.22";
@@ -25423,7 +26184,7 @@ function vitePlusTarballUrl(arch, os = "linux") {
 function defaultProvisionCacheDir(env = process.env) {
   const override = env["SCRIPT_JAIL_CACHE_DIR"];
   if (override !== void 0 && override !== "") return override;
-  return (0, import_node_path15.join)((0, import_node_os8.tmpdir)(), "script-jail-cache");
+  return (0, import_node_path16.join)((0, import_node_os8.tmpdir)(), "script-jail-cache");
 }
 var SHELL_SHIM_BASH = "bash";
 var SHELL_SHIM_COREUTILS = "coreutils";
@@ -25431,21 +26192,22 @@ async function provisionNodeMac(input) {
   const doRunCommand = input.runCommand ?? runCommand;
   const http = input.http ?? new NodeHttpClient();
   const { arch, cacheDir } = input;
-  (0, import_node_fs19.mkdirSync)(cacheDir, { recursive: true });
-  const root = (0, import_node_path15.join)(
+  const baseEnv = input.env ?? process.env;
+  (0, import_node_fs20.mkdirSync)(cacheDir, { recursive: true });
+  const root = (0, import_node_path16.join)(
     cacheDir,
     "script-jail-node-mac",
     `node-${NODE_VERSION}-${arch}-vp${VITE_PLUS_VERSION}`
   );
-  const vpHome = (0, import_node_path15.join)(root, "vp-home");
-  const shellShimDir = (0, import_node_path15.join)(root, "shell-shim");
-  const markerPath = (0, import_node_path15.join)(root, "resign-marker.json");
+  const vpHome = (0, import_node_path16.join)(root, "vp-home");
+  const shellShimDir = (0, import_node_path16.join)(root, "shell-shim");
+  const markerPath = (0, import_node_path16.join)(root, "resign-marker.json");
   const cached2 = readMarker(markerPath);
   if (cached2 !== void 0) {
     const nodePath2 = cached2.nodePath;
-    if ((0, import_node_fs19.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand)) {
-      (0, import_node_fs19.mkdirSync)(shellShimDir, { recursive: true });
-      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+    if ((0, import_node_fs20.existsSync)(nodePath2) && codesignVerifies(nodePath2, doRunCommand, baseEnv)) {
+      (0, import_node_fs20.mkdirSync)(shellShimDir, { recursive: true });
+      materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand, baseEnv);
       return {
         nodeBinDir: cached2.nodeBinDir,
         nodePath: nodePath2,
@@ -25454,31 +26216,39 @@ async function provisionNodeMac(input) {
         preResignSha256: cached2.preResignSha256
       };
     }
-    (0, import_node_fs19.rmSync)(root, { recursive: true, force: true });
+    (0, import_node_fs20.rmSync)(root, { recursive: true, force: true });
   }
-  (0, import_node_fs19.rmSync)(root, { recursive: true, force: true });
-  (0, import_node_fs19.mkdirSync)(vpHome, { recursive: true });
-  (0, import_node_fs19.mkdirSync)(shellShimDir, { recursive: true });
-  const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand });
+  (0, import_node_fs20.rmSync)(root, { recursive: true, force: true });
+  (0, import_node_fs20.mkdirSync)(vpHome, { recursive: true });
+  (0, import_node_fs20.mkdirSync)(shellShimDir, { recursive: true });
+  const vpBin = await fetchVpBinary({ arch, root, http, runCommand: doRunCommand, env: baseEnv });
   const vpEnv = {
-    ...process.env,
+    ...baseEnv,
     VP_HOME: vpHome,
-    COREPACK_HOME: (0, import_node_path15.join)(vpHome, "corepack"),
-    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+    COREPACK_HOME: (0, import_node_path16.join)(vpHome, "corepack"),
+    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+    // round-17f (codex [medium]): this is a PRE-agent corepack boundary — `vp env
+    // install` and the `corepack enable` below run at the checkout cwd, BEFORE the
+    // macOS-bare trust gate.  baseEnv was sanitized (corepack_ family stripped), so
+    // pin COREPACK_ENV_FILE=0 here too — otherwise a repo `.corepack.env` could still
+    // feed corepack startup flags on this path (COREPACK_HOME is set so the file can't
+    // steer the cache, but the uniform "never load a project .corepack.env" invariant
+    // must hold at EVERY corepack boundary, host + guest + provisioning).
+    COREPACK_ENV_FILE: "0"
   };
   doRunCommand(vpBin, ["env", "install", NODE_VERSION], { env: vpEnv });
-  const nodeBinDir = findNodeBinDir((0, import_node_path15.join)(vpHome, "js_runtime"));
+  const nodeBinDir = findNodeBinDir((0, import_node_path16.join)(vpHome, "js_runtime"));
   if (nodeBinDir === null) {
     throw new Error(
-      `script-jail: vp produced no Node toolchain under ${(0, import_node_path15.join)(vpHome, "js_runtime")} (vp env install ${NODE_VERSION} succeeded but no bin/node found).`
+      `script-jail: vp produced no Node toolchain under ${(0, import_node_path16.join)(vpHome, "js_runtime")} (vp env install ${NODE_VERSION} succeeded but no bin/node found).`
     );
   }
-  const nodePath = (0, import_node_path15.join)(nodeBinDir, "node");
+  const nodePath = (0, import_node_path16.join)(nodeBinDir, "node");
   const preResignSha256 = await sha256File2(nodePath);
-  const corepackPath = (0, import_node_path15.join)(nodeBinDir, "corepack");
+  const corepackPath = (0, import_node_path16.join)(nodeBinDir, "corepack");
   doRunCommand(corepackPath, ["enable"], { env: { ...vpEnv, PATH: prependPath(nodeBinDir, vpEnv) } });
-  resignAdHoc(nodePath, doRunCommand);
-  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand);
+  resignAdHoc(nodePath, doRunCommand, baseEnv);
+  materializeShellShims(shellShimDir, input.macBashPath, input.macCoreutilsPath, doRunCommand, baseEnv);
   writeMarker(markerPath, {
     version: RESIGN_MARKER_VERSION,
     nodeBinDir,
@@ -25496,7 +26266,7 @@ async function provisionNodeMac(input) {
 var RESIGN_MARKER_VERSION = 3;
 function readMarker(path) {
   try {
-    const parsed = JSON.parse((0, import_node_fs19.readFileSync)(path, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs20.readFileSync)(path, "utf8"));
     const { version: version2, nodeBinDir, nodePath, preResignSha256 } = parsed;
     if (version2 !== RESIGN_MARKER_VERSION || typeof nodeBinDir !== "string" || typeof nodePath !== "string" || typeof preResignSha256 !== "string") {
       return void 0;
@@ -25507,47 +26277,47 @@ function readMarker(path) {
   }
 }
 function writeMarker(path, marker) {
-  (0, import_node_fs19.writeFileSync)(path, JSON.stringify(marker, null, 2) + "\n", "utf8");
+  (0, import_node_fs20.writeFileSync)(path, JSON.stringify(marker, null, 2) + "\n", "utf8");
 }
 async function fetchVpBinary(input) {
   const { arch, root, http } = input;
   const url2 = vitePlusTarballUrl(arch, "darwin");
   const expectedSha = VITE_PLUS_DARWIN_SHA256[arch];
-  const tgzPath = (0, import_node_path15.join)(root, "vp.tgz");
-  const extractDir = (0, import_node_path15.join)(root, "vp-extract");
-  (0, import_node_fs19.mkdirSync)(extractDir, { recursive: true });
+  const tgzPath = (0, import_node_path16.join)(root, "vp.tgz");
+  const extractDir = (0, import_node_path16.join)(root, "vp-extract");
+  (0, import_node_fs20.mkdirSync)(extractDir, { recursive: true });
   await http.download(url2, tgzPath, expectedSha);
-  input.runCommand("tar", ["-xzf", tgzPath, "-C", extractDir]);
-  const vpBin = (0, import_node_path15.join)(extractDir, "package", "vp");
-  if (!(0, import_node_fs19.existsSync)(vpBin)) {
+  input.runCommand("tar", ["-xzf", tgzPath, "-C", extractDir], { env: input.env });
+  const vpBin = (0, import_node_path16.join)(extractDir, "package", "vp");
+  if (!(0, import_node_fs20.existsSync)(vpBin)) {
     throw new Error(
       `script-jail: vp binary not found at ${vpBin} after extracting ${url2}.`
     );
   }
-  (0, import_node_fs19.chmodSync)(vpBin, 493);
+  (0, import_node_fs20.chmodSync)(vpBin, 493);
   return vpBin;
 }
 function findNodeBinDir(jsRuntimeDir) {
-  if (!(0, import_node_fs19.existsSync)(jsRuntimeDir)) return null;
+  if (!(0, import_node_fs20.existsSync)(jsRuntimeDir)) return null;
   const stack = [{ dir: jsRuntimeDir, depth: 0 }];
   while (stack.length > 0) {
     const { dir, depth } = stack.pop();
     let entries;
     try {
-      entries = (0, import_node_fs19.readdirSync)(dir);
+      entries = (0, import_node_fs20.readdirSync)(dir);
     } catch {
       continue;
     }
     for (const name of entries) {
-      const child = (0, import_node_path15.join)(dir, name);
+      const child = (0, import_node_path16.join)(dir, name);
       let isDir;
       try {
-        isDir = (0, import_node_fs19.statSync)(child).isDirectory();
+        isDir = (0, import_node_fs20.statSync)(child).isDirectory();
       } catch {
         continue;
       }
       if (!isDir) continue;
-      if (name === "bin" && (0, import_node_fs19.existsSync)((0, import_node_path15.join)(child, "node"))) {
+      if (name === "bin" && (0, import_node_fs20.existsSync)((0, import_node_path16.join)(child, "node"))) {
         return child;
       }
       if (depth < 4) stack.push({ dir: child, depth: depth + 1 });
@@ -25556,45 +26326,50 @@ function findNodeBinDir(jsRuntimeDir) {
   return null;
 }
 function prependPath(dir, env) {
-  const existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin";
-  return `${dir}:${existing}`;
+  const existing = env["PATH"];
+  const base = existing === void 0 || existing === "" ? "/usr/bin:/bin:/usr/sbin:/sbin" : existing;
+  return `${dir}:${base}`;
 }
-function resignAdHoc(binPath, doRunCommand, identifier) {
-  doRunCommand("codesign", ["--remove-signature", binPath]);
+function resignAdHoc(binPath, doRunCommand, env, identifier) {
+  doRunCommand("codesign", ["--remove-signature", binPath], { env });
   doRunCommand(
     "codesign",
-    identifier === void 0 ? ["--force", "--sign", "-", binPath] : ["--force", "--sign", "-", "--identifier", identifier, binPath]
+    identifier === void 0 ? ["--force", "--sign", "-", binPath] : ["--force", "--sign", "-", "--identifier", identifier, binPath],
+    { env }
   );
-  (0, import_node_child_process5.spawnSync)("xattr", ["-d", "com.apple.quarantine", binPath], { stdio: "ignore" });
-  doRunCommand("codesign", ["--verify", binPath]);
-}
-function codesignVerifies(binPath, doRunCommand) {
   try {
-    doRunCommand("codesign", ["--verify", binPath]);
+    doRunCommand("xattr", ["-d", "com.apple.quarantine", binPath], { env });
+  } catch {
+  }
+  doRunCommand("codesign", ["--verify", binPath], { env });
+}
+function codesignVerifies(binPath, doRunCommand, env) {
+  try {
+    doRunCommand("codesign", ["--verify", binPath], { env });
     return true;
   } catch {
     return false;
   }
 }
-function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand) {
-  materializeOne(macBashPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand);
-  materializeOne(macCoreutilsPath, (0, import_node_path15.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand);
+function materializeShellShims(shellShimDir, macBashPath, macCoreutilsPath, doRunCommand, env) {
+  materializeOne(macBashPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_BASH), doRunCommand, env);
+  materializeOne(macCoreutilsPath, (0, import_node_path16.join)(shellShimDir, SHELL_SHIM_COREUTILS), doRunCommand, env);
 }
-function materializeOne(src, dest, doRunCommand) {
+function materializeOne(src, dest, doRunCommand, env) {
   requireShimSource(src);
-  const tmp = (0, import_node_path15.join)((0, import_node_path15.dirname)(dest), `.${(0, import_node_path15.basename)(dest)}.${process.pid}.${Date.now()}.tmp`);
+  const tmp = (0, import_node_path16.join)((0, import_node_path16.dirname)(dest), `.${(0, import_node_path16.basename)(dest)}.${process.pid}.${Date.now()}.tmp`);
   try {
-    (0, import_node_fs19.copyFileSync)(src, tmp);
-    (0, import_node_fs19.chmodSync)(tmp, 493);
-    resignAdHoc(tmp, doRunCommand, (0, import_node_path15.basename)(dest));
-    (0, import_node_fs19.renameSync)(tmp, dest);
+    (0, import_node_fs20.copyFileSync)(src, tmp);
+    (0, import_node_fs20.chmodSync)(tmp, 493);
+    resignAdHoc(tmp, doRunCommand, env, (0, import_node_path16.basename)(dest));
+    (0, import_node_fs20.renameSync)(tmp, dest);
   } catch (err) {
-    (0, import_node_fs19.rmSync)(tmp, { force: true });
+    (0, import_node_fs20.rmSync)(tmp, { force: true });
     throw err;
   }
 }
 function requireShimSource(src) {
-  if (!(0, import_node_fs19.existsSync)(src)) {
+  if (!(0, import_node_fs20.existsSync)(src)) {
     throw new Error(
       `script-jail: bundled shell-shim binary not found at ${src}. Build it with \`pnpm build\` on an Apple Silicon mac (or fetch the release artifact).`
     );
@@ -25602,7 +26377,7 @@ function requireShimSource(src) {
 }
 
 // src/rootfs/macho.ts
-var import_node_fs20 = require("node:fs");
+var import_node_fs21 = require("node:fs");
 function readU32LE(buf, off) {
   return (buf[off] | buf[off + 1] << 8 | buf[off + 2] << 16 | buf[off + 3] << 24) >>> 0;
 }
@@ -25639,19 +26414,19 @@ function machoNameEquals(buf, off, width, name) {
 function validateMachOShimFile(path, expectedCpuType) {
   let fd;
   try {
-    fd = (0, import_node_fs20.openSync)(path, "r");
+    fd = (0, import_node_fs21.openSync)(path, "r");
   } catch (err) {
     return `cannot open: ${err instanceof Error ? err.message : String(err)}`;
   }
   try {
     let fileSize;
     try {
-      fileSize = (0, import_node_fs20.statSync)(path).size;
+      fileSize = (0, import_node_fs21.statSync)(path).size;
     } catch (err) {
       return `cannot stat: ${err instanceof Error ? err.message : String(err)}`;
     }
     const prelude = Buffer.alloc(FAT_HEADER_SIZE);
-    if ((0, import_node_fs20.readSync)(fd, prelude, 0, FAT_HEADER_SIZE, 0) < FAT_HEADER_SIZE) {
+    if ((0, import_node_fs21.readSync)(fd, prelude, 0, FAT_HEADER_SIZE, 0) < FAT_HEADER_SIZE) {
       return `file too short (< ${FAT_HEADER_SIZE} bytes)`;
     }
     const magic = readU32LE(prelude, 0);
@@ -25662,7 +26437,7 @@ function validateMachOShimFile(path, expectedCpuType) {
       }
       const tableBytes = nfat * FAT_ARCH_SIZE;
       const table = Buffer.alloc(tableBytes);
-      if ((0, import_node_fs20.readSync)(fd, table, 0, tableBytes, FAT_HEADER_SIZE) < tableBytes) {
+      if ((0, import_node_fs21.readSync)(fd, table, 0, tableBytes, FAT_HEADER_SIZE) < tableBytes) {
         return `short read of fat_arch table (need ${tableBytes} bytes)`;
       }
       for (let i = 0; i < nfat; i++) {
@@ -25682,14 +26457,14 @@ function validateMachOShimFile(path, expectedCpuType) {
     return validateThinMachOAt(fd, 0, fileSize, expectedCpuType);
   } finally {
     try {
-      (0, import_node_fs20.closeSync)(fd);
+      (0, import_node_fs21.closeSync)(fd);
     } catch {
     }
   }
 }
 function validateThinMachOAt(fd, base, limit, expectedCpuType) {
   const hdr = Buffer.alloc(MACHO64_HEADER_SIZE);
-  const n = (0, import_node_fs20.readSync)(fd, hdr, 0, MACHO64_HEADER_SIZE, base);
+  const n = (0, import_node_fs21.readSync)(fd, hdr, 0, MACHO64_HEADER_SIZE, base);
   if (n < MACHO64_HEADER_SIZE) {
     return `header too short at offset ${base} (${n} bytes; need \u2265 ${MACHO64_HEADER_SIZE})`;
   }
@@ -25717,7 +26492,7 @@ function validateThinMachOAt(fd, base, limit, expectedCpuType) {
     return `load-command region runs past slice end (header ${MACHO64_HEADER_SIZE} + sizeofcmds ${sizeofcmds} > slice ${limit - base})`;
   }
   const cmds = Buffer.alloc(sizeofcmds);
-  const m = (0, import_node_fs20.readSync)(fd, cmds, 0, sizeofcmds, base + MACHO64_HEADER_SIZE);
+  const m = (0, import_node_fs21.readSync)(fd, cmds, 0, sizeofcmds, base + MACHO64_HEADER_SIZE);
   if (m < sizeofcmds) {
     return `short read of load commands (got ${m}; need ${sizeofcmds})`;
   }
@@ -25771,7 +26546,7 @@ function pickOrchestratorEnv(baseEnv) {
 }
 function createMacBareExecute(deps) {
   const platform5 = deps.platform ?? import_node_process5.platform;
-  const doExists = deps.existsSync ?? import_node_fs21.existsSync;
+  const doExists = deps.existsSync ?? import_node_fs22.existsSync;
   const doProvision = deps.provisionNodeMac ?? provisionNodeMac;
   const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
   const doValidateShim = deps.validateMachOShimFile ?? validateMachOShimFile;
@@ -25798,6 +26573,14 @@ function createMacBareExecute(deps) {
     const provisioned = await doProvision({
       arch: deps.arch,
       cacheDir: defaultProvisionCacheDir(baseEnv),
+      // SECURITY (codex round-5 [critical]): provisioning runs ON THE HOST and
+      // BEFORE the audit trust gate — it spawns bare-name `tar`/`codesign`/
+      // `xattr` + Node-based `vp`/`corepack`.  Hand it the SAME sanitized env the
+      // orchestrator gets (checkout dirs dropped from PATH + dangerous
+      // loader/config selectors stripped) so a workflow-prepended
+      // `$GITHUB_WORKSPACE/bin` can't shadow a system tool and an inherited
+      // NODE_OPTIONS/DYLD_* can't inject into a provisioning child pre-trust.
+      env: stripDangerousEnv(baseEnv),
       // The bundled plain-arm64 substitutes the shim's SIP redirect points at:
       // staged as <shellShimDir>/bash and <shellShimDir>/coreutils.
       macBashPath: runtime.bashPath,
@@ -25808,11 +26591,15 @@ function createMacBareExecute(deps) {
         `re-signed node not found at ${provisioned.nodePath} after provisioning.`
       );
     }
+    const { repoOverlay, controlSidecars } = partitionControlSidecars(
+      input.extraRepoOverlayFiles
+    );
     const staged = stageRepoDirectory({
       repoDir: input.repoDir,
       parentDir: input.scratchDir,
-      extraRepoOverlayFiles: input.extraRepoOverlayFiles
+      extraRepoOverlayFiles: repoOverlay
     });
+    const controlEnv = controlSidecarEnv(controlSidecars);
     const backendConfigPath = rewriteConfigWorkDir({
       configPath: input.configPath,
       outDir: input.scratchDir,
@@ -25826,10 +26613,25 @@ function createMacBareExecute(deps) {
           ...pickOrchestratorEnv(baseEnv),
           // Mirror init.sh / docker.ts: corepack must not prompt offline.
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+          // round-17f (codex [critical]): macOS-bare has NO COREPACK_HOME set, and its
+          // Phase B launches pnpm/yarn via `node corepack.js` (a real corepack invocation,
+          // straced).  Corepack loads a PROJECT `.corepack.env` (cwd=repoDir) unless
+          // COREPACK_ENV_FILE=0; process.env WINS over the file (corepack.cjs:13556).  A
+          // repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would otherwise
+          // steer corepack to a planted cache AND diverge from the host part-2 (which now
+          // pins COREPACK_ENV_FILE=0).  Pin it so macOS-bare ignores the file, matching
+          // the host install.
+          COREPACK_ENV_FILE: "0",
           PATH: prependPath2(provisioned.nodeBinDir, baseEnv),
           SCRIPT_JAIL_CONNECTION: "stdio",
           SCRIPT_JAIL_BACKEND: "macos-bare",
           SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+          // macOS-bare runs the agent directly on the host (no container /etc).  Deliver
+          // the pm-flags / pnpm-arch control sidecars as env CONTENT (no file at any path),
+          // keeping `etc/script-jail/` out of the audited repo root (audit-only sidecar
+          // oracle).  Empty dict when no sidecar → guest degrades to "no override".
+          // loadPmFlags / applyPnpmArchOverlay re-sanitize the content.
+          ...controlEnv,
           SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
           SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
           SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -25865,29 +26667,29 @@ function resolveRuntimePaths2(repoRoot, imagesDir, doExists) {
     process.env["SCRIPT_JAIL_ACTION_ROOT"],
     process.env["GITHUB_ACTION_PATH"],
     repoRoot,
-    (0, import_node_path16.join)(repoRoot, ".."),
+    (0, import_node_path17.join)(repoRoot, ".."),
     process.cwd()
   ].filter((p) => typeof p === "string" && p.length > 0);
   const agentPath = findFirst2(
     [
-      ...roots.map((root) => (0, import_node_path16.join)(root, "guest-agent.cjs")),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "guest-agent.cjs"))
+      ...roots.map((root) => (0, import_node_path17.join)(root, "guest-agent.cjs")),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "dist", "guest-agent.cjs"))
     ],
     "guest-agent.cjs",
     doExists
   );
   const platformPreloadPath = findFirst2(
     [
-      ...roots.map((root) => (0, import_node_path16.join)(root, "preloads", "platform-spoof.cjs")),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "preloads", "platform-spoof.cjs"))
+      ...roots.map((root) => (0, import_node_path17.join)(root, "preloads", "platform-spoof.cjs")),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "dist", "preloads", "platform-spoof.cjs"))
     ],
     "platform-spoof.cjs",
     doExists
   );
   const envSpyPreloadPath = findFirst2(
     [
-      ...roots.map((root) => (0, import_node_path16.join)(root, "preloads", "env-spy.cjs")),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "dist", "preloads", "env-spy.cjs"))
+      ...roots.map((root) => (0, import_node_path17.join)(root, "preloads", "env-spy.cjs")),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "dist", "preloads", "env-spy.cjs"))
     ],
     "env-spy.cjs",
     doExists
@@ -25895,22 +26697,22 @@ function resolveRuntimePaths2(repoRoot, imagesDir, doExists) {
   const dylibName = "libscriptjail-arm64.dylib";
   const nativePreloadPath = firstExistingOrDefault(
     [
-      (0, import_node_path16.join)(imagesDir, dylibName),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "images", dylibName))
+      (0, import_node_path17.join)(imagesDir, dylibName),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "images", dylibName))
     ],
     doExists
   );
   const bashPath = firstExistingOrDefault(
     [
-      (0, import_node_path16.join)(imagesDir, "bash-arm64"),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "bash-arm64"))
+      (0, import_node_path17.join)(imagesDir, "bash-arm64"),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "images", "bash-arm64"))
     ],
     doExists
   );
   const coreutilsPath = firstExistingOrDefault(
     [
-      (0, import_node_path16.join)(imagesDir, "coreutils-arm64"),
-      ...roots.map((root) => (0, import_node_path16.join)(root, "images", "coreutils-arm64"))
+      (0, import_node_path17.join)(imagesDir, "coreutils-arm64"),
+      ...roots.map((root) => (0, import_node_path17.join)(root, "images", "coreutils-arm64"))
     ],
     doExists
   );
@@ -25936,7 +26738,7 @@ function firstExistingOrDefault(candidates, doExists) {
   return candidates[0];
 }
 function prependPath2(dir, env) {
-  const existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+  const existing = sanitizePathValue(env["PATH"]) ?? SAFE_SYSTEM_PATH;
   return `${dir}:${existing}`;
 }
 
@@ -26019,10 +26821,10 @@ async function run(deps = {}) {
     }
     throw err;
   }
-  const configPath = (0, import_node_path17.resolve)(cwd, args.configPath);
-  const lockPath = (0, import_node_path17.resolve)(cwd, args.lockPath);
+  const configPath = (0, import_node_path18.resolve)(cwd, args.configPath);
+  const lockPath = (0, import_node_path18.resolve)(cwd, args.lockPath);
   const effectiveSpoofArch = hasSpoofArchArg(argv) ? args.spoofArch : platform5.arch;
-  const subcommand = args.subcommand ?? ((0, import_node_fs22.existsSync)(lockPath) ? "check" : "init");
+  const subcommand = args.subcommand ?? ((0, import_node_fs23.existsSync)(lockPath) ? "check" : "init");
   const mode = subcommand === "check" ? "check" : "update";
   let pm;
   try {
@@ -26045,7 +26847,7 @@ async function run(deps = {}) {
   try {
     packageImagesDir = doResolvePlatformPackageDir({
       packageName: platformPackageName(platform5),
-      devImagesDir: (0, import_node_path17.join)(repoRoot, "images")
+      devImagesDir: (0, import_node_path18.join)(repoRoot, "images")
     }).imagesDir;
   } catch (err) {
     if (err instanceof PlatformPackageMissingError) {
@@ -26067,6 +26869,7 @@ async function run(deps = {}) {
       lockPath,
       mode,
       pm,
+      args: args.args,
       spoofPlatform: args.spoofPlatform,
       effectiveSpoofArch,
       warn: warn2,
@@ -26093,6 +26896,7 @@ async function run(deps = {}) {
       lockPath,
       mode,
       pm,
+      args: args.args,
       spoofPlatform: args.spoofPlatform,
       effectiveSpoofArch,
       warn: warn2,
@@ -26115,7 +26919,7 @@ async function run(deps = {}) {
       compressedRootfsPath: artifacts.compressedRootfsPath
     });
   }
-  if (deps.makeOverlay === void 0 && !(0, import_node_fs22.existsSync)(baseRootfsPath)) {
+  if (deps.makeOverlay === void 0 && !(0, import_node_fs23.existsSync)(baseRootfsPath)) {
     const buildHint = platform5.arch === "arm64" ? `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR} --arch=arm64` : `pnpm build --runner-image=ubuntu-${DEFAULT_UBUNTU_MAJOR}`;
     stderr.write(
       `script-jail: rootfs not found at ${artifacts.rootfsPath}. Run \`${buildHint}\` (or fetch the release artifact) to produce it.
@@ -26143,7 +26947,7 @@ async function run(deps = {}) {
       // the Rust validator requires the field to be present.  Pass the
       // workDir + sentinel filename so the file path validates and so logs
       // distinguish it from any real UDS.
-      vsockUdsPath: (0, import_node_path17.resolve)(overlay.workDir, "vsock.sock"),
+      vsockUdsPath: (0, import_node_path18.resolve)(overlay.workDir, "vsock.sock"),
       vsockPort: VSOCK_PORT2,
       vcpuCount: DEFAULT_VCPU_COUNT,
       memoryMb: DEFAULT_MEMORY_MB,
@@ -26173,6 +26977,9 @@ async function run(deps = {}) {
         spoofArch: effectiveSpoofArch
       },
       pm,
+      // Developer install args (the `--args` flag) reach the audit fetch so a
+      // locally-generated lock matches a CI run using the same action `args`.
+      args: args.args,
       // hostArch comes from the injected detectPlatform (NOT re-derived from
       // process.arch) so unit tests can exercise the arm64 codepath from
       // an x64 dev box without monkey-patching process.arch.
@@ -26211,8 +27018,8 @@ async function run(deps = {}) {
 async function runLinux(input) {
   const { platform: platform5, stderr } = input;
   const arch = platform5.arch;
-  const imagesDir = process.env["SCRIPT_JAIL_CACHE_DIR"] ? (0, import_node_path17.join)(process.env["SCRIPT_JAIL_CACHE_DIR"], "script-jail-images") : (0, import_node_path17.join)((0, import_node_os9.tmpdir)(), "script-jail-images");
-  (0, import_node_fs22.mkdirSync)(imagesDir, { recursive: true });
+  const imagesDir = process.env["SCRIPT_JAIL_CACHE_DIR"] ? (0, import_node_path18.join)(process.env["SCRIPT_JAIL_CACHE_DIR"], "script-jail-images") : (0, import_node_path18.join)((0, import_node_os9.tmpdir)(), "script-jail-images");
+  (0, import_node_fs23.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
   const localPreFetch = createLocalPreFetchArtifacts({
     packageImagesDir: input.packageImagesDir,
@@ -26239,6 +27046,7 @@ async function runLinux(input) {
         spoofArch: input.effectiveSpoofArch
       },
       pm: input.pm,
+      args: input.args,
       hostArch: arch,
       workDir: (0, import_node_os9.tmpdir)(),
       // Backend executor: runAudit prepares the common config/sidecars, then
@@ -26294,6 +27102,7 @@ async function runMacBare(input) {
         spoofArch: input.effectiveSpoofArch
       },
       pm: input.pm,
+      args: input.args,
       hostArch: platform5.arch,
       // os.tmpdir() — never `cwd` — so the rewritten config + sidecars cannot
       // pollute the user's repo.  runAudit creates a private mkdtemp dir here.
@@ -26331,18 +27140,18 @@ function resolveScriptJailRoot(cwd) {
   }
   if (here === "") return cwd;
   const candidates = [
-    (0, import_node_path17.resolve)((0, import_node_path17.dirname)((0, import_node_path17.dirname)(here))),
-    (0, import_node_path17.resolve)((0, import_node_path17.dirname)((0, import_node_path17.dirname)((0, import_node_path17.dirname)(here))))
+    (0, import_node_path18.resolve)((0, import_node_path18.dirname)((0, import_node_path18.dirname)(here))),
+    (0, import_node_path18.resolve)((0, import_node_path18.dirname)((0, import_node_path18.dirname)((0, import_node_path18.dirname)(here))))
   ];
   for (const c of candidates) {
-    if ((0, import_node_fs22.existsSync)((0, import_node_path17.join)(c, "package.json"))) return c;
+    if ((0, import_node_fs23.existsSync)((0, import_node_path18.join)(c, "package.json"))) return c;
   }
   return cwd;
 }
 function readPackageVersion(cwd) {
-  const packageJsonPath = (0, import_node_path17.join)(resolveScriptJailRoot(cwd), "package.json");
+  const packageJsonPath = (0, import_node_path18.join)(resolveScriptJailRoot(cwd), "package.json");
   try {
-    const pkg = JSON.parse(String((0, import_node_fs22.readFileSync)(packageJsonPath, "utf8")));
+    const pkg = JSON.parse(String((0, import_node_fs23.readFileSync)(packageJsonPath, "utf8")));
     if (typeof pkg["version"] === "string") return pkg["version"];
   } catch {
   }

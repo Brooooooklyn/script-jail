@@ -12,7 +12,7 @@
 //   8. Normalize + render → emitFinalLockfile
 //   9. Exit
 
-import { existsSync, readFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, rmSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createServer, type Server, type Socket } from 'node:net';
@@ -23,19 +23,26 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { dirname, basename, join as joinPath } from 'node:path';
 
-import { Attribution } from './attribution.js';
+import { Attribution, buildRootPkgKeys, ROOT_SENTINEL } from './attribution.js';
+import { buildFragmentMatcher, deriveSensitiveValues, maskExactValues, maskValueFragmentsWith, redactCredentialShapes } from '../shared/redact.js';
+import { unsupportedAltRootManifest } from '../shared/root-manifest.js';
 import { LinuxProcReader } from './proc-reader.js';
 import { MacOSProcReader } from './proc-reader-macos.js';
 import { Emitter } from './emit.js';
 import { runFetchPhase, type Spawner } from './phase-fetch.js';
-import { runInstallPhase, type LineSource, type StraceRunner } from './phase-install.js';
+import {
+  runInstallPhase,
+  resolveLinuxManagerLaunch,
+  type LineSource,
+  type StraceRunner,
+} from './phase-install.js';
 import { runInstallPhaseMacos, macosManagerLaunch } from './phase-install-macos.js';
 import { MacOSInstallRunner } from './macos-install-runner.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
 import { discoverPkgDirs } from './discover-pkg-dirs.js';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   CANON_PROTECTED_ENV_NAMES_MAX_LEN,
@@ -75,6 +82,17 @@ const AgentConfig = z.object({
   pkg_dirs: z.record(z.string(), z.string()).default({}),
   /** Package manager override. Auto-detected from lockfile if not set. */
   manager: z.enum(['npm', 'pnpm', 'yarn']).optional(),
+  /**
+   * Drop-in install (`install: true`) mode.  When set, the host runs the REAL
+   * lifecycle install post-trust (src/action/host-install.ts), so the guest
+   * audit must run with the SAME post-trust config the host applies — otherwise
+   * a lifecycle script can branch on a config value that diverges between the
+   * audited sandbox and the trusted host run (the lock is value-blind: env-spy
+   * records env_read NAMEs only).  Currently this mirrors the host's pnpm
+   * `--config.ignore-pnpmfile=true` into the Phase B child env (see
+   * buildChildEnv).  Defaults false → pure-audit goldens are byte-unchanged.
+   */
+  install_mode: z.boolean().default(false),
 });
 
 export type AgentConfig = z.infer<typeof AgentConfig>;
@@ -1977,11 +1995,22 @@ export class LinuxStraceRunner implements StraceRunner {
     // Forward strace's stderr line-by-line to process.stderr with a [strace]
     // prefix so any strace diagnostics (e.g. "strace: exec failed", ptrace
     // permission errors) land on the guest's ttyS0 console.
+    //
+    // SECURITY (adversarial-review F1): the tracee inherits strace's fd2, so the
+    // install command AND its lifecycle children write their stderr here too.
+    // Apply the SAME redactor wired into the stdout tail (`_redactStdout` =
+    // redactSensitive: exact protected-env values + credential SHAPES) so a
+    // lifecycle script cannot leak a secret to the console via stderr while the
+    // stdout sibling masks it.  readline yields COMPLETE lines (crlfDelay:
+    // Infinity), matching the redactor's line-local contract.  This forwarder is
+    // purely human-visible console output — the parsed trace goes to the `-o`
+    // files (fd-based), never here — so redaction can't corrupt attribution.
     let stderrRl: ReturnType<typeof createInterface> | null = null;
     if (child.stderr) {
       stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
       stderrRl.on('line', (line: string) => {
-        process.stderr.write(`[strace] ${line}\n`);
+        const safe = this._redactStdout ? this._redactStdout(line) : line;
+        process.stderr.write(`[strace] ${safe}\n`);
       });
     }
 
@@ -2139,12 +2168,60 @@ const LIFECYCLE_HOST_NOISE_ENV_NAMES = new Set([
   'TERM',
 ]);
 
+// Guest-PROVISIONING env vars set by the backend boot (init.sh / docker.ts /
+// provision-node-mac) that have NO host counterpart.  The host runner never
+// provisions a `/opt/vp` toolchain, so a host part-2 lifecycle child sees these
+// ABSENT — but the guest exports them into its own process.env, so without this
+// strip the audited child sees them PRESENT.  That present-in-guest /
+// absent-on-host split is a value-blind-lock oracle (env-spy records env_read
+// NAMEs only — never the value, and a read is logged even for an ABSENT var), so
+// a dep can `if (process.env.VP_HOME) benign; else evil;` → benign in the audit
+// (lock matches) and evil on the trusted host.  Same class the round-15 sweep
+// closed for the npm/pnpm/yarn config pins; this closes the guest-provisioning
+// leg of it.
+//
+// VP_HOME is safe to strip outright: it is NOT read at runtime — corepack reads
+// COREPACK_HOME (a literal value, not derived from VP_HOME at orchestrate time),
+// and node/the PM resolve via PATH (docker.ts derives PATH from VP_HOME BEFORE
+// exec'ing orchestrate, after which the var is dead weight).  Stripping it from
+// the PM-process env removes it from the WHOLE lifecycle subtree (node AND `/bin/sh`
+// children alike), with zero launch breakage.
+//
+// COREPACK_HOME is DELIBERATELY NOT in this set — but it IS closed, at a different
+// seam (round-16, PR #22).  It cannot be stripped HERE because this set feeds the
+// SHARED childEnv, which is also Phase A's fetchEnv; Phase A still launches the bare
+// corepack shim (network-ON), which reads COREPACK_HOME to locate/populate the
+// `/opt/vp/corepack` cache, so stripping it from fetchEnv would break the fetch.
+// Instead, the agent (after Phase A) resolves the cached PM entry via
+// {@link resolveLinuxManagerLaunch} and launches BOTH Phase-B passes (main install
+// + root prepare) as `node <entry>` directly — bypassing the corepack shim — then
+// strips COREPACK_HOME from the Phase-B install/prepare child env ONLY.  Phase A
+// keeps it (it emits no audit events: network-on, no strace, so it is not an oracle
+// surface).  Once the shim is out of the Phase-B chain, COREPACK_HOME is no longer
+// load-bearing and nothing re-injects it (verified: corepack READS it but never
+// assigns it; it is NOT in the Rust shim STICKY_VARS).  See the Phase-B env build in
+// main() (`envWithoutCorepackHome`).  Its value is a PUBLIC CONSTANT, not a secret.
+const LIFECYCLE_GUEST_PROVISION_ENV_NAMES = new Set(['VP_HOME']);
+
+/**
+ * Strip COREPACK_HOME from a Phase-B child env (returns a NEW object so the shared
+ * childEnv/fetchEnv is never mutated).  Applied to the install + prepare envs ONLY
+ * when the round-16 direct-launch is active — see
+ * {@link LIFECYCLE_GUEST_PROVISION_ENV_NAMES}.
+ */
+function envWithoutCorepackHome(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const stripped = { ...env };
+  delete stripped['COREPACK_HOME'];
+  return stripped;
+}
+
 function sanitizeLifecycleBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const sanitized: NodeJS.ProcessEnv = {};
 
   for (const [name, value] of Object.entries(baseEnv)) {
     if (value === undefined) continue;
     if (LIFECYCLE_HOST_NOISE_ENV_NAMES.has(name)) continue;
+    if (LIFECYCLE_GUEST_PROVISION_ENV_NAMES.has(name)) continue;
     if (name.startsWith('SCRIPT_JAIL_') && !LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES.has(name)) {
       continue;
     }
@@ -2352,9 +2429,87 @@ export function buildChildEnv(
           }
         : { npm_config_cache: `${config.work_dir}/.npm-cache` };
 
+  // DROP-IN INSTALL PARITY (install: true): host part-2 runs the trusted pnpm
+  // rebuild with BOTH `--config.ignore-pnpmfile=true` AND
+  // `--config.script-shell=/bin/sh` (src/action/host-install.ts hostHardening).
+  // On pnpm 10.x EACH `--config.X` flag is re-exported into EVERY lifecycle
+  // script's env as `npm_config_X` (npm-compat config→env mapping), so a
+  // dependency script that branches on either value
+  //   if (process.env.npm_config_ignore_pnpmfile === 'true') evil(); else benign();
+  //   if (process.env.npm_config_script_shell === '/bin/sh') evil(); else benign();
+  // runs benign() in the no-flag sandbox but evil() on the trusted host — and
+  // the lock can't catch it: env-spy records env_read NAMEs only (value-blind),
+  // so both runs log the identical env_read and the diff matches.  Injecting the
+  // SAME env vars into the guest Phase B child env makes the audited value ==
+  // the executed value on pnpm 10.x.  BOTH host flags must be mirrored: missing
+  // either one re-opens the same value-blind-lock RCE for that key.
+  //
+  // EMPIRICALLY VERIFIED (2026-06-18, the EXACT `pnpm rebuild --pending` host
+  // command, BOTH keys), version-DEPENDENT:
+  //   * pnpm 10.34.3 — host flags → child sees npm_config_ignore_pnpmfile=true
+  //     AND npm_config_script_shell=/bin/sh; guest (no flags) → ABSENT.  Real
+  //     divergence.  This injection sets both on the guest → child sees both →
+  //     MATCHES the host.  RCE closed for both keys.
+  //   * pnpm 11.1.2  — pnpm uses the `pnpm_config_*` namespace internally and
+  //     STRIPS both `npm_config_*` keys from the lifecycle child on BOTH the
+  //     host (flags) and the guest (injection) paths → both ABSENT → no
+  //     divergence, this injection is a harmless no-op.
+  // The `npm_config_` prefix is REQUIRED (not `pnpm_config_`): on pnpm 11 a
+  // `pnpm_config_*` env var survives into the guest child but the host flag does
+  // NOT expose it, so mirroring under that prefix would CREATE a new divergence.
+  // npm_config_ matches the host on 10.x and is stripped in lockstep on 11.x.
+  // The script-shell value is hardcoded `/bin/sh` to mirror the host literally
+  // (guest backends are always Linux/macOS, never win32).
+  //
+  // No audit coverage is lost: install-preflight's detectPnpmfile REFUSES
+  // install:true for ANY pnpmfile vector before host part-2, so there is no
+  // repo pnpmfile left to audit on this path (and sandbox ancestor dirs are
+  // clean, so the host-only ancestor-pnpmfile suppression has no guest analog
+  // to mirror); script-shell is forced to the fixed system shell on both sides.
+  // GATED on install_mode (buildChildEnv is shared with pure-audit, install off)
+  // so pure-audit goldens stay byte-identical and the lock stays mode-consistent.
+  // npm/yarn ignore the keys → pnpm-only.
+  // INSTALL:TRUE LIFECYCLE-ENV PARITY (value-blind-lock close).  The host part-2
+  // (hostInstallEnv, 'scripts') pins a manager-specific set of env that reaches
+  // every lifecycle child; the guest Phase B must expose the IDENTICAL set or a
+  // dep branching on a value (env-spy is value-blind — NAMEs only, and it records
+  // a read even for an ABSENT var) runs a different branch on the trusted host
+  // than was audited.  Each entry mirrors the host EXACTLY (keep in lockstep with
+  // hostInstallEnv / its hostHardening flags):
+  //   pnpm — host passes `--config.ignore-pnpmfile=true` + `--config.script-shell=
+  //          /bin/sh`, which pnpm 10.x re-exports to children as `npm_config_*`.
+  //   npm  — host pins `npm_config_script_shell=/bin/sh` (#26 home-npmrc defense)
+  //          and `npm_config_ignore_scripts=false` (thread [53]: a runner
+  //          `$HOME/.npmrc ignore-scripts=true` would skip host part-2 dep scripts
+  //          the audit ran; npm re-exports both to the lifecycle child).
+  //   yarn — host pins YARN_RC_FILENAME/YARN_PLUGINS/YARN_ENABLE_CONSTRAINTS_CHECKS
+  //          (yarn re-exports these three to the child; VERIFIED yarn 4.9.1).
+  //          YARN_IGNORE_PATH is DELIBERATELY EXCLUDED: yarn consumes it and never
+  //          re-exports it, so the host child never sees it — mirroring it here
+  //          would put a value in the guest child the host child lacks, CREATING a
+  //          new divergence.  (preflight detectYarnStartupExec refuses install:true
+  //          for a repo yarnPath, so the audit-fidelity angle is already covered.)
+  // npm_config_git is NOT mirrored: the host scopes it to the FETCH phase only
+  // (part-1), so the host part-2 child — like the guest Phase B — never sees it.
+  // Hardcoded literals match the host (guest is always Linux/macOS, never win32).
+  const installModeEnv: Record<string, string> = !config.install_mode
+    ? {}
+    : resolvedManager === 'pnpm'
+      ? { npm_config_ignore_pnpmfile: 'true', npm_config_script_shell: '/bin/sh' }
+      : resolvedManager === 'npm'
+        ? { npm_config_script_shell: '/bin/sh', npm_config_ignore_scripts: 'false' }
+        : resolvedManager === 'yarn'
+          ? {
+              YARN_RC_FILENAME: '.yarnrc.yml',
+              YARN_PLUGINS: '',
+              YARN_ENABLE_CONSTRAINTS_CHECKS: 'false',
+            }
+          : {};
+
   return {
     ...inheritedEnv,
     ...cacheRedirectEnv,
+    ...installModeEnv,
     LD_PRELOAD: nativePreload,
     // The file path is the production channel: npm spawns lifecycle node
     // processes with `stdio: 'inherit'`, which only propagates fds 0-2.
@@ -2697,6 +2852,46 @@ export interface AgentInput {
   /** Used for Phase B (install under strace). Defaults to LinuxStraceRunner. */
   strace?: StraceRunner;
   /**
+   * Optional runner for the SECOND Phase-B pass that audits the ROOT project's
+   * `prepare` script (npm `rebuild --foreground-scripts` / yarn `install
+   * --immutable` do NOT run a root `prepare`, so it would otherwise never be
+   * audited).  Production leaves this undefined and the agent constructs a
+   * fresh runner over a SEPARATE events file.  TEST SEAM: when `strace` is
+   * injected (tests) the prepare pass is SKIPPED unless `prepareStrace` is ALSO
+   * injected — keeping every existing test (which injects only `strace`)
+   * byte-for-byte unaffected.
+   */
+  prepareStrace?: StraceRunner;
+  /**
+   * TEST-ONLY seam.  Forces the prepare pass to run even when `strace` is
+   * injected and `prepareStrace` is NOT — i.e. it drives the agent down the
+   * "build my own prepare runner / events file" branch with an injected main
+   * runner, so the fail-closed path (prepare events-file creation failure ⇒
+   * fatal, no lockfile) can be exercised without a real strace.  Never set in
+   * production (the `strace === undefined` branch covers it there).
+   */
+  forcePreparePass?: boolean;
+  /**
+   * TEST-ONLY seam for the npm root-prepare env capture (round-20).  In
+   * production the orchestrator sources the runner's faithful `npm_config_*` via
+   * a forced-trusted-shell `npm exec` dump and the repo's real `script-shell` via
+   * `npm config get script-shell` (see {@link captureNpmPrepareEnv}) — two real
+   * npm spawns.  Unit tests have no real npm, so when this is set the orchestrator
+   * uses it INSTEAD of the real spawns.  When it is NOT set but `strace` IS injected
+   * (any unit harness), the orchestrator defaults to an empty capture
+   * (`{ npmConfig: {}, scriptShell: null }`) so those tests run the direct-launch
+   * with just the base env.  Returning `null` simulates a dump failure so the
+   * fail-closed path can be unit-tested.  Ignored in production (`strace` undefined
+   * ⇒ the real capture runs).
+   */
+  captureNpmPrepareEnv?: (ctx: {
+    node: string;
+    npmCli: string;
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    userInstallArgs?: string[];
+  }) => { npmConfig: Record<string, string>; scriptShell: string | null } | null;
+  /**
    * Override for the running Node's version string.  Defaults to
    * `process.version` (e.g. "v20.11.0").  The leading "v" is stripped before
    * being written into the rendered lockfile so the field contains a plain
@@ -2831,6 +3026,406 @@ function diag(input: AgentInput, msg: string): void {
 }
 
 /**
+ * Source of the npm prepare-lifecycle RUNNER (#44).  Written to a temp file and
+ * DIRECT-LAUNCHED by the guest as `node <this>` (round-20) — NOT via `npm exec`.
+ *
+ * Why DIRECT-LAUNCH (round-20, replacing the round-18 `npm exec -c 'node <this>'`):
+ * `npm exec` runs the `-c` body THROUGH the repo `.npmrc script-shell`, so an evil
+ * `script-shell` is the runner's PARENT and can forge a marker / skip the runner /
+ * behave benignly under audit (verified npm 11.13.0).  Direct-launching the runner
+ * makes the GUEST its parent — the evil shell can no longer intercept the launch.
+ * The runner's faithful `npm_config_*` env is sourced SEPARATELY by the orchestrator
+ * via a forced-trusted-shell `npm exec --script-shell=/bin/sh -c '<dump env>'` (the
+ * forced shell is un-hijackable) and overlaid onto the direct-launch env; the repo's
+ * real `script-shell` is read via `npm config get script-shell` and passed to the
+ * runner via ARGV so the prepare scripts STILL run under it (faithful; an evil
+ * shell's own behavior is then audited rather than hidden).
+ *
+ * Why a runner instead of `npm run prepare`: a real `npm install` runs the root
+ * `preprepare` -> `prepare` -> `postprepare` triplet (verified npm 11.x), and it
+ * runs `preprepare`/`postprepare` EVEN WHEN there is no base `prepare`.  But
+ *   - `npm run prepare --if-present` no-ops (misses the wrappers) when there is
+ *     no base `prepare`, and
+ *   - `npm run <wrapper>` adds that wrapper's OWN pre/post (prepreprepare /
+ *     postpreprepare) which a real install never runs — a `prepreprepare` that
+ *     mutates state which `preprepare` branches on can make the AUDITED wrapper
+ *     take a benign path while the real install takes the malicious one (a
+ *     false-negative; verified), and `--ignore-scripts` only moves that
+ *     divergence into nested `npm run` calls (npm_config_ignore_scripts
+ *     propagates).
+ * `@npmcli/run-script` (npm's OWN lifecycle runner) runs exactly `scripts[event]`
+ * with NO automatic pre/post wrapping, so calling it once per event is faithful:
+ * no recursion, nested `npm run` normal, and ONLY the ROOT's own scripts run (no
+ * dependency reify) — which keeps the prepare pass's force-attribution invariant
+ * intact (every event genuinely belongs to the root's prepare).
+ *
+ * Resolves `@npmcli/run-script` relative to `npm_execpath` (the orchestrator sets it
+ * to the npm-cli.js path in the direct-launch env).  Reads its events from the cwd's
+ * package.json so no event list needs threading.  No PR-controlled data is in the
+ * launch command (the runner path + node path are script-jail-owned).
+ *
+ * @internal Exported for unit tests.
+ */
+export const NPM_PREPARE_RUNNER_SOURCE = [
+  "'use strict';",
+  'const path = require(\'path\');',
+  'const fs = require(\'fs\');',
+  'const cwd = process.cwd();',
+  // npm-cli.js path comes from ARGV (process.argv[2]), NOT process.env — the
+  // runner runs UNDER env-spy (the NODE_OPTIONS preloads), so a `process.env`
+  // read would be recorded as a (force-attributed-to-root) env_read and pollute
+  // the lock.  argv is not audited.  The env fallback is only for the unit
+  // harness (which launches the runner directly with npm_execpath set) and is
+  // short-circuited away whenever argv[2] is present (so no env read in prod).
+  "const npmCli = process.argv[2] || process.env.npm_execpath || process.env.SCRIPT_JAIL_NPM_CLI || '';",
+  'let runScript;',
+  'try {',
+  '  const paths = npmCli ? [path.dirname(npmCli)] : [cwd];',
+  "  runScript = require(require.resolve('@npmcli/run-script', { paths }));",
+  '} catch (e) {',
+  "  try { runScript = require('@npmcli/run-script'); }",
+  '  catch (e2) {',
+  "    console.error('script-jail prepare-runner: cannot resolve @npmcli/run-script: ' + ((e && e.message) || e));",
+  '    process.exit(3);',
+  '  }',
+  '}',
+  'let pkg;',
+  "try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')); }",
+  'catch (e) { process.exit(0); }', // no/unreadable package.json → nothing to audit
+  'const scripts = (pkg && pkg.scripts) || {};',
+  // The repo's RESOLVED script-shell, forwarded as run-script's `scriptShell`
+  // option.  @npmcli/run-script reads `scriptShell` from its OPTIONS object, NOT
+  // from `npm_config_script_shell` env — npm's CLI passes the resolved
+  // `script-shell` config to run-script the same way.  The guest reads it via
+  // `npm config get script-shell` (un-hijackable: prints config, executes nothing)
+  // and threads it via ARGV (process.argv[3]), NOT env — like npmCli, a
+  // `process.env` read here would be a (force-attributed-to-root) env_read under
+  // env-spy and pollute the lock.  Empty / 'null' / absent → undefined →
+  // run-script's own default (sh / cmd.exe).  Running the prepare under the repo's
+  // real (PR-controllable) shell is INTENTIONAL: a malicious `script-shell`'s own
+  // reads/writes/connects MUST be audited, exactly as a real install runs them
+  // (forcing a trusted /bin/sh here would HIDE an evil-shell escape).
+  'const sjShell = process.argv[3];',
+  "const scriptShell = (typeof sjShell === 'string' && sjShell.length > 0 && sjShell !== 'null') ? sjShell : undefined;",
+  '(async () => {',
+  "  for (const event of ['preprepare', 'prepare', 'postprepare']) {",
+  '    const s = scripts[event];',
+  "    if (typeof s === 'string' && s.length > 0) {",
+  "      await runScript({ event: event, path: cwd, pkg: pkg, stdio: 'inherit', scriptShell: scriptShell });",
+  '    }',
+  '  }',
+  '})().catch((e) => {',
+  "  console.error('script-jail prepare-runner: ' + ((e && e.message) || e));",
+  '  process.exit(1);',
+  '});',
+  '',
+].join('\n');
+
+/**
+ * Resolve the command for the second Phase-B pass that audits the ROOT
+ * project's `prepare` lifecycle script(s).
+ *
+ * Why this pass exists: the main Phase-B install command for npm
+ * (`npm rebuild --foreground-scripts`) and yarn-berry (`yarn install
+ * --immutable`) does NOT run the ROOT project's `prepare` script — only
+ * dependencies' lifecycle scripts.  A malicious root `prepare` would therefore
+ * escape the audit (and the diff gate) entirely.  pnpm's `pnpm rebuild
+ * --pending` DOES run the root `prepare` (confirmed), so pnpm needs no second
+ * pass → returns `null`.
+ *
+ * Per manager:
+ *   - npm  → DIRECT-LAUNCH the {@link NPM_PREPARE_RUNNER_SOURCE} runner as
+ *            `node <runner>` (round-20): `{ cmd: <nodePath>, args: [<runnerPath>],
+ *            raw: true }`.  The `raw` flag tells runInstallPhase /
+ *            buildMacosInstallCommand to launch this cmd+args VERBATIM — bypassing the
+ *            managerLaunch / macosManagerLaunch rewrite that would otherwise discard
+ *            the `cmd` and prepend the npm-cli.js entry (turning `node <runner>` into
+ *            the wrong `node npm-cli.js <runner>`).  `cmd` is the instrumented
+ *            `process.execPath`, so LD_PRELOAD / DYLD_INSERT_LIBRARIES survive and
+ *            strace attaches.  Direct-launch (vs the round-18 `npm exec -c`) closes
+ *            the script-shell hijack: the GUEST is the runner's parent, so a repo
+ *            `.npmrc script-shell` can no longer intercept the launch.  It also makes
+ *            a `.npmrc workspaces=true` / `workspace=<name>` selector IRRELEVANT to
+ *            whether the runner runs (there is no `npm exec` to fan out or abort), so
+ *            the root prepare is ALWAYS audited.  The runner's faithful `npm_config_*`
+ *            env (incl. neutralized `npm_config_node_options`) and the repo's real
+ *            `script-shell` are sourced by the ORCHESTRATOR (forced-shell dump +
+ *            `config get`) and overlaid onto the pass env; this function only shapes
+ *            the launch.  `npmPrepare` carries the runner + node paths (both
+ *            script-jail-owned).  When it is absent this returns a single-pass
+ *            fallback shape, but the ORCHESTRATOR fails closed instead of using it (a
+ *            single `npm run prepare` misses wrapper-only preprepare/postprepare → a
+ *            silent #44 false-negative); the fallback is reached only by direct unit
+ *            callers.
+ *   - yarn → yarn-berry has NO `--if-present`; `yarn run prepare` exits 1 when
+ *            there is no `prepare` script, which would be a wasted (and
+ *            confusingly nonzero) pass.  So we READ `${cwd}/package.json` and
+ *            only return a command when `scripts.prepare` is a non-empty string.
+ *            (yarn-berry runs preprepare/postprepare as part of `run prepare`, so
+ *            the npm wrapper-only gap does not apply.)  Any read/parse error →
+ *            `null` (skip).
+ *   - pnpm → `null` (already covered by `pnpm rebuild --pending`).
+ *
+ * Returns `null` when no prepare pass should run.
+ */
+export function resolvePrepareCommand(
+  manager: 'npm' | 'pnpm' | 'yarn',
+  cwd: string,
+  npmPrepare?: { runnerPath: string; nodePath: string; npmCli: string; scriptShell: string | null },
+): { cmd: string; args: string[]; raw?: boolean } | null {
+  if (manager === 'npm') {
+    if (npmPrepare !== undefined) {
+      // DIRECT-LAUNCH (round-20): `node <runner> <npmCli> <scriptShell>`, launched
+      // verbatim via `raw`.  `cmd` is the instrumented node (process.execPath), so
+      // LD_PRELOAD/DYLD survive and strace attaches; `raw` bypasses the
+      // managerLaunch / macosManagerLaunch rewrite (which would prepend npm-cli.js →
+      // the wrong `node npm-cli.js <runner>`).  npmCli (run-script resolution base)
+      // and scriptShell (the repo's resolved shell, '' when none) are passed as ARGV
+      // — NOT env — because the runner runs under env-spy: a `process.env` read of
+      // either would be recorded as a (force-attributed-to-root) env_read and pollute
+      // the lock.  The faithful npm_config_* env is overlaid onto the pass env by the
+      // orchestrator (the prepare SCRIPTS read those; the runner itself reads neither
+      // npmCli nor scriptShell from env).
+      return {
+        cmd: npmPrepare.nodePath,
+        args: [npmPrepare.runnerPath, npmPrepare.npmCli, npmPrepare.scriptShell ?? ''],
+        raw: true,
+      };
+    }
+    // Fallback shape (npm WITHOUT a runner).  In production the orchestrator FAILS
+    // CLOSED rather than use this (a single `npm run prepare` misses wrapper-only
+    // preprepare/postprepare — the #44 gap), so this is reached only by direct unit
+    // callers.  Still kept workspace- + node-options-neutralized for correctness.
+    return {
+      cmd: 'npm',
+      args: [
+        'run',
+        'prepare',
+        '--if-present',
+        '--foreground-scripts',
+        '--no-workspaces',
+        '--node-options=',
+      ],
+    };
+  }
+  if (manager === 'yarn') {
+    try {
+      const pkgRaw = readFileSync(joinPath(cwd, 'package.json'), 'utf8');
+      const pkg = JSON.parse(pkgRaw) as { scripts?: Record<string, unknown> };
+      const prepare = pkg.scripts?.['prepare'];
+      if (typeof prepare === 'string' && prepare.length > 0) {
+        return { cmd: 'yarn', args: ['run', 'prepare'] };
+      }
+    } catch {
+      // No package.json, unreadable, or malformed JSON → skip the prepare pass.
+      return null;
+    }
+    return null;
+  }
+  // pnpm: `pnpm rebuild --pending` already runs the root prepare.
+  return null;
+}
+
+/**
+ * Absolute path to the node-bundled `npm-cli.js`, derived from the running node's
+ * `execPath` exactly as {@link resolveLinuxManagerLaunch} and `macosManagerLaunch`
+ * do (`<toolchainRoot>/lib/node_modules/npm/bin/npm-cli.js`).  npm is node-bundled
+ * (not corepack-managed), so this is uniform across Linux FC/Docker/bare AND
+ * macOS-bare, and equals `managerLaunch.entry` when that is present for npm.
+ *
+ * @internal Exported for unit tests.
+ */
+export function npmCliEntryPath(execPath: string): string {
+  return joinPath(dirname(dirname(execPath)), 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+}
+
+/**
+ * Default (production) capture of the npm root-prepare pass's faithful environment
+ * (round-20), via two NON-AUDITED npm spawns at the repo root:
+ *
+ *   1. DUMP — `node <npmCli> exec --script-shell=/bin/sh --offline --node-options=
+ *      -c '<node> <dump.cjs>'`.  `npm exec` natively projects the repo's resolved
+ *      config into `npm_config_*` env (incl. custom `.npmrc` keys — npm does this
+ *      whenever a root `package.json` exists, which the audited repo always has).
+ *      The FORCED `--script-shell=/bin/sh` makes the `-c` body run under a trusted
+ *      shell, NOT the repo's (possibly malicious) `script-shell`, so the dump is
+ *      itself un-hijackable.  `--node-options=` clears `npm_config_node_options`
+ *      (parity with the main install's `--no-node-options`); `--offline` keeps it
+ *      network-free.  The dump child writes its `process.env` to a guest-owned
+ *      file we read back.  (No `--no-workspaces`: `npm exec -c` runs at the ROOT
+ *      cwd even under `workspaces=true` / a `workspace=` selector — verified npm
+ *      11.13.0 — so a selector does NOT fail the dump; and the runner is
+ *      direct-launched, so a selector cannot skip the root prepare either.)
+ *   2. SCRIPT-SHELL — `node <npmCli> config get script-shell`.  Prints the repo's
+ *      RESOLVED `script-shell` (no force) and executes nothing → un-hijackable.
+ *      `null`/empty → `null` (run-script's own default).
+ *
+ * Returns the projected `npm_config_*` (minus `npm_config_call` — it holds the
+ * random dump path, byte-UNSTABLE — and `npm_config_script_shell` — the forced
+ * /bin/sh; the real value is instead passed to the runner via ARGV) plus
+ * the resolved `scriptShell`.  Returns `null` when the dump produced no env file
+ * (npm exec aborted / write failed) → the orchestrator fails closed rather than
+ * run the prepare with a degraded, possibly-divergent env.
+ *
+ * The dump/config-get env is the agent's own `process.env` MINUS the audit
+ * instrumentation (LD_PRELOAD / DYLD_*): these spawns are NOT audited and must not
+ * be self-instrumented, and the captured `npm_config_*` must reflect the real
+ * config, not script-jail's injected child vars.
+ *
+ * CREDENTIAL-SPILL DEFENCE (adversarial-review round-20 [critical]): the agent's
+ * own `process.env` holds the REAL protected secrets (NPM_TOKEN, registry auth, CI
+ * secrets) — the shim only hides those from lifecycle CHILDREN, it does not scrub
+ * the agent. The dump child runs with that real env (so npm projects FAITHFUL
+ * config), but it MUST NOT serialize the whole env to disk: the dump file is NOT
+ * audited, and the (untrusted, PR-controllable) root prepare runs LATER as the same
+ * UID in the same tmpdir, so it could `readdir(tmpdir)` → read the dump file via a
+ * plain file read (NOT a `process.env` read → invisible to env-spy/shim) and
+ * exfiltrate. Two layers close this:
+ *   - the dump child writes ONLY its `npm_config_*` keys (0600), never the full env,
+ *     so a non-config secret like `NPM_TOKEN` never hits disk even transiently;
+ *   - the whole dump dir is `rmSync`'d in a `finally`, so nothing survives this
+ *     function — by the time the prepare pass runs there is no file to read.
+ *
+ * @internal Exported for unit tests.
+ */
+export function realCaptureNpmPrepareEnv(ctx: {
+  node: string;
+  npmCli: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  /**
+   * Thread [47]: the sanitized developer dep-selection args (e.g. `--omit=dev`,
+   * `--prod`, `--include=optional`). The MAIN install runs `npm rebuild <these>`
+   * (phase-install.ts) which projects npm_config_omit/include + NODE_ENV into
+   * every lifecycle child; the root-prepare pass must capture the IDENTICAL
+   * projection or a prepare branching on those values diverges from the install
+   * the args requested. These come from sanitizeInstallArgs.kept — an allowlist of
+   * FLAGS only (positionals dropped), so they are safe to pass as argv elements
+   * (no shell parse; spliced before `-c`).
+   */
+  userInstallArgs?: string[];
+}): { npmConfig: Record<string, string>; scriptShell: string | null } | null {
+  const { node, npmCli, cwd, env, userInstallArgs } = ctx;
+  let dumpDir: string;
+  try {
+    dumpDir = mkdtempSync(joinPath(tmpdir(), 'sj-prep-cap-'));
+  } catch {
+    return null;
+  }
+  try {
+    const envOutPath = joinPath(dumpDir, 'env.json');
+    const dumpScriptPath = joinPath(dumpDir, 'dump.cjs');
+    try {
+      // The dump emits ONLY npm_config_* (the sole keys this function keeps) so the
+      // file never contains non-config secrets; written 0600 as defence in depth.
+      writeFileSync(
+        dumpScriptPath,
+        "'use strict';\n" +
+          'var e = process.env, o = {}, k;\n' +
+          'for (k in e) { if (/^npm_config_/i.test(k) && typeof e[k] === "string") o[k] = e[k]; }\n' +
+          "require('fs').writeFileSync(process.env.SJ_ENV_OUT, JSON.stringify(o), { mode: 0o600 });\n",
+        { encoding: 'utf8', mode: 0o600 },
+      );
+    } catch {
+      return null;
+    }
+    // Non-audited base env: drop the preload instrumentation so npm/node run clean.
+    // NODE_OPTIONS is dropped too: the dump's outer (`node <npmCli> exec`) and inner
+    // (`node -- <dump>`) processes both honour an inherited NODE_OPTIONS at startup
+    // REGARDLESS of the `--` argv terminator, so a `--require`/`--import` in it would
+    // run code with the agent's real env (the env-side twin of the round-22 argv
+    // option-injection).  The agent launch already strips NODE_OPTIONS before the agent
+    // starts (host-install stripDangerousEnv; clean FC/Docker guest), but the dump must
+    // not DEPEND on that distant invariant — strip it here too (it is never an
+    // npm_config_ key, so the capture is unaffected).
+    const baseEnv: NodeJS.ProcessEnv = { ...env };
+    delete baseEnv['LD_PRELOAD'];
+    delete baseEnv['DYLD_INSERT_LIBRARIES'];
+    delete baseEnv['DYLD_LIBRARY_PATH'];
+    delete baseEnv['NODE_OPTIONS'];
+    // 1. DUMP (forced trusted shell → un-hijackable env capture).
+    //
+    // The `-c` body is parsed by the forced /bin/sh.  NEVER interpolate the node or
+    // dump-script PATHS into it: those come from `tmpdir()` (and `process.execPath`,
+    // which on macOS may be under an env-selected provision/cache path), so a TMPDIR /
+    // node path containing shell metacharacters would inject arbitrary commands that
+    // run with the agent's REAL env (secrets) BEFORE the npm_config_-only dump.cjs or
+    // the `finally` cleanup can help (adversarial-review round-21 [high]).  Pass the
+    // paths via env and reference them with double-quoted expansions instead: in POSIX
+    // sh `"$X"` expands to the value LITERALLY (no word-split, no glob, no re-parse of
+    // metacharacters), so a hostile path can never break out of the two-word command.
+    //
+    // The `--` end-of-options terminator is REQUIRED before the script path: without
+    // it, a `dumpScriptPath` that begins with `-` (e.g. a relative TMPDIR like
+    // `--import=data:text/javascript,<code>`) is parsed by node as a CLI OPTION and
+    // executes attacker code with the agent's real env before dump.cjs ever runs —
+    // argv option-injection, the same secret-bearing impact, NOT closed by the shell
+    // quoting (adversarial-review round-22 [high]).  After `--`, node treats the value
+    // as the positional script path verbatim, even when it starts with `-`.
+    spawnSync(
+      node,
+      [
+        npmCli,
+        'exec',
+        '--script-shell=/bin/sh',
+        '--offline',
+        '--node-options=',
+        // Thread [47]: project the SAME npm_config_* (omit/include) + NODE_ENV the
+        // main `npm rebuild <userInstallArgs>` install sets, so the captured prepare
+        // env is in lockstep. These are allowlist-sanitized FLAGS (no positionals,
+        // no value-injection), passed as argv elements (not into the `-c` shell
+        // string), so the round-21/22 shell+argv-injection guarantees are unaffected.
+        ...(userInstallArgs ?? []),
+        '-c',
+        '"$SJ_NODE" -- "$SJ_DUMP"',
+      ],
+      {
+        cwd,
+        env: { ...baseEnv, SJ_NODE: node, SJ_DUMP: dumpScriptPath, SJ_ENV_OUT: envOutPath },
+        stdio: 'ignore',
+        timeout: 120_000,
+      },
+    );
+    let dumped: Record<string, unknown> | null;
+    try {
+      dumped = JSON.parse(readFileSync(envOutPath, 'utf8')) as Record<string, unknown>;
+    } catch {
+      dumped = null;
+    }
+    if (dumped === null) return null; // npm exec aborted / -c body never ran → no faithful env.
+    const npmConfig: Record<string, string> = {};
+    for (const [k, v] of Object.entries(dumped)) {
+      if (typeof v !== 'string') continue;
+      if (!/^npm_config_/i.test(k)) continue;
+      const lower = k.toLowerCase();
+      if (lower === 'npm_config_call' || lower === 'npm_config_script_shell') continue;
+      npmConfig[k] = v;
+    }
+    // 2. SCRIPT-SHELL (no force → faithful repo value; prints config, runs nothing).
+    let scriptShell: string | null = null;
+    const shResult = spawnSync(node, [npmCli, 'config', 'get', 'script-shell'], {
+      cwd,
+      env: baseEnv,
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
+    if (shResult.status === 0 && typeof shResult.stdout === 'string') {
+      const val = shResult.stdout.trim();
+      scriptShell = val.length > 0 && val !== 'null' && val !== 'undefined' ? val : null;
+    }
+    return { npmConfig, scriptShell };
+  } finally {
+    // Never leave the dump (or the script) on disk for the later untrusted prepare
+    // to read — the file-read side-channel bypasses the env-read audit.
+    try {
+      rmSync(dumpDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup; the dir is a 0700 random-named tmpdir entry */
+    }
+  }
+}
+
+/**
  * Redact secrets from package-manager output before it is surfaced to the host
  * (Phase A failure dump).  Defence in depth (Codex round-1 [medium], 2026-06-12):
  * the failure detail tails the install tool's STDOUT, which is repo-controlled
@@ -2853,51 +3448,74 @@ function diag(input: AgentInput, msg: string): void {
  *
  * @internal Exported for unit tests.
  */
+/**
+ * Build a reusable redactor for a STABLE protected-env set.  Precomputes the
+ * sorted exact values AND the fragment gram matcher ONCE, then returns a
+ * `(text) => string` applied per line.  A per-line caller (install stderr
+ * forwarder, stdout-tail front-drop) MUST build this once and reuse it: calling
+ * `redactSensitive` per line would rebuild the O(sum |V|) gram set on every line
+ * and, for a large `protected.env`, both stall and (pre-fix) blackhole the log
+ * (adversarial-review review #7).
+ *
+ * If `protected.env` is so large the fragment matcher caps (review #8 — only
+ * reachable with > 2 MiB of declared values on a high-`ulimit` runner), the
+ * fragment pass fail-closes and masks affected DIAGNOSTIC lines whole.  Exact
+ * whole-value masking still applies, and the audit LOCKFILE — built from
+ * structured events, never from this redacted text — is unaffected, so the
+ * audit still completes (the host part-2 path, where blanking the public job log
+ * is the real harm, instead throws a clear error up front).
+ */
+export function createSensitiveRedactor(
+  protectedEnvNames: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): (text: string) => string {
+  // Layer 1 — exact protected values.  Sort longest-first so a value that is a
+  // substring of another is not partially pre-masked.  Floor is >=1 (mask every
+  // NON-EMPTY declared value): a `protected.env` name is an EXPLICIT secret
+  // declaration, so a 1-3 char declared value must still be masked or it would
+  // leak raw in the redacted install/strace output (adversarial-review F6,
+  // Finding 1 — parity with the host part-2 path).  Empty values (length 0) are
+  // skipped so an unset/blank protected var never mass-masks the output.
+  const values = protectedEnvNames
+    .map((name) => ({ name, value: env[name] }))
+    .filter((e): e is { name: string; value: string } =>
+      typeof e.value === 'string' && e.value.length >= 1,
+    )
+    .sort((a, b) => b.value.length - a.value.length);
+  // Fragment gram matcher — built ONCE here, scanned per line below.
+  const fragMatcher = buildFragmentMatcher(values.map((e) => e.value));
+  return (text: string): string => {
+    let out = text;
+    for (const { name, value } of values) {
+      out = out.split(value).join(`<REDACTED:${name}>`); // exact whole value, per-name label
+    }
+    // Also mask a FRAGMENT (prefix/suffix/middle) of any declared value — e.g. a
+    // secret truncated by a concurrent newline on the shared pipe.  ONE
+    // cross-value pass (NOT per value): a per-value call would let a longer
+    // value's shared gram strand a shorter value's leaked fragment
+    // (adversarial-review F6 round-3).  A fragment can't be attributed to a
+    // single name, so it gets a generic label.
+    out = maskValueFragmentsWith(out, fragMatcher, 'REDACTED:SECRET');
+    // Layer 2 — credential SHAPES regardless of the protected list.  Relocated
+    // verbatim into the shared single-source redactor (see src/shared/redact.ts)
+    // so the host part-1 capture path applies the IDENTICAL shape chain.  The
+    // LINE-LOCAL CONTRACT (Codex round-9 [high] #1) is documented there.
+    out = redactCredentialShapes(out);
+    return out;
+  };
+}
+
+/**
+ * One-shot redactor for a per-BUFFER caller (Phase A failure dump, Phase B
+ * stdout tail) and the tests.  Per-LINE callers must use
+ * {@link createSensitiveRedactor} once and reuse it (see its note).
+ */
 export function redactSensitive(
   text: string,
   protectedEnvNames: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  let out = text;
-  // Layer 1 — exact protected values.  Sort longest-first so a value that is a
-  // substring of another is not partially pre-masked.
-  const values = protectedEnvNames
-    .map((name) => ({ name, value: env[name] }))
-    .filter((e): e is { name: string; value: string } =>
-      typeof e.value === 'string' && e.value.length >= 4,
-    )
-    .sort((a, b) => b.value.length - a.value.length);
-  for (const { name, value } of values) {
-    out = out.split(value).join(`<REDACTED:${name}>`);
-  }
-  // Layer 2 — credential SHAPES regardless of the protected list.
-  //
-  // LINE-LOCAL CONTRACT (Codex round-9 [high] #1): every shape below matches
-  // WITHIN A SINGLE LINE — none may span a newline.  The Phase-B stdout
-  // collector redacts per complete line (see attachStdoutTailCollector); a shape
-  // whose marker and token straddle a '\n' would be masked by a whole-buffer
-  // pass but MISSED per-line, and once the marker is front-dropped the surviving
-  // token would leak.  Aligning the regexes to be line-local makes per-line
-  // redaction COMPLETE for shapes: the inter-token whitespace classes use
-  // `[^\S\n]` (whitespace except newline), and every token/value class already
-  // excludes whitespace.  Real credentials are single-line, so this loses no
-  // genuine coverage — a `Bearer` with its token on the NEXT line is, by this
-  // contract, not a credential (its token, if itself a known shape or a layer-1
-  // value, is still caught on its own line).
-  out = out
-    // scheme://user:pass@host  → keep scheme + host, drop userinfo
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<REDACTED:URL-CREDENTIALS>@')
-    // npm rc auth lines: _authToken= / _auth= / _password=  (rc or env form)
-    .replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, '$1<REDACTED>')
-    // Bearer <token>
-    .replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, '$1<REDACTED>')
-    // npm automation/granular token literals (npm_… 36+ char)
-    .replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, '<REDACTED:NPM-TOKEN>')
-    // GitHub token literals (ghp_/gho_/ghs_/ghu_/ghr_ + 36+ char)
-    .replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, '<REDACTED:GH-TOKEN>')
-    // AWS access key id (AKIA/ASIA + 16 upper-alnum)
-    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '<REDACTED:AWS-KEY>');
-  return out;
+  return createSensitiveRedactor(protectedEnvNames, env)(text);
 }
 
 export async function main(input: AgentInput): Promise<void> {
@@ -3016,22 +3634,89 @@ export async function main(input: AgentInput): Promise<void> {
     PHASE_B_STDOUT_TAIL_BYTES,
     4096 + maxProtectedValueBytes + 4096,
   );
+  // Build the per-line redactor ONCE (precomputes the fragment gram matcher) so
+  // a large `protected.env` does not pay an O(sum |V|) rebuild on every
+  // forwarded line (adversarial-review review #7).  Reused by the prepare pass.
+  const lineRedactor = createSensitiveRedactor(config.protected.env);
   const straceRunner: StraceRunner =
     input.strace ??
     (isMacosBare
-      ? new MacOSInstallRunner(undefined, eventsFile)
-      : new LinuxStraceRunner(
-          undefined,
-          eventsFile,
-          (s) => redactSensitive(s, config.protected.env),
-          stdoutTailBytes,
-        ));
+      ? new MacOSInstallRunner(undefined, eventsFile, lineRedactor)
+      : new LinuxStraceRunner(undefined, eventsFile, lineRedactor, stdoutTailBytes));
+
+  // ROOT package keys, computed ONCE here so the Attribution ctor (below), BOTH
+  // Phase-B passes (main install + the root-prepare pass) and the post-phase
+  // normalize all agree on what counts as the root project.  The ROOT project is
+  // not in node_modules, so discoverPkgDirs never maps it; its lifecycle events
+  // attribute to `<rootName>@<rootVersion>` (or bare `<rootName>` when npm sets
+  // no version).  Keys MUST match attribution's buildPkg() — use
+  // buildRootPkgKeys() as the single source of truth.  Missing/invalid root
+  // package.json → empty set (unchanged semantics: no root lifecycle events).
+  //
+  // `canonicalRootKey` is the SINGLE key the prepare pass forces every event onto
+  // (see the prepare-pass wrapping emitter below).  It is guaranteed to be a
+  // member of `rootPkgKeys`: version present (even '') → `<name>@<version>`, else
+  // the bare name; for a nameless-but-parseable root the `<repo-root>` sentinel;
+  // null ONLY when no manifest exists at all (degenerate no-root edge — nothing
+  // to force onto; the prepare pass does not run in that case).
+  //
+  // Computed HERE (not at section 10) so the nameless-root sentinel can be passed
+  // into the Attribution ctor: only reads `config.work_dir/package.json` from
+  // disk, which is already in place, so the early move is side-effect-free.
+  let rootPkgKeys = new Set<string>();
+  let canonicalRootKey: string | null = null;
+  // A PRESENT-but-non-string root `name` (`"name": 42`) is malformed: the PM
+  // coerces it to a string `npm_package_name` we cannot portably predict, so the
+  // root's events would attribute under that coerced id (which `<repo-root>`
+  // never matches) → a sentinel mismatch that fails normalization or records a
+  // phantom package.  buildRootPkgKeys returns `canonical: null` for it; we flag
+  // it here to fail closed below (distinct from a genuinely ABSENT manifest,
+  // where JSON.parse throws and this stays false).
+  let malformedRootName = false;
+  try {
+    const rootManifest = JSON.parse(readFileSync(`${config.work_dir}/package.json`, 'utf8')) as {
+      name?: unknown;
+      version?: unknown;
+    };
+    malformedRootName =
+      rootManifest.name !== undefined && typeof rootManifest.name !== 'string';
+    ({ keys: rootPkgKeys, canonical: canonicalRootKey } = buildRootPkgKeys(rootManifest));
+  } catch { /* missing/invalid root package.json → no root lifecycle events to surface */ }
+
+  // FAIL CLOSED — malformed root `name` (present but not a string).  The PM runs
+  // the root's lifecycle under a coerced `npm_package_name` that won't match the
+  // `<repo-root>` sentinel, so the root would run effectively unattributed and the
+  // lock could look deceptively clean.  Refuse to emit (a non-string `name` is
+  // malformed and never appears in a real repo, so unlike the removed nameless
+  // gate this cannot over-fire on benign unnamed monorepos).
+  if (malformedRootName) {
+    emitter.emitError(
+      'Root `package.json` has a non-string `name` (e.g. a number/object/array). The package ' +
+        'manager coerces it to a string it runs the root lifecycle under, which script-jail ' +
+        'cannot portably attribute to the repo root — the root would run effectively unaudited ' +
+        'and produce a deceptively clean lock. Refusing to emit a lockfile (give the root a ' +
+        'string `name`, or remove it for a nameless root).',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
 
   // 7. Attribution.  Linux reads /proc; macOS has no /proc, so MacOSProcReader
   //    returns null environ (attribution flows through the shim event seed) and
   //    best-effort ppid via the sj-procinfo helper.
+  //
+  //    NAMELESS ROOT: when `canonicalRootKey === ROOT_SENTINEL` (the root parsed
+  //    but had no usable `name`), pass the sentinel into the ctor so the /proc
+  //    walk attributes the root's OWN lifecycle pids (empty npm_package_name +
+  //    canonical npm_lifecycle_event) to `<repo-root>` for ALL event kinds.  The
+  //    PM driver / non-lifecycle workers carry no canonical lifecycle → still
+  //    null → dropped (no flood).  Undefined for a named/absent root, so the
+  //    walk is byte-identical to before for them.
   const attribution = new Attribution(
     isMacosBare ? new MacOSProcReader() : new LinuxProcReader(),
+    canonicalRootKey === ROOT_SENTINEL ? ROOT_SENTINEL : undefined,
+    rootPkgKeys,
   );
 
   // 8. Phase A: fetch (network on, no strace)
@@ -3041,6 +3726,30 @@ export async function main(input: AgentInput): Promise<void> {
     cwd: config.work_dir,
     env: fetchEnv,
     spawner,
+    // SECURITY (Codex re-review, audit-only sidecar oracle): the pm-flags /
+    // pnpm-arch control sidecars are delivered DIRECTLY as env CONTENT on every
+    // backend (Docker `-e`, bare/mac-bare process env, Firecracker init.sh
+    // `export` from the repo-disk copy) — NEVER as a file at a
+    // lifecycle-visible path.  This keeps a clean-repo
+    // `fs.existsSync('/etc/script-jail/pm-flags.json')` false in BOTH the audit
+    // and the host re-run (it used to be present-in-audit / absent-on-host).
+    // We (the agent) read the content here from our OWN process env (un-audited:
+    // env-spy only instruments lifecycle children) and pass it down; the same
+    // SCRIPT_JAIL_* vars are stripped from every lifecycle child by
+    // buildChildEnv (not on the allowlist), so the content rides only the
+    // agent's /proc/self/environ — the same irreducible "the agent process is
+    // detectable" class as LD_PRELOAD / config.yml, not a new fs oracle.
+    // loadPmFlags / applyPnpmArchOverlay re-sanitize whatever they receive, so
+    // this is safe even though the content originates in the repo-controlled
+    // staging namespace.  `config.yml` remains the one control file at /etc (the
+    // agent must read it; on Docker it is a read-only bind it cannot unlink) —
+    // a documented irreducible residual.
+    ...(process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] !== undefined
+      ? { pmFlagsContent: process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] }
+      : {}),
+    ...(process.env['SCRIPT_JAIL_PNPM_ARCH_CONTENT'] !== undefined
+      ? { pnpmArchContent: process.env['SCRIPT_JAIL_PNPM_ARCH_CONTENT'] }
+      : {}),
   });
   diag(input, `Phase A finished: ok=${fetchResult.ok}`);
 
@@ -3058,8 +3767,21 @@ export async function main(input: AgentInput): Promise<void> {
     // suffix leaks.  Redact the full stdout/stderr (the secret is wholly
     // present), THEN cap the already-masked text.  A mask token split by the
     // cap is harmless (a truncated `<REDACTED:` leaks nothing).
-    const stderrRedacted = redactSensitive(fetchResult.stderr, config.protected.env).trim();
-    const stdoutRedacted = redactSensitive(fetchResult.stdout, config.protected.env).trim();
+    // Developer install `args` are spliced into the Phase-A fetch argv only
+    // (runFetchPhase surfaces the already-re-sanitized set).  A PM error such as
+    // `npm warn invalid config registry="SECRET"` echoes a user-arg VALUE that
+    // matches NO credential SHAPE and is NOT a protected-ENV value — so
+    // `redactSensitive` alone would let it leak to the public Actions log
+    // (adversarial-review round-7 [high]).  Mask the KNOWN exact user-arg values
+    // FIRST (→ <REDACTED:USER-ARG>), THEN run the existing protected-env + shape
+    // redactor.  Empty userInstallArgs ⇒ deriveSensitiveValues([]) ⇒ identity,
+    // so the no-user-args failure dump stays byte-identical.  This single masked
+    // `fetchDetail` feeds BOTH sinks below (serial console + fatal frame).
+    const userArgValues = deriveSensitiveValues(fetchResult.userInstallArgs);
+    const maskUserArgs = (text: string): string =>
+      maskExactValues(text, userArgValues, 'REDACTED:USER-ARG');
+    const stderrRedacted = redactSensitive(maskUserArgs(fetchResult.stderr), config.protected.env).trim();
+    const stdoutRedacted = redactSensitive(maskUserArgs(fetchResult.stdout), config.protected.env).trim();
     const stdoutTail =
       stdoutRedacted.length > 4000 ? `…${stdoutRedacted.slice(-4000)}` : stdoutRedacted;
     const fetchDetail = [
@@ -3170,6 +3892,32 @@ export async function main(input: AgentInput): Promise<void> {
   // 10. Phase B: install (network off, under strace, StraceRunner owns the process)
   const collectedEvents: import('../lock/schema.js').AttributedEvent[] = [];
 
+  // `rootPkgKeys` / `canonicalRootKey` were computed at section 7 (just before
+  // `new Attribution(...)`) so the nameless-root sentinel could be threaded into
+  // the Attribution ctor.  See the comment there for the full contract.
+
+  // FAIL CLOSED — alternate root manifest (package.yaml / package.json5) with no
+  // package.json.  script-jail reads root identity + lifecycle scripts from
+  // package.json ONLY, but pnpm also reads them (and pnpm.configDependencies)
+  // from those alternates.  Such a repo would run its root lifecycle with
+  // npm_package_name UNSET (events DROPPED at the null-attribution gate, exactly
+  // the nameless-root class), yielding a deceptively CLEAN lock that `check`
+  // could later trust.  We have no JSON5 parser and being package.json-only is
+  // load-bearing throughout, so refuse to emit a lockfile (package.json shadows
+  // the alternates, so this only fires when there is genuinely no package.json).
+  const altRootManifest = unsupportedAltRootManifest(config.work_dir);
+  if (altRootManifest !== null) {
+    emitter.emitError(
+      `Root manifest is \`${altRootManifest}\` with no \`package.json\` — script-jail reads ` +
+        'root identity and lifecycle scripts from package.json only, so an alternate-manifest ' +
+        'root would run its lifecycle unaudited (events unattributable) and produce a ' +
+        'deceptively clean lock. Refusing to emit a lockfile (use a `package.json` root manifest).',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+
   // Wrap the emitter to also collect events for normalize.
   const collectingEmitter = new Emitter(
     new (class extends Writable {
@@ -3257,10 +4005,47 @@ export async function main(input: AgentInput): Promise<void> {
     // the strace spawn failure described above.
   }
 
+  // Round-16 (PR #22): close the COREPACK_HOME value-blind-lock oracle.  On FC/
+  // Docker the bare corepack shim reads COREPACK_HOME and leaks it into every
+  // Phase-B lifecycle child (present-in-guest `/opt/vp/corepack` vs absent-on-host).
+  // Resolve the offline-cached PM entry NOW — after Phase A warmed the cache — so
+  // BOTH Phase-B passes (main install + root prepare) launch `node <entry>` directly
+  // (bypassing the shim), then strip COREPACK_HOME from the Phase-B child env.  Gated
+  // on COREPACK_HOME present: true on FC/Docker (init.sh / docker.ts), and naturally
+  // false on the bare backend (strips the COREPACK_* family; no `/opt/vp`) and in
+  // unit tests (inject `strace`, never set COREPACK_HOME) — both keep the bare-name
+  // launch unchanged.  macOS-bare already direct-launches via buildMacosInstallCommand.
+  // FAIL-CLOSED: a resolve miss emits an error + exits non-zero rather than silently
+  // falling back to the leaky shim (which would re-open the oracle unnoticed).
+  const corepackHomeForLaunch = process.env['COREPACK_HOME'];
+  let managerLaunch: { node: string; entry: string } | undefined;
+  try {
+    managerLaunch =
+      !isMacosBare && corepackHomeForLaunch !== undefined && corepackHomeForLaunch.length > 0
+        ? resolveLinuxManagerLaunch(manager, corepackHomeForLaunch, process.execPath)
+        : undefined;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    emitter.emitError(
+      'script-jail agent: failed to resolve the offline package-manager entry for ' +
+        `direct launch — ${reason}. Refusing to emit a lockfile: falling back to the ` +
+        'bare corepack shim would re-open the COREPACK_HOME value-blind-lock oracle.',
+      true,
+    );
+    flushAndExit(input.connection.writable, 1);
+    return;
+  }
+  // Phase-B install env: COREPACK_HOME removed ONLY when direct-launching (it is no
+  // longer needed once the PM is found by absolute path).  Phase A's fetchEnv keeps
+  // it (still shim-based, and not an oracle surface).
+  const installPhaseEnv =
+    managerLaunch !== undefined ? envWithoutCorepackHome(installEnv) : installEnv;
+
   const installInput = {
     manager,
     cwd: config.work_dir,
-    env: installEnv,
+    env: installPhaseEnv,
+    ...(managerLaunch !== undefined ? { managerLaunch } : {}),
     strace: straceRunner,
     attribution,
     emitter: collectingEmitter,
@@ -3272,7 +4057,57 @@ export async function main(input: AgentInput): Promise<void> {
     // repo overflow the 64 MB /tmp tmpfs — see scratchBaseDir().
     straceBasePath: `${straceBaseDir}/strace.out`,
     protectedPaths,
+    rootPkgKeys,
+    // #19 fidelity (npm-only): re-pass the sanitized developer install args to
+    // Phase B so `npm rebuild` runs lifecycle scripts with the same dep-selection
+    // env (NODE_ENV/omit) the single-phase `npm ci <args>` would — in lockstep
+    // with the host part-2 splice.  Already sanitized by loadPmFlags; runInstall
+    // Phase ignores it for pnpm/yarn and for the prepare-pass commandOverride.
+    // Empty (no-args default) → byte-identical lock + goldens.
+    userInstallArgs: fetchResult.userInstallArgs,
+    // Nameless root → the root's OWN lifecycle pids have empty npm_package_name
+    // but a canonical npm_lifecycle_event.  The ATTRIBUTION LAYER (Attribution
+    // ctor's rootSentinel on the /proc walk + shimNpmAttribution on the shim
+    // fast-path) attributes them to the `<repo-root>` sentinel for ALL event
+    // kinds; the dispatcher then defers fs events (pkg ∈ rootPkgKeys) and stamps
+    // the non-forgeable `root_anchored` verdict.  rootSentinel is threaded here
+    // ONLY so the shim fast-path (shimExecAttribution / classifyShimNodeStartup
+    // Marker) sees it — REQUIRED on macOS, where MacOSProcReader has no environ
+    // and attribution flows entirely through the shim seed.  Conditionally spread
+    // so the field is OMITTED (not set to undefined — PhaseInstallInput uses
+    // exactOptionalPropertyTypes) for a named/absent root, keeping it inert.
+    ...(canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {}),
   };
+
+  // NOTE — the nameless-root fail-closed gates that used to live here have been
+  // REMOVED (superseded by non-forgeable root anchoring).  They previously
+  // refused any root with no `name` that ran a main-pass lifecycle (npm/pnpm
+  // preinstall/install/postinstall, plus pnpm's prepublish/rebuild union) or a
+  // pnpm main-pass `prepare`, because such events attributed to null and were
+  // DROPPED — a deceptively-clean lock.  That over-fired on the (extremely
+  // common) unnamed private monorepo root (e.g. pnpm root with `only-allow pnpm`
+  // + git-hooks), refusing to audit it at all, even in pure-audit mode where the
+  // only consequence is a weaker audit.
+  //
+  // Now: `buildRootPkgKeys` gives a nameless-but-parseable root the `<repo-root>`
+  // sentinel key, and the ATTRIBUTION LAYER (not a dispatcher rescue) surfaces
+  // its lifecycle events under that key.  ALL kinds carry the non-forgeable
+  // `root_anchored` verdict (read/write tokenized to `$REPO/...`; spawn/connect/
+  // env_read in their own channels) — genuine root → unmarked; a forged/unanchored
+  // nameless event → `<FORGED_ROOT>`.  Non-fs kinds (spawn/connect/env_read),
+  // which the OLD rescue dropped, now SURFACE under `<repo-root>` AND are anchored
+  // (the prior unmarked-non-fs gap is closed).  Critically, the PM driver and its
+  // non-lifecycle workers carry NO canonical npm_lifecycle_event, so they stay
+  // null → dropped, which is what stops the driver's bulk store/cache/$REPO I/O
+  // from flooding `<repo-root>` (the over-fire the old read/write rescue had,
+  // since the driver pid was also null-attributed and == rootPid).  The lock is
+  // no longer deceptively clean (escaping behavior surfaces and the diff gate
+  // fails on it), so no fail-closed refusal is needed, for any manager or for
+  // `install: true`.  The dedicated prepare-pass force-attribution (section 11)
+  // likewise now stamps nameless roots (canonicalRootKey is the sentinel, not
+  // null).  The alt-manifest gate (genuinely unparseable package.yaml/json5 root)
+  // and the prepare-pass ZERO-EVENT gate remain — both orthogonal to this class.
+
   // macOS-bare uses the lean shim-only dispatcher (no strace channel); Linux
   // uses the full strace+shim dispatcher.  Both share PhaseInstallInput /
   // PhaseInstallResult so the downstream exit-code / tamper / normalize logic
@@ -3352,6 +4187,416 @@ export async function main(input: AgentInput): Promise<void> {
     );
   }
 
+  // 11a. PREPARE PASS.  The main Phase-B install (`npm rebuild
+  //      --foreground-scripts` / `yarn install --immutable`) does NOT run the
+  //      ROOT project's `prepare` script — only dependencies' lifecycle
+  //      scripts.  A malicious root `prepare` would otherwise escape the audit
+  //      entirely.  pnpm's `pnpm rebuild --pending` DOES run the root prepare,
+  //      so resolvePrepareCommand returns null for it (pass skipped).
+  //
+  //      This is a SECOND `runInstallPhase`/`runInstallPhaseMacos` pass — we
+  //      reuse the whole security-critical dispatch loop (per-pid bypass
+  //      detection, events-file forgery, synthesis) verbatim via the
+  //      `commandOverride` seam rather than duplicating it.  Its events land
+  //      in the SAME `collectingEmitter` → `collectedEvents` → the lockfile,
+  //      and its tamper signal is MERGED into installResult below so the
+  //      tamper gate at 11b still fails closed on a tampering prepare.
+  //
+  //      The pass needs its OWN events file: a fresh runner over the SHARED
+  //      main events file would re-read from offset 0 and DOUBLE-EMIT every
+  //      main event.
+  //
+  //      TEST SEAM: when `input.strace` was injected (tests) we only run the
+  //      prepare pass if `input.prepareStrace` was ALSO injected.  Every
+  //      existing test injects only `input.strace`, so this keeps them
+  //      byte-for-byte unaffected (no prepare pass, no golden drift).
+  // Whether a prepare pass runs at all — independent of the npm runner.  npm is
+  // always non-null (the pass always runs); yarn is non-null iff `scripts.prepare`
+  // exists; pnpm is null.  TEST SEAM: the existing suite injects only `input.strace`;
+  // those tests must neither run a prepare pass NOR fail closed, so we run only when
+  // a prepare runner was injected (`input.prepareStrace`), or we are in production
+  // (`input.strace === undefined`), or a test explicitly opts in
+  // (`input.forcePreparePass`, used purely to exercise the fail-closed path).
+  let prepareCommand = resolvePrepareCommand(manager, config.work_dir);
+  const willRunPreparePass =
+    prepareCommand !== null &&
+    (input.prepareStrace !== undefined ||
+      input.strace === undefined ||
+      input.forcePreparePass === true);
+  // #44 (round-20): materialize the npm prepare-lifecycle runner
+  // (NPM_PREPARE_RUNNER_SOURCE) and DIRECT-LAUNCH it as `node <runner>` (via the
+  // `raw` commandOverride) so the WHOLE root prepare lifecycle
+  // (preprepare/prepare/postprepare) runs through `@npmcli/run-script` — faithful
+  // run-order, NO wrapper recursion (run-script adds no pre/post), ONLY the root's
+  // own scripts (no dependency reify → force-attribution invariant holds).  The
+  // GUEST launches the runner (NOT `npm exec -c`), so a repo `.npmrc script-shell`
+  // can no longer intercept the launch (the round-18 hijack), and a `.npmrc
+  // workspaces=true` / `workspace=` selector cannot skip the root prepare (there is
+  // no `npm exec` to fan out or abort) — the root prepare is ALWAYS audited.
+  //
+  // The runner's FAITHFUL env is sourced HERE (not from the launch command):
+  //   - npm_config_*  — captured via a forced-trusted-shell `npm exec` dump
+  //     (un-hijackable) and overlaid onto the pass env below (the direct-launched
+  //     `node` does NOT populate npm_config_* the way `npm exec` would).
+  //   - script-shell  — the repo's RESOLVED value (via `npm config get`), passed to
+  //     the runner via ARGV (NOT env) so the prepare scripts STILL run under it
+  //     (faithful; a malicious script-shell's OWN behavior is then AUDITED, not
+  //     hidden, which forcing a trusted /bin/sh for the prepare scripts would do).
+  //     ARGV avoids the runner emitting a force-attributed-to-root env_read.
+  //
+  // SECURITY (carried from round-18):
+  //   - UNPREDICTABLE runner path via mkdtempSync (0700 dir).  The main install
+  //     pass (where a malicious dependency runs) has ALREADY completed by here, AND
+  //     the random name is unknowable to it.
+  //   - FAIL CLOSED on any setup failure (runner write OR env capture).  We do NOT
+  //     fall back to a single `npm run prepare --if-present` (misses wrapper-only
+  //     preprepare/postprepare — the #44 gap) NOR run with a degraded env (a prepare
+  //     that branches on a missing npm_config_* would silently diverge).  npm-only;
+  //     yarn/pnpm never reach this.
+  let capturedNpmConfig: Record<string, string> = {};
+  let capturedScriptShell: string | null = null;
+  let prepareNpmExecpath = '';
+  if (willRunPreparePass && manager === 'npm') {
+    let runnerPath: string;
+    try {
+      const runnerDir = mkdtempSync(joinPath(straceBaseDir, 'sj-prep-'));
+      runnerPath = joinPath(runnerDir, 'runner.cjs');
+      writeFileSync(runnerPath, NPM_PREPARE_RUNNER_SOURCE, { encoding: 'utf8', mode: 0o600 });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      emitter.emitError(
+        'script-jail agent: failed to materialize the npm root-prepare runner — ' +
+          `${reason}. Refusing to emit a lockfile: falling back to a single ` +
+          '`npm run prepare` would leave wrapper-only preprepare/postprepare ' +
+          'UNAUDITED (a silent #44 false-negative).',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    // CAPTURE the faithful npm_config_* + repo script-shell (round-20).  The real
+    // forced-shell dump + `config get` spawns run ONLY in production (no injected
+    // `strace` — the same gate the rest of the agent uses to tell production from a
+    // unit harness).  Any test injects `strace`, so it uses the injected
+    // `captureNpmPrepareEnv` if provided, else an empty capture (the direct-launch
+    // then runs with just the base env) — keeping the unit suite off real npm.
+    prepareNpmExecpath = managerLaunch?.entry ?? npmCliEntryPath(process.execPath);
+    const captureCtx = {
+      node: process.execPath,
+      npmCli: prepareNpmExecpath,
+      cwd: config.work_dir,
+      env: process.env,
+      // Thread [47]: project the developer dep-selection args (--omit=dev/--prod/…)
+      // into the capture so the root-prepare env matches `npm rebuild <args>`.
+      userInstallArgs: fetchResult.userInstallArgs,
+    };
+    const capture =
+      input.captureNpmPrepareEnv !== undefined
+        ? input.captureNpmPrepareEnv(captureCtx)
+        : input.strace !== undefined
+          ? { npmConfig: {}, scriptShell: null }
+          : realCaptureNpmPrepareEnv(captureCtx);
+    if (capture === null) {
+      emitter.emitError(
+        'script-jail agent: failed to capture the npm root-prepare environment — the ' +
+          'forced-shell `npm exec` env dump produced no result (npm aborted, or the dump ' +
+          'could not be written/read). Refusing to emit a lockfile: running the root ' +
+          '`prepare` with a degraded env could silently diverge from a real install (a ' +
+          'prepare branching on a missing npm_config_* would take a different path).',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    capturedNpmConfig = capture.npmConfig;
+    capturedScriptShell = capture.scriptShell;
+    prepareCommand = resolvePrepareCommand('npm', config.work_dir, {
+      runnerPath,
+      nodePath: process.execPath,
+      // Passed as ARGV (not env) so the runner reads neither from process.env
+      // under env-spy (which would pollute the lock with force-attributed-to-root
+      // env_reads of npm_execpath / the script-shell var).
+      npmCli: prepareNpmExecpath,
+      scriptShell: capturedScriptShell,
+    });
+  }
+  // `prepareCommand !== null` re-narrows the type after the `let` reassignment above;
+  // it is always true when `willRunPreparePass` (npm re-resolves to a non-null command,
+  // yarn kept its non-null base) — a pure type guard, never false at runtime.
+  if (willRunPreparePass && prepareCommand !== null) {
+    // (The nameless-root prepare fail-closed gate that used to live here is
+    // REMOVED — superseded by root anchoring.  A nameless root now force-attributes
+    // its prepare events under the `<repo-root>` sentinel via the prepare emitter
+    // below (canonicalRootKey is the sentinel, not null); the ATTRIBUTION LAYER
+    // (Attribution ctor rootSentinel + shim fast-path) attributes the root's own
+    // prepare lifecycle pids to the sentinel rather than null, so the events reach
+    // the emitter rather than being dropped — the prepare is audited and surfaces
+    // with the non-forgeable `root_anchored` verdict.  See the NOTE in section 10.)
+    diag(input, `Phase B prepare pass: ${prepareCommand.cmd} ${prepareCommand.args.join(' ')}`);
+    // Obtain the prepare runner and its audit sink.  An injected runner owns
+    // its own sink; otherwise build a fresh runner over a SEPARATE events file
+    // — a fresh runner over the SHARED main events file would re-read from
+    // offset 0 and DOUBLE-EMIT every main event.
+    let prepareRunner: StraceRunner;
+    let prepareEventsFilePath = eventsFilePath;
+    if (input.prepareStrace !== undefined) {
+      prepareRunner = input.prepareStrace;
+    } else {
+      // FAIL CLOSED when the prepare events file cannot be created.  Silently
+      // skipping (the earlier draft) would render a final lock with the root
+      // `prepare` UNAUDITED, yet `check` mode could still return `trusted` if
+      // that lock matched a committed one produced under the same degraded
+      // condition (Codex review #2).  Same fatal posture as the MAIN events
+      // file (section 4): an unaudited lifecycle stage must never ship.
+      let pf: EventsFile;
+      try {
+        pf = makeEventsFile();
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        emitter.emitError(
+          'script-jail agent: failed to create the audit-events file for the ' +
+            `root-prepare pass — ${reason}. Refusing to emit a lockfile: the ` +
+            'root `prepare` script would otherwise run UNAUDITED and a clean ' +
+            'diff against it would be untrustworthy.',
+          true,
+        );
+        flushAndExit(input.connection.writable, 1);
+        return;
+      }
+      prepareEventsFilePath = pf.path;
+      prepareRunner = isMacosBare
+        ? new MacOSInstallRunner(undefined, pf, lineRedactor)
+        : new LinuxStraceRunner(undefined, pf, lineRedactor, stdoutTailBytes);
+    }
+    // Point the prepare child's audit sink at the events file the runner uses.
+    const prepareChildEnv = isMacosBare
+      ? buildChildEnvMacos(process.env, config, prepareEventsFilePath, input.preloadPaths)
+      : buildChildEnv(process.env, config, prepareEventsFilePath, input.preloadPaths);
+    const prepareEnvBase = isMacosBare
+      ? { ...prepareChildEnv, SCRIPT_JAIL_MACOS_AUDIT_OPS: '1' }
+      : prepareChildEnv;
+    // Round-20 (npm only): the runner is DIRECT-LAUNCHED as `node <runner>`, so npm
+    // does NOT populate `npm_config_*` the way `npm exec` would.  Replace the env's
+    // npm_config_* WHOLESALE with the faithfully-captured set (so the prepare SCRIPTS
+    // see EXACTLY a real install's config projection — no stray inherited keys) and
+    // set `npm_execpath` / `npm_node_execpath` as a real install would for scripts.
+    // The runner itself reads npmCli + the repo script-shell from ARGV (not env), so
+    // those are NOT added here — keeping the runner from emitting force-attributed
+    // env_reads.  For yarn the capture is empty and the launch routes through its own
+    // PM entry, so `prepareEnvBase` is used unchanged.
+    let prepareEnv: NodeJS.ProcessEnv = prepareEnvBase;
+    if (manager === 'npm') {
+      const merged: NodeJS.ProcessEnv = {};
+      for (const [k, v] of Object.entries(prepareEnvBase)) {
+        if (/^npm_config_/i.test(k)) continue; // dropped, replaced by the captured set
+        merged[k] = v;
+      }
+      Object.assign(merged, capturedNpmConfig);
+      merged['npm_execpath'] = prepareNpmExecpath;
+      merged['npm_node_execpath'] = process.execPath;
+      prepareEnv = merged;
+    }
+    // FORCE-ATTRIBUTION emitter, used ONLY for the prepare pass.  This pass runs
+    // ONLY the root project's own `prepare` lifecycle — for npm via the
+    // direct-launched `@npmcli/run-script` runner (preprepare/prepare/postprepare,
+    // no dependency reify), for yarn via `yarn run prepare` — so EVERY event it
+    // produces genuinely belongs to the root's prepare, by construction.  A malicious dependency cannot inject itself into this pass,
+    // so this is bulletproof regardless of any forged `npm_package_name` /
+    // lifecycle env.  We override attribution here at the emitter boundary —
+    // the only place where "this came from the prepare pass" is still known;
+    // once events land in the shared `collectedEvents` the pass identity is
+    // lost.  This makes root identity NON-FORGEABLE for the prepare pass,
+    // independent of the Linux process-tree anchoring.
+    //
+    // Mirrors `collectingEmitter` EXACTLY for non-event frames
+    // (handshake/error/final/etc. pass through unchanged); only `kind:'event'`
+    // frames are rewritten: pkg → canonicalRootKey, lifecycle → 'prepare', and
+    // the full anchorable set (read/write/spawn/connect/env_read) gets
+    // `root_anchored = true` — normalize now consults root_anchored for all of
+    // those kinds (`exec` is excluded: it carries no root_anchored).  The FORCED
+    // frame is what we push into the SHARED `collectedEvents` AND re-emit to the
+    // host stream, so the two stay consistent.
+    const preparingEmitter = new Emitter(
+      new (class extends Writable {
+        override _write(chunk: Buffer, _enc: string, cb: () => void): void {
+          const line = chunk.toString();
+          let frame: Record<string, unknown>;
+          try {
+            frame = JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            // Malformed line from a trusted internal writer — skip silently.
+            cb();
+            return;
+          }
+          if (frame['kind'] === 'event') {
+            const raw = frame['raw'] as import('../lock/schema.js').RawEvent;
+            // Force attribution: this pass runs only the root's prepare.
+            const forcedPkg = canonicalRootKey ?? (frame['pkg'] as string);
+            const forcedLifecycle: import('../lock/schema.js').LifecycleStage = 'prepare';
+            // Only stamp the non-forgeable root anchor when we actually have a
+            // parseable root manifest (canonicalRootKey is non-null).  This now
+            // INCLUDES a nameless-but-parseable root, whose canonicalRootKey is
+            // the `<repo-root>` sentinel — its prepare events force-attribute to
+            // the sentinel and are correctly stamped (the attribution layer —
+            // Attribution ctor rootSentinel + shim fast-path — attributes the
+            // root's own prepare lifecycle to the sentinel so the events reach
+            // this emitter instead of being dropped at the null gate).
+            // With NO root manifest at all, canonicalRootKey stays null and
+            // `forcedPkg` falls back to the frame's own (dep) label, which is NOT
+            // the root — the guard then withholds the stamp so we never forge the
+            // very signal normalize relies on (the prepare pass does not run in
+            // the no-manifest case anyway).
+            //
+            // Stamp the FULL anchorable set (read/write AND the non-fs set
+            // spawn/connect/env_read/env_tamper), matching normalize.ts's
+            // `<FORGED_ROOT>` contract: this pass runs ONLY the root's prepare, so
+            // EVERY event is genuinely root by construction (the comment above) —
+            // independent of the process-tree anchoring `runInstallPhase` computes.
+            // Without this a genuine root `prepare` connect/spawn/env_read/
+            // env_tamper whose process-tree verdict came back unanchored (e.g. a
+            // rootPid-null fail-closed run, or a prepare descendant that chdir'd
+            // away) would render `<FORGED_ROOT>` while the read/write equivalent
+            // renders clean — an inconsistency and a false host-bound egress
+            // warning in diff.ts. `exec` carries no root_anchored (never deferred
+            // / not in the anchorable set), so it is deliberately excluded.
+            if (
+              canonicalRootKey !== null &&
+              (raw.kind === 'read' ||
+                raw.kind === 'write' ||
+                raw.kind === 'spawn' ||
+                raw.kind === 'connect' ||
+                raw.kind === 'env_read' ||
+                raw.kind === 'env_tamper')
+            ) {
+              raw.root_anchored = true;
+            }
+            const forcedFrame = {
+              ...frame,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+              raw,
+            };
+            const forcedLine = `${JSON.stringify(forcedFrame)}\n`;
+            // Re-emit the FORCED frame to the real emitter (host stream stays
+            // consistent with what normalize sees).
+            input.connection.writable.write(forcedLine);
+            // Collect the FORCED event for normalize.
+            collectedEvents.push({
+              raw,
+              pkg: forcedPkg,
+              lifecycle: forcedLifecycle,
+            });
+          } else {
+            input.connection.writable.write(line);
+          }
+          cb();
+        }
+      })()
+    );
+    // Round-16/20: the prepare pass is the SECOND Phase-B oracle surface — keep the
+    // main install's COREPACK_HOME strip when managerLaunch is present (so a prepare
+    // never inherits it).  The LAUNCH differs by manager: npm's commandOverride is a
+    // `raw` direct-launch (`node <runner>`) that bypasses the managerLaunch rewrite
+    // (resolvePrepareCommand / the `raw` flag), so COREPACK_HOME is moot there but the
+    // strip is harmless; yarn's override routes through the rewrite (`node <yarn.js>`)
+    // as before.  pnpm has no prepare pass (its root prepare rides on the main
+    // install's `rebuild --pending`).
+    const preparePhaseEnv =
+      managerLaunch !== undefined ? envWithoutCorepackHome(prepareEnv) : prepareEnv;
+    const prepareInput = {
+      manager,
+      cwd: config.work_dir,
+      env: preparePhaseEnv,
+      ...(managerLaunch !== undefined ? { managerLaunch } : {}),
+      strace: prepareRunner,
+      attribution,
+      emitter: preparingEmitter,
+      // A DIFFERENT strace base path so per-pid `-ff` logs don't collide with
+      // the main install's files on the scratch disk.
+      straceBasePath: `${straceBaseDir}/strace-prepare.out`,
+      protectedPaths,
+      rootPkgKeys,
+      // Nameless root: its prepare-pass lifecycle pids surface under `<repo-root>`
+      // via the attribution layer (shim fast-path threaded with this sentinel; on
+      // Linux the shared Attribution instance already carries it).  The
+      // preparingEmitter then re-stamps lifecycle = 'prepare' + root_anchored.
+      // Conditionally spread (omitted, not undefined) for a named/absent root —
+      // see the installInput note above.
+      ...(canonicalRootKey === ROOT_SENTINEL ? { rootSentinel: ROOT_SENTINEL } : {}),
+      commandOverride: prepareCommand,
+    };
+    const prepareResult = isMacosBare
+      ? await runInstallPhaseMacos(prepareInput)
+      : await runInstallPhase(prepareInput);
+    diag(
+      input,
+      `Phase B prepare pass finished: exit=${prepareResult.exitCode} events=${prepareResult.eventCount}`,
+    );
+    // (Round-20: the round-18b GROUND-TRUTH execution-sentinel gate is REMOVED.
+    // It guarded `npm exec --no-workspaces` aborting before the runner ran on a
+    // `.npmrc` workspace selector.  Direct-launch (`node <runner>`) has no `npm
+    // exec` to abort, so the runner ALWAYS runs and the FATAL gate below — nonzero
+    // exit AND zero events ⇒ strace could not attach / the process never started —
+    // already covers "the runner did not run".  The selector-evasion class is gone:
+    // a selector can no longer skip the root prepare.)
+    // MERGE.  Mirrors the main-path fail-closed gate (~3402-3452):
+    //
+    //   - prepareResult.exitCode !== 0 && prepareResult.eventCount === 0:
+    //     FATAL.  The prepare PASS always launches a process (the direct-launched
+    //     `@npmcli/run-script` runner, or `yarn run prepare`), whose node/sh
+    //     startup alone emits fs reads — so a traced run must produce at least
+    //     some events even when the root has NO prepare script (the runner finds
+    //     none and exits 0).  Zero events with a nonzero exit means strace could
+    //     not attach or the PM aborted before instrumentation — i.e. the root
+    //     `prepare` may have run UNAUDITED.  A clean diff against the resulting
+    //     lockfile would be untrustworthy.  Fail closed, mirroring the main path.
+    //
+    //   - prepareResult.exitCode !== 0 && prepareResult.eventCount > 0:
+    //     Non-fatal.  Audit data exists (prepare failed offline but was
+    //     traced).  Fold counts/tamper and continue — same as the main path's
+    //     non-fatal nonzero handling.
+    //
+    //   - prepareResult.exitCode === 0: unchanged (fold counts/tamper).
+    //
+    // TWO tamper sources for the non-fatal paths, exactly mirroring what 11b
+    // does for the MAIN runner
+    // (`installResult.tamperReason ?? straceRunner.getTamperReason()`):
+    //   - `prepareResult.tamperReason` — the prepare DISPATCHER's owned reason
+    //     (shim-channel parse failure / bad LineSource).
+    //   - `prepareRunner.getTamperReason()` — the prepare RUNNER's events-file
+    //     tamper (unlink / inode-swap / mtime regression on the prepare events
+    //     file).  Critically, 11b only consults the MAIN `straceRunner`, never
+    //     the prepare runner — so without folding it in here a file-tamper on
+    //     the prepare pass's own events file would NOT fail closed.  First-
+    //     non-null wins (preserve the earliest, most specific reason).
+    if (prepareResult.exitCode !== 0 && prepareResult.eventCount === 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) ` +
+          'and produced no audit events — the root `prepare` script likely ran ' +
+          'untraced (strace could not attach) or the package manager aborted ' +
+          'before spawning it. Refusing to emit a lockfile: the root `prepare` ' +
+          'would be unaudited and a clean diff against it would be untrustworthy.',
+        true,
+      );
+      flushAndExit(input.connection.writable, 1);
+      return;
+    }
+    if (prepareResult.exitCode !== 0) {
+      emitter.emitError(
+        `Phase B (prepare pass) exited non-zero (code ${prepareResult.exitCode}) — ` +
+          'the root `prepare` script failed under audit. This is recorded in the ' +
+          'lockfile, not treated as a fatal error.',
+        false,
+      );
+    }
+    installResult.eventCount += prepareResult.eventCount;
+    const prepareTamper =
+      prepareResult.tamperReason ?? prepareRunner.getTamperReason();
+    if (installResult.tamperReason === null) {
+      installResult.tamperReason = prepareTamper;
+    }
+  }
+
   // 11b. Events-file tamper check (Findings A + B): the tailer baseline-
   //      stats the SCRIPT_JAIL_LOG_FILE path on every drain cycle and records
   //      any anomaly (unlink, inode mismatch, truncate, EACCES, parent-dir
@@ -3417,6 +4662,21 @@ export async function main(input: AgentInput): Promise<void> {
   const pkgDirs = new Map<string, string>(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config.pkg_dirs)) pkgDirs.set(k, v);
 
+  // The ROOT project is not in node_modules, so discoverPkgDirs never maps it.
+  // Its lifecycle events attribute to `<rootName>@<rootVersion>` (or bare
+  // `<rootName>` when npm sets no version): root pre/install/postinstall from
+  // the MAIN install pass, and root `prepare` from the prepare pass.  We do NOT
+  // register the root as a pkgDir — mapping it to work_dir would make the WHOLE
+  // repo $PKG, dropping every root write into the repo as intra-package (hiding
+  // the audited behaviour) and letting a dependency forge `npm_package_name=
+  // <root>` to write anywhere under the repo with the write silently dropped
+  // (Codex review #1).  Instead we pass the root keys to normalize as
+  // `rootPkgKeys`, which tokenizes the root's fs events against $REPO/
+  // $NODE_MODULES and SURFACES them (external_reads / escaped_writes) instead of
+  // throwing on the missing pkgDir.  Keys MUST match attribution's buildPkg().
+  // `rootPkgKeys` is computed ONCE before the Phase-B passes (section 10) and
+  // threaded into both — we reuse the SAME set here.
+
   // 12. Normalize + render
   //
   // On macOS-bare the normalize pass MUST run with `os: 'darwin'` so the
@@ -3426,8 +4686,8 @@ export async function main(input: AgentInput): Promise<void> {
   // that never reconcile against the Linux-produced committed lock.  The Linux
   // path keeps the default (`os` undefined → 'linux').
   const ctx: NormalizeContext = isMacosBare
-    ? { roots, pkgDirs, os: 'darwin' }
-    : { roots, pkgDirs };
+    ? { roots, pkgDirs, rootPkgKeys, os: 'darwin' }
+    : { roots, pkgDirs, rootPkgKeys };
 
   let yaml: string;
   try {

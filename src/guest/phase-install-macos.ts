@@ -35,6 +35,7 @@
 import { join, dirname } from 'node:path';
 
 import { applyProtectedPathsPolicy, ProtectedPathsMatcher } from './protected-paths.js';
+import { INSTALL_CMD } from '../shared/pm-commands.js';
 import type { AttributionResult } from './attribution.js';
 import {
   parseShimLine,
@@ -95,16 +96,10 @@ function parseMacosShimLine(line: string): MacosShimLineEvent {
   return parseShimLine(line);
 }
 
-const INSTALL_CMD: Record<'npm' | 'pnpm' | 'yarn', { cmd: string; args: string[] }> = {
-  npm:  { cmd: 'npm',  args: ['rebuild', '--foreground-scripts'] },
-  pnpm: { cmd: 'pnpm', args: ['rebuild', '--pending', '--config.side-effects-cache=false'] },
-  // No `--offline`: that flag is Yarn Classic-only; Berry rejects it with a
-  // fatal Usage Error (exit 1, zero events).  See phase-install.ts for the full
-  // rationale.  The macOS-bare backend is observe-only and does not sever the
-  // network, but the cache Phase A populated still makes this a relink+build
-  // with no required registry traffic.
-  yarn: { cmd: 'yarn', args: ['install', '--immutable'] },
-};
+// INSTALL_CMD is imported from ../shared/pm-commands.ts (shared with Linux
+// Phase B and the host drop-in install). The macOS-bare backend is observe-only
+// and does not sever the network, but the cache Phase A populated still makes
+// the relink+build run with no required registry traffic.
 
 // env-spy.cjs stamps its `node_startup_done` JSONL marker by reading these three
 // npm lifecycle fields off `process.env` (signalNodeStartupDone, env-spy.cjs
@@ -176,14 +171,45 @@ export function macosManagerLaunch(
  * Build the Phase-B install command for macOS — `macosManagerLaunch` with the
  * Phase-B subcommand (`rebuild`/`install`) and pnpm's repo-disk store-dir pin
  * (IDENTICAL store-dir value to the one the fetch phase splices).
+ *
+ * When `commandOverride` is supplied (the agent's prepare-only second pass —
+ * e.g. yarn's `{cmd:'yarn', args:['run','prepare']}`), we route the OVERRIDE'S
+ * ARGS through `macosManagerLaunch` exactly the same way: the override's `cmd`
+ * (`yarn`) is intentionally discarded — `macosManagerLaunch` always launches via
+ * the provisioned, re-signed `process.execPath` + the manager's JS entry so
+ * DYLD_INSERT_LIBRARIES survives the first exec.  No pnpm store-dir splice is
+ * added for an override (prepare passes are npm/yarn only; the resolver returns
+ * null for pnpm).
+ *
+ * `commandOverride.raw` (round-20): the npm root-prepare DIRECT-LAUNCH
+ * (`{cmd: process.execPath, args:[<runner>], raw:true}`).  Launch it VERBATIM —
+ * `cmd` is ALREADY the provisioned, re-signed `process.execPath`, so DYLD survives
+ * the first exec without going through `macosManagerLaunch` (which would wrongly
+ * prepend npm-cli.js, turning `node <runner>` into `node npm-cli.js <runner>`).
  */
 function buildMacosInstallCommand(
   manager: 'npm' | 'pnpm' | 'yarn',
   cwd: string,
+  commandOverride?: { cmd: string; args: string[]; raw?: boolean },
+  userInstallArgs?: ReadonlyArray<string>,
 ): { cmd: string; args: string[] } {
+  if (commandOverride !== undefined) {
+    if (commandOverride.raw === true) {
+      return { cmd: commandOverride.cmd, args: commandOverride.args };
+    }
+    return macosManagerLaunch(manager, commandOverride.args);
+  }
   const base = INSTALL_CMD[manager];
+  // #19 fidelity (npm-only): mirror the Linux runInstallPhase / host part-2
+  // splice so a repo passing `args` produces the SAME Phase B argv (and lock)
+  // on macOS-bare as on Linux — required for cross-backend parity.  npm-only;
+  // empty (no-args) → byte-identical.  Order mirrors the host: <base> <user
+  // args> <store-dir>.
+  const userArgs = manager === 'npm' ? (userInstallArgs ?? []) : [];
   const managerArgs =
-    manager === 'pnpm' ? [...base.args, `--store-dir=${cwd}/.pnpm-store`] : base.args;
+    manager === 'pnpm'
+      ? [...base.args, `--store-dir=${cwd}/.pnpm-store`]
+      : [...base.args, ...userArgs];
   return macosManagerLaunch(manager, managerArgs);
 }
 
@@ -201,7 +227,12 @@ export async function runInstallPhaseMacos(
   // Launch as `<re-signed node> <manager-cli.js> …` so DYLD survives the first
   // exec (see buildMacosInstallCommand).  pnpm's store-dir pin is folded in
   // there, IDENTICAL to the value the fetch phase splices.
-  const { cmd, args } = buildMacosInstallCommand(input.manager, input.cwd);
+  const { cmd, args } = buildMacosInstallCommand(
+    input.manager,
+    input.cwd,
+    input.commandOverride,
+    input.userInstallArgs,
+  );
   // No per-pid strace files on macOS; the basePath still gives runStraceTailer
   // a watchDir.  Default to a macOS tmp path when the caller didn't supply one.
   const basePath = input.straceBasePath ?? '/tmp/script-jail-strace/strace.out';
@@ -543,7 +574,7 @@ export async function runInstallPhaseMacos(
       // REPLACE the attribution entry (set for valid, DELETE for bare /
       // non-canonical / overlong so a recycled pid fails closed).
       const { attribution: startupAttrib, pathological: startupPathological } =
-        classifyShimNodeStartupMarker(line);
+        classifyShimNodeStartupMarker(line, input.rootSentinel, input.rootPkgKeys);
       nodeStartupMarkerByPid.set(shimEvent.pid, { ts: lineTs, pathological: startupPathological });
       if (startupAttrib !== null) {
         nodeStartupAttributionByPid.set(shimEvent.pid, startupAttrib);
@@ -566,7 +597,12 @@ export async function runInstallPhaseMacos(
       // Seed attribution from the shim's in-process npm lifecycle env (the
       // authoritative, never-reaped source on macOS).  Byte-identical to the
       // /proc-walk path via attributionFromEnvVars (inside shimExecAttribution).
-      const shimAttrib = shimExecAttribution(line);
+      // rootSentinel is threaded so a nameless root's own lifecycle exec (empty
+      // npm_package_name + canonical npm_lifecycle_event) seeds ROOT_SENTINEL —
+      // the macOS path's only attribution source (MacOSProcReader has no environ,
+      // so the /proc walk is inert; the dispatcher rescue that used to live here
+      // is deleted, attribution now flows entirely through this shim seed).
+      const shimAttrib = shimExecAttribution(line, input.rootSentinel, input.rootPkgKeys);
       if (shimAttrib !== null) recordAttribution(shimEvent.pid, shimAttrib, lineTs);
 
       // <EXEC_FAIL_OPEN>: the shim could not allocate the re-injected envp, so
@@ -642,7 +678,15 @@ export async function runInstallPhaseMacos(
           nodeStartupAttribution(shimEvent.pid) ??
           snapshotAttribution(shimEvent.pid);
         if (attribution !== null) {
-          emit({ raw: spawnRaw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
+          // Repo-root anchoring (observe-only default `true`; see the
+          // remaining-kinds chain below for the full rationale): a root-attributed
+          // spawn carries the verdict so normalize can distinguish a genuine root
+          // spawn from a forged one, in parity with Linux.
+          const raw: SpawnEvent =
+            input.rootPkgKeys?.has(attribution.pkg) === true
+              ? { ...spawnRaw, root_anchored: true }
+              : spawnRaw;
+          emit({ raw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
         }
       } else {
         // result:'failed'.  Linux's strace parser records a failed execve as a
@@ -673,7 +717,13 @@ export async function runInstallPhaseMacos(
             nodeStartupAttribution(shimEvent.pid) ??
             snapshotAttribution(shimEvent.pid);
           if (attribution !== null) {
-            emit({ raw: spawnRaw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
+            // Repo-root anchoring on a blocked spawn — same observe-only default
+            // `true` as the ok branch above, for normalize parity with Linux.
+            const raw: SpawnEvent =
+              input.rootPkgKeys?.has(attribution.pkg) === true
+                ? { ...spawnRaw, root_anchored: true }
+                : spawnRaw;
+            emit({ raw, pkg: attribution.pkg, lifecycle: attribution.lifecycle });
           }
         }
       }
@@ -687,14 +737,56 @@ export async function runInstallPhaseMacos(
 
     // ---- attribution chain for all remaining kinds (read/write/env_read/
     //      dlopen/connect/env_tamper) ----------------------------------------
+    // NOTE — nameless-root lifecycle attribution now happens at the ATTRIBUTION
+    // LAYER (shimExecAttribution / classifyShimNodeStartupMarker, threaded with
+    // input.rootSentinel above), NOT here.  For a nameless root's own lifecycle
+    // pid (empty npm_package_name + canonical npm_lifecycle_event) the shim seed
+    // already carries ROOT_SENTINEL for EVERY event kind — fixing the old
+    // rescue's blind spot (read/write only; spawn/connect/env_read were dropped).
+    // The PM driver / non-lifecycle workers carry no canonical lifecycle, so
+    // they seed nothing → null here → dropped (no flood).  A genuine null at
+    // this gate is a real non-lifecycle process: drop it.
     const attribution =
       freshSnapshotAttribution(shimEvent.pid) ??
       nodeStartupAttribution(shimEvent.pid) ??
       snapshotAttribution(shimEvent.pid);
-    if (attribution === null) continue;
+    if (attribution === null) {
+      continue;
+    }
+
+    // Repo-root anchoring: when this event attributes to a root-project package
+    // key we stamp `root_anchored` so normalize.ts can tell a genuine root event
+    // from a dependency forging `npm_package_name=<root>`. This now covers the
+    // non-fs set (connect/env_read/env_tamper here, spawn at its own emit site
+    // above) in addition to read/write — matching the Linux defer/stamp extension
+    // that closes the unmarked-non-fs dedupe-collapse + egress-misclassification
+    // gap. env_tamper rides this same remaining-kinds chain (emitted directly
+    // below, like connect/env_read — it has NO dedicated emit site as spawn does),
+    // so stamping it here is the only macOS touch point needed.
+    // macOS-bare is OBSERVE-ONLY and has no strace process-tree / exec-cwd
+    // machinery (see this file's header — the union-find group model, per-pid
+    // cwd table, and the prepare-pass attribution all live on the Linux path),
+    // so we cannot compute the non-forgeable verdict here; root identity is
+    // env-trusted and we default to `root_anchored: true` (a documented
+    // residual). Without this default a BENIGN root's non-fs events would render
+    // `<FORGED_ROOT>` on macOS while Linux renders them clean — a parity break.
+    // The Linux/Firecracker backend computes the real value via
+    // isRepoRootAnchored() and remains the enforcement boundary. The field is
+    // OMITTED entirely (never set to false) on non-root events so frames stay
+    // byte-identical → zero behavior change while `rootPkgKeys` is undefined.
+    const isRootAttributedAnchorableEvent =
+      (shimEvent.kind === 'read' ||
+        shimEvent.kind === 'write' ||
+        shimEvent.kind === 'connect' ||
+        shimEvent.kind === 'env_read' ||
+        shimEvent.kind === 'env_tamper') &&
+      input.rootPkgKeys?.has(attribution.pkg) === true;
+    const raw: RawEvent = isRootAttributedAnchorableEvent
+      ? { ...shimEvent, root_anchored: true }
+      : shimEvent;
 
     const attributed: AttributedEvent = {
-      raw: shimEvent,
+      raw,
       pkg: attribution.pkg,
       lifecycle: attribution.lifecycle,
     };

@@ -524,3 +524,89 @@ describe('provisionNodeMac — atomic shim restage', () => {
     expect(readdirSync(first.shellShimDir).sort()).toEqual(['bash', 'coreutils']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// provisionNodeMac — pre-trust env threading (codex round-5 [critical])
+// ---------------------------------------------------------------------------
+//
+// Provisioning runs ON THE HOST before any audit trust gate.  The module is
+// policy-agnostic: the caller (mac-bare backend) hands it a SANITIZED `env`, and
+// provisionNodeMac must thread THAT env to every host spawn — vp, corepack, and
+// the bare-name `tar`/`codesign`/`xattr` system tools — never reaching for
+// `process.env` itself.  If it leaked the raw runner env, a checkout-prepended
+// PATH could shadow a PR-committed `tar`/`codesign`/`xattr` and an inherited
+// NODE_OPTIONS/DYLD_* could inject into the Node-based vp/corepack pre-trust.
+
+describe('provisionNodeMac — threads the injected env to every host spawn', () => {
+  it('every spawn (incl. the now-seam-routed xattr) gets input.env, not process.env', async () => {
+    const dir = tempDir();
+    const inner = makeFakeRunCommand();
+    const captured: Array<{ cmd: string; args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+    // SENTINEL is absent from the real process.env, so its presence in a spawn's
+    // env PROVES the call used the injected env, not an inherited process.env.
+    const SENTINEL = 'SJ_PROVISION_ENV_SENTINEL';
+    const run: NonNullable<ProvisionNodeMacInput['runCommand']> = (cmd, args, opts = {}) => {
+      captured.push({ cmd, args, env: opts.env });
+      return inner.run(cmd, args, opts);
+    };
+    const input = makeInput(dir, inner, {
+      runCommand: run,
+      env: { [SENTINEL]: '1', PATH: '/usr/bin:/bin' },
+    });
+
+    await provisionNodeMac(input);
+
+    const tar = captured.filter((c) => c.cmd === 'tar');
+    const vp = captured.filter((c) => c.args[0] === 'env' && c.args[1] === 'install');
+    const corepack = captured.filter((c) => c.args[0] === 'enable');
+    const codesign = captured.filter((c) => c.cmd === 'codesign');
+    const xattr = captured.filter((c) => c.cmd === 'xattr');
+
+    expect(tar.length).toBeGreaterThan(0);
+    expect(vp.length).toBeGreaterThan(0);
+    expect(corepack.length).toBeGreaterThan(0);
+    expect(codesign.length).toBeGreaterThan(0);
+    // xattr is now routed through the runCommand seam (was a raw spawnSync), so
+    // it is BOTH observable here AND receives the sanitized env.
+    expect(xattr.length).toBeGreaterThan(0);
+
+    for (const c of [...tar, ...vp, ...corepack, ...codesign, ...xattr]) {
+      expect(c.env?.[SENTINEL]).toBe('1');
+    }
+    // corepack PATH prepends nodeBinDir to the INJECTED PATH (/usr/bin:/bin), so
+    // the system dirs survive and no raw inherited PATH segment creeps in.
+    expect(corepack[0]!.env?.['PATH']).toMatch(/:\/usr\/bin:\/bin$/);
+    // round-17f (codex [medium]): the pre-agent corepack boundaries (`vp env install`
+    // + `corepack enable`, both run at the checkout cwd before the trust gate) must pin
+    // COREPACK_ENV_FILE=0 so a repo `.corepack.env` is never loaded — uniform with the
+    // host install + every backend.
+    for (const c of [...vp, ...corepack]) {
+      expect(c.env?.['COREPACK_ENV_FILE']).toBe('0');
+    }
+  });
+
+  it('an empty inherited PATH never becomes a trailing cwd segment ([F3] codex round-6)', async () => {
+    const dir = tempDir();
+    const inner = makeFakeRunCommand();
+    const captured: Array<{ cmd: string; args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+    const run: NonNullable<ProvisionNodeMacInput['runCommand']> = (cmd, args, opts = {}) => {
+      captured.push({ cmd, args, env: opts.env });
+      return inner.run(cmd, args, opts);
+    };
+    // PATH='' is what stripDangerousEnv would never now emit, but provisioning
+    // must self-defend: corepack's PATH must NOT end with ':' (a zero-length
+    // entry = cwd search) — it falls back to a trusted system PATH instead.
+    const input = makeInput(dir, inner, { runCommand: run, env: { PATH: '' } });
+
+    await provisionNodeMac(input);
+
+    const corepack = captured.find((c) => c.args[0] === 'enable');
+    expect(corepack).toBeDefined();
+    const path = corepack!.env?.['PATH'] ?? '';
+    expect(path.endsWith(':')).toBe(false);
+    expect(path.endsWith('/usr/bin:/bin:/usr/sbin:/sbin')).toBe(true);
+    // nodeBinDir (== dirname of the corepack cmd) is prepended ahead of it.
+    const nodeBinDir = corepack!.cmd.slice(0, corepack!.cmd.lastIndexOf('/'));
+    expect(path.startsWith(`${nodeBinDir}:`)).toBe(true);
+  });
+});

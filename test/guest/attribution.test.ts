@@ -3,7 +3,12 @@
 // All tests use a synthetic in-memory ProcReader — no /proc I/O.
 
 import { describe, it, expect } from 'vitest';
-import { Attribution } from '../../src/guest/attribution.js';
+import {
+  Attribution,
+  attributionFromEnvVars,
+  buildRootPkgKeys,
+  ROOT_SENTINEL,
+} from '../../src/guest/attribution.js';
 import type { ProcReader, AttributionResult } from '../../src/guest/attribution.js';
 
 // ---------------------------------------------------------------------------
@@ -378,6 +383,89 @@ describe('Attribution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// buildRootPkgKeys — mirrors buildPkg exactly (single source of truth)
+// ---------------------------------------------------------------------------
+
+describe('buildRootPkgKeys', () => {
+  // Normal version: both bare name and name@version in keys; canonical = name@version
+  it('normal version → keys contain name and name@version; canonical = name@version', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 'x', version: '1.0.0' });
+    expect([...keys].sort()).toEqual(['x', 'x@1.0.0']);
+    expect(canonical).toBe('x@1.0.0');
+  });
+
+  // EMPTY-STRING version: this is the bug case — npm sets npm_package_version='' so
+  // attribution produces pkg 'x@', NOT 'x'.  Keys must include 'x@'.
+  it('empty-string version → keys contain BOTH bare name AND name@ (mirrors buildPkg)', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 'x', version: '' });
+    expect(keys.has('x')).toBe(true);
+    expect(keys.has('x@')).toBe(true);   // critical: NOT skipped by length > 0
+    expect(canonical).toBe('x@');
+  });
+
+  // Scoped package with empty version
+  it('scoped package with empty-string version → keys contain @scope/y and @scope/y@', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: '@scope/y', version: '' });
+    expect(keys.has('@scope/y')).toBe(true);
+    expect(keys.has('@scope/y@')).toBe(true);
+    expect(canonical).toBe('@scope/y@');
+  });
+
+  // Missing version field: canonical is bare name only
+  it('missing version field → keys contain only bare name; canonical = name', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 'x' });
+    expect([...keys]).toEqual(['x']);
+    expect(canonical).toBe('x');
+  });
+
+  // Nameless-but-parseable manifest → the `<repo-root>` sentinel (NOT null).
+  // A parseable root with no usable `name` used to yield {∅, null}; it now gets
+  // the ROOT_SENTINEL so the attribution layer (attributionFromEnvVars: empty
+  // name + recognised lifecycle event → sentinel) can surface its lifecycle
+  // events under `<repo-root>` (tokenized to $REPO/...) instead of dropping them.
+  // A genuinely ABSENT manifest still yields null canonical
+  // because the caller (agent.ts) never reaches buildRootPkgKeys in that case
+  // (its JSON.parse throws), keeping the alt-manifest fail-closed gate reachable.
+  it('missing name → ROOT_SENTINEL key + canonical (nameless-but-parseable)', () => {
+    const { keys, canonical } = buildRootPkgKeys({});
+    expect([...keys]).toEqual([ROOT_SENTINEL]);
+    expect(canonical).toBe(ROOT_SENTINEL);
+  });
+
+  it('empty-string name → ROOT_SENTINEL key + canonical', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: '' });
+    expect([...keys]).toEqual([ROOT_SENTINEL]);
+    expect(canonical).toBe(ROOT_SENTINEL);
+  });
+
+  // PRESENT-but-non-string name is MALFORMED (not nameless): the PM coerces it to
+  // a string `npm_package_name` the root runs under, which `<repo-root>` would NOT
+  // match.  buildRootPkgKeys returns `canonical: null` + EMPTY keys so the agent
+  // fails closed on it (distinct from the empty/absent nameless cases above).
+  it('non-string name (number) → null canonical + empty keys (malformed, NOT the sentinel)', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: 42 });
+    expect([...keys]).toEqual([]);
+    expect(canonical).toBeNull();
+  });
+
+  it('non-string name (object) → null canonical + empty keys', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: { a: 1 } });
+    expect([...keys]).toEqual([]);
+    expect(canonical).toBeNull();
+  });
+
+  it('non-string name (boolean) → null canonical + empty keys', () => {
+    const { keys, canonical } = buildRootPkgKeys({ name: true });
+    expect([...keys]).toEqual([]);
+    expect(canonical).toBeNull();
+  });
+
+  it('ROOT_SENTINEL is the documented `<repo-root>` literal', () => {
+    expect(ROOT_SENTINEL).toBe('<repo-root>');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Separate describe block: validate AttributionResult shape
 // ---------------------------------------------------------------------------
 
@@ -399,5 +487,317 @@ describe('AttributionResult shape', () => {
     const result = new Attribution(reader).attribute(20);
     expect(result).not.toBeNull();
     expect(result!.pkg).toBe('my-tool@3.2.1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// attributionFromEnvVars — the shared composer used by BOTH the /proc walk and
+// the shim fast-path.  Nameless-root handling lives HERE (4th `rootSentinel`
+// param), surfacing all event kinds for the nameless root's lifecycle while
+// keeping the PM driver (no canonical lifecycle) → null → dropped.
+// ---------------------------------------------------------------------------
+
+describe('attributionFromEnvVars (nameless-root layer)', () => {
+  // NAMED pkg: takes the existing name-set branch regardless of rootSentinel.
+  it('named pkg + canonical event → named pkg (no rootSentinel)', () => {
+    expect(attributionFromEnvVars('lodash', '4.17.21', 'postinstall')).toEqual({
+      pkg: 'lodash@4.17.21',
+      lifecycle: 'postinstall',
+    });
+  });
+
+  it('named pkg + canonical event + rootSentinel set → STILL the named pkg (sentinel ignored)', () => {
+    expect(
+      attributionFromEnvVars('lodash', '4.17.21', 'postinstall', ROOT_SENTINEL),
+    ).toEqual({ pkg: 'lodash@4.17.21', lifecycle: 'postinstall' });
+  });
+
+  // NAMELESS (empty/undefined name) + canonical event + rootSentinel → sentinel.
+  it("empty name + canonical event + rootSentinel → {pkg:'<repo-root>', lifecycle:event}", () => {
+    expect(attributionFromEnvVars('', '0.0.0', 'preinstall', ROOT_SENTINEL)).toEqual({
+      pkg: ROOT_SENTINEL,
+      lifecycle: 'preinstall',
+    });
+  });
+
+  it('undefined name + canonical event + rootSentinel → sentinel', () => {
+    expect(attributionFromEnvVars(undefined, undefined, 'install', ROOT_SENTINEL)).toEqual({
+      pkg: ROOT_SENTINEL,
+      lifecycle: 'install',
+    });
+  });
+
+  for (const stage of ['preinstall', 'install', 'postinstall', 'prepare'] as const) {
+    it(`empty name + canonical '${stage}' + rootSentinel → sentinel with that lifecycle`, () => {
+      expect(attributionFromEnvVars('', undefined, stage, ROOT_SENTINEL)).toEqual({
+        pkg: ROOT_SENTINEL,
+        lifecycle: stage,
+      });
+    });
+  }
+
+  // GATED: without rootSentinel, a nameless lifecycle is null (driver-safe).
+  it('empty name + canonical event WITHOUT rootSentinel → null (gated off)', () => {
+    expect(attributionFromEnvVars('', '0.0.0', 'preinstall')).toBeNull();
+  });
+
+  it('undefined name + canonical event WITHOUT rootSentinel → null', () => {
+    expect(attributionFromEnvVars(undefined, undefined, 'install')).toBeNull();
+  });
+
+  // NON-canonical event: never fires the nameless branch (this is what keeps the
+  // PM driver and `npm run <task>` helpers out of the sentinel).
+  it('empty name + NON-canonical event + rootSentinel → null', () => {
+    expect(attributionFromEnvVars('', undefined, 'test', ROOT_SENTINEL)).toBeNull();
+  });
+
+  it('empty name + missing event + rootSentinel → null', () => {
+    expect(attributionFromEnvVars('', undefined, undefined, ROOT_SENTINEL)).toBeNull();
+  });
+
+  // pnpm root REBUILD-CLASS hooks: pnpm's main-pass `rebuild --pending` runs the
+  // root's prepublish/prerebuild/rebuild/postrebuild scripts with a NON-canonical
+  // npm_lifecycle_event.  For the nameless-root sentinel these fold into `install`
+  // so the hooks are AUDITED rather than dropped (regression closer for the
+  // removed fail-closed gate).
+  for (const hook of ['prepublish', 'prerebuild', 'rebuild', 'postrebuild'] as const) {
+    it(`empty name + pnpm hook '${hook}' + rootSentinel → sentinel folded into 'install'`, () => {
+      expect(attributionFromEnvVars('', undefined, hook, ROOT_SENTINEL)).toEqual({
+        pkg: ROOT_SENTINEL,
+        lifecycle: 'install',
+      });
+    });
+
+    // GATED + scoped: a NAMED pkg running the same hook keeps the strict 4-stage
+    // gate → null (the widening is sentinel-only, never changes named attribution).
+    it(`NAMED pkg + pnpm hook '${hook}' (even with rootSentinel) → null (strict gate)`, () => {
+      expect(attributionFromEnvVars('left-pad', '1.0.0', hook, ROOT_SENTINEL)).toBeNull();
+    });
+
+    // GATED on rootSentinel: without it, the hook is null (no flood, no surface).
+    it(`empty name + pnpm hook '${hook}' WITHOUT rootSentinel → null`, () => {
+      expect(attributionFromEnvVars('', undefined, hook)).toBeNull();
+    });
+  }
+
+  // npm prepare-WRAPPER hooks: `npm run prepare` fires preprepare/prepare/
+  // postprepare.  For the nameless-root sentinel, preprepare/postprepare (NON-
+  // canonical) fold into `prepare` so they survive the null gate and the prepare
+  // emitter restamps them under <repo-root>.
+  for (const hook of ['preprepare', 'postprepare'] as const) {
+    it(`empty name + npm wrapper hook '${hook}' + rootSentinel → sentinel folded into 'prepare'`, () => {
+      expect(attributionFromEnvVars('', undefined, hook, ROOT_SENTINEL)).toEqual({
+        pkg: ROOT_SENTINEL,
+        lifecycle: 'prepare',
+      });
+    });
+
+    it(`NAMED pkg + npm wrapper hook '${hook}' (even with rootSentinel) → null (strict gate)`, () => {
+      expect(attributionFromEnvVars('left-pad', '1.0.0', hook, ROOT_SENTINEL)).toBeNull();
+    });
+
+    it(`empty name + npm wrapper hook '${hook}' WITHOUT rootSentinel → null`, () => {
+      expect(attributionFromEnvVars('', undefined, hook)).toBeNull();
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Attribution ctor with rootSentinel — the /proc-walk consumer of the nameless
+// branch (Linux).  A pid running the nameless root's own lifecycle attributes
+// to the sentinel; a driver-like pid (no canonical lifecycle) stays null.
+// ---------------------------------------------------------------------------
+
+describe('Attribution ctor rootSentinel (/proc-walk nameless attribution)', () => {
+  it('nameless root pid (empty name + canonical event) → ROOT_SENTINEL', () => {
+    const reader = syntheticReader({
+      500: { ppid: 1, env: { npm_package_name: '', npm_lifecycle_event: 'postinstall', PATH: '/usr/bin' } },
+    });
+    const result = new Attribution(reader, ROOT_SENTINEL).attribute(500);
+    expect(result).toEqual({ pkg: ROOT_SENTINEL, lifecycle: 'postinstall' });
+  });
+
+  it('driver-like pid (NO npm_* env) → null even with rootSentinel set (no flood)', () => {
+    const reader = syntheticReader({
+      600: { ppid: 1, env: { PATH: '/usr/bin' } },
+    });
+    expect(new Attribution(reader, ROOT_SENTINEL).attribute(600)).toBeNull();
+  });
+
+  it('driver-like pid (name unset, NON-canonical lifecycle) → null with rootSentinel set', () => {
+    const reader = syntheticReader({
+      610: { ppid: 1, env: { npm_lifecycle_event: 'test', PATH: '/usr/bin' } },
+    });
+    expect(new Attribution(reader, ROOT_SENTINEL).attribute(610)).toBeNull();
+  });
+
+  it('descendant of a nameless lifecycle pid inherits the sentinel via the walk', () => {
+    const reader = syntheticReader({
+      // child: own environ unreadable / no npm vars → walk up
+      720: { ppid: 700, env: { PATH: '/usr/bin' } },
+      // nameless root lifecycle ancestor
+      700: { ppid: 1, env: { npm_package_name: '', npm_lifecycle_event: 'install', PATH: '/usr/bin' } },
+    });
+    expect(new Attribution(reader, ROOT_SENTINEL).attribute(720)).toEqual({
+      pkg: ROOT_SENTINEL,
+      lifecycle: 'install',
+    });
+  });
+
+  it('WITHOUT rootSentinel: the same nameless root pid → null (named-root parity)', () => {
+    const reader = syntheticReader({
+      500: { ppid: 1, env: { npm_package_name: '', npm_lifecycle_event: 'postinstall', PATH: '/usr/bin' } },
+    });
+    expect(new Attribution(reader).attribute(500)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// attributionFromEnvVars — NAMED-root rebuild-class / prepare-wrapper fold (#27)
+//
+// pnpm's main-pass `pnpm rebuild --pending` runs the NAMED root project's OWN
+// prepublish/prerebuild/rebuild/postrebuild hooks with the root's
+// npm_package_name SET but a NON-canonical npm_lifecycle_event → they miss the
+// strict 4-stage gate and would be DROPPED, yet host part-2 RUNS them
+// post-trust (install:true RCE).  The 5th `rootKeys` param folds them the same
+// way the nameless root does, but SCOPED to the actual root key so a non-root
+// NAMED dependency keeps the strict gate.
+// ---------------------------------------------------------------------------
+
+describe('attributionFromEnvVars (named-root fold #27)', () => {
+  // rootKeys exactly as buildRootPkgKeys would produce for `myroot@1.0.0`.
+  const rootKeys = buildRootPkgKeys({ name: 'myroot', version: '1.0.0' }).keys;
+
+  it('buildRootPkgKeys sanity: named root yields both bare + name@version keys', () => {
+    expect([...rootKeys]).toEqual(['myroot', 'myroot@1.0.0']);
+  });
+
+  // pnpm rebuild-class hooks on the NAMED root → folded into 'install'.
+  for (const hook of ['prepublish', 'prerebuild', 'rebuild', 'postrebuild'] as const) {
+    it(`named ROOT + pnpm hook '${hook}' + rootKeys → root folded into 'install'`, () => {
+      expect(attributionFromEnvVars('myroot', '1.0.0', hook, undefined, rootKeys)).toEqual({
+        pkg: 'myroot@1.0.0',
+        lifecycle: 'install',
+      });
+    });
+
+    // SCOPED: a NAMED dependency NOT in rootKeys running the SAME hook keeps the
+    // strict 4-stage gate → null (the fold never touches non-root attribution).
+    it(`named DEP + pnpm hook '${hook}' (rootKeys set, dep ∉ rootKeys) → null`, () => {
+      expect(attributionFromEnvVars('left-pad', '1.0.0', hook, undefined, rootKeys)).toBeNull();
+    });
+
+    // GATED on rootKeys: even the root key produces null without rootKeys passed
+    // (byte-identical to pre-#27 behavior for callers that don't thread it).
+    it(`named ROOT + pnpm hook '${hook}' WITHOUT rootKeys → null (gated)`, () => {
+      expect(attributionFromEnvVars('myroot', '1.0.0', hook)).toBeNull();
+    });
+  }
+
+  // npm prepare-wrapper hooks on the NAMED root → folded into 'prepare'.
+  for (const hook of ['preprepare', 'postprepare'] as const) {
+    it(`named ROOT + npm wrapper hook '${hook}' + rootKeys → root folded into 'prepare'`, () => {
+      expect(attributionFromEnvVars('myroot', '1.0.0', hook, undefined, rootKeys)).toEqual({
+        pkg: 'myroot@1.0.0',
+        lifecycle: 'prepare',
+      });
+    });
+
+    it(`named DEP + npm wrapper hook '${hook}' (dep ∉ rootKeys) → null`, () => {
+      expect(attributionFromEnvVars('left-pad', '1.0.0', hook, undefined, rootKeys)).toBeNull();
+    });
+
+    it(`named ROOT + npm wrapper hook '${hook}' WITHOUT rootKeys → null (gated)`, () => {
+      expect(attributionFromEnvVars('myroot', '1.0.0', hook)).toBeNull();
+    });
+  }
+
+  // A CANONICAL event on the named root is UNCHANGED by the fold — it takes the
+  // first (strict 4-stage) branch, with or without rootKeys.
+  it('named ROOT + canonical event → strict-branch named pkg (fold inert)', () => {
+    expect(attributionFromEnvVars('myroot', '1.0.0', 'postinstall', undefined, rootKeys)).toEqual({
+      pkg: 'myroot@1.0.0',
+      lifecycle: 'postinstall',
+    });
+    expect(attributionFromEnvVars('myroot', '1.0.0', 'postinstall')).toEqual({
+      pkg: 'myroot@1.0.0',
+      lifecycle: 'postinstall',
+    });
+  });
+
+  // Version-less root: npm leaves npm_package_version unset, buildPkg → bare
+  // 'myroot', buildRootPkgKeys → {'myroot'}; the fold still matches.
+  it('version-less named ROOT + pnpm hook + rootKeys → bare-name folded into install', () => {
+    const bareKeys = buildRootPkgKeys({ name: 'myroot' }).keys;
+    expect([...bareKeys]).toEqual(['myroot']);
+    expect(attributionFromEnvVars('myroot', undefined, 'rebuild', undefined, bareKeys)).toEqual({
+      pkg: 'myroot',
+      lifecycle: 'install',
+    });
+  });
+
+  // A NON-canonical, NON-folded event (e.g. 'test') on the named root → null
+  // even in rootKeys: only the two hook families fold, everything else stays
+  // gated (no over-surfacing of arbitrary root scripts).
+  it("named ROOT + non-folded event 'test' + rootKeys → null", () => {
+    expect(attributionFromEnvVars('myroot', '1.0.0', 'test', undefined, rootKeys)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attribution ctor rootKeys — the /proc-walk consumer of the named-root fold.
+// A pid running the NAMED root's own rebuild-class/prepare-wrapper hook folds
+// to install/prepare; a NAMED dependency pid running the same hook stays null.
+// ---------------------------------------------------------------------------
+
+describe('Attribution ctor rootKeys (named-root /proc-walk fold #27)', () => {
+  const rootKeys = buildRootPkgKeys({ name: 'myroot', version: '1.0.0' }).keys;
+
+  it('named root pid (rebuild hook) → folded into install', () => {
+    const reader = syntheticReader({
+      800: { ppid: 1, env: npmEnv('myroot', '1.0.0', 'prerebuild') },
+    });
+    // rootSentinel undefined (named root), rootKeys threaded as 3rd ctor arg.
+    expect(new Attribution(reader, undefined, rootKeys).attribute(800)).toEqual({
+      pkg: 'myroot@1.0.0',
+      lifecycle: 'install',
+    });
+  });
+
+  it('named root pid (preprepare wrapper) → folded into prepare', () => {
+    const reader = syntheticReader({
+      810: { ppid: 1, env: npmEnv('myroot', '1.0.0', 'preprepare') },
+    });
+    expect(new Attribution(reader, undefined, rootKeys).attribute(810)).toEqual({
+      pkg: 'myroot@1.0.0',
+      lifecycle: 'prepare',
+    });
+  });
+
+  it('named DEP pid (same rebuild hook, dep ∉ rootKeys) → null (strict gate held)', () => {
+    const reader = syntheticReader({
+      820: { ppid: 1, env: npmEnv('left-pad', '1.0.0', 'prerebuild') },
+    });
+    expect(new Attribution(reader, undefined, rootKeys).attribute(820)).toBeNull();
+  });
+
+  it('descendant of a named-root rebuild-hook pid inherits the fold via the walk', () => {
+    const reader = syntheticReader({
+      // child: own environ has no npm vars → walk up
+      920: { ppid: 900, env: { PATH: '/usr/bin' } },
+      // named-root rebuild-hook ancestor
+      900: { ppid: 1, env: npmEnv('myroot', '1.0.0', 'rebuild') },
+    });
+    expect(new Attribution(reader, undefined, rootKeys).attribute(920)).toEqual({
+      pkg: 'myroot@1.0.0',
+      lifecycle: 'install',
+    });
+  });
+
+  it('WITHOUT rootKeys: the named-root rebuild-hook pid → null (gated, pre-#27 parity)', () => {
+    const reader = syntheticReader({
+      800: { ppid: 1, env: npmEnv('myroot', '1.0.0', 'prerebuild') },
+    });
+    expect(new Attribution(reader).attribute(800)).toBeNull();
   });
 });

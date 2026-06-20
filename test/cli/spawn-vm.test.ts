@@ -12,9 +12,9 @@
 //     any child process is spawned)
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 import {
   resolveScriptJailVmBinary,
@@ -22,6 +22,7 @@ import {
   toJsonPayload,
   spawnVm,
   assertVmHelperEntitlement,
+  sanitizedHostEnv,
   VZ_ENTITLEMENT,
   MacOSVmBinaryNotFoundError,
   MacOSVmArtifactNotFoundError,
@@ -52,6 +53,63 @@ describe('resolveScriptJailVmBinary', () => {
     const envBin = touchExe(join(scratch, 'env-bin', 'script-jail-vm'));
     const found = resolveScriptJailVmBinary({ envOverride: envBin });
     expect(found).toBe(envBin);
+  });
+
+  it('FAILS CLOSED on a non-absolute SCRIPT_JAIL_VM_BIN (codex round-8 — checkout-relative override)', () => {
+    // A relative override would `existsSync` + spawn against the process cwd (the
+    // checkout), so a PR-committed `./script-jail-vm` must NOT be resolvable.
+    expect(() =>
+      resolveScriptJailVmBinary({ envOverride: './script-jail-vm' }),
+    ).toThrow(/must be an absolute path/);
+    expect(() =>
+      resolveScriptJailVmBinary({ envOverride: 'bin/script-jail-vm' }),
+    ).toThrow(/must be an absolute path/);
+  });
+
+  it('FAILS CLOSED on an absolute SCRIPT_JAIL_VM_BIN UNDER the checkout (codex round-9 — checkout-controlled helper)', () => {
+    // Absolute is necessary but NOT sufficient: `$GITHUB_WORKSPACE/bin/script-jail-vm`
+    // is absolute yet still PR-authored, and the codesign preflight is NOT a provenance
+    // check (ad-hoc signing with the entitlement is the documented dev flow), so it can
+    // never catch a checkout-resident helper.  Treat `scratch` as the checkout root and
+    // point the override inside it: must fail closed before any spawn.  The helper file is
+    // created on purpose — the checkout-containment gate runs BEFORE `existsSync`, so the
+    // throw proves the gate (not a missing-file fallthrough) rejected it; creating it also
+    // keeps realpath canonicalization consistent on both sides of the containment test.
+    const prevWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = scratch;
+    try {
+      const envBin = touchExe(join(scratch, 'bin', 'script-jail-vm'));
+      expect(() =>
+        resolveScriptJailVmBinary({ envOverride: envBin }),
+      ).toThrow(/inside the checkout/);
+    } finally {
+      if (prevWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = prevWorkspace;
+    }
+  });
+
+  it('FAILS CLOSED on a SCRIPT_JAIL_VM_BIN spelled under the checkout via a symlink-OUT dir (round-12 #24 sibling)', () => {
+    // `$GITHUB_WORKSPACE/tools -> <outside>` realpaths OUTSIDE the checkout, so the
+    // round-9 realpath-only gate KEEPS it — but the symlink is PR-committed, so the
+    // PR controls where `$GITHUB_WORKSPACE/tools/script-jail-vm` resolves = pre-trust
+    // RCE.  isPathUnderCheckout now also checks the LEXICAL spelling, so the override
+    // is rejected on its under-checkout path regardless of the link target.
+    if (process.platform === 'win32') return;
+    const outside = mkdtempSync(join(tmpdir(), 'sj-vmbin-out-'));
+    const tools = join(scratch, 'tools');
+    symlinkSync(outside, tools); // checkout-lexical dir → outside REAL dir
+    const envBin = touchExe(join(tools, 'script-jail-vm')); // creates under `outside`
+    const prevWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = scratch;
+    try {
+      expect(() =>
+        resolveScriptJailVmBinary({ envOverride: envBin }),
+      ).toThrow(/inside the checkout/);
+    } finally {
+      if (prevWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = prevWorkspace;
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it('falls back to target/release/script-jail-vm when env override is absent', () => {
@@ -413,5 +471,63 @@ describe('spawnVm — preflights', () => {
     ).rejects.toThrow(MacOSVmEntitlementError);
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual(['-d', '--entitlements', '-', binary]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sanitizedHostEnv — the env every pre-trust host exec in spawnVm uses (the
+// `codesign -d` entitlement preflight AND the VZ helper boot)
+// ---------------------------------------------------------------------------
+//
+// Both run in spawnVm BEFORE the audit produces / diffs the lock.  The codesign
+// preflight is a BARE-NAME exec (a checkout-prepended PATH cannot resolve a
+// PR-committed `./codesign`); the VZ helper is absolute-path but ad-hoc signed
+// and honours DYLD_*, so no inherited loader var (DYLD_*/LD_*/NODE_OPTIONS) may
+// reach it.  Pin the SAME `stripDangerousEnv` policy the other backends use.
+
+describe('sanitizedHostEnv — pre-trust host execs (codesign + VZ helper) use a sanitized env', () => {
+  // sanitizedHostEnv() sanitizes the REAL process.env, so set the vars there
+  // (mirrors test/action/backend/bare.test.ts's GITHUB_WORKSPACE save/restore).
+  const SAVED = {
+    GITHUB_WORKSPACE: process.env['GITHUB_WORKSPACE'],
+    PATH: process.env['PATH'],
+    DYLD_INSERT_LIBRARIES: process.env['DYLD_INSERT_LIBRARIES'],
+    NODE_OPTIONS: process.env['NODE_OPTIONS'],
+  };
+  let checkout: string;
+
+  beforeEach(() => {
+    // A real checkout dir so realpath-based containment resolves (mac /tmp symlink).
+    checkout = mkdtempSync(join(tmpdir(), 'sj-codesign-env-'));
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    // `checkoutRoots()` reads the REAL process env, so the workflow checkout must
+    // be visible there for its bin dir to be recognised + dropped from PATH.
+    process.env['GITHUB_WORKSPACE'] = checkout;
+    // checkout-controlled dir prepended ahead of the system dirs.
+    process.env['PATH'] = `${checkoutBin}${delimiter}/usr/bin${delimiter}/bin`;
+    // dangerous loader selectors that must never reach the pre-trust codesign exec.
+    process.env['DYLD_INSERT_LIBRARIES'] = './evil.dylib';
+    process.env['NODE_OPTIONS'] = '--require ./evil.js';
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(SAVED)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try { rmSync(checkout, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('strips DYLD_INSERT_LIBRARIES / NODE_OPTIONS and drops the checkout PATH dir', () => {
+    const env = sanitizedHostEnv();
+
+    // dangerous loader/config selectors dropped
+    expect(env['DYLD_INSERT_LIBRARIES']).toBeUndefined();
+    expect(env['NODE_OPTIONS']).toBeUndefined();
+
+    // PATH: checkout bin dropped, system dirs kept in order, and never ''
+    expect(env['PATH']).toBe(`/usr/bin${delimiter}/bin`);
+    expect(env['PATH']).not.toBe('');
   });
 });

@@ -204,7 +204,7 @@ describe('CLI — VM-launch stub', () => {
             spoofArch: input.overrides.spoofArch ?? input.hostArch,
           });
         }
-        return { exitCode: 0 };
+        return { exitCode: 0, trusted: false };
       },
       buildArchFlagOverlay: (input) => {
         capturedHostArch = input.hostArch;
@@ -225,7 +225,7 @@ describe('CLI — VM-launch stub', () => {
       detectHost: () => ({ macosMajor: 15, hostArch: 'arm64' }),
       runAudit: async (input) => {
         capturedSpoofArch = input.overrides.spoofArch ?? null;
-        return { exitCode: 0 };
+        return { exitCode: 0, trusted: false };
       },
     }));
 
@@ -243,7 +243,7 @@ describe('CLI — VM-launch stub', () => {
       detectHost: () => ({ macosMajor: 15, hostArch: 'arm64' }),
       runAudit: async (input) => {
         capturedSpoofArch = input.overrides.spoofArch ?? null;
-        return { exitCode: 0 };
+        return { exitCode: 0, trusted: false };
       },
     }));
 
@@ -317,7 +317,7 @@ describe('CLI — macOS backend selection (vz vs bare)', () => {
         cwd: () => repoDir,
         stdout, stderr,
         createMacBareExecute: () => { reachedExecute = true; return async () => ({ finalYaml: '', nonFatalWarnings: [] }); },
-        runAudit: async () => { reachedAudit = true; return { exitCode: 0 }; },
+        runAudit: async () => { reachedAudit = true; return { exitCode: 0, trusted: false }; },
         spawnVm: async () => { throw new MacOSVmNotImplementedError(); },
       },
     ));
@@ -351,7 +351,7 @@ describe('CLI — macOS backend selection (vz vs bare)', () => {
           // The bare path must NOT use the VZ launch closure.
           expect(input.launch).toBeUndefined();
           expect(input.hostArch).toBe('x64');
-          return { exitCode: 0 };
+          return { exitCode: 0, trusted: false };
         },
       },
     ));
@@ -379,7 +379,7 @@ describe('CLI — macOS backend selection (vz vs bare)', () => {
         },
         runAudit: async (input) => {
           expect(typeof input.execute).toBe('function');
-          return { exitCode: 0 };
+          return { exitCode: 0, trusted: false };
         },
         // If the vz default leaked through, spawnVm would throw and fail us.
         spawnVm: async () => { throw new MacOSVmNotImplementedError('vz path should not run'); },
@@ -418,7 +418,7 @@ describe('CLI — Linux backend wiring', () => {
       stdout, stderr,
       runAudit: async (input) => {
         captured = input as unknown as Record<string, unknown>;
-        return { exitCode: 0 };
+        return { exitCode: 0, trusted: false };
       },
     }));
     expect(code).toBe(0);
@@ -451,7 +451,7 @@ describe('CLI — Linux backend wiring', () => {
           hostArch: 'x64',
           mode: 'update',
         });
-        return { exitCode: 0 };
+        return { exitCode: 0, trusted: false };
       },
       runSelectedBackend: async (sel) => {
         capturedRequested = sel.requested;
@@ -493,7 +493,7 @@ describe('CLI — Linux backend wiring', () => {
           hostArch: 'x64',
           mode: 'update',
         });
-        return { exitCode: 0 };
+        return { exitCode: 0, trusted: false };
       },
       runSelectedBackend: async () => {
         reachedBackend = true;

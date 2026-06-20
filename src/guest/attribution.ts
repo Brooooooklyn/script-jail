@@ -57,6 +57,51 @@ function isCanonicalStage(s: string): s is LifecycleStage {
 }
 
 /**
+ * pnpm's main-pass (`pnpm rebuild --pending`) runs, on a ROOT project, a set of
+ * lifecycle hooks BEYOND the four canonical {@link LifecycleStage} names:
+ * `prepublish` (pnpm 10) and `prerebuild` / `rebuild` / `postrebuild` (pnpm 11).
+ * Verified by an exhaustive 24-candidate probe across pnpm 10.34 + 11.1: all fire
+ * with `npm_package_name` UNSET on a nameless root.  These are real root build
+ * scripts whose fs/connect/env_read must be audited, but their
+ * `npm_lifecycle_event` value is NOT a member of `LifecycleStage`, so they cannot
+ * be a rendered lock bucket on their own.  For the NAMELESS-ROOT sentinel case we
+ * therefore recognise them and fold them into the canonical `install` bucket
+ * (they run during the install/rebuild phase, alongside install/postinstall).
+ *
+ * Scoped to the sentinel case ONLY (see {@link attributionFromEnvVars}): a NAMED
+ * dependency or root keeps the strict 4-stage gate, so this widening never
+ * changes named-package attribution or the rendered lifecycle of any non-root
+ * event.  It also cannot create a `<repo-root>` flood — the PM driver and its
+ * non-lifecycle workers carry NO `npm_lifecycle_event` at all, so they still
+ * attribute to null; only a pid actually running one of these root hook scripts
+ * carries the value.
+ */
+const PNPM_ROOT_REBUILD_HOOKS = new Set<string>([
+  'prepublish',
+  'prerebuild',
+  'rebuild',
+  'postrebuild',
+]);
+
+/**
+ * npm runs `npm run <script>` with its pre/post WRAPPERS: `pre<script>` →
+ * `<script>` → `post<script>`, each with `npm_lifecycle_event` set to that stage.
+ * The dedicated root-`prepare` pass (`resolvePrepareCommand` → `npm run prepare
+ * --if-present`) therefore fires `preprepare` → `prepare` → `postprepare`.  On a
+ * nameless root all three run with `npm_package_name` UNSET, but only `prepare`
+ * is a canonical {@link LifecycleStage}; `preprepare` / `postprepare` are NOT, so
+ * without recognition here their non-spawn events (env_read / connect / fs / dlopen)
+ * are dropped at the dispatcher null-attribution gate — BEFORE the prepare pass's
+ * force-attribution emitter (which restamps everything it sees to `<repo-root>` +
+ * `prepare`) can rewrite them, since the emitter only sees events the dispatcher
+ * actually emits.  Recognising them (folded into `prepare`) makes them survive the
+ * null gate so the emitter restamps them — closing the same deceptively-clean-lock
+ * class the removed fail-closed gate covered.  Same sentinel-only scoping as
+ * {@link PNPM_ROOT_REBUILD_HOOKS}: a named package keeps the strict 4-stage gate.
+ */
+const NPM_ROOT_PREPARE_WRAPPER_HOOKS = new Set<string>(['preprepare', 'postprepare']);
+
+/**
  * Build the pkg string from a non-empty name and an optional version.
  * Returns `name@version` when version is present, otherwise just `name`.
  */
@@ -65,10 +110,152 @@ function buildPkg(name: string, version: string | undefined): string {
 }
 
 /**
+ * Synthetic package key for a NAMELESS (but parseable) root manifest.
+ *
+ * A root `package.json` with no usable `name` leaves npm/pnpm `npm_package_name`
+ * unset, so the root's own lifecycle events get null NAME attribution and would
+ * be silently DROPPED — the root lifecycle runs unaudited and the lock looks
+ * deceptively clean.  We instead give the nameless root this stable key, and the
+ * ATTRIBUTION LAYER attributes the root's own lifecycle pids to it (see
+ * {@link attributionFromEnvVars}: empty name + canonical lifecycle event →
+ * sentinel).  ALL kinds carry the non-forgeable `root_anchored` verdict: read/
+ * writes render as `$REPO/...` (the no-pkgDir root path) and non-fs kinds in
+ * their own channels — genuine root unmarked, a forged/unanchored event prefixed
+ * `<FORGED_ROOT>` — exactly like a named root (the unmarked-non-fs gap is closed).
+ *
+ * `<` / `>` cannot appear in an npm package name, so this never collides with a
+ * real dependency key; it shares the `<unattributed>` / `<FORGED_ROOT>` sentinel
+ * namespace and sorts before letters by codepoint (byte-stable render order).
+ */
+export const ROOT_SENTINEL = '<repo-root>';
+
+/**
+ * Build the complete set of root-package identity keys from a parsed
+ * root `package.json` manifest, and the canonical key to use when
+ * force-attributing events to the root.
+ *
+ * Rules mirror `buildPkg` exactly:
+ *   - Bare `name` is ALWAYS added (covers the "version field absent →
+ *     npm sets no npm_package_version → attribution yields bare name" case).
+ *   - `name@version` is added whenever `version` is a string — INCLUDING
+ *     the empty string `''` — because npm/pnpm set `npm_package_version=`
+ *     (empty) when `package.json` has `"version": ""`, which makes
+ *     `buildPkg` produce `name@` (NOT the bare `name`).  Gating on
+ *     `version.length > 0` would diverge from `buildPkg` for that case,
+ *     causing a root fs event with `pkg='name@'` to go unrecognised and
+ *     `normalize` to throw `pkgDirs missing entry`.
+ *
+ * Returns `{ keys: Set<string>, canonical: string | null }` where:
+ *   - `keys` is the set of all pkg strings that could be emitted by
+ *     attribution for a root event.
+ *   - `canonical` is the single key used to force-attribute root events
+ *     (the most-specific one: `name@version` when version is a string,
+ *     else `name`).  For a nameless-but-parseable manifest (name ABSENT or
+ *     EMPTY string) it is the synthetic {@link ROOT_SENTINEL}.  For a
+ *     PRESENT-but-non-string `name` (`42` / `{}` / `[]` / `true`) it is
+ *     `null` with EMPTY keys — that case is MALFORMED (the PM coerces the
+ *     value to a string `npm_package_name` we cannot portably predict, so
+ *     the sentinel would mismatch); the caller fails closed on it.  A
+ *     genuinely absent manifest also yields `null`, but the caller never
+ *     reaches here in that case (its JSON.parse throws).
+ *
+ * Used by both `src/guest/agent.ts` (guest side) and `src/main.ts`
+ * (host side) to avoid duplicating this logic — divergence was the
+ * original bug.
+ */
+export function buildRootPkgKeys(manifest: { name?: unknown; version?: unknown }): {
+  keys: Set<string>;
+  canonical: string | null;
+} {
+  const keys = new Set<string>();
+  if (manifest.name !== undefined && typeof manifest.name !== 'string') {
+    // PRESENT-but-NON-STRING name (`"name": 42` / `{}` / `[]` / `true`).  This is
+    // NOT the nameless case and is unpredictable across PMs (verified, npm 11.13):
+    // a number/bool is COERCED and exported as `npm_package_name` ("42" / "true"),
+    // so the root's events take the NAMED branch under a coerced id `<repo-root>`
+    // would NOT match (sentinel mismatch → fs events fail normalization, non-fs
+    // events record under a phantom package); an object/array prints
+    // `[object Object]` in the banner but is NOT exported as `npm_package_name` at
+    // all (stays unset).  Either way the key is unpredictable, so signal a
+    // malformed manifest with `canonical: null` + empty keys; the agent fails
+    // closed on it (a non-string `name` is malformed and astronomically rare in
+    // real repos, so this never over-fires the way the removed nameless gate did).
+    // `null` here is distinct from the nameless sentinel below — only the
+    // genuinely-absent/empty-name root is auditable.
+    return { keys, canonical: null };
+  }
+  if (typeof manifest.name !== 'string' || manifest.name.length === 0) {
+    // Nameless but PARSEABLE root (name ABSENT or empty string) → stable synthetic
+    // key (see ROOT_SENTINEL).  npm/pnpm leave `npm_package_name` empty/unset for
+    // this case, so the root's lifecycle events take the sentinel branch in
+    // {@link attributionFromEnvVars} and surface under `<repo-root>`.
+    return { keys: new Set([ROOT_SENTINEL]), canonical: ROOT_SENTINEL };
+  }
+  const name = manifest.name;
+  keys.add(name);
+  if (typeof manifest.version === 'string') {
+    // version is present (even if empty ''): mirrors buildPkg → `name@version`
+    keys.add(`${name}@${manifest.version}`);
+    return { keys, canonical: `${name}@${manifest.version}` };
+  }
+  // version field absent → canonical is bare name
+  return { keys, canonical: name };
+}
+
+/**
  * Compose an {@link AttributionResult} from raw npm lifecycle env vars, applying
  * the SAME match rules as the /proc walk: `npm_package_name` must be non-empty
  * AND `npm_lifecycle_event` must be one of the canonical {@link LifecycleStage}
- * values. Returns null otherwise.
+ * values. Returns the named pkg for that case.
+ *
+ * NAMELESS-ROOT case (4th param `rootSentinel`): a root `package.json` with no
+ * usable `name` leaves `npm_package_name` empty/unset, but the package manager
+ * STILL sets an `npm_lifecycle_event` when running the root's OWN lifecycle
+ * script. When `rootSentinel` is supplied AND the name is empty AND the event is
+ * recognised, return `{pkg: rootSentinel, lifecycle: …}`:
+ *   - a canonical {@link LifecycleStage} (`preinstall`/`install`/`postinstall`/
+ *     `prepare`; npm + pnpm both set these with the name unset) → that stage;
+ *   - a pnpm root rebuild-class hook ({@link PNPM_ROOT_REBUILD_HOOKS}:
+ *     `prepublish`/`prerebuild`/`rebuild`/`postrebuild`, which pnpm's main-pass
+ *     `rebuild --pending` runs on the root with a NON-canonical lifecycle name)
+ *     → folded into `install`, so these hooks are AUDITED rather than dropped;
+ *   - an npm prepare-wrapper hook ({@link NPM_ROOT_PREPARE_WRAPPER_HOOKS}:
+ *     `preprepare`/`postprepare`, which npm fires around the dedicated root
+ *     `prepare` pass) → folded into `prepare`, so they too are audited.
+ * This surfaces ALL event kinds for the nameless root's lifecycle (and its
+ * env-inheriting descendants), not just read/write. The PM driver and its
+ * non-lifecycle workers carry NO `npm_lifecycle_event`, so they stay null →
+ * dropped — that is what stops the driver's bulk store/cache I/O from flooding
+ * `<repo-root>`. Returns null when neither case matches.
+ *
+ * NAMED-ROOT case (5th param `rootKeys`, #27): the SAME rebuild-class /
+ * prepare-wrapper hooks also fire on a NAMED root (pnpm `rebuild --pending` runs
+ * the root project's own prepublish/prerebuild/rebuild/postrebuild with the
+ * root's `npm_package_name` SET but a non-canonical event). When `rootKeys`
+ * contains `buildPkg(name, version)` they fold IDENTICALLY (rebuild-class →
+ * `install`, prepare-wrapper → `prepare`) so the named root's hooks are audited
+ * rather than dropped — host part-2 (`pnpm rebuild --pending`) runs them
+ * post-trust, so a dropped hook would be an install:true RCE. The fold is SCOPED
+ * to `rootKeys` membership: a NAMED dependency (not in `rootKeys`) keeps the
+ * strict 4-stage gate, so this never changes non-root attribution or the
+ * rendered lifecycle of any non-root event. A dependency forging the root name is
+ * caught by the non-forgeable `root_anchored` stamp at the emit chokepoint.
+ *
+ * FORGEABLE-ENV RESIDUAL (now CLOSED for all kinds): a dependency that UNSETS
+ * `npm_package_name` while keeping a recognised `npm_lifecycle_event` (a canonical
+ * stage or a rebuild-class hook) could mislabel its events under `<repo-root>` —
+ * the same forgeable-env class as the named-root `TODO(v2)` below. Downstream
+ * protection is now UNIFORM across kinds: read/write AND the non-fs trio
+ * (spawn/connect/env_read) all carry the NON-forgeable `root_anchored` stamp
+ * (deferred at the phase-install emit chokepoint, computed at end-of-drain from
+ * the kernel process tree), so a forged/unanchored root-claimed event of ANY kind
+ * renders with the `<FORGED_ROOT>` prefix at render time. This closes the prior
+ * unmarked-non-fs gap: a forged `connect`/`spawn`/`env_read` can no longer
+ * dedupe-collapse with a genuine root entry, and a forged `<repo-root>` `prepare`
+ * connect is no longer misclassified as host-safe by the drop-in-install egress
+ * partition (`src/action/diff.ts`). Surfacing-WITH-anchoring is the design: events
+ * are never dropped (dropping would be the blind spot this change closes) but a
+ * forgery is always fail-loud.
  *
  * Shared by {@link Attribution._walk} (reading /proc/<pid>/environ) and the
  * phase-install dispatcher's shim-exec fast path (reading the
@@ -95,6 +282,8 @@ export function attributionFromEnvVars(
   name: string | undefined,
   version: string | undefined,
   event: string | undefined,
+  rootSentinel?: string,
+  rootKeys?: ReadonlySet<string>,
 ): AttributionResult | null {
   if (
     name !== undefined &&
@@ -103,6 +292,70 @@ export function attributionFromEnvVars(
     isCanonicalStage(event)
   ) {
     return { pkg: buildPkg(name, version), lifecycle: event };
+  }
+  // NAMED-ROOT rebuild-class / prepare-wrapper hooks (#27): pnpm's main-pass
+  // `pnpm rebuild --pending` runs the root project's OWN
+  // prepublish/prerebuild/rebuild/postrebuild with the root's npm_package_name SET
+  // but a NON-canonical npm_lifecycle_event — so they miss the strict 4-stage gate
+  // above and would attribute to null → be DROPPED from the audit, yet host part-2
+  // (`pnpm rebuild --pending`) RUNS them post-trust on the real runner = an
+  // install:true RCE (the lock omits their fs/connect/env_read, so it still matches
+  // the committed copy and the trust gate passes).  Fold them the SAME way the
+  // nameless root does (below), but SCOPED to the actual root via `rootKeys`
+  // membership so a NON-root NAMED dependency keeps the strict gate — deps run
+  // canonical install/postinstall, never these rebuild-class hooks non-canonically,
+  // and a dep forging the root name is caught by the non-forgeable `root_anchored`
+  // stamping at the emit chokepoint.  The folded {pkg:name@version} lands in
+  // `rootPkgKeys` there → deferred + root-anchored exactly like a canonical root
+  // install event.
+  if (
+    name !== undefined &&
+    name.length > 0 &&
+    event !== undefined &&
+    rootKeys !== undefined &&
+    rootKeys.has(buildPkg(name, version))
+  ) {
+    if (PNPM_ROOT_REBUILD_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version), lifecycle: 'install' };
+    }
+    if (NPM_ROOT_PREPARE_WRAPPER_HOOKS.has(event)) {
+      return { pkg: buildPkg(name, version), lifecycle: 'prepare' };
+    }
+  }
+  // Nameless-root lifecycle: the root has no `name`, so npm_package_name is
+  // empty/unset, but the package manager STILL sets a lifecycle event when
+  // running the root's OWN lifecycle script (verified: npm + pnpm both set
+  // preinstall/install/postinstall/prepare with name unset).
+  // The PM driver and its non-lifecycle workers have NO npm_lifecycle_event, so
+  // they stay null → dropped — this gate is what prevents the driver's bulk I/O
+  // from flooding `<repo-root>`. Gated on `rootSentinel`: inert for named roots
+  // (which take the branch above) and when there is no parseable root manifest.
+  if (
+    rootSentinel !== undefined &&
+    (name === undefined || name.length === 0) &&
+    event !== undefined
+  ) {
+    if (isCanonicalStage(event)) {
+      return { pkg: rootSentinel, lifecycle: event };
+    }
+    // pnpm's main-pass also runs the root's `prepublish`/`prerebuild`/`rebuild`/
+    // `postrebuild` hooks with a NON-canonical `npm_lifecycle_event`.  Fold them
+    // into `install` so the nameless root's rebuild-class hooks are AUDITED
+    // (their fs/connect/env_read surface under `<repo-root>`) rather than dropped
+    // — see {@link PNPM_ROOT_REBUILD_HOOKS}.  This restores the coverage the
+    // removed nameless-root fail-closed gate provided, without re-introducing its
+    // over-fire on benign unnamed monorepos.
+    if (PNPM_ROOT_REBUILD_HOOKS.has(event)) {
+      return { pkg: rootSentinel, lifecycle: 'install' };
+    }
+    // npm fires `preprepare`/`postprepare` around the dedicated root-`prepare`
+    // pass (`npm run prepare`); on a nameless root these run with name UNSET and a
+    // NON-canonical event.  Fold into `prepare` so they survive the null gate and
+    // the prepare emitter restamps them to `<repo-root>` — see
+    // {@link NPM_ROOT_PREPARE_WRAPPER_HOOKS}.
+    if (NPM_ROOT_PREPARE_WRAPPER_HOOKS.has(event)) {
+      return { pkg: rootSentinel, lifecycle: 'prepare' };
+    }
   }
   return null;
 }
@@ -120,8 +373,32 @@ export class Attribution {
   // result.
   private readonly cache: Map<number, AttributionResult | null> = new Map();
 
-  constructor(reader: ProcReader) {
+  /**
+   * Synthetic root key for a NAMELESS-but-parseable root manifest, or undefined
+   * when the root is named or absent. Threaded into every
+   * {@link attributionFromEnvVars} call inside {@link _walk}, so a /proc-observed
+   * pid running the nameless root's OWN lifecycle (empty npm_package_name +
+   * canonical npm_lifecycle_event) attributes to this sentinel instead of null.
+   * The PM driver and its non-lifecycle workers carry NO canonical lifecycle, so
+   * they still attribute to null → dropped (no flood). Inert when undefined.
+   */
+  private readonly rootSentinel: string | undefined;
+
+  /**
+   * The root package keys (`name` + `name@version`, or `<repo-root>` for a
+   * nameless root) — `buildRootPkgKeys`.  Threaded into every
+   * {@link attributionFromEnvVars} call inside {@link _walk} so a /proc-observed
+   * pid running the NAMED root's OWN non-canonical rebuild-class hook
+   * (prepublish/prerebuild/rebuild/postrebuild) folds to the root instead of null
+   * (#27).  Membership-scoped, so a non-root named dependency keeps the strict
+   * 4-stage gate. Inert when undefined.
+   */
+  private readonly rootKeys: ReadonlySet<string> | undefined;
+
+  constructor(reader: ProcReader, rootSentinel?: string, rootKeys?: ReadonlySet<string>) {
     this.reader = reader;
+    this.rootSentinel = rootSentinel;
+    this.rootKeys = rootKeys;
   }
 
   /**
@@ -129,6 +406,13 @@ export class Attribution {
    * ancestor whose environ has `npm_package_name` (non-empty) AND
    * `npm_lifecycle_event` is one of the four canonical LifecycleStage values.
    * Return that pkg + lifecycle pair.
+   *
+   * When this instance was constructed with a {@link rootSentinel} (nameless
+   * root), an ancestor with EMPTY `npm_package_name` but a canonical
+   * `npm_lifecycle_event` also matches — attributing to the sentinel. This is
+   * how the nameless root's OWN lifecycle pids (and env-inheriting descendants)
+   * surface for ALL event kinds; the PM driver carries no canonical lifecycle
+   * and still walks to null.
    *
    * Returns null when:
    *   - The walk reaches pid 0 or 1 without finding a match.
@@ -138,6 +422,10 @@ export class Attribution {
    * Results are cached per starting pid. A second call with the same pid will
    * return the cached value without any additional /proc reads — unless
    * {@link invalidate} has been called for the pid in between.
+   *
+   * When this instance carries a {@link rootSentinel}, a nameless root's own
+   * lifecycle pid (empty npm_package_name + canonical npm_lifecycle_event)
+   * attributes to that sentinel rather than null; see {@link _walk}.
    */
   attribute(pid: number): AttributionResult | null {
     if (this.cache.has(pid)) {
@@ -199,6 +487,8 @@ export class Attribution {
           env.get('npm_package_name'),
           env.get('npm_package_version'),
           env.get('npm_lifecycle_event'),
+          this.rootSentinel,
+          this.rootKeys,
         );
         if (attrib !== null) {
           return attrib;

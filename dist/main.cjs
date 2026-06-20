@@ -2083,9 +2083,9 @@ var require_dispatcher_base = __commonJS({
       }
       close(callback) {
         if (callback === void 0) {
-          return new Promise((resolve4, reject) => {
+          return new Promise((resolve6, reject) => {
             this.close((err, data) => {
-              return err ? reject(err) : resolve4(data);
+              return err ? reject(err) : resolve6(data);
             });
           });
         }
@@ -2123,12 +2123,12 @@ var require_dispatcher_base = __commonJS({
           err = null;
         }
         if (callback === void 0) {
-          return new Promise((resolve4, reject) => {
+          return new Promise((resolve6, reject) => {
             this.destroy(err, (err2, data) => {
               return err2 ? (
                 /* istanbul ignore next: should never error */
                 reject(err2)
-              ) : resolve4(data);
+              ) : resolve6(data);
             });
           });
         }
@@ -4395,8 +4395,8 @@ var require_util2 = __commonJS({
     function createDeferredPromise() {
       let res;
       let rej;
-      const promise2 = new Promise((resolve4, reject) => {
-        res = resolve4;
+      const promise2 = new Promise((resolve6, reject) => {
+        res = resolve6;
         rej = reject;
       });
       return { promise: promise2, resolve: res, reject: rej };
@@ -6537,12 +6537,12 @@ upgrade: ${upgrade}\r
           cb();
         }
       }
-      const waitForDrain = () => new Promise((resolve4, reject) => {
+      const waitForDrain = () => new Promise((resolve6, reject) => {
         assert2(callback === null);
         if (socket[kError]) {
           reject(socket[kError]);
         } else {
-          callback = resolve4;
+          callback = resolve6;
         }
       });
       socket.on("close", onDrain).on("drain", onDrain);
@@ -7179,12 +7179,12 @@ var require_client_h2 = __commonJS({
           cb();
         }
       }
-      const waitForDrain = () => new Promise((resolve4, reject) => {
+      const waitForDrain = () => new Promise((resolve6, reject) => {
         assert2(callback === null);
         if (socket[kError]) {
           reject(socket[kError]);
         } else {
-          callback = resolve4;
+          callback = resolve6;
         }
       });
       h2stream.on("close", onDrain).on("drain", onDrain);
@@ -7662,16 +7662,16 @@ var require_client = __commonJS({
         return this[kNeedDrain] < 2;
       }
       async [kClose]() {
-        return new Promise((resolve4) => {
+        return new Promise((resolve6) => {
           if (this[kSize]) {
-            this[kClosedResolve] = resolve4;
+            this[kClosedResolve] = resolve6;
           } else {
-            resolve4(null);
+            resolve6(null);
           }
         });
       }
       async [kDestroy](err) {
-        return new Promise((resolve4) => {
+        return new Promise((resolve6) => {
           const requests = this[kQueue].splice(this[kPendingIdx]);
           for (let i = 0; i < requests.length; i++) {
             const request = requests[i];
@@ -7682,7 +7682,7 @@ var require_client = __commonJS({
               this[kClosedResolve]();
               this[kClosedResolve] = null;
             }
-            resolve4(null);
+            resolve6(null);
           };
           if (this[kHTTPContext]) {
             this[kHTTPContext].destroy(err, callback);
@@ -7733,7 +7733,7 @@ var require_client = __commonJS({
         });
       }
       try {
-        const socket = await new Promise((resolve4, reject) => {
+        const socket = await new Promise((resolve6, reject) => {
           client[kConnector]({
             host,
             hostname: hostname3,
@@ -7745,7 +7745,7 @@ var require_client = __commonJS({
             if (err) {
               reject(err);
             } else {
-              resolve4(socket2);
+              resolve6(socket2);
             }
           });
         });
@@ -8081,8 +8081,8 @@ var require_pool_base = __commonJS({
         if (this[kQueue].isEmpty()) {
           await Promise.all(this[kClients].map((c) => c.close()));
         } else {
-          await new Promise((resolve4) => {
-            this[kClosedResolve] = resolve4;
+          await new Promise((resolve6) => {
+            this[kClosedResolve] = resolve6;
           });
         }
       }
@@ -9297,7 +9297,7 @@ var require_readable = __commonJS({
         if (this._readableState.closeEmitted) {
           return null;
         }
-        return await new Promise((resolve4, reject) => {
+        return await new Promise((resolve6, reject) => {
           if (this[kContentLength] > limit) {
             this.destroy(new AbortError());
           }
@@ -9310,7 +9310,7 @@ var require_readable = __commonJS({
             if (signal?.aborted) {
               reject(signal.reason ?? new AbortError());
             } else {
-              resolve4(null);
+              resolve6(null);
             }
           }).on("error", noop).on("data", function(chunk) {
             limit -= chunk.length;
@@ -9329,7 +9329,7 @@ var require_readable = __commonJS({
     }
     async function consume(stream, type) {
       assert2(!stream[kConsume]);
-      return new Promise((resolve4, reject) => {
+      return new Promise((resolve6, reject) => {
         if (isUnusable(stream)) {
           const rState = stream._readableState;
           if (rState.destroyed && rState.closeEmitted === false) {
@@ -9346,7 +9346,7 @@ var require_readable = __commonJS({
             stream[kConsume] = {
               type,
               stream,
-              resolve: resolve4,
+              resolve: resolve6,
               reject,
               length: 0,
               body: []
@@ -9416,18 +9416,18 @@ var require_readable = __commonJS({
       return buffer;
     }
     function consumeEnd(consume2) {
-      const { type, body, resolve: resolve4, stream, length } = consume2;
+      const { type, body, resolve: resolve6, stream, length } = consume2;
       try {
         if (type === "text") {
-          resolve4(chunksDecode(body, length));
+          resolve6(chunksDecode(body, length));
         } else if (type === "json") {
-          resolve4(JSON.parse(chunksDecode(body, length)));
+          resolve6(JSON.parse(chunksDecode(body, length)));
         } else if (type === "arrayBuffer") {
-          resolve4(chunksConcat(body, length).buffer);
+          resolve6(chunksConcat(body, length).buffer);
         } else if (type === "blob") {
-          resolve4(new Blob(body, { type: stream[kContentType] }));
+          resolve6(new Blob(body, { type: stream[kContentType] }));
         } else if (type === "bytes") {
-          resolve4(chunksConcat(body, length));
+          resolve6(chunksConcat(body, length));
         }
         consumeFinish(consume2);
       } catch (err) {
@@ -9684,9 +9684,9 @@ var require_api_request = __commonJS({
     };
     function request(opts, callback) {
       if (callback === void 0) {
-        return new Promise((resolve4, reject) => {
+        return new Promise((resolve6, reject) => {
           request.call(this, opts, (err, data) => {
-            return err ? reject(err) : resolve4(data);
+            return err ? reject(err) : resolve6(data);
           });
         });
       }
@@ -9909,9 +9909,9 @@ var require_api_stream = __commonJS({
     };
     function stream(opts, factory, callback) {
       if (callback === void 0) {
-        return new Promise((resolve4, reject) => {
+        return new Promise((resolve6, reject) => {
           stream.call(this, opts, factory, (err, data) => {
-            return err ? reject(err) : resolve4(data);
+            return err ? reject(err) : resolve6(data);
           });
         });
       }
@@ -10196,9 +10196,9 @@ var require_api_upgrade = __commonJS({
     };
     function upgrade(opts, callback) {
       if (callback === void 0) {
-        return new Promise((resolve4, reject) => {
+        return new Promise((resolve6, reject) => {
           upgrade.call(this, opts, (err, data) => {
-            return err ? reject(err) : resolve4(data);
+            return err ? reject(err) : resolve6(data);
           });
         });
       }
@@ -10290,9 +10290,9 @@ var require_api_connect = __commonJS({
     };
     function connect(opts, callback) {
       if (callback === void 0) {
-        return new Promise((resolve4, reject) => {
+        return new Promise((resolve6, reject) => {
           connect.call(this, opts, (err, data) => {
-            return err ? reject(err) : resolve4(data);
+            return err ? reject(err) : resolve6(data);
           });
         });
       }
@@ -11761,10 +11761,10 @@ var require_headers = __commonJS({
         const lowercaseName = isLowerCase ? name : name.toLowerCase();
         const exists2 = this[kHeadersMap].get(lowercaseName);
         if (exists2) {
-          const delimiter = lowercaseName === "cookie" ? "; " : ", ";
+          const delimiter2 = lowercaseName === "cookie" ? "; " : ", ";
           this[kHeadersMap].set(lowercaseName, {
             name: exists2.name,
-            value: `${exists2.value}${delimiter}${value}`
+            value: `${exists2.value}${delimiter2}${value}`
           });
         } else {
           this[kHeadersMap].set(lowercaseName, { name, value });
@@ -14154,7 +14154,7 @@ var require_fetch = __commonJS({
       function dispatch({ body }) {
         const url2 = requestCurrentURL(request);
         const agent = fetchParams.controller.dispatcher;
-        return new Promise((resolve4, reject) => agent.dispatch(
+        return new Promise((resolve6, reject) => agent.dispatch(
           {
             path: url2.pathname + url2.search,
             origin: url2.origin,
@@ -14230,7 +14230,7 @@ var require_fetch = __commonJS({
                 }
               }
               const onError = this.onError.bind(this);
-              resolve4({
+              resolve6({
                 status,
                 statusText,
                 headersList,
@@ -14276,7 +14276,7 @@ var require_fetch = __commonJS({
               for (let i = 0; i < rawHeaders.length; i += 2) {
                 headersList.append(bufferToLowerCasedHeaderName(rawHeaders[i]), rawHeaders[i + 1].toString("latin1"), true);
               }
-              resolve4({
+              resolve6({
                 status,
                 statusText: STATUS_CODES[status],
                 headersList,
@@ -14681,7 +14681,7 @@ var require_util4 = __commonJS({
     var { getEncoding } = require_encoding();
     var { serializeAMimeType, parseMIMEType } = require_data_url();
     var { types } = require("node:util");
-    var { StringDecoder } = require("string_decoder");
+    var { StringDecoder: StringDecoder2 } = require("string_decoder");
     var { btoa: btoa2 } = require("node:buffer");
     var staticPropertyDescriptors = {
       enumerable: true,
@@ -14772,7 +14772,7 @@ var require_util4 = __commonJS({
             dataURL += serializeAMimeType(parsed);
           }
           dataURL += ";base64,";
-          const decoder = new StringDecoder("latin1");
+          const decoder = new StringDecoder2("latin1");
           for (const chunk of bytes) {
             dataURL += btoa2(decoder.write(chunk));
           }
@@ -14801,7 +14801,7 @@ var require_util4 = __commonJS({
         }
         case "BinaryString": {
           let binaryString = "";
-          const decoder = new StringDecoder("latin1");
+          const decoder = new StringDecoder2("latin1");
           for (const chunk of bytes) {
             binaryString += decoder.write(chunk);
           }
@@ -17952,8 +17952,8 @@ var require_util8 = __commonJS({
       return true;
     }
     function delay(ms) {
-      return new Promise((resolve4) => {
-        setTimeout(resolve4, ms).unref();
+      return new Promise((resolve6) => {
+        setTimeout(resolve6, ms).unref();
       });
     }
     module2.exports = {
@@ -22594,10 +22594,10 @@ var require_resolve_block_map = __commonJS({
       let offset = bm.offset;
       let commentEnd = null;
       for (const collItem of bm.items) {
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep3, value } = collItem;
         const keyProps = resolveProps.resolveProps(start, {
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep3?.[0],
           offset,
           onError,
           parentIndent: bm.indent,
@@ -22611,7 +22611,7 @@ var require_resolve_block_map = __commonJS({
             else if ("indent" in key && key.indent !== bm.indent)
               onError(offset, "BAD_INDENT", startColMsg);
           }
-          if (!keyProps.anchor && !keyProps.tag && !sep) {
+          if (!keyProps.anchor && !keyProps.tag && !sep3) {
             commentEnd = keyProps.end;
             if (keyProps.comment) {
               if (map2.comment)
@@ -22635,7 +22635,7 @@ var require_resolve_block_map = __commonJS({
         ctx.atKey = false;
         if (utilMapIncludes.mapIncludes(ctx, map2.items, keyNode))
           onError(keyStart, "DUPLICATE_KEY", "Map keys must be unique");
-        const valueProps = resolveProps.resolveProps(sep ?? [], {
+        const valueProps = resolveProps.resolveProps(sep3 ?? [], {
           indicator: "map-value-ind",
           next: value,
           offset: keyNode.range[2],
@@ -22651,7 +22651,7 @@ var require_resolve_block_map = __commonJS({
             if (ctx.options.strict && keyProps.start < valueProps.found.offset - 1024)
               onError(keyNode.range, "KEY_OVER_1024_CHARS", "The : indicator must be at most 1024 chars after the start of an implicit block mapping key");
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep, null, valueProps, onError);
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep3, null, valueProps, onError);
           if (ctx.schema.compat)
             utilFlowIndentCheck.flowIndentCheck(bm.indent, value, onError);
           offset = valueNode.range[2];
@@ -22742,7 +22742,7 @@ var require_resolve_end = __commonJS({
       let comment = "";
       if (end) {
         let hasSpace = false;
-        let sep = "";
+        let sep3 = "";
         for (const token of end) {
           const { source, type } = token;
           switch (type) {
@@ -22756,13 +22756,13 @@ var require_resolve_end = __commonJS({
               if (!comment)
                 comment = cb;
               else
-                comment += sep + cb;
-              sep = "";
+                comment += sep3 + cb;
+              sep3 = "";
               break;
             }
             case "newline":
               if (comment)
-                sep += source;
+                sep3 += source;
               hasSpace = true;
               break;
             default:
@@ -22805,18 +22805,18 @@ var require_resolve_flow_collection = __commonJS({
       let offset = fc.offset + fc.start.source.length;
       for (let i = 0; i < fc.items.length; ++i) {
         const collItem = fc.items[i];
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep3, value } = collItem;
         const props = resolveProps.resolveProps(start, {
           flow: fcName,
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep3?.[0],
           offset,
           onError,
           parentIndent: fc.indent,
           startOnNewline: false
         });
         if (!props.found) {
-          if (!props.anchor && !props.tag && !sep && !value) {
+          if (!props.anchor && !props.tag && !sep3 && !value) {
             if (i === 0 && props.comma)
               onError(props.comma, "UNEXPECTED_TOKEN", `Unexpected , in ${fcName}`);
             else if (i < fc.items.length - 1)
@@ -22870,8 +22870,8 @@ var require_resolve_flow_collection = __commonJS({
             }
           }
         }
-        if (!isMap && !sep && !props.found) {
-          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep, null, props, onError);
+        if (!isMap && !sep3 && !props.found) {
+          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep3, null, props, onError);
           coll.items.push(valueNode);
           offset = valueNode.range[2];
           if (isBlock(value))
@@ -22883,7 +22883,7 @@ var require_resolve_flow_collection = __commonJS({
           if (isBlock(key))
             onError(keyNode.range, "BLOCK_IN_FLOW", blockMsg);
           ctx.atKey = false;
-          const valueProps = resolveProps.resolveProps(sep ?? [], {
+          const valueProps = resolveProps.resolveProps(sep3 ?? [], {
             flow: fcName,
             indicator: "map-value-ind",
             next: value,
@@ -22894,8 +22894,8 @@ var require_resolve_flow_collection = __commonJS({
           });
           if (valueProps.found) {
             if (!isMap && !props.found && ctx.options.strict) {
-              if (sep)
-                for (const st of sep) {
+              if (sep3)
+                for (const st of sep3) {
                   if (st === valueProps.found)
                     break;
                   if (st.type === "newline") {
@@ -22912,7 +22912,7 @@ var require_resolve_flow_collection = __commonJS({
             else
               onError(valueProps.start, "MISSING_CHAR", `Missing , or : between ${fcName} items`);
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep, null, valueProps, onError) : null;
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep3, null, valueProps, onError) : null;
           if (valueNode) {
             if (isBlock(value))
               onError(valueNode.range, "BLOCK_IN_FLOW", blockMsg);
@@ -23092,7 +23092,7 @@ var require_resolve_block_scalar = __commonJS({
           chompStart = i + 1;
       }
       let value = "";
-      let sep = "";
+      let sep3 = "";
       let prevMoreIndented = false;
       for (let i = 0; i < contentStart; ++i)
         value += lines[i][0].slice(trimIndent) + "\n";
@@ -23109,24 +23109,24 @@ var require_resolve_block_scalar = __commonJS({
           indent = "";
         }
         if (type === Scalar.Scalar.BLOCK_LITERAL) {
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          value += sep3 + indent.slice(trimIndent) + content;
+          sep3 = "\n";
         } else if (indent.length > trimIndent || content[0] === "	") {
-          if (sep === " ")
-            sep = "\n";
-          else if (!prevMoreIndented && sep === "\n")
-            sep = "\n\n";
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          if (sep3 === " ")
+            sep3 = "\n";
+          else if (!prevMoreIndented && sep3 === "\n")
+            sep3 = "\n\n";
+          value += sep3 + indent.slice(trimIndent) + content;
+          sep3 = "\n";
           prevMoreIndented = true;
         } else if (content === "") {
-          if (sep === "\n")
+          if (sep3 === "\n")
             value += "\n";
           else
-            sep = "\n";
+            sep3 = "\n";
         } else {
-          value += sep + content;
-          sep = " ";
+          value += sep3 + content;
+          sep3 = " ";
           prevMoreIndented = false;
         }
       }
@@ -23308,25 +23308,25 @@ var require_resolve_flow_scalar = __commonJS({
       if (!match)
         return source;
       let res = match[1];
-      let sep = " ";
+      let sep3 = " ";
       let pos = first.lastIndex;
       line.lastIndex = pos;
       while (match = line.exec(source)) {
         if (match[1] === "") {
-          if (sep === "\n")
-            res += sep;
+          if (sep3 === "\n")
+            res += sep3;
           else
-            sep = "\n";
+            sep3 = "\n";
         } else {
-          res += sep + match[1];
-          sep = " ";
+          res += sep3 + match[1];
+          sep3 = " ";
         }
         pos = line.lastIndex;
       }
       const last = /[ \t]*(.*)/sy;
       last.lastIndex = pos;
       match = last.exec(source);
-      return res + sep + (match?.[1] ?? "");
+      return res + sep3 + (match?.[1] ?? "");
     }
     function doubleQuotedValue(source, onError) {
       let res = "";
@@ -24136,14 +24136,14 @@ var require_cst_stringify = __commonJS({
         }
       }
     }
-    function stringifyItem({ start, key, sep, value }) {
+    function stringifyItem({ start, key, sep: sep3, value }) {
       let res = "";
       for (const st of start)
         res += st.source;
       if (key)
         res += stringifyToken(key);
-      if (sep)
-        for (const st of sep)
+      if (sep3)
+        for (const st of sep3)
           res += st.source;
       if (value)
         res += stringifyToken(value);
@@ -25310,18 +25310,18 @@ var require_parser = __commonJS({
         if (this.type === "map-value-ind") {
           const prev = getPrevProps(this.peek(2));
           const start = getFirstKeyStartProps(prev);
-          let sep;
+          let sep3;
           if (scalar.end) {
-            sep = scalar.end;
-            sep.push(this.sourceToken);
+            sep3 = scalar.end;
+            sep3.push(this.sourceToken);
             delete scalar.end;
           } else
-            sep = [this.sourceToken];
+            sep3 = [this.sourceToken];
           const map2 = {
             type: "block-map",
             offset: scalar.offset,
             indent: scalar.indent,
-            items: [{ start, key: scalar, sep }]
+            items: [{ start, key: scalar, sep: sep3 }]
           };
           this.onKeyLine = true;
           this.stack[this.stack.length - 1] = map2;
@@ -25474,15 +25474,15 @@ var require_parser = __commonJS({
                 } else if (isFlowToken(it.key) && !includesToken(it.sep, "newline")) {
                   const start2 = getFirstKeyStartProps(it.start);
                   const key = it.key;
-                  const sep = it.sep;
-                  sep.push(this.sourceToken);
+                  const sep3 = it.sep;
+                  sep3.push(this.sourceToken);
                   delete it.key;
                   delete it.sep;
                   this.stack.push({
                     type: "block-map",
                     offset: this.offset,
                     indent: this.indent,
-                    items: [{ start: start2, key, sep }]
+                    items: [{ start: start2, key, sep: sep3 }]
                   });
                 } else if (start.length > 0) {
                   it.sep = it.sep.concat(start, this.sourceToken);
@@ -25676,13 +25676,13 @@ var require_parser = __commonJS({
             const prev = getPrevProps(parent);
             const start = getFirstKeyStartProps(prev);
             fixFlowSeqItems(fc);
-            const sep = fc.end.splice(1, fc.end.length);
-            sep.push(this.sourceToken);
+            const sep3 = fc.end.splice(1, fc.end.length);
+            sep3.push(this.sourceToken);
             const map2 = {
               type: "block-map",
               offset: fc.offset,
               indent: fc.indent,
-              items: [{ start, key: fc, sep }]
+              items: [{ start, key: fc, sep: sep3 }]
             };
             this.onKeyLine = true;
             this.stack[this.stack.length - 1] = map2;
@@ -26043,15 +26043,15 @@ function issueFileCommand(command, message) {
   });
 }
 function prepareKeyValueMessage(key, value) {
-  const delimiter = `ghadelimiter_${crypto.randomUUID()}`;
+  const delimiter2 = `ghadelimiter_${crypto.randomUUID()}`;
   const convertedValue = toCommandValue(value);
-  if (key.includes(delimiter)) {
-    throw new Error(`Unexpected input: name should not contain the delimiter "${delimiter}"`);
+  if (key.includes(delimiter2)) {
+    throw new Error(`Unexpected input: name should not contain the delimiter "${delimiter2}"`);
   }
-  if (convertedValue.includes(delimiter)) {
-    throw new Error(`Unexpected input: value should not contain the delimiter "${delimiter}"`);
+  if (convertedValue.includes(delimiter2)) {
+    throw new Error(`Unexpected input: value should not contain the delimiter "${delimiter2}"`);
   }
-  return `${key}<<${delimiter}${os2.EOL}${convertedValue}${os2.EOL}${delimiter}`;
+  return `${key}<<${delimiter2}${os2.EOL}${convertedValue}${os2.EOL}${delimiter2}`;
 }
 
 // node_modules/.pnpm/@actions+core@3.0.1/node_modules/@actions/core/lib/core.js
@@ -26117,11 +26117,11 @@ var import_os = require("os");
 var import_fs = require("fs");
 var __awaiter = function(thisArg, _arguments, P, generator) {
   function adopt(value) {
-    return value instanceof P ? value : new P(function(resolve4) {
-      resolve4(value);
+    return value instanceof P ? value : new P(function(resolve6) {
+      resolve6(value);
     });
   }
-  return new (P || (P = Promise))(function(resolve4, reject) {
+  return new (P || (P = Promise))(function(resolve6, reject) {
     function fulfilled(value) {
       try {
         step(generator.next(value));
@@ -26137,7 +26137,7 @@ var __awaiter = function(thisArg, _arguments, P, generator) {
       }
     }
     function step(result) {
-      result.done ? resolve4(result.value) : adopt(result.value).then(fulfilled, rejected);
+      result.done ? resolve6(result.value) : adopt(result.value).then(fulfilled, rejected);
     }
     step((generator = generator.apply(thisArg, _arguments || [])).next());
   });
@@ -26428,12 +26428,210 @@ function setOutput(name, value) {
 }
 
 // src/main.ts
-var import_node_fs16 = require("node:fs");
-var import_node_os5 = require("node:os");
-var import_node_path12 = require("node:path");
+var import_node_fs19 = require("node:fs");
+var import_node_os6 = require("node:os");
+var import_node_path15 = require("node:path");
 
 // src/action/inputs.ts
 var import_node_path = require("node:path");
+
+// src/shared/pm-commands.ts
+var FETCH_CMD = {
+  npm: { cmd: "npm", args: ["ci", "--ignore-scripts"] },
+  pnpm: {
+    cmd: "pnpm",
+    args: ["install", "--frozen-lockfile", "--ignore-scripts", "--config.side-effects-cache=false"]
+  },
+  yarn: { cmd: "yarn", args: ["install", "--immutable", "--mode=skip-build"] }
+};
+var INSTALL_CMD = {
+  // SECURITY (#43, home/project-npmrc node-options): npm re-derives `node-options`
+  // from the EFFECTIVE npm config (userconfig $HOME/.npmrc AND the project
+  // repoDir/.npmrc, the latter PR-controlled + staged into the sandbox) and exports
+  // it to lifecycle scripts as both the child `NODE_OPTIONS` and the
+  // `npm_config_node_options` env value.  `--no-node-options` neutralizes BOTH on
+  // EVERY Phase-B site at once (this is the shared, lockstep source): the trusted
+  // host never honors an audit-blind home-npmrc `--require <path>` (the host has no
+  // shim to overwrite NODE_OPTIONS), and host+guest export an IDENTICAL empty
+  // `npm_config_node_options` so a script branching on that env value cannot diverge
+  // (env-spy records the NAME only — a host-only flag would be a value-blind oracle).
+  // It MUST live here, not in a host-only hardening list, precisely to keep the host
+  // and guest argv byte-identical.  Guest instrumentation is unaffected: the JS
+  // preloads ride the LD_PRELOAD shim's exec-time NODE_OPTIONS rewrite, not npm's
+  // node-options passthrough.  Verified npm 11.13.0: an empty NODE_OPTIONS /
+  // npm_config_node_options ENV pin does NOT override the npmrc file, but
+  // `--no-node-options` does, and it preserves the npmrc's registry/auth.
+  npm: { cmd: "npm", args: ["rebuild", "--foreground-scripts", "--no-node-options"] },
+  pnpm: { cmd: "pnpm", args: ["rebuild", "--pending", "--config.side-effects-cache=false"] },
+  // No `--offline`: that is a Yarn Classic flag; Berry rejects it (Usage Error,
+  // exit 1, zero events). Offline is enforced by the Phase-B network-namespace
+  // sever; the cache Phase A populated makes this a zero-network relink+build.
+  yarn: { cmd: "yarn", args: ["install", "--immutable"] }
+};
+function pnpmStoreDirArg(pm, cwd) {
+  return pm === "pnpm" ? [`--store-dir=${cwd}/.pnpm-store`] : [];
+}
+function isBareFlag(token) {
+  return !token.includes("=");
+}
+function registryUrlHasCredentials(value) {
+  try {
+    const u = new URL(value);
+    if (u.username.length > 0 || u.password.length > 0) return true;
+  } catch {
+  }
+  let s = value.trim();
+  const scheme = /^[a-z][a-z0-9+.-]{0,31}:/i.exec(s);
+  if (scheme !== null) s = s.slice(scheme[0].length);
+  if (s.startsWith("//")) s = s.slice(2);
+  const authority = s.split(/[/?#]/, 1)[0] ?? "";
+  return authority.includes("@");
+}
+function canonicalFlagKey(token) {
+  if (token.length === 0 || token[0] !== "-") return null;
+  let i = 0;
+  while (i < token.length && token[i] === "-") i += 1;
+  let body = token.slice(i);
+  const eq = body.indexOf("=");
+  if (eq !== -1) body = body.slice(0, eq);
+  body = body.toLowerCase();
+  if (body.startsWith("no-")) body = body.slice("no-".length);
+  if (body.startsWith("config.")) body = body.slice("config.".length);
+  let key = "";
+  for (const ch of body) {
+    if (ch !== "-" && ch !== "_" && ch !== ".") key += ch;
+  }
+  return key;
+}
+function dropReason(key) {
+  switch (key) {
+    case "ignorescripts":
+      return "--ignore-scripts";
+    case "frozenlockfile":
+      return "--frozen-lockfile";
+    case "fixlockfile":
+      return "--fix-lockfile";
+    case "lockfiledir":
+      return "--lockfile-dir";
+    case "lockfileonly":
+      return "--lockfile-only";
+    case "lockfile":
+      return "--lockfile";
+    case "modulesdir":
+      return "--modules-dir";
+    case "virtualstoredir":
+      return "--virtual-store-dir";
+    case "storedir":
+      return "--store-dir";
+    case "workspaceroot":
+      return "--workspace-root";
+    case "dir":
+      return "--dir";
+    case "prefix":
+      return "--prefix";
+    case "global":
+      return "--global";
+    case "filter":
+      return "--filter";
+    case "recursive":
+      return "--recursive";
+    case "mode":
+      return "--mode";
+    case "immutable":
+      return "--immutable";
+    case "registry":
+      return "--registry (inline credentials \u2014 set registry auth in .npmrc/env)";
+    default:
+      return "<flag>";
+  }
+}
+var ALLOWED_FLAG_KEYS = /* @__PURE__ */ new Map([
+  ["omit", { takesValue: true }],
+  ["include", { takesValue: true }],
+  ["prod", { takesValue: false }],
+  ["production", { takesValue: false }],
+  ["dev", { takesValue: false }],
+  ["optional", { takesValue: false }],
+  ["p", { takesValue: false }],
+  // -P (pnpm --prod / npm --save-prod / npm -p --parseable)
+  ["d", { takesValue: false }],
+  // -D (pnpm --dev  / npm --save-dev  / npm -d --loglevel)
+  // private-registry SOURCE; root-lock gate unaffected (see note).  AUTH must go
+  // in .npmrc/env — an inline-credential URL value is rejected (F1).
+  ["registry", { takesValue: true, rejectValue: registryUrlHasCredentials }]
+]);
+function filterAgainstAllowlist(args, allow) {
+  const kept = [];
+  const dropped = [];
+  const droppedKeys = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const key = canonicalFlagKey(a);
+    if (key !== null && key.length > 0) {
+      const allowed = allow.get(key);
+      if (allowed !== void 0) {
+        const eq = a.indexOf("=");
+        const splitValue = allowed.takesValue && isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-") ? args[i + 1] : void 0;
+        const value = eq >= 0 ? a.slice(eq + 1) : splitValue;
+        if (allowed.rejectValue !== void 0 && value !== void 0 && allowed.rejectValue(value)) {
+          dropped.push(a);
+          droppedKeys.push(dropReason(key));
+          if (splitValue !== void 0) dropped.push(args[++i]);
+          continue;
+        }
+        kept.push(a);
+        if (splitValue !== void 0) {
+          kept.push(args[++i]);
+        }
+        continue;
+      }
+      dropped.push(a);
+      droppedKeys.push(dropReason(key));
+      if (isBareFlag(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+        dropped.push(args[++i]);
+      }
+      continue;
+    }
+    dropped.push(a);
+    droppedKeys.push("<positional>");
+  }
+  return { kept, dropped, droppedKeys };
+}
+function sanitizeInstallArgs(args) {
+  return filterAgainstAllowlist(args, ALLOWED_FLAG_KEYS);
+}
+function splitInstallArgs(raw) {
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let started = false;
+  for (const ch of raw) {
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (ch === " " || ch === "	" || ch === "\n" || ch === "\r") {
+      if (started) {
+        out.push(cur);
+        cur = "";
+        started = false;
+      }
+      continue;
+    }
+    cur += ch;
+    started = true;
+  }
+  if (started) out.push(cur);
+  return out;
+}
+
+// src/action/inputs.ts
 var VALID_PLATFORMS = /* @__PURE__ */ new Set(["linux", "darwin", "win32"]);
 var VALID_ARCHES = /* @__PURE__ */ new Set(["x64", "arm64"]);
 var VALID_MODES = /* @__PURE__ */ new Set(["check", "update"]);
@@ -26480,6 +26678,16 @@ function parseInputs(input) {
       `script-jail: invalid value for input "cache-firecracker": "${cacheStr}". Expected "true" or "false".`
     );
   }
+  const args = splitInstallArgs(getInput("args") ?? "");
+  const installStr = (getInput("install") ?? "").trim();
+  let install;
+  if (installStr === "" || installStr === "false") install = false;
+  else if (installStr === "true") install = true;
+  else {
+    throw new Error(
+      `script-jail: invalid value for input "install": "${installStr}". Expected "true" or "false".`
+    );
+  }
   const configRel = rawConfig.trim() === "" ? ".script-jail.yml" : rawConfig.trim();
   const lockRel = rawLock.trim() === "" ? ".script-jail.lock.yml" : rawLock.trim();
   return {
@@ -26489,7 +26697,9 @@ function parseInputs(input) {
     spoofPlatform: platformStr,
     spoofArch: archStr,
     backend: backendStr,
-    cacheFirecracker
+    cacheFirecracker,
+    args,
+    install
   };
 }
 function isMode(s) {
@@ -26513,10 +26723,1161 @@ function defaultGetInput(name) {
   return process.env[key];
 }
 
+// src/action/host-install.ts
+var import_node_child_process = require("node:child_process");
+var import_node_fs = require("node:fs");
+var import_node_os = require("node:os");
+var import_node_path2 = require("node:path");
+var import_node_string_decoder = require("node:string_decoder");
+
+// src/shared/redact.ts
+function redactCredentialShapes(text) {
+  return text.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s@]+@/gi, "$1<REDACTED:URL-CREDENTIALS>@").replace(/(^|[\s='"(`])\/\/[^/\s@]+@/g, "$1//<REDACTED:URL-CREDENTIALS>@").replace(/((?:_authToken|_auth|_password)[^\S\n]*=[^\S\n]*)\S+/gi, "$1<REDACTED>").replace(/(Bearer[^\S\n]+)[A-Za-z0-9._~+/-]{8,}=*/g, "$1<REDACTED>").replace(/\bnpm_[A-Za-z0-9]{36,}\b/g, "<REDACTED:NPM-TOKEN>").replace(/\bgh[posur]_[A-Za-z0-9]{36,}\b/g, "<REDACTED:GH-TOKEN>").replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "<REDACTED:AWS-KEY>");
+}
+function maskExactValues(text, values, label = "REDACTED", minLen = 4) {
+  const unique = Array.from(new Set(values)).filter((v) => v.length >= minLen).sort((a, b) => b.length - a.length);
+  let out = text;
+  const replacement = `<${label}>`;
+  for (const value of unique) {
+    out = out.split(value).join(replacement);
+  }
+  return out;
+}
+var DEFAULT_MIN_FRAGMENT = 8;
+var MAX_FRAGMENT_VALUE_CHARS = 2 * 1024 * 1024;
+var FRAGMENT_MAX_GRAMS = 1 << 22;
+function buildFragmentMatcher(values, minFragment = DEFAULT_MIN_FRAGMENT) {
+  const unique = Array.from(new Set(values));
+  let totalChars = 0;
+  for (const v of unique) {
+    totalChars += v.length;
+    if (totalChars > MAX_FRAGMENT_VALUE_CHARS) {
+      return { grams: /* @__PURE__ */ new Set(), capped: true, minFragment };
+    }
+  }
+  const grams = /* @__PURE__ */ new Set();
+  let capped = false;
+  for (const v of unique) {
+    if (v.length <= minFragment) continue;
+    for (let i = 0; i + minFragment <= v.length; i += 1) {
+      grams.add(v.slice(i, i + minFragment));
+      if (grams.size >= FRAGMENT_MAX_GRAMS) {
+        capped = true;
+        break;
+      }
+    }
+    if (capped) break;
+  }
+  return { grams, capped, minFragment };
+}
+function maskValueFragmentsWith(text, matcher, label = "REDACTED") {
+  const { grams, capped, minFragment } = matcher;
+  if (text.length < minFragment) return text;
+  const replacement = `<${label}>`;
+  if (capped) return replacement;
+  if (grams.size === 0) return text;
+  const n = text.length;
+  let out = "";
+  let i = 0;
+  while (i + minFragment <= n) {
+    if (grams.has(text.slice(i, i + minFragment))) {
+      let j = i;
+      while (j + 1 + minFragment <= n && grams.has(text.slice(j + 1, j + 1 + minFragment))) j += 1;
+      out += replacement;
+      i = j + minFragment;
+    } else {
+      out += text[i];
+      i += 1;
+    }
+  }
+  out += text.slice(i);
+  return out;
+}
+function deriveSensitiveValues(args) {
+  const values = [];
+  for (const t of args) {
+    values.push(t);
+    const eq = t.indexOf("=");
+    if (eq >= 0) values.push(t.slice(eq + 1));
+  }
+  return values;
+}
+
+// src/action/host-install.ts
+var RESOLVED_TRUSTED_GIT;
+function trustedGitPath() {
+  if (RESOLVED_TRUSTED_GIT !== void 0) return RESOLVED_TRUSTED_GIT;
+  RESOLVED_TRUSTED_GIT = resolveGitFromPath() ?? "git";
+  return RESOLVED_TRUSTED_GIT;
+}
+var CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+function canonicalForCompare(p) {
+  let abs;
+  try {
+    abs = (0, import_node_fs.realpathSync)((0, import_node_path2.resolve)(p));
+  } catch {
+    abs = (0, import_node_path2.resolve)(p);
+  }
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+function lexicalForCompare(p) {
+  const abs = (0, import_node_path2.resolve)(p);
+  return CASE_INSENSITIVE_FS ? abs.toLowerCase() : abs;
+}
+function checkoutRoots() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(canonicalForCompare(v));
+  }
+  return roots;
+}
+function checkoutRootsLexical() {
+  const roots = [];
+  for (const v of [
+    process.env["GITHUB_WORKSPACE"],
+    process.env["SCRIPT_JAIL_REPO_DIR"],
+    process.cwd()
+  ]) {
+    if (v !== void 0 && v !== "") roots.push(lexicalForCompare(v));
+  }
+  return roots;
+}
+function isLexicallyUnderCheckout(p, lexRoots) {
+  const abs = lexicalForCompare(p);
+  for (const root of lexRoots) {
+    if (abs === root || abs.startsWith(root + import_node_path2.sep)) return true;
+  }
+  return false;
+}
+function isUnderCheckout(p, roots) {
+  const abs = canonicalForCompare(p);
+  for (const root of roots) {
+    if (abs === root || abs.startsWith(root + import_node_path2.sep)) return true;
+  }
+  return false;
+}
+function isPathUnderCheckout(p) {
+  return isUnderCheckout(p, checkoutRoots()) || isLexicallyUnderCheckout(p, checkoutRootsLexical());
+}
+function trustedHostTmpdir() {
+  let canonical;
+  try {
+    canonical = (0, import_node_fs.realpathSync)("/tmp");
+  } catch (err) {
+    throw new Error(
+      `script-jail: \`install: true\` could not resolve a trusted host temp directory (/tmp): ${err.message}`
+    );
+  }
+  if (!(0, import_node_path2.isAbsolute)(canonical) || isPathUnderCheckout(canonical)) {
+    throw new Error(
+      `script-jail: \`install: true\` refuses host temp "${canonical}" \u2014 it must be an absolute path outside the checkout (TMPDIR parity with the Firecracker audit).`
+    );
+  }
+  return canonical;
+}
+function resolveGitFromPath() {
+  const pathVar = process.env["PATH"];
+  if (pathVar === void 0 || pathVar === "") return void 0;
+  const names = process.platform === "win32" ? ["git.exe", "git.cmd", "git"] : ["git"];
+  const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
+  for (const dir of pathVar.split(import_node_path2.delimiter)) {
+    if (dir === "") continue;
+    if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
+    for (const name of names) {
+      const candidate = (0, import_node_path2.join)(dir, name);
+      if (!(0, import_node_path2.isAbsolute)(candidate)) continue;
+      let st;
+      try {
+        st = (0, import_node_fs.statSync)(candidate);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      try {
+        (0, import_node_fs.accessSync)(candidate, import_node_fs.constants.X_OK);
+      } catch {
+        continue;
+      }
+      if (isUnderCheckout(candidate, roots)) continue;
+      if (isLexicallyUnderCheckout(candidate, lexRoots)) continue;
+      return candidate;
+    }
+  }
+  return void 0;
+}
+var HOST_INSTALL_KEEP_BASE_ENV_NAMES = /* @__PURE__ */ new Set(["PATH", "HOME"]);
+var HOST_INSTALL_KEEP_AUTH_ENV_NAMES = new Set(
+  [
+    "NODE_AUTH_TOKEN",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "GIT_ALLOW_PROTOCOL",
+    // restricts the git transport set, never weakens
+    "GIT_TERMINAL_PROMPT"
+    // behaviour flag (prevents an interactive clone hang)
+  ].map((n) => n.toLowerCase())
+);
+function isHostInstallParityKeepName(name, phase) {
+  if (HOST_INSTALL_KEEP_BASE_ENV_NAMES.has(name)) return true;
+  if (phase === "scripts") return false;
+  const lower = name.toLowerCase();
+  if (HOST_INSTALL_KEEP_AUTH_ENV_NAMES.has(lower)) return true;
+  return lower.startsWith("npm_config_") || lower.startsWith("pnpm_config_") || lower.startsWith("yarn_");
+}
+var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
+  [
+    // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
+    "NODE_OPTIONS",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_PATH",
+    // adds require() search dirs → a checkout-relative one loads PR code
+    // npm's globalconfig is `{globalPrefix}/etc/npmrc`, and npm derives globalPrefix
+    // from PLAIN (non-npm_config_*) env in loadGlobalPrefix(): `PREFIX` sets it
+    // directly and `PREFIX`-less `DESTDIR` prepends to the node-derived prefix
+    // (@npmcli/config/lib/index.js:327-339).  VERIFIED npm 11.13.0: `PREFIX=<dir>`
+    // (or `DESTDIR=<dir>`) with `<dir>/etc/npmrc` (resp. `<dir>{nodePrefix}/etc/npmrc`)
+    // declaring `script-shell=<pwn>` makes `npm rebuild --foreground-scripts` exec the
+    // attacker shell — the SAME npmrc-redirect-then-exec class as the denied
+    // npm_config_prefix, but reached via plain env so the npm_config_* canon misses it.
+    // (HOME → `~/.npmrc` is the analogous userconfig vector, gated separately by
+    // install-preflight.ts:detectCheckoutRelativeHome; XDG_CONFIG_HOME is NOT an npmrc
+    // locator in npm 11.13.0 — verified inert.)
+    "PREFIX",
+    "DESTDIR",
+    // [19] Git EXEC/config-FILE selectors (git+ssh|https deps; --ignore-scripts
+    // does NOT stop git being invoked).  Enumerated (not blanket GIT_*) so benign
+    // behaviour flags such as GIT_TERMINAL_PROMPT/GIT_ALLOW_PROTOCOL are preserved.
+    // The git BINARY itself stays pinned via npm_config_git.
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_ASKPASS",
+    // verified-class: git invokes the askpass program by path
+    "SSH_ASKPASS",
+    "GIT_EXEC_PATH",
+    // VERIFIED: GIT_EXEC_PATH=./core runs checkout core/git-remote-https
+    "GIT_TEMPLATE_DIR",
+    // clone hooks dir
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    // gates inline GIT_CONFIG_KEY_*/VALUE_*; dropping it makes them inert
+    "GIT_CONFIG_PARAMETERS",
+    // VERIFIED: ='core.sshCommand=./ssh' runs ./ssh on ssh:// clone
+    // Native-build TOOL selectors honored by node-gyp/gyp/make (checkout-relative
+    // interpreter/compiler/linker runs during a native `npm rebuild`).  PYTHON* and
+    // node-gyp* are caught by the family prefixes below.  Stripping forces the
+    // system toolchain auto-detect — the same default the clean-VM audit used.
+    "CC",
+    "CXX",
+    "CPP",
+    "LINK",
+    "LD",
+    "AR",
+    "AS",
+    "MAKE",
+    // GNU make startup/config env (consumed before any target): MAKEFLAGS
+    // ='--eval=$(shell …)' runs a command at make startup, MAKEFILES=/path
+    // evaluates a makefile pre-target (both VERIFIED).  node-gyp invokes make.
+    "MAKEFLAGS",
+    "GNUMAKEFLAGS",
+    "MAKEFILES",
+    // (Corepack EXEC/config selectors AND its version-steering behaviour flags are
+    // dropped by the `corepack_` FAMILY prefix below — see that entry.)
+    // LOCALAPPDATA is corepack's win32-ONLY cache-root selector (= the COREPACK_HOME
+    // executable-cache class, just platform-scoped).  The action only runs on
+    // Linux/macOS runners (never win32), where neither corepack nor any PM reads it,
+    // so dropping it is functionally inert on every real host AND closes two things:
+    // (a) round-17e — a PR/runner-set LOCALAPPDATA must never steer corepackCacheRoot
+    // to a planted cache (corepackCacheRoot now also ignores it off-win32), and
+    // (b) the value-blind env_read parity — the clean-VM/guest audit never carries
+    // LOCALAPPDATA, so the host lifecycle child must not either (else a dep reading
+    // process.env.LOCALAPPDATA gets a host-present/audit-absent oracle NAME).
+    "LOCALAPPDATA",
+    // pnpm's global bin / executable dir (also where `pnpm setup` puts pnpm on
+    // PATH).  Not a config-file locator and NOT auto-prepended to a lifecycle
+    // script's PATH (both VERIFIED pnpm 11.1.2 — only XDG_CONFIG_HOME relocates the
+    // readable config), but it IS passed verbatim to lifecycle children and the
+    // clean-VM audit inherits none, so drop it for parity: a checkout-relative
+    // PNPM_HOME never reaches the host pnpm or a script that reads it.
+    "PNPM_HOME",
+    // Shell / interpreter startup hooks that run on a NON-interactive spawn.
+    // (POSIX `$ENV` is sourced only by INTERACTIVE sh, not `sh -c`, and `ENV` is a
+    // common legit "environment name" var, so it is deliberately NOT stripped.)
+    "BASH_ENV",
+    // bash -c sources it
+    "ZDOTDIR",
+    // zsh startup dir
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB"
+  ].map((n) => n.toLowerCase())
+);
+var HOST_INSTALL_DANGEROUS_ENV_PREFIXES = [
+  "ld_",
+  // ELF dynamic loader: LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH / …
+  "dyld_",
+  // macOS dyld analogs (the host bare backend runs on macOS)
+  "python",
+  // PYTHON / PYTHONPATH / PYTHONHOME / PYTHONSTARTUP (sitecustomize exec)
+  "node_gyp_",
+  // NODE_GYP_FORCE_PYTHON, … (VERIFIED node-gyp interpreter selector)
+  // XDG base-dir family.  pnpm locates its GLOBAL config at
+  // `$XDG_CONFIG_HOME/pnpm/{config.yaml,rc}` (VERIFIED pnpm 11.1.2: an inherited
+  // `XDG_CONFIG_HOME=<checkout>/.config` makes the host pnpm read a PR-committed
+  // `.config/pnpm/config.yaml` whose `scriptShell:` then runs an attacker shell on
+  // `pnpm rebuild --pending` — npm & yarn do NOT read XDG for config, verified).
+  // The clean-VM audit inherits NO XDG_*, so the host must run without them too;
+  // dropping the whole family is parity-safe (config/data/state/cache all default
+  // to the runner's real HOME, which the HOME gate keeps outside the checkout) and
+  // forecloses any future XDG-located PM config.
+  "xdg_",
+  // npm re-derives npm_package_config_* from the AUDITED package.json; an INHERITED
+  // one for a key absent from package.json would pass through to node-gyp
+  // (e.g. npm_package_config_node_gyp_python), so drop inherited ones — npm re-adds
+  // the legit values from the package.json the sandbox already audited.
+  "npm_package_config_",
+  // Corepack family — a pnpm/yarn bare command is commonly a corepack shim.  Two
+  // dangerous sub-classes, BOTH dropped here so the SHARED sanitizer (every backend
+  // AGENT spawn AND the host install) applies one parity policy:
+  //   EXEC/config selectors — COREPACK_HOME (executable CACHE; a checkout-relative
+  //     one makes corepack run a PR-planted bin/pnpm.cjs — VERIFIED corepack 0.35.0),
+  //     COREPACK_ENV_FILE (loads env from a file), COREPACK_NPM_REGISTRY /
+  //     COREPACK_INTEGRITY_KEYS / COREPACK_ROOT (redirect/unsign the downloaded PM).
+  //   VERSION-STEERING flags — COREPACK_ENABLE_PROJECT_SPEC=0 makes corepack IGNORE
+  //     the repo's `packageManager` and run a DIFFERENT pm VERSION (VERIFIED corepack
+  //     0.35.0: yarn 3.8.7 pin -> 4.5.0), a host-vs-audit (and bare-audit-vs-host)
+  //     SEMANTICS skew; COREPACK_DEFAULT_TO_LATEST / COREPACK_ENABLE_STRICT likewise.
+  // The clean-VM audit inherits NO COREPACK_*, so dropping the whole family keeps
+  // host==audit AND bare-audit==host.  The ONE flag a spawn legitimately needs,
+  // COREPACK_ENABLE_DOWNLOAD_PROMPT=0 (avoid an interactive hang on an uncached PM
+  // download), is RE-PINNED by every corepack-running caller AFTER this strip
+  // (hostInstallEnv, backend/bare.ts, backend/mac-bare.ts, backend/docker.ts,
+  // rootfs/init.sh, cli/provision-node-mac.ts) — never relied on as an inherited
+  // pass-through.
+  "corepack_"
+];
+var PM_CONFIG_AUTH_SCALARS = /* @__PURE__ */ new Set([
+  "registry",
+  // default registry URL
+  // npm-only: rewrites the HOST of lockfile-pinned tarball URLs to the configured
+  // `registry` (VERIFIED npm 11.13.0 honors both separators, no Unknown-env warning).
+  // Needed for a mirror where the lockfile pins NON-default public hosts but an
+  // egress-locked runner must funnel all fetches through one internal registry, else
+  // the host install fails after a clean audit.  PURE routing — pacote/arborist
+  // rewrite only host/port/protocol/path and STILL verify the integrity hash against
+  // the fetched bytes (no exec/loader/config-FILE).  pnpm has no consumer (zero dist
+  // refs on 10.34.3/11.1.2) → harmless no-op there, like the other npm-only scalars.
+  "replace_registry_host",
+  "_auth",
+  // legacy single-registry base64 basic auth
+  "email",
+  // legacy auth identity
+  "ca",
+  // inline PEM CA (string/array) — data, not a path
+  "cafile",
+  // PEM CA file path — read as cert DATA, never interpreted
+  "cert",
+  // inline PEM client cert (deprecated → certfile)
+  "certfile",
+  // PEM client-cert file path — TLS material
+  "key",
+  // inline PEM client key (deprecated → keyfile)
+  "keyfile",
+  // PEM client-key file path — TLS material
+  "strict_ssl",
+  // TLS verification toggle
+  "proxy",
+  // HTTP(S) proxy URL (npm + pnpm)
+  "https_proxy",
+  // HTTPS proxy URL (npm + pnpm)
+  "noproxy",
+  // proxy-bypass host list — npm's canonical key
+  // pnpm's canonical proxy spellings are `http-proxy` / `no-proxy` (DISTINCT from
+  // npm's `proxy` / `noproxy`).  VERIFIED pnpm 11.1.2 reads `pnpm_config_http_proxy`
+  // -> `http-proxy` (feeds ProxyAgent) and `pnpm_config_no_proxy` -> `no-proxy`
+  // (feeds checkNoProxy); pnpm 10.34.3 reads the SAME via the `npm_config_` form.
+  // Without these a pnpm install behind an HTTP-only proxy (or needing a no-proxy
+  // bypass for an internal registry) fails on the host.  Pure network config (URL /
+  // host list), no exec.  npm treats both as "Unknown env config" (ignores — harmless).
+  "http_proxy",
+  // pnpm `http-proxy`
+  "no_proxy",
+  // pnpm `no-proxy`
+  // Network binding + fetch tuning — pure data (a validated IP, an int), never an
+  // exec/loader/config-FILE selector.  VERIFIED env-settable on npm 11.13.0 + pnpm
+  // 11.1.2 (pnpm_config_ form) + pnpm 10.34.3 (npm_config_ form): multi-homed /
+  // internal-registry / slow-registry installs legitimately need these to REACH the
+  // registry, and the clean-VM audit inherits none, so the host must be able to too.
+  // `network_concurrency` is pnpm-only (npm ignores as "Unknown env config" — no-op).
+  "local_address",
+  // source IP for a multi-homed runner (npm validates it as an IP)
+  "maxsockets",
+  // connection pool size
+  "fetch_timeout",
+  // request timeout (ms)
+  "fetch_retries",
+  // retry count for a flaky internal registry
+  "fetch_retry_factor",
+  "fetch_retry_mintimeout",
+  "fetch_retry_maxtimeout",
+  "network_concurrency"
+  // pnpm-only request concurrency
+]);
+function isAllowedPmConfigKey(slice) {
+  if (slice.startsWith("//")) return true;
+  if (slice.startsWith("@") && slice.includes(":")) return true;
+  return PM_CONFIG_AUTH_SCALARS.has(slice.replace(/-/g, "_"));
+}
+var YARN_ENV_ALLOW = /* @__PURE__ */ new Set([
+  "YARN_NPM_AUTH_TOKEN",
+  "YARN_NPM_AUTH_IDENT",
+  "YARN_NPM_REGISTRY_SERVER",
+  "YARN_NPM_ALWAYS_AUTH",
+  "YARN_HTTP_PROXY",
+  // -> httpProxy (URL)
+  "YARN_HTTPS_PROXY",
+  // -> httpsProxy (URL)
+  "YARN_HTTP_TIMEOUT",
+  // -> httpTimeout (int)
+  "YARN_HTTP_RETRY",
+  // -> httpRetry (int)
+  "YARN_NETWORK_CONCURRENCY",
+  // -> networkConcurrency (int)
+  "YARN_HTTPS_CA_FILE_PATH",
+  // -> httpsCaFilePath (PEM CA, read as TLS material)
+  "YARN_HTTPS_CERT_FILE_PATH",
+  // -> httpsCertFilePath (PEM client cert)
+  "YARN_HTTPS_KEY_FILE_PATH"
+  // -> httpsKeyFilePath (PEM client key)
+]);
+function isDangerousEnvName(name) {
+  const lower = name.toLowerCase();
+  for (const prefix of HOST_INSTALL_DANGEROUS_ENV_PREFIXES) {
+    if (lower.startsWith(prefix)) return true;
+  }
+  if (lower.startsWith("pnpm_config_")) {
+    return !isAllowedPmConfigKey(lower.slice("pnpm_config_".length));
+  }
+  if (lower.startsWith("npm_config_")) {
+    return !isAllowedPmConfigKey(lower.slice("npm_config_".length));
+  }
+  if (lower.startsWith("yarn_")) {
+    return !YARN_ENV_ALLOW.has(name.toUpperCase());
+  }
+  return HOST_INSTALL_DANGEROUS_ENV_NAMES.has(lower);
+}
+var SAFE_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+function sanitizePathValue(pathVar) {
+  if (pathVar === void 0) return void 0;
+  const roots = checkoutRoots();
+  const lexRoots = checkoutRootsLexical();
+  const kept = [];
+  for (const dir of pathVar.split(import_node_path2.delimiter)) {
+    if (!(0, import_node_path2.isAbsolute)(dir)) continue;
+    if (isUnderCheckout(dir, roots)) continue;
+    if (isLexicallyUnderCheckout(dir, lexRoots)) continue;
+    kept.push(dir);
+  }
+  return kept.length === 0 ? SAFE_SYSTEM_PATH : kept.join(import_node_path2.delimiter);
+}
+function stripDangerousEnv(srcEnv) {
+  const env = {};
+  for (const [name, value] of Object.entries(srcEnv)) {
+    if (value === void 0) continue;
+    if (isDangerousEnvName(name)) continue;
+    env[name] = value;
+  }
+  const sanitizedPath = sanitizePathValue(srcEnv["PATH"]);
+  if (sanitizedPath === void 0) delete env["PATH"];
+  else env["PATH"] = sanitizedPath;
+  return env;
+}
+function lifecycleCacheParityEnv(pm, repoDir) {
+  if (pm === "npm") return { npm_config_cache: `${repoDir}/.npm-cache` };
+  if (pm === "yarn")
+    return {
+      YARN_GLOBAL_FOLDER: `${repoDir}/.yarn-global`,
+      YARN_CACHE_FOLDER: `${repoDir}/.yarn-cache`
+    };
+  return {};
+}
+function hostInstallEnv(pm, repoDir, phase, hostTmpdir) {
+  const env = stripDangerousEnv(process.env);
+  for (const name of Object.keys(env)) {
+    if (!isHostInstallParityKeepName(name, phase)) delete env[name];
+  }
+  if (phase === "fetch") env["npm_config_git"] = trustedGitPath();
+  env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
+  env["COREPACK_ENV_FILE"] = "0";
+  if (pm === "npm") {
+    env["npm_config_script_shell"] = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
+    env["npm_config_ignore_scripts"] = "false";
+  }
+  if (pm === "yarn") {
+    env["YARN_IGNORE_PATH"] = "1";
+    env["YARN_RC_FILENAME"] = ".yarnrc.yml";
+    env["YARN_PLUGINS"] = "";
+    env["YARN_ENABLE_CONSTRAINTS_CHECKS"] = "false";
+  }
+  Object.assign(env, lifecycleCacheParityEnv(pm, repoDir));
+  if (hostTmpdir !== void 0) env["TMPDIR"] = hostTmpdir;
+  return env;
+}
+var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
+var captureSpawn = (cmd, args, cwd, env) => {
+  const r = (0, import_node_child_process.spawnSync)(cmd, args, {
+    cwd,
+    // SECURITY: `env` carries the `npm_config_git` pin so a repo `.npmrc git=`
+    // cannot redirect npm's git binary during the PRE-TRUST part-1 install
+    // (see hostInstallEnv() / trustedGitPath()).
+    env,
+    stdio: ["inherit", "pipe", "pipe"],
+    shell: false,
+    encoding: "utf8",
+    maxBuffer: CAPTURE_MAX_BUFFER
+  });
+  return {
+    status: r.status,
+    signal: r.signal,
+    error: r.error,
+    stdout: typeof r.stdout === "string" ? r.stdout : "",
+    stderr: typeof r.stderr === "string" ? r.stderr : ""
+  };
+};
+function hostInstallNoScripts(pm, repoDir, args, io, spawn3 = captureSpawn, hostTmpdir) {
+  const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
+  if (droppedKeys.length > 0) {
+    const n = dropped.length;
+    const keys = droppedKeys.join(", ");
+    io.warn(
+      `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} (${keys}) \u2014 not on the allowlist of dependency-selection flags, or carrying an unsafe value (e.g. an inline-credential --registry URL). Only flags that filter the lockfile-pinned tree (plus a credential-free --registry) are forwarded; anything that could redirect the lock/root/output/source, re-enable lifecycle scripts, or carry an inline credential is dropped.`
+    );
+  }
+  const base = FETCH_CMD[pm];
+  const hostHardening = pm === "pnpm" ? ["--ignore-pnpmfile"] : [];
+  const finalArgs = [...base.args, ...kept, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  const safeBaseArgs = [...base.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  const userArgSuffix = kept.length > 0 ? ` (+${kept.length} user install arg${kept.length === 1 ? "" : "s"}, not shown)` : "";
+  io.stdout.write(
+    `[script-jail] host install (lifecycle scripts disabled): ${base.cmd} ${safeBaseArgs.join(" ")}${userArgSuffix}
+`
+  );
+  const safeDisplayArgs = kept.length > 0 ? [...safeBaseArgs, `(+${kept.length} user install arg${kept.length === 1 ? "" : "s"}, not shown)`] : safeBaseArgs;
+  const sensitive = deriveSensitiveValues(kept);
+  const onOutput = (stdout, stderr) => {
+    if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
+    if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
+  };
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, "fetch", hostTmpdir), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
+}
+function redactCaptured(text, sensitive) {
+  let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");
+  red = redactCredentialShapes(red);
+  return red;
+}
+var HOST_PART2_MAX_LINE_BYTES = 1048576;
+var HOST_PART2_POISON_MARKER = "[script-jail] (oversized output line truncated)";
+var HOST_PART2_TRUNCATED_MARKER = "[script-jail] (trailing output dropped \u2014 pipe held open past grace)";
+var HOST_PART2_DRAIN_GRACE_MS = 2e3;
+function makeLineSink(which2, onLine, maxBytes = HOST_PART2_MAX_LINE_BYTES) {
+  const decoder = new import_node_string_decoder.StringDecoder("utf8");
+  let pending = "";
+  let poisoned = false;
+  const onData = (chunk) => {
+    pending += decoder.write(chunk);
+    let nl;
+    while ((nl = pending.indexOf("\n")) !== -1) {
+      const line = pending.slice(0, nl);
+      pending = pending.slice(nl + 1);
+      if (poisoned) {
+        poisoned = false;
+        continue;
+      }
+      onLine(which2, line);
+    }
+    if (poisoned) {
+      pending = "";
+    } else if (pending.length > maxBytes) {
+      onLine(which2, HOST_PART2_POISON_MARKER);
+      pending = "";
+      poisoned = true;
+    }
+  };
+  const finalize2 = (streamEnded) => {
+    pending += decoder.end();
+    if (poisoned) {
+      pending = "";
+      poisoned = false;
+      return;
+    }
+    if (pending.length === 0) return;
+    onLine(which2, streamEnded ? pending : HOST_PART2_TRUNCATED_MARKER);
+    pending = "";
+  };
+  return { onData, finalize: finalize2 };
+}
+var streamSpawn = (cmd, args, cwd, env, onLine) => new Promise((resolve6) => {
+  let child;
+  try {
+    child = (0, import_node_child_process.spawn)(cmd, args, { cwd, env, stdio: ["inherit", "pipe", "pipe"], shell: false });
+  } catch (error51) {
+    resolve6({ status: null, signal: null, error: error51 });
+    return;
+  }
+  const sinks = {
+    stdout: { sink: makeLineSink("stdout", onLine, HOST_PART2_MAX_LINE_BYTES), stream: child.stdout, ended: false },
+    stderr: { sink: makeLineSink("stderr", onLine, HOST_PART2_MAX_LINE_BYTES), stream: child.stderr, ended: false }
+  };
+  child.stdout?.on("data", sinks.stdout.sink.onData);
+  child.stderr?.on("data", sinks.stderr.sink.onData);
+  let exit = null;
+  let settled = false;
+  let graceTimer = null;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (graceTimer !== null) clearTimeout(graceTimer);
+    for (const s of [sinks.stdout, sinks.stderr]) {
+      s.sink.finalize(s.ended);
+      s.stream?.destroy();
+    }
+    resolve6(exit ?? { status: null, signal: null });
+  };
+  let ends = 0;
+  const wireEnd = (s) => {
+    if (s.stream == null) return;
+    ends += 1;
+    s.stream.on("end", () => {
+      s.ended = true;
+      ends -= 1;
+      if (ends === 0 && exit !== null) finish();
+    });
+  };
+  wireEnd(sinks.stdout);
+  wireEnd(sinks.stderr);
+  child.on("error", (error51) => {
+    exit = { status: null, signal: null, error: error51 };
+    finish();
+  });
+  child.on("exit", (status, signal) => {
+    exit ??= { status, signal };
+    if (ends === 0) finish();
+    else {
+      graceTimer = setTimeout(finish, HOST_PART2_DRAIN_GRACE_MS);
+      graceTimer.unref?.();
+    }
+  });
+});
+function corepackCacheRoot(procEnv) {
+  const home = procEnv["COREPACK_HOME"];
+  if (home !== void 0 && home.length > 0) return home;
+  const base = process.platform === "win32" ? procEnv["LOCALAPPDATA"] ?? (0, import_node_path2.join)((0, import_node_os.homedir)(), "AppData", "Local") : procEnv["XDG_CACHE_HOME"] ?? (0, import_node_path2.join)((0, import_node_os.homedir)(), ".cache");
+  return (0, import_node_path2.join)(base, "node", "corepack");
+}
+function readHostPnpmBinRel(verDir) {
+  for (const file2 of [".corepack", "package.json"]) {
+    try {
+      const meta3 = JSON.parse((0, import_node_fs.readFileSync)((0, import_node_path2.join)(verDir, file2), "utf8"));
+      const bin = meta3.bin;
+      if (bin !== void 0 && !Array.isArray(bin)) {
+        const rel = bin["pnpm"];
+        if (typeof rel === "string" && rel.length > 0) return rel;
+      }
+    } catch {
+    }
+  }
+  return null;
+}
+function isCorepackShim(binPath) {
+  if (binPath === void 0 || binPath.length === 0) return false;
+  try {
+    const real = (0, import_node_fs.realpathSync)(binPath);
+    const content = (0, import_node_fs.readFileSync)(real, "utf8");
+    return content.includes("corepack.cjs");
+  } catch {
+    return true;
+  }
+}
+function resolveBareOnPath(pm, pathVar) {
+  if (pathVar === void 0 || pathVar === "") return void 0;
+  const names = process.platform === "win32" ? [`${pm}.cmd`, `${pm}.exe`, pm] : [pm];
+  for (const dir of pathVar.split(import_node_path2.delimiter)) {
+    if (dir === "") continue;
+    for (const name of names) {
+      const candidate = (0, import_node_path2.join)(dir, name);
+      if (!(0, import_node_path2.isAbsolute)(candidate)) continue;
+      let st;
+      try {
+        st = (0, import_node_fs.statSync)(candidate);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      try {
+        (0, import_node_fs.accessSync)(candidate, import_node_fs.constants.X_OK);
+      } catch {
+        continue;
+      }
+      return candidate;
+    }
+  }
+  return void 0;
+}
+function cacheHasAnyVersion(cacheRoot, pm) {
+  try {
+    return (0, import_node_fs.readdirSync)((0, import_node_path2.join)(cacheRoot, "v1", pm), { withFileTypes: true }).some(
+      (d) => d.isDirectory()
+    );
+  } catch {
+    return false;
+  }
+}
+function readPackageManagerPin(repoDir) {
+  try {
+    const pkg = JSON.parse((0, import_node_fs.readFileSync)((0, import_node_path2.join)(repoDir, "package.json"), "utf8"));
+    const pm = pkg.packageManager;
+    if (typeof pm !== "string" || pm.length === 0) return void 0;
+    const at = pm.lastIndexOf("@");
+    if (at <= 0) return void 0;
+    const name = pm.slice(0, at);
+    let version2 = pm.slice(at + 1);
+    const plus = version2.indexOf("+");
+    if (plus !== -1) version2 = version2.slice(0, plus);
+    if (version2.length === 0) return void 0;
+    return { name, version: version2 };
+  } catch {
+    return void 0;
+  }
+}
+function resolveHostManagerLaunch(pm, repoDir, procEnv = process.env, execPath = process.execPath) {
+  if (pm === "npm") {
+    const toolchainRoot = (0, import_node_path2.dirname)((0, import_node_path2.dirname)(execPath));
+    const entry2 = (0, import_node_path2.join)(toolchainRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+    if (!(0, import_node_fs.existsSync)(entry2)) {
+      throw new Error(
+        `script-jail: host lifecycle install refuses to bare-launch npm (value-blind COREPACK_ROOT oracle): node-bundled npm-cli.js not found at ${entry2}. A bare \`npm\` may be a \`corepack enable npm\` shim that sets COREPACK_ROOT; the clean-VM audit also fails on a node without bundled npm, so this fails closed to match.`
+      );
+    }
+    return { node: execPath, entry: entry2 };
+  }
+  let corepackManaged;
+  try {
+    const bareBin = resolveBareOnPath(pm, procEnv["PATH"]);
+    corepackManaged = bareBin !== void 0 ? isCorepackShim(bareBin) : cacheHasAnyVersion(corepackCacheRoot(procEnv), pm);
+  } catch {
+    corepackManaged = true;
+  }
+  if (!corepackManaged) {
+    return void 0;
+  }
+  const cacheRoot = corepackCacheRoot(procEnv);
+  const pmDir = (0, import_node_path2.join)(cacheRoot, "v1", pm);
+  const pin = readPackageManagerPin(repoDir);
+  const failClosed = (detail) => {
+    throw new Error(
+      `script-jail: host lifecycle install refuses to bare-launch the corepack-managed ${pm} (value-blind COREPACK_ROOT oracle): ${detail}. Expected the corepack-cached ${pm}${pin && pin.name === pm ? ` ${pin.version}` : ""} under ${pmDir}. Run the action's part-1 install (which warms the corepack cache) first, or pin "packageManager" in package.json so the version can be resolved.`
+    );
+  };
+  let verDir;
+  if (pin !== void 0 && pin.name === pm) {
+    const pinnedDir = (0, import_node_path2.join)(pmDir, pin.version);
+    if (!(0, import_node_fs.existsSync)(pinnedDir)) {
+      failClosed(`the pinned version dir ${pinnedDir} is absent`);
+    }
+    verDir = pinnedDir;
+  } else {
+    let versionDirs;
+    try {
+      versionDirs = (0, import_node_fs.readdirSync)(pmDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch (err) {
+      return failClosed(`cannot read the corepack cache dir ${pmDir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (versionDirs.length !== 1) {
+      return failClosed(
+        `expected exactly one ${pm} version dir, found ${versionDirs.length}${versionDirs.length > 0 ? ` (${versionDirs.join(", ")})` : ""}; with no "packageManager" pin the version is ambiguous on a multi-version corepack cache \u2014 pin "packageManager" in package.json to disambiguate`
+      );
+    }
+    verDir = (0, import_node_path2.join)(pmDir, versionDirs[0]);
+  }
+  if (pm === "yarn") {
+    const entry2 = (0, import_node_path2.join)(verDir, "yarn.js");
+    if (!(0, import_node_fs.existsSync)(entry2)) failClosed(`yarn.js not found at ${entry2}`);
+    return { node: execPath, entry: entry2 };
+  }
+  const rel = readHostPnpmBinRel(verDir);
+  if (rel === null) {
+    failClosed(`could not read the pnpm entry path from ${(0, import_node_path2.join)(verDir, ".corepack")} or package.json bin`);
+  }
+  const entry = (0, import_node_path2.resolve)(verDir, rel);
+  if (!(0, import_node_fs.existsSync)(entry)) failClosed(`pnpm entry not found at ${entry}`);
+  return { node: execPath, entry };
+}
+async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn, resolveLaunch = resolveHostManagerLaunch, hostTmpdir) {
+  const cmd = INSTALL_CMD[pm];
+  const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : [];
+  const { kept } = sanitizeInstallArgs(args);
+  const userArgs = pm === "npm" ? kept : [];
+  const finalArgs = [...cmd.args, ...userArgs, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  const safeFinalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
+  const userArgSuffix = userArgs.length > 0 ? ` (+${userArgs.length} user install arg${userArgs.length === 1 ? "" : "s"}, not shown)` : "";
+  const childEnv = hostInstallEnv(pm, repoDir, "scripts", hostTmpdir);
+  const launch = resolveLaunch(pm, repoDir, childEnv);
+  const spawnCmd = launch ? launch.node : cmd.cmd;
+  const spawnArgs = launch ? [launch.entry, ...finalArgs] : finalArgs;
+  io.stdout.write(
+    `[script-jail] host lifecycle scripts (audit matched): ${cmd.cmd} ${safeFinalArgs.join(" ")}${userArgSuffix}
+`
+  );
+  if (launch !== void 0) {
+    io.stdout.write("[script-jail] (launched directly via node to bypass corepack)\n");
+  }
+  const sensitive = protectedEnvNames.map((name) => process.env[name]).filter((v) => typeof v === "string");
+  const userArgValues = deriveSensitiveValues(userArgs);
+  const fragMatcher = buildFragmentMatcher(sensitive);
+  if (fragMatcher.capped) {
+    throw new Error(
+      "script-jail: protected.env declares more distinct secret material than the host lifecycle-log redactor can safely index (> 2 MiB of values). Refusing to stream host lifecycle output \u2014 redacting per line against an incomplete secret index would either leak a torn secret fragment or blank every line. Reduce protected.env."
+    );
+  }
+  const onLine = (stream, line) => {
+    let safe = maskExactValues(line, sensitive, "REDACTED:ENV", 1);
+    safe = maskValueFragmentsWith(safe, fragMatcher, "REDACTED:ENV");
+    safe = maskExactValues(safe, userArgValues, "REDACTED:USER-ARG");
+    safe = redactCredentialShapes(safe);
+    (stream === "stdout" ? io.stdout : io.stderr).write(`${safe}
+`);
+  };
+  const r = await spawn3(spawnCmd, spawnArgs, repoDir, childEnv, onLine);
+  const safeErrArgs = `${safeFinalArgs.join(" ")}${userArgSuffix}`;
+  if (r.error !== void 0) {
+    throw new Error(`script-jail: host lifecycle-script run could not spawn "${cmd.cmd}": ${r.error.message}`);
+  }
+  if (r.signal != null) {
+    throw new Error(`script-jail: host lifecycle-script run (\`${cmd.cmd} ${safeErrArgs}\`) was killed by ${r.signal}`);
+  }
+  if (r.status !== 0) {
+    throw new Error(
+      `script-jail: host lifecycle-script run (\`${cmd.cmd} ${safeErrArgs}\`) exited with code ${r.status ?? "null"}`
+    );
+  }
+  io.stdout.write(`[script-jail] host lifecycle-script run complete
+`);
+}
+function runOrThrow(cmd, args, cwd, env, spawn3, label, io, displayArgs, onOutput) {
+  const r = spawn3(cmd, args, cwd, env);
+  if (onOutput !== void 0 && (r.stdout !== void 0 || r.stderr !== void 0)) {
+    onOutput(r.stdout ?? "", r.stderr ?? "");
+  }
+  if (r.error !== void 0) {
+    throw new Error(`script-jail: host ${label} could not spawn "${cmd}": ${r.error.message}`);
+  }
+  if (r.signal != null) {
+    throw new Error(`script-jail: host ${label} (\`${cmd} ${displayArgs.join(" ")}\`) was killed by ${r.signal}`);
+  }
+  if (r.status !== 0) {
+    throw new Error(
+      `script-jail: host ${label} (\`${cmd} ${displayArgs.join(" ")}\`) exited with code ${r.status ?? "null"}`
+    );
+  }
+  io.stdout.write(`[script-jail] host ${label} complete
+`);
+}
+
+// src/action/install-preflight.ts
+var import_node_fs3 = require("node:fs");
+var import_node_path4 = require("node:path");
+var import_yaml = __toESM(require_dist(), 1);
+
+// src/shared/root-manifest.ts
+var import_node_fs2 = require("node:fs");
+var import_node_path3 = require("node:path");
+var ALT_ROOT_MANIFESTS = ["package.yaml", "package.json5"];
+function unsupportedAltRootManifest(repoDir) {
+  if ((0, import_node_fs2.existsSync)((0, import_node_path3.join)(repoDir, "package.json"))) return null;
+  for (const name of ALT_ROOT_MANIFESTS) {
+    if ((0, import_node_fs2.existsSync)((0, import_node_path3.join)(repoDir, name))) return name;
+  }
+  return null;
+}
+
+// src/action/install-preflight.ts
+function readProtectedEnvNames(configPath) {
+  try {
+    const raw = (0, import_yaml.parse)((0, import_node_fs3.readFileSync)(configPath, "utf8"));
+    const env = raw?.protected?.env;
+    if (!Array.isArray(env)) return [];
+    return env.filter((e) => typeof e === "string" && e.length > 0);
+  } catch {
+    return [];
+  }
+}
+function detectPreTrustConfigExec(repoDir, manager, workspaceRoot) {
+  if (manager === "pnpm") return detectPnpmfile(repoDir, workspaceRoot);
+  if (manager === "yarn") return detectYarnStartupExec(repoDir, workspaceRoot);
+  return null;
+}
+function detectCheckoutRelativeHome(homeDir, repoDir, workspaceRoot) {
+  if (homeDir === void 0) return null;
+  if (!(0, import_node_path4.isAbsolute)(homeDir)) {
+    return `HOME (\`${homeDir}\`) is not an ABSOLUTE path. Each package manager resolves its home config (\`~/.npmrc\`, \`~/.yarnrc.yml\`) against ITS OWN working directory \u2014 the host install runs the PM with \`cwd=repoDir\` \u2014 so a relative HOME resolves INTO the checkout (e.g. \`../.home\` -> \`$GITHUB_WORKSPACE/.home/.npmrc\` for a subdir repo) and an EMPTY HOME makes npm read a literal \`repoDir/~/.npmrc\`; either way a PR-committed home config executes on the runner BEFORE the audit decides anything, unseen by the sandbox. Set HOME to an ABSOLUTE path outside the checkout for the script-jail step, or audit without \`install\`.`;
+  }
+  const home = realpathOrResolve(homeDir);
+  const roots = [realpathOrResolve(repoDir)];
+  if (workspaceRoot !== void 0 && workspaceRoot !== "") roots.push(realpathOrResolve(workspaceRoot));
+  for (const root of roots) {
+    if (isPathUnder(home, root)) {
+      return `HOME (\`${homeDir}\`) resolves under the checkout (\`${root}\`). Package managers load config from \`$HOME\` at startup (\`$HOME/.yarnrc.yml\` plugins / \`$HOME/.npmrc\` script-shell), so a PR-committed home config would execute on the runner BEFORE the audit decides anything \u2014 unseen by the sandbox, which uses a different HOME. Set HOME to a path OUTSIDE the checkout for the script-jail step, or audit without \`install\`.`;
+    }
+  }
+  return null;
+}
+var RESERVED_SIDECAR_DIR = "etc/script-jail";
+function detectReservedScriptJailPaths(repoDir) {
+  const segments = RESERVED_SIDECAR_DIR.split("/");
+  let cur = repoDir;
+  for (let i = 0; i < segments.length; i++) {
+    cur = (0, import_node_path4.join)(cur, segments[i]);
+    let seg;
+    try {
+      seg = (0, import_node_fs3.lstatSync)(cur);
+    } catch {
+      return null;
+    }
+    if (seg.isSymbolicLink() || !seg.isDirectory()) {
+      const rel = segments.slice(0, i + 1).join("/");
+      const kind = seg.isSymbolicLink() ? "symlink" : "file";
+      return `the checkout commits \`${rel}\` as a ${kind}, but script-jail OWNS the \`${RESERVED_SIDECAR_DIR}/\` directory and overlays its sidecars there in the sandboxed copy of the repo. The host install re-runs lifecycle scripts against the REAL checkout, where this ${kind} persists and can resolve to content the audit never saw \u2014 a host-vs-sandbox divergence the value-blind lock cannot capture. Remove \`${rel}\` from the checkout, or audit without \`install\`.`;
+    }
+  }
+  const reservedDir = cur;
+  let entries = [];
+  try {
+    entries = (0, import_node_fs3.readdirSync)(reservedDir, { recursive: true });
+  } catch {
+    entries = [];
+  }
+  if (entries.length === 0) {
+    return `the checkout commits \`${RESERVED_SIDECAR_DIR}\` as an empty directory (a gitlink/submodule, git index mode 160000) \u2014 but script-jail OWNS that directory and creates it in the sandboxed copy of the repo. The host install re-runs lifecycle scripts against the REAL checkout, where this directory persists while the audit (after the in-VM sidecar cleanup) does not \u2014 a host-vs-sandbox presence divergence the value-blind lock cannot capture. Remove \`${RESERVED_SIDECAR_DIR}\` from the checkout, or audit without \`install\`.`;
+  }
+  const committed = entries.filter((rel) => !entries.some((other) => other !== rel && other.startsWith(`${rel}/`))).map((rel) => `${RESERVED_SIDECAR_DIR}/${rel}`).sort();
+  const shown = committed.slice(0, 5).map((p) => `\`${p}\``).join(", ");
+  const more = committed.length > 5 ? ` (and ${committed.length - 5} more)` : "";
+  return `the checkout commits ${committed.length} entr${committed.length === 1 ? "y" : "ies"} under \`${RESERVED_SIDECAR_DIR}/\` (${shown}${more}) \u2014 a directory script-jail owns and overwrites in the sandboxed copy of the repo (config.yml / pm-flags.json / pnpm-arch.json). The host install re-runs lifecycle scripts against the REAL checkout, where these entries keep their committed content/type while the audit saw script-jail's \u2014 a host-vs-sandbox divergence the value-blind lock cannot capture (a committed gitlink/submodule directory hits this too). Remove \`${RESERVED_SIDECAR_DIR}/\` from the checkout, or audit without \`install\`.`;
+}
+function detectSubdirInstallAncestorEscape(repoDir, workspaceRoot) {
+  if (workspaceRoot === void 0 || workspaceRoot === "") return null;
+  if (scanDirs(repoDir, workspaceRoot).length <= 1) return null;
+  return `the install directory (\`${repoDir}\`) is a SUBDIRECTORY of the checkout root (\`${workspaceRoot}\`). The sandbox audits only the install directory, but the host install re-runs lifecycle scripts there with the REAL checkout as its parent \u2014 so a script that reads or \`require()\`s a committed file ABOVE the install dir (e.g. \`../<file>\`) runs against PR content the audit never staged, a host-vs-sandbox divergence the value-blind lock cannot capture. Run the audit from the checkout root (set SCRIPT_JAIL_REPO_DIR to the checkout root, or unset it), or audit without \`install\`.`;
+}
+function detectInstallWorkDirDivergence(configPath) {
+  if (!(0, import_node_fs3.existsSync)(configPath)) return null;
+  let parsed;
+  try {
+    parsed = (0, import_yaml.parse)((0, import_node_fs3.readFileSync)(configPath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const wd = parsed["work_dir"];
+  if (wd === void 0) return null;
+  if (typeof wd !== "string" || wd === "/work") return null;
+  return `config sets work_dir to '${wd}', but \`install: true\` runs the host install/rebuild at the repository root (mounted as /work in the sandbox). The guest would audit '${wd}' while the runner installs and runs lifecycle scripts at the repo root, so a clean lock for that subdir would authorize unaudited repo-root scripts. Remove work_dir (or set it to '/work') when using \`install\`, or run script-jail at the subproject root via SCRIPT_JAIL_REPO_DIR.`;
+}
+function scanDirs(repoDir, workspaceRoot) {
+  const repo = realpathOrResolve(repoDir);
+  if (workspaceRoot === void 0 || workspaceRoot === "") return [repo];
+  const root = realpathOrResolve(workspaceRoot);
+  const rel = (0, import_node_path4.relative)(root, repo);
+  const outside = rel === ".." || rel.startsWith(".." + import_node_path4.sep) || (0, import_node_path4.isAbsolute)(rel);
+  if (outside) return [repo];
+  const dirs = [];
+  let cur = repo;
+  for (; ; ) {
+    dirs.push(cur);
+    if (cur === root) break;
+    const parent = (0, import_node_path4.dirname)(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return dirs;
+}
+function realpathOrResolve(p) {
+  const abs = (0, import_node_path4.resolve)(p);
+  try {
+    return (0, import_node_fs3.realpathSync)(abs);
+  } catch {
+    return abs;
+  }
+}
+function isPathUnder(child, root) {
+  if (child === root) return true;
+  const rel = (0, import_node_path4.relative)(root, child);
+  if (rel === "") return true;
+  return !(rel === ".." || rel.startsWith(".." + import_node_path4.sep) || (0, import_node_path4.isAbsolute)(rel));
+}
+var PNPM_GUIDANCE = " would run unaudited on the runner BEFORE the audit decides anything. `install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, or audit without `install` (the sandbox still records the pnpmfile there).";
+function detectPnpmfile(repoDir, workspaceRoot) {
+  const atRepo = detectPnpmConfigInRepoDir(repoDir);
+  if (atRepo !== null) return atRepo;
+  const ancestors = scanDirs(repoDir, workspaceRoot);
+  for (let i = 1; i < ancestors.length; i++) {
+    const reason = detectPnpmConfigDepsInDir(ancestors[i]);
+    if (reason !== null) return reason;
+  }
+  return null;
+}
+function detectPnpmConfigInRepoDir(repoDir) {
+  if ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, ".pnpmfile.mjs"))) {
+    return "a repo `.pnpmfile.mjs`" + PNPM_GUIDANCE;
+  }
+  if ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, ".pnpmfile.cjs"))) {
+    return "a repo `.pnpmfile.cjs`" + PNPM_GUIDANCE;
+  }
+  const npmrc = tryReadFile((0, import_node_path4.join)(repoDir, ".npmrc"));
+  if (npmrc !== null && npmrcHasPnpmfileKey(npmrc)) {
+    return "a repo `.npmrc` `pnpmfile`/`global-pnpmfile` override" + PNPM_GUIDANCE;
+  }
+  const ws = tryReadFile((0, import_node_path4.join)(repoDir, "pnpm-workspace.yaml"));
+  if (ws !== null) {
+    let parsed;
+    try {
+      parsed = (0, import_yaml.parse)(ws);
+    } catch {
+      return "an unparseable `pnpm-workspace.yaml` (cannot prove no `pnpmfile`)" + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && ("pnpmfile" in parsed || "configDependencies" in parsed)) {
+      return "a repo `pnpm-workspace.yaml` `pnpmfile`/`configDependencies`" + PNPM_GUIDANCE;
+    }
+  }
+  const pkgJson = tryReadFile((0, import_node_path4.join)(repoDir, "package.json"));
+  if (pkgJson !== null) {
+    let parsed;
+    try {
+      parsed = JSON.parse(pkgJson);
+    } catch {
+      return "an unparseable root `package.json` (cannot prove no `pnpm.configDependencies`)" + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && isRecord(parsed["pnpm"])) {
+      const pnpmField = parsed["pnpm"];
+      if ("configDependencies" in pnpmField || "pnpmfile" in pnpmField) {
+        return "a repo `package.json` `pnpm.configDependencies`/`pnpm.pnpmfile`" + PNPM_GUIDANCE;
+      }
+    }
+  }
+  const altManifest = unsupportedAltRootManifest(repoDir);
+  if (altManifest !== null) {
+    return `a repo \`${altManifest}\` root manifest with no \`package.json\` (pnpm reads its \`pnpm.configDependencies\` and lifecycle scripts, which script-jail cannot vet pre-trust); \`install: true\` requires a \`package.json\`. Audit without \`install\`, or convert the root manifest to \`package.json\`.`;
+  }
+  return null;
+}
+function detectPnpmConfigDepsInDir(dir) {
+  const ws = tryReadFile((0, import_node_path4.join)(dir, "pnpm-workspace.yaml"));
+  if (ws !== null) {
+    let parsed;
+    try {
+      parsed = (0, import_yaml.parse)(ws);
+    } catch {
+      return `an ancestor (\`${dir}\`) unparseable \`pnpm-workspace.yaml\` (cannot prove no \`configDependencies\`)` + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && "configDependencies" in parsed) {
+      return `an ancestor (\`${dir}\`) \`pnpm-workspace.yaml\` \`configDependencies\`` + PNPM_GUIDANCE;
+    }
+  }
+  const pkgJson = tryReadFile((0, import_node_path4.join)(dir, "package.json"));
+  if (pkgJson !== null) {
+    let parsed;
+    try {
+      parsed = JSON.parse(pkgJson);
+    } catch {
+      return `an ancestor (\`${dir}\`) unparseable \`package.json\` (cannot prove no \`pnpm.configDependencies\`)` + PNPM_GUIDANCE;
+    }
+    if (isRecord(parsed) && isRecord(parsed["pnpm"]) && "configDependencies" in parsed["pnpm"]) {
+      return `an ancestor (\`${dir}\`) \`package.json\` \`pnpm.configDependencies\`` + PNPM_GUIDANCE;
+    }
+  }
+  const altManifest = unsupportedAltRootManifest(dir);
+  if (altManifest !== null) {
+    return `an ancestor (\`${dir}\`) \`${altManifest}\` root manifest with no \`package.json\` (pnpm reads its \`pnpm.configDependencies\` from an ancestor workspace root and fetches it pre-trust, which script-jail cannot vet); \`install: true\` requires a \`package.json\` at every workspace root above the install dir. Audit without \`install\`, or convert the ancestor root manifest to \`package.json\`.`;
+  }
+  return null;
+}
+var YARN_GUIDANCE = " executes repo-controlled code on the runner at `yarn install` startup, BEFORE the audit decides anything. `install: true` cannot run that pre-trust. Remove it, or audit without `install` (the sandbox still records it there).";
+function detectYarnStartupExec(repoDir, workspaceRoot) {
+  const repo = realpathOrResolve(repoDir);
+  const chain = scanDirs(repoDir, workspaceRoot);
+  const hasYarnConfig = chain.some((d) => (0, import_node_fs3.existsSync)((0, import_node_path4.join)(d, "yarn.config.cjs")));
+  for (const dir of chain) {
+    const reason = detectYarnStartupExecInDir(dir, dir === repo, hasYarnConfig);
+    if (reason !== null) return reason;
+  }
+  return null;
+}
+function detectYarnStartupExecInDir(dir, atRepoDir, hasYarnConfig) {
+  const content = tryReadFile((0, import_node_path4.join)(dir, ".yarnrc.yml"));
+  if (content === null) return null;
+  const where = atRepoDir ? "a repo" : `an ancestor (\`${dir}\`)`;
+  let parsed;
+  try {
+    parsed = (0, import_yaml.parse)(content);
+  } catch {
+    return `${where} present-but-unparseable \`.yarnrc.yml\` (cannot prove no \`yarnPath\`/\`plugins\`)` + YARN_GUIDANCE;
+  }
+  if (!isRecord(parsed)) return null;
+  if (typeof parsed["yarnPath"] === "string" && parsed["yarnPath"].length > 0) {
+    return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+  }
+  if (Array.isArray(parsed["plugins"]) && parsed["plugins"].length > 0) {
+    return `${where} \`.yarnrc.yml\` \`plugins\` entry` + YARN_GUIDANCE;
+  }
+  if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && hasYarnConfig) {
+    return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
+  }
+  if (!atRepoDir && "enableScripts" in parsed && !isNotDefinitelyFalse(parsed["enableScripts"])) {
+    return `${where} \`.yarnrc.yml\` \`enableScripts: false\` (host would skip dependency build scripts the sandbox runs)` + YARN_GUIDANCE;
+  }
+  return null;
+}
+function tryReadFile(path) {
+  try {
+    return (0, import_node_fs3.readFileSync)(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+function isRecord(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function isNotDefinitelyFalse(v) {
+  return !(v === false || v === "false" || v === 0 || v === "0" || v === null || v === "" || v === void 0);
+}
+function npmrcHasPnpmfileKey(content) {
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.replace(/[;#].*$/, "").trim();
+    if (line === "") continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim().toLowerCase();
+    if (key === "pnpmfile" || key === "global-pnpmfile") return true;
+  }
+  return false;
+}
+
 // src/shared/detect-pm.ts
 var import_node_crypto = require("node:crypto");
-var import_node_fs = require("node:fs");
-var import_node_path2 = require("node:path");
+var import_node_fs4 = require("node:fs");
+var import_node_path5 = require("node:path");
 
 // src/shared/log.ts
 function warn(msg, write = (s) => {
@@ -26542,16 +27903,16 @@ var LOCKFILE_PRIORITY = [
 var BUN_LOCKFILES = ["bun.lock", "bun.lockb"];
 function detectPm(input) {
   const fs3 = input.fs ?? {
-    existsSync: import_node_fs.existsSync,
-    readFileSync: (p) => (0, import_node_fs.readFileSync)(p)
+    existsSync: import_node_fs4.existsSync,
+    readFileSync: (p) => (0, import_node_fs4.readFileSync)(p)
   };
   const warn2 = input.warn ?? warn;
   const found = LOCKFILE_PRIORITY.filter(
-    (entry) => fs3.existsSync((0, import_node_path2.join)(input.repoDir, entry.name))
+    (entry) => fs3.existsSync((0, import_node_path5.join)(input.repoDir, entry.name))
   );
   if (found.length === 0) {
     const hasBun = BUN_LOCKFILES.some(
-      (name) => fs3.existsSync((0, import_node_path2.join)(input.repoDir, name))
+      (name) => fs3.existsSync((0, import_node_path5.join)(input.repoDir, name))
     );
     if (hasBun) throw new BunUnsupportedError();
     throw new Error(
@@ -26566,7 +27927,7 @@ function detectPm(input) {
       `[detect-pm] multiple lockfiles found; using ${chosen.name} (ignoring: ${otherNames})`
     );
   }
-  const lockfilePath = (0, import_node_path2.join)(input.repoDir, chosen.name);
+  const lockfilePath = (0, import_node_path5.join)(input.repoDir, chosen.name);
   const buf = fs3.readFileSync(lockfilePath);
   const lockfileSha256 = (0, import_node_crypto.createHash)("sha256").update(buf).digest("hex");
   return {
@@ -26576,8 +27937,11 @@ function detectPm(input) {
   };
 }
 
+// src/rootfs/vite-plus.ts
+var NODE_VERSION = "24.15.0";
+
 // src/action/runner-image.ts
-var import_node_fs2 = require("node:fs");
+var import_node_fs5 = require("node:fs");
 var UnsupportedRunnerImageError = class extends Error {
   constructor(message) {
     super(message);
@@ -26596,8 +27960,8 @@ var VERSION_ID_MAP = {
 function detectRunnerImage(input) {
   const imageOsEnv = input !== void 0 && "imageOsEnv" in input ? input.imageOsEnv : process.env["ImageOS"];
   const fs3 = input?.fs ?? {
-    existsSync: import_node_fs2.existsSync,
-    readFileSync: (p, enc) => (0, import_node_fs2.readFileSync)(p, enc)
+    existsSync: import_node_fs5.existsSync,
+    readFileSync: (p, enc) => (0, import_node_fs5.readFileSync)(p, enc)
   };
   if (imageOsEnv !== void 0 && imageOsEnv !== "") {
     const mapped = IMAGE_OS_MAP[imageOsEnv];
@@ -26646,25 +28010,25 @@ function parseOsRelease(raw) {
 }
 
 // src/action/firecracker/download.ts
-var import_node_fs4 = require("node:fs");
+var import_node_fs7 = require("node:fs");
 var import_promises2 = require("node:fs/promises");
-var import_node_path3 = require("node:path");
-var import_node_os = require("node:os");
+var import_node_path6 = require("node:path");
+var import_node_os2 = require("node:os");
 var import_node_crypto3 = require("node:crypto");
 var import_node_zlib = require("node:zlib");
 
 // src/shared/http-download.ts
 var import_node_crypto2 = require("node:crypto");
-var import_node_fs3 = require("node:fs");
+var import_node_fs6 = require("node:fs");
 var import_promises = require("node:fs/promises");
 var import_node_https = require("node:https");
 var import_node_http = require("node:http");
 async function sha256File(filePath) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve6, reject) => {
     const hash2 = (0, import_node_crypto2.createHash)("sha256");
-    const stream = (0, import_node_fs3.createReadStream)(filePath);
+    const stream = (0, import_node_fs6.createReadStream)(filePath);
     stream.on("data", (chunk) => hash2.update(chunk));
-    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("end", () => resolve6(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
@@ -26692,20 +28056,20 @@ var NodeHttpClient = class {
 async function downloadToFile(url2, destPath, redirects) {
   if (redirects > 5) throw new Error(`Too many redirects fetching ${url2}`);
   const getter = url2.startsWith("https://") ? import_node_https.get : import_node_http.get;
-  await new Promise((resolve4, reject) => {
+  await new Promise((resolve6, reject) => {
     getter(url2, (res) => {
       if (res.statusCode !== void 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve4).catch(reject);
+        downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve6).catch(reject);
         return;
       }
       if (res.statusCode !== 200) {
         reject(new Error(`HTTP ${res.statusCode ?? "?"} fetching ${url2}`));
         return;
       }
-      const out = (0, import_node_fs3.createWriteStream)(destPath);
+      const out = (0, import_node_fs6.createWriteStream)(destPath);
       res.pipe(out);
-      out.on("finish", () => resolve4());
+      out.on("finish", () => resolve6());
       out.on("error", reject);
       res.on("error", reject);
     }).on("error", reject);
@@ -26735,16 +28099,16 @@ async function ensureBinaries(input) {
       `script-jail: unknown Firecracker version "${firecrackerVersion}" for ${arch2}. Add it (with a pinned SHA-256) to KNOWN_TARBALL_SHA256 in src/action/firecracker/download.ts.`
     );
   }
-  (0, import_node_fs4.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs7.mkdirSync)(imagesDir, { recursive: true });
   const tarUrl = `https://github.com/firecracker-microvm/firecracker/releases/download/v${firecrackerVersion}/firecracker-v${firecrackerVersion}-${releaseArch}.tgz`;
-  const tarPath = (0, import_node_path3.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
-  const fcBinPath = (0, import_node_path3.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
-  const vmlinuxPath = (0, import_node_path3.join)(imagesDir, "vmlinux");
+  const tarPath = (0, import_node_path6.join)(imagesDir, `firecracker-v${firecrackerVersion}-${releaseArch}.tgz`);
+  const fcBinPath = (0, import_node_path6.join)(imagesDir, `firecracker-v${firecrackerVersion}`);
+  const vmlinuxPath = (0, import_node_path6.join)(imagesDir, "vmlinux");
   const [tarFresh] = await Promise.all([
     ensureFile(http, tarUrl, tarPath, expectedTarSha),
     ensureFile(http, kernelUrl, vmlinuxPath, kernelSha256)
   ]);
-  if ((0, import_node_fs4.existsSync)(fcBinPath)) {
+  if ((0, import_node_fs7.existsSync)(fcBinPath)) {
     await (0, import_promises2.unlink)(fcBinPath);
   }
   void tarFresh;
@@ -26752,7 +28116,7 @@ async function ensureBinaries(input) {
   return { firecrackerPath: fcBinPath, vmlinuxPath };
 }
 async function ensureFile(http, url2, destPath, expectedSha256) {
-  if ((0, import_node_fs4.existsSync)(destPath)) {
+  if ((0, import_node_fs7.existsSync)(destPath)) {
     const actual = await sha256File(destPath);
     if (actual === expectedSha256) return false;
     console.warn(
@@ -26763,14 +28127,14 @@ async function ensureFile(http, url2, destPath, expectedSha256) {
   return true;
 }
 async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch) {
-  const tmpOut = (0, import_node_path3.join)(
-    (0, import_node_os.tmpdir)(),
+  const tmpOut = (0, import_node_path6.join)(
+    (0, import_node_os2.tmpdir)(),
     `script-jail-fc-${(0, import_node_crypto3.randomBytes)(4).toString("hex")}`
   );
   const targetEntry = `firecracker-v${version2}-${releaseArch}`;
-  await new Promise((resolve4, reject) => {
+  await new Promise((resolve6, reject) => {
     const gunzip = (0, import_node_zlib.createGunzip)();
-    const input = (0, import_node_fs4.createReadStream)(tarPath);
+    const input = (0, import_node_fs7.createReadStream)(tarPath);
     const BLOCK = 512;
     let buf = Buffer.alloc(0);
     let state = "header";
@@ -26783,7 +28147,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
       outStream?.close();
       outStream = null;
       if (err) reject(err);
-      else resolve4();
+      else resolve6();
     };
     gunzip.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -26797,7 +28161,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
         ));
         return;
       }
-      resolve4();
+      resolve6();
     });
     gunzip.on("error", cleanup);
     input.on("error", cleanup);
@@ -26817,7 +28181,7 @@ async function extractFirecrackerBinary(tarPath, destPath, version2, releaseArch
           if (name === targetEntry && declaredSize > 0) {
             capturing = true;
             foundEntry = true;
-            outStream = (0, import_node_fs4.createWriteStream)(tmpOut);
+            outStream = (0, import_node_fs7.createWriteStream)(tmpOut);
           } else {
             capturing = false;
           }
@@ -26852,12 +28216,12 @@ function firecrackerReleaseArch(arch2) {
 }
 
 // src/action/pre-fetch-artifacts.ts
-var import_node_fs6 = require("node:fs");
-var import_node_path4 = require("node:path");
+var import_node_fs9 = require("node:fs");
+var import_node_path7 = require("node:path");
 
 // src/rootfs/repro-hash.ts
 var import_node_crypto4 = require("node:crypto");
-var import_node_fs5 = require("node:fs");
+var import_node_fs8 = require("node:fs");
 var EXT4_BLOCK_SIZE = 4096;
 var EXT4_BLOCKS_PER_GROUP = 8 * EXT4_BLOCK_SIZE;
 var EXT4_VOLATILE_SUPERBLOCK_FIELDS = [
@@ -26910,9 +28274,9 @@ function applyMaskToBuffer(buf, bufStart, ranges) {
   }
 }
 function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve6, reject) => {
     const hash2 = (0, import_node_crypto4.createHash)("sha256");
-    const stream = (0, import_node_fs5.createReadStream)(
+    const stream = (0, import_node_fs8.createReadStream)(
       filePath,
       chunkSize === void 0 ? void 0 : { highWaterMark: chunkSize }
     );
@@ -26922,12 +28286,12 @@ function hashFileWithMaskedRanges(filePath, ranges, chunkSize) {
       offset += chunk.length;
       hash2.update(chunk);
     });
-    stream.on("end", () => resolve4(hash2.digest("hex")));
+    stream.on("end", () => resolve6(hash2.digest("hex")));
     stream.on("error", reject);
   });
 }
 async function canonicalRootfsHash(filePath, chunkSize) {
-  const size = (0, import_node_fs5.statSync)(filePath).size;
+  const size = (0, import_node_fs8.statSync)(filePath).size;
   const ranges = ext4VolatileByteRanges(size);
   return hashFileWithMaskedRanges(filePath, ranges, chunkSize);
 }
@@ -26943,7 +28307,7 @@ async function preFetchArtifacts(input) {
   const { imagesDir, runnerImage, manifest, http } = input;
   const platform6 = input.platform ?? "linux";
   const arch2 = input.arch ?? "x64";
-  (0, import_node_fs6.mkdirSync)(imagesDir, { recursive: true });
+  (0, import_node_fs9.mkdirSync)(imagesDir, { recursive: true });
   const wantedRootfs = rootfsAssetName(runnerImage, arch2);
   const wantedLibscriptjail = libscriptjailAssetName(arch2);
   const assets = [
@@ -26969,7 +28333,7 @@ async function preFetchArtifacts(input) {
       ({ name, expected, digest }) => ensureAsset({
         http,
         url: assetUrl(manifest, name),
-        destPath: (0, import_node_path4.join)(imagesDir, name),
+        destPath: (0, import_node_path7.join)(imagesDir, name),
         expectedDigest: expected,
         computeDigest: digest
       })
@@ -26996,7 +28360,7 @@ function requireExpected(manifest, platform6, asset) {
 }
 async function ensureAsset(args) {
   const { http, url: url2, destPath, expectedDigest, computeDigest } = args;
-  if ((0, import_node_fs6.existsSync)(destPath)) {
+  if ((0, import_node_fs9.existsSync)(destPath)) {
     const actual = await computeDigest(destPath);
     if (actual === expectedDigest) return;
     console.warn(
@@ -27089,15 +28453,15 @@ function validateManifest(manifest) {
 }
 
 // src/action/firecracker/overlay.ts
-var import_node_fs7 = require("node:fs");
+var import_node_fs10 = require("node:fs");
 var import_promises3 = require("node:fs/promises");
-var import_node_path5 = require("node:path");
-var import_node_os2 = require("node:os");
-var import_node_child_process = require("node:child_process");
+var import_node_path8 = require("node:path");
+var import_node_os3 = require("node:os");
+var import_node_child_process2 = require("node:child_process");
 var import_node_process = require("node:process");
 async function makeOverlay(input) {
-  const workDir = input.workDir ?? (0, import_node_fs7.mkdtempSync)((0, import_node_path5.join)((0, import_node_os2.tmpdir)(), "script-jail-run-"));
-  (0, import_node_fs7.mkdirSync)(workDir, { recursive: true });
+  const workDir = input.workDir ?? (0, import_node_fs10.mkdtempSync)((0, import_node_path8.join)((0, import_node_os3.tmpdir)(), "script-jail-run-"));
+  (0, import_node_fs10.mkdirSync)(workDir, { recursive: true });
   try {
     return await buildOverlayInto(workDir, input);
   } catch (err) {
@@ -27111,18 +28475,20 @@ async function makeOverlay(input) {
 }
 async function buildOverlayInto(workDir, input) {
   const { baseRootfsPath, repoSrcPath, configPath, extraRepoOverlayFiles } = input;
-  const rootfsCopyPath = (0, import_node_path5.join)(workDir, "rootfs.ext4");
-  copyRootfs(baseRootfsPath, rootfsCopyPath);
-  const repoStageDir = (0, import_node_path5.join)(workDir, "repo-stage");
-  (0, import_node_fs7.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
-  const configDestDir = (0, import_node_path5.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs7.mkdirSync)(configDestDir, { recursive: true });
-  (0, import_node_fs7.copyFileSync)(configPath, (0, import_node_path5.join)(configDestDir, "config.yml"));
+  const env = input.env ?? process.env;
+  const rootfsCopyPath = (0, import_node_path8.join)(workDir, "rootfs.ext4");
+  copyRootfs(baseRootfsPath, rootfsCopyPath, env);
+  const repoStageDir = (0, import_node_path8.join)(workDir, "repo-stage");
+  (0, import_node_fs10.mkdirSync)(repoStageDir, { recursive: true });
+  (0, import_node_fs10.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false, verbatimSymlinks: true });
+  ensureRealDirectory((0, import_node_path8.join)(repoStageDir, "etc"));
+  const configDestDir = (0, import_node_path8.join)(repoStageDir, "etc", "script-jail");
+  ensureRealDirectory(configDestDir);
+  (0, import_node_fs10.copyFileSync)(configPath, (0, import_node_path8.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
-    const stageRoot = (0, import_node_path5.resolve)(repoStageDir);
+    const stageRoot = (0, import_node_path8.resolve)(repoStageDir);
     for (const entry of extraRepoOverlayFiles) {
-      const dest = (0, import_node_path5.resolve)(stageRoot, entry.relPath);
+      const dest = (0, import_node_path8.resolve)(stageRoot, entry.relPath);
       if (dest !== stageRoot && !dest.startsWith(stageRoot + "/")) {
         throw new Error(
           `[overlay] extraRepoOverlayFiles entry '${entry.relPath}' escapes the repo stage dir`
@@ -27131,24 +28497,27 @@ async function buildOverlayInto(workDir, input) {
       writeOverlayFile(stageRoot, entry.relPath, entry.content);
     }
   }
-  const repoDiskPath = (0, import_node_path5.join)(workDir, "repo.ext4");
+  const repoDiskPath = (0, import_node_path8.join)(workDir, "repo.ext4");
   await buildExt4Disk({
     srcDir: repoStageDir,
     label: "repo",
     sizeMB: estimateDiskSizeMB(repoStageDir),
-    outPath: repoDiskPath
+    outPath: repoDiskPath,
+    env
   });
-  const scratchDiskPath = (0, import_node_path5.join)(workDir, "scratch.ext4");
+  const scratchDiskPath = (0, import_node_path8.join)(workDir, "scratch.ext4");
   await buildExt4Disk({
     label: SCRATCH_DISK_LABEL,
     sizeMB: SCRATCH_DISK_MB,
-    outPath: scratchDiskPath
+    outPath: scratchDiskPath,
+    env
   });
-  const sjtmpDiskPath = (0, import_node_path5.join)(workDir, "sjtmp.ext4");
+  const sjtmpDiskPath = (0, import_node_path8.join)(workDir, "sjtmp.ext4");
   await buildExt4Disk({
     label: SJTMP_DISK_LABEL,
     sizeMB: SJTMP_DISK_MB,
-    outPath: sjtmpDiskPath
+    outPath: sjtmpDiskPath,
+    env
   });
   const cleanup = async () => {
     try {
@@ -27168,36 +28537,50 @@ function writeOverlayFile(root, relPath, content) {
   }
   let dir = root;
   for (const part of parts.slice(0, -1)) {
-    dir = (0, import_node_path5.join)(dir, part);
+    dir = (0, import_node_path8.join)(dir, part);
     ensureRealDirectory(dir);
   }
-  const dest = (0, import_node_path5.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs7.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs7.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  const dest = (0, import_node_path8.join)(dir, parts[parts.length - 1]);
+  let leaf;
+  try {
+    leaf = (0, import_node_fs10.lstatSync)(dest);
+  } catch {
+    leaf = void 0;
+  }
+  if (leaf !== void 0) {
+    const kind = leaf.isSymbolicLink() ? "symlink" : leaf.isDirectory() ? "directory (a committed gitlink/submodule or plain directory)" : "file";
+    throw new Error(
+      `[overlay] cannot stage script-jail overlay: the checkout already has a ${kind} at '${dest}' \u2014 script-jail OWNS this path and writes its own sidecar here. It refuses to replace committed checkout content (under install:true that would also diverge the audit from the host re-run). Remove it from the checkout.`
+    );
+  }
+  (0, import_node_fs10.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory(path) {
-  if (!(0, import_node_fs7.existsSync)(path)) {
-    (0, import_node_fs7.mkdirSync)(path, { recursive: true });
+  let stat2;
+  try {
+    stat2 = (0, import_node_fs10.lstatSync)(path);
+  } catch {
+    (0, import_node_fs10.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat2 = (0, import_node_fs7.lstatSync)(path);
   if (stat2.isDirectory() && !stat2.isSymbolicLink()) return;
-  (0, import_node_fs7.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs7.mkdirSync)(path, { recursive: true });
+  throw new Error(
+    `[overlay] cannot stage script-jail overlay: the checkout has a non-directory at '${path}' (a committed symlink or file) where script-jail needs a real directory. install:true refuses to replace it \u2014 that would make the audit diverge from the host checkout. Remove it from the checkout, or audit without 'install'.`
+  );
 }
-function copyRootfs(src, dest) {
+function copyRootfs(src, dest, env) {
   if (import_node_process.platform === "linux") {
-    const result = (0, import_node_child_process.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore" });
+    const result = (0, import_node_child_process2.spawnSync)("cp", ["--reflink=auto", src, dest], { stdio: "ignore", env });
     if (result.status === 0) return;
   }
-  (0, import_node_fs7.cpSync)(src, dest);
+  (0, import_node_fs10.cpSync)(src, dest);
 }
 async function buildExt4Disk(opts) {
-  const { srcDir, label, sizeMB, outPath } = opts;
+  const { srcDir, label, sizeMB, outPath, env } = opts;
   const sizeSpec = `${sizeMB}M`;
-  const mkfs = resolveMkfsExt4();
+  const mkfs = resolveMkfsExt4(env);
   if (mkfs !== null) {
-    const result = (0, import_node_child_process.spawnSync)(
+    const result = (0, import_node_child_process2.spawnSync)(
       mkfs,
       [
         ...srcDir !== void 0 ? ["-d", srcDir] : [],
@@ -27210,7 +28593,9 @@ async function buildExt4Disk(opts) {
         outPath,
         sizeSpec
       ],
-      { stdio: "inherit" }
+      // SECURITY: bare `mkfs.ext4` on Linux is resolved via PATH pre-trust — the
+      // caller-sanitized `env` prevents a checkout-prepended PATH / loader var hijack.
+      { stdio: "inherit", env }
     );
     if (result.status !== 0) {
       throw new Error(
@@ -27219,25 +28604,27 @@ async function buildExt4Disk(opts) {
     }
     return;
   }
-  const outDir = (0, import_node_path5.join)(outPath, "..");
-  const imageName = (0, import_node_path5.basename)(outPath);
+  const outDir = (0, import_node_path8.join)(outPath, "..");
+  const imageName = (0, import_node_path8.basename)(outPath);
   const srcMount = srcDir !== void 0 ? `-v "${srcDir}:/work:ro" ` : "";
   const seedFlag = srcDir !== void 0 ? "-d /work " : "";
-  (0, import_node_child_process.execSync)(
+  (0, import_node_child_process2.execSync)(
     `docker run --rm ` + srcMount + `-v "${outDir}:/out" alpine:latest sh -c "apk add --no-cache e2fsprogs &&  mkfs.ext4 ${seedFlag}-L ${label} -O ^has_journal -m 0 /out/${imageName} ${sizeSpec}"`,
-    { stdio: "inherit" }
+    // SECURITY: `docker`/`sh` resolve by bare name pre-trust — use the
+    // caller-sanitized `env` so a checkout PATH / loader var can't hijack them.
+    { stdio: "inherit", env }
   );
 }
-function resolveMkfsExt4() {
+function resolveMkfsExt4(env) {
   if (import_node_process.platform === "linux") return "mkfs.ext4";
   if (import_node_process.platform !== "darwin") return null;
   for (const candidate of [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
     "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
   ]) {
-    if ((0, import_node_fs7.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs10.existsSync)(candidate)) return candidate;
   }
-  const lookup = (0, import_node_child_process.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8" });
+  const lookup = (0, import_node_child_process2.spawnSync)("command", ["-v", "mkfs.ext4"], { shell: "/bin/sh", encoding: "utf8", env });
   if (lookup.status === 0 && lookup.stdout.trim()) return lookup.stdout.trim();
   return null;
 }
@@ -27250,10 +28637,10 @@ function estimateDiskSizeMB(dir) {
   let totalBytes = 0;
   const visit = (p) => {
     try {
-      const stat2 = (0, import_node_fs7.statSync)(p, { bigint: false });
+      const stat2 = (0, import_node_fs10.statSync)(p, { bigint: false });
       if (stat2.isDirectory()) {
-        for (const child of (0, import_node_fs7.readdirSync)(p)) {
-          visit((0, import_node_path5.join)(p, child));
+        for (const child of (0, import_node_fs10.readdirSync)(p)) {
+          visit((0, import_node_path8.join)(p, child));
         }
       } else if (stat2.isFile() || stat2.isSymbolicLink()) {
         totalBytes += stat2.size;
@@ -27261,16 +28648,16 @@ function estimateDiskSizeMB(dir) {
     } catch {
     }
   };
-  if ((0, import_node_fs7.existsSync)(dir)) visit(dir);
+  if ((0, import_node_fs10.existsSync)(dir)) visit(dir);
   const estimatedMB = Math.ceil(totalBytes * 2 / (1024 * 1024));
   return Math.max(REPO_DISK_MIN_MB, estimatedMB);
 }
 
 // src/action/firecracker/launch.ts
 var import_node_http2 = require("node:http");
-var import_node_fs8 = require("node:fs");
+var import_node_fs11 = require("node:fs");
 var import_promises4 = require("node:fs/promises");
-var import_node_child_process2 = require("node:child_process");
+var import_node_child_process3 = require("node:child_process");
 var import_node_process2 = require("node:process");
 var DEFAULT_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off ro rootfstype=ext4 init=/sbin/init";
 async function launchVm(input) {
@@ -27287,7 +28674,11 @@ async function launchVm(input) {
     vsockUdsPath,
     enableNetwork,
     socketPath,
-    bootArgs = DEFAULT_BOOT_ARGS
+    bootArgs = DEFAULT_BOOT_ARGS,
+    // SECURITY: the tap-setup `ip` spawns are bare-name + pre-trust — default to
+    // process.env only when the caller (e.g. the platform-gated direct test path)
+    // omits it; the Firecracker backend always threads its sanitized env down.
+    env = process.env
   } = input;
   if (!input.spawner) {
     if (import_node_process2.platform !== "linux") {
@@ -27295,7 +28686,7 @@ async function launchVm(input) {
         `script-jail: Firecracker requires Linux. Current platform: ${import_node_process2.platform}. Run this action in a Linux environment or inject a test spawner.`
       );
     }
-    if (!(0, import_node_fs8.existsSync)("/dev/kvm")) {
+    if (!(0, import_node_fs11.existsSync)("/dev/kvm")) {
       throw new Error(
         "script-jail: /dev/kvm not found. Firecracker requires KVM. Ensure the runner has hardware virtualisation enabled."
       );
@@ -27307,7 +28698,7 @@ async function launchVm(input) {
   const handle = spawner.spawn(
     firecrackerPath,
     ["--api-sock", socketPath],
-    { stdio: "forward" }
+    { stdio: "forward", env }
   );
   try {
     await poller.waitForSocket(socketPath, 5e3);
@@ -27353,7 +28744,7 @@ async function launchVm(input) {
       mem_size_mib: memMB
     });
     if (enableNetwork) {
-      await setupTapDevice(apiClient);
+      await setupTapDevice(apiClient, env);
     }
     await apiClient.put("/vsock", {
       guest_cid: vsockCid,
@@ -27379,14 +28770,16 @@ async function launchVm(input) {
     waitForExit: () => handle.waitForExit()
   };
 }
-async function setupTapDevice(api) {
-  const existing = (0, import_node_child_process2.spawnSync)("ip", ["link", "show", "tap0"], {
-    stdio: ["ignore", "ignore", "ignore"]
+async function setupTapDevice(api, env) {
+  const existing = (0, import_node_child_process3.spawnSync)("ip", ["link", "show", "tap0"], {
+    stdio: ["ignore", "ignore", "ignore"],
+    env
   });
   const alreadyExists = existing.status === 0;
   if (!alreadyExists) {
-    const mkTap = (0, import_node_child_process2.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
-      stdio: ["ignore", "pipe", "pipe"]
+    const mkTap = (0, import_node_child_process3.spawnSync)("ip", ["tuntap", "add", "tap0", "mode", "tap"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env
     });
     if (mkTap.status !== 0) {
       const stderr = (mkTap.stderr?.toString() ?? "").trim();
@@ -27397,7 +28790,7 @@ async function setupTapDevice(api) {
       return;
     }
   }
-  (0, import_node_child_process2.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore" });
+  (0, import_node_child_process3.spawnSync)("ip", ["link", "set", "tap0", "up"], { stdio: "ignore", env });
   await api.put("/network-interfaces/eth0", {
     iface_id: "eth0",
     guest_mac: "06:00:AC:10:00:02",
@@ -27407,23 +28800,24 @@ async function setupTapDevice(api) {
 var NodeSpawner = class {
   spawn(cmd, args, opts) {
     const childStdio = opts.stdio === "ignore" ? "ignore" : ["ignore", "pipe", "pipe"];
-    const child = (0, import_node_child_process2.spawn)(cmd, [...args], {
+    const child = (0, import_node_child_process3.spawn)(cmd, [...args], {
       stdio: childStdio,
-      detached: false
+      detached: false,
+      ...opts.env !== void 0 ? { env: opts.env } : {}
     });
     if (opts.stdio === "forward") {
       forwardStream(child.stdout, "[fc:out] ");
       forwardStream(child.stderr, "[fc:err] ");
     }
     let exitCode;
-    const exitPromise = new Promise((resolve4) => {
+    const exitPromise = new Promise((resolve6) => {
       child.on("close", (code) => {
         exitCode = code ?? 1;
-        resolve4(exitCode);
+        resolve6(exitCode);
       });
       child.on("error", () => {
         exitCode = 1;
-        resolve4(1);
+        resolve6(1);
       });
     });
     return {
@@ -27459,14 +28853,14 @@ var FsSocketPoller = class {
   async waitForSocket(socketPath, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((0, import_node_fs8.existsSync)(socketPath)) return;
+      if ((0, import_node_fs11.existsSync)(socketPath)) return;
       await sleep(50);
     }
     throw new Error(`Timeout waiting for socket: ${socketPath}`);
   }
 };
 function sleep(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve6) => setTimeout(resolve6, ms));
 }
 var UnixSocketApiClient = class {
   constructor(socketPath) {
@@ -27480,7 +28874,7 @@ var UnixSocketApiClient = class {
     return this._request("PATCH", path, body);
   }
   _request(method, path, body) {
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve6, reject) => {
       const payload = JSON.stringify(body);
       const req = (0, import_node_http2.request)(
         {
@@ -27505,7 +28899,7 @@ var UnixSocketApiClient = class {
                 )
               );
             } else {
-              resolve4();
+              resolve6();
             }
           });
         }
@@ -27615,22 +29009,22 @@ async function openVsockSession(udsPath, port, options) {
   const session = {
     events,
     sendGo: () => {
-      return new Promise((resolve4, reject) => {
+      return new Promise((resolve6, reject) => {
         void reject;
         const ok = duplex.write("go\n");
         if (!ok) {
           const writeable = duplex;
           if (typeof writeable.once === "function") {
             writeable.once("drain", () => {
-              resolve4();
+              resolve6();
             });
           } else {
             setImmediate(() => {
-              resolve4();
+              resolve6();
             });
           }
         } else {
-          resolve4();
+          resolve6();
         }
       });
     },
@@ -27641,7 +29035,7 @@ async function openVsockSession(udsPath, port, options) {
   return session;
 }
 function connectUnixSocket(sockPath, timeoutMs) {
-  return new Promise((resolve4, reject) => {
+  return new Promise((resolve6, reject) => {
     const sock = (0, import_node_net.createConnection)(sockPath);
     const timer = setTimeout(() => {
       sock.destroy();
@@ -27649,7 +29043,7 @@ function connectUnixSocket(sockPath, timeoutMs) {
     }, timeoutMs);
     sock.once("connect", () => {
       clearTimeout(timer);
-      resolve4(sock);
+      resolve6(sock);
     });
     sock.once("error", (err) => {
       clearTimeout(timer);
@@ -27688,7 +29082,7 @@ async function dialVsockWithRetry(udsPath, port, totalTimeoutMs) {
   );
 }
 function waitForOkLine(sock, timeoutMs) {
-  return new Promise((resolve4) => {
+  return new Promise((resolve6) => {
     const chunks = [];
     let settled = false;
     const finish = (result) => {
@@ -27698,7 +29092,7 @@ function waitForOkLine(sock, timeoutMs) {
       sock.off("data", onData);
       sock.off("close", onClose);
       sock.off("error", onError);
-      resolve4(result);
+      resolve6(result);
     };
     const onData = (chunk) => {
       chunks.push(chunk);
@@ -27728,7 +29122,7 @@ function waitForOkLine(sock, timeoutMs) {
   });
 }
 function sleep2(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve6) => setTimeout(resolve6, ms));
 }
 function socketToDuplex(sock) {
   return {
@@ -27742,7 +29136,7 @@ function socketToDuplex(sock) {
 
 // src/action/firecracker/teardown.ts
 var import_promises5 = require("node:fs/promises");
-var import_node_fs9 = require("node:fs");
+var import_node_fs12 = require("node:fs");
 async function teardown(handles) {
   if (handles.vsock !== null) {
     await safeRun("close vsock session", () => handles.vsock.close());
@@ -27783,7 +29177,7 @@ async function safeRun(label, fn) {
   }
 }
 async function removeIfExists(filePath) {
-  if (!(0, import_node_fs9.existsSync)(filePath)) return;
+  if (!(0, import_node_fs12.existsSync)(filePath)) return;
   try {
     await (0, import_promises5.unlink)(filePath);
   } catch (err) {
@@ -27791,13 +29185,13 @@ async function removeIfExists(filePath) {
   }
 }
 function timeout(ms) {
-  return new Promise((resolve4) => setTimeout(resolve4, ms));
+  return new Promise((resolve6) => setTimeout(resolve6, ms));
 }
 
 // src/shared/run-audit.ts
-var import_node_fs11 = require("node:fs");
+var import_node_fs14 = require("node:fs");
 var import_promises6 = require("node:fs/promises");
-var import_node_path7 = require("node:path");
+var import_node_path10 = require("node:path");
 
 // src/cli/arch-flags.ts
 function buildArchFlagOverlay(_input) {
@@ -28314,7 +29708,7 @@ function splitLines(text) {
 }
 
 // src/action/diff.ts
-var import_yaml = __toESM(require_dist(), 1);
+var import_yaml2 = __toESM(require_dist(), 1);
 
 // node_modules/.pnpm/zod@4.4.3/node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -29930,8 +31324,8 @@ function emoji() {
 }
 var ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
 var ipv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/;
-var mac = (delimiter) => {
-  const escapedDelim = escapeRegex(delimiter ?? ":");
+var mac = (delimiter2) => {
+  const escapedDelim = escapeRegex(delimiter2 ?? ":");
   return new RegExp(`^(?:[0-9A-F]{2}${escapedDelim}){5}[0-9A-F]{2}$|^(?:[0-9a-f]{2}${escapedDelim}){5}[0-9a-f]{2}$`);
 };
 var cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/([0-9]|[1-2][0-9]|3[0-2])$/;
@@ -42840,7 +44234,8 @@ var FsReadEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var FsWriteEvent = external_exports.object({
   kind: external_exports.literal("write"),
@@ -42850,14 +44245,21 @@ var FsWriteEvent = external_exports.object({
   hidden: external_exports.boolean(),
   errno: external_exports.enum(["ENOENT", "EACCES"]).optional(),
   dirfd: external_exports.number().optional(),
-  retFd: external_exports.number().optional()
+  retFd: external_exports.number().optional(),
+  root_anchored: external_exports.boolean().optional()
 });
 var EnvReadEvent = external_exports.object({
   kind: external_exports.literal("env_read"),
   name: external_exports.string(),
   pid: external_exports.number(),
   ts: external_exports.number(),
-  hidden: external_exports.boolean()
+  hidden: external_exports.boolean(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_read events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed env_read). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var SpawnEvent = external_exports.object({
   kind: external_exports.literal("spawn"),
@@ -42879,7 +44281,13 @@ var SpawnEvent = external_exports.object({
   // diff exposes the un-audited subtree (it is NOT an audit_bypass hard-fail —
   // benign find/sed use stays green; a reviewer just sees the marker). Omitted
   // (never `false`) so existing/non-blind records stay byte-identical.
-  audit_blind: external_exports.boolean().optional()
+  audit_blind: external_exports.boolean().optional(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on spawn events that
+  // attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed spawn). Closes the unmarked-non-fs gap.
+  root_anchored: external_exports.boolean().optional()
 });
 var DlopenEvent = external_exports.object({
   kind: external_exports.literal("dlopen"),
@@ -42897,7 +44305,15 @@ var NetworkEvent = external_exports.object({
   // 'ok' = phase A (fetch with network on). 'blocked' = phase B (offline).
   result: external_exports.enum(["ok", "blocked"]),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on connect events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed connect). Closes the unmarked-non-fs gap and
+  // the drop-in-install egress-misclassification (a forged root prepare connect
+  // is no longer mistaken for the genuine root's host-safe prepare).
+  root_anchored: external_exports.boolean().optional()
 });
 var ExecEvent = external_exports.object({
   kind: external_exports.literal("exec"),
@@ -42986,7 +44402,16 @@ var EnvTamperEvent = external_exports.object({
   reason: external_exports.string().optional(),
   refused: external_exports.literal(true),
   pid: external_exports.number(),
-  ts: external_exports.number()
+  ts: external_exports.number(),
+  // SEMANTIC, same contract as the read/write `root_anchored` above: the
+  // non-forgeable repo-root-anchoring verdict, stamped only on env_tamper events
+  // that attribute to a root-project key, OMITTED (never `false`) otherwise, and
+  // NEVER rendered (normalize consumes it to emit a `<FORGED_ROOT>` prefix on a
+  // forged/unanchored root-claimed `<REFUSED>` env_tamper). Closes the last
+  // unmarked root-claimable + rendered + deduped kind. Does NOT apply to the
+  // `audit_fd_lost` variant — that routes to audit_bypass and is hard-failed
+  // independently by findAuditBypass, so dedupe-collapse cannot hide it.
+  root_anchored: external_exports.boolean().optional()
 });
 var RawEvent = external_exports.discriminatedUnion("kind", [
   FsReadEvent,
@@ -43103,7 +44528,7 @@ function canonicalizeVolatileFields(yaml) {
 function findAuditBypass(generated) {
   let doc;
   try {
-    doc = (0, import_yaml.parse)(generated);
+    doc = (0, import_yaml2.parse)(generated);
   } catch {
     return [];
   }
@@ -43145,6 +44570,87 @@ function formatAuditBypassError(entries) {
   const more = entries.length > MAX ? ` (+${entries.length - MAX} more)` : "";
   return "Audit envelope was bypassed \u2014 see audit_bypass entries: [" + head.join("; ") + "]" + more;
 }
+function collectNetworkAttempts(generated) {
+  let doc;
+  try {
+    doc = (0, import_yaml2.parse)(generated);
+  } catch {
+    return [];
+  }
+  if (doc === null || typeof doc !== "object") return [];
+  const parsed = Lock.safeParse(doc);
+  const packagesRaw = parsed.success ? parsed.data.packages : doc.packages;
+  if (packagesRaw === void 0 || packagesRaw === null || typeof packagesRaw !== "object") {
+    return [];
+  }
+  const out = [];
+  for (const [packageId, pkgRaw] of Object.entries(
+    packagesRaw
+  )) {
+    if (pkgRaw === null || typeof pkgRaw !== "object") continue;
+    const lifecycleRaw = pkgRaw.lifecycle;
+    if (lifecycleRaw === null || lifecycleRaw === void 0 || typeof lifecycleRaw !== "object") {
+      continue;
+    }
+    for (const [stage, blockRaw] of Object.entries(
+      lifecycleRaw
+    )) {
+      if (blockRaw === null || typeof blockRaw !== "object") continue;
+      const na = blockRaw.network_attempts;
+      if (!Array.isArray(na)) continue;
+      for (const entry of na) {
+        if (typeof entry === "string" && entry.length > 0) {
+          out.push({ packageId, stage, entry });
+        }
+      }
+    }
+  }
+  return out;
+}
+function formatEgressWarning(entries, opts) {
+  const MAX = 20;
+  const auditedOnly = [];
+  const hostBound = [];
+  for (const e of entries) {
+    if (e.stage === "prepare" && opts.manager !== "pnpm" && opts.rootPackageIds.has(e.packageId) && // A `<FORGED_ROOT> ` entry attributes to a root key but is NOT the genuine
+    // root's prepare (normalize stamps the prefix when the non-forgeable
+    // root_anchored verdict is not true). Under `install:true` the forging
+    // dependency's lifecycle DOES run online on the host, so a forged connect
+    // is a REAL egress risk — it must route to hostBound, never be carved out
+    // as audited-only/host-safe. (Genuine root prepare connects render without
+    // the prefix and stay audited-only.)
+    !e.entry.startsWith("<FORGED_ROOT> ")) {
+      auditedOnly.push(e);
+    } else {
+      hostBound.push(e);
+    }
+  }
+  const summary2 = hostBound.length > 0 ? `script-jail install: part 2 runs lifecycle scripts ONLINE on the host. The offline audit recorded ${hostBound.length} network egress attempt(s) that WILL now succeed (listed below). IPs are offline-audit values \u2014 the host may resolve different addresses; review the committed lock before trusting this install.` : (
+    // No host-bound egress: only audited-only root `prepare` entries remain.
+    // Do NOT claim host egress — the root `prepare` was audited in the
+    // sandbox and the host rebuild (npm/yarn) does not run it.
+    `script-jail install: part 2 runs lifecycle scripts on the host; the root \`prepare\` egress below was audited in the sandbox and will NOT run on the host.`
+  );
+  const lines = hostBound.slice(0, MAX).map((e) => {
+    return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+  });
+  if (hostBound.length > MAX) {
+    lines.push(`  (+${hostBound.length - MAX} more \u2014 see the committed lock)`);
+  }
+  if (auditedOnly.length > 0) {
+    lines.push("  audited in the sandbox; NOT run on the host (root `prepare`):");
+    const auditedLines = auditedOnly.slice(0, MAX).map((e) => {
+      return `  ${e.packageId} (${e.stage})  ${e.entry}`;
+    });
+    lines.push(...auditedLines);
+    if (auditedOnly.length > MAX) {
+      lines.push(`  (+${auditedOnly.length - MAX} more \u2014 see the committed lock)`);
+    }
+  }
+  const detail = `${lines.join("\n")}
+`;
+  return { summary: summary2, detail };
+}
 function countLines(s) {
   if (s === "") return 0;
   let n = 0;
@@ -43156,13 +44662,13 @@ function countLines(s) {
 }
 
 // src/action/config-override.ts
-var import_node_fs10 = require("node:fs");
-var import_node_os3 = require("node:os");
-var import_node_path6 = require("node:path");
-var import_yaml2 = __toESM(require_dist(), 1);
+var import_node_fs13 = require("node:fs");
+var import_node_os4 = require("node:os");
+var import_node_path9 = require("node:path");
+var import_yaml3 = __toESM(require_dist(), 1);
 function buildEffectiveConfig(input) {
-  const text = (0, import_node_fs10.readFileSync)(input.userConfigPath, "utf8");
-  const parsed = (0, import_yaml2.parse)(text);
+  const text = (0, import_node_fs13.readFileSync)(input.userConfigPath, "utf8");
+  const parsed = (0, import_yaml3.parse)(text);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   const existingSpoof = config2["spoof"] !== null && typeof config2["spoof"] === "object" && !Array.isArray(config2["spoof"]) ? config2["spoof"] : {};
   config2["spoof"] = {
@@ -43170,25 +44676,32 @@ function buildEffectiveConfig(input) {
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch
   };
-  const outDir = input.workDir ?? (0, import_node_fs10.mkdtempSync)((0, import_node_path6.join)((0, import_node_os3.tmpdir)(), "script-jail-config-"));
-  const configPath = (0, import_node_path6.join)(outDir, "config.yml");
-  (0, import_node_fs10.writeFileSync)(configPath, (0, import_yaml2.stringify)(config2), "utf8");
+  if (input.workDirOverride !== void 0) {
+    config2["work_dir"] = input.workDirOverride;
+  }
+  delete config2["install_mode"];
+  if (input.installMode === true) {
+    config2["install_mode"] = true;
+  }
+  const outDir = input.workDir ?? (0, import_node_fs13.mkdtempSync)((0, import_node_path9.join)((0, import_node_os4.tmpdir)(), "script-jail-config-"));
+  const configPath = (0, import_node_path9.join)(outDir, "config.yml");
+  (0, import_node_fs13.writeFileSync)(configPath, (0, import_yaml3.stringify)(config2), "utf8");
   const result = { configPath };
   if (input.yarnrcOverlay !== void 0) {
-    const yarnrcPath = (0, import_node_path6.join)(outDir, ".yarnrc.yml");
-    (0, import_node_fs10.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
+    const yarnrcPath = (0, import_node_path9.join)(outDir, ".yarnrc.yml");
+    (0, import_node_fs13.writeFileSync)(yarnrcPath, input.yarnrcOverlay, "utf8");
     result.yarnrcPath = yarnrcPath;
   }
   if (input.pmFlagsJson !== void 0) {
-    const pmFlagsPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pm-flags.json");
-    (0, import_node_fs10.mkdirSync)((0, import_node_path6.dirname)(pmFlagsPath), { recursive: true });
-    (0, import_node_fs10.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
+    const pmFlagsPath = (0, import_node_path9.join)(outDir, "etc", "script-jail", "pm-flags.json");
+    (0, import_node_fs13.mkdirSync)((0, import_node_path9.dirname)(pmFlagsPath), { recursive: true });
+    (0, import_node_fs13.writeFileSync)(pmFlagsPath, JSON.stringify(input.pmFlagsJson, null, 2) + "\n", "utf8");
     result.pmFlagsPath = pmFlagsPath;
   }
   if (input.pnpmArchOverlay !== void 0) {
-    const pnpmArchPath = (0, import_node_path6.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
-    (0, import_node_fs10.mkdirSync)((0, import_node_path6.dirname)(pnpmArchPath), { recursive: true });
-    (0, import_node_fs10.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
+    const pnpmArchPath = (0, import_node_path9.join)(outDir, "etc", "script-jail", "pnpm-arch.json");
+    (0, import_node_fs13.mkdirSync)((0, import_node_path9.dirname)(pnpmArchPath), { recursive: true });
+    (0, import_node_fs13.writeFileSync)(pnpmArchPath, input.pnpmArchOverlay, "utf8");
     result.pnpmArchPath = pnpmArchPath;
   }
   return result;
@@ -43205,10 +44718,25 @@ async function runAudit(input) {
     spoofArch: input.overrides.spoofArch ?? input.hostArch
   });
   for (const w of archOverlay.warnings) input.io.warn(w);
-  const scratchDir = (0, import_node_fs11.mkdtempSync)((0, import_node_path7.join)(input.workDir, "script-jail-config-"));
+  const scratchDir = (0, import_node_fs14.mkdtempSync)((0, import_node_path10.join)(input.workDir, "script-jail-config-"));
   let result;
   let overlay = null;
   try {
+    const { kept: userInstallArgs, dropped, droppedKeys } = sanitizeInstallArgs(
+      input.args ?? []
+    );
+    if (droppedKeys.length > 0) {
+      const n = dropped.length;
+      const keys = droppedKeys.join(", ");
+      input.io.warn(
+        `script-jail: ignoring ${n} install arg${n === 1 ? "" : "s"} (${keys}) \u2014 not on the allowlist of dependency-selection flags, or carrying an unsafe value (e.g. an inline-credential --registry URL). Only flags that filter the lockfile-pinned tree (plus a credential-free --registry) are forwarded; anything that could redirect the lock/root/output/source, re-enable lifecycle scripts, or carry an inline credential is dropped.`
+      );
+    }
+    const archPmFlags = archOverlay.pmFlagsJson;
+    const pmFlagsJson = {
+      extra_install_args: archPmFlags?.extra_install_args ?? [],
+      ...userInstallArgs.length > 0 ? { user_install_args: userInstallArgs } : {}
+    };
     const effectiveConfig = buildEffectiveConfig({
       userConfigPath: input.configPath,
       overrides: {
@@ -43219,27 +44747,35 @@ async function runAudit(input) {
         spoofArch: input.overrides.spoofArch ?? input.hostArch
       },
       workDir: scratchDir,
+      // install:true cwd parity — pin the guest audit work_dir to the host
+      // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
+      // installMode also flips on here so the guest audit mirrors the host
+      // install's post-trust pnpm config (--config.ignore-pnpmfile=true) into
+      // the Phase B lifecycle env — closing the value-blind config-asymmetry
+      // (env-spy records env_read NAMEs only).  `installWorkDir` is the
+      // canonical install:true signal (set ONLY on that path).
+      ...input.installWorkDir !== void 0 ? { workDirOverride: input.installWorkDir, installMode: true } : {},
       ...archOverlay.yarnrcOverlay !== void 0 ? { yarnrcOverlay: archOverlay.yarnrcOverlay } : {},
-      ...archOverlay.pmFlagsJson !== void 0 ? { pmFlagsJson: archOverlay.pmFlagsJson } : {},
+      pmFlagsJson,
       ...archOverlay.pnpmArchOverlay !== void 0 ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay } : {}
     });
     const extraRepoOverlayFiles = [];
     if (effectiveConfig.yarnrcPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: ".yarnrc.yml",
-        content: (0, import_node_fs11.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
+        content: (0, import_node_fs14.readFileSync)(effectiveConfig.yarnrcPath, "utf8")
       });
     }
     if (effectiveConfig.pmFlagsPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pm-flags.json",
-        content: (0, import_node_fs11.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
+        content: (0, import_node_fs14.readFileSync)(effectiveConfig.pmFlagsPath, "utf8")
       });
     }
     if (effectiveConfig.pnpmArchPath !== void 0) {
       extraRepoOverlayFiles.push({
         relPath: "etc/script-jail/pnpm-arch.json",
-        content: (0, import_node_fs11.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
+        content: (0, import_node_fs14.readFileSync)(effectiveConfig.pnpmArchPath, "utf8")
       });
     }
     if (input.execute !== void 0) {
@@ -43250,7 +44786,8 @@ async function runAudit(input) {
         scratchDir,
         pm: input.pm,
         hostArch: input.hostArch,
-        mode: input.mode
+        mode: input.mode,
+        auditWorkDir: input.installWorkDir ?? "/work"
       });
     } else {
       if (input.launch === void 0) {
@@ -43263,7 +44800,8 @@ async function runAudit(input) {
         baseRootfsPath: input.baseRootfsPath,
         repoSrcPath: input.repoDir,
         configPath: effectiveConfig.configPath,
-        extraRepoOverlayFiles
+        extraRepoOverlayFiles,
+        env: stripDangerousEnv(process.env)
       });
       result = await input.launch(overlay);
     }
@@ -43280,16 +44818,16 @@ async function runAudit(input) {
     }
   }
   if (input.mode === "update") {
-    (0, import_node_fs11.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
+    (0, import_node_fs14.writeFileSync)(input.lockPath, result.finalYaml, "utf8");
     input.io.stderr.write(
       `[script-jail] wrote ${Buffer.byteLength(result.finalYaml, "utf8")} bytes to ${input.lockPath}
 `
     );
     input.io.setOutput?.("lockfile", input.lockPath);
     input.io.setOutput?.("diff", "");
-    return { exitCode: 0 };
+    return { exitCode: 0, trusted: false };
   }
-  const committed = (0, import_node_fs11.existsSync)(input.lockPath) ? (0, import_node_fs11.readFileSync)(input.lockPath, "utf8") : "";
+  const committed = (0, import_node_fs14.existsSync)(input.lockPath) ? (0, import_node_fs14.readFileSync)(input.lockPath, "utf8") : "";
   const lockLabel = relativeForDisplay(input.lockPath, input.repoDir);
   const diff = renderDiff({
     lockPath: lockLabel,
@@ -43312,39 +44850,39 @@ async function runAudit(input) {
     input.io.stderr.write(`${msg}
 `);
     input.io.emitAuditBypassAnnotation?.(lockLabel, msg);
-    return { exitCode: 1 };
+    return { exitCode: 1, trusted: false };
   }
-  return { exitCode: diff.match ? 0 : 1 };
+  return { exitCode: diff.match ? 0 : 1, trusted: diff.match, generatedLock: result.finalYaml };
 }
 function relativeForDisplay(absPath, repoDir) {
-  const rel = (0, import_node_path7.relative)(repoDir, absPath);
-  if (rel.startsWith("..") || (0, import_node_path7.isAbsolute)(rel)) return absPath;
+  const rel = (0, import_node_path10.relative)(repoDir, absPath);
+  if (rel.startsWith("..") || (0, import_node_path10.isAbsolute)(rel)) return absPath;
   return rel;
 }
 
 // src/action/backend/firecracker.ts
 var import_node_crypto5 = require("node:crypto");
-var import_node_fs13 = require("node:fs");
-var import_node_os4 = require("node:os");
-var import_node_path9 = require("node:path");
+var import_node_fs16 = require("node:fs");
+var import_node_os5 = require("node:os");
+var import_node_path12 = require("node:path");
 var import_node_process3 = require("node:process");
 
 // src/action/cache.ts
-var import_node_fs12 = require("node:fs");
-var import_node_path8 = require("node:path");
+var import_node_fs15 = require("node:fs");
+var import_node_path11 = require("node:path");
 function maybeClearCache(input) {
   if (input.cacheFirecracker) return;
-  const fs3 = input.fs ?? { rmSync: import_node_fs12.rmSync };
+  const fs3 = input.fs ?? { rmSync: import_node_fs15.rmSync };
   const releaseArch = input.arch === "arm64" ? "aarch64" : "x86_64";
-  const tarPath = (0, import_node_path8.join)(
+  const tarPath = (0, import_node_path11.join)(
     input.imagesDir,
     `firecracker-v${input.firecrackerVersion}-${releaseArch}.tgz`
   );
-  const fcBinPath = (0, import_node_path8.join)(
+  const fcBinPath = (0, import_node_path11.join)(
     input.imagesDir,
     `firecracker-v${input.firecrackerVersion}`
   );
-  const vmlinuxPath = (0, import_node_path8.join)(input.imagesDir, "vmlinux");
+  const vmlinuxPath = (0, import_node_path11.join)(input.imagesDir, "vmlinux");
   fs3.rmSync(tarPath, { force: true });
   fs3.rmSync(fcBinPath, { force: true });
   fs3.rmSync(vmlinuxPath, { force: true });
@@ -43361,16 +44899,16 @@ var BackendUnavailableError = class extends Error {
 };
 
 // src/action/backend/process.ts
-var import_node_child_process3 = require("node:child_process");
+var import_node_child_process4 = require("node:child_process");
 function commandSucceeds(cmd, args, opts = {}) {
-  const result = (0, import_node_child_process3.spawnSync)(cmd, args, {
+  const result = (0, import_node_child_process4.spawnSync)(cmd, args, {
     stdio: "ignore",
     env: opts.env
   });
   return result.status === 0;
 }
 function runCommand(cmd, args, opts = {}) {
-  const result = (0, import_node_child_process3.spawnSync)(cmd, args, {
+  const result = (0, import_node_child_process4.spawnSync)(cmd, args, {
     stdio: "pipe",
     encoding: "utf8",
     env: opts.env
@@ -43383,7 +44921,7 @@ function runCommand(cmd, args, opts = {}) {
   }
 }
 async function runAgentProcess(input) {
-  const child = (0, import_node_child_process3.spawn)(input.cmd, input.args, {
+  const child = (0, import_node_child_process4.spawn)(input.cmd, input.args, {
     cwd: input.cwd,
     env: input.env,
     stdio: ["pipe", "pipe", "pipe"]
@@ -43395,9 +44933,9 @@ async function runAgentProcess(input) {
   const nonFatalWarnings = [];
   let finalYaml = null;
   let fatalError = null;
-  const exitPromise = new Promise((resolve4) => {
-    child.on("close", (code) => resolve4(code ?? 1));
-    child.on("error", () => resolve4(1));
+  const exitPromise = new Promise((resolve6) => {
+    child.on("close", (code) => resolve6(code ?? 1));
+    child.on("error", () => resolve6(1));
   });
   try {
     for await (const frame of parseFrames(child.stdout)) {
@@ -43458,8 +44996,10 @@ function createFirecrackerBackend(deps) {
   const doLaunchVm = deps.launchVm ?? launchVm;
   const doOpenVsockSession = deps.openVsockSession ?? openVsockSession;
   const doTeardown = deps.teardown ?? teardown;
-  const checkExists = deps.existsSync ?? import_node_fs13.existsSync;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const checkExists = deps.existsSync ?? import_node_fs16.existsSync;
   const hostPlatform = deps.platform ?? import_node_process3.platform;
+  const safeEnv = stripDangerousEnv(deps.env ?? process.env);
   return {
     name: "firecracker",
     async run(ctx) {
@@ -43470,7 +45010,7 @@ function createFirecrackerBackend(deps) {
         if (!checkExists("/dev/kvm")) {
           throw new BackendUnavailableError("firecracker", "/dev/kvm is missing");
         }
-        if (!commandSucceeds("ip", ["link", "show", "tap0"])) {
+        if (!doCommandSucceeds("ip", ["link", "show", "tap0"], { env: safeEnv })) {
           throw new BackendUnavailableError("firecracker", "tap0 is not configured");
         }
       }
@@ -43500,10 +45040,13 @@ function createFirecrackerBackend(deps) {
         http: ctx.http
       });
       const overlay = await doMakeOverlay({
-        baseRootfsPath: (0, import_node_path9.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
+        baseRootfsPath: (0, import_node_path12.join)(ctx.imagesDir, rootfsImageName(ctx.runnerImage, ctx.arch)),
         repoSrcPath: ctx.repoDir,
         configPath: ctx.configPath,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
+        // SECURITY: sanitized env for overlay's bare-name pre-trust host spawns
+        // (cp / mkfs.ext4 / command -v / macOS Docker fallback).
+        env: safeEnv
       });
       try {
         return await launchFirecracker({
@@ -43512,7 +45055,9 @@ function createFirecrackerBackend(deps) {
           launchVm: doLaunchVm,
           openVsockSession: doOpenVsockSession,
           teardown: doTeardown,
-          warn: deps.warn
+          warn: deps.warn,
+          // SECURITY: sanitized env for launch.ts's bare-name pre-trust tap `ip` spawns.
+          env: safeEnv
         });
       } finally {
         await overlay.cleanup();
@@ -43525,8 +45070,8 @@ function rootfsImageName(runnerImage, arch2) {
 }
 async function launchFirecracker(input) {
   const runId = (0, import_node_crypto5.randomBytes)(4).toString("hex");
-  const apiSocketPath = (0, import_node_path9.join)((0, import_node_os4.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
-  const vsockUdsPath = (0, import_node_path9.join)((0, import_node_os4.tmpdir)(), `script-jail-vsock-${runId}`);
+  const apiSocketPath = (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), `script-jail-fc-api-${runId}.sock`);
+  const vsockUdsPath = (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), `script-jail-vsock-${runId}`);
   let vm = null;
   let vsock = null;
   let finalYaml = null;
@@ -43548,7 +45093,9 @@ async function launchFirecracker(input) {
       vsockCid: GUEST_CID,
       vsockUdsPath,
       enableNetwork: true,
-      socketPath: apiSocketPath
+      socketPath: apiSocketPath,
+      // SECURITY: sanitized env for the tap-setup `ip` spawns (launch.ts).
+      env: input.env
     });
     vsock = await input.openVsockSession(vsockUdsPath, VSOCK_PORT);
     for await (const frame of vsock.events) {
@@ -43592,25 +45139,25 @@ async function launchFirecracker(input) {
 var import_node_crypto6 = require("node:crypto");
 
 // src/action/backend/stage.ts
-var import_node_fs14 = require("node:fs");
-var import_node_path10 = require("node:path");
-var import_yaml3 = __toESM(require_dist(), 1);
+var import_node_fs17 = require("node:fs");
+var import_node_path13 = require("node:path");
+var import_yaml4 = __toESM(require_dist(), 1);
 function stageRepoDirectory(input) {
-  const stageRoot = (0, import_node_fs14.mkdtempSync)((0, import_node_path10.join)(input.parentDir, "repo-stage-"));
-  const repoStage = (0, import_node_path10.join)(stageRoot, "work");
-  (0, import_node_fs14.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
+  const stageRoot = (0, import_node_fs17.mkdtempSync)((0, import_node_path13.join)(input.parentDir, "repo-stage-"));
+  const repoStage = (0, import_node_path13.join)(stageRoot, "work");
+  (0, import_node_fs17.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false, verbatimSymlinks: true });
   materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
   return {
     path: repoStage,
     cleanup: () => {
-      (0, import_node_fs14.rmSync)(stageRoot, { recursive: true, force: true });
+      (0, import_node_fs17.rmSync)(stageRoot, { recursive: true, force: true });
     }
   };
 }
 function materializeExtraFiles(rootDir, files) {
-  const root = (0, import_node_path10.resolve)(rootDir);
+  const root = (0, import_node_path13.resolve)(rootDir);
   for (const entry of files) {
-    const dest = (0, import_node_path10.resolve)(root, entry.relPath);
+    const dest = (0, import_node_path13.resolve)(root, entry.relPath);
     if (dest !== root && !dest.startsWith(root + "/")) {
       throw new Error(
         `[backend] extraRepoOverlayFiles entry '${entry.relPath}' escapes the staged repo`
@@ -43628,40 +45175,84 @@ function writeOverlayFile2(root, relPath, content) {
   }
   let dir = root;
   for (const part of parts.slice(0, -1)) {
-    dir = (0, import_node_path10.join)(dir, part);
+    dir = (0, import_node_path13.join)(dir, part);
     ensureRealDirectory2(dir);
   }
-  const dest = (0, import_node_path10.join)(dir, parts[parts.length - 1]);
-  (0, import_node_fs14.rmSync)(dest, { recursive: true, force: true });
-  (0, import_node_fs14.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
+  const dest = (0, import_node_path13.join)(dir, parts[parts.length - 1]);
+  let leaf;
+  try {
+    leaf = (0, import_node_fs17.lstatSync)(dest);
+  } catch {
+    leaf = void 0;
+  }
+  if (leaf !== void 0) {
+    const kind = leaf.isSymbolicLink() ? "symlink" : leaf.isDirectory() ? "directory (a committed gitlink/submodule or plain directory)" : "file";
+    throw new Error(
+      `[backend] cannot stage script-jail overlay: the checkout already has a ${kind} at '${dest}' \u2014 script-jail OWNS this path and writes its own sidecar here. It refuses to replace committed checkout content (under install:true that would also diverge the audit from the host re-run). Remove it from the checkout.`
+    );
+  }
+  (0, import_node_fs17.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory2(path) {
-  if (!(0, import_node_fs14.existsSync)(path)) {
-    (0, import_node_fs14.mkdirSync)(path, { recursive: true });
+  let stat2;
+  try {
+    stat2 = (0, import_node_fs17.lstatSync)(path);
+  } catch {
+    (0, import_node_fs17.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat2 = (0, import_node_fs14.lstatSync)(path);
   if (stat2.isDirectory() && !stat2.isSymbolicLink()) return;
-  (0, import_node_fs14.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs14.mkdirSync)(path, { recursive: true });
+  throw new Error(
+    `[backend] cannot stage script-jail overlay: the checkout has a non-directory at '${path}' (a committed symlink or file) where script-jail needs a real directory. install:true refuses to replace it \u2014 that would make the audit diverge from the host checkout. Remove it from the checkout, or audit without 'install'.`
+  );
 }
 function rewriteConfigWorkDir(input) {
-  const raw = (0, import_node_fs14.readFileSync)(input.configPath, "utf8");
-  const parsed = (0, import_yaml3.parse)(raw);
+  const raw = (0, import_node_fs17.readFileSync)(input.configPath, "utf8");
+  const parsed = (0, import_yaml4.parse)(raw);
   const config2 = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? { ...parsed } : {};
   config2["work_dir"] = input.workDir;
-  const outPath = (0, import_node_path10.join)(input.outDir, "config.backend.yml");
-  (0, import_node_fs14.writeFileSync)(outPath, (0, import_yaml3.stringify)(config2), "utf8");
+  const outPath = (0, import_node_path13.join)(input.outDir, "config.backend.yml");
+  (0, import_node_fs17.writeFileSync)(outPath, (0, import_yaml4.stringify)(config2), "utf8");
   return outPath;
+}
+var RESERVED_SIDECAR_DIR2 = "etc/script-jail";
+var CONTROL_SIDECAR_ENV_BY_NAME = {
+  "pm-flags.json": "SCRIPT_JAIL_PM_FLAGS_CONTENT",
+  "pnpm-arch.json": "SCRIPT_JAIL_PNPM_ARCH_CONTENT"
+};
+function partitionControlSidecars(files) {
+  const repoOverlay = [];
+  const controlSidecars = [];
+  for (const f of files) {
+    if (f.relPath === RESERVED_SIDECAR_DIR2 || f.relPath.startsWith(`${RESERVED_SIDECAR_DIR2}/`)) {
+      controlSidecars.push(f);
+    } else {
+      repoOverlay.push(f);
+    }
+  }
+  return { repoOverlay, controlSidecars };
+}
+function controlSidecarEnv(controlSidecars) {
+  const env = {};
+  for (const entry of controlSidecars) {
+    const name = entry.relPath.split("/").filter((p) => p.length > 0).pop();
+    const envName = name !== void 0 ? CONTROL_SIDECAR_ENV_BY_NAME[name] : void 0;
+    if (envName !== void 0) env[envName] = entry.content;
+  }
+  return env;
 }
 
 // src/action/backend/docker.ts
 function createDockerBackend(deps = {}) {
   const env = deps.env ?? process.env;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const doRunCommand = deps.runCommand ?? runCommand;
+  const safeEnv = stripDangerousEnv(env);
   return {
     name: "docker",
     async run(ctx) {
-      if (!commandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env })) {
+      if (!doCommandSucceeds("docker", ["version", "--format", "{{.Server.Version}}"], { env: safeEnv })) {
         throw new BackendUnavailableError("docker", "docker is not installed or the daemon is unavailable");
       }
       const { ref: imageRef, warning } = resolveDockerImageRef(ctx, {
@@ -43669,12 +45260,12 @@ function createDockerBackend(deps = {}) {
       });
       if (warning !== void 0) writeDockerWarning(deps.stderr, warning);
       if (ctx.selfTest) {
-        if (!commandSucceeds("docker", ["image", "inspect", imageRef], { env })) {
+        if (!doCommandSucceeds("docker", ["image", "inspect", imageRef], { env: safeEnv })) {
           throw new BackendUnavailableError("docker", `local image ${imageRef} is missing`);
         }
       } else {
         try {
-          runCommand("docker", ["pull", imageRef], { env });
+          doRunCommand("docker", ["pull", imageRef], { env: safeEnv });
         } catch (err) {
           throw new BackendUnavailableError(
             "docker",
@@ -43682,18 +45273,34 @@ function createDockerBackend(deps = {}) {
           );
         }
       }
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: repoOverlay
       });
+      const controlEnv = controlSidecarEnv(controlSidecars);
+      const controlEnvFlags = Object.entries(controlEnv).flatMap(([name, value]) => [
+        "-e",
+        `${name}=${value}`
+      ]);
       const containerName = `script-jail-${(0, import_node_crypto6.randomBytes)(4).toString("hex")}`;
+      const workDir = ctx.auditWorkDir ?? "/work";
       try {
         const script = [
           "set -eu",
           "export VP_HOME=/opt/vp",
           "export COREPACK_HOME=/opt/vp/corepack",
           "export COREPACK_ENABLE_DOWNLOAD_PROMPT=0",
+          // round-17f (codex [critical], uniform policy): never load a PROJECT
+          // `.corepack.env` (cwd=repoDir).  Docker already sets COREPACK_HOME (so the
+          // file can't steer it — process.env wins, corepack.cjs:13556) and Phase B
+          // direct-launches, so this is defense-in-depth, but pinning it on EVERY
+          // backend + the host keeps one "ignore .corepack.env" policy (mirrors how
+          // COREPACK_ENABLE_DOWNLOAD_PROMPT is pinned everywhere).
+          "export COREPACK_ENV_FILE=0",
           'mkdir -p "${VP_HOME}" "${COREPACK_HOME}"',
           'NODE_VERSION="$(cat /etc/script-jail/node-version)"',
           'vp env install "${NODE_VERSION}" >&2',
@@ -43704,9 +45311,11 @@ function createDockerBackend(deps = {}) {
           "mkdir -p /tmp/script-jail-strace",
           "export SCRIPT_JAIL_CONNECTION=stdio",
           "export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml",
+          // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT are delivered via the container `-e`
+          // env (already in this shell's env), NOT exported here — `exec` preserves them.
           "exec node /usr/local/lib/script-jail/guest-agent.cjs"
         ].join("; ");
-        return await runAgentProcess({
+        return await doRunAgentProcess({
           cmd: "docker",
           args: [
             "run",
@@ -43718,30 +45327,40 @@ function createDockerBackend(deps = {}) {
             "--security-opt",
             "seccomp=unconfined",
             "-v",
-            `${staged.path}:/work`,
+            `${staged.path}:${workDir}`,
             "-v",
             `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
+            // Control sidecars (pm-flags.json / pnpm-arch.json) delivered as env CONTENT,
+            // NOT a file at any path (audit-only sidecar oracle): the guest reads
+            // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT from the agent env so the sandbox
+            // fetch applies the SAME install args as the host part-1 install.  Each is a
+            // single `-e NAME=value` argv element (#31): literal regardless of content
+            // (JSON braces/quotes/newlines), never re-parsed by a shell.  loadPmFlags /
+            // applyPnpmArchOverlay re-sanitize the content.  Empty when no sidecar →
+            // no `-e` → guest degrades to "no override".
+            ...controlEnvFlags,
             imageRef,
             "/bin/sh",
             "-lc",
             script
           ],
-          env,
+          env: safeEnv,
           label: "docker",
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {},
           onFetchDone: async () => {
-            runCommand("docker", ["network", "disconnect", "bridge", containerName], { env });
+            doRunCommand("docker", ["network", "disconnect", "bridge", containerName], { env: safeEnv });
           }
         });
       } finally {
         try {
-          runCommand("docker", ["rm", "-f", containerName], { env });
+          doRunCommand("docker", ["rm", "-f", containerName], { env: safeEnv });
         } catch {
         }
         cleanupStagedDockerRepo({
           staged,
           imageRef,
-          env,
+          env: safeEnv,
+          run: doRunCommand,
           ...deps.stderr !== void 0 ? { stderr: deps.stderr } : {}
         });
       }
@@ -43824,23 +45443,26 @@ function resolveDockerImageRef(ctx, opts = {}) {
 }
 
 // src/action/backend/bare.ts
-var import_node_fs15 = require("node:fs");
-var import_node_path11 = require("node:path");
+var import_node_fs18 = require("node:fs");
+var import_node_path14 = require("node:path");
 var import_node_process4 = require("node:process");
 function createBareBackend(deps = {}) {
   const hostPlatform = deps.platform ?? import_node_process4.platform;
   const env = deps.env ?? process.env;
   const doPreFetchArtifacts = deps.preFetchArtifacts ?? preFetchArtifacts;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const safeEnv = stripDangerousEnv(env);
   return {
     name: "bare",
     async run(ctx) {
       if (hostPlatform !== "linux") {
         throw new BackendUnavailableError("bare", `requires Linux (detected ${hostPlatform})`);
       }
-      if (!commandSucceeds("strace", ["-V"], { env })) {
+      if (!doCommandSucceeds("strace", ["-V"], { env: safeEnv })) {
         throw new BackendUnavailableError("bare", "strace is not available");
       }
-      if (!commandSucceeds("unshare", ["-n", "--", "true"], { env })) {
+      if (!doCommandSucceeds("unshare", ["-n", "--", "true"], { env: safeEnv })) {
         throw new BackendUnavailableError("bare", "unshare -n is not available");
       }
       if (!ctx.selfTest) {
@@ -43854,24 +45476,55 @@ function createBareBackend(deps = {}) {
         });
       }
       const runtime = resolveRuntimePaths(ctx);
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles
+        extraRepoOverlayFiles: repoOverlay
       });
+      const controlEnv = controlSidecarEnv(controlSidecars);
       const backendConfigPath = rewriteConfigWorkDir({
         configPath: ctx.configPath,
         outDir: ctx.scratchDir,
         workDir: staged.path
       });
       try {
-        return await runAgentProcess({
+        return await doRunAgentProcess({
           cmd: process.execPath,
           args: [runtime.agentPath],
           env: {
-            ...env,
+            // PARITY: the bare agent runs ON THE HOST and inherits the runner env
+            // (unlike the clean-VM Firecracker/Docker guest).  `safeEnv` already
+            // stripped the dangerous loader/tool/config selectors + sanitized PATH
+            // (same policy as the host install + the probes above), so the bare
+            // AUDIT sees the same env the hardened host install does and an
+            // inherited NODE_OPTIONS can't inject into the agent process itself.
+            ...safeEnv,
+            // stripDangerousEnv now drops the whole COREPACK_* family (incl. any
+            // inherited COREPACK_ENABLE_DOWNLOAD_PROMPT), so re-pin it here — corepack
+            // 0.35.0 defaults the prompt ON, and an uncached pm download would block
+            // the bare AUDIT otherwise (mac-bare/docker/init.sh re-pin it the same way).
+            COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+            // round-17f (codex [critical]): corepack loads a PROJECT `.corepack.env`
+            // (cwd=repoDir) at startup unless COREPACK_ENV_FILE=0; process.env WINS over
+            // the file (corepack.cjs:13556).  The bare AUDIT has NO COREPACK_HOME set, so
+            // a repo `.corepack.env` setting COREPACK_HOME=<checkout>/evil would steer
+            // both Phase A AND the bare-launched Phase B corepack shim to a planted cache
+            // (Phase B is straced → it would even diverge from the host part-2, which now
+            // pins COREPACK_ENV_FILE=0).  Pin it here so the bare audit ignores the file,
+            // matching the host install.  (Set as a literal AFTER the safeEnv strip, like
+            // the download-prompt flag — survives into the agent's PM children.)
+            COREPACK_ENV_FILE: "0",
             SCRIPT_JAIL_CONNECTION: "stdio",
             SCRIPT_JAIL_CONFIG_PATH: backendConfigPath,
+            // Bare mode runs the agent directly on the host (no container /etc).  Deliver
+            // the pm-flags / pnpm-arch control sidecars as env CONTENT (no file at any
+            // path), keeping `etc/script-jail/` out of the audited repo root (audit-only
+            // sidecar oracle).  Empty dict when no sidecar → guest degrades to "no
+            // override".  loadPmFlags / applyPnpmArchOverlay re-sanitize the content.
+            ...controlEnv,
             SCRIPT_JAIL_NATIVE_PRELOAD_PATH: runtime.nativePreloadPath,
             SCRIPT_JAIL_PLATFORM_PRELOAD_PATH: runtime.platformPreloadPath,
             SCRIPT_JAIL_ENV_SPY_PRELOAD_PATH: runtime.envSpyPreloadPath,
@@ -43892,28 +45545,28 @@ function resolveRuntimePaths(ctx) {
     process.env["SCRIPT_JAIL_ACTION_ROOT"],
     process.env["GITHUB_ACTION_PATH"],
     moduleDir,
-    (0, import_node_path11.join)(moduleDir, ".."),
-    (0, import_node_path11.join)(moduleDir, "..", ".."),
+    (0, import_node_path14.join)(moduleDir, ".."),
+    (0, import_node_path14.join)(moduleDir, "..", ".."),
     process.cwd()
   ].filter((p) => typeof p === "string" && p.length > 0);
   const agentPath = findFirst([
-    ...roots.map((root) => (0, import_node_path11.join)(root, "guest-agent.cjs")),
-    ...roots.map((root) => (0, import_node_path11.join)(root, "dist", "guest-agent.cjs"))
+    ...roots.map((root) => (0, import_node_path14.join)(root, "guest-agent.cjs")),
+    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "guest-agent.cjs"))
   ], "guest-agent.cjs");
   const platformPreloadPath = findFirst([
-    ...roots.map((root) => (0, import_node_path11.join)(root, "preloads", "platform-spoof.cjs")),
-    ...roots.map((root) => (0, import_node_path11.join)(root, "dist", "preloads", "platform-spoof.cjs"))
+    ...roots.map((root) => (0, import_node_path14.join)(root, "preloads", "platform-spoof.cjs")),
+    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "preloads", "platform-spoof.cjs"))
   ], "platform-spoof.cjs");
   const envSpyPreloadPath = findFirst([
-    ...roots.map((root) => (0, import_node_path11.join)(root, "preloads", "env-spy.cjs")),
-    ...roots.map((root) => (0, import_node_path11.join)(root, "dist", "preloads", "env-spy.cjs"))
+    ...roots.map((root) => (0, import_node_path14.join)(root, "preloads", "env-spy.cjs")),
+    ...roots.map((root) => (0, import_node_path14.join)(root, "dist", "preloads", "env-spy.cjs"))
   ], "env-spy.cjs");
   const libName = ctx.arch === "arm64" ? "libscriptjail-arm64.so" : "libscriptjail.so";
   const nativePreloadPath = findFirst([
-    (0, import_node_path11.join)(ctx.imagesDir, libName),
-    (0, import_node_path11.join)(ctx.imagesDir, "libscriptjail.so"),
-    ...roots.map((root) => (0, import_node_path11.join)(root, "images", libName)),
-    ...roots.map((root) => (0, import_node_path11.join)(root, "images", "libscriptjail.so"))
+    (0, import_node_path14.join)(ctx.imagesDir, libName),
+    (0, import_node_path14.join)(ctx.imagesDir, "libscriptjail.so"),
+    ...roots.map((root) => (0, import_node_path14.join)(root, "images", libName)),
+    ...roots.map((root) => (0, import_node_path14.join)(root, "images", "libscriptjail.so"))
   ], libName);
   return {
     agentPath,
@@ -43928,18 +45581,30 @@ function currentModuleDir() {
 }
 function findFirst(candidates, label) {
   for (const candidate of candidates) {
-    if ((0, import_node_fs15.existsSync)(candidate)) return candidate;
+    if ((0, import_node_fs18.existsSync)(candidate)) return candidate;
   }
   throw new BackendUnavailableError("bare", `${label} was not found`);
 }
 
 // src/action/backend/select.ts
 var AUTO_ORDER = ["firecracker", "docker", "bare"];
+var INSTALL_ALIGNED_BACKENDS = /* @__PURE__ */ new Set([
+  "firecracker",
+  "docker"
+]);
 async function runSelectedBackend(input) {
-  const order = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const aligned = input.requireRepoDirAligned === true;
+  if (aligned && input.requested !== "auto" && !INSTALL_ALIGNED_BACKENDS.has(input.requested)) {
+    throw new Error(
+      `script-jail: \`install: true\` requires a repoDir-aligned backend (firecracker or docker); the "${input.requested}" backend audits in a temporary staged copy and cannot safely re-run host lifecycle scripts.`
+    );
+  }
+  const baseOrder = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const order = aligned ? baseOrder.filter((b) => INSTALL_ALIGNED_BACKENDS.has(b)) : baseOrder;
   const unavailable = [];
   for (const name of order) {
     try {
+      input.onBackendSelected?.(name);
       return await input.backends[name].run(input.ctx);
     } catch (err) {
       if (err instanceof BackendUnavailableError) {
@@ -43956,7 +45621,31 @@ async function runSelectedBackend(input) {
   );
 }
 
+// src/guest/attribution.ts
+var CANONICAL_STAGES = new Set(LifecycleStage.options);
+var ROOT_SENTINEL = "<repo-root>";
+function buildRootPkgKeys(manifest) {
+  const keys = /* @__PURE__ */ new Set();
+  if (manifest.name !== void 0 && typeof manifest.name !== "string") {
+    return { keys, canonical: null };
+  }
+  if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+    return { keys: /* @__PURE__ */ new Set([ROOT_SENTINEL]), canonical: ROOT_SENTINEL };
+  }
+  const name = manifest.name;
+  keys.add(name);
+  if (typeof manifest.version === "string") {
+    keys.add(`${name}@${manifest.version}`);
+    return { keys, canonical: `${name}@${manifest.version}` };
+  }
+  return { keys, canonical: name };
+}
+
 // src/main.ts
+function nodeMajorOf(version2) {
+  const m = version2.replace(/^v/, "").match(/^(\d+)/);
+  return m === null ? NaN : parseInt(m[1], 10);
+}
 async function main(deps = {}) {
   const {
     validateManifest: doValidateManifest = validateManifest,
@@ -43968,7 +45657,9 @@ async function main(deps = {}) {
     launchVm: doLaunchVm = launchVm,
     openVsockSession: doOpenVsockSession = openVsockSession,
     teardown: doTeardown = teardown,
-    exitProcess = process.exit
+    exitProcess = process.exit,
+    hostInstallNoScripts: doHostInstallNoScripts = hostInstallNoScripts,
+    hostRunScripts: doHostRunScripts = hostRunScripts
   } = deps;
   const selfTest = process.env["SCRIPT_JAIL_E2E_SELF_TEST"] === "1";
   if (!selfTest) {
@@ -43987,9 +45678,80 @@ async function main(deps = {}) {
     }
     throw err;
   }
+  if (inputs.install) {
+    if (inputs.mode === "update") {
+      process.stdout.write(
+        "::error::script-jail: `install: true` requires `mode: check`. Update mode regenerates the lock and skips the audit-bypass gate, so there is no fail-closed signal to run lifecycle scripts against. Generate the lock with `mode: update` (install off), commit it, then enable `install` with `mode: check`.\n"
+      );
+      exitProcess(1);
+    }
+    if (!(0, import_node_fs19.existsSync)(inputs.lockPath)) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires a committed lock at ${inputs.lockPath}. Generate one with \`mode: update\` (install off), commit it, then enable \`install\`.
+`
+      );
+      exitProcess(1);
+    }
+    if (inputs.spoofPlatform !== process.platform || inputs.spoofArch !== actionHostArch) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires the spoof target to match the runner. Spoof platform/arch (${inputs.spoofPlatform}/${inputs.spoofArch}) must equal the real runner (${process.platform}/${actionHostArch}); otherwise an audited script can branch on process.platform/arch so the sandbox audits one branch while the runner executes the other, and the trusted lock would not describe what actually runs. Remove the spoof override (or set it to the runner's real platform/arch) when using \`install\`.
+`
+      );
+      exitProcess(1);
+    }
+    const auditNodeMajor = nodeMajorOf(NODE_VERSION);
+    const hostNodeMajor = nodeMajorOf(process.version);
+    if (hostNodeMajor !== auditNodeMajor) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` requires the runner's Node major to match the audited toolchain. The sandbox audits under Node ${NODE_VERSION} (major ${auditNodeMajor}), but this runner executes host lifecycle scripts under ${process.version} (major ${Number.isFinite(hostNodeMajor) ? hostNodeMajor : "unknown"}); a package can branch on process.version / native ABI so the audited branch differs from what the runner builds and runs, and the trusted lock would not describe it. Align the runner's Node (e.g. actions/setup-node with node-version ${auditNodeMajor}) with the audited major, or audit without \`install\`.
+`
+      );
+      exitProcess(1);
+    }
+    const workspaceRoot = process.env["GITHUB_WORKSPACE"];
+    const configExecReason = detectPreTrustConfigExec(repoDir, pm.manager, workspaceRoot);
+    if (configExecReason !== null) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` refused \u2014 ${configExecReason}
+`
+      );
+      exitProcess(1);
+    }
+    const workDirDivergence = detectInstallWorkDirDivergence(inputs.configPath);
+    if (workDirDivergence !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${workDirDivergence}
+`);
+      exitProcess(1);
+    }
+    const homeReason = detectCheckoutRelativeHome(process.env["HOME"], repoDir, workspaceRoot);
+    if (homeReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${homeReason}
+`);
+      exitProcess(1);
+    }
+    const reservedPathReason = detectReservedScriptJailPaths(repoDir);
+    if (reservedPathReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${reservedPathReason}
+`);
+      exitProcess(1);
+    }
+    const subdirEscapeReason = detectSubdirInstallAncestorEscape(repoDir, workspaceRoot);
+    if (subdirEscapeReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${subdirEscapeReason}
+`);
+      exitProcess(1);
+    }
+    if (inputs.backend !== "auto" && !INSTALL_ALIGNED_BACKENDS.has(inputs.backend)) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` is not supported on the \`${inputs.backend}\` backend \u2014 it audits in a temporary staged copy whose path differs from the checkout, so a committed symlink can make the host re-run execute code the audit never resolved. Use \`backend: firecracker\` or \`backend: docker\` (which audit at the checkout path), or audit without \`install\`.
+`
+      );
+      exitProcess(1);
+    }
+  }
   const runnerImage = detectRunnerImage();
-  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path12.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path12.join)((0, import_node_os5.tmpdir)(), "script-jail-images");
-  (0, import_node_fs16.mkdirSync)(imagesDir, { recursive: true });
+  const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path15.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path15.join)((0, import_node_os6.tmpdir)(), "script-jail-images");
+  (0, import_node_fs19.mkdirSync)(imagesDir, { recursive: true });
   const http = new NodeHttpClient();
   const backends = {
     firecracker: createFirecrackerBackend({
@@ -44011,6 +45773,7 @@ async function main(deps = {}) {
       stderr: process.stderr
     })
   };
+  let auditBackend;
   const result = await runAudit({
     repoDir,
     configPath: inputs.configPath,
@@ -44022,6 +45785,16 @@ async function main(deps = {}) {
     },
     pm: pm.manager,
     hostArch: actionHostArch,
+    // Developer install args reach the sandbox fetch (so the audited tree
+    // matches what part 1 installed on the host).
+    args: inputs.args,
+    // install:true cwd parity: pin the guest audit work_dir to the real
+    // repoDir so the sandbox runs lifecycle scripts at the SAME cwd the
+    // uninstrumented host re-run uses, closing a `process.cwd()` detection
+    // oracle (FC/docker; bare/mac-bare re-pin to their staged path, so the
+    // cwd parity is a documented residual there).  Undefined in pure-audit
+    // mode (guest default /work stands).
+    ...inputs.install ? { installWorkDir: repoDir } : {},
     // Pass `imagesDir` as the workDir so the rewritten config lives under
     // the same RUNNER_TEMP-rooted tree we already use for binaries.
     // GitHub Actions purges RUNNER_TEMP between jobs; without this,
@@ -44032,6 +45805,13 @@ async function main(deps = {}) {
       requested: inputs.backend,
       backends,
       warn,
+      // install:true requires a repoDir-aligned backend (FC/docker); drop `bare`
+      // from auto and reject an explicit bare here as a backstop to the pre-audit
+      // gate.  (Codex re-review: bare-backend staged-symlink escape.)
+      requireRepoDirAligned: inputs.install,
+      onBackendSelected: (name) => {
+        auditBackend = name;
+      },
       ctx: {
         ...auditInput,
         imagesDir,
@@ -44053,6 +45833,31 @@ async function main(deps = {}) {
       }
     }
   });
+  if (inputs.install) {
+    const hostTmpdir = auditBackend === "firecracker" ? trustedHostTmpdir() : void 0;
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, void 0, hostTmpdir);
+    if (result.trusted) {
+      const egress = collectNetworkAttempts(result.generatedLock ?? "");
+      if (egress.length > 0) {
+        let rootPackageIds = /* @__PURE__ */ new Set();
+        try {
+          const rootManifest = JSON.parse(
+            (0, import_node_fs19.readFileSync)((0, import_node_path15.join)(repoDir, "package.json"), "utf8")
+          );
+          ({ keys: rootPackageIds } = buildRootPkgKeys(rootManifest));
+        } catch {
+        }
+        const { summary: summary2, detail } = formatEgressWarning(egress, {
+          manager: pm.manager,
+          rootPackageIds
+        });
+        warn(summary2);
+        process.stdout.write(detail);
+      }
+      const protectedEnvNames = readProtectedEnvNames(inputs.configPath);
+      await doHostRunScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames, void 0, void 0, hostTmpdir);
+    }
+  }
   if (result.exitCode !== 0) exitProcess(result.exitCode);
 }
 function detectActionHostArch(arch2 = process.arch) {

@@ -56,6 +56,14 @@ export interface ApplyPnpmArchInput {
    * Exposed so unit tests can point at a temp file.
    */
   overlayPath?: string;
+  /**
+   * The overlay JSON delivered DIRECTLY via the `SCRIPT_JAIL_PNPM_ARCH_CONTENT`
+   * env var (threaded by the agent).  Preferred over `overlayPath` so the
+   * control sidecar never lands at a lifecycle-visible filesystem path — same
+   * audit-only sidecar oracle close as pm-flags (see load-pm-flags.ts).  When
+   * present (even empty-string), the file is not read.
+   */
+  content?: string;
 }
 
 export interface ApplyPnpmArchResult {
@@ -80,7 +88,8 @@ export function applyPnpmArchOverlay(
 
   let supportedArchitectures: unknown;
   try {
-    const raw = fs.readFileSync(overlayPath, 'utf8');
+    const raw =
+      input.content !== undefined ? input.content : fs.readFileSync(overlayPath, 'utf8');
     const parsed = PnpmArchSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) return { applied: false };
     supportedArchitectures = parsed.data.supportedArchitectures;

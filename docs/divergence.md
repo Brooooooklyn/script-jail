@@ -27,6 +27,85 @@ determinism across hosts:
   Virtualization.framework expose different device and procfs/sysfs shapes.
   Most package installs do not inspect these, but a native postinstall can.
 
+- **`install: true` audit cwd (cwd-detection parity).** Under `install: true`
+  the host re-runs lifecycle scripts at the real repoDir, so the audit aligns its
+  cwd to match: **Firecracker/Docker** pin the guest `work_dir` to `${repoDir}`
+  (Docker `-v staged:${repoDir}`; Firecracker `mount --move`s the repo disk there
+  in `init.sh`, falling back to a `/work` audit if the move fails). The
+  **`bare`/`mac-bare`** backends audit at a staged temp path and do **not** align,
+  so under `install: true` their `process.cwd()` differs from the host re-run — a
+  cwd-detection residual. Firecracker is the enforcement boundary; a payload that
+  branches on `process.cwd()` would be caught there, recorded as a host-vs-sandbox
+  cwd parity only on FC/Docker. Either way this is defense-in-depth, not a complete
+  sandbox guarantee — see the `install: true` trust model in
+  [docs/design.md](./design.md#drop-in-install-trust-model-install-true).
+
+- **`install: true` host package-manager VERSION (defense-in-depth residual).**
+  The host lifecycle pass (`src/action/host-install.ts`) runs the
+  **runner's** installed `npm`/`pnpm`/`yarn` version — not necessarily the
+  corepack-pinned version the guest audit uses inside the sandbox. A lifecycle
+  script that branches on the PM version (`npm --version`,
+  `process.env.npm_config_user_agent`, a `packageManager`-gated code path)
+  therefore sees the runner's version on the host re-run and the corepack-pinned
+  one in the audit, so its behaviour can diverge. This is **low severity and not
+  PR-controllable**: the runner PM version is owner/runner-image controlled, not
+  something a fork PR can set, and it is bounded by the same trust model as the
+  rest of the host pass — the host only runs lifecycle scripts whose sandbox
+  audit was already clean. **Firecracker is the enforcement boundary**, and this
+  is an accepted residual rather than a parity bug.
+
+  The host **bypasses corepack** by direct-launching `node <cached-entry>`
+  exactly like the guest (commit 81a0747 / `resolveLinuxManagerLaunch`): when the
+  bare `pnpm`/`yarn` on the runner is a corepack shim (or corepack has cached a
+  version), `hostRunScripts` resolves the offline-cached PM entry from the
+  action's corepack cache and spawns `node <entry> …` instead. This keeps
+  `COREPACK_ROOT`/`COREPACK_HOME` **absent on both sides** — corepack sets
+  `COREPACK_ROOT` *unconditionally* in the lifecycle child before launching a
+  managed bin, and env-stripping alone cannot close it (corepack re-sets it inside
+  its own process), so the only lever is to not go through corepack. That closes
+  the **value-blind oracle** where a dep does `if (process.env.COREPACK_ROOT)
+  evil(); else benign();` — benign in the audit (clean lock) but evil on the host.
+
+  The launch resolver inspects the **same sanitized `PATH` and the same default
+  corepack cache** the part-1 fetch warmed: `hostRunScripts` builds the child env
+  once (`hostInstallEnv(…,'scripts')`) and feeds it to *both* the resolver and the
+  spawn, so the corepack-shim probe reads exactly the binary the child execs and
+  the cache-root probe reads the stripped default `~/.cache/node/corepack` (part-1
+  ran corepack under the same stripped env), not an inherited
+  `COREPACK_HOME`/`XDG_CACHE_HOME`. The shim probe matches the verified
+  `corepack.cjs` require-target signature only (the bare `corepack`/`runMain`
+  substrings were over-broad and could mis-flag a standalone PM).
+
+  Residual: a **standalone (non-corepack) consumer** (e.g. `pnpm/action-setup`)
+  bare-launches its own PM, which is safe — it sets no `COREPACK_ROOT`, so the
+  guest (no `COREPACK_ROOT`) and host already match. The resolver inspects the bare
+  PM the child would exec (first match on the sanitized `PATH`): a **readable,
+  non-shim** binary is a *confirmed* standalone PM and bare-launches **even if the
+  runner's corepack cache holds a (stale) version of that PM** — a leftover
+  `~/.cache/node/corepack` entry from an unrelated prior job must not hijack or
+  fail-closed-break a proven standalone install (there is no `COREPACK_ROOT` risk to
+  justify overriding it). **npm** routes through the node-bundled `npm-cli.js`
+  directly; if that is absent (a node without bundled npm, or one where bare `npm`
+  is a `corepack enable npm` shim) the host **fails closed** (throws) — the guest's
+  `resolveLinuxManagerLaunch` throws on the same layout, so this is parity-correct,
+  not a new divergence. A corepack-managed PM (the bare PM **is** a corepack shim,
+  or none is on `PATH`) whose cached entry cannot be resolved **fails closed**
+  (throws) rather than bare-launching and re-opening the oracle. This includes the
+  **multi-version-no-pin** case: when the bare PM is a corepack shim on a reused/
+  self-hosted runner whose corepack cache holds >1 version **and** the repo has no
+  `packageManager` pin, the resolver cannot disambiguate which version part-1
+  resolved (corepack does **not** write a per-`COREPACK_HOME` `lastKnownGood.json`
+  on the project-pin-driven flow — verified corepack 0.35.0), so it fails closed;
+  pin `"packageManager"` in `package.json` to resolve it. A corepack-managed
+  **yarn@1.x** pin fails closed on **both** host and guest (the resolver expects a
+  berry `yarn.js`), again no new host/guest divergence. (The host child env is
+  otherwise hardened: `hostInstallEnv` strips inherited loader/config vars —
+  `NODE_OPTIONS`, `LD_PRELOAD`/`LD_AUDIT`/`DYLD_*`, `GIT_SSH_COMMAND` and the
+  other git transport overrides, `NPM_CONFIG_SCRIPT_SHELL`/`_USERCONFIG`/
+  `_GLOBALCONFIG`/`_IGNORE_SCRIPTS` — and sanitizes `PATH` of every
+  checkout-controlled dir, so a PR cannot inject pre-trust code or redirect
+  tool/config resolution that the audit never saw.)
+
 - **Native binaries the lifecycle script execs directly.** Some scripts
   shell out to a host-provided binary (`python`, `cc`, `make`). Whether the
   VM rootfs ships that binary is a property of the rootfs build, not of the
@@ -448,6 +527,100 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
     exit} AND {no later observed activity} — the **same class** as PR #10's
     accepted post-exit-freeze residual (a root attacker racing the tailer is
     outside the enforceable boundary).
+  - **Defer-and-re-resolve: two irreducible single-pass cross-file ordering limits,
+    handled in the SAFE direction (accepted residuals).** `strace -ff` writes one
+    trace file per pid and the guest drains them in `readdir` (inode) order with no
+    causal key, so a clone child's relative `openat(AT_FDCWD, …)` can be processed
+    BEFORE its parent's `clone() = <child>` line. The deterministic fix
+    (`src/guest/phase-install.ts`, "defer-and-re-resolve") parks such an unresolved
+    relative open and re-resolves it at end-of-drain against the clone-inherited
+    initial cwd. Two cross-file orderings cannot be disambiguated in a single pass;
+    both resolve to a **fail-loud, never-hide-real-behavior** outcome:
+    - **(#1) CLONE_FS cwd-group provenance → fail closed to `<UNRESOLVED_PATH>`.**
+      A deferred read ANY of whose process-lineage ancestors was EVER a member of a
+      `CLONE_FS` cwd group is failed closed rather than resolved, because a
+      sibling/grandparent `chdir` of the shared group cwd can be causally-prior to the
+      read yet drain AFTER the clone snapshot, leaving the inherited cwd STALE
+      (resolving would risk a protected-path FALSE NEGATIVE). The gate is a
+      **replay-time** bounded walk UP the `childParent` lineage
+      (`lineageEverCwdShared(seedParentPid)`) against the sticky `everCwdShared` set —
+      both structures are complete after the full drain, so the verdict is
+      drain-independent. The walk covers ANY `CLONE_FS` ancestor in the lineage, not
+      just the immediate parent: a plain-fork intermediate that is NOT itself in
+      `everCwdShared` can COPY a stale shared-group cwd down to the child from a
+      `CLONE_FS`-shared ancestor whose `chdir` drained late (codex round-3 #1) — a
+      pure `everCwdShared.has(seedParentPid)` check (the immediate parent only) missed
+      that transitive case and silently resolved against the stale cwd. The earlier
+      stamp-time membership sample is likewise blind when even the immediate parent's
+      own `CLONE_FS` membership edge drains after it plain-forks the child
+      (codex round-2 #1). The walk also **fails closed on lineage ambiguity** (codex
+      round-3 pid-reuse follow-up): the final `childParent` map is read at replay, so a
+      recycled intermediate pid (re-cloned by a different, non-`CLONE_FS` parent before
+      replay, overwriting its parent edge) could otherwise route the walk down the
+      recycled chain and silently MISS the original `CLONE_FS` ancestor. An overwritten
+      edge is recorded in `childParentReused`; the walk returns "shared" (fail closed)
+      when it hits a reused edge, a cycle, or the iteration cap — `false` is trusted
+      only for an unambiguous walk to the lineage root. (No single-edge-per-pid map is
+      generation-CORRECT under reuse — first-write and last-write each lose a different
+      generation — so the walk is generation-SAFE, not correct: it never yields a silent
+      false negative, at the cost of the reuse over-fire.) Accepted conservative
+      over-fires, both SAFE (the probe surfaces as a fail-loud `<UNRESOLVED_PATH>`
+      audit_bypass, never a missed protected path) and confined to pathological trees:
+      (a) a parent that shared then `unshare(CLONE_FS)`-detached still carries the
+      sticky bit, so a plain child it forks afterward also fails closed; (b) a PURE
+      plain-fork chain with NO `CLONE_FS` ancestor but whose deferred read's lineage
+      intermediate (seedParent-walk) pid is RECYCLED mid-drain also fails closed (the
+      recycled edge makes the original lineage unverifiable); and (c) a deferred read
+      whose OWN pid is recycled across generations with DIFFERENT-parent clones
+      (`childParentReused.has(P)`) AND where some parent generation has a `CLONE_FS`
+      lineage (`childAllParents`) fails closed — the wrong-generation stamp might have
+      laundered a real shared ancestor out of the walk. The own-pid-reuse gate is
+      PRECISE: a pure plain-fork recycled pid (no `CLONE_FS` parent generation) still
+      resolves under its stamped generation, preserving the accepted reaped-pid residual
+      (MEMORY: `reaped-child-env-read-pid-reuse-residual`). A lineage with NO `CLONE_FS`
+      ancestor AND no pid reuse (the real napi/plain-fork flake this fix targets)
+      completes a clean walk to the root and still resolves — **including** the case
+      where a chain intermediate `chdir`s AFTER it clones the next hop: the intermediate's
+      chdir `lineTs` versus its clone-of-next-hop `lineTs` are both in that pid's OWN
+      per-pid file, a proven within-file happens-before, so the walk recognizes the child
+      inherited the intermediate's PRE-`chdir` cwd and keeps resolving (rather than failing
+      closed on the mere presence of a later chdir). This removes a real drain-order
+      divergence: ROOT-DOWN drain resolved the inherited cwd while LEAF-UP previously
+      fell to `<UNRESOLVED_PATH>` — the two now agree. Only a genuinely unprovable order
+      (an unobserved seeding clone, or a `CLONE_FS`/pid-reuse lineage) still fails closed. Two **accepted
+      pre-existing SILENT false-negative residuals** (out of scope — verified to predate
+      this fix on HEAD; the lineage walk does not change either): **(i) inline COPY
+      staleness** — the INLINE (non-deferred) path takes a private COPY of the shared
+      group-root cwd at clone-drain, so when the shared `chdir` drains last the model
+      resolves against the stale copy; the true protected path (e.g. shared
+      `$HOME/.ssh/...`) is not surfaced and the stale non-protected resolution is dropped
+      with no `<UNRESOLVED_PATH>`. **(ii) same-parent pid-reuse generation ambiguity** —
+      when the SAME numeric parent re-forks the SAME child pid and the parent's own cwd
+      changed between generations, the deferred read can be first-stamp-wins bound to the
+      wrong generation's cwd (verified identical on HEAD `c198ee3` — the original
+      `everCwdShared.has(seedParentPid)` gate keys on the same wrong-gen
+      seedParent/initialCwd). This is the same irreducible generation-ambiguity class as
+      the reaped-pid residual: the wrong-gen stamp is byte-identical to a legitimate
+      same-generation stamp and there is no `CLONE_FS` signal to trip the precise gate,
+      so failing closed would break the legitimate same-pid fast-exit resolve and
+      over-fire the reaped-pid class. Both residuals are pinned by regressions so a
+      future generation-qualified rewrite (the only sound closure) is a deliberate,
+      visible change; neither is claimed harmless.
+    - **(#3) Inherited Node-bootstrap window → emit (over-record), never suppress.**
+      A deferred read in an inherited Node-bootstrap window is EMITTED (over-recorded
+      as package behavior) rather than suppressed when cross-file ordering is
+      ambiguous. The replay filters a deferred read as bootstrap noise ONLY on
+      POSITIVE, drain-independent evidence — the resolved path is already in the
+      `nodeBootstrapFileReads` baseline, the child inherited file-pending at its
+      seeding clone (gated by the child's OWN startup-done marker), or the child has
+      its OWN bootstrap window (own marker ts vs read ts, same per-pid file → causal).
+      The prior cross-file `read.ts < parentEndedTs` parent-window inference was
+      DROPPED: it could SUPPRESS a genuine package read of a non-Node helper forked
+      after the parent's bootstrap window closed but whose racing read drained before
+      the parent's marker (codex round-2 #3) — and suppressing a real package read is
+      the dangerous direction for a security audit. The residual (a Node-internal
+      read of a non-Node child over-recorded as package behavior) never hides real
+      behavior and does not occur in normal npm/pnpm/yarn plain-fork lifecycle trees.
   Any finding **fails the gate** even when the
   comparable text is byte-equal, so the exclusion can never launder a real
   escape. The exclusion is also **symmetric down to the lifecycle stage**: a
@@ -655,6 +828,50 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   the spawn result — not just the path — will surface as a diff. Do **not**
   blanket-canonicalize spawn results to attempt-only: that would erase the
   Linux signal that an exec was blocked.
+
+- **Root identity is env-trusted on macOS-bare (`root_anchored` defaulted
+  `true`).** The root project's fs events surface as `$REPO/...`, and a dependency
+  forging `npm_package_name=<root>` to launder its repo writes under the root is
+  caught on Linux/Firecracker by the non-forgeable `root_anchored` verdict, which
+  is computed from the kernel process tree + per-pid exec-cwd
+  (`isRepoRootAnchored`; see `docs/design.md` "Non-forgeable root identity").
+  macOS-bare is **observe-only** and has no `strace` process-tree / exec-cwd
+  machinery, so it cannot compute that verdict and **defaults
+  `root_anchored: true`** on every root-attributed fs event
+  (`src/guest/phase-install-macos.ts`). Consequence for divergence: a **forged**
+  attack payload could render differently across backends — Linux marks the
+  laundered write `<FORGED_ROOT> $REPO/...`, macOS-bare treats it as a genuine
+  `$REPO/...` — so the two locks diverge on that line for a *malicious* fixture.
+  **Benign/parity fixtures are unaffected:** a genuine root event anchors `true`
+  on both backends and renders identically. The dedicated root-`prepare` pass also
+  force-attributes `root_anchored: true` on both backends (it runs only the root's
+  prepare, by construction). As with the other macOS-bare residuals,
+  **Firecracker is the enforcement boundary**; the env-trusted default is a known
+  no-strace fidelity gap, not a parity bug.
+
+  This residual extends to **nameless roots** (a parseable root `package.json`
+  with no `name`, e.g. an unnamed private monorepo root running
+  `preinstall: npx only-allow pnpm` + `postinstall: simple-git-hooks`). Such a
+  root's own lifecycle is recognised in the **attribution layer** — an empty
+  `npm_package_name` plus a canonical `npm_lifecycle_event` attributes to the
+  synthetic `<repo-root>` sentinel (`ROOT_SENTINEL`; see `docs/design.md`
+  "Non-forgeable root identity"). On macOS-bare this flows through the shim
+  fast-path (`shimExecAttribution` / `classifyShimNodeStartupMarker`), which is
+  the only attribution source there (no `/proc` environ). Its lifecycle events
+  are now **surfaced** — not dropped, and no longer fail-closed — for **all** event
+  kinds (`spawn` / `connect` / `env_read` as well as `read` / `write`); and **all**
+  of those kinds now route through the same `root_anchored` stamp as a named root
+  (the prior unmarked-non-fs residual is closed). Linux/Firecracker computes the
+  real verdict from the process tree; macOS-bare, having no process tree,
+  **defaults `root_anchored: true`** on every root-attributed read/write/spawn/
+  connect/env_read. So a **forged/unanchored** nameless event of any kind can
+  render differently across backends — Linux marks it `<FORGED_ROOT> …` (e.g.
+  `<FORGED_ROOT> $REPO/...` or `<FORGED_ROOT> connect host:port`), macOS-bare
+  renders it unmarked (genuine) — exactly as for a named forged root. Benign
+  nameless-root fixtures anchor `true` on Linux and render identically on both
+  sides (the macOS-bare non-fs default `true` is precisely what preserves that
+  parity — without it a benign root's non-fs events would mis-render
+  `<FORGED_ROOT>` on macOS only); Firecracker remains the enforcement boundary.
 
 - **Dropped `audit_bypass` detectors.** Three `audit_bypass` event kinds are
   **strace-derived** and have no macOS equivalent, because there is no kernel

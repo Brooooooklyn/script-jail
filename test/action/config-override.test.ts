@@ -102,6 +102,109 @@ describe('buildEffectiveConfig', () => {
     expect(parsed['spoof']).toEqual({ platform: 'linux', arch: 'arm64' });
   });
 
+  it('pins work_dir to workDirOverride (install:true cwd parity) and leaves it unset otherwise', () => {
+    writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
+
+    // No override -> work_dir absent (guest schema default /work stands).
+    const without = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(without['work_dir']).toBeUndefined();
+
+    // Override -> the runner-specific repoDir is written verbatim (it is
+    // tokenized to $REPO in the lock, so this stays byte-stable).
+    const repoDir = '/home/runner/work/myrepo/myrepo';
+    const withOverride = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+          workDirOverride: repoDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(withOverride['work_dir']).toBe(repoDir);
+    // Siblings still preserved alongside the pinned work_dir.
+    expect(withOverride['node_version']).toBe(20);
+  });
+
+  it('sets install_mode:true only when installMode is passed (#22 pnpmfile parity)', () => {
+    writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
+
+    // Pure-audit (no installMode) -> the key is ABSENT so the guest schema
+    // default (false) stands and pure-audit goldens are byte-unchanged.
+    const without = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(without['install_mode']).toBeUndefined();
+
+    // install:true -> install_mode:true so buildChildEnv mirrors the host
+    // install's pnpm --config.ignore-pnpmfile=true into the lifecycle env.
+    const withMode = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+          installMode: true,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(withMode['install_mode']).toBe(true);
+  });
+
+  it('scrubs a repo-supplied install_mode:true on the pure-audit path (host-owned bit)', () => {
+    // SECURITY: a PR `.script-jail.yml` must NOT be able to flip the guest into
+    // install-mode parity (which injects pnpm npm_config_* env, changes pnpm
+    // goldens, and bypasses the install:true gate).  install_mode is host-owned:
+    // when the trusted host does NOT pass installMode, any repo value is dropped.
+    writeFileSync(userConfigPath, 'install_mode: true\nnode_version: 20\n', 'utf8');
+
+    const without = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(without['install_mode']).toBeUndefined();
+
+    // And the trusted host input still wins regardless of (mismatched) repo value.
+    writeFileSync(userConfigPath, 'install_mode: false\nnode_version: 20\n', 'utf8');
+    const withMode = parseYaml(
+      readFileSync(
+        buildEffectiveConfig({
+          userConfigPath,
+          overrides: { spoofPlatform: 'linux', spoofArch: 'x64' },
+          workDir,
+          installMode: true,
+        }).configPath,
+        'utf8',
+      ),
+    ) as Record<string, unknown>;
+    expect(withMode['install_mode']).toBe(true);
+  });
+
   it('never mutates the user source file', () => {
     writeFileSync(userConfigPath, FULL_USER_YAML, 'utf8');
     const before = readFileSync(userConfigPath, 'utf8');

@@ -63,6 +63,17 @@ export interface BuildEffectiveConfigInput {
    */
   workDir?: string;
   /**
+   * Optional override for the guest audit `work_dir` (the cwd the lifecycle
+   * scripts run at).  Set for `install: true` to the real host repoDir so the
+   * sandbox audit runs at the SAME absolute path as the host re-run, closing a
+   * `process.cwd()` detection oracle (FC/docker; bare/mac-bare re-pin work_dir
+   * to their staged path via `rewriteConfigWorkDir`, so this is overridden
+   * there — the cwd parity is a documented residual for those backends).  When
+   * undefined the guest schema default (`/work`) stands.  The literal value
+   * never reaches the lock — it is tokenized to `$REPO` (src/lock/tokenize.ts).
+   */
+  workDirOverride?: string;
+  /**
    * Optional `.yarnrc.yml` content to materialize alongside the config.
    * Optional Yarn Berry `supportedArchitectures` override.  Written verbatim
    * to `<workDir>/.yarnrc.yml`.
@@ -70,12 +81,15 @@ export interface BuildEffectiveConfigInput {
   yarnrcOverlay?: string;
   /**
    * Optional `etc/script-jail/pm-flags.json` payload.  Read by the guest
-   * (`src/guest/phase-fetch.ts`) which appends `extra_install_args` to npm's
-   * `ci` invocation.  npm only — pnpm does not accept these CLI flags.
+   * (`src/guest/phase-fetch.ts`).  Two channels:
+   *   * `extra_install_args` — npm-only arch hints (`--cpu/--os/--libc`),
+   *     appended to `npm ci` only (pnpm/yarn reject these CLI flags).
+   *   * `user_install_args`  — developer install flags (the action `args`
+   *     input), appended to ALL THREE managers' fetch command.
    * Written verbatim (after JSON.stringify) to
    * `<workDir>/etc/script-jail/pm-flags.json`.
    */
-  pmFlagsJson?: { extra_install_args: string[] };
+  pmFlagsJson?: { extra_install_args: string[]; user_install_args?: string[] };
   /**
    * Optional `etc/script-jail/pnpm-arch.json` content.  Provided by the
    * Optional pnpm `supportedArchitectures` override.  The guest
@@ -84,6 +98,16 @@ export interface BuildEffectiveConfigInput {
    * Written verbatim to `<workDir>/etc/script-jail/pnpm-arch.json`.
    */
   pnpmArchOverlay?: string;
+  /**
+   * Drop-in install (`install: true`) marker.  When true the guest audit runs
+   * with the SAME post-trust config the host install applies (currently: pnpm
+   * `--config.ignore-pnpmfile=true` mirrored into the Phase B lifecycle env), so
+   * a lifecycle script can't branch on a config value that diverges between the
+   * audited sandbox and the trusted host re-run.  Sets `install_mode: true` in
+   * the guest config (consumed by `buildChildEnv`).  Omitted for pure-audit so
+   * goldens stay byte-identical.
+   */
+  installMode?: boolean;
 }
 
 export interface BuildEffectiveConfigResult {
@@ -135,6 +159,35 @@ export function buildEffectiveConfig(
     platform: input.overrides.spoofPlatform,
     arch: input.overrides.spoofArch,
   };
+
+  // `install: true` cwd parity (FC/docker): pin the guest audit cwd to the real
+  // host repoDir so `process.cwd()` matches the uninstrumented host re-run.
+  // bare/mac-bare overwrite this with their staged path downstream.  Tokenized
+  // to `$REPO` in the lock, so the runner-specific value is byte-stable.
+  if (input.workDirOverride !== undefined) {
+    config['work_dir'] = input.workDirOverride;
+  }
+
+  // `install: true` post-trust config parity: tell the guest it is running in
+  // drop-in install mode so buildChildEnv mirrors the host install's pnpm-only
+  // `--config.ignore-pnpmfile=true` / `--config.script-shell=/bin/sh` into the
+  // Phase B lifecycle env (the lock is value-blind, so a divergent config value
+  // would otherwise let a dependency script run a different branch on the
+  // trusted host than was audited).
+  //
+  // SECURITY: `install_mode` is HOST-OWNED state, NEVER repo-controllable.  The
+  // config object above is seeded from the user's `.script-jail.yml`, so a PR
+  // that writes `install_mode: true` would otherwise survive into a PURE-AUDIT
+  // run (where `input.installMode` is undefined) and flip the guest into the
+  // install-mode parity env — injecting the pnpm `npm_config_*` keys, changing
+  // pure-audit pnpm goldens, and bypassing the genuine `install: true` gate.
+  // Scrub any repo-supplied value FIRST, then set it ONLY from the trusted host
+  // input.  Deleting an absent key is a no-op, so non-pnpm / non-install repos
+  // stay byte-identical.
+  delete config['install_mode'];
+  if (input.installMode === true) {
+    config['install_mode'] = true;
+  }
 
   const outDir =
     input.workDir ?? mkdtempSync(join(tmpdir(), 'script-jail-config-'));

@@ -63,6 +63,22 @@ function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
   return path;
 }
 
+/**
+ * Write a root `package.json` into the agent's work_dir (= testDir).
+ *
+ * Historically the prepare-pass fail-closed gate refused to emit a lockfile when
+ * a prepare/lifecycle pass would run but the root manifest had no usable `name`
+ * (canonicalRootKey === null).  That gate is now REMOVED: root anchoring was
+ * extended to the nameless case, so a nameless-but-parseable root gets the
+ * `<repo-root>` sentinel (canonicalRootKey === ROOT_SENTINEL) and its lifecycle
+ * reads/writes surface under `$REPO/...` instead of being dropped.  Tests pass a
+ * NAMED root when they want the named-anchoring path and OMIT the name to
+ * exercise the nameless `<repo-root>` surfacing path.
+ */
+function writeRootPkg(dir: string, pkg: Record<string, unknown>): void {
+  writeFileSync(join(dir, 'package.json'), JSON.stringify(pkg), 'utf8');
+}
+
 /** Make a MemoryConnection where:
  *  - `readable` is a PassThrough we can push data into (simulating host → guest)
  *  - `writable` is a PassThrough we can read from (guest → host output)
@@ -619,6 +635,129 @@ describe('agent main()', () => {
     expect(frames.map((f) => f['kind'])).not.toContain('final');
   });
 
+  // ---------------------------------------------------------------------------
+  // Phase-A FAILURE redaction — developer install `args` value masking.
+  //
+  // adversarial-review round-7 [high]: the drop-in install threads developer
+  // `args` into the SANDBOX Phase-A fetch via the pm-flags `user_install_args`
+  // channel.  On the fetch-FAILURE path the agent redacts the PM stderr/stdout
+  // with `redactSensitive` (protected-ENV values + credential SHAPES) ONLY —
+  // which does NOT mask a user-arg value like `SECRET_TOKEN` echoed by
+  // `npm warn invalid config registry="SECRET_TOKEN"`.  That value matched no
+  // shape and no protected env, so it leaked to the public Actions log via BOTH
+  // sinks (serial-console `process.stderr.write` + the fatal vsock error frame).
+  // The fix masks the known exact user-arg values FIRST.
+  // ---------------------------------------------------------------------------
+  describe('Phase-A fetch-failure redacts developer install args', () => {
+    /** Fail-spawner: Phase A fetch exits non-zero with a chosen stderr/stdout. */
+    function failingFetchSpawner(stderr: string, stdout = ''): Spawner {
+      return {
+        async spawn() {
+          return { exitCode: 1, stdout, stderr };
+        },
+      };
+    }
+
+    /**
+     * Drive main() to the Phase-A failure site with `userArgs` staged in a
+     * pm-flags.json (npm consumes user_install_args).  Captures BOTH sinks:
+     * the fatal error frame's message and everything written to process.stderr.
+     */
+    async function runPhaseAFailure(
+      userArgs: string[],
+      stderr: string,
+      stdout = '',
+    ): Promise<{ frameMsg: string; serial: string }> {
+      const { conn, getOutput } = makeConn();
+      const configPath = writeConfig(testDir);
+
+      // Stage user_install_args via the env CONTENT channel (the production delivery on
+      // every backend — audit-only sidecar oracle): the agent reads
+      // SCRIPT_JAIL_PM_FLAGS_CONTENT and threads it into runFetchPhase.
+      const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+      process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = JSON.stringify({
+        extra_install_args: [],
+        user_install_args: userArgs,
+      });
+
+      // Capture the serial-console sink (process.stderr.write).
+      let serial = '';
+      const origWrite = process.stderr.write.bind(process.stderr);
+      const stderrSpy = (chunk: string | Uint8Array): boolean => {
+        serial += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+        return true;
+      };
+      process.stderr.write = stderrSpy as typeof process.stderr.write;
+
+      const origExit = process.exit.bind(process);
+      // @ts-expect-error — patching process.exit for test
+      process.exit = () => { /* no-op */ };
+
+      try {
+        await main({
+          configPath,
+          connection: conn,
+          spawner: failingFetchSpawner(stderr, stdout),
+          strace: emptyStrace(), // never reached — Phase A fails first
+          dnsLookup: offlineLookup,
+        });
+      } finally {
+        process.exit = origExit;
+        process.stderr.write = origWrite;
+        if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+        else process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = oldPmFlags;
+      }
+
+      const frames = getOutput()
+        .split('\n')
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const errFrame = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+      return { frameMsg: String(errFrame?.['message'] ?? ''), serial };
+    }
+
+    it('a credential-bearing `--registry=SECRET_TOKEN` is DROPPED, so it never reaches the PM or the mask set', async () => {
+      // Under the fail-closed allowlist `--registry` is a source-swap flag and is
+      // dropped entirely — it never reaches the Phase-A fetch argv, so the PM can
+      // never echo it.  The mask set therefore has nothing to redact (the arg is
+      // gone, not merely masked), and the dump stays byte-identical to no-args.
+      const { frameMsg, serial } = await runPhaseAFailure(
+        ['--registry=SECRET_TOKEN'],
+        'npm error could not resolve registry offline\n',
+      );
+      // The secret never entered the argv, so the (simulated) PM output that the
+      // realistic install would produce contains no user-arg value to leak.  No
+      // user-arg mask token is injected because userInstallArgs is empty.
+      expect(frameMsg).not.toContain('<REDACTED:USER-ARG>');
+      expect(serial).not.toContain('<REDACTED:USER-ARG>');
+      expect(frameMsg).toContain('could not resolve registry offline');
+    });
+
+    it('masks a KEPT allowlisted value-flag value echoed by the PM (whole-token, len>=4)', async () => {
+      // The user-arg-value redactor still guards the surviving allowlisted args:
+      // `--include=optionaldeps` is kept, and its value (len>=4) is masked whole
+      // if the PM echoes it on the failure path.  Proves the path is alive.
+      const { frameMsg, serial } = await runPhaseAFailure(
+        ['--include=optionaldeps'],
+        'npm warn config: applied --include=optionaldeps in command line options\n',
+      );
+      expect(frameMsg).not.toContain('optionaldeps');
+      expect(serial).not.toContain('optionaldeps');
+      expect(frameMsg).toContain('<REDACTED:USER-ARG>');
+      expect(serial).toContain('<REDACTED:USER-ARG>');
+    });
+
+    it('leaves a no-user-args Phase-A failure byte-identical (deriveSensitiveValues([]) is identity)', async () => {
+      const stderr = '➤ YN0001: │ Error: ENOSPC: no space left on device, write\n';
+      const { frameMsg, serial } = await runPhaseAFailure([], stderr);
+      // No mask token injected; the (trimmed) PM error survives verbatim.
+      expect(frameMsg).not.toContain('<REDACTED:USER-ARG>');
+      expect(serial).not.toContain('<REDACTED:USER-ARG>');
+      expect(frameMsg).toContain('ENOSPC: no space left on device');
+      expect(serial).toContain('ENOSPC: no space left on device');
+    });
+  });
+
   it('still emits install_done and the final lockfile when Phase B exits non-zero but audited scripts', async () => {
     // A non-zero Phase B exit WITH collected events means a dependency
     // lifecycle script ran and failed under audit (e.g. an offline
@@ -1071,6 +1210,1310 @@ describe('agent main()', () => {
   });
 });
 
+describe('agent main() root-prepare second pass', () => {
+  // A StraceRunner that yields ONE strace execve line with no paired shim exec
+  // → recorded as a `<SYSCALL_EXEC_BYPASS>` event, which emits even without
+  // /proc attribution (lands under `<unattributed>`).  So the pass reports
+  // eventCount>0, AND we record the (cmd,args) it was asked to run.  The
+  // DISTINCT argv[0] basename (rendered verbatim by the bypass synthesis) lets
+  // us tell the main pass's event apart from the prepare pass's in the lock.
+  function recordingEventStrace(progName: string): {
+    runner: StraceRunner;
+    calls: Array<{ cmd: string; args: string[] }>;
+  } {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const runner: StraceRunner = {
+      async *run(cmd: string, args: string[]) {
+        calls.push({ cmd, args });
+        const pid = 7000 + calls.length;
+        yield {
+          pid,
+          line: `execve("/usr/bin/${progName}", ["${progName}"], 0x7ffd /* 12 vars */) = 0`,
+          source: 'strace' as const,
+        };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op */ },
+      getRootPid() { return 7001; },
+    };
+    return { runner, calls };
+  }
+
+  it('runs the prepare pass (npm) when prepareStrace is injected; merges its events', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → prepare-pass fail-closed gate is satisfied (canonicalRootKey set).
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+    const diagMsgs: string[] = [];
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+      diag: (m) => diagMsgs.push(m),
+    });
+
+    // The prepare runner WAS invoked via the #44 round-20 DIRECT-LAUNCH:
+    // `{cmd: <node>, args: [<runner>, <npmCli>, <scriptShell>], raw:true}` (NOT
+    // `npm exec`, NOT rebuild).  No managerLaunch is set in tests, so the `raw`
+    // launch passes cmd+args verbatim: cmd is process.execPath; args is the runner
+    // path (random mkdtemp under straceBaseDir → match its shape), the derived
+    // npm-cli.js path, and the script-shell ('' — the default empty capture's null).
+    expect(prep.calls).toHaveLength(1);
+    expect(prep.calls[0]!.cmd).toBe(process.execPath);
+    expect(prep.calls[0]!.args).toHaveLength(3);
+    expect(prep.calls[0]!.args[0]).toMatch(/[/\\]runner\.cjs$/);
+    expect(prep.calls[0]!.args[1]).toMatch(/[/\\]npm-cli\.js$/);
+    expect(prep.calls[0]!.args[2]).toBe('');
+    // The main install runner ran the install command (#43: shared base carries --no-node-options).
+    expect(main_.calls).toHaveLength(1);
+    expect(main_.calls[0]!.args).toEqual(['rebuild', '--foreground-scripts', '--no-node-options']);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // A final lockfile is emitted and contains BOTH passes' events (merged into
+    // the same collectingEmitter → collectedEvents → lockfile).
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    expect(yaml).toContain('MAINPROG');
+    expect(yaml).toContain('PREPPROG');
+
+    // A diag breadcrumb confirms the prepare pass fired.
+    expect(diagMsgs.some((m) => m.includes('prepare pass'))).toBe(true);
+  });
+
+  // REGRESSION (prepare-wrapper non-fs anchoring): the prepare-pass force-
+  // attribution emitter (`preparingEmitter`) must force-stamp `root_anchored:true`
+  // on the FULL anchorable set (read/write AND spawn/connect/env_read), not just
+  // read/write.  This pass runs ONLY the root's prepare, so EVERY event is
+  // genuinely root by construction — independent of the process-tree verdict.
+  //
+  // We drive the edge case where `runInstallPhase`'s OWN anchoring fails closed:
+  // the injected prepareStrace returns `getRootPid()===null`, so the dispatcher
+  // stamps `root_anchored:false` on the genuine root env_read (which WOULD render
+  // `<FORGED_ROOT>`).  The wrapper must rescue it to true.  A `node_startup_done`
+  // shim marker carrying the root's npm fields seeds the pid's attribution WITHOUT
+  // /proc (main() builds a real LinuxProcReader that can't see this fake pid), so
+  // the same-pid env_read attributes to the root key and reaches the wrapper.
+  //
+  // NEGATIVE CONTROL: against the OLD read/write-only wrapper this assertion FAILS
+  // (the yaml contains `<FORGED_ROOT> AWS_SECRET_ACCESS_KEY`).
+  it('prepare-pass wrapper force-stamps root_anchored on a genuine root env_read even when rootPid is null (no <FORGED_ROOT>)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → canonicalRootKey = 'rootpkg@1.0.0' (non-null; wrapper guard satisfied).
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const PID = 8200;
+    const prepareRunner: StraceRunner = {
+      async *run() {
+        // 1) Seed root attribution for PID via a shim node_startup_done marker
+        //    (npm fields read by shimNodeStartupAttribution, no /proc needed).
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'node_startup_done',
+            pid: PID,
+            ts: 1,
+            npm_package_name: 'rootpkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'prepare',
+          }),
+        };
+        // 2) A genuine root env_read on the SAME pid → attributes to the root via
+        //    the seed; root_anchored undefined → deferred → stamped false (rootPid
+        //    null) by runInstallPhase, leaving the wrapper to rescue it.
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'env_read',
+            name: 'AWS_SECRET_ACCESS_KEY',
+            pid: PID,
+            ts: 2,
+            hidden: false,
+          }),
+        };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op */ },
+      getRootPid() { return null; }, // forces runInstallPhase → root_anchored:false
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: emptyStrace(),
+      prepareStrace: prepareRunner,
+      dnsLookup: offlineLookup,
+    });
+
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    // The genuine root prepare env_read surfaced...
+    expect(yaml).toContain('AWS_SECRET_ACCESS_KEY');
+    // ...and was NOT mislabeled forged (the wrapper force-stamped root_anchored:true).
+    expect(yaml).not.toContain('<FORGED_ROOT>');
+  });
+
+  // env_tamper is the last root-claimable + rendered + deduped kind added to the
+  // anchorable set, so the prepare-pass wrapper must force-stamp it too.  Same
+  // edge case as the env_read test above: runInstallPhase's own anchoring fails
+  // closed (rootPid null → root_anchored:false), and the wrapper must rescue the
+  // genuine root prepare env_tamper to true so it renders `<REFUSED> …` UNMARKED.
+  // NEGATIVE CONTROL: against an env_tamper-blind wrapper this assertion FAILS
+  // (the yaml contains `<FORGED_ROOT> <REFUSED> unsetenv LD_PRELOAD`).
+  it('prepare-pass wrapper force-stamps root_anchored on a genuine root env_tamper even when rootPid is null (no <FORGED_ROOT>)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const PID = 8300;
+    const prepareRunner: StraceRunner = {
+      async *run() {
+        // 1) Seed root attribution for PID via a shim node_startup_done marker.
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'node_startup_done',
+            pid: PID,
+            ts: 1,
+            npm_package_name: 'rootpkg',
+            npm_package_version: '1.0.0',
+            npm_lifecycle_event: 'prepare',
+          }),
+        };
+        // 2) A genuine root env_tamper on the SAME pid → attributes to the root
+        //    via the seed; root_anchored undefined → deferred → stamped false
+        //    (rootPid null) by runInstallPhase, leaving the wrapper to rescue it.
+        yield {
+          pid: PID,
+          source: 'shim' as const,
+          line: JSON.stringify({
+            kind: 'env_tamper',
+            op: 'unsetenv',
+            name: 'LD_PRELOAD',
+            refused: true,
+            pid: PID,
+            ts: 2,
+          }),
+        };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_reason: string) { /* no-op */ },
+      getRootPid() { return null; }, // forces runInstallPhase → root_anchored:false
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: emptyStrace(),
+      prepareStrace: prepareRunner,
+      dnsLookup: offlineLookup,
+    });
+
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    // The genuine root prepare env_tamper surfaced as a refused entry...
+    expect(yaml).toContain('<REFUSED> unsetenv LD_PRELOAD');
+    // ...and was NOT mislabeled forged (the wrapper force-stamped root_anchored:true).
+    expect(yaml).not.toContain('<FORGED_ROOT>');
+  });
+
+  it('SKIPS the prepare pass when only strace is injected (no prepareStrace)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const diagMsgs: string[] = [];
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      // prepareStrace intentionally omitted → test seam skips the pass.
+      dnsLookup: offlineLookup,
+      diag: (m) => diagMsgs.push(m),
+    });
+
+    // Only the main install ran.
+    expect(main_.calls).toHaveLength(1);
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    const yaml = String(finalFrame!['yaml'] ?? finalFrame!['lockfile'] ?? '');
+    expect(yaml).toContain('MAINPROG');
+    expect(yaml).not.toContain('PREPPROG');
+
+    // No prepare-pass breadcrumb.
+    expect(diagMsgs.some((m) => m.includes('prepare pass'))).toBe(false);
+  });
+
+  it('SKIPS the prepare pass for pnpm even with prepareStrace (resolver returns null)', async () => {
+    const { conn, hostSend } = makeConn();
+    // pnpm config — root prepare already covered by `pnpm rebuild --pending`.
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    // resolvePrepareCommand('pnpm', …) → null, so the prepare runner is never
+    // invoked even though it was injected.
+    expect(prep.calls).toHaveLength(0);
+    expect(main_.calls).toHaveLength(1);
+  });
+
+  it('merges a prepare-pass tamper reason → fails closed at the tamper gate', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so we reach the prepare pass (and its tamper merge) rather than
+    // the nameless-root gate.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    // Prepare runner yields a POISONED shim-channel line (unparseable JSONL on
+    // the trusted channel). The prepare dispatcher's `setPhaseTamper` fires and
+    // surfaces the reason via `prepareResult.tamperReason`, which the agent
+    // MERGES into installResult.tamperReason → the 11b tamper gate fails closed.
+    // (A test fake's `getTamperReason()` would NOT flow through the merge — only
+    // the dispatcher-owned reason does — so we drive the real dispatcher path.)
+    const prepTamper: StraceRunner = {
+      async *run() {
+        yield { pid: 9001, line: 'not-json-at-all{', source: 'shim' as const };
+      },
+      getExitCode() { return 0; },
+      getTamperReason() { return null; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return 9001; },
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prepTamper,
+        dnsLookup: offlineLookup,
+      });
+      // flushAndExit's callback fires one tick later.
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error frame, no final lockfile.
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toContain('audit pipeline tampered with');
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('fails closed on a prepare-RUNNER file-tamper surfaced via getTamperReason()', async () => {
+    // The PRODUCTION events-file tamper signal (unlink / inode-swap / mtime
+    // regression) is reported by the runner's `getTamperReason()`, NOT by the
+    // dispatcher's owned reason — and runInstallPhase's PhaseInstallResult only
+    // carries the dispatcher-owned reason.  The 11b gate consults the MAIN
+    // runner's getTamperReason(), but the PREPARE runner's is only reachable
+    // through the merge.  This asserts that merge folds it in (regression guard
+    // for the gap a clean lockfile would otherwise hide on a prepare-pass
+    // events-file tamper).
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so we reach the prepare pass (and its tamper merge).
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prepFileTamper: StraceRunner = {
+      async *run() { /* zero dispatcher events; tamper is file-level */ },
+      getExitCode() { return 0; },
+      // Dispatcher-owned reason stays null; the file-tamper rides here.
+      getTamperReason() { return '<EVENTS_FILE_UNLINKED> prepare'; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return null; },
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prepFileTamper,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toContain('audit pipeline tampered with');
+    expect(String(fatal!['message'])).toContain('<EVENTS_FILE_UNLINKED>');
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('FAILS CLOSED (no lockfile) when the prepare events-file cannot be created (review #2)', async () => {
+    // The prepare pass must NEVER silently skip: skipping would render a final
+    // lock with the root `prepare` UNAUDITED while `check` mode could still
+    // return trusted.  `forcePreparePass` drives the production "build my own
+    // runner / events file" branch with an injected MAIN runner; the 2nd
+    // createEventsFile call (the prepare events file) throws → fatal, no lock.
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so the nameless-root gate is satisfied and we reach the
+    // events-file-creation fail-closed path this test targets.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+    const main_ = recordingEventStrace('MAINPROG');
+
+    let calls = 0;
+    const createEventsFileCounting = () => {
+      calls += 1;
+      if (calls === 1) return createEventsFile(); // main events file — real, so the main pass works
+      const err = new Error('ENOSPC: scratch full') as NodeJS.ErrnoException;
+      err.code = 'ENOSPC';
+      throw err; // prepare events file — fail
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        forcePreparePass: true, // drive the build-own-runner branch with an injected main runner
+        createEventsFile: createEventsFileCounting,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/root-prepare pass/);
+    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
+    // The main install ran, but NO final lockfile ships (fail closed).
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('FAILS CLOSED (no lockfile) when the npm prepare runner cannot be materialized (no silent fallback, round-18)', async () => {
+    // adversarial-review round-18 CONCERN 2: the #44 runner audits the ROOT prepare
+    // lifecycle. If it can't be written, we must NOT silently fall back to a single
+    // `npm run prepare` (which misses wrapper-only preprepare/postprepare — the #44
+    // gap, and an attacker who sabotages the runner path could force that fallback).
+    // Force the runner's mkdtemp to fail by pointing the scratch base at a regular
+    // FILE; assert a fatal error mentioning the runner + no lockfile.
+    const { createEventsFile } = await import('../../src/guest/agent.js');
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+    const main_ = recordingEventStrace('MAINPROG');
+
+    // A regular file as the scratch base → mkdtempSync(<file>/script-jail-strace/…) throws.
+    const scratchFile = join(testDir, 'not-a-dir');
+    writeFileSync(scratchFile, 'x', 'utf8');
+    const goodTmp = join(testDir, 'good-ev');
+    mkdirSync(goodTmp, { recursive: true });
+
+    const prevScratch = process.env['SCRIPT_JAIL_SCRATCH_DIR'];
+    process.env['SCRIPT_JAIL_SCRATCH_DIR'] = scratchFile;
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        forcePreparePass: true, // make the prepare pass run with an injected main runner
+        // Main events file under a GOOD dir so only the prepare runner's mkdtemp fails.
+        createEventsFile: () => createEventsFile(goodTmp),
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+      if (prevScratch === undefined) delete process.env['SCRIPT_JAIL_SCRATCH_DIR'];
+      else process.env['SCRIPT_JAIL_SCRATCH_DIR'] = prevScratch;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/root-prepare runner/);
+    expect(String(fatal!['message'])).toMatch(/UNAUDITED/);
+    // The main install ran, but NO final lockfile ships (fail closed — not a fallback).
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('FAILS CLOSED (npm) when the root-prepare env capture returns null (forced-shell dump failed, round-20)', async () => {
+    // round-20: the runner is DIRECT-LAUNCHED (`node <runner>`), so a `.npmrc`
+    // workspace selector / `workspaces=true` can no longer skip it (no `npm exec`
+    // to fan out or abort) — the old sentinel/selector gates are gone.  The
+    // remaining fail-closed gate is the ENV CAPTURE: if the forced-shell `npm exec`
+    // env dump produces no result (npm aborted / the dump file is unwritable), we
+    // must NOT run the prepare with a degraded env — a prepare branching on a
+    // missing npm_config_* would silently diverge from a real install.  The capture
+    // runs BEFORE the pass launches, so the prepare runner never runs.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prep.runner,
+        captureNpmPrepareEnv: () => null, // simulate a failed forced-shell dump
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/capture the npm root-prepare environment/);
+    // The main install ran; the capture failed BEFORE the prepare pass launched, so
+    // the prepare runner never ran and no lockfile ships.
+    expect(main_.calls).toHaveLength(1);
+    expect(prep.calls).toHaveLength(0);
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('sources the prepare env via captureNpmPrepareEnv (node + npm-cli.js + work_dir), then runs the pass', async () => {
+    // The orchestrator calls the capture seam ONCE with the instrumented node, the
+    // derived npm-cli.js path, and the repo-root cwd; on success the pass runs and a
+    // lockfile ships.  (Production does the real forced-shell dump + `config get`;
+    // the seam stands in for it under the no-real-npm unit harness.)
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+    const captureCalls: Array<{ node: string; npmCli: string; cwd: string }> = [];
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      captureNpmPrepareEnv: (ctx) => {
+        captureCalls.push({ node: ctx.node, npmCli: ctx.npmCli, cwd: ctx.cwd });
+        return { npmConfig: { npm_config_registry: 'https://r.example/' }, scriptShell: '/bin/dash' };
+      },
+      dnsLookup: offlineLookup,
+    });
+
+    expect(captureCalls).toHaveLength(1);
+    expect(captureCalls[0]!.node).toBe(process.execPath);
+    expect(captureCalls[0]!.npmCli).toMatch(/[/\\]npm-cli\.js$/);
+    expect(captureCalls[0]!.cwd).toBe(testDir);
+
+    const frames = getOutput()
+      .split('\n')
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(prep.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
+  // Thread [47]: the developer dep-selection args (--omit=dev/--prod) staged in
+  // pm-flags.json must be threaded into the prepare-env capture ctx, so the captured
+  // npm_config_omit/include + NODE_ENV match the main `npm rebuild <args>` install.
+  it('threads staged userInstallArgs into the prepare-env capture ctx', async () => {
+    const { conn, hostSend } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const oldPmFlags = process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+    process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = JSON.stringify({
+      extra_install_args: [],
+      user_install_args: ['--omit=dev'],
+    });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+    const captureArgs: Array<string[] | undefined> = [];
+
+    try {
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prep.runner,
+        captureNpmPrepareEnv: (ctx) => {
+          captureArgs.push(ctx.userInstallArgs);
+          return { npmConfig: { npm_config_omit: 'dev' }, scriptShell: null };
+        },
+        dnsLookup: offlineLookup,
+      });
+    } finally {
+      if (oldPmFlags === undefined) delete process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'];
+      else process.env['SCRIPT_JAIL_PM_FLAGS_CONTENT'] = oldPmFlags;
+    }
+
+    expect(captureArgs).toHaveLength(1);
+    expect(captureArgs[0]).toEqual(['--omit=dev']);
+  });
+
+  it('FAILS CLOSED (no lockfile) when prepare exits nonzero with ZERO events (untraced-prepare audit-bypass)', async () => {
+    // The prepare PASS always launches a process (npm exec / yarn run), so a
+    // traced run must produce events (startup fs reads).  Zero events + nonzero
+    // exit = strace couldn't attach or the PM aborted before instrumentation —
+    // the root `prepare` may have run UNAUDITED.  A clean diff against the
+    // resulting lockfile would pass silently.  The gate must fail closed.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root so we reach the zero-event prepare gate this test targets.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    // Prepare runner yields ZERO events and exits nonzero — simulates
+    // strace failing to attach or PM aborting before the prepare script runs.
+    const prepZeroEvents: StraceRunner = {
+      async *run() { /* no events */ },
+      getExitCode() { return 1; },
+      getTamperReason() { return null; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return null; },
+    };
+
+    const origExit = process.exit.bind(process);
+    let exitedWith: number | string | undefined;
+    // @ts-expect-error — patching process.exit for test
+    process.exit = (code?: number | string) => { exitedWith = code; };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    try {
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        prepareStrace: prepZeroEvents,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error frame (fatal: true) mentioning the untraced prepare.
+    const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+    expect(fatal).toBeDefined();
+    expect(String(fatal!['message'])).toMatch(/prepare pass/);
+    expect(String(fatal!['message'])).toMatch(/no audit events/);
+    expect(String(fatal!['message'])).toMatch(/Refusing to emit a lockfile/);
+    // No final lockfile frame must be emitted.
+    expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+    expect(exitedWith).toBe(1);
+  });
+
+  it('does NOT fail closed when prepare exits nonzero WITH events (traced failure is fine)', async () => {
+    // Counter-test: a prepare that fails offline but was traced produces audit
+    // data.  The fix must NOT over-fail this case — the lock is still emitted.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → the nameless-root gate is satisfied; this test exercises the
+    // separate "nonzero exit WITH events" non-fatal path.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    // Prepare runner yields ONE event (traced run) but exits nonzero.
+    const prepNonzeroWithEvents: StraceRunner = {
+      async *run(cmd: string, args: string[]) {
+        void cmd; void args;
+        yield {
+          pid: 8001,
+          line: 'execve("/usr/bin/PREPPROG", ["PREPPROG"], 0x7ffd /* 12 vars */) = 0',
+          source: 'strace' as const,
+        };
+      },
+      getExitCode() { return 1; },
+      getTamperReason() { return null; },
+      recordTamper(_r: string) { /* no-op */ },
+      getRootPid() { return 8001; },
+    };
+
+    setTimeout(() => hostSend('go\n'), 10);
+
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prepNonzeroWithEvents,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // A final lockfile is still emitted (not fail-closed).
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    // A non-fatal error frame is emitted for the prepare failure.
+    const nonFatalError = frames.find((f) => f['kind'] === 'error' && f['fatal'] === false);
+    expect(nonFatalError).toBeDefined();
+    expect(String(nonFatalError!['message'])).toMatch(/prepare pass.*exited non-zero/);
+    // No fatal error — the run is not blocked.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  // --- nameless root + prepare → audits under <repo-root> (no fail-closed) ----
+  // These tests USED to assert fail-closed: a root `package.json` with a
+  // lifecycle/prepare script but NO `name` made buildRootPkgKeys return
+  // canonical=null; npm/pnpm set no npm_package_name, so the audited events were
+  // DROPPED at the dispatcher's null-attribution gate → an empty, deceptively-
+  // clean lock, which we blocked with a fatal gate.
+  //
+  // That fail-closed gate is now REMOVED.  Root anchoring was extended to the
+  // NAMELESS case: buildRootPkgKeys gives a nameless-but-parseable root the
+  // `<repo-root>` sentinel key (canonicalRootKey === ROOT_SENTINEL), the agent
+  // threads `rootSentinel` into the install/prepare inputs, and the dispatcher's
+  // nameless-root rescue force-attributes the root's reads/writes to the sentinel
+  // (tokenized to `$REPO/...`) carrying the non-forgeable `root_anchored` verdict.
+  // So the install RUNS, the events surface under `<repo-root>`, and a clean lock
+  // is produced — no fatal abort.
+  //
+  // The fake strace here (recordingEventStrace) emits an EXEC-bypass event, not
+  // an fs read/write, so we cannot assert `<repo-root>` entries at this layer —
+  // only that the gate no longer blocks (main pass ran, a `final` lockfile is
+  // emitted, no fatal error frame).  The cross-file `<repo-root>` surfacing
+  // assertions live in phase-install.test.ts.
+  it('NAMELESS root + prepare → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Nameless root (only a version) → canonicalRootKey === ROOT_SENTINEL.
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      // prepareStrace injected so the test seam allows the prepare pass; the
+      // removed nameless-root gate no longer blocks it.
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // No fatal abort: the main install ran, the prepare pass ran, and a final
+    // lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(main_.calls).toHaveLength(1);
+    expect(prep.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
+  it('NAMELESS root WITHOUT a prepare script → still produces a lockfile (no false trip)', async () => {
+    // Regression guard: for npm, resolvePrepareCommand is ALWAYS non-null
+    // (the #44 exec runner finds no prepare-lifecycle scripts and exits 0).
+    // A benign nameless npm root with no prepare must still produce a lockfile —
+    // the run is never blocked (the old nameless-root fail-closed gate is gone;
+    // a nameless root now anchors to `<repo-root>` either way).
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Nameless root, NO prepare script → gate must NOT fire.
+    writeRootPkg(testDir, { version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // No fatal error, and a final lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
+  it('NAMED root + prepare → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → canonicalRootKey is set, gate does NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The prepare pass ran and a final lockfile is emitted (no nameless-root trip).
+    expect(prep.calls).toHaveLength(1);
+    const finalFrame = frames.find((f) => f['kind'] === 'final');
+    expect(finalFrame).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  // --- pnpm main-pass variant: nameless root + prepare → audits under <repo-root> --
+  // resolvePrepareCommand('pnpm') is ALWAYS null, so the dedicated prepare pass
+  // never runs for pnpm.  pnpm's MAIN Phase-B command (`pnpm rebuild --pending`)
+  // RUNS the root `prepare`; on a nameless root npm_package_name is UNSET, so the
+  // events used to be dropped at the null-attribution gate → a deceptively-clean
+  // lock, which the (now-removed) pnpm gate blocked.  With root anchoring extended
+  // to the nameless case, the main pass RUNS and the root's reads/writes surface
+  // under `<repo-root>` — no fatal abort.
+  it('pnpm NAMELESS root + prepare → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // Nameless root (only a version) + a real prepare script → canonicalRootKey
+    // === ROOT_SENTINEL; pnpm's main pass runs it and the events surface.
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+    const prep = recordingEventStrace('PREPPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      prepareStrace: prep.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // No fatal abort: the main install pass ran and a final lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(main_.calls).toHaveLength(1);
+    // pnpm resolvePrepareCommand returns null → the dedicated prepare pass never runs.
+    expect(prep.calls).toHaveLength(0);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
+  it('pnpm NAMELESS root WITHOUT a prepare script → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // Nameless root, NO prepare script → the pnpm gate must NOT fire.
+    writeRootPkg(testDir, { version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // No fatal error, the main install ran, and a final lockfile IS emitted.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+  });
+
+  // MALFORMED root `name` (present but non-string) → FAIL CLOSED.  The PM
+  // coerces it to a string `npm_package_name` (verified: npm runs the root
+  // lifecycle under `npm_package_name="42"` for `"name": 42`) that `<repo-root>`
+  // never matches, so the root would run effectively unattributed.  A non-string
+  // `name` is malformed and absent from real repos, so failing closed cannot
+  // over-fire the way the removed nameless gate did.
+  it('MALFORMED root name (number) → FATAL, no lockfile (fail closed)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { name: 42, version: '1.0.0', scripts: { postinstall: 'node p.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    // The fail-closed path calls flushAndExit → process.exit(1); stub it so the
+    // test process doesn't terminate (mirrors the other fail-closed tests here).
+    const origExit = process.exit.bind(process);
+    // @ts-expect-error — patching process.exit for test
+    process.exit = () => { /* no-op */ };
+    try {
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // Fatal error emitted, the install pass NEVER ran, and NO lockfile shipped.
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(true);
+    expect(main_.calls).toHaveLength(0);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeUndefined();
+  });
+
+  it('MALFORMED root name (object) → FATAL, no lockfile (fail closed)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    writeRootPkg(testDir, { name: { evil: true }, version: '1.0.0' });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    const origExit = process.exit.bind(process);
+    // @ts-expect-error — patching process.exit for test
+    process.exit = () => { /* no-op */ };
+    try {
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        dnsLookup: offlineLookup,
+      });
+      await new Promise<void>((r) => setImmediate(r));
+    } finally {
+      process.exit = origExit;
+    }
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(true);
+    expect(main_.calls).toHaveLength(0);
+  });
+
+  it('pnpm NAMED root + prepare → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // Named root → canonicalRootKey is set, the pnpm gate does NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0', scripts: { prepare: 'node prep.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The main install ran and a final lockfile is emitted (no nameless-root trip).
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  // --- nameless root + preinstall/install/postinstall → audits under <repo-root> --
+  // The MAIN Phase-B command runs the ROOT's preinstall/install/postinstall for
+  // npm (`npm rebuild --foreground-scripts`) and pnpm (`pnpm rebuild --pending`).
+  // On a nameless root npm_package_name is UNSET, so the events used to be DROPPED
+  // at the null-attribution gate → a deceptively-clean lock, which the (now-removed)
+  // npm/pnpm gate blocked.  With root anchoring extended to the nameless case, the
+  // main install RUNS and the root's reads/writes surface under `<repo-root>` — no
+  // fatal abort.  (Same class as the prepare case, reached through
+  // postinstall/preinstall/install instead.)
+  for (const manager of ['npm', 'pnpm'] as const) {
+    for (const lifecycle of ['postinstall', 'preinstall', 'install'] as const) {
+      it(`NAMELESS root + ${manager} ${lifecycle} → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)`, async () => {
+        const { conn, hostSend, getOutput } = makeConn();
+        const configPath = writeConfig(testDir, { manager });
+        // Nameless root (only a version) + a real main-pass lifecycle script →
+        // canonicalRootKey === ROOT_SENTINEL; the main install runs it and the
+        // root's events surface under `<repo-root>`.
+        writeRootPkg(testDir, { version: '1.0.0', scripts: { [lifecycle]: 'node hook.js' } });
+
+        const main_ = recordingEventStrace('MAINPROG');
+
+        setTimeout(() => hostSend('go\n'), 10);
+        await main({
+          configPath,
+          connection: conn,
+          spawner: mockSpawner().spawner,
+          strace: main_.runner,
+          dnsLookup: offlineLookup,
+        });
+
+        const lines = getOutput().split('\n').filter((l) => l.trim());
+        const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+        // No fatal abort: the main install pass ran and a final lockfile IS emitted.
+        expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+        expect(main_.calls).toHaveLength(1);
+        expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+      });
+    }
+  }
+
+  // pnpm `pnpm rebuild --pending` runs MORE root lifecycles than npm: prepublish
+  // (pnpm 10) and prerebuild/rebuild/postrebuild (pnpm 11).  On a nameless root
+  // these used to be dropped at the null-attribution gate → a deceptively-clean
+  // lock blocked by the (now-removed) pnpm gate.  With root anchoring extended to
+  // the nameless case, the main install RUNS and the root's reads/writes surface
+  // under `<repo-root>` — no fatal abort.
+  for (const lifecycle of ['prepublish', 'prerebuild', 'rebuild', 'postrebuild'] as const) {
+    it(`NAMELESS root + pnpm ${lifecycle} → audits and produces a lockfile (no fail-closed; events surface under <repo-root>)`, async () => {
+      const { conn, hostSend, getOutput } = makeConn();
+      const configPath = writeConfig(testDir, { manager: 'pnpm' });
+      writeRootPkg(testDir, { version: '1.0.0', scripts: { [lifecycle]: 'node hook.js' } });
+
+      const main_ = recordingEventStrace('MAINPROG');
+
+      setTimeout(() => hostSend('go\n'), 10);
+      await main({
+        configPath,
+        connection: conn,
+        spawner: mockSpawner().spawner,
+        strace: main_.runner,
+        dnsLookup: offlineLookup,
+      });
+
+      const lines = getOutput().split('\n').filter((l) => l.trim());
+      const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+      // No fatal abort: the main install pass ran and a final lockfile IS emitted.
+      expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+      expect(main_.calls).toHaveLength(1);
+      expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    });
+  }
+
+  // --- alternate root manifest (package.yaml / package.json5) → fail closed ----
+  // pnpm ALSO accepts package.yaml / package.json5 as the root manifest and reads
+  // its lifecycle scripts + pnpm.configDependencies from them.  script-jail reads
+  // root identity from package.json ONLY, so such a root would run its lifecycle
+  // with npm_package_name UNSET → events dropped → a deceptively clean lock (the
+  // nameless-root class, reached via the manifest FORMAT).  The guest must refuse
+  // to emit a lockfile.  package.json SHADOWS the alternates, so the gate only
+  // fires when there is genuinely no package.json.
+  for (const altManifest of ['package.yaml', 'package.json5'] as const) {
+    it(`FAILS CLOSED (fatal, no lockfile) when the root manifest is \`${altManifest}\` with no package.json`, async () => {
+      const { conn, hostSend, getOutput } = makeConn();
+      const configPath = writeConfig(testDir, { manager: 'pnpm' });
+      // Alternate manifest, NO package.json → the package.json-only pipeline cannot
+      // see the root's identity or scripts.
+      writeFileSync(join(testDir, altManifest), 'name: evil\npnpm:\n  configDependencies:\n    cfg: "1.0.0+sha512-x"\n', 'utf8');
+
+      const main_ = recordingEventStrace('MAINPROG');
+
+      const origExit = process.exit.bind(process);
+      let exitedWith: number | string | undefined;
+      // @ts-expect-error — patching process.exit for test
+      process.exit = (code?: number | string) => { exitedWith = code; };
+
+      setTimeout(() => hostSend('go\n'), 10);
+      try {
+        await main({
+          configPath,
+          connection: conn,
+          spawner: mockSpawner().spawner,
+          strace: main_.runner,
+          dnsLookup: offlineLookup,
+        });
+        await new Promise<void>((r) => setImmediate(r));
+      } finally {
+        process.exit = origExit;
+      }
+
+      const lines = getOutput().split('\n').filter((l) => l.trim());
+      const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+      const fatal = frames.find((f) => f['kind'] === 'error' && f['fatal'] === true);
+      expect(fatal).toBeDefined();
+      expect(String(fatal!['message'])).toMatch(new RegExp(altManifest.replace('.', '\\.')));
+      expect(frames.some((f) => f['kind'] === 'final')).toBe(false);
+      // The gate fires BEFORE any install pass runs.
+      expect(main_.calls).toHaveLength(0);
+      expect(exitedWith).toBe(1);
+    });
+  }
+
+  it('package.yaml alongside a package.json → NO trip (package.json shadows the alternate)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'pnpm' });
+    // A real package.json shadows the alternate (pnpm ignores package.yaml when a
+    // package.json exists), so the gate must NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0' });
+    writeFileSync(join(testDir, 'package.yaml'), 'name: shadowed\n', 'utf8');
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  it('npm NAMELESS root with only a `prepublish` → still produces a lockfile (npm rebuild does not run it)', async () => {
+    // No-over-fire: `npm rebuild --foreground-scripts` does NOT run root prepublish
+    // (only pnpm does), so the npm gate must not block a nameless npm root that
+    // merely declares prepublish.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { prepublish: 'node hook.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  it('yarn NAMELESS root + postinstall → still produces a lockfile (gate is npm/pnpm-only)', async () => {
+    // yarn (Berry) SYNTHESIZES an npm_package_name for the root, so its
+    // lifecycle events are NOT silently dropped (they surface / fail the
+    // pkgDir lookup).  The FIX-3 main-pass gate is scoped to npm+pnpm; gating
+    // yarn would FALSELY block a nameless yarn root whose lifecycle is benign.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'yarn' });
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { postinstall: 'node hook.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The new gate did NOT fire: main install ran, lockfile emitted, no fatal.
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  it('NAMED root + postinstall → still produces a lockfile (no false trip)', async () => {
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    // Named root → canonicalRootKey is set, the main-pass gate does NOT fire.
+    writeRootPkg(testDir, { name: 'rootpkg', version: '1.0.0', scripts: { postinstall: 'node hook.js' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+
+  it('NAMELESS root with only a NON-lifecycle script (build) → still produces a lockfile', async () => {
+    // The gate keys off preinstall/install/postinstall specifically — a nameless
+    // root whose only script is an arbitrary `build` (never run by the main pass)
+    // must NOT be blocked.
+    const { conn, hostSend, getOutput } = makeConn();
+    const configPath = writeConfig(testDir, { manager: 'npm' });
+    writeRootPkg(testDir, { version: '1.0.0', scripts: { build: 'tsc' } });
+
+    const main_ = recordingEventStrace('MAINPROG');
+
+    setTimeout(() => hostSend('go\n'), 10);
+    await main({
+      configPath,
+      connection: conn,
+      spawner: mockSpawner().spawner,
+      strace: main_.runner,
+      dnsLookup: offlineLookup,
+    });
+
+    const lines = getOutput().split('\n').filter((l) => l.trim());
+    const frames = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(main_.calls).toHaveLength(1);
+    expect(frames.find((f) => f['kind'] === 'final')).toBeDefined();
+    expect(frames.some((f) => f['kind'] === 'error' && f['fatal'] === true)).toBe(false);
+  });
+});
+
 describe('buildChildEnv protected-env-names length gate', () => {
   // Audit-trust Finding 2 (2026-05-18): the Rust shim's `capture_canon`
   // copies SCRIPT_JAIL_PROTECTED_ENV_NAMES into a fixed-size CanonBuf
@@ -1096,6 +2539,7 @@ describe('buildChildEnv protected-env-names length gate', () => {
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -1114,6 +2558,28 @@ describe('buildChildEnv protected-env-names length gate', () => {
     // spurious env_read perturbing the byte-stable lock).
     expect(env['SCRIPT_JAIL_MACOS_AUDIT_OPS']).toBeUndefined();
     expect(env['SCRIPT_JAIL_BOGUS']).toBeUndefined();
+  });
+
+  it('strips the control-sidecar CONTENT vars from the lifecycle child env (audit-only sidecar oracle)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // The agent reads SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT from its OWN env, but they
+    // must NEVER reach a lifecycle child's process.env — otherwise the child could branch
+    // on the control content directly, re-opening the very oracle the env-delivery closes.
+    // They are not on LIFECYCLE_ALLOWED_SCRIPT_JAIL_ENV_NAMES, so the generic
+    // "strip unknown SCRIPT_JAIL_*" rule drops them.
+    const env = buildChildEnv(
+      {
+        SCRIPT_JAIL_PM_FLAGS_CONTENT: '{"extra_install_args":[],"user_install_args":["-D"]}',
+        SCRIPT_JAIL_PNPM_ARCH_CONTENT: '{"supportedArchitectures":{}}',
+        PATH: '/usr/bin:/bin',
+      },
+      makeConfig([]),
+      '/tmp/events.jsonl',
+    );
+    expect(env['SCRIPT_JAIL_PM_FLAGS_CONTENT']).toBeUndefined();
+    expect(env['SCRIPT_JAIL_PNPM_ARCH_CONTENT']).toBeUndefined();
+    // The benign PATH still passes through (only SCRIPT_JAIL_* are gated).
+    expect(env['PATH']).toBe('/usr/bin:/bin');
   });
 
   it('accepts a protect list that fits within the CanonBuf payload (<= 1023 bytes)', async () => {
@@ -1192,6 +2658,171 @@ describe('buildChildEnv protected-env-names length gate', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// buildChildEnv install_mode — drop-in install pnpm config→env parity (#22 + sibling)
+//
+// Host part-2 (install: true, post-trust) runs `pnpm rebuild --pending` with
+// BOTH `--config.ignore-pnpmfile=true` AND `--config.script-shell=/bin/sh`,
+// which on pnpm 10.x set npm_config_ignore_pnpmfile=true AND
+// npm_config_script_shell=/bin/sh in every lifecycle script's env.  The guest
+// Phase B audit must export the IDENTICAL values for BOTH keys (the lock is
+// value-blind — env-spy records env_read NAMEs only), or a dep script can
+// branch differently on the trusted host than was audited.  buildChildEnv
+// mirrors both for pnpm GATED on install_mode so pure-audit goldens stay
+// byte-identical.  Missing EITHER key re-opens the value-blind-lock RCE.
+// ---------------------------------------------------------------------------
+
+describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
+  function cfg(
+    manager: 'npm' | 'pnpm' | 'yarn',
+    installMode: boolean,
+  ): import('../../src/guest/agent.js').AgentConfig {
+    return {
+      protected: { files: [], env: [] },
+      spoof: { platform: 'linux', arch: 'x64' },
+      node_version: '20.0.0',
+      manager_lockfile_sha256: '',
+      lockfile_path: '',
+      work_dir: '/work',
+      log_fd: 3,
+      pkg_dirs: {},
+      manager,
+      install_mode: installMode,
+    };
+  }
+
+  it('install_mode + pnpm → injects BOTH npm_config_ignore_pnpmfile=true AND npm_config_script_shell=/bin/sh (matches host)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('pnpm', true), '/tmp/events.jsonl');
+    // Both host part-2 hostHardening flags (--config.ignore-pnpmfile=true,
+    // --config.script-shell=/bin/sh) must be mirrored: each is exposed to
+    // lifecycle children as npm_config_X on pnpm 10.x.
+    expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
+  });
+
+  it('install_mode + npm → mirrors npm_config_script_shell=/bin/sh (matches host part-2), NOT ignore_pnpmfile/git', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('npm', true), '/tmp/events.jsonl');
+    // npm host part-2 pins npm_config_script_shell=/bin/sh (#26); the guest Phase B
+    // must mirror the SAME value or a dep can branch on it host-vs-audit.
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
+    // Thread [53]: host part-2 also pins npm_config_ignore_scripts=false (defeats a
+    // runner home-npmrc ignore-scripts=true); npm re-exports it to the child, so the
+    // guest must mirror the SAME value in lockstep.
+    expect(env['npm_config_ignore_scripts']).toBe('false');
+    // ignore_pnpmfile is pnpm-only (npm ignores it) — not injected for npm.
+    expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+    // npm_config_git is NOT mirrored: the host scopes it to fetch/part-1 only, so
+    // the host part-2 child (like the guest Phase B) never sees it (round-15).
+    expect(env['npm_config_git']).toBeUndefined();
+  });
+
+  it('install_mode + yarn → mirrors the 3 child-reaching host yarn pins, NOT npm_config_* or YARN_IGNORE_PATH', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('yarn', true), '/tmp/events.jsonl');
+    // Host part-2 yarn pins these three and yarn re-exports them to the child
+    // (VERIFIED yarn 4.9.1); the guest must mirror EXACTLY to match the child env.
+    expect(env['YARN_RC_FILENAME']).toBe('.yarnrc.yml');
+    expect(env['YARN_PLUGINS']).toBe('');
+    expect(env['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBe('false');
+    // YARN_IGNORE_PATH is excluded: yarn never re-exports it → host child lacks it,
+    // so mirroring it would CREATE a guest-only value the host child doesn't have.
+    expect(env['YARN_IGNORE_PATH']).toBeUndefined();
+    // npm/pnpm-only keys never injected for yarn.
+    expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+    expect(env['npm_config_script_shell']).toBeUndefined();
+    expect(env['npm_config_ignore_scripts']).toBeUndefined(); // npm-only (thread [53])
+  });
+
+  it('pure-audit (install_mode false) + pnpm → NO injection of EITHER key (golden byte-stability)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('pnpm', false), '/tmp/events.jsonl');
+    expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
+    expect(env['npm_config_script_shell']).toBeUndefined();
+  });
+
+  it('pure-audit (install_mode false) + npm → NO npm_config_ignore_scripts (golden byte-stability, thread [53])', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('npm', false), '/tmp/events.jsonl');
+    expect(env['npm_config_ignore_scripts']).toBeUndefined();
+    expect(env['npm_config_script_shell']).toBeUndefined();
+  });
+
+  it('injection OVERRIDES inherited npm_config_ignore_pnpmfile AND npm_config_script_shell (last-spread wins)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // A host/runner that already exported either key with a DIFFERENT value must
+    // not defeat the parity guarantee — the install-mode injection is spread
+    // last, so it deterministically wins regardless of the inherited value.
+    const env = buildChildEnv(
+      {
+        PATH: '/usr/bin',
+        npm_config_ignore_pnpmfile: 'false',
+        npm_config_script_shell: '/bin/bash',
+      },
+      cfg('pnpm', true),
+      '/tmp/events.jsonl',
+    );
+    expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
+  });
+
+  it('macOS install_mode + pnpm → injects BOTH keys (buildChildEnvMacos reuses the Linux builder)', async () => {
+    const { buildChildEnvMacos } = await import('../../src/guest/agent.js');
+    const env = buildChildEnvMacos(
+      { PATH: '/usr/bin' },
+      cfg('pnpm', true),
+      '/tmp/events.jsonl',
+    );
+    expect(env['npm_config_ignore_pnpmfile']).toBe('true');
+    expect(env['npm_config_script_shell']).toBe('/bin/sh');
+  });
+
+  // Guest-provisioning leak parity (round-16): VP_HOME / COREPACK_HOME are
+  // exported by the backend boot (init.sh / docker.ts) into the guest's own
+  // process.env but have NO host counterpart, so leaking them into the audited
+  // lifecycle child is a value-blind-lock oracle (present-in-guest /
+  // absent-on-host).  VP_HOME is stripped HERE (in buildChildEnv) — it is never
+  // read at runtime.  COREPACK_HOME is intentionally PRESERVED by buildChildEnv
+  // because the SHARED child env is also Phase A's fetchEnv, and Phase A still
+  // launches the bare corepack shim (which needs COREPACK_HOME to populate the
+  // cache).  COREPACK_HOME is instead closed downstream, at the Phase-B
+  // install/prepare env seam: once the agent resolves the cached PM entry and
+  // launches `node <entry>` directly (resolveLinuxManagerLaunch), it strips
+  // COREPACK_HOME from the Phase-B child env only (envWithoutCorepackHome).  So
+  // it is NO LONGER an accepted residual — see the runInstallPhase managerLaunch
+  // tests in phase-install.test.ts for the direct-launch + strip coupling.
+  it('strips VP_HOME from the lifecycle child but PRESERVES COREPACK_HOME in buildChildEnv (stripped at the Phase-B seam, not here)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv(
+      {
+        PATH: '/usr/bin',
+        VP_HOME: '/opt/vp',
+        COREPACK_HOME: '/opt/vp/corepack',
+      },
+      cfg('pnpm', false),
+      '/tmp/events.jsonl',
+    );
+    // VP_HOME is a guest-only provisioning tell with no host counterpart and is
+    // not read at runtime → stripped so the audited child matches the host child.
+    expect(env['VP_HOME']).toBeUndefined();
+    // COREPACK_HOME survives buildChildEnv (Phase A's shim needs it); the Phase-B
+    // install/prepare seam strips it once direct-launch resolves the PM entry.
+    expect(env['COREPACK_HOME']).toBe('/opt/vp/corepack');
+  });
+
+  it('strips VP_HOME regardless of install_mode (it is a sandbox tell, not an install pin)', async () => {
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    // install_mode=true must NOT resurrect VP_HOME — the strip is unconditional.
+    const env = buildChildEnv(
+      { PATH: '/usr/bin', VP_HOME: '/opt/vp' },
+      cfg('pnpm', true),
+      '/tmp/events.jsonl',
+    );
+    expect(env['VP_HOME']).toBeUndefined();
+  });
+});
+
 describe('buildChildEnv protect-list entry-count and per-entry-length gates', () => {
   // Audit-trust Finding 3 (2026-05-18): the shim's static protect-list
   // table holds `MAX_PROTECTED = 64` entries of at most `NAME_MAX_LEN - 1
@@ -1212,6 +2843,7 @@ describe('buildChildEnv protect-list entry-count and per-entry-length gates', ()
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -1341,6 +2973,7 @@ describe('buildChildEnv protect-list strict env-var name gate (Finding 5)', () =
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -1429,6 +3062,7 @@ describe('buildChildEnv lifecycle env sanitization', () => {
       work_dir: '/work',
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -1497,10 +3131,53 @@ describe('redactSensitive (Phase A failure dump)', () => {
     expect(out).not.toContain('super-secret-token-value');
   });
 
-  it('skips short/empty protected values so it cannot blank out an ENOSPC trace', async () => {
+  it('skips an EMPTY/unset protected value so it cannot blank out a trace', async () => {
+    // length-0 value → never mass-masks (the >=1 floor excludes it).
     const { redactSensitive } = await import('../../src/guest/agent.js');
-    const out = redactSensitive('ENOSPC: no space left on device', ['CI'], { CI: '1' });
-    expect(out).toBe('ENOSPC: no space left on device');
+    expect(redactSensitive('ENOSPC: no space left on device', ['SECRET'], { SECRET: '' }))
+      .toBe('ENOSPC: no space left on device');
+    expect(redactSensitive('ENOSPC: no space left on device', ['SECRET'], {}))
+      .toBe('ENOSPC: no space left on device');
+  });
+
+  it('MASKS a short (1-3 char) NON-EMPTY declared protected value (F6 Finding 1)', async () => {
+    // A `protected.env` name is an explicit secret declaration — honour it
+    // regardless of length, or a short declared secret leaks raw in the output.
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    expect(redactSensitive('token ab here', ['SECRET'], { SECRET: 'ab' }))
+      .toBe('token <REDACTED:SECRET> here');
+  });
+
+  it('MASKS a PREFIX/SUFFIX/MIDDLE fragment of a declared value (F6 round-3 parity with host)', async () => {
+    // A secret truncated by a concurrent newline on the shared pipe leaks as a
+    // fragment; exact (whole-value) masking misses it, so layer-1 also runs ONE
+    // cross-value maskValueFragments pass.  A fragment can't be attributed to a
+    // single env name, so it gets the generic `<REDACTED:SECRET>` label (NOT the
+    // per-name label the whole-value mask uses).
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const SECRET = 'npm_AB12cd34EF56gh78IJ90klMNopQRstUVwx';
+    const prefix = SECRET.slice(0, 20);
+    expect(redactSensitive(`fetch with ${prefix} now`, ['NPM_TOKEN'], { NPM_TOKEN: SECRET }))
+      .toBe('fetch with <REDACTED:SECRET> now');
+    // a MIDDLE slice (both ends torn) is now masked too (n-gram overlap design).
+    const middle = SECRET.slice(9, 31);
+    expect(redactSensitive(`x ${middle} y`, ['NPM_TOKEN'], { NPM_TOKEN: SECRET }))
+      .toBe('x <REDACTED:SECRET> y');
+  });
+
+  it('masks a fragment in ONE cross-value pass so a shared gate cannot strand a tail (F6 round-3 #1)', async () => {
+    // Two declared secrets share an 8-char prefix.  A per-value pass would mask
+    // the longer value's 8-char gram run first, mutate the text, and strand the
+    // shorter value's remaining tail (`SECRET`); ONE cross-value pass masks the
+    // whole leaked fragment.  This is why the fragment pass runs once over ALL
+    // values, not once per value.
+    const { redactSensitive } = await import('../../src/guest/agent.js');
+    const v1 = 'PREFIX12' + 'z'.repeat(50);
+    const v2 = 'PREFIX12LEAKTAIL';
+    const leaked = v2.slice(0, 14); // 'PREFIX12LEAKTA' — prefix of v2, shares v1's 8-char gate
+    const out = redactSensitive(`run ${leaked} done`, ['A', 'B'], { A: v1, B: v2 });
+    expect(out).not.toContain('LEAKTA'); // the tail a per-value pass would strand past v1's gate
+    expect(out).toBe('run <REDACTED:SECRET> done');
   });
 
   it('redacts credential SHAPES not in the protected list', async () => {
@@ -1575,6 +3252,7 @@ describe('buildChildEnv package-manager cache/store redirects', () => {
       work_dir: workDir,
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
       ...(manager !== undefined ? { manager } : {}),
     };
   }
@@ -1788,6 +3466,7 @@ describe('buildChildEnvMacos macOS sticky env contract', () => {
       work_dir: workDir,
       log_fd: 3,
       pkg_dirs: {},
+      install_mode: false,
     };
   }
 
@@ -3527,6 +5206,68 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     }
   });
 
+  it('redacts credential shapes + protected-env values in forwarded stderr (parity with the stdout tail, F1)', async () => {
+    // The tracee inherits strace's fd2, so a malicious lifecycle script can print
+    // a secret (e.g. one it read from the staged pm-flags.json sidecar) to its own
+    // stderr.  The forwarder MUST apply the same redactor the stdout tail uses, so
+    // a credential can't leak to the console via stderr while stdout masks it.
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: undefined,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    // Same redactor the agent wires for the stdout tail: exact protected-env
+    // values (layer 1) + credential SHAPES (layer 2).
+    const redact = (s: string): string => redactSensitive(s, ['MY_SECRET'], { MY_SECRET: 'HUNTER2SECRET' });
+    const runner = new LinuxStraceRunner(() => fakeChild, null, redact);
+
+    const capturedStderr: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]): boolean => {
+      capturedStderr.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+      return origWrite(chunk as Parameters<typeof origWrite>[0], ...(args as Parameters<typeof origWrite>[1][]));
+    }) as typeof process.stderr.write;
+
+    try {
+      const basePath = `${tailerDir}/strace.out`;
+      const runIter = runner.run('npm', ['rebuild'], { env: {}, cwd: tailerDir, basePath });
+      const itemsPromise = (async () => {
+        const collected: unknown[] = [];
+        for await (const item of runIter) collected.push(item);
+        return collected;
+      })();
+
+      // A dep that read the sidecar and echoes its content to stderr:
+      fakeStderr.push('fetch https://user:DEPLOYKEYSECRET@reg.example/pkg\n'); // URL userinfo → layer 2
+      fakeStderr.push('leaked MY_SECRET=HUNTER2SECRET\n'); // protected-env value → layer 1
+      fakeStderr.push(null);
+      fakeFd3.push(null);
+      setTimeout(() => { closeListener?.(0); }, 30);
+      await itemsPromise;
+
+      const forwarded = capturedStderr.join('');
+      // Credential SHAPE masked.
+      expect(forwarded).not.toContain('DEPLOYKEYSECRET');
+      expect(forwarded).toContain('<REDACTED:URL-CREDENTIALS>');
+      // Exact protected-env value masked.
+      expect(forwarded).not.toContain('HUNTER2SECRET');
+      expect(forwarded).toContain('<REDACTED:MY_SECRET>');
+      // Prefix still applied.
+      expect(forwarded).toMatch(/\[strace\] /);
+    } finally {
+      process.stderr.write = origWrite;
+    }
+  });
+
   // Codex follow-up (bug #3, high, 2026-05-19): tri-state rootPid resolution.
   // When `child.pid` is defined AND readStraceChildPid returns null (timeout,
   // ambiguous, /proc unavailable), the per-pid-file fallback MUST be suppressed.
@@ -3804,6 +5545,59 @@ describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)
     // and this would be null.
     expect(runner.getTamperReason()).not.toBeNull();
     expect(runner.getTamperReason()).toMatch(/ctime advanced|without new bytes/);
+  });
+
+  it('redacts credential shapes + protected-env values in forwarded [macos] stderr (F4)', async () => {
+    // macOS-bare forwards the install tree's OWN stderr to the console, so a
+    // lifecycle script could leak a secret there.  The runner must apply the
+    // SAME redactor the Linux path uses (parity), so the leak is closed on macOS
+    // too.
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    const fakeChild = {
+      stderr: fakeStderr as unknown as NodeJS.ReadableStream,
+      stdio: [null, null, fakeStderr, fakeFd3] as Array<NodeJS.ReadableStream | null | undefined>,
+      pid: undefined as number | undefined,
+      on(event: 'close' | 'error', listener: (...a: never[]) => void) {
+        if (event === 'close') closeListener = listener as unknown as (code: number | null) => void;
+        return this;
+      },
+    };
+    const fakeSpawn = (() => fakeChild) as unknown as SpawnImpl;
+
+    const redact = (s: string): string => redactSensitive(s, ['MY_SECRET'], { MY_SECRET: 'HUNTER2SECRET' });
+    const runner = new MacOSInstallRunner(fakeSpawn, null, redact);
+
+    const capturedStderr: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]): boolean => {
+      capturedStderr.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+      return origWrite(chunk as Parameters<typeof origWrite>[0], ...(args as Parameters<typeof origWrite>[1][]));
+    }) as typeof process.stderr.write;
+
+    try {
+      const runIter = runner.run('node', [], { env: {}, cwd: macDir, basePath: join(macDir, 'strace.out') });
+      const drain = (async () => { for await (const _ of runIter) { /* drain */ } })();
+
+      fakeStderr.push('fetch https://user:DEPLOYKEYSECRET@reg.example/pkg\n'); // URL userinfo → layer 2
+      fakeStderr.push('also //user:DEPLOYKEYSECRET@reg.example/ scheme-relative\n'); // F3 shape → layer 2
+      fakeStderr.push('leaked MY_SECRET=HUNTER2SECRET\n'); // protected env → layer 1
+      fakeStderr.push(null);
+      fakeFd3.push(null);
+      setTimeout(() => { closeListener?.(0); }, 30);
+      await drain;
+
+      const forwarded = capturedStderr.join('');
+      expect(forwarded).not.toContain('DEPLOYKEYSECRET');
+      expect(forwarded).not.toContain('HUNTER2SECRET');
+      expect(forwarded).toContain('<REDACTED:URL-CREDENTIALS>');
+      expect(forwarded).toContain('<REDACTED:MY_SECRET>');
+      expect(forwarded).toMatch(/\[macos\] /);
+    } finally {
+      process.stderr.write = origWrite;
+    }
   });
 });
 

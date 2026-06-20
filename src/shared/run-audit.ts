@@ -52,6 +52,8 @@ import {
   renderDiff,
 } from '../action/diff.js';
 import { buildEffectiveConfig } from '../action/config-override.js';
+import { sanitizeInstallArgs } from './pm-commands.js';
+import { stripDangerousEnv } from '../action/host-install.js';
 import {
   makeOverlay,
   type OverlayResult,
@@ -110,6 +112,15 @@ export interface AuditExecutionInput {
   extraRepoOverlayFiles: ReadonlyArray<{ relPath: string; content: string }>;
   /** The private per-run scratch dir owned by runAudit for config sidecars. */
   scratchDir: string;
+  /**
+   * The absolute path the guest audit runs the lifecycle scripts at (the
+   * config `work_dir`).  `/work` for a normal audit; the real host repoDir for
+   * `install: true` (cwd parity with the uninstrumented host re-run — see
+   * `installWorkDir` on RunAuditInput).  Docker mounts the staged repo at this
+   * path; bare/mac-bare re-pin work_dir to their staged path and ignore it.
+   * Defaults to `/work` when unset.
+   */
+  auditWorkDir?: string;
   /** Detected package manager for the user's repo. */
   pm: 'npm' | 'pnpm' | 'yarn';
   /** Host architecture of the runner / dev box. */
@@ -135,6 +146,21 @@ export interface RunAuditInput {
   pm: 'npm' | 'pnpm' | 'yarn';
   /** Host architecture of the runner / dev box. */
   hostArch: 'x64' | 'arm64';
+  /**
+   * Developer-supplied package-manager install args (the action `args` input),
+   * already split + sanitized.  Threaded into the sandbox fetch via the
+   * pm-flags.json `user_install_args` channel so the audited tree matches what
+   * the host install resolves.  Undefined / empty = no extra args.
+   */
+  args?: string[] | undefined;
+  /**
+   * When set (the action's `install: true` path), the absolute host repoDir to
+   * pin the guest audit `work_dir` to, so the sandbox audits lifecycle scripts
+   * at the SAME cwd the host re-run uses — closing a `process.cwd()` detection
+   * oracle.  Undefined for pure-audit / CLI runs (guest default `/work` stands).
+   * Tokenized to `$REPO` in the lock, so the runner-specific value is byte-stable.
+   */
+  installWorkDir?: string | undefined;
   /**
    * Absolute path to the base rootfs ext4. Required by the legacy
    * makeOverlay+launch path; unused when `execute` is supplied.
@@ -190,7 +216,7 @@ export interface RunAuditInput {
 
 export async function runAudit(
   input: RunAuditInput,
-): Promise<{ exitCode: number }> {
+): Promise<{ exitCode: number; trusted: boolean; generatedLock?: string }> {
   const doBuildArchFlagOverlay =
     input.buildArchFlagOverlay ?? buildArchFlagOverlay;
   const doMakeOverlay = input.makeOverlay ?? makeOverlay;
@@ -219,6 +245,59 @@ export async function runAudit(
   let result: LauncherResult;
   let overlay: OverlayResult | null = null;
   try {
+    // Merge the two pm-flags.json channels: npm-only arch hints from the
+    // (production no-op) arch overlay, plus the developer `args` input on the
+    // separate `user_install_args` channel (applied to all managers in the
+    // guest).  Emit the sidecar only when at least one channel has content so
+    // the normal no-args parity path stays byte-identical to before.
+    //
+    // SECURITY + PARITY: sanitize the user args HERE, with the SAME
+    // `sanitizeInstallArgs` the host install uses, so (a) no script-re-enabling
+    // arg ever reaches the network-on Phase A fetch in the sandbox, and (b) the
+    // audited tree is built from the identical argv as the host no-scripts
+    // install.  Without this the sandbox fetch would receive RAW args and could
+    // diverge from — or be more permissive than — the host part-1 install.
+    const { kept: userInstallArgs, dropped, droppedKeys } = sanitizeInstallArgs(
+      input.args ?? [],
+    );
+    // OBSERVABILITY (Codex review, thread [49]): the host no-scripts install
+    // warns about dropped args, but that path only runs under `install: true`
+    // (main.ts gates `doHostInstallNoScripts` on it).  In audit-only Action mode
+    // and on every CLI run the host install never executes, so a user passing
+    // `--filter`/`--dir`/an inline-credential `--registry` got silently ignored
+    // here.  Surface it via the same seam used for arch-overlay warnings above.
+    // Log ONLY droppedKeys (canonical flag names / `<positional>` constants from
+    // `dropReason`), never the raw `dropped` tokens — those can carry a secret
+    // (e.g. `--registry=https://user:TOKEN@host`).  No lockfile impact: the
+    // no-args path yields droppedKeys=[] → no warning → byte-stable parity.
+    if (droppedKeys.length > 0) {
+      const n = dropped.length;
+      const keys = droppedKeys.join(', ');
+      input.io.warn(
+        `script-jail: ignoring ${n} install arg${n === 1 ? '' : 's'} (${keys}) — ` +
+          `not on the allowlist of dependency-selection flags, or carrying an ` +
+          `unsafe value (e.g. an inline-credential --registry URL). Only flags ` +
+          `that filter the lockfile-pinned tree (plus a credential-free ` +
+          `--registry) are forwarded; anything that could redirect the ` +
+          `lock/root/output/source, re-enable lifecycle scripts, or carry an ` +
+          `inline credential is dropped.`,
+      );
+    }
+    const archPmFlags = archOverlay.pmFlagsJson;
+    // SECURITY (host-owned sidecar): ALWAYS emit pm-flags.json — even when both
+    // channels are empty.  The overlay writer (`materializeExtraFiles` /
+    // overlay.ts) rm+writes, so an always-present host file OVERWRITES any
+    // repo-committed `etc/script-jail/pm-flags.json` (which the Firecracker
+    // init copies into `/etc` and the guest would otherwise trust verbatim).
+    // This is the same reason `config.yml` is safe — the host always writes it.
+    // An empty file makes the guest append nothing, so the no-args parity path
+    // stays byte-identical; a repo can no longer inject install args (benign OR
+    // script-re-enabling) into the network-on Phase A fetch.
+    const pmFlagsJson = {
+      extra_install_args: archPmFlags?.extra_install_args ?? [],
+      ...(userInstallArgs.length > 0 ? { user_install_args: userInstallArgs } : {}),
+    };
+
     // 3. Build the effective config + sidecars under the private scratch.
     //    The user's source config file on the host is never modified.
     const effectiveConfig = buildEffectiveConfig({
@@ -231,12 +310,20 @@ export async function runAudit(
         spoofArch: input.overrides.spoofArch ?? input.hostArch,
       },
       workDir: scratchDir,
+      // install:true cwd parity — pin the guest audit work_dir to the host
+      // repoDir (FC/docker).  Omitted on pure-audit/CLI runs (default /work).
+      // installMode also flips on here so the guest audit mirrors the host
+      // install's post-trust pnpm config (--config.ignore-pnpmfile=true) into
+      // the Phase B lifecycle env — closing the value-blind config-asymmetry
+      // (env-spy records env_read NAMEs only).  `installWorkDir` is the
+      // canonical install:true signal (set ONLY on that path).
+      ...(input.installWorkDir !== undefined
+        ? { workDirOverride: input.installWorkDir, installMode: true }
+        : {}),
       ...(archOverlay.yarnrcOverlay !== undefined
         ? { yarnrcOverlay: archOverlay.yarnrcOverlay }
         : {}),
-      ...(archOverlay.pmFlagsJson !== undefined
-        ? { pmFlagsJson: archOverlay.pmFlagsJson }
-        : {}),
+      pmFlagsJson,
       ...(archOverlay.pnpmArchOverlay !== undefined
         ? { pnpmArchOverlay: archOverlay.pnpmArchOverlay }
         : {}),
@@ -276,6 +363,7 @@ export async function runAudit(
         pm: input.pm,
         hostArch: input.hostArch,
         mode: input.mode,
+        auditWorkDir: input.installWorkDir ?? '/work',
       });
     } else {
       if (input.launch === undefined) {
@@ -286,11 +374,20 @@ export async function runAudit(
       }
 
       // 5. Build per-run overlay (rootfs + repo ext4 disks).
+      //
+      // SECURITY (codex round-7 host-exec sweep): this legacy launch path is the
+      // macOS VZ backend (the DEFAULT on Apple Silicon).  makeOverlay spawns
+      // bare-name host tools (`cp`, `mkfs.ext4`/`command -v`, a docker fallback)
+      // BEFORE the audit trust gate, so it must get a sanitized env — a
+      // checkout-prepended/empty PATH or an inherited loader var could otherwise
+      // hijack them on the host.  The `execute` backends sanitize internally;
+      // this is the one makeOverlay call runAudit owns directly.
       overlay = await doMakeOverlay({
         baseRootfsPath: input.baseRootfsPath,
         repoSrcPath: input.repoDir,
         configPath: effectiveConfig.configPath,
         extraRepoOverlayFiles,
+        env: stripDangerousEnv(process.env),
       });
 
       // 6. Launch the VM via the caller-supplied closure.  We own the
@@ -310,6 +407,12 @@ export async function runAudit(
   }
 
   // 6. Post-VM: write or diff.
+  //
+  // `trusted` is the host's signal that it is safe to run lifecycle scripts on
+  // the runner (the drop-in install part-2).  It is TRUE only on a clean
+  // `check`: the generated lock matches the committed one AND no audit-bypass
+  // entry is present.  `update` mode is NEVER trusted — it regenerates the lock
+  // and skips the bypass scan entirely, so there is no fail-closed gate.
   if (input.mode === 'update') {
     writeFileSync(input.lockPath, result.finalYaml, 'utf8');
     // Diagnostic: emit path + byte count so the next workflow run can map
@@ -321,7 +424,7 @@ export async function runAudit(
     );
     input.io.setOutput?.('lockfile', input.lockPath);
     input.io.setOutput?.('diff', '');
-    return { exitCode: 0 };
+    return { exitCode: 0, trusted: false };
   }
 
   // mode === 'check'
@@ -365,10 +468,17 @@ export async function runAudit(
     // passes undefined for emitAuditBypassAnnotation — its stderr
     // message above is sufficient.
     input.io.emitAuditBypassAnnotation?.(lockLabel, msg);
-    return { exitCode: 1 };
+    return { exitCode: 1, trusted: false };
   }
 
-  return { exitCode: diff.match ? 0 : 1 };
+  // Clean check: trusted ⇔ the generated lock matches the committed one (and we
+  // already returned above if any bypass entry was present).  Return the
+  // GENERATED lock (well-formed — the guest just rendered it) so the drop-in
+  // install can surface its recorded egress from a guaranteed-parseable source.
+  // Reading the committed file instead would risk a parse failure (it can be
+  // malformed in a canonicalized volatile field yet still diff-match), silently
+  // skipping the egress warning before part 2 runs scripts online.
+  return { exitCode: diff.match ? 0 : 1, trusted: diff.match, generatedLock: result.finalYaml };
 }
 
 // ---------------------------------------------------------------------------

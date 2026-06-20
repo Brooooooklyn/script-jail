@@ -45,7 +45,7 @@ export interface Spawner {
   spawn(
     cmd: string,
     args: ReadonlyArray<string>,
-    opts: { stdio: 'ignore' | 'forward' },
+    opts: { stdio: 'ignore' | 'forward'; env?: NodeJS.ProcessEnv | undefined },
   ): SpawnHandle;
 }
 
@@ -101,6 +101,18 @@ export interface LaunchInput {
    * Phase B: false (network isolated).
    */
   enableNetwork: boolean;
+  /**
+   * SECURITY (pre-trust bare-name host RCE): env for the tap-setup `ip` spawns
+   * (`ip link show tap0`, `ip tuntap add`, `ip link set up`) — all bare-name +
+   * pre-trust on the host.  The caller MUST pass an env whose dangerous
+   * loader/config selectors are stripped and PATH has checkout-controlled dirs
+   * dropped; the Firecracker backend threads its ONE `stripDangerousEnv` result
+   * down (see backend/firecracker.ts).  Omitted ⇒ `process.env` (only the
+   * platform-gated direct test path / non-network launches reach the default).
+   * The firecracker binary itself is spawned by ABSOLUTE path via `Spawner`, so
+   * it is unaffected.
+   */
+  env?: NodeJS.ProcessEnv | undefined;
   /** Path for the Firecracker API socket. Created by firecracker at boot. */
   socketPath: string;
   /**
@@ -162,6 +174,10 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
     enableNetwork,
     socketPath,
     bootArgs = DEFAULT_BOOT_ARGS,
+    // SECURITY: the tap-setup `ip` spawns are bare-name + pre-trust — default to
+    // process.env only when the caller (e.g. the platform-gated direct test path)
+    // omits it; the Firecracker backend always threads its sanitized env down.
+    env = process.env,
   } = input;
 
   // Platform guard — only skip when a fake spawner is injected.
@@ -191,10 +207,16 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
   // to process.stderr with a `[fc]` prefix. Without this, VM boot
   // failures and init/agent crashes are invisible — the host only
   // sees the eventual "vsock session ended without a final frame".
+  // SECURITY (codex round-8 host-exec sweep): the firecracker binary is an
+  // absolute-path spawn (no PATH shadow), but it is a dynamically-linked ELF, so
+  // an inherited LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH could inject into the
+  // host firecracker process BEFORE the audit produces/diffs the lock.  Spawn it
+  // with the caller-sanitized env (dangerous loader selectors dropped) — the
+  // Firecracker backend threads its `safeEnv` down to here.
   const handle = spawner.spawn(
     firecrackerPath,
     ['--api-sock', socketPath],
-    { stdio: 'forward' },
+    { stdio: 'forward', env },
   );
 
   // 2. Wait for the API socket to be ready.
@@ -281,7 +303,7 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
 
     // 6. Optional network (Phase A only).
     if (enableNetwork) {
-      await setupTapDevice(apiClient);
+      await setupTapDevice(apiClient, env);
     }
 
     // 7. PUT /vsock
@@ -336,19 +358,26 @@ export async function launchVm(input: LaunchInput): Promise<VmHandle> {
  * TODO(v2): Dynamically allocate tap device names to support multiple
  * concurrent VMs on the same host.
  */
-async function setupTapDevice(api: FirecrackerApiClient): Promise<void> {
+async function setupTapDevice(api: FirecrackerApiClient, env: NodeJS.ProcessEnv): Promise<void> {
   // Detect pre-existing tap0.  `ip link show tap0` exits 0 when present and
   // non-zero (with "Device 'tap0' does not exist" on stderr) when not — we
   // only consult the exit status, never the device's link state, because
   // a workflow may bring it up *after* this check completes.
+  //
+  // SECURITY: every `ip` spawn here is bare-name + pre-trust on the host, so
+  // each carries the caller-sanitized `env` (dangerous loader/config selectors
+  // stripped, checkout PATH dirs dropped) — a checkout-prepended `./ip` or an
+  // inherited LD_PRELOAD must not reach these.
   const existing = spawnSync('ip', ['link', 'show', 'tap0'], {
     stdio: ['ignore', 'ignore', 'ignore'],
+    env,
   });
   const alreadyExists = existing.status === 0;
 
   if (!alreadyExists) {
     const mkTap = spawnSync('ip', ['tuntap', 'add', 'tap0', 'mode', 'tap'], {
       stdio: ['ignore', 'pipe', 'pipe'],
+      env,
     });
     if (mkTap.status !== 0) {
       const stderr = (mkTap.stderr?.toString() ?? '').trim();
@@ -366,7 +395,7 @@ async function setupTapDevice(api: FirecrackerApiClient): Promise<void> {
   // step it may already be up, in which case this is a no-op.  Failures here
   // are non-fatal — Firecracker will fail loudly on the API call if the host
   // device isn't usable.
-  spawnSync('ip', ['link', 'set', 'tap0', 'up'], { stdio: 'ignore' });
+  spawnSync('ip', ['link', 'set', 'tap0', 'up'], { stdio: 'ignore', env });
 
   await api.put('/network-interfaces/eth0', {
     iface_id: 'eth0',
@@ -383,7 +412,7 @@ class NodeSpawner implements Spawner {
   spawn(
     cmd: string,
     args: ReadonlyArray<string>,
-    opts: { stdio: 'ignore' | 'forward' },
+    opts: { stdio: 'ignore' | 'forward'; env?: NodeJS.ProcessEnv | undefined },
   ): SpawnHandle {
     // 'ignore' wires both stdout and stderr to /dev/null at the OS level.
     // 'forward' pipes them so we can prefix each line and tee to our own
@@ -395,6 +424,7 @@ class NodeSpawner implements Spawner {
     const child = nodeSpawn(cmd, [...args], {
       stdio: childStdio,
       detached: false,
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
     });
 
     if (opts.stdio === 'forward') {

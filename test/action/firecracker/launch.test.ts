@@ -39,10 +39,10 @@ function makeFakeApiClient(): { client: FirecrackerApiClient; calls: ApiCall[] }
 
 function makeFakeSpawner(): {
   spawner: Spawner;
-  spawnCalls: Array<{ cmd: string; args: ReadonlyArray<string> }>;
+  spawnCalls: Array<{ cmd: string; args: ReadonlyArray<string>; env: NodeJS.ProcessEnv | undefined }>;
   handle: SpawnHandle & { _pid: number };
 } {
-  const spawnCalls: Array<{ cmd: string; args: ReadonlyArray<string> }> = [];
+  const spawnCalls: Array<{ cmd: string; args: ReadonlyArray<string>; env: NodeJS.ProcessEnv | undefined }> = [];
   const handle: SpawnHandle & { _pid: number } = {
     _pid: 1234,
     get pid() { return 1234; },
@@ -50,8 +50,8 @@ function makeFakeSpawner(): {
     waitForExit: () => Promise.resolve(0),
   };
   const spawner: Spawner = {
-    spawn(cmd, args, _opts) {
-      spawnCalls.push({ cmd, args: [...args] });
+    spawn(cmd, args, opts) {
+      spawnCalls.push({ cmd, args: [...args], env: opts.env });
       return handle;
     },
   };
@@ -90,6 +90,10 @@ function makeInput(
     vsockUdsPath: '/tmp/vsock.sock',
     enableNetwork: false,
     socketPath: '/tmp/fc.sock',
+    // SECURITY: the Firecracker backend threads a `stripDangerousEnv`-sanitized
+    // env here for the (network-on) tap-setup `ip` spawns; harmless for the
+    // default enableNetwork:false tests (the `ip` spawns never fire).
+    env: { PATH: '/usr/sbin:/sbin' },
     apiClient: client,
     spawner,
     poller: makeFakePoller(),
@@ -114,6 +118,21 @@ describe('launchVm', () => {
     expect(call!.cmd).toBe('/usr/bin/firecracker');
     expect(call!.args).toContain('--api-sock');
     expect(call!.args).toContain(socketPath);
+  });
+
+  it('spawns firecracker with the caller-threaded env (codex round-8 — LD_* injection defense)', async () => {
+    const { spawner, spawnCalls } = makeFakeSpawner();
+    const { client } = makeFakeApiClient();
+    // The Firecracker backend threads a stripDangerousEnv-sanitized env here; the
+    // binary is absolute-path but a dynamically-linked ELF, so it must NOT inherit
+    // the raw runner env (an inherited LD_PRELOAD would inject pre-trust).
+    const threadedEnv = { PATH: '/usr/sbin:/sbin', HOME: '/home/runner' };
+    await launchVm(makeInput({ spawner, apiClient: client, env: threadedEnv }));
+
+    expect(spawnCalls).toHaveLength(1);
+    // The exact threaded env reaches the spawn — NOT process.env (which carries
+    // the test runner's vars, e.g. it has no such isolated shape).
+    expect(spawnCalls[0]!.env).toEqual(threadedEnv);
   });
 
   it('sends PUT /boot-source with kernel path and boot_args', async () => {

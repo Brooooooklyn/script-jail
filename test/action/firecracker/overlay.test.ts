@@ -97,6 +97,35 @@ describe('makeOverlay — partial-build failure removes the workDir', () => {
     // repo — must be gone.
     expect(existsSync(workDir)).toBe(false);
   });
+
+  it('FAILS CLOSED when an overlay LEAF pre-exists as a directory (gitlink/submodule leaf gap)', async () => {
+    // Codex re-review: a committed gitlink/submodule (git index mode 160000) at
+    // etc/script-jail/pm-flags.json checks out as a real (empty) DIRECTORY.  The old
+    // `rmSync(dest, {recursive}); writeFileSync` would delete it and write our sidecar
+    // into the repo-disk copy ONLY, while the host's real checkout keeps the dir — a
+    // host-vs-audit divergence the value-blind lock can't capture.  writeOverlayFile
+    // must throw (before mkfs, so this runs on every platform).  A real empty dir at the
+    // leaf reproduces the checked-out gitlink's filesystem state without needing git.
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+    const workDir = mkdtempSync(join(tmpdir(), 'script-jail-leaf-gap-'));
+    const repoSrc = mkdtempSync(join(tmpdir(), 'script-jail-leaf-repo-'));
+    writeFileSync(join(repoSrc, 'package.json'), '{"name":"x"}');
+    mkdirSync(join(repoSrc, 'etc', 'script-jail', 'pm-flags.json'), { recursive: true });
+
+    await expect(
+      makeOverlay({
+        baseRootfsPath,
+        repoSrcPath: repoSrc,
+        configPath,
+        workDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).rejects.toThrow(/already has a directory .* writes its own sidecar/);
+
+    expect(existsSync(workDir)).toBe(false); // makeOverlay's try/catch cleaned up.
+    rmSync(repoSrc, { recursive: true, force: true });
+  });
 });
 
 describe('makeOverlay — staging (no ext4 build)', () => {
@@ -367,5 +396,53 @@ describe.skipIf(!isLinux)('makeOverlay — full (Linux + mkfs.ext4)', () => {
     } finally {
       await result.cleanup();
     }
+  });
+
+  // SECURITY (pre-trust bare-name host RCE): on Linux the disk-build spawns
+  // (`cp --reflink=auto`, bare `mkfs.ext4`) resolve via the PATH carried in the
+  // caller-supplied `env`.  The Firecracker backend threads its sanitized env
+  // down so a checkout-prepended PATH dir / inherited loader var can't hijack
+  // them.  These two tests pin that `input.env` is actually HONORED for tool
+  // resolution: a sanitized system PATH succeeds; a PATH with no `mkfs.ext4`
+  // (and `cp` unavailable for the reflink fast-path) fails — proving the spawns
+  // do NOT silently fall back to the ambient process.env.
+  it('honors a sanitized env PATH when building the disks (success)', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+
+    const result = await makeOverlay({
+      baseRootfsPath,
+      repoSrcPath: repoDir,
+      configPath,
+      // A SAFE_SYSTEM_PATH-equivalent value: mkfs.ext4 lives in /usr/sbin|/sbin,
+      // cp in /usr/bin|/bin.  No checkout dir, no loader vars — the hardened shape.
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+    });
+
+    try {
+      expect(existsSync(result.scratchDiskPath)).toBe(true);
+      expect(existsSync(result.repoDiskPath)).toBe(true);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('fails when the threaded env PATH cannot resolve mkfs.ext4 (env is honored, not bypassed)', async () => {
+    const baseRootfsPath = fakeBaseRootfs(testDir);
+    const configPath = fakeConfig(testDir);
+    // An empty-but-existing dir on PATH: neither `cp` (reflink fast-path) nor the
+    // bare `mkfs.ext4` resolve, so the build must throw.  If the spawns ignored
+    // `input.env` and used the ambient PATH, this would (wrongly) succeed.
+    const emptyBin = join(testDir, 'empty-bin');
+    mkdirSync(emptyBin, { recursive: true });
+
+    await expect(
+      makeOverlay({
+        baseRootfsPath,
+        repoSrcPath: repoDir,
+        configPath,
+        env: { PATH: emptyBin },
+      }),
+    ).rejects.toThrow(/mkfs\.ext4|ENOENT|spawn/i);
   });
 });

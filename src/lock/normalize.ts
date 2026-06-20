@@ -125,6 +125,19 @@ export interface NormalizeContext {
   roots: TokenizeRoots;
   // pkg@version → installed path inside the VM (e.g. /work/node_modules/esbuild)
   pkgDirs: Map<string, string>;
+  // Keys (name AND name@version) identifying the ROOT project, which has no
+  // node_modules dir.  Its lifecycle events (root pre/install/postinstall from
+  // the main install pass; root `prepare` from the prepare pass) attribute to
+  // these keys.  We deliberately give the root NO pkgDir: mapping it to the
+  // repo root would treat the WHOLE repo as $PKG, so every root write into the
+  // repo would drop as "intra-package" — hiding the build/escape behaviour we
+  // audit, and letting a dependency FORGE `npm_package_name=<root>` to write
+  // anywhere under the repo with the write silently dropped.  Instead, listing
+  // the root here makes normalize SURFACE the root's fs events (external_reads /
+  // escaped_writes) rather than throw on the missing pkgDir — visible in the
+  // lock, diffable, forgery-safe.  Omitted/empty ⇒ no root events to surface
+  // (byte-identical to the pre-feature behaviour for every existing caller).
+  rootPkgKeys?: Set<string>;
   // Host OS the audit ran on.  Defaults to 'linux' when omitted so every
   // existing caller (the Linux Action guest, all unit/integration tests)
   // produces byte-identical output.  Only 'darwin' enables the macOS-only
@@ -152,18 +165,80 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         : ev.raw.kind === 'read' || ev.raw.kind === 'write'
           ? ev.raw.path
           : undefined;
-    if (isSystemNoise(ev, fsPath, os)) continue;
+    if (isSystemNoise(ev, fsPath, os, ctx.roots)) continue;
 
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
 
+    // Genuine-vs-forged ROOT attribution.
+    //
+    // `npm_package_name` (which drives `ev.pkg`) is FORGEABLE: any dependency
+    // can export `npm_package_name=<root>` to make its own fs events attribute
+    // to the root project's key.  The root has no pkgDir (it is not under
+    // node_modules), so a root-claimed event tokenizes against $REPO/
+    // $NODE_MODULES (no $PKG) and SURFACES as external_reads / escaped_writes —
+    // which is exactly what we want for the *genuine* root, but would let a
+    // forging dependency (a) write anywhere under the repo and have it surface
+    // under the root, then (b) if the path matches a real root write,
+    // dedupe-collapse away (hidden) downstream in sortAndDedupe.
+    //
+    // `root_anchored` closes that hole.  It is a NON-forgeable verdict the
+    // producer stamps on root-attributed fs events: the Linux dispatcher
+    // derives it from the kernel process tree + per-pid exec-cwd (genuine root
+    // → true; a dep forging the root label → false), macOS-bare defaults it
+    // true (observe-only), and the prepare pass forces it true (that pass runs
+    // ONLY the root's prepare).  It is consumed here and NEVER rendered.
+    //
+    //   - claimsRoot && root_anchored === true  → GENUINE root: surface as
+    //     `$REPO/...` exactly as before.
+    //   - claimsRoot && root_anchored !== true  → FORGED root: still surface
+    //     (never drop, never throw — dropping would be a dependency-triggered
+    //     DoS/hide, throwing would crash the whole audit), but prefix with
+    //     `<FORGED_ROOT> ` so it is a DISTINCT string that can never
+    //     dedupe-collapse with a genuine root entry and is fail-loud for review.
+    const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
+    // `root_anchored` lives only on the read/write/env_read/spawn/connect/
+    // env_tamper members of the RawEvent union; the inline `kind` test narrows
+    // the union so TS can read the field. A forged/unanchored root-claimed event
+    // of ANY of these kinds gets the `<FORGED_ROOT>` prefix, so it can never
+    // dedupe-collapse with — or be mistaken for — a genuine root entry (incl. the
+    // drop-in-install egress partition in diff.ts).
+    //
+    // `dlopen` and `exec` are deliberately NOT anchored (conscious exclusions):
+    //   * dlopen renders `<BLOCKED>` only — the load NEVER executed and
+    //     dlopen-block.cjs is not in the default preload set, so a dedupe-
+    //     collapsed dlopen hides nothing executable.
+    //   * exec's audit-relevant output goes to `audit_bypass`, which
+    //     findAuditBypass (src/action/diff.ts, gate `entry.length > 0`) hard-fails
+    //     on independently of the byte-diff — so dedupe-collapse cannot hide it.
+    //     exec also cannot be deferred (bypass-synthesis ordering) nor reliably
+    //     emit-time anchored (incomplete process tree → flaky verdict).
+    // The env_tamper `audit_fd_lost` variant is likewise excluded below: it routes
+    // to audit_bypass and is gated independently by findAuditBypass.
+    const isForgedRoot =
+      claimsRoot &&
+      (ev.raw.kind === 'read' ||
+        ev.raw.kind === 'write' ||
+        ev.raw.kind === 'env_read' ||
+        ev.raw.kind === 'spawn' ||
+        ev.raw.kind === 'connect' ||
+        ev.raw.kind === 'env_tamper') &&
+      ev.raw.root_anchored !== true;
+
     // For fs events (read/write) a missing pkgDirs entry is an error: without
     // pkgDir the $PKG token can never form, so intra-package reads would
-    // silently leak into external_reads — the opposite of what we want.
-    if (pkgDir === undefined && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
+    // silently leak into external_reads — the opposite of what we want.  A pkg
+    // that CLAIMS root (genuine or forged) is the one legitimate no-pkgDir case
+    // (handled above/below); everything else with no pkgDir is an unknown/forged
+    // NON-root attribution and we fail closed.
+    if (pkgDir === undefined && !claimsRoot && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`,
       );
     }
+
+    // Outermost prefix for a forged-root fs event.  Empty for genuine root and
+    // every non-root pkg, so their output is byte-identical to before.
+    const forgedPrefix = isForgedRoot ? '<FORGED_ROOT> ' : '';
 
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
 
@@ -173,8 +248,9 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // linux (computed once at the top of the loop).
         const tokenized = normalizeVolatilePath(tokenize(fsPath!, ctx.roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package read
-        const tagged = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
-        block.external_reads.push(tagged);
+        const hiddenTag = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
+        // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
+        block.external_reads.push(`${forgedPrefix}${hiddenTag}`);
         break;
       }
       case 'write': {
@@ -185,12 +261,14 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // package's directory?". An auditor needs both signals.
         const hiddenPrefix = ev.raw.hidden ? '<HIDDEN> ' : '';
         const crossPrefix = isCrossPackage(tokenized) ? '<CROSS_PACKAGE> ' : '';
-        block.escaped_writes.push(`${hiddenPrefix}${crossPrefix}${tokenized}`);
+        // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
+        block.escaped_writes.push(`${forgedPrefix}${hiddenPrefix}${crossPrefix}${tokenized}`);
         break;
       }
       case 'env_read': {
         const tagged = ev.raw.hidden ? `<HIDDEN> ${ev.raw.name}` : ev.raw.name;
-        block.env_read.push(tagged);
+        // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
+        block.env_read.push(`${forgedPrefix}${tagged}`);
         break;
       }
       case 'spawn': {
@@ -224,8 +302,13 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // stays green while a reviewer still sees which exec escaped the audit.
         // The marker sits AFTER any result tag, e.g. `<ENOENT> <AUDIT_BLIND> …`.
         const auditBlind = ev.raw.audit_blind === true ? '<AUDIT_BLIND> ' : '';
-        if (ev.raw.result === 'ok') block.spawn_attempts.push(`${auditBlind}${cmd}`);
-        else block.spawn_blocked.push(`<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`);
+        // forgedPrefix is the OUTERMOST prefix, before BOTH the result tag and
+        // the <AUDIT_BLIND> marker (empty for genuine root / non-root).
+        if (ev.raw.result === 'ok') block.spawn_attempts.push(`${forgedPrefix}${auditBlind}${cmd}`);
+        else
+          block.spawn_blocked.push(
+            `${forgedPrefix}<${ev.raw.result.toUpperCase()}> ${auditBlind}${cmd}`,
+          );
         break;
       }
       case 'dlopen': {
@@ -235,7 +318,11 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
       }
       case 'connect': {
         const tag = ev.raw.result === 'blocked' ? '<BLOCKED> ' : '';
-        block.network_attempts.push(`${tag}connect ${ev.raw.host}:${ev.raw.port}`);
+        // forgedPrefix is the OUTERMOST prefix, before the <BLOCKED> result tag
+        // (empty for genuine root / non-root). diff.ts's drop-in-install egress
+        // partition keys off this prefix to route a forged root prepare connect
+        // to host-bound rather than misclassifying it as host-safe.
+        block.network_attempts.push(`${forgedPrefix}${tag}connect ${ev.raw.host}:${ev.raw.port}`);
         break;
       }
       case 'exec': {
@@ -341,6 +428,9 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // it and hard-fails the lockfile diff.  Same severity classification
         // as `<EXEC_FAIL_OPEN>`.
         if (ev.raw.op === 'audit_fd_lost') {
+          // audit_fd_lost is gated independently by findAuditBypass (hard-fails on
+          // any non-empty audit_bypass entry), so dedupe-collapse cannot hide it —
+          // it is NOT forged-root-prefixed. Leave UNCHANGED.
           block.audit_bypass.push('<AUDIT_FD_LOST>');
           break;
         }
@@ -348,7 +438,9 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         const entry = name !== undefined
           ? `<REFUSED> ${ev.raw.op} ${name}`
           : `<REFUSED> ${ev.raw.op}`;
-        block.env_tamper.push(entry);
+        // forgedPrefix is the OUTERMOST prefix, before the <REFUSED> tag (empty
+        // for genuine root / non-root → byte-identical output).
+        block.env_tamper.push(`${forgedPrefix}${entry}`);
         break;
       }
     }
@@ -469,11 +561,24 @@ function isSystemNoise(
   ev: AttributedEvent,
   fsPath: string | undefined,
   os: 'linux' | 'darwin',
+  roots: TokenizeRoots,
 ): boolean {
   if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') return false;
   // fsPath is always defined for read/write (computed by the caller): on
   // darwin it is the /private-canonicalized path, on linux it is ev.raw.path.
   const p = fsPath ?? ev.raw.path;
+  // The audited repo ALWAYS wins over every system-noise prefix.  The install:true
+  // M1 fix aligns the guest audit work_dir to the host repoDir, so on a SELF-HOSTED
+  // GitHub runner the checkout lives under /opt/actions-runner/_work/<repo>/<repo> —
+  // i.e. roots.repo is UNDER the bare `/opt` noise prefix.  Without this guard the
+  // `/opt` startsWith match would swallow EVERY repo fs read/write (escaped_writes
+  // and cross-package node_modules writes included — the lock's primary fs attack
+  // channel), so a malicious package's filesystem behaviour would silently vanish
+  // from the lock on those runners.  Checking roots.repo also covers roots.nodeModules
+  // (it lives under repo).  In the common case (repo NOT under /opt) this is a no-op:
+  // such a path would not have matched any noise prefix anyway.  The genuine /opt/vp
+  // toolchain reads are NOT under roots.repo, so they still drop below.
+  if (isUnderRoot(p, roots.repo) || isUnderRoot(p, roots.nodeModules)) return false;
   // Shared prefixes apply on BOTH platforms (macOS ships /usr/lib, /usr/share,
   // /dev too) so Linux output stays byte-identical regardless of os.
   if (SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix))) return true;
@@ -492,4 +597,13 @@ function isSystemNoise(
 
 function basename(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1);
+}
+
+// True when `path` is `root` itself or lies inside `root`, with a path-segment
+// boundary so `/work` matches `/work` and `/work/x` but NOT `/worker`.  Mirrors
+// tokenize.ts's (unexported) pathHasPrefix so the repo-wins exemption in
+// isSystemNoise honours the same prefix semantics tokenization later uses.
+function isUnderRoot(path: string, root: string): boolean {
+  if (!path.startsWith(root)) return false;
+  return path.length === root.length || path[root.length] === '/';
 }

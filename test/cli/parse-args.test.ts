@@ -21,6 +21,7 @@ describe('parseArgs — happy paths', () => {
       // `--backend` defaults to null; src/cli/index.ts resolves the effective
       // backend per host (darwin: vz on arm64, bare otherwise).
       backend: null,
+      args: [],
       help: false,
       version: false,
       errors: [],
@@ -185,5 +186,28 @@ describe('parseArgs — multi-error accumulation', () => {
     expect(out.errors[1]).toMatch(/--config requires a value/);
     // The invalid backend value must NOT be accepted.
     expect(out.backend).toBeNull();
+  });
+});
+
+describe('parseArgs — --args', () => {
+  it('splits a quoted --args value (dash-leading, joined form)', () => {
+    const out = parseArgs(['check', '--args=-D --omit=dev']);
+    expect(out.errors).toEqual([]);
+    expect(out.args).toEqual(['-D', '--omit=dev']);
+  });
+
+  it('consumes a dash-leading value in the split form', () => {
+    const out = parseArgs(['check', '--args', '-P --frozen-lockfile']);
+    expect(out.errors).toEqual([]);
+    expect(out.args).toEqual(['-P', '--frozen-lockfile']);
+  });
+
+  it('records an error when --args has no value', () => {
+    const out = parseArgs(['check', '--args']);
+    expect(out.errors).toContain('--args requires a value');
+  });
+
+  it('defaults to [] when --args is absent', () => {
+    expect(parseArgs(['check']).args).toEqual([]);
   });
 });

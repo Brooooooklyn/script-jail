@@ -115,6 +115,9 @@ export interface RunMainInput {
     spoofPlatform?: 'linux' | 'darwin' | 'win32';
     spoofArch?: 'x64' | 'arm64';
     cacheFirecracker?: boolean;
+    install?: boolean;
+    args?: string;
+    backend?: 'auto' | 'firecracker' | 'docker' | 'bare';
   };
   /** Deps from fakeVmFactory().deps — call sites typically pass exactly this. */
   deps: MainDeps;
@@ -445,6 +448,7 @@ const TRACKED_ENV_KEYS: ReadonlyArray<string> = [
   'INPUT_SPOOF-PLATFORM',
   'INPUT_SPOOF-ARCH',
   'INPUT_CACHE-FIRECRACKER',
+  'INPUT_BACKEND',
   'ImageOS',
   'RUNNER_TEMP',
 ];
@@ -604,6 +608,21 @@ export async function runMain(input: RunMainInput): Promise<RunMainResult> {
     process.env['INPUT_CACHE-FIRECRACKER'] = String(input.inputs.cacheFirecracker);
   } else {
     delete process.env['INPUT_CACHE-FIRECRACKER'];
+  }
+  if (input.inputs.install !== undefined) {
+    process.env['INPUT_INSTALL'] = String(input.inputs.install);
+  } else {
+    delete process.env['INPUT_INSTALL'];
+  }
+  if (input.inputs.args !== undefined) {
+    process.env['INPUT_ARGS'] = input.inputs.args;
+  } else {
+    delete process.env['INPUT_ARGS'];
+  }
+  if (input.inputs.backend !== undefined) {
+    process.env['INPUT_BACKEND'] = input.inputs.backend;
+  } else {
+    delete process.env['INPUT_BACKEND'];
   }
 
   // detectRunnerImage requires ImageOS or a parseable /etc/os-release.  On

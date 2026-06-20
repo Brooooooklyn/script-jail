@@ -70,6 +70,99 @@ jobs:
 available. On GitHub-hosted `ubuntu-24.04-arm`, KVM is unavailable, so the
 parity workflow normally falls through to Docker.
 
+## Drop-in Install
+
+By default the Action only **audits** — it never installs dependencies on your
+runner. Set `install: true` to make it a **drop-in replacement for your install
+step**. It splits the install into two halves:
+
+1. **On the runner, with lifecycle scripts disabled** — `npm ci`/`pnpm install
+   --frozen-lockfile`/`yarn install --immutable` with `--ignore-scripts`
+   (`--mode=skip-build` for yarn). This is always safe: no third-party code runs.
+   It populates your real `node_modules`.
+2. **In the sandbox** — the same install runs under the audit envelope and the
+   generated lockfile is diffed against the committed `.script-jail.lock.yml`.
+3. **On the runner, only if the audit matches** — the deferred lifecycle scripts
+   run on the host, completing a usable `node_modules`. On any drift or
+   audit-bypass the scripts are **never** run and the job fails.
+
+```yaml
+      - uses: Brooooooklyn/script-jail@<pinned-tag>
+        with:
+          mode: check          # required for install (see below)
+          install: true
+          # Extra package-manager install flags, applied to BOTH the host
+          # install and the sandbox audit (so the lock can't drift):
+          args: "--omit=dev"
+```
+
+Then your build steps can use `node_modules` directly — no second `install` step.
+
+**Requirements & semantics**
+
+- `install: true` requires `mode: check` **and** a committed `.script-jail.lock.yml`.
+  Generate the lock once with `mode: update` (install off), commit it, then turn
+  `install` on. `install` is rejected in `update` mode (update regenerates the
+  lock and skips the bypass scan, so there is no fail-closed gate).
+- On audit **drift or bypass**, the safe no-scripts `node_modules` is left in
+  place but the lifecycle scripts are skipped and the job exits non-zero.
+- `args` is split into discrete argv items (quote values that contain spaces)
+  and passed to the package manager directly — never through a shell. It is
+  filtered by a **fail-closed allowlist**: only dependency-selection flags
+  (`--omit`/`--include`/`--prod`/`--dev`/`--optional`/`-P`/`-D`) plus a
+  credential-free `--registry` are forwarded; everything else — anything that
+  could re-enable scripts or steer which tree installs (`--ignore-scripts`,
+  lockfile/`--lockfile-dir`/`--dir`/`--modules-dir`/`--prefix`/`--global`/
+  `--filter`, yarn `--mode`, …) — is dropped with a warning. Pass flags **valid
+  for your package manager** (the `--omit=dev` example is npm; pnpm uses
+  `--prod`; yarn-berry `install` takes none); a flag your manager rejects fails
+  the audit. Registry **auth** stays in `.npmrc`/env — a `--registry` URL with
+  inline `user:pass@` credentials is **dropped** (it would otherwise be staged
+  into a sidecar the audited package can read).
+- The Action **audits** your root project's `prepare` script in the sandbox but
+  does **not run it on the runner** in step 3 for npm/yarn (they run only
+  `rebuild`/`install --immutable`, which never invoke a root `prepare`; pnpm
+  `rebuild --pending` does). So for npm/yarn `install: true` is a drop-in
+  replacement for installing your **dependencies**, not a full build of your
+  **own** package: if your root `prepare` generates build output (compiling
+  `dist/`, etc.), run your build step separately afterwards. Any
+  `network_attempts` the egress warning attributes to the root `prepare` pass
+  are shown as **audited in the sandbox, not run on the host** (npm/yarn),
+  rather than as host-bound egress.
+- **Root identity is non-forgeable.** Your root project's events surface in the
+  lock as `$REPO/...`. On the enforcing Linux/Firecracker backend the root is
+  identified from the kernel process tree plus each process's working directory
+  at exec time — **not** from env — so a dependency cannot forge
+  `npm_package_name=<your-project>` to launder its own repo writes under your
+  root. A write that *claims* to be the root but is not anchored to it surfaces
+  distinctly with a `<FORGED_ROOT> ` prefix in `external_reads`/`escaped_writes`
+  (fail-loud, never hidden), so review catches it.
+
+> **Security note.** Step 3 runs the lifecycle scripts **on the runner with the
+> network on** (real postinstalls fetch prebuilt binaries, so this is
+> unavoidable). The sandbox audited them offline, so a `connect` recorded as
+> `<BLOCKED>` in the lock **will succeed** on the runner. Trust comes from the
+> committed lock being reviewed, not from host isolation: a matching audit means
+> "behaviour is unchanged from the reviewed lock," not "safe to run online."
+> Review the recorded reads/writes/spawns/connects before committing a lock.
+> Because step 3 re-runs on the *uninstrumented* runner, an environment-sensitive
+> script can detect the sandbox (via `os.hostname()`, container marker files, or
+> the audit's own `LD_PRELOAD`) and behave differently there; script-jail aligns
+> the audit cwd and strips env tells as defense-in-depth, but this is **not** a
+> sandbox guarantee against a payload tailored to the audit environment (see the
+> [trust model](./docs/design.md#drop-in-install-trust-model-install-true)).
+> Audit-only mode (`install` unset) keeps scripts entirely inside the sandbox.
+>
+> Before step 3 runs, if the matched lock recorded any `network_attempts`, the
+> action emits a `::warning::` naming the count and the destinations those
+> scripts will now reach online. Egress the root `prepare` pass recorded is
+> listed in a **separate "audited in the sandbox; NOT run on the host"** block
+> for npm/yarn (their step 3 never runs the root `prepare`); for pnpm it stays
+> in the host-bound list. The destinations are the **IP:port** the offline audit
+> observed (`connect()` carries a resolved address, not a DNS name), so a fresh
+> online resolve may hit a different address — treat the list as a heads-up, not
+> an exact preview.
+
 ## Configuration
 
 `.script-jail.yml` defines which files and env vars should be hidden from

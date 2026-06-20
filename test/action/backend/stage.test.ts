@@ -1,0 +1,325 @@
+// script-jail — test/action/backend/stage.test.ts
+//
+// Tests for stageRepoDirectory() — the shared docker/bare/mac-bare repo
+// stager (src/action/backend/stage.ts).
+
+import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { isAbsolute, join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+import {
+  controlSidecarEnv,
+  partitionControlSidecars,
+  stageRepoDirectory,
+} from '../../../src/action/backend/stage.js';
+
+let testDir: string;
+
+beforeEach(() => {
+  testDir = mkdtempSync(join(tmpdir(), 'script-jail-stage-test-'));
+});
+
+afterEach(() => {
+  try {
+    rmSync(testDir, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+});
+
+describe('stageRepoDirectory', () => {
+  it('stages only repoDir contents, never host ancestor files (sandbox-isolation invariant)', () => {
+    // WHY THIS MATTERS (ancestor-pnpmfile divergence safety):
+    //
+    // A codex [high] claimed an ANCESTOR `.pnpmfile.mjs` (when repoDir is a
+    // subdir of the workspace root) could bypass the install preflight via
+    // sandbox-vs-host tree divergence: the host suppresses pnpmfiles with
+    // `--ignore-pnpmfile`, but if the SANDBOX ran an ancestor pnpmfile it
+    // could rewrite the audited graph while the host stayed blind.
+    //
+    // That finding is inert ONLY because every backend stages exactly
+    // `ctx.repoDir` — a single `cpSync(repoDir, …)` with no parent walk
+    // (stage.ts:26; overlay.ts:170 for Firecracker) — and the guest pnpm
+    // runs at `/work` = the staged repoDir root.  An ancestor file ABOVE
+    // repoDir on the host is therefore never copied into the sandbox and
+    // cannot be loaded by the guest pnpm.  This test pins that invariant so
+    // a future change that staged the workspace root / an ancestor above
+    // `/work` (which WOULD make the codex finding a real bypass) fails loudly
+    // instead of silently regressing the security boundary.
+
+    // Parent dir holds sentinel ancestor files that must NOT leak into the
+    // stage (these are exactly the pnpm config files the finding worried
+    // about).
+    const parent = join(testDir, 'workspace-root');
+    mkdirSync(parent, { recursive: true });
+    writeFileSync(
+      join(parent, '.pnpmfile.mjs'),
+      'export function readPackage(pkg) { return pkg; }\n',
+    );
+    writeFileSync(
+      join(parent, 'pnpm-workspace.yaml'),
+      'packages:\n  - "repo"\n',
+    );
+    writeFileSync(join(parent, 'ancestor-secret.txt'), 'do-not-stage-me\n');
+
+    // The actual repoDir is a child of the parent and has its own files.
+    const repoDir = join(parent, 'repo');
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+    writeFileSync(
+      join(repoDir, 'package.json'),
+      JSON.stringify({ name: 'inner-repo', version: '1.0.0' }),
+    );
+    writeFileSync(join(repoDir, 'src', 'index.js'), 'console.log("hi")\n');
+
+    const staged = stageRepoDirectory({
+      repoDir,
+      parentDir: testDir,
+      extraRepoOverlayFiles: [],
+    });
+
+    try {
+      // The repoDir's own files ARE present in the stage.
+      expect(existsSync(join(staged.path, 'package.json'))).toBe(true);
+      expect(existsSync(join(staged.path, 'src', 'index.js'))).toBe(true);
+
+      // The ancestor sentinels are NOT present anywhere in the stage root —
+      // staging copies repoDir contents directly into the stage root, so any
+      // parent-of-repoDir content would have to come from an ancestor walk
+      // that does not (and must not) exist.
+      expect(existsSync(join(staged.path, '.pnpmfile.mjs'))).toBe(false);
+      expect(existsSync(join(staged.path, 'pnpm-workspace.yaml'))).toBe(false);
+      expect(existsSync(join(staged.path, 'ancestor-secret.txt'))).toBe(false);
+
+      // And the stage root is the repoDir content itself — there is no nested
+      // `repo/` directory and no `workspace-root/`, i.e. the host ancestor
+      // chain is absent.
+      expect(existsSync(join(staged.path, 'repo'))).toBe(false);
+      expect(existsSync(join(staged.path, 'workspace-root'))).toBe(false);
+    } finally {
+      staged.cleanup();
+    }
+  });
+
+  it('cleanup() removes the entire stage root, not just the work subdir', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(repoDir, { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+
+    const staged = stageRepoDirectory({
+      repoDir,
+      parentDir: testDir,
+      extraRepoOverlayFiles: [],
+    });
+
+    expect(existsSync(staged.path)).toBe(true);
+    staged.cleanup();
+    expect(existsSync(staged.path)).toBe(false);
+  });
+
+  // Codex re-review (staged-symlink escape): a committed RELATIVE symlink must be
+  // staged VERBATIM (relative), NOT rewritten to an absolute realpath target.
+  // Otherwise the audit resolves it to a path absent in the sandbox while host
+  // part-2 resolves the original relative link and executes un-audited code.
+  it('preserves a committed RELATIVE symlink verbatim (does not rewrite to absolute)', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'node_modules', 'evil'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(repoDir, 'node_modules', 'evil', 'payload.js'), '//evil\n');
+    // The exact finding shape: a root-level relative symlink into node_modules.
+    symlinkSync('node_modules/evil/payload.js', join(repoDir, 'runner'));
+
+    const staged = stageRepoDirectory({ repoDir, parentDir: testDir, extraRepoOverlayFiles: [] });
+    try {
+      const stagedLink = readlinkSync(join(staged.path, 'runner'));
+      // VERBATIM: still the relative target, NOT an absolute realpath rewrite.
+      expect(stagedLink).toBe('node_modules/evil/payload.js');
+      expect(isAbsolute(stagedLink)).toBe(false);
+      // It resolves WITHIN the staged tree (same relative rule the host uses).
+      expect(realpathSync(join(staged.path, 'runner'))).toBe(
+        realpathSync(join(staged.path, 'node_modules', 'evil', 'payload.js')),
+      );
+    } finally {
+      staged.cleanup();
+    }
+  });
+
+  // Codex re-review (overlay-ancestor-symlink escape): the materializer must FAIL
+  // CLOSED (throw) when an overlay-path ancestor is a committed symlink/file, NOT
+  // silently replace it in the staged copy only (which diverges from the host).
+  it('THROWS instead of replacing a committed `etc` symlink ancestor when overlaying a sidecar', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'payload'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(repoDir, 'payload', 'runner.js'), '//evil\n');
+    symlinkSync('payload', join(repoDir, 'etc')); // committed relative `etc -> payload`
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/non-directory at .* \(a committed symlink or file\)/);
+  });
+
+  it('THROWS when an overlay-path ancestor (etc/script-jail) is a committed file', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'etc'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(repoDir, 'etc', 'script-jail'), 'not-a-dir');
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/non-directory/);
+  });
+
+  it('overlays normally into a legit checkout (no false positive)', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(repoDir, { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+
+    const staged = stageRepoDirectory({
+      repoDir,
+      parentDir: testDir,
+      extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{"ok":1}' }],
+    });
+    try {
+      expect(existsSync(join(staged.path, 'etc', 'script-jail', 'pm-flags.json'))).toBe(true);
+    } finally {
+      staged.cleanup();
+    }
+  });
+
+  // Codex re-review (gitlink leaf gap): a committed gitlink/submodule (git index mode
+  // 160000) at the overlay LEAF checks out as a real (empty) DIRECTORY.  The old
+  // `rmSync(dest, {recursive}); writeFileSync` would delete it and write our sidecar in
+  // the staged copy ONLY, while the host keeps the dir — host-vs-audit divergence.  The
+  // materializer must FAIL CLOSED on ANY pre-existing leaf.  A real empty dir at the leaf
+  // reproduces the checked-out gitlink's filesystem state without needing git.
+  it('THROWS when the overlay LEAF pre-exists as a directory (gitlink/submodule leaf)', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'etc', 'script-jail', 'pm-flags.json'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/already has a directory .* writes its own sidecar/);
+  });
+
+  it('THROWS when the overlay LEAF pre-exists as a committed symlink', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'etc', 'script-jail'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(repoDir, 'outside.json'), 'attacker');
+    symlinkSync('../../outside.json', join(repoDir, 'etc', 'script-jail', 'pm-flags.json'));
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/already has a symlink .* writes its own sidecar/);
+  });
+
+  // The symlinked-ancestor repoDir variant: even when repoDir is reached via a
+  // symlinked spelling, verbatim staging keeps the link relative so it never
+  // rewrites to the realpath spelling (which would land outside the audit mount).
+  it('keeps the symlink relative even when repoDir is reached via a symlinked ancestor', () => {
+    const real = join(testDir, 'real');
+    mkdirSync(join(real, 'repo', 'node_modules', 'evil'), { recursive: true });
+    writeFileSync(join(real, 'repo', 'package.json'), '{"name":"x"}');
+    writeFileSync(join(real, 'repo', 'node_modules', 'evil', 'payload.js'), '//evil\n');
+    symlinkSync('node_modules/evil/payload.js', join(real, 'repo', 'runner'));
+    // A symlinked spelling of the same checkout.
+    const link = join(testDir, 'link');
+    symlinkSync(real, link);
+    const repoDirViaLink = join(link, 'repo');
+
+    const staged = stageRepoDirectory({ repoDir: repoDirViaLink, parentDir: testDir, extraRepoOverlayFiles: [] });
+    try {
+      const stagedLink = readlinkSync(join(staged.path, 'runner'));
+      expect(stagedLink).toBe('node_modules/evil/payload.js'); // not /…/real/repo/node_modules/…
+      expect(isAbsolute(stagedLink)).toBe(false);
+    } finally {
+      staged.cleanup();
+    }
+  });
+});
+
+// Codex re-review (audit-only sidecar oracle): script-jail's control sidecars must be
+// deliverable OUT of the repo tree so the audited repo root never holds an
+// `etc/script-jail/` the host's real checkout lacks.  These pure helpers back the
+// docker/bare/mac-bare out-of-repo delivery.
+describe('partitionControlSidecars', () => {
+  it('routes etc/script-jail/* to controlSidecars and keeps .yarnrc.yml as a repo overlay', () => {
+    const { repoOverlay, controlSidecars } = partitionControlSidecars([
+      { relPath: '.yarnrc.yml', content: 'nodeLinker: node-modules\n' },
+      { relPath: 'etc/script-jail/pm-flags.json', content: '{}' },
+      { relPath: 'etc/script-jail/pnpm-arch.json', content: '{}' },
+    ]);
+    expect(repoOverlay.map((f) => f.relPath)).toEqual(['.yarnrc.yml']);
+    expect(controlSidecars.map((f) => f.relPath).sort()).toEqual([
+      'etc/script-jail/pm-flags.json',
+      'etc/script-jail/pnpm-arch.json',
+    ]);
+  });
+
+  it('returns empty partitions for an empty input', () => {
+    const { repoOverlay, controlSidecars } = partitionControlSidecars([]);
+    expect(repoOverlay).toEqual([]);
+    expect(controlSidecars).toEqual([]);
+  });
+});
+
+describe('controlSidecarEnv', () => {
+  it('maps each known control sidecar basename to its CONTENT env var (no file written)', () => {
+    const env = controlSidecarEnv([
+      { relPath: 'etc/script-jail/pm-flags.json', content: '{"extra_install_args":[]}' },
+      { relPath: 'etc/script-jail/pnpm-arch.json', content: '{"a":1}' },
+    ]);
+    expect(env).toEqual({
+      SCRIPT_JAIL_PM_FLAGS_CONTENT: '{"extra_install_args":[]}',
+      SCRIPT_JAIL_PNPM_ARCH_CONTENT: '{"a":1}',
+    });
+    // Crucially: this is a pure content→env map.  No file is written anywhere — the
+    // audit-only sidecar oracle close depends on NO sidecar landing at any fs path.
+    expect(existsSync(join(testDir, 'sj-control'))).toBe(false);
+  });
+
+  it('preserves multi-line (pretty-printed) JSON content verbatim', () => {
+    const pretty = '{\n  "extra_install_args": [],\n  "user_install_args": ["-D"]\n}\n';
+    const env = controlSidecarEnv([{ relPath: 'etc/script-jail/pm-flags.json', content: pretty }]);
+    expect(env['SCRIPT_JAIL_PM_FLAGS_CONTENT']).toBe(pretty);
+  });
+
+  it('returns an empty dict when there are no control sidecars', () => {
+    expect(controlSidecarEnv([])).toEqual({});
+  });
+
+  it('ignores a sidecar with an unrecognized basename (no reader exists for it)', () => {
+    const env = controlSidecarEnv([
+      { relPath: 'etc/script-jail/unknown.json', content: '{}' },
+      { relPath: 'etc/script-jail/pm-flags.json', content: '{"extra_install_args":[]}' },
+    ]);
+    expect(env).toEqual({ SCRIPT_JAIL_PM_FLAGS_CONTENT: '{"extra_install_args":[]}' });
+  });
+});

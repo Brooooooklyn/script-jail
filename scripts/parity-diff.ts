@@ -266,6 +266,35 @@ const PARITY_ONLY_ENV_READS = new Set([
   'LD_PRELOAD',
   'VP_HOME',
   'COREPACK_HOME',
+  // Round-16 (PR #22): both the Linux GUEST Phase-B AND the trusted-host part-2
+  // now launch the cached PM entry DIRECTLY (`node <entry>`) instead of the bare
+  // corepack shim, to close the COREPACK_HOME/COREPACK_ROOT value-blind-lock oracle.
+  // With the shim out of the process tree, the corepack-shim-owned env reads
+  // disappear from the lifecycle child: COREPACK_ROOT (only ever SET by the shim)
+  // and COREPACK_ENABLE_DOWNLOAD_PROMPT (read by the shim) no longer surface as
+  // env_read names on the Linux side.
+  //
+  // TRANSITIONAL waiver — do NOT remove yet: this is a cross-backend tolerance
+  // (Linux-CI side vs the STALE committed macOS-VZ baseline, which still records
+  // these reads until it is regenerated on bare-metal Apple Silicon).  The host
+  // oracle is closed by the host DIRECT-LAUNCH (src/action/host-install.ts
+  // resolveHostManagerLaunch), NOT by this waiver — the waiver only reconciles the
+  // one-sided absence against the stale baseline (same class as VP_HOME/
+  // COREPACK_HOME above; public constants, not secrets).  Harmless once the macOS-VZ
+  // baseline is regenerated (the names then appear on neither side, and this can be
+  // dropped).
+  'COREPACK_ROOT',
+  'COREPACK_ENABLE_DOWNLOAD_PROMPT',
+  // round-17f (PR #22): COREPACK_ENV_FILE=0 is now pinned at EVERY corepack boundary
+  // (hostInstallEnv, bare/mac-bare/docker/init.sh, macOS provisioning) so a repo
+  // `.corepack.env` can never reintroduce a stripped COREPACK_HOME.  Being present in
+  // the lifecycle child env it surfaces as an env_read NAME on the fresh CI backends
+  // (Linux AND macOS-bare BOTH have it → they agree; diff-macos-bare shows no delta),
+  // but the STALE committed macOS-VZ baseline predates the pin and lacks it.  Same
+  // TRANSITIONAL class as COREPACK_ROOT/COREPACK_ENABLE_DOWNLOAD_PROMPT above: a public
+  // constant (=0), symmetric across fresh backends, NOT a secret or real divergence;
+  // drop once the macOS-VZ baseline is regenerated (it then appears on both sides).
+  'COREPACK_ENV_FILE',
   'SCRIPT_JAIL_MACOS_AUDIT_OPS',
   'SCRIPT_JAIL_SHELL_SHIM_DIR',
   // The macOS-bare guest passes the per-install work dir to its provisioned

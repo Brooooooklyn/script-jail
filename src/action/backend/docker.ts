@@ -3,12 +3,20 @@ import { randomBytes } from 'node:crypto';
 import type { AuditBackend, BackendContext } from './types.js';
 import { BackendUnavailableError } from './types.js';
 import { commandSucceeds, runAgentProcess, runCommand } from './process.js';
-import { stageRepoDirectory } from './stage.js';
+import {
+  controlSidecarEnv,
+  partitionControlSidecars,
+  stageRepoDirectory,
+} from './stage.js';
 import type { StagedRepo } from './stage.js';
+import { stripDangerousEnv } from '../host-install.js';
 
 export interface DockerBackendDeps {
   stderr?: { write(s: string): unknown };
   env?: NodeJS.ProcessEnv;
+  commandSucceeds?: typeof commandSucceeds;
+  runAgentProcess?: typeof runAgentProcess;
+  runCommand?: typeof runCommand;
   /**
    * When true, a manifest entry that is still a bootstrap placeholder digest
    * (`...@sha256:PLACEHOLDER_*`) falls back to the tag-only ref so a fresh
@@ -33,10 +41,26 @@ type RunCommand = (
 
 export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend {
   const env = deps.env ?? process.env;
+  const doCommandSucceeds = deps.commandSucceeds ?? commandSucceeds;
+  const doRunAgentProcess = deps.runAgentProcess ?? runAgentProcess;
+  const doRunCommand = deps.runCommand ?? runCommand;
+
+  // SECURITY (pre-trust bare-name `docker` resolution): every HOST invocation
+  // below runs the `docker` CLI by BARE NAME (resolved via PATH) BEFORE the audit
+  // trust gate — the availability probe, the pull, the `docker run` agent, the
+  // network-disconnect / `rm -f` teardown, and the ownership-restore chown.  A
+  // checkout-prepended PATH dir could otherwise run a PR-committed `./docker`, or
+  // an inherited LD_PRELOAD/DYLD_*/NODE_OPTIONS could inject into the host `docker`
+  // process, BEFORE anything is trusted.  Sanitize ONCE here (same policy as the
+  // host install + the bare backend) and use `safeEnv` for ALL host `docker` spawns.
+  // NOTE: this is the HOST CLI env only — the IN-CONTAINER PATH/env the agent script
+  // exports inside `docker run … /bin/sh -lc` is untouched (it runs in the guest).
+  const safeEnv = stripDangerousEnv(env);
+
   return {
     name: 'docker',
     async run(ctx: BackendContext) {
-      if (!commandSucceeds('docker', ['version', '--format', '{{.Server.Version}}'], { env })) {
+      if (!doCommandSucceeds('docker', ['version', '--format', '{{.Server.Version}}'], { env: safeEnv })) {
         throw new BackendUnavailableError('docker', 'docker is not installed or the daemon is unavailable');
       }
 
@@ -45,12 +69,12 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
       });
       if (warning !== undefined) writeDockerWarning(deps.stderr, warning);
       if (ctx.selfTest) {
-        if (!commandSucceeds('docker', ['image', 'inspect', imageRef], { env })) {
+        if (!doCommandSucceeds('docker', ['image', 'inspect', imageRef], { env: safeEnv })) {
           throw new BackendUnavailableError('docker', `local image ${imageRef} is missing`);
         }
       } else {
         try {
-          runCommand('docker', ['pull', imageRef], { env });
+          doRunCommand('docker', ['pull', imageRef], { env: safeEnv });
         } catch (err) {
           throw new BackendUnavailableError(
             'docker',
@@ -59,18 +83,51 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
         }
       }
 
+      // SECURITY (audit-only sidecar oracle): keep script-jail's control sidecars off
+      // EVERY lifecycle-visible filesystem path.  `.yarnrc.yml` is genuine repo config the
+      // host install also reads at the repo root, so it stays in the stage; the
+      // `etc/script-jail/*` control files (pm-flags.json / pnpm-arch.json) are delivered as
+      // env CONTENT via `-e` below — never a file the audit has and the host's real
+      // checkout lacks.  (`config.yml` is the one control file delivered as a read-only
+      // bind, a documented irreducible residual.)
+      const { repoOverlay, controlSidecars } = partitionControlSidecars(
+        ctx.extraRepoOverlayFiles,
+      );
       const staged = stageRepoDirectory({
         repoDir: ctx.repoDir,
         parentDir: ctx.scratchDir,
-        extraRepoOverlayFiles: ctx.extraRepoOverlayFiles,
+        extraRepoOverlayFiles: repoOverlay,
       });
+      // pm-flags.json / pnpm-arch.json content → `SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT`
+      // env (empty dict when absent → no `-e`, guest degrades to "no override").  The guest
+      // reads these from the agent's process env, which buildChildEnv strips from every
+      // lifecycle child.
+      const controlEnv = controlSidecarEnv(controlSidecars);
+      const controlEnvFlags = Object.entries(controlEnv).flatMap(([name, value]) => [
+        '-e',
+        `${name}=${value}`,
+      ]);
       const containerName = `script-jail-${randomBytes(4).toString('hex')}`;
+      // install:true cwd parity — mount the staged repo at the SAME absolute
+      // path the host re-run uses (ctx.repoDir, threaded via auditWorkDir) so
+      // the audited `process.cwd()` matches the host's, closing a cwd oracle;
+      // falls back to `/work` for a normal audit.  The config's work_dir
+      // matches (set by buildEffectiveConfig from installWorkDir), so the
+      // agent cd's here.
+      const workDir = ctx.auditWorkDir ?? '/work';
       try {
         const script = [
           'set -eu',
           'export VP_HOME=/opt/vp',
           'export COREPACK_HOME=/opt/vp/corepack',
           'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
+          // round-17f (codex [critical], uniform policy): never load a PROJECT
+          // `.corepack.env` (cwd=repoDir).  Docker already sets COREPACK_HOME (so the
+          // file can't steer it — process.env wins, corepack.cjs:13556) and Phase B
+          // direct-launches, so this is defense-in-depth, but pinning it on EVERY
+          // backend + the host keeps one "ignore .corepack.env" policy (mirrors how
+          // COREPACK_ENABLE_DOWNLOAD_PROMPT is pinned everywhere).
+          'export COREPACK_ENV_FILE=0',
           'mkdir -p "${VP_HOME}" "${COREPACK_HOME}"',
           'NODE_VERSION="$(cat /etc/script-jail/node-version)"',
           'vp env install "${NODE_VERSION}" >&2',
@@ -81,10 +138,12 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
           'mkdir -p /tmp/script-jail-strace',
           'export SCRIPT_JAIL_CONNECTION=stdio',
           'export SCRIPT_JAIL_CONFIG_PATH=/etc/script-jail/config.yml',
+          // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT are delivered via the container `-e`
+          // env (already in this shell's env), NOT exported here — `exec` preserves them.
           'exec node /usr/local/lib/script-jail/guest-agent.cjs',
         ].join('; ');
 
-        return await runAgentProcess({
+        return await doRunAgentProcess({
           cmd: 'docker',
           args: [
             'run',
@@ -93,30 +152,40 @@ export function createDockerBackend(deps: DockerBackendDeps = {}): AuditBackend 
             '--name', containerName,
             '--cap-add=SYS_PTRACE',
             '--security-opt', 'seccomp=unconfined',
-            '-v', `${staged.path}:/work`,
+            '-v', `${staged.path}:${workDir}`,
             '-v', `${ctx.configPath}:/etc/script-jail/config.yml:ro`,
+            // Control sidecars (pm-flags.json / pnpm-arch.json) delivered as env CONTENT,
+            // NOT a file at any path (audit-only sidecar oracle): the guest reads
+            // SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT from the agent env so the sandbox
+            // fetch applies the SAME install args as the host part-1 install.  Each is a
+            // single `-e NAME=value` argv element (#31): literal regardless of content
+            // (JSON braces/quotes/newlines), never re-parsed by a shell.  loadPmFlags /
+            // applyPnpmArchOverlay re-sanitize the content.  Empty when no sidecar →
+            // no `-e` → guest degrades to "no override".
+            ...controlEnvFlags,
             imageRef,
             '/bin/sh',
             '-lc',
             script,
           ],
-          env,
+          env: safeEnv,
           label: 'docker',
           ...(deps.stderr !== undefined ? { stderr: deps.stderr } : {}),
           onFetchDone: async () => {
-            runCommand('docker', ['network', 'disconnect', 'bridge', containerName], { env });
+            doRunCommand('docker', ['network', 'disconnect', 'bridge', containerName], { env: safeEnv });
           },
         });
       } finally {
         try {
-          runCommand('docker', ['rm', '-f', containerName], { env });
+          doRunCommand('docker', ['rm', '-f', containerName], { env: safeEnv });
         } catch {
           // The --rm container is normally already gone.
         }
         cleanupStagedDockerRepo({
           staged,
           imageRef,
-          env,
+          env: safeEnv,
+          run: doRunCommand,
           ...(deps.stderr !== undefined ? { stderr: deps.stderr } : {}),
         });
       }

@@ -287,18 +287,107 @@ if [ ! -f /work/etc/script-jail/config.yml ]; then
 fi
 cp /work/etc/script-jail/config.yml /etc/script-jail/config.yml
 
-# pm-flags.json is OPTIONAL. The normal same-arch parity path does not stage
-# it, so absence is normal — degrade silently and let `loadPmFlags()` in the
-# guest default to "no extra args".
+# install_mode is host-owned (config-override.ts scrubs any repo-supplied value and
+# sets it true ONLY on the install:true path).  Read it once here — it gates BOTH the
+# repo-disk sidecar removal below (audit-only sidecar oracle) and the fatal-on-relocate-
+# failure check further down (cwd-parity).  Same leading-anchor sed idiom as work_dir.
+SJ_INSTALL="$(sed -n 's/^install_mode:[[:space:]]*//p' /etc/script-jail/config.yml | head -n1)"
+SJ_INSTALL="${SJ_INSTALL%\"}"; SJ_INSTALL="${SJ_INSTALL#\"}"; SJ_INSTALL="${SJ_INSTALL%\'}"; SJ_INSTALL="${SJ_INSTALL#\'}"
+
+# pm-flags.json / pnpm-arch.json are OPTIONAL control sidecars.  Deliver their CONTENT
+# to the agent via env (SCRIPT_JAIL_{PM_FLAGS,PNPM_ARCH}_CONTENT), NOT a file at
+# /etc/script-jail/* (audit-only sidecar oracle): the host re-runs lifecycle scripts at
+# the REAL checkout, which has NO `etc/script-jail/`, so a clean-repo
+# `fs.existsSync('/etc/script-jail/pm-flags.json')` must be false in the audit too.  The
+# agent reads these from its process env (this `export` propagates through the setpriv /
+# dumb-init / orchestrate handoff below — setpriv does NOT clear the env); buildChildEnv
+# strips them from every lifecycle child.  Absence is normal (same-arch parity / no args)
+# → unset → the guest degrades to "no override".  `$(cat …)` keeps multi-line JSON
+# (pretty-printed); only the trailing newline is dropped, which JSON.parse tolerates.
 if [ -f /work/etc/script-jail/pm-flags.json ]; then
-  cp /work/etc/script-jail/pm-flags.json /etc/script-jail/pm-flags.json
+  export SCRIPT_JAIL_PM_FLAGS_CONTENT="$(cat /work/etc/script-jail/pm-flags.json)"
+fi
+if [ -f /work/etc/script-jail/pnpm-arch.json ]; then
+  export SCRIPT_JAIL_PNPM_ARCH_CONTENT="$(cat /work/etc/script-jail/pnpm-arch.json)"
 fi
 
-# pnpm-arch.json is OPTIONAL. The guest (src/guest/apply-pnpm-arch.ts) merges
-# its `supportedArchitectures` block into the repo's root package.json before
-# Phase A when present. Absence is normal — degrade silently to "no merge".
-if [ -f /work/etc/script-jail/pnpm-arch.json ]; then
-  cp /work/etc/script-jail/pnpm-arch.json /etc/script-jail/pnpm-arch.json
+# --- Remove the repo-disk sidecar copies (audit-only sidecar oracle) ----------
+# config.yml is the ONLY control file copied to /etc above; pm-flags / pnpm-arch ride the
+# env (read just above).  Their repo-disk copies still sit in /work/etc/script-jail, which
+# `mount --move` would carry to repoDir under install:true — letting a lifecycle script
+# branch on `fs.existsSync('etc/script-jail/pm-flags.json')`: present in the audit, absent
+# on the host — a divergence the value-blind lock can't capture (Codex re-review).  Remove
+# the whole repo-disk sidecar dir so /work matches the host.  Gated on install_mode: on a
+# passing install:true run the host-side reserved-path gate guarantees this dir is
+# script-jail's OWN (it refuses any committed `etc/script-jail/` entry, including a
+# gitlink), so the removal can never touch consumer content.  `rmdir /work/etc` only
+# succeeds when script-jail created that dir (empty after the rm); a consumer's own `etc/`
+# with other files stays put (non-empty → rmdir no-op).
+if [ "$SJ_INSTALL" = "true" ]; then
+  rm -rf /work/etc/script-jail
+  rmdir /work/etc 2>/dev/null || true
+fi
+
+# --- install:true cwd parity (relocate the repo mount to the host repoDir) ---
+# For `install: true` the host re-runs lifecycle scripts on the UNINSTRUMENTED
+# runner at the real checkout path (repoDir), while the audit ran at /work.  A
+# dependency script can branch on `process.cwd()` (the getcwd syscall is NOT
+# traced) — benign under /work, malicious on the host — and the byte-stable lock
+# still matches.  The host pins the config `work_dir` to repoDir for that case;
+# relocate the repo mount there so the audited cwd equals the host re-run's.
+#
+# Runs HERE on purpose: still root with CAP_SYS_ADMIN (the line ~413 setpriv
+# drops sys_admin), and AFTER every /work read above (config/pm-flags/pnpm-arch
+# are already copied to the fixed /etc paths).  `mount --move` (util-linux; the
+# rootfs ships it — see the blkid -L use above) leaves no /work alias, so strace
+# can only observe repo opens under repoDir = roots.repo → tokenized to $REPO.
+# /scratch and /sjtmp are SIBLING mounts, untouched by moving /work.
+#
+# No-op for the default /work audit (work_dir absent or == /work).  On any
+# relocate failure we FALL BACK to auditing at /work (rewrite work_dir) rather
+# than break the run: the audit still happens; only the install:true cwd parity
+# (defense-in-depth) is skipped for that run.  Both paths are byte-stable
+# ($REPO either way).  The leading-anchor sed only matches a top-level key.
+SJ_WD="$(sed -n 's/^work_dir:[[:space:]]*//p' /etc/script-jail/config.yml | head -n1)"
+SJ_WD="${SJ_WD%\"}"; SJ_WD="${SJ_WD#\"}"; SJ_WD="${SJ_WD%\'}"; SJ_WD="${SJ_WD#\'}"
+if [ -n "$SJ_WD" ] && [ "$SJ_WD" != "/work" ]; then
+  case "$SJ_WD" in
+    # Never relocate onto the FS root, a /work descendant, or a system mount
+    # (would shatter the rootfs).  A real repoDir is always a nested checkout
+    # path (e.g. /home/runner/work/x/x or /opt/actions-runner/_work/x/x), never
+    # exactly one of these — so this guard never fires on a valid run.
+    /|/work/*|/etc|/usr|/bin|/sbin|/lib|/lib64|/proc|/sys|/dev|/run|/var|/tmp|/opt|/root|/home|/scratch|/sjtmp)
+      fatal "refusing to relocate repo mount onto unsafe work_dir '$SJ_WD'" ;;
+    /*)
+      sj_relocated=0
+      if mkdir -p "$SJ_WD"; then
+        # Clear shared propagation so MS_MOVE is permitted, then move.
+        mount --make-private /work 2>/dev/null || true
+        if mount --move /work "$SJ_WD" 2>/dev/null; then
+          sj_relocated=1
+        fi
+      fi
+      if [ "$sj_relocated" != "1" ]; then
+        # SECURITY (Codex re-review, FC silent relocate fallback): under install:true the
+        # host re-runs lifecycle at repoDir (=$SJ_WD).  Auditing at /work instead would
+        # leave the audited cwd != the host re-run's cwd — a script branching on
+        # process.cwd() (getcwd is NOT traced) is benign under /work, malicious on the
+        # host, and the rewrite-back to work_dir:/work even makes a path divergence
+        # tokenize as $REPO on both sides (silent, not diff-surfaced).  Fail closed: a
+        # failed relocate is a hard error in install mode, not a silent downgrade.  (In a
+        # well-formed FC microVM this never fires — repoDir is always a nested checkout
+        # path and mount --move succeeds after the make-private above.)
+        if [ "$SJ_INSTALL" = "true" ]; then
+          fatal "install:true requires the repo mount at '$SJ_WD' but 'mount --move /work' failed; refusing to audit at /work (cwd parity would silently diverge from the host re-run)"
+        fi
+        echo "[init] repo relocate to '$SJ_WD' failed; auditing at /work (install cwd parity skipped)" >&2
+        sed -i 's|^work_dir:.*|work_dir: /work|' /etc/script-jail/config.yml \
+          || fatal "could not reset work_dir to /work after a failed relocate"
+      fi
+      ;;
+    *)
+      fatal "work_dir '$SJ_WD' is not an absolute path" ;;
+  esac
 fi
 
 # --- Node toolchain (vite-plus) ----------------------------------------------
@@ -314,6 +403,11 @@ fi
 export VP_HOME=/opt/vp
 export COREPACK_HOME=/opt/vp/corepack
 export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+# round-17f (codex [critical], uniform policy): never load a PROJECT `.corepack.env`
+# (cwd=repoDir).  FC already sets COREPACK_HOME (the file can't steer it — process.env
+# wins, corepack.cjs:13556) and Phase B direct-launches, so this is defense-in-depth,
+# but pinning it on every backend + the host keeps one "ignore .corepack.env" policy.
+export COREPACK_ENV_FILE=0
 
 if [ ! -f /etc/script-jail/node-version ]; then
   fatal "/etc/script-jail/node-version not baked into rootfs"
