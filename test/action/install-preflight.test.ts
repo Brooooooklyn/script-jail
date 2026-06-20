@@ -16,6 +16,7 @@ import {
   detectInstallWorkDirDivergence,
   detectCheckoutRelativeHome,
   detectReservedScriptJailPaths,
+  detectSubdirInstallAncestorEscape,
 } from '../../src/action/install-preflight.js';
 
 let dir: string;
@@ -690,5 +691,56 @@ describe('detectReservedScriptJailPaths — install reserved-sidecar gate (threa
   it('does NOT flag an unrelated file under etc/ outside the script-jail namespace', () => {
     write('etc/other/config.json', '{}');
     expect(detectReservedScriptJailPaths(dir)).toBeNull();
+  });
+});
+
+describe('detectSubdirInstallAncestorEscape — strict-subdir install gate (Codex re-review [critical] ancestor-escape)', () => {
+  it('refuses repoDir = a STRICT SUBDIR of the checkout root', () => {
+    const repoDir = join(dir, 'packages', 'app');
+    mkdirSync(repoDir, { recursive: true });
+    const reason = detectSubdirInstallAncestorEscape(repoDir, dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/SUBDIRECTORY of the checkout root/);
+    expect(reason).toContain(repoDir);
+  });
+
+  it('refuses a DEEP nested subdir (two levels down)', () => {
+    const repoDir = join(dir, 'a', 'b', 'c');
+    mkdirSync(repoDir, { recursive: true });
+    expect(detectSubdirInstallAncestorEscape(repoDir, dir)).not.toBeNull();
+  });
+
+  it('allows repoDir === the checkout root (no PR-controlled ancestor between them)', () => {
+    expect(detectSubdirInstallAncestorEscape(dir, dir)).toBeNull();
+  });
+
+  it('returns null when workspaceRoot is undefined (non-action / local — ancestor not PR-controlled)', () => {
+    const repoDir = join(dir, 'packages', 'app');
+    mkdirSync(repoDir, { recursive: true });
+    expect(detectSubdirInstallAncestorEscape(repoDir, undefined)).toBeNull();
+  });
+
+  it('returns null when workspaceRoot is the empty string', () => {
+    const repoDir = join(dir, 'packages', 'app');
+    mkdirSync(repoDir, { recursive: true });
+    expect(detectSubdirInstallAncestorEscape(repoDir, '')).toBeNull();
+  });
+
+  it('returns null when repoDir is OUTSIDE the checkout root (sibling / runner-temp consumer)', () => {
+    // <dir>/ws is the checkout; <dir>/outside is a sibling, not under it.
+    const ws = join(dir, 'ws');
+    const outside = join(dir, 'outside');
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    expect(detectSubdirInstallAncestorEscape(outside, ws)).toBeNull();
+  });
+
+  it('is NOT fooled by a sibling-prefixed name (..pkg) into treating a non-descendant as inside', () => {
+    // `<dir>/wsX` shares the `<dir>/ws` prefix lexically but is NOT a descendant.
+    const ws = join(dir, 'ws');
+    const sibling = join(dir, 'wsX', 'app');
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(sibling, { recursive: true });
+    expect(detectSubdirInstallAncestorEscape(sibling, ws)).toBeNull();
   });
 });

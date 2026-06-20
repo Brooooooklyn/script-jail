@@ -250,6 +250,16 @@ fix)**:
 - **env hygiene.** The host re-run drops the env-var tells the sandbox does not
   carry (`HOSTNAME`, `PWD`, every `SCRIPT_JAIL_*` host knob), aligning the env-var
   view with what the audit saw.
+- **no un-staged ancestor.** The sandbox stages only `repoDir`, but host part 2
+  runs at `cwd=repoDir` on the runner where the checkout *ancestor* is real and
+  PR-controlled. A root lifecycle script reading `../<committed>` (a value-blind
+  read) or `require()`-ing `../../mal.js` (code the audit never ran) would diverge.
+  So `install: true` **refuses a `repoDir` that is a strict subdirectory of
+  `GITHUB_WORKSPACE`** (`detectSubdirInstallAncestorEscape`): the audit must run
+  from the checkout root, where `repoDir`'s parent is runner-owned, not
+  PR-controlled. A subproject (`SCRIPT_JAIL_REPO_DIR=<subdir>`) can still be audited
+  in pure-audit mode (`install: false`); only the host re-run requires root-level
+  `repoDir`.
 
 What this CANNOT close (irreducible while host part 2 runs uninstrumented):
 

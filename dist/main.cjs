@@ -27650,6 +27650,11 @@ function detectReservedScriptJailPaths(repoDir) {
   const more = committed.length > 5 ? ` (and ${committed.length - 5} more)` : "";
   return `the checkout commits ${committed.length} file${committed.length === 1 ? "" : "s"} under \`${RESERVED_SIDECAR_DIR}/\` (${shown}${more}) \u2014 a directory script-jail owns and overwrites in the sandboxed copy of the repo (config.yml / pm-flags.json / pnpm-arch.json). The host install re-runs lifecycle scripts against the REAL checkout, where these files keep their committed content while the audit saw script-jail's \u2014 a host-vs-sandbox content divergence the value-blind lock cannot capture. Remove \`${RESERVED_SIDECAR_DIR}/\` from the checkout, or audit without \`install\`.`;
 }
+function detectSubdirInstallAncestorEscape(repoDir, workspaceRoot) {
+  if (workspaceRoot === void 0 || workspaceRoot === "") return null;
+  if (scanDirs(repoDir, workspaceRoot).length <= 1) return null;
+  return `the install directory (\`${repoDir}\`) is a SUBDIRECTORY of the checkout root (\`${workspaceRoot}\`). The sandbox audits only the install directory, but the host install re-runs lifecycle scripts there with the REAL checkout as its parent \u2014 so a script that reads or \`require()\`s a committed file ABOVE the install dir (e.g. \`../<file>\`) runs against PR content the audit never staged, a host-vs-sandbox divergence the value-blind lock cannot capture. Run the audit from the checkout root (set SCRIPT_JAIL_REPO_DIR to the checkout root, or unset it), or audit without \`install\`.`;
+}
 function detectInstallWorkDirDivergence(configPath) {
   if (!(0, import_node_fs3.existsSync)(configPath)) return null;
   let parsed;
@@ -45626,6 +45631,12 @@ async function main(deps = {}) {
     const reservedPathReason = detectReservedScriptJailPaths(repoDir);
     if (reservedPathReason !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${reservedPathReason}
+`);
+      exitProcess(1);
+    }
+    const subdirEscapeReason = detectSubdirInstallAncestorEscape(repoDir, workspaceRoot);
+    if (subdirEscapeReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused \u2014 ${subdirEscapeReason}
 `);
       exitProcess(1);
     }

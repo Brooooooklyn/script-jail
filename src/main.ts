@@ -23,7 +23,7 @@ import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
 import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
-import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, detectCheckoutRelativeHome, detectReservedScriptJailPaths, readProtectedEnvNames } from './action/install-preflight.js';
+import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, detectCheckoutRelativeHome, detectReservedScriptJailPaths, detectSubdirInstallAncestorEscape, readProtectedEnvNames } from './action/install-preflight.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { NODE_VERSION } from './rootfs/vite-plus.js';
 import { detectRunnerImage } from './action/runner-image.js';
@@ -312,6 +312,19 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     const reservedPathReason = detectReservedScriptJailPaths(repoDir);
     if (reservedPathReason !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused — ${reservedPathReason}\n`);
+      exitProcess(1);
+    }
+    // SECURITY: refuse install when repoDir is a STRICT SUBDIR of the checkout root.
+    // The audit stages only repoDir, but host part-2 re-runs lifecycle scripts at
+    // cwd=repoDir on the runner where the PR-committed ancestor (repoDir→workspaceRoot)
+    // is readable/executable (`../<file>` read, or require('../../mal.js') of code the
+    // sandbox never ran) — an un-staged-ancestor escape the value-blind lock cannot
+    // capture, and the WHOLE ancestor class (not just etc/script-jail). Only reachable
+    // via SCRIPT_JAIL_REPO_DIR=<subdir>+install:true; fail closed on that topology.
+    // (install-preflight.ts:detectSubdirInstallAncestorEscape.)
+    const subdirEscapeReason = detectSubdirInstallAncestorEscape(repoDir, workspaceRoot);
+    if (subdirEscapeReason !== null) {
+      process.stdout.write(`::error::script-jail: \`install: true\` refused — ${subdirEscapeReason}\n`);
       exitProcess(1);
     }
   }

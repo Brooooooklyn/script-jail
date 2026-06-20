@@ -245,6 +245,53 @@ export function detectReservedScriptJailPaths(repoDir: string): string | null {
 }
 
 /**
+ * Returns a reason when `install: true` must be REFUSED because `repoDir` is a
+ * STRICT SUBDIRECTORY of the PR-controlled checkout root (`workspaceRoot` =
+ * GITHUB_WORKSPACE) — the un-staged ancestor escape.
+ *
+ * SECURITY (Codex re-review [critical], ancestor-escape): the sandbox audit stages
+ * ONLY `repoDir` (stage.ts `cpSync` / overlay.ts), so in the guest `repoDir/../x`
+ * is an empty rootfs path (ENOENT). The host part-2 re-run executes lifecycle
+ * scripts at `cwd=repoDir` ON THE RUNNER (host-install.ts), where `repoDir/../x`
+ * resolves to a REAL PR-committed file in the checkout ancestor between `repoDir`
+ * and `workspaceRoot`. A root lifecycle script that READS `../<committed>` (a
+ * value-blind external read) or `require()`s `../<committed>.js` (UN-AUDITED code
+ * the sandbox never ran) is audited on the absent/benign branch but takes the
+ * attacker branch on the host — a host-vs-sandbox divergence the lock cannot
+ * capture. This is the WHOLE ancestor class (any path above `repoDir`, not just
+ * the `etc/script-jail/` sidecars), so an enumerated ancestor scan would be
+ * incomplete; the only complete close is to refuse the subdir-under-checkout
+ * topology and require the audit to run from the checkout root (so the host's
+ * `cwd=repoDir` parent is runner-owned, not PR-controlled).
+ *
+ * Cost is ~zero for documented usage: a `node24` action's `process.cwd()` is
+ * always GITHUB_WORKSPACE (no input or `working-directory:` makes `repoDir` a
+ * subdir), and the CLI never runs host part-2. The only firing path is the
+ * undocumented `SCRIPT_JAIL_REPO_DIR=<subdir>` knob combined with `install: true`
+ * — fail-closed on exactly that self-sabotage shape. Host-static; no
+ * lockfile/byte-stability impact. Reuses `scanDirs` containment: a strict subdir
+ * yields a chain longer than `[repoDir]`.
+ */
+export function detectSubdirInstallAncestorEscape(
+  repoDir: string,
+  workspaceRoot: string | undefined,
+): string | null {
+  if (workspaceRoot === undefined || workspaceRoot === '') return null;
+  // scanDirs returns [repoDir] when repoDir === workspaceRoot, or is OUTSIDE it,
+  // and a longer repoDir→workspaceRoot chain ONLY when repoDir is a strict subdir.
+  if (scanDirs(repoDir, workspaceRoot).length <= 1) return null;
+  return (
+    `the install directory (\`${repoDir}\`) is a SUBDIRECTORY of the checkout root ` +
+    `(\`${workspaceRoot}\`). The sandbox audits only the install directory, but the host ` +
+    `install re-runs lifecycle scripts there with the REAL checkout as its parent — so a ` +
+    `script that reads or \`require()\`s a committed file ABOVE the install dir (e.g. ` +
+    `\`../<file>\`) runs against PR content the audit never staged, a host-vs-sandbox ` +
+    `divergence the value-blind lock cannot capture. Run the audit from the checkout root ` +
+    `(set SCRIPT_JAIL_REPO_DIR to the checkout root, or unset it), or audit without \`install\`.`
+  );
+}
+
+/**
  * Returns a human-readable reason when `install: true` must be REFUSED because
  * the consumer config declares a `work_dir` that DIVERGES from the host install
  * cwd; null when aligned (default `/work`, unset, or explicitly `/work`).
