@@ -277,6 +277,11 @@ fix)**:
   differently than host part 2 does, even on a repoDir-aligned backend (e.g. when
   `repoDir` is reached via a symlinked ancestor). Verbatim keeps committed relative
   symlinks relative, so both sides resolve them by the identical in-tree rule.
+  Relatedly, the overlay materializer fails closed (`ensureRealDirectory` throws) if
+  an ancestor of a script-jail overlay path (`etc`, `etc/script-jail`) is a committed
+  symlink/file — it must never replace it with a real dir in the staged copy only,
+  which would let the host resolve `etc/x` through the committed symlink to content the
+  audit never saw. The preflight refuses the same shape early for a clean message.
   Residual: a committed symlink whose target *escapes* the repo (relative `../x` or
   absolute `/etc/x`). The PR-controllable escape (a subdir `repoDir` whose parent is
   inside the checkout) is already refused by the strict-subdir gate above; for a

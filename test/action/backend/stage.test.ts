@@ -149,6 +149,57 @@ describe('stageRepoDirectory', () => {
     }
   });
 
+  // Codex re-review (overlay-ancestor-symlink escape): the materializer must FAIL
+  // CLOSED (throw) when an overlay-path ancestor is a committed symlink/file, NOT
+  // silently replace it in the staged copy only (which diverges from the host).
+  it('THROWS instead of replacing a committed `etc` symlink ancestor when overlaying a sidecar', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'payload'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(repoDir, 'payload', 'runner.js'), '//evil\n');
+    symlinkSync('payload', join(repoDir, 'etc')); // committed relative `etc -> payload`
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/non-directory at .* \(a committed symlink or file\)/);
+  });
+
+  it('THROWS when an overlay-path ancestor (etc/script-jail) is a committed file', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(join(repoDir, 'etc'), { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(repoDir, 'etc', 'script-jail'), 'not-a-dir');
+
+    expect(() =>
+      stageRepoDirectory({
+        repoDir,
+        parentDir: testDir,
+        extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{}' }],
+      }),
+    ).toThrow(/non-directory/);
+  });
+
+  it('overlays normally into a legit checkout (no false positive)', () => {
+    const repoDir = join(testDir, 'repo');
+    mkdirSync(repoDir, { recursive: true });
+    writeFileSync(join(repoDir, 'package.json'), '{"name":"x"}');
+
+    const staged = stageRepoDirectory({
+      repoDir,
+      parentDir: testDir,
+      extraRepoOverlayFiles: [{ relPath: 'etc/script-jail/pm-flags.json', content: '{"ok":1}' }],
+    });
+    try {
+      expect(existsSync(join(staged.path, 'etc', 'script-jail', 'pm-flags.json'))).toBe(true);
+    } finally {
+      staged.cleanup();
+    }
+  });
+
   // The symlinked-ancestor repoDir variant: even when repoDir is reached via a
   // symlinked spelling, verbatim staging keeps the link relative so it never
   // rewrites to the realpath spelling (which would land outside the audit mount).

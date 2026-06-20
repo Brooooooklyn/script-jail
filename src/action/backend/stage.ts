@@ -1,6 +1,5 @@
 import {
   cpSync,
-  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -78,14 +77,33 @@ function writeOverlayFile(root: string, relPath: string, content: string): void 
 }
 
 function ensureRealDirectory(path: string): void {
-  if (!existsSync(path)) {
-    mkdirSync(path, { recursive: true });
+  let stat;
+  try {
+    // lstat (no-follow on the FINAL component): inspect THIS ancestor segment
+    // itself.  writeOverlayFile calls this per-segment (…/etc, then …/etc/script-jail),
+    // so a symlinked `etc` is seen as a symlink here even though a joined-path lstat
+    // would have followed it.
+    stat = lstatSync(path);
+  } catch {
+    mkdirSync(path, { recursive: true }); // absent → create a real dir
     return;
   }
-  const stat = lstatSync(path);
-  if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  rmSync(path, { recursive: true, force: true });
-  mkdirSync(path, { recursive: true });
+  if (stat.isDirectory() && !stat.isSymbolicLink()) return; // already a real dir
+  // SECURITY (Codex re-review, overlay-ancestor-symlink escape): the segment EXISTS
+  // but is NOT a real directory — a committed SYMLINK (incl. dangling / symlink-to-dir)
+  // or a regular FILE.  The old code rm+mkdir-REPLACED it, which mutates the staged copy
+  // ONLY: the host's real checkout keeps the committed symlink/file, so host part-2
+  // resolves a path (e.g. `etc/x` through a committed `etc -> payload`) to PR content
+  // the audit — seeing a fresh real dir — never resolved (ENOENT, dropped), executing it
+  // under a trusted lock.  Fail closed: throwing aborts the audit (untrusted ⇒ no host
+  // install).  This is the single chokepoint covering every overlay path × ancestor
+  // segment × backend.
+  throw new Error(
+    `[backend] cannot stage script-jail overlay: the checkout has a non-directory at ` +
+      `'${path}' (a committed symlink or file) where script-jail needs a real directory. ` +
+      `install:true refuses to replace it — that would make the audit diverge from the ` +
+      `host checkout. Remove it from the checkout, or audit without 'install'.`,
+  );
 }
 
 export function rewriteConfigWorkDir(input: {

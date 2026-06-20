@@ -692,6 +692,39 @@ describe('detectReservedScriptJailPaths — install reserved-sidecar gate (threa
     write('etc/other/config.json', '{}');
     expect(detectReservedScriptJailPaths(dir)).toBeNull();
   });
+
+  // Codex re-review (overlay-ancestor-symlink escape): a committed SYMLINK at an
+  // ANCESTOR segment of etc/script-jail (e.g. `etc -> payload`) bypassed the old
+  // joined-path lstat (which FOLLOWS `etc`). The segment-walk catches it.
+  it('blocks a committed SYMLINK at the `etc` ancestor (etc -> payload)', () => {
+    mkdirSync(join(dir, 'payload'), { recursive: true });
+    writeFileSync(join(dir, 'payload', 'runner.js'), '//evil\n');
+    symlinkSync(join(dir, 'payload'), join(dir, 'etc')); // etc -> payload (no payload/script-jail)
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/commits `etc` as a symlink/);
+  });
+
+  it('blocks a committed SYMLINK at etc/script-jail itself', () => {
+    mkdirSync(join(dir, 'etc'), { recursive: true });
+    mkdirSync(join(dir, 'elsewhere'), { recursive: true });
+    symlinkSync(join(dir, 'elsewhere'), join(dir, 'etc', 'script-jail'));
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/commits `etc\/script-jail` as a symlink/);
+  });
+
+  it('blocks a committed FILE at the `etc` ancestor', () => {
+    write('etc', 'not-a-dir');
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/commits `etc` as a file/);
+  });
+
+  it('does NOT flag a real `etc/` dir with unrelated contents and no script-jail subdir', () => {
+    write('etc/hosts', '127.0.0.1 localhost\n');
+    expect(detectReservedScriptJailPaths(dir)).toBeNull();
+  });
 });
 
 describe('detectSubdirInstallAncestorEscape — strict-subdir install gate (Codex re-review [critical] ancestor-escape)', () => {

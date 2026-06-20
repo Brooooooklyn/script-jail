@@ -8757,8 +8757,9 @@ async function buildOverlayInto(workDir, input) {
   const repoStageDir = (0, import_node_path7.join)(workDir, "repo-stage");
   (0, import_node_fs7.mkdirSync)(repoStageDir, { recursive: true });
   (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false, verbatimSymlinks: true });
+  ensureRealDirectory((0, import_node_path7.join)(repoStageDir, "etc"));
   const configDestDir = (0, import_node_path7.join)(repoStageDir, "etc", "script-jail");
-  (0, import_node_fs7.mkdirSync)(configDestDir, { recursive: true });
+  ensureRealDirectory(configDestDir);
   (0, import_node_fs7.copyFileSync)(configPath, (0, import_node_path7.join)(configDestDir, "config.yml"));
   if (extraRepoOverlayFiles !== void 0) {
     const stageRoot = (0, import_node_path7.resolve)(repoStageDir);
@@ -8820,14 +8821,17 @@ function writeOverlayFile(root, relPath, content) {
   (0, import_node_fs7.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory(path) {
-  if (!(0, import_node_fs7.existsSync)(path)) {
+  let stat;
+  try {
+    stat = (0, import_node_fs7.lstatSync)(path);
+  } catch {
     (0, import_node_fs7.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs7.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs7.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs7.mkdirSync)(path, { recursive: true });
+  throw new Error(
+    `[overlay] cannot stage script-jail overlay: the checkout has a non-directory at '${path}' (a committed symlink or file) where script-jail needs a real directory. install:true refuses to replace it \u2014 that would make the audit diverge from the host checkout. Remove it from the checkout, or audit without 'install'.`
+  );
 }
 function copyRootfs(src, dest, env) {
   if (import_node_process.platform === "linux") {
@@ -25692,14 +25696,17 @@ function writeOverlayFile2(root, relPath, content) {
   (0, import_node_fs18.writeFileSync)(dest, content, { encoding: "utf8", flag: "wx" });
 }
 function ensureRealDirectory2(path) {
-  if (!(0, import_node_fs18.existsSync)(path)) {
+  let stat;
+  try {
+    stat = (0, import_node_fs18.lstatSync)(path);
+  } catch {
     (0, import_node_fs18.mkdirSync)(path, { recursive: true });
     return;
   }
-  const stat = (0, import_node_fs18.lstatSync)(path);
   if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  (0, import_node_fs18.rmSync)(path, { recursive: true, force: true });
-  (0, import_node_fs18.mkdirSync)(path, { recursive: true });
+  throw new Error(
+    `[backend] cannot stage script-jail overlay: the checkout has a non-directory at '${path}' (a committed symlink or file) where script-jail needs a real directory. install:true refuses to replace it \u2014 that would make the audit diverge from the host checkout. Remove it from the checkout, or audit without 'install'.`
+  );
 }
 function rewriteConfigWorkDir(input) {
   const raw = (0, import_node_fs18.readFileSync)(input.configPath, "utf8");

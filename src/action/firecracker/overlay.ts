@@ -198,8 +198,13 @@ async function buildOverlayInto(
   // the disk are relative to /work.  The agent reads config from
   // /etc/script-jail/config.yml which is on the rootfs; the init.sh copies it
   // from /work/etc/script-jail/config.yml into /etc/script-jail/ at boot.
+  // Create the overlay dirs through the same fail-closed helper writeOverlayFile
+  // uses, per-segment, so a committed symlink/file at `etc` or `etc/script-jail`
+  // aborts the audit instead of being silently replaced in the staged copy only
+  // (Codex re-review, overlay-ancestor-symlink escape).
+  ensureRealDirectory(join(repoStageDir, 'etc'));
   const configDestDir = join(repoStageDir, 'etc', 'script-jail');
-  mkdirSync(configDestDir, { recursive: true });
+  ensureRealDirectory(configDestDir);
   copyFileSync(configPath, join(configDestDir, 'config.yml'));
 
   // 3b. Layer any caller-supplied extra files onto the repo stage dir.
@@ -290,14 +295,29 @@ function writeOverlayFile(root: string, relPath: string, content: string): void 
 }
 
 function ensureRealDirectory(path: string): void {
-  if (!existsSync(path)) {
-    mkdirSync(path, { recursive: true });
+  let stat;
+  try {
+    // lstat (no-follow on the FINAL component): inspect THIS ancestor segment
+    // itself, called per-segment so a symlinked `etc` is seen as a symlink here.
+    stat = lstatSync(path);
+  } catch {
+    mkdirSync(path, { recursive: true }); // absent → create a real dir
     return;
   }
-  const stat = lstatSync(path);
-  if (stat.isDirectory() && !stat.isSymbolicLink()) return;
-  rmSync(path, { recursive: true, force: true });
-  mkdirSync(path, { recursive: true });
+  if (stat.isDirectory() && !stat.isSymbolicLink()) return; // already a real dir
+  // SECURITY (Codex re-review, overlay-ancestor-symlink escape): the segment EXISTS
+  // but is NOT a real directory (a committed SYMLINK incl. dangling/symlink-to-dir, or
+  // a regular FILE).  Replacing it would mutate the staged copy ONLY — the host's real
+  // checkout keeps the committed symlink/file, so host part-2 resolves a path through it
+  // to PR content the audit (seeing a fresh real dir) never resolved, executing it under
+  // a trusted lock.  Fail closed: throw aborts the audit (untrusted ⇒ no host install).
+  // Single chokepoint over every overlay path × ancestor segment.  (Mirror of stage.ts.)
+  throw new Error(
+    `[overlay] cannot stage script-jail overlay: the checkout has a non-directory at ` +
+      `'${path}' (a committed symlink or file) where script-jail needs a real directory. ` +
+      `install:true refuses to replace it — that would make the audit diverge from the ` +
+      `host checkout. Remove it from the checkout, or audit without 'install'.`,
+  );
 }
 
 /**

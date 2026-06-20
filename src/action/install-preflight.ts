@@ -194,37 +194,57 @@ const RESERVED_SIDECAR_DIR = 'etc/script-jail';
  * check only; no lockfile/byte-stability impact.
  */
 export function detectReservedScriptJailPaths(repoDir: string): string | null {
-  const reservedDir = join(repoDir, RESERVED_SIDECAR_DIR);
-  let top: ReturnType<typeof lstatSync>;
-  try {
-    // lstat (not stat): a committed SYMLINK at `etc/script-jail` is itself illegitimate
-    // and must not be followed (it could redirect into / out of the repo).
-    top = lstatSync(reservedDir);
-  } catch {
-    return null; // ENOENT — the checkout commits nothing under etc/script-jail/.
-  }
-  const committed: string[] = [];
-  if (top.isDirectory()) {
-    let entries: string[] = [];
+  // Walk each ANCESTOR SEGMENT of the reserved dir NO-FOLLOW (`etc`, then
+  // `etc/script-jail`). A committed SYMLINK or FILE at a segment is itself an
+  // overlay-collision vector: the overlay materializer would replace it with a real
+  // dir in the STAGED copy only, while the host's real checkout keeps the committed
+  // symlink/file — so a script resolving a path through it (e.g. `etc/x` via a
+  // committed `etc -> payload`) reads attacker content the audit never saw (Codex
+  // re-review, overlay-ancestor-symlink escape). A joined-path `lstat(etc/script-jail)`
+  // would FOLLOW a symlinked `etc` and miss this, so walk segment-by-segment.
+  const segments = RESERVED_SIDECAR_DIR.split('/');
+  let cur = repoDir;
+  for (let i = 0; i < segments.length; i++) {
+    cur = join(cur, segments[i]!);
+    let seg: ReturnType<typeof lstatSync>;
     try {
-      entries = readdirSync(reservedDir, { recursive: true }) as string[];
+      seg = lstatSync(cur);
     } catch {
-      entries = [];
+      return null; // segment absent ⇒ nothing committed along the reserved path.
     }
-    for (const rel of entries) {
-      let st: ReturnType<typeof lstatSync>;
-      try {
-        st = lstatSync(join(reservedDir, rel));
-      } catch {
-        continue; // raced removal — ignore.
-      }
-      // Count files AND symlinks (a committed symlink under the dir is a vector too);
-      // skip intermediate directory entries readdir(recursive) also returns.
-      if (!st.isDirectory()) committed.push(`${RESERVED_SIDECAR_DIR}/${rel}`);
+    if (seg.isSymbolicLink() || !seg.isDirectory()) {
+      const rel = segments.slice(0, i + 1).join('/');
+      const kind = seg.isSymbolicLink() ? 'symlink' : 'file';
+      return (
+        `the checkout commits \`${rel}\` as a ${kind}, but script-jail OWNS the ` +
+        `\`${RESERVED_SIDECAR_DIR}/\` directory and overlays its sidecars there in the ` +
+        `sandboxed copy of the repo. The host install re-runs lifecycle scripts against ` +
+        `the REAL checkout, where this ${kind} persists and can resolve to content the ` +
+        `audit never saw — a host-vs-sandbox divergence the value-blind lock cannot ` +
+        `capture. Remove \`${rel}\` from the checkout, or audit without \`install\`.`
+      );
     }
-  } else {
-    // A regular file or symlink committed AT `etc/script-jail` itself.
-    committed.push(RESERVED_SIDECAR_DIR);
+    // real directory → descend to the next segment
+  }
+  // `etc/script-jail` exists as a REAL directory: refuse any committed file under it.
+  const reservedDir = cur;
+  const committed: string[] = [];
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(reservedDir, { recursive: true }) as string[];
+  } catch {
+    entries = [];
+  }
+  for (const rel of entries) {
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(join(reservedDir, rel));
+    } catch {
+      continue; // raced removal — ignore.
+    }
+    // Count files AND symlinks (a committed symlink under the dir is a vector too);
+    // skip intermediate directory entries readdir(recursive) also returns.
+    if (!st.isDirectory()) committed.push(`${RESERVED_SIDECAR_DIR}/${rel}`);
   }
   if (committed.length === 0) return null; // an empty dir is not git-committable; be safe.
   committed.sort();
