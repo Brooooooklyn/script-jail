@@ -182,8 +182,12 @@ async function buildOverlayInto(
   const repoStageDir = join(workDir, 'repo-stage');
   mkdirSync(repoStageDir, { recursive: true });
 
-  // Copy repository files.
-  cpSync(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  // Copy repository files.  `verbatimSymlinks` keeps a committed RELATIVE symlink
+  // relative (cpSync would otherwise rewrite it to its realpath absolute target),
+  // so the audit and the host part-2 re-run resolve it identically — closing the
+  // staged-symlink escape (Codex re-review; mirror of stage.ts).  No-op for current
+  // fixtures (none commit a symlink).
+  cpSync(repoSrcPath, repoStageDir, { recursive: true, dereference: false, verbatimSymlinks: true });
 
   // Overlay the script-jail config at the path the guest agent expects:
   //   /etc/script-jail/config.yml  →  inside the repo stage dir we write it at

@@ -8756,7 +8756,7 @@ async function buildOverlayInto(workDir, input) {
   copyRootfs(baseRootfsPath, rootfsCopyPath, env);
   const repoStageDir = (0, import_node_path7.join)(workDir, "repo-stage");
   (0, import_node_fs7.mkdirSync)(repoStageDir, { recursive: true });
-  (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false });
+  (0, import_node_fs7.cpSync)(repoSrcPath, repoStageDir, { recursive: true, dereference: false, verbatimSymlinks: true });
   const configDestDir = (0, import_node_path7.join)(repoStageDir, "etc", "script-jail");
   (0, import_node_fs7.mkdirSync)(configDestDir, { recursive: true });
   (0, import_node_fs7.copyFileSync)(configPath, (0, import_node_path7.join)(configDestDir, "config.yml"));
@@ -25654,7 +25654,7 @@ var import_yaml3 = __toESM(require_dist(), 1);
 function stageRepoDirectory(input) {
   const stageRoot = (0, import_node_fs18.mkdtempSync)((0, import_node_path14.join)(input.parentDir, "repo-stage-"));
   const repoStage = (0, import_node_path14.join)(stageRoot, "work");
-  (0, import_node_fs18.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false });
+  (0, import_node_fs18.cpSync)(input.repoDir, repoStage, { recursive: true, dereference: false, verbatimSymlinks: true });
   materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
   return {
     path: repoStage,

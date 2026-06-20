@@ -270,6 +270,19 @@ fix)**:
   file host part 1 created. So `install: true` **requires `backend: firecracker` or
   `backend: docker`** (`INSTALL_ALIGNED_BACKENDS`): an explicit `bare` is refused and
   `auto` never falls through to it. `bare` remains available for pure audits.
+- **verbatim symlinks.** Staging copies the repo with `cpSync(..., verbatimSymlinks:
+  true)` (`stage.ts`, `firecracker/overlay.ts`). Without it, cpSync rewrites a
+  committed RELATIVE symlink to its realpath ABSOLUTE target — which can land outside
+  the audit mount (or at a path the sandbox lacks), so the audit resolves it
+  differently than host part 2 does, even on a repoDir-aligned backend (e.g. when
+  `repoDir` is reached via a symlinked ancestor). Verbatim keeps committed relative
+  symlinks relative, so both sides resolve them by the identical in-tree rule.
+  Residual: a committed symlink whose target *escapes* the repo (relative `../x` or
+  absolute `/etc/x`). The PR-controllable escape (a subdir `repoDir` whose parent is
+  inside the checkout) is already refused by the strict-subdir gate above; for a
+  root-level `repoDir` the escape lands in the runner-owned parent (not PR-content),
+  and an absolute target resolves against the sandbox's own filesystem — the same
+  host/guest content divergence as the marker-file row below.
 
 What this CANNOT close (irreducible while host part 2 runs uninstrumented):
 

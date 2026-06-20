@@ -23,7 +23,16 @@ export function stageRepoDirectory(input: {
 }): StagedRepo {
   const stageRoot = mkdtempSync(join(input.parentDir, 'repo-stage-'));
   const repoStage = join(stageRoot, 'work');
-  cpSync(input.repoDir, repoStage, { recursive: true, dereference: false });
+  // SECURITY (Codex re-review, staged-symlink escape): `verbatimSymlinks` keeps a
+  // committed RELATIVE symlink relative in the staged copy. WITHOUT it, cpSync
+  // (dereference:false) rewrites a relative symlink to its REALPATH absolute target
+  // in the ORIGINAL checkout, so the audit resolves it to a path that does not exist
+  // in the sandbox (ENOENT → read dropped) while host part-2 resolves the original
+  // relative link and EXECUTES the file host part-1 created — un-audited code under a
+  // trusted lock. Verbatim makes the link resolve identically (relative, within the
+  // tree) on both sides. No byte-stability impact: no committed symlink exists in any
+  // fixture, so this is a no-op for current inputs.
+  cpSync(input.repoDir, repoStage, { recursive: true, dereference: false, verbatimSymlinks: true });
   materializeExtraFiles(repoStage, input.extraRepoOverlayFiles);
   return {
     path: repoStage,
