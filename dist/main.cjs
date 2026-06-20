@@ -27615,17 +27615,40 @@ function detectCheckoutRelativeHome(homeDir, repoDir, workspaceRoot) {
   }
   return null;
 }
-var RESERVED_SIDECAR_RELPATHS = [
-  "etc/script-jail/pm-flags.json",
-  "etc/script-jail/pnpm-arch.json"
-];
+var RESERVED_SIDECAR_DIR = "etc/script-jail";
 function detectReservedScriptJailPaths(repoDir) {
-  for (const rel of RESERVED_SIDECAR_RELPATHS) {
-    if ((0, import_node_fs3.existsSync)((0, import_node_path4.join)(repoDir, rel))) {
-      return `the checkout commits a file at \`${rel}\`, a path script-jail owns and overwrites in the sandboxed copy of the repo. The host install re-runs lifecycle scripts against the REAL checkout, where this file keeps its committed content while the audit saw script-jail's \u2014 a host-vs-sandbox content divergence the value-blind lock cannot capture. Remove the \`etc/script-jail/\` files from the checkout, or audit without \`install\`.`;
-    }
+  const reservedDir = (0, import_node_path4.join)(repoDir, RESERVED_SIDECAR_DIR);
+  let top;
+  try {
+    top = (0, import_node_fs3.lstatSync)(reservedDir);
+  } catch {
+    return null;
   }
-  return null;
+  const committed = [];
+  if (top.isDirectory()) {
+    let entries = [];
+    try {
+      entries = (0, import_node_fs3.readdirSync)(reservedDir, { recursive: true });
+    } catch {
+      entries = [];
+    }
+    for (const rel of entries) {
+      let st;
+      try {
+        st = (0, import_node_fs3.lstatSync)((0, import_node_path4.join)(reservedDir, rel));
+      } catch {
+        continue;
+      }
+      if (!st.isDirectory()) committed.push(`${RESERVED_SIDECAR_DIR}/${rel}`);
+    }
+  } else {
+    committed.push(RESERVED_SIDECAR_DIR);
+  }
+  if (committed.length === 0) return null;
+  committed.sort();
+  const shown = committed.slice(0, 5).map((p) => `\`${p}\``).join(", ");
+  const more = committed.length > 5 ? ` (and ${committed.length - 5} more)` : "";
+  return `the checkout commits ${committed.length} file${committed.length === 1 ? "" : "s"} under \`${RESERVED_SIDECAR_DIR}/\` (${shown}${more}) \u2014 a directory script-jail owns and overwrites in the sandboxed copy of the repo (config.yml / pm-flags.json / pnpm-arch.json). The host install re-runs lifecycle scripts against the REAL checkout, where these files keep their committed content while the audit saw script-jail's \u2014 a host-vs-sandbox content divergence the value-blind lock cannot capture. Remove \`${RESERVED_SIDECAR_DIR}/\` from the checkout, or audit without \`install\`.`;
 }
 function detectInstallWorkDirDivergence(configPath) {
   if (!(0, import_node_fs3.existsSync)(configPath)) return null;

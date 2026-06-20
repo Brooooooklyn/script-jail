@@ -620,7 +620,7 @@ describe('detectCheckoutRelativeHome — refuse install on a checkout-relative $
   });
 });
 
-describe('detectReservedScriptJailPaths — install reserved-sidecar gate (thread [39])', () => {
+describe('detectReservedScriptJailPaths — install reserved-sidecar gate (threads [39] + [critical] config.yml)', () => {
   it('blocks a checkout-committed etc/script-jail/pm-flags.json', () => {
     write('etc/script-jail/pm-flags.json', '{"extra_install_args":["--registry=https://evil"]}');
     expect(detectReservedScriptJailPaths(dir)).toMatch(/pm-flags\.json/);
@@ -629,6 +629,56 @@ describe('detectReservedScriptJailPaths — install reserved-sidecar gate (threa
   it('blocks a checkout-committed etc/script-jail/pnpm-arch.json', () => {
     write('etc/script-jail/pnpm-arch.json', '{}');
     expect(detectReservedScriptJailPaths(dir)).toMatch(/pnpm-arch\.json/);
+  });
+
+  // [critical] (Codex re-review): FC copies the generated config.yml INTO the staged
+  // tree at etc/script-jail/config.yml, shadowing a committed one; the old enumerated
+  // list (pm-flags/pnpm-arch only) let this through. The directory-level gate catches it.
+  it('blocks a checkout-committed etc/script-jail/config.yml (the FC config-shadow vector)', () => {
+    write('etc/script-jail/config.yml', 'manager: npm\n# host-only-attacker-marker\n');
+    expect(detectReservedScriptJailPaths(dir)).toMatch(/config\.yml/);
+  });
+
+  // Future-proofing: a sidecar name script-jail does not yet write must STILL be
+  // refused — the gate is directory-level, not an enumerated allow/deny list.
+  it('blocks ANY committed file under etc/script-jail/ (future/unknown sidecar)', () => {
+    write('etc/script-jail/some-future-sidecar.json', '{}');
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/etc\/script-jail\//);
+  });
+
+  it('blocks a committed file NESTED below etc/script-jail/', () => {
+    write('etc/script-jail/sub/deep/payload.json', '{}');
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/payload\.json/);
+  });
+
+  it('blocks a SYMLINK committed under etc/script-jail/ (redirect vector)', () => {
+    write('outside.json', '{"x":1}');
+    mkdirSync(join(dir, 'etc', 'script-jail'), { recursive: true });
+    symlinkSync(join(dir, 'outside.json'), join(dir, 'etc', 'script-jail', 'link.json'));
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/link\.json/);
+  });
+
+  it('blocks a regular file committed AT etc/script-jail itself (not a dir)', () => {
+    write('etc/script-jail', 'attacker');
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/etc\/script-jail/);
+  });
+
+  it('lists multiple committed sidecars in the refusal message', () => {
+    write('etc/script-jail/config.yml', 'manager: npm\n');
+    write('etc/script-jail/pm-flags.json', '{}');
+    const reason = detectReservedScriptJailPaths(dir);
+    expect(reason).not.toBeNull();
+    expect(reason).toMatch(/config\.yml/);
+    expect(reason).toMatch(/pm-flags\.json/);
+    expect(reason).toMatch(/commits 2 files/);
   });
 
   it('returns null for a clean checkout (no reserved sidecars)', () => {

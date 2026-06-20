@@ -38,7 +38,7 @@
 //     non-GitHub git dep) is already neutralized by the `npm_config_git` pin in
 //     host-install.ts.  Nothing left to detect here.
 
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
@@ -163,47 +163,85 @@ export function detectCheckoutRelativeHome(
 }
 
 /**
- * The repo-overlay sidecar paths script-jail OWNS and overwrites in the STAGED
- * copy of the repo (run-audit.ts emits `etc/script-jail/pm-flags.json` ALWAYS,
- * and `etc/script-jail/pnpm-arch.json` under an arch overlay). `etc/script-jail/`
- * is not a consumer-facing path (the consumer config is `.script-jail.yml` at the
- * repo root), so a checkout never legitimately commits one of these.
+ * The repo-relative DIRECTORY script-jail OWNS and overwrites in the STAGED copy
+ * of the repo. `etc/script-jail/` is not a consumer-facing path (the consumer
+ * config is `.script-jail.yml` at the repo root), so a checkout never legitimately
+ * commits ANYTHING under it.
  */
-const RESERVED_SIDECAR_RELPATHS = [
-  'etc/script-jail/pm-flags.json',
-  'etc/script-jail/pnpm-arch.json',
-] as const;
+const RESERVED_SIDECAR_DIR = 'etc/script-jail';
 
 /**
  * Returns a reason when `install: true` must be REFUSED because the checkout
- * commits a file at a script-jail-OWNED overlay sidecar path.
+ * commits ANY file under the script-jail-OWNED overlay directory `etc/script-jail/`.
  *
- * SECURITY (Codex review thread [39]): run-audit.ts ALWAYS writes
- * `etc/script-jail/pm-flags.json` into the STAGED repo copy (stage.ts / overlay.ts
- * rm+write), so the AUDIT sees host-owned (benign, fixed) content there. But the
- * `install: true` host part-2 re-run executes the REAL lifecycle scripts in the
- * REAL repoDir (main.ts doHostRunScripts), OUTSIDE every sandbox, where a
- * PR-committed file at that path keeps its attacker content. Reads are value-blind
- * in the lock (schema external_reads = paths only), so a script branching on the
- * file's CONTENT is audited against the benign host copy but runs a different
- * branch on the runner — a host-vs-sandbox distinguisher. The overlay's
- * overwrite-don't-refuse posture silently accepted such a file; this gate converts
- * it to fail-closed. Host-static check only; no lockfile/byte-stability impact.
+ * SECURITY (Codex review threads [39] + [critical] config.yml): script-jail writes
+ * its own sidecars into the STAGED repo copy under `etc/script-jail/` — `pm-flags.json`
+ * (ALWAYS, every backend), `pnpm-arch.json` (arch overlay), and on the Firecracker
+ * backend `config.yml` itself (overlay.ts copies the generated config INTO the staged
+ * tree at `etc/script-jail/config.yml`, AFTER the repo cpSync, so it shadows any
+ * committed file there). The AUDIT therefore sees script-jail's host-owned content at
+ * those paths. But the `install: true` host part-2 re-run executes the REAL lifecycle
+ * scripts at `cwd=repoDir` (host-install.ts), OUTSIDE every sandbox, where a PR-committed
+ * file under `etc/script-jail/` keeps its attacker content. Reads are value-blind in the
+ * lock (schema external_reads = paths only), so a script branching on the file's CONTENT
+ * is audited against script-jail's copy but takes a different branch on the runner — a
+ * host-vs-sandbox distinguisher the lock cannot capture.
+ *
+ * The gate is DIRECTORY-level (not an enumerated file list) on purpose: an enumerated
+ * list already missed `config.yml`, and any future host-owned sidecar added under this
+ * dir would silently re-open the class. Since `etc/script-jail/` is never consumer-facing,
+ * refusing the whole directory has zero false-positive cost and is future-proof. Host-static
+ * check only; no lockfile/byte-stability impact.
  */
 export function detectReservedScriptJailPaths(repoDir: string): string | null {
-  for (const rel of RESERVED_SIDECAR_RELPATHS) {
-    if (existsSync(join(repoDir, rel))) {
-      return (
-        `the checkout commits a file at \`${rel}\`, a path script-jail owns and ` +
-        `overwrites in the sandboxed copy of the repo. The host install re-runs ` +
-        `lifecycle scripts against the REAL checkout, where this file keeps its ` +
-        `committed content while the audit saw script-jail's — a host-vs-sandbox ` +
-        `content divergence the value-blind lock cannot capture. Remove the ` +
-        `\`etc/script-jail/\` files from the checkout, or audit without \`install\`.`
-      );
-    }
+  const reservedDir = join(repoDir, RESERVED_SIDECAR_DIR);
+  let top: ReturnType<typeof lstatSync>;
+  try {
+    // lstat (not stat): a committed SYMLINK at `etc/script-jail` is itself illegitimate
+    // and must not be followed (it could redirect into / out of the repo).
+    top = lstatSync(reservedDir);
+  } catch {
+    return null; // ENOENT — the checkout commits nothing under etc/script-jail/.
   }
-  return null;
+  const committed: string[] = [];
+  if (top.isDirectory()) {
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(reservedDir, { recursive: true }) as string[];
+    } catch {
+      entries = [];
+    }
+    for (const rel of entries) {
+      let st: ReturnType<typeof lstatSync>;
+      try {
+        st = lstatSync(join(reservedDir, rel));
+      } catch {
+        continue; // raced removal — ignore.
+      }
+      // Count files AND symlinks (a committed symlink under the dir is a vector too);
+      // skip intermediate directory entries readdir(recursive) also returns.
+      if (!st.isDirectory()) committed.push(`${RESERVED_SIDECAR_DIR}/${rel}`);
+    }
+  } else {
+    // A regular file or symlink committed AT `etc/script-jail` itself.
+    committed.push(RESERVED_SIDECAR_DIR);
+  }
+  if (committed.length === 0) return null; // an empty dir is not git-committable; be safe.
+  committed.sort();
+  const shown = committed
+    .slice(0, 5)
+    .map((p) => `\`${p}\``)
+    .join(', ');
+  const more = committed.length > 5 ? ` (and ${committed.length - 5} more)` : '';
+  return (
+    `the checkout commits ${committed.length} file${committed.length === 1 ? '' : 's'} under ` +
+    `\`${RESERVED_SIDECAR_DIR}/\` (${shown}${more}) — a directory script-jail owns and ` +
+    `overwrites in the sandboxed copy of the repo (config.yml / pm-flags.json / ` +
+    `pnpm-arch.json). The host install re-runs lifecycle scripts against the REAL ` +
+    `checkout, where these files keep their committed content while the audit saw ` +
+    `script-jail's — a host-vs-sandbox content divergence the value-blind lock cannot ` +
+    `capture. Remove \`${RESERVED_SIDECAR_DIR}/\` from the checkout, or audit without \`install\`.`
+  );
 }
 
 /**

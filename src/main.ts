@@ -301,12 +301,14 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       process.stdout.write(`::error::script-jail: \`install: true\` refused — ${homeReason}\n`);
       exitProcess(1);
     }
-    // SECURITY: refuse a checkout that commits a file at a script-jail-owned overlay
-    // sidecar path (etc/script-jail/pm-flags.json|pnpm-arch.json). The audit sees
-    // script-jail's host-written content there (overlay overwrites the staged copy),
-    // but host part-2 re-runs lifecycle scripts against the REAL checkout where the
-    // committed file persists — a host-vs-sandbox content distinguisher the
-    // value-blind lock cannot capture. (install-preflight.ts:detectReservedScriptJailPaths.)
+    // SECURITY: refuse a checkout that commits ANY file under the script-jail-owned
+    // overlay directory etc/script-jail/ (pm-flags.json / pnpm-arch.json / config.yml —
+    // FC copies the generated config.yml INTO the staged tree, shadowing a committed one).
+    // The audit sees script-jail's host-written content there (overlay overwrites the
+    // staged copy), but host part-2 re-runs lifecycle scripts against the REAL checkout
+    // where the committed file persists — a host-vs-sandbox content distinguisher the
+    // value-blind lock cannot capture. Directory-level (not a file list) so a future
+    // sidecar can't re-open the class. (install-preflight.ts:detectReservedScriptJailPaths.)
     const reservedPathReason = detectReservedScriptJailPaths(repoDir);
     if (reservedPathReason !== null) {
       process.stdout.write(`::error::script-jail: \`install: true\` refused — ${reservedPathReason}\n`);

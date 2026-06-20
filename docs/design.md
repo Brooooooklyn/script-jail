@@ -255,6 +255,15 @@ What this CANNOT close (irreducible while host part 2 runs uninstrumented):
 
 - **Syscalls** — `os.hostname()`/`uname()` (no backend hooks them) and other
   kernel-observable differences (the microVM/container `/proc`, mount table, …).
+- **Node version string** — the audit pins the guest Node (`NODE_VERSION` in
+  `src/rootfs/vite-plus.ts`); host part 2 runs under the Action's bundled Node
+  (`action.yml using: node24`), whose *patch* level the consumer cannot pin. A
+  script branching on the exact `process.version` / `process.versions.modules`
+  string is therefore in the same uninstrumented-detection class as `os.hostname()`
+  (no layer records it). `main.ts` gates on the Node **major** only: the major sets
+  the native ABI (`NODE_MODULE_VERSION` is per-major), so the one lock-*affecting*
+  divergence — a native addon compiled against a different ABI — is closed, while
+  exact-patch parity would break `install: true` on essentially every real runner.
 - **Marker files** — `/.dockerenv` (Docker), `/etc/script-jail/config.yml`.
 - **The instrument itself** — the audited child MUST carry
   `LD_PRELOAD=libscriptjail.so` and `NODE_OPTIONS=--require …preloads`; a script
