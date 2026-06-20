@@ -356,6 +356,46 @@ describe('detectPreTrustConfigExec — yarn ancestor .yarnrc.yml scan', () => {
     expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/unparseable/);
   });
 
+  // enableScripts cascade (codex idx-36): an ANCESTOR `.yarnrc.yml` setting only
+  // `enableScripts: false` is NEVER staged into the sandbox (stage stages only
+  // repoDir), so the audit runs dependency build scripts (yarn default
+  // enableScripts=true) while host part-2 — running at cwd=repoDir, honoring the
+  // ancestor rc cascade — SKIPS them.  That audit-builds / host-skips divergence
+  // escapes the value-blind lock, so install:true must refuse pre-trust.
+  it('blocks an ancestor enableScripts:false (audit-builds / host-skips divergence)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'enableScripts: false\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    const reason = detectPreTrustConfigExec(pkg, 'yarn', ws);
+    expect(reason).toMatch(/enableScripts/);
+    // Names the ancestor dir so the user can find the offending rc.
+    expect(reason).toContain(ws);
+  });
+
+  it('does NOT block repoDir-own enableScripts:false (its rc IS staged → audit and host agree)', () => {
+    const ws = dir;
+    writeAt(join(ws, '.yarnrc.yml'), 'enableScripts: false\n');
+    writeAt(join(ws, 'package.json'), '{"name":"ws"}');
+    expect(detectPreTrustConfigExec(ws, 'yarn', ws)).toBeNull();
+  });
+
+  it('does NOT block an ancestor enableScripts:true (both audit and host build → no divergence)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'enableScripts: true\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toBeNull();
+  });
+
+  it('does NOT block an ancestor rc with NO enableScripts key (absent = default true)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'nodeLinker: node-modules\n');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toBeNull();
+  });
+
   // Containment regression: a child directory whose NAME starts with ".." (e.g.
   // "..pkg") yields a `relative(ws, repo)` of "..pkg/app".  A naive
   // `startsWith('..')` containment check wrongly classifies that valid child as

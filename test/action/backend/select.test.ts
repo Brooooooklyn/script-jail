@@ -66,6 +66,32 @@ describe('runSelectedBackend', () => {
     expect(calls.filter((c) => c.startsWith('warn:'))).toHaveLength(2);
   });
 
+  // codex round-4 (TMPDIR stale-callback guard): main.ts captures the auditing backend
+  // from onBackendSelected to decide the host TMPDIR-parity value.  In the auto-fallback
+  // case (FC unavailable → docker), onBackendSelected must end on the backend that
+  // ACTUALLY ran (docker) — a stale 'firecracker' would make the host set TMPDIR while
+  // the Docker guest had none (re-opening the presence oracle).
+  it('onBackendSelected fires per attempt; the last call is the backend that runs', async () => {
+    const selected: string[] = [];
+    const result = await runSelectedBackend({
+      requested: 'auto',
+      ctx: ctx(),
+      warn: () => {},
+      onBackendSelected: (name) => { selected.push(name); },
+      backends: {
+        firecracker: backend('firecracker', async () => {
+          throw new BackendUnavailableError('firecracker', 'no kvm');
+        }),
+        docker: backend('docker', async () => ({ finalYaml: 'ok\n', nonFatalWarnings: [] })),
+        bare: backend('bare', async () => ({ finalYaml: 'wrong\n', nonFatalWarnings: [] })),
+      },
+    });
+    expect(result.finalYaml).toBe('ok\n');
+    // Both attempted, in order; docker is the LAST (the one that returned).
+    expect(selected).toEqual(['firecracker', 'docker']);
+    expect(selected[selected.length - 1]).toBe('docker');
+  });
+
   it('does not fall back after a backend starts and throws a runtime error', async () => {
     const calls: string[] = [];
     await expect(runSelectedBackend({

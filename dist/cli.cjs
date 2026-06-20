@@ -7755,6 +7755,18 @@ function isUnderCheckout(p, roots) {
 function isPathUnderCheckout(p) {
   return isUnderCheckout(p, checkoutRoots()) || isLexicallyUnderCheckout(p, checkoutRootsLexical());
 }
+var HOST_INSTALL_KEEP_AUTH_ENV_NAMES = new Set(
+  [
+    "NODE_AUTH_TOKEN",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "GIT_ALLOW_PROTOCOL",
+    // restricts the git transport set, never weakens
+    "GIT_TERMINAL_PROMPT"
+    // behaviour flag (prevents an interactive clone hang)
+  ].map((n) => n.toLowerCase())
+);
 var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
   [
     // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
@@ -26128,6 +26140,7 @@ async function runSelectedBackend(input) {
   const unavailable = [];
   for (const name of order) {
     try {
+      input.onBackendSelected?.(name);
       return await input.backends[name].run(input.ctx);
     } catch (err) {
       if (err instanceof BackendUnavailableError) {

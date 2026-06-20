@@ -22,6 +22,7 @@ import {
   hostInstallNoScripts,
   hostRunScripts,
   isPathUnderCheckout,
+  trustedHostTmpdir,
   resolveGitFromPath,
   stripDangerousEnv,
   sanitizePathValue,
@@ -2548,22 +2549,21 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     },
   );
 
-  it('does NOT strip legit env: git behaviour flags, registry/auth, NODE_ENV/ENV, build vars', () => {
-    // Family/enumerated stripping must not over-reach: restricting git flags, the
-    // registry + auth tokens the host legitimately ADDS over the audit, NODE_ENV
-    // (not a loader var), POSIX `ENV` (an env-NAME, not the sh startup hook for
-    // `sh -c`), and arbitrary build vars all survive.
+  it('keeps the registry/auth/proxy/git-behaviour pins in the part-1 FETCH child', () => {
+    // The parity ALLOWLIST keeps the credential/routing surface the host legitimately
+    // ADDS over the clean-VM audit in the FETCH phase (part-1, no scripts run) so it can
+    // reach a private/proxied registry or a git: dep: git behaviour flags, registry +
+    // auth tokens (npm_config_* survivors), and proxy URLs.  (Dropped in part-2 — see
+    // the phase-asymmetry test below.)
     const KEEP: Record<string, string> = {
       GIT_ALLOW_PROTOCOL: 'https', // restricts, never weakens
       GIT_TERMINAL_PROMPT: '0', // behaviour flag (blanket GIT_* would wrongly drop it)
-      CI: 'true',
-      NODE_ENV: 'production', // NOT NODE_OPTIONS/NODE_PATH — must be kept
-      ENV: 'production', // not the interactive-sh startup file for `sh -c`
       NODE_AUTH_TOKEN: 'tok-keep-me',
       npm_config_registry: 'https://registry.npmjs.org/',
       'npm_config_//registry.npmjs.org/:_authToken': 'npm-auth-keep',
+      HTTP_PROXY: 'http://proxy.internal:8080',
       HTTPS_PROXY: 'http://proxy.internal:8080',
-      MY_UNRELATED_VAR: 'value-keep-me',
+      NO_PROXY: 'localhost,127.0.0.1',
     };
     for (const [k, v] of Object.entries(KEEP)) process.env[k] = v;
     const rec = makeRecorder();
@@ -2572,6 +2572,235 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
     const env = envs[0]!;
     for (const [k, v] of Object.entries(KEEP)) expect(env[k]).toBe(v);
   });
+
+  // codex follow-up to idx 25: NODE_ENV/CI alone was whack-a-mole.  The host re-run
+  // env is now a parity ALLOWLIST — every ambient runner/workflow var the FC/Docker
+  // guest lifecycle child never has (GITHUB_*/RUNNER_*/arbitrary `env:`/POSIX ENV/
+  // locale) is dropped from BOTH host phases, closing the value-blind env-read oracle
+  // beyond NODE_ENV/CI.  A denylist could not: a workflow can set an arbitrary var
+  // (MY_WORKFLOW_FLAG), so the dangerous set is unbounded.
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'ALLOWLIST drops ambient runner/workflow env from BOTH host phases (%s)',
+    async (pm) => {
+      const DROP = {
+        GITHUB_ACTIONS: 'true',
+        GITHUB_WORKSPACE: '/home/runner/work/proj/proj',
+        GITHUB_REF: 'refs/pull/1/merge',
+        RUNNER_OS: 'Linux',
+        RUNNER_TEMP: '/home/runner/work/_temp',
+        MY_WORKFLOW_FLAG: '1', // arbitrary workflow `env:` — the un-denylistable case
+        ENV: 'production', // POSIX env-name, ambient (guest never has it)
+        LANG: 'en_US.UTF-8',
+        // TMPDIR: the two guest backends disagree (FC=/sjtmp, Docker=none), so the host
+        // keeps neither — a workflow-set TMPDIR must not become a Docker host/guest oracle.
+        TMPDIR: '/runner/custom-tmp',
+      };
+      for (const [k, v] of Object.entries(DROP)) process.env[k] = v;
+      // part-1 fetch
+      const recA = makeRecorder();
+      const envsA: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], recA.io, envCapturingSpawn(envsA));
+      for (const k of Object.keys(DROP)) {
+        expect(envsA[0]![k], `part-1 ${pm} ${k}`).toBeUndefined();
+      }
+      // part-2 scripts
+      const recB = makeRecorder();
+      const envsB: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts(
+        pm,
+        '/repo',
+        [],
+        recB.io,
+        [],
+        envCapturingStreamSpawn(envsB),
+        bareLaunchResolver,
+      );
+      for (const k of Object.keys(DROP)) {
+        expect(envsB[0]![k], `part-2 ${pm} ${k}`).toBeUndefined();
+      }
+    },
+  );
+
+  // Backend-aware TMPDIR (codex round-3 [critical] close): when the AUDIT ran on
+  // Firecracker the guest lifecycle child has TMPDIR=/sjtmp (a dedicated VM disk),
+  // so a `process.env.TMPDIR` read is PRESENT in the audit.  Docker's guest has none.
+  // main.ts threads the auditing backend's TMPDIR policy as `hostTmpdir`: a real host
+  // temp for FC (so the host read takes the same present branch), undefined for Docker
+  // (the allowlist already drops any workflow TMPDIR → absent both sides).  Even though
+  // an ambient workflow-set TMPDIR is otherwise dropped, the FC `hostTmpdir` is set on
+  // BOTH host phases.  (Value differs from /sjtmp — accepted residual; presence matches.)
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'sets TMPDIR on BOTH host phases when hostTmpdir is passed (Firecracker audit parity) (%s)',
+    async (pm) => {
+      // An ambient workflow TMPDIR that the allowlist drops — proves the value comes
+      // from hostTmpdir, not from inheritance.
+      process.env['TMPDIR'] = '/runner/custom-tmp';
+      const HOST_TMP = '/tmp/script-jail-host';
+      // part-1 fetch
+      const recA = makeRecorder();
+      const envsA: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], recA.io, envCapturingSpawn(envsA), HOST_TMP);
+      expect(envsA[0]!['TMPDIR'], `part-1 ${pm}`).toBe(HOST_TMP);
+      // part-2 scripts
+      const recB = makeRecorder();
+      const envsB: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts(
+        pm,
+        '/repo',
+        [],
+        recB.io,
+        [],
+        envCapturingStreamSpawn(envsB),
+        bareLaunchResolver,
+        HOST_TMP,
+      );
+      expect(envsB[0]!['TMPDIR'], `part-2 ${pm}`).toBe(HOST_TMP);
+    },
+  );
+
+  // Docker audit (or no host temp): hostTmpdir defaults to undefined → TMPDIR stays
+  // dropped on BOTH phases, matching the Docker guest (which has none).
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'leaves TMPDIR dropped on BOTH host phases when hostTmpdir is undefined (Docker audit) (%s)',
+    async (pm) => {
+      process.env['TMPDIR'] = '/runner/custom-tmp';
+      const recA = makeRecorder();
+      const envsA: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], recA.io, envCapturingSpawn(envsA));
+      expect(envsA[0]!['TMPDIR'], `part-1 ${pm}`).toBeUndefined();
+      const recB = makeRecorder();
+      const envsB: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts(
+        pm,
+        '/repo',
+        [],
+        recB.io,
+        [],
+        envCapturingStreamSpawn(envsB),
+        bareLaunchResolver,
+      );
+      expect(envsB[0]!['TMPDIR'], `part-2 ${pm}`).toBeUndefined();
+    },
+  );
+
+  // codex round-4 [high]: the FC host TMPDIR value must NOT come from os.tmpdir()
+  // (which honors the ambient, attacker-controllable TMPDIR/TMP/TEMP).  trustedHostTmpdir
+  // ignores those names and returns a fixed, canonicalized, outside-checkout /tmp — so a
+  // malicious workflow cannot redirect trusted-host tempfile writes under the checkout.
+  describe('trustedHostTmpdir (FC-parity host temp source)', () => {
+    it('ignores ambient TMPDIR/TMP/TEMP and returns the canonical outside-checkout /tmp', () => {
+      const canonical = realpathSync('/tmp');
+      // Poison every name os.tmpdir() would honor — point them UNDER the checkout (cwd).
+      process.env['TMPDIR'] = join(process.cwd(), 'evil-tmp');
+      process.env['TMP'] = join(process.cwd(), 'evil-tmp2');
+      process.env['TEMP'] = 'relative/evil';
+      const got = trustedHostTmpdir();
+      expect(got).toBe(canonical);
+      expect(isAbsolute(got)).toBe(true);
+      expect(isPathUnderCheckout(got)).toBe(false);
+      expect(got).not.toBe(process.env['TMPDIR']);
+    });
+
+    it('throws (fail closed) when the canonical /tmp resolves under the checkout', () => {
+      const canonical = realpathSync('/tmp');
+      // Force /tmp to count as under-checkout by making its PARENT the workspace root.
+      process.env['GITHUB_WORKSPACE'] = canonical.slice(0, canonical.lastIndexOf('/')) || '/';
+      expect(() => trustedHostTmpdir()).toThrow(/absolute path outside the checkout/);
+    });
+  });
+
+  it('ALLOWLIST keeps the guest-parity base env (PATH/HOME) on the host child', () => {
+    process.env['HOME'] = '/home/runner';
+    const rec = makeRecorder();
+    const envs: Array<NodeJS.ProcessEnv> = [];
+    hostInstallNoScripts('npm', '/repo', [], rec.io, envCapturingSpawn(envs));
+    const env = envs[0]!;
+    expect(env['PATH']).toBeDefined();
+    expect(env['HOME']).toBe('/home/runner');
+  });
+
+  // codex round-2 #1: the registry-auth/proxy surface is host-present but the guest
+  // Phase B lifecycle child has NONE of it (the runner's auth is never forwarded into
+  // the VM/container — private-registry auth rides the staged .npmrc).  So it is kept
+  // ONLY in the FETCH phase (part-1, no scripts run); the SCRIPT phase (part-2) drops
+  // it so the host lifecycle child equals the guest Phase B (no value-blind oracle).
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'keeps registry-auth/proxy in part-1 fetch but DROPS it in part-2 scripts (%s)',
+    async (pm) => {
+      const AUTH: Record<string, string> = {
+        NODE_AUTH_TOKEN: 'tok',
+        HTTP_PROXY: 'http://proxy:8080',
+        HTTPS_PROXY: 'http://proxy:8080',
+        NO_PROXY: 'localhost',
+        npm_config_registry: 'https://registry.npmjs.org/',
+        'npm_config_//registry.npmjs.org/:_authToken': 'auth',
+        YARN_NPM_AUTH_TOKEN: 'ytok',
+      };
+      for (const [k, v] of Object.entries(AUTH)) process.env[k] = v;
+      // part-1 fetch — KEEPS the credential/routing surface
+      const recA = makeRecorder();
+      const envsA: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], recA.io, envCapturingSpawn(envsA));
+      expect(envsA[0]!['NODE_AUTH_TOKEN'], `part-1 ${pm}`).toBe('tok');
+      expect(envsA[0]!['HTTPS_PROXY'], `part-1 ${pm}`).toBe('http://proxy:8080');
+      expect(envsA[0]!['npm_config_registry'], `part-1 ${pm}`).toBe('https://registry.npmjs.org/');
+      // part-2 scripts — DROPS it all (== guest Phase B)
+      const recB = makeRecorder();
+      const envsB: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts(
+        pm,
+        '/repo',
+        [],
+        recB.io,
+        [],
+        envCapturingStreamSpawn(envsB),
+        bareLaunchResolver,
+      );
+      for (const k of Object.keys(AUTH)) {
+        expect(envsB[0]![k], `part-2 ${pm} ${k}`).toBeUndefined();
+      }
+    },
+  );
+
+  // idx 25 (P1): the install:true host re-run must NOT inherit the ambient
+  // lifecycle-branch build env (NODE_ENV / CI) that the Firecracker/Docker guest
+  // audit NEVER receives.  The guest reconstructs a clean env (FC init.sh / docker
+  // -e forward only SCRIPT_JAIL_*/instrumentation; the guest agent's
+  // sanitizeLifecycleBaseEnv never carries NODE_ENV/CI), so a value-blind env_read
+  // can branch benign in the audit yet take the production/CI branch on the trusted
+  // host under a matching clean lock (catastrophic false-negative).  The strip lives
+  // in hostInstallEnv (host-side only), NOT in stripDangerousEnv — the bare/mac-bare
+  // AGENT shares stripDangerousEnv and legitimately inherits these (the audit IS the
+  // host there; those backends are not install-aligned).  npm itself sets the
+  // DERIVED NODE_ENV from --omit/--include in lockstep on host AND guest, so
+  // dropping the INHERITED ambient value does not break dep-group projection.
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'strips ambient lifecycle-branch env (NODE_ENV/CI) from the part-1 fetch child for FC/Docker audit parity (%s)',
+    (pm) => {
+      process.env['NODE_ENV'] = 'production';
+      process.env['CI'] = 'true';
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      hostInstallNoScripts(pm, '/repo', [], rec.io, envCapturingSpawn(envs));
+      const env = envs[0]!;
+      expect(env['NODE_ENV']).toBeUndefined();
+      expect(env['CI']).toBeUndefined();
+    },
+  );
+
+  it.each(['npm', 'pnpm', 'yarn'] as const)(
+    'strips ambient lifecycle-branch env (NODE_ENV/CI) from the part-2 lifecycle child for FC/Docker audit parity (%s)',
+    async (pm) => {
+      process.env['NODE_ENV'] = 'production';
+      process.env['CI'] = 'true';
+      const rec = makeRecorder();
+      const envs: Array<NodeJS.ProcessEnv> = [];
+      await hostRunScripts(pm, '/repo', [], rec.io, [], envCapturingStreamSpawn(envs), bareLaunchResolver);
+      const env = envs[0]!;
+      expect(env['NODE_ENV']).toBeUndefined();
+      expect(env['CI']).toBeUndefined();
+    },
+  );
 
   it('stripDangerousEnv (shared with the bare backend agent spawn): drops selectors + sanitizes PATH, keeps SCRIPT_JAIL_/noise/legit', () => {
     // The Linux bare backend applies this to the env it spawns the audit AGENT

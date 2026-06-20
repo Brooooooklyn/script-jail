@@ -26860,6 +26860,25 @@ function isUnderCheckout(p, roots) {
   }
   return false;
 }
+function isPathUnderCheckout(p) {
+  return isUnderCheckout(p, checkoutRoots()) || isLexicallyUnderCheckout(p, checkoutRootsLexical());
+}
+function trustedHostTmpdir() {
+  let canonical;
+  try {
+    canonical = (0, import_node_fs.realpathSync)("/tmp");
+  } catch (err) {
+    throw new Error(
+      `script-jail: \`install: true\` could not resolve a trusted host temp directory (/tmp): ${err.message}`
+    );
+  }
+  if (!(0, import_node_path2.isAbsolute)(canonical) || isPathUnderCheckout(canonical)) {
+    throw new Error(
+      `script-jail: \`install: true\` refuses host temp "${canonical}" \u2014 it must be an absolute path outside the checkout (TMPDIR parity with the Firecracker audit).`
+    );
+  }
+  return canonical;
+}
 function resolveGitFromPath() {
   const pathVar = process.env["PATH"];
   if (pathVar === void 0 || pathVar === "") return void 0;
@@ -26892,16 +26911,26 @@ function resolveGitFromPath() {
   }
   return void 0;
 }
-var HOST_INSTALL_STRIP_ENV_NAMES = /* @__PURE__ */ new Set([
-  "HOSTNAME",
-  // os.hostname() syscall still differs; this only aligns the env var
-  "PWD",
-  // process.cwd() ignores PWD, but a script may read it directly
-  "COLS",
-  "LINES",
-  "POSIXLY_CORRECT",
-  "TERM"
-]);
+var HOST_INSTALL_KEEP_BASE_ENV_NAMES = /* @__PURE__ */ new Set(["PATH", "HOME"]);
+var HOST_INSTALL_KEEP_AUTH_ENV_NAMES = new Set(
+  [
+    "NODE_AUTH_TOKEN",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "GIT_ALLOW_PROTOCOL",
+    // restricts the git transport set, never weakens
+    "GIT_TERMINAL_PROMPT"
+    // behaviour flag (prevents an interactive clone hang)
+  ].map((n) => n.toLowerCase())
+);
+function isHostInstallParityKeepName(name, phase) {
+  if (HOST_INSTALL_KEEP_BASE_ENV_NAMES.has(name)) return true;
+  if (phase === "scripts") return false;
+  const lower = name.toLowerCase();
+  if (HOST_INSTALL_KEEP_AUTH_ENV_NAMES.has(lower)) return true;
+  return lower.startsWith("npm_config_") || lower.startsWith("pnpm_config_") || lower.startsWith("yarn_");
+}
 var HOST_INSTALL_DANGEROUS_ENV_NAMES = new Set(
   [
     // [13] Node loader hooks + module search + TLS trust (Node-based PM child).
@@ -27184,12 +27213,10 @@ function lifecycleCacheParityEnv(pm, repoDir) {
     };
   return {};
 }
-function hostInstallEnv(pm, repoDir, phase) {
+function hostInstallEnv(pm, repoDir, phase, hostTmpdir) {
   const env = stripDangerousEnv(process.env);
   for (const name of Object.keys(env)) {
-    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name) || name.startsWith("SCRIPT_JAIL_")) {
-      delete env[name];
-    }
+    if (!isHostInstallParityKeepName(name, phase)) delete env[name];
   }
   if (phase === "fetch") env["npm_config_git"] = trustedGitPath();
   env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0";
@@ -27205,6 +27232,7 @@ function hostInstallEnv(pm, repoDir, phase) {
     env["YARN_ENABLE_CONSTRAINTS_CHECKS"] = "false";
   }
   Object.assign(env, lifecycleCacheParityEnv(pm, repoDir));
+  if (hostTmpdir !== void 0) env["TMPDIR"] = hostTmpdir;
   return env;
 }
 var CAPTURE_MAX_BUFFER = 64 * 1024 * 1024;
@@ -27228,7 +27256,7 @@ var captureSpawn = (cmd, args, cwd, env) => {
     stderr: typeof r.stderr === "string" ? r.stderr : ""
   };
 };
-function hostInstallNoScripts(pm, repoDir, args, io, spawn3 = captureSpawn) {
+function hostInstallNoScripts(pm, repoDir, args, io, spawn3 = captureSpawn, hostTmpdir) {
   const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
   if (droppedKeys.length > 0) {
     const n = dropped.length;
@@ -27252,7 +27280,7 @@ function hostInstallNoScripts(pm, repoDir, args, io, spawn3 = captureSpawn) {
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, "fetch"), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, "fetch", hostTmpdir), spawn3, "no-scripts install", io, safeDisplayArgs, onOutput);
 }
 function redactCaptured(text, sensitive) {
   let red = maskExactValues(text, sensitive, "REDACTED:USER-ARG");
@@ -27496,7 +27524,7 @@ function resolveHostManagerLaunch(pm, repoDir, procEnv = process.env, execPath =
   if (!(0, import_node_fs.existsSync)(entry)) failClosed(`pnpm entry not found at ${entry}`);
   return { node: execPath, entry };
 }
-async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn, resolveLaunch = resolveHostManagerLaunch) {
+async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spawn3 = streamSpawn, resolveLaunch = resolveHostManagerLaunch, hostTmpdir) {
   const cmd = INSTALL_CMD[pm];
   const hostHardening = pm === "pnpm" ? ["--config.ignore-pnpmfile=true", "--config.script-shell=/bin/sh"] : [];
   const { kept } = sanitizeInstallArgs(args);
@@ -27504,7 +27532,7 @@ async function hostRunScripts(pm, repoDir, args, io, protectedEnvNames = [], spa
   const finalArgs = [...cmd.args, ...userArgs, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   const safeFinalArgs = [...cmd.args, ...pnpmStoreDirArg(pm, repoDir), ...hostHardening];
   const userArgSuffix = userArgs.length > 0 ? ` (+${userArgs.length} user install arg${userArgs.length === 1 ? "" : "s"}, not shown)` : "";
-  const childEnv = hostInstallEnv(pm, repoDir, "scripts");
+  const childEnv = hostInstallEnv(pm, repoDir, "scripts", hostTmpdir);
   const launch = resolveLaunch(pm, repoDir, childEnv);
   const spawnCmd = launch ? launch.node : cmd.cmd;
   const spawnArgs = launch ? [launch.entry, ...finalArgs] : finalArgs;
@@ -27815,6 +27843,9 @@ function detectYarnStartupExecInDir(dir, atRepoDir, hasYarnConfig) {
   }
   if (isNotDefinitelyFalse(parsed["enableConstraintsChecks"]) && hasYarnConfig) {
     return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
+  }
+  if (!atRepoDir && "enableScripts" in parsed && !isNotDefinitelyFalse(parsed["enableScripts"])) {
+    return `${where} \`.yarnrc.yml\` \`enableScripts: false\` (host would skip dependency build scripts the sandbox runs)` + YARN_GUIDANCE;
   }
   return null;
 }
@@ -45573,6 +45604,7 @@ async function runSelectedBackend(input) {
   const unavailable = [];
   for (const name of order) {
     try {
+      input.onBackendSelected?.(name);
       return await input.backends[name].run(input.ctx);
     } catch (err) {
       if (err instanceof BackendUnavailableError) {
@@ -45741,6 +45773,7 @@ async function main(deps = {}) {
       stderr: process.stderr
     })
   };
+  let auditBackend;
   const result = await runAudit({
     repoDir,
     configPath: inputs.configPath,
@@ -45776,6 +45809,9 @@ async function main(deps = {}) {
       // from auto and reject an explicit bare here as a backstop to the pre-audit
       // gate.  (Codex re-review: bare-backend staged-symlink escape.)
       requireRepoDirAligned: inputs.install,
+      onBackendSelected: (name) => {
+        auditBackend = name;
+      },
       ctx: {
         ...auditInput,
         imagesDir,
@@ -45798,7 +45834,8 @@ async function main(deps = {}) {
     }
   });
   if (inputs.install) {
-    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn });
+    const hostTmpdir = auditBackend === "firecracker" ? trustedHostTmpdir() : void 0;
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, void 0, hostTmpdir);
     if (result.trusted) {
       const egress = collectNetworkAttempts(result.generatedLock ?? "");
       if (egress.length > 0) {
@@ -45818,7 +45855,7 @@ async function main(deps = {}) {
         process.stdout.write(detail);
       }
       const protectedEnvNames = readProtectedEnvNames(inputs.configPath);
-      await doHostRunScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
+      await doHostRunScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames, void 0, void 0, hostTmpdir);
     }
   }
   if (result.exitCode !== 0) exitProcess(result.exitCode);

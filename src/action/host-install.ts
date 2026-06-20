@@ -214,6 +214,49 @@ export function isPathUnderCheckout(p: string): boolean {
 }
 
 /**
+ * A TRUSTED host temp root for the `install: true` Firecracker-parity `TMPDIR`
+ * (threaded into {@link hostInstallEnv} as `hostTmpdir`).  The Firecracker guest
+ * lifecycle child has `TMPDIR=/sjtmp` (a dedicated VM disk, absolute, outside any
+ * checkout); to close the value-blind PRESENCE oracle the host re-run must also have
+ * `TMPDIR` present.
+ *
+ * SECURITY (codex round-4 [high]): do NOT derive this from `os.tmpdir()`.  `os.tmpdir()`
+ * honors the AMBIENT `process.env.TMPDIR`/`TMP`/`TEMP`, which a malicious workflow `env:`
+ * (or a fork PR's workflow) sets on the action process.  Threading that value into the
+ * TRUSTED host lifecycle child would let an attacker point `TMPDIR` UNDER the checkout
+ * (or set a relative value resolved against `cwd=repoDir`), redirecting every
+ * `$TMPDIR`-spelled tempfile WRITE the post-trust scripts make INTO the repo tree — a
+ * write the audit (guest `/sjtmp`) never saw and which can dedupe-collapse with a genuine
+ * root write.  So this IGNORES the ambient names entirely and uses a FIXED system temp
+ * (`/tmp`), realpath-canonicalized (defeats a symlinked `/tmp`) and asserted absolute +
+ * outside-checkout.  It THROWS — fail closed, refusing the host re-run rather than running
+ * it with an unsafe or divergent temp — if `/tmp` cannot be validated.  Only the PRESENCE
+ * closes the oracle; the value differing from `/sjtmp` is the documented accepted residual
+ * (a script must branch on `TMPDIR`'s VALUE, and `/sjtmp` cannot exist on the host).
+ */
+export function trustedHostTmpdir(): string {
+  let canonical: string;
+  try {
+    // Fixed `/tmp` (NOT os.tmpdir()): the canonical POSIX temp, independent of the
+    // attacker-controllable TMPDIR/TMP/TEMP names.  realpathSync resolves a symlinked
+    // `/tmp` so a `/tmp -> <checkout>/x` redirect is caught by the under-checkout test.
+    canonical = realpathSync('/tmp');
+  } catch (err) {
+    throw new Error(
+      `script-jail: \`install: true\` could not resolve a trusted host temp directory ` +
+        `(/tmp): ${(err as Error).message}`,
+    );
+  }
+  if (!isAbsolute(canonical) || isPathUnderCheckout(canonical)) {
+    throw new Error(
+      `script-jail: \`install: true\` refuses host temp "${canonical}" — it must be an ` +
+        `absolute path outside the checkout (TMPDIR parity with the Firecracker audit).`,
+    );
+  }
+  return canonical;
+}
+
+/**
  * Scan `process.env.PATH` for the first executable named `git`/`git.exe`
  * OUTSIDE the checkout tree and return its ABSOLUTE path.  Returns `undefined`
  * when none is found (caller falls back to the bare literal).
@@ -327,35 +370,111 @@ export function resolveGitFromPath(): string | undefined {
  * likewise rejected there.
  */
 /**
- * Env-var names that betray the sandbox-vs-host split to a lifecycle script.
- * Stripped from the host re-run so its env-var view matches what the SANDBOX
- * audited (the guest's `sanitizeLifecycleBaseEnv` strips the same noise +
- * unknown SCRIPT_JAIL_* from the audited child).
+ * VALUE-BLIND ENV-READ ORACLE — why the install-aligned host re-run env is an
+ * ALLOWLIST, not a denylist (idx 25 / codex follow-up).
  *
- * DEFENSE-IN-DEPTH, NOT A COMPLETE ORACLE CLOSE: this aligns only the env-VAR
- * layer.  An environment-sensitive payload can still distinguish the audit from
- * the host via signals env-stripping cannot touch — `os.hostname()`/`uname()`
- * (syscalls, no backend hooks them), the audit-only instrument env the guest
- * MUST carry (`LD_PRELOAD`, `NODE_OPTIONS` preloads), and container/VM marker
- * files (`/.dockerenv`, `/etc/script-jail/config.yml`, microVM `/proc`).
- * `process.cwd()` is handled separately by the work_dir cwd-parity (M1).
+ * The Firecracker/Docker guest audits inside a CLEAN env reconstructed from
+ * scratch (FC `init.sh` exports a fixed set; Docker forwards only the two
+ * SCRIPT_JAIL_* control vars via `-e`; the guest agent's `sanitizeLifecycleBaseEnv`
+ * never carries the runner's ambient env).  So the guest lifecycle child's env-NAME
+ * set is small and fixed: PATH/HOME/TMPDIR + the package manager's own derived
+ * `npm_*` + instrumentation.  The host re-run, by contrast, inherits the runner's
+ * `process.env` — which on a real GitHub runner holds GITHUB_*, RUNNER_*, and ANY
+ * var the owner's workflow `env:` block set.
+ *
+ * The lock records env-read NAMES only (value-blind), and an attacker controls
+ * which branch (NAME present vs absent) is the evil one.  So ANY name present for
+ * the host child but absent for the guest child is an oracle: a dependency reads it,
+ * branches benign in the audit (absent), then takes the evil branch on the trusted
+ * host (present), under a matching clean lock — the catastrophic false-negative.
+ * A DENYLIST can NEVER close this — a workflow can set an arbitrary var, so the
+ * dangerous set is unbounded.  The only complete close is an ALLOWLIST: keep only
+ * names the guest lifecycle child also has, drop everything else ambient
+ * (GITHUB_*, RUNNER_*, NODE_ENV, CI, LANG, arbitrary `env:`).
+ *
+ * Host-side ONLY: this allowlist lives in hostInstallEnv (the install-aligned
+ * path).  It is intentionally NOT in stripDangerousEnv (shared with the bare/mac-bare
+ * AGENT, which legitimately inherits ambient env — there the audit IS the host, the
+ * backend is not install-aligned).  NOT a complete oracle close beyond the env layer:
+ * `os.hostname()`/`uname()` syscalls, the audit-only instrument env the guest MUST
+ * carry (`LD_PRELOAD`, `NODE_OPTIONS`), and container/VM marker files remain
+ * out-of-band tells; `process.cwd()` is handled by the work_dir cwd-parity (M1).
  */
-const HOST_INSTALL_STRIP_ENV_NAMES = new Set([
-  'HOSTNAME', // os.hostname() syscall still differs; this only aligns the env var
-  'PWD', // process.cwd() ignores PWD, but a script may read it directly
-  'COLS',
-  'LINES',
-  'POSIXLY_CORRECT',
-  'TERM',
-]);
+// Base ambient names the guest lifecycle child ALSO has, so the host re-run keeps
+// them in BOTH phases for parity.  PATH is already sanitized by
+// stripDangerousEnv/sanitizePathValue; HOME is the runner's real, outside-checkout
+// HOME (both guest backends export HOME).
+//
+// TMPDIR is DELIBERATELY NOT here: the two install-aligned guest backends already
+// DISAGREE on it — Firecracker exports TMPDIR=/sjtmp into the lifecycle child (an
+// ENOSPC mitigation in src/rootfs/init.sh) while Docker exports none — so no
+// host-side rule can match both at once.  Dropping it (a Linux runner sets no TMPDIR
+// by default, so this is usually a no-op) gives full parity with the Docker guest
+// (both absent) and prevents a workflow-set TMPDIR becoming a host-present/guest-absent
+// oracle.  RESIDUAL vs the Firecracker guest (/sjtmp present, host absent): irreducible
+// from the host while guest code is frozen — same accepted class as the guest's other
+// injected tells (LD_PRELOAD/SCRIPT_JAIL_*); Firecracker is the enforcement boundary,
+// the proper close is guest-side (filter TMPDIR from the lifecycle child / attribution).
+const HOST_INSTALL_KEEP_BASE_ENV_NAMES = new Set(['PATH', 'HOME']);
+
+// Non-namespaced registry-auth / proxy / git-behaviour env the host install
+// legitimately ADDS over the clean-VM audit.  Each carries credentials / routing /
+// restrict-only behaviour — no exec/loader/config-FILE selector.  Matched
+// case-insensitively.  FETCH-PHASE ONLY (see isHostInstallParityKeepName): part-1
+// (--ignore-scripts) needs them to reach a private/proxied registry or a git: dep and
+// runs NO lifecycle script, so there is no env-read oracle there.  The guest lifecycle
+// child has NONE of these (verified: the runner's auth is never forwarded into the
+// VM/container — private-registry auth rides the staged repoDir/.npmrc, not the env),
+// so the SCRIPT phase (part-2) MUST drop them to equal the guest Phase B.
+const HOST_INSTALL_KEEP_AUTH_ENV_NAMES = new Set(
+  [
+    'NODE_AUTH_TOKEN',
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'NO_PROXY',
+    'GIT_ALLOW_PROTOCOL', // restricts the git transport set, never weakens
+    'GIT_TERMINAL_PROMPT', // behaviour flag (prevents an interactive clone hang)
+  ].map((n) => n.toLowerCase()),
+);
+
+/**
+ * True when an env NAME (already filtered through stripDangerousEnv) must SURVIVE
+ * into the install-aligned host PM child.  PHASE-AWARE ALLOWLIST (see the oracle note
+ * above).
+ *
+ * BOTH phases keep the guest base (PATH/HOME).  The registry/auth/TLS/proxy surface —
+ * the non-namespaced auth/proxy/git pins AND the npm_config_* / pnpm_config_* / yarn_*
+ * survivors (stripDangerousEnv already dropped every key in those namespaces except
+ * the registry/auth/TLS/proxy allowlist) — is kept ONLY in the FETCH phase: part-1
+ * runs no lifecycle script (no oracle) but needs it to reach a private/proxied
+ * registry; the clean-VM guest lifecycle child has NONE of it, so the SCRIPT phase
+ * (part-2) drops it so host part-2 == guest Phase B (all absent).  Mirrors the
+ * fetch-only scoping of the npm_config_git pin.  Everything else ambient (GITHUB_*,
+ * RUNNER_*, NODE_ENV, CI, LANG, TMPDIR, SCRIPT_JAIL_*, arbitrary workflow `env:`) is
+ * dropped in BOTH phases.  The COREPACK_* / cache / script-shell pins are layered on
+ * AFTER this filter, so they are unaffected by it.
+ */
+function isHostInstallParityKeepName(name: string, phase: 'fetch' | 'scripts'): boolean {
+  if (HOST_INSTALL_KEEP_BASE_ENV_NAMES.has(name)) return true;
+  // The credential/routing surface is fetch-only — part-2's lifecycle child must
+  // match the guest Phase B, which never has any of it.
+  if (phase === 'scripts') return false;
+  const lower = name.toLowerCase();
+  if (HOST_INSTALL_KEEP_AUTH_ENV_NAMES.has(lower)) return true;
+  return (
+    lower.startsWith('npm_config_') ||
+    lower.startsWith('pnpm_config_') ||
+    lower.startsWith('yarn_')
+  );
+}
 
 // ---------------------------------------------------------------------------
 // SECURITY: strip INHERITED loader/config env vars that enable pre-trust code
 // execution or host-vs-audit config divergence
 // ---------------------------------------------------------------------------
 //
-// This is a SEPARATE category from HOST_INSTALL_STRIP_ENV_NAMES above (which is
-// sandbox-tell NOISE only).  The names below are LOADER / TOOL-RESOLUTION /
+// This is a SEPARATE category from the hostInstallEnv parity ALLOWLIST above (which
+// keeps only the guest-parity names).  The names below are LOADER / TOOL-RESOLUTION /
 // CONFIG-LOCATING env vars that the host package-manager child HONORS but the
 // Firecracker/Docker audit NEVER saw — the audit reconstructs its env from
 // scratch (it does NOT inherit the runner env) and injects only its own
@@ -890,17 +1009,23 @@ function hostInstallEnv(
   pm: Manager,
   repoDir: string,
   phase: 'fetch' | 'scripts',
+  hostTmpdir?: string,
 ): NodeJS.ProcessEnv {
   // Drop dangerous selectors + sanitize PATH (shared with the bare backend), THEN
-  // drop the sandbox-tell noise + SCRIPT_JAIL_* knobs, THEN layer the security pins
-  // on top so a stripped name can never accidentally remove a pin.
+  // ALLOWLIST the surviving ambient env down to the guest lifecycle child's name-set
+  // + the required auth/proxy pins, THEN layer the security pins on top so a filtered
+  // name can never accidentally remove a pin.
   const env = stripDangerousEnv(process.env);
+  // Close the value-blind env-read oracle: keep only names the FC/Docker guest
+  // lifecycle child also has.  BOTH phases keep the base (PATH/HOME); only the FETCH
+  // phase additionally keeps the registry/auth/TLS/proxy surface (part-1 runs no
+  // lifecycle script, so no oracle, and it needs that surface to reach a private
+  // registry), while the SCRIPT phase drops it so host part-2 == guest Phase B.
+  // Everything else ambient (GITHUB_*/RUNNER_*/NODE_ENV/CI/LANG/TMPDIR/arbitrary
+  // workflow `env:` + every SCRIPT_JAIL_* host knob) is dropped in both.  A denylist
+  // could not — a workflow can set an arbitrary var.  See isHostInstallParityKeepName.
   for (const name of Object.keys(env)) {
-    // Sandbox-tell NOISE + every SCRIPT_JAIL_* host knob (REPO_DIR, CACHE_DIR,
-    // ACTION_ROOT, …): audit-absent tells, unused by the package manager.
-    if (HOST_INSTALL_STRIP_ENV_NAMES.has(name) || name.startsWith('SCRIPT_JAIL_')) {
-      delete env[name];
-    }
+    if (!isHostInstallParityKeepName(name, phase)) delete env[name];
   }
   // VALUE-BLIND-LOCK PARITY (round-15): `npm_config_git` defeats a repo `.npmrc
   // git=<pwn>` during git-DEPENDENCY CLONE, which happens ONLY in the FETCH phase
@@ -982,6 +1107,18 @@ function hostInstallEnv(
   // SAME repoDir-relative cache the guest injects, REPLACING any PR-inherited
   // (already-stripped) value with a trusted one.  See lifecycleCacheParityEnv.
   Object.assign(env, lifecycleCacheParityEnv(pm, repoDir));
+  // TMPDIR-presence parity with the AUDITING backend (value-blind env-read oracle).
+  // The caller passes `hostTmpdir` ONLY when the audit ran on a backend whose guest
+  // lifecycle child HAS TMPDIR (Firecracker exports /sjtmp); it passes undefined for
+  // Docker (guest has none → the allowlist already dropped it).  The value is a TRUSTED
+  // absolute outside-checkout temp from `trustedHostTmpdir()` (a fixed /tmp, NOT the
+  // ambient-honoring os.tmpdir() — see that helper / codex round-4 [high]).  Setting the
+  // NAME here makes a lifecycle script's `process.env.TMPDIR` read take the same
+  // present/absent branch on host part-2 as it did in the audit.  The VALUE differs from
+  // the VM's /sjtmp (a dedicated disk that does not exist on the host) — an accepted
+  // residual visible only to a script branching on TMPDIR's value, same class as the
+  // cwd/cache-path residuals.
+  if (hostTmpdir !== undefined) env['TMPDIR'] = hostTmpdir;
   return env;
 }
 
@@ -1056,6 +1193,10 @@ export function hostInstallNoScripts(
   args: ReadonlyArray<string>,
   io: HostInstallIo,
   spawn: HostSpawn = captureSpawn,
+  // TMPDIR-presence parity with the auditing backend (see hostInstallEnv): a real
+  // host temp when Firecracker audited (guest has TMPDIR=/sjtmp), undefined for
+  // Docker (guest has none → dropped).  Threaded from main.ts's auditBackend.
+  hostTmpdir?: string,
 ): void {
   const { kept, dropped, droppedKeys } = sanitizeInstallArgs(args);
   // SECURITY: never log raw `dropped` tokens — they may carry credential values
@@ -1118,7 +1259,7 @@ export function hostInstallNoScripts(
     if (stdout.length > 0) io.stdout.write(redactCaptured(stdout, sensitive));
     if (stderr.length > 0) io.stderr.write(redactCaptured(stderr, sensitive));
   };
-  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, 'fetch'), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
+  runOrThrow(base.cmd, finalArgs, repoDir, hostInstallEnv(pm, repoDir, 'fetch', hostTmpdir), spawn, 'no-scripts install', io, safeDisplayArgs, onOutput);
 }
 
 /** Mask user-arg values first (exact), then catch credential SHAPES. */
@@ -1736,6 +1877,9 @@ export async function hostRunScripts(
   protectedEnvNames: readonly string[] = [],
   spawn: HostStreamSpawn = streamSpawn,
   resolveLaunch: HostManagerLaunchResolver = resolveHostManagerLaunch,
+  // TMPDIR-presence parity with the auditing backend (see hostInstallEnv): a real
+  // host temp when Firecracker audited, undefined for Docker.  From main.ts.
+  hostTmpdir?: string,
 ): Promise<void> {
   const cmd = INSTALL_CMD[pm];
   // SECURITY (host part-2, symmetric with part-1's --ignore-pnpmfile): `pnpm
@@ -1810,7 +1954,7 @@ export async function hostRunScripts(
   //     warmed the DEFAULT `~/.cache/node/corepack`.  Reading raw `process.env` here
   //     would point `corepackCacheRoot` at an inherited dir part-1 never used,
   //     voiding the cache backstop AND failing a legit corepack consumer closed.
-  const childEnv = hostInstallEnv(pm, repoDir, 'scripts');
+  const childEnv = hostInstallEnv(pm, repoDir, 'scripts', hostTmpdir);
   // SECURITY (COREPACK_ROOT value-blind oracle): resolve HOW to launch the PM.
   // `undefined` → bare-launch is safe (standalone PM sets no COREPACK_ROOT); a
   // `{node,entry}` → direct-launch `node <entry> ...finalArgs`, BYPASSING corepack

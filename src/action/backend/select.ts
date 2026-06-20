@@ -43,6 +43,15 @@ export async function runSelectedBackend(input: {
    * run after a non-repoDir-aligned audit.
    */
   requireRepoDirAligned?: boolean;
+  /**
+   * Invoked with the CONCRETE backend actually selected, immediately before it
+   * runs.  `install: true` uses this to make the host re-run's env match the
+   * AUDITING backend (e.g. the Firecracker guest exports `TMPDIR=/sjtmp` while
+   * Docker exports none — the host TMPDIR-presence must match whichever audited,
+   * or a lifecycle script reading `process.env.TMPDIR` becomes a value-blind
+   * benign-in-audit / evil-on-host oracle).
+   */
+  onBackendSelected?: (name: ConcreteBackend) => void;
 }): Promise<LauncherResult> {
   const aligned = input.requireRepoDirAligned === true;
   if (
@@ -64,6 +73,7 @@ export async function runSelectedBackend(input: {
 
   for (const name of order) {
     try {
+      input.onBackendSelected?.(name);
       return await input.backends[name].run(input.ctx);
     } catch (err) {
       if (err instanceof BackendUnavailableError) {

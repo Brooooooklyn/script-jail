@@ -693,6 +693,21 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, hasYarnConf
   if (isNotDefinitelyFalse(parsed['enableConstraintsChecks']) && hasYarnConfig) {
     return `${where} \`.yarnrc.yml\` \`enableConstraintsChecks\` with a \`yarn.config.cjs\`` + YARN_GUIDANCE;
   }
+  // `enableScripts: false` in an ANCESTOR rc (not repoDir's own) is an audit/host
+  // DIVERGENCE the value-blind lock cannot record: the sandbox stages ONLY repoDir
+  // (backend/stage.ts), so the ancestor rc never reaches it and the audit runs
+  // dependency build scripts at yarn's default (enableScripts=true).  But host
+  // part-2 runs at cwd=repoDir and honors Berry's rc cascade (the inherited
+  // YARN_ENABLE_SCRIPTS is swept, so the rc governs — see host-install.ts), so it
+  // SKIPS those scripts.  audit-builds / host-skips = catastrophic for an
+  // install-aligned backend.  Refuse pre-trust.  Gate strictly: `!atRepoDir`
+  // (repoDir's OWN rc IS staged, so audit and host already agree there — no
+  // divergence to close); `'enableScripts' in parsed` (an absent key is the
+  // default true, which must not over-fire); and DEFINITELY false only (ancestor
+  // `enableScripts: true` also builds on both sides — no divergence).
+  if (!atRepoDir && 'enableScripts' in parsed && !isNotDefinitelyFalse(parsed['enableScripts'])) {
+    return `${where} \`.yarnrc.yml\` \`enableScripts: false\` (host would skip dependency build scripts the sandbox runs)` + YARN_GUIDANCE;
+  }
   return null;
 }
 

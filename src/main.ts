@@ -22,7 +22,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { parseInputs } from './action/inputs.js';
-import { hostInstallNoScripts, hostRunScripts } from './action/host-install.js';
+import {
+  hostInstallNoScripts,
+  hostRunScripts,
+  trustedHostTmpdir,
+} from './action/host-install.js';
 import { detectPreTrustConfigExec, detectInstallWorkDirDivergence, detectCheckoutRelativeHome, detectReservedScriptJailPaths, detectSubdirInstallAncestorEscape, readProtectedEnvNames } from './action/install-preflight.js';
 import { detectPm, BunUnsupportedError, type DetectedPm } from './shared/detect-pm.js';
 import { NODE_VERSION } from './rootfs/vite-plus.js';
@@ -46,6 +50,7 @@ import { createDockerBackend } from './action/backend/docker.js';
 import { createBareBackend } from './action/backend/bare.js';
 import { runSelectedBackend, INSTALL_ALIGNED_BACKENDS } from './action/backend/select.js';
 import type { BackendMap } from './action/backend/select.js';
+import type { ConcreteBackend } from './action/backend/types.js';
 import { buildRootPkgKeys } from './guest/attribution.js';
 
 // ---------------------------------------------------------------------------
@@ -392,6 +397,9 @@ export async function main(deps: MainDeps = {}): Promise<void> {
     }),
   };
 
+  // Capture the CONCRETE backend the audit actually ran on, so the install:true
+  // host re-run can match its env (TMPDIR-presence parity — see hostTmpdir below).
+  let auditBackend: ConcreteBackend | undefined;
   const result = await runAudit({
     repoDir,
     configPath: inputs.configPath,
@@ -427,6 +435,9 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       // from auto and reject an explicit bare here as a backstop to the pre-audit
       // gate.  (Codex re-review: bare-backend staged-symlink escape.)
       requireRepoDirAligned: inputs.install,
+      onBackendSelected: (name) => {
+        auditBackend = name;
+      },
       ctx: {
         ...auditInput,
         imagesDir,
@@ -460,7 +471,23 @@ export async function main(deps: MainDeps = {}): Promise<void> {
   // scripts ONLINE on the runner (no netns sever) — trust derives from the
   // reviewed, matched lock.
   if (inputs.install) {
-    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn });
+    // TMPDIR-presence parity with the AUDITING backend (value-blind env-read oracle):
+    // the Firecracker guest exports TMPDIR=/sjtmp into the lifecycle child (an ENOSPC
+    // mitigation), while Docker exports none.  So the host re-run sets TMPDIR ONLY when
+    // Firecracker audited, and leaves it unset (dropped by the hostInstallEnv allowlist)
+    // when Docker audited — matching whichever produced the lock so a lifecycle script
+    // reading `process.env.TMPDIR` takes the SAME branch on both sides.  install:true only
+    // ever runs FC/Docker (gated above), so a non-FC backend here is Docker → drop.
+    //
+    // SECURITY (codex round-4 [high]): the FC host value comes from trustedHostTmpdir()
+    // — a FIXED /tmp, realpath-canonicalized + asserted absolute/outside-checkout — NOT
+    // os.tmpdir(), which would honor the AMBIENT process.env.TMPDIR/TMP/TEMP a malicious
+    // workflow `env:` controls and let an attacker redirect trusted-host tempfile WRITES
+    // under the checkout.  The value still differs from the VM's /sjtmp — an accepted
+    // residual only a script branching on TMPDIR's VALUE could see (same class as the
+    // cwd/cache-path residuals; /sjtmp is a dedicated VM disk that cannot exist on host).
+    const hostTmpdir = auditBackend === 'firecracker' ? trustedHostTmpdir() : undefined;
+    doHostInstallNoScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, undefined, hostTmpdir);
     if (result.trusted) {
       // Surface the egress from the GENERATED lock runAudit just produced — it
       // is guaranteed well-formed (the guest rendered it) and, on a trusted
@@ -503,7 +530,7 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       // args (same `inputs.args` part-1 took) so `npm rebuild` runs lifecycle
       // scripts with the same NODE_ENV/omit env as the single-phase `npm ci
       // <args>` — in lockstep with the guest Phase B audit.
-      await doHostRunScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames);
+      await doHostRunScripts(pm.manager, repoDir, inputs.args, { stdout: process.stdout, stderr: process.stderr, warn }, protectedEnvNames, undefined, undefined, hostTmpdir);
     }
   }
 
