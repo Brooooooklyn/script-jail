@@ -2703,8 +2703,10 @@ describe('host env hardening — strip dangerous loader/config vars + sanitize P
 
     it('throws (fail closed) when the canonical /tmp resolves under the checkout', () => {
       const canonical = realpathSync('/tmp');
-      // Force /tmp to count as under-checkout by making its PARENT the workspace root.
-      process.env['GITHUB_WORKSPACE'] = canonical.slice(0, canonical.lastIndexOf('/')) || '/';
+      // Force /tmp to count as under-checkout by making the checkout root BE canonical
+      // /tmp itself — isUnderCheckout matches `abs === root`, so this fires portably
+      // (the filesystem root '/' is rejected as a checkout root, so its parent won't).
+      process.env['GITHUB_WORKSPACE'] = canonical;
       expect(() => trustedHostTmpdir()).toThrow(/absolute path outside the checkout/);
     });
   });
