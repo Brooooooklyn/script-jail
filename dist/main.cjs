@@ -45499,8 +45499,19 @@ function findFirst(candidates, label) {
 
 // src/action/backend/select.ts
 var AUTO_ORDER = ["firecracker", "docker", "bare"];
+var INSTALL_ALIGNED_BACKENDS = /* @__PURE__ */ new Set([
+  "firecracker",
+  "docker"
+]);
 async function runSelectedBackend(input) {
-  const order = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const aligned = input.requireRepoDirAligned === true;
+  if (aligned && input.requested !== "auto" && !INSTALL_ALIGNED_BACKENDS.has(input.requested)) {
+    throw new Error(
+      `script-jail: \`install: true\` requires a repoDir-aligned backend (firecracker or docker); the "${input.requested}" backend audits in a temporary staged copy and cannot safely re-run host lifecycle scripts.`
+    );
+  }
+  const baseOrder = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const order = aligned ? baseOrder.filter((b) => INSTALL_ALIGNED_BACKENDS.has(b)) : baseOrder;
   const unavailable = [];
   for (const name of order) {
     try {
@@ -45640,6 +45651,13 @@ async function main(deps = {}) {
 `);
       exitProcess(1);
     }
+    if (inputs.backend !== "auto" && !INSTALL_ALIGNED_BACKENDS.has(inputs.backend)) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` is not supported on the \`${inputs.backend}\` backend \u2014 it audits in a temporary staged copy whose path differs from the checkout, so a committed symlink can make the host re-run execute code the audit never resolved. Use \`backend: firecracker\` or \`backend: docker\` (which audit at the checkout path), or audit without \`install\`.
+`
+      );
+      exitProcess(1);
+    }
   }
   const runnerImage = detectRunnerImage();
   const imagesDir = process.env["RUNNER_TEMP"] ? (0, import_node_path15.join)(process.env["RUNNER_TEMP"], "script-jail-images") : (0, import_node_path15.join)((0, import_node_os6.tmpdir)(), "script-jail-images");
@@ -45696,6 +45714,10 @@ async function main(deps = {}) {
       requested: inputs.backend,
       backends,
       warn,
+      // install:true requires a repoDir-aligned backend (FC/docker); drop `bare`
+      // from auto and reject an explicit bare here as a backstop to the pre-audit
+      // gate.  (Codex re-review: bare-backend staged-symlink escape.)
+      requireRepoDirAligned: inputs.install,
       ctx: {
         ...auditInput,
         imagesDir,

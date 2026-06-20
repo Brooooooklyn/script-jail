@@ -260,6 +260,16 @@ fix)**:
   PR-controlled. A subproject (`SCRIPT_JAIL_REPO_DIR=<subdir>`) can still be audited
   in pure-audit mode (`install: false`); only the host re-run requires root-level
   `repoDir`.
+- **repoDir-aligned backend only.** The host re-run trusts that the audit resolved
+  paths the same way the host will. That holds only when the audit ran at the SAME
+  absolute path as `repoDir`: Firecracker (`mount --move` to `repoDir`) and Docker
+  (`-v staged:${repoDir}`). The `bare` backend audits in a TEMPORARY staged copy at
+  a different path, where `cpSync(dereference:false)` rewrites a committed relative
+  symlink to an absolute target in the original checkout — so the audit can resolve
+  a path to `ENOENT` (dropped) while host part 2 resolves and *executes* the real
+  file host part 1 created. So `install: true` **requires `backend: firecracker` or
+  `backend: docker`** (`INSTALL_ALIGNED_BACKENDS`): an explicit `bare` is refused and
+  `auto` never falls through to it. `bare` remains available for pure audits.
 
 What this CANNOT close (irreducible while host part 2 runs uninstrumented):
 

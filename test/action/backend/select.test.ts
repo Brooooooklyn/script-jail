@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { runSelectedBackend } from '../../../src/action/backend/select.js';
+import { runSelectedBackend, INSTALL_ALIGNED_BACKENDS } from '../../../src/action/backend/select.js';
 import { BackendUnavailableError, type AuditBackend, type BackendContext } from '../../../src/action/backend/types.js';
 
 function backend(
@@ -103,5 +103,128 @@ describe('runSelectedBackend', () => {
         bare: backend('bare', async () => ({ finalYaml: '', nonFatalWarnings: [] })),
       },
     })).rejects.toThrow(BackendUnavailableError);
+  });
+
+  // Codex re-review (bare-backend staged-symlink escape): install:true must only run
+  // on a repoDir-aligned backend (FC/docker). requireRepoDirAligned drops bare from
+  // auto and throws on an explicit non-aligned backend — host scripts can never run
+  // after a temp-staged audit.
+  describe('requireRepoDirAligned (install:true)', () => {
+    it('the allowlist contains exactly the repoDir-aligned backends', () => {
+      expect([...INSTALL_ALIGNED_BACKENDS].sort()).toEqual(['docker', 'firecracker']);
+      expect(INSTALL_ALIGNED_BACKENDS.has('bare')).toBe(false);
+    });
+
+    it('auto NEVER tries bare and never lands on it', async () => {
+      const calls: string[] = [];
+      const result = await runSelectedBackend({
+        requested: 'auto',
+        requireRepoDirAligned: true,
+        ctx: ctx(),
+        warn: () => {},
+        backends: {
+          firecracker: backend('firecracker', async () => {
+            calls.push('firecracker');
+            throw new BackendUnavailableError('firecracker', 'no kvm');
+          }),
+          docker: backend('docker', async () => {
+            calls.push('docker');
+            return { finalYaml: 'ok\n', nonFatalWarnings: [] };
+          }),
+          bare: backend('bare', async () => {
+            calls.push('bare');
+            return { finalYaml: 'BARE-RAN\n', nonFatalWarnings: [] };
+          }),
+        },
+      });
+      expect(result.finalYaml).toBe('ok\n'); // docker, not bare
+      expect(calls).toEqual(['firecracker', 'docker']);
+      expect(calls).not.toContain('bare');
+    });
+
+    it('auto with FC+docker both unavailable FAILS without trying bare', async () => {
+      const calls: string[] = [];
+      await expect(runSelectedBackend({
+        requested: 'auto',
+        requireRepoDirAligned: true,
+        ctx: ctx(),
+        warn: () => {},
+        backends: {
+          firecracker: backend('firecracker', async () => {
+            calls.push('firecracker');
+            throw new BackendUnavailableError('firecracker', 'no kvm');
+          }),
+          docker: backend('docker', async () => {
+            calls.push('docker');
+            throw new BackendUnavailableError('docker', 'no daemon');
+          }),
+          bare: backend('bare', async () => {
+            calls.push('bare');
+            return { finalYaml: 'BARE-RAN\n', nonFatalWarnings: [] };
+          }),
+        },
+      })).rejects.toThrow(/no audit backend available\. Tried firecracker, docker/);
+      expect(calls).not.toContain('bare');
+    });
+
+    it('explicit bare THROWS and never runs the bare backend', async () => {
+      const calls: string[] = [];
+      await expect(runSelectedBackend({
+        requested: 'bare',
+        requireRepoDirAligned: true,
+        ctx: ctx(),
+        warn: () => {},
+        backends: {
+          firecracker: backend('firecracker', async () => ({ finalYaml: '', nonFatalWarnings: [] })),
+          docker: backend('docker', async () => ({ finalYaml: '', nonFatalWarnings: [] })),
+          bare: backend('bare', async () => {
+            calls.push('bare');
+            return { finalYaml: 'BARE-RAN\n', nonFatalWarnings: [] };
+          }),
+        },
+      })).rejects.toThrow(/install: true` requires a repoDir-aligned backend/);
+      expect(calls).toEqual([]); // bare.run never invoked
+    });
+
+    it('explicit firecracker still runs normally under install:true', async () => {
+      const result = await runSelectedBackend({
+        requested: 'firecracker',
+        requireRepoDirAligned: true,
+        ctx: ctx(),
+        warn: () => {},
+        backends: {
+          firecracker: backend('firecracker', async () => ({ finalYaml: 'fc\n', nonFatalWarnings: [] })),
+          docker: backend('docker', async () => ({ finalYaml: '', nonFatalWarnings: [] })),
+          bare: backend('bare', async () => ({ finalYaml: '', nonFatalWarnings: [] })),
+        },
+      });
+      expect(result.finalYaml).toBe('fc\n');
+    });
+
+    it('WITHOUT the flag (pure-audit), auto still includes bare (unchanged behavior)', async () => {
+      const calls: string[] = [];
+      const result = await runSelectedBackend({
+        requested: 'auto',
+        // requireRepoDirAligned omitted → pure-audit path
+        ctx: ctx(),
+        warn: () => {},
+        backends: {
+          firecracker: backend('firecracker', async () => {
+            calls.push('firecracker');
+            throw new BackendUnavailableError('firecracker', 'no kvm');
+          }),
+          docker: backend('docker', async () => {
+            calls.push('docker');
+            throw new BackendUnavailableError('docker', 'no daemon');
+          }),
+          bare: backend('bare', async () => {
+            calls.push('bare');
+            return { finalYaml: 'bare-ok\n', nonFatalWarnings: [] };
+          }),
+        },
+      });
+      expect(result.finalYaml).toBe('bare-ok\n');
+      expect(calls).toEqual(['firecracker', 'docker', 'bare']);
+    });
   });
 });

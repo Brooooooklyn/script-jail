@@ -329,6 +329,44 @@ describe.sequential('e2e: drop-in install gating', () => {
     }
   });
 
+  // Codex re-review (bare-backend staged-symlink escape): install:true trusts that
+  // the audit ran at the SAME absolute path as the host repoDir. Only FC/docker
+  // satisfy that; `bare` audits in a temp staged copy where a committed symlink can
+  // make the host execute code the audit never resolved. Refuse explicit bare before
+  // any host install.
+  it('install + explicit backend:bare → fail-closed before any install, exit 1', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, backend: 'bare', ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/not supported on the `bare` backend/);
+    expect(cap.installCalls).toHaveLength(0); // exited before part 1
+    expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + explicit backend:firecracker → not blocked by the backend-alignment gate', async () => {
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, backend: 'firecracker', ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.stdout).not.toMatch(/not supported on the `bare` backend/);
+    expect(result.exit).toBeNull(); // clean match → both halves run
+    expect(cap.runCalls).toEqual([{ pm: 'npm' }]);
+  });
+
   it('install + spoof MATCHING the runner → allowed (both halves run)', async () => {
     const factory = fakeVmFactory({ fixtures: FIXTURES });
     const consumer = setUpConsumer({ pm: 'npm', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });

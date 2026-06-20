@@ -26052,8 +26052,19 @@ function findFirst(candidates, label) {
 
 // src/action/backend/select.ts
 var AUTO_ORDER = ["firecracker", "docker", "bare"];
+var INSTALL_ALIGNED_BACKENDS = /* @__PURE__ */ new Set([
+  "firecracker",
+  "docker"
+]);
 async function runSelectedBackend(input) {
-  const order = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const aligned = input.requireRepoDirAligned === true;
+  if (aligned && input.requested !== "auto" && !INSTALL_ALIGNED_BACKENDS.has(input.requested)) {
+    throw new Error(
+      `script-jail: \`install: true\` requires a repoDir-aligned backend (firecracker or docker); the "${input.requested}" backend audits in a temporary staged copy and cannot safely re-run host lifecycle scripts.`
+    );
+  }
+  const baseOrder = input.requested === "auto" ? AUTO_ORDER : [input.requested];
+  const order = aligned ? baseOrder.filter((b) => INSTALL_ALIGNED_BACKENDS.has(b)) : baseOrder;
   const unavailable = [];
   for (const name of order) {
     try {

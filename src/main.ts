@@ -44,7 +44,7 @@ import { collectNetworkAttempts, formatEgressWarning } from './action/diff.js';
 import { createFirecrackerBackend } from './action/backend/firecracker.js';
 import { createDockerBackend } from './action/backend/docker.js';
 import { createBareBackend } from './action/backend/bare.js';
-import { runSelectedBackend } from './action/backend/select.js';
+import { runSelectedBackend, INSTALL_ALIGNED_BACKENDS } from './action/backend/select.js';
 import type { BackendMap } from './action/backend/select.js';
 import { buildRootPkgKeys } from './guest/attribution.js';
 
@@ -327,6 +327,26 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       process.stdout.write(`::error::script-jail: \`install: true\` refused — ${subdirEscapeReason}\n`);
       exitProcess(1);
     }
+    // SECURITY (Codex re-review, bare-backend staged-symlink escape): install:true
+    // re-runs lifecycle scripts on the host at cwd=repoDir, trusting the audit. That
+    // trust holds ONLY if the audit ran at the SAME absolute path (repoDir) — true for
+    // firecracker/docker, FALSE for `bare`, which audits in a TEMP staged copy where a
+    // committed relative symlink is rewritten to the original checkout: the audit
+    // resolves it to ENOENT (read dropped) while host part-2 resolves+EXECUTES the real
+    // file host part-1 created — un-audited code while the lock says trusted. Refuse an
+    // explicit non-aligned backend BEFORE any host install; auto also drops bare under
+    // install (select.ts requireRepoDirAligned). Allowlist via INSTALL_ALIGNED_BACKENDS
+    // so a future backend is fail-closed until proven repoDir-aligned.
+    if (inputs.backend !== 'auto' && !INSTALL_ALIGNED_BACKENDS.has(inputs.backend)) {
+      process.stdout.write(
+        `::error::script-jail: \`install: true\` is not supported on the \`${inputs.backend}\` ` +
+          `backend — it audits in a temporary staged copy whose path differs from the checkout, ` +
+          `so a committed symlink can make the host re-run execute code the audit never resolved. ` +
+          `Use \`backend: firecracker\` or \`backend: docker\` (which audit at the checkout path), ` +
+          `or audit without \`install\`.\n`,
+      );
+      exitProcess(1);
+    }
   }
 
   // --- Detect runner image -------------------------------------------------
@@ -403,6 +423,10 @@ export async function main(deps: MainDeps = {}): Promise<void> {
       requested: inputs.backend,
       backends,
       warn,
+      // install:true requires a repoDir-aligned backend (FC/docker); drop `bare`
+      // from auto and reject an explicit bare here as a backstop to the pre-audit
+      // gate.  (Codex re-review: bare-backend staged-symlink escape.)
+      requireRepoDirAligned: inputs.install,
       ctx: {
         ...auditInput,
         imagesDir,
