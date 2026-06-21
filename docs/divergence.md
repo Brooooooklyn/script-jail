@@ -621,6 +621,38 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
       the dangerous direction for a security audit. The residual (a Node-internal
       read of a non-Node child over-recorded as package behavior) never hides real
       behavior and does not occur in normal npm/pnpm/yarn plain-fork lifecycle trees.
+    - **(#4) Deferred null-ATTRIBUTION re-resolution → drain-order-independent,
+      recycled-pid-SAFE.** Yarn Berry runs a binary lifecycle (e.g. napi-rs's `husky`
+      `prepare`) via a TRANSIENT launcher it writes to `$TMPDIR/xfs-<hash>/<bin>`
+      (`@yarnpkg/fslib` `getTempName`). That launcher pid is often reaped before its
+      strace lines drain, so the LIVE `/proc` walk returns null and — pre-fix — its
+      spawn + absolute reads/writes were DROPPED, flaking between captured and absent
+      across runs (the shim-before-strace drain order is a soft contract). The fix
+      parks such null-attribution SPAWNS and ABSOLUTE reads/writes and, at end-of-drain,
+      re-resolves them via `resolveDeferredAttribution` against the COMPLETE
+      `attributionGenByPid` map (the set of DISTINCT `(pkg,lifecycle)` generations
+      recorded for the pid across the whole drain — drain-order-independent by
+      construction). A single-generation pid attributes confidently (the determinism
+      win); a pid number RECYCLED across generations (≥2 distinct generations)
+      resolves to `<unattributed>` so the event SURFACES fail-loud (it tokenizes
+      against `$NODE_MODULES`/`$REPO` with no `$PKG` prefix) rather than relabeling a
+      gen-A escaped write under the recycled gen-B package and being DROPPED as an
+      intra-package `$PKG` write (codex round-2 [high]). A pid never seeded → dropped
+      (the null-gate floor). **Accepted pre-existing residual (codex round-3
+      [critical]; owner decision — document + ship):** the INLINE (non-deferred,
+      live-`/proc`-`result`) fs path is NOT covered by this map. If a gen-A write line
+      drains while the dispatcher LAGS and the kernel has already RECYCLED the pid to
+      gen-B with a populated `/proc` (so `attribute(pid)` returns gen-B), that write
+      emits under gen-B and, if it lands in gen-B's own dir, is dropped as an
+      intra-package write — a HIDDEN escaped write. This is the WRITE manifestation of
+      the same PID_MAX-wrap-bounded `/proc`-liveness reorder race the exit-line handler
+      already documents as accepted (`src/guest/phase-install.ts`, the
+      `attributionSnapshotByPid` exit-line model), and predates this fix (committed in
+      PR #22, not introduced here). The only sound closure is to defer the inline fs
+      path to end-of-drain resolution (so attribution reads the complete
+      `attributionGenByPid`) or a generation-qualified `/proc` walk; both are out of
+      scope for the determinism fix and tracked as a deliberate, visible follow-up. It
+      is NOT covered by the env_read-only `reaped-child-env-read-pid-reuse-residual`.
   Any finding **fails the gate** even when the
   comparable text is byte-equal, so the exclusion can never launder a real
   escape. The exclusion is also **symmetric down to the lifecycle stage**: a

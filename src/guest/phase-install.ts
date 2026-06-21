@@ -2528,6 +2528,37 @@ export async function runInstallPhase(
     stamped?: boolean;
   }
   const deferredRelOpens: DeferredRelOpen[] = [];
+  //   deferredNullAttribEvents: null-/proc-attribution events from a REAPED pid
+  //     whose LD_PRELOAD shim exec-seed (recordAttribution) has not drained yet,
+  //     parked for end-of-drain re-resolution against the COMPLETE
+  //     `attributionGenByPid`. The shim-before-strace drain order is a SOFT,
+  //     unenforced contract (agent.ts), so a spawn / absolute read from a
+  //     transient launcher — e.g. yarn-berry's `getTempName('xfs-')` shim
+  //     `$TMPDIR/xfs-<hash>/<bin>` that runs a binary lifecycle like `husky` —
+  //     flakes between CAPTURED (seed drained first → inline 6589 snapshot
+  //     fallback / live /proc) and DROPPED (strace drained first → no snapshot →
+  //     null-gate drop). The flake is a /proc-LIVENESS race: `result` is the LIVE
+  //     /proc walk only (no snapshot fallback), so a reaped pid is null-attributed
+  //     and its reads (unlike spawns) have no inline snapshot fallback. Deferring
+  //     makes the capture drain-order-INDEPENDENT: at replay the seed is present.
+  //     Only SPAWNS (no inline snapshot at drain) and ABSOLUTE reads/writes (no
+  //     cwd dependency) are parked here; relative opens keep the cwd-aware
+  //     deferredRelOpens path (whose fallback shares the same resolver). An entry
+  //     still unseeded at replay (a genuinely unshimmed static/setuid/env-scrubbed
+  //     system pid) is DROPPED, preserving the null-gate "no system-pid flood"
+  //     floor. Re-resolved via `resolveDeferredAttribution` (NOT raw `.get`, NOT
+  //     the last-writer `snapshotAttribution`): it reads `attributionGenByPid`,
+  //     which is COMPLETE and drain-order-INDEPENDENT at end-of-drain, so a single-
+  //     generation pid attributes to the SAME package the inline path would have
+  //     when the seed drained first (the determinism win), while a RECYCLED pid
+  //     (≥2 distinct generations) resolves to `<unattributed>` — surfacing the
+  //     event fail-loud rather than relabeling a gen-A escaped write under a gen-B
+  //     package and DROPPING it as an intra-package write (round-2 [high]). Cleared
+  //     at end-of-drain like the other deferred lists.
+  interface DeferredNullAttribEvent {
+    rawEvent: Extract<RawEvent, { kind: 'spawn' | 'read' | 'write' }>;
+  }
+  const deferredNullAttribEvents: DeferredNullAttribEvent[] = [];
   //   nodeBootstrapFileEndedTs: ts of a pid's OWN node-startup-done marker (the
   //     strace open of NODE_STARTUP_DONE_STRACE_PATH or its shim event), first-
   //     writer-wins. Same per-pid file as the pid's reads → causal ts. Used at
@@ -2974,6 +3005,31 @@ export async function runInstallPhase(
       stale: boolean;
     }
   > = new Map();
+  // Per-pid record of the DISTINCT attribution generations recorded for the pid
+  // across the WHOLE drain (drain-order-INDEPENDENT, complete at end-of-drain).
+  // A pid number can be RECYCLED within one install (gen-A exits, the kernel
+  // reuses its pid for gen-B); under strace `-ff` both generations share the same
+  // per-pid file, and each generation's LD_PRELOAD shim exec-seed calls
+  // `recordAttribution` with its OWN (pkg, lifecycle).  `attributionSnapshotByPid`
+  // keeps only the LAST writer, so a fresh end-of-drain lookup for a deferred
+  // gen-A event could resolve gen-B's package — and if gen-A's escaped write
+  // landed in gen-B's package dir, tokenize would render it `$PKG/...` and
+  // normalize would DROP it as an intra-package write (a HIDDEN escaped write —
+  // the catastrophic false-negative; codex adversarial-review round-2 [high]).
+  // This map records, per pid: the first generation key seen and whether MORE
+  // THAN ONE distinct (pkg, lifecycle) was ever recorded (`ambiguous`).  Used
+  // ONLY by `resolveDeferredAttribution` at the end-of-drain deferred replays:
+  // exactly-one generation → attribute confidently; ambiguous (recycled / re-exec
+  // into a new identity) → route to `<unattributed>` so the event SURFACES
+  // fail-loud (never hidden under the wrong package's $PKG subtree).  Keyed on
+  // (pkg, lifecycle) — not pkg alone — so that "first generation key" is itself
+  // drain-order-independent (a single generation has exactly one key; any
+  // difference flips `ambiguous`, which is set-membership and order-free).
+  // Per-pid cost mirrors `attributionSnapshotByPid` (one small record per pid).
+  const attributionGenByPid: Map<
+    number,
+    { pkg: string; lifecycle: AttributedEvent['lifecycle']; ambiguous: boolean }
+  > = new Map();
   // Per-pid record of the most recent node_startup_done marker observed for the
   // pid: its dispatch ts (the monotonic `lineTs`) and whether it was
   // `pathological` (an overlong/forged synthetic npm id; see
@@ -3116,6 +3172,48 @@ export async function runInstallPhase(
         stale: false,
       });
     }
+    // Track distinct attribution generations for the end-of-drain deferred
+    // replays (see `attributionGenByPid`).  This is UNCONDITIONAL — independent
+    // of the recordedAtTs monotonicity gate above — because we want EVERY
+    // generation ever asserted for this pid, not just the surviving last-writer
+    // snapshot: a recycled pid's gen-B seed would otherwise silently mask gen-A
+    // and let a deferred gen-A escaped write resolve to gen-B's package.
+    const gen = attributionGenByPid.get(pid);
+    if (gen === undefined) {
+      attributionGenByPid.set(pid, {
+        pkg: attr.pkg,
+        lifecycle: attr.lifecycle,
+        ambiguous: false,
+      });
+    } else if (!gen.ambiguous && (gen.pkg !== attr.pkg || gen.lifecycle !== attr.lifecycle)) {
+      gen.ambiguous = true;
+    }
+  };
+  // Resolve a deferred event's attribution at end-of-drain from the COMPLETE,
+  // drain-order-INDEPENDENT `attributionGenByPid` (NOT a fresh
+  // `snapshotAttribution(P)` lookup, which returns only the last-writer snapshot
+  // and so could relabel a deferred gen-A event under a recycled gen-B package).
+  //   - never attributed (no shim seed / clone ever named the pid) → null → the
+  //     caller DROPS it, preserving the null-gate "no system-pid flood" floor.
+  //   - exactly ONE generation → attribute confidently (the determinism win: the
+  //     yarn-berry `xfs-<hash>/<bin>` husky launcher has a single seed, so its
+  //     spawn + reads resolve identically on every run regardless of drain order).
+  //   - AMBIGUOUS (pid recycled or re-exec'd into a different identity) → route to
+  //     `<unattributed>` so a deferred read/write SURFACES (normalize tokenizes it
+  //     WITHOUT a $PKG prefix → external_reads / escaped_writes, fail-loud) instead
+  //     of being mis-attributed under a package whose own subtree the path lies in
+  //     and DROPPED as an intra-package write.  `<unattributed>` is fail-loud (a
+  //     distinct package block that can never dedupe-collapse with a real package),
+  //     so this is strictly safer than both the old relabel-and-hide and a silent
+  //     drop.  Lifecycle 'install' matches the existing `<unattributed>` spawn/
+  //     bypass convention.
+  const resolveDeferredAttribution = (
+    pid: number,
+  ): { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null => {
+    const gen = attributionGenByPid.get(pid);
+    if (gen === undefined) return null;
+    if (gen.ambiguous) return { pkg: '<unattributed>', lifecycle: 'install' };
+    return { pkg: gen.pkg, lifecycle: gen.lifecycle };
   };
 
   // node_startup_done attribution — deliberately SEPARATE from
@@ -6605,23 +6703,26 @@ export async function runInstallPhase(
                 pkg: isStale ? '<unattributed>' : spawnSnapshot.pkg,
                 lifecycle: isStale ? 'install' : spawnSnapshot.lifecycle,
               });
+            } else {
+              // No snapshot YET: the spawning pid is unattributable via /proc (the
+              // short-lived helper is already reaped) and its shim exec-seed has
+              // not drained yet.  The common short-lived-helper case (e.g. the
+              // `dirname`/`sed`/`uname` forks of an npm/pnpm `.bin` shell shim) is
+              // normally recovered upstream because the tailer yields shim records
+              // before the strace lines for the same exec (the shim's `emit_exec`
+              // write precedes `real_execve`, which precedes strace's execve line —
+              // see `runStraceTailer`), so `recordAttribution` has usually seeded a
+              // FRESH snapshot by the time the strace spawn is processed.  But that
+              // shim-before-strace drain order is a SOFT, unenforced contract
+              // (agent.ts), so a transient launcher (yarn-berry `xfs-<hash>/<bin>`
+              // running a binary lifecycle like `husky`) flakes between captured
+              // and dropped across backends.  DEFER and re-resolve at end-of-drain
+              // against the COMPLETE attributionSnapshotByPid (the late shim seed is
+              // present by then) — drain-order-INDEPENDENT.  Still unseeded at replay
+              // (a genuinely unshimmed static/setuid/env-scrubbed process) → DROPPED
+              // there, falling back to /proc exactly as before (the null-gate floor).
+              deferredNullAttribEvents.push({ rawEvent });
             }
-            // No snapshot: the spawning pid is unattributable via /proc (the
-            // short-lived helper is already reaped) and no clone-propagated or
-            // shim-seeded snapshot exists for it.  Drop it — emitting an
-            // unattributable spawn would attribute it under no package.  The
-            // common short-lived-helper case (e.g. the `dirname`/`sed`/`uname`
-            // forks of an npm/pnpm `.bin` shell shim) is instead recovered
-            // DETERMINISTICALLY upstream: the LD_PRELOAD shim stamps the
-            // process's own `npm_package_name`/`npm_lifecycle_event` into its
-            // `exec` record, and the tailer yields shim records before the
-            // strace lines for the same exec (the shim's `emit_exec` write
-            // precedes `real_execve`, which precedes strace's execve line — see
-            // `runStraceTailer`), so `recordAttribution` has already seeded a
-            // FRESH snapshot for this pid by the time the strace spawn is
-            // processed.  This branch therefore only fires for genuinely
-            // unshimmed processes (static/setuid/env-scrubbed), which fall back
-            // to /proc exactly as before.
             continue;
           }
           // NOTE — nameless-root lifecycle attribution now happens at the
@@ -6661,6 +6762,23 @@ export async function runInstallPhase(
               lifecycle: null,
               sharedAtRead: everCwdShared.has(rawEvent.pid),
             });
+          } else if (
+            (rawEvent.kind === 'read' || rawEvent.kind === 'write') &&
+            rawEvent.dirfd === undefined &&
+            path.isAbsolute(rawEvent.path)
+          ) {
+            // Determinism (defer-and-re-resolve): an ABSOLUTE AT_FDCWD read/write
+            // from a reaped pid whose shim exec-seed has not drained yet (the same
+            // /proc-liveness race as the spawn branch above — `result` is the LIVE
+            // /proc walk only, with NO snapshot fallback for reads). Unlike the
+            // relative case it needs NO cwd resolution (the path is already
+            // absolute), only ATTRIBUTION — which the late shim seed provides. DEFER
+            // it; the end-of-drain replay re-resolves via snapshotAttribution and
+            // runs the SAME emit pipeline as the inline resolved-read path. Still
+            // unseeded at replay → DROPPED (the null-gate floor). Numeric-dirfd
+            // opens are NOT deferred: their per-pid fd table is gone once reaped, so
+            // they cannot be resolved at replay (kept on the existing drop path).
+            deferredNullAttribEvents.push({ rawEvent });
           }
           continue;
         }
@@ -6807,6 +6925,21 @@ export async function runInstallPhase(
           if (shouldFilterNodeBootstrapFileRead(resolved)) {
             continue;
           }
+          // ACCEPTED RESIDUAL (codex round-3 [critical]; owner decision: document +
+          // ship; see docs/divergence.md "(#4) Deferred null-ATTRIBUTION").  This
+          // INLINE path emits under the LIVE `/proc` `result`, which is NOT checked
+          // against `attributionGenByPid`.  If the dispatcher LAGS and the kernel has
+          // already RECYCLED rawEvent.pid to a new generation (so `attribute()` now
+          // reports the recycled package), an old generation's escaped WRITE into the
+          // recycled package's own dir emits under that package and normalize drops it
+          // as an intra-package `$PKG` write — a hidden escaped write.  This is the
+          // WRITE manifestation of the PID_MAX-wrap-bounded `/proc`-liveness reorder
+          // race the exit-line handler already accepts; it PREDATES this fix (PR #22)
+          // and is NOT introduced by the deferred-null re-resolution above.  The
+          // deferred (reaped, `result === null`) path IS recycled-pid-safe via
+          // `resolveDeferredAttribution`.  Sound closure (deferring the inline fs path
+          // to end-of-drain, or a generation-qualified `/proc` walk) is tracked as a
+          // separate, visible follow-up.
           const attributed: AttributedEvent = {
             raw: resolved,
             pkg: result.pkg,
@@ -6994,11 +7127,30 @@ export async function runInstallPhase(
     let lifecycle = d.lifecycle;
     if (pkg === null || lifecycle === null) {
       const inh = d.inheritedAttrib;
-      if (inh === null || inh === undefined) {
-        continue; // unattributable (or clone never drained) → drop
+      if (inh !== null && inh !== undefined) {
+        pkg = inh.pkg;
+        lifecycle = inh.lifecycle;
+      } else {
+        // No clone-propagated attribution: the parent at the seeding clone was
+        // itself null-attributed (e.g. the yarn/pnpm DRIVER pid, which carries no
+        // canonical npm_lifecycle_event). Before dropping, fall back to the read
+        // pid's OWN shim exec-seed identity — the SAME late-seed source the
+        // deferredNullAttribEvents path uses for absolute reads. A transient
+        // launcher (yarn-berry `xfs-<hash>/<bin>`) whose relative open could not be
+        // cwd-resolved inline (reaped before its clone drained) but that the
+        // LD_PRELOAD shim exec-seeded still attributes correctly here.
+        // `resolveDeferredAttribution` reads the COMPLETE end-of-drain
+        // `attributionGenByPid` (drain-INDEPENDENT, and recycled-pid-SAFE — a
+        // pid whose number was reused resolves to `<unattributed>`, never to a
+        // later generation's package). Still null (a genuine system pid never
+        // seeded) → DROP, preserving the null-gate floor.
+        const snap = resolveDeferredAttribution(P);
+        if (snap === null) {
+          continue;
+        }
+        pkg = snap.pkg;
+        lifecycle = snap.lifecycle;
       }
-      pkg = inh.pkg;
-      lifecycle = inh.lifecycle;
     }
     let initial = d.initialCwd;
     // FIX #1 (ROUND-2 #1 — parent-side CLONE_FS provenance via REPLAY-time sticky
@@ -7277,6 +7429,68 @@ export async function runInstallPhase(
     }
   }
   deferredRelOpens.length = 0;
+
+  // Determinism (defer-and-re-resolve): re-resolve the null-/proc-attribution
+  // SPAWNS and ABSOLUTE reads/writes parked during the drain because a reaped
+  // pid's shim exec-seed had not drained yet. Same placement rationale as the
+  // deferredRelOpens replay above — AFTER the main drain (attributionGenByPid is
+  // COMPLETE, including the late shim seed) but BEFORE
+  // `flushAllNodeBootstrapCandidates()` so a re-resolved absolute read participates
+  // in the SAME node-bootstrap classifier (filtered AND buffered identically) as
+  // the inline path. Attribution is resolved via `resolveDeferredAttribution`,
+  // which reads the COMPLETE, drain-order-INDEPENDENT `attributionGenByPid`:
+  //   - single generation → the SAME package the inline path would have when the
+  //     seed drained first (the determinism win for the husky launcher);
+  //   - recycled / re-exec'd pid (≥2 distinct generations) → `<unattributed>`, so
+  //     a deferred gen-A escaped write SURFACES fail-loud instead of relabeling
+  //     under a recycled gen-B package and being DROPPED as an intra-package write
+  //     (the round-2 [high] hidden-escaped-write hole);
+  //   - never seeded (a genuine non-lifecycle system pid) → null → DROPPED,
+  //     preserving the null-gate floor.
+  // Re-resolved root-attributed events `emit()` into `deferredRootEvents` (flushed
+  // at the very end), so `root_anchored` is still stamped against the COMPLETE tree.
+  for (const d of deferredNullAttribEvents) {
+    const P = d.rawEvent.pid;
+    const attrib = resolveDeferredAttribution(P);
+    if (attrib === null) {
+      continue; // never seeded → drop (null-gate floor)
+    }
+    if (d.rawEvent.kind === 'spawn') {
+      emit({ raw: d.rawEvent, pkg: attrib.pkg, lifecycle: attrib.lifecycle });
+      continue;
+    }
+    // read | write — always ABSOLUTE here (the defer gate required
+    // path.isAbsolute && dirfd === undefined). canonicalize (a no-op `path.resolve`
+    // for an absolute AT_FDCWD path) → producer-write drop → emit.
+    const canonical = canonicalizeForEmit(P, d.rawEvent.path, d.rawEvent.dirfd);
+    if (canonical === null) {
+      continue; // defensive: an absolute path never fails to canonicalize
+    }
+    if (
+      d.rawEvent.kind === 'write' &&
+      eventsFilePathCanonical !== null &&
+      (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)
+    ) {
+      continue; // env-spy's own events-file append (see inline producer-write drop)
+    }
+    const resolved: RawEvent = { ...d.rawEvent, path: canonical };
+    // Deliberately do NOT run the node-bootstrap file filter / candidate buffering
+    // here — PREFER-EMIT (codex adversarial-review #2). Both helpers consult MUTABLE
+    // end-of-drain state (`nodeBootstrapFilePendingPids` and the GLOBAL set-union
+    // `nodeBootstrapFileReads` baseline). Consulting that final baseline for a read
+    // whose ACTUAL open happened earlier is DRAIN-ORDER-DEPENDENT: a node-bootstrap
+    // baseline that grew AFTER this read's drain position would SUPPRESS it at
+    // replay even though the inline (drain-time) path would have emitted it — a
+    // false NEGATIVE and a re-introduced cross-run flap (the exact class the
+    // relative deferredRelOpens replay avoids via read-TIME capture, 3rd-pass F4).
+    // A reaped null-/proc-attribution read is by construction a real lifecycle
+    // helper recovered from its shim exec-seed (the husky launcher), NOT Node's OWN
+    // startup bootstrap — those processes are tracked and attributed LIVE, never
+    // reach this deferred-null path. Over-recording such a read (the benign
+    // direction for a security audit) is preferable to a drain-order-dependent drop.
+    emit({ raw: resolved, pkg: attrib.pkg, lifecycle: attrib.lifecycle });
+  }
+  deferredNullAttribEvents.length = 0;
 
   flushAllNodeBootstrapCandidates();
 

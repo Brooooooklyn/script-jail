@@ -35,6 +35,26 @@ export interface TokenizeRoots {
 
 const HASH_PATTERN = /[A-Za-z0-9_-]{16,}/g;
 const TEMP_SUFFIX = /\.tmp(\.[A-Za-z0-9]+)?$/;
+// Yarn Berry (@yarnpkg/fslib `getTempName`) launches binary lifecycle scripts via a
+// transient shim it writes to a temp dir named `xfs-<hash>`, where the hash is
+// `Math.ceil(Math.random()*0x100000000).toString(16).padStart(8,'0')` — 8 lowercase hex
+// digits, occasionally 9 (when the value reaches 2^32). That `xfs-<8-9hex>` segment is only
+// 12-13 chars, below HASH_PATTERN's 16 floor, so it would otherwise pass through verbatim and
+// make the path per-run-random (e.g. `$TMPDIR/xfs-021cebd2/husky`). Collapse the segment
+// to `<hash>` (matching how a long `xfs-<32hex>` segment already collapses via HASH_PATTERN).
+//
+// ANCHORED to the FIRST segment directly under `$TMPDIR` on purpose (codex
+// adversarial-review #3 — over-mask). `getTempName` creates the launcher dir
+// directly under the fslib temp root (= the guest TMPDIR), so the real shape is
+// always `$TMPDIR/xfs-<hash>/…` at depth 1 — exactly what the napi-rs flake showed.
+// A GLOBAL/unanchored rule would also collapse a NESTED stable segment
+// (`$TMPDIR/stable/xfs-deadbeef/…`) or a `$CACHE/…/xfs-<hex>/…` content-store path
+// — attacker-influenceable stable names whose collapse would dedupe distinct audit
+// entries and DESTROY signal. Restricting to the leading `$TMPDIR/xfs-<hex>` keeps
+// the determinism fix while preserving every other path verbatim. NOT applied under
+// `$CACHE` (Yarn never writes these launchers there). No `g` flag: a single
+// start-anchored match.
+const YARN_FSLIB_TEMP = /^(\$TMPDIR\/)xfs-[0-9a-f]{8,9}(?=\/|$)/;
 
 export function tokenize(rawPath: string, roots: TokenizeRoots, currentPkgDir?: string): string {
   if (!rawPath.startsWith('/')) {
@@ -81,6 +101,7 @@ function pathHasPrefix(path: string, prefix: string): boolean {
 function collapseUnstable(path: string): string {
   let out = path;
   if (TEMP_SUFFIX.test(out)) out = out.replace(TEMP_SUFFIX, '.tmp<hash>');
+  out = out.replace(YARN_FSLIB_TEMP, '$1<hash>');
   out = out.replace(HASH_PATTERN, (match) => {
     // Don't collapse short alphanumerics that happen to be ≥16 chars but look like words.
     if (/^[A-Z][A-Za-z]{15,}$/.test(match)) return match;

@@ -172,6 +172,52 @@ describe('normalize', () => {
     });
   });
 
+  // The guest routes a deferred read/write from a RECYCLED / re-exec'd pid
+  // (ambiguous attribution generation; resolveDeferredAttribution in
+  // phase-install.ts) under the `<unattributed>` sentinel rather than guessing
+  // one of the conflated packages. That key has NO pkgDir by design — and a
+  // no-pkgDir non-root read/write normally THROWS (fail closed). normalize
+  // EXEMPTS `<unattributed>`: with no $PKG prefix the path tokenizes against
+  // $NODE_MODULES / $REPO and SURFACES, so an escaped write into the recycled
+  // package's own dir can never be hidden as an intra-package `$PKG` write.
+  describe('<unattributed> sentinel (recycled-pid ambiguity, no pkgDir)', () => {
+    const unattribWrite = (path: string): AttributedEvent => ({
+      raw: { kind: 'write', path, pid: 1, ts: 0, hidden: false },
+      pkg: '<unattributed>',
+      lifecycle: 'install',
+    });
+    const unattribRead = (path: string): AttributedEvent => ({
+      raw: { kind: 'read', path, pid: 1, ts: 0, hidden: false },
+      pkg: '<unattributed>',
+      lifecycle: 'install',
+    });
+
+    it('does NOT throw on a no-pkgDir <unattributed> write (the throw is reserved for real package keys)', () => {
+      expect(() => normalize([unattribWrite('/work/node_modules/pkg-b/index.js')], ctx)).not.toThrow();
+    });
+
+    it('SURFACES a recycled-pid write into another package dir as a <CROSS_PACKAGE> escaped write (never hidden)', () => {
+      const result = normalize([unattribWrite('/work/node_modules/pkg-b/index.js')], ctx);
+      const block = getBlock(result, '<unattributed>', 'install');
+      expect(block?.escaped_writes).toEqual(['<CROSS_PACKAGE> $NODE_MODULES/pkg-b/index.js']);
+    });
+
+    it('SURFACES a recycled-pid read as an external_read', () => {
+      const result = normalize([unattribRead('/work/src/secret.ts')], ctx);
+      const block = getBlock(result, '<unattributed>', 'install');
+      expect(block?.external_reads).toEqual(['$REPO/src/secret.ts']);
+    });
+
+    it('a REAL package key with a missing pkgDir still throws (fail closed preserved)', () => {
+      const ev: AttributedEvent = {
+        raw: { kind: 'write', path: '/work/node_modules/pkg-b/index.js', pid: 1, ts: 0, hidden: false },
+        pkg: 'ghost@9.9.9',
+        lifecycle: 'install',
+      };
+      expect(() => normalize([ev], ctx)).toThrow(/pkgDirs missing entry/);
+    });
+  });
+
   describe('hidden events (<HIDDEN> prefix)', () => {
     it('prefixes hidden reads', () => {
       const events = [readEv('/root/.ssh/id_rsa', true)];

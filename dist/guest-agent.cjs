@@ -26379,6 +26379,7 @@ var import_micromatch = __toESM(require_micromatch(), 1);
 // src/lock/tokenize.ts
 var HASH_PATTERN = /[A-Za-z0-9_-]{16,}/g;
 var TEMP_SUFFIX = /\.tmp(\.[A-Za-z0-9]+)?$/;
+var YARN_FSLIB_TEMP = /^(\$TMPDIR\/)xfs-[0-9a-f]{8,9}(?=\/|$)/;
 function tokenize(rawPath, roots, currentPkgDir) {
   if (!rawPath.startsWith("/")) {
     return rawPath;
@@ -26412,6 +26413,7 @@ function pathHasPrefix(path3, prefix) {
 function collapseUnstable(path3) {
   let out = path3;
   if (TEMP_SUFFIX.test(out)) out = out.replace(TEMP_SUFFIX, ".tmp<hash>");
+  out = out.replace(YARN_FSLIB_TEMP, "$1<hash>");
   out = out.replace(HASH_PATTERN, (match) => {
     if (/^[A-Z][A-Za-z]{15,}$/.test(match)) return match;
     return "<hash>";
@@ -27228,6 +27230,7 @@ async function runInstallPhase(input) {
   const pidCloneTimeCwd = /* @__PURE__ */ new Map();
   const childSeedCloneTs = /* @__PURE__ */ new Map();
   const deferredRelOpens = [];
+  const deferredNullAttribEvents = [];
   const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
   function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
     const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
@@ -27324,6 +27327,7 @@ async function runInstallPhase(input) {
   const forgerySamples = [];
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
+  const attributionGenByPid = /* @__PURE__ */ new Map();
   const nodeStartupMarkerByPid = /* @__PURE__ */ new Map();
   const supersededByDifferentGenerationMarker = (pid, snapshot) => {
     const marker = nodeStartupMarkerByPid.get(pid);
@@ -27362,6 +27366,22 @@ async function runInstallPhase(input) {
         stale: false
       });
     }
+    const gen = attributionGenByPid.get(pid);
+    if (gen === void 0) {
+      attributionGenByPid.set(pid, {
+        pkg: attr.pkg,
+        lifecycle: attr.lifecycle,
+        ambiguous: false
+      });
+    } else if (!gen.ambiguous && (gen.pkg !== attr.pkg || gen.lifecycle !== attr.lifecycle)) {
+      gen.ambiguous = true;
+    }
+  };
+  const resolveDeferredAttribution = (pid) => {
+    const gen = attributionGenByPid.get(pid);
+    if (gen === void 0) return null;
+    if (gen.ambiguous) return { pkg: "<unattributed>", lifecycle: "install" };
+    return { pkg: gen.pkg, lifecycle: gen.lifecycle };
   };
   const nodeStartupAttributionByPid = /* @__PURE__ */ new Map();
   const nodeStartupAttribution = (pid) => nodeStartupAttributionByPid.get(pid) ?? null;
@@ -28614,6 +28634,8 @@ async function runInstallPhase(input) {
                 pkg: isStale ? "<unattributed>" : spawnSnapshot.pkg,
                 lifecycle: isStale ? "install" : spawnSnapshot.lifecycle
               });
+            } else {
+              deferredNullAttribEvents.push({ rawEvent });
             }
             continue;
           }
@@ -28624,6 +28646,8 @@ async function runInstallPhase(input) {
               lifecycle: null,
               sharedAtRead: everCwdShared.has(rawEvent.pid)
             });
+          } else if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.dirfd === void 0 && path2.isAbsolute(rawEvent.path)) {
+            deferredNullAttribEvents.push({ rawEvent });
           }
           continue;
         }
@@ -28734,11 +28758,17 @@ async function runInstallPhase(input) {
     let lifecycle = d.lifecycle;
     if (pkg === null || lifecycle === null) {
       const inh = d.inheritedAttrib;
-      if (inh === null || inh === void 0) {
-        continue;
+      if (inh !== null && inh !== void 0) {
+        pkg = inh.pkg;
+        lifecycle = inh.lifecycle;
+      } else {
+        const snap = resolveDeferredAttribution(P);
+        if (snap === null) {
+          continue;
+        }
+        pkg = snap.pkg;
+        lifecycle = snap.lifecycle;
       }
-      pkg = inh.pkg;
-      lifecycle = inh.lifecycle;
     }
     let initial = d.initialCwd;
     let childPidReuseHidCloneFs = false;
@@ -28848,6 +28878,27 @@ async function runInstallPhase(input) {
     }
   }
   deferredRelOpens.length = 0;
+  for (const d of deferredNullAttribEvents) {
+    const P = d.rawEvent.pid;
+    const attrib = resolveDeferredAttribution(P);
+    if (attrib === null) {
+      continue;
+    }
+    if (d.rawEvent.kind === "spawn") {
+      emit({ raw: d.rawEvent, pkg: attrib.pkg, lifecycle: attrib.lifecycle });
+      continue;
+    }
+    const canonical = canonicalizeForEmit(P, d.rawEvent.path, d.rawEvent.dirfd);
+    if (canonical === null) {
+      continue;
+    }
+    if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
+      continue;
+    }
+    const resolved = { ...d.rawEvent, path: canonical };
+    emit({ raw: resolved, pkg: attrib.pkg, lifecycle: attrib.lifecycle });
+  }
+  deferredNullAttribEvents.length = 0;
   flushAllNodeBootstrapCandidates();
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
@@ -29573,7 +29624,7 @@ function normalize(events, ctx) {
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
     const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
     const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "env_read" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_tamper") && ev.raw.root_anchored !== true;
-    if (pkgDir === void 0 && !claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
+    if (pkgDir === void 0 && !claimsRoot && ev.pkg !== "<unattributed>" && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`
       );

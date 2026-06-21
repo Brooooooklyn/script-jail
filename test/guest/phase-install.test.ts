@@ -1871,6 +1871,259 @@ describe('runInstallPhase', () => {
       expect(spawns).toHaveLength(0);
     });
 
+    // napi-rs husky-prepare determinism (defer-and-re-resolve, 2026-06-21).
+    // yarn-berry runs a binary lifecycle (`husky` in napi-rs' `prepare`) via a
+    // TRANSIENT launcher it writes to `$TMPDIR/xfs-<8hex>/husky` (getTempName).
+    // That launcher pid is reaped before its strace lines are tailed, so
+    // attribute()→null (the LIVE /proc walk is `result`'s only source); its
+    // identity lives ONLY in the LD_PRELOAD shim exec-seed. SPAWNS already had an
+    // inline snapshot fallback (the `attributionSnapshotByPid.get` branch); ABSOLUTE
+    // READS did NOT — so when the launcher's /proc was gone by the time its read
+    // lines drained, or the shim seed drained AFTER the strace lines (the soft
+    // shim-before-strace contract is not enforced across backends), the launcher's
+    // spawn + its repo-root / shim-file reads were DROPPED non-deterministically.
+    // Two identical napi-rs audits produced different locks (one with
+    // `[$REPO, $TMPDIR/xfs-.../husky]`, one empty). The fix DEFERS null-attribution
+    // spawns + absolute reads and re-resolves them at end-of-drain via
+    // snapshotAttribution (which ACCEPTS the now-stale shim-seeded snapshot — the
+    // exit-line marks it stale — and is generation-guarded), making capture
+    // drain-order- AND /proc-liveness-INDEPENDENT.
+    describe('reaped transient-launcher (yarn xfs-<hash>) determinism', () => {
+      const HUSKY_SHIM = '/tmp/xfs-021cebd2/husky';
+      const SHIM_SEED = {
+        pid: 0,
+        source: 'shim' as const,
+        line: JSON.stringify({
+          kind: 'exec',
+          prog: HUSKY_SHIM,
+          argv0: 'husky',
+          envp_alloc_failed: false,
+          result: 'ok',
+          pid: 777,
+          ts: 5,
+          npm_package_name: 'napi-rs',
+          npm_package_version: '0.0.0',
+          npm_lifecycle_event: 'prepare',
+        }),
+      };
+      // The launcher's OWN strace lines (one per-pid file, so execve < reads <
+      // exit): exec the shim, read the repo root + the shim file by ABSOLUTE path,
+      // then exit. The `+++ exited +++` line marks the shim-seeded snapshot STALE,
+      // but re-resolution reads `attributionGenByPid` (via resolveDeferredAttribution),
+      // which records the launcher's single generation regardless of stale/last-writer
+      // state — so a one-generation pid attributes confidently and deterministically.
+      const STRACE_LINES: Array<{ pid: number; line: string; source: 'strace' }> = [
+        { pid: 777, source: 'strace', line: `execve("${HUSKY_SHIM}", ["husky"], 0x1 /* 0 vars */) = 0` },
+        { pid: 777, source: 'strace', line: 'openat(AT_FDCWD, "/work", O_RDONLY) = 3' },
+        { pid: 777, source: 'strace', line: `openat(AT_FDCWD, "${HUSKY_SHIM}", O_RDONLY) = 4` },
+        { pid: 777, source: 'strace', line: '+++ exited with 0 +++' },
+      ];
+
+      // Run records and return a canonical, order-independent view of what the
+      // launcher pid (777) contributed across the fs/spawn channels (mirrors how
+      // render() sorts the lock). Filtered to spawn/read/write so an unrelated
+      // syscall-bypass synth (kind 'exec', fired only when no shim ack exists) does
+      // not confound the comparison.
+      const captured = async (
+        records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }>,
+        proc: Record<number, { ppid: number | null; env: Record<string, string> | null }> = {},
+      ): Promise<string[]> => {
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'yarn',
+          cwd: '/work',
+          env: BASE_ENV,
+          // Pin rootPid identically (null) across runs so drain order is the ONLY
+          // variable — the default rootPid is the FIRST record's pid, which differs
+          // between seed-first and strace-first orderings.
+          strace: cannedStraceRunner(records, 0, { rootPid: null }),
+          attribution: new Attribution(mockProcReader(proc)),
+          emitter,
+        });
+        return lines
+          .map((l) => JSON.parse(l) as Record<string, unknown>)
+          .filter((e) => {
+            const raw = e['raw'] as Record<string, unknown>;
+            return (
+              raw['pid'] === 777 &&
+              (raw['kind'] === 'spawn' || raw['kind'] === 'read' || raw['kind'] === 'write')
+            );
+          })
+          .map((e) => {
+            const raw = e['raw'] as Record<string, unknown>;
+            const key = raw['kind'] === 'spawn' ? JSON.stringify(raw['argv']) : (raw['path'] as string);
+            return `${raw['kind'] as string}|${e['pkg'] as string}|${key}`;
+          })
+          .sort();
+      };
+
+      const EXPECTED = [
+        'read|napi-rs@0.0.0|/tmp/xfs-021cebd2/husky',
+        'read|napi-rs@0.0.0|/work',
+        'spawn|napi-rs@0.0.0|["husky"]',
+      ];
+      const ALIVE = {
+        777: {
+          ppid: null,
+          env: {
+            npm_package_name: 'napi-rs',
+            npm_package_version: '0.0.0',
+            npm_lifecycle_event: 'prepare',
+          },
+        },
+      };
+
+      it('captures spawn + absolute reads when the shim seed drains AFTER the strace lines (the run2 race that dropped them)', async () => {
+        // Reaped pid, seed LAST — the ordering that dropped everything pre-fix.
+        expect(await captured([...STRACE_LINES, SHIM_SEED])).toEqual(EXPECTED);
+      });
+
+      it('is identical across drain order and /proc liveness (the flake is closed)', async () => {
+        // A. strace-first + reaped → spawn+reads deferred; seed arrives after exit
+        //    so the replay snapshot is FRESH.
+        const straceFirstReaped = await captured([...STRACE_LINES, SHIM_SEED]);
+        // B. seed-first + reaped → spawn emits inline (snapshot present, pre-exit);
+        //    reads defer; the exit then marks the snapshot STALE, but the read replay
+        //    resolves the launcher's single generation from attributionGenByPid.
+        const seedFirstReaped = await captured([SHIM_SEED, ...STRACE_LINES]);
+        // C. /proc alive + seed → everything attributes inline via the live walk.
+        const procAlive = await captured([SHIM_SEED, ...STRACE_LINES], ALIVE);
+
+        expect(straceFirstReaped).toEqual(EXPECTED);
+        expect(seedFirstReaped).toEqual(EXPECTED);
+        expect(procAlive).toEqual(EXPECTED);
+      });
+
+      it('FLOOR: a reaped launcher with NO shim seed and no /proc drops the spawn + reads (no system-pid flood)', async () => {
+        // Genuinely unattributable: deferred, then dropped at replay because
+        // attributionGenByPid has no entry for 777 (resolveDeferredAttribution →
+        // null). The null-gate floor is preserved.
+        expect(await captured(STRACE_LINES)).toEqual([]);
+      });
+
+      // codex adversarial-review #2 (prefer-emit): the deferred-read replay must NOT
+      // consult the MUTABLE end-of-drain node-bootstrap baseline. A node process
+      // (pid 50) registers a path into nodeBootstrapFileReads as its own startup
+      // noise; the reaped launcher (777) ALSO reads that path. Consulting the final
+      // baseline at replay would DROP the launcher's read (a drain-order-dependent
+      // false negative); prefer-emit keeps it.
+      it('does NOT drop a deferred absolute read whose path a LATER node-bootstrap baseline also recorded', async () => {
+        const VICTIM = '/work/node_modules/victim/package.json';
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          // A node process becomes bootstrap-pending and registers VICTIM into the
+          // global nodeBootstrapFileReads baseline (filtered as its own startup read).
+          { pid: 50, source: 'strace', line: 'execve("/usr/bin/node", ["node", "boot.js"], 0x1 /* 0 vars */) = 0' },
+          { pid: 50, source: 'strace', line: `openat(AT_FDCWD, "${VICTIM}", O_RDONLY) = 3` },
+          // The reaped launcher reads the SAME path (absolute, null /proc → deferred).
+          { pid: 777, source: 'strace', line: `openat(AT_FDCWD, "${VICTIM}", O_RDONLY) = 4` },
+          { pid: 777, source: 'strace', line: '+++ exited with 0 +++' },
+          SHIM_SEED,
+        ];
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'yarn',
+          cwd: '/work',
+          env: BASE_ENV,
+          strace: cannedStraceRunner(records, 0, { rootPid: null }),
+          // pid 50 is an attributed live node (so its read registers VICTIM into the
+          // baseline + is filtered); pid 777 is reaped (absent → deferred).
+          attribution: new Attribution(
+            mockProcReader({
+              50: {
+                ppid: null,
+                env: { npm_package_name: 'somenode', npm_package_version: '1.0.0', npm_lifecycle_event: 'install' },
+              },
+            }),
+          ),
+          emitter,
+        });
+        const launcherRead = lines
+          .map((l) => JSON.parse(l) as Record<string, unknown>)
+          .find((e) => {
+            const raw = e['raw'] as Record<string, unknown>;
+            return raw['pid'] === 777 && raw['kind'] === 'read' && raw['path'] === VICTIM;
+          });
+        expect(launcherRead).toBeDefined();
+        expect(launcherRead!['pkg']).toBe('napi-rs@0.0.0');
+      });
+
+      // codex adversarial-review round-2 [high] — the catastrophic hidden-escaped-
+      // write hole. A reaped pid (777) does a gen-A absolute WRITE into ANOTHER
+      // package's dir (pkg-b/index.js) while null-attributed, so it is DEFERRED.
+      // gen-A's late shim seed records pkg-a; the pid number is then RECYCLED and
+      // gen-B's seed records pkg-b. A naive end-of-drain last-writer lookup
+      // (`snapshotAttribution(777)`) returns pkg-b, so the write would emit under
+      // pkg-b — and normalize tokenizes /work/node_modules/pkg-b/index.js as
+      // `$PKG/index.js` and DROPS it as an intra-package write. A real cross-package
+      // escaped write VANISHES. The fix resolves via `attributionGenByPid`, which
+      // sees TWO generations (pkg-a, pkg-b) → AMBIGUOUS → routes to `<unattributed>`
+      // so the write SURFACES (normalize renders it as a $NODE_MODULES escaped write,
+      // fail-loud) and can never be hidden under the recycled package's subtree.
+      it('reuse-ambiguity: a deferred gen-A write into a recycled pkg dir surfaces under <unattributed>, never the recycled package (no hidden escaped write)', async () => {
+        const VICTIM = '/work/node_modules/pkg-b/index.js';
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          // gen-A (reaped, null /proc) writes into pkg-b's dir → absolute → DEFERRED.
+          { pid: 777, source: 'strace', line: `openat(AT_FDCWD, "${VICTIM}", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3` },
+          { pid: 777, source: 'strace', line: '+++ exited with 0 +++' },
+          // gen-A's late shim seed names pkg-a (this generation's TRUE owner).
+          {
+            pid: 0,
+            source: 'shim',
+            line: JSON.stringify({
+              kind: 'exec',
+              prog: '/tmp/xfs-aaaaaaaa/binA',
+              argv0: 'binA',
+              envp_alloc_failed: false,
+              result: 'ok',
+              pid: 777,
+              ts: 10,
+              npm_package_name: 'pkg-a',
+              npm_package_version: '1.0.0',
+              npm_lifecycle_event: 'postinstall',
+            }),
+          },
+          // pid 777 is RECYCLED: gen-B's seed names pkg-b (== the dir owner of the
+          // gen-A write). Last-writer would relabel the gen-A write under pkg-b.
+          {
+            pid: 0,
+            source: 'shim',
+            line: JSON.stringify({
+              kind: 'exec',
+              prog: '/tmp/xfs-bbbbbbbb/binB',
+              argv0: 'binB',
+              envp_alloc_failed: false,
+              result: 'ok',
+              pid: 777,
+              ts: 20,
+              npm_package_name: 'pkg-b',
+              npm_package_version: '2.0.0',
+              npm_lifecycle_event: 'postinstall',
+            }),
+          },
+        ];
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'yarn',
+          cwd: '/work',
+          env: BASE_ENV,
+          strace: cannedStraceRunner(records, 0, { rootPid: null }),
+          attribution: new Attribution(mockProcReader({})), // 777 reaped → null
+          emitter,
+        });
+        const write = lines
+          .map((l) => JSON.parse(l) as Record<string, unknown>)
+          .find((e) => {
+            const raw = e['raw'] as Record<string, unknown>;
+            return raw['pid'] === 777 && raw['kind'] === 'write' && raw['path'] === VICTIM;
+          });
+        // It must be PRESENT (not dropped) and attributed to the fail-loud sentinel,
+        // never to pkg-b (which would hide it as an intra-package write).
+        expect(write).toBeDefined();
+        expect(write!['pkg']).toBe('<unattributed>');
+        expect(write!['pkg']).not.toBe('pkg-b@2.0.0');
+      });
+    });
+
     // Audit-trust follow-up to the clone-propagation fix (Codex review of
     // commit e5af2be, 2026-05-19): the propagation block reads
     // `attributionSnapshotByPid.get(parentPid)` which is empty when the
