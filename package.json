@@ -35,7 +35,8 @@
     "test:integration": "vitest run --project=integration",
     "test:e2e": "vitest run --project=e2e",
     "typecheck": "tsc --noEmit",
-    "cli": "oxnode src/cli/index.ts"
+    "cli": "oxnode src/cli/index.ts",
+    "release:backfill": "oxnode scripts/release-backfill.ts"
   },
   "dependencies": {
     "@actions/cache": "6.0.0",

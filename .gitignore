@@ -35,6 +35,8 @@ coverage/
 *.log
 .script-jail.log
 .script-jail.events.jsonl
+# …but keep committed test fixtures that happen to end in .log
+!test/release/fixtures/*.log
 
 # Editor
 .vscode/
