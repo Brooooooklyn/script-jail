@@ -633,12 +633,39 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
       `attributionGenByPid` map (the set of DISTINCT `(pkg,lifecycle)` generations
       recorded for the pid across the whole drain — drain-order-independent by
       construction). A single-generation pid attributes confidently (the determinism
-      win); a pid number RECYCLED across generations (≥2 distinct generations)
-      resolves to `<unattributed>` so the event SURFACES fail-loud (it tokenizes
-      against `$NODE_MODULES`/`$REPO` with no `$PKG` prefix) rather than relabeling a
-      gen-A escaped write under the recycled gen-B package and being DROPPED as an
-      intra-package `$PKG` write (codex round-2 [high]). A pid never seeded → dropped
-      (the null-gate floor). **Accepted pre-existing residual (codex round-3
+      win); a pid number RECYCLED across generations resolves to `<unattributed>` so the
+      event SURFACES fail-loud (it tokenizes against `$NODE_MODULES`/`$REPO` with no
+      `$PKG` prefix) rather than relabeling a gen-A escaped write under the recycled
+      gen-B package and being DROPPED as an intra-package `$PKG` write (codex round-2
+      [high]). A pid never seeded → dropped (the null-gate floor). The recycle is
+      detected by THREE drain-order-independent signals, so the surface holds even when
+      the earlier generation is UNSHIMMED and never seeds the gen map (codex Bugbot
+      [medium], 2026-06-21): (a) the gen map itself flips `ambiguous` when ≥2 distinct
+      generations each seed; (b) `pidRecycled` — strace observed a successful execve for
+      the pid AFTER its own `+++ exited +++` line (a definitive new program image on a
+      reused pid number, ordered within the pid's own `-ff` file); (c) `childParentReused`
+      — the pid's clone parent edge was repointed by a DIFFERENT parent. Any of the three
+      → `<unattributed>`. This gate covers every event resolved THROUGH
+      `resolveDeferredAttribution`: the absolute null-attribution replay AND the
+      relative-open `inheritedAttrib`-null fallback. **Accepted pre-existing residual
+      (codex round-4 [critical], verified PRE-EXISTING not introduced by this fix):** a
+      relative open that DOES carry a clone-propagated `inheritedAttrib` reads that stamp
+      DIRECTLY (it predates this fix verbatim), bypassing `resolveDeferredAttribution`.
+      `stampDeferredRelOpens` is keyed by pid alone + first-stamp-wins, so for a recycled
+      pid the stamp is whichever generation's clone drained first. In the narrow corner
+      where (i) BOTH generations are pure plain-fork (no `CLONE_FS` anywhere, so
+      `childPidReuseHidCloneFs` does not veto), (ii) the wrong generation's clone drains
+      first, (iii) neither generation `chdir`'d (so the cwd resolves), AND (iv) the
+      resolved path lands inside the stamped wrong package's own dir, the relative write
+      relabels under that package and `normalize` drops it as `$PKG` — a hidden write.
+      Any `CLONE_FS` in either lineage routes it to `<UNRESOLVED_PATH>` (surfaces). This
+      is the SAME pure-plain-fork recycled-pid residual class the env_read path documents
+      (`reaped-child-env-read-pid-reuse-residual`) and is drain-order-dependent like the
+      inline path below; the sound closure (route recycled-pid relative opens through
+      `resolveDeferredAttribution`) is deliberately deferred because it changes the
+      accepted F6 "bind to the stamping generation" behavior (recycled-pid relative reads
+      would become deterministic `<unattributed>` instead of the first-stamp generation —
+      a precision-vs-determinism tradeoff). **Accepted pre-existing residual (codex round-3
       [critical]; owner decision — document + ship):** the INLINE (non-deferred,
       live-`/proc`-`result`) fs path is NOT covered by this map. If a gen-A write line
       drains while the dispatcher LAGS and the kernel has already RECYCLED the pid to

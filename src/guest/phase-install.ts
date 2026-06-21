@@ -3030,6 +3030,29 @@ export async function runInstallPhase(
     number,
     { pkg: string; lifecycle: AttributedEvent['lifecycle']; ambiguous: boolean }
   > = new Map();
+  // Per-pid RECYCLE signals for `resolveDeferredAttribution`, both kernel-observed
+  // and independent of whether the EARLIER generation ever seeded `attributionGenByPid`
+  // (codex Bugbot [medium], 2026-06-21).  `attributionGenByPid` flips `ambiguous` only
+  // when ≥2 distinct generations each call `recordAttribution`.  But an EARLIER
+  // generation can be UNSHIMMED (a bare/static/env-scrubbed process that never seeds)
+  // while a LATER recycled generation seeds exactly one (pkg, lifecycle) — then the gen
+  // map holds a single non-ambiguous entry and a deferred gen-A escaped write resolves
+  // to gen-B's package (DROPPED as intra-package `$PKG` if it lands in gen-B's own dir —
+  // the hidden escaped write).  These two sets catch the recycle WITHOUT the earlier
+  // generation having to seed:
+  //   • pidSawExit — strace observed a `+++ exited/killed +++` line for the pid.  Set in
+  //     the exit-line pre-parser.  Under strace `-ff` a pid's lines (across BOTH
+  //     generations) live in one per-pid file read in order, so the exit always precedes
+  //     a recycled generation's later lines.
+  //   • pidRecycled — a successful execve (`spawn`/`ok`) drained for the pid AFTER its
+  //     own exit line (`pidSawExit` already set) — a definitive new program image on a
+  //     reused pid number.  exec-CHAIN (multiple execve, no exit between) does NOT trip
+  //     it (no exit line separates same-generation re-execs).  Set in the spawn handler.
+  // (`childParentReused`, declared above, is a third recycle signal — a clone parent edge
+  // repointed by a DIFFERENT parent — caught at clone time without needing the exit line;
+  // `resolveDeferredAttribution` ORs it in too.)
+  const pidSawExit: Set<number> = new Set();
+  const pidRecycled: Set<number> = new Set();
   // Per-pid record of the most recent node_startup_done marker observed for the
   // pid: its dispatch ts (the monotonic `lineTs`) and whether it was
   // `pathological` (an overlong/forged synthetic npm id; see
@@ -3212,7 +3235,20 @@ export async function runInstallPhase(
   ): { pkg: string; lifecycle: AttributedEvent['lifecycle'] } | null => {
     const gen = attributionGenByPid.get(pid);
     if (gen === undefined) return null;
-    if (gen.ambiguous) return { pkg: '<unattributed>', lifecycle: 'install' };
+    // AMBIGUOUS via the gen map (≥2 distinct generations each seeded) OR a recycle
+    // observed independently of seeding (pidRecycled = execve-after-own-exit;
+    // childParentReused = clone edge repointed by a different parent).  Either way the
+    // pid number spanned >1 generation, so a lone surviving seed cannot be trusted: an
+    // EARLIER unshimmed generation's deferred escaped write would otherwise resolve to
+    // the recycled generation's package and, if it lands in that package's own dir, be
+    // DROPPED as intra-package `$PKG` — a hidden escaped write (codex Bugbot [medium],
+    // 2026-06-21).  Route to `<unattributed>` so it SURFACES fail-loud (a distinct
+    // package block that never dedupe-collapses), strictly safer than relabel-and-hide
+    // OR a silent drop.  The single-generation, never-recycled pid (the husky launcher)
+    // still attributes confidently — the determinism win is preserved.
+    if (gen.ambiguous || pidRecycled.has(pid) || childParentReused.has(pid)) {
+      return { pkg: '<unattributed>', lifecycle: 'install' };
+    }
     return { pkg: gen.pkg, lifecycle: gen.lifecycle };
   };
 
@@ -3834,6 +3870,12 @@ export async function runInstallPhase(
       //      theoretical concern: tens of thousands of pid allocations
       //      would be required to wrap PID_MAX.
       if (line.startsWith('+++') && line.endsWith('+++')) {
+        // Recycle detection (codex Bugbot [medium], 2026-06-21): mark that strace
+        // observed this pid terminate.  A later successful execve for the same pid
+        // (processed in the same per-pid `-ff` file, hence AFTER this line) is then a
+        // recycled generation → `pidRecycled` → its deferred events route to
+        // `<unattributed>` even when the earlier generation never seeded the gen map.
+        pidSawExit.add(pid);
         flushNodeBootstrapCandidate(pid);
         if (packageManagerClientPids.delete(pid)) {
           completedPackageManagerClientPids.add(pid);
@@ -6182,6 +6224,19 @@ export async function runInstallPhase(
         // survives execve (per execve(2)), so the attacker's
         // chdir(events-dir) before the exec still applies after.
         if (rawEvent.kind === 'spawn' && rawEvent.result === 'ok') {
+          // Recycle detection (codex Bugbot [medium], 2026-06-21): a successful
+          // execve drained for a pid whose own `+++ exited +++` line was ALREADY
+          // seen is a new program image on a REUSED pid number — the pid spanned >1
+          // generation.  Mark it so `resolveDeferredAttribution` routes the pid's
+          // deferred events to `<unattributed>` (SURFACE) instead of confidently
+          // attributing an EARLIER unshimmed generation's escaped write to this
+          // recycled generation's lone seed (the hidden-escaped-write hole).  This is
+          // drain-order-independent: within a pid's per-pid `-ff` file the exit line
+          // precedes a recycled generation's execve, so `pidSawExit` is already set.
+          // exec-CHAIN (re-exec with no exit between) never trips it — no exit line.
+          if (pidSawExit.has(rawEvent.pid)) {
+            pidRecycled.add(rawEvent.pid);
+          }
           // Repo-root anchoring: snapshot the pid's cwd at its FIRST execve
           // only (later re-execs keep the first snapshot). The PM sets a
           // lifecycle script's cwd to the package dir BEFORE the exec, so this

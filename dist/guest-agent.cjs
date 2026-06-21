@@ -27328,6 +27328,8 @@ async function runInstallPhase(input) {
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
   const attributionGenByPid = /* @__PURE__ */ new Map();
+  const pidSawExit = /* @__PURE__ */ new Set();
+  const pidRecycled = /* @__PURE__ */ new Set();
   const nodeStartupMarkerByPid = /* @__PURE__ */ new Map();
   const supersededByDifferentGenerationMarker = (pid, snapshot) => {
     const marker = nodeStartupMarkerByPid.get(pid);
@@ -27380,7 +27382,9 @@ async function runInstallPhase(input) {
   const resolveDeferredAttribution = (pid) => {
     const gen = attributionGenByPid.get(pid);
     if (gen === void 0) return null;
-    if (gen.ambiguous) return { pkg: "<unattributed>", lifecycle: "install" };
+    if (gen.ambiguous || pidRecycled.has(pid) || childParentReused.has(pid)) {
+      return { pkg: "<unattributed>", lifecycle: "install" };
+    }
     return { pkg: gen.pkg, lifecycle: gen.lifecycle };
   };
   const nodeStartupAttributionByPid = /* @__PURE__ */ new Map();
@@ -27642,6 +27646,7 @@ async function runInstallPhase(input) {
     }
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
+        pidSawExit.add(pid);
         flushNodeBootstrapCandidate(pid);
         if (packageManagerClientPids.delete(pid)) {
           completedPackageManagerClientPids.add(pid);
@@ -28464,6 +28469,9 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          if (pidSawExit.has(rawEvent.pid)) {
+            pidRecycled.add(rawEvent.pid);
+          }
           if (!execCwd.has(rawEvent.pid)) {
             if (cwdUnknownHas(rawEvent.pid)) {
               execCwd.set(rawEvent.pid, null);

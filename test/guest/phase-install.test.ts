@@ -2122,6 +2122,69 @@ describe('runInstallPhase', () => {
         expect(write!['pkg']).toBe('<unattributed>');
         expect(write!['pkg']).not.toBe('pkg-b@2.0.0');
       });
+
+      // codex Bugbot [medium], 2026-06-21 — the SINGLE-SEED recycle hole the gen-map
+      // alone could not catch. Unlike `reuse-ambiguity` (above), gen-A is UNSHIMMED: it
+      // NEVER calls recordAttribution, so `attributionGenByPid` is NOT ambiguous — it
+      // holds gen-B's lone (pkg-b) seed. A naive resolve would attribute gen-A's
+      // deferred write to pkg-b and normalize would DROP it as intra-package `$PKG`.
+      // The recycle is observed independently of seeding: gen-B's STRACE execve drains
+      // AFTER gen-A's `+++ exited +++` line (same per-pid `-ff` file order) → the pid
+      // is marked `pidRecycled` → `resolveDeferredAttribution` routes the write to
+      // `<unattributed>` (SURFACES) instead of the recycled package (HIDDEN).
+      it('single-seed recycle (unshimmed gen-A): execve-after-exit forces <unattributed>, never the lone recycled seed', async () => {
+        const VICTIM = '/work/node_modules/pkg-b/index.js';
+        const records: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [
+          // gen-A is UNSHIMMED (no shim exec record). A bare strace execve establishes
+          // the generation; attribution is null (reaped) so it never seeds the gen map.
+          { pid: 777, source: 'strace', line: 'execve("/tmp/xfs-aaaaaaaa/binA", ["binA"], 0x1 /* 0 vars */) = 0' },
+          // gen-A writes into pkg-b's dir while null-attributed → absolute → DEFERRED.
+          { pid: 777, source: 'strace', line: `openat(AT_FDCWD, "${VICTIM}", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3` },
+          // gen-A terminates → pidSawExit(777).
+          { pid: 777, source: 'strace', line: '+++ exited with 0 +++' },
+          // pid 777 RECYCLED: gen-B's strace execve drains AFTER gen-A's exit → the pid
+          // spanned >1 generation even though gen-A never seeded → pidRecycled(777).
+          { pid: 777, source: 'strace', line: 'execve("/tmp/xfs-bbbbbbbb/binB", ["binB"], 0x1 /* 0 vars */) = 0' },
+          // gen-B's shim seed is the ONLY entry in attributionGenByPid (pkg-b == the dir
+          // owner of the gen-A write). A single, non-ambiguous seed — the trap.
+          {
+            pid: 0,
+            source: 'shim',
+            line: JSON.stringify({
+              kind: 'exec',
+              prog: '/tmp/xfs-bbbbbbbb/binB',
+              argv0: 'binB',
+              envp_alloc_failed: false,
+              result: 'ok',
+              pid: 777,
+              ts: 30,
+              npm_package_name: 'pkg-b',
+              npm_package_version: '2.0.0',
+              npm_lifecycle_event: 'postinstall',
+            }),
+          },
+        ];
+        const { emitter, lines } = makeEmitter();
+        await runInstallPhase({
+          manager: 'yarn',
+          cwd: '/work',
+          env: BASE_ENV,
+          strace: cannedStraceRunner(records, 0, { rootPid: null }),
+          attribution: new Attribution(mockProcReader({})), // 777 reaped → null
+          emitter,
+        });
+        const write = lines
+          .map((l) => JSON.parse(l) as Record<string, unknown>)
+          .find((e) => {
+            const raw = e['raw'] as Record<string, unknown>;
+            return raw['pid'] === 777 && raw['kind'] === 'write' && raw['path'] === VICTIM;
+          });
+        // Present (not dropped) and routed to the fail-loud sentinel — NEVER pkg-b,
+        // which would hide the cross-package write as intra-package `$PKG`.
+        expect(write).toBeDefined();
+        expect(write!['pkg']).toBe('<unattributed>');
+        expect(write!['pkg']).not.toBe('pkg-b@2.0.0');
+      });
     });
 
     // Audit-trust follow-up to the clone-propagation fix (Codex review of
