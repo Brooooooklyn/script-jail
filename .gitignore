@@ -38,6 +38,9 @@ coverage/
 # …but keep committed test fixtures that happen to end in .log
 !test/release/fixtures/*.log
 
+# release-backfill CLI staging tree (downloaded producer artifacts, per-run)
+.release-backfill/
+
 # Editor
 .vscode/
 .idea/
