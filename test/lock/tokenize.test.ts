@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { tokenize, isInsidePkg, isCrossPackage, type TokenizeRoots } from '../../src/lock/tokenize.js';
+import {
+  tokenize,
+  isInsidePkg,
+  isCrossPackage,
+  stripTrailingSlashes,
+  canonicalizeTokenizeRoots,
+  type TokenizeRoots,
+} from '../../src/lock/tokenize.js';
 
 const roots: TokenizeRoots = {
   repo: '/work',
@@ -352,5 +359,59 @@ describe('byte-stability under an arbitrary absolute repo root (install:true cwd
       '/etc/passwd',
     ].join('\n');
     for (const out of outputs) expect(out).toBe(expected);
+  });
+});
+
+describe('stripTrailingSlashes', () => {
+  it('strips one or more trailing slashes', () => {
+    expect(stripTrailingSlashes('/opt/r/r/')).toBe('/opt/r/r');
+    expect(stripTrailingSlashes('/opt/r/r//')).toBe('/opt/r/r');
+  });
+  it('is a no-op for a clean path', () => {
+    expect(stripTrailingSlashes('/opt/r/r')).toBe('/opt/r/r');
+  });
+  it('preserves a lone root slash', () => {
+    expect(stripTrailingSlashes('/')).toBe('/');
+    expect(stripTrailingSlashes('//')).toBe('/');
+  });
+});
+
+describe('canonicalizeTokenizeRoots', () => {
+  it('strips trailing slashes from EVERY prefix (repo/nodeModules/home/tmp/cache)', () => {
+    const out = canonicalizeTokenizeRoots({
+      repo: '/work/',
+      nodeModules: '/work/node_modules/',
+      home: '/root/',
+      tmp: '/tmp/',
+      cache: '/root/.cache/pnpm/',
+    });
+    expect(out).toEqual({
+      repo: '/work',
+      nodeModules: '/work/node_modules',
+      home: '/root',
+      tmp: '/tmp',
+      cache: '/root/.cache/pnpm',
+    });
+  });
+  it('strips the optional tmpLegacy alias when present', () => {
+    const out = canonicalizeTokenizeRoots({
+      repo: '/work/',
+      nodeModules: '/work/node_modules/',
+      home: '/root/',
+      tmp: '/scratch/tmp/',
+      tmpLegacy: '/tmp/',
+      cache: '/root/.cache/pnpm/',
+    });
+    expect(out.tmpLegacy).toBe('/tmp');
+  });
+  it('is a no-op for already-clean roots (byte-identical lock)', () => {
+    const clean: TokenizeRoots = {
+      repo: '/work',
+      nodeModules: '/work/node_modules',
+      home: '/root',
+      tmp: '/tmp',
+      cache: '/root/.cache/pnpm',
+    };
+    expect(canonicalizeTokenizeRoots(clean)).toEqual(clean);
   });
 });

@@ -10364,8 +10364,10 @@ __export(agent_exports, {
   buildChildEnvMacos: () => buildChildEnvMacos,
   createEventsFile: () => createEventsFile,
   createSensitiveRedactor: () => createSensitiveRedactor,
+  installModeInjectedEnv: () => installModeInjectedEnv,
   macosTokenizeRoots: () => macosTokenizeRoots,
   main: () => main,
+  normalizeInstallModeDropEnvNames: () => normalizeInstallModeDropEnvNames,
   npmCliEntryPath: () => npmCliEntryPath,
   readStraceChildPid: () => readStraceChildPid,
   realCaptureNpmPrepareEnv: () => realCaptureNpmPrepareEnv,
@@ -26381,6 +26383,22 @@ function parseFaccessat2(args, retVal, pid, ts) {
 var import_micromatch = __toESM(require_micromatch(), 1);
 
 // src/lock/tokenize.ts
+function stripTrailingSlashes(p) {
+  let end = p.length;
+  while (end > 1 && p[end - 1] === "/") end--;
+  return end === p.length ? p : p.slice(0, end);
+}
+function canonicalizeTokenizeRoots(roots) {
+  return {
+    ...roots,
+    repo: stripTrailingSlashes(roots.repo),
+    nodeModules: stripTrailingSlashes(roots.nodeModules),
+    home: stripTrailingSlashes(roots.home),
+    tmp: stripTrailingSlashes(roots.tmp),
+    ...roots.tmpLegacy !== void 0 ? { tmpLegacy: stripTrailingSlashes(roots.tmpLegacy) } : {},
+    cache: stripTrailingSlashes(roots.cache)
+  };
+}
 var HASH_PATTERN = /[A-Za-z0-9_-]{16,}/g;
 var TEMP_SUFFIX = /\.tmp(\.[A-Za-z0-9]+)?$/;
 var YARN_FSLIB_TEMP = /^(\$TMPDIR\/)xfs-[0-9a-f]{8,9}(?=\/|$)/;
@@ -26452,7 +26470,7 @@ var ProtectedPathsMatcher = class {
   roots;
   os;
   constructor(input) {
-    this.roots = input.roots;
+    this.roots = canonicalizeTokenizeRoots(input.roots);
     this.tokenizedPatterns = input.patterns.map(normalizePattern);
     this.os = input.os ?? "linux";
   }
@@ -29696,9 +29714,10 @@ var NPM_DEBUG_LOG_BASENAME = /\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}_\d{3}Z-debug-(
 function normalize(events, ctx) {
   const out = /* @__PURE__ */ new Map();
   const os = ctx.os ?? "linux";
+  const roots = canonicalizeTokenizeRoots(ctx.roots);
   for (const ev of events) {
     const fsPath = (ev.raw.kind === "read" || ev.raw.kind === "write") && os === "darwin" ? canonicalizePrivateRealpath(ev.raw.path) : ev.raw.kind === "read" || ev.raw.kind === "write" ? ev.raw.path : void 0;
-    if (isSystemNoise(ev, fsPath, os, ctx.roots)) continue;
+    if (isSystemNoise(ev, fsPath, os, roots)) continue;
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
     const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
     const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "env_read" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_tamper") && ev.raw.root_anchored !== true;
@@ -29708,17 +29727,25 @@ function normalize(events, ctx) {
       );
     }
     const forgedPrefix = isForgedRoot ? "<FORGED_ROOT> " : "";
+    if (ctx.installMode === true && claimsRoot && !isForgedRoot) {
+      if (ev.raw.kind === "env_read" && ctx.injectedInstallModeEnvNames?.has(ev.raw.name)) {
+        continue;
+      }
+      if (ev.raw.kind === "read" && !ev.raw.hidden && isStrictAncestorDir(fsPath ?? ev.raw.path, roots.repo)) {
+        continue;
+      }
+    }
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
     switch (ev.raw.kind) {
       case "read": {
-        const tokenized = normalizeVolatilePath(tokenize(fsPath, ctx.roots, pkgDir));
+        const tokenized = normalizeVolatilePath(tokenize(fsPath, roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
         const hiddenTag = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
         block.external_reads.push(`${forgedPrefix}${hiddenTag}`);
         break;
       }
       case "write": {
-        const tokenized = normalizeVolatilePath(tokenize(fsPath, ctx.roots, pkgDir));
+        const tokenized = normalizeVolatilePath(tokenize(fsPath, roots, pkgDir));
         if (isInsidePkg(tokenized)) continue;
         const hiddenPrefix = ev.raw.hidden ? "<HIDDEN> " : "";
         const crossPrefix = isCrossPackage(tokenized) ? "<CROSS_PACKAGE> " : "";
@@ -29733,7 +29760,7 @@ function normalize(events, ctx) {
       case "spawn": {
         const tokenizedArgv = ev.raw.argv.map((a, i) => {
           if (!a.startsWith("/")) return a;
-          const tokenized = tokenize(a, ctx.roots, pkgDir);
+          const tokenized = tokenize(a, roots, pkgDir);
           if (i === 0 && tokenized.startsWith("/")) {
             const base = tokenized.slice(tokenized.lastIndexOf("/") + 1);
             if (NORMALIZABLE_BINARIES.has(base)) return base;
@@ -29750,7 +29777,7 @@ function normalize(events, ctx) {
         break;
       }
       case "dlopen": {
-        const tokenized = tokenize(ev.raw.filename, ctx.roots, pkgDir);
+        const tokenized = tokenize(ev.raw.filename, roots, pkgDir);
         block.dlopen_attempts.push(`<BLOCKED> ${tokenized}`);
         break;
       }
@@ -29761,22 +29788,22 @@ function normalize(events, ctx) {
       }
       case "exec": {
         if (ev.raw.envp_alloc_failed) {
-          const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
+          const tokenized = tokenize(ev.raw.prog, roots, pkgDir);
           block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
         }
         if (ev.raw.syscall_bypass) {
           const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
-          const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
+          const tokenized = ident.startsWith("/") ? tokenize(ident, roots, pkgDir) : ident;
           block.audit_bypass.push(`<SYSCALL_EXEC_BYPASS> ${tokenized}`);
         }
         if (ev.raw.events_file_forgery) {
           const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
-          const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
+          const tokenized = ident.startsWith("/") ? tokenize(ident, roots, pkgDir) : ident;
           block.audit_bypass.push(`<EVENTS_FILE_FORGERY> ${tokenized}`);
         }
         if (ev.raw.unresolved_path) {
           const ident = ev.raw.argv0 && ev.raw.argv0.length > 0 ? ev.raw.argv0 : ev.raw.prog;
-          const tokenized = ident.startsWith("/") ? tokenize(ident, ctx.roots, pkgDir) : ident;
+          const tokenized = ident.startsWith("/") ? tokenize(ident, roots, pkgDir) : ident;
           block.audit_bypass.push(`<UNRESOLVED_PATH> ${tokenized}`);
         }
         break;
@@ -29884,6 +29911,7 @@ function parseBlockedSpawn(entry) {
 }
 function isSystemNoise(ev, fsPath, os, roots) {
   if (ev.raw.kind !== "read" && ev.raw.kind !== "write") return false;
+  if (ev.raw.hidden) return false;
   const p = fsPath ?? ev.raw.path;
   if (isUnderRoot(p, roots.repo) || isUnderRoot(p, roots.nodeModules)) return false;
   if (SYSTEM_NOISE_PREFIXES.some((prefix) => p.startsWith(prefix))) return true;
@@ -29900,6 +29928,11 @@ function basename3(path3) {
 function isUnderRoot(path3, root) {
   if (!path3.startsWith(root)) return false;
   return path3.length === root.length || path3[root.length] === "/";
+}
+function isStrictAncestorDir(dir, repo) {
+  const d = stripTrailingSlashes(dir);
+  const r = stripTrailingSlashes(repo);
+  return d.length < r.length && isUnderRoot(r, d);
 }
 
 // src/lock/render.ts
@@ -31108,6 +31141,23 @@ function sanitizeLifecycleBaseEnv(baseEnv) {
   }
   return sanitized;
 }
+var INSTALL_MODE_ENV_BY_MANAGER = {
+  pnpm: { npm_config_ignore_pnpmfile: "true", npm_config_script_shell: "/bin/sh" },
+  npm: { npm_config_script_shell: "/bin/sh", npm_config_ignore_scripts: "false" },
+  yarn: {
+    YARN_IGNORE_PATH: "1",
+    YARN_RC_FILENAME: ".yarnrc.yml",
+    YARN_PLUGINS: "",
+    YARN_ENABLE_CONSTRAINTS_CHECKS: "false"
+  }
+};
+function installModeInjectedEnv(installMode, manager) {
+  return installMode ? INSTALL_MODE_ENV_BY_MANAGER[manager] : {};
+}
+function normalizeInstallModeDropEnvNames(installMode, manager) {
+  if (!installMode || manager !== "yarn") return /* @__PURE__ */ new Set();
+  return new Set(Object.keys(installModeInjectedEnv(true, "yarn")));
+}
 function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
   const preloads = [
     preloadPaths?.platformSpoof ?? "/usr/local/lib/script-jail/platform-spoof.cjs",
@@ -31163,12 +31213,10 @@ function buildChildEnv(baseEnv, config2, eventsFilePath, preloadPaths) {
     YARN_GLOBAL_FOLDER: `${config2.work_dir}/.yarn-global`,
     YARN_CACHE_FOLDER: `${config2.work_dir}/.yarn-cache`
   } : { npm_config_cache: `${config2.work_dir}/.npm-cache` };
-  const installModeEnv = !config2.install_mode ? {} : resolvedManager === "pnpm" ? { npm_config_ignore_pnpmfile: "true", npm_config_script_shell: "/bin/sh" } : resolvedManager === "npm" ? { npm_config_script_shell: "/bin/sh", npm_config_ignore_scripts: "false" } : resolvedManager === "yarn" ? {
-    YARN_IGNORE_PATH: "1",
-    YARN_RC_FILENAME: ".yarnrc.yml",
-    YARN_PLUGINS: "",
-    YARN_ENABLE_CONSTRAINTS_CHECKS: "false"
-  } : {};
+  const installModeEnv = installModeInjectedEnv(
+    config2.install_mode === true,
+    resolvedManager
+  );
   return {
     ...inheritedEnv,
     ...cacheRedirectEnv,
@@ -31226,7 +31274,7 @@ function buildChildEnvMacos(baseEnv, config2, eventsFilePath, preloadPaths) {
   return env;
 }
 function macosTokenizeRoots(workDir) {
-  const home = (0, import_node_os.homedir)();
+  const home = stripTrailingSlashes((0, import_node_os.homedir)());
   const rawTmp = (0, import_node_os.tmpdir)();
   let tmp;
   try {
@@ -31700,9 +31748,10 @@ ${fetchDetail}
     }()
   );
   const linuxTmp = (0, import_node_os.tmpdir)();
-  const roots = isMacosBare ? macosTokenizeRoots(config2.work_dir) : {
-    repo: config2.work_dir,
-    nodeModules: `${config2.work_dir}/node_modules`,
+  const canonWorkDir = stripTrailingSlashes(config2.work_dir);
+  const roots = isMacosBare ? macosTokenizeRoots(canonWorkDir) : {
+    repo: canonWorkDir,
+    nodeModules: `${canonWorkDir}/node_modules`,
     home: "/root",
     tmp: linuxTmp,
     ...linuxTmp !== "/tmp" ? { tmpLegacy: "/tmp" } : {},
@@ -31990,7 +32039,9 @@ ${stdoutTail}`;
   diag(input, `pkgDirs discovered: ${discoveredPkgDirs.size} packages`);
   const pkgDirs = new Map(discoveredPkgDirs);
   for (const [k, v] of Object.entries(config2.pkg_dirs)) pkgDirs.set(k, v);
-  const ctx = isMacosBare ? { roots, pkgDirs, rootPkgKeys, os: "darwin" } : { roots, pkgDirs, rootPkgKeys };
+  const installMode = config2.install_mode === true;
+  const injectedInstallModeEnvNames = normalizeInstallModeDropEnvNames(installMode, manager);
+  const ctx = isMacosBare ? { roots, pkgDirs, rootPkgKeys, os: "darwin", installMode, injectedInstallModeEnvNames } : { roots, pkgDirs, rootPkgKeys, installMode, injectedInstallModeEnvNames };
   let yaml;
   try {
     const packages = normalize(collectedEvents, ctx);
@@ -32076,8 +32127,10 @@ if (isMain) {
   buildChildEnvMacos,
   createEventsFile,
   createSensitiveRedactor,
+  installModeInjectedEnv,
   macosTokenizeRoots,
   main,
+  normalizeInstallModeDropEnvNames,
   npmCliEntryPath,
   readStraceChildPid,
   realCaptureNpmPrepareEnv,

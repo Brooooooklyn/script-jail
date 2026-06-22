@@ -42,6 +42,7 @@ import { MacOSInstallRunner } from './macos-install-runner.js';
 import { ProtectedPathsMatcher } from './protected-paths.js';
 import { normalize, type NormalizeContext } from '../lock/normalize.js';
 import { render } from '../lock/render.js';
+import { stripTrailingSlashes } from '../lock/tokenize.js';
 import { discoverPkgDirs } from './discover-pkg-dirs.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -2501,6 +2502,87 @@ function sanitizeLifecycleBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv
 }
 
 /**
+ * The env script-jail itself injects into the package-manager LAUNCH env ONLY
+ * under `install: true`, per manager, to MIRROR the host install's launch env
+ * (`hostInstallEnv`):
+ *   - pnpm: ignore the repo `.pnpmfile.cjs` + pin the script shell.
+ *   - npm:  pin the script shell + force `ignore-scripts=false`.
+ *   - yarn: ignore the repo `.yarnrc.yml` `yarnPath` (run the corepack/registry
+ *           yarn pinned by `packageManager`, matching the host) + neutralize
+ *           plugins/constraints (the install-preflight gate already refuses any
+ *           repo that declares them, so these are no-ops for a gate-passing repo).
+ *
+ * SINGLE SOURCE OF TRUTH: this map drives BOTH (a) the launch-env injection in
+ * `buildChildEnv` and (b) the NAME set normalize uses to drop the genuine root's
+ * reads of these injected names (`injectedInstallModeEnvNames`). Keeping them in
+ * one place means the guest injection and the guest filter can never drift — a
+ * name is filtered iff script-jail itself injected it.
+ *
+ * IMPORTANT — the normalize filter is NOT simply `Object.keys` of this map for
+ * every manager: see {@link normalizeInstallModeDropEnvNames}. The injection is
+ * per-manager and identical across the install and prepare passes ONLY for yarn
+ * (and pnpm); npm's prepare pass STRIPS all `npm_config_*` and rebuilds the env
+ * from `capturedNpmConfig` (which excludes `npm_config_script_shell`), so an
+ * injected npm name is ABSENT in npm prepare and dropping it there would erase a
+ * genuine root env_read. The normalize drop is therefore yarn-scoped.
+ */
+const INSTALL_MODE_ENV_BY_MANAGER: Readonly<
+  Record<'npm' | 'pnpm' | 'yarn', Readonly<Record<string, string>>>
+> = {
+  pnpm: { npm_config_ignore_pnpmfile: 'true', npm_config_script_shell: '/bin/sh' },
+  npm: { npm_config_script_shell: '/bin/sh', npm_config_ignore_scripts: 'false' },
+  yarn: {
+    YARN_IGNORE_PATH: '1',
+    YARN_RC_FILENAME: '.yarnrc.yml',
+    YARN_PLUGINS: '',
+    YARN_ENABLE_CONSTRAINTS_CHECKS: 'false',
+  },
+};
+
+/** The install-mode launch-env script-jail injects for `manager` (empty when
+ *  install is off). The values matter for the launch env; `Object.keys` of the
+ *  same result is the NAME set normalize filters — see {@link INSTALL_MODE_ENV_BY_MANAGER}. */
+export function installModeInjectedEnv(
+  installMode: boolean,
+  manager: 'npm' | 'pnpm' | 'yarn',
+): Readonly<Record<string, string>> {
+  return installMode ? INSTALL_MODE_ENV_BY_MANAGER[manager] : {};
+}
+
+/**
+ * The install-mode injected env-var NAMES that normalize may drop from a
+ * genuine-root `env_read` (script-jail's OWN launch-env injection read back by
+ * the root). This is NOT the full {@link installModeInjectedEnv} key set for
+ * every manager — it is scoped to **yarn**:
+ *
+ *   - **yarn** — the prepare pass reuses the install launch env UNCHANGED (see
+ *     `agent.ts` prepare-pass: for yarn `prepareEnvBase` is passed through), so
+ *     every injected `YARN_*` is present in BOTH the install AND prepare passes.
+ *     A genuine-root read of one is therefore always a script-jail artifact and
+ *     safe to drop in any lifecycle.
+ *   - **npm** — the prepare pass STRIPS all `npm_config_*` and rebuilds the env
+ *     from `capturedNpmConfig`, which deliberately EXCLUDES `npm_config_script_shell`
+ *     (and `npm_config_call`). So the install-mode npm names are ABSENT in npm
+ *     prepare; a root prepare reading `npm_config_script_shell` is a GENUINE
+ *     env_read that `main` records — dropping it would be a false negative vs
+ *     `main`. We therefore never drop npm names at normalize.
+ *   - **pnpm** — lifecycle-invariant like yarn, but its `install: true` path is
+ *     unverified end-to-end, so we conservatively exclude it too.
+ *
+ * npm/pnpm `install: true` env-parity (their injected names leaking into the
+ * install-pass lock) is a separate, pre-existing concern — `main` does not filter
+ * them either, so leaving them unfiltered here is no regression. Tracked as a
+ * follow-up; not addressed by the yarn-targeted lock-parity fix.
+ */
+export function normalizeInstallModeDropEnvNames(
+  installMode: boolean,
+  manager: 'npm' | 'pnpm' | 'yarn',
+): ReadonlySet<string> {
+  if (!installMode || manager !== 'yarn') return new Set<string>();
+  return new Set(Object.keys(installModeInjectedEnv(true, 'yarn')));
+}
+
+/**
  * @internal Exported for unit tests only — production calls this from
  * `main()`.  The over-long-protect-list rejection (audit-trust Finding 2)
  * is the load-bearing invariant tested via this surface.
@@ -2772,20 +2854,12 @@ export function buildChildEnv(
   // npm_config_git is NOT mirrored: the host scopes it to the FETCH phase only
   // (part-1), so the host part-2 child — like the guest Phase B — never sees it.
   // Hardcoded literals match the host (guest is always Linux/macOS, never win32).
-  const installModeEnv: Record<string, string> = !config.install_mode
-    ? {}
-    : resolvedManager === 'pnpm'
-      ? { npm_config_ignore_pnpmfile: 'true', npm_config_script_shell: '/bin/sh' }
-      : resolvedManager === 'npm'
-        ? { npm_config_script_shell: '/bin/sh', npm_config_ignore_scripts: 'false' }
-        : resolvedManager === 'yarn'
-          ? {
-              YARN_IGNORE_PATH: '1',
-              YARN_RC_FILENAME: '.yarnrc.yml',
-              YARN_PLUGINS: '',
-              YARN_ENABLE_CONSTRAINTS_CHECKS: 'false',
-            }
-          : {};
+  // Single source of truth with normalize's `injectedInstallModeEnvNames` filter
+  // (see {@link installModeInjectedEnv} / {@link INSTALL_MODE_ENV_BY_MANAGER}).
+  const installModeEnv: Readonly<Record<string, string>> = installModeInjectedEnv(
+    config.install_mode === true,
+    resolvedManager,
+  );
 
   return {
     ...inheritedEnv,
@@ -2927,7 +3001,11 @@ export function macosTokenizeRoots(workDir: string): {
   tmp: string;
   cache: string;
 } {
-  const home = homedir();
+  // Canonicalize HOME before deriving `cache` from it: Node forwards a trailing
+  // slash from the HOME env (os.homedir()), which would (a) make a $HOME-prefixed
+  // protected pattern miss in the matcher and (b) yield `home//Library/...` for
+  // cache (an internal double slash stripTrailingSlashes cannot later fix).
+  const home = stripTrailingSlashes(homedir());
   const rawTmp = tmpdir();
   let tmp: string;
   try {
@@ -4252,11 +4330,20 @@ export async function main(input: AgentInput): Promise<void> {
   // TMPDIR, so tmpdir() is '/tmp' there and the alias is omitted —
   // byte-identical to the previous hardcoded root.
   const linuxTmp = tmpdir();
+  // Canonicalize work_dir ONCE here (config.work_dir is verbatim — it can arrive
+  // with a trailing slash from SCRIPT_JAIL_REPO_DIR / GITHUB_WORKSPACE / a config
+  // override). Both the ProtectedPathsMatcher below AND normalize() consume THIS
+  // SAME `roots` object, and every path-prefix check they run (tokenize,
+  // isUnderRoot, isUnderNodeModules) uses segment-boundary semantics that break
+  // when the root ends in '/', silently dropping genuine repo/node_modules events.
+  // Stripping here keeps the matcher and normalize in agreement; no-op for clean
+  // roots, so existing locks/goldens are byte-identical.
+  const canonWorkDir = stripTrailingSlashes(config.work_dir);
   const roots = isMacosBare
-    ? macosTokenizeRoots(config.work_dir)
+    ? macosTokenizeRoots(canonWorkDir)
     : {
-        repo: config.work_dir,
-        nodeModules: `${config.work_dir}/node_modules`,
+        repo: canonWorkDir,
+        nodeModules: `${canonWorkDir}/node_modules`,
         home: '/root',
         tmp: linuxTmp,
         ...(linuxTmp !== '/tmp' ? { tmpLegacy: '/tmp' } : {}),
@@ -4966,9 +5053,20 @@ export async function main(input: AgentInput): Promise<void> {
   // would silently leave the lock with raw `/System`, `/private/var`, … paths
   // that never reconcile against the Linux-produced committed lock.  The Linux
   // path keeps the default (`os` undefined → 'linux').
+  // install_mode-gated normalize behaviour: (1) env_read drop of script-jail's
+  // OWN injected names on the genuine root, and (2) strict-ancestor fs-read drop
+  // (the package manager's upward rc/project walk from the deep host repoDir).
+  // The env-drop NAME set is yarn-scoped — see {@link normalizeInstallModeDropEnvNames}:
+  // npm's prepare pass strips `npm_config_*`, so dropping an injected npm name in
+  // npm prepare would erase a genuine root env_read (false negative vs main). The
+  // fs-ancestor drop stays manager-agnostic (it is the trusted root's own cwd walk,
+  // value-blind dirs, never a dependency action). Both are no-ops when install is
+  // off → pure-audit / mode:update output is byte-identical.
+  const installMode = config.install_mode === true;
+  const injectedInstallModeEnvNames = normalizeInstallModeDropEnvNames(installMode, manager);
   const ctx: NormalizeContext = isMacosBare
-    ? { roots, pkgDirs, rootPkgKeys, os: 'darwin' }
-    : { roots, pkgDirs, rootPkgKeys };
+    ? { roots, pkgDirs, rootPkgKeys, os: 'darwin', installMode, injectedInstallModeEnvNames }
+    : { roots, pkgDirs, rootPkgKeys, installMode, injectedInstallModeEnvNames };
 
   let yaml: string;
   try {

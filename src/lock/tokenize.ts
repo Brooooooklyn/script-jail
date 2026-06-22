@@ -33,6 +33,53 @@ export interface TokenizeRoots {
   cache: string; // per-manager, e.g. "/root/.local/share/pnpm/store"
 }
 
+/**
+ * Strip trailing slashes from a path prefix, preserving a lone root `/`.
+ * The root prefixes in {@link TokenizeRoots} are derived from `config.work_dir`
+ * (which can arrive with a trailing slash from SCRIPT_JAIL_REPO_DIR /
+ * GITHUB_WORKSPACE / a config override). Every prefix comparison here and in
+ * normalize.ts / protected-paths.ts uses segment-boundary semantics
+ * (`path[root.length] === '/'`) that BREAK when the root itself ends in '/',
+ * which would silently drop genuine repo/node_modules events. Canonicalize the
+ * roots ONCE at construction (see agent.ts) with this shared helper so the
+ * package-manager matcher AND normalize agree. No-op for clean roots.
+ */
+export function stripTrailingSlashes(p: string): string {
+  let end = p.length;
+  while (end > 1 && p[end - 1] === '/') end--;
+  return end === p.length ? p : p.slice(0, end);
+}
+
+/**
+ * Canonicalize EVERY root prefix by stripping trailing slashes, so the
+ * segment-boundary prefix checks in tokenize / normalize.isUnderRoot /
+ * ProtectedPathsMatcher never mis-fire on a trailing-slash root. The SAME helper
+ * is used by both ProtectedPathsMatcher (emit-time protected-path policy) and
+ * normalize (lock rendering) so they agree on what is "under" each root.
+ *
+ * ALL prefixes — not just repo/nodeModules — must be canonicalized: the matcher
+ * tokenizes a probed path against EVERY root, so a trailing slash on `home`
+ * makes `tokenize('/home/u/.ssh/id_rsa')` fail the boundary check (the byte after
+ * the prefix is '.', not '/'), leaving the path UN-tokenized so a protected
+ * pattern like `$HOME/.ssh/**` no longer matches — and the ENOENT probe of a real
+ * secret is then dropped as unprotected noise (a false negative, NOT cosmetic).
+ * The same risk applies to `$TMPDIR`/`$CACHE` protected patterns, so tmp,
+ * tmpLegacy and cache are stripped too. (Internal double slashes — e.g.
+ * `home//Library` — are a CONSTRUCTION bug fixed at the source by canonicalizing
+ * the base BEFORE deriving children; this helper only fixes trailing slashes.)
+ */
+export function canonicalizeTokenizeRoots(roots: TokenizeRoots): TokenizeRoots {
+  return {
+    ...roots,
+    repo: stripTrailingSlashes(roots.repo),
+    nodeModules: stripTrailingSlashes(roots.nodeModules),
+    home: stripTrailingSlashes(roots.home),
+    tmp: stripTrailingSlashes(roots.tmp),
+    ...(roots.tmpLegacy !== undefined ? { tmpLegacy: stripTrailingSlashes(roots.tmpLegacy) } : {}),
+    cache: stripTrailingSlashes(roots.cache),
+  };
+}
+
 const HASH_PATTERN = /[A-Za-z0-9_-]{16,}/g;
 const TEMP_SUFFIX = /\.tmp(\.[A-Za-z0-9]+)?$/;
 // Yarn Berry (@yarnpkg/fslib `getTempName`) launches binary lifecycle scripts via a

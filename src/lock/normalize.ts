@@ -19,7 +19,14 @@
 
 import type { AttributedEvent, LifecycleBlock, PackageBlock } from './schema.js';
 import { canonicalizePrivateRealpath } from './private-realpath.js';
-import { isCrossPackage, isInsidePkg, tokenize, type TokenizeRoots } from './tokenize.js';
+import {
+  canonicalizeTokenizeRoots,
+  isCrossPackage,
+  isInsidePkg,
+  stripTrailingSlashes,
+  tokenize,
+  type TokenizeRoots,
+} from './tokenize.js';
 
 // Binaries whose absolute argv[0] paths are collapsed to the bare basename in
 // spawn_attempts. Paths like /usr/local/bin/node, /usr/bin/node, and
@@ -146,11 +153,51 @@ export interface NormalizeContext {
   // Linux lockfile must never be able to smuggle macOS-shaped paths past a
   // Linux audit gate.
   os?: 'linux' | 'darwin';
+  // True ONLY under `install: true` (the drop-in host install). Two normalize
+  // behaviours are gated on it, BOTH no-ops when false so pure-audit / mode:update
+  // output stays byte-identical:
+  //   1. env_read: drop the GENUINE root's reads of the names in
+  //      `injectedInstallModeEnvNames` (script-jail's OWN launch-env injection).
+  //   2. fs read: drop the GENUINE root's strict-ANCESTOR-of-repo reads (the pm's
+  //      upward rc/project search stat-probes, an artifact of install:true aligning
+  //      the audit cwd to the deep host repoDir). Root-scoped exactly like #1: a
+  //      DEPENDENCY reading a repo ancestor (runner-layout probe) is PRESERVED.
+  // Together these make the install_mode audit lock byte-identical to the
+  // install-off (mode:update) lock, so the documented `mode:update` → `mode:check`
+  // + `install` onboarding matches. See agent.ts `normalizeInstallModeDropEnvNames`.
+  installMode?: boolean;
+  // The env-var NAMES script-jail itself injects into the pm launch env that are
+  // SAFE to drop from the genuine root's env_read block — yarn-scoped (see agent.ts
+  // `normalizeInstallModeDropEnvNames`). EMPTY for npm/pnpm: npm's prepare pass
+  // strips `npm_config_*`, so an injected npm name is absent there and dropping it
+  // would erase a genuine root env_read. For yarn the injection is identical across
+  // the install and prepare passes, so a genuine-root read of an injected `YARN_*`
+  // is always a script-jail artifact. These are script-jail's OWN names, never
+  // names a dependency chose; dropped ONLY for the genuine root (claimsRoot &&
+  // !forged) — a DEPENDENCY reading the same name attributes to ITS OWN pkg and is
+  // PRESERVED (sandbox-detection signal intact). Empty set ⇒ the env-drop is a no-op.
+  injectedInstallModeEnvNames?: ReadonlySet<string>;
 }
 
 export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map<string, PackageBlock> {
   const out = new Map<string, PackageBlock>();
   const os = ctx.os ?? 'linux';
+
+  // Canonicalize the root prefixes ONCE. `roots.repo` is `config.work_dir`
+  // verbatim (agent.ts builds roots with no path.resolve) and work_dir can arrive
+  // with a trailing slash (SCRIPT_JAIL_REPO_DIR / GITHUB_WORKSPACE / a config
+  // override). Every root-prefix check below — the isSystemNoise repo-wins
+  // exemption (isUnderRoot), tokenize, and the install_mode strict-ancestor drop —
+  // uses segment-boundary semantics (`path[root.length] === '/'`) that BREAK when
+  // the root itself ends in '/': e.g. on a `/opt/actions-runner/_work/r/r/` layout
+  // a genuine read of `…/r/r/package.json` fails the repo-wins check, then the bare
+  // `/opt` system-noise prefix drops it — a real dependency/root fs action silently
+  // removed. Stripping here once keeps every downstream comparison sound; clean
+  // (no-trailing-slash) roots are unchanged, so existing locks/goldens are
+  // byte-identical. The SAME helper canonicalizes ProtectedPathsMatcher's roots
+  // (src/guest/protected-paths.ts) so the emit-time protected-path policy and the
+  // lock rendering agree on what is "under the repo".
+  const roots: TokenizeRoots = canonicalizeTokenizeRoots(ctx.roots);
 
   for (const ev of events) {
     // For fs events, canonicalize the macOS /private realpath BEFORE both the
@@ -165,7 +212,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         : ev.raw.kind === 'read' || ev.raw.kind === 'write'
           ? ev.raw.path
           : undefined;
-    if (isSystemNoise(ev, fsPath, os, ctx.roots)) continue;
+    if (isSystemNoise(ev, fsPath, os, roots)) continue;
 
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
 
@@ -254,13 +301,66 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
     // every non-root pkg, so their output is byte-identical to before.
     const forgedPrefix = isForgedRoot ? '<FORGED_ROOT> ' : '';
 
+    // install:true neutralizes two install_mode-ONLY artifacts of script-jail's OWN
+    // injection so the install_mode audit lock matches the install-off (mode:update)
+    // lock — making the action's documented `mode:update` (install off) → commit →
+    // `mode:check` + `install` onboarding match for yarn repos. These drops run
+    // BEFORE getLifecycleBlock ON PURPOSE: a (pkg, lifecycle) whose ENTIRE content is
+    // install_mode-dropped artifacts must NOT create an empty block that the
+    // install-off lock lacks (that empty block would itself break byte-parity).
+    //   (1) env_read of a name script-jail injects into the pm LAUNCH env under
+    //       install_mode (yarn YARN_* ONLY — npm/pnpm pass an EMPTY set; see agent.ts
+    //       normalizeInstallModeDropEnvNames for why the drop is yarn-scoped). yarn
+    //       reads them back during config load, so they surface ONLY under
+    //       install_mode and ONLY on the genuine root.
+    //   (2) fs READ of a strict ANCESTOR of repoDir: install:true aligns the audit
+    //       cwd to the deep host repoDir (the M1 cwd-oracle fix), so the pm's
+    //       unconditional upward rc/project search stat-probes each ancestor of
+    //       repoDir (/home, /home/runner, …). Under pure-audit the cwd is /work,
+    //       whose only ancestor is '/' (never treated as an ancestor), so these
+    //       never appear install-off.
+    // SAFETY — this is NOT the reverted blanket normalize name-drop (which erased the
+    // sandbox-detection signal for EVERY package). Both drops are scoped to:
+    //   * install_mode only — pure-audit / mode:update output is byte-identical;
+    //   * the GENUINE root only (claimsRoot && !isForgedRoot) — a DEPENDENCY that
+    //     reads an injected name OR probes a repo ancestor attributes to ITS OWN pkg
+    //     (claimsRoot=false) and is STILL RECORDED (signal intact); a FORGED-root
+    //     event keeps its <FORGED_ROOT> entry (isForgedRoot ⇒ not dropped here);
+    //   * (env) the KNOWN injected-name set script-jail itself sets (single source of
+    //     truth with the launch-env injection — never a name a dep chose);
+    //   * (fs) READS only — an ancestor WRITE is a genuine escape and flows through
+    //     the 'write' case below, never dropped.
+    //   * (fs) NON-protected reads only — a `hidden` ancestor read (its path matched
+    //     the user's protected.files at emit) is something the auditor explicitly
+    //     opted into, so it is NOT dropped (renders `<HIDDEN> …`). Unlike the env
+    //     drop — script-jail's OWN injected names, safe to drop hidden-or-not — an
+    //     ancestor fs path is the USER's filesystem; hiding a protected probe of it
+    //     would be a false negative. (A repo that protects a repoDir ANCESTOR and
+    //     uses install:true would then see drift vs the install-off lock — a
+    //     fail-closed false positive, acceptable; the common case protects $REPO/
+    //     $HOME secrets, never a repoDir ancestor, so napi-rs parity is unaffected.)
+    if (ctx.installMode === true && claimsRoot && !isForgedRoot) {
+      if (ev.raw.kind === 'env_read' && ctx.injectedInstallModeEnvNames?.has(ev.raw.name)) {
+        continue;
+      }
+      if (
+        ev.raw.kind === 'read' &&
+        !ev.raw.hidden &&
+        isStrictAncestorDir(fsPath ?? ev.raw.path, roots.repo)
+      ) {
+        continue;
+      }
+    }
+
     const block = getLifecycleBlock(out, ev.pkg, ev.lifecycle);
 
     switch (ev.raw.kind) {
       case 'read': {
+        // (install_mode genuine-root strict-ancestor reads were dropped above, before
+        // getLifecycleBlock, so they never create an empty block.)
         // fsPath is the /private-canonicalized path on darwin, ev.raw.path on
         // linux (computed once at the top of the loop).
-        const tokenized = normalizeVolatilePath(tokenize(fsPath!, ctx.roots, pkgDir));
+        const tokenized = normalizeVolatilePath(tokenize(fsPath!, roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package read
         const hiddenTag = ev.raw.hidden ? `<HIDDEN> ${tokenized}` : tokenized;
         // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
@@ -268,7 +368,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         break;
       }
       case 'write': {
-        const tokenized = normalizeVolatilePath(tokenize(fsPath!, ctx.roots, pkgDir));
+        const tokenized = normalizeVolatilePath(tokenize(fsPath!, roots, pkgDir));
         if (isInsidePkg(tokenized)) continue; // drop intra-package write
         // Both prefixes are independent: <HIDDEN> answers "was this a protected
         // path?"; <CROSS_PACKAGE> answers "did this write escape into another
@@ -280,6 +380,8 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         break;
       }
       case 'env_read': {
+        // (install_mode genuine-root reads of script-jail's injected env names were
+        // dropped above, before getLifecycleBlock, so they never create an empty block.)
         const tagged = ev.raw.hidden ? `<HIDDEN> ${ev.raw.name}` : ev.raw.name;
         // forgedPrefix is the OUTERMOST prefix (empty for genuine root / non-root).
         block.env_read.push(`${forgedPrefix}${tagged}`);
@@ -291,7 +393,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // like /usr/local/bin/node — not stable across runners.
         const tokenizedArgv = ev.raw.argv.map((a, i) => {
           if (!a.startsWith('/')) return a;
-          const tokenized = tokenize(a, ctx.roots, pkgDir);
+          const tokenized = tokenize(a, roots, pkgDir);
           // If argv[0] is still an absolute path after tokenization (i.e. it did
           // not match any known root), collapse it to its basename when it is one
           // of the well-known runtime binaries. This makes the lockfile byte-stable
@@ -326,7 +428,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         break;
       }
       case 'dlopen': {
-        const tokenized = tokenize(ev.raw.filename, ctx.roots, pkgDir);
+        const tokenized = tokenize(ev.raw.filename, roots, pkgDir);
         block.dlopen_attempts.push(`<BLOCKED> ${tokenized}`);
         break;
       }
@@ -363,7 +465,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
         // clean even when audit was bypassed, which is the worst possible
         // outcome for an auditor.
         if (ev.raw.envp_alloc_failed) {
-          const tokenized = tokenize(ev.raw.prog, ctx.roots, pkgDir);
+          const tokenized = tokenize(ev.raw.prog, roots, pkgDir);
           block.audit_bypass.push(`<EXEC_FAIL_OPEN> ${tokenized}`);
         }
         if (ev.raw.syscall_bypass) {
@@ -375,7 +477,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
             ? ev.raw.argv0
             : ev.raw.prog;
           const tokenized = ident.startsWith('/')
-            ? tokenize(ident, ctx.roots, pkgDir)
+            ? tokenize(ident, roots, pkgDir)
             : ident;
           block.audit_bypass.push(`<SYSCALL_EXEC_BYPASS> ${tokenized}`);
         }
@@ -393,7 +495,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
             ? ev.raw.argv0
             : ev.raw.prog;
           const tokenized = ident.startsWith('/')
-            ? tokenize(ident, ctx.roots, pkgDir)
+            ? tokenize(ident, roots, pkgDir)
             : ident;
           block.audit_bypass.push(`<EVENTS_FILE_FORGERY> ${tokenized}`);
         }
@@ -419,7 +521,7 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
           // We still defensively call tokenize() for absolute idents to
           // mirror the other audit_bypass branches.
           const tokenized = ident.startsWith('/')
-            ? tokenize(ident, ctx.roots, pkgDir)
+            ? tokenize(ident, roots, pkgDir)
             : ident;
           block.audit_bypass.push(`<UNRESOLVED_PATH> ${tokenized}`);
         }
@@ -578,6 +680,16 @@ function isSystemNoise(
   roots: TokenizeRoots,
 ): boolean {
   if (ev.raw.kind !== 'read' && ev.raw.kind !== 'write') return false;
+  // A user-PROTECTED fs probe (hidden:true — its path matched the auditor's
+  // protected.files at emit, see protected-paths.ts) is an explicit opt-in: it
+  // must ALWAYS surface as `<HIDDEN> …`, never be swallowed by a system-noise
+  // prefix.  Otherwise a protected read of, e.g., an /opt or /etc path (a repo
+  // ancestor on a self-hosted /opt/actions-runner runner, or a deliberately
+  // audited system file) would be dropped here BEFORE the genuine-root hidden
+  // exemption in the main loop can preserve it.  Fail open for hidden fs events —
+  // this is the same "never drop a protected probe" invariant the install_mode
+  // ancestor drop honours.
+  if (ev.raw.hidden) return false;
   // fsPath is always defined for read/write (computed by the caller): on
   // darwin it is the /private-canonicalized path, on linux it is ev.raw.path.
   const p = fsPath ?? ev.raw.path;
@@ -620,4 +732,19 @@ function basename(path: string): string {
 function isUnderRoot(path: string, root: string): boolean {
   if (!path.startsWith(root)) return false;
   return path.length === root.length || path[root.length] === '/';
+}
+
+// True when `dir` is a STRICT ancestor (proper parent dir) of `repo`, with the
+// same path-segment-boundary semantics as isUnderRoot: `/home/runner/work` is a
+// strict ancestor of `/home/runner/work/napi-rs/napi-rs` but `/home/runner/wo` is
+// not (no segment boundary), and `repo` itself is not its own strict ancestor.
+// `/` is intentionally NOT treated as a strict ancestor (isUnderRoot's segment
+// rule already excludes it), matching the empirical ancestor set and keeping the
+// drop conservative.  Both operands are trailing-slash-canonicalized first so a
+// trailing-slash repo root (`/path/repo/`) does NOT make `/path/repo` (repoDir
+// itself) compare as a strict ancestor and get dropped.
+function isStrictAncestorDir(dir: string, repo: string): boolean {
+  const d = stripTrailingSlashes(dir);
+  const r = stripTrailingSlashes(repo);
+  return d.length < r.length && isUnderRoot(r, d);
 }
