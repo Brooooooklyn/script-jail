@@ -28,12 +28,21 @@
 //     regresses).  Relocation sources confirmed: `.npmrc` `pnpmfile=` /
 //     `global-pnpmfile=` (pnpm <=10), `pnpm-workspace.yaml` `pnpmfile:` (all
 //     versions) and `configDependencies:`.
-//   * yarn (Berry) — `.yarnrc.yml` `yarnPath` (re-execs a repo binary), `plugins`
-//     (loads repo modules at startup), and `enableConstraintsChecks: true` (runs
-//     repo `yarn.config.cjs` via the install-time validate hook) all execute
-//     during `yarn install --immutable --mode=skip-build`.  NO single yarn flag
-//     suppresses all three, so this reject IS the enforcement for yarn.  Classic
-//     `.yarnrc` `yarn-path` is NOT honored under Berry, so it is not a vector.
+//   * yarn (Berry) — `.yarnrc.yml` `plugins` (loads repo modules at startup) and
+//     `enableConstraintsChecks: true` (runs repo `yarn.config.cjs` via the
+//     install-time validate hook) execute during `yarn install --immutable
+//     --mode=skip-build` and are refused.  `yarnPath` (re-execs a repo binary) is
+//     treated differently under the OWNER TRUST DECISION: the repo's OWN committed
+//     `.yarn/releases` yarn is trusted toolchain (the repo is CI's trust root), so a
+//     repoDir-own yarnPath resolving INSIDE repoDir is ALLOWED; an ANCESTOR yarnPath
+//     (unstaged → unaudited) or an escaping/out-of-repo yarnPath is still refused.
+//     This is sound because under install:true BOTH sides ignore the vendored yarnPath
+//     and run the registry yarn pinned by `packageManager`: the guest sets
+//     YARN_IGNORE_PATH=1 in its install-mode launch env (agent.ts buildChildEnv) and
+//     `hostInstallEnv` pins it on BOTH host phases (host-install.ts).  So audit == host,
+//     the repo-vendored binary is never executed by script-jail, and the allowed
+//     yarnPath is inert.  Classic `.yarnrc` `yarn-path` is NOT honored under Berry, so
+//     it is not a vector.
 //   * npm — the only known pre-trust config exec (the `git` BINARY selected for a
 //     non-GitHub git dep) is already neutralized by the `npm_config_git` pin in
 //     host-install.ts.  Nothing left to detect here.
@@ -444,6 +453,52 @@ function isPathUnder(child: string, root: string): boolean {
   return !(rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel));
 }
 
+/**
+ * True when a repoDir-own `.yarnrc.yml` `yarnPath` resolves OUTSIDE repoDir — i.e.
+ * it is NOT the repo's own committed `.yarn/releases` toolchain.  Yarn resolves a
+ * RELATIVE `yarnPath` against the rc file's directory (= repoDir for the repoDir-own
+ * rc) and uses an ABSOLUTE `yarnPath` verbatim.  Checked BOTH lexically (catches a
+ * `../` escape or an absolute out-of-repo path) AND, when the target exists, by
+ * realpath (catches a symlink-OUT planted inside `.yarn/releases`).  `repoDir` is
+ * already realpath'd by the caller (`scanDirs`), so the lexical prefix is canonical.
+ */
+function yarnPathEscapesRepo(repoDir: string, yarnPath: string): boolean {
+  const target = resolve(repoDir, yarnPath);
+  if (!isPathUnder(target, repoDir)) return true; // lexical `../`/absolute escape
+  try {
+    if (!isPathUnder(realpathSync(target), repoDir)) return true; // symlink-OUT escape
+  } catch {
+    // Nonexistent target — the lexical bound above already holds (no symlink to follow).
+  }
+  return false;
+}
+
+/**
+ * True when `dir`'s `package.json` declares an EXACT `packageManager: "yarn@<version>"`
+ * pin — the form `yarn set version` always writes (e.g. `yarn@4.17.0` or
+ * `yarn@4.17.0+sha224.…`).  Required to allow a repoDir-own `yarnPath` under
+ * `install: true`: with `YARN_IGNORE_PATH=1` both the audit and the host IGNORE the
+ * vendored yarn and corepack-resolve the version from this pin, so an exact pin is what
+ * guarantees they run the SAME yarn.  With NO pin each side falls back to its own
+ * corepack default (empirically yarn 1.22.x, not the vendored 4.x) → audit-vs-host
+ * version skew the value-blind lock cannot catch.  Ranges/tags (`yarn@latest`,
+ * `yarn@4`) are rejected — corepack would resolve them non-deterministically.
+ */
+function hasExactYarnPackageManagerPin(dir: string): boolean {
+  const content = tryReadFile(join(dir, 'package.json'));
+  if (content === null) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return false;
+  }
+  if (!isRecord(parsed)) return false;
+  const pm = parsed['packageManager'];
+  if (typeof pm !== 'string') return false;
+  return /^yarn@\d+\.\d+\.\d+(\+[A-Za-z0-9._-]+)?$/.test(pm.trim());
+}
+
 const PNPM_GUIDANCE =
   ' would run unaudited on the runner BEFORE the audit decides anything. ' +
   '`install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, ' +
@@ -620,6 +675,14 @@ const YARN_GUIDANCE =
   'BEFORE the audit decides anything. `install: true` cannot run that pre-trust. ' +
   'Remove it, or audit without `install` (the sandbox still records it there).';
 
+const YARN_PIN_GUIDANCE =
+  ' in `package.json`. Under `install: true` the repo-vendored yarn is ignored ' +
+  '(YARN_IGNORE_PATH=1 on both the audit and the host); the version is corepack-' +
+  'resolved from `packageManager`. Without an EXACT pin each side falls back to its ' +
+  'own corepack default (e.g. yarn 1.22.x, not the vendored 4.x), so the audit and ' +
+  'the host install could run DIFFERENT yarn versions — a divergence the value-blind ' +
+  'lock cannot catch. Add `"packageManager": "yarn@<version>"`, or audit without `install`.';
+
 function detectYarnStartupExec(repoDir: string, workspaceRoot?: string): string | null {
   // Berry walks UP from the install cwd and loads `.yarnrc.yml` from EACH
   // ancestor dir at startup, so a `plugins:`/`yarnPath` in a parent rc within the
@@ -669,8 +732,38 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, hasYarnConf
     return `${where} present-but-unparseable \`.yarnrc.yml\` (cannot prove no \`yarnPath\`/\`plugins\`)` + YARN_GUIDANCE;
   }
   if (!isRecord(parsed)) return null; // empty / scalar yaml declares nothing
-  if (typeof parsed['yarnPath'] === 'string' && parsed['yarnPath'].length > 0) {
-    return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+  const yarnPathVal = parsed['yarnPath'];
+  if (typeof yarnPathVal === 'string' && yarnPathVal.length > 0) {
+    // OWNER TRUST DECISION (install:true): the repo's OWN committed `.yarn/releases`
+    // yarn binary is trusted toolchain — the repo is CI's trust root, and this is
+    // not dependency code — so a repoDir-own `yarnPath` that stays INSIDE repoDir no
+    // longer refuses install:true (the yarn-Berry / napi-rs case).  This is sound
+    // because BOTH the audit and the host install IGNORE the vendored yarnPath and run
+    // the registry yarn pinned by `packageManager`: the guest sets YARN_IGNORE_PATH=1
+    // in its install-mode launch env (buildChildEnv) and hostInstallEnv pins it on both
+    // host phases (host-install.ts).  So audit == host (no vendored-vs-registry gap),
+    // and the vendored binary is never executed by script-jail on this path.  STILL
+    // refuse:
+    //   (a) an ANCESTOR (`!atRepoDir`) yarnPath — never staged into the sandbox
+    //       (backend/stage.ts stages only repoDir), so its enableScripts cascade and
+    //       any host-side rc effects are audit-blind; and
+    //   (b) a repoDir yarnPath that ESCAPES repoDir (`yarnPathEscapesRepo`) — not the
+    //       committed toolchain; defense-in-depth in case YARN_IGNORE_PATH ever fails to
+    //       suppress on some yarn version, an out-of-repo binary must never be trusted.
+    if (!atRepoDir || yarnPathEscapesRepo(dir, yarnPathVal)) {
+      return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+    }
+    // VERSION PARITY: both the audit and the host IGNORE the vendored binary
+    // (YARN_IGNORE_PATH=1) and corepack-resolve the version from `packageManager`, so
+    // REQUIRE an exact `yarn@<version>` pin.  Without it the GUEST audit would corepack-
+    // default (e.g. yarn 1.22.x for a Berry repo — a nonsense audit) and a corepack host
+    // would skew from the guest.  With the pin the guest and a corepack-shim host both run
+    // the pinned version.  (A non-corepack STANDALONE host yarn of a different version is
+    // the accepted, NON-PR-controllable `install: true` host-PM-version residual — runner-
+    // image controlled, FC is the enforcement boundary; see docs/divergence.md.)
+    if (!hasExactYarnPackageManagerPin(dir)) {
+      return `${where} \`.yarnrc.yml\` \`yarnPath\` without an exact \`packageManager: "yarn@<version>"\` pin` + YARN_PIN_GUIDANCE;
+    }
   }
   if (Array.isArray(parsed['plugins']) && parsed['plugins'].length > 0) {
     return `${where} \`.yarnrc.yml\` \`plugins\` entry` + YARN_GUIDANCE;

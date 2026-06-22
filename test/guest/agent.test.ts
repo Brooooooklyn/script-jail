@@ -2719,17 +2719,19 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     expect(env['npm_config_git']).toBeUndefined();
   });
 
-  it('install_mode + yarn → mirrors the 3 child-reaching host yarn pins, NOT npm_config_* or YARN_IGNORE_PATH', async () => {
+  it('install_mode + yarn → mirrors ALL FOUR host yarn launch pins incl YARN_IGNORE_PATH (audit==host, no vendored-vs-registry divergence)', async () => {
     const { buildChildEnv } = await import('../../src/guest/agent.js');
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('yarn', true), '/tmp/events.jsonl');
-    // Host part-2 yarn pins these three and yarn re-exports them to the child
-    // (VERIFIED yarn 4.9.1); the guest must mirror EXACTLY to match the child env.
     expect(env['YARN_RC_FILENAME']).toBe('.yarnrc.yml');
     expect(env['YARN_PLUGINS']).toBe('');
     expect(env['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBe('false');
-    // YARN_IGNORE_PATH is excluded: yarn never re-exports it → host child lacks it,
-    // so mirroring it would CREATE a guest-only value the host child doesn't have.
-    expect(env['YARN_IGNORE_PATH']).toBeUndefined();
+    // YARN_IGNORE_PATH=1 is REQUIRED: it makes the guest install-mode yarn IGNORE the
+    // repo `.yarnrc.yml` `yarnPath` and run the SAME registry yarn the host runs
+    // (host hostInstallEnv also pins it). Without it the guest would re-exec the
+    // repo-VENDORED yarn while the host runs the registry yarn — an audit-vs-host
+    // divergence that could hide dependency lifecycle behavior. yarn consumes it and
+    // never re-exports it, so the lifecycle child sees it absent on BOTH sides.
+    expect(env['YARN_IGNORE_PATH']).toBe('1');
     // npm/pnpm-only keys never injected for yarn.
     expect(env['npm_config_ignore_pnpmfile']).toBeUndefined();
     expect(env['npm_config_script_shell']).toBeUndefined();
@@ -2748,6 +2750,18 @@ describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
     const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('npm', false), '/tmp/events.jsonl');
     expect(env['npm_config_ignore_scripts']).toBeUndefined();
     expect(env['npm_config_script_shell']).toBeUndefined();
+  });
+
+  it('pure-audit (install_mode false) + yarn → NO YARN_* injection incl YARN_IGNORE_PATH (check mode audits the repo yarn as-is; golden byte-stability)', async () => {
+    // YARN_IGNORE_PATH=1 is install-mode-ONLY: check mode has no host install to
+    // diverge from, so it audits the repo's yarn (incl. yarnPath) unchanged and must
+    // not inject any YARN_* pin (keeps existing check-mode locks / goldens stable).
+    const { buildChildEnv } = await import('../../src/guest/agent.js');
+    const env = buildChildEnv({ PATH: '/usr/bin' }, cfg('yarn', false), '/tmp/events.jsonl');
+    expect(env['YARN_IGNORE_PATH']).toBeUndefined();
+    expect(env['YARN_RC_FILENAME']).toBeUndefined();
+    expect(env['YARN_PLUGINS']).toBeUndefined();
+    expect(env['YARN_ENABLE_CONSTRAINTS_CHECKS']).toBeUndefined();
   });
 
   it('injection OVERRIDES inherited npm_config_ignore_pnpmfile AND npm_config_script_shell (last-spread wins)', async () => {

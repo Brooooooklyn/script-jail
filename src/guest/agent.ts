@@ -2751,13 +2751,24 @@ export function buildChildEnv(
   //          and `npm_config_ignore_scripts=false` (thread [53]: a runner
   //          `$HOME/.npmrc ignore-scripts=true` would skip host part-2 dep scripts
   //          the audit ran; npm re-exports both to the lifecycle child).
-  //   yarn — host pins YARN_RC_FILENAME/YARN_PLUGINS/YARN_ENABLE_CONSTRAINTS_CHECKS
-  //          (yarn re-exports these three to the child; VERIFIED yarn 4.9.1).
-  //          YARN_IGNORE_PATH is DELIBERATELY EXCLUDED: yarn consumes it and never
-  //          re-exports it, so the host child never sees it — mirroring it here
-  //          would put a value in the guest child the host child lacks, CREATING a
-  //          new divergence.  (preflight detectYarnStartupExec refuses install:true
-  //          for a repo yarnPath, so the audit-fidelity angle is already covered.)
+  //   yarn — host pins YARN_IGNORE_PATH=1 / YARN_RC_FILENAME / YARN_PLUGINS /
+  //          YARN_ENABLE_CONSTRAINTS_CHECKS in its LAUNCH env (hostInstallEnv).  The
+  //          guest install-mode LAUNCH env MUST mirror ALL FOUR.
+  //          YARN_IGNORE_PATH=1 is REQUIRED (it was previously, wrongly, excluded):
+  //          it makes BOTH host and guest yarn IGNORE the repo `.yarnrc.yml` `yarnPath`
+  //          and run the corepack/registry yarn pinned by `packageManager`.  Without it
+  //          on the guest, the guest audit re-execs the repo-VENDORED yarn (via
+  //          yarnPath) while the host runs the REGISTRY yarn — an audit-vs-host
+  //          divergence that can HIDE dependency lifecycle behavior (a vendored yarn
+  //          that runs dep scripts differently than registry yarn → unaudited host
+  //          action = false negative).  VERIFIED (cached yarn 4.17.0): a direct
+  //          `node yarn.js` re-execs `yarnPath` UNLESS YARN_IGNORE_PATH=1.  This is the
+  //          counterpart of install-preflight allowing a repoDir-own committed yarnPath:
+  //          the relaxation is sound ONLY because both sides now ignore yarnPath and run
+  //          the SAME registry yarn.  The earlier "exclude it to avoid a child
+  //          divergence" rationale was wrong — the HOST launch env ALSO sets it, so the
+  //          lifecycle child sees the same state on both sides regardless of whether
+  //          yarn re-exports it (it does not; yarn consumes it).
   // npm_config_git is NOT mirrored: the host scopes it to the FETCH phase only
   // (part-1), so the host part-2 child — like the guest Phase B — never sees it.
   // Hardcoded literals match the host (guest is always Linux/macOS, never win32).
@@ -2769,6 +2780,7 @@ export function buildChildEnv(
         ? { npm_config_script_shell: '/bin/sh', npm_config_ignore_scripts: 'false' }
         : resolvedManager === 'yarn'
           ? {
+              YARN_IGNORE_PATH: '1',
               YARN_RC_FILENAME: '.yarnrc.yml',
               YARN_PLUGINS: '',
               YARN_ENABLE_CONSTRAINTS_CHECKS: 'false',

@@ -147,9 +147,64 @@ describe('detectPreTrustConfigExec — pnpm', () => {
 });
 
 describe('detectPreTrustConfigExec — yarn (Berry)', () => {
-  it('blocks .yarnrc.yml yarnPath', () => {
-    write('.yarnrc.yml', 'yarnPath: ./.evil-yarn.cjs\n');
+  it('ALLOWS a repoDir-own yarnPath INSIDE the checkout WITH an exact packageManager pin (napi-rs case)', () => {
+    // OWNER TRUST DECISION: the repo's own committed yarn binary is trusted toolchain.
+    // A repoDir-own yarnPath under repoDir + an exact `packageManager: yarn@<ver>` pin
+    // (so audit and host corepack-resolve the SAME yarn) no longer refuses install:true.
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\nnodeLinker: node-modules\n');
+    write('package.json', '{"name":"x","packageManager":"yarn@4.17.0"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
+  });
+
+  it('ALLOWS a contained yarnPath with a packageManager pin carrying an integrity hash', () => {
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x","packageManager":"yarn@4.17.0+sha224.abcdef0123456789"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
+  });
+
+  it('still BLOCKS a contained yarnPath when there is NO packageManager pin (version-skew risk)', () => {
+    // Without a pin, corepack on each side falls back to its own default yarn version
+    // (empirically 1.22.x, not the vendored 4.x) → audit-vs-host version skew.
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/packageManager/);
+  });
+
+  it('still BLOCKS a contained yarnPath with a NON-exact packageManager (yarn@4 / yarn@latest)', () => {
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x","packageManager":"yarn@latest"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/packageManager/);
+  });
+
+  it('still BLOCKS a contained yarnPath when packageManager pins a DIFFERENT manager (pnpm)', () => {
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x","packageManager":"pnpm@9.0.0"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/packageManager/);
+  });
+
+  it('still BLOCKS a repoDir-own yarnPath that ESCAPES the checkout (../ out-of-repo)', () => {
+    write('.yarnrc.yml', 'yarnPath: ../../evil.cjs\n');
     expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/yarnPath/);
+  });
+
+  it('still BLOCKS a repoDir-own yarnPath that is an ABSOLUTE out-of-repo path', () => {
+    write('.yarnrc.yml', 'yarnPath: /opt/evil/yarn.cjs\n');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/yarnPath/);
+  });
+
+  it('still BLOCKS a repoDir yarnPath whose target SYMLINKS out of the checkout', () => {
+    // A committed-looking `.yarn/releases/yarn.cjs` that is actually a symlink to an
+    // out-of-repo file: lexical containment passes but the realpath check catches it.
+    const outside = join(dirname(dir), `sj-yp-out-${Date.now()}.cjs`);
+    writeFileSync(outside, 'module.exports = {}');
+    mkdirSync(join(dir, '.yarn', 'releases'), { recursive: true });
+    symlinkSync(outside, join(dir, '.yarn', 'releases', 'yarn.cjs'));
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn.cjs\n');
+    try {
+      expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/yarnPath/);
+    } finally {
+      rmSync(outside, { force: true });
+    }
   });
 
   it('blocks .yarnrc.yml plugins (object form)', () => {
@@ -352,6 +407,21 @@ describe('detectPreTrustConfigExec — yarn ancestor .yarnrc.yml scan', () => {
     const ws = dir;
     const pkg = join(ws, 'pkg');
     writeAt(join(ws, '.yarnrc.yml'), 'yarnPath: : : [unbalanced\n  - {');
+    writeAt(join(pkg, 'package.json'), '{"name":"p"}');
+    expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/unparseable/);
+  });
+
+  // REGRESSION (the yarnPath relaxation must NOT touch the unparseable branch): the
+  // present-but-unparseable refusal is LOAD-BEARING for the enableScripts:false
+  // divergence detector below — a malformed ancestor rc that ALSO hides
+  // `enableScripts: false` must STILL refuse via the unparseable branch.  If
+  // unparseable were ever relaxed, `parsed` stays undefined → `!isRecord(parsed)` →
+  // return null, making the enableScripts:false branch UNREACHABLE and re-opening the
+  // catastrophic audit-builds / host-skips false negative.  Keep this fail-closed.
+  it('fails closed on a malformed ANCESTOR rc that hides enableScripts:false (unparseable shields the divergence detector)', () => {
+    const ws = dir;
+    const pkg = join(ws, 'pkg');
+    writeAt(join(ws, '.yarnrc.yml'), 'enableScripts: false\n: : [unbalanced\n  - {');
     writeAt(join(pkg, 'package.json'), '{"name":"p"}');
     expect(detectPreTrustConfigExec(pkg, 'yarn', ws)).toMatch(/unparseable/);
   });

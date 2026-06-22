@@ -40,6 +40,39 @@ determinism across hosts:
   sandbox guarantee — see the `install: true` trust model in
   [docs/design.md](./design.md#drop-in-install-trust-model-install-true).
 
+- **`install: true` yarn-Berry `yarnPath` (repo-toolchain trust; audit and host both run the registry yarn).**
+  The pre-trust gate (`src/action/install-preflight.ts`) **allows `install: true` for a
+  repoDir-own committed `yarnPath`** (one resolving INSIDE repoDir, i.e. the repo's own
+  `.yarn/releases/yarn-*.cjs`). This is an **owner trust decision**: the repo's own committed
+  yarn toolchain is trusted (the repo is CI's trust root, not dependency code), the same class
+  as a committed lifecycle script. Still **refused**: an *ancestor* `yarnPath` (never staged
+  into the sandbox → would run unaudited), an *escaping*/out-of-repo `yarnPath`, and
+  `.yarnrc.yml` `plugins:` / `enableConstraintsChecks`+`yarn.config.cjs` (these execute repo
+  code at yarn startup and remain refused; relaxable per-consumer if ever needed).
+
+  **Audit == host because both ignore `yarnPath`.** Under `install: true` the guest sets
+  `YARN_IGNORE_PATH=1` in its yarn launch env for **both** phases (`buildChildEnv` install-mode
+  pins), exactly like `hostInstallEnv` does on both host phases. A direct `node yarn.js` re-execs
+  `yarnPath` UNLESS `YARN_IGNORE_PATH=1` (verified, yarn 4.17.0), so without this the guest would
+  audit the repo-VENDORED yarn while the host ran the REGISTRY yarn — an audit-vs-host divergence
+  that could hide dependency lifecycle behavior. With it, **both** the audit (guest Phase A fetch
+  + Phase B install) and the host install (part-1 + part-2) run the corepack/registry yarn pinned
+  by `packageManager`, ignoring the vendored `yarnPath` entirely. The repo-vendored binary is
+  therefore never executed by script-jail on this path, so the gate allowing a repoDir-own
+  `yarnPath` is sound (it is inert — both sides ignore it) and no dependency action can hide in a
+  vendored-vs-registry gap. (`YARN_IGNORE_PATH=1` is install-mode-ONLY: pure `mode: check`, which
+  has no host install to diverge from, audits the repo's yarn as-is and is unchanged.) The gate
+  ALSO requires an exact `packageManager: "yarn@<version>"` pin for a contained `yarnPath`, so the
+  guest audit and a corepack-shim host both corepack-resolve the SAME version (without it the guest
+  would corepack-default to yarn 1.22.x for a Berry repo — a nonsense audit; verified). A
+  non-corepack **standalone** host yarn of a different version is NOT closed by the pin and falls
+  under the *install: true host package-manager VERSION* residual immediately below (runner-image
+  controlled, NOT PR-controllable, Firecracker-enforced). Residual (accepted, benign):
+  script-jail audits+installs with the registry yarn of the pinned version, not the repo's exact
+  vendored file; for the normal case (an unmodified `yarn set version` binary) these are the same
+  official release, and a repo that *patched* its vendored yarn would have the patch ignored
+  **consistently on both sides**. **Firecracker is the enforcement boundary.**
+
 - **`install: true` host package-manager VERSION (defense-in-depth residual).**
   The host lifecycle pass (`src/action/host-install.ts`) runs the
   **runner's** installed `npm`/`pnpm`/`yarn` version — not necessarily the
