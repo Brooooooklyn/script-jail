@@ -27727,6 +27727,15 @@ function isPathUnder(child, root) {
   if (rel === "") return true;
   return !(rel === ".." || rel.startsWith(".." + import_node_path4.sep) || (0, import_node_path4.isAbsolute)(rel));
 }
+function yarnPathEscapesRepo(repoDir, yarnPath) {
+  const target = (0, import_node_path4.resolve)(repoDir, yarnPath);
+  if (!isPathUnder(target, repoDir)) return true;
+  try {
+    if (!isPathUnder((0, import_node_fs3.realpathSync)(target), repoDir)) return true;
+  } catch {
+  }
+  return false;
+}
 var PNPM_GUIDANCE = " would run unaudited on the runner BEFORE the audit decides anything. `install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, or audit without `install` (the sandbox still records the pnpmfile there).";
 function detectPnpmfile(repoDir, workspaceRoot) {
   const atRepo = detectPnpmConfigInRepoDir(repoDir);
@@ -27835,8 +27844,11 @@ function detectYarnStartupExecInDir(dir, atRepoDir, hasYarnConfig) {
     return `${where} present-but-unparseable \`.yarnrc.yml\` (cannot prove no \`yarnPath\`/\`plugins\`)` + YARN_GUIDANCE;
   }
   if (!isRecord(parsed)) return null;
-  if (typeof parsed["yarnPath"] === "string" && parsed["yarnPath"].length > 0) {
-    return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+  const yarnPathVal = parsed["yarnPath"];
+  if (typeof yarnPathVal === "string" && yarnPathVal.length > 0) {
+    if (!atRepoDir || yarnPathEscapesRepo(dir, yarnPathVal)) {
+      return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+    }
   }
   if (Array.isArray(parsed["plugins"]) && parsed["plugins"].length > 0) {
     return `${where} \`.yarnrc.yml\` \`plugins\` entry` + YARN_GUIDANCE;

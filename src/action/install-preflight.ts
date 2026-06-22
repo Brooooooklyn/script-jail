@@ -28,12 +28,20 @@
 //     regresses).  Relocation sources confirmed: `.npmrc` `pnpmfile=` /
 //     `global-pnpmfile=` (pnpm <=10), `pnpm-workspace.yaml` `pnpmfile:` (all
 //     versions) and `configDependencies:`.
-//   * yarn (Berry) — `.yarnrc.yml` `yarnPath` (re-execs a repo binary), `plugins`
-//     (loads repo modules at startup), and `enableConstraintsChecks: true` (runs
-//     repo `yarn.config.cjs` via the install-time validate hook) all execute
-//     during `yarn install --immutable --mode=skip-build`.  NO single yarn flag
-//     suppresses all three, so this reject IS the enforcement for yarn.  Classic
-//     `.yarnrc` `yarn-path` is NOT honored under Berry, so it is not a vector.
+//   * yarn (Berry) — `.yarnrc.yml` `plugins` (loads repo modules at startup) and
+//     `enableConstraintsChecks: true` (runs repo `yarn.config.cjs` via the
+//     install-time validate hook) execute during `yarn install --immutable
+//     --mode=skip-build` and are refused.  `yarnPath` (re-execs a repo binary) is
+//     treated differently under the OWNER TRUST DECISION: the repo's OWN committed
+//     `.yarn/releases` yarn is trusted toolchain (the repo is CI's trust root), so a
+//     repoDir-own yarnPath resolving INSIDE repoDir is ALLOWED; an ANCESTOR yarnPath
+//     (unstaged → unaudited) or an escaping/out-of-repo yarnPath is still refused.
+//     The HOST never re-execs ANY yarnPath regardless: `hostInstallEnv` pins
+//     YARN_IGNORE_PATH=1 on BOTH host phases (host-install.ts), so host part-1/part-2
+//     run the trusted registry yarn, byte-matching the guest's audited Phase B (which
+//     also direct-launches the registry `yarn.js`).  This gate governs only the
+//     guest-fetch / unstaged-ancestor surface for yarnPath.  Classic `.yarnrc`
+//     `yarn-path` is NOT honored under Berry, so it is not a vector.
 //   * npm — the only known pre-trust config exec (the `git` BINARY selected for a
 //     non-GitHub git dep) is already neutralized by the `npm_config_git` pin in
 //     host-install.ts.  Nothing left to detect here.
@@ -444,6 +452,26 @@ function isPathUnder(child: string, root: string): boolean {
   return !(rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel));
 }
 
+/**
+ * True when a repoDir-own `.yarnrc.yml` `yarnPath` resolves OUTSIDE repoDir — i.e.
+ * it is NOT the repo's own committed `.yarn/releases` toolchain.  Yarn resolves a
+ * RELATIVE `yarnPath` against the rc file's directory (= repoDir for the repoDir-own
+ * rc) and uses an ABSOLUTE `yarnPath` verbatim.  Checked BOTH lexically (catches a
+ * `../` escape or an absolute out-of-repo path) AND, when the target exists, by
+ * realpath (catches a symlink-OUT planted inside `.yarn/releases`).  `repoDir` is
+ * already realpath'd by the caller (`scanDirs`), so the lexical prefix is canonical.
+ */
+function yarnPathEscapesRepo(repoDir: string, yarnPath: string): boolean {
+  const target = resolve(repoDir, yarnPath);
+  if (!isPathUnder(target, repoDir)) return true; // lexical `../`/absolute escape
+  try {
+    if (!isPathUnder(realpathSync(target), repoDir)) return true; // symlink-OUT escape
+  } catch {
+    // Nonexistent target — the lexical bound above already holds (no symlink to follow).
+  }
+  return false;
+}
+
 const PNPM_GUIDANCE =
   ' would run unaudited on the runner BEFORE the audit decides anything. ' +
   '`install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, ' +
@@ -669,8 +697,23 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, hasYarnConf
     return `${where} present-but-unparseable \`.yarnrc.yml\` (cannot prove no \`yarnPath\`/\`plugins\`)` + YARN_GUIDANCE;
   }
   if (!isRecord(parsed)) return null; // empty / scalar yaml declares nothing
-  if (typeof parsed['yarnPath'] === 'string' && parsed['yarnPath'].length > 0) {
-    return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+  const yarnPathVal = parsed['yarnPath'];
+  if (typeof yarnPathVal === 'string' && yarnPathVal.length > 0) {
+    // OWNER TRUST DECISION (install:true): the repo's OWN committed `.yarn/releases`
+    // yarn binary is trusted toolchain — the repo is CI's trust root, and this is
+    // not dependency code — so a repoDir-own `yarnPath` that stays INSIDE repoDir no
+    // longer refuses install:true (the yarn-Berry / napi-rs case).  STILL refuse:
+    //   (a) an ANCESTOR (`!atRepoDir`) yarnPath — it is never staged into the sandbox
+    //       (backend/stage.ts stages only repoDir), so it would run UNAUDITED; and
+    //   (b) a repoDir yarnPath that ESCAPES repoDir — not the committed toolchain, and
+    //       it would re-exec in the network-on guest Phase A fetch (`yarnPathEscapesRepo`).
+    // The HOST never re-execs ANY yarnPath: hostInstallEnv pins YARN_IGNORE_PATH=1 on
+    // BOTH host phases (host-install.ts), so host part-1/part-2 always run the trusted
+    // registry yarn — byte-matching what the guest audited in Phase B.  This gate only
+    // governs the guest-fetch / unstaged-ancestor surface, not a host RCE.
+    if (!atRepoDir || yarnPathEscapesRepo(dir, yarnPathVal)) {
+      return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+    }
   }
   if (Array.isArray(parsed['plugins']) && parsed['plugins'].length > 0) {
     return `${where} \`.yarnrc.yml\` \`plugins\` entry` + YARN_GUIDANCE;

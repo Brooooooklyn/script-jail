@@ -2756,8 +2756,10 @@ export function buildChildEnv(
   //          YARN_IGNORE_PATH is DELIBERATELY EXCLUDED: yarn consumes it and never
   //          re-exports it, so the host child never sees it — mirroring it here
   //          would put a value in the guest child the host child lacks, CREATING a
-  //          new divergence.  (preflight detectYarnStartupExec refuses install:true
-  //          for a repo yarnPath, so the audit-fidelity angle is already covered.)
+  //          new divergence.  (This holds REGARDLESS of the preflight gate: even
+  //          though detectYarnStartupExec now ALLOWS a repoDir-own committed yarnPath
+  //          for install:true, yarn still never re-exports YARN_IGNORE_PATH, so the
+  //          lifecycle child sees it absent on BOTH sides — the exclusion stays sound.)
   // npm_config_git is NOT mirrored: the host scopes it to the FETCH phase only
   // (part-1), so the host part-2 child — like the guest Phase B — never sees it.
   // Hardcoded literals match the host (guest is always Linux/macOS, never win32).

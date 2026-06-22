@@ -441,11 +441,12 @@ describe.sequential('e2e: drop-in install gating', () => {
     expect(cap.runCalls).toHaveLength(0);
   });
 
-  it('install + yarn with a .yarnrc.yml yarnPath → fail-closed before any install, exit 1', async () => {
+  it('install + yarn with an ESCAPING .yarnrc.yml yarnPath → fail-closed before any install, exit 1', async () => {
     const factory = fakeVmFactory({ fixtures: FIXTURES });
     const consumer = setUpConsumer({ pm: 'yarn', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
-    // A repo yarnPath re-execs a repo binary at `yarn install` startup.
-    writeFileSync(join(consumer.consumerDir, '.yarnrc.yml'), 'yarnPath: ./.evil-yarn.cjs\n', 'utf8');
+    // A yarnPath that ESCAPES the checkout is NOT the repo's own committed toolchain;
+    // it re-execs an out-of-repo binary in the network-on guest Phase A fetch → refuse.
+    writeFileSync(join(consumer.consumerDir, '.yarnrc.yml'), 'yarnPath: ../../evil.cjs\n', 'utf8');
     const cap = makeHostCaptures();
 
     const result = await runMain({
@@ -458,6 +459,31 @@ describe.sequential('e2e: drop-in install gating', () => {
     expect(result.stdout).toMatch(/yarnPath/);
     expect(cap.installCalls).toHaveLength(0);
     expect(cap.runCalls).toHaveLength(0);
+  });
+
+  it('install + yarn with a repoDir-own yarnPath INSIDE the checkout → allowed (both halves run)', async () => {
+    // OWNER TRUST DECISION: the repo's own committed `.yarn/releases` yarn binary is
+    // trusted toolchain (the napi-rs case). A contained repoDir yarnPath no longer
+    // refuses install:true; the host install still ignores it (YARN_IGNORE_PATH=1).
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'yarn', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    writeFileSync(
+      join(consumer.consumerDir, '.yarnrc.yml'),
+      'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\nnodeLinker: node-modules\n',
+      'utf8',
+    );
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toBeNull(); // no refusal → action completes normally
+    expect(result.stdout).not.toMatch(/yarnPath/);
+    expect(cap.installCalls).toEqual([{ pm: 'yarn', args: [] }]); // part 1 ran
+    expect(cap.runCalls).toEqual([{ pm: 'yarn' }]); // part 2 ran (trusted)
   });
 
   it('install + pnpm with NO pnpmfile → allowed (both halves run)', async () => {

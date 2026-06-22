@@ -40,6 +40,29 @@ determinism across hosts:
   sandbox guarantee — see the `install: true` trust model in
   [docs/design.md](./design.md#drop-in-install-trust-model-install-true).
 
+- **`install: true` yarn-Berry `yarnPath` (repo-toolchain trust + fetch-phase launcher asymmetry).**
+  The pre-trust gate (`src/action/install-preflight.ts`) **allows `install: true` for a
+  repoDir-own committed `yarnPath`** (one resolving INSIDE repoDir, i.e. the repo's own
+  `.yarn/releases/yarn-*.cjs`). This is an **owner trust decision**: the repo's own committed
+  yarn toolchain is trusted (the repo is CI's trust root, not dependency code), the same class
+  as a committed lifecycle script. Still **refused**: an *ancestor* `yarnPath` (never staged
+  into the sandbox → would run unaudited), an *escaping*/out-of-repo `yarnPath`, and
+  `.yarnrc.yml` `plugins:` / `enableConstraintsChecks`+`yarn.config.cjs` (these execute repo
+  code at yarn startup and remain refused; relaxable per-consumer if ever needed).
+
+  The **audited build phase is lockstep**: `hostInstallEnv` pins `YARN_IGNORE_PATH=1` on BOTH
+  host phases, so host part-1 (fetch) and part-2 (lifecycle) run the trusted registry/corepack
+  `node yarn.js` — exactly what the guest audits in Phase B (`resolveLinuxManagerLaunch` also
+  ignores the vendored `yarnPath`). The host never re-execs the vendored binary, so no
+  dependency action can hide in a vendored-vs-registry yarn gap. Residual (accepted): the
+  **un-audited fetch step is asymmetric** — guest Phase A re-execs the *vendored* yarn (corepack
+  shim, no `YARN_IGNORE_PATH`) while host part-1 runs the *registry* yarn. This is benign: Phase A
+  is `--mode=skip-build` (runs **zero** dependency lifecycle scripts), network-on and un-straced
+  (un-audited on both sides), and both consume the same frozen `--immutable` committed lockfile →
+  the same pinned tree. The only thing that could differ is link-time output of a *tampered*
+  vendored yarn, which is the repo's OWN committed toolchain (owner-trusted) and invisible to the
+  value-blind lock either way. **Firecracker is the enforcement boundary.**
+
 - **`install: true` host package-manager VERSION (defense-in-depth residual).**
   The host lifecycle pass (`src/action/host-install.ts`) runs the
   **runner's** installed `npm`/`pnpm`/`yarn` version — not necessarily the
