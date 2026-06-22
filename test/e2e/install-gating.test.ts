@@ -12,7 +12,7 @@
 //   install: false (default)        → neither runs (audit only)
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { setUpConsumer, fakeVmFactory, runMain, type FixtureName } from './harness.js';
@@ -472,6 +472,12 @@ describe.sequential('e2e: drop-in install gating', () => {
       'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\nnodeLinker: node-modules\n',
       'utf8',
     );
+    // An exact packageManager pin is required to allow the contained yarnPath (audit
+    // and host corepack-resolve the SAME yarn version).
+    const pkgPath = join(consumer.consumerDir, 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    pkg.packageManager = 'yarn@4.17.0';
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
     const cap = makeHostCaptures();
 
     const result = await runMain({
@@ -484,6 +490,31 @@ describe.sequential('e2e: drop-in install gating', () => {
     expect(result.stdout).not.toMatch(/yarnPath/);
     expect(cap.installCalls).toEqual([{ pm: 'yarn', args: [] }]); // part 1 ran
     expect(cap.runCalls).toEqual([{ pm: 'yarn' }]); // part 2 ran (trusted)
+  });
+
+  it('install + yarn with a contained yarnPath but NO packageManager pin → fail-closed, exit 1', async () => {
+    // Without an exact packageManager pin, the audit and host corepack-resolve their
+    // own default yarn version (skew) — refuse before any install.
+    const factory = fakeVmFactory({ fixtures: FIXTURES });
+    const consumer = setUpConsumer({ pm: 'yarn', fixtures: FIXTURES, committedLockYaml: factory.finalYaml });
+    writeFileSync(
+      join(consumer.consumerDir, '.yarnrc.yml'),
+      'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\nnodeLinker: node-modules\n',
+      'utf8',
+    );
+    // setUpConsumer's package.json has NO packageManager pin (left as-is).
+    const cap = makeHostCaptures();
+
+    const result = await runMain({
+      consumerDir: consumer.consumerDir,
+      inputs: { config: consumer.configPath, lock: consumer.lockPath, mode: 'check', install: true, ...HOST_SPOOF },
+      deps: { ...factory.deps, ...cap.hostSeams },
+    });
+
+    expect(result.exit).toEqual({ code: 1 });
+    expect(result.stdout).toMatch(/packageManager/);
+    expect(cap.installCalls).toHaveLength(0);
+    expect(cap.runCalls).toHaveLength(0);
   });
 
   it('install + pnpm with NO pnpmfile → allowed (both halves run)', async () => {

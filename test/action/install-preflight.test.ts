@@ -147,11 +147,39 @@ describe('detectPreTrustConfigExec — pnpm', () => {
 });
 
 describe('detectPreTrustConfigExec — yarn (Berry)', () => {
-  it('ALLOWS a repoDir-own yarnPath INSIDE the checkout (committed .yarn/releases — napi-rs case)', () => {
+  it('ALLOWS a repoDir-own yarnPath INSIDE the checkout WITH an exact packageManager pin (napi-rs case)', () => {
     // OWNER TRUST DECISION: the repo's own committed yarn binary is trusted toolchain.
-    // A repoDir-own yarnPath resolving under repoDir no longer refuses install:true.
+    // A repoDir-own yarnPath under repoDir + an exact `packageManager: yarn@<ver>` pin
+    // (so audit and host corepack-resolve the SAME yarn) no longer refuses install:true.
     write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\nnodeLinker: node-modules\n');
+    write('package.json', '{"name":"x","packageManager":"yarn@4.17.0"}');
     expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
+  });
+
+  it('ALLOWS a contained yarnPath with a packageManager pin carrying an integrity hash', () => {
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x","packageManager":"yarn@4.17.0+sha224.abcdef0123456789"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toBeNull();
+  });
+
+  it('still BLOCKS a contained yarnPath when there is NO packageManager pin (version-skew risk)', () => {
+    // Without a pin, corepack on each side falls back to its own default yarn version
+    // (empirically 1.22.x, not the vendored 4.x) → audit-vs-host version skew.
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/packageManager/);
+  });
+
+  it('still BLOCKS a contained yarnPath with a NON-exact packageManager (yarn@4 / yarn@latest)', () => {
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x","packageManager":"yarn@latest"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/packageManager/);
+  });
+
+  it('still BLOCKS a contained yarnPath when packageManager pins a DIFFERENT manager (pnpm)', () => {
+    write('.yarnrc.yml', 'yarnPath: ./.yarn/releases/yarn-4.17.0.cjs\n');
+    write('package.json', '{"name":"x","packageManager":"pnpm@9.0.0"}');
+    expect(detectPreTrustConfigExec(dir, 'yarn')).toMatch(/packageManager/);
   });
 
   it('still BLOCKS a repoDir-own yarnPath that ESCAPES the checkout (../ out-of-repo)', () => {

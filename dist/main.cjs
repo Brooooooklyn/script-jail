@@ -27736,6 +27736,20 @@ function yarnPathEscapesRepo(repoDir, yarnPath) {
   }
   return false;
 }
+function hasExactYarnPackageManagerPin(dir) {
+  const content = tryReadFile((0, import_node_path4.join)(dir, "package.json"));
+  if (content === null) return false;
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return false;
+  }
+  if (!isRecord(parsed)) return false;
+  const pm = parsed["packageManager"];
+  if (typeof pm !== "string") return false;
+  return /^yarn@\d+\.\d+\.\d+(\+[A-Za-z0-9._-]+)?$/.test(pm.trim());
+}
 var PNPM_GUIDANCE = " would run unaudited on the runner BEFORE the audit decides anything. `install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, or audit without `install` (the sandbox still records the pnpmfile there).";
 function detectPnpmfile(repoDir, workspaceRoot) {
   const atRepo = detectPnpmConfigInRepoDir(repoDir);
@@ -27823,6 +27837,7 @@ function detectPnpmConfigDepsInDir(dir) {
   return null;
 }
 var YARN_GUIDANCE = " executes repo-controlled code on the runner at `yarn install` startup, BEFORE the audit decides anything. `install: true` cannot run that pre-trust. Remove it, or audit without `install` (the sandbox still records it there).";
+var YARN_PIN_GUIDANCE = ' in `package.json`. Under `install: true` the repo-vendored yarn is ignored (YARN_IGNORE_PATH=1 on both the audit and the host); the version is corepack-resolved from `packageManager`. Without an EXACT pin each side falls back to its own corepack default (e.g. yarn 1.22.x, not the vendored 4.x), so the audit and the host install could run DIFFERENT yarn versions \u2014 a divergence the value-blind lock cannot catch. Add `"packageManager": "yarn@<version>"`, or audit without `install`.';
 function detectYarnStartupExec(repoDir, workspaceRoot) {
   const repo = realpathOrResolve(repoDir);
   const chain = scanDirs(repoDir, workspaceRoot);
@@ -27848,6 +27863,9 @@ function detectYarnStartupExecInDir(dir, atRepoDir, hasYarnConfig) {
   if (typeof yarnPathVal === "string" && yarnPathVal.length > 0) {
     if (!atRepoDir || yarnPathEscapesRepo(dir, yarnPathVal)) {
       return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+    }
+    if (!hasExactYarnPackageManagerPin(dir)) {
+      return `${where} \`.yarnrc.yml\` \`yarnPath\` without an exact \`packageManager: "yarn@<version>"\` pin` + YARN_PIN_GUIDANCE;
     }
   }
   if (Array.isArray(parsed["plugins"]) && parsed["plugins"].length > 0) {

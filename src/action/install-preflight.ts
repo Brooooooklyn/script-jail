@@ -473,6 +473,32 @@ function yarnPathEscapesRepo(repoDir: string, yarnPath: string): boolean {
   return false;
 }
 
+/**
+ * True when `dir`'s `package.json` declares an EXACT `packageManager: "yarn@<version>"`
+ * pin — the form `yarn set version` always writes (e.g. `yarn@4.17.0` or
+ * `yarn@4.17.0+sha224.…`).  Required to allow a repoDir-own `yarnPath` under
+ * `install: true`: with `YARN_IGNORE_PATH=1` both the audit and the host IGNORE the
+ * vendored yarn and corepack-resolve the version from this pin, so an exact pin is what
+ * guarantees they run the SAME yarn.  With NO pin each side falls back to its own
+ * corepack default (empirically yarn 1.22.x, not the vendored 4.x) → audit-vs-host
+ * version skew the value-blind lock cannot catch.  Ranges/tags (`yarn@latest`,
+ * `yarn@4`) are rejected — corepack would resolve them non-deterministically.
+ */
+function hasExactYarnPackageManagerPin(dir: string): boolean {
+  const content = tryReadFile(join(dir, 'package.json'));
+  if (content === null) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return false;
+  }
+  if (!isRecord(parsed)) return false;
+  const pm = parsed['packageManager'];
+  if (typeof pm !== 'string') return false;
+  return /^yarn@\d+\.\d+\.\d+(\+[A-Za-z0-9._-]+)?$/.test(pm.trim());
+}
+
 const PNPM_GUIDANCE =
   ' would run unaudited on the runner BEFORE the audit decides anything. ' +
   '`install: true` cannot trust a tree built by a pnpmfile. Remove the pnpmfile, ' +
@@ -649,6 +675,14 @@ const YARN_GUIDANCE =
   'BEFORE the audit decides anything. `install: true` cannot run that pre-trust. ' +
   'Remove it, or audit without `install` (the sandbox still records it there).';
 
+const YARN_PIN_GUIDANCE =
+  ' in `package.json`. Under `install: true` the repo-vendored yarn is ignored ' +
+  '(YARN_IGNORE_PATH=1 on both the audit and the host); the version is corepack-' +
+  'resolved from `packageManager`. Without an EXACT pin each side falls back to its ' +
+  'own corepack default (e.g. yarn 1.22.x, not the vendored 4.x), so the audit and ' +
+  'the host install could run DIFFERENT yarn versions — a divergence the value-blind ' +
+  'lock cannot catch. Add `"packageManager": "yarn@<version>"`, or audit without `install`.';
+
 function detectYarnStartupExec(repoDir: string, workspaceRoot?: string): string | null {
   // Berry walks UP from the install cwd and loads `.yarnrc.yml` from EACH
   // ancestor dir at startup, so a `plugins:`/`yarnPath` in a parent rc within the
@@ -718,6 +752,14 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, hasYarnConf
     //       suppress on some yarn version, an out-of-repo binary must never be trusted.
     if (!atRepoDir || yarnPathEscapesRepo(dir, yarnPathVal)) {
       return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
+    }
+    // VERSION PARITY: allowing the contained yarnPath is sound ONLY if the audit and
+    // the host resolve the SAME yarn.  Both ignore the vendored binary (YARN_IGNORE_PATH=1)
+    // and corepack-resolve from `packageManager`, so REQUIRE an exact `yarn@<version>`
+    // pin — without it each side uses its own corepack default and can skew (see
+    // `hasExactYarnPackageManagerPin`).
+    if (!hasExactYarnPackageManagerPin(dir)) {
+      return `${where} \`.yarnrc.yml\` \`yarnPath\` without an exact \`packageManager: "yarn@<version>"\` pin` + YARN_PIN_GUIDANCE;
     }
   }
   if (Array.isArray(parsed['plugins']) && parsed['plugins'].length > 0) {
