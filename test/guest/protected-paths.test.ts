@@ -326,3 +326,61 @@ describe('applyProtectedPathsPolicy', () => {
     });
   });
 });
+
+// ── trailing-slash roots.repo (matcher self-canonicalizes) ───────────────────
+// roots.repo / roots.nodeModules are derived from config.work_dir, which can
+// arrive with a trailing slash (SCRIPT_JAIL_REPO_DIR / GITHUB_WORKSPACE). The
+// matcher must canonicalize them, or its tokenize() segment-boundary check fails
+// and a protected probe is silently dropped instead of marked <HIDDEN>.
+describe('ProtectedPathsMatcher: trailing-slash roots.repo', () => {
+  const slashRepo = '/opt/actions-runner/_work/r/r';
+  const slashRoots = {
+    repo: `${slashRepo}/`,
+    nodeModules: `${slashRepo}/node_modules/`,
+    home: '/root',
+    tmp: '/tmp',
+    cache: '/root/.cache/pnpm',
+  };
+  const slashEv = (path: string, errno?: 'ENOENT' | 'EACCES'): AttributedEvent => {
+    const raw =
+      errno === undefined
+        ? { kind: 'read' as const, path, pid: 1, ts: 0, hidden: false }
+        : { kind: 'read' as const, path, pid: 1, ts: 0, hidden: false, errno };
+    return { raw, pkg: pkgId, lifecycle: 'postinstall' };
+  };
+
+  it('matches $REPO/.env under a trailing-slash repo (isProtected → true)', () => {
+    const m = new ProtectedPathsMatcher({ patterns: ['$REPO/.env'], roots: slashRoots });
+    expect(m.isProtected(`${slashRepo}/.env`)).toBe(true);
+  });
+
+  it('emits <HIDDEN> (not drop) for an ENOENT probe of a protected $REPO/.env', () => {
+    const m = new ProtectedPathsMatcher({ patterns: ['$REPO/.env'], roots: slashRoots });
+    const out = applyProtectedPathsPolicy(slashEv(`${slashRepo}/.env`, 'ENOENT'), m);
+    expect(out).not.toBeNull();
+    if (out!.raw.kind === 'read') {
+      expect(out!.raw.hidden).toBe(true);
+      expect(out!.raw).not.toHaveProperty('errno');
+    }
+  });
+
+  it('still treats a benign sibling-package read under a trailing-slash node_modules as droppable', () => {
+    const m = new ProtectedPathsMatcher({ patterns: [], roots: slashRoots });
+    expect(m.isUnderNodeModules(`${slashRepo}/node_modules/debug/index.js`)).toBe(true);
+  });
+
+  it('matches $HOME/.ssh/** under a trailing-slash HOME and emits <HIDDEN> (not drop)', () => {
+    // The matcher tokenizes against EVERY root, so a trailing-slash home would
+    // make a $HOME-prefixed pattern miss and drop a protected secret probe. ALL
+    // roots must be canonicalized.
+    const homeSlashRoots = { ...slashRoots, home: '/tmp/home-slash/' };
+    const m = new ProtectedPathsMatcher({ patterns: ['$HOME/.ssh/**'], roots: homeSlashRoots });
+    expect(m.isProtected('/tmp/home-slash/.ssh/id_rsa')).toBe(true);
+    const out = applyProtectedPathsPolicy(slashEv('/tmp/home-slash/.ssh/id_rsa', 'ENOENT'), m);
+    expect(out).not.toBeNull();
+    if (out!.raw.kind === 'read') {
+      expect(out!.raw.hidden).toBe(true);
+      expect(out!.raw).not.toHaveProperty('errno');
+    }
+  });
+});

@@ -2673,6 +2673,42 @@ describe('buildChildEnv protected-env-names length gate', () => {
 // byte-identical.  Missing EITHER key re-opens the value-blind-lock RCE.
 // ---------------------------------------------------------------------------
 
+describe('normalizeInstallModeDropEnvNames (yarn-scoped env-drop set)', () => {
+  // The normalize env_read drop must drop ONLY names that script-jail's install-mode
+  // injection actually placed in the launch env for EVERY pass of that manager.
+  // That holds for yarn (its prepare pass reuses the install launch env unchanged),
+  // but NOT for npm: npm's prepare pass strips npm_config_* and rebuilds from
+  // capturedNpmConfig (excludes npm_config_script_shell), so dropping an injected npm
+  // name in npm prepare would erase a GENUINE root env_read (false negative vs main).
+  // The helper is therefore yarn-only; npm/pnpm get an EMPTY set (no env-drop).
+  it('yarn + install_mode → the four injected YARN_* names', async () => {
+    const { normalizeInstallModeDropEnvNames } = await import('../../src/guest/agent.js');
+    expect([...normalizeInstallModeDropEnvNames(true, 'yarn')].sort()).toEqual([
+      'YARN_ENABLE_CONSTRAINTS_CHECKS',
+      'YARN_IGNORE_PATH',
+      'YARN_PLUGINS',
+      'YARN_RC_FILENAME',
+    ]);
+  });
+
+  it('npm + install_mode → EMPTY (npm prepare strips npm_config_*; dropping would hide a genuine read)', async () => {
+    const { normalizeInstallModeDropEnvNames } = await import('../../src/guest/agent.js');
+    expect(normalizeInstallModeDropEnvNames(true, 'npm').size).toBe(0);
+  });
+
+  it('pnpm + install_mode → EMPTY (conservatively excluded; install:true unverified)', async () => {
+    const { normalizeInstallModeDropEnvNames } = await import('../../src/guest/agent.js');
+    expect(normalizeInstallModeDropEnvNames(true, 'pnpm').size).toBe(0);
+  });
+
+  it('install OFF → EMPTY for every manager (pure-audit / mode:update byte-identical)', async () => {
+    const { normalizeInstallModeDropEnvNames } = await import('../../src/guest/agent.js');
+    expect(normalizeInstallModeDropEnvNames(false, 'yarn').size).toBe(0);
+    expect(normalizeInstallModeDropEnvNames(false, 'npm').size).toBe(0);
+    expect(normalizeInstallModeDropEnvNames(false, 'pnpm').size).toBe(0);
+  });
+});
+
 describe('buildChildEnv install_mode pnpmfile parity (#22)', () => {
   function cfg(
     manager: 'npm' | 'pnpm' | 'yarn',

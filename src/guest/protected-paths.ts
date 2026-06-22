@@ -21,7 +21,7 @@
 import micromatch from 'micromatch';
 import type { AttributedEvent, FsReadEvent, FsWriteEvent } from '../lock/schema.js';
 import type { TokenizeRoots } from '../lock/tokenize.js';
-import { tokenize } from '../lock/tokenize.js';
+import { canonicalizeTokenizeRoots, tokenize } from '../lock/tokenize.js';
 import { canonicalizePrivateRealpath } from '../lock/private-realpath.js';
 
 export interface ProtectedPathsMatcherInput {
@@ -45,7 +45,15 @@ export class ProtectedPathsMatcher {
   private readonly os: 'linux' | 'darwin';
 
   constructor(input: ProtectedPathsMatcherInput) {
-    this.roots = input.roots;
+    // Canonicalize the DROP-critical root prefixes (repo / nodeModules) so a
+    // trailing-slash root (config.work_dir can arrive with one from
+    // SCRIPT_JAIL_REPO_DIR / GITHUB_WORKSPACE) does not defeat the
+    // segment-boundary prefix check in tokenize() / isUnderNodeModules() and
+    // silently DROP a protected probe (e.g. an ENOENT read of `$REPO/.env` would
+    // fail to tokenize, isProtected() would return false, and the policy would
+    // drop it as unprotected noise instead of emitting `<HIDDEN> $REPO/.env`).
+    // Same shared helper normalize() uses, so the matcher and the lock agree.
+    this.roots = canonicalizeTokenizeRoots(input.roots);
     this.tokenizedPatterns = input.patterns.map(normalizePattern);
     this.os = input.os ?? 'linux';
   }

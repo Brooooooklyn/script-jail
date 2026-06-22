@@ -348,6 +348,85 @@ describe('normalize', () => {
       const block = getBlock(result, selfHostedPkgId);
       expect(block?.external_reads ?? []).toEqual([]);
     });
+
+    // Regression (R6 [high]): roots.repo is config.work_dir VERBATIM and can carry a
+    // trailing slash (SCRIPT_JAIL_REPO_DIR / GITHUB_WORKSPACE). isUnderRoot's
+    // segment-boundary check (path[root.length] === '/') breaks when the root ITSELF
+    // ends in '/', so the repo-wins exemption was skipped and the bare /opt
+    // system-noise prefix dropped genuine repo/node_modules activity. normalize()
+    // now canonicalizes roots ONCE, so a trailing-slash /opt repo behaves identically.
+    describe('trailing-slash roots.repo on a /opt layout (canonicalized — repo-wins still honoured)', () => {
+      const slashCtx: NormalizeContext = {
+        ...selfHostedCtx,
+        roots: {
+          ...selfHostedCtx.roots,
+          repo: `${selfHostedRepo}/`,
+          nodeModules: `${selfHostedNodeModules}/`,
+        },
+        rootPkgKeys: new Set(['acme@0.0.0']),
+      };
+      const rootRead = (path: string): AttributedEvent => ({
+        raw: { kind: 'read', path, pid: 1, ts: 0, hidden: false, root_anchored: true },
+        pkg: 'acme@0.0.0',
+        lifecycle: 'install',
+      });
+      const rootWrite = (path: string): AttributedEvent => ({
+        raw: { kind: 'write', path, pid: 1, ts: 0, hidden: false, root_anchored: true },
+        pkg: 'acme@0.0.0',
+        lifecycle: 'install',
+      });
+
+      it('SURFACES a dependency read of repo/package.json (not dropped as /opt noise)', () => {
+        const result = normalize([selfHostedRead(`${selfHostedRepo}/package.json`)], slashCtx);
+        expect(getBlock(result, selfHostedPkgId)?.external_reads).toEqual(['$REPO/package.json']);
+      });
+
+      it('SURFACES a dependency cross-package write under node_modules (not dropped as /opt noise)', () => {
+        const result = normalize([selfHostedWrite(`${selfHostedNodeModules}/debug/x.js`)], slashCtx);
+        expect(getBlock(result, selfHostedPkgId)?.escaped_writes).toContain(
+          '<CROSS_PACKAGE> $NODE_MODULES/debug/x.js',
+        );
+      });
+
+      it('SURFACES a genuine root read of repo/package.json and a root write to repo/dist/pwn.js', () => {
+        const result = normalize(
+          [rootRead(`${selfHostedRepo}/package.json`), rootWrite(`${selfHostedRepo}/dist/pwn.js`)],
+          slashCtx,
+        );
+        const block = getBlock(result, 'acme@0.0.0', 'install');
+        expect(block?.external_reads).toEqual(['$REPO/package.json']);
+        expect(block?.escaped_writes).toEqual(['$REPO/dist/pwn.js']);
+      });
+
+      it('STILL drops a genuine /opt toolchain read (not under the trailing-slash repo)', () => {
+        const result = normalize([selfHostedRead('/opt/vp/js_runtime/node/24/bin/node')], slashCtx);
+        expect(getBlock(result, selfHostedPkgId)?.external_reads ?? []).toEqual([]);
+      });
+    });
+
+    // Regression (R9 [high]): isSystemNoise runs BEFORE attribution + the install_mode
+    // hidden-ancestor exemption. On a /opt self-hosted layout, a user-PROTECTED
+    // (hidden) read of a /opt-prefixed repo ANCESTOR is NOT under roots.repo, so the
+    // bare /opt noise prefix would drop it before it could render <HIDDEN>. A hidden
+    // fs event must fail OPEN in isSystemNoise — a protected probe is never noise.
+    it('does NOT drop a HIDDEN (protected) /opt read as system noise', () => {
+      const hiddenOptRead: AttributedEvent = {
+        raw: {
+          kind: 'read',
+          path: '/opt/actions-runner/_work/acme/secret.pem',
+          pid: 1,
+          ts: 0,
+          hidden: true,
+        },
+        pkg: selfHostedPkgId,
+        lifecycle: 'postinstall',
+      };
+      const result = normalize([hiddenOptRead], selfHostedCtx);
+      // Not under repo, /opt-prefixed, but hidden → surfaces with <HIDDEN>.
+      expect(getBlock(result, selfHostedPkgId)?.external_reads).toEqual([
+        '<HIDDEN> /opt/actions-runner/_work/acme/secret.pem',
+      ]);
+    });
   });
 
   describe('spawn events', () => {
@@ -1290,6 +1369,247 @@ describe('normalize', () => {
       const write = block?.escaped_writes[0] ?? '';
       expect(write).toContain('<CROSS_PACKAGE>');
       expect(write).not.toContain('<HIDDEN>');
+    });
+  });
+
+  // install:true neutralizes two install_mode-only artifacts of script-jail's OWN
+  // injection so the install_mode lock matches the install-off (mode:update) lock:
+  //   (1) the genuine root's env_read of script-jail's injected launch-env names,
+  //   (2) the pm's upward rc/project stat-probes of repoDir's strict ancestors.
+  // Both are tightly scoped and no-ops when install is off.
+  describe('install_mode: drops script-jail injected env + cwd-ancestor reads (genuine root only)', () => {
+    const REPO = '/home/runner/work/napi-rs/napi-rs';
+    const ROOT = 'napi-rs@0.0.0';
+    const DEP = 'evil-dep@1.0.0';
+    const imRoots = {
+      repo: REPO,
+      nodeModules: `${REPO}/node_modules`,
+      home: '/home/runner',
+      tmp: '/tmp',
+      cache: '/home/runner/.cache',
+    };
+    const injected = new Set([
+      'YARN_IGNORE_PATH',
+      'YARN_RC_FILENAME',
+      'YARN_PLUGINS',
+      'YARN_ENABLE_CONSTRAINTS_CHECKS',
+    ]);
+    const imCtx: NormalizeContext = {
+      roots: imRoots,
+      pkgDirs: new Map([[DEP, `${REPO}/node_modules/evil-dep`]]),
+      rootPkgKeys: new Set([ROOT]),
+      installMode: true,
+      injectedInstallModeEnvNames: injected,
+    };
+    // Genuine root: root_anchored === true (the prepare pass forces it; the install
+    // pass derives it from the process tree). Forged root: root_anchored absent.
+    const rootEnv = (name: string): AttributedEvent => ({
+      raw: { kind: 'env_read', name, pid: 1, ts: 0, hidden: false, root_anchored: true },
+      pkg: ROOT,
+      lifecycle: 'install',
+    });
+    const rootRead = (path: string): AttributedEvent => ({
+      raw: { kind: 'read', path, pid: 1, ts: 0, hidden: false, root_anchored: true },
+      pkg: ROOT,
+      lifecycle: 'install',
+    });
+    const rootWrite = (path: string): AttributedEvent => ({
+      raw: { kind: 'write', path, pid: 1, ts: 0, hidden: false, root_anchored: true },
+      pkg: ROOT,
+      lifecycle: 'install',
+    });
+    const depEnv = (name: string): AttributedEvent => ({
+      raw: { kind: 'env_read', name, pid: 2, ts: 0, hidden: false },
+      pkg: DEP,
+      lifecycle: 'postinstall',
+    });
+    const depRead = (path: string): AttributedEvent => ({
+      raw: { kind: 'read', path, pid: 2, ts: 0, hidden: false },
+      pkg: DEP,
+      lifecycle: 'postinstall',
+    });
+    const forgedRootEnv = (name: string): AttributedEvent => ({
+      raw: { kind: 'env_read', name, pid: 3, ts: 0, hidden: false }, // no root_anchored → forged
+      pkg: ROOT,
+      lifecycle: 'install',
+    });
+    const rootBlock = (m: ReturnType<typeof normalize>) => m.get(ROOT)?.lifecycle['install' as 'postinstall'];
+    const depBlock = (m: ReturnType<typeof normalize>) => m.get(DEP)?.lifecycle['postinstall'];
+
+    it('drops the genuine root reads of the injected names, keeps genuine reads', () => {
+      const result = normalize(
+        [
+          rootEnv('YARN_PLUGINS'),
+          rootEnv('YARN_RC_FILENAME'),
+          rootEnv('YARN_ENABLE_CONSTRAINTS_CHECKS'),
+          rootEnv('BERRY_BIN_FOLDER'),
+        ],
+        imCtx,
+      );
+      expect(rootBlock(result)?.env_read).toEqual(['BERRY_BIN_FOLDER']);
+    });
+
+    it('KEEPS a dependency read of an injected name (sandbox-detection signal preserved)', () => {
+      const result = normalize([depEnv('YARN_PLUGINS')], imCtx);
+      expect(depBlock(result)?.env_read).toContain('YARN_PLUGINS');
+    });
+
+    it('KEEPS a forged-root read of an injected name, surfaced with <FORGED_ROOT>', () => {
+      const result = normalize([forgedRootEnv('YARN_PLUGINS')], imCtx);
+      expect(rootBlock(result)?.env_read).toEqual(['<FORGED_ROOT> YARN_PLUGINS']);
+    });
+
+    it('is a no-op for injected env when install is OFF', () => {
+      const result = normalize([rootEnv('YARN_PLUGINS')], { ...imCtx, installMode: false });
+      expect(rootBlock(result)?.env_read).toEqual(['YARN_PLUGINS']);
+    });
+
+    it('drops strict-ANCESTOR fs reads of repoDir (the upward rc/project walk)', () => {
+      const result = normalize(
+        [
+          rootRead('/home'),
+          rootRead('/home/runner'),
+          rootRead('/home/runner/work'),
+          rootRead('/home/runner/work/napi-rs'),
+        ],
+        imCtx,
+      );
+      expect(rootBlock(result)?.external_reads ?? []).toEqual([]);
+    });
+
+    it('KEEPS a DEPENDENCY read of a strict repo ancestor (runner-layout probe, not root)', () => {
+      // /home/runner/work is a strict ancestor of repo, but a DEPENDENCY (not in
+      // rootPkgKeys) reading it is genuine probe behaviour — the drop is genuine-root
+      // -scoped, so this MUST still surface in the dependency's external_reads.
+      const result = normalize([depRead('/home/runner/work')], imCtx);
+      expect(depBlock(result)?.external_reads).toContain('$HOME/work');
+    });
+
+    it('KEEPS a sibling read (not an ancestor) and a WRITE to an ancestor (genuine escape)', () => {
+      // /home/runner is roots.home, so /home/runner/.ssh tokenizes to $HOME/.ssh —
+      // a SIBLING of repo's ancestor chain, NOT a strict ancestor → still recorded.
+      const sib = normalize([rootRead('/home/runner/.ssh/id_rsa')], imCtx);
+      expect(rootBlock(sib)?.external_reads).toContain('$HOME/.ssh/id_rsa');
+      // A WRITE to a strict ancestor is a genuine escape (the drop is reads-only).
+      const w = normalize([rootWrite('/home/runner/work/napi-rs')], imCtx);
+      expect((rootBlock(w)?.escaped_writes ?? []).length).toBeGreaterThan(0);
+    });
+
+    it('does NOT create an empty root block when ALL its events are dropped artifacts (parity)', () => {
+      // A (root, lifecycle) whose ENTIRE content is install_mode-dropped artifacts
+      // (injected env reads + ancestor reads) must produce NO block — otherwise the
+      // install_mode lock would render an empty root block the install-off lock lacks,
+      // breaking byte-parity. The drops run BEFORE getLifecycleBlock for this reason.
+      const result = normalize(
+        [rootEnv('YARN_PLUGINS'), rootEnv('YARN_RC_FILENAME'), rootRead('/home/runner/work')],
+        imCtx,
+      );
+      expect(result.get(ROOT)).toBeUndefined();
+      expect(result.size).toBe(0);
+    });
+
+    it('is a no-op for ancestor reads when install is OFF', () => {
+      // /home/runner/work tokenizes to $HOME/work (home=/home/runner); under
+      // install-off it is NOT dropped (the ancestor branch is install_mode-gated).
+      const result = normalize([rootRead('/home/runner/work')], { ...imCtx, installMode: false });
+      expect(rootBlock(result)?.external_reads).toContain('$HOME/work');
+    });
+
+    it('KEEPS a genuine-root HIDDEN (protected) ancestor read as <HIDDEN> (not dropped)', () => {
+      // A repoDir-ancestor read that matched the user's protected.files at emit
+      // (hidden:true) is an opt-in audit signal — unlike script-jail's injected env
+      // names, the ancestor is the USER's filesystem. The strict-ancestor drop must
+      // exempt hidden reads so the protected probe still renders <HIDDEN>.
+      const rootReadHidden = (path: string): AttributedEvent => ({
+        raw: { kind: 'read', path, pid: 1, ts: 0, hidden: true, root_anchored: true },
+        pkg: ROOT,
+        lifecycle: 'install',
+      });
+      const result = normalize([rootReadHidden('/home/runner/work')], imCtx);
+      expect(rootBlock(result)?.external_reads).toEqual(['<HIDDEN> $HOME/work']);
+    });
+
+    // R4 regression (npm-prepare false negative): npm's prepare pass STRIPS all
+    // npm_config_* and rebuilds the env from capturedNpmConfig, which EXCLUDES
+    // npm_config_script_shell — so an injected npm name is ABSENT in npm prepare and
+    // a genuine root prepare read of it is REAL (main records it). agent.ts gives
+    // npm an EMPTY injected set (normalizeInstallModeDropEnvNames is yarn-scoped), so
+    // the env-drop must be a no-op here and RETAIN the env_read.
+    it('npm install_mode (EMPTY injected set): retains a genuine root prepare read of npm_config_script_shell', () => {
+      const prepareBlock = (m: ReturnType<typeof normalize>) =>
+        m.get(ROOT)?.lifecycle['prepare' as 'postinstall'];
+      const rootPrepareEnv = (name: string): AttributedEvent => ({
+        raw: { kind: 'env_read', name, pid: 1, ts: 0, hidden: false, root_anchored: true },
+        pkg: ROOT,
+        lifecycle: 'prepare',
+      });
+      const npmCtx: NormalizeContext = {
+        ...imCtx,
+        // What normalizeInstallModeDropEnvNames(true, 'npm') returns: EMPTY.
+        injectedInstallModeEnvNames: new Set<string>(),
+      };
+      const result = normalize([rootPrepareEnv('npm_config_script_shell')], npmCtx);
+      expect(prepareBlock(result)?.env_read).toEqual(['npm_config_script_shell']);
+    });
+
+    // ----- hidden (protected.env name match) interplay with the env-drop -----
+    // `hidden:true` means ONLY that the env-var NAME is in the user's protected.env
+    // list (env-spy.cjs / shim is_protected); it renders `<HIDDEN> NAME`. The
+    // genuine-root injected-name drop is INTENTIONALLY hidden-agnostic:
+    //   * an injected YARN_* is script-jail's OWN control var and install_mode-ONLY
+    //     (install-off never injects/reads it), so for the GENUINE root it must be
+    //     dropped hidden-or-not — keeping `<HIDDEN> YARN_*` would diverge from the
+    //     install-off lock (which lacks it) and FAIL the check.
+    //   * the drop is genuine-root-scoped, so a DEPENDENCY's hidden read of the same
+    //     name and a genuine root's hidden read of a REAL secret (NOT an injected
+    //     name) are both PRESERVED as `<HIDDEN> NAME` — no secret/dep signal lost.
+    const rootEnvHidden = (name: string): AttributedEvent => ({
+      raw: { kind: 'env_read', name, pid: 1, ts: 0, hidden: true, root_anchored: true },
+      pkg: ROOT,
+      lifecycle: 'install',
+    });
+    const depEnvHidden = (name: string): AttributedEvent => ({
+      raw: { kind: 'env_read', name, pid: 2, ts: 0, hidden: true }, // dependency: no root_anchored
+      pkg: DEP,
+      lifecycle: 'postinstall',
+    });
+
+    it('drops a genuine-root HIDDEN read of an injected name (parity: install-off lacks it)', () => {
+      const result = normalize([rootEnvHidden('YARN_PLUGINS')], imCtx);
+      expect(result.get(ROOT)).toBeUndefined();
+      expect(result.size).toBe(0);
+    });
+
+    it('KEEPS a DEPENDENCY HIDDEN read of an injected name as <HIDDEN> (sandbox-detection signal intact)', () => {
+      const result = normalize([depEnvHidden('YARN_PLUGINS')], imCtx);
+      expect(depBlock(result)?.env_read).toContain('<HIDDEN> YARN_PLUGINS');
+    });
+
+    it('KEEPS a genuine-root HIDDEN read of a REAL secret (non-injected name) as <HIDDEN>', () => {
+      // NPM_TOKEN is NOT in the injected set, so the drop never touches it — a real
+      // protected secret read by the root still surfaces with its <HIDDEN> marker.
+      const result = normalize([rootEnvHidden('NPM_TOKEN')], imCtx);
+      expect(rootBlock(result)?.env_read).toEqual(['<HIDDEN> NPM_TOKEN']);
+    });
+
+    // ----- trailing-slash repo root robustness (isStrictAncestorDir) -----
+    // roots.repo is config.work_dir verbatim (no path.resolve), and work_dir can
+    // arrive with a trailing slash (SCRIPT_JAIL_REPO_DIR / GITHUB_WORKSPACE). A naive
+    // length+prefix compare made repoDir-ITSELF look like a strict ancestor of a
+    // trailing-slash repo and dropped a genuine root read of it. The drop must still
+    // fire for TRUE ancestors.
+    const slashRoots = { ...imRoots, repo: `${REPO}/` };
+    const slashCtx: NormalizeContext = { ...imCtx, roots: slashRoots };
+
+    it('does NOT drop a genuine root read of repoDir-ITSELF when roots.repo has a trailing slash', () => {
+      const result = normalize([rootRead(REPO)], slashCtx);
+      // repoDir-itself is NOT a strict ancestor → survives (recorded, not dropped).
+      expect((rootBlock(result)?.external_reads ?? []).length).toBeGreaterThan(0);
+    });
+
+    it('STILL drops a true strict ancestor when roots.repo has a trailing slash', () => {
+      const result = normalize([rootRead('/home/runner/work')], slashCtx);
+      expect(rootBlock(result)?.external_reads ?? []).toEqual([]);
     });
   });
 });
