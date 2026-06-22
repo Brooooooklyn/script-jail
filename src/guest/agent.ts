@@ -1124,6 +1124,9 @@ export async function* runStraceTailer(
   // ---- wait for child exit, then drain -------------------------------------
 
   opts.exitPromise.then(async () => {
+    process.stderr.write(
+      `[agent][diag] tailer: exitPromise resolved — strace whole-tree exit observed (base=${opts.basePrefix})\n`,
+    );
     // Decide whether to freeze the two "advanced WITHOUT new bytes" meta gates
     // (see the childExited declaration).  The freeze is a RELAXATION, so it
     // engages ONLY when strace exited NORMALLY (by exit(), signal === null) —
@@ -1324,6 +1327,17 @@ export async function* runStraceTailer(
 
   // ---- generator loop ------------------------------------------------------
 
+  // [agent][diag] heartbeat: surfaces whether timers fire on this guest and the
+  // loop's terminal state (done = strace exited; fd3Done = fd-3 pipe EOF). If
+  // this never prints, the event loop is wedged; if it prints with done=false
+  // forever, the traced tree never exited (a child hung).
+  const heartbeatTimer = setInterval(() => {
+    process.stderr.write(
+      `[agent][diag] tailer heartbeat (base=${opts.basePrefix}): done=${done} fd3Done=${fd3Done} queue=${queue.length}\n`,
+    );
+  }, 5000);
+  if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+
   try {
     while (true) {
       // Drain the queue first.
@@ -1338,6 +1352,7 @@ export async function* runStraceTailer(
       await new Promise<void>((resolve) => { wakeResolve = resolve; });
     }
   } finally {
+    clearInterval(heartbeatTimer);
     // Cleanup on early consumer break (try/finally).
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
     if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
@@ -2127,6 +2142,9 @@ export class LinuxStraceRunner implements StraceRunner {
       // tailer callback so the decision is fixed before any per-pid
       // file is drained.
       rootPidDeterministicResolution = true;
+      process.stderr.write(
+        `[agent][diag] run: strace pid=${child.pid} base=${basename(opts.basePath)} — awaiting root-pid resolution\n`,
+      );
       const pid = await readStraceChildPid(child.pid, opts.rootPidResolveDeadlineMs, {
         ...(opts.rootPidResolveSettlePolls !== undefined
           ? { settlePolls: opts.rootPidResolveSettlePolls }
@@ -2135,6 +2153,9 @@ export class LinuxStraceRunner implements StraceRunner {
           ? { pollIntervalMs: opts.rootPidResolvePollIntervalMs }
           : {}),
       });
+      process.stderr.write(
+        `[agent][diag] run: strace pid=${child.pid} base=${basename(opts.basePath)} — root-pid resolved=${pid}\n`,
+      );
       if (pid !== null) {
         this._rootPid = pid;
       }
@@ -2176,6 +2197,9 @@ export class LinuxStraceRunner implements StraceRunner {
       });
     }
 
+    process.stderr.write(
+      `[agent][diag] run: strace pid=${child.pid} base=${basePrefix} — tailer starting (draining until whole-tree exit)\n`,
+    );
     try {
       yield* runStraceTailer({
         watchDir,

@@ -30528,6 +30528,10 @@ async function* runStraceTailer(opts) {
     wake();
   }, pollIntervalMs);
   opts.exitPromise.then(async () => {
+    process.stderr.write(
+      `[agent][diag] tailer: exitPromise resolved \u2014 strace whole-tree exit observed (base=${opts.basePrefix})
+`
+    );
     const exitStatus = opts.exitStatusRef;
     if (exitStatus !== void 0) {
       if (exitStatus.signal !== null || exitStatus.spawnError === true) {
@@ -30620,6 +30624,13 @@ async function* runStraceTailer(opts) {
     done = true;
     wake();
   });
+  const heartbeatTimer = setInterval(() => {
+    process.stderr.write(
+      `[agent][diag] tailer heartbeat (base=${opts.basePrefix}): done=${done} fd3Done=${fd3Done} queue=${queue.length}
+`
+    );
+  }, 5e3);
+  if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
   try {
     while (true) {
       while (queue.length > 0) {
@@ -30631,6 +30642,7 @@ async function* runStraceTailer(opts) {
       });
     }
   } finally {
+    clearInterval(heartbeatTimer);
     if (pollTimer !== null) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -30921,10 +30933,18 @@ var LinuxStraceRunner = class {
     let rootPidDeterministicResolution = false;
     if (child.pid !== void 0) {
       rootPidDeterministicResolution = true;
+      process.stderr.write(
+        `[agent][diag] run: strace pid=${child.pid} base=${(0, import_node_path6.basename)(opts.basePath)} \u2014 awaiting root-pid resolution
+`
+      );
       const pid = await readStraceChildPid(child.pid, opts.rootPidResolveDeadlineMs, {
         ...opts.rootPidResolveSettlePolls !== void 0 ? { settlePolls: opts.rootPidResolveSettlePolls } : {},
         ...opts.rootPidResolvePollIntervalMs !== void 0 ? { pollIntervalMs: opts.rootPidResolvePollIntervalMs } : {}
       });
+      process.stderr.write(
+        `[agent][diag] run: strace pid=${child.pid} base=${(0, import_node_path6.basename)(opts.basePath)} \u2014 root-pid resolved=${pid}
+`
+      );
       if (pid !== null) {
         this._rootPid = pid;
       }
@@ -30941,6 +30961,10 @@ var LinuxStraceRunner = class {
 `);
       });
     }
+    process.stderr.write(
+      `[agent][diag] run: strace pid=${child.pid} base=${basePrefix} \u2014 tailer starting (draining until whole-tree exit)
+`
+    );
     try {
       yield* runStraceTailer({
         watchDir,
