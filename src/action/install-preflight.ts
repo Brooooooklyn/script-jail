@@ -753,11 +753,14 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, hasYarnConf
     if (!atRepoDir || yarnPathEscapesRepo(dir, yarnPathVal)) {
       return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
     }
-    // VERSION PARITY: allowing the contained yarnPath is sound ONLY if the audit and
-    // the host resolve the SAME yarn.  Both ignore the vendored binary (YARN_IGNORE_PATH=1)
-    // and corepack-resolve from `packageManager`, so REQUIRE an exact `yarn@<version>`
-    // pin — without it each side uses its own corepack default and can skew (see
-    // `hasExactYarnPackageManagerPin`).
+    // VERSION PARITY: both the audit and the host IGNORE the vendored binary
+    // (YARN_IGNORE_PATH=1) and corepack-resolve the version from `packageManager`, so
+    // REQUIRE an exact `yarn@<version>` pin.  Without it the GUEST audit would corepack-
+    // default (e.g. yarn 1.22.x for a Berry repo — a nonsense audit) and a corepack host
+    // would skew from the guest.  With the pin the guest and a corepack-shim host both run
+    // the pinned version.  (A non-corepack STANDALONE host yarn of a different version is
+    // the accepted, NON-PR-controllable `install: true` host-PM-version residual — runner-
+    // image controlled, FC is the enforcement boundary; see docs/divergence.md.)
     if (!hasExactYarnPackageManagerPin(dir)) {
       return `${where} \`.yarnrc.yml\` \`yarnPath\` without an exact \`packageManager: "yarn@<version>"\` pin` + YARN_PIN_GUIDANCE;
     }

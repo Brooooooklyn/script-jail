@@ -61,11 +61,17 @@ determinism across hosts:
   therefore never executed by script-jail on this path, so the gate allowing a repoDir-own
   `yarnPath` is sound (it is inert — both sides ignore it) and no dependency action can hide in a
   vendored-vs-registry gap. (`YARN_IGNORE_PATH=1` is install-mode-ONLY: pure `mode: check`, which
-  has no host install to diverge from, audits the repo's yarn as-is and is unchanged.) Residual
-  (accepted, benign): script-jail audits+installs with the registry yarn of the pinned version,
-  not the repo's exact vendored file; for the normal case (an unmodified `yarn set version`
-  binary) these are the same official release, and a repo that *patched* its vendored yarn would
-  have the patch ignored **consistently on both sides**. **Firecracker is the enforcement boundary.**
+  has no host install to diverge from, audits the repo's yarn as-is and is unchanged.) The gate
+  ALSO requires an exact `packageManager: "yarn@<version>"` pin for a contained `yarnPath`, so the
+  guest audit and a corepack-shim host both corepack-resolve the SAME version (without it the guest
+  would corepack-default to yarn 1.22.x for a Berry repo — a nonsense audit; verified). A
+  non-corepack **standalone** host yarn of a different version is NOT closed by the pin and falls
+  under the *install: true host package-manager VERSION* residual immediately below (runner-image
+  controlled, NOT PR-controllable, Firecracker-enforced). Residual (accepted, benign):
+  script-jail audits+installs with the registry yarn of the pinned version, not the repo's exact
+  vendored file; for the normal case (an unmodified `yarn set version` binary) these are the same
+  official release, and a repo that *patched* its vendored yarn would have the patch ignored
+  **consistently on both sides**. **Firecracker is the enforcement boundary.**
 
 - **`install: true` host package-manager VERSION (defense-in-depth residual).**
   The host lifecycle pass (`src/action/host-install.ts`) runs the
