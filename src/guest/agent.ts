@@ -15,6 +15,7 @@
 import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, rmSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
+import { performance } from 'node:perf_hooks';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
 import { PassThrough, Writable, type Readable } from 'node:stream';
@@ -317,6 +318,96 @@ export class MacOSSpawner implements Spawner {
 // ---------------------------------------------------------------------------
 
 /**
+ * fd-3 (LD_PRELOAD JSONL) reader controller.
+ *
+ * WHY THIS IS ATTACHED EARLY (in `run()`), NOT inside `runStraceTailer`: the
+ * production tailer is `yield*`'d only AFTER `run()` awaits readStraceChildPid,
+ * which polls /proc for up to ROOT_PID_RESOLVE_DEADLINE_MS (~5s). The strace
+ * child's fd-3 is a child-process SOCKET; when the traced tree finishes DURING
+ * that await, Node destroys `child.stdio[3]` and DISCARDS both any buffered
+ * fd-3 bytes AND the 'close' event the instant the child closes. A readline
+ * attached AFTER that point sees NOTHING — every env_read/dlopen line on the
+ * channel is LOST (a FALSE NEGATIVE, the catastrophic direction) and 'close'
+ * never fires, so the tailer's fd3-done flag never flips and the audit HANGS.
+ * (Empirically confirmed: attaching a readline to a child's fd-3 after the
+ * child closed loses all lines and never emits 'close'.) Attaching the reader
+ * IMMEDIATELY after spawn — before the await — keeps the socket flowing so
+ * every line is buffered and the EOF is observed, exactly as
+ * attachStdoutTailCollector already does for fd-1.
+ *
+ * The controller buffers lines (and the closed state) until the tailer adopts
+ * it via {@link Fd3Reader.setSink}; then lines flow straight into the tailer's
+ * queue and `wake()` re-evaluates the terminal condition.
+ */
+export interface Fd3Reader {
+  /**
+   * Adopt the reader: flush any pre-buffered lines into `push`, route all
+   * subsequent lines there too, and call `wake` on every line and on close.
+   * Called once when the tailer starts.
+   */
+  setSink(
+    push: (item: { pid: number; line: string; source: LineSource }) => void,
+    wake: () => void,
+  ): void;
+  /** True once fd-3 has hit EOF — or immediately when there is no stream. */
+  isClosed(): boolean;
+}
+
+/**
+ * Attach a line reader to a child's fd-3 IMMEDIATELY (see {@link Fd3Reader}).
+ * Production calls this right after spawn, before the readStraceChildPid await;
+ * tests inject a raw `fd3Stream` into runStraceTailer, which wraps it here.
+ */
+export function attachFd3Reader(stream: Readable | null): Fd3Reader {
+  const pending: Array<{ pid: number; line: string; source: LineSource }> = [];
+  let closed = false;
+  let sink:
+    | ((item: { pid: number; line: string; source: LineSource }) => void)
+    | null = null;
+  let wake: (() => void) | null = null;
+
+  const emit = (item: {
+    pid: number;
+    line: string;
+    source: LineSource;
+  }): void => {
+    if (sink !== null) sink(item);
+    else pending.push(item);
+    wake?.();
+  };
+
+  if (stream !== null) {
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    rl.on('line', (line: string) => {
+      // fd-3 is the preload-owned pipe — tagged `'shim'`.
+      if (line.length > 0) emit({ pid: 0, line, source: 'shim' });
+    });
+    rl.on('close', () => {
+      closed = true;
+      wake?.();
+    });
+  } else {
+    // No fd-3 channel (test stubs / runners that don't pipe fd 3) → done now.
+    closed = true;
+  }
+
+  return {
+    setSink(push, w): void {
+      sink = push;
+      wake = w;
+      for (const item of pending) push(item);
+      pending.length = 0;
+      // Wake once so the tailer re-evaluates its terminal condition against any
+      // lines/close that arrived before adoption (the fast-install case).
+      w();
+    },
+    isClosed(): boolean {
+      return closed;
+    },
+  };
+}
+
+/**
  * Options for StraceTailer. The `fd3Stream` seam lets tests inject a fake
  * Readable instead of an actual child-process pipe.
  */
@@ -328,8 +419,19 @@ export interface StraceTailerOptions {
   /**
    * Readable stream representing the child's fd 3 (LD_PRELOAD JSONL).
    * When null, no fd-3 lines are emitted (useful when the child doesn't write to fd 3).
+   *
+   * Used ONLY by tests that inject a fake stream; production passes a
+   * pre-attached {@link fd3Reader} instead (attached before the readStraceChildPid
+   * await so no line / EOF is missed — see {@link Fd3Reader}).
    */
   fd3Stream: Readable | null;
+  /**
+   * Pre-attached fd-3 reader controller (production path). When provided it
+   * takes precedence over {@link fd3Stream}: the reader was attached in `run()`
+   * immediately after spawn, so fd-3 lines and the EOF observed during the
+   * readStraceChildPid await are buffered rather than discarded.
+   */
+  fd3Reader?: Fd3Reader;
   /**
    * Absolute path of a shared JSONL events file produced by the env-shim and
    * env-spy preload (production channel — see {@link createEventsFile}).
@@ -970,25 +1072,14 @@ export async function* runStraceTailer(
   }
 
   // ---- fd 3 readline -------------------------------------------------------
-
-  let fd3Done = false;
-
-  if (opts.fd3Stream !== null) {
-    const rl = createInterface({ input: opts.fd3Stream, crlfDelay: Infinity });
-    rl.on('line', (line: string) => {
-      if (line.length > 0) {
-        // fd-3 is the preload-owned pipe — tagged `'shim'`.
-        queue.push({ pid: 0, line, source: 'shim' });
-        wake();
-      }
-    });
-    rl.on('close', () => {
-      fd3Done = true;
-      wake();
-    });
-  } else {
-    fd3Done = true;
-  }
+  //
+  // Prefer the pre-attached reader from `run()` (production — attached BEFORE
+  // the readStraceChildPid await so no fd-3 line / EOF is lost on a fast
+  // install; see attachFd3Reader). Tests inject a raw `fd3Stream`, wrapped here:
+  // their in-memory PassThrough buffers on late attach, so the test path is
+  // already safe — only a real child-process socket discards on close.
+  const fd3 = opts.fd3Reader ?? attachFd3Reader(opts.fd3Stream);
+  fd3.setSink((item) => { queue.push(item); }, wake);
 
   // ---- fs.watch + polling loop ---------------------------------------------
 
@@ -1212,7 +1303,11 @@ export async function* runStraceTailer(
     // per-pid files mid-flush — the exact data loss being fixed.  The hard
     // cap only stops TAILING; strace has already exited by construction, so
     // file sizes are final and the loop reaches a fixed point quickly.
-    const hardDeadline = Date.now() + settleHardCapMs;
+    // MONOTONIC (performance.now = CLOCK_MONOTONIC), NOT Date.now(): a stalled
+    // CLOCK_REALTIME on a virtualized guest would make this "never hang" safety net
+    // never fire (the same Firecracker quirk that wedged readStraceChildPid). The
+    // primary exit here is the quiet-passes fixed point; this is the backstop.
+    const hardDeadline = performance.now() + settleHardCapMs;
     let quiet = 0;
     let prev = '';
     // Monotonic snapshot of total capture progress: per-pid file count +
@@ -1244,7 +1339,7 @@ export async function* runStraceTailer(
         quiet = 0;
       }
       prev = cur;
-      if (Date.now() >= hardDeadline) break; // safety net — never hang
+      if (performance.now() >= hardDeadline) break; // safety net — never hang
       await delay(pollIntervalMs);
     }
     // Resolve any provisional ctime verdict.  A clean whole-tree exit already
@@ -1327,7 +1422,7 @@ export async function* runStraceTailer(
       }
 
       // If we've set done AND fd3 is done AND queue is empty → finished.
-      if (done && fd3Done && queue.length === 0) break;
+      if (done && fd3.isClosed() && queue.length === 0) break;
 
       // Wait for a wake signal.
       await new Promise<void>((resolve) => { wakeResolve = resolve; });
@@ -1402,52 +1497,135 @@ export type SpawnImpl = (
  * we have the install root.
  *
  * Returns:
- *   - the child pid on success,
- *   - `null` when the deadline expires without a single pid appearing,
- *   - `null` when MORE THAN ONE pid appears (ambiguous, e.g. strace itself
- *     spawned a helper thread; the dispatcher's null path is the safe
- *     conservative behaviour),
- *   - `null` when `/proc` is unavailable (some test sandboxes, non-Linux
- *     reads).
+ *   - the durable install-root pid on success (strace's SOLE direct child once
+ *     it has STABILIZED — see {@link ROOT_PID_RESOLVE_SETTLE_POLLS}),
+ *   - `null` when the deadline expires without a child stabilizing,
+ *   - `null` when `/proc` is unavailable for the whole deadline (test sandboxes,
+ *     non-Linux reads).
  *
- * Blocking is intentional: this runs ONCE per install, at agent startup
- * before any user-visible work, in a sub-100ms window.  The event loop
- * isn't carrying meaningful traffic at this point — the strace child has
- * just been fork()'d and hasn't yet emitted any per-pid file output for
- * the tailer to drain.
+ * ASYNC + STABILIZATION (determinism fix, 2026-06-21): runs ONCE per install, at
+ * agent startup, BEFORE any install output exists. The prior code returned the
+ * FIRST single child it observed, which RACED a TRANSIENT LAUNCHER: on napi-rs
+ * yarn-berry, strace's first direct child can be a wrapper (measured: pid 106)
+ * that forks the real install command (pid 108) and exits within ≤10ms, after
+ * which 108 reparents to strace (the subreaper). Polling at t≈0ms caught the
+ * transient; polling a few ms later caught the durable root — a pure timing
+ * race. The transient produces NO traced events, so `installRootPid` never seeds
+ * AND the root's exec-cwd is never seeded to `workDir` (its children inherit an
+ * "unknown" cwd), so EVERY root-attributed event renders `<FORGED_ROOT>` — the
+ * napi-rs husky postinstall determinism flap. We now STABILIZE: accept strace's
+ * sole direct child only after it persists for {@link
+ * ROOT_PID_RESOLVE_SETTLE_POLLS} consecutive polls. The transient (≤10ms) never
+ * survives the streak; the durable root (alive the whole multi-second install)
+ * always does. ASYNC (await, not busy-wait) so the fd1 tail drain keeps flowing.
+ * The resolution stays NON-FORGEABLE: it is the kernel's `/proc` view of strace's
+ * own child, which no traced package can spoof.
  *
- * Exported only so unit tests can exercise the parser without spawning
- * a real strace.
+ * Exported only so unit tests can exercise the parser without spawning a real
+ * strace (drive a scripted children sequence via `opts.readChildren`).
  */
-export function readStraceChildPid(
+// Generous wall-clock bound for strace to fork its single direct child (the
+// install command) and populate `/proc/<strace>/task/<strace>/children`. The
+// durable root settles within a few hundred ms; the only cost of a large bound
+// is paid in the catastrophic case where strace never produces a STABLE child
+// (e.g. it failed to start) — there we wait this long, then fail closed (null →
+// `<FORGED_ROOT>`), the safe direction. 5s is a 10-100x margin over the observed
+// transient-launcher lifetime (≤10ms) plus the settle window.
+export const ROOT_PID_RESOLVE_DEADLINE_MS = 5000;
+
+// Number of CONSECUTIVE polls (at POLL_INTERVAL_MS apart) the SAME single
+// strace-direct-child must persist before we accept it as the durable install
+// root.  Rationale (napi-rs yarn-berry, measured): strace's FIRST direct child
+// can be a TRANSIENT LAUNCHER — a wrapper that forks the real install command
+// and exits within ≤10ms, after which the real root reparents to strace (the
+// subreaper).  The transient produces NO traced events, so seeding installRootPid
+// from it leaves it unseeded → every root-attributed event renders `<FORGED_ROOT>`
+// (the postinstall determinism flap).  Returning the FIRST single child we see
+// races that swap.  Requiring the candidate to remain strace's SOLE direct child
+// across this many polls deterministically SKIPS the transient (gone within ~1
+// poll) and locks onto the durable root (stable for the whole multi-second
+// install).  20 polls × 10ms ≈ 200ms is a ~20x margin over the transient lifetime,
+// and is negligible startup latency against a minutes-long install.
+export const ROOT_PID_RESOLVE_SETTLE_POLLS = 20;
+
+export async function readStraceChildPid(
   stracePid: number,
-  deadlineMs = 50,
-): number | null {
-  const start = Date.now();
-  // Cap iterations defensively in case `Date.now()` is somehow non-
-  // monotonic in the runtime (a virtualisation quirk we don't see today
-  // but is cheap to guard against).
-  for (let iter = 0; iter < 10; iter++) {
-    if (Date.now() - start >= deadlineMs) break;
-    let raw: string;
-    try {
-      raw = readFileSync(
-        `/proc/${stracePid}/task/${stracePid}/children`,
-        'utf8',
-      ).trim();
-    } catch {
-      // strace hasn't yet fork'd its child, or /proc is unavailable.
-      // Brief synchronous backoff via a tight busy-wait keyed on
-      // Date.now(); the deadline check above bounds total time.
-      const sleepStart = Date.now();
-      while (Date.now() - sleepStart < 5) { /* spin */ }
-      continue;
-    }
-    if (raw.length === 0) {
-      // No child observed yet — wait briefly and re-poll.  Same backoff
-      // strategy as the catch branch above.
-      const sleepStart = Date.now();
-      while (Date.now() - sleepStart < 5) { /* spin */ }
+  deadlineMs = ROOT_PID_RESOLVE_DEADLINE_MS,
+  opts: {
+    settlePolls?: number;
+    pollIntervalMs?: number;
+    // Test-only injectable `/proc/<strace>/task/<strace>/children` reader.
+    // Returns the file's trimmed contents, or null when unreadable (strace not
+    // yet forked / `/proc` unavailable). Production omits it → real readFileSync.
+    readChildren?: (stracePid: number) => string | null;
+    // Test-only injectable MONOTONIC clock (ms). Production uses
+    // `performance.now()` (CLOCK_MONOTONIC). See the clock note below.
+    now?: () => number;
+  } = {},
+): Promise<number | null> {
+  // MONOTONIC deadline clock.  We deliberately do NOT use `Date.now()`
+  // (CLOCK_REALTIME): on a virtualized guest CLOCK_REALTIME can STALL while
+  // CLOCK_MONOTONIC keeps ticking (observed on a Firecracker microVM — Date.now()
+  // effectively frozen for the whole install).  With a Date.now()-based deadline,
+  // a frozen real-time clock made `Date.now() - start` stay 0, the `>= deadlineMs`
+  // break NEVER fired, and the loop ran its full iteration backstop — ~33 min at a
+  // 10 ms poll — wedging the Phase-B prepare pass (a fast no-op prepare child never
+  // reaches the settle below, so it falls through to this deadline path; the
+  // long-lived main install settles and returns first, so it was unaffected).
+  // `performance.now()` is CLOCK_MONOTONIC — the SAME clock domain that drives the
+  // `setTimeout` poll below — so if the polls advance at all, this deadline is
+  // GUARANTEED to fire.
+  const now = opts.now ?? ((): number => performance.now());
+  const start = now();
+  const startReal = Date.now(); // diagnostic only — surfaces a stalled CLOCK_REALTIME
+  // ASYNC (await) rather than a synchronous busy-wait: `run()` is an async
+  // generator and the install command's stdout tail collector
+  // (attachStdoutTailCollector) is already attached, so we must NOT block the
+  // event loop — a busy-wait would starve that drain and could deadlock a
+  // verbose install on the fd1 pipe buffer. (In practice no install output
+  // exists yet: strace forks the install command only AFTER it starts.)
+  const POLL_INTERVAL_MS = opts.pollIntervalMs ?? 10;
+  const settlePolls =
+    opts.settlePolls ?? ROOT_PID_RESOLVE_SETTLE_POLLS;
+  const readChildren =
+    opts.readChildren ??
+    ((sp: number): string | null => {
+      try {
+        return readFileSync(
+          `/proc/${sp}/task/${sp}/children`,
+          'utf8',
+        ).trim();
+      } catch {
+        // strace hasn't yet fork'd its child, or `/proc` is unavailable.
+        return null;
+      }
+    });
+
+  // Stabilization: the durable install root is strace's SOLE direct child that
+  // PERSISTS for `settlePolls` consecutive polls. A transient launcher (≤10ms)
+  // never survives the streak; a momentary 0-child gap (transient died, root
+  // not yet reparented) or >1-child window (transient + durable both briefly
+  // alive) resets it. Both reset conditions are conservative (we keep waiting
+  // for a stable sole child), so the verdict cannot pin a transient.
+  let candidate: number | null = null;
+  let streak = 0;
+  // Iteration backstop.  The monotonic deadline above is the REAL bound; this is a
+  // second guard against a pathological clock.  Unlike the prior fixed 200_000 cap
+  // (~33 min at a 10 ms poll — which BECAME the effective bound when the old
+  // Date.now() deadline silently failed on a stalled CLOCK_REALTIME), it is a sane
+  // multiple of the nominal poll count (deadlineMs / interval), so it can never run
+  // for minutes.
+  const maxIters =
+    Math.max(1, Math.ceil(deadlineMs / Math.max(1, POLL_INTERVAL_MS))) * 4 + 100;
+  let iter = 0;
+  for (; iter < maxIters; iter++) {
+    if (now() - start >= deadlineMs) break;
+    const raw = readChildren(stracePid);
+    if (raw === null || raw.length === 0) {
+      // Not forked yet / transitional gap → reset the streak.
+      candidate = null;
+      streak = 0;
+      await new Promise<void>((r) => setTimeout(r, POLL_INTERVAL_MS));
       continue;
     }
     const pids = raw
@@ -1455,11 +1633,47 @@ export function readStraceChildPid(
       .filter((s) => s.length > 0)
       .map((s) => parseInt(s, 10))
       .filter((n) => Number.isFinite(n) && n > 0);
-    if (pids.length === 1) return pids[0] ?? null;
-    // Ambiguous (multiple children) — fail closed.
-    if (pids.length > 1) return null;
-    const sleepStart = Date.now();
-    while (Date.now() - sleepStart < 5) { /* spin */ }
+    if (pids.length === 1) {
+      const p = pids[0]!;
+      if (p === candidate) {
+        streak += 1;
+      } else {
+        candidate = p;
+        streak = 1;
+      }
+      if (streak >= settlePolls) {
+        return p;
+      }
+    } else {
+      // 0 (handled above) or >1 (transient + durable both alive momentarily):
+      // transitional → reset the streak and keep waiting for a stable sole child.
+      candidate = null;
+      streak = 0;
+    }
+    await new Promise<void>((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+  // Deadline / backstop expired without a child stabilizing → fail closed (null →
+  // `<FORGED_ROOT>`), the safe direction. The durable root settles in ~200ms, so
+  // this only fires if strace never produced a stable sole child for the deadline
+  // (e.g. a fast no-op prepare child that exits before the settle — harmless: its
+  // events force-attribute to root via the prepare emitter regardless).
+  //
+  // Diagnostic: if the MONOTONIC elapsed time is far larger than the CLOCK_REALTIME
+  // elapsed time, the real-time clock STALLED (the Firecracker quirk that the old
+  // Date.now()-based deadline tripped over). Surface it on the guest console so the
+  // condition is visible, but only when the two clocks actually diverged.
+  const monoMs = Math.round(now() - start);
+  const realMs = Date.now() - startReal;
+  if (monoMs - realMs > 1000) {
+    try {
+      process.stderr.write(
+        `[agent] readStraceChildPid: CLOCK_REALTIME stalled while resolving the ` +
+          `strace root pid (monoMs=${monoMs}, realMs=${realMs}, iters=${iter}); ` +
+          `bounded by the monotonic deadline → null (fail-closed).\n`,
+      );
+    } catch {
+      /* best-effort diagnostic */
+    }
   }
   return null;
 }
@@ -1757,7 +1971,23 @@ export class LinuxStraceRunner implements StraceRunner {
   async *run(
     cmd: string,
     args: string[],
-    opts: { env: NodeJS.ProcessEnv; cwd: string; basePath: string },
+    opts: {
+      env: NodeJS.ProcessEnv;
+      cwd: string;
+      basePath: string;
+      // Test-only override for the strace-child-pid resolution deadline. Real
+      // installs use the generous ROOT_PID_RESOLVE_DEADLINE_MS default; unit
+      // tests that drive a /proc-failing fake pid pass a tiny value so the
+      // fail-closed (null) path returns promptly instead of waiting the full
+      // production deadline.
+      rootPidResolveDeadlineMs?: number;
+      // Test-only overrides for the durable-root stabilization (see
+      // readStraceChildPid). Tests with a fake /proc that yields a stable child
+      // can set settlePolls=1 (+ pollIntervalMs=0) to resolve immediately rather
+      // than wait the production settle window.
+      rootPidResolveSettlePolls?: number;
+      rootPidResolvePollIntervalMs?: number;
+    },
   ): AsyncIterable<{ pid: number; line: string; source: LineSource }> {
     // Audit-trust Finding 2 (high, 2026-05-18): strace's `-e trace=execve`
     // does NOT cover `execveat`.  A lifecycle script that issues
@@ -1893,6 +2123,77 @@ export class LinuxStraceRunner implements StraceRunner {
       this._stdoutTailBytes,
     );
 
+    // Attach the fd-3 (LD_PRELOAD JSONL) reader AND the fd-2 (strace stderr)
+    // forwarder NOW — BEFORE the readStraceChildPid await below — for the SAME
+    // reason fd-1 is drained above. The await can run up to
+    // ROOT_PID_RESOLVE_DEADLINE_MS (~5s), and a fast install finishes within it.
+    // fd-3 is a child-process SOCKET: if no reader is attached when the child
+    // closes, Node discards every buffered fd-3 line (a dropped env_read =
+    // FALSE NEGATIVE) AND the 'close' event (so the tailer's fd3-done flag never
+    // flips → the audit HANGS). An unread fd-2 pipe can likewise fill and
+    // deadlock a verbose install. Attaching both here keeps the sockets flowing
+    // from the first byte. See {@link attachFd3Reader}.
+
+    // child.stdio[3] is the read end of the fd-3 pipe.
+    const fd3Stream = child.stdio[3] as Readable | null;
+    const fd3Reader = attachFd3Reader(fd3Stream);
+
+    // Forward strace's stderr line-by-line to process.stderr with a [strace]
+    // prefix so any strace diagnostics (e.g. "strace: exec failed", ptrace
+    // permission errors) land on the guest's ttyS0 console.
+    //
+    // SECURITY (adversarial-review F1): the tracee inherits strace's fd2, so the
+    // install command AND its lifecycle children write their stderr here too.
+    // Apply the SAME redactor wired into the stdout tail (`_redactStdout` =
+    // redactSensitive: exact protected-env values + credential SHAPES) so a
+    // lifecycle script cannot leak a secret to the console via stderr while the
+    // stdout sibling masks it.  readline yields COMPLETE lines (crlfDelay:
+    // Infinity), matching the redactor's line-local contract.  This forwarder is
+    // purely human-visible console output — the parsed trace goes to the `-o`
+    // files (fd-based), never here — so redaction can't corrupt attribution.
+    let stderrRl: ReturnType<typeof createInterface> | null = null;
+    if (child.stderr) {
+      stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
+      stderrRl.on('line', (line: string) => {
+        const safe = this._redactStdout ? this._redactStdout(line) : line;
+        process.stderr.write(`[strace] ${safe}\n`);
+      });
+    }
+
+    // Capture strace's exit disposition (code + signal) so the tailer can tell
+    // a CLEAN whole-tree exit from an ABNORMAL termination (e.g. a tracee
+    // SIGKILLing its tracer to detach and survive).  Mutated BEFORE resolve()
+    // so the tailer's exitPromise.then() observes it.  See
+    // StraceTailerOptions.exitStatusRef.
+    //
+    // MUST be attached IMMEDIATELY after spawn — BEFORE the `await
+    // readStraceChildPid(...)` PID-stabilization below, which can poll /proc for
+    // up to ROOT_PID_RESOLVE_DEADLINE_MS (~5s).  `close`/`error` are one-shot and
+    // un-buffered: if strace dies DURING that await (spawn failure, OOM-kill,
+    // segfault) with no listener attached, the event is lost, exitPromise never
+    // resolves, the tailer's `done` flag is never set, and the audit HANGS
+    // forever (a denial of audit — worse than failing closed).  readStraceChildPid's
+    // own deadline only bounds PID resolution, NOT this exit promise.
+    const exitStatus: { code: number | null; signal: NodeJS.Signals | null; spawnError?: boolean } = {
+      code: null,
+      signal: null,
+    };
+    const exitPromise = new Promise<void>((resolve) => {
+      child.on('close', (code, signal) => {
+        exitStatus.code = code;
+        exitStatus.signal = signal;
+        this._exitCode = code ?? 1;
+        resolve();
+      });
+      child.on('error', () => {
+        // Spawn/runtime error: strace never ran → classify as a spawn error so
+        // the tailer fails closed instead of freezing its meta gates.
+        exitStatus.spawnError = true;
+        this._exitCode = 1;
+        resolve();
+      });
+    });
+
     // Codex follow-up (bug #1, high, 2026-05-19): deterministically capture
     // the install command's pid by reading `/proc/<strace_pid>/task/<strace_
     // pid>/children` immediately after spawn.  strace's direct child IS the
@@ -1910,9 +2211,11 @@ export class LinuxStraceRunner implements StraceRunner {
     // was inherited from a chdir'd parent) and slipping AT_FDCWD-relative
     // probes past protected-paths.
     //
-    // The /proc query is bounded (≤50ms / ≤10 iterations).  On the
-    // production guest, strace forks its child within a single scheduler
-    // quantum, so the loop usually completes on the first iteration.
+    // The /proc query is bounded (ROOT_PID_RESOLVE_DEADLINE_MS).  strace forks
+    // its child within a single scheduler quantum on an idle guest, so the loop
+    // usually completes on the first poll; the generous deadline (await, not
+    // busy-wait) only matters on a slow/contended VM, where the prior 50ms cap
+    // lost the race → null → spurious `<FORGED_ROOT>` (the determinism bug).
     //
     // Codex follow-up (bug #3, high, 2026-05-19): TRI-STATE resolution.
     // Pre-fix, the file-observation fallback (recordRootPid below) ran
@@ -1951,7 +2254,14 @@ export class LinuxStraceRunner implements StraceRunner {
       // tailer callback so the decision is fixed before any per-pid
       // file is drained.
       rootPidDeterministicResolution = true;
-      const pid = readStraceChildPid(child.pid);
+      const pid = await readStraceChildPid(child.pid, opts.rootPidResolveDeadlineMs, {
+        ...(opts.rootPidResolveSettlePolls !== undefined
+          ? { settlePolls: opts.rootPidResolveSettlePolls }
+          : {}),
+        ...(opts.rootPidResolvePollIntervalMs !== undefined
+          ? { pollIntervalMs: opts.rootPidResolvePollIntervalMs }
+          : {}),
+      });
       if (pid !== null) {
         this._rootPid = pid;
       }
@@ -1960,65 +2270,24 @@ export class LinuxStraceRunner implements StraceRunner {
     }
     // Else: child.pid is undefined → spawn-stub / test path; allow the
     // per-pid-file fallback to seed _rootPid below.
-
-    // Capture strace's exit disposition (code + signal) so the tailer can tell
-    // a CLEAN whole-tree exit from an ABNORMAL termination (e.g. a tracee
-    // SIGKILLing its tracer to detach and survive).  Mutated BEFORE resolve()
-    // so the tailer's exitPromise.then() observes it.  See
-    // StraceTailerOptions.exitStatusRef.
-    const exitStatus: { code: number | null; signal: NodeJS.Signals | null; spawnError?: boolean } = {
-      code: null,
-      signal: null,
-    };
-    const exitPromise = new Promise<void>((resolve) => {
-      child.on('close', (code, signal) => {
-        exitStatus.code = code;
-        exitStatus.signal = signal;
-        this._exitCode = code ?? 1;
-        resolve();
-      });
-      child.on('error', () => {
-        // Spawn/runtime error: strace never ran → classify as a spawn error so
-        // the tailer fails closed instead of freezing its meta gates.
-        exitStatus.spawnError = true;
-        this._exitCode = 1;
-        resolve();
-      });
-    });
+    //
+    // NOTE: `exitStatus` / `exitPromise` are constructed ABOVE (immediately after
+    // spawn, before the readStraceChildPid await) so a strace death during PID
+    // stabilization cannot be missed.  Do not move them back down here.
 
     const watchDir = dirname(opts.basePath);
     const basePrefix = basename(opts.basePath);
-
-    // child.stdio[3] is the read end of the fd-3 pipe.
-    const fd3Stream = child.stdio[3] as Readable | null;
-
-    // Forward strace's stderr line-by-line to process.stderr with a [strace]
-    // prefix so any strace diagnostics (e.g. "strace: exec failed", ptrace
-    // permission errors) land on the guest's ttyS0 console.
-    //
-    // SECURITY (adversarial-review F1): the tracee inherits strace's fd2, so the
-    // install command AND its lifecycle children write their stderr here too.
-    // Apply the SAME redactor wired into the stdout tail (`_redactStdout` =
-    // redactSensitive: exact protected-env values + credential SHAPES) so a
-    // lifecycle script cannot leak a secret to the console via stderr while the
-    // stdout sibling masks it.  readline yields COMPLETE lines (crlfDelay:
-    // Infinity), matching the redactor's line-local contract.  This forwarder is
-    // purely human-visible console output — the parsed trace goes to the `-o`
-    // files (fd-based), never here — so redaction can't corrupt attribution.
-    let stderrRl: ReturnType<typeof createInterface> | null = null;
-    if (child.stderr) {
-      stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
-      stderrRl.on('line', (line: string) => {
-        const safe = this._redactStdout ? this._redactStdout(line) : line;
-        process.stderr.write(`[strace] ${safe}\n`);
-      });
-    }
+    // NOTE: `fd3Stream` / `fd3Reader` / `stderrRl` are attached ABOVE (right
+    // after spawn, before the readStraceChildPid await) so a fast install's
+    // fd-3 lines + EOF — and a verbose install's fd-2 — are never lost or
+    // dropped during the await.  Do not move them back down here.
 
     try {
       yield* runStraceTailer({
         watchDir,
         basePrefix,
         fd3Stream,
+        fd3Reader,
         ...(this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,

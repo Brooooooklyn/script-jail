@@ -621,6 +621,65 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
       the dangerous direction for a security audit. The residual (a Node-internal
       read of a non-Node child over-recorded as package behavior) never hides real
       behavior and does not occur in normal npm/pnpm/yarn plain-fork lifecycle trees.
+    - **(#4) Deferred null-ATTRIBUTION re-resolution → drain-order-independent,
+      recycled-pid-SAFE.** Yarn Berry runs a binary lifecycle (e.g. napi-rs's `husky`
+      `prepare`) via a TRANSIENT launcher it writes to `$TMPDIR/xfs-<hash>/<bin>`
+      (`@yarnpkg/fslib` `getTempName`). That launcher pid is often reaped before its
+      strace lines drain, so the LIVE `/proc` walk returns null and — pre-fix — its
+      spawn + absolute reads/writes were DROPPED, flaking between captured and absent
+      across runs (the shim-before-strace drain order is a soft contract). The fix
+      parks such null-attribution SPAWNS and ABSOLUTE reads/writes and, at end-of-drain,
+      re-resolves them via `resolveDeferredAttribution` against the COMPLETE
+      `attributionGenByPid` map (the set of DISTINCT `(pkg,lifecycle)` generations
+      recorded for the pid across the whole drain — drain-order-independent by
+      construction). A single-generation pid attributes confidently (the determinism
+      win); a pid number RECYCLED across generations resolves to `<unattributed>` so the
+      event SURFACES fail-loud (it tokenizes against `$NODE_MODULES`/`$REPO` with no
+      `$PKG` prefix) rather than relabeling a gen-A escaped write under the recycled
+      gen-B package and being DROPPED as an intra-package `$PKG` write (codex round-2
+      [high]). A pid never seeded → dropped (the null-gate floor). The recycle is
+      detected by THREE drain-order-independent signals, so the surface holds even when
+      the earlier generation is UNSHIMMED and never seeds the gen map (codex Bugbot
+      [medium], 2026-06-21): (a) the gen map itself flips `ambiguous` when ≥2 distinct
+      generations each seed; (b) `pidRecycled` — strace observed a successful execve for
+      the pid AFTER its own `+++ exited +++` line (a definitive new program image on a
+      reused pid number, ordered within the pid's own `-ff` file); (c) `childParentReused`
+      — the pid's clone parent edge was repointed by a DIFFERENT parent. Any of the three
+      → `<unattributed>`. This gate covers every event resolved THROUGH
+      `resolveDeferredAttribution`: the absolute null-attribution replay AND the
+      relative-open `inheritedAttrib`-null fallback. **Accepted pre-existing residual
+      (codex round-4 [critical], verified PRE-EXISTING not introduced by this fix):** a
+      relative open that DOES carry a clone-propagated `inheritedAttrib` reads that stamp
+      DIRECTLY (it predates this fix verbatim), bypassing `resolveDeferredAttribution`.
+      `stampDeferredRelOpens` is keyed by pid alone + first-stamp-wins, so for a recycled
+      pid the stamp is whichever generation's clone drained first. In the narrow corner
+      where (i) BOTH generations are pure plain-fork (no `CLONE_FS` anywhere, so
+      `childPidReuseHidCloneFs` does not veto), (ii) the wrong generation's clone drains
+      first, (iii) neither generation `chdir`'d (so the cwd resolves), AND (iv) the
+      resolved path lands inside the stamped wrong package's own dir, the relative write
+      relabels under that package and `normalize` drops it as `$PKG` — a hidden write.
+      Any `CLONE_FS` in either lineage routes it to `<UNRESOLVED_PATH>` (surfaces). This
+      is the SAME pure-plain-fork recycled-pid residual class the env_read path documents
+      (`reaped-child-env-read-pid-reuse-residual`) and is drain-order-dependent like the
+      inline path below; the sound closure (route recycled-pid relative opens through
+      `resolveDeferredAttribution`) is deliberately deferred because it changes the
+      accepted F6 "bind to the stamping generation" behavior (recycled-pid relative reads
+      would become deterministic `<unattributed>` instead of the first-stamp generation —
+      a precision-vs-determinism tradeoff). **Accepted pre-existing residual (codex round-3
+      [critical]; owner decision — document + ship):** the INLINE (non-deferred,
+      live-`/proc`-`result`) fs path is NOT covered by this map. If a gen-A write line
+      drains while the dispatcher LAGS and the kernel has already RECYCLED the pid to
+      gen-B with a populated `/proc` (so `attribute(pid)` returns gen-B), that write
+      emits under gen-B and, if it lands in gen-B's own dir, is dropped as an
+      intra-package write — a HIDDEN escaped write. This is the WRITE manifestation of
+      the same PID_MAX-wrap-bounded `/proc`-liveness reorder race the exit-line handler
+      already documents as accepted (`src/guest/phase-install.ts`, the
+      `attributionSnapshotByPid` exit-line model), and predates this fix (committed in
+      PR #22, not introduced here). The only sound closure is to defer the inline fs
+      path to end-of-drain resolution (so attribution reads the complete
+      `attributionGenByPid`) or a generation-qualified `/proc` walk; both are out of
+      scope for the determinism fix and tracked as a deliberate, visible follow-up. It
+      is NOT covered by the env_read-only `reaped-child-env-read-pid-reuse-residual`.
   Any finding **fails the gate** even when the
   comparable text is byte-equal, so the exclusion can never launder a real
   escape. The exclusion is also **symmetric down to the lifecycle stage**: a
@@ -886,6 +945,36 @@ canonicalization. These are the macOS-specific cases that filter must absorb.
   inherent fidelity gap of a no-strace backend: **Firecracker remains the
   high-assurance backend**; the macOS bare backend trades some kernel-level
   cross-checks for a VM-free, CI-native macOS audit.
+
+- **The `node_startup_done` marker is forgeable content on macOS-bare.** The
+  marker rides the same same-UID-appendable JSONL channel as every other event,
+  and macOS-bare drops the `<EVENTS_FILE_FORGERY>` detector (above), so a
+  same-UID lifecycle process can append a syntactically valid marker for any pid.
+  The dispatcher therefore treats marker *contents* (ts, npm fields, any
+  provenance tag) as untrusted and uses a marker only in directions that cannot
+  manufacture a false negative from a forged line:
+  - **Env-read window is record-safe (this branch).** A marker only *ends* a
+    pid's bootstrap env window — it never opens a `raw.ts < endedTs` suppression
+    ceiling (a forged high `ts` would otherwise drop every later env read). There
+    is deliberately no trusted marker-provenance field; the worst a forged marker
+    can do is clear pending early → record *more* (the safe direction).
+  - **Two residual marker-trust paths remain, both pre-existing and accepted.**
+    (1) A marker still *confirms+drops* a non-node candidate pid's buffered
+    read/env_read events as Node bootstrap baseline — this is the load-bearing
+    suppression of the shebang pm-client's own bootstrap noise (benignly the
+    client execs `node` in the same pid and env-spy emits the marker), so making
+    it record-safe would flood every benign macOS lock; a *forged* same-pid
+    marker is the adversarial flip-side. (2) A marker's npm fields seed/supersede
+    per-pid attribution (`classifyShimNodeStartupMarker`) — macOS-bare's *only*
+    attribution source, since `MacOSProcReader` has no `/proc` environ — so a
+    forged marker can relabel a later env read (the same forgeable-attribution
+    residual as a forged exec env; supersession itself exists for recycled-pid
+    correctness). Benign installs are unaffected (the marker env-spy emits carries
+    the *same* npm fields the exec snapshot already recorded → no relabel; a
+    genuine non-node candidate emits no marker → its buffer flushes). As with the
+    other macOS-bare residuals, **Firecracker is the enforcement boundary**: the
+    strace backend's process tree + `<EVENTS_FILE_FORGERY>` detector close both
+    paths there. These are accepted no-strace fidelity gaps, not parity bugs.
 
 ## Cross-host parity testing
 

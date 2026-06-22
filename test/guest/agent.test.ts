@@ -2,7 +2,7 @@
 // Wires all mocks together; uses a MemoryConnection and fake config file.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { PassThrough } from 'node:stream';
+import { PassThrough, type Readable } from 'node:stream';
 import { writeFileSync, mkdirSync, rmSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,8 @@ import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, PHASE_B_STDOUT_TAIL_BYTES, PHASE_B_STDOUT_PENDING_MAX_BYTES, redactSensitive } from '../../src/guest/agent.js';
+import { spawn } from 'node:child_process';
+import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, attachFd3Reader, PHASE_B_STDOUT_TAIL_BYTES, PHASE_B_STDOUT_PENDING_MAX_BYTES, redactSensitive } from '../../src/guest/agent.js';
 import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
 import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
@@ -5102,6 +5103,65 @@ describe('runStraceTailer', () => {
 });
 
 // ---------------------------------------------------------------------------
+// attachFd3Reader — early fd-3 attach (fast-install hang + false-negative fix)
+// ---------------------------------------------------------------------------
+describe('attachFd3Reader (early fd-3 attach)', () => {
+  it('captures fd-3 lines + EOF that arrive BEFORE the tailer adopts the reader', async () => {
+    // Reproduces the production race the early attach fixes. The strace child's
+    // fd-3 is a real socket; if the traced tree finishes during the
+    // readStraceChildPid await — i.e. BEFORE runStraceTailer attaches a reader —
+    // Node DISCARDS the buffered fd-3 lines AND the EOF (a late readline sees
+    // nothing: every env_read on the channel is LOST = false negative, and
+    // 'close' never fires → the tailer's fd3-done flag never flips → HANG).
+    // attachFd3Reader is attached in run() right after spawn, so it buffers
+    // everything; the tailer then adopts it via setSink and loses nothing.
+    const lineA = '{"kind":"env_read","name":"HOME","pid":42}';
+    const lineB = '{"kind":"env_read","name":"PATH","pid":42}';
+    const child = spawn(
+      'sh',
+      ['-c', `echo '${lineA}' >&3; echo '${lineB}' >&3; exit 0`],
+      { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] },
+    );
+
+    // EARLY attach — exactly what run() does, before the await.
+    const reader = attachFd3Reader(child.stdio[3] as Readable | null);
+
+    // Simulate the readStraceChildPid await: wait until the child has fully
+    // closed BEFORE the tailer adopts the reader (the window that lost data).
+    await new Promise<void>((r) => child.on('close', () => r()));
+
+    const collected: Array<{ pid: number; line: string; source: string }> = [];
+    reader.setSink((item) => collected.push(item), () => {});
+
+    expect(collected.map((c) => c.line)).toEqual([lineA, lineB]);
+    expect(collected.every((c) => c.pid === 0 && c.source === 'shim')).toBe(true);
+    expect(reader.isClosed()).toBe(true);
+  });
+
+  it('reports closed immediately when there is no fd-3 stream', () => {
+    const reader = attachFd3Reader(null);
+    expect(reader.isClosed()).toBe(true);
+    const collected: unknown[] = [];
+    reader.setSink((item) => collected.push(item), () => {});
+    expect(collected).toEqual([]);
+  });
+
+  it('routes lines that arrive AFTER setSink straight to the sink + wakes', async () => {
+    const stream = new PassThrough();
+    const reader = attachFd3Reader(stream);
+    const collected: string[] = [];
+    let wakes = 0;
+    reader.setSink((item) => collected.push(item.line), () => { wakes += 1; });
+    stream.write('{"kind":"dlopen","filename":"/x.node"}\n');
+    stream.end();
+    await new Promise<void>((r) => setTimeout(r, 20));
+    expect(collected).toEqual(['{"kind":"dlopen","filename":"/x.node"}']);
+    expect(reader.isClosed()).toBe(true);
+    expect(wakes).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // LinuxStraceRunner stderr forwarding tests
 // ---------------------------------------------------------------------------
 
@@ -5305,6 +5365,9 @@ describe('LinuxStraceRunner stderr forwarding', () => {
       env: {},
       cwd: tailerDir,
       basePath,
+      // child.pid=0 makes readStraceChildPid throw on every /proc read; a tiny
+      // deadline returns null promptly instead of waiting the production default.
+      rootPidResolveDeadlineMs: 15,
     });
     const itemsPromise: Promise<Array<{ pid: number; line: string; source: 'shim' | 'strace' }>> = (async () => {
       const collected: Array<{ pid: number; line: string; source: 'shim' | 'strace' }> = [];
@@ -5326,6 +5389,60 @@ describe('LinuxStraceRunner stderr forwarding', () => {
     // file with pid 4242 was visible the entire run.  The suppression
     // is what bug #3's fix introduces.
     expect(runner.getRootPid()).toBeNull();
+  });
+
+  // Adversarial-review [high] (2026-06-22): strace's `close`/`error` handlers
+  // MUST be attached IMMEDIATELY after spawn — BEFORE the readStraceChildPid
+  // PID-stabilization await (which can poll /proc for up to ~5s).  `close` is
+  // one-shot and un-buffered: if strace dies DURING that await with no listener
+  // attached, the event is lost, exitPromise never resolves, the tailer's `done`
+  // flag is never set, and the audit HANGS forever (denial of audit).  Here the
+  // fake child fires `close` ~30ms into a 300ms PID-resolution window; with the
+  // handler attached pre-await the run completes promptly, with the (pre-fix)
+  // post-await attachment it would hang past the race deadline.
+  it('strace close DURING PID-stabilization await is captured (no hang) (review [high])', async () => {
+    const fakeStderr = new PassThrough();
+    const fakeFd3 = new PassThrough();
+    let closeListener: ((code: number | null) => void) | undefined;
+
+    // pid=0 → readStraceChildPid throws on every /proc read and loops to the
+    // deadline, giving a real await window during which we fire `close`.
+    const fakeChild: SpawnResult = {
+      stderr: fakeStderr,
+      stdio: [null, null, fakeStderr, fakeFd3],
+      pid: 0,
+      on(event: string, listener: unknown) {
+        if (event === 'close') closeListener = listener as (code: number | null) => void;
+        return this;
+      },
+    };
+
+    const runner = new LinuxStraceRunner(() => fakeChild);
+    const basePath = `${tailerDir}/strace.out`;
+
+    const runIter = runner.run('npm', ['rebuild'], {
+      env: {},
+      cwd: tailerDir,
+      basePath,
+      // 300ms window so the close (fired at ~30ms) lands DURING the await.
+      rootPidResolveDeadlineMs: 300,
+    });
+    const itemsPromise = (async () => {
+      for await (const _item of runIter) {
+        void _item;
+      }
+    })();
+    fakeStderr.push(null);
+    fakeFd3.push(null);
+    // Fire close 30ms in — well inside the 300ms stabilization await. With the
+    // pre-await handler attachment, closeListener is already set.
+    setTimeout(() => { closeListener?.(0); }, 30);
+
+    const outcome = await Promise.race([
+      itemsPromise.then(() => 'completed' as const),
+      new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 4000)),
+    ]);
+    expect(outcome).toBe('completed');
   });
 
   // Bug #3 sanity — the test-fake fallback path still works.  When
@@ -5447,7 +5564,7 @@ describe('readStraceChildPid', () => {
     // every readFileSync attempt will throw and the loop will exit
     // after the deadline.  Set a short deadline to keep the test fast.
     const { readStraceChildPid } = await import('../../src/guest/agent.js');
-    const result = readStraceChildPid(0, 15);
+    const result = await readStraceChildPid(0, 15);
     expect(result).toBeNull();
   });
 
@@ -5457,8 +5574,102 @@ describe('readStraceChildPid', () => {
     // BUT we use a 0ms deadline so the loop exits on the first
     // Date.now() check without reading anything).
     const { readStraceChildPid } = await import('../../src/guest/agent.js');
-    const result = readStraceChildPid(process.pid, 0);
+    const result = await readStraceChildPid(process.pid, 0);
     expect(result).toBeNull();
+  });
+
+  // FLAP A regression (transient-launcher race): strace's FIRST direct child can
+  // be a short-lived launcher (e.g. yarn's node shim) that EXITS and reparents the
+  // durable install root underneath it. Resolving on the first sole-child reading
+  // pins the TRANSIENT — its pid then seeds `installRootPid`, the durable root's
+  // events never anchor, and root fs writes render `<FORGED_ROOT>` non-
+  // deterministically. The stabilization (settle N consecutive polls; reset on a
+  // 0- or >1-child window) must skip the transient and return the DURABLE root.
+  it('skips a transient launcher and returns the durable root that stabilizes', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    // Scripted `/proc/<strace>/task/<strace>/children`, one entry per poll:
+    //   null              strace not forked yet            → reset
+    //   "106" "106"       transient launcher, sole child   → streak reaches 2 (< 3)
+    //   "106 108"         transient + durable both alive   → reset (>1 child)
+    //   "108" "108" "108" durable root, sole child         → streak reaches 3 → RETURN
+    const sequence: Array<string | null> = [null, '106', '106', '106 108', '108', '108', '108'];
+    let i = 0;
+    const readChildren = (): string | null => {
+      const v = sequence[Math.min(i, sequence.length - 1)] ?? null;
+      i += 1;
+      return v;
+    };
+    const result = await readStraceChildPid(0, 5000, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      readChildren,
+    });
+    // The transient (106) only ever reached streak 2 before the >1-child reset, so
+    // it is NEVER pinned; the durable root (108) settles for 3 polls and wins.
+    expect(result).toBe(108);
+  });
+
+  it('returns the durable root when it is the sole child from the first poll', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    const result = await readStraceChildPid(0, 5000, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      readChildren: () => '108',
+    });
+    expect(result).toBe(108);
+  });
+
+  // REGRESSION (Firecracker CLOCK_REALTIME stall, 2026-06-22): the production
+  // deadline MUST come from a MONOTONIC clock, not Date.now(). On a Firecracker
+  // guest CLOCK_REALTIME stalled while CLOCK_MONOTONIC (setTimeout) ticked, so the
+  // old `Date.now() - start >= deadlineMs` break NEVER fired and the loop ran its
+  // full 200_000-iteration cap (~33 min at a 10 ms poll) — wedging the prepare
+  // pass. Simulate a FROZEN deadline clock (`now` never advances) with a child that
+  // never settles: the function MUST still terminate promptly via the sane
+  // iteration backstop (NOT loop ~200_000 times). If this regresses, the test hangs
+  // until the suite timeout instead of completing in well under a second.
+  it('terminates via the bounded backstop when the deadline clock is frozen', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    let reads = 0;
+    const result = await readStraceChildPid(0, 50, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      // Frozen monotonic clock → the time-based deadline can never fire.
+      now: () => 0,
+      // Never a stable sole child → never settles → falls to the deadline/backstop.
+      readChildren: () => {
+        reads += 1;
+        return null;
+      },
+    });
+    expect(result).toBeNull();
+    // maxIters = ceil(deadlineMs/max(1,pollInterval))*4 + 100 = 50*4 + 100 = 300.
+    // The OLD fixed 200_000 cap would have polled ~200_000 times here.
+    expect(reads).toBeLessThan(1000);
+  });
+
+  // The deadline is measured against the INJECTED monotonic clock: once it advances
+  // past `deadlineMs` the loop breaks (proving the bound tracks `now`, not Date.now).
+  it('bounds the wait by the monotonic deadline clock', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    let t = 0;
+    let reads = 0;
+    const result = await readStraceChildPid(0, 100, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      now: () => {
+        t += 25; // advance 25ms of monotonic time per call
+        return t;
+      },
+      readChildren: () => {
+        reads += 1;
+        return null;
+      },
+    });
+    expect(result).toBeNull();
+    // start=now()=25; break when now()-25 >= 100 → now() >= 125 → ~6 calls in.
+    // A handful of polls, nowhere near the backstop.
+    expect(reads).toBeLessThan(20);
   });
 });
 

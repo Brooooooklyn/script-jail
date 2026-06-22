@@ -29,6 +29,20 @@ export interface RepoRootAnchorInput {
    *  caller's group-aware accessor. A pid whose cwd became unresolvable is
    *  unprovable, so the walk treats it as a disqualifier (fail closed). */
   cwdUnknown: (pid: number) => boolean;
+  /** returns true iff this pid NUMBER was observed REUSED across >1 generation
+   *  (the caller's `childParentReused ∪ pidRecycled`). A recycled pid has a
+   *  LAST-WINS `childParent` edge — the surviving parent is whichever clone line
+   *  drained last, which is strace -ff drain-order-dependent — and its `execCwd`
+   *  snapshot may belong to a different generation than the event being anchored.
+   *  We cannot prove WHICH generation an event belongs to without temporal
+   *  ordering (which is exactly the racy signal we refuse to depend on), so the
+   *  walk treats a recycled pid as a disqualifier (fail closed → a deterministic
+   *  `<FORGED_ROOT>`). Both source sets are order-independent membership (a pid
+   *  that ever got ≥2 distinct parent edges / exec'd after its own exit), so this
+   *  predicate — and therefore the verdict — is drain-order-INDEPENDENT. Mirrors
+   *  the `childParentReused` veto in the sibling `lineageEverCwdShared` /
+   *  `lineageSharedGroupMutated` walks. */
+  recycled: (pid: number) => boolean;
   /** the resolved repo root (path.resolve of the install cwd). */
   workDir: string;
   /** the traced package-manager root pid (the trusted anchor). */
@@ -51,9 +65,33 @@ export function isRepoRootAnchored(input: RepoRootAnchorInput): boolean {
   const { childParent, execCwd, workDir, rootPid } = input;
 
   let cur = input.pid;
+  // Cycle detection: a cycle in `childParent` is only reachable when pid-reuse
+  // repointed an edge back into the walked path, so a revisited pid is itself an
+  // untrustworthy (recycled) lineage. Detecting it explicitly fails closed
+  // immediately rather than relying on MAX_DEPTH exhaustion. Mirrors the `seen`
+  // guard in the sibling `lineageEverCwdShared` / `lineageSharedGroupMutated`
+  // walks.
+  const seen = new Set<number>();
 
   for (let depth = 0; depth < MAX_DEPTH; depth++) {
-    // Reached the trusted PM anchor with no disqualifier along the way.
+    // Cycle (only via pid-reuse) → lineage unverifiable → fail closed.
+    if (seen.has(cur)) {
+      return false;
+    }
+    seen.add(cur);
+
+    // Recycled pid NUMBER on the walk path → its `childParent` edge (last-wins)
+    // and `execCwd` snapshot are drain-order-dependent / possibly the wrong
+    // generation → fail closed. Checked BEFORE the `rootPid` success terminal
+    // (security-conservative): a reused root pid number is not blindly trusted.
+    // In practice the PM root pid is long-lived and never flagged, so genuine
+    // root events are unaffected; a false NEGATIVE (a hidden forged write) is the
+    // catastrophic direction, so we prefer the deterministic over-surface.
+    if (input.recycled(cur)) {
+      return false;
+    }
+
+    // Reached the trusted PM anchor via a clean (acyclic, non-recycled) path.
     if (cur === rootPid) {
       return true;
     }

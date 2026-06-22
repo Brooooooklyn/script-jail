@@ -61,10 +61,12 @@ describe('tokenize', () => {
       };
 
       it('maps the redirected tmp root to $TMPDIR with collapsing', () => {
-        // `xfs-<32hex>` matches HASH_PATTERN as one [A-Za-z0-9_-]{16,} run
-        // (the hyphen is in the class), so the whole segment collapses.
-        const result = tokenize('/scratch/tmp/xfs-a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/archive.zip', scratchRoots);
-        expect(result).toBe('$TMPDIR/<hash>/archive.zip');
+        // Realistic Yarn Berry transient-shim dir: `getTempName('xfs-')` =>
+        // `xfs-<8 hex>`.  The whole `xfs-021cebd2` segment is only 12 chars, BELOW
+        // HASH_PATTERN's 16 floor, so without the YARN_FSLIB_TEMP rule it would leak
+        // a per-run-random path into the lockfile (the napi-rs husky non-determinism).
+        const result = tokenize('/scratch/tmp/xfs-021cebd2/husky', scratchRoots);
+        expect(result).toBe('$TMPDIR/<hash>/husky');
       });
 
       it('maps the literal /tmp to $TMPDIR too (tools that ignore TMPDIR)', () => {
@@ -162,6 +164,53 @@ describe('tokenize', () => {
       const result = tokenize('/root/.local/share/pnpm/store/v3/files/abcdef1234567890abcdef.bin', roots);
       expect(result).toContain('$CACHE');
       expect(result).toContain('<hash>');
+    });
+
+    // Yarn Berry runs binary lifecycle scripts (e.g. napi-rs' `husky`) through a
+    // transient shim under `$TMPDIR/xfs-<8-9 hex>/`.  That 8-9 hex run is below
+    // HASH_PATTERN's 16 floor, so it needs its own targeted collapse or the path is
+    // per-run-random and `mode: check` flaps.  See YARN_FSLIB_TEMP in tokenize.ts.
+    describe('yarn-fslib transient temp dir (xfs-<hash>)', () => {
+      it('collapses the 8-hex shim segment under $TMPDIR', () => {
+        expect(tokenize('/tmp/xfs-021cebd2/husky', roots)).toBe('$TMPDIR/<hash>/husky');
+      });
+
+      it('collapses the 9-hex edge case (hash === 2^32) under $TMPDIR', () => {
+        expect(tokenize('/tmp/xfs-100000000/husky', roots)).toBe('$TMPDIR/<hash>/husky');
+      });
+
+      it('collapses the bare shim dir (no trailing path) under $TMPDIR', () => {
+        expect(tokenize('/tmp/xfs-021cebd2', roots)).toBe('$TMPDIR/<hash>');
+      });
+
+      it('does NOT collapse a non-hex xfs- segment (only [0-9a-f] random names)', () => {
+        // `xfs-deadzzzz` is not 8-9 hex — left to the general heuristic (here: short, kept).
+        expect(tokenize('/tmp/xfs-config/file', roots)).toBe('$TMPDIR/xfs-config/file');
+      });
+
+      it('does NOT mask a partial/over-long hex run masquerading as the shim', () => {
+        // 7 hex (too short) and 10 hex (too long) are not the fslib shape — left verbatim.
+        expect(tokenize('/tmp/xfs-abcdef0/x', roots)).toBe('$TMPDIR/xfs-abcdef0/x');
+        expect(tokenize('/tmp/xfs-0123456789/x', roots)).toBe('$TMPDIR/xfs-0123456789/x');
+      });
+
+      // Over-mask guard (codex adversarial-review #3): the rule is ANCHORED to the
+      // FIRST segment directly under $TMPDIR (getTempName writes the launcher there).
+      // A NESTED `xfs-<hex>` is an attacker-influenceable STABLE name, not the random
+      // fslib launcher — collapsing it would dedupe distinct audit entries.
+      it('does NOT collapse a NESTED xfs-<hex> segment (only depth-1 under $TMPDIR)', () => {
+        expect(tokenize('/tmp/stable/xfs-deadbeef/husky', roots)).toBe(
+          '$TMPDIR/stable/xfs-deadbeef/husky',
+        );
+      });
+
+      // Yarn never writes these launchers in the content store — a `xfs-<hex>`
+      // segment under $CACHE is a stable name and must survive verbatim.
+      it('does NOT collapse an xfs-<hex> segment under $CACHE', () => {
+        expect(
+          tokenize('/root/.local/share/pnpm/store/xfs-cafebabe/pkg.tgz', roots),
+        ).toBe('$CACHE/xfs-cafebabe/pkg.tgz');
+      });
     });
   });
 

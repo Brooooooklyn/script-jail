@@ -76,6 +76,16 @@ const _writeSync = fs.writeSync;
 const _openSync = fs.openSync;
 const _closeSync = fs.closeSync;
 const _processExit = process.exit.bind(process);
+// Capture the ORIGINAL monotonic clock at preload-load time (same monkeypatch
+// defense as the fs/exit captures above).  Audit event ts MUST come from this
+// captured binding, NOT the public `process.hrtime.bigint` slot: that slot is
+// writable/configurable, so a lifecycle script could `process.hrtime.bigint =
+// () => 0n` AFTER the preload loads and then read an unprotected env name — the
+// forged ts=0 would make the guest's per-pid bootstrap window treat a GENUINE
+// post-bootstrap read as pre-marker noise and SUPPRESS it (a false negative,
+// the catastrophic direction). The preload runs before any lifecycle JS, so the
+// binding captured here is the real clock the script can no longer reach.
+const _hrtimeBigint = process.hrtime.bigint.bind(process.hrtime);
 const _stderrWrite =
   process.stderr && typeof process.stderr.write === 'function'
     ? process.stderr.write.bind(process.stderr)
@@ -172,7 +182,7 @@ let logFd = -1;
  * @param {string} reason — debug detail, surfaced in the JSONL line.
  */
 function emitAuditFdLostAndExit(reason) {
-  const ts = Number(process.hrtime.bigint() / 1_000_000n);
+  const ts = Number(_hrtimeBigint());
   const line = JSON.stringify({
     kind: 'env_tamper',
     op: 'audit_fd_lost',
@@ -295,7 +305,16 @@ function writeAuditLine(line) {
  * @param {boolean} hidden
  */
 function logEnvRead(name, hidden) {
-  const ts = Number(process.hrtime.bigint() / 1_000_000n);
+  // ts is RAW CLOCK_MONOTONIC nanoseconds (process.hrtime.bigint()), NOT
+  // milliseconds.  The Linux guest's node-bootstrap env window
+  // (shouldFilterNodeBootstrapEnvRead) compares this ts against the Rust shim's
+  // node_startup_done marker ts, which is clock_gettime(CLOCK_MONOTONIC) in
+  // nanoseconds (src/shim/src/lib.rs).  In-process, libuv's uv_hrtime() reads
+  // the SAME CLOCK_MONOTONIC the shim does, so the two ts are directly
+  // comparable.  Emitting ms here (the old `/ 1_000_000n`) made an env-spy read
+  // numerically ALWAYS less than the ns marker → every post-bootstrap JS read
+  // was wrongly suppressed (a false negative — the catastrophic direction).
+  const ts = Number(_hrtimeBigint());
   writeAuditLine(JSON.stringify({
     kind: 'env_read',
     name,
@@ -317,12 +336,22 @@ function signalNodeStartupDone() {
   // way the shim does (read from the underlying env store, before the Proxy)
   // so classifyShimNodeStartupMarker can seed attribution byte-identically.
   if (origEnv[NODE_STARTUP_DONE_JSONL_ENV] === '1') {
-    const ts = Number(process.hrtime.bigint() / 1_000_000n);
+    const ts = Number(_hrtimeBigint());
     /** @type {Record<string, string | number>} */
     const marker = {
       kind: 'node_startup_done',
       pid: process.pid,
       ts,
+      // No provenance tag. This direct marker exists ONLY as a reliable bootstrap
+      // boundary on macOS (the Mach-O shim's setenv-intercept marker may not fire
+      // in a hardened node). The phase-install-macos dispatcher treats EVERY
+      // node_startup_done line identically — a marker only ENDS the pid's env
+      // window (post-marker reads are then RECORDED), it never opens a
+      // `raw.ts < endedTs` suppression window. That is deliberate: this line lands
+      // on the same-UID-appendable events channel, so any lifecycle process can
+      // forge one, and a trusted provenance tag + ts ceiling would let a forged
+      // high-ts marker suppress genuine env reads (a false negative). The `ts` is
+      // emitted for parse/symmetry only and is not used to window on macOS.
     };
     const npmName = origEnv['npm_package_name'];
     const npmVersion = origEnv['npm_package_version'];

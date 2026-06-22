@@ -230,7 +230,21 @@ export function normalize(events: AttributedEvent[], ctx: NormalizeContext): Map
     // that CLAIMS root (genuine or forged) is the one legitimate no-pkgDir case
     // (handled above/below); everything else with no pkgDir is an unknown/forged
     // NON-root attribution and we fail closed.
-    if (pkgDir === undefined && !claimsRoot && (ev.raw.kind === 'read' || ev.raw.kind === 'write')) {
+    //
+    // EXCEPTION: the `<unattributed>` sentinel.  The guest routes a deferred
+    // read/write from a RECYCLED / re-exec'd pid (ambiguous attribution generation
+    // — `resolveDeferredAttribution` in phase-install.ts) here instead of guessing
+    // one of the conflated packages.  It has no pkgDir BY DESIGN: with no $PKG
+    // prefix the path tokenizes against $REPO / $NODE_MODULES and SURFACES (fail-
+    // loud, in a distinct sentinel block that can never dedupe-collapse with a real
+    // package).  This is exactly the no-hide guarantee we want — so do NOT throw on
+    // it.  A REAL package key with a missing pkgDir is still an internal error.
+    if (
+      pkgDir === undefined &&
+      !claimsRoot &&
+      ev.pkg !== '<unattributed>' &&
+      (ev.raw.kind === 'read' || ev.raw.kind === 'write')
+    ) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`,
       );

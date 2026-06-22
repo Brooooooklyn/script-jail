@@ -40,6 +40,10 @@ const _writeSync = fs.writeSync;
 const _openSync = fs.openSync;
 const _closeSync = fs.closeSync;
 const _processExit = process.exit.bind(process);
+// Capture the ORIGINAL monotonic clock at load time (same monkeypatch defense
+// as env-spy.cjs): audit ts must not come from the writable public
+// `process.hrtime.bigint` slot a lifecycle script can replace.
+const _hrtimeBigint = process.hrtime.bigint.bind(process.hrtime);
 const _stderrWrite =
   process.stderr && typeof process.stderr.write === 'function'
     ? process.stderr.write.bind(process.stderr)
@@ -120,7 +124,10 @@ function resolveLogFd() {
  * @param {string} reason
  */
 function emitAuditFdLostAndExit(reason) {
-  const ts = Number(process.hrtime.bigint() / 1_000_000n);
+  // CLOCK_MONOTONIC nanoseconds (matches env-spy.cjs + the Rust shim) so all
+  // preload/shim JSONL ts share one comparable clock.  Captured binding — see
+  // env-spy.cjs logEnvRead for the monkeypatch-forge rationale.
+  const ts = Number(_hrtimeBigint());
   const line = JSON.stringify({
     kind: 'env_tamper',
     op: 'audit_fd_lost',
@@ -167,7 +174,10 @@ function logDlopen(filename) {
   const fd = resolveLogFd();
   if (fd < 0) return;
 
-  const ts = Number(process.hrtime.bigint() / 1_000_000n);
+  // CLOCK_MONOTONIC nanoseconds (matches env-spy.cjs + the Rust shim) so all
+  // preload/shim JSONL ts share one comparable clock.  Captured binding — see
+  // env-spy.cjs logEnvRead for the monkeypatch-forge rationale.
+  const ts = Number(_hrtimeBigint());
   const line = JSON.stringify({
     kind: 'dlopen',
     filename,

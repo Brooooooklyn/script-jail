@@ -10355,7 +10355,10 @@ __export(agent_exports, {
   PHASE_B_STDOUT_PENDING_MAX_BYTES: () => PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES: () => PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough: () => import_node_stream.PassThrough,
+  ROOT_PID_RESOLVE_DEADLINE_MS: () => ROOT_PID_RESOLVE_DEADLINE_MS,
+  ROOT_PID_RESOLVE_SETTLE_POLLS: () => ROOT_PID_RESOLVE_SETTLE_POLLS,
   StdioConnection: () => StdioConnection,
+  attachFd3Reader: () => attachFd3Reader,
   attachStdoutTailCollector: () => attachStdoutTailCollector,
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
@@ -10375,6 +10378,7 @@ module.exports = __toCommonJS(agent_exports);
 var import_node_fs5 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_readline2 = require("node:readline");
+var import_node_perf_hooks = require("node:perf_hooks");
 var import_node_net = require("node:net");
 var import_node_dns = require("node:dns");
 var import_node_stream = require("node:stream");
@@ -26379,6 +26383,7 @@ var import_micromatch = __toESM(require_micromatch(), 1);
 // src/lock/tokenize.ts
 var HASH_PATTERN = /[A-Za-z0-9_-]{16,}/g;
 var TEMP_SUFFIX = /\.tmp(\.[A-Za-z0-9]+)?$/;
+var YARN_FSLIB_TEMP = /^(\$TMPDIR\/)xfs-[0-9a-f]{8,9}(?=\/|$)/;
 function tokenize(rawPath, roots, currentPkgDir) {
   if (!rawPath.startsWith("/")) {
     return rawPath;
@@ -26412,6 +26417,7 @@ function pathHasPrefix(path3, prefix) {
 function collapseUnstable(path3) {
   let out = path3;
   if (TEMP_SUFFIX.test(out)) out = out.replace(TEMP_SUFFIX, ".tmp<hash>");
+  out = out.replace(YARN_FSLIB_TEMP, "$1<hash>");
   out = out.replace(HASH_PATTERN, (match) => {
     if (/^[A-Z][A-Za-z]{15,}$/.test(match)) return match;
     return "<hash>";
@@ -26522,7 +26528,15 @@ var MAX_DEPTH = 1024;
 function isRepoRootAnchored(input) {
   const { childParent, execCwd, workDir, rootPid } = input;
   let cur = input.pid;
+  const seen = /* @__PURE__ */ new Set();
   for (let depth = 0; depth < MAX_DEPTH; depth++) {
+    if (seen.has(cur)) {
+      return false;
+    }
+    seen.add(cur);
+    if (input.recycled(cur)) {
+      return false;
+    }
     if (cur === rootPid) {
       return true;
     }
@@ -27228,7 +27242,9 @@ async function runInstallPhase(input) {
   const pidCloneTimeCwd = /* @__PURE__ */ new Map();
   const childSeedCloneTs = /* @__PURE__ */ new Map();
   const deferredRelOpens = [];
+  const deferredNullAttribEvents = [];
   const nodeBootstrapFileEndedTs = /* @__PURE__ */ new Map();
+  const nodeBootstrapEnvEndedTs = /* @__PURE__ */ new Map();
   function stampDeferredRelOpens(childPid, inheritedCwd, cloneFsSeed, parentAttrib, parentPid) {
     const bootstrapPendingInherited = nodeBootstrapFilePendingPids.has(childPid);
     for (const d of deferredRelOpens) {
@@ -27275,6 +27291,20 @@ async function runInstallPhase(input) {
       // Route through `cwdUnknownHas` (which maps pid -> rootedCwd) so the
       // walker's fail-closed disqualifier sees the real unknown state.
       cwdUnknown: cwdUnknownHas,
+      // Pid-reuse determinism: a pid number observed reused across generations
+      // (childParentReused = its clone edge was repointed by a different parent;
+      // pidRecycled = it exec'd after its own exit line) has a LAST-WINS
+      // `childParent` edge whose surviving parent is whichever clone line drained
+      // LAST — strace -ff drain-order-dependent. Without this veto the walk could
+      // anchor genuine in one drain order and fail closed in another (the napi-rs
+      // yarn-berry husky-postinstall `<FORGED_ROOT>` flap: the transient launcher's
+      // lineage passes through a recycled intermediate). Both sets are
+      // order-independent membership, so the veto pins the verdict to a
+      // deterministic value. The same two signals already gate
+      // `resolveDeferredAttribution` (the attribution layer); this extends them to
+      // the anchoring walk. See also the `childParentReused` veto in
+      // `lineageEverCwdShared` / `lineageSharedGroupMutated`.
+      recycled: (p) => childParentReused.has(p) || pidRecycled.has(p),
       workDir: path2.resolve(input.cwd),
       rootPid
     });
@@ -27324,6 +27354,9 @@ async function runInstallPhase(input) {
   const forgerySamples = [];
   const unresolvedPathSamples = [];
   const attributionSnapshotByPid = /* @__PURE__ */ new Map();
+  const attributionGenByPid = /* @__PURE__ */ new Map();
+  const pidSawExit = /* @__PURE__ */ new Set();
+  const pidRecycled = /* @__PURE__ */ new Set();
   const nodeStartupMarkerByPid = /* @__PURE__ */ new Map();
   const supersededByDifferentGenerationMarker = (pid, snapshot) => {
     const marker = nodeStartupMarkerByPid.get(pid);
@@ -27362,6 +27395,24 @@ async function runInstallPhase(input) {
         stale: false
       });
     }
+    const gen = attributionGenByPid.get(pid);
+    if (gen === void 0) {
+      attributionGenByPid.set(pid, {
+        pkg: attr.pkg,
+        lifecycle: attr.lifecycle,
+        ambiguous: false
+      });
+    } else if (!gen.ambiguous && (gen.pkg !== attr.pkg || gen.lifecycle !== attr.lifecycle)) {
+      gen.ambiguous = true;
+    }
+  };
+  const resolveDeferredAttribution = (pid) => {
+    const gen = attributionGenByPid.get(pid);
+    if (gen === void 0) return null;
+    if (gen.ambiguous || pidRecycled.has(pid) || childParentReused.has(pid)) {
+      return { pkg: "<unattributed>", lifecycle: "install" };
+    }
+    return { pkg: gen.pkg, lifecycle: gen.lifecycle };
   };
   const nodeStartupAttributionByPid = /* @__PURE__ */ new Map();
   const nodeStartupAttribution = (pid) => nodeStartupAttributionByPid.get(pid) ?? null;
@@ -27504,6 +27555,10 @@ async function runInstallPhase(input) {
       }
       return true;
     }
+    const endedTs = nodeBootstrapEnvEndedTs.get(raw.pid);
+    if (endedTs !== void 0) {
+      return raw.ts < endedTs;
+    }
     return nodeBootstrapEnvReads.has(raw.name);
   };
   const shouldFilterPackageManagerClientEnvRead = (raw) => {
@@ -27554,6 +27609,7 @@ async function runInstallPhase(input) {
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path2.resolve(input.cwd));
+        if (!pidCloneTimeCwd.has(pid)) pidCloneTimeCwd.set(pid, path2.resolve(input.cwd));
         execCwd.set(pid, path2.resolve(input.cwd));
       }
     }
@@ -27585,6 +27641,9 @@ async function runInstallPhase(input) {
         const wasCandidate = confirmNodeBootstrapCandidate(shimEvent.pid);
         if (!wasCandidate && !nodeBootstrapFileCompletedPids.has(shimEvent.pid)) {
           nodeBootstrapFilePendingPids.add(shimEvent.pid);
+        }
+        if (!nodeBootstrapEnvEndedTs.has(shimEvent.pid)) {
+          nodeBootstrapEnvEndedTs.set(shimEvent.pid, shimEvent.ts);
         }
         clearNodeBootstrapEnv(shimEvent.pid);
         continue;
@@ -27622,6 +27681,7 @@ async function runInstallPhase(input) {
     }
     if (source === "strace") {
       if (line.startsWith("+++") && line.endsWith("+++")) {
+        pidSawExit.add(pid);
         flushNodeBootstrapCandidate(pid);
         if (packageManagerClientPids.delete(pid)) {
           completedPackageManagerClientPids.add(pid);
@@ -28444,6 +28504,9 @@ async function runInstallPhase(input) {
       if (straceEvents === null) continue;
       for (const rawEvent of straceEvents) {
         if (rawEvent.kind === "spawn" && rawEvent.result === "ok") {
+          if (pidSawExit.has(rawEvent.pid)) {
+            pidRecycled.add(rawEvent.pid);
+          }
           if (!execCwd.has(rawEvent.pid)) {
             if (cwdUnknownHas(rawEvent.pid)) {
               execCwd.set(rawEvent.pid, null);
@@ -28614,6 +28677,8 @@ async function runInstallPhase(input) {
                 pkg: isStale ? "<unattributed>" : spawnSnapshot.pkg,
                 lifecycle: isStale ? "install" : spawnSnapshot.lifecycle
               });
+            } else {
+              deferredNullAttribEvents.push({ rawEvent });
             }
             continue;
           }
@@ -28623,6 +28688,24 @@ async function runInstallPhase(input) {
               pkg: null,
               lifecycle: null,
               sharedAtRead: everCwdShared.has(rawEvent.pid)
+            });
+          } else if ((rawEvent.kind === "read" || rawEvent.kind === "write") && rawEvent.dirfd === void 0 && path2.isAbsolute(rawEvent.path)) {
+            deferredNullAttribEvents.push({
+              rawEvent,
+              // Node-bootstrap FILE-pending verdict CAPTURED AT DEFER TIME (the
+              // read's drain moment). A reaped read is deferred here, at
+              // `result === null`, BEFORE it reaches the inline node-bootstrap
+              // filter (`shouldFilterNodeBootstrapFileRead`, ~line 7004). The
+              // defer gate and that filter run in the SAME drain iteration with
+              // NO mutation of `nodeBootstrapFilePendingPids` between them, so
+              // this snapshot equals exactly what the inline filter's pending
+              // branch would compute for the same read. Honored at the
+              // end-of-drain replay so a reaped Node-bootstrap read suppresses
+              // IDENTICALLY to the inline path — closing the reap-timing flap (a
+              // reaped root/lifecycle-runner's OWN `/usr`, `/etc/ssl`,
+              // `$REPO/package.json` bootstrap reads leaking under PREFER-EMIT).
+              // Writes are never node-bootstrap-suppressed → captured `false`.
+              bootstrapFilePendingAtDefer: rawEvent.kind === "read" && nodeBootstrapFilePendingPids.has(rawEvent.pid)
             });
           }
           continue;
@@ -28734,11 +28817,17 @@ async function runInstallPhase(input) {
     let lifecycle = d.lifecycle;
     if (pkg === null || lifecycle === null) {
       const inh = d.inheritedAttrib;
-      if (inh === null || inh === void 0) {
-        continue;
+      if (inh !== null && inh !== void 0) {
+        pkg = inh.pkg;
+        lifecycle = inh.lifecycle;
+      } else {
+        const snap = resolveDeferredAttribution(P);
+        if (snap === null) {
+          continue;
+        }
+        pkg = snap.pkg;
+        lifecycle = snap.lifecycle;
       }
-      pkg = inh.pkg;
-      lifecycle = inh.lifecycle;
     }
     let initial = d.initialCwd;
     let childPidReuseHidCloneFs = false;
@@ -28848,6 +28937,41 @@ async function runInstallPhase(input) {
     }
   }
   deferredRelOpens.length = 0;
+  for (const d of deferredNullAttribEvents) {
+    const P = d.rawEvent.pid;
+    const attrib = resolveDeferredAttribution(P);
+    if (attrib === null) {
+      continue;
+    }
+    if (d.rawEvent.kind === "spawn") {
+      emit({ raw: d.rawEvent, pkg: attrib.pkg, lifecycle: attrib.lifecycle });
+      continue;
+    }
+    const canonical = canonicalizeForEmit(P, d.rawEvent.path, d.rawEvent.dirfd);
+    if (canonical === null) {
+      continue;
+    }
+    if (d.rawEvent.kind === "write" && eventsFilePathCanonical !== null && (canonical === eventsFilePathCanonical || canonical === eventsFilePathResolved)) {
+      continue;
+    }
+    const resolved = { ...d.rawEvent, path: canonical };
+    if (resolved.kind === "read" && !resolved.hidden && !matcher.isProtected(resolved.path) && d.bootstrapFilePendingAtDefer === true) {
+      const fileEndedTs = nodeBootstrapFileEndedTs.get(P);
+      if (fileEndedTs === void 0 || d.rawEvent.ts < fileEndedTs) {
+        continue;
+      }
+    }
+    const attributed = {
+      raw: resolved,
+      pkg: attrib.pkg,
+      lifecycle: attrib.lifecycle
+    };
+    if (shouldBufferNodeBootstrapCandidateFileRead(attributed)) {
+      continue;
+    }
+    emit(attributed);
+  }
+  deferredNullAttribEvents.length = 0;
   flushAllNodeBootstrapCandidates();
   for (const [pid, samples] of straceExecsByPid) {
     const straceCount = samples.length;
@@ -29074,6 +29198,7 @@ async function runInstallPhaseMacos(input) {
   const nodeBootstrapCandidateConfirmedPids = /* @__PURE__ */ new Set();
   const nodeBootstrapCandidateFileMarkerPids = /* @__PURE__ */ new Set();
   const nodeBootstrapEnvReads = /* @__PURE__ */ new Set();
+  const nodeBootstrapEnvMarkedPids = /* @__PURE__ */ new Set();
   const nodeBootstrapFileReads = /* @__PURE__ */ new Set();
   const packageManagerClientPids = /* @__PURE__ */ new Set();
   const completedPackageManagerClientPids = /* @__PURE__ */ new Set();
@@ -29186,6 +29311,9 @@ async function runInstallPhaseMacos(input) {
       }
       return true;
     }
+    if (nodeBootstrapEnvMarkedPids.has(raw.pid)) {
+      return false;
+    }
     return nodeBootstrapEnvReads.has(raw.name);
   };
   const shouldFilterPackageManagerClientEnvRead = (raw) => {
@@ -29254,6 +29382,7 @@ async function runInstallPhaseMacos(input) {
       }
       confirmNodeBootstrapCandidate(shimEvent.pid);
       completeNodeBootstrapCandidateFileMarker(shimEvent.pid);
+      nodeBootstrapEnvMarkedPids.add(shimEvent.pid);
       clearNodeBootstrapEnv(shimEvent.pid);
       clearNodeBootstrapFile(shimEvent.pid);
       continue;
@@ -29573,7 +29702,7 @@ function normalize(events, ctx) {
     const pkgDir = ctx.pkgDirs.get(ev.pkg);
     const claimsRoot = ctx.rootPkgKeys?.has(ev.pkg) ?? false;
     const isForgedRoot = claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write" || ev.raw.kind === "env_read" || ev.raw.kind === "spawn" || ev.raw.kind === "connect" || ev.raw.kind === "env_tamper") && ev.raw.root_anchored !== true;
-    if (pkgDir === void 0 && !claimsRoot && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
+    if (pkgDir === void 0 && !claimsRoot && ev.pkg !== "<unattributed>" && (ev.raw.kind === "read" || ev.raw.kind === "write")) {
       throw new Error(
         `normalize: pkgDirs missing entry for ${ev.pkg} (kind=${ev.raw.kind}, path=${ev.raw.path})`
       );
@@ -30106,6 +30235,41 @@ var MacOSSpawner = class {
     return new LinuxSpawner().spawn(launch.cmd, launch.args, opts);
   }
 };
+function attachFd3Reader(stream) {
+  const pending = [];
+  let closed = false;
+  let sink = null;
+  let wake = null;
+  const emit = (item) => {
+    if (sink !== null) sink(item);
+    else pending.push(item);
+    wake?.();
+  };
+  if (stream !== null) {
+    const rl = (0, import_node_readline2.createInterface)({ input: stream, crlfDelay: Infinity });
+    rl.on("line", (line) => {
+      if (line.length > 0) emit({ pid: 0, line, source: "shim" });
+    });
+    rl.on("close", () => {
+      closed = true;
+      wake?.();
+    });
+  } else {
+    closed = true;
+  }
+  return {
+    setSink(push, w) {
+      sink = push;
+      wake = w;
+      for (const item of pending) push(item);
+      pending.length = 0;
+      w();
+    },
+    isClosed() {
+      return closed;
+    }
+  };
+}
 async function* runStraceTailer(opts) {
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const drainMs = opts.drainMs ?? 100;
@@ -30333,22 +30497,10 @@ async function* runStraceTailer(opts) {
     }
     wake();
   }
-  let fd3Done = false;
-  if (opts.fd3Stream !== null) {
-    const rl = (0, import_node_readline2.createInterface)({ input: opts.fd3Stream, crlfDelay: Infinity });
-    rl.on("line", (line) => {
-      if (line.length > 0) {
-        queue.push({ pid: 0, line, source: "shim" });
-        wake();
-      }
-    });
-    rl.on("close", () => {
-      fd3Done = true;
-      wake();
-    });
-  } else {
-    fd3Done = true;
-  }
+  const fd3 = opts.fd3Reader ?? attachFd3Reader(opts.fd3Stream);
+  fd3.setSink((item) => {
+    queue.push(item);
+  }, wake);
   let watcher = null;
   try {
     watcher = (0, import_node_fs5.watch)(opts.watchDir, (_event, _filename) => {
@@ -30411,7 +30563,7 @@ async function* runStraceTailer(opts) {
         pendingCtimeTamper = null;
       }
     }
-    const hardDeadline = Date.now() + settleHardCapMs;
+    const hardDeadline = import_node_perf_hooks.performance.now() + settleHardCapMs;
     let quiet = 0;
     let prev = "";
     const progressKey = () => {
@@ -30432,7 +30584,7 @@ async function* runStraceTailer(opts) {
         quiet = 0;
       }
       prev = cur;
-      if (Date.now() >= hardDeadline) break;
+      if (import_node_perf_hooks.performance.now() >= hardDeadline) break;
       await delay(pollIntervalMs);
     }
     if (pendingCtimeTamper !== null && !childExited) {
@@ -30497,7 +30649,7 @@ async function* runStraceTailer(opts) {
       while (queue.length > 0) {
         yield queue.shift();
       }
-      if (done && fd3Done && queue.length === 0) break;
+      if (done && fd3.isClosed() && queue.length === 0) break;
       await new Promise((resolve3) => {
         wakeResolve = resolve3;
       });
@@ -30537,33 +30689,64 @@ async function* runStraceTailer(opts) {
     }
   }
 }
-function readStraceChildPid(stracePid, deadlineMs = 50) {
-  const start = Date.now();
-  for (let iter = 0; iter < 10; iter++) {
-    if (Date.now() - start >= deadlineMs) break;
-    let raw;
+var ROOT_PID_RESOLVE_DEADLINE_MS = 5e3;
+var ROOT_PID_RESOLVE_SETTLE_POLLS = 20;
+async function readStraceChildPid(stracePid, deadlineMs = ROOT_PID_RESOLVE_DEADLINE_MS, opts = {}) {
+  const now = opts.now ?? (() => import_node_perf_hooks.performance.now());
+  const start = now();
+  const startReal = Date.now();
+  const POLL_INTERVAL_MS = opts.pollIntervalMs ?? 10;
+  const settlePolls = opts.settlePolls ?? ROOT_PID_RESOLVE_SETTLE_POLLS;
+  const readChildren = opts.readChildren ?? ((sp) => {
     try {
-      raw = (0, import_node_fs5.readFileSync)(
-        `/proc/${stracePid}/task/${stracePid}/children`,
+      return (0, import_node_fs5.readFileSync)(
+        `/proc/${sp}/task/${sp}/children`,
         "utf8"
       ).trim();
     } catch {
-      const sleepStart2 = Date.now();
-      while (Date.now() - sleepStart2 < 5) {
-      }
-      continue;
+      return null;
     }
-    if (raw.length === 0) {
-      const sleepStart2 = Date.now();
-      while (Date.now() - sleepStart2 < 5) {
-      }
+  });
+  let candidate = null;
+  let streak = 0;
+  const maxIters = Math.max(1, Math.ceil(deadlineMs / Math.max(1, POLL_INTERVAL_MS))) * 4 + 100;
+  let iter = 0;
+  for (; iter < maxIters; iter++) {
+    if (now() - start >= deadlineMs) break;
+    const raw = readChildren(stracePid);
+    if (raw === null || raw.length === 0) {
+      candidate = null;
+      streak = 0;
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       continue;
     }
     const pids = raw.split(/\s+/).filter((s) => s.length > 0).map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n) && n > 0);
-    if (pids.length === 1) return pids[0] ?? null;
-    if (pids.length > 1) return null;
-    const sleepStart = Date.now();
-    while (Date.now() - sleepStart < 5) {
+    if (pids.length === 1) {
+      const p = pids[0];
+      if (p === candidate) {
+        streak += 1;
+      } else {
+        candidate = p;
+        streak = 1;
+      }
+      if (streak >= settlePolls) {
+        return p;
+      }
+    } else {
+      candidate = null;
+      streak = 0;
+    }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+  const monoMs = Math.round(now() - start);
+  const realMs = Date.now() - startReal;
+  if (monoMs - realMs > 1e3) {
+    try {
+      process.stderr.write(
+        `[agent] readStraceChildPid: CLOCK_REALTIME stalled while resolving the strace root pid (monoMs=${monoMs}, realMs=${realMs}, iters=${iter}); bounded by the monotonic deadline \u2192 null (fail-closed).
+`
+      );
+    } catch {
     }
   }
   return null;
@@ -30742,13 +30925,16 @@ var LinuxStraceRunner = class {
       this._redactStdout,
       this._stdoutTailBytes
     );
-    let rootPidDeterministicResolution = false;
-    if (child.pid !== void 0) {
-      rootPidDeterministicResolution = true;
-      const pid = readStraceChildPid(child.pid);
-      if (pid !== null) {
-        this._rootPid = pid;
-      }
+    const fd3Stream = child.stdio[3];
+    const fd3Reader = attachFd3Reader(fd3Stream);
+    let stderrRl = null;
+    if (child.stderr) {
+      stderrRl = (0, import_node_readline2.createInterface)({ input: child.stderr, crlfDelay: Infinity });
+      stderrRl.on("line", (line) => {
+        const safe = this._redactStdout ? this._redactStdout(line) : line;
+        process.stderr.write(`[strace] ${safe}
+`);
+      });
     }
     const exitStatus = {
       code: null,
@@ -30767,23 +30953,25 @@ var LinuxStraceRunner = class {
         resolve3();
       });
     });
+    let rootPidDeterministicResolution = false;
+    if (child.pid !== void 0) {
+      rootPidDeterministicResolution = true;
+      const pid = await readStraceChildPid(child.pid, opts.rootPidResolveDeadlineMs, {
+        ...opts.rootPidResolveSettlePolls !== void 0 ? { settlePolls: opts.rootPidResolveSettlePolls } : {},
+        ...opts.rootPidResolvePollIntervalMs !== void 0 ? { pollIntervalMs: opts.rootPidResolvePollIntervalMs } : {}
+      });
+      if (pid !== null) {
+        this._rootPid = pid;
+      }
+    }
     const watchDir = (0, import_node_path6.dirname)(opts.basePath);
     const basePrefix = (0, import_node_path6.basename)(opts.basePath);
-    const fd3Stream = child.stdio[3];
-    let stderrRl = null;
-    if (child.stderr) {
-      stderrRl = (0, import_node_readline2.createInterface)({ input: child.stderr, crlfDelay: Infinity });
-      stderrRl.on("line", (line) => {
-        const safe = this._redactStdout ? this._redactStdout(line) : line;
-        process.stderr.write(`[strace] ${safe}
-`);
-      });
-    }
     try {
       yield* runStraceTailer({
         watchDir,
         basePrefix,
         fd3Stream,
+        fd3Reader,
         ...this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
@@ -31878,7 +32066,10 @@ if (isMain) {
   PHASE_B_STDOUT_PENDING_MAX_BYTES,
   PHASE_B_STDOUT_TAIL_BYTES,
   PassThrough,
+  ROOT_PID_RESOLVE_DEADLINE_MS,
+  ROOT_PID_RESOLVE_SETTLE_POLLS,
   StdioConnection,
+  attachFd3Reader,
   attachStdoutTailCollector,
   buildChildEnv,
   buildChildEnvMacos,

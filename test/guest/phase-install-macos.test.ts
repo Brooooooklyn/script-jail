@@ -247,6 +247,82 @@ describe('runInstallPhaseMacos — shim-only dispatch', () => {
     expect((envRead!.raw as { hidden: boolean }).hidden).toBe(true);
   });
 
+  // Adversarial-review [critical] (2026-06-22): a genuine POST-marker env read
+  // whose NAME was seen during bootstrap must be RECORDED, not dropped by the
+  // global name-baseline (the catastrophic false-negative the per-pid window was
+  // added to close). The marker ENDS the window (record-safe) regardless of its
+  // contents: lifecycle pid reads OPENSSL_CONF in-window (ts=2 → suppressed +
+  // baselined), its node_startup_done marker ends the window (ts=3), then it
+  // reads OPENSSL_CONF again post-marker (ts=4 → MUST be recorded).
+  it('RECORDS a post-marker env read whose name was seen during bootstrap (record-safe, review [critical])', async () => {
+    const { events } = await drive([
+      execLine({ basename: 'node' }), // begins the node-bootstrap window for PID
+      JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: PID, ts: 2, hidden: false }),
+      JSON.stringify({
+        kind: 'node_startup_done',
+        pid: PID,
+        ts: 3,
+        npm_package_name: 'evil-pkg',
+        npm_package_version: '1.0.0',
+        npm_lifecycle_event: 'postinstall',
+      }),
+      JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: PID, ts: 4, hidden: false }),
+    ]);
+    const opensslReads = events.filter(
+      (e) => e.raw.kind === 'env_read' && (e.raw as { name: string }).name === 'OPENSSL_CONF',
+    );
+    // In-window ts=2 suppressed (pending); post-marker ts=4 recorded.
+    expect(opensslReads.length).toBe(1);
+    expect((opensslReads[0]!.raw as { ts: number }).ts).toBe(4);
+  });
+
+  // Adversarial-review Round-6/Round-7 [critical]: the marker ts is NEVER a
+  // `raw.ts < endedTs` suppression ceiling. A marker whose ts is far AHEAD of a
+  // genuine read's ts (e.g. a shim clock_gettime marker offset from env-spy's
+  // hrtime reads) must NOT drop that read. Marker ts=1000, post-marker read ts=5.
+  it('RECORDS a post-marker env read when the marker ts is far ahead of the read ts (no ts ceiling, review [critical])', async () => {
+    const { events } = await drive([
+      execLine({ basename: 'node' }),
+      JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: PID, ts: 2, hidden: false }),
+      JSON.stringify({ kind: 'node_startup_done', pid: PID, ts: 1000 }),
+      JSON.stringify({ kind: 'env_read', name: 'OPENSSL_CONF', pid: PID, ts: 5, hidden: false }),
+    ]);
+    const opensslReads = events.filter(
+      (e) => e.raw.kind === 'env_read' && (e.raw as { name: string }).name === 'OPENSSL_CONF',
+    );
+    // In-window ts=2 suppressed (pending); post-marker ts=5 RECORDED (not dropped
+    // by a bogus 5 < 1000 ts comparison).
+    expect(opensslReads.length).toBe(1);
+    expect((opensslReads[0]!.raw as { ts: number }).ts).toBe(5);
+  });
+
+  // Adversarial-review Round-7 [critical] (option B): the macOS events channel is
+  // same-UID-appendable and has NO strace-backed forgery detector, so a lifecycle
+  // script can forge a node_startup_done line — including a fake `emit_src` tag and
+  // a maximal ts. The dispatcher MUST NOT trust marker contents to open a
+  // suppression window; a forged high-ts marker may only END the window (record
+  // direction), never drop genuine reads. Here a child's marker is forged with
+  // emit_src:'env-spy' and ts=MAX_SAFE_INTEGER; a genuine post-marker read (real
+  // small ts) MUST still be recorded — under the pre-fix ts ceiling it would have
+  // been dropped as `4 < 9007199254740991` (the catastrophic false-negative).
+  it('RECORDS a genuine read after a FORGED high-ts emit_src marker (provenance not trusted, review [critical])', async () => {
+    const { events } = await drive([
+      execLine({ basename: 'node' }), // begins the node-bootstrap window for PID
+      JSON.stringify({ kind: 'env_read', name: 'AWS_SECRET_ACCESS_KEY', pid: PID, ts: 2, hidden: false }),
+      // Forged marker: attacker-chosen maximal ts + a fake env-spy provenance tag.
+      JSON.stringify({ kind: 'node_startup_done', pid: PID, ts: 9007199254740991, emit_src: 'env-spy' }),
+      // Genuine post-marker read with a real (small) ts.
+      JSON.stringify({ kind: 'env_read', name: 'AWS_SECRET_ACCESS_KEY', pid: PID, ts: 4, hidden: false }),
+    ]);
+    const secretReads = events.filter(
+      (e) => e.raw.kind === 'env_read' && (e.raw as { name: string }).name === 'AWS_SECRET_ACCESS_KEY',
+    );
+    // In-window ts=2 suppressed (pending); post-marker ts=4 RECORDED despite the
+    // forged 9e15 ts ceiling that the pre-fix code would have applied.
+    expect(secretReads.length).toBe(1);
+    expect((secretReads[0]!.raw as { ts: number }).ts).toBe(4);
+  });
+
   it('synthesizes a spawn for a successful exec (argv0 ?? prog), attributed to the seeded package', async () => {
     const { events } = await drive([execLine({ basename: 'install.sh' })]);
     const spawn = events.find((e) => e.raw.kind === 'spawn');
