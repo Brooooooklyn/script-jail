@@ -36,12 +36,13 @@
 //     `.yarn/releases` yarn is trusted toolchain (the repo is CI's trust root), so a
 //     repoDir-own yarnPath resolving INSIDE repoDir is ALLOWED; an ANCESTOR yarnPath
 //     (unstaged → unaudited) or an escaping/out-of-repo yarnPath is still refused.
-//     The HOST never re-execs ANY yarnPath regardless: `hostInstallEnv` pins
-//     YARN_IGNORE_PATH=1 on BOTH host phases (host-install.ts), so host part-1/part-2
-//     run the trusted registry yarn, byte-matching the guest's audited Phase B (which
-//     also direct-launches the registry `yarn.js`).  This gate governs only the
-//     guest-fetch / unstaged-ancestor surface for yarnPath.  Classic `.yarnrc`
-//     `yarn-path` is NOT honored under Berry, so it is not a vector.
+//     This is sound because under install:true BOTH sides ignore the vendored yarnPath
+//     and run the registry yarn pinned by `packageManager`: the guest sets
+//     YARN_IGNORE_PATH=1 in its install-mode launch env (agent.ts buildChildEnv) and
+//     `hostInstallEnv` pins it on BOTH host phases (host-install.ts).  So audit == host,
+//     the repo-vendored binary is never executed by script-jail, and the allowed
+//     yarnPath is inert.  Classic `.yarnrc` `yarn-path` is NOT honored under Berry, so
+//     it is not a vector.
 //   * npm — the only known pre-trust config exec (the `git` BINARY selected for a
 //     non-GitHub git dep) is already neutralized by the `npm_config_git` pin in
 //     host-install.ts.  Nothing left to detect here.
@@ -702,15 +703,19 @@ function detectYarnStartupExecInDir(dir: string, atRepoDir: boolean, hasYarnConf
     // OWNER TRUST DECISION (install:true): the repo's OWN committed `.yarn/releases`
     // yarn binary is trusted toolchain — the repo is CI's trust root, and this is
     // not dependency code — so a repoDir-own `yarnPath` that stays INSIDE repoDir no
-    // longer refuses install:true (the yarn-Berry / napi-rs case).  STILL refuse:
-    //   (a) an ANCESTOR (`!atRepoDir`) yarnPath — it is never staged into the sandbox
-    //       (backend/stage.ts stages only repoDir), so it would run UNAUDITED; and
-    //   (b) a repoDir yarnPath that ESCAPES repoDir — not the committed toolchain, and
-    //       it would re-exec in the network-on guest Phase A fetch (`yarnPathEscapesRepo`).
-    // The HOST never re-execs ANY yarnPath: hostInstallEnv pins YARN_IGNORE_PATH=1 on
-    // BOTH host phases (host-install.ts), so host part-1/part-2 always run the trusted
-    // registry yarn — byte-matching what the guest audited in Phase B.  This gate only
-    // governs the guest-fetch / unstaged-ancestor surface, not a host RCE.
+    // longer refuses install:true (the yarn-Berry / napi-rs case).  This is sound
+    // because BOTH the audit and the host install IGNORE the vendored yarnPath and run
+    // the registry yarn pinned by `packageManager`: the guest sets YARN_IGNORE_PATH=1
+    // in its install-mode launch env (buildChildEnv) and hostInstallEnv pins it on both
+    // host phases (host-install.ts).  So audit == host (no vendored-vs-registry gap),
+    // and the vendored binary is never executed by script-jail on this path.  STILL
+    // refuse:
+    //   (a) an ANCESTOR (`!atRepoDir`) yarnPath — never staged into the sandbox
+    //       (backend/stage.ts stages only repoDir), so its enableScripts cascade and
+    //       any host-side rc effects are audit-blind; and
+    //   (b) a repoDir yarnPath that ESCAPES repoDir (`yarnPathEscapesRepo`) — not the
+    //       committed toolchain; defense-in-depth in case YARN_IGNORE_PATH ever fails to
+    //       suppress on some yarn version, an out-of-repo binary must never be trusted.
     if (!atRepoDir || yarnPathEscapesRepo(dir, yarnPathVal)) {
       return `${where} \`.yarnrc.yml\` \`yarnPath\`` + YARN_GUIDANCE;
     }

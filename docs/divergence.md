@@ -40,7 +40,7 @@ determinism across hosts:
   sandbox guarantee — see the `install: true` trust model in
   [docs/design.md](./design.md#drop-in-install-trust-model-install-true).
 
-- **`install: true` yarn-Berry `yarnPath` (repo-toolchain trust + fetch-phase launcher asymmetry).**
+- **`install: true` yarn-Berry `yarnPath` (repo-toolchain trust; audit and host both run the registry yarn).**
   The pre-trust gate (`src/action/install-preflight.ts`) **allows `install: true` for a
   repoDir-own committed `yarnPath`** (one resolving INSIDE repoDir, i.e. the repo's own
   `.yarn/releases/yarn-*.cjs`). This is an **owner trust decision**: the repo's own committed
@@ -50,18 +50,22 @@ determinism across hosts:
   `.yarnrc.yml` `plugins:` / `enableConstraintsChecks`+`yarn.config.cjs` (these execute repo
   code at yarn startup and remain refused; relaxable per-consumer if ever needed).
 
-  The **audited build phase is lockstep**: `hostInstallEnv` pins `YARN_IGNORE_PATH=1` on BOTH
-  host phases, so host part-1 (fetch) and part-2 (lifecycle) run the trusted registry/corepack
-  `node yarn.js` — exactly what the guest audits in Phase B (`resolveLinuxManagerLaunch` also
-  ignores the vendored `yarnPath`). The host never re-execs the vendored binary, so no
-  dependency action can hide in a vendored-vs-registry yarn gap. Residual (accepted): the
-  **un-audited fetch step is asymmetric** — guest Phase A re-execs the *vendored* yarn (corepack
-  shim, no `YARN_IGNORE_PATH`) while host part-1 runs the *registry* yarn. This is benign: Phase A
-  is `--mode=skip-build` (runs **zero** dependency lifecycle scripts), network-on and un-straced
-  (un-audited on both sides), and both consume the same frozen `--immutable` committed lockfile →
-  the same pinned tree. The only thing that could differ is link-time output of a *tampered*
-  vendored yarn, which is the repo's OWN committed toolchain (owner-trusted) and invisible to the
-  value-blind lock either way. **Firecracker is the enforcement boundary.**
+  **Audit == host because both ignore `yarnPath`.** Under `install: true` the guest sets
+  `YARN_IGNORE_PATH=1` in its yarn launch env for **both** phases (`buildChildEnv` install-mode
+  pins), exactly like `hostInstallEnv` does on both host phases. A direct `node yarn.js` re-execs
+  `yarnPath` UNLESS `YARN_IGNORE_PATH=1` (verified, yarn 4.17.0), so without this the guest would
+  audit the repo-VENDORED yarn while the host ran the REGISTRY yarn — an audit-vs-host divergence
+  that could hide dependency lifecycle behavior. With it, **both** the audit (guest Phase A fetch
+  + Phase B install) and the host install (part-1 + part-2) run the corepack/registry yarn pinned
+  by `packageManager`, ignoring the vendored `yarnPath` entirely. The repo-vendored binary is
+  therefore never executed by script-jail on this path, so the gate allowing a repoDir-own
+  `yarnPath` is sound (it is inert — both sides ignore it) and no dependency action can hide in a
+  vendored-vs-registry gap. (`YARN_IGNORE_PATH=1` is install-mode-ONLY: pure `mode: check`, which
+  has no host install to diverge from, audits the repo's yarn as-is and is unchanged.) Residual
+  (accepted, benign): script-jail audits+installs with the registry yarn of the pinned version,
+  not the repo's exact vendored file; for the normal case (an unmodified `yarn set version`
+  binary) these are the same official release, and a repo that *patched* its vendored yarn would
+  have the patch ignored **consistently on both sides**. **Firecracker is the enforcement boundary.**
 
 - **`install: true` host package-manager VERSION (defense-in-depth residual).**
   The host lifecycle pass (`src/action/host-install.ts`) runs the
