@@ -3621,6 +3621,18 @@ export async function runInstallPhase(
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path.resolve(input.cwd));
+        // Record the root's clone-time inherited cwd too. The root is strace's
+        // own child (launched IN `input.cwd`), so it never gets a pidCloneTimeCwd
+        // entry from the clone handler (which only seeds CLONE children). The
+        // deferred-relative-open recovery walk (see stampDeferredRelOpens replay)
+        // climbs childParent looking for the nearest non-mutating ancestor with a
+        // KNOWN pidCloneTimeCwd; without this seed the walk reaches the root, finds
+        // no entry, and exhausts → null → <UNRESOLVED_PATH>. The root never chdir's
+        // before launching the install (input.cwd IS its clone-time cwd), so this
+        // is the exact value a descendant that cloned off the root inherited. (A
+        // raced deferred read whose lineage terminates at the root therefore
+        // resolves against the repo root instead of fail-loud surfacing.)
+        if (!pidCloneTimeCwd.has(pid)) pidCloneTimeCwd.set(pid, path.resolve(input.cwd));
         // Determinism (defer-and-re-resolve): the root's cwd is seeded above, so
         // a root AT_FDCWD-relative open ALWAYS resolves inline and never reaches
         // the deferral path — no separate initial-cwd capture is needed here.

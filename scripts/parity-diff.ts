@@ -306,6 +306,22 @@ const PARITY_ONLY_ENV_READS = new Set([
   // behavior — a package READING it is still recorded in the macOS lock; only the
   // cross-backend one-sided presence is reconciled here.
   'SCRIPT_JAIL_WORK_DIR',
+  // The harness's protected-env-name list (the tamper-detection allowlist passed
+  // to the Linux Rust shim) and the marker-emit control flag.  Both are
+  // script-jail's OWN injected control vars, not dependency behavior:
+  //   - SCRIPT_JAIL_PROTECTED_ENV_NAMES is Linux-only by construction (macOS-bare
+  //     uses SCRIPT_JAIL_MACOS_AUDIT_OPS for the same role — already filtered above),
+  //     so it surfaces on the Linux side only.
+  //   - SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL is read by env-spy ITSELF to decide
+  //     whether to write the node_startup_done marker; it surfaces post-marker on
+  //     macOS-bare but is pre-marker bootstrap noise (suppressed) on Linux — the
+  //     same marker-timing-fidelity asymmetry documented at FORCE_COLOR below.
+  // Like every other SCRIPT_JAIL_* provisioning var here, a package READING one is
+  // still recorded in that backend's own lockfile; only the cross-backend one-sided
+  // NAME presence is reconciled.  Exact names (no prefix) so a novel SCRIPT_JAIL_*
+  // surfaces.
+  'SCRIPT_JAIL_PROTECTED_ENV_NAMES',
+  'SCRIPT_JAIL_EMIT_NODE_STARTUP_JSONL',
   '_',
   'SHLVL',
   'TMPDIR',
@@ -351,6 +367,11 @@ const PARITY_ONLY_ENV_READS = new Set([
   'XBS_DISABLE_LIBINFO',
   '__CFPREFERENCES_AVOID_DAEMON',
   '__CFPreferencesTestDaemon',
+  // CoreFoundation's per-process text-encoding hint, set by the macOS OS for
+  // every spawned child and read by libSystem/CF image init — no Linux analog,
+  // so it surfaces one-sided on macOS-bare.  Same class as the __CFPreferences*
+  // probes above; harness/OS runtime, never the package's own logic.
+  '__CF_USER_TEXT_ENCODING',
   // The macOS-bare injection vars the dyld loader reads to perform the shim
   // insert — the exact macOS analog of `LD_PRELOAD` (already filtered above).
   // Like `LD_PRELOAD`, a package READING these to detect the audit is recorded

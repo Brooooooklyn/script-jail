@@ -27607,6 +27607,7 @@ async function runInstallPhase(input) {
         installRootSeeded = true;
         installRootPid = pid;
         cwdSet(pid, path2.resolve(input.cwd));
+        if (!pidCloneTimeCwd.has(pid)) pidCloneTimeCwd.set(pid, path2.resolve(input.cwd));
         execCwd.set(pid, path2.resolve(input.cwd));
       }
     }
