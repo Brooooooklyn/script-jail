@@ -2,7 +2,7 @@
 // Wires all mocks together; uses a MemoryConnection and fake config file.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { PassThrough } from 'node:stream';
+import { PassThrough, type Readable } from 'node:stream';
 import { writeFileSync, mkdirSync, rmSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,8 @@ import { stringify } from 'yaml';
 
 import { createConnection } from 'node:net';
 
-import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, PHASE_B_STDOUT_TAIL_BYTES, PHASE_B_STDOUT_PENDING_MAX_BYTES, redactSensitive } from '../../src/guest/agent.js';
+import { spawn } from 'node:child_process';
+import { LinuxVsockConnection, LinuxStraceRunner, main, MemoryConnection, runStraceTailer, attachStdoutTailCollector, attachFd3Reader, PHASE_B_STDOUT_TAIL_BYTES, PHASE_B_STDOUT_PENDING_MAX_BYTES, redactSensitive } from '../../src/guest/agent.js';
 import type { DnsLookupFn, SpawnResult, EventsFile, SpawnImpl } from '../../src/guest/agent.js';
 import { MacOSInstallRunner } from '../../src/guest/macos-install-runner.js';
 import type { Spawner } from '../../src/guest/phase-fetch.js';
@@ -5098,6 +5099,65 @@ describe('runStraceTailer', () => {
     expect(tamperRef.reason).toMatch(
       /ctime advanced without new bytes|shrank below max-seen|mtime regressed/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// attachFd3Reader — early fd-3 attach (fast-install hang + false-negative fix)
+// ---------------------------------------------------------------------------
+describe('attachFd3Reader (early fd-3 attach)', () => {
+  it('captures fd-3 lines + EOF that arrive BEFORE the tailer adopts the reader', async () => {
+    // Reproduces the production race the early attach fixes. The strace child's
+    // fd-3 is a real socket; if the traced tree finishes during the
+    // readStraceChildPid await — i.e. BEFORE runStraceTailer attaches a reader —
+    // Node DISCARDS the buffered fd-3 lines AND the EOF (a late readline sees
+    // nothing: every env_read on the channel is LOST = false negative, and
+    // 'close' never fires → the tailer's fd3-done flag never flips → HANG).
+    // attachFd3Reader is attached in run() right after spawn, so it buffers
+    // everything; the tailer then adopts it via setSink and loses nothing.
+    const lineA = '{"kind":"env_read","name":"HOME","pid":42}';
+    const lineB = '{"kind":"env_read","name":"PATH","pid":42}';
+    const child = spawn(
+      'sh',
+      ['-c', `echo '${lineA}' >&3; echo '${lineB}' >&3; exit 0`],
+      { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] },
+    );
+
+    // EARLY attach — exactly what run() does, before the await.
+    const reader = attachFd3Reader(child.stdio[3] as Readable | null);
+
+    // Simulate the readStraceChildPid await: wait until the child has fully
+    // closed BEFORE the tailer adopts the reader (the window that lost data).
+    await new Promise<void>((r) => child.on('close', () => r()));
+
+    const collected: Array<{ pid: number; line: string; source: string }> = [];
+    reader.setSink((item) => collected.push(item), () => {});
+
+    expect(collected.map((c) => c.line)).toEqual([lineA, lineB]);
+    expect(collected.every((c) => c.pid === 0 && c.source === 'shim')).toBe(true);
+    expect(reader.isClosed()).toBe(true);
+  });
+
+  it('reports closed immediately when there is no fd-3 stream', () => {
+    const reader = attachFd3Reader(null);
+    expect(reader.isClosed()).toBe(true);
+    const collected: unknown[] = [];
+    reader.setSink((item) => collected.push(item), () => {});
+    expect(collected).toEqual([]);
+  });
+
+  it('routes lines that arrive AFTER setSink straight to the sink + wakes', async () => {
+    const stream = new PassThrough();
+    const reader = attachFd3Reader(stream);
+    const collected: string[] = [];
+    let wakes = 0;
+    reader.setSink((item) => collected.push(item.line), () => { wakes += 1; });
+    stream.write('{"kind":"dlopen","filename":"/x.node"}\n');
+    stream.end();
+    await new Promise<void>((r) => setTimeout(r, 20));
+    expect(collected).toEqual(['{"kind":"dlopen","filename":"/x.node"}']);
+    expect(reader.isClosed()).toBe(true);
+    expect(wakes).toBeGreaterThan(0);
   });
 });
 

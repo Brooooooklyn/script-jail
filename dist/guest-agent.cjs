@@ -10358,6 +10358,7 @@ __export(agent_exports, {
   ROOT_PID_RESOLVE_DEADLINE_MS: () => ROOT_PID_RESOLVE_DEADLINE_MS,
   ROOT_PID_RESOLVE_SETTLE_POLLS: () => ROOT_PID_RESOLVE_SETTLE_POLLS,
   StdioConnection: () => StdioConnection,
+  attachFd3Reader: () => attachFd3Reader,
   attachStdoutTailCollector: () => attachStdoutTailCollector,
   buildChildEnv: () => buildChildEnv,
   buildChildEnvMacos: () => buildChildEnvMacos,
@@ -30234,6 +30235,41 @@ var MacOSSpawner = class {
     return new LinuxSpawner().spawn(launch.cmd, launch.args, opts);
   }
 };
+function attachFd3Reader(stream) {
+  const pending = [];
+  let closed = false;
+  let sink = null;
+  let wake = null;
+  const emit = (item) => {
+    if (sink !== null) sink(item);
+    else pending.push(item);
+    wake?.();
+  };
+  if (stream !== null) {
+    const rl = (0, import_node_readline2.createInterface)({ input: stream, crlfDelay: Infinity });
+    rl.on("line", (line) => {
+      if (line.length > 0) emit({ pid: 0, line, source: "shim" });
+    });
+    rl.on("close", () => {
+      closed = true;
+      wake?.();
+    });
+  } else {
+    closed = true;
+  }
+  return {
+    setSink(push, w) {
+      sink = push;
+      wake = w;
+      for (const item of pending) push(item);
+      pending.length = 0;
+      w();
+    },
+    isClosed() {
+      return closed;
+    }
+  };
+}
 async function* runStraceTailer(opts) {
   const pollIntervalMs = opts.pollIntervalMs ?? 50;
   const drainMs = opts.drainMs ?? 100;
@@ -30461,22 +30497,10 @@ async function* runStraceTailer(opts) {
     }
     wake();
   }
-  let fd3Done = false;
-  if (opts.fd3Stream !== null) {
-    const rl = (0, import_node_readline2.createInterface)({ input: opts.fd3Stream, crlfDelay: Infinity });
-    rl.on("line", (line) => {
-      if (line.length > 0) {
-        queue.push({ pid: 0, line, source: "shim" });
-        wake();
-      }
-    });
-    rl.on("close", () => {
-      fd3Done = true;
-      wake();
-    });
-  } else {
-    fd3Done = true;
-  }
+  const fd3 = opts.fd3Reader ?? attachFd3Reader(opts.fd3Stream);
+  fd3.setSink((item) => {
+    queue.push(item);
+  }, wake);
   let watcher = null;
   try {
     watcher = (0, import_node_fs5.watch)(opts.watchDir, (_event, _filename) => {
@@ -30528,10 +30552,6 @@ async function* runStraceTailer(opts) {
     wake();
   }, pollIntervalMs);
   opts.exitPromise.then(async () => {
-    process.stderr.write(
-      `[agent][diag] tailer: exitPromise resolved \u2014 strace whole-tree exit observed (base=${opts.basePrefix})
-`
-    );
     const exitStatus = opts.exitStatusRef;
     if (exitStatus !== void 0) {
       if (exitStatus.signal !== null || exitStatus.spawnError === true) {
@@ -30624,25 +30644,17 @@ async function* runStraceTailer(opts) {
     done = true;
     wake();
   });
-  const heartbeatTimer = setInterval(() => {
-    process.stderr.write(
-      `[agent][diag] tailer heartbeat (base=${opts.basePrefix}): done=${done} fd3Done=${fd3Done} queue=${queue.length}
-`
-    );
-  }, 5e3);
-  if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
   try {
     while (true) {
       while (queue.length > 0) {
         yield queue.shift();
       }
-      if (done && fd3Done && queue.length === 0) break;
+      if (done && fd3.isClosed() && queue.length === 0) break;
       await new Promise((resolve3) => {
         wakeResolve = resolve3;
       });
     }
   } finally {
-    clearInterval(heartbeatTimer);
     if (pollTimer !== null) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -30913,6 +30925,17 @@ var LinuxStraceRunner = class {
       this._redactStdout,
       this._stdoutTailBytes
     );
+    const fd3Stream = child.stdio[3];
+    const fd3Reader = attachFd3Reader(fd3Stream);
+    let stderrRl = null;
+    if (child.stderr) {
+      stderrRl = (0, import_node_readline2.createInterface)({ input: child.stderr, crlfDelay: Infinity });
+      stderrRl.on("line", (line) => {
+        const safe = this._redactStdout ? this._redactStdout(line) : line;
+        process.stderr.write(`[strace] ${safe}
+`);
+      });
+    }
     const exitStatus = {
       code: null,
       signal: null
@@ -30933,43 +30956,22 @@ var LinuxStraceRunner = class {
     let rootPidDeterministicResolution = false;
     if (child.pid !== void 0) {
       rootPidDeterministicResolution = true;
-      process.stderr.write(
-        `[agent][diag] run: strace pid=${child.pid} base=${(0, import_node_path6.basename)(opts.basePath)} \u2014 awaiting root-pid resolution
-`
-      );
       const pid = await readStraceChildPid(child.pid, opts.rootPidResolveDeadlineMs, {
         ...opts.rootPidResolveSettlePolls !== void 0 ? { settlePolls: opts.rootPidResolveSettlePolls } : {},
         ...opts.rootPidResolvePollIntervalMs !== void 0 ? { pollIntervalMs: opts.rootPidResolvePollIntervalMs } : {}
       });
-      process.stderr.write(
-        `[agent][diag] run: strace pid=${child.pid} base=${(0, import_node_path6.basename)(opts.basePath)} \u2014 root-pid resolved=${pid}
-`
-      );
       if (pid !== null) {
         this._rootPid = pid;
       }
     }
     const watchDir = (0, import_node_path6.dirname)(opts.basePath);
     const basePrefix = (0, import_node_path6.basename)(opts.basePath);
-    const fd3Stream = child.stdio[3];
-    let stderrRl = null;
-    if (child.stderr) {
-      stderrRl = (0, import_node_readline2.createInterface)({ input: child.stderr, crlfDelay: Infinity });
-      stderrRl.on("line", (line) => {
-        const safe = this._redactStdout ? this._redactStdout(line) : line;
-        process.stderr.write(`[strace] ${safe}
-`);
-      });
-    }
-    process.stderr.write(
-      `[agent][diag] run: strace pid=${child.pid} base=${basePrefix} \u2014 tailer starting (draining until whole-tree exit)
-`
-    );
     try {
       yield* runStraceTailer({
         watchDir,
         basePrefix,
         fd3Stream,
+        fd3Reader,
         ...this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
@@ -32067,6 +32069,7 @@ if (isMain) {
   ROOT_PID_RESOLVE_DEADLINE_MS,
   ROOT_PID_RESOLVE_SETTLE_POLLS,
   StdioConnection,
+  attachFd3Reader,
   attachStdoutTailCollector,
   buildChildEnv,
   buildChildEnvMacos,

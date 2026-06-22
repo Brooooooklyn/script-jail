@@ -318,6 +318,96 @@ export class MacOSSpawner implements Spawner {
 // ---------------------------------------------------------------------------
 
 /**
+ * fd-3 (LD_PRELOAD JSONL) reader controller.
+ *
+ * WHY THIS IS ATTACHED EARLY (in `run()`), NOT inside `runStraceTailer`: the
+ * production tailer is `yield*`'d only AFTER `run()` awaits readStraceChildPid,
+ * which polls /proc for up to ROOT_PID_RESOLVE_DEADLINE_MS (~5s). The strace
+ * child's fd-3 is a child-process SOCKET; when the traced tree finishes DURING
+ * that await, Node destroys `child.stdio[3]` and DISCARDS both any buffered
+ * fd-3 bytes AND the 'close' event the instant the child closes. A readline
+ * attached AFTER that point sees NOTHING — every env_read/dlopen line on the
+ * channel is LOST (a FALSE NEGATIVE, the catastrophic direction) and 'close'
+ * never fires, so the tailer's fd3-done flag never flips and the audit HANGS.
+ * (Empirically confirmed: attaching a readline to a child's fd-3 after the
+ * child closed loses all lines and never emits 'close'.) Attaching the reader
+ * IMMEDIATELY after spawn — before the await — keeps the socket flowing so
+ * every line is buffered and the EOF is observed, exactly as
+ * attachStdoutTailCollector already does for fd-1.
+ *
+ * The controller buffers lines (and the closed state) until the tailer adopts
+ * it via {@link Fd3Reader.setSink}; then lines flow straight into the tailer's
+ * queue and `wake()` re-evaluates the terminal condition.
+ */
+export interface Fd3Reader {
+  /**
+   * Adopt the reader: flush any pre-buffered lines into `push`, route all
+   * subsequent lines there too, and call `wake` on every line and on close.
+   * Called once when the tailer starts.
+   */
+  setSink(
+    push: (item: { pid: number; line: string; source: LineSource }) => void,
+    wake: () => void,
+  ): void;
+  /** True once fd-3 has hit EOF — or immediately when there is no stream. */
+  isClosed(): boolean;
+}
+
+/**
+ * Attach a line reader to a child's fd-3 IMMEDIATELY (see {@link Fd3Reader}).
+ * Production calls this right after spawn, before the readStraceChildPid await;
+ * tests inject a raw `fd3Stream` into runStraceTailer, which wraps it here.
+ */
+export function attachFd3Reader(stream: Readable | null): Fd3Reader {
+  const pending: Array<{ pid: number; line: string; source: LineSource }> = [];
+  let closed = false;
+  let sink:
+    | ((item: { pid: number; line: string; source: LineSource }) => void)
+    | null = null;
+  let wake: (() => void) | null = null;
+
+  const emit = (item: {
+    pid: number;
+    line: string;
+    source: LineSource;
+  }): void => {
+    if (sink !== null) sink(item);
+    else pending.push(item);
+    wake?.();
+  };
+
+  if (stream !== null) {
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    rl.on('line', (line: string) => {
+      // fd-3 is the preload-owned pipe — tagged `'shim'`.
+      if (line.length > 0) emit({ pid: 0, line, source: 'shim' });
+    });
+    rl.on('close', () => {
+      closed = true;
+      wake?.();
+    });
+  } else {
+    // No fd-3 channel (test stubs / runners that don't pipe fd 3) → done now.
+    closed = true;
+  }
+
+  return {
+    setSink(push, w): void {
+      sink = push;
+      wake = w;
+      for (const item of pending) push(item);
+      pending.length = 0;
+      // Wake once so the tailer re-evaluates its terminal condition against any
+      // lines/close that arrived before adoption (the fast-install case).
+      w();
+    },
+    isClosed(): boolean {
+      return closed;
+    },
+  };
+}
+
+/**
  * Options for StraceTailer. The `fd3Stream` seam lets tests inject a fake
  * Readable instead of an actual child-process pipe.
  */
@@ -329,8 +419,19 @@ export interface StraceTailerOptions {
   /**
    * Readable stream representing the child's fd 3 (LD_PRELOAD JSONL).
    * When null, no fd-3 lines are emitted (useful when the child doesn't write to fd 3).
+   *
+   * Used ONLY by tests that inject a fake stream; production passes a
+   * pre-attached {@link fd3Reader} instead (attached before the readStraceChildPid
+   * await so no line / EOF is missed — see {@link Fd3Reader}).
    */
   fd3Stream: Readable | null;
+  /**
+   * Pre-attached fd-3 reader controller (production path). When provided it
+   * takes precedence over {@link fd3Stream}: the reader was attached in `run()`
+   * immediately after spawn, so fd-3 lines and the EOF observed during the
+   * readStraceChildPid await are buffered rather than discarded.
+   */
+  fd3Reader?: Fd3Reader;
   /**
    * Absolute path of a shared JSONL events file produced by the env-shim and
    * env-spy preload (production channel — see {@link createEventsFile}).
@@ -971,25 +1072,14 @@ export async function* runStraceTailer(
   }
 
   // ---- fd 3 readline -------------------------------------------------------
-
-  let fd3Done = false;
-
-  if (opts.fd3Stream !== null) {
-    const rl = createInterface({ input: opts.fd3Stream, crlfDelay: Infinity });
-    rl.on('line', (line: string) => {
-      if (line.length > 0) {
-        // fd-3 is the preload-owned pipe — tagged `'shim'`.
-        queue.push({ pid: 0, line, source: 'shim' });
-        wake();
-      }
-    });
-    rl.on('close', () => {
-      fd3Done = true;
-      wake();
-    });
-  } else {
-    fd3Done = true;
-  }
+  //
+  // Prefer the pre-attached reader from `run()` (production — attached BEFORE
+  // the readStraceChildPid await so no fd-3 line / EOF is lost on a fast
+  // install; see attachFd3Reader). Tests inject a raw `fd3Stream`, wrapped here:
+  // their in-memory PassThrough buffers on late attach, so the test path is
+  // already safe — only a real child-process socket discards on close.
+  const fd3 = opts.fd3Reader ?? attachFd3Reader(opts.fd3Stream);
+  fd3.setSink((item) => { queue.push(item); }, wake);
 
   // ---- fs.watch + polling loop ---------------------------------------------
 
@@ -1124,9 +1214,6 @@ export async function* runStraceTailer(
   // ---- wait for child exit, then drain -------------------------------------
 
   opts.exitPromise.then(async () => {
-    process.stderr.write(
-      `[agent][diag] tailer: exitPromise resolved — strace whole-tree exit observed (base=${opts.basePrefix})\n`,
-    );
     // Decide whether to freeze the two "advanced WITHOUT new bytes" meta gates
     // (see the childExited declaration).  The freeze is a RELAXATION, so it
     // engages ONLY when strace exited NORMALLY (by exit(), signal === null) —
@@ -1327,17 +1414,6 @@ export async function* runStraceTailer(
 
   // ---- generator loop ------------------------------------------------------
 
-  // [agent][diag] heartbeat: surfaces whether timers fire on this guest and the
-  // loop's terminal state (done = strace exited; fd3Done = fd-3 pipe EOF). If
-  // this never prints, the event loop is wedged; if it prints with done=false
-  // forever, the traced tree never exited (a child hung).
-  const heartbeatTimer = setInterval(() => {
-    process.stderr.write(
-      `[agent][diag] tailer heartbeat (base=${opts.basePrefix}): done=${done} fd3Done=${fd3Done} queue=${queue.length}\n`,
-    );
-  }, 5000);
-  if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
-
   try {
     while (true) {
       // Drain the queue first.
@@ -1346,13 +1422,12 @@ export async function* runStraceTailer(
       }
 
       // If we've set done AND fd3 is done AND queue is empty → finished.
-      if (done && fd3Done && queue.length === 0) break;
+      if (done && fd3.isClosed() && queue.length === 0) break;
 
       // Wait for a wake signal.
       await new Promise<void>((resolve) => { wakeResolve = resolve; });
     }
   } finally {
-    clearInterval(heartbeatTimer);
     // Cleanup on early consumer break (try/finally).
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
     if (watcher !== null) { try { watcher.close(); } catch { /* ignore */ } watcher = null; }
@@ -2048,6 +2123,43 @@ export class LinuxStraceRunner implements StraceRunner {
       this._stdoutTailBytes,
     );
 
+    // Attach the fd-3 (LD_PRELOAD JSONL) reader AND the fd-2 (strace stderr)
+    // forwarder NOW — BEFORE the readStraceChildPid await below — for the SAME
+    // reason fd-1 is drained above. The await can run up to
+    // ROOT_PID_RESOLVE_DEADLINE_MS (~5s), and a fast install finishes within it.
+    // fd-3 is a child-process SOCKET: if no reader is attached when the child
+    // closes, Node discards every buffered fd-3 line (a dropped env_read =
+    // FALSE NEGATIVE) AND the 'close' event (so the tailer's fd3-done flag never
+    // flips → the audit HANGS). An unread fd-2 pipe can likewise fill and
+    // deadlock a verbose install. Attaching both here keeps the sockets flowing
+    // from the first byte. See {@link attachFd3Reader}.
+
+    // child.stdio[3] is the read end of the fd-3 pipe.
+    const fd3Stream = child.stdio[3] as Readable | null;
+    const fd3Reader = attachFd3Reader(fd3Stream);
+
+    // Forward strace's stderr line-by-line to process.stderr with a [strace]
+    // prefix so any strace diagnostics (e.g. "strace: exec failed", ptrace
+    // permission errors) land on the guest's ttyS0 console.
+    //
+    // SECURITY (adversarial-review F1): the tracee inherits strace's fd2, so the
+    // install command AND its lifecycle children write their stderr here too.
+    // Apply the SAME redactor wired into the stdout tail (`_redactStdout` =
+    // redactSensitive: exact protected-env values + credential SHAPES) so a
+    // lifecycle script cannot leak a secret to the console via stderr while the
+    // stdout sibling masks it.  readline yields COMPLETE lines (crlfDelay:
+    // Infinity), matching the redactor's line-local contract.  This forwarder is
+    // purely human-visible console output — the parsed trace goes to the `-o`
+    // files (fd-based), never here — so redaction can't corrupt attribution.
+    let stderrRl: ReturnType<typeof createInterface> | null = null;
+    if (child.stderr) {
+      stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
+      stderrRl.on('line', (line: string) => {
+        const safe = this._redactStdout ? this._redactStdout(line) : line;
+        process.stderr.write(`[strace] ${safe}\n`);
+      });
+    }
+
     // Capture strace's exit disposition (code + signal) so the tailer can tell
     // a CLEAN whole-tree exit from an ABNORMAL termination (e.g. a tracee
     // SIGKILLing its tracer to detach and survive).  Mutated BEFORE resolve()
@@ -2142,9 +2254,6 @@ export class LinuxStraceRunner implements StraceRunner {
       // tailer callback so the decision is fixed before any per-pid
       // file is drained.
       rootPidDeterministicResolution = true;
-      process.stderr.write(
-        `[agent][diag] run: strace pid=${child.pid} base=${basename(opts.basePath)} — awaiting root-pid resolution\n`,
-      );
       const pid = await readStraceChildPid(child.pid, opts.rootPidResolveDeadlineMs, {
         ...(opts.rootPidResolveSettlePolls !== undefined
           ? { settlePolls: opts.rootPidResolveSettlePolls }
@@ -2153,9 +2262,6 @@ export class LinuxStraceRunner implements StraceRunner {
           ? { pollIntervalMs: opts.rootPidResolvePollIntervalMs }
           : {}),
       });
-      process.stderr.write(
-        `[agent][diag] run: strace pid=${child.pid} base=${basename(opts.basePath)} — root-pid resolved=${pid}\n`,
-      );
       if (pid !== null) {
         this._rootPid = pid;
       }
@@ -2171,40 +2277,17 @@ export class LinuxStraceRunner implements StraceRunner {
 
     const watchDir = dirname(opts.basePath);
     const basePrefix = basename(opts.basePath);
+    // NOTE: `fd3Stream` / `fd3Reader` / `stderrRl` are attached ABOVE (right
+    // after spawn, before the readStraceChildPid await) so a fast install's
+    // fd-3 lines + EOF — and a verbose install's fd-2 — are never lost or
+    // dropped during the await.  Do not move them back down here.
 
-    // child.stdio[3] is the read end of the fd-3 pipe.
-    const fd3Stream = child.stdio[3] as Readable | null;
-
-    // Forward strace's stderr line-by-line to process.stderr with a [strace]
-    // prefix so any strace diagnostics (e.g. "strace: exec failed", ptrace
-    // permission errors) land on the guest's ttyS0 console.
-    //
-    // SECURITY (adversarial-review F1): the tracee inherits strace's fd2, so the
-    // install command AND its lifecycle children write their stderr here too.
-    // Apply the SAME redactor wired into the stdout tail (`_redactStdout` =
-    // redactSensitive: exact protected-env values + credential SHAPES) so a
-    // lifecycle script cannot leak a secret to the console via stderr while the
-    // stdout sibling masks it.  readline yields COMPLETE lines (crlfDelay:
-    // Infinity), matching the redactor's line-local contract.  This forwarder is
-    // purely human-visible console output — the parsed trace goes to the `-o`
-    // files (fd-based), never here — so redaction can't corrupt attribution.
-    let stderrRl: ReturnType<typeof createInterface> | null = null;
-    if (child.stderr) {
-      stderrRl = createInterface({ input: child.stderr, crlfDelay: Infinity });
-      stderrRl.on('line', (line: string) => {
-        const safe = this._redactStdout ? this._redactStdout(line) : line;
-        process.stderr.write(`[strace] ${safe}\n`);
-      });
-    }
-
-    process.stderr.write(
-      `[agent][diag] run: strace pid=${child.pid} base=${basePrefix} — tailer starting (draining until whole-tree exit)\n`,
-    );
     try {
       yield* runStraceTailer({
         watchDir,
         basePrefix,
         fd3Stream,
+        fd3Reader,
         ...(this._eventsFile !== null ? {
           eventsFilePath: this._eventsFile.path,
           eventsBaseline: this._eventsFile.baseline,
