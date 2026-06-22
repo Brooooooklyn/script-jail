@@ -10377,6 +10377,7 @@ module.exports = __toCommonJS(agent_exports);
 var import_node_fs5 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_readline2 = require("node:readline");
+var import_node_perf_hooks = require("node:perf_hooks");
 var import_node_net = require("node:net");
 var import_node_dns = require("node:dns");
 var import_node_stream = require("node:stream");
@@ -30538,7 +30539,7 @@ async function* runStraceTailer(opts) {
         pendingCtimeTamper = null;
       }
     }
-    const hardDeadline = Date.now() + settleHardCapMs;
+    const hardDeadline = import_node_perf_hooks.performance.now() + settleHardCapMs;
     let quiet = 0;
     let prev = "";
     const progressKey = () => {
@@ -30559,7 +30560,7 @@ async function* runStraceTailer(opts) {
         quiet = 0;
       }
       prev = cur;
-      if (Date.now() >= hardDeadline) break;
+      if (import_node_perf_hooks.performance.now() >= hardDeadline) break;
       await delay(pollIntervalMs);
     }
     if (pendingCtimeTamper !== null && !childExited) {
@@ -30667,7 +30668,9 @@ async function* runStraceTailer(opts) {
 var ROOT_PID_RESOLVE_DEADLINE_MS = 5e3;
 var ROOT_PID_RESOLVE_SETTLE_POLLS = 20;
 async function readStraceChildPid(stracePid, deadlineMs = ROOT_PID_RESOLVE_DEADLINE_MS, opts = {}) {
-  const start = Date.now();
+  const now = opts.now ?? (() => import_node_perf_hooks.performance.now());
+  const start = now();
+  const startReal = Date.now();
   const POLL_INTERVAL_MS = opts.pollIntervalMs ?? 10;
   const settlePolls = opts.settlePolls ?? ROOT_PID_RESOLVE_SETTLE_POLLS;
   const readChildren = opts.readChildren ?? ((sp) => {
@@ -30682,8 +30685,10 @@ async function readStraceChildPid(stracePid, deadlineMs = ROOT_PID_RESOLVE_DEADL
   });
   let candidate = null;
   let streak = 0;
-  for (let iter = 0; iter < 2e5; iter++) {
-    if (Date.now() - start >= deadlineMs) break;
+  const maxIters = Math.max(1, Math.ceil(deadlineMs / Math.max(1, POLL_INTERVAL_MS))) * 4 + 100;
+  let iter = 0;
+  for (; iter < maxIters; iter++) {
+    if (now() - start >= deadlineMs) break;
     const raw = readChildren(stracePid);
     if (raw === null || raw.length === 0) {
       candidate = null;
@@ -30708,6 +30713,17 @@ async function readStraceChildPid(stracePid, deadlineMs = ROOT_PID_RESOLVE_DEADL
       streak = 0;
     }
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+  const monoMs = Math.round(now() - start);
+  const realMs = Date.now() - startReal;
+  if (monoMs - realMs > 1e3) {
+    try {
+      process.stderr.write(
+        `[agent] readStraceChildPid: CLOCK_REALTIME stalled while resolving the strace root pid (monoMs=${monoMs}, realMs=${realMs}, iters=${iter}); bounded by the monotonic deadline \u2192 null (fail-closed).
+`
+      );
+    } catch {
+    }
   }
   return null;
 }

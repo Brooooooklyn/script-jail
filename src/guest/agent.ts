@@ -15,6 +15,7 @@
 import { existsSync, readFileSync, writeFileSync, watch as fsWatch, readdirSync, statSync, openSync, readSync, closeSync, fstatSync, mkdirSync, mkdtempSync, rmSync, chmodSync, realpathSync, constants as fsConstants, type Stats } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
+import { performance } from 'node:perf_hooks';
 import { createServer, type Server, type Socket } from 'node:net';
 import { lookup as dnsLookup } from 'node:dns';
 import { PassThrough, Writable, type Readable } from 'node:stream';
@@ -1212,7 +1213,11 @@ export async function* runStraceTailer(
     // per-pid files mid-flush — the exact data loss being fixed.  The hard
     // cap only stops TAILING; strace has already exited by construction, so
     // file sizes are final and the loop reaches a fixed point quickly.
-    const hardDeadline = Date.now() + settleHardCapMs;
+    // MONOTONIC (performance.now = CLOCK_MONOTONIC), NOT Date.now(): a stalled
+    // CLOCK_REALTIME on a virtualized guest would make this "never hang" safety net
+    // never fire (the same Firecracker quirk that wedged readStraceChildPid). The
+    // primary exit here is the quiet-passes fixed point; this is the backstop.
+    const hardDeadline = performance.now() + settleHardCapMs;
     let quiet = 0;
     let prev = '';
     // Monotonic snapshot of total capture progress: per-pid file count +
@@ -1244,7 +1249,7 @@ export async function* runStraceTailer(
         quiet = 0;
       }
       prev = cur;
-      if (Date.now() >= hardDeadline) break; // safety net — never hang
+      if (performance.now() >= hardDeadline) break; // safety net — never hang
       await delay(pollIntervalMs);
     }
     // Resolve any provisional ctime verdict.  A clean whole-tree exit already
@@ -1463,9 +1468,26 @@ export async function readStraceChildPid(
     // Returns the file's trimmed contents, or null when unreadable (strace not
     // yet forked / `/proc` unavailable). Production omits it → real readFileSync.
     readChildren?: (stracePid: number) => string | null;
+    // Test-only injectable MONOTONIC clock (ms). Production uses
+    // `performance.now()` (CLOCK_MONOTONIC). See the clock note below.
+    now?: () => number;
   } = {},
 ): Promise<number | null> {
-  const start = Date.now();
+  // MONOTONIC deadline clock.  We deliberately do NOT use `Date.now()`
+  // (CLOCK_REALTIME): on a virtualized guest CLOCK_REALTIME can STALL while
+  // CLOCK_MONOTONIC keeps ticking (observed on a Firecracker microVM — Date.now()
+  // effectively frozen for the whole install).  With a Date.now()-based deadline,
+  // a frozen real-time clock made `Date.now() - start` stay 0, the `>= deadlineMs`
+  // break NEVER fired, and the loop ran its full iteration backstop — ~33 min at a
+  // 10 ms poll — wedging the Phase-B prepare pass (a fast no-op prepare child never
+  // reaches the settle below, so it falls through to this deadline path; the
+  // long-lived main install settles and returns first, so it was unaffected).
+  // `performance.now()` is CLOCK_MONOTONIC — the SAME clock domain that drives the
+  // `setTimeout` poll below — so if the polls advance at all, this deadline is
+  // GUARANTEED to fire.
+  const now = opts.now ?? ((): number => performance.now());
+  const start = now();
+  const startReal = Date.now(); // diagnostic only — surfaces a stalled CLOCK_REALTIME
   // ASYNC (await) rather than a synchronous busy-wait: `run()` is an async
   // generator and the install command's stdout tail collector
   // (attachStdoutTailCollector) is already attached, so we must NOT block the
@@ -1497,11 +1519,17 @@ export async function readStraceChildPid(
   // for a stable sole child), so the verdict cannot pin a transient.
   let candidate: number | null = null;
   let streak = 0;
-  // Safety cap against a non-monotonic clock (a virtualisation quirk we don't
-  // see today but is cheap to guard against); generously above
-  // deadlineMs / POLL_INTERVAL_MS so the time-based deadline is the real bound.
-  for (let iter = 0; iter < 200_000; iter++) {
-    if (Date.now() - start >= deadlineMs) break;
+  // Iteration backstop.  The monotonic deadline above is the REAL bound; this is a
+  // second guard against a pathological clock.  Unlike the prior fixed 200_000 cap
+  // (~33 min at a 10 ms poll — which BECAME the effective bound when the old
+  // Date.now() deadline silently failed on a stalled CLOCK_REALTIME), it is a sane
+  // multiple of the nominal poll count (deadlineMs / interval), so it can never run
+  // for minutes.
+  const maxIters =
+    Math.max(1, Math.ceil(deadlineMs / Math.max(1, POLL_INTERVAL_MS))) * 4 + 100;
+  let iter = 0;
+  for (; iter < maxIters; iter++) {
+    if (now() - start >= deadlineMs) break;
     const raw = readChildren(stracePid);
     if (raw === null || raw.length === 0) {
       // Not forked yet / transitional gap → reset the streak.
@@ -1534,9 +1562,29 @@ export async function readStraceChildPid(
     }
     await new Promise<void>((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
-  // Deadline expired without a child stabilizing → fail closed (null →
+  // Deadline / backstop expired without a child stabilizing → fail closed (null →
   // `<FORGED_ROOT>`), the safe direction. The durable root settles in ~200ms, so
-  // this only fires if strace never produced a stable sole child for 5s.
+  // this only fires if strace never produced a stable sole child for the deadline
+  // (e.g. a fast no-op prepare child that exits before the settle — harmless: its
+  // events force-attribute to root via the prepare emitter regardless).
+  //
+  // Diagnostic: if the MONOTONIC elapsed time is far larger than the CLOCK_REALTIME
+  // elapsed time, the real-time clock STALLED (the Firecracker quirk that the old
+  // Date.now()-based deadline tripped over). Surface it on the guest console so the
+  // condition is visible, but only when the two clocks actually diverged.
+  const monoMs = Math.round(now() - start);
+  const realMs = Date.now() - startReal;
+  if (monoMs - realMs > 1000) {
+    try {
+      process.stderr.write(
+        `[agent] readStraceChildPid: CLOCK_REALTIME stalled while resolving the ` +
+          `strace root pid (monoMs=${monoMs}, realMs=${realMs}, iters=${iter}); ` +
+          `bounded by the monotonic deadline → null (fail-closed).\n`,
+      );
+    } catch {
+      /* best-effort diagnostic */
+    }
+  }
   return null;
 }
 

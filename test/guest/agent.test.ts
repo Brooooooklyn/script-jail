@@ -5558,6 +5558,59 @@ describe('readStraceChildPid', () => {
     });
     expect(result).toBe(108);
   });
+
+  // REGRESSION (Firecracker CLOCK_REALTIME stall, 2026-06-22): the production
+  // deadline MUST come from a MONOTONIC clock, not Date.now(). On a Firecracker
+  // guest CLOCK_REALTIME stalled while CLOCK_MONOTONIC (setTimeout) ticked, so the
+  // old `Date.now() - start >= deadlineMs` break NEVER fired and the loop ran its
+  // full 200_000-iteration cap (~33 min at a 10 ms poll) — wedging the prepare
+  // pass. Simulate a FROZEN deadline clock (`now` never advances) with a child that
+  // never settles: the function MUST still terminate promptly via the sane
+  // iteration backstop (NOT loop ~200_000 times). If this regresses, the test hangs
+  // until the suite timeout instead of completing in well under a second.
+  it('terminates via the bounded backstop when the deadline clock is frozen', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    let reads = 0;
+    const result = await readStraceChildPid(0, 50, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      // Frozen monotonic clock → the time-based deadline can never fire.
+      now: () => 0,
+      // Never a stable sole child → never settles → falls to the deadline/backstop.
+      readChildren: () => {
+        reads += 1;
+        return null;
+      },
+    });
+    expect(result).toBeNull();
+    // maxIters = ceil(deadlineMs/max(1,pollInterval))*4 + 100 = 50*4 + 100 = 300.
+    // The OLD fixed 200_000 cap would have polled ~200_000 times here.
+    expect(reads).toBeLessThan(1000);
+  });
+
+  // The deadline is measured against the INJECTED monotonic clock: once it advances
+  // past `deadlineMs` the loop breaks (proving the bound tracks `now`, not Date.now).
+  it('bounds the wait by the monotonic deadline clock', async () => {
+    const { readStraceChildPid } = await import('../../src/guest/agent.js');
+    let t = 0;
+    let reads = 0;
+    const result = await readStraceChildPid(0, 100, {
+      settlePolls: 3,
+      pollIntervalMs: 0,
+      now: () => {
+        t += 25; // advance 25ms of monotonic time per call
+        return t;
+      },
+      readChildren: () => {
+        reads += 1;
+        return null;
+      },
+    });
+    expect(result).toBeNull();
+    // start=now()=25; break when now()-25 >= 100 → now() >= 125 → ~6 calls in.
+    // A handful of polls, nowhere near the backstop.
+    expect(reads).toBeLessThan(20);
+  });
 });
 
 describe('MacOSInstallRunner post-exit freeze omission (Codex round-2 finding 1)', () => {
